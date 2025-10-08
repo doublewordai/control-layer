@@ -1,0 +1,1 @@
+export { AccessManagementModal } from "./AccessManagementModal";

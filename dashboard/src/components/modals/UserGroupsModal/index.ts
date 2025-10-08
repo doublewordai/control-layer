@@ -1,0 +1,1 @@
+export { UserGroupsModal } from "./UserGroupsModal";

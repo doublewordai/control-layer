@@ -1,0 +1,31 @@
+target/
+Dockerfile
+.dockerignore
+.git/
+.gitignore
+*.md
+*.log
+.env
+.env.local
+.DS_Store
+tests.log
+x.log
+
+# IDE files
+.vscode/
+.idea/
+
+# OS files
+Thumbs.db
+
+# Temporary files
+*.tmp
+*.temp
+
+# Documentation
+docs/
+README*
+
+# Test artifacts
+coverage/
+*.prof

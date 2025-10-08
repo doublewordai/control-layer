@@ -1,0 +1,46 @@
+[
+  {
+    "id": "a1b2c3d4-e5f6-7890-1234-567890abcdef",
+    "name": "Internal",
+    "description": "Internal inference endpoint for proprietary models",
+    "url": "http://internal-models:8080",
+    "created_by": "550e8400-e29b-41d4-a716-446655440000",
+    "created_at": "2024-01-01T10:00:00Z",
+    "updated_at": "2024-01-15T14:30:00Z",
+    "requires_api_key": false,
+    "model_filter": null
+  },
+  {
+    "id": "b2c3d4e5-f678-9012-3456-7890abcdef01",
+    "name": "Anthropic",
+    "description": "Anthropic Claude models endpoint",
+    "url": "https://api.anthropic.com",
+    "created_by": "550e8400-e29b-41d4-a716-446655440000",
+    "created_at": "2024-01-02T11:15:00Z",
+    "updated_at": "2024-01-18T09:45:00Z",
+    "requires_api_key": true,
+    "model_filter": null
+  },
+  {
+    "id": "c3d4e5f6-7890-1234-5678-90abcdef0123",
+    "name": "OpenAI",
+    "description": "OpenAI GPT models endpoint",
+    "url": "https://api.openai.com",
+    "created_by": "550e8400-e29b-41d4-a716-446655440000",
+    "created_at": "2024-01-03T12:30:00Z",
+    "updated_at": "2024-01-20T16:20:00Z",
+    "requires_api_key": true,
+    "model_filter": ["gpt-4", "gpt-3.5-turbo"]
+  },
+  {
+    "id": "d4e5f6a7-8901-2345-6789-0abcdef01234",
+    "name": "OpenRouter",
+    "description": "OpenRouter aggregated models endpoint",
+    "url": "https://openrouter.ai/api/v1",
+    "created_by": "550e8400-e29b-41d4-a716-446655440000",
+    "created_at": "2024-01-04T08:20:00Z",
+    "updated_at": "2024-01-22T11:15:00Z",
+    "requires_api_key": true,
+    "model_filter": null
+  }
+]

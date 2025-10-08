@@ -1,0 +1,319 @@
+@import "tailwindcss";
+
+@plugin 'tailwindcss-animate';
+
+@custom-variant dark (&:is(.dark *));
+
+@theme {
+  --color-doubleword-primary: #fe6767;
+  --color-doubleword-concrete: #e2e0d3;
+  --color-doubleword-yellow: #fcda7e;
+  --color-doubleword-purple: #6d71f5;
+  --color-doubleword-green: #76c08f;
+
+  --color-doubleword-red-50: #fff5f5;
+  --color-doubleword-red-100: #ffe8e8;
+  --color-doubleword-red-200: #ffd4d4;
+  --color-doubleword-red-300: #ffb3b3;
+  --color-doubleword-red-400: #ff8a8a;
+  --color-doubleword-red-500: #fe6767;
+  --color-doubleword-red-600: #e54d4d;
+  --color-doubleword-red-700: #cc3636;
+  --color-doubleword-red-800: #a62b2b;
+  --color-doubleword-red-900: #802222;
+  --color-doubleword-red: #fe6767;
+  --color-doubleword-red-light: #ff8a8a;
+  --color-doubleword-red-dark: #e54d4d;
+
+  --color-doubleword-neutral-50: #fafaf9;
+  --color-doubleword-neutral-100: #f5f4f1;
+  --color-doubleword-neutral-200: #ebe9e0;
+  --color-doubleword-neutral-300: #e2e0d3;
+  --color-doubleword-neutral-400: #d0cdb8;
+  --color-doubleword-neutral-500: #b5b19a;
+  --color-doubleword-neutral-600: #938f78;
+  --color-doubleword-neutral-700: #726e5b;
+  --color-doubleword-neutral-800: #4f4c3f;
+  --color-doubleword-neutral-900: #2e2c26;
+
+  --color-doubleword-background-primary: #ffffff;
+  --color-doubleword-background-secondary: #fafaf9;
+  --color-doubleword-background-tertiary: #f5f4f1;
+  --color-doubleword-background-card: #ffffff;
+  --color-doubleword-background-dark: #2e2c26;
+
+  --color-doubleword-text-primary: #2e2c26;
+  --color-doubleword-text-secondary: #4f4c3f;
+  --color-doubleword-text-tertiary: #726e5b;
+  --color-doubleword-text-muted: #938f78;
+  --color-doubleword-text-light: #ffffff;
+  --color-doubleword-text-light-secondary: #fafaf9;
+
+  --color-doubleword-border: #e2e0d3;
+  --color-doubleword-border-light: #f5f4f1;
+  --color-doubleword-border-dark: #d0cdb8;
+
+  --color-background: hsl(var(--background));
+  --color-foreground: hsl(var(--foreground));
+
+  --color-card: hsl(var(--card));
+  --color-card-foreground: hsl(var(--card-foreground));
+
+  --color-popover: hsl(var(--popover));
+  --color-popover-foreground: hsl(var(--popover-foreground));
+
+  --color-primary: hsl(var(--primary));
+  --color-primary-foreground: hsl(var(--primary-foreground));
+
+  --color-secondary: hsl(var(--secondary));
+  --color-secondary-foreground: hsl(var(--secondary-foreground));
+
+  --color-muted: hsl(var(--muted));
+  --color-muted-foreground: hsl(var(--muted-foreground));
+
+  --color-accent: hsl(var(--accent));
+  --color-accent-foreground: hsl(var(--accent-foreground));
+
+  --color-destructive: hsl(var(--destructive));
+  --color-destructive-foreground: hsl(var(--destructive-foreground));
+
+  --color-border: hsl(var(--border));
+  --color-input: hsl(var(--input));
+  --color-ring: hsl(var(--ring));
+
+  --color-chart-1: hsl(var(--chart-1));
+  --color-chart-2: hsl(var(--chart-2));
+  --color-chart-3: hsl(var(--chart-3));
+  --color-chart-4: hsl(var(--chart-4));
+  --color-chart-5: hsl(var(--chart-5));
+
+  --font-space-grotesk: Space Grotesk, sans-serif;
+  --font-sans: Space Grotesk, ui-sans-serif, system-ui, sans-serif;
+
+  --text-responsive: calc(1rem + 0.5vw);
+
+  --radius-xl: 1rem;
+  --radius-2xl: 1.5rem;
+  --radius-3xl: 2rem;
+  --radius-4xl: 3rem;
+  --radius-lg: var(--radius);
+  --radius-md: calc(var(--radius) - 2px);
+  --radius-sm: calc(var(--radius) - 4px);
+
+  --animate-fade-in: fadeIn 0.3s ease-in-out;
+  --animate-slide-up: slideUp 0.3s ease-out;
+
+  @keyframes fadeIn {
+    0% {
+      opacity: 0;
+    }
+    100% {
+      opacity: 1;
+    }
+  }
+  @keyframes slideUp {
+    0% {
+      transform: translateY(10px);
+      opacity: 0;
+    }
+    100% {
+      transform: translateY(0);
+      opacity: 1;
+    }
+  }
+}
+
+/*
+  The default border color has changed to `currentcolor` in Tailwind CSS v4,
+  so we've added these compatibility styles to make sure everything still
+  looks the same as it did with Tailwind CSS v3.
+
+  If we ever want to remove these styles, we need to add an explicit border
+  color utility to any element that depends on these defaults.
+*/
+@layer base {
+  *,
+  ::after,
+  ::before,
+  ::backdrop,
+  ::file-selector-button {
+    border-color: var(--color-gray-200, currentcolor);
+  }
+}
+
+@utility btn-primary {
+  @apply bg-doubleword-primary text-white px-4 py-2 rounded-lg font-medium transition-colors hover:bg-doubleword-red-dark focus:outline-hidden focus:ring-2 focus:ring-doubleword-primary focus:ring-offset-2;
+}
+
+@utility btn-secondary {
+  @apply bg-doubleword-neutral-100 text-doubleword-text-primary border border-doubleword-border px-4 py-2 rounded-lg font-medium transition-colors hover:bg-doubleword-neutral-200 focus:outline-hidden focus:ring-2 focus:ring-doubleword-primary focus:ring-offset-2;
+}
+
+@utility card {
+  @apply bg-white rounded-lg border border-doubleword-border shadow-xs;
+}
+
+@utility input {
+  @apply w-full px-3 py-2 border border-doubleword-border rounded-lg focus:outline-hidden focus:ring-2 focus:ring-doubleword-primary focus:border-transparent transition-colors;
+}
+
+@utility text-responsive {
+  font-size: calc(1rem + 0.5vw);
+}
+
+@utility scientific-notation {
+  @apply text-base font-medium;
+}
+
+@utility animate-fade-in {
+  animation: fadeIn 0.3s ease-in-out;
+}
+
+@utility animate-slide-up {
+  animation: slideUp 0.3s ease-out;
+}
+
+@layer base {
+  :root {
+    --doubleword-primary: 254 103 103;
+    --doubleword-concrete: 226 224 211;
+    --doubleword-yellow: 252 218 126;
+    --doubleword-purple: 109 113 245;
+    --doubleword-green: 118 192 143;
+    --background: 0 0% 100%;
+    --foreground: 20 14.3% 4.1%;
+    --card: 0 0% 100%;
+    --card-foreground: 20 14.3% 4.1%;
+    --popover: 0 0% 100%;
+    --popover-foreground: 20 14.3% 4.1%;
+    --primary: 24 9.8% 10%;
+    --primary-foreground: 60 9.1% 97.8%;
+    --secondary: 60 4.8% 95.9%;
+    --secondary-foreground: 24 9.8% 10%;
+    --muted: 60 4.8% 95.9%;
+    --muted-foreground: 25 5.3% 44.7%;
+    --accent: 12 6.5% 15.1%;
+    --accent-foreground: 60 9.1% 97.8%;
+    --destructive: 0 84.2% 60.2%;
+    --destructive-foreground: 60 9.1% 97.8%;
+    --border: 20 5.9% 90%;
+    --input: 20 5.9% 90%;
+    --ring: 20 14.3% 4.1%;
+    --chart-1: oklch(0.6 0.15 250);
+    --chart-2: oklch(0.646 0.222 41.116);
+    --chart-3: oklch(0.828 0.189 84.429);
+    --chart-4: oklch(0.769 0.188 70.08);
+    --chart-5: oklch(0.398 0.07 227.392);
+    --radius: 0.5rem;
+  }
+
+  html {
+    -webkit-font-smoothing: antialiased;
+    -moz-osx-font-smoothing: grayscale;
+  }
+
+  body {
+    @apply font-sans text-doubleword-text-primary bg-doubleword-background-secondary;
+    margin: 0;
+    min-height: 100vh;
+    line-height: 1.5;
+    font-weight: 400;
+  }
+
+  * {
+    box-sizing: border-box;
+  }
+  .dark {
+    --background: 20 14.3% 4.1%;
+    --foreground: 60 9.1% 97.8%;
+    --card: 20 14.3% 4.1%;
+    --card-foreground: 60 9.1% 97.8%;
+    --popover: 20 14.3% 4.1%;
+    --popover-foreground: 60 9.1% 97.8%;
+    --primary: 60 9.1% 97.8%;
+    --primary-foreground: 24 9.8% 10%;
+    --secondary: 12 6.5% 15.1%;
+    --secondary-foreground: 60 9.1% 97.8%;
+    --muted: 12 6.5% 15.1%;
+    --muted-foreground: 24 5.4% 63.9%;
+    --accent: 12 6.5% 15.1%;
+    --accent-foreground: 60 9.1% 97.8%;
+    --destructive: 0 62.8% 30.6%;
+    --destructive-foreground: 60 9.1% 97.8%;
+    --border: 12 6.5% 15.1%;
+    --input: 12 6.5% 15.1%;
+    --ring: 24 5.7% 82.9%;
+    --chart-1: oklch(0.65 0.18 260);
+    --chart-2: oklch(0.488 0.243 264.376);
+    --chart-3: oklch(0.769 0.188 70.08);
+    --chart-4: oklch(0.645 0.246 16.439);
+    --chart-5: oklch(0.627 0.265 303.9);
+  }
+}
+
+@layer base {
+  * {
+    @apply border-border;
+  }
+  body {
+    @apply bg-background text-foreground;
+  }
+}
+
+/*
+  ---break---
+*/
+
+:root {
+  --sidebar: #2e2c26;
+  --sidebar-foreground: #ccc5b4;
+  --sidebar-primary: #fe6767;
+  --sidebar-primary-foreground: #ffffff;
+  --sidebar-accent: #fe6767;
+  --sidebar-accent-foreground: #ffffff;
+  --sidebar-border: #3a3831;
+  --sidebar-ring: hsl(217.2 91.2% 59.8%);
+}
+
+/*
+  ---break---
+*/
+
+.dark {
+  --sidebar: #2e2c26;
+  --sidebar-foreground: #ccc5b4;
+  --sidebar-primary: #fe6767;
+  --sidebar-primary-foreground: #ffffff;
+  --sidebar-accent: #fe6767;
+  --sidebar-accent-foreground: #ffffff;
+  --sidebar-border: #3a3831;
+  --sidebar-ring: hsl(217.2 91.2% 59.8%);
+}
+
+/*
+  ---break---
+*/
+
+@theme inline {
+  --color-sidebar: var(--sidebar);
+  --color-sidebar-foreground: var(--sidebar-foreground);
+  --color-sidebar-primary: var(--sidebar-primary);
+  --color-sidebar-primary-foreground: var(--sidebar-primary-foreground);
+  --color-sidebar-accent: var(--sidebar-accent);
+  --color-sidebar-accent-foreground: var(--sidebar-accent-foreground);
+  --color-sidebar-border: var(--sidebar-border);
+  --color-sidebar-ring: var(--sidebar-ring);
+}
+
+/*
+  ---break---
+*/
+
+@layer base {
+  * {
+    @apply border-border outline-ring/50;
+  }
+  body {
+    @apply bg-background text-foreground;
+  }
+}
