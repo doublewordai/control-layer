@@ -304,18 +304,14 @@ jobs:
           CLAY_CRITICAL=$(calculate_vulns clay-vulnerabilities.json "Critical")
           CLAY_HIGH=$(calculate_vulns clay-vulnerabilities.json "High")
 
-          # Calculate totals
-          TOTAL_CRITICAL=$((CLAY_CRITICAL )
-          TOTAL_HIGH=$((CLAY_HIGH))
-
           # Console output
           echo "Security scan completed:"
-          echo "  Critical vulnerabilities: $TOTAL_CRITICAL"
-          echo "  High vulnerabilities: $TOTAL_HIGH"
+          echo "  Critical vulnerabilities: $CLAY_CRITICAL"
+          echo "  High vulnerabilities: $CLAY_HIGH"
 
           # Set outputs for metrics reporting
-          echo "total_critical=$TOTAL_CRITICAL" >> $GITHUB_OUTPUT
-          echo "total_high=$TOTAL_HIGH" >> $GITHUB_OUTPUT
+          echo "total_critical=$CLAY_CRITICAL" >> $GITHUB_OUTPUT
+          echo "total_high=$CLAY_HIGH" >> $GITHUB_OUTPUT
 
       - name: Report vulnerability counts to Somnial
         if: always()
