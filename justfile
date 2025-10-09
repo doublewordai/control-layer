@@ -679,8 +679,7 @@ ci target *args="":
 # Security scanning: 'just security-scan [TAG]'
 #
 # Scans published container images from GitHub Container Registry for vulnerabilities.
-# Uses Grype to scan all three main images (clay, nginx, oauth2-proxy) and provides
-# detailed vulnerability reports by severity level.
+# Uses Grype to scan the clay image and provides detailed vulnerability reports by severity level.
 #
 # Arguments:
 # TAG: Image tag to scan (defaults to 'latest' if not specified)
@@ -709,13 +708,11 @@ security-scan target="latest" *args="":
     SCAN_TAG="${TAG:-{{target}}}"
     REGISTRY="ghcr.io/doublewordai/control-layer/"
     CLAY_TAG="${REGISTRY}clay:$SCAN_TAG"
-    NGINX_TAG="${REGISTRY}nginx:$SCAN_TAG"
-    OA2P_TAG="quay.io/oauth2-proxy/oauth2-proxy:v7.12.0"
 
     echo "🔍 Scanning published container images for vulnerabilities..."
     echo "Tag: $SCAN_TAG"
-    echo "Images: $CLAY_TAG, $NGINX_TAG, $OA2P_TAG"
-    
+    echo "Images: $CLAY_TAG"
+
     # Function to calculate vulnerability counts
     calculate_vulns() {
         local file=$1
@@ -735,18 +732,6 @@ security-scan target="latest" *args="":
         echo '{"matches": []}' > clay-vulnerabilities.json
     }
     
-    echo "Scanning nginx image: $NGINX_TAG" 
-    grype "$NGINX_TAG" --output json --file nginx-vulnerabilities.json --quiet || {
-        echo "⚠️  Nginx scan failed, skipping..."
-        echo '{"matches": []}' > nginx-vulnerabilities.json
-    }
-    
-    echo "Scanning oauth2-proxy image: $OA2P_TAG"
-    grype "$OA2P_TAG" --output json --file oa2p-vulnerabilities.json --quiet || {
-        echo "⚠️  Oauth2-proxy scan failed, skipping..."
-        echo '{"matches": []}' > oa2p-vulnerabilities.json
-    }
-    
     # Calculate metrics for each component
     CLAY_CRITICAL=$(calculate_vulns clay-vulnerabilities.json "Critical")
     CLAY_HIGH=$(calculate_vulns clay-vulnerabilities.json "High")
@@ -754,24 +739,12 @@ security-scan target="latest" *args="":
     CLAY_LOW=$(calculate_vulns clay-vulnerabilities.json "Low")
     CLAY_TOTAL=$(jq '.matches | length' clay-vulnerabilities.json 2>/dev/null || echo "0")
     
-    NGINX_CRITICAL=$(calculate_vulns nginx-vulnerabilities.json "Critical")
-    NGINX_HIGH=$(calculate_vulns nginx-vulnerabilities.json "High") 
-    NGINX_MEDIUM=$(calculate_vulns nginx-vulnerabilities.json "Medium")
-    NGINX_LOW=$(calculate_vulns nginx-vulnerabilities.json "Low")
-    NGINX_TOTAL=$(jq '.matches | length' nginx-vulnerabilities.json 2>/dev/null || echo "0")
-    
-    OA2P_CRITICAL=$(calculate_vulns oa2p-vulnerabilities.json "Critical")
-    OA2P_HIGH=$(calculate_vulns oa2p-vulnerabilities.json "High")
-    OA2P_MEDIUM=$(calculate_vulns oa2p-vulnerabilities.json "Medium")
-    OA2P_LOW=$(calculate_vulns oa2p-vulnerabilities.json "Low")
-    OA2P_TOTAL=$(jq '.matches | length' oa2p-vulnerabilities.json 2>/dev/null || echo "0")
-    
     # Calculate totals
-    TOTAL_CRITICAL=$((CLAY_CRITICAL + NGINX_CRITICAL + OA2P_CRITICAL))
-    TOTAL_HIGH=$((CLAY_HIGH + NGINX_HIGH + OA2P_HIGH))
-    TOTAL_MEDIUM=$((CLAY_MEDIUM + NGINX_MEDIUM + OA2P_MEDIUM))
-    TOTAL_LOW=$((CLAY_LOW + NGINX_LOW + OA2P_LOW))
-    TOTAL_VULNS=$((CLAY_TOTAL + NGINX_TOTAL + OA2P_TOTAL))
+    TOTAL_CRITICAL=$((CLAY_CRITICAL))
+    TOTAL_HIGH=$((CLAY_HIGH))
+    TOTAL_MEDIUM=$((CLAY_MEDIUM))
+    TOTAL_LOW=$((CLAY_LOW))
+    TOTAL_VULNS=$((CLAY_TOTAL))
     
     # Display results
     echo ""
@@ -780,16 +753,12 @@ security-scan target="latest" *args="":
     printf "%-10s %-9s %-6s %-8s %-5s %-7s\n" "Component" "Critical" "High" "Medium" "Low" "Total"
     echo "-------------------------------------------------------"
     printf "%-10s %-9s %-6s %-8s %-5s %-7s\n" "Clay" "$CLAY_CRITICAL" "$CLAY_HIGH" "$CLAY_MEDIUM" "$CLAY_LOW" "$CLAY_TOTAL"
-    printf "%-10s %-9s %-6s %-8s %-5s %-7s\n" "Nginx" "$NGINX_CRITICAL" "$NGINX_HIGH" "$NGINX_MEDIUM" "$NGINX_LOW" "$NGINX_TOTAL"  
-    printf "%-10s %-9s %-6s %-8s %-5s %-7s\n" "OA2P" "$OA2P_CRITICAL" "$OA2P_HIGH" "$OA2P_MEDIUM" "$OA2P_LOW" "$OA2P_TOTAL"
     echo "-------------------------------------------------------"
     printf "%-10s %-9s %-6s %-8s %-5s %-7s\n" "Total" "$TOTAL_CRITICAL" "$TOTAL_HIGH" "$TOTAL_MEDIUM" "$TOTAL_LOW" "$TOTAL_VULNS"
     
     echo ""
     echo "📁 Detailed reports saved:"
     echo "  - clay-vulnerabilities.json"
-    echo "  - nginx-vulnerabilities.json" 
-    echo "  - oa2p-vulnerabilities.json"
     
     # Warn about critical vulnerabilities
     if [ "$TOTAL_CRITICAL" -gt 0 ]; then

@@ -158,9 +158,6 @@ If you see something like "error returned from database: password authentication
 then you'll need to change your pg_hba.conf file - see [here](https://stackoverflow.com/a/55039419).
 N.B. I needed to use sudo vim pg_hba.conf and then run `sudo service postgresql restart` afterwards.
 
-**Error from registry: unauthorized (nginx)**
-→ Authenticate with ghcr: https://docs.github.com/en/packages/working-with-a-github-packages-registry/working-with-the-container-registry
-
 **"Test database missing or inaccessible" from check-db, and db-setup doesn't fix it**
 → Try creating the databases manually with `createdb onwards_pilot_test` and `createdb test`.
 If you get "createdb: error: database creation failed: ERROR: permission denied to create database" then try executing them as postgres.

@@ -287,8 +287,6 @@ jobs:
           TAG=$(echo "$TAG_LIST" | cut -d',' -f1 | cut -d':' -f2)
 
           CLAY_TAG="ghcr.io/doublewordai/control-layer/clay:$TAG"
-          NGINX_TAG="ghcr.io/doublewordai/control-layer/nginx:$TAG"
-          OA2P_TAG="quay.io/oauth2-proxy/oauth2-proxy:v7.12.0"
 
           echo "Scanning images for security vulnerabilities..."
           echo "Tag: $TAG"
@@ -306,21 +304,9 @@ jobs:
           CLAY_CRITICAL=$(calculate_vulns clay-vulnerabilities.json "Critical")
           CLAY_HIGH=$(calculate_vulns clay-vulnerabilities.json "High")
 
-          # Scan nginx image  
-          echo "Scanning nginx image: $NGINX_TAG"
-          grype "$NGINX_TAG" --output json --file nginx-vulnerabilities.json
-          NGINX_CRITICAL=$(calculate_vulns nginx-vulnerabilities.json "Critical")
-          NGINX_HIGH=$(calculate_vulns nginx-vulnerabilities.json "High")
-
-          # Scan oauth2-proxy image
-          echo "Scanning OA2P image: $OA2P_TAG"  
-          grype "$OA2P_TAG" --output json --file oauth2p-vulnerabilities.json
-          OA2P_CRITICAL=$(calculate_vulns oauth2p-vulnerabilities.json "Critical")
-          OA2P_HIGH=$(calculate_vulns oauth2p-vulnerabilities.json "High")
-
           # Calculate totals
-          TOTAL_CRITICAL=$((CLAY_CRITICAL + NGINX_CRITICAL + OA2P_CRITICAL))
-          TOTAL_HIGH=$((CLAY_HIGH + NGINX_HIGH + OA2P_HIGH))
+          TOTAL_CRITICAL=$((CLAY_CRITICAL )
+          TOTAL_HIGH=$((CLAY_HIGH))
 
           # Console output
           echo "Security scan completed:"
