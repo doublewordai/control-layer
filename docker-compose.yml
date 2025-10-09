@@ -1,0 +1,39 @@
+services:
+  postgres:
+    image: postgres:15
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-clay}
+      POSTGRES_USER: ${POSTGRES_USER:-clay}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-clay_password}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U clay -d clay"]
+      start_period: 1s
+      interval: 1s
+      timeout: 3s
+      retries: 10
+
+  clay:
+    image: ghcr.io/doublewordai/control-layer/clay:${TAG:-latest}
+    pull_policy: ${PULL_POLICY:-always}
+    ports:
+      - "3001:3001"
+    environment:
+      - RUST_LOG=debug
+      - DATABASE_URL=postgres://clay:clay_password@postgres:5432/clay
+    volumes:
+      - ./clay_config.yaml:/app/config.yaml:ro
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:3001/healthz"]
+      start_period: 1s
+      interval: 100s
+      timeout: 3s
+      retries: 10
+
+volumes:
+  postgres_data:
+
+networks:
+  default:
+    driver: bridge

@@ -1,0 +1,60 @@
+services:
+  postgres:
+    ports:
+      - "5433:5432"
+    healthcheck:
+      disable: true
+
+  clay:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: dev
+    ports:
+      - "3001:3001"
+    environment:
+      - DATABASE_URL=postgres://clay:clay_password@postgres:5432/clay
+    volumes:
+      - ./clay_config.yaml:/app/config.yaml:ro
+      - ./clay/src:/app/clay/src:ro
+      - ./clay/Cargo.toml:/app/clay/Cargo.toml:ro
+      - ./clay/Cargo.lock:/app/clay/Cargo.lock
+      - ./clay/migrations:/app/clay/migrations:ro
+      - ./clay/.sqlx:/app/clay/.sqlx:ro
+      - clay_target:/app/clay/target
+      - cargo_registry:/usr/local/cargo/registry
+      - cargo_git:/usr/local/cargo/git
+    depends_on:
+      postgres:
+        condition: service_started
+    healthcheck:
+      disable: true
+
+  clay-frontend:
+    build:
+      context: ./dashboard
+      dockerfile: Dockerfile
+    ports:
+      - "5173:5173"
+    environment:
+      - BACKEND_URL=http://clay:3001
+    volumes:
+      - ./dashboard:/app
+      - clay_frontend_node_modules:/app/node_modules
+      - /app/.vite
+    develop:
+      watch:
+        - action: rebuild
+          path: ./dashboard/package.json
+        - action: rebuild
+          path: ./dashboard/Dockerfile
+
+volumes:
+  clay_target:
+  clay_frontend_node_modules:
+  cargo_registry:
+  cargo_git:
+
+networks:
+  default:
+    driver: bridge

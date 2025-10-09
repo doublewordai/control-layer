@@ -25,10 +25,10 @@ psql -c "CREATE DATABASE clay;"
 
 ### 2. Environment Configuration
 
-Create `.env` file in the `application/clay` directory:
+Create `.env` file in the current directory:
 
 ```bash
-# application/clay/.env
+# .env
 DATABASE_URL=postgres://your-username@localhost:5432/clay
 ```
 
@@ -37,7 +37,6 @@ Replace `your-username` with your PostgreSQL username.
 ### 3. Run Database Migrations
 
 ```bash
-cd application/clay
 sqlx migrate run
 ```
 
@@ -53,8 +52,6 @@ cargo sqlx prepare
 ## Running the Service
 
 ```bash
-cd application/clay
-
 # Run with live database connection
 cargo run
 
