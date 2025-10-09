@@ -35,5 +35,5 @@ target "clay" {
 
 # Group target for building all images
 group "default" {
-  targets = ["clay", "nginx"]
+  targets = ["clay"]
 }
