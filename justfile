@@ -353,8 +353,8 @@ test target="" *args="":
         fi
 
         # Generate admin JWT
-        ADMIN_JWT=$(USERNAME=$ADMIN_EMAIL PASSWORD=$ADMIN_PASSWORD ./scripts/generate-jwt.sh 2>&1)
-        if [ $? -eq 0 ]; then
+       
+        if ADMIN_JWT=$(EMAIL=$ADMIN_EMAIL PASSWORD=$ADMIN_PASSWORD ./scripts/generate-jwt.sh); then
             echo "admin_jwt=$ADMIN_JWT" > test.env
             echo "✅ Admin JWT generated successfully"
         else
@@ -373,7 +373,7 @@ test target="" *args="":
 
         # Generate user JWT
         echo "Generating user JWT..."
-        if USER_JWT=$(USERNAME=user@example.org PASSWORD=user_password ./scripts/generate-jwt.sh); then
+        if USER_JWT=$(EMAIL=user@example.org PASSWORD=user_password ./scripts/generate-jwt.sh); then
             echo "user_jwt=$USER_JWT" >> test.env
             echo "✅ User JWT generated successfully"
         else
@@ -618,7 +618,7 @@ jwt:
 # Generate cookie for the configured admin user
 # Requires ADMIN_PASSWORD environment variable
 jwt-admin:
-    @USERNAME="$(just get-admin-email)" PASSWORD="${ADMIN_PASSWORD}" ./scripts/generate-jwt.sh
+    @EMAIL="$(just get-admin-email)" PASSWORD="${ADMIN_PASSWORD}" ./scripts/generate-jwt.sh
 
 # Run CI pipeline locally: 'just ci [rust|ts]'
 #

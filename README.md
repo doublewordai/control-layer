@@ -101,7 +101,7 @@ just jwt <email>         # Generate auth token
 
 ## CI Metrics
 
-View real-time build and performance metrics for this project [here](https://charts.somnial.co/doubleword-control-layer).
+View real-time build and performance metrics for [this project](https://charts.somnial.co/doubleword-control-layer).
 
 ## FAQ
 
@@ -155,7 +155,7 @@ just down
 ensure prepared SQL queries are up to date. Ensure you're using Rust 1.88 or higher (`rustc --version`).
 
 If you see something like "error returned from database: password authentication failed for user "postgres""
-then you'll need to change your pg_hba.conf file - see [here](https://stackoverflow.com/a/55039419).
+then you'll need to change your [pg_hba.conf file](https://stackoverflow.com/a/55039419).
 N.B. I needed to use sudo vim pg_hba.conf and then run `sudo service postgresql restart` afterwards.
 
 **"Test database missing or inaccessible" from check-db, and db-setup doesn't fix it**

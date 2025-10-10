@@ -406,8 +406,6 @@ jobs:
         run: just setup
 
       # Run end to end docker-compose tests
-      # OA2 doesn't like being turned off (or rather nginx doesnt) so we configure it here such that we can reenable
-      # it some time in the future for testing.
       - name: Run Docker end-to-end tests
         id: e2e-step
         run: |
