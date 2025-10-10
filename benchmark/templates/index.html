@@ -1,0 +1,256 @@
+{% extends "base.html" %}
+
+{% block content %}
+<div style="margin-bottom: 20px;">
+    <a href="/monitor" style="color: #2563eb; text-decoration: none; font-weight: 500;">View System Monitor →</a>
+</div>
+
+<div class="card">
+    <h2 style="margin-bottom: 24px; font-size: 22px;">Configure Benchmark</h2>
+
+    <div id="error" class="error"></div>
+
+    <form id="benchmark-form">
+        <div class="form-group">
+            <label for="url">Target URL</label>
+            <input type="text" id="url" name="url" value="http://localhost:8080/v1/chat/completions" required>
+        </div>
+
+        <div class="form-group">
+            <label for="concurrency">Concurrency (parallel requests)</label>
+            <input type="number" id="concurrency" name="concurrency" value="10" min="1" required>
+        </div>
+
+        <div class="form-group">
+            <label for="requests">Total Requests</label>
+            <input type="number" id="requests" name="requests" value="100" min="1" required>
+        </div>
+
+        <div class="form-group">
+            <label for="api_key">API Key (optional)</label>
+            <input type="password" id="api_key" name="api_key" placeholder="Bearer token will be added automatically">
+        </div>
+
+        <div class="form-group">
+            <label for="body">Request Body (JSON)</label>
+            <textarea id="body" name="body" required>{
+  "model": "simple-model",
+  "messages": [
+    {
+      "role": "user",
+      "content": "Hello, how are you?"
+    }
+  ]
+}</textarea>
+        </div>
+
+        <button type="submit" id="submit-btn">Run Benchmark</button>
+    </form>
+</div>
+
+<div id="loading" class="loading">
+    <div class="spinner"></div>
+    <p style="margin-top: 16px; color: #6b7280;">Running benchmark...</p>
+    <button id="cancel-btn" class="cancel-btn">Cancel Benchmark</button>
+</div>
+
+<div id="results" class="card results">
+    <h2 style="margin-bottom: 24px; font-size: 22px;">Benchmark Results</h2>
+
+    <div class="metric">
+        <span class="metric-label">Total Time</span>
+        <span class="metric-value" id="total-time">-</span>
+    </div>
+
+    <div class="metric">
+        <span class="metric-label">Requests per Second</span>
+        <span class="metric-value" id="rps">-</span>
+    </div>
+
+    <div class="metric">
+        <span class="metric-label">Total Requests</span>
+        <span class="metric-value" id="total-requests">-</span>
+    </div>
+
+    <div class="metric">
+        <span class="metric-label">Successful Requests</span>
+        <span class="metric-value" id="successful">-</span>
+    </div>
+
+    <div class="metric">
+        <span class="metric-label">Failed Requests</span>
+        <span class="metric-value" id="failed">-</span>
+    </div>
+
+    <div class="metric">
+        <span class="metric-label">P50 Latency</span>
+        <span class="metric-value" id="p50">-</span>
+    </div>
+
+    <div class="metric">
+        <span class="metric-label">P90 Latency</span>
+        <span class="metric-value" id="p90">-</span>
+    </div>
+
+    <div class="metric">
+        <span class="metric-label">P99 Latency</span>
+        <span class="metric-value" id="p99">-</span>
+    </div>
+
+    <div class="metric">
+        <span class="metric-label">Min Latency</span>
+        <span class="metric-value" id="min">-</span>
+    </div>
+
+    <div class="metric">
+        <span class="metric-label">Max Latency</span>
+        <span class="metric-value" id="max">-</span>
+    </div>
+
+    <div class="metric">
+        <span class="metric-label">Avg Latency</span>
+        <span class="metric-value" id="avg">-</span>
+    </div>
+</div>
+
+<script>
+    const form = document.getElementById('benchmark-form');
+    const submitBtn = document.getElementById('submit-btn');
+    const loading = document.getElementById('loading');
+    const results = document.getElementById('results');
+    const errorDiv = document.getElementById('error');
+    const cancelBtn = document.getElementById('cancel-btn');
+
+    let currentRunId = null;
+    let currentEventSource = null;
+
+    form.addEventListener('submit', async (e) => {
+        e.preventDefault();
+
+        errorDiv.classList.remove('show');
+        errorDiv.textContent = '';
+        results.classList.remove('show');
+        loading.classList.add('show');
+        submitBtn.disabled = true;
+
+        try {
+            const body = JSON.parse(document.getElementById('body').value);
+            const apiKey = document.getElementById('api_key').value;
+
+            const payload = {
+                url: document.getElementById('url').value,
+                concurrency: parseInt(document.getElementById('concurrency').value),
+                requests: parseInt(document.getElementById('requests').value),
+                body: body,
+                stream_progress: true
+            };
+
+            if (apiKey) {
+                payload.api_key = apiKey;
+            }
+
+            const response = await fetch('/benchmark', {
+                method: 'POST',
+                headers: {
+                    'Content-Type': 'application/json',
+                },
+                body: JSON.stringify(payload)
+            });
+
+            if (!response.ok) {
+                throw new Error(`HTTP ${response.status}: ${await response.text()}`);
+            }
+
+            const data = await response.json();
+
+            if (!data.run_id) {
+                throw new Error('No run_id returned from server');
+            }
+
+            currentRunId = data.run_id;
+            const eventSource = new EventSource(`/benchmark/${data.run_id}/events`);
+            currentEventSource = eventSource;
+
+            eventSource.onmessage = (event) => {
+                const update = JSON.parse(event.data);
+
+                if (update.status === 'running') {
+                    const percent = Math.round((update.completed / update.total) * 100);
+                    document.querySelector('.loading p').textContent = `Running benchmark... ${update.completed}/${update.total} (${percent}%)`;
+                } else if (update.status === 'completed' && update.results) {
+                    eventSource.close();
+                    currentEventSource = null;
+                    currentRunId = null;
+
+                    const res = update.results;
+                    document.getElementById('total-time').textContent = res.total_time_seconds.toFixed(2) + 's';
+                    document.getElementById('rps').textContent = res.requests_per_second.toFixed(2);
+                    document.getElementById('total-requests').textContent = res.total_requests;
+                    document.getElementById('successful').textContent = res.successful_requests;
+                    document.getElementById('failed').textContent = res.failed_requests;
+                    document.getElementById('p50').textContent = res.p50_latency_ms + 'ms';
+                    document.getElementById('p90').textContent = res.p90_latency_ms + 'ms';
+                    document.getElementById('p99').textContent = res.p99_latency_ms + 'ms';
+                    document.getElementById('min').textContent = res.min_latency_ms + 'ms';
+                    document.getElementById('max').textContent = res.max_latency_ms + 'ms';
+                    document.getElementById('avg').textContent = res.avg_latency_ms.toFixed(2) + 'ms';
+
+                    loading.classList.remove('show');
+                    results.classList.add('show');
+                    submitBtn.disabled = false;
+                } else if (update.status === 'cancelled') {
+                    eventSource.close();
+                    currentEventSource = null;
+                    currentRunId = null;
+
+                    loading.classList.remove('show');
+                    errorDiv.textContent = 'Benchmark was cancelled';
+                    errorDiv.classList.add('show');
+                    submitBtn.disabled = false;
+                }
+            };
+
+            eventSource.onerror = (error) => {
+                eventSource.close();
+                currentEventSource = null;
+                currentRunId = null;
+                loading.classList.remove('show');
+                errorDiv.textContent = 'Error: Lost connection to server';
+                errorDiv.classList.add('show');
+                submitBtn.disabled = false;
+            };
+
+        } catch (error) {
+            loading.classList.remove('show');
+            errorDiv.textContent = 'Error: ' + error.message;
+            errorDiv.classList.add('show');
+            submitBtn.disabled = false;
+        }
+    });
+
+    cancelBtn.addEventListener('click', async () => {
+        if (!currentRunId) return;
+
+        try {
+            cancelBtn.disabled = true;
+            cancelBtn.textContent = 'Cancelling...';
+
+            const response = await fetch(`/benchmark/${currentRunId}/cancel`, {
+                method: 'POST'
+            });
+
+            if (!response.ok) {
+                throw new Error(`Failed to cancel: ${response.status}`);
+            }
+
+        } catch (error) {
+            loading.classList.remove('show');
+            errorDiv.textContent = 'Error cancelling: ' + error.message;
+            errorDiv.classList.add('show');
+            submitBtn.disabled = false;
+            cancelBtn.disabled = false;
+            cancelBtn.textContent = 'Cancel Benchmark';
+        }
+    });
+</script>
+{% endblock %}

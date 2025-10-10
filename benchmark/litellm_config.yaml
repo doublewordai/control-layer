@@ -1,0 +1,10 @@
+general_settings:
+  master_key: sk-1234
+  database_url: "postgresql://litellm:litellm_password@litellm-postgres:5432/litellm"
+
+model_list:
+  - model_name: benchmark-model
+    litellm_params:
+      model: openai/simple-model
+      api_base: http://benchmark:8080/v1
+      api_key: dummy-key

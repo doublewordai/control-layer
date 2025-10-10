@@ -204,13 +204,29 @@ db-setup:
 #
 # Examples:
 #   just dev                    # Standard development stack
+#   just dev --benchmark         # Start benchmark stack instead
 dev *args="":
     #!/usr/bin/env bash
     set -euo pipefail
 
-    # Pass all arguments directly to docker compose
-    echo "Starting development stack..."
-    docker compose -f docker-compose.yml -f docker-compose.override.yml up --build --watch {{args}}
+    # Check if --benchmark flag is present
+    USE_BENCHMARK=false
+    docker_args=""
+    for arg in {{args}}; do
+        if [ "$arg" = "--benchmark" ]; then
+            USE_BENCHMARK=true
+        else
+            docker_args="$docker_args $arg"
+        fi
+    done
+
+    if [ "$USE_BENCHMARK" = "true" ]; then
+        echo "Starting benchmark stack..."
+        docker compose -f docker-compose.benchmark.yml up --build --watch $docker_args
+    else
+        echo "Starting development stack..."
+        docker compose -f docker-compose.yml -f docker-compose.override.yml up --build --watch $docker_args
+    fi
 
 # Start production stack: 'just up'
 #

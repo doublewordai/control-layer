@@ -49,6 +49,21 @@ services:
         - action: rebuild
           path: ./dashboard/Dockerfile
 
+  benchmark:
+    build:
+      context: ./benchmark
+      dockerfile: Dockerfile
+    ports:
+      - "8080:8080"
+    develop:
+      watch:
+        - action: rebuild
+          path: ./benchmark/Cargo.toml
+        - action: rebuild
+          path: ./benchmark/Cargo.lock
+        - action: rebuild
+          path: ./benchmark/src
+
 volumes:
   clay_target:
   clay_frontend_node_modules:

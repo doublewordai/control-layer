@@ -1,0 +1,307 @@
+{% extends "base.html" %}
+
+{% block title %}System Monitor - OpenAI Benchmark{% endblock %}
+
+{% block content %}
+<style>
+    .nav {
+        margin-bottom: 20px;
+    }
+
+    .nav a {
+        color: #2563eb;
+        text-decoration: none;
+        margin-right: 20px;
+        font-weight: 500;
+    }
+
+    .nav a:hover {
+        text-decoration: underline;
+    }
+
+    .metrics-grid {
+        display: grid;
+        grid-template-columns: repeat(auto-fit, minmax(300px, 1fr));
+        gap: 20px;
+        margin-bottom: 24px;
+    }
+
+    .stat-card {
+        background: white;
+        border-radius: 8px;
+        padding: 20px;
+        box-shadow: 0 1px 3px rgba(0,0,0,0.1);
+    }
+
+    .stat-label {
+        font-size: 14px;
+        color: #6b7280;
+        margin-bottom: 8px;
+    }
+
+    .stat-value {
+        font-size: 32px;
+        font-weight: 600;
+        color: #111827;
+    }
+
+    .stat-unit {
+        font-size: 16px;
+        color: #6b7280;
+        margin-left: 4px;
+    }
+
+    .progress-bar {
+        height: 8px;
+        background: #e5e7eb;
+        border-radius: 4px;
+        margin-top: 12px;
+        overflow: hidden;
+    }
+
+    .progress-fill {
+        height: 100%;
+        background: #2563eb;
+        transition: width 0.3s ease;
+    }
+
+    .progress-fill.warning {
+        background: #f59e0b;
+    }
+
+    .progress-fill.danger {
+        background: #dc2626;
+    }
+
+    .chart-container {
+        background: white;
+        border-radius: 8px;
+        padding: 20px;
+        box-shadow: 0 1px 3px rgba(0,0,0,0.1);
+    }
+
+    .chart-title {
+        font-size: 18px;
+        font-weight: 600;
+        margin-bottom: 16px;
+        color: #111827;
+    }
+
+    canvas {
+        width: 100% !important;
+        height: 200px !important;
+    }
+
+    .timestamp {
+        font-size: 12px;
+        color: #9ca3af;
+        margin-top: 8px;
+    }
+</style>
+
+<div class="nav">
+    <a href="/">← Back to Benchmark</a>
+</div>
+
+<div class="metrics-grid">
+    <div class="stat-card">
+        <div class="stat-label">CPU Usage</div>
+        <div class="stat-value">
+            <span id="cpu-value">0</span><span class="stat-unit">%</span>
+        </div>
+        <div class="progress-bar">
+            <div class="progress-fill" id="cpu-bar"></div>
+        </div>
+    </div>
+
+    <div class="stat-card">
+        <div class="stat-label">Memory Usage</div>
+        <div class="stat-value">
+            <span id="memory-value">0</span><span class="stat-unit">%</span>
+        </div>
+        <div class="progress-bar">
+            <div class="progress-fill" id="memory-bar"></div>
+        </div>
+        <div class="timestamp" id="memory-details">0 / 0 GB</div>
+    </div>
+
+    <div class="stat-card">
+        <div class="stat-label">File Descriptors</div>
+        <div class="stat-value">
+            <span id="open-fds" style="font-size: 24px;">0</span><span class="stat-unit">/ <span id="max-fds">0</span></span>
+        </div>
+        <div class="progress-bar">
+            <div class="progress-fill" id="fd-bar"></div>
+        </div>
+    </div>
+
+    <div class="stat-card">
+        <div class="stat-label">Load Average</div>
+        <div class="stat-value">
+            <span id="load-1min" style="font-size: 24px;">0.00</span>
+        </div>
+        <div class="timestamp">
+            <span id="load-5min">0.00</span> / <span id="load-15min">0.00</span> (5m / 15m)
+        </div>
+    </div>
+
+    <div class="stat-card">
+        <div class="stat-label">Network RX</div>
+        <div class="stat-value">
+            <span id="network-rx">0</span><span class="stat-unit">KB/s</span>
+        </div>
+    </div>
+
+    <div class="stat-card">
+        <div class="stat-label">Network TX</div>
+        <div class="stat-value">
+            <span id="network-tx">0</span><span class="stat-unit">KB/s</span>
+        </div>
+    </div>
+
+    <div class="stat-card">
+        <div class="stat-label">TCP Connections</div>
+        <div class="stat-value" style="font-size: 20px;">
+            <span id="tcp-established">0</span> EST
+        </div>
+        <div class="timestamp">
+            <span id="tcp-time-wait">0</span> TIME_WAIT / <span id="tcp-close-wait">0</span> CLOSE_WAIT
+        </div>
+    </div>
+</div>
+
+<div class="chart-container">
+    <div class="chart-title">CPU & Memory History</div>
+    <canvas id="metrics-chart"></canvas>
+</div>
+
+<script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.0/dist/chart.umd.min.js"></script>
+<script>
+    const MAX_DATA_POINTS = 60;
+    const chartData = {
+        labels: [],
+        cpu: [],
+        memory: []
+    };
+
+    const ctx = document.getElementById('metrics-chart').getContext('2d');
+    const chart = new Chart(ctx, {
+        type: 'line',
+        data: {
+            labels: chartData.labels,
+            datasets: [
+                {
+                    label: 'CPU %',
+                    data: chartData.cpu,
+                    borderColor: '#2563eb',
+                    backgroundColor: 'rgba(37, 99, 235, 0.1)',
+                    tension: 0.4,
+                    fill: true
+                },
+                {
+                    label: 'Memory %',
+                    data: chartData.memory,
+                    borderColor: '#10b981',
+                    backgroundColor: 'rgba(16, 185, 129, 0.1)',
+                    tension: 0.4,
+                    fill: true
+                }
+            ]
+        },
+        options: {
+            responsive: true,
+            maintainAspectRatio: false,
+            scales: {
+                y: {
+                    beginAtZero: true,
+                    max: 100,
+                    ticks: {
+                        callback: function(value) {
+                            return value + '%';
+                        }
+                    }
+                },
+                x: {
+                    display: false
+                }
+            },
+            plugins: {
+                legend: {
+                    display: true,
+                    position: 'top'
+                }
+            }
+        }
+    });
+
+    function updateProgressBar(barId, percentage) {
+        const bar = document.getElementById(barId);
+        bar.style.width = percentage + '%';
+
+        bar.className = 'progress-fill';
+        if (percentage > 80) {
+            bar.classList.add('danger');
+        } else if (percentage > 60) {
+            bar.classList.add('warning');
+        }
+    }
+
+    function formatBytes(bytes) {
+        return (bytes / (1024 ** 3)).toFixed(2);
+    }
+
+    function updateChart(timestamp, cpuPercent, memoryPercent) {
+        const time = new Date(timestamp * 1000).toLocaleTimeString();
+
+        chartData.labels.push(time);
+        chartData.cpu.push(cpuPercent);
+        chartData.memory.push(memoryPercent);
+
+        if (chartData.labels.length > MAX_DATA_POINTS) {
+            chartData.labels.shift();
+            chartData.cpu.shift();
+            chartData.memory.shift();
+        }
+
+        chart.update('none');
+    }
+
+    const eventSource = new EventSource('/system/metrics');
+
+    eventSource.onmessage = function(event) {
+        const metrics = JSON.parse(event.data);
+
+        document.getElementById('cpu-value').textContent = metrics.cpu_usage_percent.toFixed(1);
+        updateProgressBar('cpu-bar', metrics.cpu_usage_percent);
+
+        document.getElementById('memory-value').textContent = metrics.memory_used_percent.toFixed(1);
+        updateProgressBar('memory-bar', metrics.memory_used_percent);
+
+        const memUsedGB = formatBytes(metrics.memory_used_bytes);
+        const memTotalGB = formatBytes(metrics.memory_total_bytes);
+        document.getElementById('memory-details').textContent = `${memUsedGB} / ${memTotalGB} GB`;
+
+        document.getElementById('open-fds').textContent = metrics.open_file_descriptors;
+        document.getElementById('max-fds').textContent = metrics.max_file_descriptors;
+        const fdPercent = (metrics.open_file_descriptors / metrics.max_file_descriptors) * 100;
+        updateProgressBar('fd-bar', fdPercent);
+
+        document.getElementById('load-1min').textContent = metrics.load_average_1min.toFixed(2);
+        document.getElementById('load-5min').textContent = metrics.load_average_5min.toFixed(2);
+        document.getElementById('load-15min').textContent = metrics.load_average_15min.toFixed(2);
+
+        document.getElementById('network-rx').textContent = (metrics.network_rx_bytes_per_sec / 1024).toFixed(1);
+        document.getElementById('network-tx').textContent = (metrics.network_tx_bytes_per_sec / 1024).toFixed(1);
+
+        document.getElementById('tcp-established').textContent = metrics.tcp_established;
+        document.getElementById('tcp-time-wait').textContent = metrics.tcp_time_wait;
+        document.getElementById('tcp-close-wait').textContent = metrics.tcp_close_wait;
+
+        updateChart(metrics.timestamp, metrics.cpu_usage_percent, metrics.memory_used_percent);
+    };
+
+    eventSource.onerror = function() {
+        console.error('EventSource failed');
+    };
+</script>
+{% endblock %}
