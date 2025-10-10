@@ -1,30 +1,31 @@
 #!/bin/bash
 
-# Check if username and password are provided via environment variables
-if [ -z "$USERNAME" ]; then
-  echo "USERNAME environment variable not set" >&2
-  echo "Usage: USERNAME=user@example.com PASSWORD=yourpassword $0" >&2
+# Check if email and password are provided via environment variables
+if [ -z "$EMAIL" ]; then
+  echo "EMAIL environment variable not set" >&2
+  echo "Usage: EMAIL=user@example.com PASSWORD=yourpassword $0" >&2
   exit 1
 fi
 
 if [ -z "$PASSWORD" ]; then
   echo "PASSWORD environment variable not set" >&2
-  echo "Usage: USERNAME=user@example.com PASSWORD=yourpassword $0" >&2
+  echo "Usage: EMAIL=user@example.com PASSWORD=yourpassword $0" >&2
   exit 1
 fi
 
 # Call the login endpoint and capture the cookie
+echo "Attempting login with email: $EMAIL" >&2
 RESPONSE=$(curl -s -c - -w "\nHTTP_STATUS:%{http_code}" \
   -X POST \
   -H "Content-Type: application/json" \
-  -d "{\"email\":\"$USERNAME\",\"password\":\"$PASSWORD\"}" \
+  -d "{\"email\":\"$EMAIL\",\"password\":\"$PASSWORD\"}" \
   http://localhost:3001/authentication/login 2>/dev/null)
 
-HTTP_STATUS=$(echo "$RESPONSE" | grep -oP 'HTTP_STATUS:\K\d+')
+HTTP_STATUS=$(echo "$RESPONSE" | sed -n 's/.*HTTP_STATUS:\([0-9]*\).*/\1/p')
 
 if [ "$HTTP_STATUS" = "200" ]; then
   # Extract the cookie value from the response
-  COOKIE=$(echo "$RESPONSE" | grep -oP 'clay_session\s+\K[^\s]+' | head -1)
+  COOKIE=$(echo "$RESPONSE" | awk '/clay_session/ {for(i=1;i<=NF;i++) if($i=="clay_session") print $(i+1); exit}')
   if [ -n "$COOKIE" ]; then
     echo "$COOKIE"
   else
@@ -34,7 +35,7 @@ if [ "$HTTP_STATUS" = "200" ]; then
     exit 1
   fi
 else
-  echo "❌ Login failed for $USERNAME (HTTP $HTTP_STATUS)" >&2
+  echo "❌ Login failed for $EMAIL (HTTP $HTTP_STATUS)" >&2
   echo "Response body:" >&2
   echo "$RESPONSE" | grep -v "HTTP_STATUS:" >&2
   exit 1

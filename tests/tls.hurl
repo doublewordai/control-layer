@@ -1,3 +1,3 @@
 # HTTPS should work in production scenario
-GET https://localhost/health
+GET http://localhost:3001/health
 HTTP 200

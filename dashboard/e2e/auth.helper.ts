@@ -15,7 +15,7 @@ export class AuthHelper {
 
   constructor(private page: Page) {
     // Get admin email from environment variable, with fallback for backward compatibility
-    this.adminEmail = process.env.ADMIN_EMAIL || "yicheng@doubleword.ai";
+    this.adminEmail = process.env.ADMIN_EMAIL || "test@doubleword.ai";
   }
 
   /**
@@ -68,12 +68,12 @@ export class AuthHelper {
       // Path to the generate-jwt.sh script relative to the dashboard directory
       const scriptPath = path.resolve(
         __dirname,
-        "../../../scripts/generate-jwt.sh",
+        "../../scripts/generate-jwt.sh",
       );
 
       // Execute the script with username and password
       return execSync(
-        `USERNAME="${username}" PASSWORD="${password}" ${scriptPath}`,
+        `EMAIL="${username}" PASSWORD="${password}" ${scriptPath}`,
         {
           encoding: "utf8",
           stdio: ["pipe", "pipe", "pipe"], // Capture stderr separately to avoid validation output

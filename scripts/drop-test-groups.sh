@@ -15,7 +15,7 @@ if [ -z "$ADMIN_PASSWORD" ]; then
 fi
 
 # Generate admin cookie for authentication
-ADMIN_JWT=$(USERNAME="$ADMIN_EMAIL" PASSWORD="$ADMIN_PASSWORD" ./scripts/generate-jwt.sh)
+ADMIN_JWT=$(EMAIL="$ADMIN_EMAIL" PASSWORD="$ADMIN_PASSWORD" ./scripts/generate-jwt.sh)
 
 if [ -z "$ADMIN_JWT" ]; then
   echo "Failed to generate admin JWT" >&2
