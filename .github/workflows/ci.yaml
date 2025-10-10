@@ -411,9 +411,6 @@ jobs:
       - name: Run Docker end-to-end tests
         id: e2e-step
         run: |
-          # Copy ADC JSON to path expected by docker-compose
-          cp $GOOGLE_APPLICATION_CREDENTIALS ./service-account.json
-          chmod 644 ./service-account.json
           START_TIME=$(date +%s)
           just test docker
           END_TIME=$(date +%s)
