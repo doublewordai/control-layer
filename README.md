@@ -10,7 +10,7 @@ Complete with web dashboard, user authentication, and API gateway.
 
 ```bash
 # Install CLI tools (macOS)
-brew install just jwt-cli hurl mkcert sops kind kubectl helm gh
+brew install just jwt-cli hurl mkcert kind kubectl helm gh
 
 # Or install manually:
 # just: https://github.com/casey/just
