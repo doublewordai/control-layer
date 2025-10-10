@@ -326,3 +326,123 @@ jobs:
 
           curl -X POST "https://charts.somnial.co/doubleword-control-layer/critical-vulnerabilities?value=${CRITICAL}" || echo "Failed to report critical vulnerabilities"
           curl -X POST "https://charts.somnial.co/doubleword-control-layer/high-vulnerabilities?value=${HIGH}" || echo "Failed to report high vulnerabilities"
+
+  e2e-test-docker:
+    runs-on: depot-ubuntu-24.04
+    needs: build
+
+    permissions:
+      contents: read
+      packages: read
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+      
+      - name: Install just
+        uses: extractions/setup-just@v2
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: "npm"
+          cache-dependency-path: dashboard/package-lock.json
+
+      - name: Install dashboard dependencies
+        working-directory: ./dashboard
+        run: npm ci
+
+      - name: Install Playwright browsers
+        working-directory: ./dashboard
+        run: npx playwright install chromium --only-shell
+
+      - name: Install hurl
+        uses: gacts/install-hurl@v1
+
+      - name: Install jwt-cli
+        run: |
+          curl -L https://github.com/mike-engel/jwt-cli/releases/latest/download/jwt-linux.tar.gz | tar xz
+          sudo mv jwt /usr/local/bin/
+
+      - name: Install mkcert
+        run: |
+          # Install mkcert for certificate generation
+          curl -JLO "https://dl.filippo.io/mkcert/latest?for=linux/amd64"
+          chmod +x mkcert-v*-linux-amd64
+          sudo cp mkcert-v*-linux-amd64 /usr/local/bin/mkcert
+
+      - name: Setup SOPS
+        uses: nhedger/setup-sops@v2
+
+      # Note, not needed for this workflow, but required by 'just setup'
+      - name: Install PostgreSQL tools
+        run: |
+          sudo apt-get install -y postgresql-client
+
+      # Note, not needed for this workflow, but required by 'just setup'
+      - name: Install Kind
+        uses: helm/kind-action@v1
+        with:
+          install_only: true
+
+      # Note, not needed for this workflow, but required by 'just setup'
+      - name: Install kubectl
+        uses: azure/setup-kubectl@v4
+
+      # Note, not needed for this workflow, but required by 'just setup'
+      - name: Install Helm
+        uses: azure/setup-helm@v4
+
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # For SOPs
+      # We have to export the gke credentials here so we can copy them in for oa2 to use as a service account
+      - name: Authenticate to Google Cloud
+        uses: google-github-actions/auth@v2
+        with:
+          credentials_json: ${{ secrets.GCP_SA_KEY }}
+          export_environment_variables: true
+
+      - name: Set up Docker Compose
+        uses: docker/setup-compose-action@v1
+
+      # Install self-signed certs, check all deps are installed.
+      - name: Setup development environment
+        run: just setup
+
+      # Run end to end docker-compose tests
+      # OA2 doesn't like being turned off (or rather nginx doesnt) so we configure it here such that we can reenable
+      # it some time in the future for testing.
+      - name: Run Docker end-to-end tests
+        id: e2e-step
+        run: |
+          # Copy ADC JSON to path expected by docker-compose
+          cp $GOOGLE_APPLICATION_CREDENTIALS ./service-account.json
+          chmod 644 ./service-account.json
+          START_TIME=$(date +%s)
+          just test docker
+          END_TIME=$(date +%s)
+          E2E_DURATION=$((END_TIME - START_TIME))
+          echo "e2e_duration=$E2E_DURATION" >> $GITHUB_OUTPUT
+          echo "Docker E2E tests completed in ${E2E_DURATION}s"
+
+          # Report metrics to Somnial
+          curl -X POST "https://charts.somnial.co/doubleword-control-layer/e2e-docker-duration?value=${E2E_DURATION}" || true
+        env:
+          TAG: ${{ needs.build.outputs.image-tag }}
+          GOOGLE_ADMIN_EMAIL: ${{ secrets.E2E_ADMIN_EMAIL }}
+          ALLOWED_EMAIL_DOMAINS: ${{ secrets.E2E_ALLOWED_EMAIL_DOMAINS }}
+          FQDN: ${{ secrets.E2E_FQDN }}
+          PROVIDER: ${{ secrets.E2E_PROVIDER }}
+          CLIENT_ID:  ${{ secrets.E2E_CLIENT_ID }}
+          CLIENT_SECRET: ${{ secrets.E2E_CLIENT_SECRET }}
+          AUTH_URL: ${{ secrets.E2E_AUTH_URL }}
+          TOKEN_URL: ${{ secrets.E2E_TOKEN_URL }}
+          REDIRECT_URL: ${{ secrets.E2E_REDIRECT_URL }}
+          JWT_SECRET: ${{ secrets.E2E_JWT_SECRET }}
