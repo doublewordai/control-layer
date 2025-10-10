@@ -372,9 +372,6 @@ jobs:
           chmod +x mkcert-v*-linux-amd64
           sudo cp mkcert-v*-linux-amd64 /usr/local/bin/mkcert
 
-      - name: Setup SOPS
-        uses: nhedger/setup-sops@v2
-
       # Note, not needed for this workflow, but required by 'just setup'
       - name: Install PostgreSQL tools
         run: |
@@ -400,14 +397,6 @@ jobs:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
-
-      # For SOPs
-      # We have to export the gke credentials here so we can copy them in for oa2 to use as a service account
-      - name: Authenticate to Google Cloud
-        uses: google-github-actions/auth@v2
-        with:
-          credentials_json: ${{ secrets.GCP_SA_KEY }}
-          export_environment_variables: true
 
       - name: Set up Docker Compose
         uses: docker/setup-compose-action@v1

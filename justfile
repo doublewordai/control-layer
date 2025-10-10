@@ -23,7 +23,7 @@ get-admin-email:
 # - Access to doublewordai GCP project (for environment decryption)
 #
 # First-time setup:
-#   brew install docker hurl jwt-cli mkcert sops kind kubectl helm gh postgresql
+#   brew install docker hurl jwt-cli mkcert kind kubectl helm gh postgresql
 #   gcloud auth login  # Required for environment decryption
 #   just setup
 #
@@ -39,7 +39,7 @@ setup:
     missing_tools=()
 
     # Required tools
-    required_tools=("docker" "hurl" "jwt" "mkcert" "sops" "kind" "kubectl" "helm" "gh" "psql" "createdb")
+    required_tools=("docker" "hurl" "jwt" "mkcert" "kind" "kubectl" "helm" "gh" "psql" "createdb")
     for tool in "${required_tools[@]}"; do
         if ! command -v "$tool" >/dev/null 2>&1; then
             missing_tools+=("$tool")
@@ -59,7 +59,7 @@ setup:
         done
         echo ""
         echo "Install with:"
-        echo "  brew install docker hurl jwt-cli mkcert sops kind kubectl helm gh postgresql"
+        echo "  brew install docker hurl jwt-cli mkcert kind kubectl helm gh postgresql"
         echo ""
         echo "Note: docker compose-plugin is included with Docker Desktop"
         echo ""
