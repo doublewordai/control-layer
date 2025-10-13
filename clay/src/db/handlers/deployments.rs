@@ -396,11 +396,7 @@ impl<'c> Repository for Deployments<'c> {
             pricing_params.downstream_ratio                 // $31
         )
         .fetch_one(&mut *self.db)
-        .await
-        .map_err(|e| match e {
-            sqlx::Error::RowNotFound => anyhow::anyhow!("Deployment with id {} not found", id),
-            _ => e.into(),
-        })?;
+        .await?;
 
         // Convert DB model_type back to enum
         let model_type = model.r#type.as_deref().and_then(|s| match s {

@@ -190,6 +190,7 @@ export interface EndpointCreateRequest {
   url: string;
   api_key?: string;
   model_filter?: string[]; // Array of model IDs to sync, or null for all models
+  alias_mapping?: Record<string, string>; // model_name -> custom_alias
 }
 
 export interface EndpointUpdateRequest {
