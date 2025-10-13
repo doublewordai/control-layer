@@ -1,0 +1,3 @@
+# Rustfmt configuration for Zeus
+max_width = 140
+

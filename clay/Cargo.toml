@@ -1,0 +1,79 @@
+[package]
+name = "clay"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+axum = "0.8"
+tokio = { version = "1.0", features = ["full"] }
+tokio-util = "0.7"
+sqlx = { version = "0.8", features = [
+  "runtime-tokio-rustls",
+  "postgres",
+  "uuid",
+  "chrono",
+  "migrate",
+  "rust_decimal",
+] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+uuid = { version = "1.0", features = ["v4", "serde"] }
+chrono = { version = "0.4", features = ["serde"] }
+anyhow = "1.0"
+tracing = "0.1"
+tracing-subscriber = "0.3"
+tower = "0.5"
+tower-http = { version = "0.6", features = ["cors", "fs", "trace"] }
+async-trait = "0.1"
+url = { version = "2.4", features = ["serde"] }
+clap = { version = "4.4", features = ["derive", "env"] }
+reqwest = { version = "0.12", features = ["json", "rustls-tls"] }
+humantime = "2.2.0"
+humantime-serde = "1.1"
+utoipa = { version = "5.0", features = [
+  "axum_extras",
+  "chrono",
+  "uuid",
+  "macros",
+] }
+utoipa-rapidoc = { version = "6.0", features = ["axum"] }
+figment = { version = "0.10", features = ["yaml", "env", "test"] }
+rand = "0.8"
+# Authentication
+jsonwebtoken = "9.0"
+argon2 = "0.5"
+base64 = "0.22"
+bytes = "1.5"
+onwards = "0.8.1"
+thiserror = "2.0.14"
+axum-prometheus = "0.9"
+outlet = "0.4.0"
+outlet-postgres = "0.4.1"
+async-openai = { version = "0.29.2", default-features = false }
+brotli = "7.0"
+lettre = { version = "0.11", features = [
+  "smtp-transport",
+  "file-transport",
+  "tokio1-rustls-tls",
+  "builder",
+], default-features = false }
+aes-gcm = "0.10.3"
+paste = "1.0"
+serde_with = "3.14.1"
+rust_decimal = { version = "1.38.0", features = ["serde"] }
+bon = "3.3"
+# Prometheus for GenAI metrics (via axum-prometheus)
+prometheus = "0.13"
+
+[dev-dependencies]
+axum-test = "17.3"
+sqlx = { version = "0.8", features = [
+  "postgres",
+  "runtime-tokio-rustls",
+  "uuid",
+  "chrono",
+  "migrate",
+] }
+tokio-test = "0.4"
+serial_test = "3.0"
+test-log = { version = "0.2", features = ["trace"] }

@@ -1,0 +1,1 @@
+export { GroupManagementModal } from "./GroupManagementModal";

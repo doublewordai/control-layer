@@ -1,0 +1,75 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n            UPDATE inference_endpoints SET\n                name = COALESCE($2, name),\n                description = CASE \n                    WHEN $3::text IS NOT NULL THEN $3\n                    ELSE description \n                END,\n                url = COALESCE($4, url),\n                api_key = CASE \n                    WHEN $5::text IS NOT NULL THEN $5\n                    ELSE api_key \n                END,\n                model_filter = CASE \n                    WHEN $6::text[] IS NOT NULL THEN $6\n                    ELSE model_filter \n                END,\n                updated_at = NOW()\n            WHERE id = $1\n            RETURNING *\n            ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "name",
+        "type_info": "Varchar"
+      },
+      {
+        "ordinal": 1,
+        "name": "description",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 2,
+        "name": "url",
+        "type_info": "Varchar"
+      },
+      {
+        "ordinal": 3,
+        "name": "created_by",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 4,
+        "name": "created_at",
+        "type_info": "Timestamptz"
+      },
+      {
+        "ordinal": 5,
+        "name": "updated_at",
+        "type_info": "Timestamptz"
+      },
+      {
+        "ordinal": 6,
+        "name": "model_filter",
+        "type_info": "TextArray"
+      },
+      {
+        "ordinal": 7,
+        "name": "api_key",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 8,
+        "name": "id",
+        "type_info": "Uuid"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Varchar",
+        "Text",
+        "Varchar",
+        "Text",
+        "TextArray"
+      ]
+    },
+    "nullable": [
+      false,
+      true,
+      false,
+      false,
+      false,
+      false,
+      true,
+      true,
+      false
+    ]
+  },
+  "hash": "bb8a330fde21d68d7527538bca629ecd5795fbf088214dde6534a673753b25a9"
+}
