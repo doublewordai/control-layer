@@ -5,13 +5,13 @@ use crate::{
     },
     auth::permissions::{operation, resource, RequiresPermission},
     db::{
-        handlers::{inference_endpoints::InferenceEndpointFilter, InferenceEndpoints, Repository},
+        handlers::{inference_endpoints::InferenceEndpointFilter, InferenceEndpoints, Deployments, Repository}, // Add Deployments here
         models::inference_endpoints::{InferenceEndpointCreateDBRequest, InferenceEndpointUpdateDBRequest},
     },
     errors::{Error, Result},
     sync::{
         deployments::fetch_models::{FetchModels, FetchModelsReqwest, SyncConfig},
-        endpoint_sync,
+        endpoint_sync::{self, sync_endpoint_models_with_aliases}, // Add sync_endpoint_models_with_aliases here
     },
     types::InferenceEndpointId,
     AppState,
@@ -238,38 +238,78 @@ pub async fn create_inference_endpoint(
         message: "Invalid URL format".to_string(),
     })?;
 
-    let mut conn = state.db.acquire().await.map_err(|e| Error::Database(e.into()))?;
-    let mut repo = InferenceEndpoints::new(&mut conn);
+    // Start transaction for atomic endpoint creation + sync
+    let mut tx = state.db.begin().await.map_err(|e| Error::Database(e.into()))?;
+
+    // Create the endpoint within the transaction
+    let mut repo = InferenceEndpoints::new(&mut tx);
     let db_request = InferenceEndpointCreateDBRequest {
         created_by: current_user.id,
         name: create_request.name,
         description: create_request.description,
         url,
         api_key: create_request.api_key,
-        model_filter: create_request.model_filter,
+        model_filter: create_request.model_filter.clone(),
     };
 
     let endpoint = repo.create(&db_request).await?;
 
-    // Optionally synchronize after creation
+    // If sync is requested, perform it within the transaction
     if create_request.sync {
-        // The creation is atomic, but it's not co-atomic with the sync, you can just rerun the sync after if it fails.
-        match endpoint_sync::synchronize_endpoint(endpoint.id, state.db).await {
+        // Create sync config from the newly created endpoint
+        let sync_config = SyncConfig::from_endpoint(&endpoint);
+        let fetcher = FetchModelsReqwest::new(sync_config);
+
+        // Perform sync within the same transaction with custom aliases
+        let mut deployments_repo = Deployments::new(&mut tx);
+        
+        match sync_endpoint_models_with_aliases(
+            endpoint.clone(), 
+            &mut deployments_repo, 
+            fetcher,
+            &create_request.alias_mapping
+        ).await {
             Ok(sync_result) => {
                 tracing::info!(
-                    "Auto-sync after endpoint {} creation: {} changes made",
+                    "Sync during endpoint {} creation: {} changes made, {} new models",
                     endpoint.id,
-                    sync_result.changes_made
+                    sync_result.changes_made,
+                    sync_result.new_models_created
                 );
+                
+                // Check if any models failed to import due to alias conflicts
+                if sync_result.new_models_created == 0 && sync_result.total_models_fetched > 0 {
+                    return Err(Error::BadRequest {
+                        message: format!(
+                            "Could not import any of the {} models from this endpoint. This may be due to alias conflicts with existing models.",
+                            sync_result.total_models_fetched
+                        ),
+                    });
+                }
             }
-            Err(e) => {
-                tracing::warn!("Auto-sync failed after endpoint {} creation: {}", endpoint.id, e);
-                // Continue anyway - creation succeeded even if sync failed
+            Err(sync_error) => {
+                match sync_error {
+                    crate::sync::endpoint_sync::SyncError::AliasConflicts { conflicts } => {
+                        return Err(Error::Conflict {
+                            message: "Alias conflicts detected".to_string(),
+                            conflicts: Some(conflicts),
+                        });
+                    }
+                    crate::sync::endpoint_sync::SyncError::Other(e) => {
+                        tracing::warn!("Sync failed during endpoint {} creation: {}", endpoint.id, e);
+                        return Err(Error::BadRequest {
+                            message: format!("Failed to sync models from endpoint: {}", e),
+                        });
+                    }
+                }
             }
         }
     } else {
-        tracing::info!("Skipped sync after endpoint {} creation (sync=false)", endpoint.id);
+        tracing::info!("Skipped sync during endpoint {} creation (sync=false)", endpoint.id);
     }
+
+    // Commit the transaction only if everything succeeded
+    tx.commit().await.map_err(|e| Error::Database(e.into()))?;
 
     Ok((StatusCode::CREATED, Json(endpoint.into())))
 }

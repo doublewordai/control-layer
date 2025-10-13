@@ -10,10 +10,21 @@ use anyhow::Result;
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
 use sqlx::PgPool;
+use std::collections::HashMap;
 use std::collections::HashSet;
 use tracing::{debug, instrument, warn};
 use utoipa::ToSchema;
 use uuid::Uuid;
+
+#[derive(Debug, thiserror::Error)]
+pub enum SyncError {
+    #[error("Alias conflicts detected")]
+    AliasConflicts {
+        conflicts: Vec<crate::errors::AliasConflict>,
+    },
+    #[error(transparent)]
+    Other(#[from] anyhow::Error),
+}
 
 #[derive(Debug, Serialize, Deserialize, ToSchema)]
 pub struct EndpointSyncResponse {
@@ -231,13 +242,172 @@ where
     })
 }
 
-async fn get_existing_models<D>(deployments_repo: &mut D, endpoint_id: InferenceEndpointId) -> Result<Vec<DeploymentDBResponse>>
+/// Sync function for endpoint creation with optional alias mapping
+#[instrument(skip(deployments_repo, fetch_models))]
+pub async fn sync_endpoint_models_with_aliases<D, F>(
+    endpoint_info: InferenceEndpointDBResponse,
+    deployments_repo: &mut D,
+    fetch_models: F,
+    alias_mapping: &Option<HashMap<String, String>>,
+) -> std::result::Result<EndpointSyncResponse, SyncError>
+where
+    D: Repository<
+        CreateRequest = DeploymentCreateDBRequest,
+        UpdateRequest = DeploymentUpdateDBRequest,
+        Response = DeploymentDBResponse,
+        Id = DeploymentId,
+        Filter = DeploymentFilter,
+    >,
+    F: FetchModels,
+{
+    // Get fetched models
+    let fetched_models = fetch_models.fetch().await?;
+    let existing_models = get_existing_models(deployments_repo, endpoint_info.id).await
+        .map_err(|e| anyhow::anyhow!("Failed to get existing models: {}", e))?;
+
+    let existing_model_names: HashSet<String> = existing_models.iter().map(|m| m.model_name.clone()).collect();
+    let mut changes_made = 0;
+    let mut new_models_created = 0;
+    let sync_time = Utc::now();
+
+    // Filter models based on endpoint's model_filter if specified
+    let models_to_sync: Vec<_> = if let Some(model_filter) = &endpoint_info.model_filter {
+        fetched_models
+            .data
+            .iter()
+            .filter(|model| model_filter.contains(&model.id))
+            .collect()
+    } else {
+        fetched_models.data.iter().collect()
+    };
+
+    debug!(
+        "Endpoint {} syncing {} of {} fetched models with alias mapping: {:?}",
+        endpoint_info.name,
+        models_to_sync.len(),
+        fetched_models.data.len(),
+        alias_mapping
+    );
+
+    // Use system user ID for creating deployments
+    let system_user_id = Uuid::nil();
+
+    // Create new models with custom aliases if provided
+    for model in &models_to_sync {
+        if !existing_model_names.contains(&model.id) {
+            // Determine the alias for this model
+            let alias = alias_mapping
+                .as_ref()
+                .and_then(|mapping| mapping.get(&model.id))
+                .cloned()
+                .unwrap_or_else(|| model.id.clone());
+
+            match create_deployment_with_alias(deployments_repo, model, &endpoint_info, system_user_id, alias.clone()).await {
+                Ok(_) => {
+                    debug!("Created new deployment for model: {} with alias: {}", model.id, alias);
+                    new_models_created += 1;
+                    changes_made += 1;
+                }
+                Err(e) => {
+                    // Check if this is an alias conflict and extract structured info
+                    if let Some(conflict) = extract_alias_conflict_from_error(&e, &model.id, &alias) {
+                        warn!("Alias conflict for model '{}' with alias '{}': {}", model.id, alias, e);
+                        // Return immediately with just this one conflict
+                        return Err(SyncError::AliasConflicts {
+                            conflicts: vec![conflict],
+                        });
+                    } else {
+                        // For non-conflict errors, fail fast
+                        return Err(SyncError::Other(e));
+                    }
+                }
+            }
+        }
+    }
+
+    debug!(
+        "Sync completed: {} new models created, {} total changes",
+        new_models_created, changes_made
+    );
+
+    Ok(EndpointSyncResponse {
+        endpoint_id: endpoint_info.id,
+        changes_made,
+        new_models_created,
+        models_reactivated: 0,
+        models_deactivated: 0,
+        models_deleted: 0,
+        total_models_fetched: fetched_models.data.len(),
+        filtered_models_count: models_to_sync.len(),
+        synced_at: sync_time,
+    })
+}
+
+/// Extract alias conflict information from database error - specific to deployment creation
+fn extract_alias_conflict_from_error(
+    error: &anyhow::Error,
+    model_name: &str,
+    attempted_alias: &str,
+) -> Option<crate::errors::AliasConflict> {
+    // Try to downcast to our DbError
+    if let Some(db_error) = error.downcast_ref::<crate::db::errors::DbError>() {
+        if let crate::db::errors::DbError::UniqueViolation { 
+            constraint, 
+            conflicting_value, 
+            .. 
+        } = db_error {
+            if constraint.as_deref() == Some("deployed_models_alias_unique") {
+                return Some(crate::errors::AliasConflict {
+                    model_name: model_name.to_string(),
+                    attempted_alias: conflicting_value
+                        .clone()
+                        .unwrap_or_else(|| attempted_alias.to_string()),
+                });
+            }
+        }
+    }
+    None
+}
+
+/// Create deployment with custom alias - now returns structured error info
+async fn create_deployment_with_alias<D>(
+    deployments_repo: &mut D,
+    model: &OpenAIModel,
+    endpoint_info: &InferenceEndpointDBResponse,
+    created_by: UserId,
+    alias: String,
+) -> Result<()>
+where
+    D: Repository<CreateRequest = DeploymentCreateDBRequest, Response = DeploymentDBResponse>,
+{
+    let db_request = DeploymentCreateDBRequest::builder()
+        .created_by(created_by)
+        .model_name(model.id.clone())
+        .alias(alias.clone())
+        .hosted_on(endpoint_info.id)
+        .build();
+
+    match deployments_repo.create(&db_request).await {
+        Ok(_) => {
+            debug!("Created deployment for model: {} with alias: {} on endpoint: {}", 
+                   model.id, alias, endpoint_info.name);
+            Ok(())
+        }
+        Err(e) => {
+            // Convert DbError to anyhow::Error so we can extract conflict info later
+            Err(anyhow::Error::from(e))
+        }
+    }
+}
+
+// Update the get_existing_models function to handle the Result conversion
+async fn get_existing_models<D>(deployments_repo: &mut D, endpoint_id: InferenceEndpointId) -> crate::db::errors::Result<Vec<DeploymentDBResponse>>
 where
     D: Repository<Response = DeploymentDBResponse, Id = DeploymentId, Filter = DeploymentFilter>,
 {
     // Fetch all models for this endpoint, including soft-deleted ones for sync purposes
     let filter = DeploymentFilter::new(0, i64::MAX).with_endpoint(endpoint_id);
-    Ok(deployments_repo.list(&filter).await?)
+    deployments_repo.list(&filter).await
 }
 
 async fn create_deployment<D>(

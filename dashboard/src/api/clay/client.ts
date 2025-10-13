@@ -170,9 +170,18 @@ const modelApi = {
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify(data),
     });
+    
     if (!response.ok) {
+      if (response.status === 409) {
+        // For 409 conflicts, try to get the actual server error message
+        const errorText = await response.text();
+        throw new Error(errorText || `Failed to hello model: ${response.status}`);
+      }
+      
+      // Generic error for all other cases
       throw new Error(`Failed to update model: ${response.status}`);
     }
+    
     return response.json();
   },
 };
@@ -209,14 +218,55 @@ const endpointApi = {
   },
 
   async create(data: EndpointCreateRequest): Promise<Endpoint> {
+    
     const response = await fetch("/admin/api/v1/endpoints", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify(data),
     });
+    
+    
     if (!response.ok) {
-      throw new Error(`Failed to create endpoint: ${response.status}`);
+      console.log(`❌ Error response (${response.status}):`, response.statusText);
+      
+      try {
+        // Always try to get the response body first
+        const responseText = await response.text();
+        
+        // Try to parse as JSON
+        let responseData;
+        try {
+          responseData = JSON.parse(responseText);
+        } catch (parseError) {
+          throw new Error(responseText || `Failed to create endpoint: ${response.status}`);
+        }
+        
+        // Handle different status codes
+        if (response.status === 409) {
+          if (responseData.conflicts) {
+            const conflictError = new Error(responseData.message || "Alias conflicts detected");
+            (conflictError as any).isConflict = true;
+            (conflictError as any).conflicts = responseData.conflicts;
+            throw conflictError;
+          }
+        }
+        
+        // Generic error with JSON message
+        throw new Error(responseData.message || responseText || `Failed to create endpoint: ${response.status}`);
+        
+      } catch (error) {
+        
+        // If it's already our custom error, re-throw it
+        if (error && typeof error === 'object' && 'isConflict' in error) {
+          throw error;
+        }
+        
+        // Otherwise throw the error we caught
+        throw error;
+      }
     }
+    
+    console.log("✅ Success response, parsing JSON...");
     return response.json();
   },
 

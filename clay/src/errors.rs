@@ -4,6 +4,7 @@ use axum::{
     http::StatusCode,
     response::{IntoResponse, Response},
 };
+use serde::{Deserialize, Serialize};
 use thiserror::Error as ThisError;
 
 #[derive(ThisError, Debug)]
@@ -39,7 +40,21 @@ pub enum Error {
     /// Unexpected error with full context chain
     #[error(transparent)]
     Other(#[from] anyhow::Error),
+
+    /// Conflict error, e.g., for unique constraint violations
+    #[error("Conflict: {message}")]
+    Conflict {
+        message: String,
+        conflicts: Option<Vec<AliasConflict>>,
+    },
 }
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct AliasConflict {
+    pub model_name: String,
+    pub attempted_alias: String,
+}
+
 
 impl Error {
     pub fn status_code(&self) -> StatusCode {
@@ -58,6 +73,7 @@ impl Error {
                 DbError::Other(_) => StatusCode::INTERNAL_SERVER_ERROR,
             },
             Error::Other(_) => StatusCode::INTERNAL_SERVER_ERROR,
+            Error::Conflict { .. } => StatusCode::CONFLICT,
         }
     }
 
@@ -80,6 +96,7 @@ impl Error {
                     match (table.as_deref(), constraint.as_deref()) {
                         (Some("users"), Some(c)) if c.contains("email") => "An account with this email address already exists".to_string(),
                         (Some("users"), Some(c)) if c.contains("username") => "This username is already taken".to_string(),
+                        (Some("deployed_models"), Some("deployed_models_alias_unique")) => "The specified alias is already in use. Please choose a different alias.".to_string(),
                         _ => "Resource already exists".to_string(),
                     }
                 }
@@ -96,6 +113,13 @@ impl Error {
                 DbError::Other(_) => "Database error occurred".to_string(),
             },
             Error::Other(_) => "Internal server error".to_string(),
+            Error::Conflict { message, conflicts } => {
+                if let Some(conflicts) = conflicts {
+                    format!("{message}: {:?}", conflicts)
+                } else {
+                    message.clone()
+                }
+            }
         }
     }
 }
@@ -116,11 +140,34 @@ impl IntoResponse for Error {
             Error::BadRequest { .. } | Error::NotFound { .. } => {
                 tracing::debug!("Client error: {}", self);
             }
+            Error::Conflict { .. } => {
+                tracing::warn!("Conflict error: {}", self);
+            }
         }
 
         let status = self.status_code();
-        let user_message = self.user_message();
-        (status, user_message).into_response()
+        
+        // Handle conflict errors with structured JSON response
+        match &self {
+            Error::Conflict { message, conflicts } => {
+                use serde_json::json;
+                let body = if let Some(conflicts) = conflicts {
+                    json!({
+                        "message": message,
+                        "conflicts": conflicts
+                    })
+                } else {
+                    json!({ "message": message })
+                };
+                
+                (status, axum::response::Json(body)).into_response()
+            }
+            _ => {
+                // For all other errors, return simple text message (unchanged)
+                let user_message = self.user_message();
+                (status, user_message).into_response()
+            }
+        }
     }
 }
 

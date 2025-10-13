@@ -2,6 +2,7 @@ use crate::db::models::inference_endpoints::InferenceEndpointDBResponse;
 use crate::types::{InferenceEndpointId, UserId};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use utoipa::{IntoParams, ToSchema};
 
 /// A model from an OpenAI-compatible API
@@ -32,6 +33,15 @@ pub struct ListEndpointsQuery {
     pub limit: Option<i64>,
 }
 
+/// Model with custom alias for endpoint creation
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct ModelWithAlias {
+    /// The model name (as returned by the API)
+    pub model_name: String,
+    /// Custom alias for routing (defaults to model_name if not provided)
+    pub alias: String,
+}
+
 // Request models
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct InferenceEndpointCreate {
@@ -39,7 +49,13 @@ pub struct InferenceEndpointCreate {
     pub description: Option<String>,
     pub url: String,
     pub api_key: Option<String>,
+    /// List of model names to import from the endpoint (if None, imports all)
     pub model_filter: Option<Vec<String>>,
+    /// Optional mapping of model names to custom aliases
+    /// Key: model_name, Value: desired_alias
+    /// If a model is not in this map, its alias will default to the model_name
+    #[serde(default)]
+    pub alias_mapping: Option<HashMap<String, String>>,
     /// Whether to automatically synchronize models after creation (defaults to true)
     #[serde(default = "default_sync")]
     pub sync: bool,

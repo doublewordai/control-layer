@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "\n            SELECT g.* FROM groups g\n            INNER JOIN user_groups ug ON g.id = ug.group_id\n            WHERE ug.user_id = $1 AND g.id != '00000000-0000-0000-0000-000000000000'\n            ORDER BY g.name\n            ",
+  "query": "\n            INSERT INTO groups (name, description, created_by, created_at, updated_at)\n            VALUES ($1, $2, $3, $4, $5)\n            RETURNING *\n            ",
   "describe": {
     "columns": [
       {
@@ -36,7 +36,11 @@
     ],
     "parameters": {
       "Left": [
-        "Uuid"
+        "Varchar",
+        "Text",
+        "Uuid",
+        "Timestamptz",
+        "Timestamptz"
       ]
     },
     "nullable": [
@@ -48,5 +52,5 @@
       false
     ]
   },
-  "hash": "4b61705dca645c50d3d94181935167bee14b11a5212eb24ef6e10d7dab926a3a"
+  "hash": "2a6806c04aee1aef22338865c9ca57ea61f8fdcb536ae99131fe4c58644b9741"
 }
