@@ -1,0 +1,73 @@
+# Clay Configuration.
+
+# Server configuration
+host: "0.0.0.0"
+port: 3001
+
+# Database connection
+database_url: "postgres://postgres:postgres@localhost:5432/test"
+
+# Admin user email - will be created on first startup. This is the only admin
+# user that's created by the system - later admin users must be created by
+# signing in as this user.
+admin_email: "test@doubleword.ai"
+# Optional admin password - if set, enables native login for the admin user
+# If not set, admin can only login via proxy auth (headers)
+admin_password: "test123456"
+
+# Model sources - inference endpoints to connect to Uncomment and configure as
+# needed. These seed the database on the very first run, but changes are dynamically
+# managed thereafter: Changes to this field on an instance w/ an active
+# dataabase won't persist.
+model_sources: []
+
+# Frontend metadata - shown in the header.
+metadata:
+  region: "UK South"
+  organization: "Doubleword"
+
+# Authentication configuration
+auth:
+  # Native authentication (email/password)
+  native:
+    enabled: true
+    allow_registration: true
+    password:
+      min_length: 8
+      max_length: 64
+    session:
+      timeout: "24h"
+      cookie_name: "clay_session"
+      cookie_secure: true
+      cookie_same_site: "strict"
+
+  # Proxy header authentication
+  proxy_header:
+    enabled: true
+    user_field_name: "x-doubleword-user"
+    groups_field_name: "x-doubleword-user-groups"
+    provider_field_name: "x-doubleword-sso-provider"
+    auto_create_users: true
+    import_idp_groups: true
+    blacklisted_sso_groups:
+      - "example1"
+      - "example2"
+
+  # Security settings
+  security:
+    enable_csrf: true
+    jwt_expiry: "1h"
+    cors:
+      allowed_origins:
+        - "http://localhost:5173" # Vite dev server
+        - "https://localhost" # Local HTTPS
+      allow_credentials: true
+      max_age: 3600
+
+# Secret key for session signing (set via CLAY_SECRET_KEY environment variable)
+secret_key: "your-secret-key-here"
+# Note: Environment variables can override any top-level setting, with a CLAY_ prefix:
+# CLAY_PORT=8080
+#
+# DATABASE_URL is an exception: supply it without the prefix like:
+# DATABASE_URL=postgres://prod@db:5432/my_db
