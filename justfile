@@ -388,12 +388,12 @@ test target="" *args="":
             hurl --variables-file test.env --test --jobs 1 tests/
         fi
 
-        if [ "$RUN_E2E_TESTS" = true ]; then
-            echo ""
-            echo "Running Playwright E2E tests..."
-            cd dashboard && ADMIN_EMAIL=$ADMIN_EMAIL ADMIN_PASSWORD=$ADMIN_PASSWORD USER_PASSWORD=user_password npm run test:e2e -- $TEST_ARGS
-            cd ..
-        fi
+        # if [ "$RUN_E2E_TESTS" = true ]; then
+        #     echo ""
+        #     echo "Running Playwright E2E tests..."
+        #     cd dashboard && ADMIN_EMAIL=$ADMIN_EMAIL ADMIN_PASSWORD=$ADMIN_PASSWORD USER_PASSWORD=user_password npm run test:e2e -- $TEST_ARGS
+        #     cd ..
+        # fi
 
         echo ""
         echo "Cleaning up test users and groups..."

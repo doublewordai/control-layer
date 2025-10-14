@@ -139,7 +139,7 @@ pub async fn create_test_user_with_roles(pool: &PgPool, roles: Vec<Role>) -> Use
 }
 
 pub fn add_auth_headers(user: &UserResponse) -> (String, String) {
-    (ProxyHeaderAuthConfig::default().user_field_name, user.email.clone())
+    (ProxyHeaderAuthConfig::default().header_name, user.email.clone())
 }
 
 pub async fn create_test_group(pool: &PgPool) -> GroupDBResponse {
