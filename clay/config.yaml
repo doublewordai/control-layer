@@ -71,7 +71,7 @@ auth:
   # Proxy header authentication (current system)
   proxy_header:
     enabled: false # X-Doubleword-User header auth
-    user_field_name: "x-doubleword-user"
+    header_name: "x-doubleword-user"
     auto_create_users: true
 
   # Security settings

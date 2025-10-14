@@ -54,7 +54,6 @@ pub struct GroupResponse {
     /// stack trying to follow the relationship.
     #[schema(no_recursion)]
     pub models: Option<Vec<DeployedModelResponse>>,
-    pub source: String,
 }
 
 impl From<GroupDBResponse> for GroupResponse {
@@ -66,7 +65,6 @@ impl From<GroupDBResponse> for GroupResponse {
             created_by: db.created_by,
             created_at: db.created_at,
             updated_at: db.updated_at,
-            source: db.source,
             users: None, // By default, relationships are not included
             models: None,
         }

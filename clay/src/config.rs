@@ -81,12 +81,8 @@ pub struct NativeAuthConfig {
 #[serde(default)]
 pub struct ProxyHeaderAuthConfig {
     pub enabled: bool,
-    pub user_field_name: String,
-    pub groups_field_name: String,
+    pub header_name: String,
     pub auto_create_users: bool,
-    pub blacklisted_sso_groups: Vec<String>,
-    pub provider_field_name: String,
-    pub import_idp_groups: bool,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -232,12 +228,8 @@ impl Default for ProxyHeaderAuthConfig {
     fn default() -> Self {
         Self {
             enabled: true, // Current behavior by default
-            user_field_name: "x-doubleword-user".to_string(),
-            groups_field_name: "x-doubleword-user-groups".to_string(),
-            provider_field_name: "x-doubleword-sso-provider".to_string(),
+            header_name: "x-doubleword-user".to_string(),
             auto_create_users: true,
-            blacklisted_sso_groups: Vec::new(),
-            import_idp_groups: false,
         }
     }
 }
@@ -535,7 +527,7 @@ database_url: postgres://test:5432/test_db
             // Check auth defaults
             assert!(!config.auth.native.enabled);
             assert!(config.auth.proxy_header.enabled);
-            assert_eq!(config.auth.proxy_header.user_field_name, "x-doubleword-user");
+            assert_eq!(config.auth.proxy_header.header_name, "x-doubleword-user");
             assert!(config.auth.proxy_header.auto_create_users);
 
             // Check nested defaults
@@ -562,7 +554,7 @@ auth:
       min_length: 12
   proxy_header:
     enabled: false
-    user_field_name: "x-custom-user"
+    header_name: "x-custom-user"
   security:
     jwt_expiry: "2h"
 "#,
@@ -581,7 +573,7 @@ auth:
             assert_eq!(config.auth.native.password.max_length, 64); // still default
 
             assert!(!config.auth.proxy_header.enabled);
-            assert_eq!(config.auth.proxy_header.user_field_name, "x-custom-user");
+            assert_eq!(config.auth.proxy_header.header_name, "x-custom-user");
 
             assert_eq!(config.auth.security.jwt_expiry, Duration::from_secs(2 * 60 * 60));
 

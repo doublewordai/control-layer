@@ -45,5 +45,4 @@ pub struct GroupDBResponse {
     pub created_by: UserId,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
-    pub source: String,
 }

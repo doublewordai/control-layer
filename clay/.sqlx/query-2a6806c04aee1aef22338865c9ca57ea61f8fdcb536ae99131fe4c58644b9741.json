@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "\n            INSERT INTO groups (name, description, created_by, created_at, updated_at, source)\n            VALUES ($1, $2, $3, $4, $5, 'native')\n            RETURNING *\n            ",
+  "query": "\n            INSERT INTO groups (name, description, created_by, created_at, updated_at)\n            VALUES ($1, $2, $3, $4, $5)\n            RETURNING *\n            ",
   "describe": {
     "columns": [
       {
@@ -32,11 +32,6 @@
         "ordinal": 5,
         "name": "updated_at",
         "type_info": "Timestamptz"
-      },
-      {
-        "ordinal": 6,
-        "name": "source",
-        "type_info": "Text"
       }
     ],
     "parameters": {
@@ -54,9 +49,8 @@
       true,
       false,
       false,
-      false,
       false
     ]
   },
-  "hash": "693115f4302a611508670602d0e3701bd2306e47366d90280eecfacd90d0c5e4"
+  "hash": "2a6806c04aee1aef22338865c9ca57ea61f8fdcb536ae99131fe4c58644b9741"
 }
