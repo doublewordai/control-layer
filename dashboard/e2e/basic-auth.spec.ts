@@ -2,18 +2,15 @@ import { test, expect } from "@playwright/test";
 import { AuthHelper } from "./auth.helper";
 
 // Get admin email from environment variable, with fallback for backward compatibility
-const adminEmail = process.env.ADMIN_EMAIL || "test@doubleword.ai";
+const adminEmail = process.env.ADMIN_EMAIL || "yicheng@doubleword.ai";
 
 test.describe("Authentication Flow", () => {
   test("should redirect unauthenticated users to login", async ({ page }) => {
     // Navigate to the dashboard without authentication
-    await page.goto("http://localhost:3001/");
+    await page.goto("/");
 
-    // Should be redirected to login page
-    await expect(page).toHaveURL(/\/login$/);
-
-    // Should see login form
-    await expect(page.getByText(/sign in/i).first()).toBeVisible();
+    // Should be redirected to OAuth provider (Google in this case)
+    await expect(page).toHaveURL(/accounts\.google\.com/);
   });
 
   test("admin should have full dashboard access", async ({ page }) => {
@@ -24,7 +21,7 @@ test.describe("Authentication Flow", () => {
     await page.goto("/");
 
     // Should reach the dashboard
-    await expect(page).toHaveURL(/^http:\/\/localhost:3001\/(models)?$/);
+    await expect(page).toHaveURL(/^https:\/\/localhost\/(models)?$/);
 
     // Should see admin user info in the sidebar
     await expect(
@@ -41,7 +38,6 @@ test.describe("Authentication Flow", () => {
     await expect(
       page.getByRole("link", { name: /users.*groups/i }),
     ).toBeVisible();
-  
     await expect(page.getByRole("link", { name: /endpoints/i })).toBeVisible();
   });
 
@@ -55,7 +51,7 @@ test.describe("Authentication Flow", () => {
     await page.goto("/");
 
     // Should reach the dashboard
-    await expect(page).toHaveURL(/^http:\/\/localhost:3001\/(models)?$/);
+    await expect(page).toHaveURL(/^https:\/\/localhost\/(models)?$/);
 
     // Should see user info in the sidebar
     await expect(

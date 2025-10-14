@@ -240,7 +240,7 @@ impl Auth {
     /// Extract authentication from request headers
     pub fn from_request(request_data: &RequestData, config: &Config) -> Self {
         // Check for proxy header (Playground/SSO access)
-        let proxy_header_name = &config.auth.proxy_header.user_field_name;
+        let proxy_header_name = &config.auth.proxy_header.header_name;
         if let Some(email) = Self::get_header_value(request_data, proxy_header_name) {
             return Auth::Playground { user_email: email };
         }
