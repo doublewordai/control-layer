@@ -23,6 +23,7 @@ target/
 # Coverage reports
 cobertura.xml
 *.lcov
+*lcov.info
 
 # Playwright test artifacts
 test-results/

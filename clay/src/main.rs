@@ -1101,7 +1101,9 @@ mod test {
 
         // Metrics endpoint should not exist - falls through to SPA fallback
         let metrics_response = server.get("/internal/metrics").await;
-        assert_eq!(metrics_response.status_code().as_u16(), 404);
+        let metrics_content = metrics_response.text();
+        // Should not contain Prometheus metrics format
+        assert!(!metrics_content.contains("# HELP") && !metrics_content.contains("# TYPE"));
     }
 
     #[sqlx::test]

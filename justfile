@@ -7,28 +7,17 @@ default:
 # Helper function to get admin email from clay_config.yaml
 # Usage: ADMIN_EMAIL=$(just get-admin-email)
 get-admin-email:
-    @grep 'admin_email:' clay_config.yaml | sed 's/.*admin_email:[ ]*"\(.*\)"/\1/'
+    @grep 'admin_email:' config.yaml | sed 's/.*admin_email:[ ]*"\(.*\)"/\1/'
 
 # Setup development environment for local development
-#
-# This command prepares your local environment by:
-# - Checking for required development tools (docker, hurl, jwt-cli, etc.)
-# - Generating self-signed certificates for HTTPS
-# - Decrypting environment configuration (if enc.env exists)
-# - Checking database setup status
 #
 # Prerequisites:
 # - macOS or Linux
 # - Homebrew (recommended for tool installation)
-# - Access to doublewordai GCP project (for environment decryption)
 #
 # First-time setup:
-#   brew install docker hurl jwt-cli mkcert kind kubectl helm gh postgresql
-#   gcloud auth login  # Required for environment decryption
+#   brew install docker hurl postgresql
 #   just setup
-#
-# For Rust development, also run:
-#   just db-setup
 setup:
     #!/usr/bin/env bash
     set -euo pipefail
@@ -39,7 +28,7 @@ setup:
     missing_tools=()
 
     # Required tools
-    required_tools=("docker" "hurl" "jwt" "mkcert" "kind" "kubectl" "helm" "gh" "psql" "createdb")
+    required_tools=("docker" "hurl" "jwt" "psql" "createdb")
     for tool in "${required_tools[@]}"; do
         if ! command -v "$tool" >/dev/null 2>&1; then
             missing_tools+=("$tool")
@@ -59,14 +48,13 @@ setup:
         done
         echo ""
         echo "Install with:"
-        echo "  brew install docker hurl jwt-cli mkcert kind kubectl helm gh postgresql"
+        echo "  brew install docker hurl jwt-cli mkcert postgresql"
         echo ""
         echo "Note: docker compose-plugin is included with Docker Desktop"
         echo ""
         echo "Individual installation guides:"
         echo "  jwt-cli: https://github.com/mike-engel/jwt-cli"
         echo "  hurl: https://hurl.dev/docs/installation.html"
-        echo "  mkcert: https://github.com/FiloSottile/mkcert"
         exit 1
     fi
 
@@ -75,34 +63,6 @@ setup:
     echo "✅ Development setup complete!"
     echo ""
     echo "Checking database setup..."
-    just check-db || echo "💡 To develop Rust code, run 'just db-setup'"
-
-# Check database setup status for Rust tests
-#
-# IMPORTANT: Rust development requires a running PostgreSQL database!
-#
-# The clay service stores user/group/model data in PostgreSQL, &:
-#
-# - SQLx (our database library) performs compile-time SQL validation, & so even
-#   compiling Rust code requires database connectivity.
-# - For testing, we uses sqlx's test harness which requires a database to run.
-#
-# This command verifies:
-# - PostgreSQL client tools are installed (psql, createdb)
-# - 'postgres' user exists and can create databases
-# - 'test' database is accessible for running tests
-#
-# If checks fail, run 'just db-setup' to fix the configuration
-check-db:
-    #!/usr/bin/env bash
-    set -euo pipefail
-
-    # Check if PostgreSQL tools are available
-    if ! command -v psql >/dev/null 2>&1; then
-        echo "❌ PostgreSQL tools not found. Install with:"
-        echo "  brew install postgresql"
-        exit 1
-    fi
 
     # Check if postgres user exists
     postgres_user_exists=false
@@ -179,7 +139,6 @@ db-setup:
         echo "  brew install postgresql"
         echo ""
         echo "Or manually create test databases:"
-        echo "  createdb onwards_pilot_test"
         echo "  createdb test"
         exit 1
     fi
@@ -210,7 +169,7 @@ dev *args="":
 
     # Pass all arguments directly to docker compose
     echo "Starting development stack..."
-    docker compose -f docker-compose.yml -f docker-compose.override.yml up --build --watch {{args}}
+    docker compose up --build --watch {{args}}
 
 # Start production stack: 'just up'
 #
@@ -343,18 +302,18 @@ test target="" *args="":
         echo "Generating test cookies..."
         # Get admin credentials from clay_config.yaml
         ADMIN_EMAIL=$(just get-admin-email)
-        ADMIN_PASSWORD=$(grep 'admin_password:' clay_config.yaml | sed 's/.*admin_password:[ ]*"\(.*\)"/\1/')
+        ADMIN_PASSWORD=$(grep 'admin_password:' config.yaml | sed 's/.*admin_password:[ ]*"\(.*\)"/\1/')
         echo "Using admin email: $ADMIN_EMAIL"
 
         # Check for required passwords
         if [ -z "$ADMIN_PASSWORD" ]; then
-            echo "❌ Error: admin_password not set in clay_config.yaml"
+            echo "❌ Error: admin_password not set in config.yaml"
             exit 1
         fi
 
         # Generate admin JWT
        
-        if ADMIN_JWT=$(EMAIL=$ADMIN_EMAIL PASSWORD=$ADMIN_PASSWORD ./scripts/generate-jwt.sh); then
+        if ADMIN_JWT=$(EMAIL=$ADMIN_EMAIL PASSWORD=$ADMIN_PASSWORD ./scripts/login.sh); then
             echo "admin_jwt=$ADMIN_JWT" > test.env
             echo "✅ Admin JWT generated successfully"
         else
@@ -373,7 +332,7 @@ test target="" *args="":
 
         # Generate user JWT
         echo "Generating user JWT..."
-        if USER_JWT=$(EMAIL=user@example.org PASSWORD=user_password ./scripts/generate-jwt.sh); then
+        if USER_JWT=$(EMAIL=user@example.org PASSWORD=user_password ./scripts/login.sh); then
             echo "user_jwt=$USER_JWT" >> test.env
             echo "✅ User JWT generated successfully"
         else
@@ -613,12 +572,12 @@ fmt target *args="":
 # Examples:
 #   USERNAME=admin@example.org PASSWORD=secret just jwt
 jwt:
-    @./scripts/generate-jwt.sh
+    @./scripts/login.sh
 
 # Generate cookie for the configured admin user
 # Requires ADMIN_PASSWORD environment variable
 jwt-admin:
-    @EMAIL="$(just get-admin-email)" PASSWORD="${ADMIN_PASSWORD}" ./scripts/generate-jwt.sh
+    @EMAIL="$(just get-admin-email)" PASSWORD="${ADMIN_PASSWORD}" ./scripts/login.sh
 
 # Run CI pipeline locally: 'just ci [rust|ts]'
 #
