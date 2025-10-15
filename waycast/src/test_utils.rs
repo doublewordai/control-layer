@@ -45,14 +45,11 @@ pub async fn create_test_app(pool: PgPool, enable_sync: bool) -> (TestServer, Op
 }
 
 pub fn create_test_config() -> crate::config::Config {
-    let database_url = std::env::var("TEST_DATABASE_URL")
-        .unwrap_or_else(|_| "postgres://postgres@localhost/test".to_string());
+    let database_url = std::env::var("TEST_DATABASE_URL").unwrap_or_else(|_| "postgres://postgres@localhost/test".to_string());
 
     crate::config::Config {
         database_url: None, // Deprecated field
-        database: crate::config::DatabaseConfig::External {
-            url: database_url,
-        },
+        database: crate::config::DatabaseConfig::External { url: database_url },
         host: "127.0.0.1".to_string(),
         port: 0,
         admin_email: "admin@test.com".to_string(),
