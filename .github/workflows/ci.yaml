@@ -446,6 +446,8 @@ jobs:
         run: npm ci
 
       - name: Build binary
+        env:
+          GITHUB_TOKEN: ${{ secrets.RELEASE_TOKEN }}
         run: |
           cargo build --release --target ${{ matrix.target }} --bin waycast --features embedded-db,build-frontend
 
