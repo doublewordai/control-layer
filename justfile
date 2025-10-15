@@ -65,6 +65,9 @@ setup:
     just check-db || echo "Run 'Database not setup properly! just db-setup' to setup database for rust development"
 
 check-db:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    echo "Setting up development environment..."
     # Check if postgres user exists
     postgres_user_exists=false
     if psql -U postgres -d postgres -c '\q' 2>/dev/null; then
