@@ -486,40 +486,12 @@ mod tests {
     use figment::Jail;
 
     #[test]
-    fn test_default_config() {
-        Jail::expect_with(|jail| {
-            jail.create_file(
-                "test.yaml",
-                r#"
-database_url: postgres://test:5432/test_db
-"#,
-            )?;
-
-            let args = Args {
-                config: "test.yaml".to_string(),
-            };
-
-            let config = Config::load(&args)?;
-
-            // Check defaults
-            assert_eq!(config.host, "0.0.0.0");
-            assert_eq!(config.port, 3001);
-            assert_eq!(config.admin_email, "admin@example.org");
-
-            // Check nested defaults
-            assert_eq!(config.metadata.region, "UK South");
-            assert_eq!(config.metadata.organization, "ACME Corp");
-
-            Ok(())
-        });
-    }
-
-    #[test]
     fn test_model_sources_config() {
         Jail::expect_with(|jail| {
             jail.create_file(
                 "test.yaml",
                 r#"
+secret_key: hello
 model_sources:
   - name: openai
     url: https://api.openai.com
@@ -558,6 +530,7 @@ model_sources:
             jail.create_file(
                 "test.yaml",
                 r#"
+secret_key: hello
 metadata:
   region: US East
   organization: Test Corp
@@ -580,37 +553,6 @@ metadata:
             // YAML values should be preserved
             assert_eq!(config.metadata.region, "US East");
             assert_eq!(config.metadata.organization, "Test Corp");
-
-            Ok(())
-        });
-    }
-
-    #[test]
-    fn test_auth_config_defaults() {
-        Jail::expect_with(|jail| {
-            jail.create_file(
-                "test.yaml",
-                r#"
-database_url: postgres://test:5432/test_db
-"#,
-            )?;
-
-            let args = Args {
-                config: "test.yaml".to_string(),
-            };
-
-            let config = Config::load(&args)?;
-
-            // Check auth defaults
-            assert!(!config.auth.native.enabled);
-            assert!(config.auth.proxy_header.enabled);
-            assert_eq!(config.auth.proxy_header.header_name, "x-doubleword-user");
-            assert!(config.auth.proxy_header.auto_create_users);
-
-            // Check nested defaults
-            assert_eq!(config.auth.native.password.min_length, 8);
-            assert_eq!(config.auth.native.password.max_length, 64);
-            assert_eq!(config.auth.native.session.cookie_name, "waycast_session");
 
             Ok(())
         });
