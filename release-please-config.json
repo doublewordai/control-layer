@@ -1,8 +1,8 @@
 {
   "packages": {
-    ".": {
-      "release-type": "rust",
-      "package-name": "waycast"
+    "waycast": {
+      "release-type": "rust"
     }
-  }
+  },
+  "include-component-in-tag": false
 }
