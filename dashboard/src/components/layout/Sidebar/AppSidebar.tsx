@@ -12,7 +12,7 @@ import {
   LogOut,
   ChevronUp,
 } from "lucide-react";
-import { useUser, useConfig } from "../../../api/clay/hooks";
+import { useUser, useConfig } from "../../../api/waycast/hooks";
 import { UserAvatar } from "../../ui";
 import { useAuthorization } from "../../../utils";
 import { useAuth } from "../../../contexts/auth";
@@ -191,7 +191,7 @@ export function AppLayout({ children }: { children: React.ReactNode }) {
                 </>
               )}
               <a
-                href="https://docs.doubleword.ai/control-layer"
+                href="https://docs.doubleword.ai/waycast"
                 target="_blank"
                 rel="noopener noreferrer"
                 className="flex items-center gap-2 text-muted-foreground hover:text-primary transition-colors font-medium"

@@ -1,7 +1,7 @@
 import React, { useState } from "react";
 import { Info } from "lucide-react";
-import { useCreateUser } from "../../../api/clay";
-import type { Role } from "../../../api/clay/types";
+import { useCreateUser } from "../../../api/waycast";
+import type { Role } from "../../../api/waycast/types";
 import { AVAILABLE_ROLES, getRoleDisplayName } from "../../../utils/roles";
 import {
   Dialog,

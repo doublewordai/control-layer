@@ -7,7 +7,7 @@ import {
   useDeleteUser,
   useDeleteGroup,
   type Group as BackendGroup,
-} from "../../../../api/clay";
+} from "../../../../api/waycast";
 import {
   CreateUserModal,
   CreateGroupModal,

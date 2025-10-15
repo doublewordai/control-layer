@@ -5,7 +5,7 @@ import { setupServer } from "msw/node";
 import { http, HttpResponse } from "msw";
 import React from "react";
 import { describe, it, expect, beforeAll, afterEach, afterAll } from "vitest";
-import { handlers } from "../../../../api/clay/mocks/handlers";
+import { handlers } from "../../../../api/waycast/mocks/handlers";
 import { Endpoints } from "./Endpoints";
 
 // Setup MSW server

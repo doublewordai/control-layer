@@ -15,9 +15,15 @@ dist-ssr
 coverage
 *.local
 
+# Rust embedded static assets - keep only the stub
+waycast/static/*
+!waycast/static/index.html
+target/
+
 # Coverage reports
 cobertura.xml
 *.lcov
+*lcov.info
 
 # Playwright test artifacts
 test-results/
@@ -36,3 +42,6 @@ playwright/.cache/
 *.njsproj
 *.sln
 *.sw?
+data/
+waycast/static/
+.waycast_data/

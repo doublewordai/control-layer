@@ -26,7 +26,7 @@ import {
 import { SettingsProvider, useSettings } from "./contexts";
 import { AuthProvider, useAuth } from "./contexts/auth";
 import { useAuthorization } from "./utils";
-import { useRegistrationInfo } from "./api/clay/hooks";
+import { useRegistrationInfo } from "./api/waycast/hooks";
 
 // Create a client
 const queryClient = new QueryClient({
@@ -36,17 +36,17 @@ const queryClient = new QueryClient({
       gcTime: 10 * 60 * 1000, // 10 minutes (was cacheTime in v4)
       refetchOnWindowFocus: false,
       retry: (failureCount, error) => {
-        // Don't retry on 401/403 (auth errors) - fail fast
+        // Don't retry on 401/403/404 (auth/not found errors) - fail fast
         if (error instanceof Error) {
           // Check if it's our ApiError with status property
           if (
             "status" in error &&
-            (error.status === 401 || error.status === 403)
+            (error.status === 401 || error.status === 403 || error.status === 404)
           ) {
             return false;
           }
-          // Also check error message for "401" or "403" as fallback
-          if (error.message.includes("401") || error.message.includes("403")) {
+          // Also check error message for "401", "403", or "404" as fallback
+          if (error.message.includes("401") || error.message.includes("403") || error.message.includes("404")) {
             return false;
           }
         }

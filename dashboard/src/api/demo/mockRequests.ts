@@ -1,7 +1,7 @@
 import type {
   RequestResponsePair,
   RequestsAggregateResponse,
-} from "../clay/types";
+} from "../waycast/types";
 import demoRequests from "./data/requests.json";
 import type { Request as DemoRequest } from "./types";
 

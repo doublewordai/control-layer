@@ -1,7 +1,7 @@
 # Get the current user (using user_jwt to auto-create the user)
 GET http://localhost:3001/admin/api/v1/users/current
 [Cookies]
-clay_session: {{user_jwt}}
+waycast_session: {{user_jwt}}
 HTTP 200
 [Captures]
 test_user_id: jsonpath "$.id" 
@@ -9,7 +9,7 @@ test_user_id: jsonpath "$.id"
 # Verify the user currently has User role
 GET http://localhost:3001/admin/api/v1/users/{{test_user_id}}
 [Cookies]
-clay_session: {{admin_jwt}}
+waycast_session: {{admin_jwt}}
 HTTP 200
 [Captures]
 original_roles: jsonpath "$.roles"
@@ -20,19 +20,19 @@ jsonpath "$.roles" count == 1
 # Test that regular users cannot access admin endpoints (list users)
 GET http://localhost:3001/admin/api/v1/users
 [Cookies]
-clay_session: {{user_jwt}}
+waycast_session: {{user_jwt}}
 HTTP 403
 
 # Test that regular users cannot access admin endpoints (list groups)
 GET http://localhost:3001/admin/api/v1/groups
 [Cookies]
-clay_session: {{user_jwt}}
+waycast_session: {{user_jwt}}
 HTTP 403
 
 # Patch user role to PlatformManager (StandardUser will be automatically preserved)
 PATCH http://localhost:3001/admin/api/v1/users/{{test_user_id}}
 [Cookies]
-clay_session: {{admin_jwt}}
+waycast_session: {{admin_jwt}}
 {
   "roles": ["PlatformManager"]
 }
@@ -50,12 +50,12 @@ POST http://localhost:3001/authentication/login
 }
 HTTP 200
 [Captures]
-user_jwt: cookie "clay_session"
+user_jwt: cookie "waycast_session"
 
 # Test that user with PlatformManager role can now access admin endpoints (list users)
 GET http://localhost:3001/admin/api/v1/users
 [Cookies]
-clay_session: {{user_jwt}}
+waycast_session: {{user_jwt}}
 HTTP 200
 [Asserts]
 jsonpath "$" isCollection
@@ -63,7 +63,7 @@ jsonpath "$" isCollection
 # Test that user with PlatformManager role can now access admin endpoints (list groups)
 GET http://localhost:3001/admin/api/v1/groups
 [Cookies]
-clay_session: {{user_jwt}}
+waycast_session: {{user_jwt}}
 HTTP 200
 [Asserts]
 jsonpath "$" isCollection
@@ -71,7 +71,7 @@ jsonpath "$" isCollection
 # Test that they can now access specific admin operations (create group)
 POST http://localhost:3001/admin/api/v1/groups
 [Cookies]
-clay_session: {{user_jwt}}
+waycast_session: {{user_jwt}}
 {
   "name": "test-group-roles-{{newUuid}}",
   "description": "Test group created by role test"
@@ -83,7 +83,7 @@ test_group_id: jsonpath "$.id"
 # Try to patch user to have only RequestViewer (StandardUser should still be preserved)
 PATCH http://localhost:3001/admin/api/v1/users/{{test_user_id}}
 [Cookies]
-clay_session: {{admin_jwt}}
+waycast_session: {{admin_jwt}}
 {
   "roles": ["RequestViewer"]
 }
@@ -96,7 +96,7 @@ jsonpath "$.roles" count == 2
 # Try to patch user to have empty roles (StandardUser should still be preserved)
 PATCH http://localhost:3001/admin/api/v1/users/{{test_user_id}}
 [Cookies]
-clay_session: {{admin_jwt}}
+waycast_session: {{admin_jwt}}
 {
   "roles": []
 }
@@ -113,23 +113,23 @@ POST http://localhost:3001/authentication/login
 }
 HTTP 200
 [Captures]
-user_jwt: cookie "clay_session"
+user_jwt: cookie "waycast_session"
 
 # Test that user with only StandardUser role cannot access admin endpoints (list users)
 GET http://localhost:3001/admin/api/v1/users
 [Cookies]
-clay_session: {{user_jwt}}
+waycast_session: {{user_jwt}}
 HTTP 403
 
 # Test that user with only StandardUser role cannot access admin endpoints (list groups)
 GET http://localhost:3001/admin/api/v1/groups
 [Cookies]
-clay_session: {{user_jwt}}
+waycast_session: {{user_jwt}}
 HTTP 403
 
 # Clean up: Delete the test group (using admin privileges)
 # @cookie_storage_clear
 DELETE http://localhost:3001/admin/api/v1/groups/{{test_group_id}}
 [Cookies]
-clay_session: {{admin_jwt}}
+waycast_session: {{admin_jwt}}
 HTTP 204

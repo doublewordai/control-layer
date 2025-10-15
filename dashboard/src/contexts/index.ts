@@ -9,5 +9,5 @@ export { SettingsProvider } from "./settings/SettingsContext";
 export { useSettings } from "./settings/hooks";
 export type { FeatureFlags, AppSettings } from "./settings/types";
 
-// User types (moved to clay API types)
-// Note: User context replaced with TanStack Query hooks in api/clay
+// User types (moved to waycast API types)
+// Note: User context replaced with TanStack Query hooks in api/waycast

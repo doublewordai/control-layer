@@ -1,4 +1,4 @@
-import type { Role } from "../api/clay/types";
+import type { Role } from "../api/waycast/types";
 
 // Available user roles - must match Role type
 export const AVAILABLE_ROLES: Role[] = [

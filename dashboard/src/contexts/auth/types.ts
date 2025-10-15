@@ -1,4 +1,4 @@
-import type { UserResponse } from "../../api/clay/types";
+import type { UserResponse } from "../../api/waycast/types";
 
 export interface AuthState {
   user: UserResponse | null;

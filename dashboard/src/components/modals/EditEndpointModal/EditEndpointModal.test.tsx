@@ -13,9 +13,9 @@ import {
   beforeEach,
 } from "vitest";
 import React from "react";
-import { handlers } from "../../../api/clay/mocks/handlers";
+import { handlers } from "../../../api/waycast/mocks/handlers";
 import { EditEndpointModal } from "./EditEndpointModal";
-import type { Endpoint } from "../../../api/clay/types";
+import type { Endpoint } from "../../../api/waycast/types";
 
 // Setup MSW server
 const server = setupServer(...handlers);
