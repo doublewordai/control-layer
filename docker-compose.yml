@@ -20,8 +20,6 @@ services:
     build:
       context: .
       dockerfile: Dockerfile
-      provenance: mode=max
-      sbom: true
     ports:
       - "3001:3001"
     environment:

@@ -243,6 +243,8 @@ jobs:
           push: true
           project: ${{ secrets.DEPOT_PROJECT_ID }}
           set: |
+            *.attest=type=sbom
+            *.attest=type=provenance
             waycast.platform=linux/amd64,linux/arm64
 
       - name: Record build time
