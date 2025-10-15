@@ -216,7 +216,7 @@ jobs:
           DOCKER_METADATA_PR_HEAD_SHA: true
         with:
           images: ghcr.io/doublewordai/waycast
-          sep-tags: ","
+          sep-tags: "\n"
           tags: |
             type=sha,event=branch,prefix=sha-
             type=semver,pattern={{version}}
@@ -230,6 +230,16 @@ jobs:
           echo "start_time=$START_TIME" >> $GITHUB_OUTPUT
           echo "Starting Docker build at $(date)"
 
+      - name: Format tags for bake
+        id: format-tags
+        run: |
+          TAGS="${{ steps.meta.outputs.tags }}"
+          # Convert newline-separated tags into multiple --set lines
+          TAG_SETS=$(echo "$TAGS" | sed 's/^/waycast.tags=/')
+          echo "tag_sets<<EOF" >> $GITHUB_OUTPUT
+          echo "$TAG_SETS" >> $GITHUB_OUTPUT
+          echo "EOF" >> $GITHUB_OUTPUT
+
       - name: Run depot bake
         uses: depot/bake-action@v1
         with:
@@ -238,7 +248,7 @@ jobs:
           push: true
           project: ${{ secrets.DEPOT_PROJECT_ID }}
           set: |
-            waycast.tags=${{ steps.meta.outputs.tags }}
+            ${{ steps.format-tags.outputs.tag_sets }}
             *.attest=type=sbom
             *.attest=type=provenance
             waycast.platform=linux/amd64,linux/arm64
@@ -288,7 +298,7 @@ jobs:
           # Define image tags using the built images
           TAG_LIST="${{ needs.build.outputs.image-tag }}"
           # Extract just the SHA tag for our scan
-          TAG=$(echo "$TAG_LIST" | cut -d',' -f1 | cut -d':' -f2)
+          TAG=$(echo "$TAG_LIST" | head -n1 | cut -d':' -f2)
 
           WAYCAST_TAG="ghcr.io/doublewordai/waycast:$TAG"
 
@@ -378,9 +388,9 @@ jobs:
       - name: Run Docker end-to-end tests
         id: e2e-step
         run: |
-          # Extract first image from comma-separated list
+          # Extract first image from newline-separated list
           IMAGE_LIST="${{ needs.build.outputs.image-tag }}"
-          export IMAGE=$(echo "$IMAGE_LIST" | cut -d',' -f1)
+          export IMAGE=$(echo "$IMAGE_LIST" | head -n1)
           echo "Using image: $IMAGE"
 
           START_TIME=$(date +%s)
