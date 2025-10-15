@@ -230,17 +230,12 @@ jobs:
           echo "start_time=$START_TIME" >> $GITHUB_OUTPUT
           echo "Starting Docker build at $(date)"
 
-      - name: Run depot bake
-        uses: depot/bake-action@v1
+      - name: Build and push
+        uses: docker/bake-action@v6
         env:
           TAG: ${{ steps.meta.outputs.tags }}
         with:
-          files: ./docker-compose.yml
-          targets: waycast
           push: true
-          project: ${{ secrets.DEPOT_PROJECT_ID }}
-          sbom: true
-          provenance: mode=max
           set: |
             waycast.platform=linux/amd64,linux/arm64
 
@@ -343,7 +338,7 @@ jobs:
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
-      
+
       - name: Install just
         uses: extractions/setup-just@v2
 
@@ -429,7 +424,7 @@ jobs:
           ALLOWED_EMAIL_DOMAINS: ${{ secrets.E2E_ALLOWED_EMAIL_DOMAINS }}
           FQDN: ${{ secrets.E2E_FQDN }}
           PROVIDER: ${{ secrets.E2E_PROVIDER }}
-          CLIENT_ID:  ${{ secrets.E2E_CLIENT_ID }}
+          CLIENT_ID: ${{ secrets.E2E_CLIENT_ID }}
           CLIENT_SECRET: ${{ secrets.E2E_CLIENT_SECRET }}
           AUTH_URL: ${{ secrets.E2E_AUTH_URL }}
           TOKEN_URL: ${{ secrets.E2E_TOKEN_URL }}
