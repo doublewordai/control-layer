@@ -23,7 +23,7 @@ services:
     ports:
       - "3001:3001"
     environment:
-      - RUST_LOG=debug
+      - RUST_LOG={RUST_LOG:-info}
       - DATABASE_URL=postgres://waycast:waycast_password@postgres:5432/waycast
     volumes:
       - ./config.yaml:/app/config.yaml:ro
