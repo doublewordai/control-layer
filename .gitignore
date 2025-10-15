@@ -15,6 +15,11 @@ dist-ssr
 coverage
 *.local
 
+# Rust embedded static assets - keep only the stub
+clay/static/*
+!clay/static/index.html
+target/
+
 # Coverage reports
 cobertura.xml
 *.lcov
@@ -36,3 +41,6 @@ playwright/.cache/
 *.njsproj
 *.sln
 *.sw?
+data/
+clay/static/
+.clay_data/

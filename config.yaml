@@ -1,24 +1,37 @@
-# Onwards Pilot Configuration
-# This is the default configuration file. Copy to onwards-pilot.production.yaml
-# for production settings that include API keys.
+# Clay configuration
+# This is the default configuration file.
 
 # Server configuration
-host: "0.0.0.0"
+# To advertise publically, set to "0.0.0.0", or the specific network interface
+# you've exposed.
+host: "localhost"
 port: 3001
 
-# Database connection
-database_url: "postgres://postgres:postgres@localhost:5432/test"
+# Database configuration
+database:
+  # By default, we bundle postgres with the application. It's launched on a
+  # random port, and data doesn't persist between application restarts.
+  # To have data persist, set persistent=true, and set a data_dir.
+  # We strongly recommend setting up external postgres in production!
+  type: embedded
+  data_dir: null
+  persistent: false
+
+  # TODO: Use an external database in production
+  # type: external
 
 # Admin user email - will be created on first startup
-admin_email: "fergus.finn@doubleword.ai"
+admin_email: "test@doubleword.ai"
+# TODO: Change this in production!
+admin_password: "hunter2"
+
+# Secret key for jwt signing.
+# TODO: Change this in production
+secret_key: insecure-change-in-production
 
 # Model sources - inference endpoints to connect to
 # Uncomment and configure as needed
-model_sources:
-  # Local development server
-  - name: "local"
-    url: "http://host.docker.internal:8000"
-    sync_interval: "10s"
+model_sources: []
 
 # Example configurations:
 # model_sources:
@@ -26,32 +39,15 @@ model_sources:
 #   - name: "openai"
 #     url: "https://api.openai.com"
 #     api_key: "sk-..."  # Required for model sync
-#     sync_interval: "30s"
-#
-#   # Anthropic API
-#   - name: "anthropic"
-#     url: "https://api.anthropic.com"
-#     api_key: "sk-ant-..."  # Required for model sync
-#     sync_interval: "1m"
 #
 #   # Internal model server (no auth required)
 #   - name: "internal"
-#     url: "http://internal-models:8080"
-#     sync_interval: "5m"
-#
-#   # Local development server
-#   - name: "local"
-#     url: "http://localhost:8000"
-#     sync_interval: "10s"
+#     url: "http://localhost:8080"
 
 # Frontend metadata
 metadata:
   region: "UK South"
   organization: "ACME Corp"
-
-# Global secret key for encryption/signing (REQUIRED)
-# Generate with: openssl rand -base64 32
-# secret_key: "your-secret-key-here"
 
 # Authentication configuration
 auth:
@@ -68,7 +64,8 @@ auth:
       cookie_secure: true
       cookie_same_site: "strict"
 
-  # Proxy header authentication (current system)
+  # Proxy header authentication. Will accept & autocreate users based on emails
+  # supplied in a header. Lets you use an upstream proxy to authenticate users.
   proxy_header:
     enabled: false # X-Doubleword-User header auth
     header_name: "x-doubleword-user"
@@ -80,13 +77,10 @@ auth:
     jwt_expiry: "1h"
     cors:
       allowed_origins:
-        - "http://localhost:5173"  # Development frontend (Vite)
-        - "https://localhost"      # Local HTTPS
+        - "http://localhost:5173" # Development frontend (Vite)
+        - "https://localhost" # Local HTTPS
       allow_credentials: true
-      max_age: 3600  # Cache preflight requests for 1 hour
-
-# Secret key for jwt signing
-secret_key: insecure-change-in-production
+      max_age: 3600 # Cache preflight requests for 1 hour
 
 # Optional feature toggles
 enable_metrics: true # Enable Prometheus metrics endpoint

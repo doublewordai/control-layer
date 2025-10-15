@@ -391,7 +391,7 @@ mod tests {
         // Create config with request logging enabled (like in main.rs test)
         let mut config = create_test_config();
         config.enable_request_logging = true;
-        config.database_url = pool.connect_options().to_url_lossy().to_string();
+        config.database = crate::config::DatabaseConfig::External { url: pool.connect_options().to_url_lossy().to_string() };
 
         // Build router with request logging enabled
         let mut app_state = crate::AppState::builder().db(pool.clone()).config(config).build();
@@ -425,7 +425,7 @@ mod tests {
         // Create config with request logging enabled (like in main.rs test)
         let mut config = create_test_config();
         config.enable_request_logging = true;
-        config.database_url = pool.connect_options().to_url_lossy().to_string();
+        config.database = crate::config::DatabaseConfig::External { url: pool.connect_options().to_url_lossy().to_string() };
 
         // Build router with request logging enabled
         let mut app_state = crate::AppState::builder().db(pool.clone()).config(config).build();
@@ -470,7 +470,7 @@ mod tests {
         // This exercises the outlet database query and conversion logic (lines 112-184)
         let mut config = create_test_config();
         config.enable_request_logging = true;
-        config.database_url = pool.connect_options().to_url_lossy().to_string();
+        config.database = crate::config::DatabaseConfig::External { url: pool.connect_options().to_url_lossy().to_string() };
 
         let mut app_state = crate::AppState::builder().db(pool.clone()).config(config).build();
         let onwards_router = axum::Router::new();
@@ -832,7 +832,7 @@ mod tests {
         // Create config with request logging enabled
         let mut config = create_test_config();
         config.enable_request_logging = true;
-        config.database_url = pool.connect_options().to_url_lossy().to_string();
+        config.database = crate::config::DatabaseConfig::External { url: pool.connect_options().to_url_lossy().to_string() };
 
         // Build router with request logging enabled
         let mut app_state = crate::AppState::builder().db(pool.clone()).config(config).build();
@@ -867,7 +867,7 @@ mod tests {
         // Create config with request logging enabled
         let mut config = create_test_config();
         config.enable_request_logging = true;
-        config.database_url = pool.connect_options().to_url_lossy().to_string();
+        config.database = crate::config::DatabaseConfig::External { url: pool.connect_options().to_url_lossy().to_string() };
 
         // Build router with request logging enabled
         let mut app_state = crate::AppState::builder().db(pool.clone()).config(config).build();
@@ -906,7 +906,7 @@ mod tests {
         // Create config with request logging enabled
         let mut config = create_test_config();
         config.enable_request_logging = true;
-        config.database_url = pool.connect_options().to_url_lossy().to_string();
+        config.database = crate::config::DatabaseConfig::External { url: pool.connect_options().to_url_lossy().to_string() };
 
         // Build router with request logging enabled
         let mut app_state = crate::AppState::builder().db(pool.clone()).config(config).build();
@@ -943,7 +943,7 @@ mod tests {
         // Create config with request logging enabled
         let mut config = create_test_config();
         config.enable_request_logging = true;
-        config.database_url = pool.connect_options().to_url_lossy().to_string();
+        config.database = crate::config::DatabaseConfig::External { url: pool.connect_options().to_url_lossy().to_string() };
 
         // Build router with request logging enabled
         let mut app_state = crate::AppState::builder().db(pool.clone()).config(config).build();
@@ -999,7 +999,7 @@ mod tests {
         // Create config with request logging enabled
         let mut config = create_test_config();
         config.enable_request_logging = true;
-        config.database_url = pool.connect_options().to_url_lossy().to_string();
+        config.database = crate::config::DatabaseConfig::External { url: pool.connect_options().to_url_lossy().to_string() };
 
         // Build router with request logging enabled
         let mut app_state = crate::AppState::builder().db(pool.clone()).config(config).build();
@@ -1047,7 +1047,7 @@ mod tests {
         // Create config with request logging enabled
         let mut config = create_test_config();
         config.enable_request_logging = true;
-        config.database_url = pool.connect_options().to_url_lossy().to_string();
+        config.database = crate::config::DatabaseConfig::External { url: pool.connect_options().to_url_lossy().to_string() };
 
         // Build router with request logging enabled
         let mut app_state = crate::AppState::builder().db(pool.clone()).config(config).build();
@@ -1094,7 +1094,7 @@ mod tests {
         // Create config with request logging enabled
         let mut config = create_test_config();
         config.enable_request_logging = true;
-        config.database_url = pool.connect_options().to_url_lossy().to_string();
+        config.database = crate::config::DatabaseConfig::External { url: pool.connect_options().to_url_lossy().to_string() };
 
         // Build router with request logging enabled
         let mut app_state = crate::AppState::builder().db(pool.clone()).config(config).build();
@@ -1159,7 +1159,7 @@ mod tests {
         // Create config with request logging enabled
         let mut config = create_test_config();
         config.enable_request_logging = true;
-        config.database_url = pool.connect_options().to_url_lossy().to_string();
+        config.database = crate::config::DatabaseConfig::External { url: pool.connect_options().to_url_lossy().to_string() };
 
         // Build router with request logging enabled
         let mut app_state = crate::AppState::builder().db(pool.clone()).config(config).build();

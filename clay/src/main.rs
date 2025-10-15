@@ -8,6 +8,7 @@ mod errors;
 mod metrics;
 mod openapi;
 mod request_logging;
+mod static_assets;
 mod sync;
 mod types;
 
@@ -26,10 +27,10 @@ use crate::{
 use auth::middleware::admin_ai_proxy_middleware;
 use axum::http::HeaderValue;
 use axum::{
-    handler::HandlerWithoutStateExt,
-    http::{Request, Response, StatusCode},
+    body::Body,
+    http::{Request, Response, StatusCode, Uri},
     middleware::from_fn_with_state,
-    response::Html,
+    response::{Html, IntoResponse},
     routing::{delete, get, patch, post},
     Router, ServiceExt,
 };
@@ -40,12 +41,12 @@ use config::{Args, Config};
 use outlet::{RequestLoggerConfig, RequestLoggerLayer};
 use outlet_postgres::PostgresHandler;
 use request_logging::{AiRequest, AiResponse};
-use sqlx::{Executor, PgPool};
+use sqlx::{ConnectOptions, Executor, PgPool};
 use std::time::Duration;
 use tokio::net::TcpListener;
 use tower::Layer;
 use tower::ServiceBuilder;
-use tower_http::{cors::CorsLayer, services::ServeDir, trace::TraceLayer};
+use tower_http::{cors::CorsLayer, trace::TraceLayer};
 use tracing::{debug, info, instrument, Span};
 use utoipa::OpenApi;
 use utoipa_rapidoc::RapiDoc;
@@ -165,7 +166,7 @@ pub async fn seed_database(sources: &[config::ModelSource], db: &PgPool) -> Resu
     // Commit the transaction - either everything succeeds or nothing changes
     tx.commit().await?;
 
-    info!("Database seeded successfully");
+    debug!("Database seeded successfully");
 
     Ok(())
 }
@@ -194,13 +195,48 @@ fn create_cors_layer(config: &Config) -> anyhow::Result<CorsLayer> {
     Ok(cors)
 }
 
+/// Serve embedded static assets with SPA fallback
+#[instrument]
+async fn serve_embedded_asset(uri: Uri) -> impl IntoResponse {
+    let mut path = uri.path().trim_start_matches('/');
+
+    // If path is empty or ends with /, serve index.html
+    if path.is_empty() || path.ends_with('/') {
+        path = "index.html";
+    }
+
+    // Try to serve the requested file
+    if let Some(content) = static_assets::Assets::get(path) {
+        let mime = mime_guess::from_path(path).first_or_octet_stream();
+        return Response::builder()
+            .header(axum::http::header::CONTENT_TYPE, mime.as_ref())
+            .body(Body::from(content.data.into_owned()))
+            .unwrap();
+    }
+
+    // If not found, serve index.html for SPA client-side routing
+    if let Some(index) = static_assets::Assets::get("index.html") {
+        return Response::builder()
+            .header(axum::http::header::CONTENT_TYPE, "text/html")
+            .body(Body::from(index.data.into_owned()))
+            .unwrap();
+    }
+
+    // If even index.html is missing, return 404
+    Response::builder().status(StatusCode::NOT_FOUND).body(Body::empty()).unwrap()
+}
+
 /// SPA fallback handler - serves index.html for client-side routes
 #[instrument(err)]
-async fn spa_fallback(uri: axum::http::Uri) -> Result<Html<String>, StatusCode> {
-    debug!("Hitting SPA fallback");
-    match tokio::fs::read_to_string("static/index.html").await {
-        Ok(content) => Ok(Html(content)),
-        Err(_) => Err(StatusCode::INTERNAL_SERVER_ERROR),
+async fn spa_fallback(uri: Uri) -> Result<Html<String>, StatusCode> {
+    debug!("Hitting SPA fallback for: {}", uri.path());
+
+    // Serve embedded index.html
+    if let Some(index) = static_assets::Assets::get("index.html") {
+        let content = String::from_utf8_lossy(&index.data).to_string();
+        Ok(Html(content))
+    } else {
+        Err(StatusCode::INTERNAL_SERVER_ERROR)
     }
 }
 
@@ -211,7 +247,7 @@ pub async fn setup_app(
     pool: PgPool,
     config: Config,
 ) -> anyhow::Result<(Router, sync::onwards_config::OnwardsConfigSync, tokio_util::sync::DropGuard)> {
-    info!("Setting up application");
+    debug!("Setting up application");
     // Seed database with initial configuration (only runs once)
     seed_database(&config.model_sources, &pool).await?;
 
@@ -240,6 +276,9 @@ pub async fn build_router(state: &mut AppState, onwards_router: Router) -> anyho
     let outlet_layer = if state.config.enable_request_logging {
         // Setup request logging with PostgreSQL handler using schema separation
 
+        // Get the database URL from the existing pool
+        let database_url = state.db.connect_options().to_url_lossy().to_string();
+
         let outlet_pool = sqlx::postgres::PgPoolOptions::new()
             .max_connections(5) // Smaller pool for logging
             .after_connect(|conn, _meta| {
@@ -249,7 +288,7 @@ pub async fn build_router(state: &mut AppState, onwards_router: Router) -> anyho
                     Ok(())
                 })
             })
-            .connect(&state.config.database_url)
+            .connect(&database_url)
             .await
             .expect("Failed to create outlet database pool");
 
@@ -410,7 +449,8 @@ pub async fn build_router(state: &mut AppState, onwards_router: Router) -> anyho
         )
         .with_state(state.clone());
 
-    let fallback = ServeDir::new("static").fallback(get(spa_fallback).into_service());
+    // Serve embedded static assets, falling back to SPA for unmatched routes
+    let fallback = get(serve_embedded_asset).fallback(get(spa_fallback));
 
     // Build the app with admin API and onwards proxy nested. serve the (restricted) openai spec.
     let router = Router::new()
@@ -480,12 +520,6 @@ pub async fn build_router(state: &mut AppState, onwards_router: Router) -> anyho
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    // Parse CLI args
-    let args = Args::parse();
-
-    // Load configuration
-    let config = Config::load(&args)?;
-
     // Initialize tracing with environment filter
     tracing_subscriber::fmt()
         .with_env_filter(
@@ -494,10 +528,44 @@ async fn main() -> anyhow::Result<()> {
         )
         .init();
 
-    info!("Starting control layer with configuration: {:#?}", config);
+    // Parse CLI args
+    let args = Args::parse();
+    debug!("{:?}", args);
 
-    // Database connection
-    let pool = PgPool::connect(&config.database_url).await?;
+    // Load configuration
+    let config = Config::load(&args)?;
+    debug!("Starting control layer with configuration: {:#?}", config);
+
+    // Database connection - handle both embedded and external
+    let (_embedded_db, database_url) = match &config.database {
+        config::DatabaseConfig::Embedded { .. } => {
+            let persistent = config.database.embedded_persistent();
+            info!("Starting with embedded database (persistent: {})", persistent);
+            if !persistent {
+                info!("persistent=false: database will be ephemeral and data will be lost on shutdown");
+            }
+            #[cfg(feature = "embedded-db")]
+            {
+                let data_dir = config.database.embedded_data_dir();
+                let embedded_db = db::embedded::EmbeddedDatabase::start(data_dir, persistent).await?;
+                let url = embedded_db.connection_string().to_string();
+                (Some(embedded_db), url)
+            }
+            #[cfg(not(feature = "embedded-db"))]
+            {
+                anyhow::bail!(
+                    "Embedded database is configured but the feature is not enabled. \
+                     Rebuild with --features embedded-db to use embedded database."
+                );
+            }
+        }
+        config::DatabaseConfig::External { url } => {
+            info!("Using external database");
+            (None::<db::embedded::EmbeddedDatabase>, url.clone())
+        }
+    };
+
+    let pool = PgPool::connect(&database_url).await?;
 
     // Run migrations
     sqlx::migrate!("./migrations").run(&pool).await?;
@@ -529,17 +597,57 @@ async fn main() -> anyhow::Result<()> {
 
     let bind_addr = config.bind_address();
     let listener = TcpListener::bind(&bind_addr).await?;
-    info!("Control layer listening on {}", bind_addr);
+    info!(
+        "Control layer listening on http://{}, available at http://localhost:{}",
+        bind_addr, config.port
+    );
 
-    // Run the server
-    axum::serve(listener, app_with_middleware.into_make_service()).await?;
+    // Run the server with graceful shutdown
+    axum::serve(listener, app_with_middleware.into_make_service())
+        .with_graceful_shutdown(shutdown_signal())
+        .await?;
+
+    // Clean up embedded database if it exists
+    if let Some(embedded_db) = _embedded_db {
+        info!("Shutting down embedded database...");
+        embedded_db.stop().await?;
+    }
 
     Ok(())
 }
 
+/// Wait for shutdown signal (SIGTERM or Ctrl+C)
+async fn shutdown_signal() {
+    use tokio::signal;
+
+    let ctrl_c = async {
+        signal::ctrl_c().await.expect("Failed to install Ctrl+C handler");
+    };
+
+    #[cfg(unix)]
+    let terminate = async {
+        signal::unix::signal(signal::unix::SignalKind::terminate())
+            .expect("Failed to install SIGTERM handler")
+            .recv()
+            .await;
+    };
+
+    #[cfg(not(unix))]
+    let terminate = std::future::pending::<()>();
+
+    tokio::select! {
+        _ = ctrl_c => {
+            info!("Received Ctrl+C, shutting down gracefully...");
+        },
+        _ = terminate => {
+            info!("Received SIGTERM, shutting down gracefully...");
+        },
+    }
+}
+
 #[cfg(test)]
 mod test {
-    use super::{create_initial_admin_user, spa_fallback, AppState};
+    use super::{create_initial_admin_user, AppState};
     use crate::{
         api::models::users::Role,
         auth::middleware::admin_ai_proxy_middleware,
@@ -549,7 +657,7 @@ mod test {
     };
     use axum::ServiceExt as _;
     use outlet_postgres::RequestFilter;
-    use sqlx::{ConnectOptions, PgPool};
+    use sqlx::PgPool;
     use tower::Layer as _;
 
     /// Integration test: setup the whole stack, including syncing the onwards config from
@@ -797,8 +905,6 @@ mod test {
         // Create test config with request logging enabled
         let mut config = crate::test_utils::create_test_config();
         config.enable_request_logging = true;
-        // Use the same database URL as the test pool
-        config.database_url = pool.connect_options().to_url_lossy().to_string();
 
         // Build router with request logging enabled
         let mut app_state = AppState::builder().db(pool.clone()).config(config).build();
@@ -832,8 +938,6 @@ mod test {
         // Create test config with request logging disabled
         let mut config = crate::test_utils::create_test_config();
         config.enable_request_logging = false;
-        // Use the same database URL as the test pool (for consistency)
-        config.database_url = pool.connect_options().to_url_lossy().to_string();
 
         // Build router with request logging disabled
         let mut app_state = AppState::builder().db(pool.clone()).config(config).build();
@@ -933,39 +1037,6 @@ mod test {
     }
 
     #[tokio::test]
-    async fn test_spa_fallback_regular_path() {
-        // Create temporary test file
-        tokio::fs::create_dir_all("static").await.ok();
-        let test_content = "<html><body>Test SPA</body></html>";
-        tokio::fs::write("static/index.html", test_content)
-            .await
-            .expect("Should write test file");
-
-        let uri = axum::http::Uri::from_static("/some/spa/route");
-        let result = spa_fallback(uri).await;
-
-        assert!(result.is_ok());
-        let html = result.unwrap();
-        assert_eq!(html.0, test_content);
-
-        // Cleanup
-        tokio::fs::remove_file("static/index.html").await.ok();
-        tokio::fs::remove_dir("static").await.ok();
-    }
-
-    #[tokio::test]
-    async fn test_spa_fallback_file_not_found() {
-        // Ensure the file doesn't exist
-        tokio::fs::remove_file("static/index.html").await.ok();
-
-        let uri = axum::http::Uri::from_static("/some/route");
-        let result = spa_fallback(uri).await;
-
-        assert!(result.is_err());
-        assert_eq!(result.unwrap_err(), axum::http::StatusCode::INTERNAL_SERVER_ERROR);
-    }
-
-    #[tokio::test]
     async fn test_openapi_yaml_endpoint() {
         // Create a simple test router with just the openapi endpoint
         let router = axum::Router::new().route(
@@ -1028,9 +1099,9 @@ mod test {
             .expect("Failed to build router");
         let server = axum_test::TestServer::new(router).expect("Failed to create test server");
 
-        // Metrics endpoint should not exist - falls through to SPA fallback (500 since no static file)
+        // Metrics endpoint should not exist - falls through to SPA fallback
         let metrics_response = server.get("/internal/metrics").await;
-        assert_eq!(metrics_response.status_code().as_u16(), 500);
+        assert_eq!(metrics_response.status_code().as_u16(), 404);
     }
 
     #[sqlx::test]

@@ -3,6 +3,11 @@ name = "clay"
 version = "0.1.0"
 edition = "2021"
 
+[features]
+default = []
+embedded-db = ["dep:postgresql_embedded"]
+build-frontend = []
+
 [dependencies]
 axum = "0.8"
 tokio = { version = "1.0", features = ["full"] }
@@ -64,6 +69,11 @@ rust_decimal = { version = "1.38.0", features = ["serde"] }
 bon = "3.3"
 # Prometheus for GenAI metrics (via axum-prometheus)
 prometheus = "0.13"
+# Embedded database support
+postgresql_embedded = { version = "0.20", optional = true, features = ["bundled"] }
+# Embedded static assets
+rust-embed = { version = "8.5", features = ["debug-embed"] }
+mime_guess = "2.0"
 
 [dev-dependencies]
 axum-test = "17.3"

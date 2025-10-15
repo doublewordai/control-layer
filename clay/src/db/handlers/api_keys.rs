@@ -1361,7 +1361,10 @@ mod tests {
         let config = crate::config::Config {
             host: "localhost".to_string(),
             port: 3001,
-            database_url: "postgres://test@localhost/test".to_string(),
+            database_url: None,
+            database: crate::config::DatabaseConfig::External {
+                url: "postgres://test@localhost/test".to_string(),
+            },
             admin_email: "admin@example.org".to_string(),
             admin_password: None,
             secret_key: None,

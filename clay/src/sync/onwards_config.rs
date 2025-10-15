@@ -55,7 +55,7 @@ impl OnwardsConfigSync {
         // Listen to auth config changes
         listener.listen("auth_config_changed").await?;
 
-        info!("Started onwards configuration listener");
+        debug!("Started onwards configuration listener");
 
         // Debouncing: prevent rapid-fire reloads
         let mut last_reload_time = std::time::Instant::now();
@@ -151,7 +151,7 @@ impl OnwardsConfigSync {
 /// Loads the current targets configuration from the database
 #[tracing::instrument(skip(db))]
 async fn load_targets_from_db(db: &PgPool) -> Result<Targets, anyhow::Error> {
-    info!("Loading onwards targets from database");
+    debug!("Loading onwards targets from database");
 
     let mut tx = db.begin().await?;
     let models;
@@ -189,7 +189,7 @@ async fn load_targets_from_db(db: &PgPool) -> Result<Targets, anyhow::Error> {
         }
     }
     tx.commit().await?;
-    info!("Loaded {} deployments from database", models.len());
+    debug!("Loaded {} deployments from database", models.len());
 
     // Convert to ConfigFile format
     let config = convert_to_config_file(models, &deployment_api_keys, &endpoint_urls, &endpoint_api_keys);

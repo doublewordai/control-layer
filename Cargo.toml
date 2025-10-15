@@ -1,0 +1,4 @@
+[workspace]
+members = ["clay"]
+default-members = ["clay"]
+resolver = "2"

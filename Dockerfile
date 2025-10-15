@@ -32,9 +32,14 @@ COPY clay/src clay/src
 COPY clay/migrations clay/migrations
 COPY clay/.sqlx clay/.sqlx
 
+# Copy frontend build from dashboard-builder stage into static/ folder
+# This will be embedded into the binary by rust-embed
+COPY --from=dashboard-builder /app/dist clay/static/
+
 WORKDIR /app/clay/
 
 # Build the application with offline mode for SQLx
+# The frontend assets in static/ will be embedded at compile time
 ENV SQLX_OFFLINE=true
 RUN cargo build --release
 
@@ -59,14 +64,11 @@ RUN apt-get update && apt-get install -y \
   curl \
   && rm -rf /var/lib/apt/lists/*
 
-# Copy the binary from backend builder stage
+# Copy the binary from backend builder stage (frontend is already embedded in the binary)
 COPY --from=backend-builder /app/clay/target/release/clay /app/clay
 
 # Copy migrations
 COPY clay/migrations ./app/migrations
-
-# Copy frontend assets from frontend builder stage
-COPY --from=dashboard-builder /app/dist /app/static
 
 # Set working directory
 WORKDIR /app

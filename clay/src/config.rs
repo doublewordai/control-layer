@@ -4,6 +4,7 @@ use figment::{
     Figment,
 };
 use serde::{Deserialize, Serialize};
+use std::path::PathBuf;
 use std::time::Duration;
 use url::Url;
 
@@ -14,7 +15,7 @@ use crate::errors::Error;
 #[command(author, version, about, long_about = None)]
 pub struct Args {
     /// Path to configuration file
-    #[arg(short, long, env = "CLAY_CONFIG", default_value = "config.yaml")]
+    #[arg(short = 'f', long, env = "CLAY_CONFIG", default_value = "config.yaml")]
     pub config: String,
 }
 
@@ -23,7 +24,11 @@ pub struct Args {
 pub struct Config {
     pub host: String,
     pub port: u16,
-    pub database_url: String,
+    /// Deprecated: Use `database` field instead. Kept for backward compatibility.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub database_url: Option<String>,
+    /// Database configuration - either embedded or external
+    pub database: DatabaseConfig,
     pub admin_email: String,
     pub admin_password: Option<String>,
     // Global secret key for encryption/signing
@@ -38,6 +43,66 @@ pub struct Config {
     pub enable_metrics: bool,
     // Request logging configuration
     pub enable_request_logging: bool,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(tag = "type", rename_all = "lowercase")]
+pub enum DatabaseConfig {
+    /// Use embedded PostgreSQL database (requires embedded-db feature)
+    Embedded {
+        /// Directory where database data will be stored (default: .clay_data/postgres)
+        #[serde(skip_serializing_if = "Option::is_none")]
+        data_dir: Option<PathBuf>,
+        /// Whether to persist data between restarts (default: false/ephemeral)
+        #[serde(default)]
+        persistent: bool,
+    },
+    /// Use external PostgreSQL database
+    External {
+        /// Connection string for external database
+        url: String,
+    },
+}
+
+impl Default for DatabaseConfig {
+    fn default() -> Self {
+        // Default to external for backward compatibility
+        DatabaseConfig::External {
+            url: "postgres://localhost:5432/clay".to_string(),
+        }
+    }
+}
+
+impl DatabaseConfig {
+    /// Get the database URL, resolving embedded if needed
+    /// This is used during startup to get the connection string
+    pub fn is_embedded(&self) -> bool {
+        matches!(self, DatabaseConfig::Embedded { .. })
+    }
+
+    /// Get external URL if available
+    pub fn external_url(&self) -> Option<&str> {
+        match self {
+            DatabaseConfig::External { url } => Some(url),
+            DatabaseConfig::Embedded { .. } => None,
+        }
+    }
+
+    /// Get embedded data directory if configured
+    pub fn embedded_data_dir(&self) -> Option<PathBuf> {
+        match self {
+            DatabaseConfig::Embedded { data_dir, .. } => data_dir.clone(),
+            DatabaseConfig::External { .. } => None,
+        }
+    }
+
+    /// Get embedded persistence flag if configured
+    pub fn embedded_persistent(&self) -> bool {
+        match self {
+            DatabaseConfig::Embedded { persistent, .. } => *persistent,
+            DatabaseConfig::External { .. } => false,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -178,7 +243,8 @@ impl Default for Config {
         Self {
             host: "0.0.0.0".to_string(),
             port: 3001,
-            database_url: "postgres://localhost:5432/onwards_pilot".to_string(),
+            database_url: None, // Deprecated field
+            database: DatabaseConfig::default(),
             admin_email: "admin@example.org".to_string(),
             admin_password: None,
             secret_key: None,
@@ -305,9 +371,25 @@ impl ModelSource {
 impl Config {
     #[allow(clippy::result_large_err)]
     pub fn load(args: &Args) -> Result<Self, figment::Error> {
-        let config: Self = Self::figment(args).extract()?;
+        let mut config: Self = Self::figment(args).extract()?;
+
+        // Backward compatibility: if database_url is set, use it
+        if let Some(url) = config.database_url.take() {
+            tracing::warn!(
+                "Using deprecated 'database_url' field. Please migrate to 'database' configuration. \
+                 See documentation for details."
+            );
+            config.database = DatabaseConfig::External { url };
+        }
+
         config.validate().map_err(|e| figment::Error::from(e.to_string()))?;
         Ok(config)
+    }
+
+    /// Get the database connection string
+    /// Returns None if using embedded database (connection string will be set at runtime)
+    pub fn database_url(&self) -> Option<&str> {
+        self.database.external_url()
     }
 
     /// Validate the configuration for consistency and required fields
