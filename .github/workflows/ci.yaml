@@ -405,7 +405,7 @@ jobs:
 
   build-binaries:
     if: github.event_name == 'release'
-    needs: [build, e2e-test-docker]
+    needs: [build]
     strategy:
       matrix:
         include:
@@ -430,9 +430,24 @@ jobs:
         with:
           targets: ${{ matrix.target }}
 
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: waycast
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: "npm"
+          cache-dependency-path: dashboard/package-lock.json
+
+      - name: Install dashboard dependencies
+        working-directory: ./dashboard
+        run: npm ci
+
       - name: Build binary
         run: |
-          cargo build --release --target ${{ matrix.target }} --bin waycast
+          cargo build --release --target ${{ matrix.target }} --bin waycast --features embedded-db,build-frontend
 
       - name: Package binary
         run: |
@@ -455,7 +470,7 @@ jobs:
 
   publish-crates:
     if: github.event_name == 'release'
-    needs: [build, e2e-test-docker]
+    needs: [build]
     runs-on: depot-ubuntu-24.04
 
     steps:
