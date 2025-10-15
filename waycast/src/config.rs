@@ -245,8 +245,8 @@ impl Default for Config {
             port: 3001,
             database_url: None, // Deprecated field
             database: DatabaseConfig::default(),
-            admin_email: "admin@example.org".to_string(),
-            admin_password: None,
+            admin_email: "test@doubleword.ai".to_string(),
+            admin_password: Some("hunter2".to_string()),
             secret_key: None,
             model_sources: vec![],
             metadata: Metadata::default(),
@@ -281,8 +281,8 @@ impl Default for ModelSource {
 impl Default for NativeAuthConfig {
     fn default() -> Self {
         Self {
-            enabled: false,
-            allow_registration: true,
+            enabled: true,
+            allow_registration: false,
             password: PasswordConfig::default(),
             session: SessionConfig::default(),
             email: EmailConfig::default(),
@@ -293,7 +293,7 @@ impl Default for NativeAuthConfig {
 impl Default for ProxyHeaderAuthConfig {
     fn default() -> Self {
         Self {
-            enabled: true, // Current behavior by default
+            enabled: false,
             header_name: "x-doubleword-user".to_string(),
             auto_create_users: true,
         }
@@ -323,7 +323,7 @@ impl Default for PasswordConfig {
 impl Default for SecurityConfig {
     fn default() -> Self {
         Self {
-            jwt_expiry: Duration::from_secs(60 * 60), // 1 hour
+            jwt_expiry: Duration::from_secs(24 * 60 * 60), // 24 hours
             cors: CorsConfig::default(),
         }
     }
@@ -333,8 +333,7 @@ impl Default for CorsConfig {
     fn default() -> Self {
         Self {
             allowed_origins: vec![
-                CorsOrigin::Url(Url::parse("http://localhost:5173").unwrap()), // Development frontend (Vite)
-                CorsOrigin::Url(Url::parse("https://localhost").unwrap()),     // Local HTTPS
+                CorsOrigin::Url(Url::parse("htt://localhost:3001").unwrap()), // Development frontend (Vite)
             ],
             allow_credentials: true,
             max_age: Some(3600), // Cache preflight for 1 hour
@@ -357,7 +356,7 @@ impl Default for PasswordResetEmailConfig {
     fn default() -> Self {
         Self {
             token_expiry: Duration::from_secs(30 * 60),    // 30 minutes
-            base_url: "http://localhost:5173".to_string(), // Frontend URL
+            base_url: "http://localhost:3001".to_string(), // Frontend URL
         }
     }
 }
@@ -373,12 +372,8 @@ impl Config {
     pub fn load(args: &Args) -> Result<Self, figment::Error> {
         let mut config: Self = Self::figment(args).extract()?;
 
-        // Backward compatibility: if database_url is set, use it
+        // if database_url is set, use it
         if let Some(url) = config.database_url.take() {
-            tracing::warn!(
-                "Using deprecated 'database_url' field. Please migrate to 'database' configuration. \
-                 See documentation for details."
-            );
             config.database = DatabaseConfig::External { url };
         }
 
@@ -475,7 +470,7 @@ impl Config {
             // Load base config file
             .merge(Yaml::file(&args.config))
             // Environment variables can still override specific values
-            .merge(Env::prefixed("WAYCAST_").split("_"))
+            .merge(Env::prefixed("WAYCAST_").split("__"))
             // Common DATABASE_URL pattern
             .merge(Env::raw().only(&["DATABASE_URL"]))
     }

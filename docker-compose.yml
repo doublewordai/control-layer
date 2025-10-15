@@ -25,6 +25,8 @@ services:
     environment:
       - RUST_LOG={RUST_LOG:-info}
       - DATABASE_URL=postgres://waycast:waycast_password@postgres:5432/waycast
+      - WAYCAST_SECRET_KEY=mysupersecretkey
+
     volumes:
       - ./config.yaml:/app/config.yaml:ro
     healthcheck:
