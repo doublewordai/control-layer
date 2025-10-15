@@ -412,9 +412,9 @@ jobs:
           - os: macos-latest
             target: aarch64-apple-darwin
             artifact_name: waycast-aarch64-apple-darwin
-          - os: ubuntu-latest
-            target: x86_64-unknown-linux-gnu
-            artifact_name: waycast-x86_64-unknown-linux-gnu
+          - os: depot-ubuntu-24.04
+            target: x86_64-unknown-linux-musl
+            artifact_name: waycast-x86_64-unknown-linux-musl
 
     runs-on: ${{ matrix.os }}
 
@@ -433,6 +433,10 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: waycast
+
+      - name: Install musl tools
+        if: matrix.target == 'x86_64-unknown-linux-musl'
+        run: sudo apt-get update && sudo apt-get install -y musl-tools
 
       - name: Setup Node.js
         uses: actions/setup-node@v4
