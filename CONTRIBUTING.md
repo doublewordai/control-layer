@@ -4,20 +4,22 @@
 
 ```bash
 # Install CLI tools (macOS)
-brew install just jwt-cli hurl mkcert kind kubectl helm gh
+brew install just hurl
 
 # Or install manually:
 # just: https://github.com/casey/just
-# jwt-cli: https://github.com/mike-engel/jwt-cli
 # hurl: https://hurl.dev/docs/installation.html
-# mkcert: https://github.com/FiloSottile/mkcert
 ```
 
-**Important**: Rust version 1.88 or higher is required for SQLx compatibility. If you encounter SQLx prepare issues, verify your Rust version with `rustc --version`.
+**Important**: Rust version 1.88 or higher is required for SQLx compatibility.
+If you encounter SQLx prepare issues, verify your Rust version with `rustc
+--version`.
 
 ### 2. Initial Setup
 
-**For local development**: Update the `admin_email` in `config.yaml` to your own email address instead of the default. This email will be used as the admin account for testing.
+**For local development**: Update the `admin_email` in `config.yaml` to your
+own email address instead of the default. This email will be used as the admin
+account for testing.
 
 ### 3. Start the System
 
@@ -35,20 +37,14 @@ The system will be available at:
 
 ### 4. Programmatically testing the REST API
 
-The following command generates a JWT token that will bypass SSO for API testing:
+The following command generates a JWT token that you can use for API testing:
 
 ```bash
 # Generate JWT for API testing
 TOKEN=$(just jwt your-email@company.com)
 
 # Use in API requests
-curl https://localhost/api/v1/users -b "waycast_session=$TOKEN"
-```
-
-Alternatively, the REST API is exposed at port `3001` when docker compose is running in dev mode. Behind the proxy, all authorization is handled by the (trusted) `X-Doubleword-User` header: for example, you can use the following command to get the list of users:
-
-```bash
-curl -H "X-Doubleword-User: your-email@company.com" https://localhost:3001/api/v1/users
+curl http://localhost:3001/api/v1/users -b "waycast_session=$TOKEN"
 ```
 
 ## Development Workflow
@@ -95,7 +91,7 @@ just jwt <email>         # Generate auth token
 
 ## CI Metrics
 
-View real-time build and performance metrics for [this project](https://charts.somnial.co/doubleword-waycast).
+View real-time build and performance metrics for [this project](https://charts.somnial.co/doubleword-waycast)
 
 ## FAQ
 
