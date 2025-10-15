@@ -42,7 +42,7 @@ jobs:
           echo "Frontend CI pipeline completed in ${CI_DURATION}s"
 
           # Report metrics to Somnial
-          curl -X POST "https://charts.somnial.co/doubleword-control-layer/frontend-ci-duration?value=${CI_DURATION}" || true
+          curl -X POST "https://charts.somnial.co/doubleword-waycast/frontend-ci-duration?value=${CI_DURATION}" || true
 
       - name: Extract frontend coverage metrics
         id: coverage-step
@@ -71,7 +71,7 @@ jobs:
             echo "Frontend code coverage: ${COVERAGE}%"
             
             # Report coverage to Somnial
-            curl -X POST "https://charts.somnial.co/doubleword-control-layer/frontend-code-coverage?value=${COVERAGE}" || true
+            curl -X POST "https://charts.somnial.co/doubleword-waycast/frontend-code-coverage?value=${COVERAGE}" || true
           else
             echo "No coverage report found at coverage/lcov.info - coverage may not have been generated"
             echo "coverage=0" >> $GITHUB_OUTPUT
@@ -91,8 +91,8 @@ jobs:
           echo "Bundle: ${TOTAL_SIZE} bytes (${GZIPPED_SIZE} gzipped)"
 
           # Report bundle metrics to Somnial
-          curl -X POST "https://charts.somnial.co/doubleword-control-layer/total-bundle-size?value=${TOTAL_SIZE}" || true
-          curl -X POST "https://charts.somnial.co/doubleword-control-layer/gzipped-bundle-size?value=${GZIPPED_SIZE}" || true
+          curl -X POST "https://charts.somnial.co/doubleword-waycast/total-bundle-size?value=${TOTAL_SIZE}" || true
+          curl -X POST "https://charts.somnial.co/doubleword-waycast/gzipped-bundle-size?value=${GZIPPED_SIZE}" || true
 
   backend-test:
     runs-on: depot-ubuntu-24.04-16
@@ -124,7 +124,7 @@ jobs:
       # used only for caching binary installs
       - uses: Swatinem/rust-cache@v2
         with:
-          workspaces: clay
+          workspaces: waycast
 
       - name: Install just
         uses: extractions/setup-just@v2
@@ -135,7 +135,7 @@ jobs:
           cargo install cargo-llvm-cov --locked
 
       - name: Run database migrations
-        working-directory: ./clay
+        working-directory: ./waycast
         env:
           DATABASE_URL: postgres://postgres:postgres@localhost:5432/test
         run: |
@@ -155,11 +155,11 @@ jobs:
           echo "Rust CI pipeline completed in ${CI_DURATION}s"
 
           # Report metrics to Somnial
-          curl -X POST "https://charts.somnial.co/doubleword-control-layer/backend-ci-duration?value=${CI_DURATION}" || true
+          curl -X POST "https://charts.somnial.co/doubleword-waycast/backend-ci-duration?value=${CI_DURATION}" || true
 
       - name: Extract backend coverage metrics
         id: coverage-step
-        working-directory: ./clay
+        working-directory: ./waycast
         run: |
           # Extract coverage from already generated lcov.info file (from 'just ci rust')
           echo "Checking for coverage files..."
@@ -184,7 +184,7 @@ jobs:
             echo "Backend code coverage: ${COVERAGE}%"
             
             # Report coverage to Somnial
-            curl -X POST "https://charts.somnial.co/doubleword-control-layer/backend-code-coverage?value=${COVERAGE}" || true
+            curl -X POST "https://charts.somnial.co/doubleword-waycast/backend-code-coverage?value=${COVERAGE}" || true
           else
             echo "No coverage report found at lcov.info - coverage may not have been generated"
             echo "coverage=0" >> $GITHUB_OUTPUT
@@ -215,12 +215,13 @@ jobs:
         env:
           DOCKER_METADATA_PR_HEAD_SHA: true
         with:
-          images: ""
+          images: ghcr.io/doublewordai/waycast
           sep-tags: ","
           tags: |
-            type=sha,event=branch
+            type=sha,event=branch,prefix=sha-
             type=semver,pattern={{version}}
             type=semver,pattern={{major}}.{{minor}}
+            type=raw,value=latest,enable=${{ github.event_name == 'release' }}
 
       - name: Build and push all images
         id: build-step
@@ -231,13 +232,16 @@ jobs:
 
       - name: Run depot bake
         uses: depot/bake-action@v1
-        env:
-          TAGS: ${{ steps.meta.outputs.tags }}
         with:
-          files: ./docker-bake.hcl
-          targets: default
+          files: ./docker-compose.yml
+          targets: waycast
           push: true
           project: ${{ secrets.DEPOT_PROJECT_ID }}
+          set: |
+            waycast.tags=${{ steps.meta.outputs.tags }}
+            *.attest=type=sbom
+            *.attest=type=provenance
+            waycast.platform=linux/amd64,linux/arm64
 
       - name: Record build time
         id: build-time-step
@@ -248,7 +252,7 @@ jobs:
           echo "Docker build completed in ${BUILD_DURATION}s"
 
           # Report build time to Somnial
-          curl -X POST "https://charts.somnial.co/doubleword-control-layer/docker-build-duration?value=${BUILD_DURATION}" || true
+          curl -X POST "https://charts.somnial.co/doubleword-waycast/docker-build-duration?value=${BUILD_DURATION}" || true
 
     outputs:
       image-tag: ${{ steps.meta.outputs.tags }}
@@ -286,7 +290,7 @@ jobs:
           # Extract just the SHA tag for our scan
           TAG=$(echo "$TAG_LIST" | cut -d',' -f1 | cut -d':' -f2)
 
-          CLAY_TAG="ghcr.io/doublewordai/control-layer/clay:$TAG"
+          WAYCAST_TAG="ghcr.io/doublewordai/waycast:$TAG"
 
           echo "Scanning images for security vulnerabilities..."
           echo "Tag: $TAG"
@@ -298,20 +302,20 @@ jobs:
             jq -r --arg sev "$severity" '[.matches[] | select(.vulnerability.severity == $sev)] | length' "$file"
           }
 
-          # Scan clay image
-          echo "Scanning clay image: $CLAY_TAG"
-          grype "$CLAY_TAG" --output json --file clay-vulnerabilities.json
-          CLAY_CRITICAL=$(calculate_vulns clay-vulnerabilities.json "Critical")
-          CLAY_HIGH=$(calculate_vulns clay-vulnerabilities.json "High")
+          # Scan waycast image
+          echo "Scanning waycast image: $WAYCAST_TAG"
+          grype "$WAYCAST_TAG" --output json --file waycast-vulnerabilities.json
+          WAYCAST_CRITICAL=$(calculate_vulns waycast-vulnerabilities.json "Critical")
+          WAYCAST_HIGH=$(calculate_vulns waycast-vulnerabilities.json "High")
 
           # Console output
           echo "Security scan completed:"
-          echo "  Critical vulnerabilities: $CLAY_CRITICAL"
-          echo "  High vulnerabilities: $CLAY_HIGH"
+          echo "  Critical vulnerabilities: $WAYCAST_CRITICAL"
+          echo "  High vulnerabilities: $WAYCAST_HIGH"
 
           # Set outputs for metrics reporting
-          echo "total_critical=$CLAY_CRITICAL" >> $GITHUB_OUTPUT
-          echo "total_high=$CLAY_HIGH" >> $GITHUB_OUTPUT
+          echo "total_critical=$WAYCAST_CRITICAL" >> $GITHUB_OUTPUT
+          echo "total_high=$WAYCAST_HIGH" >> $GITHUB_OUTPUT
 
       - name: Report vulnerability counts to Somnial
         if: always()
@@ -324,8 +328,8 @@ jobs:
           echo "  Critical vulnerabilities: ${CRITICAL}"
           echo "  High vulnerabilities: ${HIGH}"
 
-          curl -X POST "https://charts.somnial.co/doubleword-control-layer/critical-vulnerabilities?value=${CRITICAL}" || echo "Failed to report critical vulnerabilities"
-          curl -X POST "https://charts.somnial.co/doubleword-control-layer/high-vulnerabilities?value=${HIGH}" || echo "Failed to report high vulnerabilities"
+          curl -X POST "https://charts.somnial.co/doubleword-waycast/critical-vulnerabilities?value=${CRITICAL}" || echo "Failed to report critical vulnerabilities"
+          curl -X POST "https://charts.somnial.co/doubleword-waycast/high-vulnerabilities?value=${HIGH}" || echo "Failed to report high vulnerabilities"
 
   e2e-test-docker:
     runs-on: depot-ubuntu-24.04
@@ -338,7 +342,7 @@ jobs:
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
-      
+
       - name: Install just
         uses: extractions/setup-just@v2
 
@@ -360,37 +364,6 @@ jobs:
       - name: Install hurl
         uses: gacts/install-hurl@v1
 
-      - name: Install jwt-cli
-        run: |
-          curl -L https://github.com/mike-engel/jwt-cli/releases/latest/download/jwt-linux.tar.gz | tar xz
-          sudo mv jwt /usr/local/bin/
-
-      - name: Install mkcert
-        run: |
-          # Install mkcert for certificate generation
-          curl -JLO "https://dl.filippo.io/mkcert/latest?for=linux/amd64"
-          chmod +x mkcert-v*-linux-amd64
-          sudo cp mkcert-v*-linux-amd64 /usr/local/bin/mkcert
-
-      # Note, not needed for this workflow, but required by 'just setup'
-      - name: Install PostgreSQL tools
-        run: |
-          sudo apt-get install -y postgresql-client
-
-      # Note, not needed for this workflow, but required by 'just setup'
-      - name: Install Kind
-        uses: helm/kind-action@v1
-        with:
-          install_only: true
-
-      # Note, not needed for this workflow, but required by 'just setup'
-      - name: Install kubectl
-        uses: azure/setup-kubectl@v4
-
-      # Note, not needed for this workflow, but required by 'just setup'
-      - name: Install Helm
-        uses: azure/setup-helm@v4
-
       - name: Log in to GitHub Container Registry
         uses: docker/login-action@v3
         with:
@@ -401,14 +374,15 @@ jobs:
       - name: Set up Docker Compose
         uses: docker/setup-compose-action@v1
 
-      # Install self-signed certs, check all deps are installed.
-      - name: Setup development environment
-        run: just setup
-
       # Run end to end docker-compose tests
       - name: Run Docker end-to-end tests
         id: e2e-step
         run: |
+          # Extract first image from comma-separated list
+          IMAGE_LIST="${{ needs.build.outputs.image-tag }}"
+          export IMAGE=$(echo "$IMAGE_LIST" | cut -d',' -f1)
+          echo "Using image: $IMAGE"
+
           START_TIME=$(date +%s)
           just test docker
           END_TIME=$(date +%s)
@@ -417,16 +391,54 @@ jobs:
           echo "Docker E2E tests completed in ${E2E_DURATION}s"
 
           # Report metrics to Somnial
-          curl -X POST "https://charts.somnial.co/doubleword-control-layer/e2e-docker-duration?value=${E2E_DURATION}" || true
+          curl -X POST "https://charts.somnial.co/doubleword-waycast/e2e-docker-duration?value=${E2E_DURATION}" || true
+
+  build-binaries:
+    if: github.event_name == 'release'
+    needs: [build, e2e-test-docker]
+    strategy:
+      matrix:
+        include:
+          - os: macos-latest
+            target: aarch64-apple-darwin
+            artifact_name: waycast-aarch64-apple-darwin
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            artifact_name: waycast-x86_64-unknown-linux-gnu
+
+    runs-on: ${{ matrix.os }}
+
+    permissions:
+      contents: write
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Build binary
+        run: |
+          cargo build --release --target ${{ matrix.target }} --bin waycast
+
+      - name: Package binary
+        run: |
+          cd target/${{ matrix.target }}/release
+          tar czf ${{ matrix.artifact_name }}.tar.gz waycast
+          mv ${{ matrix.artifact_name }}.tar.gz ${{ github.workspace }}/
+
+      - name: Generate SHA256 checksum
+        run: |
+          shasum -a 256 ${{ matrix.artifact_name }}.tar.gz > ${{ matrix.artifact_name }}.tar.gz.sha256
+
+      - name: Upload binary to release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            ${{ matrix.artifact_name }}.tar.gz
+            ${{ matrix.artifact_name }}.tar.gz.sha256
         env:
-          TAG: ${{ needs.build.outputs.image-tag }}
-          GOOGLE_ADMIN_EMAIL: ${{ secrets.E2E_ADMIN_EMAIL }}
-          ALLOWED_EMAIL_DOMAINS: ${{ secrets.E2E_ALLOWED_EMAIL_DOMAINS }}
-          FQDN: ${{ secrets.E2E_FQDN }}
-          PROVIDER: ${{ secrets.E2E_PROVIDER }}
-          CLIENT_ID:  ${{ secrets.E2E_CLIENT_ID }}
-          CLIENT_SECRET: ${{ secrets.E2E_CLIENT_SECRET }}
-          AUTH_URL: ${{ secrets.E2E_AUTH_URL }}
-          TOKEN_URL: ${{ secrets.E2E_TOKEN_URL }}
-          REDIRECT_URL: ${{ secrets.E2E_REDIRECT_URL }}
-          JWT_SECRET: ${{ secrets.E2E_JWT_SECRET }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

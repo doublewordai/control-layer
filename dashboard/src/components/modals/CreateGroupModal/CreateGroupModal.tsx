@@ -1,5 +1,5 @@
 import React, { useState, useEffect } from "react";
-import { useCreateGroup } from "../../../api/clay";
+import { useCreateGroup } from "../../../api/waycast";
 import {
   Dialog,
   DialogContent,

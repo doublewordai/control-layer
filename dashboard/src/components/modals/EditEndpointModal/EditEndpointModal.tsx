@@ -8,13 +8,13 @@ import {
   DialogFooter,
 } from "../../ui/dialog";
 import { Button } from "../../ui/button";
-import { useValidateEndpoint, useUpdateEndpoint } from "../../../api/clay";
+import { useValidateEndpoint, useUpdateEndpoint } from "../../../api/waycast";
 import type {
   EndpointValidateRequest,
   AvailableModel,
   EndpointUpdateRequest,
   Endpoint,
-} from "../../../api/clay/types";
+} from "../../../api/waycast/types";
 
 interface EditEndpointModalProps {
   isOpen: boolean;

@@ -1,0 +1,44 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Doubleword Control Layer</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@300;400;500;600;700&display=swap" rel="stylesheet">
+    <link rel="stylesheet" href="/styles.css">
+</head>
+<body>
+    <div class="container">
+        <header>
+            <h1>Control Layer</h1>
+            <p class="subtitle">Dummy Test Frontend</p>
+        </header>
+
+        <main>
+            <div class="card">
+                <h2>Welcome</h2>
+                <p>This is a placeholder frontend for testing purposes.</p>
+            </div>
+
+            <div class="card">
+                <h2>API Links</h2>
+                <ul>
+                    <li><a href="/admin/api/v1/config">Config API</a></li>
+                    <li><a href="/admin/docs">Admin API Docs</a></li>
+                    <li><a href="/ai/docs">AI API Docs</a></li>
+                    <li><a href="/healthz">Health Check</a></li>
+                </ul>
+            </div>
+
+            <div class="card">
+                <h2>Status</h2>
+                <p id="status">Checking connection...</p>
+            </div>
+        </main>
+    </div>
+
+    <script src="/app.js"></script>
+</body>
+</html>

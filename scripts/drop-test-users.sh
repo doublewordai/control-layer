@@ -1,21 +1,21 @@
 #!/bin/bash
 
-# Extract admin credentials from clay_config.yaml
-ADMIN_EMAIL=$(grep 'admin_email:' clay_config.yaml | sed 's/.*admin_email:[ ]*"\(.*\)"/\1/')
-ADMIN_PASSWORD=$(grep 'admin_password:' clay_config.yaml | sed 's/.*admin_password:[ ]*"\(.*\)"/\1/')
+# Extract admin credentials from config.yaml
+ADMIN_EMAIL=$(grep 'admin_email:' config.yaml | sed 's/.*admin_email:[ ]*"\(.*\)"/\1/')
+ADMIN_PASSWORD=$(grep 'admin_password:' config.yaml | sed 's/.*admin_password:[ ]*"\(.*\)"/\1/')
 
 if [ -z "$ADMIN_EMAIL" ]; then
-  echo "Failed to extract admin email from clay_config.yaml" >&2
+  echo "Failed to extract admin email from config.yaml" >&2
   exit 1
 fi
 
 if [ -z "$ADMIN_PASSWORD" ]; then
-  echo "Failed to extract admin password from clay_config.yaml" >&2
+  echo "Failed to extract admin password from config.yaml" >&2
   exit 1
 fi
 
 # Generate admin JWT for authentication
-ADMIN_JWT=$(EMAIL=$ADMIN_EMAIL PASSWORD=$ADMIN_PASSWORD ./scripts/generate-jwt.sh 2>/dev/null)
+ADMIN_JWT=$(EMAIL=$ADMIN_EMAIL PASSWORD=$ADMIN_PASSWORD ./scripts/login.sh 2>/dev/null)
 
 if [ -z "$ADMIN_JWT" ]; then
   echo "Failed to generate admin JWT" >&2
@@ -26,7 +26,7 @@ echo "Fetching all users..." >&2
 
 # Get all users
 USERS=$(curl -s -X GET http://localhost:3001/admin/api/v1/users \
-  -b "clay_session=${ADMIN_JWT}" | jq -r '.[] | "\(.id):\(.email)"')
+  -b "waycast_session=${ADMIN_JWT}" | jq -r '.[] | "\(.id):\(.email)"')
 
 if [ -z "$USERS" ]; then
   echo "No users found or failed to fetch users" >&2
@@ -45,7 +45,7 @@ while IFS=: read -r user_id user_email; do
     # Delete the user
     HTTP_STATUS=$(curl -s -o /dev/null -w "%{http_code}" \
       -X DELETE "http://localhost:3001/admin/api/v1/users/${user_id}" \
-      -b "clay_session=${ADMIN_JWT}")
+      -b "waycast_session=${ADMIN_JWT}")
 
     if [ "$HTTP_STATUS" = "204" ]; then
       echo "✅ Successfully deleted $user_email" >&2

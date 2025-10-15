@@ -15,7 +15,7 @@ import {
   useAddUserToGroup,
   useRemoveUserFromGroup,
   type Group as BackendGroup,
-} from "../../../api/clay";
+} from "../../../api/waycast";
 
 interface GroupManagementModalProps {
   isOpen: boolean;

@@ -1,0 +1,96 @@
+# Clay configuration
+# This is the default configuration file.
+
+# Server configuration
+# To advertise publically, set to "0.0.0.0", or the specific network interface
+# you've exposed.
+host: "0.0.0.0"
+port: 3001
+
+# Database configuration
+database:
+  # By default, we bundle postgres with the application. It's launched on a
+  # random port, and data is stored in $HOME/.waycast_data/
+  # To have data not persists across restarts, set persistent=false.
+  # We strongly recommend setting up external postgres in production!
+  type: embedded
+  data_dir: null
+  persistent: true
+
+  # TODO: Use an external database in production
+  # type: external
+
+# Admin user email - will be created on first startup
+admin_email: "test@doubleword.ai"
+# TODO: Change this in production!
+admin_password: "hunter2"
+
+# Secret key for jwt signing.
+# TODO: Change this in production
+secret_key: insecure-change-in-production
+
+# Model sources - inference endpoints to connect to
+# Uncomment and configure as needed
+model_sources: []
+
+# Example configurations:
+# model_sources:
+#   # OpenAI API
+#   - name: "openai"
+#     url: "https://api.openai.com"
+#     api_key: "sk-..."  # Required for model sync
+#
+#   # Internal model server (no auth required)
+#   - name: "internal"
+#     url: "http://localhost:8080"
+
+# Frontend metadata
+metadata:
+  region: "UK South"
+  organization: "ACME Corp"
+
+# Authentication configuration
+auth:
+  # Native username/password authentication
+  native:
+    enabled: true # Enable native login system
+    allow_registration: true
+    password:
+      min_length: 8
+      max_length: 64
+    session:
+      timeout: "24h"
+      cookie_name: "waycast_session"
+      cookie_secure: true
+      cookie_same_site: "strict"
+
+  # Proxy header authentication. Will accept & autocreate users based on emails
+  # supplied in a header. Lets you use an upstream proxy to authenticate users.
+  proxy_header:
+    enabled: false # X-Doubleword-User header auth
+    header_name: "x-doubleword-user"
+    auto_create_users: true
+
+  # Security settings
+  security:
+    enable_csrf: true
+    jwt_expiry: "1h"
+    cors:
+      allowed_origins:
+        - "http://localhost:5173" # Development frontend (Vite)
+        - "https://localhost" # Local HTTPS
+      allow_credentials: true
+      max_age: 3600 # Cache preflight requests for 1 hour
+
+# Optional feature toggles
+enable_metrics: true # Enable Prometheus metrics endpoint
+enable_request_logging: true # Enable request/response logging to database
+# Note: Environment variables can override top level setting, as long as they're supplied with the CLAY_ prefix.:
+# CLAY_PORT=8080
+#
+# The exception is DATABASE_URL:
+# DATABASE_URL=postgres://prod@db:5432/my_database
+#
+# For arrays like model_sources, use environment-specific config files
+# (e.g., config.production.yaml) rather than env vars.
+
