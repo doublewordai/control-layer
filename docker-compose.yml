@@ -15,7 +15,7 @@ services:
       retries: 10
 
   waycast:
-    image: ghcr.io/doublewordai/waycast/waycast:${TAG:-latest}
+    image: ghcr.io/doublewordai/waycast:${TAG:-latest}
     pull_policy: ${PULL_POLICY:-always}
     build:
       context: .

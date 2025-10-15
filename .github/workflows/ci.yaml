@@ -215,7 +215,7 @@ jobs:
         env:
           DOCKER_METADATA_PR_HEAD_SHA: true
         with:
-          images: ghcr.io/${{ github.repository }}/waycast
+          images: ghcr.io/doublewordai/waycast
           sep-tags: ","
           tags: |
             type=sha,event=branch,prefix=sha-
@@ -230,19 +230,15 @@ jobs:
           echo "start_time=$START_TIME" >> $GITHUB_OUTPUT
           echo "Starting Docker build at $(date)"
 
-      - name: Set up Docker Compose
-        uses: docker/setup-compose-action@v1
-
       - name: Run depot bake
         uses: depot/bake-action@v1
-        env:
-          TAG: ${{ steps.meta.outputs.tags }}
         with:
           files: ./docker-compose.yml
           targets: waycast
           push: true
           project: ${{ secrets.DEPOT_PROJECT_ID }}
           set: |
+            waycast.tags=${{ steps.meta.outputs.tags }}
             *.attest=type=sbom
             *.attest=type=provenance
             waycast.platform=linux/amd64,linux/arm64
@@ -294,7 +290,7 @@ jobs:
           # Extract just the SHA tag for our scan
           TAG=$(echo "$TAG_LIST" | cut -d',' -f1 | cut -d':' -f2)
 
-          WAYCAST_TAG="ghcr.io/doublewordai/waycast/waycast:$TAG"
+          WAYCAST_TAG="ghcr.io/doublewordai/waycast:$TAG"
 
           echo "Scanning images for security vulnerabilities..."
           echo "Tag: $TAG"
