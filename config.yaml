@@ -4,7 +4,7 @@
 # Server configuration
 # To advertise publically, set to "0.0.0.0", or the specific network interface
 # you've exposed.
-host: "localhost"
+host: "0.0.0.0"
 port: 3001
 
 # Database configuration
@@ -60,7 +60,7 @@ auth:
       max_length: 64
     session:
       timeout: "24h"
-      cookie_name: "clay_session"
+      cookie_name: "waycast_session"
       cookie_secure: true
       cookie_same_site: "strict"
 
@@ -92,5 +92,5 @@ enable_request_logging: true # Enable request/response logging to database
 # DATABASE_URL=postgres://prod@db:5432/my_database
 #
 # For arrays like model_sources, use environment-specific config files
-# (e.g., clay_config.production.yaml) rather than env vars.
+# (e.g., config.production.yaml) rather than env vars.
 

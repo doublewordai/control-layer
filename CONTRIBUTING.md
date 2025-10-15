@@ -17,7 +17,7 @@ brew install just jwt-cli hurl mkcert kind kubectl helm gh
 
 ### 2. Initial Setup
 
-**For local development**: Update the `admin_email` in `clay_config.yaml` to your own email address instead of the default. This email will be used as the admin account for testing.
+**For local development**: Update the `admin_email` in `config.yaml` to your own email address instead of the default. This email will be used as the admin account for testing.
 
 ### 3. Start the System
 
@@ -42,7 +42,7 @@ The following command generates a JWT token that will bypass SSO for API testing
 TOKEN=$(just jwt your-email@company.com)
 
 # Use in API requests
-curl https://localhost/api/v1/users -b "VouchCookie=$TOKEN"
+curl https://localhost/api/v1/users -b "waycast_session=$TOKEN"
 ```
 
 Alternatively, the REST API is exposed at port `3001` when docker compose is running in dev mode. Behind the proxy, all authorization is handled by the (trusted) `X-Doubleword-User` header: for example, you can use the following command to get the list of users:

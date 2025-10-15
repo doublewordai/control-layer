@@ -189,24 +189,8 @@ dev *args="":
 up *args="":
     #!/usr/bin/env bash
     set -euo pipefail
-    BUILD_LOCAL=false
-    docker_args=""
-    for arg in {{args}}; do
-        if [ "$arg" = "--build" ]; then
-            BUILD_LOCAL=true
-        else
-            docker_args="$docker_args $arg"
-        fi
-    done
 
-    if [ "$BUILD_LOCAL" = "true" ]; then
-        echo "🔨 Building local images with latest tag..."
-        TAGS=latest PLATFORMS=linux/amd64 ATTESTATIONS=false docker buildx bake --load
-        echo "🚀 Starting docker services with local images..."
-        TAG=latest PULL_POLICY=never docker compose -f docker-compose.yml up $docker_args
-    else
-        docker compose -f docker-compose.yml up $docker_args
-    fi
+    docker compose -f docker-compose.yml up {{args}}
 
 
 # Stop services: 'just down'
@@ -284,39 +268,30 @@ test target="" *args="":
                 --e2e-only)
                     RUN_API_TESTS=false
                     ;;
-                --reporter=*)
-                    CUSTOM_REPORTER=true
-                    TEST_ARGS="$TEST_ARGS $arg"
-                    ;;
                 *)
                     TEST_ARGS="$TEST_ARGS $arg"
                     ;;
             esac
         done
 
-        # Add default reporter if none specified
-        if [ "$CUSTOM_REPORTER" = false ]; then
-            TEST_ARGS="--reporter=list $TEST_ARGS"
-        fi
-
         echo "Cleaning up any leftover test data from previous runs..."
         ./scripts/drop-test-users.sh > /dev/null 2>&1 || echo "  (no previous test users to clean up)"
         ./scripts/drop-test-groups.sh > /dev/null 2>&1 || echo "  (no previous test groups to clean up)"
 
         echo "Generating test cookies..."
-        # Get admin credentials from clay_config.yaml
+        # Get admin credentials from config.yaml
         ADMIN_EMAIL=$(just get-admin-email)
         ADMIN_PASSWORD=$(grep 'admin_password:' config.yaml | sed 's/.*admin_password:[ ]*"\(.*\)"/\1/')
-        echo "Using admin email: $ADMIN_EMAIL"
-
         # Check for required passwords
         if [ -z "$ADMIN_PASSWORD" ]; then
             echo "❌ Error: admin_password not set in config.yaml"
             exit 1
         fi
 
+        echo "Using admin email: $ADMIN_EMAIL, and admin password $ADMIN_PASSWORD"
+
+
         # Generate admin JWT
-       
         if ADMIN_JWT=$(EMAIL=$ADMIN_EMAIL PASSWORD=$ADMIN_PASSWORD ./scripts/login.sh); then
             echo "admin_jwt=$ADMIN_JWT" > test.env
             echo "✅ Admin JWT generated successfully"
@@ -556,10 +531,10 @@ fmt target *args="":
 # Generate JWT token for API testing: 'just jwt user@example.com'
 #
 # Creates a signed JWT token for testing authenticated API endpoints. The token
-# is formatted for use with curl as a VouchCookie.
+# is formatted for use with curl as a waycast_session.
 #
 # Usage with curl: TOKEN=$(just jwt admin@company.com) curl -b
-# "VouchCookie=$TOKEN" https://localhost/api/v1/users
+# "waycast_session=$TOKEN" https://localhost/api/v1/users
 #
 # In order to use the token, the user e/ email EMAIL must already exist in the
 # database - i.e. either be the default admin user, or later created by them.
