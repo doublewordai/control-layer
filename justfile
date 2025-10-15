@@ -28,7 +28,7 @@ setup:
     missing_tools=()
 
     # Required tools
-    required_tools=("docker" "hurl" "jwt" "psql" "createdb")
+    required_tools=("docker" "hurl" "psql" "createdb")
     for tool in "${required_tools[@]}"; do
         if ! command -v "$tool" >/dev/null 2>&1; then
             missing_tools+=("$tool")
@@ -48,12 +48,11 @@ setup:
         done
         echo ""
         echo "Install with:"
-        echo "  brew install docker hurl jwt-cli mkcert postgresql"
+        echo "  brew install docker hurl postgresql"
         echo ""
         echo "Note: docker compose-plugin is included with Docker Desktop"
         echo ""
         echo "Individual installation guides:"
-        echo "  jwt-cli: https://github.com/mike-engel/jwt-cli"
         echo "  hurl: https://hurl.dev/docs/installation.html"
         exit 1
     fi
@@ -63,7 +62,9 @@ setup:
     echo "✅ Development setup complete!"
     echo ""
     echo "Checking database setup..."
+    just check-db || echo "Run 'Database not setup properly! just db-setup' to setup database for rust development"
 
+check-db:
     # Check if postgres user exists
     postgres_user_exists=false
     if psql -U postgres -d postgres -c '\q' 2>/dev/null; then
