@@ -230,12 +230,18 @@ jobs:
           echo "start_time=$START_TIME" >> $GITHUB_OUTPUT
           echo "Starting Docker build at $(date)"
 
-      - name: Build and push
-        uses: docker/bake-action@v6
+      - name: Set up Docker Compose
+        uses: docker/setup-compose-action@v1
+
+      - name: Run depot bake
+        uses: depot/bake-action@v1
         env:
           TAG: ${{ steps.meta.outputs.tags }}
         with:
+          files: ./docker-compose.yml
+          targets: waycast
           push: true
+          project: ${{ secrets.DEPOT_PROJECT_ID }}
           set: |
             waycast.platform=linux/amd64,linux/arm64
 
@@ -360,36 +366,10 @@ jobs:
       - name: Install hurl
         uses: gacts/install-hurl@v1
 
-      - name: Install jwt-cli
-        run: |
-          curl -L https://github.com/mike-engel/jwt-cli/releases/latest/download/jwt-linux.tar.gz | tar xz
-          sudo mv jwt /usr/local/bin/
-
-      - name: Install mkcert
-        run: |
-          # Install mkcert for certificate generation
-          curl -JLO "https://dl.filippo.io/mkcert/latest?for=linux/amd64"
-          chmod +x mkcert-v*-linux-amd64
-          sudo cp mkcert-v*-linux-amd64 /usr/local/bin/mkcert
-
       # Note, not needed for this workflow, but required by 'just setup'
       - name: Install PostgreSQL tools
         run: |
           sudo apt-get install -y postgresql-client
-
-      # Note, not needed for this workflow, but required by 'just setup'
-      - name: Install Kind
-        uses: helm/kind-action@v1
-        with:
-          install_only: true
-
-      # Note, not needed for this workflow, but required by 'just setup'
-      - name: Install kubectl
-        uses: azure/setup-kubectl@v4
-
-      # Note, not needed for this workflow, but required by 'just setup'
-      - name: Install Helm
-        uses: azure/setup-helm@v4
 
       - name: Log in to GitHub Container Registry
         uses: docker/login-action@v3
