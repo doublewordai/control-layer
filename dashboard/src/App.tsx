@@ -26,7 +26,7 @@ import {
 import { SettingsProvider, useSettings } from "./contexts";
 import { AuthProvider, useAuth } from "./contexts/auth";
 import { useAuthorization } from "./utils";
-import { useRegistrationInfo } from "./api/clay/hooks";
+import { useRegistrationInfo } from "./api/waycast/hooks";
 
 // Create a client
 const queryClient = new QueryClient({

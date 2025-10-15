@@ -8,7 +8,7 @@ import {
   AtSign,
   Info,
 } from "lucide-react";
-import { useUser, useUpdateUser } from "../../../../api/clay/hooks";
+import { useUser, useUpdateUser } from "../../../../api/waycast/hooks";
 import {
   UserAvatar,
   Tooltip,
@@ -19,7 +19,7 @@ import {
   HoverCardTrigger,
 } from "../../../ui";
 import { AVAILABLE_ROLES, getRoleDisplayName } from "../../../../utils/roles";
-import type { Role } from "../../../../api/clay/types";
+import type { Role } from "../../../../api/waycast/types";
 
 export const Profile: React.FC = () => {
   const {

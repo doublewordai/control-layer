@@ -12,8 +12,8 @@ import {
   CardHeader,
   CardTitle,
 } from "../ui/card";
-import { useConfirmPasswordReset } from "../../api/clay/hooks";
-import { ApiError } from "../../api/clay/errors";
+import { useConfirmPasswordReset } from "../../api/waycast/hooks";
+import { ApiError } from "../../api/waycast/errors";
 import { toast } from "sonner";
 
 export function PasswordResetForm() {

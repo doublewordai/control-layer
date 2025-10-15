@@ -230,7 +230,7 @@ export interface EndpointValidateResponse {
 
 // ===== REQUESTS/TRAFFIC MONITORING TYPES =====
 
-// Backend HTTP request/response types matching clay API
+// Backend HTTP request/response types matching waycast API
 export interface HttpRequest {
   id: number;
   timestamp: string;
@@ -260,7 +260,7 @@ export interface ListRequestsResponse {
   requests: RequestResponsePair[];
 }
 
-// AI request/response types (matching clay's tagged ApiAiRequest/ApiAiResponse enums)
+// AI request/response types (matching waycast's tagged ApiAiRequest/ApiAiResponse enums)
 // Now properly tagged for easy discrimination
 export type AiRequest =
   | { type: "chat_completions"; data: ChatCompletionRequest }

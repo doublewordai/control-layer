@@ -1,7 +1,7 @@
-# Docker Bake file for building control-layer images with multiplatform support and attestations
+# Docker Bake file for building waycast images with multiplatform support and attestations
 
 variable "REGISTRY" {
-  default = "ghcr.io/doublewordai/control-layer"
+  default = "ghcr.io/doublewordai/waycast"
 }
 
 # Build platforms
@@ -19,11 +19,11 @@ variable "ATTESTATIONS" {
   default = "true"
 }
 
-# Clay main application (includes frontend)
-target "clay" {
+# Waycast main application (includes frontend)
+target "waycast" {
   context = "."
   dockerfile = "Dockerfile"
-  tags = TAGS != "" ? [for tag in split(",", TAGS) : "${REGISTRY}/clay:${tag}"] : []
+  tags = TAGS != "" ? [for tag in split(",", TAGS) : "${REGISTRY}/waycast:${tag}"] : []
   labels = {}
   platforms = split(",", PLATFORMS)
   annotations = []
@@ -35,5 +35,5 @@ target "clay" {
 
 # Group target for building all images
 group "default" {
-  targets = ["clay"]
+  targets = ["waycast"]
 }

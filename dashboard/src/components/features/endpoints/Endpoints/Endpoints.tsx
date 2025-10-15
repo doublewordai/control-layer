@@ -5,7 +5,7 @@ import {
   useSynchronizeEndpoint,
   useUpdateEndpoint,
   useDeleteEndpoint,
-} from "../../../../api/clay";
+} from "../../../../api/waycast";
 import { Button } from "../../../ui/button";
 import { DataTable } from "../../../ui/data-table";
 import { createColumns } from "./columns";
@@ -22,7 +22,7 @@ import {
   DeleteEndpointModal,
   EditEndpointModal,
 } from "../../../modals";
-import type { Endpoint } from "../../../../api/clay/types";
+import type { Endpoint } from "../../../../api/waycast/types";
 
 export function Endpoints() {
   const [showCreateModal, setShowCreateModal] = useState(false);

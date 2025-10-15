@@ -29,18 +29,18 @@ impl EmbeddedDatabase {
     /// Uses an ephemeral port (assigned by the OS) to avoid conflicts.
     ///
     /// # Arguments
-    /// * `data_dir` - Directory where PostgreSQL data will be stored (default: `$HOME/clay_data/postgres`)
+    /// * `data_dir` - Directory where PostgreSQL data will be stored (default: `$HOME/waycast_data/postgres`)
     /// * `persistent` - Whether to persist data between restarts (default: false/ephemeral)
     ///
     /// # Returns
     /// A running EmbeddedDatabase instance with connection string containing the actual port
     pub async fn start(data_dir: Option<PathBuf>, persistent: bool) -> anyhow::Result<Self> {
         let data_dir = data_dir.unwrap_or_else(|| {
-            // Default to $HOME/clay_data/postgres, fallback to ./clay_data/postgres if HOME not available
+            // Default to $HOME/waycast_data/postgres, fallback to ./waycast_data/postgres if HOME not available
             if let Some(home) = std::env::home_dir() {
-                home.join(".clay_data").join("postgres")
+                home.join(".waycast_data").join("postgres")
             } else {
-                PathBuf::from("clay_data/postgres")
+                PathBuf::from("waycast_data/postgres")
             }
         });
 
@@ -82,12 +82,23 @@ impl EmbeddedDatabase {
         // Get the actual port that was assigned
         let actual_port = postgres.settings().port;
 
-        // Create the default database
-        let database_name = "clay";
-        postgres
-            .create_database(database_name)
-            .await
-            .map_err(|e| anyhow::anyhow!("Failed to create database '{}': {}", database_name, e))?;
+        // Create the default database (or use existing if already present)
+        let database_name = "waycast";
+        match postgres.create_database(database_name).await {
+            Ok(_) => {
+                debug!("Created new database '{}'", database_name);
+            }
+            Err(e) => {
+                // Check if error is because database already exists
+                let error_msg = e.to_string();
+                if error_msg.contains("already exists") {
+                    debug!("Database '{}' already exists, using existing database", database_name);
+                } else {
+                    // Some other error occurred
+                    return Err(anyhow::anyhow!("Failed to create database '{}': {}", database_name, e));
+                }
+            }
+        }
 
         let connection_string = postgres.settings().url(database_name);
 

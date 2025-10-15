@@ -1,4 +1,4 @@
-/// A client implementation for the `clay` backend API.
+/// A client implementation for the `waycast` backend API.
 import type {
   Model,
   Endpoint,
@@ -555,7 +555,7 @@ const authApi = {
 };
 
 // Main nested API object
-export const clayApi = {
+export const waycastApi = {
   users: userApi,
   models: modelApi,
   endpoints: endpointApi,

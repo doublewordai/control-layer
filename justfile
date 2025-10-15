@@ -4,7 +4,7 @@ set dotenv-load
 default:
     @just --list
 
-# Helper function to get admin email from clay_config.yaml
+# Helper function to get admin email from config.yaml
 # Usage: ADMIN_EMAIL=$(just get-admin-email)
 get-admin-email:
     @grep 'admin_email:' config.yaml | sed 's/.*admin_email:[ ]*"\(.*\)"/\1/'
@@ -99,7 +99,7 @@ check-db:
 #
 # IMPORTANT: Rust development requires a running PostgreSQL database!
 #
-# The clay service stores user/group/model data in PostgreSQL, &:
+# The waycast service stores user/group/model data in PostgreSQL, &:
 #
 # - SQLx (our database library) performs compile-time SQL validation, & so even
 #   compiling Rust code requires database connectivity.
@@ -151,15 +151,15 @@ db-setup:
 # - docker-compose.override.yml: Development-specific settings (ports, volumes, hot reload)
 #
 # Services running in development mode:
-# - clay: Rust API server (port 3001) - hot reloads via volume mounts
-# - clay-frontend: React dev server (port 5173) - Vite HMR enabled
+# - waycast: Rust API server (port 3001) - hot reloads via volume mounts
+# - waycast-frontend: React dev server (port 5173) - Vite HMR enabled
 # - postgres: Database (port 5432) - exposed for direct access
 #
 # The --watch flag enables hot reload. File changes trigger container rebuilds.
 #
 # Access the app at: https://localhost
 # Direct API access: http://localhost:3001
-# Database: postgres://clay:clay_password@localhost:5432/clay
+# Database: postgres://waycast:waycast_password@localhost:5432/waycast
 #
 #
 # Examples:
@@ -325,7 +325,7 @@ test target="" *args="":
 
         # Delete and recreate test user to ensure clean state
         echo "Ensuring clean test user..."
-        docker compose exec -T postgres psql -U clay -d clay -c "DELETE FROM users WHERE email = 'user@example.org';" > /dev/null 2>&1 || true
+        docker compose exec -T postgres psql -U waycast -d waycast -c "DELETE FROM users WHERE email = 'user@example.org';" > /dev/null 2>&1 || true
         curl -s -X POST http://localhost:3001/authentication/register \
             -H "Content-Type: application/json" \
             -d '{"email":"user@example.org","username":"testuser","password":"user_password","display_name":"Test User"}' \
@@ -427,7 +427,7 @@ test target="" *args="":
                 fi
                 # Remove --watch from args and pass remaining to cargo test
                 remaining_args=$(echo "{{args}}" | sed 's/--watch//g' | xargs)
-                cd clay && cargo watch -x "test $remaining_args"
+                cd waycast && cargo watch -x "test $remaining_args"
             elif [[ "{{args}}" == *"--coverage"* ]]; then
                 if ! command -v cargo-llvm-cov >/dev/null 2>&1; then
                     echo "❌ Error: cargo-llvm-cov not found. Install with:"
@@ -436,9 +436,9 @@ test target="" *args="":
                     echo "  cargo binstall cargo-llvm-cov"
                     exit 1
                 fi
-                cd clay && cargo llvm-cov --fail-under-lines 60 --lcov --output-path lcov.info
+                cd waycast && cargo llvm-cov --fail-under-lines 60 --lcov --output-path lcov.info
             else
-                cd clay && cargo test {{args}}
+                cd waycast && cargo test {{args}}
             fi
             ;;
         ts)
@@ -474,7 +474,7 @@ test target="" *args="":
 # rust: Rust code formatting and linting
 # - Runs cargo fmt --check to verify formatting
 # - Runs cargo clippy for Rust-specific lints and suggestions
-# - Checks all Rust projects (clay)
+# - Checks all Rust projects (waycast)
 # - Pass clippy args like -- -D warnings for stricter checking
 #
 #
@@ -497,7 +497,7 @@ lint target *args="":
             npm run lint -- --max-warnings 0 {{args}}
             ;;
         rust)
-            cd clay
+            cd waycast
             echo "Checking Cargo.lock sync..."
             cargo metadata --locked > /dev/null
             echo "Running cargo fmt --check..."
@@ -525,7 +525,7 @@ lint target *args="":
 #
 # rust: Rust code formatting
 # - Uses cargo fmt to format all Rust code
-# - Formats all Rust projects (clay)
+# - Formats all Rust projects (waycast)
 # - Applies standard Rust formatting conventions
 # - Modifies files in place to fix formatting issues
 #
@@ -541,8 +541,8 @@ fmt target *args="":
             cd dashboard && npx prettier --write . {{args}}
             ;;
         rust)
-            echo "Running cargo fmt for clay..."
-            cd clay && cargo fmt {{args}}
+            echo "Running cargo fmt for waycast..."
+            cd waycast && cargo fmt {{args}}
             ;;
         *)
             echo "Usage: just fmt [ts|rust]"
@@ -608,7 +608,7 @@ ci target *args="":
         rust)
             echo "🦀 Running Rust CI pipeline..."
             echo "📋 Setting up llvm-cov environment for consistent compilation..."
-            cd clay
+            cd waycast
             echo "🧪 Step 1/1: Running tests with coverage..."
             just test rust --coverage {{args}}
             eval "$(cargo llvm-cov show-env --export-prefix)"
@@ -639,7 +639,7 @@ ci target *args="":
 # Security scanning: 'just security-scan [TAG]'
 #
 # Scans published container images from GitHub Container Registry for vulnerabilities.
-# Uses Grype to scan the clay image and provides detailed vulnerability reports by severity level.
+# Uses Grype to scan the waycast image and provides detailed vulnerability reports by severity level.
 #
 # Arguments:
 # TAG: Image tag to scan (defaults to 'latest' if not specified)
@@ -666,12 +666,12 @@ security-scan target="latest" *args="":
     
     # Use environment variable if set, otherwise use the provided target as tag
     SCAN_TAG="${TAG:-{{target}}}"
-    REGISTRY="ghcr.io/doublewordai/control-layer/"
-    CLAY_TAG="${REGISTRY}clay:$SCAN_TAG"
+    REGISTRY="ghcr.io/doublewordai/waycast/"
+    WAYCAST_TAG="${REGISTRY}waycast:$SCAN_TAG"
 
     echo "🔍 Scanning published container images for vulnerabilities..."
     echo "Tag: $SCAN_TAG"
-    echo "Images: $CLAY_TAG"
+    echo "Images: $WAYCAST_TAG"
 
     # Function to calculate vulnerability counts
     calculate_vulns() {
@@ -686,39 +686,39 @@ security-scan target="latest" *args="":
     
     # Scan each image
     echo ""
-    echo "Scanning clay image: $CLAY_TAG"
-    grype "$CLAY_TAG" --output json --file clay-vulnerabilities.json --quiet || {
-        echo "⚠️  Clay scan failed, skipping..."
-        echo '{"matches": []}' > clay-vulnerabilities.json
+    echo "Scanning waycast image: $WAYCAST_TAG"
+    grype "$WAYCAST_TAG" --output json --file waycast-vulnerabilities.json --quiet || {
+        echo "⚠️  Waycast scan failed, skipping..."
+        echo '{"matches": []}' > waycast-vulnerabilities.json
     }
-    
+
     # Calculate metrics for each component
-    CLAY_CRITICAL=$(calculate_vulns clay-vulnerabilities.json "Critical")
-    CLAY_HIGH=$(calculate_vulns clay-vulnerabilities.json "High")
-    CLAY_MEDIUM=$(calculate_vulns clay-vulnerabilities.json "Medium")
-    CLAY_LOW=$(calculate_vulns clay-vulnerabilities.json "Low")
-    CLAY_TOTAL=$(jq '.matches | length' clay-vulnerabilities.json 2>/dev/null || echo "0")
-    
+    WAYCAST_CRITICAL=$(calculate_vulns waycast-vulnerabilities.json "Critical")
+    WAYCAST_HIGH=$(calculate_vulns waycast-vulnerabilities.json "High")
+    WAYCAST_MEDIUM=$(calculate_vulns waycast-vulnerabilities.json "Medium")
+    WAYCAST_LOW=$(calculate_vulns waycast-vulnerabilities.json "Low")
+    WAYCAST_TOTAL=$(jq '.matches | length' waycast-vulnerabilities.json 2>/dev/null || echo "0")
+
     # Calculate totals
-    TOTAL_CRITICAL=$((CLAY_CRITICAL))
-    TOTAL_HIGH=$((CLAY_HIGH))
-    TOTAL_MEDIUM=$((CLAY_MEDIUM))
-    TOTAL_LOW=$((CLAY_LOW))
-    TOTAL_VULNS=$((CLAY_TOTAL))
-    
+    TOTAL_CRITICAL=$((WAYCAST_CRITICAL))
+    TOTAL_HIGH=$((WAYCAST_HIGH))
+    TOTAL_MEDIUM=$((WAYCAST_MEDIUM))
+    TOTAL_LOW=$((WAYCAST_LOW))
+    TOTAL_VULNS=$((WAYCAST_TOTAL))
+
     # Display results
     echo ""
     echo "🛡️  Security Scan Results"
     echo "========================="
     printf "%-10s %-9s %-6s %-8s %-5s %-7s\n" "Component" "Critical" "High" "Medium" "Low" "Total"
     echo "-------------------------------------------------------"
-    printf "%-10s %-9s %-6s %-8s %-5s %-7s\n" "Clay" "$CLAY_CRITICAL" "$CLAY_HIGH" "$CLAY_MEDIUM" "$CLAY_LOW" "$CLAY_TOTAL"
+    printf "%-10s %-9s %-6s %-8s %-5s %-7s\n" "Waycast" "$WAYCAST_CRITICAL" "$WAYCAST_HIGH" "$WAYCAST_MEDIUM" "$WAYCAST_LOW" "$WAYCAST_TOTAL"
     echo "-------------------------------------------------------"
     printf "%-10s %-9s %-6s %-8s %-5s %-7s\n" "Total" "$TOTAL_CRITICAL" "$TOTAL_HIGH" "$TOTAL_MEDIUM" "$TOTAL_LOW" "$TOTAL_VULNS"
-    
+
     echo ""
     echo "📁 Detailed reports saved:"
-    echo "  - clay-vulnerabilities.json"
+    echo "  - waycast-vulnerabilities.json"
     
     # Warn about critical vulnerabilities
     if [ "$TOTAL_CRITICAL" -gt 0 ]; then

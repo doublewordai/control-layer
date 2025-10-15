@@ -1,5 +1,5 @@
 // Frontend display types for the requests feature
-import type { AiRequest, AiResponse } from "../../../api/clay/types";
+import type { AiRequest, AiResponse } from "../../../api/waycast/types";
 
 export interface RequestsEntry {
   id: string;

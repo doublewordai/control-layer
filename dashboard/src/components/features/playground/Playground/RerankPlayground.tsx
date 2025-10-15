@@ -1,6 +1,6 @@
 import React from "react";
 import { ArrowUpDown, Plus, X } from "lucide-react";
-import type { Model, RerankResponse } from "../../../../api/clay/types";
+import type { Model, RerankResponse } from "../../../../api/waycast/types";
 import { Textarea } from "../../../ui/textarea";
 import { Button } from "../../../ui/button";
 import {

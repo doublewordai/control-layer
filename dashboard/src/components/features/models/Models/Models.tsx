@@ -19,7 +19,7 @@ import {
   type Model,
   useEndpoints,
   type Endpoint,
-} from "../../../../api/clay";
+} from "../../../../api/waycast";
 import { AccessManagementModal } from "../../../modals";
 import { ApiExamples } from "../../../modals";
 import { useAuthorization } from "../../../../utils";

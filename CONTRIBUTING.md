@@ -55,8 +55,8 @@ curl -H "X-Doubleword-User: your-email@company.com" https://localhost:3001/api/v
 
 In development mode, both frontend and backend services automatically reload on file changes:
 
-- **Frontend** (clay-frontend): Uses Vite dev server with hot module replacement
-- **Backend** (clay): Uses `cargo watch` to rebuild and restart on Rust code changes
+- **Frontend** (waycast-frontend): Uses Vite dev server with hot module replacement
+- **Backend** (waycast): Uses `cargo watch` to rebuild and restart on Rust code changes
 
 ### Running Tests
 
@@ -69,14 +69,14 @@ just test           # Run tests against running services
 This system consists of several interconnected services:
 
 ```bash
-control-layer/
-├── clay/              # Rust API server (user/group/model management)
+waycast/
+├── waycast/           # Rust API server (user/group/model management)
 ├── dashboard/         # React/TypeScript web frontend
 ```
 
 **Service Documentation:**
 
-- **[clay](application/clay/README.md)** - API server setup and development
+- **[waycast](application/waycast/README.md)** - API server setup and development
 - **[dashboard](application/dashboard/README.md)** - Frontend development
 
 **System Architecture:** See [ARCHITECTURE.md](ARCHITECTURE.md) for detailed system diagrams
@@ -95,7 +95,7 @@ just jwt <email>         # Generate auth token
 
 ## CI Metrics
 
-View real-time build and performance metrics for [this project](https://charts.somnial.co/doubleword-control-layer).
+View real-time build and performance metrics for [this project](https://charts.somnial.co/doubleword-waycast).
 
 ## FAQ
 
@@ -106,8 +106,8 @@ View real-time build and performance metrics for [this project](https://charts.s
 docker compose logs -f
 
 # View specific service logs
-docker compose logs -f clay
-docker compose logs -f clay-frontend
+docker compose logs -f waycast
+docker compose logs -f waycast-frontend
 ```
 
 **How do I reset the database?**
@@ -144,8 +144,8 @@ just down
 **HTTPS returns 400 Bad Request**
 → Clear your browser cache and cookies for localhost, then try again. This often occurs when switching between different authentication configurations.
 
-**Strange sqlx build errors, referencing SQL queries, when building `clay` image**
-→ Navigate to the `application/clay` directory and run `cargo sqlx prepare` to
+**Strange sqlx build errors, referencing SQL queries, when building `waycast` image**
+→ Navigate to the `application/waycast` directory and run `cargo sqlx prepare` to
 ensure prepared SQL queries are up to date. Ensure you're using Rust 1.88 or higher (`rustc --version`).
 
 If you see something like "error returned from database: password authentication failed for user "postgres""

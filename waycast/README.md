@@ -1,4 +1,4 @@
-# Clay API Server
+# Waycast API Server
 
 Rust-based API server for user, group, and model management with PostgreSQL database.
 
@@ -17,19 +17,19 @@ Rust-based API server for user, group, and model management with PostgreSQL data
 brew services start postgresql
 
 # Create database
-createdb clay
+createdb waycast
 
 # Or connect to existing PostgreSQL instance
-psql -c "CREATE DATABASE clay;"
+psql -c "CREATE DATABASE waycast;"
 ```
 
 ### 2. Environment Configuration
 
-Create `.env` file in the `application/clay` directory:
+Create `.env` file in the `application/waycast` directory:
 
 ```bash
-# application/clay/.env
-DATABASE_URL=postgres://your-username@localhost:5432/clay
+# application/waycast/.env
+DATABASE_URL=postgres://your-username@localhost:5432/waycast
 ```
 
 Replace `your-username` with your PostgreSQL username.
@@ -37,7 +37,7 @@ Replace `your-username` with your PostgreSQL username.
 ### 3. Run Database Migrations
 
 ```bash
-cd application/clay
+cd application/waycast
 sqlx migrate run
 ```
 
@@ -53,7 +53,7 @@ cargo sqlx prepare
 ## Running the Service
 
 ```bash
-cd application/clay
+cd application/waycast
 
 # Run with live database connection
 cargo run
@@ -64,15 +64,15 @@ cargo test
 
 ## Configuration
 
-The service uses `config.yaml` (or `CLAY_*` environment variables):
+The service uses `config.yaml` (or `WAYCAST_*` environment variables):
 
-- `CLAY_HOST`: Server host (default: 0.0.0.0)
-- `CLAY_PORT`: Server port (default: 3001)
+- `WAYCAST_HOST`: Server host (default: 0.0.0.0)
+- `WAYCAST_PORT`: Server port (default: 3001)
 - `DATABASE_URL`: PostgreSQL connection string
 
 ## User Roles and Permissions
 
-Clay uses an additive role-based access control system where users can have multiple roles that combine to provide different levels of access.
+Waycast uses an additive role-based access control system where users can have multiple roles that combine to provide different levels of access.
 
 ### Role Types
 
@@ -119,7 +119,7 @@ Roles are additive, meaning users gain the combined permissions of all their ass
 
 - Ensure PostgreSQL is running: `brew services start postgresql`
 - Check DATABASE_URL in `.env` file
-- Verify database exists: `psql -l | grep clay`
+- Verify database exists: `psql -l | grep waycast`
 
 **Migration errors**
 

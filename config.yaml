@@ -10,12 +10,12 @@ port: 3001
 # Database configuration
 database:
   # By default, we bundle postgres with the application. It's launched on a
-  # random port, and data doesn't persist between application restarts.
-  # To have data persist, set persistent=true, and set a data_dir.
+  # random port, and data is stored in $HOME/.waycast_data/
+  # To have data not persists across restarts, set persistent=false.
   # We strongly recommend setting up external postgres in production!
   type: embedded
   data_dir: null
-  persistent: false
+  persistent: true
 
   # TODO: Use an external database in production
   # type: external

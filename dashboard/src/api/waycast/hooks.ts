@@ -1,5 +1,5 @@
 import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query";
-import { clayApi } from "./client";
+import { waycastApi } from "./client";
 import { queryKeys } from "./keys";
 import type {
   UserCreateRequest,
@@ -21,7 +21,7 @@ import type {
 export function useConfig() {
   return useQuery({
     queryKey: ["config"],
-    queryFn: () => clayApi.config.get(),
+    queryFn: () => waycastApi.config.get(),
     staleTime: 30 * 60 * 1000, // 30 minutes - config rarely changes
   });
 }
@@ -31,7 +31,7 @@ export function useUsers(options?: UsersQuery & { enabled?: boolean }) {
   const { enabled = true, ...queryOptions } = options || {};
   return useQuery({
     queryKey: queryKeys.users.query(queryOptions),
-    queryFn: () => clayApi.users.list(queryOptions),
+    queryFn: () => waycastApi.users.list(queryOptions),
     enabled,
   });
 }
@@ -39,7 +39,7 @@ export function useUsers(options?: UsersQuery & { enabled?: boolean }) {
 export function useUser(id: string) {
   return useQuery({
     queryKey: queryKeys.users.byId(id),
-    queryFn: () => clayApi.users.get(id),
+    queryFn: () => waycastApi.users.get(id),
   });
 }
 
@@ -48,7 +48,7 @@ export function useCreateUser() {
 
   return useMutation({
     mutationKey: ["users", "create"],
-    mutationFn: (data: UserCreateRequest) => clayApi.users.create(data),
+    mutationFn: (data: UserCreateRequest) => waycastApi.users.create(data),
     // Refetch queries after mutation completes (success or error)
     onSettled: () => {
       queryClient.invalidateQueries({ queryKey: queryKeys.users.all });
@@ -63,7 +63,7 @@ export function useUpdateUser() {
   return useMutation({
     mutationKey: ["users", "update"],
     mutationFn: ({ id, data }: { id: string; data: UserUpdateRequest }) =>
-      clayApi.users.update(id, data),
+      waycastApi.users.update(id, data),
     // Refetch queries after mutation completes (success or error)
     onSettled: () => {
       queryClient.invalidateQueries({ queryKey: queryKeys.users.all });
@@ -77,7 +77,7 @@ export function useDeleteUser() {
 
   return useMutation({
     mutationKey: ["users", "delete"],
-    mutationFn: (id: string) => clayApi.users.delete(id),
+    mutationFn: (id: string) => waycastApi.users.delete(id),
     // Refetch queries after mutation completes (success or error)
     onSettled: () => {
       queryClient.invalidateQueries({ queryKey: queryKeys.users.all });
@@ -90,14 +90,14 @@ export function useDeleteUser() {
 export function useModels(options?: ModelsQuery) {
   return useQuery({
     queryKey: queryKeys.models.query(options),
-    queryFn: () => clayApi.models.list(options),
+    queryFn: () => waycastApi.models.list(options),
   });
 }
 
 export function useModel(id: string) {
   return useQuery({
     queryKey: queryKeys.models.byId(id),
-    queryFn: () => clayApi.models.get(id),
+    queryFn: () => waycastApi.models.get(id),
   });
 }
 
@@ -106,7 +106,7 @@ export function useUpdateModel() {
 
   return useMutation({
     mutationFn: ({ id, data }: { id: string; data: ModelUpdateRequest }) =>
-      clayApi.models.update(id, data),
+      waycastApi.models.update(id, data),
     onSuccess: (updatedModel) => {
       queryClient.invalidateQueries({ queryKey: queryKeys.models.all });
       queryClient.setQueryData(
@@ -122,7 +122,7 @@ export function useGroups(options?: GroupsQuery & { enabled?: boolean }) {
   const { enabled = true, ...queryOptions } = options || {};
   return useQuery({
     queryKey: queryKeys.groups.query(queryOptions),
-    queryFn: () => clayApi.groups.list(queryOptions),
+    queryFn: () => waycastApi.groups.list(queryOptions),
     enabled,
   });
 }
@@ -130,7 +130,7 @@ export function useGroups(options?: GroupsQuery & { enabled?: boolean }) {
 export function useGroup(id: string) {
   return useQuery({
     queryKey: queryKeys.groups.byId(id),
-    queryFn: () => clayApi.groups.get(id),
+    queryFn: () => waycastApi.groups.get(id),
   });
 }
 
@@ -138,7 +138,7 @@ export function useCreateGroup() {
   const queryClient = useQueryClient();
 
   return useMutation({
-    mutationFn: (data: GroupCreateRequest) => clayApi.groups.create(data),
+    mutationFn: (data: GroupCreateRequest) => waycastApi.groups.create(data),
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: queryKeys.groups.all });
     },
@@ -150,7 +150,7 @@ export function useUpdateGroup() {
 
   return useMutation({
     mutationFn: ({ id, data }: { id: string; data: GroupUpdateRequest }) =>
-      clayApi.groups.update(id, data),
+      waycastApi.groups.update(id, data),
     onSuccess: (updatedGroup) => {
       queryClient.invalidateQueries({ queryKey: queryKeys.groups.all });
       queryClient.setQueryData(
@@ -165,7 +165,7 @@ export function useDeleteGroup() {
   const queryClient = useQueryClient();
 
   return useMutation({
-    mutationFn: (id: string) => clayApi.groups.delete(id),
+    mutationFn: (id: string) => waycastApi.groups.delete(id),
     onSuccess: (_, deletedId) => {
       queryClient.invalidateQueries({ queryKey: queryKeys.groups.all });
       queryClient.removeQueries({ queryKey: queryKeys.groups.byId(deletedId) });
@@ -180,7 +180,7 @@ export function useAddUserToGroup() {
   return useMutation({
     mutationKey: ["groups", "addUser"],
     mutationFn: ({ groupId, userId }: { groupId: string; userId: string }) =>
-      clayApi.groups.addUser(groupId, userId),
+      waycastApi.groups.addUser(groupId, userId),
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: queryKeys.groups.all });
       queryClient.invalidateQueries({ queryKey: queryKeys.users.all });
@@ -194,7 +194,7 @@ export function useRemoveUserFromGroup() {
   return useMutation({
     mutationKey: ["groups", "removeUser"],
     mutationFn: ({ groupId, userId }: { groupId: string; userId: string }) =>
-      clayApi.groups.removeUser(groupId, userId),
+      waycastApi.groups.removeUser(groupId, userId),
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: queryKeys.groups.all });
       queryClient.invalidateQueries({ queryKey: queryKeys.users.all });
@@ -207,7 +207,7 @@ export function useAddModelToGroup() {
 
   return useMutation({
     mutationFn: ({ groupId, modelId }: { groupId: string; modelId: string }) =>
-      clayApi.groups.addModel(groupId, modelId),
+      waycastApi.groups.addModel(groupId, modelId),
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: queryKeys.groups.all });
       queryClient.invalidateQueries({ queryKey: queryKeys.models.all });
@@ -220,7 +220,7 @@ export function useRemoveModelFromGroup() {
 
   return useMutation({
     mutationFn: ({ groupId, modelId }: { groupId: string; modelId: string }) =>
-      clayApi.groups.removeModel(groupId, modelId),
+      waycastApi.groups.removeModel(groupId, modelId),
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: queryKeys.groups.all });
       queryClient.invalidateQueries({ queryKey: queryKeys.models.all });
@@ -233,7 +233,7 @@ export function useEndpoints(options?: { enabled?: boolean }) {
   const { enabled = true } = options || {};
   return useQuery({
     queryKey: queryKeys.endpoints.all,
-    queryFn: () => clayApi.endpoints.list(),
+    queryFn: () => waycastApi.endpoints.list(),
     enabled,
   });
 }
@@ -241,7 +241,7 @@ export function useEndpoints(options?: { enabled?: boolean }) {
 export function useEndpoint(id: string) {
   return useQuery({
     queryKey: queryKeys.endpoints.byId(id),
-    queryFn: () => clayApi.endpoints.get(id),
+    queryFn: () => waycastApi.endpoints.get(id),
   });
 }
 
@@ -249,7 +249,7 @@ export function useValidateEndpoint() {
   return useMutation({
     mutationKey: ["endpoints", "validate"],
     mutationFn: (data: EndpointValidateRequest) =>
-      clayApi.endpoints.validate(data),
+      waycastApi.endpoints.validate(data),
   });
 }
 
@@ -258,7 +258,7 @@ export function useCreateEndpoint() {
 
   return useMutation({
     mutationKey: ["endpoints", "create"],
-    mutationFn: (data: EndpointCreateRequest) => clayApi.endpoints.create(data),
+    mutationFn: (data: EndpointCreateRequest) => waycastApi.endpoints.create(data),
     onSettled: () => {
       queryClient.invalidateQueries({ queryKey: queryKeys.endpoints.all });
       queryClient.invalidateQueries({ queryKey: queryKeys.models.all });
@@ -272,7 +272,7 @@ export function useUpdateEndpoint() {
   return useMutation({
     mutationKey: ["endpoints", "update"],
     mutationFn: ({ id, data }: { id: string; data: EndpointUpdateRequest }) =>
-      clayApi.endpoints.update(id, data),
+      waycastApi.endpoints.update(id, data),
     onSettled: (_, __, variables) => {
       queryClient.invalidateQueries({ queryKey: queryKeys.endpoints.all });
       queryClient.invalidateQueries({ queryKey: queryKeys.models.all });
@@ -290,7 +290,7 @@ export function useDeleteEndpoint() {
 
   return useMutation({
     mutationKey: ["endpoints", "delete"],
-    mutationFn: (id: string) => clayApi.endpoints.delete(id),
+    mutationFn: (id: string) => waycastApi.endpoints.delete(id),
     onSettled: () => {
       queryClient.invalidateQueries({ queryKey: queryKeys.endpoints.all });
       queryClient.invalidateQueries({ queryKey: queryKeys.models.all });
@@ -303,7 +303,7 @@ export function useSynchronizeEndpoint() {
 
   return useMutation({
     mutationKey: ["endpoints", "synchronize"],
-    mutationFn: (id: string) => clayApi.endpoints.synchronize(id),
+    mutationFn: (id: string) => waycastApi.endpoints.synchronize(id),
     onSettled: () => {
       // Refetch models since synchronization affects deployments
       queryClient.invalidateQueries({ queryKey: queryKeys.models.all });
@@ -315,14 +315,14 @@ export function useSynchronizeEndpoint() {
 export function useApiKeys(userId = "current") {
   return useQuery({
     queryKey: queryKeys.apiKeys.query(userId),
-    queryFn: () => clayApi.users.apiKeys.getAll(userId),
+    queryFn: () => waycastApi.users.apiKeys.getAll(userId),
   });
 }
 
 export function useApiKey(id: string, userId = "current") {
   return useQuery({
     queryKey: queryKeys.apiKeys.byId(id, userId),
-    queryFn: () => clayApi.users.apiKeys.get(id, userId),
+    queryFn: () => waycastApi.users.apiKeys.get(id, userId),
   });
 }
 
@@ -336,7 +336,7 @@ export function useCreateApiKey() {
     }: {
       data: ApiKeyCreateRequest;
       userId?: string;
-    }) => clayApi.users.apiKeys.create(data, userId),
+    }) => waycastApi.users.apiKeys.create(data, userId),
     onSuccess: (_, { userId = "current" }) => {
       queryClient.invalidateQueries({
         queryKey: queryKeys.apiKeys.query(userId),
@@ -355,7 +355,7 @@ export function useDeleteApiKey() {
     }: {
       keyId: string;
       userId?: string;
-    }) => clayApi.users.apiKeys.delete(keyId, userId),
+    }) => waycastApi.users.apiKeys.delete(keyId, userId),
     onSuccess: (_, { keyId, userId = "current" }) => {
       queryClient.invalidateQueries({
         queryKey: queryKeys.apiKeys.query(userId),
@@ -383,7 +383,7 @@ export function useRequests(
 
   return useQuery({
     queryKey: queryKeys.requests.query(optionsWithDate),
-    queryFn: () => clayApi.requests.list(optionsWithDate),
+    queryFn: () => waycastApi.requests.list(optionsWithDate),
     enabled: queryOptions?.enabled ?? true,
   });
 }
@@ -402,7 +402,7 @@ export function useRequestsAggregate(
       timestampBefore,
     ),
     queryFn: () =>
-      clayApi.requests.aggregate(model, timestampAfter, timestampBefore),
+      waycastApi.requests.aggregate(model, timestampAfter, timestampBefore),
   });
 }
 
@@ -413,7 +413,7 @@ export function useRequestsAggregateByUser(
 ) {
   return useQuery({
     queryKey: queryKeys.requests.aggregateByUser(model, startDate, endDate),
-    queryFn: () => clayApi.requests.aggregateByUser(model, startDate, endDate),
+    queryFn: () => waycastApi.requests.aggregateByUser(model, startDate, endDate),
     enabled: !!model,
   });
 }
@@ -422,7 +422,7 @@ export function useRequestsAggregateByUser(
 export function useRegistrationInfo() {
   return useQuery({
     queryKey: ["registration-info"],
-    queryFn: () => clayApi.auth.getRegistrationInfo(),
+    queryFn: () => waycastApi.auth.getRegistrationInfo(),
     staleTime: 5 * 60 * 1000, // 5 minutes
   });
 }
@@ -430,7 +430,7 @@ export function useRegistrationInfo() {
 export function useLoginInfo() {
   return useQuery({
     queryKey: ["login-info"],
-    queryFn: () => clayApi.auth.getLoginInfo(),
+    queryFn: () => waycastApi.auth.getLoginInfo(),
     staleTime: 5 * 60 * 1000, // 5 minutes
   });
 }
@@ -438,7 +438,7 @@ export function useLoginInfo() {
 export function useRequestPasswordReset() {
   return useMutation({
     mutationKey: ["password-reset", "request"],
-    mutationFn: (email: string) => clayApi.auth.requestPasswordReset({ email }),
+    mutationFn: (email: string) => waycastApi.auth.requestPasswordReset({ email }),
   });
 }
 
@@ -449,6 +449,6 @@ export function useConfirmPasswordReset() {
       token_id: string;
       token: string;
       new_password: string;
-    }) => clayApi.auth.confirmPasswordReset(data),
+    }) => waycastApi.auth.confirmPasswordReset(data),
   });
 }

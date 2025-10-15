@@ -1,4 +1,4 @@
 [workspace]
-members = ["clay"]
-default-members = ["clay"]
+members = ["waycast"]
+default-members = ["waycast"]
 resolver = "2"

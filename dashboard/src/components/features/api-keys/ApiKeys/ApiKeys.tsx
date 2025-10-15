@@ -5,8 +5,8 @@ import {
   useCreateApiKey,
   useDeleteApiKey,
   type ApiKeyCreateResponse,
-} from "../../../../api/clay";
-import { useUser } from "../../../../api/clay/hooks";
+} from "../../../../api/waycast";
+import { useUser } from "../../../../api/waycast/hooks";
 import { DataTable } from "../../../ui/data-table";
 import { createColumns } from "./columns";
 import {

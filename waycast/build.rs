@@ -10,7 +10,7 @@ fn main() {
     if build_frontend {
         println!("cargo:warning=Building frontend with npm...");
 
-        // Get the project root (parent of clay directory)
+        // Get the project root (parent of waycast directory)
         let manifest_dir = PathBuf::from(env::var("CARGO_MANIFEST_DIR").unwrap());
         let project_root = manifest_dir.parent().unwrap();
         let dashboard_dir = project_root.join("dashboard");

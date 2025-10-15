@@ -1,6 +1,6 @@
 import React, { useState } from "react";
 import { AlertTriangle } from "lucide-react";
-import { useDeleteUser } from "../../../api/clay";
+import { useDeleteUser } from "../../../api/waycast";
 import {
   Dialog,
   DialogContent,

@@ -1,7 +1,7 @@
 import { beforeAll, afterEach, afterAll, describe, it, expect } from "vitest";
 import { setupServer } from "msw/node";
 import { handlers } from "../mocks/handlers";
-import { clayApi } from "../client";
+import { waycastApi } from "../client";
 import type {
   UserCreateRequest,
   GroupCreateRequest,
@@ -29,10 +29,10 @@ afterAll(() => {
   server.close();
 });
 
-describe("clayApi.users", () => {
+describe("waycastApi.users", () => {
   describe("list", () => {
     it("should fetch users without query parameters", async () => {
-      const users = await clayApi.users.list();
+      const users = await waycastApi.users.list();
 
       expect(users).toBeInstanceOf(Array);
       expect(users.length).toBeGreaterThan(0);
@@ -43,7 +43,7 @@ describe("clayApi.users", () => {
     });
 
     it("should fetch users with include=groups parameter", async () => {
-      const users = await clayApi.users.list({ include: "groups" });
+      const users = await waycastApi.users.list({ include: "groups" });
 
       expect(users).toBeInstanceOf(Array);
       expect(users[0]).toHaveProperty("groups");
@@ -52,7 +52,7 @@ describe("clayApi.users", () => {
 
     it("should construct URL correctly with query parameters", async () => {
       // Test that the URL is constructed properly by checking the response
-      const users = await clayApi.users.list({ include: "groups" });
+      const users = await waycastApi.users.list({ include: "groups" });
 
       // The handler should return users with groups when include=groups
       expect(users[0]).toHaveProperty("groups");
@@ -62,7 +62,7 @@ describe("clayApi.users", () => {
   describe("get", () => {
     it("should fetch a specific user by ID", async () => {
       const userId = "550e8400-e29b-41d4-a716-446655440001";
-      const user = await clayApi.users.get(userId);
+      const user = await waycastApi.users.get(userId);
 
       expect(user).toHaveProperty("id", userId);
       expect(user).toHaveProperty("username");
@@ -72,7 +72,7 @@ describe("clayApi.users", () => {
     it("should throw error for non-existent user", async () => {
       const nonExistentId = "non-existent-id";
 
-      await expect(clayApi.users.get(nonExistentId)).rejects.toThrow(
+      await expect(waycastApi.users.get(nonExistentId)).rejects.toThrow(
         "Failed to fetch user: 404",
       );
     });
@@ -87,7 +87,7 @@ describe("clayApi.users", () => {
         roles: ["User"],
       };
 
-      const createdUser = await clayApi.users.create(userData);
+      const createdUser = await waycastApi.users.create(userData);
 
       expect(createdUser).toHaveProperty("id");
       expect(createdUser.username).toBe(userData.username);
@@ -107,7 +107,7 @@ describe("clayApi.users", () => {
         avatar_url: "https://example.com/avatar.jpg",
       };
 
-      const createdUser = await clayApi.users.create(userData);
+      const createdUser = await waycastApi.users.create(userData);
 
       // Verify all fields are properly serialized and returned
       expect(createdUser.username).toBe(userData.username);
@@ -126,7 +126,7 @@ describe("clayApi.users", () => {
         roles: ["Admin"],
       };
 
-      const updatedUser = await clayApi.users.update(userId, updateData);
+      const updatedUser = await waycastApi.users.update(userId, updateData);
 
       expect(updatedUser.id).toBe(userId);
       expect(updatedUser.display_name).toBe(updateData.display_name);
@@ -139,7 +139,7 @@ describe("clayApi.users", () => {
       const updateData: UserUpdateRequest = { display_name: "Updated" };
 
       await expect(
-        clayApi.users.update(nonExistentId, updateData),
+        waycastApi.users.update(nonExistentId, updateData),
       ).rejects.toThrow("Failed to update user: 404");
     });
   });
@@ -148,13 +148,13 @@ describe("clayApi.users", () => {
     it("should delete an existing user", async () => {
       const userId = "550e8400-e29b-41d4-a716-446655440001";
 
-      await expect(clayApi.users.delete(userId)).resolves.toBeUndefined();
+      await expect(waycastApi.users.delete(userId)).resolves.toBeUndefined();
     });
 
     it("should throw error when deleting non-existent user", async () => {
       const nonExistentId = "non-existent-id";
 
-      await expect(clayApi.users.delete(nonExistentId)).rejects.toThrow(
+      await expect(waycastApi.users.delete(nonExistentId)).rejects.toThrow(
         "Failed to delete user: 404",
       );
     });
@@ -163,7 +163,7 @@ describe("clayApi.users", () => {
   describe("apiKeys", () => {
     describe("getAll", () => {
       it("should fetch all API keys for current user", async () => {
-        const apiKeys = await clayApi.users.apiKeys.getAll();
+        const apiKeys = await waycastApi.users.apiKeys.getAll();
 
         expect(apiKeys).toBeInstanceOf(Array);
         expect(apiKeys.length).toBeGreaterThan(0);
@@ -174,7 +174,7 @@ describe("clayApi.users", () => {
 
       it("should fetch API keys for specific user", async () => {
         const userId = "550e8400-e29b-41d4-a716-446655440001";
-        const apiKeys = await clayApi.users.apiKeys.getAll(userId);
+        const apiKeys = await waycastApi.users.apiKeys.getAll(userId);
 
         expect(apiKeys).toBeInstanceOf(Array);
       });
@@ -183,7 +183,7 @@ describe("clayApi.users", () => {
     describe("get", () => {
       it("should fetch specific API key", async () => {
         const keyId = "key-1";
-        const apiKey = await clayApi.users.apiKeys.get(keyId);
+        const apiKey = await waycastApi.users.apiKeys.get(keyId);
 
         expect(apiKey).toHaveProperty("id", keyId);
         expect(apiKey).toHaveProperty("name");
@@ -192,7 +192,7 @@ describe("clayApi.users", () => {
       it("should throw error for non-existent API key", async () => {
         const nonExistentId = "non-existent-key";
 
-        await expect(clayApi.users.apiKeys.get(nonExistentId)).rejects.toThrow(
+        await expect(waycastApi.users.apiKeys.get(nonExistentId)).rejects.toThrow(
           "Failed to fetch API key: 404",
         );
       });
@@ -205,7 +205,7 @@ describe("clayApi.users", () => {
           description: "Test description",
         };
 
-        const createdKey = await clayApi.users.apiKeys.create(keyData);
+        const createdKey = await waycastApi.users.apiKeys.create(keyData);
 
         expect(createdKey).toHaveProperty("id");
         expect(createdKey).toHaveProperty("key"); // Only returned on creation
@@ -220,7 +220,7 @@ describe("clayApi.users", () => {
           name: "User Key",
         };
 
-        const createdKey = await clayApi.users.apiKeys.create(keyData, userId);
+        const createdKey = await waycastApi.users.apiKeys.create(keyData, userId);
 
         expect(createdKey).toHaveProperty("key");
         expect(createdKey.name).toBe(keyData.name);
@@ -232,7 +232,7 @@ describe("clayApi.users", () => {
         const keyId = "key-1";
 
         await expect(
-          clayApi.users.apiKeys.delete(keyId),
+          waycastApi.users.apiKeys.delete(keyId),
         ).resolves.toBeUndefined();
       });
 
@@ -240,17 +240,17 @@ describe("clayApi.users", () => {
         const nonExistentId = "non-existent-key";
 
         await expect(
-          clayApi.users.apiKeys.delete(nonExistentId),
+          waycastApi.users.apiKeys.delete(nonExistentId),
         ).rejects.toThrow("Failed to delete API key: 404");
       });
     });
   });
 });
 
-describe("clayApi.models", () => {
+describe("waycastApi.models", () => {
   describe("list", () => {
     it("should fetch all models", async () => {
-      const models = await clayApi.models.list();
+      const models = await waycastApi.models.list();
 
       expect(models).toBeInstanceOf(Object);
       expect(Object.keys(models).length).toBeGreaterThan(0);
@@ -263,7 +263,7 @@ describe("clayApi.models", () => {
     });
 
     it("should filter models by endpoint", async () => {
-      const models = await clayApi.models.list({ endpoint: "2" });
+      const models = await waycastApi.models.list({ endpoint: "2" });
 
       expect(models).toBeInstanceOf(Object);
       const modelValues = Object.values(models);
@@ -271,7 +271,7 @@ describe("clayApi.models", () => {
     });
 
     it("should include groups when requested", async () => {
-      const models = await clayApi.models.list({ include: "groups" });
+      const models = await waycastApi.models.list({ include: "groups" });
 
       const firstModel = Object.values(models)[0];
       expect(firstModel).toHaveProperty("groups");
@@ -279,7 +279,7 @@ describe("clayApi.models", () => {
     });
 
     it("should construct URL correctly with multiple parameters", async () => {
-      const models = await clayApi.models.list({
+      const models = await waycastApi.models.list({
         endpoint: "c3d4e5f6-7890-1234-5678-90abcdef0123",
         include: "groups",
       });
@@ -297,7 +297,7 @@ describe("clayApi.models", () => {
   describe("get", () => {
     it("should fetch specific model", async () => {
       const modelId = "f914c573-4c00-4a37-a878-53318a6d5a5b";
-      const model = await clayApi.models.get(modelId);
+      const model = await waycastApi.models.get(modelId);
 
       expect(model).toHaveProperty("id", modelId);
       expect(model).toHaveProperty("alias");
@@ -307,7 +307,7 @@ describe("clayApi.models", () => {
     it("should throw error for non-existent model", async () => {
       const nonExistentId = "non-existent-model";
 
-      await expect(clayApi.models.get(nonExistentId)).rejects.toThrow(
+      await expect(waycastApi.models.get(nonExistentId)).rejects.toThrow(
         "Failed to fetch model: 404",
       );
     });
@@ -322,7 +322,7 @@ describe("clayApi.models", () => {
         capabilities: ["text", "vision", "code"],
       };
 
-      const updatedModel = await clayApi.models.update(modelId, updateData);
+      const updatedModel = await waycastApi.models.update(modelId, updateData);
 
       expect(updatedModel.alias).toBe(updateData.alias);
       expect(updatedModel.description).toBe(updateData.description);
@@ -336,7 +336,7 @@ describe("clayApi.models", () => {
         model_type: null,
       };
 
-      const updatedModel = await clayApi.models.update(modelId, updateData);
+      const updatedModel = await waycastApi.models.update(modelId, updateData);
 
       expect(updatedModel.description).toBeNull();
       expect(updatedModel.model_type).toBeNull();
@@ -344,10 +344,10 @@ describe("clayApi.models", () => {
   });
 });
 
-describe("clayApi.endpoints", () => {
+describe("waycastApi.endpoints", () => {
   describe("list", () => {
     it("should fetch all endpoints", async () => {
-      const endpoints = await clayApi.endpoints.list();
+      const endpoints = await waycastApi.endpoints.list();
 
       expect(endpoints).toBeInstanceOf(Array);
       expect(endpoints.length).toBeGreaterThan(0);
@@ -359,7 +359,7 @@ describe("clayApi.endpoints", () => {
   describe("get", () => {
     it("should fetch specific endpoint", async () => {
       const endpointId = "a1b2c3d4-e5f6-7890-1234-567890abcdef";
-      const endpoint = await clayApi.endpoints.get(endpointId);
+      const endpoint = await waycastApi.endpoints.get(endpointId);
 
       expect(endpoint).toHaveProperty(
         "id",
@@ -371,17 +371,17 @@ describe("clayApi.endpoints", () => {
     it("should throw error for non-existent endpoint", async () => {
       const nonExistentId = "99999999-9999-9999-9999-999999999999";
 
-      await expect(clayApi.endpoints.get(nonExistentId)).rejects.toThrow(
+      await expect(waycastApi.endpoints.get(nonExistentId)).rejects.toThrow(
         "Failed to fetch endpoint: 404",
       );
     });
   });
 });
 
-describe("clayApi.groups", () => {
+describe("waycastApi.groups", () => {
   describe("list", () => {
     it("should fetch all groups", async () => {
-      const groups = await clayApi.groups.list();
+      const groups = await waycastApi.groups.list();
 
       expect(groups).toBeInstanceOf(Array);
       expect(groups.length).toBeGreaterThan(0);
@@ -390,21 +390,21 @@ describe("clayApi.groups", () => {
     });
 
     it("should include users when requested", async () => {
-      const groups = await clayApi.groups.list({ include: "users" });
+      const groups = await waycastApi.groups.list({ include: "users" });
 
       expect(groups[0]).toHaveProperty("users");
       expect(groups[0].users).toBeInstanceOf(Array);
     });
 
     it("should include models when requested", async () => {
-      const groups = await clayApi.groups.list({ include: "models" });
+      const groups = await waycastApi.groups.list({ include: "models" });
 
       expect(groups[0]).toHaveProperty("models");
       expect(groups[0].models).toBeInstanceOf(Array);
     });
 
     it("should include both users and models when requested", async () => {
-      const groups = await clayApi.groups.list({ include: "users,models" });
+      const groups = await waycastApi.groups.list({ include: "users,models" });
 
       expect(groups[0]).toHaveProperty("users");
       expect(groups[0]).toHaveProperty("models");
@@ -414,7 +414,7 @@ describe("clayApi.groups", () => {
   describe("get", () => {
     it("should fetch specific group", async () => {
       const groupId = "550e8400-e29b-41d4-a716-446655441001";
-      const group = await clayApi.groups.get(groupId);
+      const group = await waycastApi.groups.get(groupId);
 
       expect(group).toHaveProperty("id", groupId);
       expect(group).toHaveProperty("name");
@@ -423,7 +423,7 @@ describe("clayApi.groups", () => {
     it("should throw error for non-existent group", async () => {
       const nonExistentId = "non-existent-group";
 
-      await expect(clayApi.groups.get(nonExistentId)).rejects.toThrow(
+      await expect(waycastApi.groups.get(nonExistentId)).rejects.toThrow(
         "Failed to fetch group: 404",
       );
     });
@@ -436,7 +436,7 @@ describe("clayApi.groups", () => {
         description: "Test group",
       };
 
-      const createdGroup = await clayApi.groups.create(groupData);
+      const createdGroup = await waycastApi.groups.create(groupData);
 
       expect(createdGroup).toHaveProperty("id");
       expect(createdGroup.name).toBe(groupData.name);
@@ -454,7 +454,7 @@ describe("clayApi.groups", () => {
         description: "Updated description",
       };
 
-      const updatedGroup = await clayApi.groups.update(groupId, updateData);
+      const updatedGroup = await waycastApi.groups.update(groupId, updateData);
 
       expect(updatedGroup.name).toBe(updateData.name);
       expect(updatedGroup.description).toBe(updateData.description);
@@ -465,7 +465,7 @@ describe("clayApi.groups", () => {
     it("should delete group", async () => {
       const groupId = "550e8400-e29b-41d4-a716-446655441001";
 
-      await expect(clayApi.groups.delete(groupId)).resolves.toBeUndefined();
+      await expect(waycastApi.groups.delete(groupId)).resolves.toBeUndefined();
     });
   });
 
@@ -476,7 +476,7 @@ describe("clayApi.groups", () => {
         const userId = "550e8400-e29b-41d4-a716-446655440001";
 
         await expect(
-          clayApi.groups.addUser(groupId, userId),
+          waycastApi.groups.addUser(groupId, userId),
         ).resolves.toBeUndefined();
       });
 
@@ -485,7 +485,7 @@ describe("clayApi.groups", () => {
         const userId = "550e8400-e29b-41d4-a716-446655440001";
 
         await expect(
-          clayApi.groups.addUser(nonExistentGroupId, userId),
+          waycastApi.groups.addUser(nonExistentGroupId, userId),
         ).rejects.toThrow("Failed to add user to group: 404");
       });
     });
@@ -496,7 +496,7 @@ describe("clayApi.groups", () => {
         const userId = "550e8400-e29b-41d4-a716-446655440001";
 
         await expect(
-          clayApi.groups.removeUser(groupId, userId),
+          waycastApi.groups.removeUser(groupId, userId),
         ).resolves.toBeUndefined();
       });
     });
@@ -507,7 +507,7 @@ describe("clayApi.groups", () => {
         const modelId = "f914c573-4c00-4a37-a878-53318a6d5a5b";
 
         await expect(
-          clayApi.groups.addModel(groupId, modelId),
+          waycastApi.groups.addModel(groupId, modelId),
         ).resolves.toBeUndefined();
       });
     });
@@ -518,7 +518,7 @@ describe("clayApi.groups", () => {
         const modelId = "f914c573-4c00-4a37-a878-53318a6d5a5b";
 
         await expect(
-          clayApi.groups.removeModel(groupId, modelId),
+          waycastApi.groups.removeModel(groupId, modelId),
         ).resolves.toBeUndefined();
       });
     });
@@ -527,26 +527,26 @@ describe("clayApi.groups", () => {
 
 describe("Error Handling", () => {
   it("should handle HTTP 500 errors", async () => {
-    await expect(clayApi.users.get("error-500")).rejects.toThrow(
+    await expect(waycastApi.users.get("error-500")).rejects.toThrow(
       "Failed to fetch user: 500",
     );
   });
 
   it("should handle network errors", async () => {
-    await expect(clayApi.users.get("network-error")).rejects.toThrow();
+    await expect(waycastApi.users.get("network-error")).rejects.toThrow();
   });
 
   it("should throw meaningful error messages", async () => {
-    await expect(clayApi.users.get("non-existent-id")).rejects.toThrow(
+    await expect(waycastApi.users.get("non-existent-id")).rejects.toThrow(
       "Failed to fetch user: 404",
     );
-    await expect(clayApi.models.get("non-existent-model")).rejects.toThrow(
+    await expect(waycastApi.models.get("non-existent-model")).rejects.toThrow(
       "Failed to fetch model: 404",
     );
-    await expect(clayApi.groups.get("non-existent-group")).rejects.toThrow(
+    await expect(waycastApi.groups.get("non-existent-group")).rejects.toThrow(
       "Failed to fetch group: 404",
     );
-    await expect(clayApi.endpoints.get("999")).rejects.toThrow(
+    await expect(waycastApi.endpoints.get("999")).rejects.toThrow(
       "Failed to fetch endpoint: 404",
     );
   });
@@ -555,9 +555,9 @@ describe("Error Handling", () => {
 describe("URL Construction", () => {
   it("should handle empty query parameters correctly", async () => {
     // Test that URLs are constructed correctly when no parameters are provided
-    const users = await clayApi.users.list();
-    const models = await clayApi.models.list();
-    const groups = await clayApi.groups.list();
+    const users = await waycastApi.users.list();
+    const models = await waycastApi.models.list();
+    const groups = await waycastApi.groups.list();
 
     expect(users).toBeInstanceOf(Array);
     expect(models).toBeInstanceOf(Object);
@@ -565,8 +565,8 @@ describe("URL Construction", () => {
   });
 
   it("should handle single query parameters", async () => {
-    const usersWithGroups = await clayApi.users.list({ include: "groups" });
-    const modelsFiltered = await clayApi.models.list({ endpoint: "2" });
+    const usersWithGroups = await waycastApi.users.list({ include: "groups" });
+    const modelsFiltered = await waycastApi.models.list({ endpoint: "2" });
 
     expect(usersWithGroups[0]).toHaveProperty("groups");
     expect(
@@ -575,11 +575,11 @@ describe("URL Construction", () => {
   });
 
   it("should handle multiple query parameters", async () => {
-    const models = await clayApi.models.list({
+    const models = await waycastApi.models.list({
       endpoint: "c3d4e5f6-7890-1234-5678-90abcdef0123",
       include: "groups",
     });
-    const groups = await clayApi.groups.list({ include: "users,models" });
+    const groups = await waycastApi.groups.list({ include: "users,models" });
 
     const modelValues = Object.values(models);
     expect(
@@ -596,16 +596,16 @@ describe("URL Construction", () => {
 
 describe("Type Safety", () => {
   it("should return correctly typed responses", async () => {
-    const user = await clayApi.users.get(
+    const user = await waycastApi.users.get(
       "550e8400-e29b-41d4-a716-446655440001",
     );
-    const model = await clayApi.models.get(
+    const model = await waycastApi.models.get(
       "f914c573-4c00-4a37-a878-53318a6d5a5b",
     );
-    const group = await clayApi.groups.get(
+    const group = await waycastApi.groups.get(
       "550e8400-e29b-41d4-a716-446655441001",
     );
-    const endpoint = await clayApi.endpoints.get(
+    const endpoint = await waycastApi.endpoints.get(
       "a1b2c3d4-e5f6-7890-1234-567890abcdef",
     );
 
@@ -627,8 +627,8 @@ describe("Type Safety", () => {
   });
 
   it("should handle optional fields correctly", async () => {
-    const usersWithGroups = await clayApi.users.list({ include: "groups" });
-    const modelsWithGroups = await clayApi.models.list({ include: "groups" });
+    const usersWithGroups = await waycastApi.users.list({ include: "groups" });
+    const modelsWithGroups = await waycastApi.models.list({ include: "groups" });
 
     // Optional fields should be present when requested
     expect(usersWithGroups[0].groups).toBeDefined();

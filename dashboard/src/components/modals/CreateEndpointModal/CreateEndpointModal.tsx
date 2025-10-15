@@ -3,7 +3,7 @@ import { Server, Check, AlertCircle, Loader2 } from "lucide-react";
 import { useForm } from "react-hook-form";
 import { zodResolver } from "@hookform/resolvers/zod";
 import * as z from "zod";
-import { useValidateEndpoint, useCreateEndpoint } from "../../../api/clay";
+import { useValidateEndpoint, useCreateEndpoint } from "../../../api/waycast";
 import { Button } from "../../ui/button";
 import {
   Dialog,
@@ -28,7 +28,7 @@ import type {
   EndpointValidateRequest,
   AvailableModel,
   EndpointCreateRequest,
-} from "../../../api/clay/types";
+} from "../../../api/waycast/types";
 
 interface CreateEndpointModalProps {
   isOpen: boolean;

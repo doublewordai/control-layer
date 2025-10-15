@@ -24,19 +24,19 @@ RUN apt-get update && apt-get install -y \
 
 # Create app directory
 WORKDIR /app
-RUN mkdir -p /app/clay
+RUN mkdir -p /app/waycast
 
-# Copy clay code and dependencies
-COPY clay/Cargo.toml clay/Cargo.lock clay/
-COPY clay/src clay/src
-COPY clay/migrations clay/migrations
-COPY clay/.sqlx clay/.sqlx
+# Copy waycast code and dependencies
+COPY waycast/Cargo.toml waycast/Cargo.lock waycast/
+COPY waycast/src waycast/src
+COPY waycast/migrations waycast/migrations
+COPY waycast/.sqlx waycast/.sqlx
 
 # Copy frontend build from dashboard-builder stage into static/ folder
 # This will be embedded into the binary by rust-embed
-COPY --from=dashboard-builder /app/dist clay/static/
+COPY --from=dashboard-builder /app/dist waycast/static/
 
-WORKDIR /app/clay/
+WORKDIR /app/waycast/
 
 # Build the application with offline mode for SQLx
 # The frontend assets in static/ will be embedded at compile time
@@ -65,10 +65,10 @@ RUN apt-get update && apt-get install -y \
   && rm -rf /var/lib/apt/lists/*
 
 # Copy the binary from backend builder stage (frontend is already embedded in the binary)
-COPY --from=backend-builder /app/clay/target/release/clay /app/clay
+COPY --from=backend-builder /app/waycast/target/release/waycast /app/waycast
 
 # Copy migrations
-COPY clay/migrations ./app/migrations
+COPY waycast/migrations ./app/migrations
 
 # Set working directory
 WORKDIR /app
@@ -77,5 +77,5 @@ WORKDIR /app
 EXPOSE 3001
 
 # Run the application
-ENTRYPOINT ["./clay"]
+ENTRYPOINT ["./waycast"]
 CMD []

@@ -1,4 +1,4 @@
-# Control Layer
+# Waycast
 
 **Enterprise Access Control for AI.**
 
