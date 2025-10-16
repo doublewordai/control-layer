@@ -28,7 +28,10 @@ Waycast requires a PostgreSQL database to run. If you have one already (for
 example, via a cloud provider), run:
 
 ```bash
-docker run -p 3001:3001 -e DATABASE_URL=<your postgres connection string here> -e SECRET_KEY="mysupersecretkey" waycast/waycast:latest
+docker run -p 3001:3001 \ 
+    -e DATABASE_URL=<your postgres connection string here> \
+    -e SECRET_KEY="mysupersecretkey" \
+    ghcr.io/doublewordai/waycast:latest
 ```
 
 Make sure to replace the secret key with a secure random value in production.
@@ -42,10 +45,10 @@ the container at `/app/config.yaml`, like follows:
 
 ```bash
 docker run -p 3001:3001 \
-  -e DATABASE_URL=<your postgres connection string here> 
+  -e DATABASE_URL=<your postgres connection string here> \
   -e SECRET_KEY="mysupersecretkey"  \
   -v ./config.yaml:/app/config.yaml \
-  waycast/waycast:latest
+  ghcr.io/doublewordai/waycast:latest
 ```
 
 The docker compose file will mount a
