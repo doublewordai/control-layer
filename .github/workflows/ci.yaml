@@ -454,6 +454,7 @@ jobs:
         if: matrix.target == 'x86_64-unknown-linux-musl'
         env:
           GITHUB_TOKEN: ${{ secrets.RELEASE_TOKEN }}
+          OPENSSL_VENDORED: "1"
         run: |
           cross build --release --target ${{ matrix.target }} --bin waycast --features embedded-db,build-frontend
 
