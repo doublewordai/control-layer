@@ -191,6 +191,7 @@ jobs:
           fi
 
   build:
+    if: github.event_name != 'release' || !github.event.release.prerelease
     runs-on: depot-ubuntu-24.04
 
     permissions:
@@ -405,7 +406,6 @@ jobs:
 
   build-binaries:
     if: github.event_name == 'release'
-    needs: [build]
     strategy:
       fail-fast: false
       matrix:
@@ -547,8 +547,7 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
   publish-crates:
-    if: github.event_name == 'release'
-    needs: [build]
+    if: github.event_name == 'release' && !github.event.release.prerelease
     runs-on: depot-ubuntu-24.04
 
     steps:
