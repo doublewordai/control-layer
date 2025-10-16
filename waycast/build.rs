@@ -1,3 +1,4 @@
+/// Build script to support building the frontend with npm.
 use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
