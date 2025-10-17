@@ -17,9 +17,6 @@ services:
   waycast:
     image: ${IMAGE:-ghcr.io/doublewordai/waycast:${TAG:-latest}}
     pull_policy: ${PULL_POLICY:-always}
-    build:
-      context: .
-      dockerfile: Dockerfile
     ports:
       - "3001:3001"
     environment:
