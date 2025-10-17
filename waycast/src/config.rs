@@ -147,7 +147,11 @@ pub struct NativeAuthConfig {
 pub struct ProxyHeaderAuthConfig {
     pub enabled: bool,
     pub header_name: String,
+    pub groups_field_name: String,
     pub auto_create_users: bool,
+    pub blacklisted_sso_groups: Vec<String>,
+    pub provider_field_name: String,
+    pub import_idp_groups: bool,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -295,7 +299,11 @@ impl Default for ProxyHeaderAuthConfig {
         Self {
             enabled: false,
             header_name: "x-doubleword-user".to_string(),
+            groups_field_name: "x-doubleword-user-groups".to_string(),
+            provider_field_name: "x-doubleword-sso-provider".to_string(),
             auto_create_users: true,
+            blacklisted_sso_groups: Vec::new(),
+            import_idp_groups: false,
         }
     }
 }

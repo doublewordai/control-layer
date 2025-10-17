@@ -1,3 +1,5 @@
+use crate::db::errors::DbError;
+use crate::db::handlers::Groups;
 use crate::{
     api::models::users::{CurrentUser, Role},
     auth::session,
@@ -9,13 +11,11 @@ use crate::{
     AppState,
 };
 use axum::{extract::FromRequestParts, http::request::Parts};
+use sqlx::PgPool;
+use tracing::info;
 
 /// Extract user from JWT session cookie if present and valid
-fn try_jwt_session_auth(
-    parts: &axum::http::request::Parts,
-    config: &crate::config::Config,
-    _user_repo: &mut Users, // Not used for JWT auth but consistent signature
-) -> Result<Option<CurrentUser>> {
+fn try_jwt_session_auth(parts: &axum::http::request::Parts, config: &crate::config::Config) -> Result<Option<CurrentUser>> {
     let cookie_header = match parts.headers.get(axum::http::header::COOKIE) {
         Some(header) => header,
         None => return Ok(None),
@@ -49,7 +49,7 @@ fn try_jwt_session_auth(
 async fn try_proxy_header_auth(
     parts: &axum::http::request::Parts,
     config: &crate::config::Config,
-    user_repo: &mut Users<'_>,
+    db: &PgPool,
 ) -> Result<Option<CurrentUser>> {
     let user_email = match parts
         .headers
@@ -60,8 +60,12 @@ async fn try_proxy_header_auth(
         None => return Ok(None),
     };
 
-    match user_repo.get_user_by_email(user_email).await? {
-        Some(user) => Ok(Some(CurrentUser {
+    let mut tx = db.begin().await.unwrap();
+    let mut user_repo = Users::new(&mut tx);
+
+    info!("User email from header: {:?}", parts.headers);
+    let user_result = match user_repo.get_user_by_email(user_email).await? {
+        Some(user) => Some(CurrentUser {
             id: user.id,
             username: user.username,
             email: user.email,
@@ -69,7 +73,7 @@ async fn try_proxy_header_auth(
             roles: user.roles,
             display_name: user.display_name,
             avatar_url: user.avatar_url,
-        })),
+        }),
         None => {
             if config.auth.proxy_header.auto_create_users {
                 let create_request = UserCreateDBRequest {
@@ -84,7 +88,7 @@ async fn try_proxy_header_auth(
                 };
 
                 let new_user = user_repo.create(&create_request).await?;
-                Ok(Some(CurrentUser {
+                Some(CurrentUser {
                     id: new_user.id,
                     username: new_user.username,
                     email: new_user.email,
@@ -92,32 +96,75 @@ async fn try_proxy_header_auth(
                     roles: new_user.roles,
                     display_name: new_user.display_name,
                     avatar_url: new_user.avatar_url,
-                }))
+                })
             } else {
-                Ok(None)
+                None
+            }
+        }
+    };
+
+    // If we found a user, check their oauth groups match their db ones.
+    if let Some(user) = &user_result {
+        if config.auth.proxy_header.import_idp_groups {
+            let user_groups: Option<Vec<&str>> = match parts
+                .headers
+                .get(&config.auth.proxy_header.groups_field_name)
+                .and_then(|h| h.to_str().ok())
+            {
+                Some(group_string) => {
+                    let groups: Vec<&str> = group_string
+                        .split(",")
+                        .map(|g| g.trim())
+                        .filter(|g| !config.auth.proxy_header.blacklisted_sso_groups.contains(&g.to_string()))
+                        .collect();
+                    if groups.is_empty() {
+                        None
+                    } else {
+                        Some(groups)
+                    }
+                }
+                None => None,
+            };
+
+            let source = parts
+                .headers
+                .get(&config.auth.proxy_header.provider_field_name) // &String works as &str
+                .and_then(|h| h.to_str().ok()) // convert HeaderValue → &str
+                .unwrap_or("unknown"); // default if header missing or invalid UTF-8
+            if let Some(groups) = user_groups {
+                let mut group_repo = Groups::new(&mut tx);
+                group_repo
+                    .sync_groups_with_sso(
+                        user.id,
+                        groups.into_iter().map(|s| s.to_string()).collect(),
+                        source,
+                        &format!("A group provisioned by the {source} SSO source."),
+                    )
+                    .await?;
             }
         }
     }
+
+    // Only commit if both user and group operations succeeded
+    tx.commit().await.map_err(DbError::from)?;
+    Ok(user_result)
 }
 
 impl FromRequestParts<AppState> for CurrentUser {
     type Rejection = Error;
 
     async fn from_request_parts(parts: &mut Parts, state: &AppState) -> Result<Self> {
-        let mut user_conn = state.db.acquire().await.unwrap();
-        let mut user_repo = Users::new(&mut user_conn);
-
         // Try authentication methods in order, returning the first successful one
         // Native authentication first (JWT sessions)
         if state.config.auth.native.enabled {
-            if let Some(user) = try_jwt_session_auth(parts, &state.config, &mut user_repo)? {
+            if let Some(user) = try_jwt_session_auth(parts, &state.config)? {
                 return Ok(user);
             }
         }
 
         // Fall back to proxy header authentication
         if state.config.auth.proxy_header.enabled {
-            if let Some(user) = try_proxy_header_auth(parts, &state.config, &mut user_repo).await? {
+            if let Some(user) = try_proxy_header_auth(parts, &state.config, &state.db).await? {
                 return Ok(user);
             }
         }

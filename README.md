@@ -104,7 +104,13 @@ auth:
   proxy_header:
     enabled: false # X-Doubleword-User header auth
     header_name: "x-doubleword-user"
-    # Whether users should be automatically created if their email is supplied
+    groups_field_name: "x-doubleword-user-groups" # Header from which to read out group claims
+    blacklisted_sso_groups:  # Which SSO groups to ignore from the iDP
+       - "t1"
+       - "t2"
+    provider_field_name: "x-doubleword-sso-provider" # Header from which to read the sso provider (for source column)
+    import_idp_groups: false # Whether to import iDP groups or not
+     # Whether users should be automatically created if their email is supplied
     # in a header, or whether they must be pre-created by an admin in the UI.
     # If false, users that aren't precreated will receive a 403 Forbidden error.
     auto_create_users: true
