@@ -47,10 +47,10 @@ brew install just hurl
 # hurl: https://hurl.dev/docs/installation.html
 ```
 
-You'll need rust installed to develop the backend, and `npm` for the frontend.
-We use [sqlx](https://github.com/launchbadge/sqlx) for rust development, so
-you'll need a running postgres database to compile the project. Alternatively,
-if you're not changing the postgres queries, you can build with
+You'll need rust installed to develop the backend, and `npm` and `node` for the
+frontend. We use [sqlx](https://github.com/launchbadge/sqlx) for rust
+development, so you'll need a running postgres database to compile the project.
+Alternatively, if you're not changing the postgres queries, you can build with
 `SQLX_OFFLINE=1` to skip the database check at compile time.
 
 **Important**: Rust version 1.88 or higher is required for SQLx compatibility.
