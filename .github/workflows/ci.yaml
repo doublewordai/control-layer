@@ -231,28 +231,16 @@ jobs:
           echo "start_time=$START_TIME" >> $GITHUB_OUTPUT
           echo "Starting Docker build at $(date)"
 
-      - name: Format tags for bake
-        id: format-tags
-        run: |
-          TAGS="${{ steps.meta.outputs.tags }}"
-          # Convert newline-separated tags into multiple --set lines
-          TAG_SETS=$(echo "$TAGS" | sed 's/^/waycast.tags=/')
-          echo "tag_sets<<EOF" >> $GITHUB_OUTPUT
-          echo "$TAG_SETS" >> $GITHUB_OUTPUT
-          echo "EOF" >> $GITHUB_OUTPUT
-
-      - name: Run depot bake
-        uses: depot/bake-action@v1
+      - name: Build and push with Depot
+        uses: depot/build-push-action@v1
         with:
-          files: ./docker-compose.yml
-          targets: waycast
+          context: .
+          file: ./Dockerfile
+          platforms: linux/amd64,linux/arm64
           push: true
-          project: ${{ secrets.DEPOT_PROJECT_ID }}
-          set: |
-            ${{ steps.format-tags.outputs.tag_sets }}
-            *.attest=type=sbom
-            *.attest=type=provenance
-            waycast.platform=linux/amd64,linux/arm64
+          tags: ${{ steps.meta.outputs.tags }}
+          sbom: true
+          provenance: true
 
       - name: Record build time
         id: build-time-step
