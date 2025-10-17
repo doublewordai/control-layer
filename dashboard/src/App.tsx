@@ -41,12 +41,18 @@ const queryClient = new QueryClient({
           // Check if it's our ApiError with status property
           if (
             "status" in error &&
-            (error.status === 401 || error.status === 403 || error.status === 404)
+            (error.status === 401 ||
+              error.status === 403 ||
+              error.status === 404)
           ) {
             return false;
           }
           // Also check error message for "401", "403", or "404" as fallback
-          if (error.message.includes("401") || error.message.includes("403") || error.message.includes("404")) {
+          if (
+            error.message.includes("401") ||
+            error.message.includes("403") ||
+            error.message.includes("404")
+          ) {
             return false;
           }
         }
@@ -81,7 +87,7 @@ function RootRedirect() {
 }
 
 function AppRoutes() {
-  const { isFeatureEnabled, isMswReady, setMswReady, settings } = useSettings();
+  const { isFeatureEnabled, isMswReady, setMswReady } = useSettings();
   const { data: registrationInfo } = useRegistrationInfo();
 
   // Initialize MSW based on demo mode
@@ -112,28 +118,6 @@ function AppRoutes() {
 
     enableMocking();
   }, [isFeatureEnabled, setMswReady]);
-
-  // Set up global fetch wrapper for dev user impersonation
-  useEffect(() => {
-    const originalFetch = window.fetch;
-    window.fetch = function (url, options = {}) {
-      if (isFeatureEnabled("devUser") && settings.impersonateUserHeader) {
-        // Properly handle headers whether they're a Headers object or plain object
-        const headers = new Headers(options.headers || {});
-        headers.set("X-Doubleword-User", settings.impersonateUserHeader);
-
-        options = {
-          ...options,
-          headers: headers,
-        };
-      }
-      return originalFetch(url, options);
-    };
-
-    return () => {
-      window.fetch = originalFetch;
-    }; // cleanup
-  }, [isFeatureEnabled, settings.impersonateUserHeader]);
 
   // Show loading screen while MSW initializes in demo mode
   if (isFeatureEnabled("demo") && !isMswReady) {

@@ -12,7 +12,11 @@ import {
   Edit,
   Check,
 } from "lucide-react";
-import { useModels, useEndpoints, useUpdateModel } from "../../../../api/waycast";
+import {
+  useModels,
+  useEndpoints,
+  useUpdateModel,
+} from "../../../../api/waycast";
 import { getModelType } from "../../../../utils/modelType";
 import { useAuthorization } from "../../../../utils";
 import { ApiExamples, AccessManagementModal } from "../../../modals";

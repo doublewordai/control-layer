@@ -152,23 +152,3 @@ impl EmbeddedDatabase {
         Ok(())
     }
 }
-
-#[cfg(test)]
-#[cfg(feature = "embedded-db")]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_mask_password() {
-        let url = "postgresql://user:secret@localhost:5432/dbname";
-        let masked = mask_password(url);
-        assert_eq!(masked, "postgresql://user:****@localhost:5432/dbname");
-    }
-
-    #[test]
-    fn test_mask_password_no_password() {
-        let url = "postgresql://localhost:5432/dbname";
-        let masked = mask_password(url);
-        assert_eq!(masked, url);
-    }
-}

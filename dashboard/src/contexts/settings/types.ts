@@ -4,8 +4,16 @@
 export interface FeatureFlags {
   /** Enable demo mode with mock data and service worker */
   demo: boolean;
-  /** Enable development user switcher for testing different roles */
-  devUser: boolean;
+}
+
+/**
+ * Configuration for demo mode behavior
+ */
+export interface DemoConfig {
+  /** Custom response template for playground chat completions */
+  customResponse?: string;
+  /** Whether to include the user's message in the response */
+  includeUserMessage?: boolean;
 }
 
 /**
@@ -16,6 +24,6 @@ export interface AppSettings {
   apiBaseUrl: string;
   /** Feature flag toggles */
   features: FeatureFlags;
-  /** User email to impersonate via X-Doubleword-User header in development */
-  impersonateUserHeader?: string;
+  /** Demo mode configuration */
+  demoConfig?: DemoConfig;
 }

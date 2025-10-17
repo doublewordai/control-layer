@@ -1,5 +1,5 @@
 import { createContext } from "react";
-import type { FeatureFlags, AppSettings } from "./types";
+import type { FeatureFlags, AppSettings, DemoConfig } from "./types";
 
 /**
  * Context type for the Settings system
@@ -11,8 +11,8 @@ export interface SettingsContextType {
   toggleFeature: (feature: keyof FeatureFlags, enabled: boolean) => void;
   /** Check if a feature flag is currently enabled */
   isFeatureEnabled: (feature: keyof FeatureFlags) => boolean;
-  /** Set the user email to impersonate via X-Doubleword-User header */
-  setImpersonateUser: (email: string) => void;
+  /** Update demo mode configuration */
+  updateDemoConfig: (config: Partial<DemoConfig>) => void;
   /** Whether MSW (Mock Service Worker) is ready to handle requests */
   isMswReady: boolean;
   /** Set MSW ready state */

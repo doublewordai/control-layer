@@ -6,9 +6,8 @@ description = "A self-hostable observability and analytics platform for LLM appl
 license = "MIT OR Apache-2.0"
 
 [features]
-default = []
+default = ["embedded-db"]
 embedded-db = ["dep:postgresql_embedded"]
-build-frontend = []
 
 [dependencies]
 axum = "0.8"

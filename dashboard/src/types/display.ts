@@ -1,4 +1,7 @@
-import type { User as BackendUser, Group as BackendGroup } from "../api/waycast";
+import type {
+  User as BackendUser,
+  Group as BackendGroup,
+} from "../api/waycast";
 
 // Frontend display types - extending backend types with computed fields
 export type DisplayUser = BackendUser & {

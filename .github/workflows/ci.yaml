@@ -412,12 +412,31 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v4
 
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: "npm"
+          cache-dependency-path: dashboard/package-lock.json
+
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
 
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: waycast
+
+      - name: Build frontend and copy to waycast/static
+        run: |
+          echo "Building frontend for crates.io package..."
+          cd dashboard
+          npm ci
+          npm run build
+          echo "Copying built files to waycast/static..."
+          rm -rf ../waycast/static
+          cp -r dist ../waycast/static
+          echo "✅ Frontend built and copied to waycast/static"
+          ls -la ../waycast/static
 
       - name: Publish waycast to crates.io
         working-directory: ./waycast

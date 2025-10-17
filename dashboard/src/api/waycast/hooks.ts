@@ -258,7 +258,8 @@ export function useCreateEndpoint() {
 
   return useMutation({
     mutationKey: ["endpoints", "create"],
-    mutationFn: (data: EndpointCreateRequest) => waycastApi.endpoints.create(data),
+    mutationFn: (data: EndpointCreateRequest) =>
+      waycastApi.endpoints.create(data),
     onSettled: () => {
       queryClient.invalidateQueries({ queryKey: queryKeys.endpoints.all });
       queryClient.invalidateQueries({ queryKey: queryKeys.models.all });
@@ -413,7 +414,8 @@ export function useRequestsAggregateByUser(
 ) {
   return useQuery({
     queryKey: queryKeys.requests.aggregateByUser(model, startDate, endDate),
-    queryFn: () => waycastApi.requests.aggregateByUser(model, startDate, endDate),
+    queryFn: () =>
+      waycastApi.requests.aggregateByUser(model, startDate, endDate),
     enabled: !!model,
   });
 }
@@ -438,7 +440,8 @@ export function useLoginInfo() {
 export function useRequestPasswordReset() {
   return useMutation({
     mutationKey: ["password-reset", "request"],
-    mutationFn: (email: string) => waycastApi.auth.requestPasswordReset({ email }),
+    mutationFn: (email: string) =>
+      waycastApi.auth.requestPasswordReset({ email }),
   });
 }
 
