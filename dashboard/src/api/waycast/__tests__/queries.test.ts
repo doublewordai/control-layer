@@ -192,9 +192,9 @@ describe("waycastApi.users", () => {
       it("should throw error for non-existent API key", async () => {
         const nonExistentId = "non-existent-key";
 
-        await expect(waycastApi.users.apiKeys.get(nonExistentId)).rejects.toThrow(
-          "Failed to fetch API key: 404",
-        );
+        await expect(
+          waycastApi.users.apiKeys.get(nonExistentId),
+        ).rejects.toThrow("Failed to fetch API key: 404");
       });
     });
 
@@ -220,7 +220,10 @@ describe("waycastApi.users", () => {
           name: "User Key",
         };
 
-        const createdKey = await waycastApi.users.apiKeys.create(keyData, userId);
+        const createdKey = await waycastApi.users.apiKeys.create(
+          keyData,
+          userId,
+        );
 
         expect(createdKey).toHaveProperty("key");
         expect(createdKey.name).toBe(keyData.name);
@@ -628,7 +631,9 @@ describe("Type Safety", () => {
 
   it("should handle optional fields correctly", async () => {
     const usersWithGroups = await waycastApi.users.list({ include: "groups" });
-    const modelsWithGroups = await waycastApi.models.list({ include: "groups" });
+    const modelsWithGroups = await waycastApi.models.list({
+      include: "groups",
+    });
 
     // Optional fields should be present when requested
     expect(usersWithGroups[0].groups).toBeDefined();

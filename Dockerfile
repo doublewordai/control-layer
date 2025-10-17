@@ -21,9 +21,16 @@ COPY Cargo.toml Cargo.lock ./
 COPY waycast/ waycast/
 COPY dashboard/ dashboard/
 
+# Build frontend and copy to waycast/static
+WORKDIR /app/dashboard
+RUN npm ci && npm run build
+WORKDIR /app
+RUN rm -rf waycast/static && cp -r dashboard/dist waycast/static
+
 # Build from workspace root (target dir will be at /app/target)
+# Use --no-default-features to disable embedded-db for Docker (uses external postgres)
 ENV SQLX_OFFLINE=true
-RUN cargo build --release -p waycast --features build-frontend
+RUN cargo build --release -p waycast --no-default-features
 
 # Development stage
 FROM backend-builder AS dev
