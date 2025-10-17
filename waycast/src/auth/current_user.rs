@@ -53,7 +53,7 @@ async fn try_proxy_header_auth(
 ) -> Result<Option<CurrentUser>> {
     let user_email = match parts
         .headers
-        .get(&config.auth.proxy_header.user_field_name)
+        .get(&config.auth.proxy_header.header_name)
         .and_then(|h| h.to_str().ok())
     {
         Some(email) => email,
