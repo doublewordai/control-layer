@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.1.3](https://github.com/doublewordai/waycast/compare/v0.1.2...v0.1.3) (2025-10-17)
+
+
+### Bug Fixes
+
+* update demos to match all current features ([#21](https://github.com/doublewordai/waycast/issues/21)) ([83b5886](https://github.com/doublewordai/waycast/commit/83b5886b32287a1db86c424b2d320cd07a979ffe))
+
 ## [0.1.2](https://github.com/doublewordai/waycast/compare/v0.1.1...v0.1.2) (2025-10-16)
 
 
