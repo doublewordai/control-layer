@@ -31,6 +31,7 @@ struct Group {
     pub created_by: UserId,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
+    pub source: String,
 }
 
 pub struct Groups<'c> {
@@ -46,6 +47,7 @@ impl From<Group> for GroupDBResponse {
             created_by: group.created_by,
             created_at: group.created_at,
             updated_at: group.updated_at,
+            source: group.source,
         }
     }
 }
@@ -62,11 +64,12 @@ impl<'c> Repository for Groups<'c> {
         let created_at = Utc::now();
         let updated_at = created_at;
 
+        // all groups created via handler/api are native, sso groups use the sync function instead
         let group = sqlx::query_as!(
             Group,
             r#"
-            INSERT INTO groups (name, description, created_by, created_at, updated_at)
-            VALUES ($1, $2, $3, $4, $5)
+            INSERT INTO groups (name, description, created_by, created_at, updated_at, source)
+            VALUES ($1, $2, $3, $4, $5, 'native')
             RETURNING *
             "#,
             request.name,
@@ -93,6 +96,7 @@ impl<'c> Repository for Groups<'c> {
             created_by: g.created_by,
             created_at: g.created_at,
             updated_at: g.updated_at,
+            source: g.source,
         }))
     }
 
@@ -421,6 +425,88 @@ impl<'c> Groups<'c> {
 
         Ok(result)
     }
+
+    pub async fn sync_groups_with_sso(
+        &mut self,
+        user_id: UserId,
+        group_names: Vec<String>,
+        source: &str,
+        description: &str,
+    ) -> Result<Vec<Uuid>> {
+        let row = sqlx::query!(
+        r#"
+
+        -- Unravel the list of group ids to check into a table
+        WITH incoming AS (
+            SELECT unnest($1::text[]) AS name
+        ),
+
+        -- Find the ids of groups that already exist with that name for this source
+        existing AS (
+            SELECT id, name
+            FROM groups
+            WHERE name IN (SELECT name FROM incoming)
+              AND source = $2
+        ),
+
+        -- Insert any non existing ones
+        inserted AS (
+            INSERT INTO groups (name, description, created_by, created_at, updated_at, source)
+            SELECT name, $4, $3, NOW(), NOW(), $2
+            FROM incoming i
+            WHERE NOT EXISTS (
+                SELECT 1 FROM groups g WHERE g.name = i.name
+            ) --NB THIS CURRENTLY MEANS YOU CANT HAVE THE SAME NAMES but different sources.
+            -- You could change the constraint to allow this, and then we wouldn't need to check every existing one for the name just the existing ones for that sso provider only.
+            RETURNING id, name
+        ),
+
+        -- Get the ids for the found existing, and the inserted ones
+        all_ids AS (
+            SELECT * FROM existing
+            UNION ALL
+            SELECT * FROM inserted
+        ),
+
+        -- Get ids of all the groups this user isn't a member of for this source - either they were
+        -- never members or they've been removed since being added.
+        orphan_ids AS (
+            SELECT id FROM groups g
+            WHERE g.source = $2
+              AND g.id NOT IN (SELECT id FROM all_ids)
+        ),
+
+        -- Remove memberships from groups the user shouldn't be in
+        deleted_user_groups AS (
+            DELETE FROM user_groups ug
+            USING orphan_ids o
+            WHERE ug.group_id = o.id
+            RETURNING ug.group_id
+        ),
+
+        -- Add memberships to groups the user should be in, if they're already in then just skip.
+        insert_user_groups AS (
+            INSERT INTO user_groups (user_id, group_id)
+            SELECT $3, g.id
+            FROM all_ids g
+            ON CONFLICT (user_id, group_id) DO NOTHING
+            RETURNING user_id, group_id
+        )
+
+        -- We want back the ids of the groups that this user is now in.
+        SELECT array_agg(id) AS member_group_ids
+        FROM all_ids
+        "#,
+        &group_names, //1
+        source,  //2
+        user_id, //3
+        description //4
+    )
+            .fetch_one(&mut *self.db)
+            .await?;
+
+        Ok(row.member_group_ids.unwrap_or_default())
+    }
 }
 
 #[cfg(test)]
@@ -446,6 +532,7 @@ mod tests {
             created_by: original_response.created_by,
             created_at: original_response.created_at,
             updated_at: chrono::Utc::now(),
+            source: "native".to_string(),
         }
     }
 
@@ -1723,6 +1810,7 @@ mod tests {
             created_by: UserId::new_v4(),
             created_at: original_time,
             updated_at: original_time,
+            source: "native".to_string(),
         };
 
         // Test ApplyUpdate trait directly
@@ -1755,6 +1843,7 @@ mod tests {
             created_by: UserId::new_v4(),
             created_at: original_time,
             updated_at: original_time,
+            source: "native".to_string(),
         };
 
         // Test ApplyUpdate with only name
@@ -1797,6 +1886,7 @@ mod tests {
             created_by: UserId::new_v4(),
             created_at: original_time,
             updated_at: original_time,
+            source: "native".to_string(),
         };
 
         // Test ApplyUpdate with no changes
@@ -1826,6 +1916,7 @@ mod tests {
             created_by: UserId::new_v4(),
             created_at: original_time,
             updated_at: original_time,
+            source: "native".to_string(),
         };
 
         // Test clearing description with empty string

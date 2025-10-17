@@ -5,7 +5,8 @@
     "description": "Full access to all development models",
     "created_by": "550e8400-e29b-41d4-a716-446655440000",
     "created_at": "2024-01-01T10:00:00Z",
-    "updated_at": "2024-01-15T14:30:00Z"
+    "updated_at": "2024-01-15T14:30:00Z",
+    "source": "native"
   },
   {
     "id": "550e8400-e29b-41d4-a716-446655441002",
@@ -13,7 +14,9 @@
     "description": "Access to analytics and ML models",
     "created_by": "550e8400-e29b-41d4-a716-446655440000",
     "created_at": "2024-01-02T09:15:00Z",
-    "updated_at": "2024-01-18T11:20:00Z"
+    "updated_at": "2024-01-18T11:20:00Z",
+    "source": "native"
+
   },
   {
     "id": "550e8400-e29b-41d4-a716-446655441003",
@@ -21,7 +24,8 @@
     "description": "Product team access to user-facing models",
     "created_by": "550e8400-e29b-41d4-a716-446655440000",
     "created_at": "2024-01-03T13:45:00Z",
-    "updated_at": "2024-01-20T09:10:00Z"
+    "updated_at": "2024-01-20T09:10:00Z",
+    "source": "native"
   },
   {
     "id": "550e8400-e29b-41d4-a716-446655441004",
@@ -29,7 +33,8 @@
     "description": "Machine learning specialists with advanced model access",
     "created_by": "550e8400-e29b-41d4-a716-446655440000",
     "created_at": "2024-01-05T16:20:00Z",
-    "updated_at": "2024-01-22T12:45:00Z"
+    "updated_at": "2024-01-22T12:45:00Z",
+    "source": "native"
   },
   {
     "id": "550e8400-e29b-41d4-a716-446655441005",
@@ -37,6 +42,7 @@
     "description": "Infrastructure and deployment access",
     "created_by": "550e8400-e29b-41d4-a716-446655440000",
     "created_at": "2024-01-07T11:30:00Z",
-    "updated_at": "2024-01-19T15:15:00Z"
+    "updated_at": "2024-01-19T15:15:00Z",
+    "source": "native"
   }
 ]
