@@ -20,6 +20,43 @@ pub struct OpenAIModelsResponse {
     pub data: Vec<OpenAIModel>,
 }
 
+/// A model from the Anthropic API
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct AnthropicModel {
+    pub created_at: String,
+    pub display_name: String,
+    pub id: String,
+    pub r#type: String,
+}
+
+/// Response from the /v1/models endpoint of the anthropic API
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct AnthropicModelsResponse {
+    pub data: Vec<AnthropicModel>,
+    pub first_id: String,
+    pub has_more: bool,
+    pub last_id: String,
+}
+
+impl From<AnthropicModelsResponse> for OpenAIModelsResponse {
+    fn from(anthropic: AnthropicModelsResponse) -> Self {
+        let data = anthropic
+            .data
+            .into_iter()
+            .map(|model| OpenAIModel {
+                id: model.id,
+                object: "model".to_string(),
+                created: 0,
+                owned_by: "anthropic".to_string(),
+            })
+            .collect();
+        Self {
+            object: "list".to_string(),
+            data,
+        }
+    }
+}
+
 /// Query parameters for listing inference endpoints
 #[derive(Debug, Deserialize, IntoParams, ToSchema)]
 pub struct ListEndpointsQuery {
