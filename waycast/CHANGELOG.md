@@ -1,5 +1,19 @@
 # Changelog
 
+## [0.3.0](https://github.com/doublewordai/waycast/compare/v0.2.0...v0.3.0) (2025-10-17)
+
+
+### Features
+
+* anthropic support ([#28](https://github.com/doublewordai/waycast/issues/28)) ([e6d444b](https://github.com/doublewordai/waycast/commit/e6d444bdd8b84ca248ba2f17d4b4a30a6522adfc))
+* expect '/v1' to be added to the openai api base path. We used to add '/v1/models/' to base paths when we were querying for models from upstream providers, but hereinafter, we'll only add '/models'. That way, we can support APIs that don't expose their openAI compatible APIs under a /v1/ subpath.([#25](https://github.com/doublewordai/waycast/issues/25)) ([3c5f3e6](https://github.com/doublewordai/waycast/commit/3c5f3e673f1bd214651673ec98377dd1f8cb3120))
+
+
+### Bug Fixes
+
+* improve splash page, and add dropdown options for anthropic, gemini, openai ([#29](https://github.com/doublewordai/waycast/issues/29)) ([7878d6b](https://github.com/doublewordai/waycast/commit/7878d6ba39d4066bd01e8d2ffdc2c84ae00f1f56))
+* make trailing slash behaviour better ([#24](https://github.com/doublewordai/waycast/issues/24)) ([cfc5335](https://github.com/doublewordai/waycast/commit/cfc533543dc0ba858d5e6c744a53874fd5558b44))
+
 ## [0.2.0](https://github.com/doublewordai/waycast/compare/v0.1.3...v0.2.0) (2025-10-17)
 
 
