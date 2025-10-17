@@ -1,4 +1,5 @@
-import { useState } from "react";
+import { useState, useEffect } from "react";
+import { useLocation } from "react-router-dom";
 import { Server, Plus, Trash2 } from "lucide-react";
 import {
   useEndpoints,
@@ -25,6 +26,7 @@ import {
 import type { Endpoint } from "../../../../api/waycast/types";
 
 export function Endpoints() {
+  const location = useLocation();
   const [showCreateModal, setShowCreateModal] = useState(false);
   const [endpointToDelete, setEndpointToDelete] = useState<Endpoint | null>(
     null,
@@ -37,6 +39,15 @@ export function Endpoints() {
   const synchronizeEndpointMutation = useSynchronizeEndpoint();
   const updateEndpointMutation = useUpdateEndpoint();
   const deleteEndpointMutation = useDeleteEndpoint();
+
+  // Auto-open create modal if navigated from another page with the flag
+  useEffect(() => {
+    if (location.state?.openCreateModal) {
+      setShowCreateModal(true);
+      // Clear the state to prevent reopening on refresh
+      window.history.replaceState({}, document.title);
+    }
+  }, [location]);
 
   const handleEdit = (endpoint: Endpoint) => {
     setEndpointToEdit(endpoint);

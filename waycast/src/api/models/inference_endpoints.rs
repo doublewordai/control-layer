@@ -9,7 +9,7 @@ use utoipa::{IntoParams, ToSchema};
 pub struct OpenAIModel {
     pub id: String,
     pub object: String,
-    pub created: i64,
+    pub created: Option<i64>, // openAI always returns this, but google never does
     pub owned_by: String,
 }
 
@@ -46,7 +46,7 @@ impl From<AnthropicModelsResponse> for OpenAIModelsResponse {
             .map(|model| OpenAIModel {
                 id: model.id,
                 object: "model".to_string(),
-                created: 0,
+                created: Some(0),
                 owned_by: "anthropic".to_string(),
             })
             .collect();
