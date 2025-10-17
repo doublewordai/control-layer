@@ -84,7 +84,7 @@ fn ensure_slash(url: &Url) -> Url {
 impl FetchModels for FetchModelsReqwest {
     async fn fetch(&self) -> anyhow::Result<OpenAIModelsResponse> {
         let url = ensure_slash(&self.base_url)
-            .join("v1/models")
+            .join("models")
             .map_err(|e| anyhow::anyhow!("Failed to construct models URL: {}", e))?;
 
         debug!("Fetching models from URL: {}", url);
