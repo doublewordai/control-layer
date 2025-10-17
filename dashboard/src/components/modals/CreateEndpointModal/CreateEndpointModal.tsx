@@ -1,5 +1,5 @@
 import React, { useState, useEffect } from "react";
-import { Server, Check, AlertCircle, Loader2 } from "lucide-react";
+import { Server, Check, AlertCircle, Loader2, Info, ChevronDown, X } from "lucide-react";
 import { useForm } from "react-hook-form";
 import { zodResolver } from "@hookform/resolvers/zod";
 import * as z from "zod";
@@ -24,6 +24,16 @@ import {
 import { Input } from "../../ui/input";
 import { Textarea } from "../../ui/textarea";
 import { Checkbox } from "../../ui/checkbox";
+import {
+  HoverCard,
+  HoverCardContent,
+  HoverCardTrigger,
+} from "../../ui/hover-card";
+import {
+  Popover,
+  PopoverContent,
+  PopoverTrigger,
+} from "../../ui/popover";
 import type {
   EndpointValidateRequest,
   AvailableModel,
@@ -49,6 +59,31 @@ const formSchema = z.object({
 
 type FormData = z.infer<typeof formSchema>;
 
+// Popular endpoint presets
+const POPULAR_ENDPOINTS = [
+  {
+    name: "OpenAI",
+    url: "https://api.openai.com/v1",
+    icon: "/endpoints/openai.svg",
+    apiKeyUrl: "https://platform.openai.com/api-keys",
+    requiresApiKey: true
+  },
+  {
+    name: "Anthropic",
+    url: "https://api.anthropic.com/v1",
+    icon: "/endpoints/anthropic.svg",
+    apiKeyUrl: "https://console.anthropic.com/settings/keys",
+    requiresApiKey: true
+  },
+  {
+    name: "Google",
+    url: "https://generativelanguage.googleapis.com/v1beta/openai/",
+    icon: "/endpoints/google.svg",
+    apiKeyUrl: "https://aistudio.google.com/api-keys",
+    requiresApiKey: true
+  },
+];
+
 export const CreateEndpointModal: React.FC<CreateEndpointModalProps> = ({
   isOpen,
   onClose,
@@ -59,6 +94,7 @@ export const CreateEndpointModal: React.FC<CreateEndpointModalProps> = ({
     useState<ValidationState>("idle");
   const [validationError, setValidationError] = useState<string | null>(null);
   const [availableModels, setAvailableModels] = useState<AvailableModel[]>([]);
+  const [urlPopoverOpen, setUrlPopoverOpen] = useState(false);
 
   const validateEndpointMutation = useValidateEndpoint();
   const createEndpointMutation = useCreateEndpoint();
@@ -199,25 +235,128 @@ export const CreateEndpointModal: React.FC<CreateEndpointModalProps> = ({
               name="url"
               render={({ field }) => (
                 <FormItem>
-                  <FormLabel>Endpoint URL *</FormLabel>
+                  <div className="flex items-center gap-1.5">
+                    <FormLabel>Endpoint URL *</FormLabel>
+                    <HoverCard openDelay={200} closeDelay={100}>
+                      <HoverCardTrigger asChild>
+                        <button
+                          type="button"
+                          className="text-gray-500 hover:text-gray-700 transition-colors"
+                          onFocus={(e) => e.preventDefault()}
+                          tabIndex={-1}
+                        >
+                          <Info className="h-4 w-4" />
+                          <span className="sr-only">
+                            Endpoint URL information
+                          </span>
+                        </button>
+                      </HoverCardTrigger>
+                      <HoverCardContent className="w-80" sideOffset={5}>
+                        <p className="text-sm text-muted-foreground">
+                          The base URL of your OpenAI-compatible inference endpoint.
+                        </p>
+                      </HoverCardContent>
+                    </HoverCard>
+                  </div>
                   <FormControl>
-                    <Input
-                      placeholder="https://api.example.com"
-                      {...field}
-                      onChange={(e) => {
-                        field.onChange(e);
-                        // Reset validation state when URL changes
-                        if (validationState === "success") {
-                          setValidationState("idle");
-                          setAvailableModels([]);
-                          form.setValue("selectedModels", []);
-                        }
-                        if (validationError) {
-                          setValidationError(null);
-                          setValidationState("idle");
-                        }
-                      }}
-                    />
+                    <div className="relative">
+                      <Input
+                        placeholder="https://api.example.com"
+                        {...field}
+                        className="pr-10"
+                        onChange={(e) => {
+                          field.onChange(e);
+                          // Reset validation state when URL changes
+                          if (validationState === "success") {
+                            setValidationState("idle");
+                            setAvailableModels([]);
+                            form.setValue("selectedModels", []);
+                          }
+                          if (validationError) {
+                            setValidationError(null);
+                            setValidationState("idle");
+                          }
+                        }}
+                      />
+                      {field.value ? (
+                        <button
+                          type="button"
+                          className="absolute right-0 top-0 h-full px-3 text-gray-500 hover:text-gray-700 transition-colors border-l"
+                          onClick={() => {
+                            form.setValue("url", "");
+                            // Reset validation state
+                            if (validationState === "success") {
+                              setValidationState("idle");
+                              setAvailableModels([]);
+                              form.setValue("selectedModels", []);
+                            }
+                            if (validationError) {
+                              setValidationError(null);
+                              setValidationState("idle");
+                            }
+                          }}
+                        >
+                          <X className="h-4 w-4" />
+                          <span className="sr-only">Clear URL</span>
+                        </button>
+                      ) : (
+                        <Popover open={urlPopoverOpen} onOpenChange={setUrlPopoverOpen}>
+                          <PopoverTrigger asChild>
+                            <button
+                              type="button"
+                              className="absolute right-0 top-0 h-full px-3 text-gray-500 hover:text-gray-700 transition-colors border-l"
+                            >
+                              <ChevronDown className="h-4 w-4" />
+                              <span className="sr-only">Select popular endpoint</span>
+                            </button>
+                          </PopoverTrigger>
+                          <PopoverContent className="w-96 p-2" align="end">
+                            <div className="space-y-1">
+                              <p className="text-xs font-medium text-gray-600 px-2 py-1">
+                                Popular Endpoints
+                              </p>
+                              {POPULAR_ENDPOINTS.map((endpoint) => (
+                                <button
+                                  key={endpoint.url}
+                                  type="button"
+                                  className="w-full text-left px-2 py-2 text-sm hover:bg-gray-100 rounded transition-colors cursor-pointer flex items-center gap-3"
+                                  onClick={() => {
+                                    form.setValue("url", endpoint.url);
+                                    setUrlPopoverOpen(false);
+                                    // Reset validation state when changing URL
+                                    if (validationState === "success") {
+                                      setValidationState("idle");
+                                      setAvailableModels([]);
+                                      form.setValue("selectedModels", []);
+                                    }
+                                    if (validationError) {
+                                      setValidationError(null);
+                                      setValidationState("idle");
+                                    }
+                                  }}
+                                >
+                                  {endpoint.icon && (
+                                    <img
+                                      src={endpoint.icon}
+                                      alt={`${endpoint.name} logo`}
+                                      className="w-5 h-5 flex-shrink-0"
+                                    />
+                                  )}
+                                  <div className="flex-1 min-w-0">
+                                    <div className="font-medium text-gray-900">
+                                      {endpoint.name}
+                                    </div>
+                                    <div className="text-xs text-gray-500 font-mono truncate">
+                                      {endpoint.url}
+                                    </div>
+                                  </div>
+                                </button>
+                              ))}
+                            </div>
+                          </PopoverContent>
+                        </Popover>
+                      )}
+                    </div>
                   </FormControl>
                   <FormMessage />
                 </FormItem>
@@ -227,17 +366,40 @@ export const CreateEndpointModal: React.FC<CreateEndpointModalProps> = ({
             <FormField
               control={form.control}
               name="apiKey"
-              render={({ field }) => (
-                <FormItem>
-                  <FormLabel>API Key (optional)</FormLabel>
-                  <FormControl>
-                    <Input type="password" placeholder="sk-..." {...field} />
-                  </FormControl>
-                  <FormDescription>
-                    Add an API key if the endpoint requires authentication
-                  </FormDescription>
-                </FormItem>
-              )}
+              render={({ field }) => {
+                const currentUrl = form.watch("url");
+                const matchedEndpoint = POPULAR_ENDPOINTS.find(
+                  (ep) => currentUrl && currentUrl.trim() === ep.url
+                );
+
+                return (
+                  <FormItem>
+                    <FormLabel>
+                      API Key {matchedEndpoint?.requiresApiKey ? "*" : "(optional)"}
+                    </FormLabel>
+                    <FormControl>
+                      <Input type="password" placeholder="sk-..." {...field} />
+                    </FormControl>
+                    <FormDescription>
+                      {matchedEndpoint ? (
+                        <>
+                          Manage your {matchedEndpoint.name} keys{" "}
+                          <a
+                            href={matchedEndpoint.apiKeyUrl}
+                            target="_blank"
+                            rel="noopener noreferrer"
+                            className="text-blue-600 hover:text-blue-700 underline"
+                          >
+                            here
+                          </a>
+                        </>
+                      ) : (
+                        "Add an API key if the endpoint requires authentication"
+                      )}
+                    </FormDescription>
+                  </FormItem>
+                );
+              }}
             />
 
             {/* Validation Status */}
