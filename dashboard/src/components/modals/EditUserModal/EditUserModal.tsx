@@ -1,7 +1,7 @@
 import React, { useState } from "react";
 import { User, Info } from "lucide-react";
-import { useUpdateUser } from "../../../api/waycast";
-import type { Role } from "../../../api/waycast/types";
+import { useUpdateUser } from "../../../api/dwctl";
+import type { Role } from "../../../api/dwctl/types";
 import { AVAILABLE_ROLES, getRoleDisplayName } from "../../../utils/roles";
 import {
   Dialog,

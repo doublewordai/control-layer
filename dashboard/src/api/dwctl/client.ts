@@ -1,4 +1,4 @@
-/// A client implementation for the `waycast` backend API.
+/// A client implementation for the `dwctl` backend API.
 import type {
   Model,
   Endpoint,
@@ -555,7 +555,7 @@ const authApi = {
 };
 
 // Main nested API object
-export const waycastApi = {
+export const dwctlApi = {
   users: userApi,
   models: modelApi,
   endpoints: endpointApi,

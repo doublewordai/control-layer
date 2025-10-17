@@ -1,6 +1,6 @@
 import React from "react";
 import { Avatar, AvatarFallback, AvatarImage } from "./avatar";
-import type { User } from "../../api/waycast/types";
+import type { User } from "../../api/dwctl/types";
 import { cn } from "../../lib/utils";
 
 interface UserAvatarProps {

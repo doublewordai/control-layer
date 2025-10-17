@@ -102,7 +102,7 @@ check-db:
 #
 # IMPORTANT: Rust development requires a running PostgreSQL database!
 #
-# The waycast service stores user/group/model data in PostgreSQL, &:
+# The dwctl service stores user/group/model data in PostgreSQL, &:
 #
 # - SQLx (our database library) performs compile-time SQL validation, & so even
 #   compiling Rust code requires database connectivity.
@@ -154,15 +154,15 @@ db-setup:
 # - docker-compose.override.yml: Development-specific settings (ports, volumes, hot reload)
 #
 # Services running in development mode:
-# - waycast: Rust API server (port 3001) - hot reloads via volume mounts
-# - waycast-frontend: React dev server (port 5173) - Vite HMR enabled
+# - dwctl: Rust API server (port 3001) - hot reloads via volume mounts
+# - dwctl-frontend: React dev server (port 5173) - Vite HMR enabled
 # - postgres: Database (port 5432) - exposed for direct access
 #
 # The --watch flag enables hot reload. File changes trigger container rebuilds.
 #
 # Access the app at: https://localhost
 # Direct API access: http://localhost:3001
-# Database: postgres://waycast:waycast_password@localhost:5432/waycast
+# Database: postgres://dwctl:dwctl_password@localhost:5432/dwctl
 #
 #
 # Examples:
@@ -303,7 +303,7 @@ test target="" *args="":
 
         # Delete and recreate test user to ensure clean state
         echo "Ensuring clean test user..."
-        docker compose exec -T postgres psql -U waycast -d waycast -c "DELETE FROM users WHERE email = 'user@example.org';" > /dev/null 2>&1 || true
+        docker compose exec -T postgres psql -U dwctl -d dwctl -c "DELETE FROM users WHERE email = 'user@example.org';" > /dev/null 2>&1 || true
         curl -s -X POST http://localhost:3001/authentication/register \
             -H "Content-Type: application/json" \
             -d '{"email":"user@example.org","username":"testuser","password":"user_password","display_name":"Test User"}' \
@@ -405,7 +405,7 @@ test target="" *args="":
                 fi
                 # Remove --watch from args and pass remaining to cargo test
                 remaining_args=$(echo "{{args}}" | sed 's/--watch//g' | xargs)
-                cd waycast && cargo watch -x "test $remaining_args"
+                cd dwctl && cargo watch -x "test $remaining_args"
             elif [[ "{{args}}" == *"--coverage"* ]]; then
                 if ! command -v cargo-llvm-cov >/dev/null 2>&1; then
                     echo "❌ Error: cargo-llvm-cov not found. Install with:"
@@ -414,9 +414,9 @@ test target="" *args="":
                     echo "  cargo binstall cargo-llvm-cov"
                     exit 1
                 fi
-                cd waycast && cargo llvm-cov --fail-under-lines 60 --lcov --output-path lcov.info
+                cd dwctl && cargo llvm-cov --fail-under-lines 60 --lcov --output-path lcov.info
             else
-                cd waycast && cargo test {{args}}
+                cd dwctl && cargo test {{args}}
             fi
             ;;
         ts)
@@ -452,7 +452,7 @@ test target="" *args="":
 # rust: Rust code formatting and linting
 # - Runs cargo fmt --check to verify formatting
 # - Runs cargo clippy for Rust-specific lints and suggestions
-# - Checks all Rust projects (waycast)
+# - Checks all Rust projects (dwctl)
 # - Pass clippy args like -- -D warnings for stricter checking
 #
 #
@@ -475,7 +475,7 @@ lint target *args="":
             npm run lint -- --max-warnings 0 {{args}}
             ;;
         rust)
-            cd waycast
+            cd dwctl
             echo "Checking Cargo.lock sync..."
             cargo metadata --locked > /dev/null
             echo "Running cargo fmt --check..."
@@ -503,7 +503,7 @@ lint target *args="":
 #
 # rust: Rust code formatting
 # - Uses cargo fmt to format all Rust code
-# - Formats all Rust projects (waycast)
+# - Formats all Rust projects (dwctl)
 # - Applies standard Rust formatting conventions
 # - Modifies files in place to fix formatting issues
 #
@@ -519,8 +519,8 @@ fmt target *args="":
             cd dashboard && npx prettier --write . {{args}}
             ;;
         rust)
-            echo "Running cargo fmt for waycast..."
-            cd waycast && cargo fmt {{args}}
+            echo "Running cargo fmt for dwctl..."
+            cd dwctl && cargo fmt {{args}}
             ;;
         *)
             echo "Usage: just fmt [ts|rust]"
@@ -531,10 +531,10 @@ fmt target *args="":
 # Generate JWT token for API testing: 'just jwt user@example.com'
 #
 # Creates a signed JWT token for testing authenticated API endpoints. The token
-# is formatted for use with curl as a waycast_session.
+# is formatted for use with curl as a dwctl_session.
 #
 # Usage with curl: TOKEN=$(just jwt admin@company.com) curl -b
-# "waycast_session=$TOKEN" https://localhost/api/v1/users
+# "dwctl_session=$TOKEN" https://localhost/api/v1/users
 #
 # In order to use the token, the user e/ email EMAIL must already exist in the
 # database - i.e. either be the default admin user, or later created by them.
@@ -586,7 +586,7 @@ ci target *args="":
         rust)
             echo "🦀 Running Rust CI pipeline..."
             echo "📋 Setting up llvm-cov environment for consistent compilation..."
-            cd waycast
+            cd dwctl
             echo "🧪 Step 1/1: Running tests with coverage..."
             just test rust --coverage {{args}}
             eval "$(cargo llvm-cov show-env --export-prefix)"
@@ -617,7 +617,7 @@ ci target *args="":
 # Security scanning: 'just security-scan [TAG]'
 #
 # Scans published container images from GitHub Container Registry for vulnerabilities.
-# Uses Grype to scan the waycast image and provides detailed vulnerability reports by severity level.
+# Uses Grype to scan the dwctl image and provides detailed vulnerability reports by severity level.
 #
 # Arguments:
 # TAG: Image tag to scan (defaults to 'latest' if not specified)
@@ -644,12 +644,12 @@ security-scan target="latest" *args="":
     
     # Use environment variable if set, otherwise use the provided target as tag
     SCAN_TAG="${TAG:-{{target}}}"
-    REGISTRY="ghcr.io/doublewordai/waycast/"
-    WAYCAST_TAG="${REGISTRY}waycast:$SCAN_TAG"
+    REGISTRY="ghcr.io/doublewordai/dwctl/"
+    DWCTL_TAG="${REGISTRY}dwctl:$SCAN_TAG"
 
     echo "🔍 Scanning published container images for vulnerabilities..."
     echo "Tag: $SCAN_TAG"
-    echo "Images: $WAYCAST_TAG"
+    echo "Images: $DWCTL_TAG"
 
     # Function to calculate vulnerability counts
     calculate_vulns() {
@@ -664,25 +664,25 @@ security-scan target="latest" *args="":
     
     # Scan each image
     echo ""
-    echo "Scanning waycast image: $WAYCAST_TAG"
-    grype "$WAYCAST_TAG" --output json --file waycast-vulnerabilities.json --quiet || {
-        echo "⚠️  Waycast scan failed, skipping..."
-        echo '{"matches": []}' > waycast-vulnerabilities.json
+    echo "Scanning dwctl image: $DWCTL_TAG"
+    grype "$DWCTL_TAG" --output json --file dwctl-vulnerabilities.json --quiet || {
+        echo "⚠️  dwctl scan failed, skipping..."
+        echo '{"matches": []}' > dwctl-vulnerabilities.json
     }
 
     # Calculate metrics for each component
-    WAYCAST_CRITICAL=$(calculate_vulns waycast-vulnerabilities.json "Critical")
-    WAYCAST_HIGH=$(calculate_vulns waycast-vulnerabilities.json "High")
-    WAYCAST_MEDIUM=$(calculate_vulns waycast-vulnerabilities.json "Medium")
-    WAYCAST_LOW=$(calculate_vulns waycast-vulnerabilities.json "Low")
-    WAYCAST_TOTAL=$(jq '.matches | length' waycast-vulnerabilities.json 2>/dev/null || echo "0")
+    DWCTL_CRITICAL=$(calculate_vulns dwctl-vulnerabilities.json "Critical")
+    DWCTL_HIGH=$(calculate_vulns dwctl-vulnerabilities.json "High")
+    DWCTL_MEDIUM=$(calculate_vulns dwctl-vulnerabilities.json "Medium")
+    DWCTL_LOW=$(calculate_vulns dwctl-vulnerabilities.json "Low")
+    DWCTL_TOTAL=$(jq '.matches | length' dwctl-vulnerabilities.json 2>/dev/null || echo "0")
 
     # Calculate totals
-    TOTAL_CRITICAL=$((WAYCAST_CRITICAL))
-    TOTAL_HIGH=$((WAYCAST_HIGH))
-    TOTAL_MEDIUM=$((WAYCAST_MEDIUM))
-    TOTAL_LOW=$((WAYCAST_LOW))
-    TOTAL_VULNS=$((WAYCAST_TOTAL))
+    TOTAL_CRITICAL=$((DWCTL_CRITICAL))
+    TOTAL_HIGH=$((DWCTL_HIGH))
+    TOTAL_MEDIUM=$((DWCTL_MEDIUM))
+    TOTAL_LOW=$((DWCTL_LOW))
+    TOTAL_VULNS=$((DWCTL_TOTAL))
 
     # Display results
     echo ""
@@ -690,13 +690,13 @@ security-scan target="latest" *args="":
     echo "========================="
     printf "%-10s %-9s %-6s %-8s %-5s %-7s\n" "Component" "Critical" "High" "Medium" "Low" "Total"
     echo "-------------------------------------------------------"
-    printf "%-10s %-9s %-6s %-8s %-5s %-7s\n" "Waycast" "$WAYCAST_CRITICAL" "$WAYCAST_HIGH" "$WAYCAST_MEDIUM" "$WAYCAST_LOW" "$WAYCAST_TOTAL"
+    printf "%-10s %-9s %-6s %-8s %-5s %-7s\n" "dwctl" "$DWCTL_CRITICAL" "$DWCTL_HIGH" "$DWCTL_MEDIUM" "$DWCTL_LOW" "$DWCTL_TOTAL"
     echo "-------------------------------------------------------"
     printf "%-10s %-9s %-6s %-8s %-5s %-7s\n" "Total" "$TOTAL_CRITICAL" "$TOTAL_HIGH" "$TOTAL_MEDIUM" "$TOTAL_LOW" "$TOTAL_VULNS"
 
     echo ""
     echo "📁 Detailed reports saved:"
-    echo "  - waycast-vulnerabilities.json"
+    echo "  - dwctl-vulnerabilities.json"
     
     # Warn about critical vulnerabilities
     if [ "$TOTAL_CRITICAL" -gt 0 ]; then

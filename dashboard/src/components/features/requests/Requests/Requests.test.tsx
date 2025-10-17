@@ -14,7 +14,7 @@ import {
   vi,
 } from "vitest";
 import { Requests } from "./Requests";
-import { handlers } from "../../../../api/waycast/mocks/handlers";
+import { handlers } from "../../../../api/dwctl/mocks/handlers";
 import { SettingsProvider } from "../../../../contexts";
 
 // Mock the authorization hook to control user permissions

@@ -1,5 +1,5 @@
 [package]
-name = "waycast"
+name = "dwctl"
 version = "0.3.0"
 edition = "2021"
 description = "A self-hostable observability and analytics platform for LLM applications"

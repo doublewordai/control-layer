@@ -3,7 +3,7 @@ import { Server, Check, AlertCircle, Loader2, Info, ChevronDown, X } from "lucid
 import { useForm } from "react-hook-form";
 import { zodResolver } from "@hookform/resolvers/zod";
 import * as z from "zod";
-import { useValidateEndpoint, useCreateEndpoint } from "../../../api/waycast";
+import { useValidateEndpoint, useCreateEndpoint } from "../../../api/dwctl";
 import { Button } from "../../ui/button";
 import {
   Dialog,
@@ -38,7 +38,7 @@ import type {
   EndpointValidateRequest,
   AvailableModel,
   EndpointCreateRequest,
-} from "../../../api/waycast/types";
+} from "../../../api/dwctl/types";
 
 interface CreateEndpointModalProps {
   isOpen: boolean;

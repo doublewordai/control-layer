@@ -1,6 +1,6 @@
 import React, { useState, useEffect } from "react";
 import { Users } from "lucide-react";
-import { useUpdateGroup } from "../../../api/waycast";
+import { useUpdateGroup } from "../../../api/dwctl";
 import {
   Dialog,
   DialogContent,

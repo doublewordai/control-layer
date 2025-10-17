@@ -231,7 +231,7 @@ export interface EndpointValidateResponse {
 
 // ===== REQUESTS/TRAFFIC MONITORING TYPES =====
 
-// Backend HTTP request/response types matching waycast API
+// Backend HTTP request/response types matching dwctl API
 export interface HttpRequest {
   id: number;
   timestamp: string;
@@ -261,7 +261,7 @@ export interface ListRequestsResponse {
   requests: RequestResponsePair[];
 }
 
-// AI request/response types (matching waycast's tagged ApiAiRequest/ApiAiResponse enums)
+// AI request/response types (matching dwctl's tagged ApiAiRequest/ApiAiResponse enums)
 // Now properly tagged for easy discrimination
 export type AiRequest =
   | { type: "chat_completions"; data: ChatCompletionRequest }

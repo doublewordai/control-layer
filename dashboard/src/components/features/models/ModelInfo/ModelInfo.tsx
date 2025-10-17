@@ -16,7 +16,7 @@ import {
   useModels,
   useEndpoints,
   useUpdateModel,
-} from "../../../../api/waycast";
+} from "../../../../api/dwctl";
 import { getModelType } from "../../../../utils/modelType";
 import { useAuthorization } from "../../../../utils";
 import { ApiExamples, AccessManagementModal } from "../../../modals";

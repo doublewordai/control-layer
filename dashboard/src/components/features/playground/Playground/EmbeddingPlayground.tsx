@@ -1,6 +1,6 @@
 import React from "react";
 import { Hash, Trash2 } from "lucide-react";
-import type { Model } from "../../../../api/waycast/types";
+import type { Model } from "../../../../api/dwctl/types";
 import { Textarea } from "../../../ui/textarea";
 import { Button } from "../../../ui/button";
 

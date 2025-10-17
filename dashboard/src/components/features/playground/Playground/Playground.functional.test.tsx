@@ -14,7 +14,7 @@ import {
   vi,
 } from "vitest";
 import Playground from "./Playground";
-import { handlers } from "../../../../api/waycast/mocks/handlers";
+import { handlers } from "../../../../api/dwctl/mocks/handlers";
 
 const server = setupServer(...handlers);
 

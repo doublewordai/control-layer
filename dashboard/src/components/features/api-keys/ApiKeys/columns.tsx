@@ -11,7 +11,7 @@ import {
   DropdownMenuLabel,
   DropdownMenuTrigger,
 } from "../../../ui/dropdown-menu";
-import type { ApiKey } from "../../../../api/waycast/types";
+import type { ApiKey } from "../../../../api/dwctl/types";
 
 interface ColumnActions {
   onDelete: (apiKey: ApiKey) => void;

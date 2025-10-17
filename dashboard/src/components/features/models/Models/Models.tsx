@@ -19,7 +19,7 @@ import {
   type Model,
   useEndpoints,
   type Endpoint,
-} from "../../../../api/waycast";
+} from "../../../../api/dwctl";
 import { AccessManagementModal } from "../../../modals";
 import { ApiExamples } from "../../../modals";
 import { useAuthorization } from "../../../../utils";
@@ -321,7 +321,7 @@ const Models: React.FC = () => {
           </h3>
           <p className="text-doubleword-neutral-600 mb-8 max-w-l mx-auto">
             Models are automatically synced when you add an inference endpoint.
-            Add an endpoint to start interacting with AI models through waycast.
+            Add an endpoint to start interacting with AI models through dwctl.
           </p>
           <Button
             onClick={() => navigate("/endpoints", { state: { openCreateModal: true } })}

@@ -1,7 +1,7 @@
 # Users can't create other users
 POST http://localhost:3001/admin/api/v1/users
 [Cookies]
-waycast_session: {{user_jwt}}
+dwctl_session: {{user_jwt}}
 {
   "username": "test-user-{{newUuid}}",
   "email": "test-{{newUuid}}@example.org",

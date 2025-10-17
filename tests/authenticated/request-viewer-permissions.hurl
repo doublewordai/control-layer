@@ -4,7 +4,7 @@
 # Create a test user with only PlatformManager role (no RequestViewer)
 POST http://localhost:3001/admin/api/v1/users
 [Cookies]
-waycast_session: {{admin_jwt}}
+dwctl_session: {{admin_jwt}}
 {
   "username": "platform-manager-{{newUuid}}",
   "email": "platform-manager-{{newUuid}}@example.org",
@@ -21,13 +21,13 @@ platform_manager_user_id: jsonpath "$.id"
 # Test that PlatformManager without RequestViewer cannot access requests endpoint
 GET http://localhost:3001/admin/api/v1/requests
 [Cookies] 
-waycast_session: {{user_jwt}}
+dwctl_session: {{user_jwt}}
 HTTP 403
 
 # Create a test user with RequestViewer role
 POST http://localhost:3001/admin/api/v1/users
 [Cookies]
-waycast_session: {{admin_jwt}}
+dwctl_session: {{admin_jwt}}
 {
   "username": "request-viewer-{{newUuid}}",
   "email": "request-viewer-{{newUuid}}@example.org", 
@@ -40,7 +40,7 @@ request_viewer_user_id: jsonpath "$.id"
 # Test that users with both PlatformManager and RequestViewer can access requests
 POST http://localhost:3001/admin/api/v1/users
 [Cookies]
-waycast_session: {{admin_jwt}}
+dwctl_session: {{admin_jwt}}
 {
   "username": "dual-role-{{newUuid}}",
   "email": "dual-role-{{newUuid}}@example.org",
@@ -54,21 +54,21 @@ dual_role_user_id: jsonpath "$.id"
 # (using the existing user_jwt which should be a StandardUser)
 GET http://localhost:3001/admin/api/v1/requests
 [Cookies]
-waycast_session: {{user_jwt}}
+dwctl_session: {{user_jwt}}
 HTTP 403
 
 # Clean up: Delete test users
 DELETE http://localhost:3001/admin/api/v1/users/{{platform_manager_user_id}}
 [Cookies]
-waycast_session: {{admin_jwt}}
+dwctl_session: {{admin_jwt}}
 HTTP 204
 
 DELETE http://localhost:3001/admin/api/v1/users/{{request_viewer_user_id}}
 [Cookies]
-waycast_session: {{admin_jwt}}
+dwctl_session: {{admin_jwt}}
 HTTP 204
 
 DELETE http://localhost:3001/admin/api/v1/users/{{dual_role_user_id}}
 [Cookies]
-waycast_session: {{admin_jwt}}
+dwctl_session: {{admin_jwt}}
 HTTP 204

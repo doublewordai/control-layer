@@ -1,4 +1,4 @@
-import type { UserResponse } from "../../api/waycast/types";
+import type { UserResponse } from "../../api/dwctl/types";
 
 export interface AuthState {
   user: UserResponse | null;

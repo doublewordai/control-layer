@@ -15,7 +15,7 @@ import {
   useRemoveModelFromGroup,
   type Model,
   type Group as BackendGroup,
-} from "../../../api/waycast";
+} from "../../../api/dwctl";
 
 interface AccessManagementModalProps {
   isOpen: boolean;

@@ -1,5 +1,5 @@
 import React, { useState, useEffect } from "react";
-import { useCreateGroup } from "../../../api/waycast";
+import { useCreateGroup } from "../../../api/dwctl";
 import {
   Dialog,
   DialogContent,

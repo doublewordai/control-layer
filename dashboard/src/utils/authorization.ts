@@ -1,6 +1,6 @@
 import { useMemo } from "react";
-import type { Role } from "../api/waycast/types";
-import { useUser } from "../api/waycast/hooks";
+import type { Role } from "../api/dwctl/types";
+import { useUser } from "../api/dwctl/hooks";
 
 export type PagePermission =
   | "models"

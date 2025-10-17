@@ -4,7 +4,7 @@ import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
 import { Prism as SyntaxHighlighter } from "react-syntax-highlighter";
 import { oneDark } from "react-syntax-highlighter/dist/esm/styles/prism";
-import type { Model } from "../../../../api/waycast/types";
+import type { Model } from "../../../../api/dwctl/types";
 import { Textarea } from "../../../ui/textarea";
 import { Button } from "../../../ui/button";
 

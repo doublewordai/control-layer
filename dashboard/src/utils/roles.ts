@@ -1,4 +1,4 @@
-import type { Role } from "../api/waycast/types";
+import type { Role } from "../api/dwctl/types";
 
 // Available user roles - must match Role type
 export const AVAILABLE_ROLES: Role[] = [

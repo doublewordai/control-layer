@@ -13,9 +13,9 @@ import {
   beforeEach,
 } from "vitest";
 import React from "react";
-import { handlers } from "../../../api/waycast/mocks/handlers";
+import { handlers } from "../../../api/dwctl/mocks/handlers";
 import { EditEndpointModal } from "./EditEndpointModal";
-import type { Endpoint } from "../../../api/waycast/types";
+import type { Endpoint } from "../../../api/dwctl/types";
 
 // Setup MSW server
 const server = setupServer(...handlers);
