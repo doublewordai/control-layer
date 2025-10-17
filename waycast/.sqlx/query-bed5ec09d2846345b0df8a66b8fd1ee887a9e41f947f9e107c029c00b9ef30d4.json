@@ -32,6 +32,11 @@
         "ordinal": 5,
         "name": "updated_at",
         "type_info": "Timestamptz"
+      },
+      {
+        "ordinal": 6,
+        "name": "source",
+        "type_info": "Text"
       }
     ],
     "parameters": {
@@ -45,6 +50,7 @@
       false,
       false,
       true,
+      false,
       false,
       false,
       false

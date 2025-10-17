@@ -731,6 +731,7 @@ export const handlers = [
       created_by: "550e8400-e29b-41d4-a716-446655440000",
       created_at: new Date().toISOString(),
       updated_at: new Date().toISOString(),
+      source: "native"
     };
     return HttpResponse.json(newGroup, { status: 201 });
   }),

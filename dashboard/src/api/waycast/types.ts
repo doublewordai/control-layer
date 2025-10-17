@@ -74,6 +74,7 @@ export interface Group {
   updated_at?: string; // ISO 8601 timestamp
   users?: User[]; // List of IDs, only present when include contains 'users'
   models?: Model[]; // List of IDs, only present when include contains 'models'
+  "source": string;
 }
 
 export interface User {
