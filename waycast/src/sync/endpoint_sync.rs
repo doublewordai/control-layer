@@ -522,7 +522,7 @@ mod tests {
         OpenAIModel {
             id: id.to_string(),
             object: "model".to_string(),
-            created: 1234567890,
+            created: Some(1234567890),
             owned_by: "test".to_string(),
         }
     }
