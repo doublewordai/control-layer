@@ -23,6 +23,13 @@ import apiKeysDataRaw from "./api-keys.json";
 import userGroups from "./user-groups.json";
 import modelsGroups from "./models-groups.json";
 import requestsDataRaw from "../../demo/data/requests.json";
+import {
+  loadDemoState,
+  addModelToGroup as addModelToGroupState,
+  removeModelFromGroup as removeModelFromGroupState,
+  addUserToGroup as addUserToGroupState,
+  removeUserFromGroup as removeUserFromGroupState,
+} from "./demoState";
 
 // Type for demo requests
 interface DemoRequest {
@@ -37,6 +44,10 @@ interface DemoRequest {
     };
   };
   duration_ms: number;
+  metadata?: {
+    email?: string;
+    [key: string]: any;
+  };
 }
 
 // Type assert the imported JSON data
@@ -45,20 +56,31 @@ const groupsData = groupsDataRaw as Group[];
 const endpointsData = endpointsDataRaw as Endpoint[];
 const modelsData = modelsDataRaw.data as Model[];
 const apiKeysData = apiKeysDataRaw as ApiKey[];
-const userGroupsData = userGroups as Record<string, string[]>;
-const modelsGroupsData = modelsGroups as Record<string, string[]>;
+const userGroupsInitial = userGroups as Record<string, string[]>;
+const modelsGroupsInitial = modelsGroups as Record<string, string[]>;
 const requestsData = requestsDataRaw as DemoRequest[];
 
-// Create reverse mapping: group ID -> user IDs
-const groupUsersData: Record<string, string[]> = {};
-Object.entries(userGroupsData).forEach(([userId, groupIds]) => {
-  groupIds.forEach((groupId) => {
-    if (!groupUsersData[groupId]) {
-      groupUsersData[groupId] = [];
-    }
-    groupUsersData[groupId].push(userId);
+// Initialize demo state (loads from localStorage or uses initial data)
+let demoState = loadDemoState(modelsGroupsInitial, userGroupsInitial);
+
+// Get current state accessors
+const getUserGroupsData = () => demoState.userGroups;
+const getModelsGroupsData = () => demoState.modelsGroups;
+
+// Create reverse mapping: group ID -> user IDs (regenerated on each access)
+const getGroupUsersData = (): Record<string, string[]> => {
+  const groupUsersData: Record<string, string[]> = {};
+  const userGroupsData = getUserGroupsData();
+  Object.entries(userGroupsData).forEach(([userId, groupIds]) => {
+    groupIds.forEach((groupId) => {
+      if (!groupUsersData[groupId]) {
+        groupUsersData[groupId] = [];
+      }
+      groupUsersData[groupId].push(userId);
+    });
   });
-});
+  return groupUsersData;
+};
 
 // Function to compute real metrics from requests data, shifted to appear as today's activity
 function computeModelMetrics(modelAlias: string) {
@@ -135,6 +157,111 @@ function computeModelMetrics(modelAlias: string) {
   };
 }
 
+// Function to aggregate requests by user email
+function computeUserUsageByModel(
+  modelAlias?: string,
+  startDate?: string,
+  endDate?: string,
+) {
+  // Filter requests by model first
+  let filteredRequests = requestsData;
+
+  if (modelAlias) {
+    filteredRequests = filteredRequests.filter(
+      (req) => req.model === modelAlias,
+    );
+  }
+
+  if (filteredRequests.length === 0) {
+    return {
+      model: modelAlias || "all",
+      start_date: startDate || new Date(0).toISOString(),
+      end_date: endDate || new Date().toISOString(),
+      total_requests: 0,
+      total_tokens: 0,
+      users: [],
+    };
+  }
+
+  // Shift timestamps to today while preserving relative timing (same as computeModelMetrics)
+  const now = new Date();
+  const originalLatestDate = new Date(
+    Math.max(
+      ...filteredRequests.map((req) => new Date(req.timestamp).getTime()),
+    ),
+  );
+  const timeShift = now.getTime() - originalLatestDate.getTime();
+
+  // Filter by date range using shifted timestamps
+  if (startDate || endDate) {
+    const start = startDate ? new Date(startDate).getTime() : 0;
+    const end = endDate ? new Date(endDate).getTime() : Date.now();
+
+    filteredRequests = filteredRequests.filter((req) => {
+      const originalTime = new Date(req.timestamp).getTime();
+      const shiftedTime = originalTime + timeShift;
+      return shiftedTime >= start && shiftedTime <= end;
+    });
+  }
+
+  // Group by user email
+  const userMap = new Map<
+    string,
+    {
+      user_email?: string;
+      request_count: number;
+      input_tokens: number;
+      output_tokens: number;
+      total_tokens: number;
+      last_active_at?: string;
+    }
+  >();
+
+  filteredRequests.forEach((req) => {
+    const email = req.metadata?.email || "anonymous";
+    const existing = userMap.get(email) || {
+      user_email: email !== "anonymous" ? email : undefined,
+      request_count: 0,
+      input_tokens: 0,
+      output_tokens: 0,
+      total_tokens: 0,
+      last_active_at: undefined,
+    };
+
+    existing.request_count += 1;
+    existing.input_tokens += req.response.usage?.prompt_tokens || 0;
+    existing.output_tokens += req.response.usage?.completion_tokens || 0;
+    existing.total_tokens += req.response.usage?.total_tokens || 0;
+
+    // Update last active with shifted timestamp
+    const shiftedTimestamp = new Date(
+      new Date(req.timestamp).getTime() + timeShift,
+    ).toISOString();
+    if (
+      !existing.last_active_at ||
+      shiftedTimestamp > existing.last_active_at
+    ) {
+      existing.last_active_at = shiftedTimestamp;
+    }
+
+    userMap.set(email, existing);
+  });
+
+  // Convert to array and calculate totals
+  const users = Array.from(userMap.values());
+  const total_requests = users.reduce((sum, u) => sum + u.request_count, 0);
+  const total_tokens = users.reduce((sum, u) => sum + u.total_tokens, 0);
+
+  return {
+    model: modelAlias || "all",
+    start_date: startDate || new Date(0).toISOString(),
+    end_date: endDate || new Date().toISOString(),
+    total_requests,
+    total_tokens,
+    users,
+  };
+}
+
 export const handlers = [
   // Error scenarios for testing - must come first to match before generic patterns
   http.get("/admin/api/v1/users/error-500", () => {
@@ -156,6 +283,7 @@ export const handlers = [
     let users = [...usersData];
 
     if (include === "groups") {
+      const userGroupsData = getUserGroupsData();
       users = users.map((user) => ({
         ...user,
         groups: (userGroupsData[user.id] || [])
@@ -273,6 +401,8 @@ export const handlers = [
       const currentUser = usersData[0]; // Use first user as demo
 
       if (currentUser) {
+        const userGroupsData = getUserGroupsData();
+        const modelsGroupsData = getModelsGroupsData();
         // Get user's group IDs
         const userGroupIds = new Set(userGroupsData[currentUser.id] || []);
 
@@ -285,6 +415,7 @@ export const handlers = [
     }
 
     if (include?.includes("groups")) {
+      const modelsGroupsData = getModelsGroupsData();
       models = models.map((model) => ({
         ...model,
         groups:
@@ -560,6 +691,7 @@ export const handlers = [
     let groups: Group[] = [...groupsData];
 
     if (include?.includes("users")) {
+      const groupUsersData = getGroupUsersData();
       groups = groups.map((group) => ({
         ...group,
         users: (groupUsersData[group.id] || [])
@@ -569,6 +701,7 @@ export const handlers = [
     }
 
     if (include?.includes("models")) {
+      const modelsGroupsData = getModelsGroupsData();
       groups = groups.map((group) => ({
         ...group,
         models: Object.entries(modelsGroupsData)
@@ -634,6 +767,12 @@ export const handlers = [
         { status: 404 },
       );
     }
+    // Update state and persist to localStorage
+    demoState = addUserToGroupState(
+      demoState,
+      params.userId as string,
+      params.groupId as string,
+    );
     return HttpResponse.json(null, { status: 204 });
   }),
 
@@ -646,6 +785,12 @@ export const handlers = [
         { status: 404 },
       );
     }
+    // Update state and persist to localStorage
+    demoState = removeUserFromGroupState(
+      demoState,
+      params.userId as string,
+      params.groupId as string,
+    );
     return HttpResponse.json(null, { status: 204 });
   }),
 
@@ -658,6 +803,12 @@ export const handlers = [
         { status: 404 },
       );
     }
+    // Update state and persist to localStorage
+    demoState = addModelToGroupState(
+      demoState,
+      params.modelId as string,
+      params.groupId as string,
+    );
     return HttpResponse.json(null, { status: 204 });
   }),
 
@@ -670,6 +821,12 @@ export const handlers = [
         { status: 404 },
       );
     }
+    // Update state and persist to localStorage
+    demoState = removeModelFromGroupState(
+      demoState,
+      params.modelId as string,
+      params.groupId as string,
+    );
     return HttpResponse.json(null, { status: 204 });
   }),
 
@@ -695,50 +852,45 @@ export const handlers = [
       .pop();
     const userContent = lastUserMessage?.content || "Hello";
 
+    // Read custom response from settings
+    const storedSettings = localStorage.getItem("app-settings");
+    let responseTemplate =
+      'This is a demo response in demo mode. You asked: "{userMessage}"';
+
+    if (storedSettings) {
+      try {
+        const settings = JSON.parse(storedSettings);
+        if (settings.demoConfig?.customResponse) {
+          responseTemplate = settings.demoConfig.customResponse;
+        }
+      } catch (e) {
+        console.error("Failed to parse settings:", e);
+      }
+    }
+
+    // Replace {userMessage} placeholder with actual user content
+    const responseContent = responseTemplate.replace(
+      /{userMessage}/g,
+      userContent,
+    );
+
     if (stream) {
       // Return a streaming response
       const encoder = new TextEncoder();
+      // Split response into chunks for streaming (roughly 10-20 chars per chunk)
+      const chunkSize = Math.max(10, Math.floor(responseContent.length / 5));
+      const chunks: string[] = [];
+      for (let i = 0; i < responseContent.length; i += chunkSize) {
+        chunks.push(responseContent.substring(i, i + chunkSize));
+      }
+
       const stream = new ReadableStream({
         start(controller) {
-          // Send initial chunk
-          const chunk1 = {
-            id: `chatcmpl-${Date.now()}`,
-            object: "chat.completion.chunk",
-            created: Math.floor(Date.now() / 1000),
-            model: model,
-            choices: [
-              {
-                index: 0,
-                delta: { role: "assistant", content: "This " },
-                finish_reason: null,
-              },
-            ],
-          };
-          controller.enqueue(
-            encoder.encode(`data: ${JSON.stringify(chunk1)}\n\n`),
-          );
+          let chunkIndex = 0;
 
-          // Send more chunks with delay
-          setTimeout(() => {
-            const chunk2 = {
-              id: `chatcmpl-${Date.now()}`,
-              object: "chat.completion.chunk",
-              created: Math.floor(Date.now() / 1000),
-              model: model,
-              choices: [
-                {
-                  index: 0,
-                  delta: { content: "is a demo response " },
-                  finish_reason: null,
-                },
-              ],
-            };
-            controller.enqueue(
-              encoder.encode(`data: ${JSON.stringify(chunk2)}\n\n`),
-            );
-
-            setTimeout(() => {
-              const chunk3 = {
+          const sendChunk = () => {
+            if (chunkIndex < chunks.length) {
+              const chunk = {
                 id: `chatcmpl-${Date.now()}`,
                 object: "chat.completion.chunk",
                 created: Math.floor(Date.now() / 1000),
@@ -746,44 +898,48 @@ export const handlers = [
                 choices: [
                   {
                     index: 0,
-                    delta: {
-                      content: `in demo mode. You asked: "${userContent}"`,
-                    },
+                    delta:
+                      chunkIndex === 0
+                        ? { role: "assistant", content: chunks[chunkIndex] }
+                        : { content: chunks[chunkIndex] },
                     finish_reason: null,
                   },
                 ],
               };
               controller.enqueue(
-                encoder.encode(`data: ${JSON.stringify(chunk3)}\n\n`),
+                encoder.encode(`data: ${JSON.stringify(chunk)}\n\n`),
               );
-
-              setTimeout(() => {
-                const chunk4 = {
-                  id: `chatcmpl-${Date.now()}`,
-                  object: "chat.completion.chunk",
-                  created: Math.floor(Date.now() / 1000),
-                  model: model,
-                  choices: [
-                    {
-                      index: 0,
-                      delta: {},
-                      finish_reason: "stop",
-                    },
-                  ],
-                  usage: {
-                    prompt_tokens: 20,
-                    completion_tokens: 15,
-                    total_tokens: 35,
+              chunkIndex++;
+              setTimeout(sendChunk, 100);
+            } else {
+              // Send final chunk with usage
+              const finalChunk = {
+                id: `chatcmpl-${Date.now()}`,
+                object: "chat.completion.chunk",
+                created: Math.floor(Date.now() / 1000),
+                model: model,
+                choices: [
+                  {
+                    index: 0,
+                    delta: {},
+                    finish_reason: "stop",
                   },
-                };
-                controller.enqueue(
-                  encoder.encode(`data: ${JSON.stringify(chunk4)}\n\n`),
-                );
-                controller.enqueue(encoder.encode("data: [DONE]\n\n"));
-                controller.close();
-              }, 100);
-            }, 100);
-          }, 100);
+                ],
+                usage: {
+                  prompt_tokens: 20,
+                  completion_tokens: 15,
+                  total_tokens: 35,
+                },
+              };
+              controller.enqueue(
+                encoder.encode(`data: ${JSON.stringify(finalChunk)}\n\n`),
+              );
+              controller.enqueue(encoder.encode("data: [DONE]\n\n"));
+              controller.close();
+            }
+          };
+
+          sendChunk();
         },
       });
 
@@ -806,7 +962,7 @@ export const handlers = [
             index: 0,
             message: {
               role: "assistant",
-              content: `This is a demo response in demo mode. You asked: "${userContent}"`,
+              content: responseContent,
             },
             finish_reason: "stop",
           },
@@ -923,5 +1079,16 @@ export const handlers = [
         ),
       },
     });
+  }),
+
+  // Requests aggregate by user
+  http.get("/admin/api/v1/requests/aggregate-by-user", ({ request }) => {
+    const url = new URL(request.url);
+    const model = url.searchParams.get("model") || undefined;
+    const startDate = url.searchParams.get("start_date") || undefined;
+    const endDate = url.searchParams.get("end_date") || undefined;
+
+    const result = computeUserUsageByModel(model, startDate, endDate);
+    return HttpResponse.json(result);
   }),
 ];

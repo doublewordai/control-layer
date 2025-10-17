@@ -1,4 +1,40 @@
-## Getting Started
+# Contributing to waycast
+
+## Workflow
+
+If you encounter an issue, or have a feature request, please open an issue on
+[github](https://github.com/doubleword/waycast/issues). If you'd like to
+contribute, try to see first if there's an open issue for what you'd like to
+work on. If not, please open one to discuss it before starting work!
+
+Some issues will be tagged as "good first issue" for newcomers.
+
+When submitting a pull request, please ensure that all lints & tests pass. To
+run linting locally, run
+
+```bash
+just lint rust
+```
+
+```bash
+just lint ts
+```
+
+All tests can be run with.
+
+```bash
+just test rust
+```
+
+```bash
+just test ts
+```
+
+```bash
+just test docker --build
+```
+
+## Developing
 
 ### 1. Install Prerequisites
 
@@ -11,6 +47,12 @@ brew install just hurl
 # hurl: https://hurl.dev/docs/installation.html
 ```
 
+You'll need rust installed to develop the backend, and `npm` for the frontend.
+We use [sqlx](https://github.com/launchbadge/sqlx) for rust development, so
+you'll need a running postgres database to compile the project. Alternatively,
+if you're not changing the postgres queries, you can build with
+`SQLX_OFFLINE=1` to skip the database check at compile time.
+
 **Important**: Rust version 1.88 or higher is required for SQLx compatibility.
 If you encounter SQLx prepare issues, verify your Rust version with `rustc
 --version`.
@@ -21,48 +63,26 @@ If you encounter SQLx prepare issues, verify your Rust version with `rustc
 own email address instead of the default. This email will be used as the admin
 account for testing.
 
-### 3. Start the System
+Run `just dev` to setup an all-in-one docker compose development environment.
+
+Alternatively, run:
 
 ```bash
-# Development mode (with hot reload)
-just dev
+cargo run
 ```
 
-The system will be available at:
-
-- **Web Dashboard**: <https://localhost:5173> (main interface)
-- **API**: <https://localhost:5173/api/v1/> (REST endpoints)
-- **LLM API**: <https://localhost:5173/ai/> (OpenAI-compatible API. Accessible with tokens provided by the dashboard).
-- **Database**: localhost:5432 (PostgreSQL, dev mode only)
-
-### 4. Programmatically testing the REST API
-
-The following command generates a JWT token that you can use for API testing:
+in one terminal (to setup the backend with an embedded postgres database - see
+the config docs in the README for how to use another database), and
 
 ```bash
-# Generate JWT for API testing
-TOKEN=$(just jwt your-email@company.com)
-
-# Use in API requests
-curl http://localhost:3001/api/v1/users -b "waycast_session=$TOKEN"
+npm run dev 
 ```
 
-## Development Workflow
-
-In development mode, both frontend and backend services automatically reload on file changes:
-
-- **Frontend** (waycast-frontend): Uses Vite dev server with hot module replacement
-- **Backend** (waycast): Uses `cargo watch` to rebuild and restart on Rust code changes
-
-### Running Tests
-
-```bash
-just test           # Run tests against running services
-```
+from the `dashboard/` folder, in another terminal, to start the frontend.
 
 ## Project Overview
 
-This system consists of several interconnected services:
+This system has two components:
 
 ```bash
 waycast/
@@ -74,8 +94,6 @@ waycast/
 
 - **[waycast](application/waycast/README.md)** - API server setup and development
 - **[dashboard](application/dashboard/README.md)** - Frontend development
-
-**System Architecture:** See [ARCHITECTURE.md](ARCHITECTURE.md) for detailed system diagrams
 
 ### Common Tasks
 
@@ -149,6 +167,7 @@ then you'll need to change your [pg_hba.conf file](https://stackoverflow.com/a/5
 N.B. I needed to use sudo vim pg_hba.conf and then run `sudo service postgresql restart` afterwards.
 
 **"Test database missing or inaccessible" from check-db, and db-setup doesn't fix it**
-→ Try creating the databases manually with `createdb onwards_pilot_test` and `createdb test`.
-If you get "createdb: error: database creation failed: ERROR: permission denied to create database" then try executing them as postgres.
-i.e. do `sudo -u postgres -i` and then run them.
+→ Try creating the databases manually. See the `justfile` for details.
+If you get "createdb: error: database creation failed: ERROR: permission denied
+to create database" then try executing them as postgres. i.e. do `sudo -u
+postgres -i` and then run them.
