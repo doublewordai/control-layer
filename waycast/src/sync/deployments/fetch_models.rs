@@ -1,4 +1,4 @@
-use crate::api::models::inference_endpoints::OpenAIModelsResponse;
+use crate::api::models::inference_endpoints::{AnthropicModelsResponse, OpenAIModelsResponse};
 use crate::db::models::inference_endpoints::InferenceEndpointDBResponse;
 use anyhow::anyhow;
 use async_trait::async_trait;
@@ -80,40 +80,100 @@ fn ensure_slash(url: &Url) -> Url {
     }
 }
 
+#[derive(Debug, Clone)]
+pub enum ModelFormat {
+    OpenAI,
+    Anthropic,
+}
+
+impl From<&Url> for ModelFormat {
+    fn from(value: &Url) -> Self {
+        if value.as_str().starts_with("https://api.anthropic.com") {
+            return Self::Anthropic;
+        }
+        Self::OpenAI
+    }
+}
+
 #[async_trait]
 impl FetchModels for FetchModelsReqwest {
     async fn fetch(&self) -> anyhow::Result<OpenAIModelsResponse> {
+        debug!("Base URL for fetching models: {}", self.base_url);
+        let fmt = (&self.base_url).into();
+        debug!("Featching models in format: {:?}", fmt);
+
         let url = ensure_slash(&self.base_url)
             .join("models")
             .map_err(|e| anyhow::anyhow!("Failed to construct models URL: {}", e))?;
 
         debug!("Fetching models from URL: {}", url);
 
-        let mut request = self.client.get(url);
+        let mut request = self.client.get(url.clone());
 
-        if let Some(api_key) = &self.openai_api_key {
-            request = request.header("Authorization", format!("Bearer {api_key}"));
-        };
+        match fmt {
+            ModelFormat::OpenAI => {
+                if let Some(api_key) = &self.openai_api_key {
+                    request = request.header("Authorization", format!("Bearer {api_key}"));
+                };
 
-        let response = request.timeout(self.request_timeout).send().await?;
+                let response = request.timeout(self.request_timeout).send().await?;
 
-        if !response.status().is_success() {
-            let status = response.status();
-            let body = response.text().await.unwrap_or_default();
-            return Err(anyhow!("OpenAI API error: {} - {}", status, body));
-        }
+                if !response.status().is_success() {
+                    let status = response.status();
+                    let body = response.text().await.unwrap_or_default();
+                    tracing::error!("Failed to make request to openAI API for models");
+                    tracing::error!("Url was: {}", url);
+                    return Err(anyhow!("OpenAI API error: {} - {}", status, body));
+                }
 
-        // Get the response body as text first for logging
-        let body_text = response.text().await?;
-        tracing::debug!("Models API response body: {}", body_text);
+                // Get the response body as text first for logging
+                let body_text = response.text().await?;
+                tracing::debug!("Models API response body: {}", body_text);
 
-        // Try to parse the JSON
-        match serde_json::from_str::<OpenAIModelsResponse>(&body_text) {
-            Ok(parsed) => Ok(parsed),
-            Err(e) => {
-                tracing::error!("Failed to parse models response as JSON. Error: {}", e);
-                tracing::error!("Response body was: {}", body_text);
-                Err(anyhow!("error decoding response body: {}", e))
+                // Try to parse the JSON
+                match serde_json::from_str::<OpenAIModelsResponse>(&body_text) {
+                    Ok(parsed) => Ok(parsed),
+                    Err(e) => {
+                        tracing::error!("Failed to make request to openAI-compatible API for models");
+                        tracing::error!("Failed to parse models response as JSON. Error: {}", e);
+                        tracing::error!("Response body was: {}", body_text);
+                        Err(anyhow!("error decoding response body: {}", e))
+                    }
+                }
+            }
+            ModelFormat::Anthropic => {
+                if let Some(api_key) = &self.openai_api_key {
+                    request = request.header("x-api-key", api_key.to_string());
+                };
+
+                // Have to set this
+                request = request.header("anthropic-version", "2023-06-01");
+
+                let response = request.timeout(self.request_timeout).send().await?;
+
+                if !response.status().is_success() {
+                    let status = response.status();
+                    let body = response.text().await.unwrap_or_default();
+                    tracing::error!("Failed to make request to anthropic API for models");
+                    tracing::error!("Url was: {}", url);
+                    return Err(anyhow!("Anthropic API error {}: {}", status, body));
+                }
+
+                // Get the response body as text first for logging
+                let body_text = response.text().await?;
+                tracing::debug!("Models API response body: {}", body_text);
+
+                // Try to parse the JSON
+                match serde_json::from_str::<AnthropicModelsResponse>(&body_text) {
+                    Ok(parsed) => Ok(parsed.into()),
+                    Err(e) => {
+                        tracing::error!("Failed to make request to anthropic API for models");
+                        tracing::error!("Url was: {}", url);
+                        tracing::error!("Failed to parse models response as JSON. Error: {}", e);
+                        tracing::error!("Response body was: {}", body_text);
+                        Err(anyhow!("error decoding response body: {}", e))
+                    }
+                }
             }
         }
     }
