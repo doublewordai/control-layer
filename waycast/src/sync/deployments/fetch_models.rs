@@ -4,7 +4,7 @@ use anyhow::anyhow;
 use async_trait::async_trait;
 use reqwest::Client;
 use std::time::Duration;
-use tracing::instrument;
+use tracing::{debug, instrument};
 use url::Url;
 
 #[derive(Debug, Clone)]
@@ -63,13 +63,31 @@ impl FetchModelsReqwest {
     }
 }
 
+/// Makes sure a url has a trailing slash.
+///
+/// This fixes a weird idiosyncracy in rusts 'join' method on urls, where joining URLs like
+/// '/hello', 'world' gives you '/world', but '/hello/', 'world' gives you '/hello/world'.
+/// Basically, call this before calling .join
+fn ensure_slash(url: &Url) -> Url {
+    if url.path().ends_with('/') {
+        url.clone()
+    } else {
+        let mut new_url = url.clone();
+        let mut path = new_url.path().to_string();
+        path.push('/');
+        new_url.set_path(&path);
+        new_url
+    }
+}
+
 #[async_trait]
 impl FetchModels for FetchModelsReqwest {
     async fn fetch(&self) -> anyhow::Result<OpenAIModelsResponse> {
-        let url = self
-            .base_url
+        let url = ensure_slash(&self.base_url)
             .join("v1/models")
             .map_err(|e| anyhow::anyhow!("Failed to construct models URL: {}", e))?;
+
+        debug!("Fetching models from URL: {}", url);
 
         let mut request = self.client.get(url);
 
