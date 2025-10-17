@@ -1,5 +1,20 @@
 # Changelog
 
+## [0.2.0](https://github.com/doublewordai/waycast/compare/v0.1.3...v0.2.0) (2025-10-17)
+
+
+### Features
+
+* trigger release please ([95a195b](https://github.com/doublewordai/waycast/commit/95a195bf677a6c09114a23a08e60a28143e112f6))
+
+
+### Bug Fixes
+
+* better OSS ux, bundle DB, frontend into single binary,  rename to waycast, simplify CI([#6](https://github.com/doublewordai/waycast/issues/6)) ([dd4bfa3](https://github.com/doublewordai/waycast/commit/dd4bfa3b3d012be33055402805a317b3a7e7766a))
+* docs change to trigger release please ([#18](https://github.com/doublewordai/waycast/issues/18)) ([8d2ae51](https://github.com/doublewordai/waycast/commit/8d2ae51be6b26b01300c9a3484c484a6b36e0e0d))
+* set proper default config values, and update the readme ([#15](https://github.com/doublewordai/waycast/issues/15)) ([2d9f5e6](https://github.com/doublewordai/waycast/commit/2d9f5e64690b97a73c673d71118a1d7ebcaf79f9))
+* update demos to match all current features ([#21](https://github.com/doublewordai/waycast/issues/21)) ([83b5886](https://github.com/doublewordai/waycast/commit/83b5886b32287a1db86c424b2d320cd07a979ffe))
+
 ## [0.1.3](https://github.com/doublewordai/waycast/compare/v0.1.2...v0.1.3) (2025-10-17)
 
 
