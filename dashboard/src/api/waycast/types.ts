@@ -1,7 +1,7 @@
 import { z } from "zod";
 
 export type ModelType = "CHAT" | "EMBEDDINGS" | "RERANKER";
-export type AuthSource = "vouch" | "native";
+export type AuthSource = "vouch" | "native" | "system" | "proxy-header";
 export type Role = "PlatformManager" | "RequestViewer" | "StandardUser";
 
 // Config/Metadata types
@@ -74,7 +74,7 @@ export interface Group {
   updated_at?: string; // ISO 8601 timestamp
   users?: User[]; // List of IDs, only present when include contains 'users'
   models?: Model[]; // List of IDs, only present when include contains 'models'
-  "source": string;
+  source: string;
 }
 
 export interface User {
@@ -521,6 +521,11 @@ export interface PasswordResetRequest {
 export interface PasswordResetConfirmRequest {
   token_id: string;
   token: string;
+  new_password: string;
+}
+
+export interface ChangePasswordRequest {
+  current_password: string;
   new_password: string;
 }
 

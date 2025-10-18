@@ -1,5 +1,13 @@
 import React, { useState, useEffect } from "react";
-import { Server, Check, AlertCircle, Loader2, Info, ChevronDown, X } from "lucide-react";
+import {
+  Server,
+  Check,
+  AlertCircle,
+  Loader2,
+  Info,
+  ChevronDown,
+  X,
+} from "lucide-react";
 import { useForm } from "react-hook-form";
 import { zodResolver } from "@hookform/resolvers/zod";
 import * as z from "zod";
@@ -29,11 +37,7 @@ import {
   HoverCardContent,
   HoverCardTrigger,
 } from "../../ui/hover-card";
-import {
-  Popover,
-  PopoverContent,
-  PopoverTrigger,
-} from "../../ui/popover";
+import { Popover, PopoverContent, PopoverTrigger } from "../../ui/popover";
 import type {
   EndpointValidateRequest,
   AvailableModel,
@@ -66,21 +70,21 @@ const POPULAR_ENDPOINTS = [
     url: "https://api.openai.com/v1",
     icon: "/endpoints/openai.svg",
     apiKeyUrl: "https://platform.openai.com/api-keys",
-    requiresApiKey: true
+    requiresApiKey: true,
   },
   {
     name: "Anthropic",
     url: "https://api.anthropic.com/v1",
     icon: "/endpoints/anthropic.svg",
     apiKeyUrl: "https://console.anthropic.com/settings/keys",
-    requiresApiKey: true
+    requiresApiKey: true,
   },
   {
     name: "Google",
     url: "https://generativelanguage.googleapis.com/v1beta/openai/",
     icon: "/endpoints/google.svg",
     apiKeyUrl: "https://aistudio.google.com/api-keys",
-    requiresApiKey: true
+    requiresApiKey: true,
   },
 ];
 
@@ -253,7 +257,8 @@ export const CreateEndpointModal: React.FC<CreateEndpointModalProps> = ({
                       </HoverCardTrigger>
                       <HoverCardContent className="w-80" sideOffset={5}>
                         <p className="text-sm text-muted-foreground">
-                          The base URL of your OpenAI-compatible inference endpoint.
+                          The base URL of your OpenAI-compatible inference
+                          endpoint.
                         </p>
                       </HoverCardContent>
                     </HoverCard>
@@ -300,14 +305,19 @@ export const CreateEndpointModal: React.FC<CreateEndpointModalProps> = ({
                           <span className="sr-only">Clear URL</span>
                         </button>
                       ) : (
-                        <Popover open={urlPopoverOpen} onOpenChange={setUrlPopoverOpen}>
+                        <Popover
+                          open={urlPopoverOpen}
+                          onOpenChange={setUrlPopoverOpen}
+                        >
                           <PopoverTrigger asChild>
                             <button
                               type="button"
                               className="absolute right-0 top-0 h-full px-3 text-gray-500 hover:text-gray-700 transition-colors border-l"
                             >
                               <ChevronDown className="h-4 w-4" />
-                              <span className="sr-only">Select popular endpoint</span>
+                              <span className="sr-only">
+                                Select popular endpoint
+                              </span>
                             </button>
                           </PopoverTrigger>
                           <PopoverContent className="w-96 p-2" align="end">
@@ -369,13 +379,14 @@ export const CreateEndpointModal: React.FC<CreateEndpointModalProps> = ({
               render={({ field }) => {
                 const currentUrl = form.watch("url");
                 const matchedEndpoint = POPULAR_ENDPOINTS.find(
-                  (ep) => currentUrl && currentUrl.trim() === ep.url
+                  (ep) => currentUrl && currentUrl.trim() === ep.url,
                 );
 
                 return (
                   <FormItem>
                     <FormLabel>
-                      API Key {matchedEndpoint?.requiresApiKey ? "*" : "(optional)"}
+                      API Key{" "}
+                      {matchedEndpoint?.requiresApiKey ? "*" : "(optional)"}
                     </FormLabel>
                     <FormControl>
                       <Input type="password" placeholder="sk-..." {...field} />
