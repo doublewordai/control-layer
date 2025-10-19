@@ -1,5 +1,13 @@
 # Changelog
 
+## [0.4.0](https://github.com/doublewordai/waycast/compare/v0.3.0...v0.4.0) (2025-10-19)
+
+
+### Features
+
+* Add the ability for headers to be used to set user groups. Useful for group mapping from downstream proxies ([#27](https://github.com/doublewordai/waycast/issues/27)) ([16362e9](https://github.com/doublewordai/waycast/commit/16362e9a61228f80e18afad620e2cc0cc9589963))
+* support changing password on the profile tab, and support uploading images in the playground ([#33](https://github.com/doublewordai/waycast/issues/33)) ([dde9250](https://github.com/doublewordai/waycast/commit/dde9250704142633c4aa039d9514616b9f4f0c11))
+
 ## [0.3.0](https://github.com/doublewordai/waycast/compare/v0.2.0...v0.3.0) (2025-10-17)
 
 
