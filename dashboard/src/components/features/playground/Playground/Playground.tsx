@@ -16,9 +16,23 @@ import {
   SelectValue,
 } from "../../../ui/select";
 
+interface ImageContent {
+  type: "image_url";
+  image_url: {
+    url: string;
+  };
+}
+
+interface TextContent {
+  type: "text";
+  text: string;
+}
+
+type MessageContent = string | (TextContent | ImageContent)[];
+
 interface Message {
   role: "user" | "assistant" | "system";
-  content: string;
+  content: MessageContent;
   timestamp: Date;
 }
 
@@ -30,6 +44,7 @@ const Playground: React.FC = () => {
 
   const [messages, setMessages] = useState<Message[]>([]);
   const [currentMessage, setCurrentMessage] = useState("");
+  const [uploadedImages, setUploadedImages] = useState<string[]>([]);
   const [isStreaming, setIsStreaming] = useState(false);
   const [streamingContent, setStreamingContent] = useState("");
   const [error, setError] = useState<string | null>(null);
@@ -97,6 +112,7 @@ const Playground: React.FC = () => {
       setRerankResult(null);
       setError(null);
       setCurrentMessage("");
+      setUploadedImages([]);
       setTextA("");
       setTextB("");
       setQuery("What is the capital of France?");
@@ -277,17 +293,97 @@ const Playground: React.FC = () => {
     }
   };
 
+  const handleImageUpload = async (
+    event: React.ChangeEvent<HTMLInputElement>,
+  ) => {
+    const files = event.target.files;
+    if (!files || files.length === 0) return;
+
+    const newImages: string[] = [];
+
+    for (let i = 0; i < files.length; i++) {
+      const file = files[i];
+
+      // Validate file type
+      if (!file.type.startsWith("image/")) {
+        setError("Please select only image files");
+        continue;
+      }
+
+      // Validate file size (max 10MB)
+      if (file.size > 10 * 1024 * 1024) {
+        setError("Image size must be less than 10MB");
+        continue;
+      }
+
+      // Convert to base64
+      const reader = new FileReader();
+      const base64Promise = new Promise<string>((resolve) => {
+        reader.onload = (e) => {
+          const base64String = e.target?.result as string;
+          resolve(base64String);
+        };
+        reader.readAsDataURL(file);
+      });
+
+      const base64 = await base64Promise;
+      newImages.push(base64);
+    }
+
+    setUploadedImages((prev) => [...prev, ...newImages]);
+    // Reset the input so the same file can be uploaded again
+    event.target.value = "";
+  };
+
+  const handleRemoveImage = (index: number) => {
+    setUploadedImages((prev) => prev.filter((_, i) => i !== index));
+  };
+
   const handleSendMessage = async () => {
-    if (!currentMessage.trim() || isStreaming || !selectedModel) return;
+    if (
+      (!currentMessage.trim() && uploadedImages.length === 0) ||
+      isStreaming ||
+      !selectedModel
+    )
+      return;
+
+    // Create message content - use multimodal format if images are present
+    let messageContent: MessageContent;
+    if (uploadedImages.length > 0) {
+      const contentParts: (TextContent | ImageContent)[] = [];
+
+      // Add text if present
+      if (currentMessage.trim()) {
+        contentParts.push({
+          type: "text",
+          text: currentMessage.trim(),
+        });
+      }
+
+      // Add images
+      uploadedImages.forEach((imageUrl) => {
+        contentParts.push({
+          type: "image_url",
+          image_url: {
+            url: imageUrl,
+          },
+        });
+      });
+
+      messageContent = contentParts;
+    } else {
+      messageContent = currentMessage.trim();
+    }
 
     const userMessage: Message = {
       role: "user",
-      content: currentMessage.trim(),
+      content: messageContent,
       timestamp: new Date(),
     };
 
     setMessages((prev) => [...prev, userMessage]);
     setCurrentMessage("");
+    setUploadedImages([]);
     setIsStreaming(true);
     setStreamingContent("");
     setError(null);
@@ -303,11 +399,11 @@ const Playground: React.FC = () => {
         {
           model: selectedModel.alias,
           messages: [
-            ...messages.map((msg) => ({
+            ...(messages.map((msg) => ({
               role: msg.role,
               content: msg.content,
-            })),
-            { role: "user", content: userMessage.content },
+            })) as any),
+            { role: "user" as const, content: userMessage.content },
           ],
           stream: true,
           stream_options: {
@@ -379,6 +475,7 @@ const Playground: React.FC = () => {
     setSimilarityResult(null);
     setRerankResult(null);
     setError(null);
+    setUploadedImages([]);
     setTextA("");
     setTextB("");
     setQuery("What is the capital of France?");
@@ -404,7 +501,7 @@ const Playground: React.FC = () => {
   return (
     <div className="h-[calc(100vh-4rem)] bg-white flex flex-col">
       {/* Header */}
-      <div className="bg-white border-b border-gray-200 px-8 py-4 flex-shrink-0">
+      <div className="bg-white border-b border-gray-200 px-8 py-3 flex-shrink-0">
         <div className="flex items-center justify-between">
           <div className="flex items-center gap-4">
             <button
@@ -515,11 +612,17 @@ const Playground: React.FC = () => {
           selectedModel={selectedModel}
           messages={messages}
           currentMessage={currentMessage}
+          uploadedImages={uploadedImages}
           streamingContent={streamingContent}
           isStreaming={isStreaming}
           error={error}
           copiedMessageIndex={copiedMessageIndex}
+          supportsImages={
+            selectedModel.capabilities?.includes("vision") ?? false
+          }
           onCurrentMessageChange={setCurrentMessage}
+          onImageUpload={handleImageUpload}
+          onRemoveImage={handleRemoveImage}
           onSendMessage={handleSendMessage}
           onCopyMessage={copyMessage}
           onKeyDown={handleKeyDown}

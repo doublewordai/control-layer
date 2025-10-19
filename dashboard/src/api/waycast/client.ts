@@ -33,6 +33,7 @@ import type {
   LoginInfo,
   PasswordResetRequest,
   PasswordResetConfirmRequest,
+  ChangePasswordRequest,
 } from "./types";
 import { ApiError } from "./errors";
 
@@ -547,6 +548,26 @@ const authApi = {
         response.status,
         errorMessage ||
           `Password reset confirmation failed: ${response.status}`,
+        response,
+      );
+    }
+    return response.json();
+  },
+
+  async changePassword(
+    request: ChangePasswordRequest,
+  ): Promise<AuthSuccessResponse> {
+    const response = await fetch("/authentication/password-change", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(request),
+      credentials: "include", // Include cookies for authentication
+    });
+    if (!response.ok) {
+      const errorMessage = await response.text();
+      throw new ApiError(
+        response.status,
+        errorMessage || `Password change failed: ${response.status}`,
         response,
       );
     }

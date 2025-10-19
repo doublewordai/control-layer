@@ -7,10 +7,10 @@ use uuid::Uuid;
 use crate::{
     api::models::{
         auth::{
-            AuthResponse, AuthSuccessResponse, LoginInfo, LoginRequest, LoginResponse, LogoutResponse, PasswordResetConfirmRequest,
-            PasswordResetRequest, PasswordResetResponse, RegisterRequest, RegisterResponse, RegistrationInfo,
+            AuthResponse, AuthSuccessResponse, ChangePasswordRequest, LoginInfo, LoginRequest, LoginResponse, LogoutResponse,
+            PasswordResetConfirmRequest, PasswordResetRequest, PasswordResetResponse, RegisterRequest, RegisterResponse, RegistrationInfo,
         },
-        users::{Role, UserResponse},
+        users::{CurrentUser, Role, UserResponse},
     },
     auth::{password, session},
     db::{
@@ -378,6 +378,99 @@ pub async fn confirm_password_reset(
 
     Ok(Json(PasswordResetResponse {
         message: "Password has been reset successfully".to_string(),
+    }))
+}
+
+/// Change password for authenticated user
+#[utoipa::path(
+    post,
+    path = "/authentication/password-change",
+    request_body = ChangePasswordRequest,
+    tag = "authentication",
+    responses(
+        (status = 200, description = "Password changed successfully", body = AuthSuccessResponse),
+        (status = 400, description = "Invalid request"),
+        (status = 401, description = "Current password is incorrect"),
+    ),
+    security(
+        ("session_token" = [])
+    )
+)]
+pub async fn change_password(
+    State(state): State<AppState>,
+    current_user: CurrentUser,
+    Json(request): Json<ChangePasswordRequest>,
+) -> Result<Json<AuthSuccessResponse>, Error> {
+    // Check if native auth is enabled
+    if !state.config.auth.native.enabled {
+        return Err(Error::BadRequest {
+            message: "Native authentication is disabled".to_string(),
+        });
+    }
+
+    let mut pool_conn = state.db.acquire().await.map_err(|e| Error::Database(e.into()))?;
+    let mut user_repo = Users::new(&mut pool_conn);
+
+    // Get the user from database
+    let user = user_repo.get_by_id(current_user.id).await?.ok_or_else(|| Error::Unauthenticated {
+        message: Some("User not found".to_string()),
+    })?;
+
+    // Check if user has a password (native auth only)
+    let password_hash = user.password_hash.as_ref().ok_or_else(|| Error::BadRequest {
+        message: "Cannot change password for non-native authentication users".to_string(),
+    })?;
+
+    // Verify current password
+    let current_password = request.current_password.clone();
+    let hash = password_hash.clone();
+    let is_valid = tokio::task::spawn_blocking(move || password::verify_string(&current_password, &hash))
+        .await
+        .map_err(|e| Error::Internal {
+            operation: format!("spawn password verification task: {e}"),
+        })??;
+
+    if !is_valid {
+        return Err(Error::Unauthenticated {
+            message: Some("Current password is incorrect".to_string()),
+        });
+    }
+
+    // Validate new password length
+    let password_config = &state.config.auth.native.password;
+    if request.new_password.len() < password_config.min_length {
+        return Err(Error::BadRequest {
+            message: format!("Password must be at least {} characters", password_config.min_length),
+        });
+    }
+    if request.new_password.len() > password_config.max_length {
+        return Err(Error::BadRequest {
+            message: format!("Password must be no more than {} characters", password_config.max_length),
+        });
+    }
+
+    // Hash new password
+    let new_password_hash = tokio::task::spawn_blocking({
+        let password = request.new_password.clone();
+        move || password::hash_string(&password)
+    })
+    .await
+    .map_err(|e| Error::Internal {
+        operation: format!("spawn password hashing task: {e}"),
+    })??;
+
+    // Update password
+    let update_request = crate::db::models::users::UserUpdateDBRequest {
+        display_name: None,
+        avatar_url: None,
+        roles: None,
+        password_hash: Some(new_password_hash),
+    };
+
+    user_repo.update(current_user.id, &update_request).await?;
+
+    Ok(Json(AuthSuccessResponse {
+        message: "Password changed successfully".to_string(),
     }))
 }
 

@@ -122,6 +122,15 @@ pub struct PasswordResetResponse {
     pub message: String,
 }
 
+/// Request to change password (for authenticated users)
+#[derive(Debug, Serialize, Deserialize, ToSchema)]
+pub struct ChangePasswordRequest {
+    /// Current password (for verification)
+    pub current_password: String,
+    /// New password
+    pub new_password: String,
+}
+
 impl IntoResponse for LogoutResponse {
     fn into_response(self) -> Response {
         let mut headers = HeaderMap::new();

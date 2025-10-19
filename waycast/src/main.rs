@@ -351,6 +351,7 @@ pub async fn build_router(state: &mut AppState, onwards_router: Router) -> anyho
             "/authentication/password-resets/{token_id}/confirm",
             post(api::handlers::auth::confirm_password_reset),
         )
+        .route("/authentication/password-change", post(api::handlers::auth::change_password))
         .with_state(state.clone());
 
     // API routes
