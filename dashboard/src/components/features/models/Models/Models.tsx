@@ -324,7 +324,9 @@ const Models: React.FC = () => {
             Add an endpoint to start interacting with AI models through waycast.
           </p>
           <Button
-            onClick={() => navigate("/endpoints", { state: { openCreateModal: true } })}
+            onClick={() =>
+              navigate("/endpoints", { state: { openCreateModal: true } })
+            }
             className="bg-doubleword-background-dark hover:bg-doubleword-neutral-900"
           >
             <Plus className="w-4 h-4 mr-2" />
@@ -571,7 +573,7 @@ const Models: React.FC = () => {
                             <span className="text-gray-600">
                               {formatNumber(
                                 model.metrics.total_input_tokens +
-                                model.metrics.total_output_tokens,
+                                  model.metrics.total_output_tokens,
                               )}{" "}
                               tokens
                             </span>
