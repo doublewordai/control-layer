@@ -219,57 +219,64 @@ const endpointApi = {
   },
 
   async create(data: EndpointCreateRequest): Promise<Endpoint> {
+  const response = await fetch("/admin/api/v1/endpoints", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(data),
+  });
+  
+  if (!response.ok) {
+    console.log(`❌ Error response (${response.status}):`, response.statusText);
     
-    const response = await fetch("/admin/api/v1/endpoints", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(data),
-    });
-    
-    
-    if (!response.ok) {
-      console.log(`❌ Error response (${response.status}):`, response.statusText);
+    try {
+      // Always try to get the response body first
+      const responseText = await response.text();
       
+      // Try to parse as JSON
+      let responseData;
       try {
-        // Always try to get the response body first
-        const responseText = await response.text();
-        
-        // Try to parse as JSON
-        let responseData;
-        try {
-          responseData = JSON.parse(responseText);
-        } catch (parseError) {
-          throw new Error(responseText || `Failed to create endpoint: ${response.status}`);
-        }
-        
-        // Handle different status codes
-        if (response.status === 409) {
-          if (responseData.conflicts) {
-            const conflictError = new Error(responseData.message || "Alias conflicts detected");
-            (conflictError as any).isConflict = true;
-            (conflictError as any).conflicts = responseData.conflicts;
-            throw conflictError;
-          }
-        }
-        
-        // Generic error with JSON message
-        throw new Error(responseData.message || responseText || `Failed to create endpoint: ${response.status}`);
-        
-      } catch (error) {
-        
-        // If it's already our custom error, re-throw it
-        if (error && typeof error === 'object' && 'isConflict' in error) {
-          throw error;
-        }
-        
-        // Otherwise throw the error we caught
+        responseData = JSON.parse(responseText);
+      } catch (parseError) {
+        const error = new Error(responseText || `Failed to create endpoint: ${response.status}`);
+        (error as any).status = response.status;
         throw error;
       }
+      
+      // Create a structured error object that matches what your frontend expects
+      const error = new Error(responseData.message || `Failed to create endpoint: ${response.status}`);
+      (error as any).status = response.status;
+      (error as any).response = {
+        status: response.status,
+        data: responseData
+      };
+      (error as any).data = responseData; // Also add direct data property
+      
+      // Handle conflicts specifically
+      if (response.status === 409) {
+        if (responseData.conflicts) {
+          (error as any).isConflict = true;
+          (error as any).conflicts = responseData.conflicts;
+        }
+      }
+      
+      throw error;
+      
+    } catch (error) {
+      // If it's already our custom error, re-throw it
+      if (error && typeof error === 'object' && ('status' in error || 'isConflict' in error)) {
+        throw error;
+      }
+      
+      // Otherwise create a structured error
+      const structuredError = new Error(error instanceof Error ? error.message : 'Unknown error');
+      (structuredError as any).status = response.status;
+      throw structuredError;
     }
-    
-    console.log("✅ Success response, parsing JSON...");
-    return response.json();
-  },
+  }
+  
+  console.log("✅ Success response, parsing JSON...");
+  return response.json();
+},
 
   async update(id: string, data: EndpointUpdateRequest): Promise<Endpoint> {
     const response = await fetch(`/admin/api/v1/endpoints/${id}`, {

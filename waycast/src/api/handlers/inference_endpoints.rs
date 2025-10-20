@@ -270,35 +270,22 @@ pub async fn create_inference_endpoint(
             &create_request.alias_mapping
         ).await {
             Ok(sync_result) => {
-                tracing::info!(
-                    "Sync during endpoint {} creation: {} changes made, {} new models",
-                    endpoint.id,
-                    sync_result.changes_made,
-                    sync_result.new_models_created
-                );
-                
-                // Check if any models failed to import due to alias conflicts
-                if sync_result.new_models_created == 0 && sync_result.total_models_fetched > 0 {
-                    return Err(Error::BadRequest {
-                        message: format!(
-                            "Could not import any of the {} models from this endpoint. This may be due to alias conflicts with existing models.",
-                            sync_result.total_models_fetched
-                        ),
-                    });
-                }
+                tracing::info!("Sync succeeded: {:?}", sync_result);
             }
             Err(sync_error) => {
+                tracing::error!("Sync failed with error: {:?}", sync_error);
                 match sync_error {
                     crate::sync::endpoint_sync::SyncError::AliasConflicts { conflicts } => {
-                        return Err(Error::Conflict {
-                            message: "Alias conflicts detected".to_string(),
+                        tracing::info!("Detected alias conflicts: {:?}", conflicts);
+                        return Err(crate::errors::Error::Conflict {
+                            message: "Alias conflicts detected during endpoint creation".to_string(),
                             conflicts: Some(conflicts),
                         });
                     }
                     crate::sync::endpoint_sync::SyncError::Other(e) => {
-                        tracing::warn!("Sync failed during endpoint {} creation: {}", endpoint.id, e);
-                        return Err(Error::BadRequest {
-                            message: format!("Failed to sync models from endpoint: {}", e),
+                        tracing::error!("Other sync error: {:#}", e);
+                        return Err(crate::errors::Error::Internal {
+                            operation: "sync endpoint models during creation".to_string(),
                         });
                     }
                 }

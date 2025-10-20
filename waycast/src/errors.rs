@@ -162,6 +162,37 @@ impl IntoResponse for Error {
                 
                 (status, axum::response::Json(body)).into_response()
             }
+            // Handle database unique violations with minimal structured JSON
+            Error::Database(DbError::UniqueViolation { constraint, table, .. }) => {
+                use serde_json::json;
+                
+                // Determine the resource and message only
+                let (message, resource) = match (table.as_deref(), constraint.as_deref()) {
+                    (Some("users"), Some(c)) if c.contains("email") => {
+                        ("An account with this email address already exists".to_string(), "user")
+                    },
+                    (Some("users"), Some(c)) if c.contains("username") => {
+                        ("This username is already taken".to_string(), "user")
+                    },
+                    (Some("deployed_models"), Some("deployed_models_alias_unique")) => {
+                        ("The specified alias is already in use. Please choose a different alias.".to_string(), "deployment")
+                    },
+                    (Some("inference_endpoints"), Some(c)) if c.contains("name") => {
+                        ("An endpoint with this name already exists".to_string(), "endpoint")
+                    },
+                    (Some("inference_endpoints"), Some(c)) if c.contains("url") => {
+                        ("An endpoint with this URL already exists".to_string(), "endpoint")
+                    },
+                    _ => ("Resource already exists".to_string(), "unknown")
+                };
+                
+                let body = json!({
+                    "message": message,
+                    "resource": resource
+                });
+                
+                (status, axum::response::Json(body)).into_response()
+            }
             _ => {
                 // For all other errors, return simple text message (unchanged)
                 let user_message = self.user_message();
