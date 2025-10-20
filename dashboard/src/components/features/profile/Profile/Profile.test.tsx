@@ -6,7 +6,7 @@ import { ReactNode } from "react";
 import { describe, it, expect, beforeAll, afterEach, afterAll } from "vitest";
 import userEvent from "@testing-library/user-event";
 import { Profile } from "./Profile";
-import { handlers } from "../../../../api/waycast/mocks/handlers";
+import { handlers } from "../../../../api/control-layer/mocks/handlers";
 
 // Setup MSW server
 const server = setupServer(...handlers);

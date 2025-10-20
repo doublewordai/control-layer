@@ -1,7 +1,7 @@
 import React, { useState, useMemo } from "react";
 import { type ColumnDef } from "@tanstack/react-table";
-import { useRequestsAggregateByUser } from "../../../../api/waycast";
-import { type UserUsage } from "../../../../api/waycast";
+import { useRequestsAggregateByUser } from "../../../../api/control-layer";
+import { type UserUsage } from "../../../../api/control-layer";
 import { DateTimeRangeSelector } from "../../../ui/date-time-range-selector";
 import { DataTable } from "../../../ui/data-table";
 import { Button } from "../../../ui/button";

@@ -14,7 +14,7 @@ import {
   useAddUserToGroup,
   useRemoveUserFromGroup,
   type Group as BackendGroup,
-} from "../../../api/waycast";
+} from "../../../api/control-layer";
 import type { DisplayUser } from "../../../types/display";
 
 interface UserGroupsModalProps {

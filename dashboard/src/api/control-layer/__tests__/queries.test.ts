@@ -1,7 +1,7 @@
 import { beforeAll, afterEach, afterAll, describe, it, expect } from "vitest";
 import { setupServer } from "msw/node";
 import { handlers } from "../mocks/handlers";
-import { waycastApi } from "../client";
+import { dwctlApi } from "../client";
 import type {
   UserCreateRequest,
   GroupCreateRequest,
@@ -29,10 +29,10 @@ afterAll(() => {
   server.close();
 });
 
-describe("waycastApi.users", () => {
+describe("dwctlApi.users", () => {
   describe("list", () => {
     it("should fetch users without query parameters", async () => {
-      const users = await waycastApi.users.list();
+      const users = await dwctlApi.users.list();
 
       expect(users).toBeInstanceOf(Array);
       expect(users.length).toBeGreaterThan(0);
@@ -43,7 +43,7 @@ describe("waycastApi.users", () => {
     });
 
     it("should fetch users with include=groups parameter", async () => {
-      const users = await waycastApi.users.list({ include: "groups" });
+      const users = await dwctlApi.users.list({ include: "groups" });
 
       expect(users).toBeInstanceOf(Array);
       expect(users[0]).toHaveProperty("groups");
@@ -52,7 +52,7 @@ describe("waycastApi.users", () => {
 
     it("should construct URL correctly with query parameters", async () => {
       // Test that the URL is constructed properly by checking the response
-      const users = await waycastApi.users.list({ include: "groups" });
+      const users = await dwctlApi.users.list({ include: "groups" });
 
       // The handler should return users with groups when include=groups
       expect(users[0]).toHaveProperty("groups");
@@ -62,7 +62,7 @@ describe("waycastApi.users", () => {
   describe("get", () => {
     it("should fetch a specific user by ID", async () => {
       const userId = "550e8400-e29b-41d4-a716-446655440001";
-      const user = await waycastApi.users.get(userId);
+      const user = await dwctlApi.users.get(userId);
 
       expect(user).toHaveProperty("id", userId);
       expect(user).toHaveProperty("username");
@@ -72,7 +72,7 @@ describe("waycastApi.users", () => {
     it("should throw error for non-existent user", async () => {
       const nonExistentId = "non-existent-id";
 
-      await expect(waycastApi.users.get(nonExistentId)).rejects.toThrow(
+      await expect(dwctlApi.users.get(nonExistentId)).rejects.toThrow(
         "Failed to fetch user: 404",
       );
     });
@@ -87,7 +87,7 @@ describe("waycastApi.users", () => {
         roles: ["User"],
       };
 
-      const createdUser = await waycastApi.users.create(userData);
+      const createdUser = await dwctlApi.users.create(userData);
 
       expect(createdUser).toHaveProperty("id");
       expect(createdUser.username).toBe(userData.username);
@@ -107,7 +107,7 @@ describe("waycastApi.users", () => {
         avatar_url: "https://example.com/avatar.jpg",
       };
 
-      const createdUser = await waycastApi.users.create(userData);
+      const createdUser = await dwctlApi.users.create(userData);
 
       // Verify all fields are properly serialized and returned
       expect(createdUser.username).toBe(userData.username);
@@ -126,7 +126,7 @@ describe("waycastApi.users", () => {
         roles: ["Admin"],
       };
 
-      const updatedUser = await waycastApi.users.update(userId, updateData);
+      const updatedUser = await dwctlApi.users.update(userId, updateData);
 
       expect(updatedUser.id).toBe(userId);
       expect(updatedUser.display_name).toBe(updateData.display_name);
@@ -139,7 +139,7 @@ describe("waycastApi.users", () => {
       const updateData: UserUpdateRequest = { display_name: "Updated" };
 
       await expect(
-        waycastApi.users.update(nonExistentId, updateData),
+        dwctlApi.users.update(nonExistentId, updateData),
       ).rejects.toThrow("Failed to update user: 404");
     });
   });
@@ -148,13 +148,13 @@ describe("waycastApi.users", () => {
     it("should delete an existing user", async () => {
       const userId = "550e8400-e29b-41d4-a716-446655440001";
 
-      await expect(waycastApi.users.delete(userId)).resolves.toBeUndefined();
+      await expect(dwctlApi.users.delete(userId)).resolves.toBeUndefined();
     });
 
     it("should throw error when deleting non-existent user", async () => {
       const nonExistentId = "non-existent-id";
 
-      await expect(waycastApi.users.delete(nonExistentId)).rejects.toThrow(
+      await expect(dwctlApi.users.delete(nonExistentId)).rejects.toThrow(
         "Failed to delete user: 404",
       );
     });
@@ -163,7 +163,7 @@ describe("waycastApi.users", () => {
   describe("apiKeys", () => {
     describe("getAll", () => {
       it("should fetch all API keys for current user", async () => {
-        const apiKeys = await waycastApi.users.apiKeys.getAll();
+        const apiKeys = await dwctlApi.users.apiKeys.getAll();
 
         expect(apiKeys).toBeInstanceOf(Array);
         expect(apiKeys.length).toBeGreaterThan(0);
@@ -174,7 +174,7 @@ describe("waycastApi.users", () => {
 
       it("should fetch API keys for specific user", async () => {
         const userId = "550e8400-e29b-41d4-a716-446655440001";
-        const apiKeys = await waycastApi.users.apiKeys.getAll(userId);
+        const apiKeys = await dwctlApi.users.apiKeys.getAll(userId);
 
         expect(apiKeys).toBeInstanceOf(Array);
       });
@@ -183,7 +183,7 @@ describe("waycastApi.users", () => {
     describe("get", () => {
       it("should fetch specific API key", async () => {
         const keyId = "key-1";
-        const apiKey = await waycastApi.users.apiKeys.get(keyId);
+        const apiKey = await dwctlApi.users.apiKeys.get(keyId);
 
         expect(apiKey).toHaveProperty("id", keyId);
         expect(apiKey).toHaveProperty("name");
@@ -193,7 +193,7 @@ describe("waycastApi.users", () => {
         const nonExistentId = "non-existent-key";
 
         await expect(
-          waycastApi.users.apiKeys.get(nonExistentId),
+          dwctlApi.users.apiKeys.get(nonExistentId),
         ).rejects.toThrow("Failed to fetch API key: 404");
       });
     });
@@ -205,7 +205,7 @@ describe("waycastApi.users", () => {
           description: "Test description",
         };
 
-        const createdKey = await waycastApi.users.apiKeys.create(keyData);
+        const createdKey = await dwctlApi.users.apiKeys.create(keyData);
 
         expect(createdKey).toHaveProperty("id");
         expect(createdKey).toHaveProperty("key"); // Only returned on creation
@@ -220,7 +220,7 @@ describe("waycastApi.users", () => {
           name: "User Key",
         };
 
-        const createdKey = await waycastApi.users.apiKeys.create(
+        const createdKey = await dwctlApi.users.apiKeys.create(
           keyData,
           userId,
         );
@@ -235,7 +235,7 @@ describe("waycastApi.users", () => {
         const keyId = "key-1";
 
         await expect(
-          waycastApi.users.apiKeys.delete(keyId),
+          dwctlApi.users.apiKeys.delete(keyId),
         ).resolves.toBeUndefined();
       });
 
@@ -243,17 +243,17 @@ describe("waycastApi.users", () => {
         const nonExistentId = "non-existent-key";
 
         await expect(
-          waycastApi.users.apiKeys.delete(nonExistentId),
+          dwctlApi.users.apiKeys.delete(nonExistentId),
         ).rejects.toThrow("Failed to delete API key: 404");
       });
     });
   });
 });
 
-describe("waycastApi.models", () => {
+describe("dwctlApi.models", () => {
   describe("list", () => {
     it("should fetch all models", async () => {
-      const models = await waycastApi.models.list();
+      const models = await dwctlApi.models.list();
 
       expect(models).toBeInstanceOf(Object);
       expect(Object.keys(models).length).toBeGreaterThan(0);
@@ -266,7 +266,7 @@ describe("waycastApi.models", () => {
     });
 
     it("should filter models by endpoint", async () => {
-      const models = await waycastApi.models.list({ endpoint: "2" });
+      const models = await dwctlApi.models.list({ endpoint: "2" });
 
       expect(models).toBeInstanceOf(Object);
       const modelValues = Object.values(models);
@@ -274,7 +274,7 @@ describe("waycastApi.models", () => {
     });
 
     it("should include groups when requested", async () => {
-      const models = await waycastApi.models.list({ include: "groups" });
+      const models = await dwctlApi.models.list({ include: "groups" });
 
       const firstModel = Object.values(models)[0];
       expect(firstModel).toHaveProperty("groups");
@@ -282,7 +282,7 @@ describe("waycastApi.models", () => {
     });
 
     it("should construct URL correctly with multiple parameters", async () => {
-      const models = await waycastApi.models.list({
+      const models = await dwctlApi.models.list({
         endpoint: "c3d4e5f6-7890-1234-5678-90abcdef0123",
         include: "groups",
       });
@@ -300,7 +300,7 @@ describe("waycastApi.models", () => {
   describe("get", () => {
     it("should fetch specific model", async () => {
       const modelId = "f914c573-4c00-4a37-a878-53318a6d5a5b";
-      const model = await waycastApi.models.get(modelId);
+      const model = await dwctlApi.models.get(modelId);
 
       expect(model).toHaveProperty("id", modelId);
       expect(model).toHaveProperty("alias");
@@ -310,7 +310,7 @@ describe("waycastApi.models", () => {
     it("should throw error for non-existent model", async () => {
       const nonExistentId = "non-existent-model";
 
-      await expect(waycastApi.models.get(nonExistentId)).rejects.toThrow(
+      await expect(dwctlApi.models.get(nonExistentId)).rejects.toThrow(
         "Failed to fetch model: 404",
       );
     });
@@ -325,7 +325,7 @@ describe("waycastApi.models", () => {
         capabilities: ["text", "vision", "code"],
       };
 
-      const updatedModel = await waycastApi.models.update(modelId, updateData);
+      const updatedModel = await dwctlApi.models.update(modelId, updateData);
 
       expect(updatedModel.alias).toBe(updateData.alias);
       expect(updatedModel.description).toBe(updateData.description);
@@ -339,7 +339,7 @@ describe("waycastApi.models", () => {
         model_type: null,
       };
 
-      const updatedModel = await waycastApi.models.update(modelId, updateData);
+      const updatedModel = await dwctlApi.models.update(modelId, updateData);
 
       expect(updatedModel.description).toBeNull();
       expect(updatedModel.model_type).toBeNull();
@@ -347,10 +347,10 @@ describe("waycastApi.models", () => {
   });
 });
 
-describe("waycastApi.endpoints", () => {
+describe("dwctlApi.endpoints", () => {
   describe("list", () => {
     it("should fetch all endpoints", async () => {
-      const endpoints = await waycastApi.endpoints.list();
+      const endpoints = await dwctlApi.endpoints.list();
 
       expect(endpoints).toBeInstanceOf(Array);
       expect(endpoints.length).toBeGreaterThan(0);
@@ -362,7 +362,7 @@ describe("waycastApi.endpoints", () => {
   describe("get", () => {
     it("should fetch specific endpoint", async () => {
       const endpointId = "a1b2c3d4-e5f6-7890-1234-567890abcdef";
-      const endpoint = await waycastApi.endpoints.get(endpointId);
+      const endpoint = await dwctlApi.endpoints.get(endpointId);
 
       expect(endpoint).toHaveProperty(
         "id",
@@ -374,17 +374,17 @@ describe("waycastApi.endpoints", () => {
     it("should throw error for non-existent endpoint", async () => {
       const nonExistentId = "99999999-9999-9999-9999-999999999999";
 
-      await expect(waycastApi.endpoints.get(nonExistentId)).rejects.toThrow(
+      await expect(dwctlApi.endpoints.get(nonExistentId)).rejects.toThrow(
         "Failed to fetch endpoint: 404",
       );
     });
   });
 });
 
-describe("waycastApi.groups", () => {
+describe("dwctlApi.groups", () => {
   describe("list", () => {
     it("should fetch all groups", async () => {
-      const groups = await waycastApi.groups.list();
+      const groups = await dwctlApi.groups.list();
 
       expect(groups).toBeInstanceOf(Array);
       expect(groups.length).toBeGreaterThan(0);
@@ -393,21 +393,21 @@ describe("waycastApi.groups", () => {
     });
 
     it("should include users when requested", async () => {
-      const groups = await waycastApi.groups.list({ include: "users" });
+      const groups = await dwctlApi.groups.list({ include: "users" });
 
       expect(groups[0]).toHaveProperty("users");
       expect(groups[0].users).toBeInstanceOf(Array);
     });
 
     it("should include models when requested", async () => {
-      const groups = await waycastApi.groups.list({ include: "models" });
+      const groups = await dwctlApi.groups.list({ include: "models" });
 
       expect(groups[0]).toHaveProperty("models");
       expect(groups[0].models).toBeInstanceOf(Array);
     });
 
     it("should include both users and models when requested", async () => {
-      const groups = await waycastApi.groups.list({ include: "users,models" });
+      const groups = await dwctlApi.groups.list({ include: "users,models" });
 
       expect(groups[0]).toHaveProperty("users");
       expect(groups[0]).toHaveProperty("models");
@@ -417,7 +417,7 @@ describe("waycastApi.groups", () => {
   describe("get", () => {
     it("should fetch specific group", async () => {
       const groupId = "550e8400-e29b-41d4-a716-446655441001";
-      const group = await waycastApi.groups.get(groupId);
+      const group = await dwctlApi.groups.get(groupId);
 
       expect(group).toHaveProperty("id", groupId);
       expect(group).toHaveProperty("name");
@@ -426,7 +426,7 @@ describe("waycastApi.groups", () => {
     it("should throw error for non-existent group", async () => {
       const nonExistentId = "non-existent-group";
 
-      await expect(waycastApi.groups.get(nonExistentId)).rejects.toThrow(
+      await expect(dwctlApi.groups.get(nonExistentId)).rejects.toThrow(
         "Failed to fetch group: 404",
       );
     });
@@ -439,7 +439,7 @@ describe("waycastApi.groups", () => {
         description: "Test group",
       };
 
-      const createdGroup = await waycastApi.groups.create(groupData);
+      const createdGroup = await dwctlApi.groups.create(groupData);
 
       expect(createdGroup).toHaveProperty("id");
       expect(createdGroup.name).toBe(groupData.name);
@@ -457,7 +457,7 @@ describe("waycastApi.groups", () => {
         description: "Updated description",
       };
 
-      const updatedGroup = await waycastApi.groups.update(groupId, updateData);
+      const updatedGroup = await dwctlApi.groups.update(groupId, updateData);
 
       expect(updatedGroup.name).toBe(updateData.name);
       expect(updatedGroup.description).toBe(updateData.description);
@@ -468,7 +468,7 @@ describe("waycastApi.groups", () => {
     it("should delete group", async () => {
       const groupId = "550e8400-e29b-41d4-a716-446655441001";
 
-      await expect(waycastApi.groups.delete(groupId)).resolves.toBeUndefined();
+      await expect(dwctlApi.groups.delete(groupId)).resolves.toBeUndefined();
     });
   });
 
@@ -479,7 +479,7 @@ describe("waycastApi.groups", () => {
         const userId = "550e8400-e29b-41d4-a716-446655440001";
 
         await expect(
-          waycastApi.groups.addUser(groupId, userId),
+          dwctlApi.groups.addUser(groupId, userId),
         ).resolves.toBeUndefined();
       });
 
@@ -488,7 +488,7 @@ describe("waycastApi.groups", () => {
         const userId = "550e8400-e29b-41d4-a716-446655440001";
 
         await expect(
-          waycastApi.groups.addUser(nonExistentGroupId, userId),
+          dwctlApi.groups.addUser(nonExistentGroupId, userId),
         ).rejects.toThrow("Failed to add user to group: 404");
       });
     });
@@ -499,7 +499,7 @@ describe("waycastApi.groups", () => {
         const userId = "550e8400-e29b-41d4-a716-446655440001";
 
         await expect(
-          waycastApi.groups.removeUser(groupId, userId),
+          dwctlApi.groups.removeUser(groupId, userId),
         ).resolves.toBeUndefined();
       });
     });
@@ -510,7 +510,7 @@ describe("waycastApi.groups", () => {
         const modelId = "f914c573-4c00-4a37-a878-53318a6d5a5b";
 
         await expect(
-          waycastApi.groups.addModel(groupId, modelId),
+          dwctlApi.groups.addModel(groupId, modelId),
         ).resolves.toBeUndefined();
       });
     });
@@ -521,7 +521,7 @@ describe("waycastApi.groups", () => {
         const modelId = "f914c573-4c00-4a37-a878-53318a6d5a5b";
 
         await expect(
-          waycastApi.groups.removeModel(groupId, modelId),
+          dwctlApi.groups.removeModel(groupId, modelId),
         ).resolves.toBeUndefined();
       });
     });
@@ -530,26 +530,26 @@ describe("waycastApi.groups", () => {
 
 describe("Error Handling", () => {
   it("should handle HTTP 500 errors", async () => {
-    await expect(waycastApi.users.get("error-500")).rejects.toThrow(
+    await expect(dwctlApi.users.get("error-500")).rejects.toThrow(
       "Failed to fetch user: 500",
     );
   });
 
   it("should handle network errors", async () => {
-    await expect(waycastApi.users.get("network-error")).rejects.toThrow();
+    await expect(dwctlApi.users.get("network-error")).rejects.toThrow();
   });
 
   it("should throw meaningful error messages", async () => {
-    await expect(waycastApi.users.get("non-existent-id")).rejects.toThrow(
+    await expect(dwctlApi.users.get("non-existent-id")).rejects.toThrow(
       "Failed to fetch user: 404",
     );
-    await expect(waycastApi.models.get("non-existent-model")).rejects.toThrow(
+    await expect(dwctlApi.models.get("non-existent-model")).rejects.toThrow(
       "Failed to fetch model: 404",
     );
-    await expect(waycastApi.groups.get("non-existent-group")).rejects.toThrow(
+    await expect(dwctlApi.groups.get("non-existent-group")).rejects.toThrow(
       "Failed to fetch group: 404",
     );
-    await expect(waycastApi.endpoints.get("999")).rejects.toThrow(
+    await expect(dwctlApi.endpoints.get("999")).rejects.toThrow(
       "Failed to fetch endpoint: 404",
     );
   });
@@ -558,9 +558,9 @@ describe("Error Handling", () => {
 describe("URL Construction", () => {
   it("should handle empty query parameters correctly", async () => {
     // Test that URLs are constructed correctly when no parameters are provided
-    const users = await waycastApi.users.list();
-    const models = await waycastApi.models.list();
-    const groups = await waycastApi.groups.list();
+    const users = await dwctlApi.users.list();
+    const models = await dwctlApi.models.list();
+    const groups = await dwctlApi.groups.list();
 
     expect(users).toBeInstanceOf(Array);
     expect(models).toBeInstanceOf(Object);
@@ -568,8 +568,8 @@ describe("URL Construction", () => {
   });
 
   it("should handle single query parameters", async () => {
-    const usersWithGroups = await waycastApi.users.list({ include: "groups" });
-    const modelsFiltered = await waycastApi.models.list({ endpoint: "2" });
+    const usersWithGroups = await dwctlApi.users.list({ include: "groups" });
+    const modelsFiltered = await dwctlApi.models.list({ endpoint: "2" });
 
     expect(usersWithGroups[0]).toHaveProperty("groups");
     expect(
@@ -578,11 +578,11 @@ describe("URL Construction", () => {
   });
 
   it("should handle multiple query parameters", async () => {
-    const models = await waycastApi.models.list({
+    const models = await dwctlApi.models.list({
       endpoint: "c3d4e5f6-7890-1234-5678-90abcdef0123",
       include: "groups",
     });
-    const groups = await waycastApi.groups.list({ include: "users,models" });
+    const groups = await dwctlApi.groups.list({ include: "users,models" });
 
     const modelValues = Object.values(models);
     expect(
@@ -599,16 +599,16 @@ describe("URL Construction", () => {
 
 describe("Type Safety", () => {
   it("should return correctly typed responses", async () => {
-    const user = await waycastApi.users.get(
+    const user = await dwctlApi.users.get(
       "550e8400-e29b-41d4-a716-446655440001",
     );
-    const model = await waycastApi.models.get(
+    const model = await dwctlApi.models.get(
       "f914c573-4c00-4a37-a878-53318a6d5a5b",
     );
-    const group = await waycastApi.groups.get(
+    const group = await dwctlApi.groups.get(
       "550e8400-e29b-41d4-a716-446655441001",
     );
-    const endpoint = await waycastApi.endpoints.get(
+    const endpoint = await dwctlApi.endpoints.get(
       "a1b2c3d4-e5f6-7890-1234-567890abcdef",
     );
 
@@ -630,8 +630,8 @@ describe("Type Safety", () => {
   });
 
   it("should handle optional fields correctly", async () => {
-    const usersWithGroups = await waycastApi.users.list({ include: "groups" });
-    const modelsWithGroups = await waycastApi.models.list({
+    const usersWithGroups = await dwctlApi.users.list({ include: "groups" });
+    const modelsWithGroups = await dwctlApi.models.list({
       include: "groups",
     });
 

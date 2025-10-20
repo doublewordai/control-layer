@@ -1,9 +1,9 @@
-# Contributing to waycast
+# Contributing to Control Layer
 
 ## Workflow
 
 If you encounter an issue, or have a feature request, please open an issue on
-[github](https://github.com/doubleword/waycast/issues). If you'd like to
+[github](https://github.com/doublewordai/control-layer/issues). If you'd like to
 contribute, try to see first if there's an open issue for what you'd like to
 work on. If not, please open one to discuss it before starting work!
 
@@ -85,15 +85,15 @@ from the `dashboard/` folder, in another terminal, to start the frontend.
 This system has two components:
 
 ```bash
-waycast/
-├── waycast/           # Rust API server (user/group/model management)
+control-layer/
+├── dwctl/             # Rust API server (user/group/model management)
 ├── dashboard/         # React/TypeScript web frontend
 ```
 
 **Service Documentation:**
 
-- **[waycast](application/waycast/README.md)** - API server setup and development
-- **[dashboard](application/dashboard/README.md)** - Frontend development
+- **[dwctl](dwctl/README.md)** - API server setup and development
+- **[dashboard](dashboard/README.md)** - Frontend development
 
 ### Common Tasks
 
@@ -109,7 +109,7 @@ just jwt <email>         # Generate auth token
 
 ## CI Metrics
 
-View real-time build and performance metrics for [this project](https://charts.somnial.co/doubleword-waycast)
+View real-time build and performance metrics for [this project](https://charts.somnial.co/doubleword-control-layer)
 
 ## FAQ
 
@@ -120,8 +120,8 @@ View real-time build and performance metrics for [this project](https://charts.s
 docker compose logs -f
 
 # View specific service logs
-docker compose logs -f waycast
-docker compose logs -f waycast-frontend
+docker compose logs -f control-layer
+docker compose logs -f control-layer-frontend
 ```
 
 **How do I reset the database?**
@@ -158,8 +158,8 @@ just down
 **HTTPS returns 400 Bad Request**
 → Clear your browser cache and cookies for localhost, then try again. This often occurs when switching between different authentication configurations.
 
-**Strange sqlx build errors, referencing SQL queries, when building `waycast` image**
-→ Navigate to the `application/waycast` directory and run `cargo sqlx prepare` to
+**Strange sqlx build errors, referencing SQL queries, when building `dwctl` image**
+→ Navigate to the `dwctl` directory and run `cargo sqlx prepare` to
 ensure prepared SQL queries are up to date. Ensure you're using Rust 1.88 or higher (`rustc --version`).
 
 If you see something like "error returned from database: password authentication failed for user "postgres""

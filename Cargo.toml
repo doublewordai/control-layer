@@ -1,4 +1,4 @@
 [workspace]
-members = ["waycast"]
-default-members = ["waycast"]
+members = ["dwctl"]
+default-members = ["dwctl"]
 resolver = "2"

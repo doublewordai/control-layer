@@ -10,7 +10,7 @@ port: 3001
 # Database configuration
 database:
   # By default, we bundle postgres with the application. It's launched on a
-  # random port, and data is stored in $HOME/.waycast_data/
+  # random port, and data is stored in $HOME/.dwctl_data/
   # To have data not persists across restarts, set persistent=false.
   # We strongly recommend setting up external postgres in production!
   type: embedded
@@ -60,7 +60,7 @@ auth:
       max_length: 64
     session:
       timeout: "24h"
-      cookie_name: "waycast_session"
+      cookie_name: "dwctl_session"
       cookie_secure: true
       cookie_same_site: "strict"
 
@@ -85,8 +85,8 @@ auth:
 # Optional feature toggles
 enable_metrics: true # Enable Prometheus metrics endpoint
 enable_request_logging: true # Enable request/response logging to database
-# Note: Environment variables can override top level setting, as long as they're supplied with the CLAY_ prefix.:
-# CLAY_PORT=8080
+# Note: Environment variables can override top level setting, as long as they're supplied with the DWCTL_ prefix:
+# DWCTL_PORT=8080
 #
 # The exception is DATABASE_URL:
 # DATABASE_URL=postgres://prod@db:5432/my_database

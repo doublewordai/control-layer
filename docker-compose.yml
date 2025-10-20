@@ -2,27 +2,27 @@ services:
   postgres:
     image: postgres:15
     environment:
-      POSTGRES_DB: ${POSTGRES_DB:-waycast}
-      POSTGRES_USER: ${POSTGRES_USER:-waycast}
-      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-waycast_password}
+      POSTGRES_DB: ${POSTGRES_DB:-control_layer}
+      POSTGRES_USER: ${POSTGRES_USER:-control_layer}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-control_layer_password}
     volumes:
       - postgres_data:/var/lib/postgresql/data
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U waycast -d waycast"]
+      test: ["CMD-SHELL", "pg_isready -U control_layer -d control_layer"]
       start_period: 1s
       interval: 1s
       timeout: 3s
       retries: 10
 
-  waycast:
-    image: ${IMAGE:-ghcr.io/doublewordai/waycast:${TAG:-latest}}
+  control-layer:
+    image: ${IMAGE:-ghcr.io/doublewordai/control-layer:${TAG:-latest}}
     pull_policy: ${PULL_POLICY:-always}
     ports:
       - "3001:3001"
     environment:
       - RUST_LOG={RUST_LOG:-info}
-      - DATABASE_URL=postgres://waycast:waycast_password@postgres:5432/waycast
-      - WAYCAST_SECRET_KEY=mysupersecretkey
+      - DATABASE_URL=postgres://control_layer:control_layer_password@postgres:5432/control_layer
+      - DWCTL_SECRET_KEY=mysupersecretkey
 
     volumes:
       - ./config.yaml:/app/config.yaml:ro

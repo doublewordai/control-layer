@@ -26,7 +26,7 @@ echo "Fetching all users..." >&2
 
 # Get all users
 USERS=$(curl -s -X GET http://localhost:3001/admin/api/v1/users \
-  -b "waycast_session=${ADMIN_JWT}" | jq -r '.[] | "\(.id):\(.email)"')
+  -b "dwctl_session=${ADMIN_JWT}" | jq -r '.[] | "\(.id):\(.email)"')
 
 if [ -z "$USERS" ]; then
   echo "No users found or failed to fetch users" >&2
@@ -45,7 +45,7 @@ while IFS=: read -r user_id user_email; do
     # Delete the user
     HTTP_STATUS=$(curl -s -o /dev/null -w "%{http_code}" \
       -X DELETE "http://localhost:3001/admin/api/v1/users/${user_id}" \
-      -b "waycast_session=${ADMIN_JWT}")
+      -b "dwctl_session=${ADMIN_JWT}")
 
     if [ "$HTTP_STATUS" = "204" ]; then
       echo "✅ Successfully deleted $user_email" >&2

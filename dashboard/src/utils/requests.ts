@@ -1,5 +1,5 @@
 // Transform backend RequestResponsePair to frontend DisplayRequest format
-import type { RequestResponsePair } from "../api/waycast/types";
+import type { RequestResponsePair } from "../api/control-layer/types";
 import type { RequestsEntry } from "../components/features/requests/types";
 
 /**

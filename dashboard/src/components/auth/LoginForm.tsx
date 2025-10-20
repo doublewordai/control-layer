@@ -13,8 +13,8 @@ import {
   CardTitle,
 } from "../ui/card";
 import { useAuth } from "../../contexts/auth";
-import { useRegistrationInfo, useLoginInfo } from "../../api/waycast/hooks";
-import { ApiError } from "../../api/waycast/errors";
+import { useRegistrationInfo, useLoginInfo } from "../../api/control-layer/hooks";
+import { ApiError } from "../../api/control-layer/errors";
 import { toast } from "sonner";
 
 export function LoginForm() {
