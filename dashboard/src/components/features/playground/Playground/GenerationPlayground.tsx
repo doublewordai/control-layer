@@ -1,16 +1,30 @@
 import React, { useRef, useEffect, useState } from "react";
-import { Send, Copy, Play, Trash2, X } from "lucide-react";
+import { Send, Copy, Play, Trash2, X, Image as ImageIcon } from "lucide-react";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
 import { Prism as SyntaxHighlighter } from "react-syntax-highlighter";
 import { oneDark } from "react-syntax-highlighter/dist/esm/styles/prism";
-import type { Model } from "../../../../api/clay/types";
+import type { Model } from "../../../../api/waycast/types";
 import { Textarea } from "../../../ui/textarea";
 import { Button } from "../../../ui/button";
 
+interface ImageContent {
+  type: "image_url";
+  image_url: {
+    url: string;
+  };
+}
+
+interface TextContent {
+  type: "text";
+  text: string;
+}
+
+type MessageContent = string | (TextContent | ImageContent)[];
+
 interface Message {
   role: "user" | "assistant" | "system";
-  content: string;
+  content: MessageContent;
   timestamp: Date;
 }
 
@@ -18,11 +32,15 @@ interface GenerationPlaygroundProps {
   selectedModel: Model;
   messages: Message[];
   currentMessage: string;
+  uploadedImages: string[];
   streamingContent: string;
   isStreaming: boolean;
   error: string | null;
   copiedMessageIndex: number | null;
+  supportsImages: boolean;
   onCurrentMessageChange: (value: string) => void;
+  onImageUpload: (event: React.ChangeEvent<HTMLInputElement>) => void;
+  onRemoveImage: (index: number) => void;
   onSendMessage: () => void;
   onCopyMessage: (content: string, index: number) => void;
   onKeyDown: (e: React.KeyboardEvent) => void;
@@ -34,11 +52,15 @@ const GenerationPlayground: React.FC<GenerationPlaygroundProps> = ({
   selectedModel,
   messages,
   currentMessage,
+  uploadedImages,
   streamingContent,
   isStreaming,
   error,
   copiedMessageIndex,
+  supportsImages,
   onCurrentMessageChange,
+  onImageUpload,
+  onRemoveImage,
   onSendMessage,
   onCopyMessage,
   onKeyDown,
@@ -47,6 +69,7 @@ const GenerationPlayground: React.FC<GenerationPlaygroundProps> = ({
 }) => {
   const messagesEndRef = useRef<HTMLDivElement>(null);
   const textareaRef = useRef<HTMLTextAreaElement>(null);
+  const fileInputRef = useRef<HTMLInputElement>(null);
   const [isHovered, setIsHovered] = useState(false);
   const [copiedCode, setCopiedCode] = useState<string | null>(null);
 
@@ -58,6 +81,26 @@ const GenerationPlayground: React.FC<GenerationPlaygroundProps> = ({
     navigator.clipboard.writeText(code);
     setCopiedCode(code);
     setTimeout(() => setCopiedCode(null), 2000);
+  };
+
+  const getTextContent = (content: MessageContent): string => {
+    if (typeof content === "string") {
+      return content;
+    }
+    // Extract text from multimodal content
+    const textPart = content.find((part) => part.type === "text") as
+      | TextContent
+      | undefined;
+    return textPart?.text || "";
+  };
+
+  const getImages = (content: MessageContent): string[] => {
+    if (typeof content === "string") {
+      return [];
+    }
+    return content
+      .filter((part) => part.type === "image_url")
+      .map((part) => (part as ImageContent).image_url.url);
   };
 
   useEffect(() => {
@@ -79,7 +122,7 @@ const GenerationPlayground: React.FC<GenerationPlaygroundProps> = ({
   return (
     <div className="flex-1 flex flex-col">
       {/* Messages */}
-      <div className="flex-1 overflow-y-auto px-8 py-6 bg-white">
+      <div className="flex-1 overflow-y-auto px-8 py-4 bg-white">
         {messages.length === 0 && !streamingContent ? (
           <div className="flex items-center justify-center h-full">
             <div
@@ -113,8 +156,23 @@ const GenerationPlayground: React.FC<GenerationPlaygroundProps> = ({
                             {message.timestamp.toLocaleTimeString()}
                           </span>
                         </div>
+                        {/* Display images if present */}
+                        {getImages(message.content).length > 0 && (
+                          <div className="mb-3 flex flex-wrap gap-2">
+                            {getImages(message.content).map(
+                              (imageUrl, imgIndex) => (
+                                <img
+                                  key={imgIndex}
+                                  src={imageUrl}
+                                  alt={`Uploaded image ${imgIndex + 1}`}
+                                  className="max-w-full max-h-64 rounded-lg object-contain"
+                                />
+                              ),
+                            )}
+                          </div>
+                        )}
                         <div className="text-sm whitespace-pre-wrap leading-relaxed">
-                          {message.content}
+                          {getTextContent(message.content)}
                         </div>
                       </div>
                     </div>
@@ -261,7 +319,7 @@ const GenerationPlayground: React.FC<GenerationPlaygroundProps> = ({
                             ),
                           }}
                         >
-                          {message.content}
+                          {getTextContent(message.content)}
                         </ReactMarkdown>
                       </div>
 
@@ -270,7 +328,10 @@ const GenerationPlayground: React.FC<GenerationPlaygroundProps> = ({
                         <div className="flex items-center gap-2 mt-3">
                           <button
                             onClick={() =>
-                              onCopyMessage(message.content, index)
+                              onCopyMessage(
+                                getTextContent(message.content),
+                                index,
+                              )
                             }
                             className="flex items-center gap-1 px-2 py-1 text-xs text-gray-500 hover:text-gray-700 hover:bg-gray-100 rounded transition-colors"
                             aria-label="Copy message"
@@ -467,8 +528,30 @@ const GenerationPlayground: React.FC<GenerationPlaygroundProps> = ({
       </div>
 
       {/* Input Area */}
-      <div className="bg-white border-t border-gray-200 px-8 py-6 flex-shrink-0">
+      <div className="bg-white border-t border-gray-200 px-8 py-4 flex-shrink-0">
         <div className="max-w-4xl mx-auto">
+          {/* Image Preview */}
+          {uploadedImages.length > 0 && (
+            <div className="mb-3 flex flex-wrap gap-2">
+              {uploadedImages.map((imageUrl, index) => (
+                <div key={index} className="relative group">
+                  <img
+                    src={imageUrl}
+                    alt={`Upload preview ${index + 1}`}
+                    className="h-20 w-20 object-cover rounded-lg border border-gray-200"
+                  />
+                  <button
+                    onClick={() => onRemoveImage(index)}
+                    className="absolute -top-2 -right-2 bg-red-500 text-white rounded-full p-1 opacity-0 group-hover:opacity-100 transition-opacity"
+                    aria-label="Remove image"
+                  >
+                    <X className="w-3 h-3" />
+                  </button>
+                </div>
+              ))}
+            </div>
+          )}
+
           <div className="flex-1 relative">
             <Textarea
               ref={textareaRef}
@@ -476,63 +559,97 @@ const GenerationPlayground: React.FC<GenerationPlaygroundProps> = ({
               onChange={(e) => onCurrentMessageChange(e.target.value)}
               onKeyDown={onKeyDown}
               placeholder="Type your message..."
-              className="pr-12 text-sm"
+              className="pr-24 text-sm"
               rows={3}
               disabled={isStreaming}
               aria-label="Message input"
             />
-            <Button
-              onClick={
-                isStreaming
-                  ? isHovered
-                    ? onCancelStreaming
-                    : undefined
-                  : onSendMessage
-              }
-              onMouseEnter={() => setIsHovered(true)}
-              onMouseLeave={() => setIsHovered(false)}
-              disabled={!isStreaming && !currentMessage.trim()}
-              size="icon"
-              className="absolute top-3 right-3 h-8 w-8 focus:outline-none focus:ring-0"
-              aria-label={
-                isStreaming
-                  ? isHovered
-                    ? "Cancel message"
-                    : "Streaming..."
-                  : "Send message"
-              }
-              title={
-                isStreaming ? (isHovered ? "Cancel" : "Streaming...") : "Send"
-              }
-            >
-              {isStreaming ? (
-                isHovered && onCancelStreaming ? (
-                  <X className="w-4 h-4" />
+            <div className="absolute top-3 right-3 flex gap-1">
+              {/* Send Button */}
+              <Button
+                onClick={
+                  isStreaming
+                    ? isHovered
+                      ? onCancelStreaming
+                      : undefined
+                    : onSendMessage
+                }
+                onMouseEnter={() => setIsHovered(true)}
+                onMouseLeave={() => setIsHovered(false)}
+                disabled={
+                  !isStreaming &&
+                  !currentMessage.trim() &&
+                  uploadedImages.length === 0
+                }
+                size="icon"
+                className="h-8 w-8 focus:outline-none focus:ring-0"
+                aria-label={
+                  isStreaming
+                    ? isHovered
+                      ? "Cancel message"
+                      : "Streaming..."
+                    : "Send message"
+                }
+                title={
+                  isStreaming ? (isHovered ? "Cancel" : "Streaming...") : "Send"
+                }
+              >
+                {isStreaming ? (
+                  isHovered && onCancelStreaming ? (
+                    <X className="w-4 h-4" />
+                  ) : (
+                    <div className="relative w-4 h-4">
+                      <div className="absolute inset-0 rounded-full border-2 border-white opacity-20"></div>
+                      <div className="absolute inset-0 rounded-full border-2 border-transparent border-t-white animate-spin"></div>
+                    </div>
+                  )
                 ) : (
-                  <div className="relative w-4 h-4">
-                    <div className="absolute inset-0 rounded-full border-2 border-white opacity-20"></div>
-                    <div className="absolute inset-0 rounded-full border-2 border-transparent border-t-white animate-spin"></div>
-                  </div>
-                )
-              ) : (
-                <Send className="w-4 h-4 -ml-0.5 mt-0.5" />
-              )}
-            </Button>
+                  <Send className="w-4 h-4 -ml-0.5 mt-0.5" />
+                )}
+              </Button>
+            </div>
           </div>
           <div className="flex items-center justify-between mt-3">
             <div className="text-sm text-gray-400">
               Enter to send • Shift+Enter for newline • Esc to cancel
             </div>
-            <Button
-              onClick={onClearConversation}
-              variant="outline"
-              size="sm"
-              disabled={messages.length === 0 && !streamingContent}
-              aria-label="Clear conversation"
-            >
-              <Trash2 className="w-4 h-4" />
-              Clear chat
-            </Button>
+            <div className="flex items-center gap-2">
+              {/* Image Upload Button - only show if model supports images */}
+              {supportsImages && (
+                <>
+                  <input
+                    ref={fileInputRef}
+                    type="file"
+                    accept="image/*"
+                    multiple
+                    onChange={onImageUpload}
+                    className="hidden"
+                    aria-label="Upload images"
+                  />
+                  <Button
+                    onClick={() => fileInputRef.current?.click()}
+                    disabled={isStreaming}
+                    variant="outline"
+                    size="sm"
+                    aria-label="Upload image"
+                    title="Upload image"
+                  >
+                    <ImageIcon className="w-4 h-4 mr-1" />
+                    Upload image
+                  </Button>
+                </>
+              )}
+              <Button
+                onClick={onClearConversation}
+                variant="outline"
+                size="sm"
+                disabled={messages.length === 0 && !streamingContent}
+                aria-label="Clear conversation"
+              >
+                <Trash2 className="w-4 h-4" />
+                Clear chat
+              </Button>
+            </div>
           </div>
         </div>
       </div>

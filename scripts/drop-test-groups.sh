@@ -1,10 +1,10 @@
 #!/bin/bash
 
-# Extract admin email from clay_config.yaml
-ADMIN_EMAIL=$(grep 'admin_email:' clay_config.yaml | sed 's/.*admin_email:[ ]*"\(.*\)"/\1/')
+# Extract admin email from config.yaml
+ADMIN_EMAIL=$(grep 'admin_email:' config.yaml | sed 's/.*admin_email:[ ]*"\(.*\)"/\1/')
 
 if [ -z "$ADMIN_EMAIL" ]; then
-  echo "Failed to extract admin email from clay_config.yaml" >&2
+  echo "Failed to extract admin email from config.yaml" >&2
   exit 1
 fi
 
@@ -15,7 +15,7 @@ if [ -z "$ADMIN_PASSWORD" ]; then
 fi
 
 # Generate admin cookie for authentication
-ADMIN_JWT=$(EMAIL="$ADMIN_EMAIL" PASSWORD="$ADMIN_PASSWORD" ./scripts/generate-jwt.sh)
+ADMIN_JWT=$(EMAIL="$ADMIN_EMAIL" PASSWORD="$ADMIN_PASSWORD" ./scripts/login.sh)
 
 if [ -z "$ADMIN_JWT" ]; then
   echo "Failed to generate admin JWT" >&2
@@ -26,7 +26,7 @@ echo "Fetching all groups..." >&2
 
 # Get all groups
 GROUPS=$(curl -s -X GET https://localhost/admin/api/v1/groups \
-  -b "VouchCookie=${ADMIN_JWT}" | jq -r '.[] | "\(.id):\(.name)"')
+  -b "waycast_session=${ADMIN_JWT}" | jq -r '.[] | "\(.id):\(.name)"')
 
 if [ -z "$GROUPS" ]; then
   echo "No groups found or failed to fetch groups" >&2
@@ -45,7 +45,7 @@ while IFS=: read -r group_id group_name; do
     # Delete the group
     HTTP_STATUS=$(curl -s -o /dev/null -w "%{http_code}" \
       -X DELETE "https://localhost/admin/api/v1/groups/${group_id}" \
-      -b "VouchCookie=${ADMIN_JWT}")
+      -b "waycast_session=${ADMIN_JWT}")
 
     if [ "$HTTP_STATUS" = "204" ]; then
       echo "✅ Successfully deleted $group_name" >&2
@@ -58,3 +58,4 @@ done <<<"$GROUPS"
 
 echo "" >&2
 echo "Deleted $DELETED_COUNT test group(s)" >&2
+

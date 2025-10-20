@@ -1,11 +1,12 @@
-import { useState } from "react";
+import { useState, useEffect } from "react";
+import { useLocation } from "react-router-dom";
 import { Server, Plus, Trash2 } from "lucide-react";
 import {
   useEndpoints,
   useSynchronizeEndpoint,
   useUpdateEndpoint,
   useDeleteEndpoint,
-} from "../../../../api/clay";
+} from "../../../../api/waycast";
 import { Button } from "../../../ui/button";
 import { DataTable } from "../../../ui/data-table";
 import { createColumns } from "./columns";
@@ -22,9 +23,10 @@ import {
   DeleteEndpointModal,
   EditEndpointModal,
 } from "../../../modals";
-import type { Endpoint } from "../../../../api/clay/types";
+import type { Endpoint } from "../../../../api/waycast/types";
 
 export function Endpoints() {
+  const location = useLocation();
   const [showCreateModal, setShowCreateModal] = useState(false);
   const [endpointToDelete, setEndpointToDelete] = useState<Endpoint | null>(
     null,
@@ -37,6 +39,15 @@ export function Endpoints() {
   const synchronizeEndpointMutation = useSynchronizeEndpoint();
   const updateEndpointMutation = useUpdateEndpoint();
   const deleteEndpointMutation = useDeleteEndpoint();
+
+  // Auto-open create modal if navigated from another page with the flag
+  useEffect(() => {
+    if (location.state?.openCreateModal) {
+      setShowCreateModal(true);
+      // Clear the state to prevent reopening on refresh
+      window.history.replaceState({}, document.title);
+    }
+  }, [location]);
 
   const handleEdit = (endpoint: Endpoint) => {
     setEndpointToEdit(endpoint);

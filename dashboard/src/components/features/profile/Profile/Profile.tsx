@@ -7,8 +7,11 @@ import {
   Shield,
   AtSign,
   Info,
+  Eye,
+  EyeOff,
+  Lock,
 } from "lucide-react";
-import { useUser, useUpdateUser } from "../../../../api/clay/hooks";
+import { useUser, useUpdateUser } from "../../../../api/waycast/hooks";
 import {
   UserAvatar,
   Tooltip,
@@ -18,8 +21,12 @@ import {
   HoverCardContent,
   HoverCardTrigger,
 } from "../../../ui";
+import { Input } from "../../../ui/input";
+import { Button } from "../../../ui/button";
 import { AVAILABLE_ROLES, getRoleDisplayName } from "../../../../utils/roles";
-import type { Role } from "../../../../api/clay/types";
+import type { Role } from "../../../../api/waycast/types";
+import { waycastApi } from "../../../../api/waycast/client";
+import { ApiError } from "../../../../api/waycast/errors";
 
 export const Profile: React.FC = () => {
   const {
@@ -32,6 +39,12 @@ export const Profile: React.FC = () => {
   const [displayName, setDisplayName] = useState("");
   const [avatarUrl, setAvatarUrl] = useState("");
   const [roles, setRoles] = useState<Role[]>([]);
+  const [currentPassword, setCurrentPassword] = useState("");
+  const [newPassword, setNewPassword] = useState("");
+  const [confirmPassword, setConfirmPassword] = useState("");
+  const [showCurrentPassword, setShowCurrentPassword] = useState(false);
+  const [showNewPassword, setShowNewPassword] = useState(false);
+  const [showConfirmPassword, setShowConfirmPassword] = useState(false);
   const [error, setError] = useState("");
   const [success, setSuccess] = useState("");
 
@@ -71,6 +84,37 @@ export const Profile: React.FC = () => {
     setSuccess("");
 
     try {
+      // Validate password fields if any are filled
+      const isChangingPassword =
+        currentPassword || newPassword || confirmPassword;
+
+      if (isChangingPassword) {
+        // Validate all password fields are filled
+        if (!currentPassword || !newPassword || !confirmPassword) {
+          setError("All password fields are required to change your password");
+          return;
+        }
+
+        // Validate passwords match
+        if (newPassword !== confirmPassword) {
+          setError("New passwords do not match");
+          return;
+        }
+
+        // Validate password length
+        if (newPassword.length < 8) {
+          setError("New password must be at least 8 characters long");
+          return;
+        }
+
+        // Validate passwords are different
+        if (currentPassword === newPassword) {
+          setError("New password must be different from current password");
+          return;
+        }
+      }
+
+      // Update profile information
       const updateData = {
         display_name: displayName.trim() || undefined,
         avatar_url: avatarUrl.trim() || undefined,
@@ -84,9 +128,39 @@ export const Profile: React.FC = () => {
         data: updateData,
       });
 
+      // Change password if requested
+      if (isChangingPassword) {
+        try {
+          await waycastApi.auth.changePassword({
+            current_password: currentPassword,
+            new_password: newPassword,
+          });
+
+          // Clear password fields on success
+          setCurrentPassword("");
+          setNewPassword("");
+          setConfirmPassword("");
+          setSuccess("Profile and password updated successfully!");
+        } catch (passwordErr) {
+          if (passwordErr instanceof ApiError) {
+            try {
+              const errorData = JSON.parse(passwordErr.message);
+              setError(errorData.message || "Failed to change password");
+            } catch {
+              setError(passwordErr.message || "Failed to change password");
+            }
+          } else {
+            setError("Failed to change password. Please try again.");
+          }
+          console.error("Password change error:", passwordErr);
+          return;
+        }
+      } else {
+        setSuccess("Profile updated successfully!");
+      }
+
       // Refetch user data to get the updated information
       await refetchUser();
-      setSuccess("Profile updated successfully!");
     } catch (err) {
       setError("Failed to update profile. Please try again.");
       console.error("Failed to update profile:", err);
@@ -105,10 +179,10 @@ export const Profile: React.FC = () => {
 
   if (loading) {
     return (
-      <div className="p-8">
-        <div className="max-w-4xl mx-auto">
+      <div className="p-6">
+        <div className="max-w-5xl mx-auto">
           <div className="animate-pulse">
-            <div className="h-8 bg-gray-200 rounded w-48 mb-6"></div>
+            <div className="h-8 bg-gray-200 rounded w-48 mb-8"></div>
             <div className="bg-white rounded-lg shadow-sm border border-gray-200 p-6">
               <div className="space-y-4">
                 <div className="h-20 bg-gray-200 rounded-full w-20 mx-auto"></div>
@@ -123,11 +197,13 @@ export const Profile: React.FC = () => {
   }
 
   return (
-    <div className="p-8">
-      <div className="max-w-4xl mx-auto">
-        <div className="mb-6">
-          <h1 className="text-2xl font-bold text-gray-900">Profile Settings</h1>
-          <p className="text-gray-600 mt-1">
+    <div className="p-6">
+      <div className="max-w-5xl mx-auto">
+        <div className="mb-8">
+          <h1 className="text-3xl font-bold text-gray-900 mb-2">
+            Profile Settings
+          </h1>
+          <p className="text-gray-600">
             Manage your account information and preferences
           </p>
         </div>
@@ -144,7 +220,7 @@ export const Profile: React.FC = () => {
           </div>
         )}
 
-        <div className="grid grid-cols-1 lg:grid-cols-3 gap-6">
+        <div className="grid grid-cols-1 lg:grid-cols-4 gap-6">
           {/* Profile Picture and Basic Info */}
           <div className="lg:col-span-1">
             <div className="bg-white rounded-lg shadow-sm border border-gray-200 p-6">
@@ -254,84 +330,175 @@ export const Profile: React.FC = () => {
           </div>
 
           {/* Editable Profile Information */}
-          <div className="lg:col-span-2">
+          <div className="lg:col-span-3">
             <div className="bg-white rounded-lg shadow-sm border border-gray-200 p-6">
-              <h4 className="text-lg font-medium text-gray-900 mb-6">
+              <h4 className="text-lg font-medium text-gray-900 mb-3">
                 Edit Profile
               </h4>
 
-              <div className="space-y-6">
-                <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
+              <div className="space-y-3">
+                <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
                   <div>
-                    <label className="block text-sm font-medium text-gray-700 mb-2">
-                      Username
+                    <label
+                      htmlFor="displayName"
+                      className="block text-sm font-medium text-gray-700 mb-1.5"
+                    >
+                      Display Name
                     </label>
-                    <input
+                    <Input
+                      id="displayName"
                       type="text"
-                      value={currentUser?.username || ""}
-                      disabled
-                      className="w-full px-3 py-2 border border-gray-300 rounded-lg bg-gray-50 text-gray-500"
+                      value={displayName}
+                      onChange={(e) => setDisplayName(e.target.value)}
+                      placeholder="Enter your display name"
                     />
                     <p className="text-xs text-gray-500 mt-1">
-                      Username cannot be changed
+                      This is how your name will appear to other users
                     </p>
                   </div>
 
                   <div>
-                    <label className="block text-sm font-medium text-gray-700 mb-2">
-                      Email Address
+                    <label
+                      htmlFor="avatarUrl"
+                      className="block text-sm font-medium text-gray-700 mb-1.5"
+                    >
+                      Avatar URL
                     </label>
-                    <input
-                      type="email"
-                      value={currentUser?.email || ""}
-                      disabled
-                      className="w-full px-3 py-2 border border-gray-300 rounded-lg bg-gray-50 text-gray-500"
+                    <Input
+                      id="avatarUrl"
+                      type="url"
+                      value={avatarUrl}
+                      onChange={(e) => setAvatarUrl(e.target.value)}
+                      placeholder="https://example.com/avatar.jpg"
                     />
                     <p className="text-xs text-gray-500 mt-1">
-                      Email cannot be changed
+                      Enter a URL to your profile picture
                     </p>
                   </div>
                 </div>
 
-                <div>
-                  <label
-                    htmlFor="displayName"
-                    className="block text-sm font-medium text-gray-700 mb-2"
-                  >
-                    Display Name
-                  </label>
-                  <input
-                    id="displayName"
-                    type="text"
-                    value={displayName}
-                    onChange={(e) => setDisplayName(e.target.value)}
-                    className="w-full px-3 py-2 border border-gray-300 rounded-lg focus:ring-2 focus:ring-doubleword-primary focus:border-transparent"
-                    placeholder="Enter your display name"
-                  />
-                  <p className="text-xs text-gray-500 mt-1">
-                    This is how your name will appear to other users
-                  </p>
-                </div>
+                {/* Password Change Fields - Only for password-based auth */}
+                {(currentUser?.auth_source === "native" ||
+                  currentUser?.auth_source === "system") && (
+                  <>
+                    <div className="pt-3 border-t border-gray-200">
+                      <h5 className="text-base font-medium text-gray-900 mb-2">
+                        Change Password
+                      </h5>
+                    </div>
 
-                <div>
-                  <label
-                    htmlFor="avatarUrl"
-                    className="block text-sm font-medium text-gray-700 mb-2"
-                  >
-                    Avatar URL
-                  </label>
-                  <input
-                    id="avatarUrl"
-                    type="url"
-                    value={avatarUrl}
-                    onChange={(e) => setAvatarUrl(e.target.value)}
-                    className="w-full px-3 py-2 border border-gray-300 rounded-lg focus:ring-2 focus:ring-doubleword-primary focus:border-transparent"
-                    placeholder="https://example.com/avatar.jpg"
-                  />
-                  <p className="text-xs text-gray-500 mt-1">
-                    Enter a URL to your profile picture
-                  </p>
-                </div>
+                    <div>
+                      <label
+                        htmlFor="currentPassword"
+                        className="block text-sm font-medium text-gray-700 mb-1.5"
+                      >
+                        Current Password
+                      </label>
+                      <div className="relative">
+                        <div className="absolute inset-y-0 left-0 pl-3 flex items-center pointer-events-none">
+                          <Lock className="h-4 w-4 text-gray-400" />
+                        </div>
+                        <Input
+                          id="currentPassword"
+                          type={showCurrentPassword ? "text" : "password"}
+                          value={currentPassword}
+                          onChange={(e) => setCurrentPassword(e.target.value)}
+                          className="pl-10 pr-10"
+                          placeholder="Enter your current password"
+                        />
+                        <button
+                          type="button"
+                          onClick={() =>
+                            setShowCurrentPassword(!showCurrentPassword)
+                          }
+                          className="absolute inset-y-0 right-0 pr-3 flex items-center"
+                          tabIndex={-1}
+                        >
+                          {showCurrentPassword ? (
+                            <EyeOff className="h-4 w-4 text-gray-400 hover:text-gray-600" />
+                          ) : (
+                            <Eye className="h-4 w-4 text-gray-400 hover:text-gray-600" />
+                          )}
+                        </button>
+                      </div>
+                    </div>
+
+                    <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
+                      <div>
+                        <label
+                          htmlFor="newPassword"
+                          className="block text-sm font-medium text-gray-700 mb-1.5"
+                        >
+                          New Password
+                        </label>
+                        <div className="relative">
+                          <div className="absolute inset-y-0 left-0 pl-3 flex items-center pointer-events-none">
+                            <Lock className="h-4 w-4 text-gray-400" />
+                          </div>
+                          <Input
+                            id="newPassword"
+                            type={showNewPassword ? "text" : "password"}
+                            value={newPassword}
+                            onChange={(e) => setNewPassword(e.target.value)}
+                            className="pl-10 pr-10"
+                            placeholder="Enter new password"
+                          />
+                          <button
+                            type="button"
+                            onClick={() => setShowNewPassword(!showNewPassword)}
+                            className="absolute inset-y-0 right-0 pr-3 flex items-center"
+                            tabIndex={-1}
+                          >
+                            {showNewPassword ? (
+                              <EyeOff className="h-4 w-4 text-gray-400 hover:text-gray-600" />
+                            ) : (
+                              <Eye className="h-4 w-4 text-gray-400 hover:text-gray-600" />
+                            )}
+                          </button>
+                        </div>
+                        <p className="text-xs text-gray-500 mt-1">
+                          At least 8 characters
+                        </p>
+                      </div>
+
+                      <div>
+                        <label
+                          htmlFor="confirmPassword"
+                          className="block text-sm font-medium text-gray-700 mb-1.5"
+                        >
+                          Confirm New Password
+                        </label>
+                        <div className="relative">
+                          <div className="absolute inset-y-0 left-0 pl-3 flex items-center pointer-events-none">
+                            <Lock className="h-4 w-4 text-gray-400" />
+                          </div>
+                          <Input
+                            id="confirmPassword"
+                            type={showConfirmPassword ? "text" : "password"}
+                            value={confirmPassword}
+                            onChange={(e) => setConfirmPassword(e.target.value)}
+                            className="pl-10 pr-10"
+                            placeholder="Confirm new password"
+                          />
+                          <button
+                            type="button"
+                            onClick={() =>
+                              setShowConfirmPassword(!showConfirmPassword)
+                            }
+                            className="absolute inset-y-0 right-0 pr-3 flex items-center"
+                            tabIndex={-1}
+                          >
+                            {showConfirmPassword ? (
+                              <EyeOff className="h-4 w-4 text-gray-400 hover:text-gray-600" />
+                            ) : (
+                              <Eye className="h-4 w-4 text-gray-400 hover:text-gray-600" />
+                            )}
+                          </button>
+                        </div>
+                      </div>
+                    </div>
+                  </>
+                )}
 
                 {currentUser?.is_admin ? (
                   <div>
@@ -401,10 +568,10 @@ export const Profile: React.FC = () => {
                   </div>
                 ) : (
                   <div>
-                    <label className="block text-sm font-medium text-gray-700 mb-2">
+                    <label className="block text-sm font-medium text-gray-700 mb-1.5">
                       Roles
                     </label>
-                    <input
+                    <Input
                       type="text"
                       value={
                         currentUser?.roles
@@ -412,7 +579,6 @@ export const Profile: React.FC = () => {
                           .join(", ") || "User"
                       }
                       disabled
-                      className="w-full px-3 py-2 border border-gray-300 rounded-lg bg-gray-50 text-gray-500"
                     />
                     <p className="text-xs text-gray-500 mt-1">
                       Roles are managed by administrators
@@ -420,11 +586,10 @@ export const Profile: React.FC = () => {
                   </div>
                 )}
 
-                <div className="flex justify-end items-center pt-6 border-t border-gray-200">
-                  <button
+                <div className="flex justify-end items-center">
+                  <Button
                     onClick={handleSave}
                     disabled={updateUserMutation.isPending}
-                    className="flex items-center gap-2 px-6 py-2 text-sm font-medium text-white bg-doubleword-primary rounded-lg hover:bg-doubleword-primary/90 disabled:opacity-50"
                   >
                     {updateUserMutation.isPending ? (
                       <Loader2 className="w-4 h-4 animate-spin" />
@@ -432,7 +597,7 @@ export const Profile: React.FC = () => {
                       <Save className="w-4 h-4" />
                     )}
                     Save Changes
-                  </button>
+                  </Button>
                 </div>
               </div>
             </div>

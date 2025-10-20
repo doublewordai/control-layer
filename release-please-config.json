@@ -1,7 +1,8 @@
 {
   "packages": {
-    ".": {
-      "release-type": "simple"
+    "waycast": {
+      "release-type": "rust"
     }
-  }
+  },
+  "include-component-in-tag": false
 }

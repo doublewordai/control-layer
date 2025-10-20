@@ -10,14 +10,12 @@ const DEFAULT_SETTINGS: AppSettings = {
   apiBaseUrl: "/admin/api/v1",
   features: {
     demo: false,
-    devUser: false,
   },
-  impersonateUserHeader: "admin@example.com",
 };
 
 /**
  * Parse feature flags from URL query parameters
- * Supports: ?flags=demo,devUser&user=admin@example.com
+ * Supports: ?flags=demo
  */
 function parseUrlFlags(): Partial<AppSettings> {
   const urlParams = new URLSearchParams(window.location.search);
@@ -30,14 +28,7 @@ function parseUrlFlags(): Partial<AppSettings> {
 
     settings.features = {
       demo: flagList.includes("demo"),
-      devUser: flagList.includes("devUser"),
     };
-  }
-
-  // Handle user parameter for impersonation
-  const userParam = urlParams.get("user");
-  if (userParam !== null) {
-    settings.impersonateUserHeader = userParam;
   }
 
   return settings;
@@ -70,15 +61,8 @@ function loadSettings(): AppSettings {
         urlSettings.features?.demo ??
         localSettings.features?.demo ??
         DEFAULT_SETTINGS.features.demo,
-      devUser:
-        urlSettings.features?.devUser ??
-        localSettings.features?.devUser ??
-        DEFAULT_SETTINGS.features.devUser,
     },
-    impersonateUserHeader:
-      urlSettings.impersonateUserHeader ??
-      localSettings.impersonateUserHeader ??
-      DEFAULT_SETTINGS.impersonateUserHeader,
+    demoConfig: localSettings.demoConfig,
   };
 }
 
@@ -139,10 +123,13 @@ export function SettingsProvider({ children }: { children: React.ReactNode }) {
     return settings.features[feature];
   };
 
-  const setImpersonateUser = (email: string) => {
+  const updateDemoConfig = (config: Partial<import("./types").DemoConfig>) => {
     setSettings((prev) => ({
       ...prev,
-      impersonateUserHeader: email,
+      demoConfig: {
+        ...prev.demoConfig,
+        ...config,
+      },
     }));
   };
 
@@ -154,7 +141,7 @@ export function SettingsProvider({ children }: { children: React.ReactNode }) {
     settings,
     toggleFeature,
     isFeatureEnabled,
-    setImpersonateUser,
+    updateDemoConfig,
     isMswReady,
     setMswReady,
   };

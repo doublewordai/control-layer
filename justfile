@@ -4,31 +4,20 @@ set dotenv-load
 default:
     @just --list
 
-# Helper function to get admin email from clay_config.yaml
+# Helper function to get admin email from config.yaml
 # Usage: ADMIN_EMAIL=$(just get-admin-email)
 get-admin-email:
-    @grep 'admin_email:' clay_config.yaml | sed 's/.*admin_email:[ ]*"\(.*\)"/\1/'
+    @grep 'admin_email:' config.yaml | sed 's/.*admin_email:[ ]*"\(.*\)"/\1/'
 
 # Setup development environment for local development
-#
-# This command prepares your local environment by:
-# - Checking for required development tools (docker, hurl, jwt-cli, etc.)
-# - Generating self-signed certificates for HTTPS
-# - Decrypting environment configuration (if enc.env exists)
-# - Checking database setup status
 #
 # Prerequisites:
 # - macOS or Linux
 # - Homebrew (recommended for tool installation)
-# - Access to doublewordai GCP project (for environment decryption)
 #
 # First-time setup:
-#   brew install docker hurl jwt-cli mkcert kind kubectl helm gh postgresql
-#   gcloud auth login  # Required for environment decryption
+#   brew install docker hurl postgresql
 #   just setup
-#
-# For Rust development, also run:
-#   just db-setup
 setup:
     #!/usr/bin/env bash
     set -euo pipefail
@@ -39,7 +28,7 @@ setup:
     missing_tools=()
 
     # Required tools
-    required_tools=("docker" "hurl" "jwt" "mkcert" "kind" "kubectl" "helm" "gh" "psql" "createdb")
+    required_tools=("docker" "hurl" "psql" "createdb")
     for tool in "${required_tools[@]}"; do
         if ! command -v "$tool" >/dev/null 2>&1; then
             missing_tools+=("$tool")
@@ -59,14 +48,12 @@ setup:
         done
         echo ""
         echo "Install with:"
-        echo "  brew install docker hurl jwt-cli mkcert kind kubectl helm gh postgresql"
+        echo "  brew install docker hurl postgresql"
         echo ""
         echo "Note: docker compose-plugin is included with Docker Desktop"
         echo ""
         echo "Individual installation guides:"
-        echo "  jwt-cli: https://github.com/mike-engel/jwt-cli"
         echo "  hurl: https://hurl.dev/docs/installation.html"
-        echo "  mkcert: https://github.com/FiloSottile/mkcert"
         exit 1
     fi
 
@@ -75,35 +62,12 @@ setup:
     echo "✅ Development setup complete!"
     echo ""
     echo "Checking database setup..."
-    just check-db || echo "💡 To develop Rust code, run 'just db-setup'"
+    just check-db || echo "Run 'Database not setup properly! just db-setup' to setup database for rust development"
 
-# Check database setup status for Rust tests
-#
-# IMPORTANT: Rust development requires a running PostgreSQL database!
-#
-# The clay service stores user/group/model data in PostgreSQL, &:
-#
-# - SQLx (our database library) performs compile-time SQL validation, & so even
-#   compiling Rust code requires database connectivity.
-# - For testing, we uses sqlx's test harness which requires a database to run.
-#
-# This command verifies:
-# - PostgreSQL client tools are installed (psql, createdb)
-# - 'postgres' user exists and can create databases
-# - 'test' database is accessible for running tests
-#
-# If checks fail, run 'just db-setup' to fix the configuration
 check-db:
     #!/usr/bin/env bash
     set -euo pipefail
-
-    # Check if PostgreSQL tools are available
-    if ! command -v psql >/dev/null 2>&1; then
-        echo "❌ PostgreSQL tools not found. Install with:"
-        echo "  brew install postgresql"
-        exit 1
-    fi
-
+    echo "Setting up development environment..."
     # Check if postgres user exists
     postgres_user_exists=false
     if psql -U postgres -d postgres -c '\q' 2>/dev/null; then
@@ -138,7 +102,7 @@ check-db:
 #
 # IMPORTANT: Rust development requires a running PostgreSQL database!
 #
-# The clay service stores user/group/model data in PostgreSQL, &:
+# The waycast service stores user/group/model data in PostgreSQL, &:
 #
 # - SQLx (our database library) performs compile-time SQL validation, & so even
 #   compiling Rust code requires database connectivity.
@@ -179,7 +143,6 @@ db-setup:
         echo "  brew install postgresql"
         echo ""
         echo "Or manually create test databases:"
-        echo "  createdb onwards_pilot_test"
         echo "  createdb test"
         exit 1
     fi
@@ -191,15 +154,15 @@ db-setup:
 # - docker-compose.override.yml: Development-specific settings (ports, volumes, hot reload)
 #
 # Services running in development mode:
-# - clay: Rust API server (port 3001) - hot reloads via volume mounts
-# - clay-frontend: React dev server (port 5173) - Vite HMR enabled
+# - waycast: Rust API server (port 3001) - hot reloads via volume mounts
+# - waycast-frontend: React dev server (port 5173) - Vite HMR enabled
 # - postgres: Database (port 5432) - exposed for direct access
 #
 # The --watch flag enables hot reload. File changes trigger container rebuilds.
 #
 # Access the app at: https://localhost
 # Direct API access: http://localhost:3001
-# Database: postgres://clay:clay_password@localhost:5432/clay
+# Database: postgres://waycast:waycast_password@localhost:5432/waycast
 #
 #
 # Examples:
@@ -210,7 +173,7 @@ dev *args="":
 
     # Pass all arguments directly to docker compose
     echo "Starting development stack..."
-    docker compose -f docker-compose.yml -f docker-compose.override.yml up --build --watch {{args}}
+    docker compose up --build --watch {{args}}
 
 # Start production stack: 'just up'
 #
@@ -226,24 +189,8 @@ dev *args="":
 up *args="":
     #!/usr/bin/env bash
     set -euo pipefail
-    BUILD_LOCAL=false
-    docker_args=""
-    for arg in {{args}}; do
-        if [ "$arg" = "--build" ]; then
-            BUILD_LOCAL=true
-        else
-            docker_args="$docker_args $arg"
-        fi
-    done
 
-    if [ "$BUILD_LOCAL" = "true" ]; then
-        echo "🔨 Building local images with latest tag..."
-        TAGS=latest PLATFORMS=linux/amd64 ATTESTATIONS=false docker buildx bake --load
-        echo "🚀 Starting docker services with local images..."
-        TAG=latest PULL_POLICY=never docker compose -f docker-compose.yml up $docker_args
-    else
-        docker compose -f docker-compose.yml up $docker_args
-    fi
+    docker compose -f docker-compose.yml up {{args}}
 
 
 # Stop services: 'just down'
@@ -321,40 +268,31 @@ test target="" *args="":
                 --e2e-only)
                     RUN_API_TESTS=false
                     ;;
-                --reporter=*)
-                    CUSTOM_REPORTER=true
-                    TEST_ARGS="$TEST_ARGS $arg"
-                    ;;
                 *)
                     TEST_ARGS="$TEST_ARGS $arg"
                     ;;
             esac
         done
 
-        # Add default reporter if none specified
-        if [ "$CUSTOM_REPORTER" = false ]; then
-            TEST_ARGS="--reporter=list $TEST_ARGS"
-        fi
-
         echo "Cleaning up any leftover test data from previous runs..."
         ./scripts/drop-test-users.sh > /dev/null 2>&1 || echo "  (no previous test users to clean up)"
         ./scripts/drop-test-groups.sh > /dev/null 2>&1 || echo "  (no previous test groups to clean up)"
 
         echo "Generating test cookies..."
-        # Get admin credentials from clay_config.yaml
+        # Get admin credentials from config.yaml
         ADMIN_EMAIL=$(just get-admin-email)
-        ADMIN_PASSWORD=$(grep 'admin_password:' clay_config.yaml | sed 's/.*admin_password:[ ]*"\(.*\)"/\1/')
-        echo "Using admin email: $ADMIN_EMAIL"
-
+        ADMIN_PASSWORD=$(grep 'admin_password:' config.yaml | sed 's/.*admin_password:[ ]*"\(.*\)"/\1/')
         # Check for required passwords
         if [ -z "$ADMIN_PASSWORD" ]; then
-            echo "❌ Error: admin_password not set in clay_config.yaml"
+            echo "❌ Error: admin_password not set in config.yaml"
             exit 1
         fi
 
+        echo "Using admin email: $ADMIN_EMAIL, and admin password $ADMIN_PASSWORD"
+
+
         # Generate admin JWT
-       
-        if ADMIN_JWT=$(EMAIL=$ADMIN_EMAIL PASSWORD=$ADMIN_PASSWORD ./scripts/generate-jwt.sh); then
+        if ADMIN_JWT=$(EMAIL=$ADMIN_EMAIL PASSWORD=$ADMIN_PASSWORD ./scripts/login.sh); then
             echo "admin_jwt=$ADMIN_JWT" > test.env
             echo "✅ Admin JWT generated successfully"
         else
@@ -365,7 +303,7 @@ test target="" *args="":
 
         # Delete and recreate test user to ensure clean state
         echo "Ensuring clean test user..."
-        docker compose exec -T postgres psql -U clay -d clay -c "DELETE FROM users WHERE email = 'user@example.org';" > /dev/null 2>&1 || true
+        docker compose exec -T postgres psql -U waycast -d waycast -c "DELETE FROM users WHERE email = 'user@example.org';" > /dev/null 2>&1 || true
         curl -s -X POST http://localhost:3001/authentication/register \
             -H "Content-Type: application/json" \
             -d '{"email":"user@example.org","username":"testuser","password":"user_password","display_name":"Test User"}' \
@@ -373,7 +311,7 @@ test target="" *args="":
 
         # Generate user JWT
         echo "Generating user JWT..."
-        if USER_JWT=$(EMAIL=user@example.org PASSWORD=user_password ./scripts/generate-jwt.sh); then
+        if USER_JWT=$(EMAIL=user@example.org PASSWORD=user_password ./scripts/login.sh); then
             echo "user_jwt=$USER_JWT" >> test.env
             echo "✅ User JWT generated successfully"
         else
@@ -467,7 +405,7 @@ test target="" *args="":
                 fi
                 # Remove --watch from args and pass remaining to cargo test
                 remaining_args=$(echo "{{args}}" | sed 's/--watch//g' | xargs)
-                cd clay && cargo watch -x "test $remaining_args"
+                cd waycast && cargo watch -x "test $remaining_args"
             elif [[ "{{args}}" == *"--coverage"* ]]; then
                 if ! command -v cargo-llvm-cov >/dev/null 2>&1; then
                     echo "❌ Error: cargo-llvm-cov not found. Install with:"
@@ -476,9 +414,9 @@ test target="" *args="":
                     echo "  cargo binstall cargo-llvm-cov"
                     exit 1
                 fi
-                cd clay && cargo llvm-cov --fail-under-lines 60 --lcov --output-path lcov.info
+                cd waycast && cargo llvm-cov --fail-under-lines 60 --lcov --output-path lcov.info
             else
-                cd clay && cargo test {{args}}
+                cd waycast && cargo test {{args}}
             fi
             ;;
         ts)
@@ -514,7 +452,7 @@ test target="" *args="":
 # rust: Rust code formatting and linting
 # - Runs cargo fmt --check to verify formatting
 # - Runs cargo clippy for Rust-specific lints and suggestions
-# - Checks all Rust projects (clay)
+# - Checks all Rust projects (waycast)
 # - Pass clippy args like -- -D warnings for stricter checking
 #
 #
@@ -537,7 +475,7 @@ lint target *args="":
             npm run lint -- --max-warnings 0 {{args}}
             ;;
         rust)
-            cd clay
+            cd waycast
             echo "Checking Cargo.lock sync..."
             cargo metadata --locked > /dev/null
             echo "Running cargo fmt --check..."
@@ -565,7 +503,7 @@ lint target *args="":
 #
 # rust: Rust code formatting
 # - Uses cargo fmt to format all Rust code
-# - Formats all Rust projects (clay)
+# - Formats all Rust projects (waycast)
 # - Applies standard Rust formatting conventions
 # - Modifies files in place to fix formatting issues
 #
@@ -581,8 +519,8 @@ fmt target *args="":
             cd dashboard && npx prettier --write . {{args}}
             ;;
         rust)
-            echo "Running cargo fmt for clay..."
-            cd clay && cargo fmt {{args}}
+            echo "Running cargo fmt for waycast..."
+            cd waycast && cargo fmt {{args}}
             ;;
         *)
             echo "Usage: just fmt [ts|rust]"
@@ -593,10 +531,10 @@ fmt target *args="":
 # Generate JWT token for API testing: 'just jwt user@example.com'
 #
 # Creates a signed JWT token for testing authenticated API endpoints. The token
-# is formatted for use with curl as a VouchCookie.
+# is formatted for use with curl as a waycast_session.
 #
 # Usage with curl: TOKEN=$(just jwt admin@company.com) curl -b
-# "VouchCookie=$TOKEN" https://localhost/api/v1/users
+# "waycast_session=$TOKEN" https://localhost/api/v1/users
 #
 # In order to use the token, the user e/ email EMAIL must already exist in the
 # database - i.e. either be the default admin user, or later created by them.
@@ -613,12 +551,12 @@ fmt target *args="":
 # Examples:
 #   USERNAME=admin@example.org PASSWORD=secret just jwt
 jwt:
-    @./scripts/generate-jwt.sh
+    @./scripts/login.sh
 
 # Generate cookie for the configured admin user
 # Requires ADMIN_PASSWORD environment variable
 jwt-admin:
-    @EMAIL="$(just get-admin-email)" PASSWORD="${ADMIN_PASSWORD}" ./scripts/generate-jwt.sh
+    @EMAIL="$(just get-admin-email)" PASSWORD="${ADMIN_PASSWORD}" ./scripts/login.sh
 
 # Run CI pipeline locally: 'just ci [rust|ts]'
 #
@@ -648,7 +586,7 @@ ci target *args="":
         rust)
             echo "🦀 Running Rust CI pipeline..."
             echo "📋 Setting up llvm-cov environment for consistent compilation..."
-            cd clay
+            cd waycast
             echo "🧪 Step 1/1: Running tests with coverage..."
             just test rust --coverage {{args}}
             eval "$(cargo llvm-cov show-env --export-prefix)"
@@ -679,7 +617,7 @@ ci target *args="":
 # Security scanning: 'just security-scan [TAG]'
 #
 # Scans published container images from GitHub Container Registry for vulnerabilities.
-# Uses Grype to scan the clay image and provides detailed vulnerability reports by severity level.
+# Uses Grype to scan the waycast image and provides detailed vulnerability reports by severity level.
 #
 # Arguments:
 # TAG: Image tag to scan (defaults to 'latest' if not specified)
@@ -706,12 +644,12 @@ security-scan target="latest" *args="":
     
     # Use environment variable if set, otherwise use the provided target as tag
     SCAN_TAG="${TAG:-{{target}}}"
-    REGISTRY="ghcr.io/doublewordai/control-layer/"
-    CLAY_TAG="${REGISTRY}clay:$SCAN_TAG"
+    REGISTRY="ghcr.io/doublewordai/waycast/"
+    WAYCAST_TAG="${REGISTRY}waycast:$SCAN_TAG"
 
     echo "🔍 Scanning published container images for vulnerabilities..."
     echo "Tag: $SCAN_TAG"
-    echo "Images: $CLAY_TAG"
+    echo "Images: $WAYCAST_TAG"
 
     # Function to calculate vulnerability counts
     calculate_vulns() {
@@ -726,39 +664,39 @@ security-scan target="latest" *args="":
     
     # Scan each image
     echo ""
-    echo "Scanning clay image: $CLAY_TAG"
-    grype "$CLAY_TAG" --output json --file clay-vulnerabilities.json --quiet || {
-        echo "⚠️  Clay scan failed, skipping..."
-        echo '{"matches": []}' > clay-vulnerabilities.json
+    echo "Scanning waycast image: $WAYCAST_TAG"
+    grype "$WAYCAST_TAG" --output json --file waycast-vulnerabilities.json --quiet || {
+        echo "⚠️  Waycast scan failed, skipping..."
+        echo '{"matches": []}' > waycast-vulnerabilities.json
     }
-    
+
     # Calculate metrics for each component
-    CLAY_CRITICAL=$(calculate_vulns clay-vulnerabilities.json "Critical")
-    CLAY_HIGH=$(calculate_vulns clay-vulnerabilities.json "High")
-    CLAY_MEDIUM=$(calculate_vulns clay-vulnerabilities.json "Medium")
-    CLAY_LOW=$(calculate_vulns clay-vulnerabilities.json "Low")
-    CLAY_TOTAL=$(jq '.matches | length' clay-vulnerabilities.json 2>/dev/null || echo "0")
-    
+    WAYCAST_CRITICAL=$(calculate_vulns waycast-vulnerabilities.json "Critical")
+    WAYCAST_HIGH=$(calculate_vulns waycast-vulnerabilities.json "High")
+    WAYCAST_MEDIUM=$(calculate_vulns waycast-vulnerabilities.json "Medium")
+    WAYCAST_LOW=$(calculate_vulns waycast-vulnerabilities.json "Low")
+    WAYCAST_TOTAL=$(jq '.matches | length' waycast-vulnerabilities.json 2>/dev/null || echo "0")
+
     # Calculate totals
-    TOTAL_CRITICAL=$((CLAY_CRITICAL))
-    TOTAL_HIGH=$((CLAY_HIGH))
-    TOTAL_MEDIUM=$((CLAY_MEDIUM))
-    TOTAL_LOW=$((CLAY_LOW))
-    TOTAL_VULNS=$((CLAY_TOTAL))
-    
+    TOTAL_CRITICAL=$((WAYCAST_CRITICAL))
+    TOTAL_HIGH=$((WAYCAST_HIGH))
+    TOTAL_MEDIUM=$((WAYCAST_MEDIUM))
+    TOTAL_LOW=$((WAYCAST_LOW))
+    TOTAL_VULNS=$((WAYCAST_TOTAL))
+
     # Display results
     echo ""
     echo "🛡️  Security Scan Results"
     echo "========================="
     printf "%-10s %-9s %-6s %-8s %-5s %-7s\n" "Component" "Critical" "High" "Medium" "Low" "Total"
     echo "-------------------------------------------------------"
-    printf "%-10s %-9s %-6s %-8s %-5s %-7s\n" "Clay" "$CLAY_CRITICAL" "$CLAY_HIGH" "$CLAY_MEDIUM" "$CLAY_LOW" "$CLAY_TOTAL"
+    printf "%-10s %-9s %-6s %-8s %-5s %-7s\n" "Waycast" "$WAYCAST_CRITICAL" "$WAYCAST_HIGH" "$WAYCAST_MEDIUM" "$WAYCAST_LOW" "$WAYCAST_TOTAL"
     echo "-------------------------------------------------------"
     printf "%-10s %-9s %-6s %-8s %-5s %-7s\n" "Total" "$TOTAL_CRITICAL" "$TOTAL_HIGH" "$TOTAL_MEDIUM" "$TOTAL_LOW" "$TOTAL_VULNS"
-    
+
     echo ""
     echo "📁 Detailed reports saved:"
-    echo "  - clay-vulnerabilities.json"
+    echo "  - waycast-vulnerabilities.json"
     
     # Warn about critical vulnerabilities
     if [ "$TOTAL_CRITICAL" -gt 0 ]; then

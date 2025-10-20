@@ -12,7 +12,11 @@ import {
   Edit,
   Check,
 } from "lucide-react";
-import { useModels, useEndpoints, useUpdateModel } from "../../../../api/clay";
+import {
+  useModels,
+  useEndpoints,
+  useUpdateModel,
+} from "../../../../api/waycast";
 import { getModelType } from "../../../../utils/modelType";
 import { useAuthorization } from "../../../../utils";
 import { ApiExamples, AccessManagementModal } from "../../../modals";
@@ -521,6 +525,61 @@ const ModelInfo: React.FC = () => {
                         />
                       </div>
 
+                      {/* Capabilities Section */}
+                      {updateData.model_type === "CHAT" && (
+                        <div className="border-t pt-4">
+                          <div className="flex items-center gap-1 mb-3">
+                            <label className="text-sm text-gray-600 font-medium">
+                              Capabilities
+                            </label>
+                          </div>
+                          <div className="flex items-center space-x-2">
+                            <input
+                              type="checkbox"
+                              id="vision-capability"
+                              checked={
+                                updateData.capabilities?.includes("vision") ??
+                                false
+                              }
+                              onChange={(e) => {
+                                const newCapabilities = e.target.checked
+                                  ? [
+                                      ...(updateData.capabilities || []),
+                                      "vision",
+                                    ]
+                                  : (updateData.capabilities || []).filter(
+                                      (c) => c !== "vision",
+                                    );
+                                setUpdateData((prev) => ({
+                                  ...prev,
+                                  capabilities: newCapabilities,
+                                }));
+                              }}
+                              className="h-4 w-4 rounded border-gray-300 text-blue-600 focus:ring-blue-500"
+                            />
+                            <label
+                              htmlFor="vision-capability"
+                              className="text-sm font-medium leading-none peer-disabled:cursor-not-allowed peer-disabled:opacity-70 flex items-center gap-1"
+                            >
+                              Vision
+                              <HoverCard openDelay={100} closeDelay={50}>
+                                <HoverCardTrigger asChild>
+                                  <Info className="h-3 w-3 text-gray-400 hover:text-gray-600" />
+                                </HoverCardTrigger>
+                                <HoverCardContent
+                                  className="w-80"
+                                  sideOffset={5}
+                                >
+                                  <p className="text-sm text-muted-foreground">
+                                    Enables image upload in the playground.
+                                  </p>
+                                </HoverCardContent>
+                              </HoverCard>
+                            </label>
+                          </div>
+                        </div>
+                      )}
+
                       {/* Rate Limiting Section */}
                       <div className="border-t pt-4">
                         <div className="flex items-center gap-1 mb-3">
@@ -747,6 +806,71 @@ const ModelInfo: React.FC = () => {
                         </p>
                       </div>
 
+                      {/* Capabilities Section - only show for CHAT models */}
+                      {(model.model_type === "CHAT" ||
+                        getModelType(model.id, model.model_name) === "chat") &&
+                        canManageGroups && (
+                          <div className="border-t pt-6">
+                            <div className="flex items-center gap-1 mb-3">
+                              <p className="text-sm text-gray-600 font-medium">
+                                Capabilities
+                              </p>
+                            </div>
+                            <div className="flex items-center space-x-2">
+                              <input
+                                type="checkbox"
+                                id="vision-capability-readonly"
+                                checked={
+                                  model.capabilities?.includes("vision") ??
+                                  false
+                                }
+                                onChange={async (e) => {
+                                  const newCapabilities = e.target.checked
+                                    ? [...(model.capabilities || []), "vision"]
+                                    : (model.capabilities || []).filter(
+                                        (c) => c !== "vision",
+                                      );
+
+                                  try {
+                                    await updateModelMutation.mutateAsync({
+                                      id: model.id,
+                                      data: {
+                                        capabilities: newCapabilities,
+                                      },
+                                    });
+                                  } catch (error) {
+                                    console.error(
+                                      "Failed to update capabilities:",
+                                      error,
+                                    );
+                                  }
+                                }}
+                                disabled={updateModelMutation.isPending}
+                                className="h-4 w-4 rounded border-gray-300 text-blue-600 focus:ring-blue-500 disabled:opacity-50"
+                              />
+                              <label
+                                htmlFor="vision-capability-readonly"
+                                className="text-sm font-medium leading-none peer-disabled:cursor-not-allowed peer-disabled:opacity-70 flex items-center gap-1"
+                              >
+                                Vision
+                                <HoverCard openDelay={100} closeDelay={50}>
+                                  <HoverCardTrigger asChild>
+                                    <Info className="h-3 w-3 text-gray-400 hover:text-gray-600" />
+                                  </HoverCardTrigger>
+                                  <HoverCardContent
+                                    className="w-80"
+                                    sideOffset={5}
+                                  >
+                                    <p className="text-sm text-muted-foreground">
+                                      Enables image upload in the playground.
+                                    </p>
+                                  </HoverCardContent>
+                                </HoverCard>
+                              </label>
+                            </div>
+                          </div>
+                        )}
+
                       {/* Rate Limiting Display - only show for Platform Managers */}
                       {canManageGroups &&
                         (model.requests_per_second !== undefined ||
@@ -931,25 +1055,6 @@ const ModelInfo: React.FC = () => {
                             : "Never"}
                         </p>
                       </div>
-                    </div>
-                  </CardContent>
-                </Card>
-              )}
-
-              {/* Capabilities */}
-              {model.capabilities && model.capabilities.length > 0 && (
-                <Card className="p-0 gap-0 rounded-lg">
-                  <CardHeader className="px-6 pt-5 pb-4">
-                    <CardTitle>Capabilities</CardTitle>
-                    <CardDescription>What this model can do</CardDescription>
-                  </CardHeader>
-                  <CardContent className="px-6 pb-6 pt-0">
-                    <div className="flex flex-wrap gap-2">
-                      {model.capabilities.map((capability, index) => (
-                        <Badge key={index} variant="secondary">
-                          {capability}
-                        </Badge>
-                      ))}
                     </div>
                   </CardContent>
                 </Card>

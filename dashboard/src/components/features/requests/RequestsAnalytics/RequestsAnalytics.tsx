@@ -12,7 +12,7 @@ import {
   PieChart,
   Sector,
 } from "recharts";
-import { useRequestsAggregate, useModels } from "../../../../api/clay";
+import { useRequestsAggregate, useModels } from "../../../../api/waycast";
 import { useMockAggregateData } from "../../../../api/demo/mockRequests";
 import { useSettings } from "../../../../contexts";
 import { Card, CardContent, CardHeader, CardTitle } from "../../../ui/card";
@@ -221,8 +221,8 @@ export function RequestsAnalytics({
         <CardHeader>
           <CardTitle className="text-sm flex items-center gap-1">
             {selectedModel
-              ? `${selectedModelDetails?.alias || selectedModel} Traffic (24hr)`
-              : "Gateway Traffic (24hr)"}
+              ? `${selectedModelDetails?.alias || selectedModel} Traffic`
+              : "Gateway Traffic"}
             <HoverCard openDelay={100} closeDelay={100}>
               <HoverCardTrigger asChild>
                 <Info className="h-3 w-3 text-muted-foreground " />

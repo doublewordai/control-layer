@@ -1,6 +1,6 @@
 import { useMemo } from "react";
-import type { Role } from "../api/clay/types";
-import { useUser } from "../api/clay/hooks";
+import type { Role } from "../api/waycast/types";
+import { useUser } from "../api/waycast/hooks";
 
 export type PagePermission =
   | "models"
