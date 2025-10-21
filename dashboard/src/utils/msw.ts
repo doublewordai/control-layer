@@ -1,5 +1,5 @@
 import { setupWorker } from "msw/browser";
-import { handlers as clayHandlers } from "../api/waycast/mocks/handlers";
+import { handlers as clayHandlers } from "../api/control-layer/mocks/handlers";
 
 const allHandlers = [...clayHandlers];
 

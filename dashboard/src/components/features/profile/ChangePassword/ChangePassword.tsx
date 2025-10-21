@@ -1,7 +1,7 @@
 import React, { useState } from "react";
 import { Lock, Loader2, Eye, EyeOff } from "lucide-react";
-import { waycastApi } from "../../../../api/waycast/client";
-import { ApiError } from "../../../../api/waycast/errors";
+import { dwctlApi } from "../../../../api/control-layer/client";
+import { ApiError } from "../../../../api/control-layer/errors";
 
 interface ChangePasswordProps {
   className?: string;
@@ -49,7 +49,7 @@ export const ChangePassword: React.FC<ChangePasswordProps> = ({
     setIsLoading(true);
 
     try {
-      await waycastApi.auth.changePassword({
+      await dwctlApi.auth.changePassword({
         current_password: currentPassword,
         new_password: newPassword,
       });

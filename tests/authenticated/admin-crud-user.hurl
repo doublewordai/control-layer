@@ -1,7 +1,7 @@
 # Successfully creating a user with unique identifier
 POST http://localhost:3001/admin/api/v1/users
 [Cookies]
-waycast_session: {{admin_jwt}}
+dwctl_session: {{admin_jwt}}
 {
   "username": "test-user-{{newUuid}}",
   "email": "test-{{newUuid}}@example.org",
@@ -15,7 +15,7 @@ user_email: jsonpath "$.email"
 # Creating a user w/ the same email gives 409 error
 POST http://localhost:3001/admin/api/v1/users
 [Cookies]
-waycast_session: {{admin_jwt}}
+dwctl_session: {{admin_jwt}}
 {
   "username": "test-user-duplicate",
   "email": "{{user_email}}",
@@ -26,6 +26,6 @@ HTTP 409
 # Delete the user
 DELETE http://localhost:3001/admin/api/v1/users/{{user_id}}
 [Cookies]
-waycast_session: {{admin_jwt}}
+dwctl_session: {{admin_jwt}}
 
 HTTP 204

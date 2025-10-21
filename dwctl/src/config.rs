@@ -15,7 +15,7 @@ use crate::errors::Error;
 #[command(author, version, about, long_about = None)]
 pub struct Args {
     /// Path to configuration file
-    #[arg(short = 'f', long, env = "WAYCAST_CONFIG", default_value = "config.yaml")]
+    #[arg(short = 'f', long, env = "DWCTL_CONFIG", default_value = "config.yaml")]
     pub config: String,
 }
 
@@ -50,7 +50,7 @@ pub struct Config {
 pub enum DatabaseConfig {
     /// Use embedded PostgreSQL database (requires embedded-db feature)
     Embedded {
-        /// Directory where database data will be stored (default: .waycast_data/postgres)
+        /// Directory where database data will be stored (default: .dwctl_data/postgres)
         #[serde(skip_serializing_if = "Option::is_none")]
         data_dir: Option<PathBuf>,
         /// Whether to persist data between restarts (default: false/ephemeral)
@@ -68,7 +68,7 @@ impl Default for DatabaseConfig {
     fn default() -> Self {
         // Default to external for backward compatibility
         DatabaseConfig::External {
-            url: "postgres://localhost:5432/waycast".to_string(),
+            url: "postgres://localhost:5432/control_layer".to_string(),
         }
     }
 }
@@ -312,7 +312,7 @@ impl Default for SessionConfig {
     fn default() -> Self {
         Self {
             timeout: Duration::from_secs(24 * 60 * 60), // 24 hours
-            cookie_name: "waycast_session".to_string(),
+            cookie_name: "dwctl_session".to_string(),
             cookie_secure: true,
             cookie_same_site: "strict".to_string(),
         }
@@ -354,7 +354,7 @@ impl Default for EmailConfig {
         Self {
             smtp: None, // Will use file transport in development
             from_email: "noreply@example.com".to_string(),
-            from_name: "Waycast App".to_string(),
+            from_name: "Control Layer".to_string(),
             password_reset: PasswordResetEmailConfig::default(),
         }
     }
@@ -402,7 +402,7 @@ impl Config {
             if self.secret_key.is_none() {
                 return Err(Error::Internal {
                     operation: "Config validation: Native authentication is enabled but secret_key is not configured. \
-                     Please set WAYCAST_SECRET_KEY environment variable or add secret_key to config file."
+                     Please set DWCTL_SECRET_KEY environment variable or add secret_key to config file."
                         .to_string(),
                 });
             }
@@ -478,7 +478,7 @@ impl Config {
             // Load base config file
             .merge(Yaml::file(&args.config))
             // Environment variables can still override specific values
-            .merge(Env::prefixed("WAYCAST_").split("__"))
+            .merge(Env::prefixed("DWCTL_").split("__"))
             // Common DATABASE_URL pattern
             .merge(Env::raw().only(&["DATABASE_URL"]))
     }
@@ -545,8 +545,8 @@ metadata:
 "#,
             )?;
 
-            jail.set_env("WAYCAST_HOST", "127.0.0.1");
-            jail.set_env("WAYCAST_PORT", "8080");
+            jail.set_env("DWCTL_HOST", "127.0.0.1");
+            jail.set_env("DWCTL_PORT", "8080");
 
             let args = Args {
                 config: "test.yaml".to_string(),

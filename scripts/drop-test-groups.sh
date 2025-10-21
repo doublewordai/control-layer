@@ -26,7 +26,7 @@ echo "Fetching all groups..." >&2
 
 # Get all groups
 GROUPS=$(curl -s -X GET https://localhost/admin/api/v1/groups \
-  -b "waycast_session=${ADMIN_JWT}" | jq -r '.[] | "\(.id):\(.name)"')
+  -b "dwctl_session=${ADMIN_JWT}" | jq -r '.[] | "\(.id):\(.name)"')
 
 if [ -z "$GROUPS" ]; then
   echo "No groups found or failed to fetch groups" >&2
@@ -45,7 +45,7 @@ while IFS=: read -r group_id group_name; do
     # Delete the group
     HTTP_STATUS=$(curl -s -o /dev/null -w "%{http_code}" \
       -X DELETE "https://localhost/admin/api/v1/groups/${group_id}" \
-      -b "waycast_session=${ADMIN_JWT}")
+      -b "dwctl_session=${ADMIN_JWT}")
 
     if [ "$HTTP_STATUS" = "204" ]; then
       echo "✅ Successfully deleted $group_name" >&2

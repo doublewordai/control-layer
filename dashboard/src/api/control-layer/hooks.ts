@@ -1,5 +1,5 @@
 import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query";
-import { waycastApi } from "./client";
+import { dwctlApi } from "./client";
 import { queryKeys } from "./keys";
 import type {
   UserCreateRequest,
@@ -21,7 +21,7 @@ import type {
 export function useConfig() {
   return useQuery({
     queryKey: ["config"],
-    queryFn: () => waycastApi.config.get(),
+    queryFn: () => dwctlApi.config.get(),
     staleTime: 30 * 60 * 1000, // 30 minutes - config rarely changes
   });
 }
@@ -31,7 +31,7 @@ export function useUsers(options?: UsersQuery & { enabled?: boolean }) {
   const { enabled = true, ...queryOptions } = options || {};
   return useQuery({
     queryKey: queryKeys.users.query(queryOptions),
-    queryFn: () => waycastApi.users.list(queryOptions),
+    queryFn: () => dwctlApi.users.list(queryOptions),
     enabled,
   });
 }
@@ -39,7 +39,7 @@ export function useUsers(options?: UsersQuery & { enabled?: boolean }) {
 export function useUser(id: string) {
   return useQuery({
     queryKey: queryKeys.users.byId(id),
-    queryFn: () => waycastApi.users.get(id),
+    queryFn: () => dwctlApi.users.get(id),
   });
 }
 
@@ -48,7 +48,7 @@ export function useCreateUser() {
 
   return useMutation({
     mutationKey: ["users", "create"],
-    mutationFn: (data: UserCreateRequest) => waycastApi.users.create(data),
+    mutationFn: (data: UserCreateRequest) => dwctlApi.users.create(data),
     // Refetch queries after mutation completes (success or error)
     onSettled: () => {
       queryClient.invalidateQueries({ queryKey: queryKeys.users.all });
@@ -63,7 +63,7 @@ export function useUpdateUser() {
   return useMutation({
     mutationKey: ["users", "update"],
     mutationFn: ({ id, data }: { id: string; data: UserUpdateRequest }) =>
-      waycastApi.users.update(id, data),
+      dwctlApi.users.update(id, data),
     // Refetch queries after mutation completes (success or error)
     onSettled: () => {
       queryClient.invalidateQueries({ queryKey: queryKeys.users.all });
@@ -77,7 +77,7 @@ export function useDeleteUser() {
 
   return useMutation({
     mutationKey: ["users", "delete"],
-    mutationFn: (id: string) => waycastApi.users.delete(id),
+    mutationFn: (id: string) => dwctlApi.users.delete(id),
     // Refetch queries after mutation completes (success or error)
     onSettled: () => {
       queryClient.invalidateQueries({ queryKey: queryKeys.users.all });
@@ -90,14 +90,14 @@ export function useDeleteUser() {
 export function useModels(options?: ModelsQuery) {
   return useQuery({
     queryKey: queryKeys.models.query(options),
-    queryFn: () => waycastApi.models.list(options),
+    queryFn: () => dwctlApi.models.list(options),
   });
 }
 
 export function useModel(id: string) {
   return useQuery({
     queryKey: queryKeys.models.byId(id),
-    queryFn: () => waycastApi.models.get(id),
+    queryFn: () => dwctlApi.models.get(id),
   });
 }
 
@@ -106,7 +106,7 @@ export function useUpdateModel() {
 
   return useMutation({
     mutationFn: ({ id, data }: { id: string; data: ModelUpdateRequest }) =>
-      waycastApi.models.update(id, data),
+      dwctlApi.models.update(id, data),
     onSuccess: (updatedModel) => {
       queryClient.invalidateQueries({ queryKey: queryKeys.models.all });
       queryClient.setQueryData(
@@ -122,7 +122,7 @@ export function useGroups(options?: GroupsQuery & { enabled?: boolean }) {
   const { enabled = true, ...queryOptions } = options || {};
   return useQuery({
     queryKey: queryKeys.groups.query(queryOptions),
-    queryFn: () => waycastApi.groups.list(queryOptions),
+    queryFn: () => dwctlApi.groups.list(queryOptions),
     enabled,
   });
 }
@@ -130,7 +130,7 @@ export function useGroups(options?: GroupsQuery & { enabled?: boolean }) {
 export function useGroup(id: string) {
   return useQuery({
     queryKey: queryKeys.groups.byId(id),
-    queryFn: () => waycastApi.groups.get(id),
+    queryFn: () => dwctlApi.groups.get(id),
   });
 }
 
@@ -138,7 +138,7 @@ export function useCreateGroup() {
   const queryClient = useQueryClient();
 
   return useMutation({
-    mutationFn: (data: GroupCreateRequest) => waycastApi.groups.create(data),
+    mutationFn: (data: GroupCreateRequest) => dwctlApi.groups.create(data),
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: queryKeys.groups.all });
     },
@@ -150,7 +150,7 @@ export function useUpdateGroup() {
 
   return useMutation({
     mutationFn: ({ id, data }: { id: string; data: GroupUpdateRequest }) =>
-      waycastApi.groups.update(id, data),
+      dwctlApi.groups.update(id, data),
     onSuccess: (updatedGroup) => {
       queryClient.invalidateQueries({ queryKey: queryKeys.groups.all });
       queryClient.setQueryData(
@@ -165,7 +165,7 @@ export function useDeleteGroup() {
   const queryClient = useQueryClient();
 
   return useMutation({
-    mutationFn: (id: string) => waycastApi.groups.delete(id),
+    mutationFn: (id: string) => dwctlApi.groups.delete(id),
     onSuccess: (_, deletedId) => {
       queryClient.invalidateQueries({ queryKey: queryKeys.groups.all });
       queryClient.removeQueries({ queryKey: queryKeys.groups.byId(deletedId) });
@@ -180,7 +180,7 @@ export function useAddUserToGroup() {
   return useMutation({
     mutationKey: ["groups", "addUser"],
     mutationFn: ({ groupId, userId }: { groupId: string; userId: string }) =>
-      waycastApi.groups.addUser(groupId, userId),
+      dwctlApi.groups.addUser(groupId, userId),
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: queryKeys.groups.all });
       queryClient.invalidateQueries({ queryKey: queryKeys.users.all });
@@ -194,7 +194,7 @@ export function useRemoveUserFromGroup() {
   return useMutation({
     mutationKey: ["groups", "removeUser"],
     mutationFn: ({ groupId, userId }: { groupId: string; userId: string }) =>
-      waycastApi.groups.removeUser(groupId, userId),
+      dwctlApi.groups.removeUser(groupId, userId),
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: queryKeys.groups.all });
       queryClient.invalidateQueries({ queryKey: queryKeys.users.all });
@@ -207,7 +207,7 @@ export function useAddModelToGroup() {
 
   return useMutation({
     mutationFn: ({ groupId, modelId }: { groupId: string; modelId: string }) =>
-      waycastApi.groups.addModel(groupId, modelId),
+      dwctlApi.groups.addModel(groupId, modelId),
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: queryKeys.groups.all });
       queryClient.invalidateQueries({ queryKey: queryKeys.models.all });
@@ -220,7 +220,7 @@ export function useRemoveModelFromGroup() {
 
   return useMutation({
     mutationFn: ({ groupId, modelId }: { groupId: string; modelId: string }) =>
-      waycastApi.groups.removeModel(groupId, modelId),
+      dwctlApi.groups.removeModel(groupId, modelId),
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: queryKeys.groups.all });
       queryClient.invalidateQueries({ queryKey: queryKeys.models.all });
@@ -233,7 +233,7 @@ export function useEndpoints(options?: { enabled?: boolean }) {
   const { enabled = true } = options || {};
   return useQuery({
     queryKey: queryKeys.endpoints.all,
-    queryFn: () => waycastApi.endpoints.list(),
+    queryFn: () => dwctlApi.endpoints.list(),
     enabled,
   });
 }
@@ -241,7 +241,7 @@ export function useEndpoints(options?: { enabled?: boolean }) {
 export function useEndpoint(id: string) {
   return useQuery({
     queryKey: queryKeys.endpoints.byId(id),
-    queryFn: () => waycastApi.endpoints.get(id),
+    queryFn: () => dwctlApi.endpoints.get(id),
   });
 }
 
@@ -249,7 +249,7 @@ export function useValidateEndpoint() {
   return useMutation({
     mutationKey: ["endpoints", "validate"],
     mutationFn: (data: EndpointValidateRequest) =>
-      waycastApi.endpoints.validate(data),
+      dwctlApi.endpoints.validate(data),
   });
 }
 
@@ -259,7 +259,7 @@ export function useCreateEndpoint() {
   return useMutation({
     mutationKey: ["endpoints", "create"],
     mutationFn: (data: EndpointCreateRequest) =>
-      waycastApi.endpoints.create(data),
+      dwctlApi.endpoints.create(data),
     onSettled: () => {
       queryClient.invalidateQueries({ queryKey: queryKeys.endpoints.all });
       queryClient.invalidateQueries({ queryKey: queryKeys.models.all });
@@ -273,7 +273,7 @@ export function useUpdateEndpoint() {
   return useMutation({
     mutationKey: ["endpoints", "update"],
     mutationFn: ({ id, data }: { id: string; data: EndpointUpdateRequest }) =>
-      waycastApi.endpoints.update(id, data),
+      dwctlApi.endpoints.update(id, data),
     onSettled: (_, __, variables) => {
       queryClient.invalidateQueries({ queryKey: queryKeys.endpoints.all });
       queryClient.invalidateQueries({ queryKey: queryKeys.models.all });
@@ -291,7 +291,7 @@ export function useDeleteEndpoint() {
 
   return useMutation({
     mutationKey: ["endpoints", "delete"],
-    mutationFn: (id: string) => waycastApi.endpoints.delete(id),
+    mutationFn: (id: string) => dwctlApi.endpoints.delete(id),
     onSettled: () => {
       queryClient.invalidateQueries({ queryKey: queryKeys.endpoints.all });
       queryClient.invalidateQueries({ queryKey: queryKeys.models.all });
@@ -304,7 +304,7 @@ export function useSynchronizeEndpoint() {
 
   return useMutation({
     mutationKey: ["endpoints", "synchronize"],
-    mutationFn: (id: string) => waycastApi.endpoints.synchronize(id),
+    mutationFn: (id: string) => dwctlApi.endpoints.synchronize(id),
     onSettled: () => {
       // Refetch models since synchronization affects deployments
       queryClient.invalidateQueries({ queryKey: queryKeys.models.all });
@@ -316,14 +316,14 @@ export function useSynchronizeEndpoint() {
 export function useApiKeys(userId = "current") {
   return useQuery({
     queryKey: queryKeys.apiKeys.query(userId),
-    queryFn: () => waycastApi.users.apiKeys.getAll(userId),
+    queryFn: () => dwctlApi.users.apiKeys.getAll(userId),
   });
 }
 
 export function useApiKey(id: string, userId = "current") {
   return useQuery({
     queryKey: queryKeys.apiKeys.byId(id, userId),
-    queryFn: () => waycastApi.users.apiKeys.get(id, userId),
+    queryFn: () => dwctlApi.users.apiKeys.get(id, userId),
   });
 }
 
@@ -337,7 +337,7 @@ export function useCreateApiKey() {
     }: {
       data: ApiKeyCreateRequest;
       userId?: string;
-    }) => waycastApi.users.apiKeys.create(data, userId),
+    }) => dwctlApi.users.apiKeys.create(data, userId),
     onSuccess: (_, { userId = "current" }) => {
       queryClient.invalidateQueries({
         queryKey: queryKeys.apiKeys.query(userId),
@@ -356,7 +356,7 @@ export function useDeleteApiKey() {
     }: {
       keyId: string;
       userId?: string;
-    }) => waycastApi.users.apiKeys.delete(keyId, userId),
+    }) => dwctlApi.users.apiKeys.delete(keyId, userId),
     onSuccess: (_, { keyId, userId = "current" }) => {
       queryClient.invalidateQueries({
         queryKey: queryKeys.apiKeys.query(userId),
@@ -384,7 +384,7 @@ export function useRequests(
 
   return useQuery({
     queryKey: queryKeys.requests.query(optionsWithDate),
-    queryFn: () => waycastApi.requests.list(optionsWithDate),
+    queryFn: () => dwctlApi.requests.list(optionsWithDate),
     enabled: queryOptions?.enabled ?? true,
   });
 }
@@ -403,7 +403,7 @@ export function useRequestsAggregate(
       timestampBefore,
     ),
     queryFn: () =>
-      waycastApi.requests.aggregate(model, timestampAfter, timestampBefore),
+      dwctlApi.requests.aggregate(model, timestampAfter, timestampBefore),
   });
 }
 
@@ -415,7 +415,7 @@ export function useRequestsAggregateByUser(
   return useQuery({
     queryKey: queryKeys.requests.aggregateByUser(model, startDate, endDate),
     queryFn: () =>
-      waycastApi.requests.aggregateByUser(model, startDate, endDate),
+      dwctlApi.requests.aggregateByUser(model, startDate, endDate),
     enabled: !!model,
   });
 }
@@ -424,7 +424,7 @@ export function useRequestsAggregateByUser(
 export function useRegistrationInfo() {
   return useQuery({
     queryKey: ["registration-info"],
-    queryFn: () => waycastApi.auth.getRegistrationInfo(),
+    queryFn: () => dwctlApi.auth.getRegistrationInfo(),
     staleTime: 5 * 60 * 1000, // 5 minutes
   });
 }
@@ -432,7 +432,7 @@ export function useRegistrationInfo() {
 export function useLoginInfo() {
   return useQuery({
     queryKey: ["login-info"],
-    queryFn: () => waycastApi.auth.getLoginInfo(),
+    queryFn: () => dwctlApi.auth.getLoginInfo(),
     staleTime: 5 * 60 * 1000, // 5 minutes
   });
 }
@@ -441,7 +441,7 @@ export function useRequestPasswordReset() {
   return useMutation({
     mutationKey: ["password-reset", "request"],
     mutationFn: (email: string) =>
-      waycastApi.auth.requestPasswordReset({ email }),
+      dwctlApi.auth.requestPasswordReset({ email }),
   });
 }
 
@@ -452,6 +452,6 @@ export function useConfirmPasswordReset() {
       token_id: string;
       token: string;
       new_password: string;
-    }) => waycastApi.auth.confirmPasswordReset(data),
+    }) => dwctlApi.auth.confirmPasswordReset(data),
   });
 }

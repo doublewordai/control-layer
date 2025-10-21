@@ -12,7 +12,7 @@ import {
   PieChart,
   Sector,
 } from "recharts";
-import { useRequestsAggregate, useModels } from "../../../../api/waycast";
+import { useRequestsAggregate, useModels } from "../../../../api/control-layer";
 import { useMockAggregateData } from "../../../../api/demo/mockRequests";
 import { useSettings } from "../../../../contexts";
 import { Card, CardContent, CardHeader, CardTitle } from "../../../ui/card";

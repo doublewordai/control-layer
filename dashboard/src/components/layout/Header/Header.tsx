@@ -33,7 +33,7 @@ export function Header() {
           </div>
           <div className="w-px h-4 bg-doubleword-neutral-200"></div>
           <a
-            href="https://docs.doubleword.ai/waycast"
+            href="https://docs.doubleword.ai/control-layer"
             target="_blank"
             rel="noopener noreferrer"
             className="flex items-center gap-2 text-doubleword-text-tertiary hover:text-doubleword-primary transition-colors font-medium"
