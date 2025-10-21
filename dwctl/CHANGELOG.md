@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.4.2](https://github.com/doublewordai/control-layer/compare/v0.4.1...v0.4.2) (2025-10-21)
+
+
+### Bug Fixes
+
+* default to embedded db if enabled ([#36](https://github.com/doublewordai/control-layer/issues/36)) ([41c2941](https://github.com/doublewordai/control-layer/commit/41c29415825ae75f81adf5293246b6c117503b04))
+
 ## [0.4.1](https://github.com/doublewordai/control-layer/compare/v0.4.0...v0.4.1) (2025-10-21)
 
 
