@@ -4,6 +4,7 @@ use crate::db::handlers::repository::Repository;
 use crate::db::handlers::{Deployments, InferenceEndpoints};
 use crate::db::models::deployments::{DeploymentCreateDBRequest, DeploymentDBResponse, DeploymentUpdateDBRequest, ModelStatus};
 use crate::db::models::inference_endpoints::InferenceEndpointDBResponse;
+use crate::errors::AliasConflict;
 use crate::sync::deployments::fetch_models::{FetchModels, FetchModelsReqwest, SyncConfig};
 use crate::types::{DeploymentId, InferenceEndpointId, UserId};
 use anyhow::Result;
@@ -430,6 +431,72 @@ where
     Ok(())
 }
 
+/// Update deployment aliases for an endpoint
+pub async fn update_endpoint_aliases(
+    endpoint: InferenceEndpointDBResponse,
+    deployments_repo: &mut Deployments<'_>,
+    alias_mapping: &HashMap<String, String>,
+) -> Result<EndpointSyncResponse, SyncError> {
+    let mut changes_made = 0;
+
+    // Get current deployments for this endpoint
+    let current_deployments = deployments_repo
+        .list(&DeploymentFilter::new(0, 1000).with_endpoint(endpoint.id))
+        .await
+        .map_err(|e| SyncError::Other(e.into()))?;
+
+    // Update aliases for existing deployments
+    for deployment in current_deployments {
+        if let Some(new_alias) = alias_mapping.get(&deployment.model_name) {
+            if &deployment.alias != new_alias {
+                // Check for alias conflicts before updating
+                let conflict_check = deployments_repo
+                    .list(&DeploymentFilter::new(0, 1000))
+                    .await
+                    .map_err(|e| SyncError::Other(e.into()))?;
+                
+                // Check if another deployment already uses this alias
+                if conflict_check.iter().any(|d| d.alias == *new_alias && d.id != deployment.id) {
+                    return Err(SyncError::AliasConflicts {
+                        conflicts: vec![AliasConflict {
+                            model_name: deployment.model_name.clone(),
+                            attempted_alias: new_alias.clone(),
+                        }],
+                    });
+                }
+
+                // Update the deployment alias
+                let update_request = DeploymentUpdateDBRequest::alias_update(new_alias.clone());
+
+                deployments_repo
+                    .update(deployment.id, &update_request)
+                    .await
+                    .map_err(|e| SyncError::Other(e.into()))?;
+
+                changes_made += 1;
+                tracing::info!(
+                    "Updated deployment {} alias from '{}' to '{}'",
+                    deployment.id,
+                    deployment.alias,
+                    new_alias
+                );
+            }
+        }
+    }
+
+    Ok(EndpointSyncResponse {
+        endpoint_id: endpoint.id,
+        changes_made,
+        new_models_created: 0,
+        models_reactivated: 0,
+        models_deactivated: 0,
+        models_deleted: 0,
+        total_models_fetched: 0,
+        filtered_models_count: 0,
+        synced_at: Utc::now(),
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use crate::{
@@ -515,8 +582,8 @@ mod tests {
             if let Some(model_name) = &request.model_name {
                 response.model_name = model_name.clone();
             }
-            if let Some(deployment_name) = &request.deployment_name {
-                response.alias = deployment_name.clone();
+            if let Some(alias) = &request.alias {
+                response.alias = alias.clone();
             }
             if let Some(description) = &request.description {
                 response.description = description.clone();

@@ -109,6 +109,8 @@ pub struct InferenceEndpointUpdate {
     pub url: Option<String>,
     pub api_key: Option<Option<String>>,
     pub model_filter: Option<Option<Vec<String>>>,
+    #[serde(default)]
+    pub alias_mapping: Option<HashMap<String, String>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]

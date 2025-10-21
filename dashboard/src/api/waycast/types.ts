@@ -199,6 +199,7 @@ export interface EndpointUpdateRequest {
   url?: string;
   api_key?: string | null;
   model_filter?: string[] | null;
+  alias_mapping?: Record<string, string>;
 }
 
 export type EndpointValidateRequest =

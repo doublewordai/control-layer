@@ -5,13 +5,13 @@ use crate::{
     },
     auth::permissions::{operation, resource, RequiresPermission},
     db::{
-        handlers::{inference_endpoints::InferenceEndpointFilter, InferenceEndpoints, Deployments, Repository}, // Add Deployments here
+        handlers::{inference_endpoints::InferenceEndpointFilter, InferenceEndpoints, Deployments, Repository},
         models::inference_endpoints::{InferenceEndpointCreateDBRequest, InferenceEndpointUpdateDBRequest},
     },
     errors::{Error, Result},
     sync::{
         deployments::fetch_models::{FetchModels, FetchModelsReqwest, SyncConfig},
-        endpoint_sync::{self, sync_endpoint_models_with_aliases}, // Add sync_endpoint_models_with_aliases here
+        endpoint_sync::{self, sync_endpoint_models_with_aliases, update_endpoint_aliases},
     },
     types::InferenceEndpointId,
     AppState,
@@ -120,26 +120,85 @@ pub async fn update_inference_endpoint(
     _: RequiresPermission<resource::Endpoints, operation::UpdateAll>,
     Json(update): Json<InferenceEndpointUpdate>,
 ) -> Result<Json<InferenceEndpointResponse>> {
-    let mut conn = state.db.acquire().await.map_err(|e| Error::Database(e.into()))?;
-    let mut repo = InferenceEndpoints::new(&mut conn);
-    let db_request = InferenceEndpointUpdateDBRequest {
-        name: update.name,
-        description: update.description,
-        url: match update.url {
-            Some(url_str) => Some(url_str.parse().map_err(|_| Error::BadRequest {
-                message: "Invalid URL format".to_string(),
-            })?),
-            None => None,
-        },
-        api_key: update.api_key,
-        model_filter: update.model_filter,
-    };
+    // For updates with alias mapping, we need a transaction
+    // For regular updates, we use a simpler approach
+    if update.alias_mapping.is_some() {
+        // Use transaction for alias mapping updates
+        let mut tx = state.db.begin().await.map_err(|e| Error::Database(e.into()))?;
+        
+        let mut repo = InferenceEndpoints::new(&mut tx);
+        let db_request = InferenceEndpointUpdateDBRequest {
+            name: update.name,
+            description: update.description,
+            url: match update.url {
+                Some(url_str) => Some(url_str.parse().map_err(|_| Error::BadRequest {
+                    message: "Invalid URL format".to_string(),
+                })?),
+                None => None,
+            },
+            api_key: update.api_key,
+            model_filter: update.model_filter.clone(),
+        };
 
-    let endpoint = repo.update(id, &db_request).await?;
+        let endpoint = repo.update(id, &db_request).await?;
 
-    {
-        // Automatically synchronize the endpoint after updating
-        match endpoint_sync::synchronize_endpoint(endpoint.id, state.db).await {
+        // Update aliases for existing deployments
+        let alias_mapping = update.alias_mapping.unwrap(); // Safe because we checked above
+        let mut deployments_repo = Deployments::new(&mut tx);
+        
+        match update_endpoint_aliases(endpoint.clone(), &mut deployments_repo, &alias_mapping).await {
+            Ok(sync_result) => {
+                tracing::info!(
+                    "Updated aliases for endpoint {}: {} changes made",
+                    endpoint.id,
+                    sync_result.changes_made
+                );
+            }
+            Err(sync_error) => {
+                tracing::error!("Failed to update aliases for endpoint {}: {}", endpoint.id, sync_error);
+                // Convert SyncError to our Error type
+                let converted_error = match sync_error {
+                    crate::sync::endpoint_sync::SyncError::AliasConflicts { conflicts } => {
+                        Error::Conflict {
+                            message: "Alias conflicts detected during endpoint update".to_string(),
+                            conflicts: Some(conflicts),
+                        }
+                    }
+                    crate::sync::endpoint_sync::SyncError::Other(_) => {
+                        Error::Internal {
+                            operation: "update endpoint aliases".to_string(),
+                        }
+                    }
+                };
+                tx.rollback().await.map_err(|e| Error::Database(e.into()))?;
+                return Err(converted_error);
+            }
+        }
+
+        tx.commit().await.map_err(|e| Error::Database(e.into()))?;
+        Ok(Json(endpoint.into()))
+    } else {
+        // Simple update without alias mapping - no transaction needed
+        let mut conn = state.db.acquire().await.map_err(|e| Error::Database(e.into()))?;
+        let mut repo = InferenceEndpoints::new(&mut conn);
+        
+        let db_request = InferenceEndpointUpdateDBRequest {
+            name: update.name,
+            description: update.description,
+            url: match update.url {
+                Some(url_str) => Some(url_str.parse().map_err(|_| Error::BadRequest {
+                    message: "Invalid URL format".to_string(),
+                })?),
+                None => None,
+            },
+            api_key: update.api_key,
+            model_filter: update.model_filter,
+        };
+
+        let endpoint = repo.update(id, &db_request).await?;
+
+        // Regular sync using the pool (not in transaction)
+        match endpoint_sync::synchronize_endpoint(endpoint.id, state.db.clone()).await {
             Ok(sync_result) => {
                 tracing::info!(
                     "Auto-sync after endpoint {} update: {} changes made",

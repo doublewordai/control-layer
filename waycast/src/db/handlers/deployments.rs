@@ -358,7 +358,7 @@ impl<'c> Repository for Deployments<'c> {
         "#,
             id,                               // $1
             request.model_name.as_ref(),      // $2
-            request.deployment_name.as_ref(), // $3 (alias)
+            request.alias.as_ref(), // $3
             // For description
             request.description.is_some() as bool,                         // $4
             request.description.as_ref().and_then(|inner| inner.as_ref()), // $5
@@ -653,7 +653,7 @@ mod tests {
 
                 let update = DeploymentUpdateDBRequest::builder()
                     .model_name("updated-model".to_string())
-                    .deployment_name("updated-deployment".to_string())
+                    .alias("updated-deployment".to_string())
                     .description(Some("Updated description".to_string()))
                     .model_type(Some(ModelType::Embeddings))
                     .capabilities(Some(vec!["embeddings".to_string(), "similarity".to_string()]))
