@@ -2,7 +2,7 @@
 
 [Announcement](https://fergusfinn.com/blog/control-layer/) | [Benchmarking](https://fergusfinn.com/blog/control-layer-benchmarking/)
 
-The Doubleword Control Layer (dwctl) is the world’s fastest AI model gateway (450x less overhead than LiteLLM. It provides a single, high-performance interface for routing, managing, and securing inference across model providers, users and deployments - both open-source and proprietary.
+The Doubleword Control Layer (dwctl) is the world’s fastest AI model gateway (450x less overhead than LiteLLM). It provides a single, high-performance interface for routing, managing, and securing inference across model providers, users and deployments - both open-source and proprietary.
 - Seamlessly switch between models
 - Turn any model (self-hosted or hosted) into a production-ready API with full auth and user controls
 - Centrally govern, monitor, and audit all inference activity
