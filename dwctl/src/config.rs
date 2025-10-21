@@ -66,9 +66,19 @@ pub enum DatabaseConfig {
 
 impl Default for DatabaseConfig {
     fn default() -> Self {
-        // Default to external for backward compatibility
-        DatabaseConfig::External {
-            url: "postgres://localhost:5432/control_layer".to_string(),
+        // Default to embedded when feature is enabled, otherwise external
+        #[cfg(feature = "embedded-db")]
+        {
+            DatabaseConfig::Embedded {
+                data_dir: None,
+                persistent: false,
+            }
+        }
+        #[cfg(not(feature = "embedded-db"))]
+        {
+            DatabaseConfig::External {
+                url: "postgres://localhost:5432/control_layer".to_string(),
+            }
         }
     }
 }
