@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.4.1](https://github.com/doublewordai/control-layer/compare/v0.4.0...v0.4.1) (2025-10-21)
+
+
+### Features
+
+* rename to dwctl ([#34](https://github.com/doublewordai/control-layer/issues/34)) ([043313e](https://github.com/doublewordai/control-layer/commit/043313ef373154399cf3d70d9afaa4596a5d739c))
+
 ## [0.4.0](https://github.com/doublewordai/control-layer/compare/v0.3.0...v0.4.0) (2025-10-19)
 
 
