@@ -24,10 +24,10 @@ export class AuthHelper {
   async loginWithJWT(email: string) {
     const jwt = this.generateJWT(email);
 
-    // Set the waycast_session that vouch-proxy expects
+    // Set the dwctl_session that vouch-proxy expects
     await this.page.context().addCookies([
       {
-        name: "waycast_session",
+        name: "dwctl_session",
         value: jwt,
         domain: "localhost",
         path: "/",

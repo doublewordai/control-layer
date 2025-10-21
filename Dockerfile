@@ -16,21 +16,21 @@ WORKDIR /app
 # Install cargo-watch for auto-reloading in dev
 RUN cargo install cargo-watch
 
-# Copy workspace and waycast code
+# Copy workspace and dwctl code
 COPY Cargo.toml Cargo.lock ./
-COPY waycast/ waycast/
+COPY dwctl/ dwctl/
 COPY dashboard/ dashboard/
 
-# Build frontend and copy to waycast/static
+# Build frontend and copy to dwctl/static
 WORKDIR /app/dashboard
 RUN npm ci && npm run build
 WORKDIR /app
-RUN rm -rf waycast/static && cp -r dashboard/dist waycast/static
+RUN rm -rf dwctl/static && cp -r dashboard/dist dwctl/static
 
 # Build from workspace root (target dir will be at /app/target)
 # Use --no-default-features to disable embedded-db for Docker (uses external postgres)
 ENV SQLX_OFFLINE=true
-RUN cargo build --release -p waycast --no-default-features
+RUN cargo build --release -p dwctl --no-default-features
 
 # Development stage
 FROM backend-builder AS dev
@@ -54,11 +54,11 @@ RUN apt-get update && apt-get install -y \
 WORKDIR /app
 
 # Copy the binary from backend builder stage (frontend is already embedded in the binary)
-COPY --from=backend-builder /app/target/release/waycast /app/waycast
+COPY --from=backend-builder /app/target/release/dwctl /app/dwctl
 
 # Expose port (app uses 3001 by default)
 EXPOSE 3001
 
 # Run the application
-ENTRYPOINT ["./waycast"]
+ENTRYPOINT ["./dwctl"]
 CMD []

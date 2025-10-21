@@ -6,7 +6,7 @@ import {
   useSynchronizeEndpoint,
   useUpdateEndpoint,
   useDeleteEndpoint,
-} from "../../../../api/waycast";
+} from "../../../../api/control-layer";
 import { Button } from "../../../ui/button";
 import { DataTable } from "../../../ui/data-table";
 import { createColumns } from "./columns";
@@ -23,7 +23,7 @@ import {
   DeleteEndpointModal,
   EditEndpointModal,
 } from "../../../modals";
-import type { Endpoint } from "../../../../api/waycast/types";
+import type { Endpoint } from "../../../../api/control-layer/types";
 
 export function Endpoints() {
   const location = useLocation();

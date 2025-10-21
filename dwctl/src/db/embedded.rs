@@ -29,18 +29,18 @@ impl EmbeddedDatabase {
     /// Uses an ephemeral port (assigned by the OS) to avoid conflicts.
     ///
     /// # Arguments
-    /// * `data_dir` - Directory where PostgreSQL data will be stored (default: `$HOME/waycast_data/postgres`)
+    /// * `data_dir` - Directory where PostgreSQL data will be stored (default: `$HOME/.dwctl_data/postgres`)
     /// * `persistent` - Whether to persist data between restarts (default: false/ephemeral)
     ///
     /// # Returns
     /// A running EmbeddedDatabase instance with connection string containing the actual port
     pub async fn start(data_dir: Option<PathBuf>, persistent: bool) -> anyhow::Result<Self> {
         let data_dir = data_dir.unwrap_or_else(|| {
-            // Default to $HOME/waycast_data/postgres, fallback to ./waycast_data/postgres if HOME not available
+            // Default to $HOME/.dwctl_data/postgres, fallback to ./dwctl_data/postgres if HOME not available
             if let Some(home) = std::env::home_dir() {
-                home.join(".waycast_data").join("postgres")
+                home.join(".dwctl_data").join("postgres")
             } else {
-                PathBuf::from("waycast_data/postgres")
+                PathBuf::from("dwctl_data/postgres")
             }
         });
 
@@ -83,7 +83,7 @@ impl EmbeddedDatabase {
         let actual_port = postgres.settings().port;
 
         // Create the default database (or use existing if already present)
-        let database_name = "waycast";
+        let database_name = "control_layer";
         match postgres.create_database(database_name).await {
             Ok(_) => {
                 debug!("Created new database '{}'", database_name);

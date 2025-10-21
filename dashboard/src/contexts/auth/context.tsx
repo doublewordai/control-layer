@@ -1,7 +1,7 @@
 import { useEffect, useState, type ReactNode } from "react";
 import { useQueryClient } from "@tanstack/react-query";
-import { waycastApi } from "../../api/waycast/client";
-import { queryKeys } from "../../api/waycast/keys";
+import { dwctlApi } from "../../api/control-layer/client";
+import { queryKeys } from "../../api/control-layer/keys";
 import { AuthContext } from "./auth-context";
 import type {
   AuthContextValue,
@@ -34,7 +34,7 @@ export function AuthProvider({ children }: AuthProviderProps) {
       setAuthState((prev) => ({ ...prev, isLoading: true }));
 
       // Try to get current user (works for both proxy and native auth)
-      const user = await waycastApi.users.get("current");
+      const user = await dwctlApi.users.get("current");
 
       // Determine auth method based on response headers or user data
       const authMethod = user.auth_source === "native" ? "native" : "proxy";
@@ -57,7 +57,7 @@ export function AuthProvider({ children }: AuthProviderProps) {
   };
 
   const login = async (credentials: LoginCredentials) => {
-    const response = await waycastApi.auth.login(credentials);
+    const response = await dwctlApi.auth.login(credentials);
 
     setAuthState({
       user: response.user,
@@ -71,7 +71,7 @@ export function AuthProvider({ children }: AuthProviderProps) {
   };
 
   const register = async (credentials: RegisterCredentials) => {
-    const response = await waycastApi.auth.register(credentials);
+    const response = await dwctlApi.auth.register(credentials);
 
     setAuthState({
       user: response.user,
@@ -86,7 +86,7 @@ export function AuthProvider({ children }: AuthProviderProps) {
 
   const logout = async () => {
     try {
-      await waycastApi.auth.logout();
+      await dwctlApi.auth.logout();
       // Always redirect to root after successful logout
       window.location.href = "/";
     } catch {

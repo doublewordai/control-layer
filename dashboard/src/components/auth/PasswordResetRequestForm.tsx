@@ -12,8 +12,8 @@ import {
   CardHeader,
   CardTitle,
 } from "../ui/card";
-import { useRequestPasswordReset } from "../../api/waycast/hooks";
-import { ApiError } from "../../api/waycast/errors";
+import { useRequestPasswordReset } from "../../api/control-layer/hooks";
+import { ApiError } from "../../api/control-layer/errors";
 import { toast } from "sonner";
 
 export function PasswordResetRequestForm() {

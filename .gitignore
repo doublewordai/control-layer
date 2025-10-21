@@ -16,8 +16,8 @@ coverage
 *.local
 
 # Rust embedded static assets - keep only the stub
-waycast/static/*
-!waycast/static/index.html
+dwctl/static/*
+!dwctl/static/index.html
 target/
 
 # Coverage reports
@@ -43,5 +43,5 @@ playwright/.cache/
 *.sln
 *.sw?
 data/
-waycast/static/
-.waycast_data/
+dwctl/static/
+.dwctl_data/

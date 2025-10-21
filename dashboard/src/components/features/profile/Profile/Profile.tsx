@@ -11,7 +11,7 @@ import {
   EyeOff,
   Lock,
 } from "lucide-react";
-import { useUser, useUpdateUser } from "../../../../api/waycast/hooks";
+import { useUser, useUpdateUser } from "../../../../api/control-layer/hooks";
 import {
   UserAvatar,
   Tooltip,
@@ -24,9 +24,9 @@ import {
 import { Input } from "../../../ui/input";
 import { Button } from "../../../ui/button";
 import { AVAILABLE_ROLES, getRoleDisplayName } from "../../../../utils/roles";
-import type { Role } from "../../../../api/waycast/types";
-import { waycastApi } from "../../../../api/waycast/client";
-import { ApiError } from "../../../../api/waycast/errors";
+import type { Role } from "../../../../api/control-layer/types";
+import { dwctlApi } from "../../../../api/control-layer/client";
+import { ApiError } from "../../../../api/control-layer/errors";
 
 export const Profile: React.FC = () => {
   const {
@@ -131,7 +131,7 @@ export const Profile: React.FC = () => {
       // Change password if requested
       if (isChangingPassword) {
         try {
-          await waycastApi.auth.changePassword({
+          await dwctlApi.auth.changePassword({
             current_password: currentPassword,
             new_password: newPassword,
           });
