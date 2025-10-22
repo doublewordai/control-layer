@@ -315,26 +315,6 @@ export const CreateEndpointModal: React.FC<CreateEndpointModalProps> = ({
     }
   };
 
-  // Helper function to parse conflict message from backend
-  const parseConflictMessage = (message: string): string[] => {
-    // Expected format: "Alias conflicts detected for models: model1 → alias1, model2 → alias2. These aliases already exist in the system."
-    const match = message.match(/Alias conflicts detected for models: (.+?)\./);
-    if (!match) return [];
-
-    const conflictPairs = match[1].split(', ');
-    const conflictAliases: string[] = [];
-
-    conflictPairs.forEach(pair => {
-      // Extract alias from "modelName → aliasName" format
-      const aliasMatch = pair.match(/(.+?) → (.+)/);
-      if (aliasMatch) {
-        conflictAliases.push(aliasMatch[2].trim());
-      }
-    });
-
-    return conflictAliases;
-  };
-
   interface ModelRowWithAliasProps {
     model: AvailableModel;
     isSelected: boolean;

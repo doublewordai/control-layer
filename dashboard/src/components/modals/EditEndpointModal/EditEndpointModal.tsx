@@ -29,7 +29,6 @@ import type {
   EndpointUpdateRequest,
   Endpoint,
 } from "../../../api/control-layer/types";
-import type { dwctlApi } from "@/api/control-layer";
 
 interface EditEndpointModalProps {
   isOpen: boolean;
@@ -112,8 +111,8 @@ export const EditEndpointModal: React.FC<EditEndpointModalProps> = ({
   // Function to fetch current deployments and set aliases
   const fetchCurrentDeployments = async () => {
     try {
-      const currentModels = await waycastApi.models.listByEndpoint(endpoint.id);
-      
+      const currentModels = await dwctlApi.models.listByEndpoint(endpoint.id);
+
       // Build current alias mapping from deployed models
       const currentAliases: Record<string, string> = {};
       currentModels.forEach(model => {
