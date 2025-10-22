@@ -5,7 +5,7 @@ use crate::{
     },
     auth::permissions::{operation, resource, RequiresPermission},
     db::{
-        handlers::{inference_endpoints::InferenceEndpointFilter, InferenceEndpoints, Deployments, Repository},
+        handlers::{inference_endpoints::InferenceEndpointFilter, Deployments, InferenceEndpoints, Repository},
         models::inference_endpoints::{InferenceEndpointCreateDBRequest, InferenceEndpointUpdateDBRequest},
     },
     errors::{Error, Result},
@@ -120,12 +120,9 @@ pub async fn update_inference_endpoint(
     _: RequiresPermission<resource::Endpoints, operation::UpdateAll>,
     Json(update): Json<InferenceEndpointUpdate>,
 ) -> Result<Json<InferenceEndpointResponse>> {
-    // For updates with alias mapping, we need a transaction
-    // For regular updates, we use a simpler approach
+    // Use a transaction if alias mapping is being updated
     if update.alias_mapping.is_some() {
-        // Use transaction for alias mapping updates
         let mut tx = state.db.begin().await.map_err(|e| Error::Database(e.into()))?;
-        
         let mut repo = InferenceEndpoints::new(&mut tx);
         let db_request = InferenceEndpointUpdateDBRequest {
             name: update.name,
@@ -145,7 +142,6 @@ pub async fn update_inference_endpoint(
         // Update aliases for existing deployments
         let alias_mapping = update.alias_mapping.unwrap(); // Safe because we checked above
         let mut deployments_repo = Deployments::new(&mut tx);
-        
         match update_endpoint_aliases(endpoint.clone(), &mut deployments_repo, &alias_mapping).await {
             Ok(sync_result) => {
                 tracing::info!(
@@ -158,30 +154,24 @@ pub async fn update_inference_endpoint(
                 tracing::error!("Failed to update aliases for endpoint {}: {}", endpoint.id, sync_error);
                 // Convert SyncError to our Error type
                 let converted_error = match sync_error {
-                    crate::sync::endpoint_sync::SyncError::AliasConflicts { conflicts } => {
-                        Error::Conflict {
-                            message: "Alias conflicts detected during endpoint update".to_string(),
-                            conflicts: Some(conflicts),
-                        }
-                    }
-                    crate::sync::endpoint_sync::SyncError::Other(_) => {
-                        Error::Internal {
-                            operation: "update endpoint aliases".to_string(),
-                        }
-                    }
+                    crate::sync::endpoint_sync::SyncError::AliasConflicts { conflicts } => Error::Conflict {
+                        message: "Alias conflicts detected during endpoint update".to_string(),
+                        conflicts: Some(conflicts),
+                    },
+                    crate::sync::endpoint_sync::SyncError::Other(_) => Error::Internal {
+                        operation: "update endpoint aliases".to_string(),
+                    },
                 };
                 tx.rollback().await.map_err(|e| Error::Database(e.into()))?;
                 return Err(converted_error);
             }
         }
-
         tx.commit().await.map_err(|e| Error::Database(e.into()))?;
         Ok(Json(endpoint.into()))
     } else {
-        // Simple update without alias mapping - no transaction needed
+        // Simple update without alias mapping
         let mut conn = state.db.acquire().await.map_err(|e| Error::Database(e.into()))?;
         let mut repo = InferenceEndpoints::new(&mut conn);
-        
         let db_request = InferenceEndpointUpdateDBRequest {
             name: update.name,
             description: update.description,
@@ -197,7 +187,7 @@ pub async fn update_inference_endpoint(
 
         let endpoint = repo.update(id, &db_request).await?;
 
-        // Regular sync using the pool (not in transaction)
+        // Perform background sync after successful update
         match endpoint_sync::synchronize_endpoint(endpoint.id, state.db.clone()).await {
             Ok(sync_result) => {
                 tracing::info!(
@@ -211,7 +201,6 @@ pub async fn update_inference_endpoint(
                 // Continue anyway - update succeeded even if sync failed
             }
         }
-
         Ok(Json(endpoint.into()))
     }
 }
@@ -250,12 +239,10 @@ pub async fn validate_inference_endpoint(
             let mut conn = state.db.acquire().await.map_err(|e| Error::Database(e.into()))?;
             let mut endpoints_repo = InferenceEndpoints::new(&mut conn);
             let endpoint = endpoints_repo.get_by_id(endpoint_id).await?;
-
             let endpoint = endpoint.ok_or_else(|| Error::NotFound {
                 resource: "Endpoint".to_string(),
                 id: endpoint_id.to_string(),
             })?;
-
             (endpoint.url, endpoint.api_key)
         }
     };
@@ -292,7 +279,6 @@ pub async fn create_inference_endpoint(
     current_user: RequiresPermission<resource::Endpoints, operation::CreateAll>,
     Json(create_request): Json<InferenceEndpointCreate>,
 ) -> Result<(StatusCode, Json<InferenceEndpointResponse>)> {
-    // Validate URL format
     let url = create_request.url.parse().map_err(|_| Error::BadRequest {
         message: "Invalid URL format".to_string(),
     })?;
@@ -313,7 +299,7 @@ pub async fn create_inference_endpoint(
 
     let endpoint = repo.create(&db_request).await?;
 
-    // If sync is requested, perform it within the transaction
+    // Optionally sync models during creation
     if create_request.sync {
         // Create sync config from the newly created endpoint
         let sync_config = SyncConfig::from_endpoint(&endpoint);
@@ -321,13 +307,7 @@ pub async fn create_inference_endpoint(
 
         // Perform sync within the same transaction with custom aliases
         let mut deployments_repo = Deployments::new(&mut tx);
-        
-        match sync_endpoint_models_with_aliases(
-            endpoint.clone(), 
-            &mut deployments_repo, 
-            fetcher,
-            &create_request.alias_mapping
-        ).await {
+        match sync_endpoint_models_with_aliases(endpoint.clone(), &mut deployments_repo, fetcher, &create_request.alias_mapping).await {
             Ok(sync_result) => {
                 tracing::info!("Sync succeeded: {:?}", sync_result);
             }
@@ -335,7 +315,6 @@ pub async fn create_inference_endpoint(
                 tracing::error!("Sync failed with error: {:?}", sync_error);
                 match sync_error {
                     crate::sync::endpoint_sync::SyncError::AliasConflicts { conflicts } => {
-                        tracing::info!("Detected alias conflicts: {:?}", conflicts);
                         return Err(crate::errors::Error::Conflict {
                             message: "Alias conflicts detected during endpoint creation".to_string(),
                             conflicts: Some(conflicts),
@@ -354,9 +333,7 @@ pub async fn create_inference_endpoint(
         tracing::info!("Skipped sync during endpoint {} creation (sync=false)", endpoint.id);
     }
 
-    // Commit the transaction only if everything succeeded
     tx.commit().await.map_err(|e| Error::Database(e.into()))?;
-
     Ok((StatusCode::CREATED, Json(endpoint.into())))
 }
 
@@ -398,11 +375,9 @@ pub async fn delete_inference_endpoint(
     }
 }
 
-// Helper function to validate endpoint connection
+// Helper: Validate endpoint connection and fetch models
 async fn validate_endpoint_connection(url: &url::Url, api_key: Option<&str>) -> Result<OpenAIModelsResponse> {
     use std::time::Duration;
-
-    // Create a temporary SyncConfig to use with the existing fetch implementation
     let sync_config = SyncConfig {
         openai_api_key: api_key.map(|s| s.to_string()),
         openai_base_url: url.clone(),
@@ -411,16 +386,12 @@ async fn validate_endpoint_connection(url: &url::Url, api_key: Option<&str>) -> 
 
     // Use the existing FetchModelsReqwest implementation
     let fetcher = FetchModelsReqwest::new(sync_config);
-
     let models_response = fetcher.fetch().await?;
-
-    // Validate the response structure
     if models_response.object != "list" {
         return Err(Error::BadRequest {
             message: "Invalid response format - expected 'list' object".to_string(),
         });
     }
-
     if models_response.data.is_empty() {
         return Err(Error::BadRequest {
             message: "No models found at this endpoint".to_string(),

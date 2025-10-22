@@ -158,7 +158,7 @@ pub async fn seed_database(sources: &[config::ModelSource], db: &PgPool) -> Resu
     // Mark database as seeded to prevent future overwrites
     sqlx::query!(
         "UPDATE system_config SET value = true, updated_at = NOW() 
-         WHERE key = 'endpoints_seeded'" 
+         WHERE key = 'endpoints_seeded'"
     )
     .execute(&mut *tx)
     .await?;

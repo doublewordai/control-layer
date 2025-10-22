@@ -356,9 +356,9 @@ impl<'c> Repository for Deployments<'c> {
         WHERE id = $1
         RETURNING *
         "#,
-            id,                               // $1
-            request.model_name.as_ref().map(|s| s.trim()),      // $2
-            request.alias.as_ref().map(|s| s.trim()), // $3
+            id,                                            // $1
+            request.model_name.as_ref().map(|s| s.trim()), // $2
+            request.alias.as_ref().map(|s| s.trim()),      // $3
             // For description
             request.description.is_some() as bool,                         // $4
             request.description.as_ref().and_then(|inner| inner.as_ref()), // $5

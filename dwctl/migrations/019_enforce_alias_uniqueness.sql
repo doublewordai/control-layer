@@ -68,10 +68,10 @@ END $$;
 ALTER TABLE deployed_models 
 ADD CONSTRAINT deployed_models_alias_unique UNIQUE (alias);
 
--- Step 4: Add an index for performance (unique constraint creates one, but being explicit)
+-- Step 4: Add an index for performance
 -- The unique constraint already creates an index, so this is just for documentation
 COMMENT ON CONSTRAINT deployed_models_alias_unique ON deployed_models IS 
 'Ensures model aliases are unique across all deployments for proper routing';
 
--- Step 5: Clean up the helper function (optional, but keeps schema clean)
+-- Step 5: Clean up the helper function
 DROP FUNCTION generate_unique_alias(TEXT, UUID);

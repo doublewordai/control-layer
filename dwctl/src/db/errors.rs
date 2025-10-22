@@ -58,7 +58,7 @@ impl From<sqlx::Error> for DbError {
             sqlx::Error::Database(db_err) => {
                 if db_err.is_unique_violation() {
                     let constraint = db_err.constraint().map(|s| s.to_string());
-                    
+
                     // Extract conflicting value only for alias conflicts
                     let conflicting_value = if let Some(pg_err) = db_err.try_downcast_ref::<sqlx::postgres::PgDatabaseError>() {
                         if let Some(detail_msg) = pg_err.detail() {

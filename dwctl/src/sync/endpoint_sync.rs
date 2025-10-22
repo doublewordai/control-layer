@@ -20,9 +20,7 @@ use uuid::Uuid;
 #[derive(Debug, thiserror::Error)]
 pub enum SyncError {
     #[error("Alias conflicts detected")]
-    AliasConflicts {
-        conflicts: Vec<crate::errors::AliasConflict>,
-    },
+    AliasConflicts { conflicts: Vec<crate::errors::AliasConflict> },
     #[error(transparent)]
     Other(#[from] anyhow::Error),
 }
@@ -263,7 +261,8 @@ where
 {
     // Get fetched models
     let fetched_models = fetch_models.fetch().await?;
-    let existing_models = get_existing_models(deployments_repo, endpoint_info.id).await
+    let existing_models = get_existing_models(deployments_repo, endpoint_info.id)
+        .await
         .map_err(|e| anyhow::anyhow!("Failed to get existing models: {}", e))?;
 
     let existing_model_names: HashSet<String> = existing_models.iter().map(|m| m.model_name.clone()).collect();
@@ -314,9 +313,7 @@ where
                     if let Some(conflict) = extract_alias_conflict_from_error(&e, &model.id, &alias) {
                         warn!("Alias conflict for model '{}' with alias '{}': {}", model.id, alias, e);
                         // Return immediately with just this one conflict
-                        return Err(SyncError::AliasConflicts {
-                            conflicts: vec![conflict],
-                        });
+                        return Err(SyncError::AliasConflicts { conflicts: vec![conflict] });
                     } else {
                         // For non-conflict errors, fail fast
                         return Err(SyncError::Other(e));
@@ -352,17 +349,16 @@ fn extract_alias_conflict_from_error(
 ) -> Option<crate::errors::AliasConflict> {
     // Try to downcast to our DbError
     if let Some(db_error) = error.downcast_ref::<crate::db::errors::DbError>() {
-        if let crate::db::errors::DbError::UniqueViolation { 
-            constraint, 
-            conflicting_value, 
-            .. 
-        } = db_error {
+        if let crate::db::errors::DbError::UniqueViolation {
+            constraint,
+            conflicting_value,
+            ..
+        } = db_error
+        {
             if constraint.as_deref() == Some("deployed_models_alias_unique") {
                 return Some(crate::errors::AliasConflict {
                     model_name: model_name.to_string(),
-                    attempted_alias: conflicting_value
-                        .clone()
-                        .unwrap_or_else(|| attempted_alias.to_string()),
+                    attempted_alias: conflicting_value.clone().unwrap_or_else(|| attempted_alias.to_string()),
                 });
             }
         }
@@ -390,8 +386,10 @@ where
 
     match deployments_repo.create(&db_request).await {
         Ok(_) => {
-            debug!("Created deployment for model: {} with alias: {} on endpoint: {}", 
-                   model.id, alias, endpoint_info.name);
+            debug!(
+                "Created deployment for model: {} with alias: {} on endpoint: {}",
+                model.id, alias, endpoint_info.name
+            );
             Ok(())
         }
         Err(e) => {
@@ -402,7 +400,10 @@ where
 }
 
 // Update the get_existing_models function to handle the Result conversion
-async fn get_existing_models<D>(deployments_repo: &mut D, endpoint_id: InferenceEndpointId) -> crate::db::errors::Result<Vec<DeploymentDBResponse>>
+async fn get_existing_models<D>(
+    deployments_repo: &mut D,
+    endpoint_id: InferenceEndpointId,
+) -> crate::db::errors::Result<Vec<DeploymentDBResponse>>
 where
     D: Repository<Response = DeploymentDBResponse, Id = DeploymentId, Filter = DeploymentFilter>,
 {
@@ -448,10 +449,8 @@ pub async fn update_endpoint_aliases(
         .map_err(|e| SyncError::Other(e.into()))?;
 
     // Build a map of existing deployments by model_name for quick lookup
-    let existing_deployments_map: HashMap<String, &DeploymentDBResponse> = current_deployments
-        .iter()
-        .map(|d| (d.model_name.clone(), d))
-        .collect();
+    let existing_deployments_map: HashMap<String, &DeploymentDBResponse> =
+        current_deployments.iter().map(|d| (d.model_name.clone(), d)).collect();
 
     // Get the models that should be deployed based on the endpoint's model_filter
     let models_to_deploy: HashSet<String> = if let Some(model_filter) = &endpoint.model_filter {
@@ -473,7 +472,7 @@ pub async fn update_endpoint_aliases(
                         .list(&DeploymentFilter::new(0, 1000))
                         .await
                         .map_err(|e| SyncError::Other(e.into()))?;
-                    
+
                     // Check for alias conflicts before updating (excluding this deployment)
                     if conflict_check.iter().any(|d| d.alias == *trimmed_alias && d.id != deployment.id) {
                         return Err(SyncError::AliasConflicts {
@@ -522,7 +521,7 @@ pub async fn update_endpoint_aliases(
                 .list(&DeploymentFilter::new(0, 1000))
                 .await
                 .map_err(|e| SyncError::Other(e.into()))?;
-            
+
             if conflict_check.iter().any(|d| d.alias == alias) {
                 return Err(SyncError::AliasConflicts {
                     conflicts: vec![AliasConflict {
@@ -569,10 +568,7 @@ pub async fn update_endpoint_aliases(
                     Ok(true) => {
                         models_deleted += 1;
                         changes_made += 1;
-                        tracing::info!(
-                            "Deleted deployment for model '{}' (removed from filter)",
-                            deployment.model_name
-                        );
+                        tracing::info!("Deleted deployment for model '{}' (removed from filter)", deployment.model_name);
                     }
                     Ok(false) => {
                         tracing::warn!("Deployment {} not found for deletion", deployment.id);

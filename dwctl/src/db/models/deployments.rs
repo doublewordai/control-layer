@@ -373,7 +373,7 @@ impl From<DeployedModelUpdate> for DeploymentUpdateDBRequest {
         };
 
         Self::builder()
-            .maybe_alias(update.alias)  // Change from deployment_name to alias
+            .maybe_alias(update.alias) // Change from deployment_name to alias
             .maybe_description(update.description)
             .maybe_model_type(update.model_type)
             .maybe_capabilities(update.capabilities)
@@ -397,7 +397,7 @@ impl DeploymentUpdateDBRequest {
 
     /// Create an update request for alias changes
     pub fn alias_update(new_alias: String) -> Self {
-        Self::builder().maybe_alias(Some(new_alias)).build()  // Use maybe_alias with Some()
+        Self::builder().maybe_alias(Some(new_alias)).build() // Use maybe_alias with Some()
     }
 }
 
