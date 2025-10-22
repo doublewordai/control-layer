@@ -226,7 +226,6 @@ const endpointApi = {
   });
   
   if (!response.ok) {
-    console.log(`❌ Error response (${response.status}):`, response.statusText);
     
     try {
       // Always try to get the response body first
@@ -242,7 +241,7 @@ const endpointApi = {
         throw error;
       }
       
-      // Create a structured error object that matches what your frontend expects
+      // Create a structured error object
       const error = new Error(responseData.message || `Failed to create endpoint: ${response.status}`);
       (error as any).status = response.status;
       (error as any).response = {
@@ -274,7 +273,6 @@ const endpointApi = {
     }
   }
   
-  console.log("✅ Success response, parsing JSON...");
   return response.json();
 },
 

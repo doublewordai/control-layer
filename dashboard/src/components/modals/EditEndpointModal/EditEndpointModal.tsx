@@ -39,7 +39,6 @@ interface EditEndpointModalProps {
 
 type ValidationState = "idle" | "testing" | "success" | "error";
 
-// Form schema
 const formSchema = z.object({
   url: z.string().min(1, "URL is required").url("Please enter a valid URL"),
   apiKey: z.string().optional(),
@@ -56,13 +55,12 @@ export const EditEndpointModal: React.FC<EditEndpointModalProps> = ({
   onSuccess,
   endpoint,
 }) => {
-  // Validation state
   const [validationState, setValidationState] = useState<ValidationState>("idle");
   const [validationError, setValidationError] = useState<string | null>(null);
   const [availableModels, setAvailableModels] = useState<AvailableModel[]>([]);
   const [modelAliases, setModelAliases] = useState<Record<string, string>>({});
   
-  // Conflict tracking
+  // Track conflicts between aliases both locally and from backend
   const [backendConflicts, setBackendConflicts] = useState<Set<string>>(new Set());
   const [localConflicts, setLocalConflicts] = useState<string[]>([]);
   
@@ -72,7 +70,6 @@ export const EditEndpointModal: React.FC<EditEndpointModalProps> = ({
   const validateEndpointMutation = useValidateEndpoint();
   const updateEndpointMutation = useUpdateEndpoint();
 
-  // Initialize form
   const form = useForm<FormData>({
     resolver: zodResolver(formSchema),
     defaultValues: {
@@ -84,7 +81,7 @@ export const EditEndpointModal: React.FC<EditEndpointModalProps> = ({
     },
   });
 
-  // Initialize form with endpoint data when modal opens
+  // Initialize form with endpoint data and fetch current deployments
   useEffect(() => {
     if (isOpen && endpoint) {
       form.reset({
@@ -103,12 +100,11 @@ export const EditEndpointModal: React.FC<EditEndpointModalProps> = ({
       setLocalConflicts([]);
       setUrlChanged(false);
 
-      // Fetch current deployments to get actual aliases
       fetchCurrentDeployments();
     }
   }, [isOpen, endpoint, form]);
 
-  // Function to fetch current deployments and set aliases
+  // Fetch current deployments to get actual aliases being used
   const fetchCurrentDeployments = async () => {
     try {
       const currentModels = await dwctlApi.models.list({ endpoint: endpoint.id });
@@ -116,24 +112,17 @@ export const EditEndpointModal: React.FC<EditEndpointModalProps> = ({
       // Build current alias mapping from deployed models
       const currentAliases: Record<string, string> = {};
       currentModels.forEach(model => {
-        // The model object has both model_name and alias
         currentAliases[model.model_name] = model.alias;
       });
       
       setModelAliases(currentAliases);
-      
-      console.log('Current deployments loaded:', {
-        models: currentModels,
-        aliases: currentAliases
-      });
     } catch (error) {
       console.error('Failed to fetch current deployments:', error);
-      // If we can't fetch current deployments, we'll fall back to the validation flow
-      // This is fine - new models will just default to model name as alias
+      // Graceful fallback - new models will default to model name as alias
     }
   };
 
-  // Function to check for local alias conflicts among selected models
+  // Check for duplicate aliases among currently selected models
   const checkLocalAliasConflicts = (updatedAliases?: Record<string, string>) => {
     const selectedModels = form.getValues("selectedModels") || [];
     const aliasesToCheck = updatedAliases || modelAliases;
@@ -144,9 +133,8 @@ export const EditEndpointModal: React.FC<EditEndpointModalProps> = ({
     return [...new Set(duplicateAliases)];
   };
 
-  // Function to check for alias conflicts
+  // Check for both local and backend alias conflicts for a specific model
   const checkAliasConflict = (currentModelId: string, aliasToCheck: string) => {
-    // Check for conflicts within current selection
     const selectedModels = form.getValues("selectedModels") || [];
     const localConflict = Object.entries(modelAliases).some(
       ([modelId, alias]) => 
@@ -155,7 +143,6 @@ export const EditEndpointModal: React.FC<EditEndpointModalProps> = ({
         selectedModels.includes(modelId)
     );
 
-    // Check for backend conflicts
     const backendConflict = backendConflicts.has(aliasToCheck);
 
     return {
@@ -173,12 +160,11 @@ export const EditEndpointModal: React.FC<EditEndpointModalProps> = ({
       return;
     }
 
-    // Clear URL errors
     form.clearErrors("url");
-
     setValidationState("testing");
     setValidationError(null);
 
+    // Use existing endpoint validation to check models available
     const validateData: EndpointValidateRequest = {
       type: "existing",
       endpoint_id: endpoint.id,
@@ -193,27 +179,21 @@ export const EditEndpointModal: React.FC<EditEndpointModalProps> = ({
         setUrlChanged(false);
 
         // Merge existing aliases with new models from the endpoint
-        const updatedAliases = { ...modelAliases }; // Start with existing aliases
+        const updatedAliases = { ...modelAliases };
         
         result.models.data.forEach(model => {
           // Only set default alias if we don't already have one for this model
           if (!updatedAliases[model.id]) {
-            updatedAliases[model.id] = model.id; // Default to model name
+            updatedAliases[model.id] = model.id;
           }
         });
         
         setModelAliases(updatedAliases);
 
-        // Update form selection based on current deployments and endpoint filter
+        // Restore previous selection if available
         const currentSelection = form.getValues("selectedModels") || [];
-        if (currentSelection.length === 0) {
-          if (endpoint.model_filter) {
-            // Use the endpoint's model filter as the selection
-            form.setValue("selectedModels", endpoint.model_filter);
-          } else {
-            // If no filter and no current selection, don't auto-select anything
-            // Let user choose which models they want
-          }
+        if (currentSelection.length === 0 && endpoint.model_filter) {
+          form.setValue("selectedModels", endpoint.model_filter);
         }
       } else {
         setValidationError(result.error || "Unknown validation error");
@@ -231,6 +211,7 @@ export const EditEndpointModal: React.FC<EditEndpointModalProps> = ({
     const isChanged = newUrl.trim() !== endpoint.url;
     setUrlChanged(isChanged);
 
+    // Reset validation state if URL changed
     if (isChanged && validationState === "success") {
       setValidationState("idle");
       setAvailableModels([]);
@@ -240,7 +221,6 @@ export const EditEndpointModal: React.FC<EditEndpointModalProps> = ({
       setLocalConflicts([]);
     }
 
-    // Clear any validation errors
     if (validationError) {
       setValidationError(null);
       if (!isChanged) {
@@ -257,19 +237,14 @@ export const EditEndpointModal: React.FC<EditEndpointModalProps> = ({
       return;
     }
 
-    // Clear previous backend conflicts
     setBackendConflicts(new Set());
 
-    // Build alias mapping - include ALL selected models with their aliases
+    // Build alias mapping for all selected models
     const aliasMapping: Record<string, string> = {};
     data.selectedModels.forEach(modelId => {
       const alias = modelAliases[modelId] || modelId;
-      // Always include the mapping, even if alias equals model name
-      // The backend will handle setting the alias column appropriately
       aliasMapping[modelId] = alias.trim();
     });
-
-    console.log('Sending alias mapping:', aliasMapping); // Debug log
 
     const updateData: EndpointUpdateRequest = {
       name: data.name.trim(),
@@ -277,11 +252,8 @@ export const EditEndpointModal: React.FC<EditEndpointModalProps> = ({
       ...(data.description?.trim() && { description: data.description.trim() }),
       ...(data.apiKey?.trim() && { api_key: data.apiKey.trim() }),
       ...(data.selectedModels.length > 0 && { model_filter: data.selectedModels }),
-      // Always include alias mapping when we have selected models
       ...(data.selectedModels.length > 0 && { alias_mapping: aliasMapping }),
     };
-
-    console.log('Update payload:', updateData); // Debug log
 
     try {
       await updateEndpointMutation.mutateAsync({
@@ -291,14 +263,10 @@ export const EditEndpointModal: React.FC<EditEndpointModalProps> = ({
       onSuccess();
       onClose();
     } catch (err: any) {
-      console.log('Full error object:', err);
-      
-      // Handle different types of conflicts (same as create logic)
+      // Handle different types of conflicts
       if (err.status === 409 || err.response?.status === 409) {
         const responseData = err.response?.data || err.data;
-        console.log('409 response data:', responseData);
         
-        // Check if this is an endpoint conflict
         if (responseData?.resource === "endpoint") {
           form.setError("name", { 
             message: "endpoint_name_conflict"
@@ -307,7 +275,7 @@ export const EditEndpointModal: React.FC<EditEndpointModalProps> = ({
           return;
         }
         
-        // Check if this is a structured alias conflict
+        // Handle structured alias conflicts from backend
         if (responseData && responseData.conflicts) {
           const conflictAliases = responseData.conflicts.map((c: any) => c.attempted_alias || c.alias);
           setBackendConflicts(new Set(conflictAliases));
@@ -322,7 +290,7 @@ export const EditEndpointModal: React.FC<EditEndpointModalProps> = ({
     }
   };
 
-  // Model row component with alias editing
+  // Model row component with inline alias editing functionality
   interface ModelRowWithAliasProps {
     model: AvailableModel;
     isSelected: boolean;
@@ -360,6 +328,7 @@ export const EditEndpointModal: React.FC<EditEndpointModalProps> = ({
       onAliasChange(newAlias);
       setIsEditing(false);
       
+      // Clear backend conflict if alias was changed
       if (hasBackendConflict && newAlias !== alias) {
         onConflictClear(alias);
       }
@@ -380,7 +349,6 @@ export const EditEndpointModal: React.FC<EditEndpointModalProps> = ({
             : ""
         }`}
       >
-        {/* Checkbox */}
         <div className="col-span-1 flex items-center">
           <Checkbox
             checked={isSelected}
@@ -388,13 +356,11 @@ export const EditEndpointModal: React.FC<EditEndpointModalProps> = ({
           />
         </div>
 
-        {/* Model Info */}
         <div className="col-span-5 flex flex-col justify-center min-w-0">
           <p className="text-sm font-medium truncate">{model.id}</p>
           <p className="text-xs text-gray-500 truncate">{model.owned_by}</p>
         </div>
 
-        {/* Alias Field */}
         <div className="col-span-6 flex items-center space-x-2">
           {isEditing ? (
             <div className="flex items-center space-x-1 flex-1">
@@ -450,7 +416,6 @@ export const EditEndpointModal: React.FC<EditEndpointModalProps> = ({
                 >
                   {alias}
                 </span>
-                {/* Show if this is a custom alias or if it's an existing deployment */}
                 {alias !== model.id && !hasConflict && (
                   <span className="text-xs text-blue-500">(custom)</span>
                 )}
@@ -482,6 +447,7 @@ export const EditEndpointModal: React.FC<EditEndpointModalProps> = ({
     } else {
       form.setValue("selectedModels", allModelIds);
       
+      // Ensure all models have aliases set
       const newAliases = { ...modelAliases };
       allModelIds.forEach(modelId => {
         if (!newAliases[modelId]) {
@@ -516,7 +482,6 @@ export const EditEndpointModal: React.FC<EditEndpointModalProps> = ({
 
         <Form {...form}>
           <form onSubmit={form.handleSubmit(onSubmit)} className="space-y-6">
-            {/* Basic Details */}
             <FormField
               control={form.control}
               name="name"
@@ -559,7 +524,6 @@ export const EditEndpointModal: React.FC<EditEndpointModalProps> = ({
               )}
             />
 
-            {/* URL and API Key */}
             <FormField
               control={form.control}
               name="url"
@@ -608,7 +572,6 @@ export const EditEndpointModal: React.FC<EditEndpointModalProps> = ({
               />
             )}
 
-            {/* Validation Status */}
             {validationState === "error" && (
               <div className="p-4 bg-red-50 border border-red-200 rounded-lg">
                 <div className="flex items-center space-x-2">
@@ -630,7 +593,7 @@ export const EditEndpointModal: React.FC<EditEndpointModalProps> = ({
               </div>
             )}
 
-            {/* Configure Models Button */}
+            {/* Model configuration section */}
             {!shouldShowModels && (
               <div className="space-y-4">
                 <div className="flex items-center justify-between">
@@ -661,7 +624,6 @@ export const EditEndpointModal: React.FC<EditEndpointModalProps> = ({
               </div>
             )}
 
-            {/* Model Selection */}
             {shouldShowModels && (
               <FormField
                 control={form.control}
@@ -766,7 +728,7 @@ export const EditEndpointModal: React.FC<EditEndpointModalProps> = ({
               />
             )}
 
-            {/* Error messages */}
+            {/* Error message displays */}
             {(form.formState.errors.name?.message === "endpoint_name_conflict" || validationError?.includes("endpoint name")) && (
               <div className="p-3 bg-red-50 border border-red-200 rounded-md">
                 <div className="flex items-center space-x-2">
@@ -800,7 +762,6 @@ export const EditEndpointModal: React.FC<EditEndpointModalProps> = ({
               </div>
             )}
 
-            {/* General validation error */}
             {validationError && !validationError.includes("endpoint name") && backendConflicts.size === 0 && (
               <div className="p-4 bg-red-50 border border-red-200 rounded-lg">
                 <p className="text-red-800 text-sm">{validationError}</p>

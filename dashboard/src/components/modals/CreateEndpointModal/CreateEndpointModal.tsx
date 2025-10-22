@@ -101,6 +101,8 @@ export const CreateEndpointModal: React.FC<CreateEndpointModalProps> = ({
   const [availableModels, setAvailableModels] = useState<AvailableModel[]>([]);
   const [modelAliases, setModelAliases] = useState<Record<string, string>>({});
   const [urlPopoverOpen, setUrlPopoverOpen] = useState(false);
+  const [backendConflicts, setBackendConflicts] = useState<Set<string>>(new Set());
+  const [localConflicts, setLocalConflicts] = useState<string[]>([]);
 
   const validateEndpointMutation = useValidateEndpoint();
   const createEndpointMutation = useCreateEndpoint();
@@ -126,29 +128,10 @@ export const CreateEndpointModal: React.FC<CreateEndpointModalProps> = ({
       setAvailableModels([]);
       setModelAliases({});
       setBackendConflicts(new Set());
-      setLocalConflicts([]); // Add this line
+      setLocalConflicts([]);
     }
   }, [isOpen, form]);
 
-  // Add state to track backend conflicts
-  const [backendConflicts, setBackendConflicts] = useState<Set<string>>(new Set());
-
-  // Add this missing state declaration:
-  const [localConflicts, setLocalConflicts] = useState<string[]>([]);
-
-  // Update reset effect to clear backend conflicts
-  useEffect(() => {
-    if (isOpen) {
-      form.reset();
-      setValidationState("idle");
-      setValidationError(null);
-      setAvailableModels([]);
-      setModelAliases({});
-      setBackendConflicts(new Set()); // Clear backend conflicts
-    }
-  }, [isOpen, form]);
-
-  // Function to check for alias conflicts
   const checkAliasConflict = (currentModelId: string, aliasToCheck: string) => {
     // Check for conflicts within current selection
     const selectedModels = form.getValues("selectedModels") || [];
@@ -162,7 +145,6 @@ export const CreateEndpointModal: React.FC<CreateEndpointModalProps> = ({
     // Check for backend conflicts
     const backendConflict = backendConflicts.has(aliasToCheck);
 
-
     return {
       hasConflict: localConflict || backendConflict,
       hasLocalConflict: localConflict,
@@ -170,7 +152,6 @@ export const CreateEndpointModal: React.FC<CreateEndpointModalProps> = ({
     };
   };
 
-  // Function to check for local alias conflicts among selected models
   const checkLocalAliasConflicts = (updatedAliases?: Record<string, string>) => {
     const selectedModels = form.getValues("selectedModels") || [];
     const aliasesToCheck = updatedAliases || modelAliases;
@@ -271,22 +252,13 @@ export const CreateEndpointModal: React.FC<CreateEndpointModalProps> = ({
       await createEndpointMutation.mutateAsync(createData);
       onSuccess();
       onClose();
-    } catch (err: any) {
-      console.log('Full error object:', err);
-      console.log('err.status:', err.status);
-      console.log('err.response?.status:', err.response?.status);
-      console.log('err.response?.data:', err.response?.data);
-      console.log('err.data:', err.data);
-      
+    } catch (err: any) {      
       // Handle different types of conflicts
       if (err.status === 409 || err.response?.status === 409) {
         const responseData = err.response?.data || err.data;
-        console.log('409 response data:', responseData);
-        console.log('responseData.resource:', responseData?.resource);
         
         // Check if this is an endpoint conflict using the simplified response
         if (responseData?.resource === "endpoint") {
-          console.log('Setting endpoint name error');
           // Set error on the name field specifically (for red border only)
           form.setError("name", { 
             message: "endpoint_name_conflict" // Use a special marker instead of user message
@@ -295,19 +267,16 @@ export const CreateEndpointModal: React.FC<CreateEndpointModalProps> = ({
           return; // Don't set backend conflicts
         }
         
-        // Check if this is a structured alias conflict (from your sync logic)
+        // Check if this is a structured alias conflict (from sync logic)
         if (responseData && responseData.conflicts) {
-          console.log('Found conflicts:', responseData.conflicts);
           const conflictAliases = responseData.conflicts.map((c: any) => c.attempted_alias || c.alias);
           setBackendConflicts(new Set(conflictAliases));
           setValidationError("Some model aliases already exist. Please edit the highlighted aliases.");
         } else {
-          console.log('Generic 409 handling');
           // Generic 409 handling
           setValidationError(responseData?.message || "A conflict occurred. Please check your input.");
         }
       } else {
-        console.log('Non-409 error handling');
         // Handle other errors
         const errorMessage = err.message || "Failed to create endpoint";
         setValidationError(errorMessage);
@@ -468,7 +437,6 @@ export const CreateEndpointModal: React.FC<CreateEndpointModalProps> = ({
     );
   };
 
-  // Add the missing handleSelectAll function
   const handleSelectAll = () => {
     const currentSelection = form.getValues("selectedModels") || [];
     const allModelIds = availableModels.map(m => m.id);
@@ -815,7 +783,6 @@ export const CreateEndpointModal: React.FC<CreateEndpointModalProps> = ({
                           className={fieldState.error ? "border-red-500 focus:border-red-500" : ""}
                         />
                       </FormControl>
-                      {/* Only show FormMessage if it's not an endpoint conflict */}
                       {fieldState.error?.message !== "endpoint_name_conflict" && <FormMessage />}
                     </FormItem>
                   )}
@@ -910,7 +877,7 @@ export const CreateEndpointModal: React.FC<CreateEndpointModalProps> = ({
                 !form.watch("name") ||
                 !form.watch("selectedModels")?.length ||
                 backendConflicts.size > 0 ||
-                localConflicts.length > 0  // Add this condition
+                localConflicts.length > 0
               }
             >
               {createEndpointMutation.isPending ? (
