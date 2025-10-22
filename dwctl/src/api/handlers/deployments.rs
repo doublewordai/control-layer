@@ -47,7 +47,7 @@ fn apply_pricing_to_response(
     params(
         ("endpoint" = Option<i32>, Query, description = "Filter by inference endpoint ID"),
         ("accessible" = Option<bool>, Query, description = "Filter to only models the current user can access (defaults to false for admins, true for users)"),
-        ("include" = Option<String>, Query, description = "Include additional data (comma-separated: 'groups', 'metrics', 'pricing'). Only platform managers can include groups. Pricing shows simple customer rates for regular users, full pricing structure for users with Pricing::ReadAll permission."),
+        ("include" = Option<String>, Query, description = "Include additional data (comma-separated: 'groups', 'metrics', 'status', 'pricing'). Only platform managers can include groups. Status shows probe monitoring information. Pricing shows simple customer rates for regular users, full pricing structure for users with Pricing::ReadAll permission."),
         ("deleted" = Option<bool>, Query, description = "Show deleted models when true (admin only), non-deleted models when false, and all models when not specified"),
         ("inactive" = Option<bool>, Query, description = "Show inactive models when true (admin only)"),
     ),
@@ -171,6 +171,7 @@ pub async fn list_deployed_models(
     let model_ids: Vec<DeploymentId> = filtered_models.iter().map(|m| m.id).collect();
     let include_groups = includes.contains(&"groups");
     let include_metrics = includes.contains(&"metrics");
+    let include_status = includes.contains(&"status");
     let include_pricing = includes.contains(&"pricing");
 
     // Fetch groups data if requested
@@ -194,6 +195,14 @@ pub async fn list_deployed_models(
         (Some(model_groups_map), Some(groups_map))
     } else {
         (None, None)
+    };
+
+    // Fetch probe status data if requested
+    let status_map = if include_status {
+        use crate::probes::db::ProbeManager;
+        ProbeManager::get_deployment_statuses(&state.db, &model_ids).await.ok()
+    } else {
+        None
     };
 
     // Build response with requested includes
@@ -234,6 +243,36 @@ pub async fn list_deployed_models(
                 Err(e) => {
                     // Log the error but don't fail the request - just skip metrics for this model
                     tracing::warn!("Failed to fetch metrics for model {}: {:?}", model_response.alias, e);
+                }
+            }
+        }
+
+        // Add probe status if requested
+        if include_status {
+            if let Some(ref statuses) = status_map {
+                if let Some((probe_id, active, interval_seconds, last_check, last_success, uptime_percentage)) = statuses.get(&model_response.id) {
+                    use crate::api::models::deployments::ModelProbeStatus;
+                    let status = ModelProbeStatus {
+                        probe_id: *probe_id,
+                        active: *active,
+                        interval_seconds: *interval_seconds,
+                        last_check: *last_check,
+                        last_success: *last_success,
+                        uptime_percentage: *uptime_percentage,
+                    };
+                    model_response = model_response.with_status(status);
+                } else {
+                    // No probe for this model - set default status
+                    use crate::api::models::deployments::ModelProbeStatus;
+                    let status = ModelProbeStatus {
+                        probe_id: None,
+                        active: false,
+                        interval_seconds: None,
+                        last_check: None,
+                        last_success: None,
+                        uptime_percentage: None,
+                    };
+                    model_response = model_response.with_status(status);
                 }
             }
         }

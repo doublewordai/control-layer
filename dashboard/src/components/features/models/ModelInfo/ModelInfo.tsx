@@ -21,6 +21,7 @@ import { getModelType } from "../../../../utils/modelType";
 import { useAuthorization } from "../../../../utils";
 import { ApiExamples, AccessManagementModal } from "../../../modals";
 import UserUsageTable from "./UserUsageTable";
+import ModelProbes from "./ModelProbes";
 import {
   Card,
   CardContent,
@@ -73,7 +74,9 @@ const ModelInfo: React.FC = () => {
   const tabFromUrl = searchParams.get("tab");
   const [activeTab, setActiveTab] = useState<string>(() => {
     // Only allow usage tab if user has permission
-    return tabFromUrl === "usage" && canManageGroups ? "usage" : "overview";
+    if (tabFromUrl === "usage" && canManageGroups) return "usage";
+    if (tabFromUrl === "probes" && canManageGroups) return "probes";
+    return "overview";
   });
 
   // Update activeTab when URL changes
@@ -81,7 +84,8 @@ const ModelInfo: React.FC = () => {
     const tabFromUrl = searchParams.get("tab");
     if (
       tabFromUrl === "overview" ||
-      (tabFromUrl === "usage" && canManageGroups)
+      (tabFromUrl === "usage" && canManageGroups) ||
+      (tabFromUrl === "probes" && canManageGroups)
     ) {
       setActiveTab(tabFromUrl);
     }
@@ -408,6 +412,15 @@ const ModelInfo: React.FC = () => {
                       >
                         <Users className="h-4 w-4" />
                         Usage
+                      </TabsTrigger>
+                    )}
+                    {canManageGroups && (
+                      <TabsTrigger
+                        value="probes"
+                        className="flex items-center gap-2"
+                      >
+                        <Activity className="h-4 w-4" />
+                        Uptime
                       </TabsTrigger>
                     )}
                   </TabsList>
@@ -1158,6 +1171,12 @@ const ModelInfo: React.FC = () => {
         {canManageGroups && (
           <TabsContent value="usage">
             <UserUsageTable modelAlias={model.alias} />
+          </TabsContent>
+        )}
+
+        {canManageGroups && (
+          <TabsContent value="probes">
+            <ModelProbes model={model} />
           </TabsContent>
         )}
       </Tabs>

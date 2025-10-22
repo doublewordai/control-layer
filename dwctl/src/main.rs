@@ -7,6 +7,7 @@ mod email;
 mod errors;
 mod metrics;
 mod openapi;
+mod probes;
 mod request_logging;
 mod static_assets;
 mod sync;
@@ -60,6 +61,9 @@ pub struct AppState {
     pub config: Config,
     pub outlet_db: Option<PgPool>,
     pub metrics_recorder: Option<GenAiMetrics>,
+    pub probe_manager: Option<probes::ProbeManager>,
+    #[builder(default = false)]
+    pub is_leader: bool,
 }
 
 /// Create the initial admin user if it doesn't exist
@@ -264,7 +268,34 @@ pub async fn setup_app(
         let _ = initial_targets.receive_updates(onwards_stream).await;
     });
 
-    let mut app_state = AppState::builder().db(pool).config(config).build();
+    // Try to acquire leader lock using PostgreSQL advisory lock
+    // Lock ID: 0x44574354_50524F42 (DWCT_PROB in hex for "dwctl probes")
+    const LEADER_LOCK_ID: i64 = 0x4457_4354_5052_4F42_i64;
+    let is_leader = sqlx::query_scalar::<_, bool>(
+        "SELECT pg_try_advisory_lock($1)"
+    )
+    .bind(LEADER_LOCK_ID)
+    .fetch_one(&pool)
+    .await?;
+
+    if is_leader {
+        info!("This instance acquired leader lock - will run background schedulers");
+    } else {
+        info!("This instance is a follower - will not run background schedulers");
+    }
+
+    // Initialize probe manager and schedulers (only if leader)
+    let probe_manager = probes::ProbeManager::new();
+    if is_leader {
+        probe_manager.initialize_schedulers(&pool).await?;
+    }
+
+    let mut app_state = AppState::builder()
+        .db(pool)
+        .config(config)
+        .probe_manager(probe_manager)
+        .is_leader(is_leader)
+        .build();
     let router = build_router(&mut app_state, onwards_router).await?;
 
     Ok((router, onwards_config_sync, drop_guard))
@@ -431,6 +462,18 @@ pub async fn build_router(state: &mut AppState, onwards_router: Router) -> anyho
         .route("/requests", get(api::handlers::requests::list_requests))
         .route("/requests/aggregate", get(api::handlers::requests::aggregate_requests))
         .route("/requests/aggregate-by-user", get(api::handlers::requests::aggregate_by_user))
+        // Probes management
+        .route("/probes", get(api::handlers::probes::list_probes))
+        .route("/probes", post(api::handlers::probes::create_probe))
+        .route("/probes/test/{deployment_id}", post(api::handlers::probes::test_probe))
+        .route("/probes/{id}", get(api::handlers::probes::get_probe))
+        .route("/probes/{id}", patch(api::handlers::probes::update_probe))
+        .route("/probes/{id}", delete(api::handlers::probes::delete_probe))
+        .route("/probes/{id}/activate", patch(api::handlers::probes::activate_probe))
+        .route("/probes/{id}/deactivate", patch(api::handlers::probes::deactivate_probe))
+        .route("/probes/{id}/execute", post(api::handlers::probes::execute_probe))
+        .route("/probes/{id}/results", get(api::handlers::probes::get_probe_results))
+        .route("/probes/{id}/statistics", get(api::handlers::probes::get_statistics))
         .layer(
             TraceLayer::new_for_http()
                 .make_span_with(|request: &Request<_>| {

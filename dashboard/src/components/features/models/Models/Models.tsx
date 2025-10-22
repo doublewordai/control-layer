@@ -1,5 +1,5 @@
 import React, { useState, useMemo } from "react";
-import { useNavigate } from "react-router-dom";
+import { useNavigate, useSearchParams } from "react-router-dom";
 import {
   Users,
   X,
@@ -13,16 +13,22 @@ import {
   ArrowUpDown,
   Info,
   ChevronRight,
+  LayoutGrid,
+  List,
 } from "lucide-react";
 import {
   useModels,
   type Model,
   useEndpoints,
   type Endpoint,
+  useProbes,
+  useProbeResults,
+  type Probe,
 } from "../../../../api/control-layer";
 import { AccessManagementModal } from "../../../modals";
 import { ApiExamples } from "../../../modals";
 import { useAuthorization } from "../../../../utils";
+import { ProbeTimeline } from "../ModelInfo/ProbeTimeline";
 import {
   Pagination,
   PaginationContent,
@@ -39,6 +45,7 @@ import {
   SelectTrigger,
   SelectValue,
 } from "../../../ui/select";
+import { Tabs, TabsContent, TabsList, TabsTrigger } from "../../../ui/tabs";
 import { Input } from "../../../ui/input";
 import {
   Card,
@@ -97,8 +104,84 @@ const formatRelativeTime = (dateString?: string): string => {
   return date.toLocaleDateString();
 };
 
+// StatusRow component for status page layout
+interface StatusRowProps {
+  model: Model;
+  probesData?: Probe[];
+  endpointsRecord: Record<string, Endpoint>;
+  onNavigate: (modelId: string) => void;
+}
+
+const StatusRow: React.FC<StatusRowProps> = ({ model, probesData, endpointsRecord, onNavigate }) => {
+  const probe = probesData?.find(p => p.deployment_id === model.id);
+  const { data: probeResults } = useProbeResults(
+    probe?.id || "",
+    { limit: 100 },
+    { enabled: !!probe }
+  );
+
+  const uptimePercentage = model.status?.uptime_percentage;
+  const lastSuccess = model.status?.last_success;
+
+  return (
+    <div
+      className="border-b border-gray-200 py-4 px-6 hover:bg-gray-50 transition-colors cursor-pointer"
+      onClick={() => onNavigate(model.id)}
+    >
+      <div className="flex items-center gap-3">
+        {/* Status indicator and model info */}
+        <div className="w-48 flex-shrink-0">
+          <div className="flex items-center gap-2">
+            <div
+              className={`h-3 w-3 rounded-full ${
+                lastSuccess === true
+                  ? "bg-green-500"
+                  : lastSuccess === false
+                    ? "bg-red-500"
+                    : "bg-gray-400"
+              }`}
+            />
+            <div>
+              <div className="font-medium text-sm">{model.alias}</div>
+              <div className="text-xs text-gray-500">
+                {endpointsRecord[model.hosted_on]?.name || "Unknown"}
+              </div>
+            </div>
+          </div>
+          <div className="text-xs text-gray-600 mt-1 ml-5 space-y-0.5">
+            {uptimePercentage !== undefined && uptimePercentage !== null && (
+              <div>{uptimePercentage.toFixed(2)}% uptime (24h)</div>
+            )}
+            {probe && (
+              <div className="text-gray-500">
+                Checking every {probe.interval_seconds}s
+              </div>
+            )}
+          </div>
+        </div>
+
+        {/* Timeline */}
+        <div className="flex-1">
+          {probeResults && probeResults.length > 0 ? (
+            <ProbeTimeline
+              results={probeResults}
+              compact={true}
+              showSummary={false}
+              showTimeLabels={true}
+              showLegend={false}
+            />
+          ) : (
+            <div className="text-sm text-gray-400">No probe data available</div>
+          )}
+        </div>
+      </div>
+    </div>
+  );
+};
+
 const Models: React.FC = () => {
   const navigate = useNavigate();
+  const [searchParams, setSearchParams] = useSearchParams();
   const { hasPermission } = useAuthorization();
   const canManageGroups = hasPermission("manage-groups");
   const canViewAnalytics = hasPermission("analytics");
@@ -112,13 +195,24 @@ const Models: React.FC = () => {
   const [searchQuery, setSearchQuery] = useState("");
   const [showAccessibleOnly, setShowAccessibleOnly] = useState(false); // For admin toggle
 
-  // Build include parameter based on permissions
-  const includeParam = (() => {
-    if (canManageGroups && canViewAnalytics) return "groups,metrics" as const;
-    if (canManageGroups) return "groups" as const;
-    if (canViewAnalytics) return "metrics" as const;
-    return undefined;
-  })();
+  // Read view mode from URL params (defaults to "grid")
+  const viewMode = searchParams.get("view") || "grid";
+  const isStatusMode = viewMode === "status";
+
+  // Handle tab change
+  const handleTabChange = (value: string) => {
+    setSearchParams({ view: value });
+  };
+
+  // Build include parameter based on permissions - always include status
+  const includeParam = useMemo(() => {
+    const parts: string[] = ["status"]; // Always fetch status for badges
+
+    if (canManageGroups) parts.push("groups");
+    if (canViewAnalytics) parts.push("metrics");
+
+    return parts.join(",");
+  }, [canManageGroups, canViewAnalytics]);
 
   const {
     data: rawModelsData,
@@ -126,7 +220,7 @@ const Models: React.FC = () => {
     error: modelsError,
   } = useModels({
     include: includeParam,
-    accessible: !canManageGroups || showAccessibleOnly, // Users always get filtered, PlatformManagers only when toggle is on
+    accessible: isStatusMode ? true : (!canManageGroups || showAccessibleOnly), // Status mode always filters to accessible, others use existing logic
   });
 
   // TODO: resolve `hosted_on` references in the backend, so we don't need this query.
@@ -135,6 +229,9 @@ const Models: React.FC = () => {
     isLoading: endpointsLoading,
     error: endpointsError,
   } = useEndpoints();
+
+  // Fetch probes data in status mode for timeline display
+  const { data: probesData } = useProbes({ enabled: isStatusMode });
 
   const loading = modelsLoading || endpointsLoading;
   const error = modelsError
@@ -181,6 +278,11 @@ const Models: React.FC = () => {
   const providers = ["all", ...uniqueProviders.sort()];
 
   const filteredModels = modelsArray.filter((model) => {
+    // In status mode, only show models with active probes
+    if (isStatusMode && !model.status?.probe_id) {
+      return false;
+    }
+
     const matchesProvider =
       filterProvider === "all" ||
       endpointsRecord[model.hosted_on]?.name === filterProvider;
@@ -241,21 +343,22 @@ const Models: React.FC = () => {
 
   return (
     <div className="p-6">
-      {/* Header */}
-      <div className="mb-6">
-        <div className="flex items-center justify-between">
-          <div>
-            <h1 className="text-3xl font-bold text-doubleword-neutral-900">
-              Models
-            </h1>
-            <p className="text-doubleword-neutral-600 mt-1">
-              View available models by provider
-            </p>
-          </div>
-          {!hasNoModels && (
-            <div className="flex items-center gap-3">
-              {/* Access toggle for admins */}
-              {canManageGroups && (
+      <Tabs value={viewMode} onValueChange={handleTabChange}>
+        {/* Header */}
+        <div className="mb-6">
+          <div className="flex flex-col lg:flex-row lg:items-center lg:justify-between gap-4">
+            <div>
+              <h1 className="text-3xl font-bold text-doubleword-neutral-900">
+                Models
+              </h1>
+              <p className="text-doubleword-neutral-600 mt-1">
+                View and monitor your deployed models
+              </p>
+            </div>
+            {!hasNoModels && (
+              <div className="flex flex-col sm:flex-row items-stretch sm:items-center gap-3">
+                {/* Access toggle for admins (not shown in status mode) */}
+                {!isStatusMode && canManageGroups && (
                 <Select
                   value={showAccessibleOnly ? "accessible" : "all"}
                   onValueChange={(value) =>
@@ -305,67 +408,137 @@ const Models: React.FC = () => {
                   ))}
                 </SelectContent>
               </Select>
+
+              {/* View mode tabs */}
+              <TabsList className="w-full sm:w-auto">
+                <TabsTrigger
+                  value="grid"
+                  className="flex items-center gap-2 flex-1 sm:flex-initial"
+                >
+                  <LayoutGrid className="h-4 w-4" />
+                  Grid
+                </TabsTrigger>
+                <TabsTrigger
+                  value="status"
+                  className="flex items-center gap-2 flex-1 sm:flex-initial"
+                >
+                  <Activity className="h-4 w-4" />
+                  Status
+                </TabsTrigger>
+              </TabsList>
             </div>
           )}
         </div>
       </div>
 
-      {/* True Empty State - No Models */}
-      {hasNoModels ? (
-        <div className="text-center py-16">
-          <div className="p-4 bg-doubleword-neutral-100 rounded-full w-20 h-20 mx-auto mb-6 flex items-center justify-center">
-            <BarChart3 className="w-10 h-10 text-doubleword-neutral-600" />
+        {/* True Empty State - No Models */}
+        {hasNoModels ? (
+          <div className="text-center py-16">
+            <div className="p-4 bg-doubleword-neutral-100 rounded-full w-20 h-20 mx-auto mb-6 flex items-center justify-center">
+              <BarChart3 className="w-10 h-10 text-doubleword-neutral-600" />
+            </div>
+            <h3 className="text-xl font-semibold text-doubleword-neutral-900 mb-3">
+              {isStatusMode
+                ? "No models being monitored"
+                : "No models available yet"}
+            </h3>
+            <p className="text-doubleword-neutral-600 mb-8 max-w-l mx-auto">
+              {isStatusMode
+                ? "No models have monitoring configured. Toggle to Grid view to set up probes."
+                : "Models are automatically synced when you add an inference endpoint. Add an endpoint to start interacting with AI models through the control layer."}
+            </p>
+            {!isStatusMode && (
+              <Button
+                onClick={() =>
+                  navigate("/endpoints", { state: { openCreateModal: true } })
+                }
+                className="bg-doubleword-background-dark hover:bg-doubleword-neutral-900"
+              >
+                <Plus className="w-4 h-4 mr-2" />
+                Add Endpoint
+              </Button>
+            )}
           </div>
-          <h3 className="text-xl font-semibold text-doubleword-neutral-900 mb-3">
-            No models available yet
-          </h3>
-          <p className="text-doubleword-neutral-600 mb-8 max-w-l mx-auto">
-            Models are automatically synced when you add an inference endpoint.
-            Add an endpoint to start interacting with AI models through the control layer.
-          </p>
-          <Button
-            onClick={() =>
-              navigate("/endpoints", { state: { openCreateModal: true } })
-            }
-            className="bg-doubleword-background-dark hover:bg-doubleword-neutral-900"
-          >
-            <Plus className="w-4 h-4 mr-2" />
-            Add Endpoint
-          </Button>
-        </div>
-      ) : hasNoFilteredResults ? (
-        /* Filtered Empty State - No Results */
-        <div className="text-center py-16 col-span-full">
-          <div className="p-4 bg-doubleword-neutral-100 rounded-full w-16 h-16 mx-auto mb-4 flex items-center justify-center">
-            <Search className="w-8 h-8 text-doubleword-neutral-600" />
-          </div>
-          <h3 className="text-lg font-medium text-doubleword-neutral-900 mb-2">
-            No models found
-          </h3>
-          <p className="text-doubleword-neutral-600 mb-6">
-            {searchQuery
-              ? `No models match "${searchQuery}"`
-              : filterProvider !== "all"
-                ? `No models found for ${filterProvider}`
-                : "Try adjusting your filters"}
-          </p>
-          <Button
-            variant="outline"
-            onClick={() => {
-              setSearchQuery("");
-              setFilterProvider("all");
-              setShowAccessibleOnly(false);
-            }}
-          >
-            Clear filters
-          </Button>
-        </div>
-      ) : (
-        /* Model Cards Grid */
-        <div
-          role="list"
-          className="grid grid-cols-1 lg:grid-cols-2 2xl:grid-cols-3 gap-6"
-        >
+        ) : (
+          <>
+            <TabsContent value="status" className="mt-0">
+              {hasNoFilteredResults ? (
+                /* Filtered Empty State - No Results */
+                <div className="text-center py-16">
+                  <div className="p-4 bg-doubleword-neutral-100 rounded-full w-16 h-16 mx-auto mb-4 flex items-center justify-center">
+                    <Search className="w-8 h-8 text-doubleword-neutral-600" />
+                  </div>
+                  <h3 className="text-lg font-medium text-doubleword-neutral-900 mb-2">
+                    No monitored models found
+                  </h3>
+                  <p className="text-doubleword-neutral-600 mb-6">
+                    {searchQuery
+                      ? `No models match "${searchQuery}"`
+                      : filterProvider !== "all"
+                        ? `No models found for ${filterProvider}`
+                        : "Try adjusting your filters"}
+                  </p>
+                  <Button
+                    variant="outline"
+                    onClick={() => {
+                      setSearchQuery("");
+                      setFilterProvider("all");
+                    }}
+                  >
+                    Clear filters
+                  </Button>
+                </div>
+              ) : (
+                /* Status Page List Layout */
+                <div>
+                  {filteredModels.map((model) => (
+                    <StatusRow
+                      key={model.id}
+                      model={model}
+                      probesData={probesData}
+                      endpointsRecord={endpointsRecord}
+                      onNavigate={(modelId) => navigate(`/models/${modelId}?from=${encodeURIComponent("/models?view=status")}`)}
+                    />
+                  ))}
+                </div>
+              )}
+            </TabsContent>
+
+            <TabsContent value="grid" className="mt-0">
+              {hasNoFilteredResults ? (
+                /* Filtered Empty State - No Results */
+                <div className="text-center py-16">
+                  <div className="p-4 bg-doubleword-neutral-100 rounded-full w-16 h-16 mx-auto mb-4 flex items-center justify-center">
+                    <Search className="w-8 h-8 text-doubleword-neutral-600" />
+                  </div>
+                  <h3 className="text-lg font-medium text-doubleword-neutral-900 mb-2">
+                    No models found
+                  </h3>
+                  <p className="text-doubleword-neutral-600 mb-6">
+                    {searchQuery
+                      ? `No models match "${searchQuery}"`
+                      : filterProvider !== "all"
+                        ? `No models found for ${filterProvider}`
+                        : "Try adjusting your filters"}
+                  </p>
+                  <Button
+                    variant="outline"
+                    onClick={() => {
+                      setSearchQuery("");
+                      setFilterProvider("all");
+                      setShowAccessibleOnly(false);
+                    }}
+                  >
+                    Clear filters
+                  </Button>
+                </div>
+              ) : (
+                <>
+                  {/* Model Cards Grid */}
+                  <div
+                    role="list"
+                    className="grid grid-cols-1 lg:grid-cols-2 2xl:grid-cols-3 gap-6"
+                  >
           {paginatedModels.map((model) => (
             <Card
               key={model.id}
@@ -385,6 +558,27 @@ const Models: React.FC = () => {
                     <div className="flex-1 min-w-0">
                       <div className="flex items-center gap-2">
                         <CardTitle className="text-lg">{model.alias}</CardTitle>
+
+                        {/* Status badge - always shown if probe exists */}
+                        {model.status?.probe_id && (
+                          <div
+                            className={`h-2 w-2 rounded-full ${
+                              model.status.last_success === true
+                                ? "bg-green-500"
+                                : model.status.last_success === false
+                                  ? "bg-red-500"
+                                  : "bg-gray-400"
+                            }`}
+                            title={
+                              model.status.last_success === true
+                                ? "Operational"
+                                : model.status.last_success === false
+                                  ? "Down"
+                                  : "Unknown"
+                            }
+                          />
+                        )}
+
                         <HoverCard openDelay={200} closeDelay={100}>
                           <HoverCardTrigger asChild>
                             <button
@@ -411,9 +605,10 @@ const Models: React.FC = () => {
                       </CardDescription>
                     </div>
 
-                    {/* Access Groups and Expand Icon */}
-                    <div className="flex items-center gap-3">
-                      {canManageGroups && (
+                    {/* Access Groups and Expand Icon (hidden in status mode) */}
+                    {!isStatusMode && (
+                      <div className="flex items-center gap-3">
+                        {canManageGroups && (
                         <div
                           className="flex items-center gap-1 max-w-[180px]"
                           onClick={(e) => e.stopPropagation()}
@@ -496,10 +691,11 @@ const Models: React.FC = () => {
                             </>
                           )}
                         </div>
-                      )}
+                        )}
 
-                      <ChevronRight className="h-5 w-5 text-gray-400 group-hover:text-gray-600 transition-colors" />
-                    </div>
+                        <ChevronRight className="h-5 w-5 text-gray-400 group-hover:text-gray-600 transition-colors" />
+                      </div>
+                    )}
                   </div>
                 </CardHeader>
 
@@ -650,11 +846,10 @@ const Models: React.FC = () => {
               </div>
             </Card>
           ))}
-        </div>
-      )}
+                  </div>
 
-      {/* Pagination */}
-      {!hasNoModels && !hasNoFilteredResults && totalPages > 1 && (
+                  {/* Pagination */}
+                  {totalPages > 1 && (
         <Pagination className="mt-8">
           <PaginationContent>
             <PaginationItem>
@@ -777,15 +972,21 @@ const Models: React.FC = () => {
             </PaginationItem>
           </PaginationContent>
         </Pagination>
-      )}
+                  )}
 
-      {/* Results Info */}
-      {!hasNoModels && !hasNoFilteredResults && filteredModels.length > 0 && (
-        <div className="flex items-center justify-center mt-4 text-sm text-gray-600">
-          Showing {startIndex + 1}-{Math.min(endIndex, totalItems)} of{" "}
-          {totalItems} models
-        </div>
-      )}
+                  {/* Results Info */}
+                  {filteredModels.length > 0 && (
+                    <div className="flex items-center justify-center mt-4 text-sm text-gray-600">
+                      Showing {startIndex + 1}-{Math.min(endIndex, totalItems)} of{" "}
+                      {totalItems} models
+                    </div>
+                  )}
+                </>
+              )}
+            </TabsContent>
+          </>
+        )}
+      </Tabs>
 
       {/* Access Management Modal - Only for Admin users */}
       {canManageGroups && accessModelId && modelsRecord[accessModelId] && (
