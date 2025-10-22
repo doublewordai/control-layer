@@ -25,7 +25,7 @@ HTTP_STATUS=$(echo "$RESPONSE" | sed -n 's/.*HTTP_STATUS:\([0-9]*\).*/\1/p')
 
 if [ "$HTTP_STATUS" = "200" ]; then
   # Extract the cookie value from the response
-  COOKIE=$(echo "$RESPONSE" | awk '/waycast_session/ {for(i=1;i<=NF;i++) if($i=="waycast_session") print $(i+1); exit}')
+  COOKIE=$(echo "$RESPONSE" | awk '/dwctl_session/ {for(i=1;i<=NF;i++) if($i=="dwctl_session") print $(i+1); exit}')
   if [ -n "$COOKIE" ]; then
     echo "$COOKIE"
   else

@@ -1,4 +1,4 @@
-import type { UserResponse } from "../../api/waycast/types";
+import type { UserResponse } from "../../api/control-layer/types";
 
 export interface AuthState {
   user: UserResponse | null;

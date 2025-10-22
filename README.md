@@ -1,22 +1,22 @@
-# Waycast
+# The Doubleword Control Layer (dwctl)
 
-Waycast provides a single, high-performance interface for routing, managing,
-and securing inference across model providers, users and deployments - both
-open-source and proprietary.
+[Announcement](https://fergusfinn.com/blog/control-layer/) | [Benchmarking](https://fergusfinn.com/blog/control-layer-benchmarking/)
 
+The Doubleword Control Layer (dwctl) is the world’s fastest AI model gateway (450x less overhead than LiteLLM). It provides a single, high-performance interface for routing, managing, and securing inference across model providers, users and deployments - both open-source and proprietary.
 - Seamlessly switch between models
-- Turn any model (self-hosted or hosted) into a production-ready API with full
-auth and user controls
+- Turn any model (self-hosted or hosted) into a production-ready API with full auth and user controls
 - Centrally govern, monitor, and audit all inference activity
+
+
 
 ## Getting started
 
 ### Docker compose
 
-With docker compose installed, these commands will start the waycast stack.
+With docker compose installed, these commands will start the Control Layer stack.
 
 ```bash
-wget https://raw.githubusercontent.com/doublewordai/waycast/refs/heads/main/docker-compose.yml
+wget https://raw.githubusercontent.com/doublewordai/control-layer/refs/heads/main/docker-compose.yml
 docker compose up -d
 ```
 
@@ -24,14 +24,14 @@ Navigate to `http://localhost:3001` to get started.
 
 ### Docker
 
-Waycast requires a PostgreSQL database to run. If you have one already (for
+Control Layer requires a PostgreSQL database to run. If you have one already (for
 example, via a cloud provider), run:
 
 ```bash
-docker run -p 3001:3001 \ 
+docker run -p 3001:3001 \
     -e DATABASE_URL=<your postgres connection string here> \
     -e SECRET_KEY="mysupersecretkey" \
-    ghcr.io/doublewordai/waycast:latest
+    ghcr.io/doublewordai/control-layer:latest
 ```
 
 Make sure to replace the secret key with a secure random value in production.
@@ -40,15 +40,15 @@ Navigate to `http://localhost:3001` to get started.
 
 ## Configuration
 
-Waycast can be configured by a `config.yaml` file. To supply one, mount it into
-the container at `/app/config.yaml`, like follows:
+Control Layer can be configured by a `config.yaml` file. To supply one, mount
+it into the container at `/app/config.yaml`, like follows:
 
 ```bash
 docker run -p 3001:3001 \
   -e DATABASE_URL=<your postgres connection string here> \
   -e SECRET_KEY="mysupersecretkey"  \
   -v ./config.yaml:/app/config.yaml \
-  ghcr.io/doublewordai/waycast:latest
+  ghcr.io/doublewordai/control-layer:latest
 ```
 
 The docker compose file will mount a
@@ -59,11 +59,11 @@ The complete default config is below.
 You can override any of these settings by
 either supplying your own config file, in which case your config file will be
 merged with this one, or by supplying environment variables prefixed with
-`WAYCAST_`.
+`DWCTL_`.
 
 Nested sections of the configuration can be specified by joining
 the keys with a double underscore, for example, to disable native
-authentication, set `WAYCAST_AUTH__NATIVE__ENABLED=false`.
+authentication, set `DWCTL_AUTH__NATIVE__ENABLED=false`.
 
 ```yaml
 # Clay configuration
@@ -93,7 +93,7 @@ auth:
     # Parameters for login session cookies.
     session:
       timeout: "24h"
-      cookie_name: "waycast_session"
+      cookie_name: "dwctl_session"
       cookie_secure: true
       cookie_same_site: "strict"
 
@@ -125,7 +125,7 @@ auth:
     # CORS Settings. In production, make sure your frontend URL is listed here.
     cors:
       allowed_origins:
-        - "http://localhost:3001" # Default - waycast server itself
+        - "http://localhost:3001" # Default - Control Layer server itself
       allow_credentials: true
       max_age: 3600 # Cache preflight requests for 1 hour
 
@@ -146,7 +146,7 @@ model_sources: []
 #     url: "http://localhost:8080"
 
 # Frontend metadata. This is just for display purposes, but can be useful to
-# give information to  users that manage your waycast deployment.
+# give information to users that manage your Control Layer deployment.
 metadata:
   region: "UK South"
   organization: "ACME Corp"
@@ -164,7 +164,7 @@ database:
   type: external
   # Override this with your own database url. Can also be configured via the
   # DATABASE_URL environment variable.
-  url: "postgres://localhost:5432/waycast"
+  url: "postgres://localhost:5432/control_layer"
 
   # Alternatively, you can use embedded postgres (requires compiling with the
   # embedded-db feature, which is not present in the default docker image)
@@ -182,7 +182,7 @@ enable_request_logging: true # Enable request/response logging to database
 
 ## Production checklist
 
-1. Setup a production-grade Postgres database, and point `waycast` to it via the
+1. Setup a production-grade Postgres database, and point Control Layer to it via the
    `DATABASE_URL` environment variable.
 2. Make sure that the secret key is set to a secure random value. For example, run
    `openssl rand -base64 32` to generate a secure random key.

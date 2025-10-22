@@ -42,7 +42,7 @@ jobs:
           echo "Frontend CI pipeline completed in ${CI_DURATION}s"
 
           # Report metrics to Somnial
-          curl -X POST "https://charts.somnial.co/doubleword-waycast/frontend-ci-duration?value=${CI_DURATION}" || true
+          curl -X POST "https://charts.somnial.co/doubleword-control-layer/frontend-ci-duration?value=${CI_DURATION}" || true
 
       - name: Extract frontend coverage metrics
         id: coverage-step
@@ -71,7 +71,7 @@ jobs:
             echo "Frontend code coverage: ${COVERAGE}%"
             
             # Report coverage to Somnial
-            curl -X POST "https://charts.somnial.co/doubleword-waycast/frontend-code-coverage?value=${COVERAGE}" || true
+            curl -X POST "https://charts.somnial.co/doubleword-control-layer/frontend-code-coverage?value=${COVERAGE}" || true
           else
             echo "No coverage report found at coverage/lcov.info - coverage may not have been generated"
             echo "coverage=0" >> $GITHUB_OUTPUT
@@ -91,8 +91,8 @@ jobs:
           echo "Bundle: ${TOTAL_SIZE} bytes (${GZIPPED_SIZE} gzipped)"
 
           # Report bundle metrics to Somnial
-          curl -X POST "https://charts.somnial.co/doubleword-waycast/total-bundle-size?value=${TOTAL_SIZE}" || true
-          curl -X POST "https://charts.somnial.co/doubleword-waycast/gzipped-bundle-size?value=${GZIPPED_SIZE}" || true
+          curl -X POST "https://charts.somnial.co/doubleword-control-layer/total-bundle-size?value=${TOTAL_SIZE}" || true
+          curl -X POST "https://charts.somnial.co/doubleword-control-layer/gzipped-bundle-size?value=${GZIPPED_SIZE}" || true
 
   backend-test:
     runs-on: depot-ubuntu-24.04-16
@@ -124,7 +124,7 @@ jobs:
       # used only for caching binary installs
       - uses: Swatinem/rust-cache@v2
         with:
-          workspaces: waycast
+          workspaces: dwctl
 
       - name: Install just
         uses: extractions/setup-just@v2
@@ -135,7 +135,7 @@ jobs:
           cargo install cargo-llvm-cov --locked
 
       - name: Run database migrations
-        working-directory: ./waycast
+        working-directory: ./dwctl
         env:
           DATABASE_URL: postgres://postgres:postgres@localhost:5432/test
         run: |
@@ -155,11 +155,11 @@ jobs:
           echo "Rust CI pipeline completed in ${CI_DURATION}s"
 
           # Report metrics to Somnial
-          curl -X POST "https://charts.somnial.co/doubleword-waycast/backend-ci-duration?value=${CI_DURATION}" || true
+          curl -X POST "https://charts.somnial.co/doubleword-control-layer/backend-ci-duration?value=${CI_DURATION}" || true
 
       - name: Extract backend coverage metrics
         id: coverage-step
-        working-directory: ./waycast
+        working-directory: ./dwctl
         run: |
           # Extract coverage from already generated lcov.info file (from 'just ci rust')
           echo "Checking for coverage files..."
@@ -184,7 +184,7 @@ jobs:
             echo "Backend code coverage: ${COVERAGE}%"
             
             # Report coverage to Somnial
-            curl -X POST "https://charts.somnial.co/doubleword-waycast/backend-code-coverage?value=${COVERAGE}" || true
+            curl -X POST "https://charts.somnial.co/doubleword-control-layer/backend-code-coverage?value=${COVERAGE}" || true
           else
             echo "No coverage report found at lcov.info - coverage may not have been generated"
             echo "coverage=0" >> $GITHUB_OUTPUT
@@ -216,7 +216,7 @@ jobs:
         env:
           DOCKER_METADATA_PR_HEAD_SHA: true
         with:
-          images: ghcr.io/doublewordai/waycast
+          images: ghcr.io/doublewordai/control-layer
           sep-tags: "\n"
           tags: |
             type=sha,event=branch,prefix=sha-
@@ -251,7 +251,7 @@ jobs:
           echo "Docker build completed in ${BUILD_DURATION}s"
 
           # Report build time to Somnial
-          curl -X POST "https://charts.somnial.co/doubleword-waycast/docker-build-duration?value=${BUILD_DURATION}" || true
+          curl -X POST "https://charts.somnial.co/doubleword-control-layer/docker-build-duration?value=${BUILD_DURATION}" || true
 
     outputs:
       image-tag: ${{ steps.meta.outputs.tags }}
@@ -289,7 +289,7 @@ jobs:
           # Extract just the SHA tag for our scan
           TAG=$(echo "$TAG_LIST" | head -n1 | cut -d':' -f2)
 
-          WAYCAST_TAG="ghcr.io/doublewordai/waycast:$TAG"
+          CONTROL_LAYER_TAG="ghcr.io/doublewordai/control-layer:$TAG"
 
           echo "Scanning images for security vulnerabilities..."
           echo "Tag: $TAG"
@@ -301,20 +301,20 @@ jobs:
             jq -r --arg sev "$severity" '[.matches[] | select(.vulnerability.severity == $sev)] | length' "$file"
           }
 
-          # Scan waycast image
-          echo "Scanning waycast image: $WAYCAST_TAG"
-          grype "$WAYCAST_TAG" --output json --file waycast-vulnerabilities.json
-          WAYCAST_CRITICAL=$(calculate_vulns waycast-vulnerabilities.json "Critical")
-          WAYCAST_HIGH=$(calculate_vulns waycast-vulnerabilities.json "High")
+          # Scan control-layer image
+          echo "Scanning control-layer image: $CONTROL_LAYER_TAG"
+          grype "$CONTROL_LAYER_TAG" --output json --file control-layer-vulnerabilities.json
+          CONTROL_LAYER_CRITICAL=$(calculate_vulns control-layer-vulnerabilities.json "Critical")
+          CONTROL_LAYER_HIGH=$(calculate_vulns control-layer-vulnerabilities.json "High")
 
           # Console output
           echo "Security scan completed:"
-          echo "  Critical vulnerabilities: $WAYCAST_CRITICAL"
-          echo "  High vulnerabilities: $WAYCAST_HIGH"
+          echo "  Critical vulnerabilities: $CONTROL_LAYER_CRITICAL"
+          echo "  High vulnerabilities: $CONTROL_LAYER_HIGH"
 
           # Set outputs for metrics reporting
-          echo "total_critical=$WAYCAST_CRITICAL" >> $GITHUB_OUTPUT
-          echo "total_high=$WAYCAST_HIGH" >> $GITHUB_OUTPUT
+          echo "total_critical=$CONTROL_LAYER_CRITICAL" >> $GITHUB_OUTPUT
+          echo "total_high=$CONTROL_LAYER_HIGH" >> $GITHUB_OUTPUT
 
       - name: Report vulnerability counts to Somnial
         if: always()
@@ -327,8 +327,8 @@ jobs:
           echo "  Critical vulnerabilities: ${CRITICAL}"
           echo "  High vulnerabilities: ${HIGH}"
 
-          curl -X POST "https://charts.somnial.co/doubleword-waycast/critical-vulnerabilities?value=${CRITICAL}" || echo "Failed to report critical vulnerabilities"
-          curl -X POST "https://charts.somnial.co/doubleword-waycast/high-vulnerabilities?value=${HIGH}" || echo "Failed to report high vulnerabilities"
+          curl -X POST "https://charts.somnial.co/doubleword-control-layer/critical-vulnerabilities?value=${CRITICAL}" || echo "Failed to report critical vulnerabilities"
+          curl -X POST "https://charts.somnial.co/doubleword-control-layer/high-vulnerabilities?value=${HIGH}" || echo "Failed to report high vulnerabilities"
 
   e2e-test-docker:
     runs-on: depot-ubuntu-24.04
@@ -390,7 +390,7 @@ jobs:
           echo "Docker E2E tests completed in ${E2E_DURATION}s"
 
           # Report metrics to Somnial
-          curl -X POST "https://charts.somnial.co/doubleword-waycast/e2e-docker-duration?value=${E2E_DURATION}" || true
+          curl -X POST "https://charts.somnial.co/doubleword-control-layer/e2e-docker-duration?value=${E2E_DURATION}" || true
 
   publish-crates:
     if: github.event_name == 'release' && !github.event.release.prerelease
@@ -412,22 +412,22 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
         with:
-          workspaces: waycast
+          workspaces: dwctl
 
-      - name: Build frontend and copy to waycast/static
+      - name: Build frontend and copy to dwctl/static
         run: |
           echo "Building frontend for crates.io package..."
           cd dashboard
           npm ci
           npm run build
-          echo "Copying built files to waycast/static..."
-          rm -rf ../waycast/static
-          cp -r dist ../waycast/static
-          echo "✅ Frontend built and copied to waycast/static"
-          ls -la ../waycast/static
+          echo "Copying built files to dwctl/static..."
+          rm -rf ../dwctl/static
+          cp -r dist ../dwctl/static
+          echo "✅ Frontend built and copied to dwctl/static"
+          ls -la ../dwctl/static
 
-      - name: Publish waycast to crates.io
-        working-directory: ./waycast
+      - name: Publish dwctl to crates.io
+        working-directory: ./dwctl
         run: cargo publish --token ${{ secrets.CARGO_REGISTRY_TOKEN }}
         env:
           CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}

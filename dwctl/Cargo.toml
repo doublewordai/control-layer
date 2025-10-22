@@ -1,8 +1,8 @@
 [package]
-name = "waycast"
-version = "0.3.0"
+name = "dwctl"
+version = "0.4.2"
 edition = "2021"
-description = "A self-hostable observability and analytics platform for LLM applications"
+description = "The Doubleword Control Layer - A self-hostable observability and analytics platform for LLM applications"
 license = "MIT OR Apache-2.0"
 
 [features]

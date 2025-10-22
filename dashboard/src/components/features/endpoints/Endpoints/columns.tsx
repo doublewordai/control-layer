@@ -25,7 +25,7 @@ import {
   DropdownMenuTrigger,
 } from "../../../ui/dropdown-menu";
 import { Popover, PopoverContent, PopoverTrigger } from "../../../ui/popover";
-import type { Endpoint } from "../../../../api/waycast/types";
+import type { Endpoint } from "../../../../api/control-layer/types";
 
 interface ColumnActions {
   onEdit: (

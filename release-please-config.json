@@ -1,6 +1,6 @@
 {
   "packages": {
-    "waycast": {
+    "dwctl": {
       "release-type": "rust"
     }
   },

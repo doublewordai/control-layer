@@ -15,7 +15,7 @@ import {
   useRemoveModelFromGroup,
   type Model,
   type Group as BackendGroup,
-} from "../../../api/waycast";
+} from "../../../api/control-layer";
 
 interface AccessManagementModalProps {
   isOpen: boolean;

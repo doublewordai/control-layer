@@ -14,7 +14,7 @@ import {
   vi,
 } from "vitest";
 import { ApiKeys } from "./ApiKeys";
-import { handlers } from "../../../../api/waycast/mocks/handlers";
+import { handlers } from "../../../../api/control-layer/mocks/handlers";
 
 // Setup MSW server with existing handlers
 const server = setupServer(...handlers);

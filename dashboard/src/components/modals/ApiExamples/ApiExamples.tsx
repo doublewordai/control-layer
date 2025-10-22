@@ -2,9 +2,9 @@ import React, { useState } from "react";
 import { Copy, Code, Plus, Loader2, Info } from "lucide-react";
 import { Prism as SyntaxHighlighter } from "react-syntax-highlighter";
 import { oneDark } from "react-syntax-highlighter/dist/esm/styles/prism";
-import { useCreateApiKey } from "../../../api/waycast";
+import { useCreateApiKey } from "../../../api/control-layer";
 import { getModelType, type ModelType } from "../../../utils/modelType";
-import type { Model } from "../../../api/waycast";
+import type { Model } from "../../../api/control-layer";
 import {
   Dialog,
   DialogContent,

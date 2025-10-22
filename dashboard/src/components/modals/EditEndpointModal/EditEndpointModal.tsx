@@ -22,13 +22,14 @@ import { Input } from "../../ui/input";
 import { Textarea } from "../../ui/textarea";
 import { Checkbox } from "../../ui/checkbox";
 import { Button } from "../../ui/button";
-import { useValidateEndpoint, useUpdateEndpoint, waycastApi } from "../../../api/waycast";
+import { useValidateEndpoint, useUpdateEndpoint, dwctlApi } from "../../../api/control-layer";
 import type {
   EndpointValidateRequest,
   AvailableModel,
   EndpointUpdateRequest,
   Endpoint,
-} from "../../../api/waycast/types";
+} from "../../../api/control-layer/types";
+import type { dwctlApi } from "@/api/control-layer";
 
 interface EditEndpointModalProps {
   isOpen: boolean;
