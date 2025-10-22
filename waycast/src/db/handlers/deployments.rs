@@ -164,8 +164,8 @@ impl<'c> Repository for Deployments<'c> {
             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18)
             RETURNING *
             "#,
-            request.model_name,
-            request.alias,
+            request.model_name.trim(),
+            request.alias.trim(),
             request.description,
             model_type_str,
             request.capabilities.as_ref().map(|caps| caps.as_slice()),
@@ -357,8 +357,8 @@ impl<'c> Repository for Deployments<'c> {
         RETURNING *
         "#,
             id,                               // $1
-            request.model_name.as_ref(),      // $2
-            request.alias.as_ref(), // $3
+            request.model_name.as_ref().map(|s| s.trim()),      // $2
+            request.alias.as_ref().map(|s| s.trim()), // $3
             // For description
             request.description.is_some() as bool,                         // $4
             request.description.as_ref().and_then(|inner| inner.as_ref()), // $5

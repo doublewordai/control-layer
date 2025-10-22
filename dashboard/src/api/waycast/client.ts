@@ -286,63 +286,84 @@ const endpointApi = {
   return response.json();
 },
 
-  async update(id: string, data: EndpointUpdateRequest): Promise<Endpoint> {
-    const response = await fetch(`/admin/api/v1/endpoints/${id}`, {
-      method: "PATCH",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(data),
+async update(id: string, data: EndpointUpdateRequest): Promise<Endpoint> {
+  const response = await fetch(`/admin/api/v1/endpoints/${id}`, {
+    method: "PATCH",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(data),
+  });
+  
+  if (!response.ok) {
+    
+    try {
+      // Always try to get the response body first
+      const responseText = await response.text();
+      
+      // Try to parse as JSON
+      let responseData;
+      try {
+        responseData = JSON.parse(responseText);
+      } catch (parseError) {
+        const error = new Error(responseText || `Failed to update endpoint: ${response.status}`);
+        (error as any).status = response.status;
+        throw error;
+      }
+      
+      // Create a structured error object that matches what your frontend expects
+      const error = new Error(responseData.message || `Failed to update endpoint: ${response.status}`);
+      (error as any).status = response.status;
+      (error as any).response = {
+        status: response.status,
+        data: responseData
+      };
+      (error as any).data = responseData; // Also add direct data property
+      
+      // Handle conflicts specifically
+      if (response.status === 409) {
+        if (responseData.conflicts) {
+          (error as any).isConflict = true;
+          (error as any).conflicts = responseData.conflicts;
+        }
+      }
+      
+      throw error;
+      
+    } catch (error) {
+      // If it's already our custom error, re-throw it
+      if (error && typeof error === 'object' && ('status' in error || 'isConflict' in error)) {
+        throw error;
+      }
+      
+      // Otherwise create a structured error
+      const structuredError = new Error(error instanceof Error ? error.message : 'Unknown error');
+      (structuredError as any).status = response.status;
+      throw structuredError;
+    }
+  }
+  
+  return response.json();
+},
+
+async synchronize(id: string): Promise<EndpointSyncResponse> {
+    const response = await fetch(`/admin/api/v1/endpoints/${id}/synchronize`, {
+      method: "POST",
     });
     
     if (!response.ok) {
-      
-      try {
-        // Always try to get the response body first
-        const responseText = await response.text();
-        
-        // Try to parse as JSON
-        let responseData;
-        try {
-          responseData = JSON.parse(responseText);
-        } catch (parseError) {
-          const error = new Error(responseText || `Failed to update endpoint: ${response.status}`);
-          (error as any).status = response.status;
-          throw error;
-        }
-        
-        // Create a structured error object that matches what your frontend expects
-        const error = new Error(responseData.message || `Failed to update endpoint: ${response.status}`);
-        (error as any).status = response.status;
-        (error as any).response = {
-          status: response.status,
-          data: responseData
-        };
-        (error as any).data = responseData; // Also add direct data property
-        
-        // Handle conflicts specifically
-        if (response.status === 409) {
-          if (responseData.conflicts) {
-            (error as any).isConflict = true;
-            (error as any).conflicts = responseData.conflicts;
-          }
-        }
-        
-        throw error;
-        
-      } catch (error) {
-        // If it's already our custom error, re-throw it
-        if (error && typeof error === 'object' && ('status' in error || 'isConflict' in error)) {
-          throw error;
-        }
-        
-        // Otherwise create a structured error
-        const structuredError = new Error(error instanceof Error ? error.message : 'Unknown error');
-        (structuredError as any).status = response.status;
-        throw structuredError;
-      }
+      throw new Error(`Failed to synchronize endpoint: ${response.status}`);
     }
     
     return response.json();
-},
+  },
+
+async delete(id: string): Promise<void> {
+    const response = await fetch(`/admin/api/v1/endpoints/${id}`, {
+      method: "DELETE",
+    });
+    if (!response.ok) {
+      throw new Error(`Failed to delete endpoint: ${response.status}`);
+    }
+  },
 };
 
 const groupApi = {

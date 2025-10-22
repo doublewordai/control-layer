@@ -266,7 +266,7 @@ export const EditEndpointModal: React.FC<EditEndpointModalProps> = ({
       const alias = modelAliases[modelId] || modelId;
       // Always include the mapping, even if alias equals model name
       // The backend will handle setting the alias column appropriately
-      aliasMapping[modelId] = alias;
+      aliasMapping[modelId] = alias.trim();
     });
 
     console.log('Sending alias mapping:', aliasMapping); // Debug log
@@ -453,10 +453,6 @@ export const EditEndpointModal: React.FC<EditEndpointModalProps> = ({
                 {/* Show if this is a custom alias or if it's an existing deployment */}
                 {alias !== model.id && !hasConflict && (
                   <span className="text-xs text-blue-500">(custom)</span>
-                )}
-                {/* Show if this model is already deployed (has existing alias from DB) */}
-                {modelAliases[model.id] && modelAliases[model.id] !== model.id && alias === modelAliases[model.id] && (
-                  <span className="text-xs text-green-600">(current)</span>
                 )}
               </div>
               <Button

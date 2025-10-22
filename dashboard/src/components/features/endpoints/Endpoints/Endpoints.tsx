@@ -83,7 +83,7 @@ export function Endpoints() {
 
   const handleSynchronize = async (endpoint: Endpoint) => {
     try {
-      await synchronizeEndpointMutation.mutateAsync(endpoint.id.toString());
+      const result = await synchronizeEndpointMutation.mutateAsync(endpoint.id.toString());
       toast.success("Endpoint synchronized successfully");
     } catch (error) {
       console.error("Failed to synchronize endpoint:", error);

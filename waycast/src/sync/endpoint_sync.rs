@@ -431,13 +431,15 @@ where
     Ok(())
 }
 
-/// Update deployment aliases for an endpoint
+/// Update deployment aliases and create/remove deployments based on model filter
 pub async fn update_endpoint_aliases(
     endpoint: InferenceEndpointDBResponse,
     deployments_repo: &mut Deployments<'_>,
     alias_mapping: &HashMap<String, String>,
 ) -> Result<EndpointSyncResponse, SyncError> {
     let mut changes_made = 0;
+    let mut new_models_created = 0;
+    let mut models_deleted = 0;
 
     // Get current deployments for this endpoint
     let current_deployments = deployments_repo
@@ -445,41 +447,141 @@ pub async fn update_endpoint_aliases(
         .await
         .map_err(|e| SyncError::Other(e.into()))?;
 
-    // Update aliases for existing deployments
-    for deployment in current_deployments {
-        if let Some(new_alias) = alias_mapping.get(&deployment.model_name) {
-            if &deployment.alias != new_alias {
-                // Check for alias conflicts before updating
-                let conflict_check = deployments_repo
-                    .list(&DeploymentFilter::new(0, 1000))
-                    .await
-                    .map_err(|e| SyncError::Other(e.into()))?;
-                
-                // Check if another deployment already uses this alias
-                if conflict_check.iter().any(|d| d.alias == *new_alias && d.id != deployment.id) {
-                    return Err(SyncError::AliasConflicts {
-                        conflicts: vec![AliasConflict {
-                            model_name: deployment.model_name.clone(),
-                            attempted_alias: new_alias.clone(),
-                        }],
-                    });
+    // Build a map of existing deployments by model_name for quick lookup
+    let existing_deployments_map: HashMap<String, &DeploymentDBResponse> = current_deployments
+        .iter()
+        .map(|d| (d.model_name.clone(), d))
+        .collect();
+
+    // Get the models that should be deployed based on the endpoint's model_filter
+    let models_to_deploy: HashSet<String> = if let Some(model_filter) = &endpoint.model_filter {
+        model_filter.iter().cloned().collect()
+    } else {
+        // If no filter, we should keep all existing models and not create new ones
+        // This is different from initial sync where we might want to sync all available models
+        existing_deployments_map.keys().cloned().collect()
+    };
+
+    // 1. Update aliases for existing deployments that should remain
+    for deployment in &current_deployments {
+        if models_to_deploy.contains(&deployment.model_name) && !deployment.deleted {
+            if let Some(new_alias) = alias_mapping.get(&deployment.model_name) {
+                let trimmed_alias = new_alias.trim();
+                if &deployment.alias != trimmed_alias {
+                    // Get fresh conflict check data for this update
+                    let conflict_check = deployments_repo
+                        .list(&DeploymentFilter::new(0, 1000))
+                        .await
+                        .map_err(|e| SyncError::Other(e.into()))?;
+                    
+                    // Check for alias conflicts before updating (excluding this deployment)
+                    if conflict_check.iter().any(|d| d.alias == *trimmed_alias && d.id != deployment.id) {
+                        return Err(SyncError::AliasConflicts {
+                            conflicts: vec![AliasConflict {
+                                model_name: deployment.model_name.clone(),
+                                attempted_alias: trimmed_alias.to_string(),
+                            }],
+                        });
+                    }
+
+                    // Update the deployment alias
+                    let update_request = DeploymentUpdateDBRequest::alias_update(trimmed_alias.to_string());
+
+                    deployments_repo
+                        .update(deployment.id, &update_request)
+                        .await
+                        .map_err(|e| SyncError::Other(e.into()))?;
+
+                    changes_made += 1;
+                    tracing::info!(
+                        "Updated deployment {} alias from '{}' to '{}'",
+                        deployment.id,
+                        deployment.alias,
+                        trimmed_alias
+                    );
                 }
+            }
+        }
+    }
 
-                // Update the deployment alias
-                let update_request = DeploymentUpdateDBRequest::alias_update(new_alias.clone());
+    // 2. Create new deployments for models in the filter that don't exist yet
+    let system_user_id = uuid::Uuid::nil();
 
-                deployments_repo
-                    .update(deployment.id, &update_request)
-                    .await
-                    .map_err(|e| SyncError::Other(e.into()))?;
+    for model_name in &models_to_deploy {
+        if !existing_deployments_map.contains_key(model_name) {
+            // This model needs to be deployed
+            let alias = alias_mapping
+                .get(model_name)
+                .cloned()
+                .unwrap_or_else(|| model_name.clone())
+                .trim() // ADD THIS LINE - always trim the alias
+                .to_string();
 
-                changes_made += 1;
-                tracing::info!(
-                    "Updated deployment {} alias from '{}' to '{}'",
-                    deployment.id,
-                    deployment.alias,
-                    new_alias
-                );
+            // Check for alias conflicts before creating
+            let conflict_check = deployments_repo
+                .list(&DeploymentFilter::new(0, 1000))
+                .await
+                .map_err(|e| SyncError::Other(e.into()))?;
+            
+            if conflict_check.iter().any(|d| d.alias == alias) {
+                return Err(SyncError::AliasConflicts {
+                    conflicts: vec![AliasConflict {
+                        model_name: model_name.clone(),
+                        attempted_alias: alias,
+                    }],
+                });
+            }
+
+            // Create the new deployment
+            let db_request = DeploymentCreateDBRequest::builder()
+                .created_by(system_user_id)
+                .model_name(model_name.clone())
+                .alias(alias.clone())
+                .hosted_on(endpoint.id)
+                .build();
+
+            match deployments_repo.create(&db_request).await {
+                Ok(_) => {
+                    new_models_created += 1;
+                    changes_made += 1;
+                    tracing::info!(
+                        "Created new deployment for model '{}' with alias '{}' on endpoint {}",
+                        model_name,
+                        alias,
+                        endpoint.id
+                    );
+                }
+                Err(e) => {
+                    tracing::error!("Failed to create deployment for model '{}': {}", model_name, e);
+                    return Err(SyncError::Other(e.into()));
+                }
+            }
+        }
+    }
+
+    // 3. Remove deployments for models that are no longer in the filter
+    // Only do this if we have a model_filter (if None, keep all existing)
+    if endpoint.model_filter.is_some() {
+        for deployment in &current_deployments {
+            if !models_to_deploy.contains(&deployment.model_name) && !deployment.deleted {
+                // This deployment should be removed
+                match deployments_repo.delete(deployment.id).await {
+                    Ok(true) => {
+                        models_deleted += 1;
+                        changes_made += 1;
+                        tracing::info!(
+                            "Deleted deployment for model '{}' (removed from filter)",
+                            deployment.model_name
+                        );
+                    }
+                    Ok(false) => {
+                        tracing::warn!("Deployment {} not found for deletion", deployment.id);
+                    }
+                    Err(e) => {
+                        tracing::error!("Failed to delete deployment {}: {}", deployment.id, e);
+                        return Err(SyncError::Other(e.into()));
+                    }
+                }
             }
         }
     }
@@ -487,12 +589,12 @@ pub async fn update_endpoint_aliases(
     Ok(EndpointSyncResponse {
         endpoint_id: endpoint.id,
         changes_made,
-        new_models_created: 0,
+        new_models_created,
         models_reactivated: 0,
         models_deactivated: 0,
-        models_deleted: 0,
-        total_models_fetched: 0,
-        filtered_models_count: 0,
+        models_deleted,
+        total_models_fetched: models_to_deploy.len(),
+        filtered_models_count: models_to_deploy.len(),
         synced_at: Utc::now(),
     })
 }

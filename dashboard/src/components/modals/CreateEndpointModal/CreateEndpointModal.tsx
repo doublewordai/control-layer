@@ -254,7 +254,7 @@ export const CreateEndpointModal: React.FC<CreateEndpointModalProps> = ({
     data.selectedModels.forEach(modelId => {
       const alias = modelAliases[modelId] || modelId;
       if (alias !== modelId) {
-        aliasMapping[modelId] = alias;
+        aliasMapping[modelId] = alias.trim();
       }
     });
 
