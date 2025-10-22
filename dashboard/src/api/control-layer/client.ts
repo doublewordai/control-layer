@@ -176,21 +176,13 @@ const modelApi = {
       if (response.status === 409) {
         // For 409 conflicts, try to get the actual server error message
         const errorText = await response.text();
-        throw new Error(errorText || `Failed to hello model: ${response.status}`);
+        throw new Error(errorText || `Failed to update model: ${response.status}`);
       }
       
       // Generic error for all other cases
       throw new Error(`Failed to update model: ${response.status}`);
     }
     
-    return response.json();
-  },
-
-  async listByEndpoint(endpointId: string): Promise<Model[]> {
-    const response = await fetch(`/admin/api/v1/models?endpoint=${endpointId}`);
-    if (!response.ok) {
-      throw new Error(`Failed to fetch models for endpoint: ${response.status}`);
-    }
     return response.json();
   },
 };

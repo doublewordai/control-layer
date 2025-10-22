@@ -111,7 +111,7 @@ export const EditEndpointModal: React.FC<EditEndpointModalProps> = ({
   // Function to fetch current deployments and set aliases
   const fetchCurrentDeployments = async () => {
     try {
-      const currentModels = await dwctlApi.models.listByEndpoint(endpoint.id);
+      const currentModels = await dwctlApi.models.list({ endpoint: endpoint.id });
 
       // Build current alias mapping from deployed models
       const currentAliases: Record<string, string> = {};
