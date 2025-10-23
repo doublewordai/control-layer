@@ -1,7 +1,7 @@
 use crate::{
     api::models::inference_endpoints::{
         InferenceEndpointCreate, InferenceEndpointResponse, InferenceEndpointUpdate, InferenceEndpointValidate,
-        InferenceEndpointValidateResponse, ListEndpointsQuery, OpenAIModelsResponse,
+        InferenceEndpointValidateResponse, ListEndpointsQuery, OpenAIModelsResponse, OpenAIModel,
     },
     auth::permissions::{operation, resource, RequiresPermission},
     db::{
@@ -21,6 +21,32 @@ use axum::{
     http::StatusCode,
     response::Json,
 };
+#[cfg(test)]
+struct MockFetchModels;
+
+#[cfg(test)]
+#[async_trait::async_trait]
+impl FetchModels for MockFetchModels {
+    async fn fetch(&self) -> anyhow::Result<OpenAIModelsResponse> {
+        Ok(OpenAIModelsResponse {
+            object: "list".to_string(),
+            data: vec![
+                OpenAIModel {
+                    id: "google/gemma-3-12b-it".to_string(),
+                    object: "model".to_string(),
+                    created: Some(0),
+                    owned_by: "test".to_string(),
+                },
+                OpenAIModel {
+                    id: "openai/gpt-4".to_string(),
+                    object: "model".to_string(),
+                    created: Some(0),
+                    owned_by: "test".to_string(),
+                },
+            ],
+        })
+    }
+}
 
 // GET /endpoints - List endpoints
 #[utoipa::path(
@@ -302,8 +328,10 @@ pub async fn create_inference_endpoint(
     // Optionally sync models during creation
     if create_request.sync {
         // Create sync config from the newly created endpoint
-        let sync_config = SyncConfig::from_endpoint(&endpoint);
-        let fetcher = FetchModelsReqwest::new(sync_config);
+        #[cfg(test)]
+        let fetcher = MockFetchModels;
+        #[cfg(not(test))]
+        let fetcher = FetchModelsReqwest::new(SyncConfig::from_endpoint(&endpoint));
 
         // Perform sync within the same transaction with custom aliases
         let mut deployments_repo = Deployments::new(&mut tx);
@@ -1545,5 +1573,367 @@ mod tests {
             .add_header(add_auth_headers(&platform_user).0, add_auth_headers(&platform_user).1)
             .await
             .assert_status(axum::http::StatusCode::NO_CONTENT);
+    }
+
+    // Alias mapping dedupe/uniqueness tests
+
+    #[sqlx::test]
+    #[test_log::test]
+    async fn test_create_endpoint_with_unique_aliases(pool: PgPool) {
+        let (app, _) = create_test_app(pool.clone(), false).await;
+        let admin_user = create_test_admin_user(&pool, Role::PlatformManager).await;
+
+        let create_request = json!({
+            "name": "Alias Endpoint",
+            "url": "https://api.alias.com/v1",
+            "sync": true,
+            "alias_mapping": {
+                "google/gemma-3-12b-it": "gen-model",
+                "openai/gpt-4": "gpt4-prod"
+            }
+        });
+
+        let response = app
+            .post("/admin/api/v1/endpoints")
+            .add_header(add_auth_headers(&admin_user).0, add_auth_headers(&admin_user).1)
+            .json(&create_request)
+            .await;
+
+        response.assert_status(axum::http::StatusCode::CREATED);
+        let endpoint: InferenceEndpointResponse = response.json();
+        assert_eq!(endpoint.name, "Alias Endpoint");
+    }
+
+    #[sqlx::test]
+    #[test_log::test]
+    async fn test_create_endpoint_with_duplicate_alias_conflict(pool: PgPool) {
+        let (app, _) = create_test_app(pool.clone(), false).await;
+        let admin_user = create_test_admin_user(&pool, Role::PlatformManager).await;
+
+        // First endpoint with alias "shared-alias"
+        let create_request1 = json!({
+            "name": "Endpoint 1",
+            "url": "https://api.dup1.com/v1",
+            "sync": true,
+            "alias_mapping": {
+                "google/gemma-3-12b-it": "shared-alias"
+            }
+        });
+        let resp1 = app
+            .post("/admin/api/v1/endpoints")
+            .add_header(add_auth_headers(&admin_user).0, add_auth_headers(&admin_user).1)
+            .json(&create_request1)
+            .await;
+        resp1.assert_status(axum::http::StatusCode::CREATED);
+
+        // Second endpoint tries to use same alias
+        let create_request2 = json!({
+            "name": "Endpoint 2",
+            "url": "https://api.dup2.com/v1",
+            "sync": true,
+            "alias_mapping": {
+                "openai/gpt-4": "shared-alias"
+            }
+        });
+        let resp2 = app
+            .post("/admin/api/v1/endpoints")
+            .add_header(add_auth_headers(&admin_user).0, add_auth_headers(&admin_user).1)
+            .json(&create_request2)
+            .await;
+        resp2.assert_status(axum::http::StatusCode::CONFLICT);
+        let body: serde_json::Value = resp2.json();
+        assert!(body["message"].as_str().unwrap().contains("Alias conflicts"));
+    }
+
+    #[sqlx::test]
+    #[test_log::test]
+    async fn test_update_endpoint_with_alias_conflict(pool: PgPool) {
+        let (app, _) = create_test_app(pool.clone(), false).await;
+        let admin_user = create_test_admin_user(&pool, Role::PlatformManager).await;
+
+        // Create two endpoints with unique aliases
+        let create1 = json!({
+            "name": "Endpoint A",
+            "url": "https://api.a.com/v1",
+            "sync": true,
+            "alias_mapping": { "google/gemma-3-12b-it": "alias-a" }
+        });
+        let resp1 = app
+            .post("/admin/api/v1/endpoints")
+            .add_header(add_auth_headers(&admin_user).0, add_auth_headers(&admin_user).1)
+            .json(&create1)
+            .await;
+        resp1.assert_status(axum::http::StatusCode::CREATED);
+        let _endpoint_a: InferenceEndpointResponse = resp1.json();
+
+        let create2 = json!({
+            "name": "Endpoint B",
+            "url": "https://api.b.com/v1",
+            "sync": true,
+            "alias_mapping": { "openai/gpt-4": "alias-b" }
+        });
+        let resp2 = app
+            .post("/admin/api/v1/endpoints")
+            .add_header(add_auth_headers(&admin_user).0, add_auth_headers(&admin_user).1)
+            .json(&create2)
+            .await;
+        resp2.assert_status(axum::http::StatusCode::CREATED);
+        let endpoint_b: InferenceEndpointResponse = resp2.json();
+
+        // Try to update endpoint B to use alias-a (should conflict)
+        let update = json!({
+            "alias_mapping": { "openai/gpt-4": "alias-a" }
+        });
+        let resp_update = app
+            .patch(&format!("/admin/api/v1/endpoints/{}", endpoint_b.id))
+            .add_header(add_auth_headers(&admin_user).0, add_auth_headers(&admin_user).1)
+            .json(&update)
+            .await;
+        resp_update.assert_status(axum::http::StatusCode::CONFLICT);
+        let body: serde_json::Value = resp_update.json();
+        assert!(body["message"].as_str().unwrap().contains("Alias conflicts"));
+    }
+
+    #[sqlx::test]
+    #[test_log::test]
+    async fn test_update_endpoint_with_unique_aliases(pool: PgPool) {
+        let (app, _) = create_test_app(pool.clone(), false).await;
+        let admin_user = create_test_admin_user(&pool, Role::PlatformManager).await;
+
+        // Create endpoint with one alias
+        let create = json!({
+            "name": "Endpoint C",
+            "url": "https://api.c.com/v1",
+            "sync": true,
+            "alias_mapping": { "google/gemma-3-12b-it": "alias-c" }
+        });
+        let resp = app
+            .post("/admin/api/v1/endpoints")
+            .add_header(add_auth_headers(&admin_user).0, add_auth_headers(&admin_user).1)
+            .json(&create)
+            .await;
+        resp.assert_status(axum::http::StatusCode::CREATED);
+        let endpoint: InferenceEndpointResponse = resp.json();
+
+        // Update alias to a new unique value
+        let update = json!({
+            "alias_mapping": { "google/gemma-3-12b-it": "alias-c2" }
+        });
+        let resp_update = app
+            .patch(&format!("/admin/api/v1/endpoints/{}", endpoint.id))
+            .add_header(add_auth_headers(&admin_user).0, add_auth_headers(&admin_user).1)
+            .json(&update)
+            .await;
+        resp_update.assert_status(axum::http::StatusCode::OK);
+        let updated: InferenceEndpointResponse = resp_update.json();
+        assert_eq!(updated.name, "Endpoint C");
+    }
+
+    #[sqlx::test]
+    #[test_log::test]
+    async fn test_alias_uniqueness_is_global(pool: PgPool) {
+        let (app, _) = create_test_app(pool.clone(), false).await;
+        let admin_user = create_test_admin_user(&pool, Role::PlatformManager).await;
+
+        // Create endpoint with alias "global-alias"
+        let create1 = json!({
+            "name": "Endpoint Global 1",
+            "url": "https://api.global1.com/v1",
+            "sync": true,
+            "alias_mapping": { "google/gemma-3-12b-it": "global-alias" }
+        });
+        let resp1 = app
+            .post("/admin/api/v1/endpoints")
+            .add_header(add_auth_headers(&admin_user).0, add_auth_headers(&admin_user).1)
+            .json(&create1)
+            .await;
+        resp1.assert_status(axum::http::StatusCode::CREATED);
+
+        // Try to create another endpoint with same alias for a different model
+        let create2 = json!({
+            "name": "Endpoint Global 2",
+            "url": "https://api.global2.com/v1",
+            "sync": true,
+            "alias_mapping": { "google/gemma-3-12b-it": "global-alias" }
+        });
+        let resp2 = app
+            .post("/admin/api/v1/endpoints")
+            .add_header(add_auth_headers(&admin_user).0, add_auth_headers(&admin_user).1)
+            .json(&create2)
+            .await;
+        resp2.assert_status(axum::http::StatusCode::CONFLICT);
+    }
+
+    #[sqlx::test]
+    #[test_log::test]
+    async fn test_alias_can_match_model_name_if_unique(pool: PgPool) {
+        let (app, _) = create_test_app(pool.clone(), false).await;
+        let admin_user = create_test_admin_user(&pool, Role::PlatformManager).await;
+
+        // Alias matches model name, but is unique
+        let create = json!({
+            "name": "Endpoint Self Alias",
+            "url": "https://api.selfalias.com/v1",
+            "sync": true,
+            "alias_mapping": { "google/gemma-3-12b-it": "google/gemma-3-12b-it" }
+        });
+        let resp = app
+            .post("/admin/api/v1/endpoints")
+            .add_header(add_auth_headers(&admin_user).0, add_auth_headers(&admin_user).1)
+            .json(&create)
+            .await;
+        resp.assert_status(axum::http::StatusCode::CREATED);
+    }
+
+    #[sqlx::test]
+    #[test_log::test]
+    async fn test_alias_update_noop_is_ok(pool: PgPool) {
+        let (app, _) = create_test_app(pool.clone(), false).await;
+        let admin_user = create_test_admin_user(&pool, Role::PlatformManager).await;
+
+        // Create endpoint with alias
+        let create = json!({
+            "name": "Endpoint Noop",
+            "url": "https://api.noop.com/v1",
+            "sync": true,
+            "alias_mapping": { "google/gemma-3-12b-it": "noop-alias" }
+        });
+        let resp = app
+            .post("/admin/api/v1/endpoints")
+            .add_header(add_auth_headers(&admin_user).0, add_auth_headers(&admin_user).1)
+            .json(&create)
+            .await;
+        resp.assert_status(axum::http::StatusCode::CREATED);
+        let endpoint: InferenceEndpointResponse = resp.json();
+
+        // Update with same alias mapping (should be a no-op, but succeed)
+        let update = json!({
+            "alias_mapping": { "google/gemma-3-12b-it": "noop-alias" }
+        });
+        let resp_update = app
+            .patch(&format!("/admin/api/v1/endpoints/{}", endpoint.id))
+            .add_header(add_auth_headers(&admin_user).0, add_auth_headers(&admin_user).1)
+            .json(&update)
+            .await;
+        resp_update.assert_status(axum::http::StatusCode::OK);
+    }
+
+    #[sqlx::test]
+    #[test_log::test]
+    async fn test_multiple_same_model_different_endpoints_unique_aliases(pool: PgPool) {
+        let (app, _) = create_test_app(pool.clone(), false).await;
+        let admin_user = create_test_admin_user(&pool, Role::PlatformManager).await;
+
+        // Endpoint 1 with gemma model, alias "alias-1"
+        let create1 = json!({
+            "name": "Endpoint 1",
+            "url": "https://api.1.com/v1",
+            "sync": true,
+            "alias_mapping": {
+                "google/gemma-3-12b-it": "alias-1",
+                "openai/gpt-4": "alias-1b"
+            }
+        });
+        let resp1 = app
+            .post("/admin/api/v1/endpoints")
+            .add_header(add_auth_headers(&admin_user).0, add_auth_headers(&admin_user).1)
+            .json(&create1)
+            .await;
+        resp1.assert_status(axum::http::StatusCode::CREATED);
+
+        // Endpoint 2 with gemma model, alias "alias-2"
+        let create2 = json!({
+            "name": "Endpoint 2",
+            "url": "https://api.2.com/v1",
+            "sync": true,
+            "alias_mapping": {
+                "google/gemma-3-12b-it": "alias-2",
+                "openai/gpt-4": "alias-2b"
+            }
+        });
+        let resp2 = app
+            .post("/admin/api/v1/endpoints")
+            .add_header(add_auth_headers(&admin_user).0, add_auth_headers(&admin_user).1)
+            .json(&create2)
+            .await;
+        resp2.assert_status(axum::http::StatusCode::CREATED);
+    }
+
+    #[sqlx::test]
+    #[test_log::test]
+    async fn test_default_alias_conflict_when_no_alias_mapping(pool: PgPool) {
+        let (app, _) = create_test_app(pool.clone(), false).await;
+        let admin_user = create_test_admin_user(&pool, Role::PlatformManager).await;
+
+        // First endpoint with gemma model, default alias (model name)
+        let create1 = json!({
+            "name": "Endpoint 1",
+            "url": "https://api.1.com/v1",
+            "sync": true
+            // no alias_mapping, so alias defaults to model name
+        });
+        let resp1 = app
+            .post("/admin/api/v1/endpoints")
+            .add_header(add_auth_headers(&admin_user).0, add_auth_headers(&admin_user).1)
+            .json(&create1)
+            .await;
+        resp1.assert_status(axum::http::StatusCode::CREATED);
+
+        // Second endpoint, also no alias_mapping, so alias defaults to model name and should conflict
+        let create2 = json!({
+            "name": "Endpoint 2",
+            "url": "https://api.2.com/v1",
+            "sync": true
+            // no alias_mapping
+        });
+        let resp2 = app
+            .post("/admin/api/v1/endpoints")
+            .add_header(add_auth_headers(&admin_user).0, add_auth_headers(&admin_user).1)
+            .json(&create2)
+            .await;
+        resp2.assert_status(axum::http::StatusCode::CONFLICT);
+        let body: serde_json::Value = resp2.json();
+        assert!(body["message"].as_str().unwrap().contains("Alias conflicts"));
+    }
+
+    #[sqlx::test]
+    #[test_log::test]
+    async fn test_endpoint_name_conflict_bounces_before_alias_conflict(pool: PgPool) {
+        let (app, _) = create_test_app(pool.clone(), false).await;
+        let admin_user = create_test_admin_user(&pool, Role::PlatformManager).await;
+
+        // First endpoint with name "Endpoint X"
+        let create1 = json!({
+            "name": "Endpoint X",
+            "url": "https://api.x.com/v1",
+            "sync": true,
+            "alias_mapping": { "google/gemma-3-12b-it": "unique-alias-x" }
+        });
+        let resp1 = app
+            .post("/admin/api/v1/endpoints")
+            .add_header(add_auth_headers(&admin_user).0, add_auth_headers(&admin_user).1)
+            .json(&create1)
+            .await;
+        resp1.assert_status(axum::http::StatusCode::CREATED);
+
+        // Second endpoint with same name, but different alias (should fail on name, not alias)
+        let create2 = json!({
+            "name": "Endpoint X", // same name
+            "url": "https://api.y.com/v1",
+            "sync": true,
+            "alias_mapping": { "google/gemma-3-12b-it": "unique-alias-y" }
+        });
+        let resp2 = app
+            .post("/admin/api/v1/endpoints")
+            .add_header(add_auth_headers(&admin_user).0, add_auth_headers(&admin_user).1)
+            .json(&create2)
+            .await;
+        resp2.assert_status(axum::http::StatusCode::CONFLICT);
+        let body: serde_json::Value = resp2.json();
+        assert!(body["message"].as_str().unwrap().contains("already exists"));
+        // Should not mention alias conflicts
+        if let Some(conflicts) = body.get("conflicts") {
+            assert!(conflicts.is_null() || conflicts.as_array().unwrap().is_empty());
+        }
     }
 }
