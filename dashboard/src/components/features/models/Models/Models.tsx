@@ -18,6 +18,7 @@ import {
 import {
   useModels,
   type Model,
+  type ModelsInclude,
   useEndpoints,
   type Endpoint,
   useProbes,
@@ -218,7 +219,7 @@ const Models: React.FC = () => {
     isLoading: modelsLoading,
     error: modelsError,
   } = useModels({
-    include: includeParam,
+    include: includeParam as ModelsInclude,
     accessible: isStatusMode ? true : (!canManageGroups || showAccessibleOnly), // Status mode always filters to accessible, others use existing logic
   });
 
@@ -229,8 +230,8 @@ const Models: React.FC = () => {
     error: endpointsError,
   } = useEndpoints();
 
-  // Fetch probes data in status mode for timeline display
-  const { data: probesData } = useProbes({ enabled: isStatusMode });
+  // Fetch probes data for timeline display
+  const { data: probesData } = useProbes();
 
   const loading = modelsLoading || endpointsLoading;
   const error = modelsError
