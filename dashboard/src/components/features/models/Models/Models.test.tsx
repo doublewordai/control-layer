@@ -4,9 +4,18 @@ import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { setupServer } from "msw/node";
 import { http, HttpResponse } from "msw";
 import { ReactNode } from "react";
-import { describe, it, expect, beforeAll, afterEach, afterAll } from "vitest";
+import { describe, it, expect, beforeAll, afterEach, afterAll, vi } from "vitest";
 import Models from "./Models";
 import { handlers } from "../../../../api/control-layer/mocks/handlers";
+
+// Mock the authorization hook
+vi.mock("../../../../utils/authorization", () => ({
+  useAuthorization: vi.fn(() => ({
+    userRoles: ["PlatformManager"],
+    hasPermission: vi.fn(() => true),
+    canAccessRoute: vi.fn(() => true),
+  })),
+}));
 
 // Setup MSW server
 const server = setupServer(...handlers);
@@ -52,7 +61,7 @@ describe("Models Component", () => {
       // Check that the page header is displayed
       expect(screen.getByText("Models")).toBeInTheDocument();
       expect(
-        screen.getByText(/View available models by provider/),
+        screen.getByText(/View and monitor your deployed models/),
       ).toBeInTheDocument();
     });
   });
@@ -90,7 +99,7 @@ describe("Models Component", () => {
       expect(screen.getByText("Models")).toBeInTheDocument();
       // Should still render the page structure even with no models
       expect(
-        screen.getByText(/View available models by provider/),
+        screen.getByText(/View and monitor your deployed models/),
       ).toBeInTheDocument();
     });
   });
