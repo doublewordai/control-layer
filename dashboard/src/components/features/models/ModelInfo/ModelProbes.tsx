@@ -57,7 +57,7 @@ const ModelProbes: React.FC<ModelProbesProps> = ({ model }) => {
     { limit: 100 },
     { enabled: !!modelProbe },
   );
-  const { data: probeStats } = useProbeStatistics(
+  const { data: _probeStats } = useProbeStatistics(
     modelProbe?.id || "",
     undefined,
     { enabled: !!modelProbe },
@@ -73,7 +73,7 @@ const ModelProbes: React.FC<ModelProbesProps> = ({ model }) => {
       } else {
         toast.error(`Test failed: ${result.error_message || "Unknown error"}`);
       }
-    } catch (error) {
+    } catch {
       toast.error("Failed to test probe");
       setTestPassed(false);
     }
@@ -98,7 +98,7 @@ const ModelProbes: React.FC<ModelProbesProps> = ({ model }) => {
       setTestResult(null);
       setTestPassed(false);
       setIntervalSeconds(60);
-    } catch (error) {
+    } catch {
       toast.error("Failed to create probe");
     }
   };
@@ -107,7 +107,7 @@ const ModelProbes: React.FC<ModelProbesProps> = ({ model }) => {
     try {
       await deleteProbeMutation.mutateAsync(id);
       toast.success("Monitoring stopped");
-    } catch (error) {
+    } catch {
       toast.error("Failed to stop monitoring");
     }
   };
@@ -121,7 +121,7 @@ const ModelProbes: React.FC<ModelProbesProps> = ({ model }) => {
         await activateProbeMutation.mutateAsync(probe.id);
         toast.success("Probe resumed");
       }
-    } catch (error) {
+    } catch {
       toast.error("Failed to toggle probe");
     }
   };
@@ -135,7 +135,7 @@ const ModelProbes: React.FC<ModelProbesProps> = ({ model }) => {
         new Promise(resolve => setTimeout(resolve, 200))
       ]);
       toast.success("Probe executed");
-    } catch (error) {
+    } catch {
       toast.error("Failed to execute probe");
     } finally {
       setIsExecuting(false);
@@ -284,7 +284,7 @@ const ModelProbes: React.FC<ModelProbesProps> = ({ model }) => {
                                 });
                                 setEditingInterval(false);
                                 toast.success("Interval updated");
-                              } catch (error) {
+                              } catch {
                                 toast.error("Failed to update interval");
                               }
                             }}

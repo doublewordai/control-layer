@@ -219,7 +219,7 @@ impl ProbeManager {
             "#,
         )
         .bind(&probe.name)
-        .bind(&probe.deployment_id)
+        .bind(probe.deployment_id)
         .bind(probe.interval_seconds)
         .fetch_one(pool)
         .await

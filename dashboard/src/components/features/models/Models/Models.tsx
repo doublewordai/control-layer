@@ -14,7 +14,6 @@ import {
   Info,
   ChevronRight,
   LayoutGrid,
-  List,
 } from "lucide-react";
 import {
   useModels,
