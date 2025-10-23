@@ -235,7 +235,7 @@ const endpointApi = {
       let responseData;
       try {
         responseData = JSON.parse(responseText);
-      } catch (parseError) {
+      } catch {
         const error = new Error(responseText || `Failed to create endpoint: ${response.status}`);
         (error as any).status = response.status;
         throw error;
@@ -293,7 +293,7 @@ async update(id: string, data: EndpointUpdateRequest): Promise<Endpoint> {
       let responseData;
       try {
         responseData = JSON.parse(responseText);
-      } catch (parseError) {
+      } catch {
         const error = new Error(responseText || `Failed to update endpoint: ${response.status}`);
         (error as any).status = response.status;
         throw error;

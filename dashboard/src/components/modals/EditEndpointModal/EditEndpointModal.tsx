@@ -83,6 +83,25 @@ export const EditEndpointModal: React.FC<EditEndpointModalProps> = ({
 
   // Initialize form with endpoint data and fetch current deployments
   useEffect(() => {
+    
+    // Fetch current deployments to get actual aliases being used
+    const fetchCurrentDeployments = async () => {
+      try {
+        const currentModels = await dwctlApi.models.list({ endpoint: endpoint.id });
+  
+        // Build current alias mapping from deployed models
+        const currentAliases: Record<string, string> = {};
+        currentModels.forEach(model => {
+          currentAliases[model.model_name] = model.alias;
+        });
+        
+        setModelAliases(currentAliases);
+      } catch (error) {
+        console.error('Failed to fetch current deployments:', error);
+        // Graceful fallback - new models will default to model name as alias
+      }
+    };
+
     if (isOpen && endpoint) {
       form.reset({
         url: endpoint.url,
@@ -103,24 +122,6 @@ export const EditEndpointModal: React.FC<EditEndpointModalProps> = ({
       fetchCurrentDeployments();
     }
   }, [isOpen, endpoint, form]);
-
-  // Fetch current deployments to get actual aliases being used
-  const fetchCurrentDeployments = async () => {
-    try {
-      const currentModels = await dwctlApi.models.list({ endpoint: endpoint.id });
-
-      // Build current alias mapping from deployed models
-      const currentAliases: Record<string, string> = {};
-      currentModels.forEach(model => {
-        currentAliases[model.model_name] = model.alias;
-      });
-      
-      setModelAliases(currentAliases);
-    } catch (error) {
-      console.error('Failed to fetch current deployments:', error);
-      // Graceful fallback - new models will default to model name as alias
-    }
-  };
 
   // Check for duplicate aliases among currently selected models
   const checkLocalAliasConflicts = (updatedAliases?: Record<string, string>) => {
