@@ -233,9 +233,9 @@ export const CreateEndpointModal: React.FC<CreateEndpointModalProps> = ({
     // Build alias mapping - only include entries where alias differs from model name
     const aliasMapping: Record<string, string> = {};
     data.selectedModels.forEach(modelId => {
-      const alias = modelAliases[modelId] || modelId;
+      const alias = (modelAliases[modelId] || modelId).trim();
       if (alias !== modelId) {
-        aliasMapping[modelId] = alias.trim();
+        aliasMapping[modelId] = alias;
       }
     });
 

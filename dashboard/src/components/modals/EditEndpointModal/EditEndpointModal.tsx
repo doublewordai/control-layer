@@ -418,7 +418,7 @@ export const EditEndpointModal: React.FC<EditEndpointModalProps> = ({
                   {alias}
                 </span>
                 {alias !== model.id && !hasConflict && (
-                  <span className="text-xs text-blue-500">(custom)</span>
+                  <span className="text-xs text-blue-500" aria-label="Custom alias">(custom)</span>
                 )}
               </div>
               <Button
