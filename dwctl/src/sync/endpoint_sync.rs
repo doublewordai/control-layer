@@ -492,51 +492,39 @@ where
         existing_deployments_map.keys().cloned().collect()
     };
 
-    // 1. Update aliases for existing deployments that should remain
+    // --- 1. Batch alias conflict check for updates ---
+    // Collect all alias changes (model_name, new_alias, deployment_id)
+    let mut update_aliases = Vec::new();
+    let mut update_alias_strings = Vec::new();
+    let mut update_exclude_ids = Vec::new();
     for deployment in &current_deployments {
         if models_to_deploy.contains(&deployment.model_name) && !deployment.deleted {
             if let Some(new_alias) = alias_mapping.get(&deployment.model_name) {
-                let trimmed_alias = new_alias.trim();
+                let trimmed_alias = new_alias.trim().to_string();
                 if deployment.alias != trimmed_alias {
-                    // Get fresh conflict check data for this update
-                    let conflict_check = deployments_repo
-                        .list(&DeploymentFilter::new(0, 1000))
-                        .await
-                        .map_err(|e| SyncError::Other(e.into()))?;
-
-                    // Check for alias conflicts before updating (excluding this deployment)
-                    if conflict_check.iter().any(|d| d.alias == *trimmed_alias && d.id != deployment.id) {
-                        return Err(SyncError::AliasConflicts {
-                            conflicts: vec![AliasConflict {
-                                model_name: deployment.model_name.clone(),
-                                attempted_alias: trimmed_alias.to_string(),
-                            }],
-                        });
-                    }
-
-                    // Update the deployment alias
-                    let update_request = DeploymentUpdateDBRequest::alias_update(trimmed_alias.to_string());
-
-                    deployments_repo
-                        .update(deployment.id, &update_request)
-                        .await
-                        .map_err(|e| SyncError::Other(e.into()))?;
-
-                    changes_made += 1;
-                    tracing::info!(
-                        "Updated deployment {} alias from '{}' to '{}'",
-                        deployment.id,
-                        deployment.alias,
-                        trimmed_alias
-                    );
+                    update_aliases.push((deployment.model_name.clone(), trimmed_alias.clone(), deployment.id));
+                    update_alias_strings.push(trimmed_alias);
+                    update_exclude_ids.push(deployment.id);
                 }
             }
         }
     }
+    // Query for conflicts in one go (excluding the deployments being updated)
+    let mut conflict_update_aliases = HashSet::new();
+    if !update_alias_strings.is_empty() {
+        let filter = DeploymentFilter::new(0, 1000).with_aliases(update_alias_strings.clone());
+        let conflict_updates = deployments_repo.list(&filter).await.map_err(|e| SyncError::Other(e.into()))?;
+        for d in conflict_updates {
+            // Only treat as conflict if not the deployment being updated
+            if !update_exclude_ids.contains(&d.id) {
+                conflict_update_aliases.insert(d.alias.clone());
+            }
+        }
+    }
 
-    // 2. Create new deployments for models in the filter that don't exist yet
-    let system_user_id = uuid::Uuid::nil();
-
+    // --- 2. Batch alias conflict check for creations ---
+    let mut create_aliases = Vec::new();
+    let mut create_model_names = Vec::new();
     for model_name in &models_to_deploy {
         if !existing_deployments_map.contains_key(model_name) {
             // This model needs to be deployed
@@ -544,53 +532,97 @@ where
                 .get(model_name)
                 .cloned()
                 .unwrap_or_else(|| model_name.clone())
-                .trim() // ADD THIS LINE - always trim the alias
+                .trim()
                 .to_string();
+            create_aliases.push(alias.clone());
+            create_model_names.push(model_name.clone());
+        }
+    }
+    let mut conflict_create_aliases = HashSet::new();
+    if !create_aliases.is_empty() {
+        let filter = DeploymentFilter::new(0, 1000).with_aliases(create_aliases.clone());
+        let conflict_creates = deployments_repo.list(&filter).await.map_err(|e| SyncError::Other(e.into()))?;
+        for d in conflict_creates {
+            conflict_create_aliases.insert(d.alias.clone());
+        }
+    }
 
-            // Check for alias conflicts before creating
-            let conflict_check = deployments_repo
-                .list(&DeploymentFilter::new(0, 1000))
-                .await
-                .map_err(|e| SyncError::Other(e.into()))?;
+    // --- 3. Apply updates, error if conflicts found ---
+    // Check for intra-batch duplicate aliases in updates
+    let mut seen = std::collections::HashSet::new();
+    let mut intra_batch_conflicts = Vec::new();
+    for (_, alias, _) in &update_aliases {
+        if !seen.insert(alias) {
+            intra_batch_conflicts.push(alias.clone());
+        }
+    }
+    if !intra_batch_conflicts.is_empty() {
+        return Err(SyncError::AliasConflicts {
+            conflicts: intra_batch_conflicts
+                .into_iter()
+                .map(|alias| AliasConflict {
+                    model_name: "<multiple>".to_string(),
+                    attempted_alias: alias,
+                })
+                .collect(),
+        });
+    }
 
-            if conflict_check.iter().any(|d| d.alias == alias) {
-                return Err(SyncError::AliasConflicts {
-                    conflicts: vec![AliasConflict {
-                        model_name: model_name.clone(),
-                        attempted_alias: alias,
-                    }],
-                });
+    for (model_name, new_alias, deployment_id) in update_aliases {
+        if conflict_update_aliases.contains(&new_alias) {
+            return Err(SyncError::AliasConflicts {
+                conflicts: vec![AliasConflict {
+                    model_name,
+                    attempted_alias: new_alias,
+                }],
+            });
+        }
+        let update_request = DeploymentUpdateDBRequest::alias_update(new_alias.clone());
+        deployments_repo
+            .update(deployment_id, &update_request)
+            .await
+            .map_err(|e| SyncError::Other(e.into()))?;
+        changes_made += 1;
+        tracing::info!("Updated deployment {} alias to '{}'", deployment_id, new_alias);
+    }
+
+    // --- 4. Create new deployments, error if conflicts found ---
+    let system_user_id = uuid::Uuid::nil();
+    for (model_name, alias) in create_model_names.into_iter().zip(create_aliases.into_iter()) {
+        if conflict_create_aliases.contains(&alias) {
+            return Err(SyncError::AliasConflicts {
+                conflicts: vec![AliasConflict {
+                    model_name,
+                    attempted_alias: alias,
+                }],
+            });
+        }
+        let db_request = DeploymentCreateDBRequest::builder()
+            .created_by(system_user_id)
+            .model_name(model_name.clone())
+            .alias(alias.clone())
+            .hosted_on(endpoint.id)
+            .build();
+
+        match deployments_repo.create(&db_request).await {
+            Ok(_) => {
+                new_models_created += 1;
+                changes_made += 1;
+                tracing::info!(
+                    "Created new deployment for model '{}' with alias '{}' on endpoint {}",
+                    model_name,
+                    alias,
+                    endpoint.id
+                );
             }
-
-            // Create the new deployment
-            let db_request = DeploymentCreateDBRequest::builder()
-                .created_by(system_user_id)
-                .model_name(model_name.clone())
-                .alias(alias.clone())
-                .hosted_on(endpoint.id)
-                .build();
-
-            match deployments_repo.create(&db_request).await {
-                Ok(_) => {
-                    new_models_created += 1;
-                    changes_made += 1;
-                    tracing::info!(
-                        "Created new deployment for model '{}' with alias '{}' on endpoint {}",
-                        model_name,
-                        alias,
-                        endpoint.id
-                    );
-                }
-                Err(e) => {
-                    tracing::error!("Failed to create deployment for model '{}': {}", model_name, e);
-                    return Err(SyncError::Other(e.into()));
-                }
+            Err(e) => {
+                tracing::error!("Failed to create deployment for model '{}': {}", model_name, e);
+                return Err(SyncError::Other(e.into()));
             }
         }
     }
 
-    // 3. Remove deployments for models that are no longer in the filter
-    // Only do this if we have a model_filter (if None, keep all existing)
+    // 5. Remove deployments for models that are no longer in the filter
     if endpoint.model_filter.is_some() {
         for deployment in &current_deployments {
             if !models_to_deploy.contains(&deployment.model_name) && !deployment.deleted {

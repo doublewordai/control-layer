@@ -21,6 +21,7 @@ pub struct DeploymentFilter {
     pub statuses: Option<Vec<ModelStatus>>,
     pub deleted: Option<bool>, // None = show all, Some(false) = show non-deleted only, Some(true) = show deleted only
     pub accessible_to: Option<UserId>, // None = show all deployments, Some(user_id) = show only deployments accessible to that user
+    pub aliases: Option<Vec<String>>,
 }
 
 impl DeploymentFilter {
@@ -32,6 +33,7 @@ impl DeploymentFilter {
             statuses: None,
             deleted: None,       // Default: show all models
             accessible_to: None, // Default: show all deployments
+            aliases: None,
         }
     }
 
@@ -52,6 +54,11 @@ impl DeploymentFilter {
 
     pub fn with_statuses(mut self, statuses: Vec<ModelStatus>) -> Self {
         self.statuses = Some(statuses);
+        self
+    }
+
+    pub fn with_aliases(mut self, aliases: Vec<String>) -> Self {
+        self.aliases = Some(aliases);
         self
     }
 }
@@ -429,6 +436,15 @@ impl<'c> Repository for Deployments<'c> {
         if let Some(deleted) = filter.deleted {
             query.push(" AND deleted = ");
             query.push_bind(deleted);
+        }
+
+        // Add aliases filter if specified
+        if let Some(ref aliases) = filter.aliases {
+            if !aliases.is_empty() {
+                query.push(" AND alias = ANY(");
+                query.push_bind(aliases);
+                query.push(")");
+            }
         }
 
         // Add accessibility filter if specified
