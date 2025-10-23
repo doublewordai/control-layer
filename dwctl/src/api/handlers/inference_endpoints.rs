@@ -1,7 +1,7 @@
 use crate::{
     api::models::inference_endpoints::{
         InferenceEndpointCreate, InferenceEndpointResponse, InferenceEndpointUpdate, InferenceEndpointValidate,
-        InferenceEndpointValidateResponse, ListEndpointsQuery, OpenAIModelsResponse, OpenAIModel,
+        InferenceEndpointValidateResponse, ListEndpointsQuery, OpenAIModel, OpenAIModelsResponse,
     },
     auth::permissions::{operation, resource, RequiresPermission},
     db::{
@@ -465,6 +465,7 @@ pub async fn synchronize_endpoint(
 
 #[cfg(test)]
 mod tests {
+    use crate::api::models::deployments::DeployedModelResponse;
     use crate::api::models::inference_endpoints::InferenceEndpointResponse;
     use crate::api::models::users::Role;
     use crate::test_utils::*;
@@ -1935,5 +1936,40 @@ mod tests {
         if let Some(conflicts) = body.get("conflicts") {
             assert!(conflicts.is_null() || conflicts.as_array().unwrap().is_empty());
         }
+    }
+
+    #[sqlx::test]
+    #[test_log::test]
+    async fn test_create_endpoint_no_alias_mapping_defaults_to_model_name(pool: PgPool) {
+        let (app, _) = create_test_app(pool.clone(), false).await;
+        let admin_user = create_test_admin_user(&pool, Role::PlatformManager).await;
+
+        let create_request = json!({
+            "name": "Default Alias Endpoint",
+            "url": "https://api.defaultalias.com/v1",
+            "sync": true
+            // no alias_mapping
+        });
+
+        let response = app
+            .post("/admin/api/v1/endpoints")
+            .add_header(add_auth_headers(&admin_user).0, add_auth_headers(&admin_user).1)
+            .json(&create_request)
+            .await;
+
+        response.assert_status(axum::http::StatusCode::CREATED);
+        let endpoint: InferenceEndpointResponse = response.json();
+
+        // Now fetch deployments for this endpoint (you may need to add an API or DB helper for this)
+        // For demonstration, let's assume you have a helper:
+        let response = app
+            .get(&format!("/admin/api/v1/models?endpoint={}", endpoint.id))
+            .add_header(add_auth_headers(&admin_user).0, add_auth_headers(&admin_user).1)
+            .await;
+
+        response.assert_status_ok();
+        let deployments: Vec<DeployedModelResponse> = response.json();
+        assert!(deployments.iter().any(|d| d.alias == "google/gemma-3-12b-it"));
+        assert!(deployments.iter().any(|d| d.alias == "openai/gpt-4"));
     }
 }

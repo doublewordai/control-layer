@@ -511,15 +511,17 @@ mod tests {
     use crate::{
         api::models::users::{Role, UserCreate, UserResponse},
         db::{
-            handlers::{Groups, Users},
+            handlers::{inference_endpoints::InferenceEndpoints, Groups, Users},
             models::{
                 deployments::{ModelPricing, ModelPricingUpdate, ProviderPricing, ProviderPricingUpdate, TokenPricing, TokenPricingUpdate},
                 groups::GroupCreateDBRequest,
+                inference_endpoints::InferenceEndpointCreateDBRequest,
                 users::UserCreateDBRequest,
             },
         },
         test_utils::get_test_endpoint_id,
     };
+
     use rust_decimal::Decimal;
     use sqlx::{Acquire, PgPool};
     use std::str::FromStr;
@@ -2093,5 +2095,96 @@ mod tests {
             .with_statuses(vec![ModelStatus::Inactive]);
         let models = repo.list(&filter).await.unwrap();
         assert!(models.iter().any(|m| m.id == deployment.id));
+    }
+
+    #[sqlx::test]
+    #[test_log::test]
+    async fn test_create_deployment_alias_conflict(pool: PgPool) {
+        let user = create_test_user(&pool).await;
+
+        let mut conn = pool.acquire().await.unwrap();
+        let mut endpoints_repo = InferenceEndpoints::new(&mut conn);
+        let endpoint_create = InferenceEndpointCreateDBRequest {
+            name: format!("test-endpoint-{}", uuid::Uuid::new_v4()),
+            url: url::Url::parse("http://localhost:8080").unwrap(),
+            api_key: None,
+            description: None,
+            model_filter: None,
+            created_by: user.id,
+        };
+        let endpoint = endpoints_repo.create(&endpoint_create).await.unwrap();
+        let test_endpoint_id = endpoint.id;
+
+        let mut repo = Deployments::new(&mut conn);
+
+        // Create the first deployment with a unique alias
+        let model_create1 = DeploymentCreateDBRequest::builder()
+            .created_by(user.id)
+            .model_name("model-1".to_string())
+            .alias("shared-alias".to_string())
+            .hosted_on(test_endpoint_id)
+            .build();
+        let _ = repo.create(&model_create1).await.unwrap();
+
+        // Try to create another deployment with the same alias (should fail)
+        let model_create2 = DeploymentCreateDBRequest::builder()
+            .created_by(user.id)
+            .model_name("model-2".to_string())
+            .alias("shared-alias".to_string())
+            .hosted_on(test_endpoint_id)
+            .build();
+        let result = repo.create(&model_create2).await;
+
+        match result {
+            Err(crate::db::errors::DbError::UniqueViolation { .. }) => { /* expected */ }
+            _ => panic!("Expected UniqueViolation error for alias"),
+        }
+    }
+
+    #[sqlx::test]
+    #[test_log::test]
+    async fn test_update_deployment_alias_conflict(pool: PgPool) {
+        let user = create_test_user(&pool).await;
+        let mut conn = pool.acquire().await.unwrap();
+
+        let mut endpoints_repo = InferenceEndpoints::new(&mut conn);
+        let endpoint_create = InferenceEndpointCreateDBRequest {
+            name: format!("test-endpoint-{}", uuid::Uuid::new_v4()),
+            url: url::Url::parse("http://localhost:8080").unwrap(),
+            api_key: None,
+            description: None,
+            model_filter: None,
+            created_by: user.id,
+        };
+        let endpoint = endpoints_repo.create(&endpoint_create).await.unwrap();
+        let test_endpoint_id = endpoint.id;
+
+        let mut repo = Deployments::new(&mut conn);
+
+        // Create two deployments with unique aliases
+        let model_create1 = DeploymentCreateDBRequest::builder()
+            .created_by(user.id)
+            .model_name("model-1".to_string())
+            .alias("alias-1".to_string())
+            .hosted_on(test_endpoint_id)
+            .build();
+        let _deployment1 = repo.create(&model_create1).await.unwrap();
+
+        let model_create2 = DeploymentCreateDBRequest::builder()
+            .created_by(user.id)
+            .model_name("model-2".to_string())
+            .alias("alias-2".to_string())
+            .hosted_on(test_endpoint_id)
+            .build();
+        let deployment2 = repo.create(&model_create2).await.unwrap();
+
+        // Try to update deployment2 to use alias-1 (should fail)
+        let update = DeploymentUpdateDBRequest::builder().alias("alias-1".to_string()).build();
+        let result = repo.update(deployment2.id, &update).await;
+
+        match result {
+            Err(crate::db::errors::DbError::UniqueViolation { .. }) => { /* expected */ }
+            _ => panic!("Expected UniqueViolation error for alias update"),
+        }
     }
 }
