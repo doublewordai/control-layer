@@ -1092,4 +1092,9 @@ export const handlers = [
     const result = computeUserUsageByModel(model, startDate, endDate);
     return HttpResponse.json(result);
   }),
+
+  // Probes API
+  http.get("/admin/api/v1/probes", () => {
+    return HttpResponse.json([]);
+  }),
 ];

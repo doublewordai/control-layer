@@ -34,6 +34,10 @@ import type {
   PasswordResetRequest,
   PasswordResetConfirmRequest,
   ChangePasswordRequest,
+  Probe,
+  CreateProbeRequest,
+  ProbeResult,
+  ProbeStatistics,
 } from "./types";
 import { ApiError } from "./errors";
 
@@ -575,6 +579,131 @@ const authApi = {
   },
 };
 
+// Probes API
+const probesApi = {
+  async list(status?: string): Promise<Probe[]> {
+    const params = new URLSearchParams();
+    if (status) params.set("status", status);
+
+    const url = `/admin/api/v1/probes${params.toString() ? "?" + params.toString() : ""}`;
+    const response = await fetch(url);
+    if (!response.ok) {
+      throw new Error(`Failed to fetch probes: ${response.status}`);
+    }
+    return response.json();
+  },
+
+  async get(id: string): Promise<Probe> {
+    const response = await fetch(`/admin/api/v1/probes/${id}`);
+    if (!response.ok) {
+      throw new Error(`Failed to fetch probe: ${response.status}`);
+    }
+    return response.json();
+  },
+
+  async create(data: CreateProbeRequest): Promise<Probe> {
+    const response = await fetch("/admin/api/v1/probes", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(data),
+    });
+    if (!response.ok) {
+      throw new Error(`Failed to create probe: ${response.status}`);
+    }
+    return response.json();
+  },
+
+  async delete(id: string): Promise<void> {
+    const response = await fetch(`/admin/api/v1/probes/${id}`, {
+      method: "DELETE",
+    });
+    if (!response.ok) {
+      throw new Error(`Failed to delete probe: ${response.status}`);
+    }
+  },
+
+  async activate(id: string): Promise<Probe> {
+    const response = await fetch(`/admin/api/v1/probes/${id}/activate`, {
+      method: "PATCH",
+    });
+    if (!response.ok) {
+      throw new Error(`Failed to activate probe: ${response.status}`);
+    }
+    return response.json();
+  },
+
+  async deactivate(id: string): Promise<Probe> {
+    const response = await fetch(`/admin/api/v1/probes/${id}/deactivate`, {
+      method: "PATCH",
+    });
+    if (!response.ok) {
+      throw new Error(`Failed to deactivate probe: ${response.status}`);
+    }
+    return response.json();
+  },
+
+  async update(id: string, data: { interval_seconds?: number }): Promise<Probe> {
+    const response = await fetch(`/admin/api/v1/probes/${id}`, {
+      method: "PATCH",
+      headers: {
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify(data),
+    });
+    if (!response.ok) {
+      throw new Error(`Failed to update probe: ${response.status}`);
+    }
+    return response.json();
+  },
+
+  async execute(id: string): Promise<ProbeResult> {
+    const response = await fetch(`/admin/api/v1/probes/${id}/execute`, {
+      method: "POST",
+    });
+    if (!response.ok) {
+      throw new Error(`Failed to execute probe: ${response.status}`);
+    }
+    return response.json();
+  },
+
+  async test(deploymentId: string): Promise<ProbeResult> {
+    const response = await fetch(`/admin/api/v1/probes/test/${deploymentId}`, {
+      method: "POST",
+    });
+    if (!response.ok) {
+      throw new Error(`Failed to test probe: ${response.status}`);
+    }
+    return response.json();
+  },
+
+  async getResults(id: string, params?: { start_time?: string; end_time?: string; limit?: number }): Promise<ProbeResult[]> {
+    const queryParams = new URLSearchParams();
+    if (params?.start_time) queryParams.set("start_time", params.start_time);
+    if (params?.end_time) queryParams.set("end_time", params.end_time);
+    if (params?.limit) queryParams.set("limit", params.limit.toString());
+
+    const url = `/admin/api/v1/probes/${id}/results${queryParams.toString() ? "?" + queryParams.toString() : ""}`;
+    const response = await fetch(url);
+    if (!response.ok) {
+      throw new Error(`Failed to fetch probe results: ${response.status}`);
+    }
+    return response.json();
+  },
+
+  async getStatistics(id: string, params?: { start_time?: string; end_time?: string }): Promise<ProbeStatistics> {
+    const queryParams = new URLSearchParams();
+    if (params?.start_time) queryParams.set("start_time", params.start_time);
+    if (params?.end_time) queryParams.set("end_time", params.end_time);
+
+    const url = `/admin/api/v1/probes/${id}/statistics${queryParams.toString() ? "?" + queryParams.toString() : ""}`;
+    const response = await fetch(url);
+    if (!response.ok) {
+      throw new Error(`Failed to fetch probe statistics: ${response.status}`);
+    }
+    return response.json();
+  },
+};
+
 // Main nested API object
 export const dwctlApi = {
   users: userApi,
@@ -584,4 +713,5 @@ export const dwctlApi = {
   config: configApi,
   requests: requestsApi,
   auth: authApi,
+  probes: probesApi,
 };

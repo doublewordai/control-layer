@@ -7,6 +7,7 @@ mod email;
 mod errors;
 mod metrics;
 mod openapi;
+mod probes;
 mod request_logging;
 mod static_assets;
 mod sync;
@@ -42,6 +43,8 @@ use outlet::{RequestLoggerConfig, RequestLoggerLayer};
 use outlet_postgres::PostgresHandler;
 use request_logging::{AiRequest, AiResponse};
 use sqlx::{ConnectOptions, Executor, PgPool};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use std::time::Duration;
 use tokio::net::TcpListener;
 use tower::Layer;
@@ -60,6 +63,9 @@ pub struct AppState {
     pub config: Config,
     pub outlet_db: Option<PgPool>,
     pub metrics_recorder: Option<GenAiMetrics>,
+    pub probe_manager: Option<probes::ProbeManager>,
+    #[builder(default = false)]
+    pub is_leader: bool,
 }
 
 /// Create the initial admin user if it doesn't exist
@@ -111,6 +117,99 @@ pub async fn create_initial_admin_user(email: &str, password: Option<&str>, db: 
 
     tx.commit().await?;
     Ok(created_user.id)
+}
+
+/// Background task for leader election
+/// Runs periodically to maintain leadership or attempt to acquire it
+///
+/// We use leadership election for figuring out who runs background tasks like sending probes to
+/// the endpoints. At some point, we may want to expand this to other tasks as well.
+///
+/// PostgreSQL advisory locks are session-based, so we need to maintain a dedicated connection
+/// for the entire duration we want to hold the lock.
+#[instrument(skip(pool, config, lock_id, on_gain_leadership, on_lose_leadership))]
+async fn leader_election_task<F1, F2, Fut1, Fut2>(
+    pool: PgPool,
+    config: config::Config,
+    is_leader: Arc<AtomicBool>,
+    lock_id: i64,
+    on_gain_leadership: F1,
+    on_lose_leadership: F2,
+) where
+    F1: Fn(PgPool, config::Config) -> Fut1 + Send + 'static,
+    F2: Fn(PgPool, config::Config) -> Fut2 + Send + 'static,
+    Fut1: std::future::Future<Output = Result<(), anyhow::Error>> + Send + 'static,
+    Fut2: std::future::Future<Output = Result<(), anyhow::Error>> + Send + 'static,
+{
+    let mut interval = tokio::time::interval(std::time::Duration::from_secs(30));
+    let mut leader_conn: Option<sqlx::pool::PoolConnection<sqlx::Postgres>> = None;
+
+    loop {
+        interval.tick().await;
+
+        let current_status = is_leader.load(Ordering::Relaxed);
+
+        // If we're not leader, try to acquire the lock
+        if !current_status {
+            // Try to acquire a connection and the lock
+            match pool.acquire().await {
+                Ok(mut conn) => {
+                    match sqlx::query_scalar::<_, bool>("SELECT pg_try_advisory_lock($1)")
+                        .bind(lock_id)
+                        .fetch_one(&mut *conn)
+                        .await
+                    {
+                        Ok(true) => {
+                            // Successfully acquired lock!
+                            info!("Gained leadership");
+                            is_leader.store(true, Ordering::Relaxed);
+                            leader_conn = Some(conn); // Keep connection alive
+
+                            if let Err(e) = on_gain_leadership(pool.clone(), config.clone()).await {
+                                tracing::error!("Failed to execute on_gain_leadership callback: {}", e);
+                            }
+                        }
+                        Ok(false) => {
+                            // Someone else has the lock
+                            debug!("Following - will retry");
+                        }
+                        Err(e) => {
+                            tracing::error!("Failed to check leader lock: {}", e);
+                        }
+                    }
+                }
+                Err(e) => {
+                    tracing::error!("Failed to acquire connection for leader election: {}", e);
+                }
+            }
+        } else {
+            // We think we're leader - verify we still hold the lock
+            // by checking if our connection is still valid
+            if let Some(ref mut conn) = leader_conn {
+                // Ping the connection to keep it alive
+                match sqlx::query("SELECT 1").execute(&mut **conn).await {
+                    Ok(_) => {
+                        debug!("✓ Leadership renewed (connection alive)");
+                    }
+                    Err(e) => {
+                        // Connection died, which will drop the advisory lock, we lost leadership
+                        tracing::warn!("Lost leadership (connection died): {}", e);
+                        info!("Lost leadership");
+                        is_leader.store(false, Ordering::Relaxed);
+                        leader_conn = None;
+
+                        if let Err(e) = on_lose_leadership(pool.clone(), config.clone()).await {
+                            tracing::error!("Failed to execute on_lose_leadership callback: {}", e);
+                        }
+                    }
+                }
+            } else {
+                // We think we're leader but have no connection, this can't happen
+                tracing::error!("Inconsistent state: is_leader=true but no connection");
+                is_leader.store(false, Ordering::Relaxed);
+            }
+        }
+    }
 }
 
 /// Seed the database with initial configuration (run only once)
@@ -246,6 +345,7 @@ async fn spa_fallback(uri: Uri) -> Result<Html<String>, StatusCode> {
 pub async fn setup_app(
     pool: PgPool,
     config: Config,
+    skip_leader_election: bool,
 ) -> anyhow::Result<(Router, sync::onwards_config::OnwardsConfigSync, tokio_util::sync::DropGuard)> {
     debug!("Setting up application");
     // Seed database with initial configuration (only runs once)
@@ -264,7 +364,68 @@ pub async fn setup_app(
         let _ = initial_targets.receive_updates(onwards_stream).await;
     });
 
-    let mut app_state = AppState::builder().db(pool).config(config).build();
+    // Leader election lock ID: 0x44574354_50524F42 (DWCT_PROB in hex for "dwctl probes")
+    const LEADER_LOCK_ID: i64 = 0x4457_4354_5052_4F42_i64;
+
+    let probe_manager = probes::ProbeManager::new();
+    let is_leader: bool;
+
+    if skip_leader_election {
+        // Skip leader election - just become leader immediately
+        is_leader = true;
+        probe_manager.initialize_schedulers(&pool, config.clone()).await?;
+        info!("Skipping leader election - running as leader");
+    } else {
+        // Normal leader election
+        is_leader = false;
+        info!("Starting leader election - will attempt to acquire leadership");
+
+        let is_leader_flag = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+
+        // Spawn leader election background task
+        let leader_election_pool = pool.clone();
+        let leader_election_manager_gain = probe_manager.clone();
+        let leader_election_manager_lose = probe_manager.clone();
+        let leader_election_config = config.clone();
+        let leader_election_flag = is_leader_flag.clone();
+        tokio::spawn(async move {
+            leader_election_task(
+                leader_election_pool,
+                leader_election_config,
+                leader_election_flag,
+                LEADER_LOCK_ID,
+                move |pool, config| {
+                    let manager = leader_election_manager_gain.clone();
+                    async move {
+                        // Wait for the server to be fully up before starting probes
+                        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+
+                        manager
+                            .initialize_schedulers(&pool, config)
+                            .await
+                            .map_err(|e| anyhow::anyhow!("Failed to initialize schedulers: {}", e))
+                    }
+                },
+                move |_pool, _config| {
+                    let manager = leader_election_manager_lose.clone();
+                    async move {
+                        manager
+                            .stop_all_schedulers()
+                            .await
+                            .map_err(|e| anyhow::anyhow!("Failed to stop schedulers: {}", e))
+                    }
+                },
+            )
+            .await;
+        });
+    }
+
+    let mut app_state = AppState::builder()
+        .db(pool)
+        .config(config)
+        .probe_manager(probe_manager)
+        .is_leader(is_leader)
+        .build();
     let router = build_router(&mut app_state, onwards_router).await?;
 
     Ok((router, onwards_config_sync, drop_guard))
@@ -431,6 +592,18 @@ pub async fn build_router(state: &mut AppState, onwards_router: Router) -> anyho
         .route("/requests", get(api::handlers::requests::list_requests))
         .route("/requests/aggregate", get(api::handlers::requests::aggregate_requests))
         .route("/requests/aggregate-by-user", get(api::handlers::requests::aggregate_by_user))
+        // Probes management
+        .route("/probes", get(api::handlers::probes::list_probes))
+        .route("/probes", post(api::handlers::probes::create_probe))
+        .route("/probes/test/{deployment_id}", post(api::handlers::probes::test_probe))
+        .route("/probes/{id}", get(api::handlers::probes::get_probe))
+        .route("/probes/{id}", patch(api::handlers::probes::update_probe))
+        .route("/probes/{id}", delete(api::handlers::probes::delete_probe))
+        .route("/probes/{id}/activate", patch(api::handlers::probes::activate_probe))
+        .route("/probes/{id}/deactivate", patch(api::handlers::probes::deactivate_probe))
+        .route("/probes/{id}/execute", post(api::handlers::probes::execute_probe))
+        .route("/probes/{id}/results", get(api::handlers::probes::get_probe_results))
+        .route("/probes/{id}/statistics", get(api::handlers::probes::get_statistics))
         .layer(
             TraceLayer::new_for_http()
                 .make_span_with(|request: &Request<_>| {
@@ -577,7 +750,7 @@ async fn main() -> anyhow::Result<()> {
         .map_err(|e| anyhow::anyhow!("Failed to create initial admin user: {}", e))?;
 
     // Setup the complete application
-    let (router, onwards_config_sync, _drop_guard) = setup_app(pool.clone(), config.clone()).await?;
+    let (router, onwards_config_sync, _drop_guard) = setup_app(pool.clone(), config.clone(), false).await?;
 
     // Apply middleware at root level BEFORE routing decisions are made
     let middleware = from_fn_with_state(
@@ -667,7 +840,7 @@ mod test {
     #[test_log::test]
     async fn test_admin_ai_proxy_middleware_with_user_access(pool: PgPool) {
         // Create test app with sync enabled
-        let (router, onwards_config_sync, _drop_guard) = crate::setup_app(pool.clone(), crate::test_utils::create_test_config())
+        let (router, onwards_config_sync, _drop_guard) = crate::setup_app(pool.clone(), crate::test_utils::create_test_config(), true)
             .await
             .expect("Failed to setup test app");
 
@@ -1065,7 +1238,7 @@ mod test {
         let config = create_test_config();
 
         // Call setup_app
-        let result = super::setup_app(pool.clone(), config).await;
+        let result = super::setup_app(pool.clone(), config, true).await;
         assert!(result.is_ok(), "setup_app should succeed");
 
         let (router, _onwards_sync, _drop_guard) = result.unwrap();

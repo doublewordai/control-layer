@@ -38,6 +38,9 @@ pub mod resource {
     #[derive(Default)]
     pub struct ModelRateLimits;
 
+    #[derive(Default)]
+    pub struct Probes;
+
     // Convert type-level markers to enum values using Into
     impl From<Users> for Resource {
         fn from(_: Users) -> Resource {
@@ -82,6 +85,11 @@ pub mod resource {
     impl From<ModelRateLimits> for Resource {
         fn from(_: ModelRateLimits) -> Resource {
             Resource::ModelRateLimits
+        }
+    }
+    impl From<Probes> for Resource {
+        fn from(_: Probes) -> Resource {
+            Resource::Probes
         }
     }
 }

@@ -7,6 +7,7 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use serde_with::rust::double_option;
 use utoipa::{IntoParams, ToSchema};
+use uuid::Uuid;
 
 /// Query parameters for listing deployed models
 /// TODO: Pagination
@@ -114,6 +115,18 @@ pub struct DeployedModelUpdateRequest {
     pub deployed_model: DeployedModelUpdate,
 }
 
+/// Probe status information for a model (only included when include=status)
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct ModelProbeStatus {
+    #[schema(value_type = Option<String>, format = "uuid")]
+    pub probe_id: Option<Uuid>,
+    pub active: bool,
+    pub interval_seconds: Option<i32>,
+    pub last_check: Option<DateTime<Utc>>,
+    pub last_success: Option<bool>,
+    pub uptime_percentage: Option<f64>,
+}
+
 /// API response for a deployed model
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct DeployedModelResponse {
@@ -145,6 +158,9 @@ pub struct DeployedModelResponse {
     /// Model usage metrics (only included if requested)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub metrics: Option<ModelMetrics>,
+    /// Probe status (only included if requested)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub status: Option<ModelProbeStatus>,
     /// Customer-facing pricing rates (only included if requested)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub pricing: Option<TokenPricing>,
@@ -170,6 +186,7 @@ impl From<DeploymentDBResponse> for DeployedModelResponse {
             burst_size: db.burst_size,
             groups: None,             // By default, relationships are not included
             metrics: None,            // By default, metrics are not included
+            status: None,             // By default, probe status is not included
             pricing: None,            // By default, pricing is not included (opt-in via include)
             downstream_pricing: None, // By default, downstream pricing is not included
         }
@@ -186,6 +203,12 @@ impl DeployedModelResponse {
     /// Create a response with metrics included
     pub fn with_metrics(mut self, metrics: ModelMetrics) -> Self {
         self.metrics = Some(metrics);
+        self
+    }
+
+    /// Create a response with probe status included
+    pub fn with_status(mut self, status: ModelProbeStatus) -> Self {
+        self.status = Some(status);
         self
     }
 
