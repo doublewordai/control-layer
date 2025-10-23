@@ -48,18 +48,18 @@ impl ProbeManager {
     ///
     /// This should be called on application startup to resume monitoring
     /// for all probes that were active when the service last shutdown.
-    pub async fn initialize_schedulers(&self, pool: &PgPool) -> Result<(), AppError> {
+    pub async fn initialize_schedulers(&self, pool: &PgPool, config: crate::config::Config) -> Result<(), AppError> {
         let probes = Self::list_active_probes(pool).await?;
 
         for probe in probes {
-            self.start_scheduler(pool.clone(), probe.id).await?;
+            self.start_scheduler(pool.clone(), probe.id, config.clone()).await?;
         }
 
         Ok(())
     }
 
     /// Start a scheduler for a probe
-    pub async fn start_scheduler(&self, pool: PgPool, probe_id: Uuid) -> Result<(), AppError> {
+    pub async fn start_scheduler(&self, pool: PgPool, probe_id: Uuid, config: crate::config::Config) -> Result<(), AppError> {
         // Check if scheduler already exists
         {
             let schedulers = self.schedulers.read().await;
@@ -140,7 +140,7 @@ impl ProbeManager {
                 }
 
                 // Execute the probe
-                match Self::execute_probe(&pool, probe_id).await {
+                match Self::execute_probe(&pool, probe_id, &config).await {
                     Ok(result) => {
                         if result.success {
                             tracing::debug!(
@@ -149,11 +149,7 @@ impl ProbeManager {
                                 result.response_time_ms.unwrap_or(0)
                             );
                         } else {
-                            tracing::warn!(
-                                "Probe {} execution failed: {:?}",
-                                probe.name,
-                                result.error_message
-                            );
+                            tracing::warn!("Probe {} execution failed: {:?}", probe.name, result.error_message);
                         }
                     }
                     Err(e) => {
@@ -162,10 +158,7 @@ impl ProbeManager {
                 }
 
                 // Sleep for the configured interval
-                tokio::time::sleep(tokio::time::Duration::from_secs(
-                    probe.interval_seconds as u64,
-                ))
-                .await;
+                tokio::time::sleep(tokio::time::Duration::from_secs(probe.interval_seconds as u64)).await;
             }
 
             tracing::info!("Scheduler for probe {} has stopped", probe_id);
@@ -190,6 +183,23 @@ impl ProbeManager {
         Ok(())
     }
 
+    /// Stop all running schedulers (used when losing leadership)
+    pub async fn stop_all_schedulers(&self) -> Result<(), AppError> {
+        let mut schedulers = self.schedulers.write().await;
+        let count = schedulers.len();
+
+        for (probe_id, handle) in schedulers.drain() {
+            handle.abort();
+            tracing::debug!("Stopped scheduler for probe {}", probe_id);
+        }
+
+        if count > 0 {
+            tracing::info!("Stopped {} probe schedulers", count);
+        }
+
+        Ok(())
+    }
+
     /// Check if a scheduler is running for a probe
     pub async fn is_scheduler_running(&self, probe_id: Uuid) -> bool {
         let schedulers = self.schedulers.read().await;
@@ -200,7 +210,7 @@ impl ProbeManager {
     ///
     /// The probe is created as active by default and a background scheduler
     /// is started immediately to execute the probe at its configured interval.
-    pub async fn create_probe(&self, pool: &PgPool, probe: CreateProbe) -> Result<Probe, AppError> {
+    pub async fn create_probe(&self, pool: &PgPool, probe: CreateProbe, config: crate::config::Config) -> Result<Probe, AppError> {
         let result = sqlx::query_as::<_, Probe>(
             r#"
             INSERT INTO probes (name, deployment_id, interval_seconds, active)
@@ -216,7 +226,7 @@ impl ProbeManager {
         .map_err(|e| anyhow::anyhow!("Failed to create probe: {}", e))?;
 
         // Auto-start scheduler for new probes
-        self.start_scheduler(pool.clone(), result.id).await?;
+        self.start_scheduler(pool.clone(), result.id, config).await?;
 
         Ok(result)
     }
@@ -292,7 +302,20 @@ impl ProbeManager {
     pub async fn get_deployment_statuses(
         pool: &PgPool,
         deployment_ids: &[Uuid],
-    ) -> Result<std::collections::HashMap<Uuid, (Option<Uuid>, bool, Option<i32>, Option<chrono::DateTime<chrono::Utc>>, Option<bool>, Option<f64>)>, AppError> {
+    ) -> Result<
+        std::collections::HashMap<
+            Uuid,
+            (
+                Option<Uuid>,
+                bool,
+                Option<i32>,
+                Option<chrono::DateTime<chrono::Utc>>,
+                Option<bool>,
+                Option<f64>,
+            ),
+        >,
+        AppError,
+    > {
         if deployment_ids.is_empty() {
             return Ok(std::collections::HashMap::new());
         }
@@ -335,7 +358,9 @@ impl ProbeManager {
 
             // Calculate 24h uptime for this probe
             let uptime_24h = if active {
-                Self::calculate_uptime_percentage(pool, probe_id, chrono::Duration::hours(24)).await.ok()
+                Self::calculate_uptime_percentage(pool, probe_id, chrono::Duration::hours(24))
+                    .await
+                    .ok()
             } else {
                 None
             };
@@ -350,11 +375,7 @@ impl ProbeManager {
     }
 
     /// Calculate uptime percentage for a probe over a time period
-    async fn calculate_uptime_percentage(
-        pool: &PgPool,
-        probe_id: Uuid,
-        duration: chrono::Duration,
-    ) -> Result<f64, AppError> {
+    async fn calculate_uptime_percentage(pool: &PgPool, probe_id: Uuid, duration: chrono::Duration) -> Result<f64, AppError> {
         let since = chrono::Utc::now() - duration;
 
         let row = sqlx::query(
@@ -383,7 +404,7 @@ impl ProbeManager {
     }
 
     /// Activate a probe and start its scheduler
-    pub async fn activate_probe(&self, pool: &PgPool, id: Uuid) -> Result<Probe, AppError> {
+    pub async fn activate_probe(&self, pool: &PgPool, id: Uuid, config: crate::config::Config) -> Result<Probe, AppError> {
         let probe = sqlx::query_as::<_, Probe>(
             r#"
             UPDATE probes SET active = true WHERE id = $1 RETURNING *
@@ -395,7 +416,7 @@ impl ProbeManager {
         .map_err(|e| anyhow::anyhow!("Failed to activate probe: {}", e))?;
 
         // Start the scheduler
-        self.start_scheduler(pool.clone(), id).await?;
+        self.start_scheduler(pool.clone(), id, config).await?;
 
         Ok(probe)
     }
@@ -419,7 +440,13 @@ impl ProbeManager {
     }
 
     /// Update a probe's configuration
-    pub async fn update_probe(&self, pool: &PgPool, id: Uuid, interval_seconds: Option<i32>) -> Result<Probe, AppError> {
+    pub async fn update_probe(
+        &self,
+        pool: &PgPool,
+        id: Uuid,
+        interval_seconds: Option<i32>,
+        config: crate::config::Config,
+    ) -> Result<Probe, AppError> {
         let probe = Self::get_probe(pool, id).await?;
         let was_active = probe.active;
 
@@ -441,7 +468,7 @@ impl ProbeManager {
         // If the probe was active and interval changed, restart the scheduler
         if was_active && interval_seconds.is_some() {
             self.stop_scheduler(id).await?;
-            self.start_scheduler(pool.clone(), id).await?;
+            self.start_scheduler(pool.clone(), id, config).await?;
         }
 
         Ok(updated_probe)
@@ -466,18 +493,17 @@ impl ProbeManager {
     }
 
     /// Test a probe configuration without creating it
-    pub async fn test_probe(pool: &PgPool, deployment_id: Uuid) -> Result<ProbeResult, AppError> {
-        // Fetch deployment and endpoint details
+    pub async fn test_probe(pool: &PgPool, deployment_id: Uuid, config: &crate::config::Config) -> Result<ProbeResult, AppError> {
+        // Fetch deployment details - use alias to route through control layer
         let context = sqlx::query(
             r#"
             SELECT
-                d.model_name,
+                d.alias,
                 d.type as model_type,
-                ie.url as endpoint_url,
-                ie.api_key
+                ak.secret as system_api_key
             FROM deployed_models d
-            JOIN inference_endpoints ie ON d.hosted_on = ie.id
-            WHERE d.id = $1
+            CROSS JOIN api_keys ak
+            WHERE d.id = $1 AND ak.id = '00000000-0000-0000-0000-000000000000'::uuid
             "#,
         )
         .bind(deployment_id)
@@ -485,12 +511,17 @@ impl ProbeManager {
         .await
         .map_err(|e| anyhow::anyhow!("Failed to fetch deployment for test: {}", e))?;
 
-        let model_name: String = context.try_get("model_name")
-            .map_err(|e| anyhow::anyhow!("Failed to get model_name: {}", e))?;
+        let model_name: String = context
+            .try_get("alias")
+            .map_err(|e| anyhow::anyhow!("Failed to get alias: {}", e))?;
         let model_type_str: Option<String> = context.try_get("model_type").ok();
-        let endpoint_url: String = context.try_get("endpoint_url")
-            .map_err(|e| anyhow::anyhow!("Failed to get endpoint_url: {}", e))?;
-        let api_key: Option<String> = context.try_get("api_key").ok();
+        let system_api_key: String = context
+            .try_get("system_api_key")
+            .map_err(|e| anyhow::anyhow!("Failed to get system_api_key: {}", e))?;
+
+        // Route through control layer's normal AI proxy (not admin path)
+        let endpoint_url = format!("http://localhost:{}/ai", config.port);
+        let api_key = Some(system_api_key);
 
         // Parse model type - default to Chat if not specified
         let model_type = match model_type_str.as_deref() {
@@ -535,23 +566,22 @@ impl ProbeManager {
     }
 
     /// Execute a probe and store the result
-    pub async fn execute_probe(pool: &PgPool, id: Uuid) -> Result<ProbeResult, AppError> {
+    pub async fn execute_probe(pool: &PgPool, id: Uuid, config: &crate::config::Config) -> Result<ProbeResult, AppError> {
         // Note: We allow executing inactive probes manually via "Run Now"
         let _probe = Self::get_probe(pool, id).await?;
 
-        // Fetch deployment and endpoint details
+        // Fetch deployment details - use alias to route through control layer
         let context = sqlx::query(
             r#"
             SELECT
                 p.id as probe_id,
-                d.model_name,
+                d.alias,
                 d.type as model_type,
-                ie.url as endpoint_url,
-                ie.api_key
+                ak.secret as system_api_key
             FROM probes p
             JOIN deployed_models d ON p.deployment_id = d.id
-            JOIN inference_endpoints ie ON d.hosted_on = ie.id
-            WHERE p.id = $1
+            CROSS JOIN api_keys ak
+            WHERE p.id = $1 AND ak.id = '00000000-0000-0000-0000-000000000000'::uuid
             "#,
         )
         .bind(id)
@@ -559,14 +589,20 @@ impl ProbeManager {
         .await
         .map_err(|e| anyhow::anyhow!("Failed to fetch probe execution context: {}", e))?;
 
-        let probe_id: Uuid = context.try_get("probe_id")
+        let probe_id: Uuid = context
+            .try_get("probe_id")
             .map_err(|e| anyhow::anyhow!("Failed to get probe_id: {}", e))?;
-        let model_name: String = context.try_get("model_name")
-            .map_err(|e| anyhow::anyhow!("Failed to get model_name: {}", e))?;
+        let model_name: String = context
+            .try_get("alias")
+            .map_err(|e| anyhow::anyhow!("Failed to get alias: {}", e))?;
         let model_type_str: Option<String> = context.try_get("model_type").ok();
-        let endpoint_url: String = context.try_get("endpoint_url")
-            .map_err(|e| anyhow::anyhow!("Failed to get endpoint_url: {}", e))?;
-        let api_key: Option<String> = context.try_get("api_key").ok();
+        let system_api_key: String = context
+            .try_get("system_api_key")
+            .map_err(|e| anyhow::anyhow!("Failed to get system_api_key: {}", e))?;
+
+        // Route through control layer's normal AI proxy (not admin path)
+        let endpoint_url = format!("http://localhost:{}/ai", config.port);
+        let api_key = Some(system_api_key);
 
         // Parse model type - default to Chat if not specified
         let model_type = match model_type_str.as_deref() {
@@ -670,18 +706,16 @@ impl ProbeManager {
             sql_query = sql_query.bind(lim);
         }
 
-        let results = sql_query.fetch_all(pool).await
+        let results = sql_query
+            .fetch_all(pool)
+            .await
             .map_err(|e| anyhow::anyhow!("Failed to fetch probe results: {}", e))?;
 
         Ok(results)
     }
 
     /// Get the last N results for a probe
-    pub async fn get_recent_results(
-        pool: &PgPool,
-        probe_id: Uuid,
-        limit: i64,
-    ) -> Result<Vec<ProbeResult>, AppError> {
+    pub async fn get_recent_results(pool: &PgPool, probe_id: Uuid, limit: i64) -> Result<Vec<ProbeResult>, AppError> {
         Self::get_probe_results(pool, probe_id, None, None, Some(limit)).await
     }
 
@@ -737,15 +771,16 @@ impl ProbeManager {
             sql_query = sql_query.bind(end);
         }
 
-        let row = sql_query.fetch_one(pool).await
+        let row = sql_query
+            .fetch_one(pool)
+            .await
             .map_err(|e| anyhow::anyhow!("Failed to fetch probe statistics: {}", e))?;
 
-        let total: i64 = row.try_get("total")
-            .map_err(|e| anyhow::anyhow!("Failed to get total: {}", e))?;
-        let successful: i64 = row.try_get("successful")
+        let total: i64 = row.try_get("total").map_err(|e| anyhow::anyhow!("Failed to get total: {}", e))?;
+        let successful: i64 = row
+            .try_get("successful")
             .map_err(|e| anyhow::anyhow!("Failed to get successful: {}", e))?;
-        let failed: i64 = row.try_get("failed")
-            .map_err(|e| anyhow::anyhow!("Failed to get failed: {}", e))?;
+        let failed: i64 = row.try_get("failed").map_err(|e| anyhow::anyhow!("Failed to get failed: {}", e))?;
         let success_rate = if total > 0 {
             (successful as f64 / total as f64) * 100.0
         } else {

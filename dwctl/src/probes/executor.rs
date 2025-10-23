@@ -32,9 +32,7 @@ pub struct ProbeExecutor {
 impl ProbeExecutor {
     /// Create a new probe executor with a default HTTP client.
     pub fn new() -> Self {
-        Self {
-            client: Client::new(),
-        }
+        Self { client: Client::new() }
     }
 
     /// Execute a probe against its configured endpoint.
@@ -47,6 +45,7 @@ impl ProbeExecutor {
         let start = Instant::now();
 
         // Construct full URL and payload based on model type
+        // Note: Don't add /v1/ here - the endpoint_url from onwards already includes it
         let (full_url, payload) = match context.model_type {
             ModelType::Chat => {
                 let url = format!("{}/chat/completions", context.endpoint_url.trim_end_matches('/'));
@@ -87,7 +86,24 @@ impl ProbeExecutor {
             Ok(resp) => {
                 let status_code = resp.status().as_u16() as i32;
 
-                match resp.json::<serde_json::Value>().await {
+                // Get response body as text first
+                let body_text = match resp.text().await {
+                    Ok(text) => text,
+                    Err(e) => {
+                        return Ok(ProbeExecution {
+                            probe_id: context.probe_id,
+                            success: false,
+                            response_time_ms: elapsed,
+                            status_code: Some(status_code),
+                            error_message: Some(format!("HTTP {} - Failed to read response body: {}", status_code, e)),
+                            response_data: None,
+                            metadata: None,
+                        });
+                    }
+                };
+
+                // Try to parse as JSON
+                match serde_json::from_str::<serde_json::Value>(&body_text) {
                     Ok(response_data) => {
                         if (200..300).contains(&status_code) {
                             Ok(ProbeExecution {
@@ -120,7 +136,10 @@ impl ProbeExecutor {
                         success: false,
                         response_time_ms: elapsed,
                         status_code: Some(status_code),
-                        error_message: Some(format!("Failed to parse response: {}", e)),
+                        error_message: Some(format!(
+                            "HTTP {} - Failed to parse response as JSON: {}. Response body: {}",
+                            status_code, e, body_text
+                        )),
                         response_data: None,
                         metadata: None,
                     }),

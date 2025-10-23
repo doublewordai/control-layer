@@ -1,12 +1,12 @@
 use crate::auth::permissions::{operation, resource, RequiresPermission};
 use crate::errors::Error;
-use crate::probes::models::{CreateProbe, Probe, ProbeResult, ProbeStatistics};
 use crate::probes::db::ProbeManager;
+use crate::probes::models::{CreateProbe, Probe, ProbeResult, ProbeStatistics};
 use crate::AppState;
 use axum::{
-    Json,
     extract::{Path, Query, State},
     http::StatusCode,
+    Json,
 };
 use chrono::{DateTime, Utc};
 use serde::Deserialize;
@@ -38,12 +38,11 @@ pub async fn create_probe(
     _: RequiresPermission<resource::Probes, operation::CreateAll>,
     Json(probe): Json<CreateProbe>,
 ) -> Result<(StatusCode, Json<Probe>), Error> {
-    let probe_manager = state.probe_manager.as_ref()
-        .ok_or_else(|| Error::Internal {
-            operation: "Probe manager not initialized".to_string(),
-        })?;
+    let probe_manager = state.probe_manager.as_ref().ok_or_else(|| Error::Internal {
+        operation: "Probe manager not initialized".to_string(),
+    })?;
 
-    let created = probe_manager.create_probe(&state.db, probe).await?;
+    let created = probe_manager.create_probe(&state.db, probe, state.config.clone()).await?;
     Ok((StatusCode::CREATED, Json(created)))
 }
 
@@ -76,10 +75,9 @@ pub async fn delete_probe(
     _: RequiresPermission<resource::Probes, operation::DeleteAll>,
     Path(id): Path<Uuid>,
 ) -> Result<StatusCode, Error> {
-    let probe_manager = state.probe_manager.as_ref()
-        .ok_or_else(|| Error::Internal {
-            operation: "Probe manager not initialized".to_string(),
-        })?;
+    let probe_manager = state.probe_manager.as_ref().ok_or_else(|| Error::Internal {
+        operation: "Probe manager not initialized".to_string(),
+    })?;
 
     probe_manager.delete_probe(&state.db, id).await?;
     Ok(StatusCode::NO_CONTENT)
@@ -91,12 +89,11 @@ pub async fn activate_probe(
     _: RequiresPermission<resource::Probes, operation::UpdateAll>,
     Path(id): Path<Uuid>,
 ) -> Result<Json<Probe>, Error> {
-    let probe_manager = state.probe_manager.as_ref()
-        .ok_or_else(|| Error::Internal {
-            operation: "Probe manager not initialized".to_string(),
-        })?;
+    let probe_manager = state.probe_manager.as_ref().ok_or_else(|| Error::Internal {
+        operation: "Probe manager not initialized".to_string(),
+    })?;
 
-    let probe = probe_manager.activate_probe(&state.db, id).await?;
+    let probe = probe_manager.activate_probe(&state.db, id, state.config.clone()).await?;
     Ok(Json(probe))
 }
 
@@ -106,10 +103,9 @@ pub async fn deactivate_probe(
     _: RequiresPermission<resource::Probes, operation::UpdateAll>,
     Path(id): Path<Uuid>,
 ) -> Result<Json<Probe>, Error> {
-    let probe_manager = state.probe_manager.as_ref()
-        .ok_or_else(|| Error::Internal {
-            operation: "Probe manager not initialized".to_string(),
-        })?;
+    let probe_manager = state.probe_manager.as_ref().ok_or_else(|| Error::Internal {
+        operation: "Probe manager not initialized".to_string(),
+    })?;
 
     let probe = probe_manager.deactivate_probe(&state.db, id).await?;
     Ok(Json(probe))
@@ -127,12 +123,13 @@ pub async fn update_probe(
     Path(id): Path<Uuid>,
     Json(update): Json<UpdateProbeRequest>,
 ) -> Result<Json<Probe>, Error> {
-    let probe_manager = state.probe_manager.as_ref()
-        .ok_or_else(|| Error::Internal {
-            operation: "Probe manager not initialized".to_string(),
-        })?;
+    let probe_manager = state.probe_manager.as_ref().ok_or_else(|| Error::Internal {
+        operation: "Probe manager not initialized".to_string(),
+    })?;
 
-    let probe = probe_manager.update_probe(&state.db, id, update.interval_seconds).await?;
+    let probe = probe_manager
+        .update_probe(&state.db, id, update.interval_seconds, state.config.clone())
+        .await?;
     Ok(Json(probe))
 }
 
@@ -142,7 +139,7 @@ pub async fn execute_probe(
     _: RequiresPermission<resource::Probes, operation::UpdateAll>,
     Path(id): Path<Uuid>,
 ) -> Result<(StatusCode, Json<ProbeResult>), Error> {
-    let result = ProbeManager::execute_probe(&state.db, id).await?;
+    let result = ProbeManager::execute_probe(&state.db, id, &state.config).await?;
     Ok((StatusCode::CREATED, Json(result)))
 }
 
@@ -152,7 +149,7 @@ pub async fn test_probe(
     _: RequiresPermission<resource::Probes, operation::ReadAll>,
     Path(deployment_id): Path<Uuid>,
 ) -> Result<(StatusCode, Json<ProbeResult>), Error> {
-    let result = ProbeManager::test_probe(&state.db, deployment_id).await?;
+    let result = ProbeManager::test_probe(&state.db, deployment_id, &state.config).await?;
     Ok((StatusCode::OK, Json(result)))
 }
 
@@ -163,14 +160,7 @@ pub async fn get_probe_results(
     Path(id): Path<Uuid>,
     Query(query): Query<ResultsQuery>,
 ) -> Result<Json<Vec<ProbeResult>>, Error> {
-    let results = ProbeManager::get_probe_results(
-        &state.db,
-        id,
-        query.start_time,
-        query.end_time,
-        query.limit,
-    )
-    .await?;
+    let results = ProbeManager::get_probe_results(&state.db, id, query.start_time, query.end_time, query.limit).await?;
     Ok(Json(results))
 }
 

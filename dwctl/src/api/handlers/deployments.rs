@@ -250,7 +250,9 @@ pub async fn list_deployed_models(
         // Add probe status if requested
         if include_status {
             if let Some(ref statuses) = status_map {
-                if let Some((probe_id, active, interval_seconds, last_check, last_success, uptime_percentage)) = statuses.get(&model_response.id) {
+                if let Some((probe_id, active, interval_seconds, last_check, last_success, uptime_percentage)) =
+                    statuses.get(&model_response.id)
+                {
                     use crate::api::models::deployments::ModelProbeStatus;
                     let status = ModelProbeStatus {
                         probe_id: *probe_id,

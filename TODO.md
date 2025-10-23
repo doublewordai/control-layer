@@ -1,11 +1,5 @@
 # Probe System TODO
 
-## Probe routing
-
-11. Currently the probes go straight to the upstream endpoints, but they should
-    actually be routed through the control layer - via the alias. That way they
-get logged, budgeted, etc.
-
 ## Architecture & Code Quality
 
 12. **Refactor probe code integration**
