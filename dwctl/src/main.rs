@@ -345,6 +345,7 @@ async fn spa_fallback(uri: Uri) -> Result<Html<String>, StatusCode> {
 pub async fn setup_app(
     pool: PgPool,
     config: Config,
+    skip_leader_election: bool,
 ) -> anyhow::Result<(Router, sync::onwards_config::OnwardsConfigSync, tokio_util::sync::DropGuard)> {
     debug!("Setting up application");
     // Seed database with initial configuration (only runs once)
@@ -364,56 +365,66 @@ pub async fn setup_app(
     });
 
     // Leader election lock ID: 0x44574354_50524F42 (DWCT_PROB in hex for "dwctl probes")
-    // Note: We don't acquire the lock here - the leader election task handles it
     const LEADER_LOCK_ID: i64 = 0x4457_4354_5052_4F42_i64;
-    let is_leader = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
 
-    info!("Starting leader election");
-    // schedulers will be started by leader election task
     let probe_manager = probes::ProbeManager::new();
+    let is_leader: bool;
 
-    // Spawn leader election background task
-    let leader_election_pool = pool.clone();
-    let leader_election_manager_gain = probe_manager.clone();
-    let leader_election_manager_lose = probe_manager.clone();
-    let leader_election_config = config.clone();
-    let leader_election_flag = is_leader.clone();
-    tokio::spawn(async move {
-        leader_election_task(
-            leader_election_pool,
-            leader_election_config,
-            leader_election_flag,
-            LEADER_LOCK_ID,
-            move |pool, config| {
-                let manager = leader_election_manager_gain.clone();
-                async move {
-                    // Wait for the server to be fully up before starting probes
-                    tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+    if skip_leader_election {
+        // Skip leader election - just become leader immediately
+        is_leader = true;
+        probe_manager.initialize_schedulers(&pool, config.clone()).await?;
+        info!("Skipping leader election - running as leader");
+    } else {
+        // Normal leader election
+        is_leader = false;
+        info!("Starting leader election - will attempt to acquire leadership");
 
-                    manager
-                        .initialize_schedulers(&pool, config)
-                        .await
-                        .map_err(|e| anyhow::anyhow!("Failed to initialize schedulers: {}", e))
-                }
-            },
-            move |_pool, _config| {
-                let manager = leader_election_manager_lose.clone();
-                async move {
-                    manager
-                        .stop_all_schedulers()
-                        .await
-                        .map_err(|e| anyhow::anyhow!("Failed to stop schedulers: {}", e))
-                }
-            },
-        )
-        .await;
-    });
+        let is_leader_flag = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+
+        // Spawn leader election background task
+        let leader_election_pool = pool.clone();
+        let leader_election_manager_gain = probe_manager.clone();
+        let leader_election_manager_lose = probe_manager.clone();
+        let leader_election_config = config.clone();
+        let leader_election_flag = is_leader_flag.clone();
+        tokio::spawn(async move {
+            leader_election_task(
+                leader_election_pool,
+                leader_election_config,
+                leader_election_flag,
+                LEADER_LOCK_ID,
+                move |pool, config| {
+                    let manager = leader_election_manager_gain.clone();
+                    async move {
+                        // Wait for the server to be fully up before starting probes
+                        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+
+                        manager
+                            .initialize_schedulers(&pool, config)
+                            .await
+                            .map_err(|e| anyhow::anyhow!("Failed to initialize schedulers: {}", e))
+                    }
+                },
+                move |_pool, _config| {
+                    let manager = leader_election_manager_lose.clone();
+                    async move {
+                        manager
+                            .stop_all_schedulers()
+                            .await
+                            .map_err(|e| anyhow::anyhow!("Failed to stop schedulers: {}", e))
+                    }
+                },
+            )
+            .await;
+        });
+    }
 
     let mut app_state = AppState::builder()
         .db(pool)
         .config(config)
         .probe_manager(probe_manager)
-        .is_leader(false) // Will be set by leader election task
+        .is_leader(is_leader)
         .build();
     let router = build_router(&mut app_state, onwards_router).await?;
 
@@ -739,7 +750,7 @@ async fn main() -> anyhow::Result<()> {
         .map_err(|e| anyhow::anyhow!("Failed to create initial admin user: {}", e))?;
 
     // Setup the complete application
-    let (router, onwards_config_sync, _drop_guard) = setup_app(pool.clone(), config.clone()).await?;
+    let (router, onwards_config_sync, _drop_guard) = setup_app(pool.clone(), config.clone(), false).await?;
 
     // Apply middleware at root level BEFORE routing decisions are made
     let middleware = from_fn_with_state(
@@ -829,7 +840,7 @@ mod test {
     #[test_log::test]
     async fn test_admin_ai_proxy_middleware_with_user_access(pool: PgPool) {
         // Create test app with sync enabled
-        let (router, onwards_config_sync, _drop_guard) = crate::setup_app(pool.clone(), crate::test_utils::create_test_config())
+        let (router, onwards_config_sync, _drop_guard) = crate::setup_app(pool.clone(), crate::test_utils::create_test_config(), true)
             .await
             .expect("Failed to setup test app");
 
@@ -1227,7 +1238,7 @@ mod test {
         let config = create_test_config();
 
         // Call setup_app
-        let result = super::setup_app(pool.clone(), config).await;
+        let result = super::setup_app(pool.clone(), config, true).await;
         assert!(result.is_ok(), "setup_app should succeed");
 
         let (router, _onwards_sync, _drop_guard) = result.unwrap();
