@@ -372,20 +372,17 @@ fn extract_alias_conflict_from_error(
     model_name: &str,
     attempted_alias: &str,
 ) -> Option<crate::errors::AliasConflict> {
-    // Try to downcast to our DbError
-    if let Some(db_error) = error.downcast_ref::<crate::db::errors::DbError>() {
-        if let crate::db::errors::DbError::UniqueViolation {
-            constraint,
-            conflicting_value,
-            ..
-        } = db_error
-        {
-            if constraint.as_deref() == Some("deployed_models_alias_unique") {
-                return Some(crate::errors::AliasConflict {
-                    model_name: model_name.to_string(),
-                    attempted_alias: conflicting_value.clone().unwrap_or_else(|| attempted_alias.to_string()),
-                });
-            }
+    if let Some(crate::db::errors::DbError::UniqueViolation {
+        constraint,
+        conflicting_value,
+        ..
+    }) = error.downcast_ref::<crate::db::errors::DbError>()
+    {
+        if constraint.as_deref() == Some("deployed_models_alias_unique") {
+            return Some(crate::errors::AliasConflict {
+                model_name: model_name.to_string(),
+                attempted_alias: conflicting_value.clone().unwrap_or_else(|| attempted_alias.to_string()),
+            });
         }
     }
     None
@@ -500,7 +497,7 @@ where
         if models_to_deploy.contains(&deployment.model_name) && !deployment.deleted {
             if let Some(new_alias) = alias_mapping.get(&deployment.model_name) {
                 let trimmed_alias = new_alias.trim();
-                if &deployment.alias != trimmed_alias {
+                if deployment.alias != trimmed_alias {
                     // Get fresh conflict check data for this update
                     let conflict_check = deployments_repo
                         .list(&DeploymentFilter::new(0, 1000))

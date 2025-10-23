@@ -70,15 +70,6 @@ pub struct ListEndpointsQuery {
     pub limit: Option<i64>,
 }
 
-/// Model with custom alias for endpoint creation
-#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
-pub struct ModelWithAlias {
-    /// The model name (as returned by the API)
-    pub model_name: String,
-    /// Custom alias for routing (defaults to model_name if not provided)
-    pub alias: String,
-}
-
 // Request models
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct InferenceEndpointCreate {

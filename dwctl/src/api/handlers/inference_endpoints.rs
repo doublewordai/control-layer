@@ -1,7 +1,7 @@
 use crate::{
     api::models::inference_endpoints::{
         InferenceEndpointCreate, InferenceEndpointResponse, InferenceEndpointUpdate, InferenceEndpointValidate,
-        InferenceEndpointValidateResponse, ListEndpointsQuery, OpenAIModel, OpenAIModelsResponse,
+        InferenceEndpointValidateResponse, ListEndpointsQuery, OpenAIModelsResponse,
     },
     auth::permissions::{operation, resource, RequiresPermission},
     db::{
@@ -23,6 +23,9 @@ use axum::{
 };
 #[cfg(test)]
 struct MockFetchModels;
+
+#[cfg(test)]
+use crate::api::models::inference_endpoints::OpenAIModel;
 
 #[cfg(test)]
 #[async_trait::async_trait]
