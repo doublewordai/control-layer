@@ -270,7 +270,8 @@ export const EditEndpointModal: React.FC<EditEndpointModalProps> = ({
         
         if (responseData?.resource === "endpoint") {
           form.setError("name", { 
-            message: "endpoint_name_conflict"
+            type: "endpoint_name_conflict",
+            message: "Endpoint name already exists."
           });
           setValidationError("Please choose a different endpoint name.");
           return;
@@ -730,7 +731,7 @@ export const EditEndpointModal: React.FC<EditEndpointModalProps> = ({
             )}
 
             {/* Error message displays */}
-            {(form.formState.errors.name?.message === "endpoint_name_conflict" || validationError?.includes("endpoint name")) && (
+            {form.formState.errors.name?.type === "endpoint_name_conflict" && (
               <div className="p-3 bg-red-50 border border-red-200 rounded-md">
                 <div className="flex items-center space-x-2">
                   <AlertCircle className="w-4 h-4 text-red-500 flex-shrink-0" />

@@ -262,7 +262,7 @@ const endpointApi = {
       
     } catch (error) {
       // If it's already our custom error, re-throw it
-      if (error && typeof error === 'object' && ('status' in error || 'isConflict' in error)) {
+      if (isApiErrorObject(error)) {
         throw error;
       }
       
@@ -678,6 +678,14 @@ const authApi = {
     return response.json();
   },
 };
+
+function isApiErrorObject(error: unknown): error is { status?: number; isConflict?: boolean } {
+  return (
+    typeof error === "object" &&
+    error !== null &&
+    ("status" in error || "isConflict" in error)
+  );
+}
 
 // Main nested API object
 export const dwctlApi = {
