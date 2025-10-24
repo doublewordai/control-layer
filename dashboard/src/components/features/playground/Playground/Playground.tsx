@@ -1,6 +1,6 @@
 import React, { useState, useEffect } from "react";
 import { useNavigate, useSearchParams } from "react-router-dom";
-import { Play, ArrowLeft } from "lucide-react";
+import { Play, ArrowLeft, Menu } from "lucide-react";
 import OpenAI from "openai";
 import { useModels } from "../../../../api/control-layer";
 import { getModelType, type ModelType } from "../../../../utils/modelType";
@@ -8,6 +8,7 @@ import type { Model, RerankResponse } from "../../../../api/control-layer/types"
 import EmbeddingPlayground from "./EmbeddingPlayground";
 import GenerationPlayground from "./GenerationPlayground";
 import RerankPlayground from "./RerankPlayground";
+import ConversationHistory from "../ConversationHistory/ConversationHistory";
 import {
   Select,
   SelectContent,
@@ -15,26 +16,8 @@ import {
   SelectTrigger,
   SelectValue,
 } from "../../../ui/select";
-
-interface ImageContent {
-  type: "image_url";
-  image_url: {
-    url: string;
-  };
-}
-
-interface TextContent {
-  type: "text";
-  text: string;
-}
-
-type MessageContent = string | (TextContent | ImageContent)[];
-
-interface Message {
-  role: "user" | "assistant" | "system";
-  content: MessageContent;
-  timestamp: Date;
-}
+import * as PlaygroundStorage from "../../../../utils/playgroundStorage";
+import type { Message, MessageContent, ImageContent, TextContent } from "../../../../utils/playgroundStorage";
 
 const Playground: React.FC = () => {
   const navigate = useNavigate();
@@ -50,6 +33,8 @@ const Playground: React.FC = () => {
   const [error, setError] = useState<string | null>(null);
   const [selectedModel, setSelectedModel] = useState<Model | null>(null);
   const [modelType, setModelType] = useState<ModelType>("chat");
+  const [currentConversationId, setCurrentConversationId] = useState<string | null>(null);
+  const [isSidebarOpen, setIsSidebarOpen] = useState(true);
   const [textA, setTextA] = useState("");
   const [textB, setTextB] = useState("");
   const [similarityResult, setSimilarityResult] = useState<{
@@ -103,26 +88,63 @@ const Playground: React.FC = () => {
     }
   }, [modelsError]);
 
-  // Reset state when switching models
+  // Initialize conversation on mount or load active conversation
   useEffect(() => {
-    if (selectedModel) {
-      setMessages([]);
-      setStreamingContent("");
-      setSimilarityResult(null);
-      setRerankResult(null);
-      setError(null);
-      setCurrentMessage("");
-      setUploadedImages([]);
-      setTextA("");
-      setTextB("");
-      setQuery("What is the capital of France?");
-      setDocuments([
-        "The capital of Brazil is Brasilia.",
-        "The capital of France is Paris.",
-        "Horses and cows are both animals",
-      ]);
+    if (selectedModel && !currentConversationId) {
+      // Check if there's an active conversation
+      const activeId = PlaygroundStorage.getActiveConversationId();
+
+      if (activeId) {
+        const activeConv = PlaygroundStorage.getConversation(activeId);
+        if (activeConv) {
+          setCurrentConversationId(activeConv.id);
+          setMessages(activeConv.messages);
+          // Update conversation's current model if it's different
+          if (activeConv.currentModelAlias !== selectedModel.alias) {
+            PlaygroundStorage.switchConversationModel(activeConv.id, selectedModel.alias);
+          }
+          return;
+        }
+      }
+
+      // No active conversation, load most recent or create new
+      const allConversations = PlaygroundStorage.getConversations();
+
+      if (allConversations.length > 0) {
+        // Load the most recent conversation
+        const sortedConversations = allConversations.sort(
+          (a, b) => new Date(b.updatedAt).getTime() - new Date(a.updatedAt).getTime()
+        );
+        const mostRecent = sortedConversations[0];
+        setCurrentConversationId(mostRecent.id);
+        setMessages(mostRecent.messages);
+        PlaygroundStorage.setActiveConversationId(mostRecent.id);
+
+        // Update conversation's current model if needed
+        if (mostRecent.currentModelAlias !== selectedModel.alias) {
+          PlaygroundStorage.switchConversationModel(mostRecent.id, selectedModel.alias);
+        }
+      } else {
+        // Create a new conversation
+        const newConversation = PlaygroundStorage.createConversation(selectedModel.alias);
+        setCurrentConversationId(newConversation.id);
+        setMessages([]);
+      }
     }
-  }, [selectedModel]);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [selectedModel?.alias]); // Only run when model is selected
+
+  // Auto-save messages to current conversation (debounced)
+  useEffect(() => {
+    if (currentConversationId && messages.length > 0) {
+      // Debounce: save after 500ms of no changes
+      const timer = setTimeout(() => {
+        PlaygroundStorage.updateConversation(currentConversationId, { messages });
+      }, 500);
+
+      return () => clearTimeout(timer);
+    }
+  }, [currentConversationId, messages]);
 
   const handleModelChange = (modelId: string) => {
     const model = models.find((m) => m.alias === modelId);
@@ -132,6 +154,12 @@ const Playground: React.FC = () => {
         (model.model_type?.toLowerCase() as ModelType) ||
           getModelType(model.id, model.alias),
       );
+
+      // Switch the current conversation's model
+      if (currentConversationId) {
+        PlaygroundStorage.switchConversationModel(currentConversationId, model.alias);
+      }
+
       navigate(`/playground?model=${encodeURIComponent(modelId)}`);
     }
   };
@@ -347,6 +375,13 @@ const Playground: React.FC = () => {
     )
       return;
 
+    // Create conversation on first message if it doesn't exist
+    if (!currentConversationId) {
+      const newConversation = PlaygroundStorage.createConversation(selectedModel.alias);
+      setCurrentConversationId(newConversation.id);
+      PlaygroundStorage.setActiveConversationId(newConversation.id);
+    }
+
     // Create message content - use multimodal format if images are present
     let messageContent: MessageContent;
     if (uploadedImages.length > 0) {
@@ -434,11 +469,12 @@ const Playground: React.FC = () => {
 
       console.log(`Total chunks received: ${chunkCount}`);
 
-      // Add the complete assistant message
+      // Add the complete assistant message with model tracking
       const assistantMessage: Message = {
         role: "assistant",
         content: fullContent,
         timestamp: new Date(),
+        modelAlias: selectedModel.alias, // Track which model generated this response
       };
 
       setMessages((prev) => [...prev, assistantMessage]);
@@ -470,6 +506,8 @@ const Playground: React.FC = () => {
   };
 
   const clearConversation = () => {
+    // Don't create conversation yet - wait for first message
+    setCurrentConversationId(null);
     setMessages([]);
     setStreamingContent("");
     setSimilarityResult(null);
@@ -498,20 +536,66 @@ const Playground: React.FC = () => {
     setTimeout(() => setCopiedMessageIndex(null), 2000);
   };
 
+  const handleSelectConversation = (id: string) => {
+    const conversation = PlaygroundStorage.getConversation(id);
+    if (conversation) {
+      setCurrentConversationId(conversation.id);
+      setMessages(conversation.messages);
+      PlaygroundStorage.setActiveConversationId(conversation.id);
+
+      // Update URL if switching to a different model
+      if (conversation.currentModelAlias !== selectedModel?.alias) {
+        const model = models.find((m) => m.alias === conversation.currentModelAlias);
+        if (model) {
+          setSelectedModel(model);
+          setModelType(
+            (model.model_type?.toLowerCase() as ModelType) ||
+              getModelType(model.id, model.alias),
+          );
+          navigate(`/playground?model=${encodeURIComponent(model.alias)}`);
+        }
+      }
+    }
+  };
+
+  const handleNewConversation = () => {
+    clearConversation();
+  };
+
   return (
-    <div className="h-[calc(100vh-4rem)] bg-white flex flex-col">
-      {/* Header */}
-      <div className="bg-white border-b border-gray-200 px-8 py-3 flex-shrink-0">
-        <div className="flex items-center justify-between">
-          <div className="flex items-center gap-4">
-            <button
-              onClick={() => navigate(fromUrl || "/models")}
-              className="p-2 text-gray-500 hover:bg-gray-100 rounded-lg transition-colors"
-              aria-label={fromUrl ? "Go back" : "Back to Models"}
-              title={fromUrl ? "Go back" : "Back to Models"}
-            >
-              <ArrowLeft className="w-5 h-5" />
-            </button>
+    <div className="h-[calc(100vh-4rem)] bg-white flex overflow-hidden">
+      {/* Conversation History Sidebar */}
+      <ConversationHistory
+        isOpen={isSidebarOpen}
+        onClose={() => setIsSidebarOpen(false)}
+        currentConversationId={currentConversationId}
+        onSelectConversation={handleSelectConversation}
+        onNewConversation={handleNewConversation}
+        currentModelAlias={selectedModel?.alias || ""}
+      />
+
+      {/* Main Content */}
+      <div className="flex-1 flex flex-col min-h-0">
+        {/* Header */}
+        <div className="bg-white border-b border-gray-200 px-8 py-3 flex-shrink-0">
+          <div className="flex items-center justify-between">
+            <div className="flex items-center gap-4">
+              <button
+                onClick={() => setIsSidebarOpen(!isSidebarOpen)}
+                className="p-2 text-gray-500 hover:bg-gray-100 rounded-lg transition-colors"
+                aria-label="Toggle conversation history"
+                title="Toggle conversation history"
+              >
+                <Menu className="w-5 h-5" />
+              </button>
+              <button
+                onClick={() => navigate(fromUrl || "/models")}
+                className="p-2 text-gray-500 hover:bg-gray-100 rounded-lg transition-colors"
+                aria-label={fromUrl ? "Go back" : "Back to Models"}
+                title={fromUrl ? "Go back" : "Back to Models"}
+              >
+                <ArrowLeft className="w-5 h-5" />
+              </button>
             <div className="flex items-center gap-3">
               <div className="w-10 h-10 bg-gray-100 rounded-lg flex items-center justify-center">
                 <Play className="w-5 h-5 text-gray-600" />
@@ -630,6 +714,7 @@ const Playground: React.FC = () => {
           onCancelStreaming={cancelStreaming}
         />
       )}
+      </div>
     </div>
   );
 };

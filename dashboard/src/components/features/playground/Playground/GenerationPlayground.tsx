@@ -68,14 +68,26 @@ const GenerationPlayground: React.FC<GenerationPlaygroundProps> = ({
   onCancelStreaming,
 }) => {
   const messagesEndRef = useRef<HTMLDivElement>(null);
+  const messagesContainerRef = useRef<HTMLDivElement>(null);
   const textareaRef = useRef<HTMLTextAreaElement>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
   const [isHovered, setIsHovered] = useState(false);
   const [copiedCode, setCopiedCode] = useState<string | null>(null);
+  const [userHasScrolled, setUserHasScrolled] = useState(false);
 
-  const scrollToBottom = () => {
-    messagesEndRef.current?.scrollIntoView({ behavior: "smooth" });
-  };
+  // Check if user is near bottom of scroll
+  const isNearBottom = React.useCallback(() => {
+    if (!messagesContainerRef.current) return true;
+    const { scrollTop, scrollHeight, clientHeight } = messagesContainerRef.current;
+    return scrollHeight - scrollTop - clientHeight < 100; // Within 100px of bottom
+  }, []);
+
+  const scrollToBottom = React.useCallback(() => {
+    if (messagesContainerRef.current) {
+      // Scroll within the messages container, not the whole page
+      messagesContainerRef.current.scrollTop = messagesContainerRef.current.scrollHeight;
+    }
+  }, []);
 
   const copyCode = (code: string) => {
     navigator.clipboard.writeText(code);
@@ -103,9 +115,32 @@ const GenerationPlayground: React.FC<GenerationPlaygroundProps> = ({
       .map((part) => (part as ImageContent).image_url.url);
   };
 
+  // Only auto-scroll if user is near bottom or hasn't manually scrolled
   useEffect(() => {
-    scrollToBottom();
-  }, [messages, streamingContent]);
+    if (isNearBottom() || !userHasScrolled) {
+      scrollToBottom();
+    }
+  }, [messages, streamingContent, isNearBottom, userHasScrolled, scrollToBottom]);
+
+  // Track user scroll behavior
+  useEffect(() => {
+    const container = messagesContainerRef.current;
+    if (!container) return;
+
+    const handleScroll = () => {
+      setUserHasScrolled(!isNearBottom());
+    };
+
+    container.addEventListener('scroll', handleScroll);
+    return () => container.removeEventListener('scroll', handleScroll);
+  }, [isNearBottom]);
+
+  // Reset scroll tracking when starting new message
+  useEffect(() => {
+    if (isStreaming) {
+      setUserHasScrolled(false);
+    }
+  }, [isStreaming]);
 
   useEffect(() => {
     const handleKeyDown = (e: KeyboardEvent) => {
@@ -120,9 +155,9 @@ const GenerationPlayground: React.FC<GenerationPlaygroundProps> = ({
   }, [isStreaming, onCancelStreaming]);
 
   return (
-    <div className="flex-1 flex flex-col">
+    <div className="flex-1 flex flex-col min-h-0">
       {/* Messages */}
-      <div className="flex-1 overflow-y-auto px-8 py-4 bg-white">
+      <div ref={messagesContainerRef} className="flex-1 overflow-y-auto px-8 py-4 bg-white">
         {messages.length === 0 && !streamingContent ? (
           <div className="flex items-center justify-center h-full">
             <div
@@ -559,7 +594,7 @@ const GenerationPlayground: React.FC<GenerationPlaygroundProps> = ({
               onChange={(e) => onCurrentMessageChange(e.target.value)}
               onKeyDown={onKeyDown}
               placeholder="Type your message..."
-              className="pr-24 text-sm"
+              className="pr-24 text-sm max-h-40 overflow-y-auto"
               rows={3}
               disabled={isStreaming}
               aria-label="Message input"
