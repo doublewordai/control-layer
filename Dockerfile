@@ -35,11 +35,14 @@ RUN cargo build --release -p dwctl --no-default-features
 # Development stage
 FROM backend-builder AS dev
 
+# Change to dwctl directory for cargo watch
+WORKDIR /app/dwctl
+
 # Expose port
 EXPOSE 3001
 
 # Default command for development: doesn't rebuild the frontend on changes
-CMD ["cargo", "watch", "-w", "src", "-x", "run"]
+CMD ["cargo", "watch", "-w", "src", "-x", "run --no-default-features"]
 
 # Runtime stage
 FROM ubuntu:24.04
