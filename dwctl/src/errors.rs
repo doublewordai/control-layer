@@ -118,7 +118,8 @@ impl Error {
             Error::Other(_) => "Internal server error".to_string(),
             Error::Conflict { message, conflicts } => {
                 if let Some(conflicts) = conflicts {
-                    format!("{message}: {:?}", conflicts)
+                    let aliases: Vec<String> = conflicts.iter().map(|c| c.attempted_alias.to_string()).collect();
+                    format!("{message}: {}", aliases.join(", "))
                 } else {
                     message.clone()
                 }

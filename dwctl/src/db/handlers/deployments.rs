@@ -2242,7 +2242,7 @@ mod tests {
         let mut repo = Deployments::new(&mut conn);
 
         // Empty model name
-        let mut model_create = DeploymentCreateDBRequest::builder()
+        let model_create = DeploymentCreateDBRequest::builder()
             .created_by(user.id)
             .model_name("   ".to_string())
             .alias("valid-alias".to_string())
@@ -2255,7 +2255,7 @@ mod tests {
         }
 
         // Empty alias
-        let mut model_create = DeploymentCreateDBRequest::builder()
+        let model_create = DeploymentCreateDBRequest::builder()
             .created_by(user.id)
             .model_name("valid-model".to_string())
             .alias("   ".to_string())
@@ -2286,7 +2286,7 @@ mod tests {
         let mut repo = Deployments::new(&mut conn);
 
         // Create a valid deployment first
-        let mut model_create = DeploymentCreateDBRequest::builder()
+        let model_create = DeploymentCreateDBRequest::builder()
             .created_by(user.id)
             .model_name("valid-model".to_string())
             .alias("valid-alias".to_string())
