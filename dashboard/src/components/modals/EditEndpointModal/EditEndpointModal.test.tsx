@@ -308,8 +308,7 @@ describe("EditEndpointModal", () => {
     fireEvent.click(configureButton);
 
     await waitFor(() => {
-      expect(screen.getByText("Connection Failed")).toBeInTheDocument();
-      expect(screen.getByText("Connection failed")).toBeInTheDocument();
+      expect(screen.getAllByText("Connection failed").length).toBeGreaterThan(0);
     });
   });
 
@@ -330,9 +329,9 @@ describe("EditEndpointModal", () => {
     fireEvent.click(configureButton);
 
     await waitFor(() => {
-      expect(screen.getByText("Model Settings")).toBeInTheDocument();
+      expect(screen.getByText(/Select Models & Configure Aliases/i)).toBeInTheDocument();
       expect(
-        screen.getByText(/Select which models to sync/),
+        screen.getByText(/Aliases default to model names but can be customized/i)
       ).toBeInTheDocument();
       expect(
         screen.getByRole("button", { name: /Select All|Deselect All/i }),
@@ -357,7 +356,7 @@ describe("EditEndpointModal", () => {
     fireEvent.click(configureButton);
 
     await waitFor(() => {
-      expect(screen.getByText("Model Settings")).toBeInTheDocument();
+      expect(screen.getByText(/Select Models & Configure Aliases/i)).toBeInTheDocument();
     });
 
     // Find model checkboxes and click one
@@ -387,7 +386,7 @@ describe("EditEndpointModal", () => {
     fireEvent.click(configureButton);
 
     await waitFor(() => {
-      expect(screen.getByText("Model Settings")).toBeInTheDocument();
+      expect(screen.getByText(/Select Models & Configure Aliases/i)).toBeInTheDocument();
     });
 
     const selectAllButton = screen.getByRole("button", {
@@ -532,8 +531,12 @@ describe("EditEndpointModal", () => {
     // Press Enter to trigger validation
     fireEvent.keyDown(urlInput, { key: "Enter", code: "Enter" });
 
+    // Click the "Test Connection" button
+    const testConnectionButton = screen.getByRole("button", { name: /Test Connection/i });
+    fireEvent.click(testConnectionButton);
+
     await waitFor(() => {
-      expect(screen.getByText("Testing...")).toBeInTheDocument();
+      expect(screen.getByText(/Testing.../i)).toBeInTheDocument();
     });
   });
 });

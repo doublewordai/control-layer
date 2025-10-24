@@ -4,6 +4,7 @@ use axum::{
     http::StatusCode,
     response::{IntoResponse, Response},
 };
+use serde::{Deserialize, Serialize};
 use thiserror::Error as ThisError;
 
 #[derive(ThisError, Debug)]
@@ -39,6 +40,19 @@ pub enum Error {
     /// Unexpected error with full context chain
     #[error(transparent)]
     Other(#[from] anyhow::Error),
+
+    /// Conflict error, e.g., for unique constraint violations
+    #[error("Conflict: {message}")]
+    Conflict {
+        message: String,
+        conflicts: Option<Vec<AliasConflict>>,
+    },
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct AliasConflict {
+    pub model_name: String,
+    pub attempted_alias: String,
 }
 
 impl Error {
@@ -55,9 +69,11 @@ impl Error {
                 DbError::ForeignKeyViolation { .. } => StatusCode::BAD_REQUEST,
                 DbError::CheckViolation { .. } => StatusCode::BAD_REQUEST,
                 DbError::ProtectedEntity { .. } => StatusCode::FORBIDDEN,
+                DbError::InvalidModelField { .. } => StatusCode::BAD_REQUEST,
                 DbError::Other(_) => StatusCode::INTERNAL_SERVER_ERROR,
             },
             Error::Other(_) => StatusCode::INTERNAL_SERVER_ERROR,
+            Error::Conflict { .. } => StatusCode::CONFLICT,
         }
     }
 
@@ -80,6 +96,9 @@ impl Error {
                     match (table.as_deref(), constraint.as_deref()) {
                         (Some("users"), Some(c)) if c.contains("email") => "An account with this email address already exists".to_string(),
                         (Some("users"), Some(c)) if c.contains("username") => "This username is already taken".to_string(),
+                        (Some("deployed_models"), Some("deployed_models_alias_unique")) => {
+                            "The specified alias is already in use. Please choose a different alias.".to_string()
+                        }
                         _ => "Resource already exists".to_string(),
                     }
                 }
@@ -93,9 +112,18 @@ impl Error {
                 } => {
                     format!("Cannot {operation:?} {entity_type}: {reason}")
                 }
+                DbError::InvalidModelField { field } => format!("Field '{field}' must not be empty or whitespace"),
                 DbError::Other(_) => "Database error occurred".to_string(),
             },
             Error::Other(_) => "Internal server error".to_string(),
+            Error::Conflict { message, conflicts } => {
+                if let Some(conflicts) = conflicts {
+                    let aliases: Vec<String> = conflicts.iter().map(|c| c.attempted_alias.to_string()).collect();
+                    format!("{message}: {}", aliases.join(", "))
+                } else {
+                    message.clone()
+                }
+            }
         }
     }
 }
@@ -116,11 +144,64 @@ impl IntoResponse for Error {
             Error::BadRequest { .. } | Error::NotFound { .. } => {
                 tracing::debug!("Client error: {}", self);
             }
+            Error::Conflict { .. } => {
+                tracing::warn!("Conflict error: {}", self);
+            }
         }
 
         let status = self.status_code();
-        let user_message = self.user_message();
-        (status, user_message).into_response()
+
+        // Handle conflict errors with structured JSON response
+        match &self {
+            Error::Conflict { message, conflicts } => {
+                use serde_json::json;
+                let body = if let Some(conflicts) = conflicts {
+                    json!({
+                        "message": message,
+                        "conflicts": conflicts
+                    })
+                } else {
+                    json!({ "message": message })
+                };
+
+                (status, axum::response::Json(body)).into_response()
+            }
+            // Handle database unique violations with minimal structured JSON
+            Error::Database(DbError::UniqueViolation { constraint, table, .. }) => {
+                use serde_json::json;
+
+                // Determine the resource and message only
+                let (message, resource) = match (table.as_deref(), constraint.as_deref()) {
+                    (Some("users"), Some(c)) if c.contains("email") => {
+                        ("An account with this email address already exists".to_string(), "user")
+                    }
+                    (Some("users"), Some(c)) if c.contains("username") => ("This username is already taken".to_string(), "user"),
+                    (Some("deployed_models"), Some("deployed_models_alias_unique")) => (
+                        "The specified alias is already in use. Please choose a different alias.".to_string(),
+                        "deployment",
+                    ),
+                    (Some("inference_endpoints"), Some(c)) if c.contains("name") => {
+                        ("An endpoint with this name already exists".to_string(), "endpoint")
+                    }
+                    (Some("inference_endpoints"), Some(c)) if c.contains("url") => {
+                        ("An endpoint with this URL already exists".to_string(), "endpoint")
+                    }
+                    _ => ("Resource already exists".to_string(), "unknown"),
+                };
+
+                let body = json!({
+                    "message": message,
+                    "resource": resource
+                });
+
+                (status, axum::response::Json(body)).into_response()
+            }
+            _ => {
+                // For all other errors, return simple text message (unchanged)
+                let user_message = self.user_message();
+                (status, user_message).into_response()
+            }
+        }
     }
 }
 

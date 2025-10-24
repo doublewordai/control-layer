@@ -39,7 +39,7 @@ FROM backend-builder AS dev
 EXPOSE 3001
 
 # Default command for development: doesn't rebuild the frontend on changes
-CMD ["cargo", "watch", "-w", "src", "-x", "run"]
+CMD ["cargo", "watch", "-w", "dwctl/src", "-x", "run -p dwctl --no-default-features"]
 
 # Runtime stage
 FROM ubuntu:24.04

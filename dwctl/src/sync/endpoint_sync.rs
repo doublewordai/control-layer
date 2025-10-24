@@ -4,16 +4,26 @@ use crate::db::handlers::repository::Repository;
 use crate::db::handlers::{Deployments, InferenceEndpoints};
 use crate::db::models::deployments::{DeploymentCreateDBRequest, DeploymentDBResponse, DeploymentUpdateDBRequest, ModelStatus};
 use crate::db::models::inference_endpoints::InferenceEndpointDBResponse;
+use crate::errors::AliasConflict;
 use crate::sync::deployments::fetch_models::{FetchModels, FetchModelsReqwest, SyncConfig};
 use crate::types::{DeploymentId, InferenceEndpointId, UserId};
 use anyhow::Result;
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
 use sqlx::PgPool;
+use std::collections::HashMap;
 use std::collections::HashSet;
 use tracing::{debug, instrument, warn};
 use utoipa::ToSchema;
 use uuid::Uuid;
+
+#[derive(Debug, thiserror::Error)]
+pub enum SyncError {
+    #[error("Alias conflicts detected")]
+    AliasConflicts { conflicts: Vec<crate::errors::AliasConflict> },
+    #[error(transparent)]
+    Other(#[from] anyhow::Error),
+}
 
 #[derive(Debug, Serialize, Deserialize, ToSchema)]
 pub struct EndpointSyncResponse {
@@ -231,13 +241,197 @@ where
     })
 }
 
-async fn get_existing_models<D>(deployments_repo: &mut D, endpoint_id: InferenceEndpointId) -> Result<Vec<DeploymentDBResponse>>
+/// Sync function for endpoint creation with optional alias mapping
+#[instrument(skip(deployments_repo, fetch_models))]
+pub async fn sync_endpoint_models_with_aliases<D, F>(
+    endpoint_info: InferenceEndpointDBResponse,
+    deployments_repo: &mut D,
+    fetch_models: F,
+    alias_mapping: &Option<HashMap<String, String>>,
+) -> std::result::Result<EndpointSyncResponse, SyncError>
+where
+    D: Repository<
+        CreateRequest = DeploymentCreateDBRequest,
+        UpdateRequest = DeploymentUpdateDBRequest,
+        Response = DeploymentDBResponse,
+        Id = DeploymentId,
+        Filter = DeploymentFilter,
+    >,
+    F: FetchModels,
+{
+    // Get fetched models
+    let fetched_models = fetch_models.fetch().await?;
+    let existing_models = get_existing_models(deployments_repo, endpoint_info.id)
+        .await
+        .map_err(|e| anyhow::anyhow!("Failed to get existing models: {}", e))?;
+
+    let existing_model_names: HashSet<String> = existing_models.iter().map(|m| m.model_name.clone()).collect();
+    let mut changes_made = 0;
+    let mut new_models_created = 0;
+    let sync_time = Utc::now();
+
+    // Filter models based on endpoint's model_filter if specified
+    let models_to_sync: Vec<_> = if let Some(model_filter) = &endpoint_info.model_filter {
+        fetched_models
+            .data
+            .iter()
+            .filter(|model| model_filter.contains(&model.id))
+            .collect()
+    } else {
+        fetched_models.data.iter().collect()
+    };
+
+    debug!(
+        "Endpoint {} syncing {} of {} fetched models with alias mapping: {:?}",
+        endpoint_info.name,
+        models_to_sync.len(),
+        fetched_models.data.len(),
+        alias_mapping
+    );
+
+    // Use system user ID for creating deployments
+    let system_user_id = Uuid::nil();
+
+    // Create new models with custom aliases if provided
+    for model in &models_to_sync {
+        if !existing_model_names.contains(&model.id) {
+            // Determine the alias for this model
+            let alias = alias_mapping
+                .as_ref()
+                .and_then(|mapping| mapping.get(&model.id))
+                .cloned()
+                .unwrap_or_else(|| model.id.clone());
+
+            match create_deployment_with_alias(deployments_repo, model, &endpoint_info, system_user_id, alias.clone()).await {
+                Ok(_) => {
+                    debug!("Created new deployment for model: {} with alias: {}", model.id, alias);
+                    new_models_created += 1;
+                    changes_made += 1;
+                }
+                Err(e) => {
+                    // Check if this is an alias conflict and extract structured info
+                    if let Some(conflict) = extract_alias_conflict_from_error(&e, &model.id, &alias) {
+                        warn!("Alias conflict for model '{}' with alias '{}': {}", model.id, alias, e);
+                        // Return immediately with just this one conflict
+                        return Err(SyncError::AliasConflicts { conflicts: vec![conflict] });
+                    } else {
+                        // For non-conflict errors, fail fast
+                        return Err(SyncError::Other(e));
+                    }
+                }
+            }
+        }
+    }
+
+    // Check for duplicate aliases in the alias mapping (or default aliases)
+    let mut seen_aliases = std::collections::HashMap::new();
+    let mut conflicts = Vec::new();
+    for model in &models_to_sync {
+        let alias = alias_mapping
+            .as_ref()
+            .and_then(|mapping| mapping.get(&model.id))
+            .cloned()
+            .unwrap_or_else(|| model.id.clone());
+        if let Some(existing_model) = seen_aliases.insert(alias.clone(), model.id.clone()) {
+            // Found a duplicate alias in this batch
+            conflicts.push(AliasConflict {
+                model_name: model.id.clone(),
+                attempted_alias: alias.clone(),
+            });
+            conflicts.push(AliasConflict {
+                model_name: existing_model,
+                attempted_alias: alias.clone(),
+            });
+        }
+    }
+    if !conflicts.is_empty() {
+        return Err(SyncError::AliasConflicts { conflicts });
+    }
+
+    debug!(
+        "Sync completed: {} new models created, {} total changes",
+        new_models_created, changes_made
+    );
+
+    Ok(EndpointSyncResponse {
+        endpoint_id: endpoint_info.id,
+        changes_made,
+        new_models_created,
+        models_reactivated: 0,
+        models_deactivated: 0,
+        models_deleted: 0,
+        total_models_fetched: fetched_models.data.len(),
+        filtered_models_count: models_to_sync.len(),
+        synced_at: sync_time,
+    })
+}
+
+/// Extract alias conflict information from database error - specific to deployment creation
+fn extract_alias_conflict_from_error(
+    error: &anyhow::Error,
+    model_name: &str,
+    attempted_alias: &str,
+) -> Option<crate::errors::AliasConflict> {
+    if let Some(crate::db::errors::DbError::UniqueViolation {
+        constraint,
+        conflicting_value,
+        ..
+    }) = error.downcast_ref::<crate::db::errors::DbError>()
+    {
+        if constraint.as_deref() == Some("deployed_models_alias_unique") {
+            return Some(crate::errors::AliasConflict {
+                model_name: model_name.to_string(),
+                attempted_alias: conflicting_value.clone().unwrap_or_else(|| attempted_alias.to_string()),
+            });
+        }
+    }
+    None
+}
+
+/// Create deployment with custom alias - now returns structured error info
+async fn create_deployment_with_alias<D>(
+    deployments_repo: &mut D,
+    model: &OpenAIModel,
+    endpoint_info: &InferenceEndpointDBResponse,
+    created_by: UserId,
+    alias: String,
+) -> Result<()>
+where
+    D: Repository<CreateRequest = DeploymentCreateDBRequest, Response = DeploymentDBResponse>,
+{
+    let db_request = DeploymentCreateDBRequest::builder()
+        .created_by(created_by)
+        .model_name(model.id.clone())
+        .alias(alias.clone())
+        .hosted_on(endpoint_info.id)
+        .build();
+
+    match deployments_repo.create(&db_request).await {
+        Ok(_) => {
+            debug!(
+                "Created deployment for model: {} with alias: {} on endpoint: {}",
+                model.id, alias, endpoint_info.name
+            );
+            Ok(())
+        }
+        Err(e) => {
+            // Convert DbError to anyhow::Error so we can extract conflict info later
+            Err(anyhow::Error::from(e))
+        }
+    }
+}
+
+// Update the get_existing_models function to handle the Result conversion
+async fn get_existing_models<D>(
+    deployments_repo: &mut D,
+    endpoint_id: InferenceEndpointId,
+) -> crate::db::errors::Result<Vec<DeploymentDBResponse>>
 where
     D: Repository<Response = DeploymentDBResponse, Id = DeploymentId, Filter = DeploymentFilter>,
 {
     // Fetch all models for this endpoint, including soft-deleted ones for sync purposes
     let filter = DeploymentFilter::new(0, i64::MAX).with_endpoint(endpoint_id);
-    Ok(deployments_repo.list(&filter).await?)
+    deployments_repo.list(&filter).await
 }
 
 async fn create_deployment<D>(
@@ -260,6 +454,210 @@ where
     Ok(())
 }
 
+/// Update deployment aliases and create/remove deployments based on model filter
+pub async fn update_endpoint_aliases<D>(
+    endpoint: InferenceEndpointDBResponse,
+    deployments_repo: &mut D,
+    alias_mapping: &HashMap<String, String>,
+) -> Result<EndpointSyncResponse, SyncError>
+where
+    D: Repository<
+        CreateRequest = DeploymentCreateDBRequest,
+        UpdateRequest = DeploymentUpdateDBRequest,
+        Response = DeploymentDBResponse,
+        Id = DeploymentId,
+        Filter = DeploymentFilter,
+    >,
+{
+    let mut changes_made = 0;
+    let mut new_models_created = 0;
+    let mut models_deleted = 0;
+
+    // Get current deployments for this endpoint
+    let current_deployments = deployments_repo
+        .list(&DeploymentFilter::new(0, 1000).with_endpoint(endpoint.id))
+        .await
+        .map_err(|e| SyncError::Other(e.into()))?;
+
+    // Build a map of existing deployments by model_name for quick lookup
+    let existing_deployments_map: HashMap<String, &DeploymentDBResponse> =
+        current_deployments.iter().map(|d| (d.model_name.clone(), d)).collect();
+
+    // Get the models that should be deployed based on the endpoint's model_filter
+    let models_to_deploy: HashSet<String> = if let Some(model_filter) = &endpoint.model_filter {
+        model_filter.iter().cloned().collect()
+    } else {
+        // If no filter, we should keep all existing models and not create new ones
+        // This is different from initial sync where we might want to sync all available models
+        existing_deployments_map.keys().cloned().collect()
+    };
+
+    // --- 1. Batch alias conflict check for updates ---
+    // Collect all alias changes (model_name, new_alias, deployment_id)
+    let mut update_aliases = Vec::new();
+    let mut update_alias_strings = Vec::new();
+    let mut update_exclude_ids = Vec::new();
+    for deployment in &current_deployments {
+        if models_to_deploy.contains(&deployment.model_name) && !deployment.deleted {
+            if let Some(new_alias) = alias_mapping.get(&deployment.model_name) {
+                let trimmed_alias = new_alias.trim().to_string();
+                if deployment.alias != trimmed_alias {
+                    update_aliases.push((deployment.model_name.clone(), trimmed_alias.clone(), deployment.id));
+                    update_alias_strings.push(trimmed_alias);
+                    update_exclude_ids.push(deployment.id);
+                }
+            }
+        }
+    }
+    // Query for conflicts in one go (excluding the deployments being updated)
+    let mut conflict_update_aliases = HashSet::new();
+    if !update_alias_strings.is_empty() {
+        let filter = DeploymentFilter::new(0, 1000).with_aliases(update_alias_strings.clone());
+        let conflict_updates = deployments_repo.list(&filter).await.map_err(|e| SyncError::Other(e.into()))?;
+        for d in conflict_updates {
+            // Only treat as conflict if not the deployment being updated
+            if !update_exclude_ids.contains(&d.id) {
+                conflict_update_aliases.insert(d.alias.clone());
+            }
+        }
+    }
+
+    // --- 2. Batch alias conflict check for creations ---
+    let mut create_aliases = Vec::new();
+    let mut create_model_names = Vec::new();
+    for model_name in &models_to_deploy {
+        if !existing_deployments_map.contains_key(model_name) {
+            // This model needs to be deployed
+            let alias = alias_mapping
+                .get(model_name)
+                .cloned()
+                .unwrap_or_else(|| model_name.clone())
+                .trim()
+                .to_string();
+            create_aliases.push(alias.clone());
+            create_model_names.push(model_name.clone());
+        }
+    }
+    let mut conflict_create_aliases = HashSet::new();
+    if !create_aliases.is_empty() {
+        let filter = DeploymentFilter::new(0, 1000).with_aliases(create_aliases.clone());
+        let conflict_creates = deployments_repo.list(&filter).await.map_err(|e| SyncError::Other(e.into()))?;
+        for d in conflict_creates {
+            conflict_create_aliases.insert(d.alias.clone());
+        }
+    }
+
+    // --- 3. Apply updates, error if conflicts found ---
+    // Check for intra-batch duplicate aliases in updates
+    let mut seen = std::collections::HashSet::new();
+    let mut intra_batch_conflicts = Vec::new();
+    for (_, alias, _) in &update_aliases {
+        if !seen.insert(alias) {
+            intra_batch_conflicts.push(alias.clone());
+        }
+    }
+    if !intra_batch_conflicts.is_empty() {
+        return Err(SyncError::AliasConflicts {
+            conflicts: intra_batch_conflicts
+                .into_iter()
+                .map(|alias| AliasConflict {
+                    model_name: "<multiple>".to_string(),
+                    attempted_alias: alias,
+                })
+                .collect(),
+        });
+    }
+
+    for (model_name, new_alias, deployment_id) in update_aliases {
+        if conflict_update_aliases.contains(&new_alias) {
+            return Err(SyncError::AliasConflicts {
+                conflicts: vec![AliasConflict {
+                    model_name,
+                    attempted_alias: new_alias,
+                }],
+            });
+        }
+        let update_request = DeploymentUpdateDBRequest::alias_update(new_alias.clone());
+        deployments_repo
+            .update(deployment_id, &update_request)
+            .await
+            .map_err(|e| SyncError::Other(e.into()))?;
+        changes_made += 1;
+        tracing::info!("Updated deployment {} alias to '{}'", deployment_id, new_alias);
+    }
+
+    // --- 4. Create new deployments, error if conflicts found ---
+    let system_user_id = uuid::Uuid::nil();
+    for (model_name, alias) in create_model_names.into_iter().zip(create_aliases.into_iter()) {
+        if conflict_create_aliases.contains(&alias) {
+            return Err(SyncError::AliasConflicts {
+                conflicts: vec![AliasConflict {
+                    model_name,
+                    attempted_alias: alias,
+                }],
+            });
+        }
+        let db_request = DeploymentCreateDBRequest::builder()
+            .created_by(system_user_id)
+            .model_name(model_name.clone())
+            .alias(alias.clone())
+            .hosted_on(endpoint.id)
+            .build();
+
+        match deployments_repo.create(&db_request).await {
+            Ok(_) => {
+                new_models_created += 1;
+                changes_made += 1;
+                tracing::info!(
+                    "Created new deployment for model '{}' with alias '{}' on endpoint {}",
+                    model_name,
+                    alias,
+                    endpoint.id
+                );
+            }
+            Err(e) => {
+                tracing::error!("Failed to create deployment for model '{}': {}", model_name, e);
+                return Err(SyncError::Other(e.into()));
+            }
+        }
+    }
+
+    // 5. Remove deployments for models that are no longer in the filter
+    if endpoint.model_filter.is_some() {
+        for deployment in &current_deployments {
+            if !models_to_deploy.contains(&deployment.model_name) && !deployment.deleted {
+                // This deployment should be removed
+                match deployments_repo.delete(deployment.id).await {
+                    Ok(true) => {
+                        models_deleted += 1;
+                        changes_made += 1;
+                        tracing::info!("Deleted deployment for model '{}' (removed from filter)", deployment.model_name);
+                    }
+                    Ok(false) => {
+                        tracing::warn!("Deployment {} not found for deletion", deployment.id);
+                    }
+                    Err(e) => {
+                        tracing::error!("Failed to delete deployment {}: {}", deployment.id, e);
+                        return Err(SyncError::Other(e.into()));
+                    }
+                }
+            }
+        }
+    }
+
+    Ok(EndpointSyncResponse {
+        endpoint_id: endpoint.id,
+        changes_made,
+        new_models_created,
+        models_reactivated: 0,
+        models_deactivated: 0,
+        models_deleted,
+        total_models_fetched: models_to_deploy.len(),
+        filtered_models_count: models_to_deploy.len(),
+        synced_at: Utc::now(),
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use crate::{
@@ -272,7 +670,9 @@ mod tests {
                 inference_endpoints::InferenceEndpointDBResponse,
             },
         },
-        sync::{deployments::fetch_models::FetchModels, endpoint_sync::sync_endpoint_models},
+        sync::{
+            deployments::fetch_models::FetchModels, endpoint_sync::sync_endpoint_models, endpoint_sync::sync_endpoint_models_with_aliases,
+        },
         DeploymentId, UserId,
     };
     use anyhow::anyhow;
@@ -345,8 +745,8 @@ mod tests {
             if let Some(model_name) = &request.model_name {
                 response.model_name = model_name.clone();
             }
-            if let Some(deployment_name) = &request.deployment_name {
-                response.alias = deployment_name.clone();
+            if let Some(alias) = &request.alias {
+                response.alias = alias.clone();
             }
             if let Some(description) = &request.description {
                 response.description = description.clone();
@@ -380,6 +780,17 @@ mod tests {
         type Filter = DeploymentFilter;
 
         async fn create(&mut self, request: &Self::CreateRequest) -> Result<Self::Response> {
+            let deployments = self.deployments.read().await;
+            if let Some(_existing) = deployments.values().find(|d| d.alias == request.alias) {
+                return Err(crate::db::errors::DbError::UniqueViolation {
+                    constraint: Some("deployed_models_alias_unique".to_string()),
+                    table: Some("deployed_models".to_string()),
+                    message: format!("Alias '{}' already exists", request.alias),
+                    conflicting_value: Some(request.alias.clone()),
+                });
+            }
+            drop(deployments);
+
             let id = uuid::Uuid::new_v4();
             let deployment = MockDeployment {
                 id,
@@ -656,5 +1067,201 @@ mod tests {
         let deployments = repo.list(&DeploymentFilter::new(0, 10)).await.unwrap();
         assert_eq!(deployments.len(), 1);
         assert_eq!(deployments[0].model_name, "existing-model");
+    }
+
+    #[tokio::test]
+    async fn test_create_deployment_with_duplicate_alias_fails() {
+        let mut repo = MockDeploymentsRepo::new();
+        let fetch_models = MockFetchModels::new();
+
+        // Set up two models
+        let models = vec![create_test_model("google/gemma-3-12b-it"), create_test_model("openai/gpt-4")];
+        fetch_models.set_models(models);
+
+        let endpoint_info = create_test_endpoint();
+
+        // First sync with unique aliases should succeed
+        let mut alias_mapping = HashMap::new();
+        alias_mapping.insert("google/gemma-3-12b-it".to_string(), "alias-1".to_string());
+        alias_mapping.insert("openai/gpt-4".to_string(), "alias-2".to_string());
+
+        let result = crate::sync::endpoint_sync::sync_endpoint_models_with_aliases(
+            endpoint_info.clone(),
+            &mut repo,
+            fetch_models.clone(),
+            &Some(alias_mapping),
+        )
+        .await;
+        assert!(result.is_ok());
+
+        // Second sync with a duplicate alias should fail
+        let mut alias_mapping_conflict = HashMap::new();
+        alias_mapping_conflict.insert("google/gemma-3-12b-it".to_string(), "shared-alias".to_string());
+        alias_mapping_conflict.insert("openai/gpt-4".to_string(), "shared-alias".to_string());
+
+        let result = crate::sync::endpoint_sync::sync_endpoint_models_with_aliases(
+            endpoint_info.clone(),
+            &mut repo,
+            fetch_models.clone(),
+            &Some(alias_mapping_conflict),
+        )
+        .await;
+        assert!(matches!(result, Err(crate::sync::endpoint_sync::SyncError::AliasConflicts { .. })));
+    }
+
+    #[tokio::test]
+    async fn test_create_deployment_with_default_alias_conflict() {
+        let mut repo = MockDeploymentsRepo::new();
+        let fetch_models = MockFetchModels::new();
+
+        // Set up a model
+        let models = vec![create_test_model("google/gemma-3-12b-it")];
+        fetch_models.set_models(models);
+
+        let endpoint_info = create_test_endpoint();
+
+        // First sync with no alias mapping (alias defaults to model name)
+        let result =
+            crate::sync::endpoint_sync::sync_endpoint_models_with_aliases(endpoint_info.clone(), &mut repo, fetch_models.clone(), &None)
+                .await;
+        assert!(result.is_ok());
+
+        // Try to sync again with the same model and no alias mapping (should conflict)
+        let result =
+            crate::sync::endpoint_sync::sync_endpoint_models_with_aliases(endpoint_info.clone(), &mut repo, fetch_models.clone(), &None)
+                .await;
+        // Should not error, as it's the same endpoint and model (idempotent)
+        assert!(result.is_ok());
+
+        // Now, simulate a second endpoint trying to use the same alias (model name)
+        let endpoint_info2 = InferenceEndpointDBResponse {
+            id: uuid::Uuid::new_v4(),
+            ..create_test_endpoint()
+        };
+        let result =
+            crate::sync::endpoint_sync::sync_endpoint_models_with_aliases(endpoint_info2, &mut repo, fetch_models.clone(), &None).await;
+        assert!(matches!(result, Err(crate::sync::endpoint_sync::SyncError::AliasConflicts { .. })));
+    }
+
+    #[tokio::test]
+    async fn test_update_endpoint_aliases_duplicate_fails() {
+        let mut repo = MockDeploymentsRepo::new();
+
+        // Add two deployments with unique aliases
+        let _id1 = repo
+            .add_deployment("google/gemma-3-12b-it".to_string(), "alias-1".to_string())
+            .await;
+        let _id2 = repo.add_deployment("openai/gpt-4".to_string(), "alias-2".to_string()).await;
+
+        let endpoint_info = create_test_endpoint();
+
+        // Try to update both to the same alias
+        let mut alias_mapping = HashMap::new();
+        alias_mapping.insert("google/gemma-3-12b-it".to_string(), "shared-alias".to_string());
+        alias_mapping.insert("openai/gpt-4".to_string(), "shared-alias".to_string());
+
+        let result = crate::sync::endpoint_sync::update_endpoint_aliases(endpoint_info.clone(), &mut repo, &alias_mapping).await;
+        assert!(matches!(result, Err(crate::sync::endpoint_sync::SyncError::AliasConflicts { .. })));
+    }
+
+    #[tokio::test]
+    async fn test_update_endpoint_aliases_unique_ok() {
+        let mut repo = MockDeploymentsRepo::new();
+
+        // Add two deployments with unique aliases
+        let _id1 = repo
+            .add_deployment("google/gemma-3-12b-it".to_string(), "alias-1".to_string())
+            .await;
+        let _id2 = repo.add_deployment("openai/gpt-4".to_string(), "alias-2".to_string()).await;
+
+        let endpoint_info = create_test_endpoint();
+
+        // Update aliases to new unique values
+        let mut alias_mapping = HashMap::new();
+        alias_mapping.insert("google/gemma-3-12b-it".to_string(), "alias-3".to_string());
+        alias_mapping.insert("openai/gpt-4".to_string(), "alias-4".to_string());
+
+        let result = crate::sync::endpoint_sync::update_endpoint_aliases(endpoint_info.clone(), &mut repo, &alias_mapping).await;
+        assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_update_endpoint_aliases_default_alias_conflict() {
+        let mut repo = MockDeploymentsRepo::new();
+
+        // Add a deployment with alias = model name
+        let _id1 = repo
+            .add_deployment("google/gemma-3-12b-it".to_string(), "google/gemma-3-12b-it".to_string())
+            .await;
+
+        let endpoint_info = create_test_endpoint();
+
+        // Try to update another deployment to use the same alias
+        let _id2 = repo.add_deployment("openai/gpt-4".to_string(), "alias-2".to_string()).await;
+
+        let mut alias_mapping = HashMap::new();
+        alias_mapping.insert("openai/gpt-4".to_string(), "google/gemma-3-12b-it".to_string());
+
+        let result = crate::sync::endpoint_sync::update_endpoint_aliases(endpoint_info.clone(), &mut repo, &alias_mapping).await;
+        assert!(matches!(result, Err(crate::sync::endpoint_sync::SyncError::AliasConflicts { .. })));
+    }
+
+    #[tokio::test]
+    async fn test_sync_endpoint_models_with_no_alias_mapping_defaults_to_model_name() {
+        let mut repo = MockDeploymentsRepo::new();
+        let fetch_models = MockFetchModels::new();
+
+        // Configure fetch_models to return two models
+        let models = vec![create_test_model("google/gemma-3-12b-it"), create_test_model("openai/gpt-4")];
+        fetch_models.set_models(models);
+
+        let endpoint_info = create_test_endpoint();
+
+        // Run sync with no alias mapping
+        let result =
+            crate::sync::endpoint_sync::sync_endpoint_models_with_aliases(endpoint_info.clone(), &mut repo, fetch_models.clone(), &None)
+                .await;
+        assert!(result.is_ok());
+
+        // Verify deployments were created with alias == model_name
+        let deployments = repo.list(&DeploymentFilter::new(0, 10)).await.unwrap();
+        let mut found_gemma = false;
+        let mut found_gpt4 = false;
+        for d in deployments {
+            if d.model_name == "google/gemma-3-12b-it" {
+                assert_eq!(d.alias, "google/gemma-3-12b-it");
+                found_gemma = true;
+            }
+            if d.model_name == "openai/gpt-4" {
+                assert_eq!(d.alias, "openai/gpt-4");
+                found_gpt4 = true;
+            }
+        }
+        assert!(found_gemma && found_gpt4);
+    }
+
+    #[tokio::test]
+    async fn test_sync_endpoint_models_with_alias_mapping() {
+        let mut repo = MockDeploymentsRepo::new();
+        let fetch_models = MockFetchModels::new();
+
+        // Configure fetch_models to return two models
+        let models = vec![create_test_model("google/gemma-3-12b-it"), create_test_model("openai/gpt-4")];
+        fetch_models.set_models(models);
+
+        let _endpoint_info = create_test_endpoint();
+
+        // First endpoint sync (should succeed)
+        let endpoint_info1 = create_test_endpoint();
+        let result = sync_endpoint_models_with_aliases(endpoint_info1.clone(), &mut repo, fetch_models.clone(), &None).await;
+        assert!(result.is_ok());
+
+        // Second endpoint sync (should fail due to alias conflict)
+        let endpoint_info2 = InferenceEndpointDBResponse {
+            id: uuid::Uuid::new_v4(),
+            ..create_test_endpoint()
+        };
+        let result = sync_endpoint_models_with_aliases(endpoint_info2, &mut repo, fetch_models.clone(), &None).await;
+        assert!(matches!(result, Err(crate::sync::endpoint_sync::SyncError::AliasConflicts { .. })));
     }
 }
