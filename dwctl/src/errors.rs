@@ -69,6 +69,7 @@ impl Error {
                 DbError::ForeignKeyViolation { .. } => StatusCode::BAD_REQUEST,
                 DbError::CheckViolation { .. } => StatusCode::BAD_REQUEST,
                 DbError::ProtectedEntity { .. } => StatusCode::FORBIDDEN,
+                DbError::InvalidModelField { .. } => StatusCode::BAD_REQUEST,
                 DbError::Other(_) => StatusCode::INTERNAL_SERVER_ERROR,
             },
             Error::Other(_) => StatusCode::INTERNAL_SERVER_ERROR,
@@ -111,6 +112,7 @@ impl Error {
                 } => {
                     format!("Cannot {operation:?} {entity_type}: {reason}")
                 }
+                DbError::InvalidModelField { field } => format!("Field '{field}' must not be empty or whitespace"),
                 DbError::Other(_) => "Database error occurred".to_string(),
             },
             Error::Other(_) => "Internal server error".to_string(),

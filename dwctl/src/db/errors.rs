@@ -45,6 +45,10 @@ pub enum DbError {
         entity_id: Option<String>, // ID for logging/debugging
     },
 
+    /// Invalid or empty model name/alias field
+    #[error("Invalid model field: {field} must not be empty or whitespace")]
+    InvalidModelField { field: &'static str },
+
     /// Catch-all for non-recoverable errors
     #[error(transparent)]
     Other(#[from] anyhow::Error),

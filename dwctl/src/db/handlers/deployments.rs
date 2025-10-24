@@ -1,5 +1,5 @@
 use crate::db::{
-    errors::Result,
+    errors::{DbError, Result},
     handlers::repository::Repository,
     models::deployments::{
         DeploymentCreateDBRequest, DeploymentDBResponse, DeploymentUpdateDBRequest, FlatPricingFields, ModelPricing, ModelStatus, ModelType,
@@ -151,6 +151,15 @@ impl<'c> Repository for Deployments<'c> {
         let created_at = Utc::now();
         let updated_at = created_at;
 
+        let model_name = request.model_name.trim();
+        let alias = request.alias.trim();
+        if model_name.is_empty() {
+            return Err(DbError::InvalidModelField { field: "model_name" });
+        }
+        if alias.is_empty() {
+            return Err(DbError::InvalidModelField { field: "alias" });
+        }
+
         let model_type_str = request.model_type.as_ref().map(|t| match t {
             ModelType::Chat => "CHAT",
             ModelType::Embeddings => "EMBEDDINGS",
@@ -258,6 +267,17 @@ impl<'c> Repository for Deployments<'c> {
     }
 
     async fn update(&mut self, id: Self::Id, request: &Self::UpdateRequest) -> Result<Self::Response> {
+        if let Some(model_name) = &request.model_name {
+            if model_name.trim().is_empty() {
+                return Err(DbError::InvalidModelField { field: "model_name" });
+            }
+        }
+        if let Some(alias) = &request.alias {
+            if alias.trim().is_empty() {
+                return Err(DbError::InvalidModelField { field: "alias" });
+            }
+        }
+
         // Convert model_type into DB string if provided
         let model_type_str: Option<&str> = request.model_type.as_ref().and_then(|inner| {
             inner.as_ref().map(|t| match t {
@@ -2201,6 +2221,93 @@ mod tests {
         match result {
             Err(crate::db::errors::DbError::UniqueViolation { .. }) => { /* expected */ }
             _ => panic!("Expected UniqueViolation error for alias update"),
+        }
+    }
+
+    #[sqlx::test]
+    #[test_log::test]
+    async fn test_create_deployment_with_empty_model_name_or_alias(pool: PgPool) {
+        let base_url = url::Url::parse("http://localhost:8080").unwrap();
+        let sources = vec![crate::config::ModelSource {
+            name: "test".to_string(),
+            url: base_url.clone(),
+            api_key: None,
+            sync_interval: std::time::Duration::from_secs(3600),
+        }];
+        crate::seed_database(&sources, &pool).await.unwrap();
+
+        let user = create_test_user(&pool).await;
+        let test_endpoint_id = get_test_endpoint_id(&pool).await;
+        let mut conn = pool.acquire().await.unwrap();
+        let mut repo = Deployments::new(&mut conn);
+
+        // Empty model name
+        let mut model_create = DeploymentCreateDBRequest::builder()
+            .created_by(user.id)
+            .model_name("   ".to_string())
+            .alias("valid-alias".to_string())
+            .hosted_on(test_endpoint_id)
+            .build();
+        let result = repo.create(&model_create).await;
+        match result {
+            Err(DbError::InvalidModelField { field }) => assert_eq!(field, "model_name"),
+            _ => panic!("Expected InvalidModelField error for empty model_name"),
+        }
+
+        // Empty alias
+        let mut model_create = DeploymentCreateDBRequest::builder()
+            .created_by(user.id)
+            .model_name("valid-model".to_string())
+            .alias("   ".to_string())
+            .hosted_on(test_endpoint_id)
+            .build();
+        let result = repo.create(&model_create).await;
+        match result {
+            Err(DbError::InvalidModelField { field }) => assert_eq!(field, "alias"),
+            _ => panic!("Expected InvalidModelField error for empty alias"),
+        }
+    }
+
+    #[sqlx::test]
+    #[test_log::test]
+    async fn test_update_deployment_with_empty_model_name_or_alias(pool: PgPool) {
+        let base_url = url::Url::parse("http://localhost:8080").unwrap();
+        let sources = vec![crate::config::ModelSource {
+            name: "test".to_string(),
+            url: base_url.clone(),
+            api_key: None,
+            sync_interval: std::time::Duration::from_secs(3600),
+        }];
+        crate::seed_database(&sources, &pool).await.unwrap();
+
+        let user = create_test_user(&pool).await;
+        let test_endpoint_id = get_test_endpoint_id(&pool).await;
+        let mut conn = pool.acquire().await.unwrap();
+        let mut repo = Deployments::new(&mut conn);
+
+        // Create a valid deployment first
+        let mut model_create = DeploymentCreateDBRequest::builder()
+            .created_by(user.id)
+            .model_name("valid-model".to_string())
+            .alias("valid-alias".to_string())
+            .hosted_on(test_endpoint_id)
+            .build();
+        let deployment = repo.create(&model_create).await.unwrap();
+
+        // Try to update model_name to empty
+        let update = DeploymentUpdateDBRequest::builder().model_name("   ".to_string()).build();
+        let result = repo.update(deployment.id, &update).await;
+        match result {
+            Err(DbError::InvalidModelField { field }) => assert_eq!(field, "model_name"),
+            _ => panic!("Expected InvalidModelField error for empty model_name"),
+        }
+
+        // Try to update alias to empty
+        let update = DeploymentUpdateDBRequest::builder().alias("   ".to_string()).build();
+        let result = repo.update(deployment.id, &update).await;
+        match result {
+            Err(DbError::InvalidModelField { field }) => assert_eq!(field, "alias"),
+            _ => panic!("Expected InvalidModelField error for empty alias"),
         }
     }
 }
