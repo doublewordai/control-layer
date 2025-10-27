@@ -113,6 +113,53 @@ pub async fn create_initial_admin_user(email: &str, password: Option<&str>, db: 
     Ok(created_user.id)
 }
 
+/// Migrates existing sensitive data to encrypted format.
+///
+/// This function should be called after database migrations run to ensure
+/// any existing sensitive data is encrypted with the ENCRYPTION_KEY.
+/// It's idempotent and safe to run multiple times.
+///
+/// If ENCRYPTION_KEY is not set, this will error when trying to encrypt.
+pub async fn migrate_to_encrypted_data(db: &PgPool) -> Result<(), anyhow::Error> {
+    // Check if encryption_key_set marker exists (with encrypted key name)
+    let encrypted_key_name = crypto::encrypt_key_name("encryption_key_set")?;
+
+    let existing_marker = sqlx::query_scalar!(
+        "SELECT value FROM system_config WHERE key = $1",
+        encrypted_key_name
+    )
+    .fetch_optional(db)
+    .await?;
+
+    if existing_marker.is_some() {
+        debug!("Encryption marker found, skipping migration");
+        return Ok(());
+    }
+
+    info!("Running encryption migration for existing data");
+
+    // Use a transaction to ensure atomicity
+    let mut tx = db.begin().await?;
+
+    // Encrypt existing API keys in inference_endpoints table
+    let count = crypto::encrypt_table_column(&mut tx, "inference_endpoints", "id", "api_key").await?;
+    info!("Encrypted {} endpoint API keys", count);
+
+    // Create the encryption_key_set marker with encrypted key name
+    sqlx::query!(
+        "INSERT INTO system_config (key, value, updated_at)
+         VALUES ($1, true, NOW())",
+        encrypted_key_name
+    )
+    .execute(&mut *tx)
+    .await?;
+
+    tx.commit().await?;
+    info!("Encryption migration completed successfully");
+
+    Ok(())
+}
+
 /// Seed the database with initial configuration (run only once)
 pub async fn seed_database(sources: &[config::ModelSource], db: &PgPool) -> Result<(), anyhow::Error> {
     // Use a transaction to ensure atomicity
@@ -155,9 +202,20 @@ pub async fn seed_database(sources: &[config::ModelSource], db: &PgPool) -> Resu
         .execute(&mut *tx)
         .await?;
 
+    // Store encrypted key name marker - the app needs ENCRYPTION_KEY to even find this row
+    let encrypted_key_name = crypto::encrypt_key_name("encryption_key_set")?;
+    sqlx::query!(
+        "INSERT INTO system_config (key, value, updated_at)
+         VALUES ($1, true, NOW())
+         ON CONFLICT (key) DO UPDATE SET value = true, updated_at = NOW()",
+        encrypted_key_name
+    )
+    .execute(&mut *tx)
+    .await?;
+
     // Mark database as seeded to prevent future overwrites
     sqlx::query!(
-        "UPDATE system_config SET value = true, updated_at = NOW() 
+        "UPDATE system_config SET value = true, updated_at = NOW()
          WHERE key = 'endpoints_seeded'"
     )
     .execute(&mut *tx)
@@ -570,6 +628,9 @@ async fn main() -> anyhow::Result<()> {
 
     // Run migrations
     sqlx::migrate!("./migrations").run(&pool).await?;
+
+    // Migrate existing data to encrypted format (idempotent)
+    migrate_to_encrypted_data(&pool).await?;
 
     // create admin user if it doesn't exist
     create_initial_admin_user(&config.admin_email, config.admin_password.as_deref(), &pool)
