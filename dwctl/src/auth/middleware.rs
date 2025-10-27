@@ -475,7 +475,6 @@ mod tests {
             config: config.clone(),
             outlet_db: None,
             metrics_recorder: None,
-            probe_manager: None,
             is_leader: false,
         };
 
@@ -574,7 +573,6 @@ mod tests {
             config: config.clone(),
             outlet_db: None,
             metrics_recorder: None,
-            probe_manager: None,
             is_leader: false,
         };
 
@@ -673,7 +671,6 @@ mod tests {
             config: config.clone(),
             outlet_db: None,
             metrics_recorder: None,
-            probe_manager: None,
             is_leader: false,
         };
 
@@ -839,7 +836,6 @@ mod tests {
             config: config.clone(),
             outlet_db: None,
             metrics_recorder: None,
-            probe_manager: None,
             is_leader: false,
         };
 

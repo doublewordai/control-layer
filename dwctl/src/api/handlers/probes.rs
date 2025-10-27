@@ -35,11 +35,7 @@ pub async fn create_probe(
     _: RequiresPermission<resource::Probes, operation::CreateAll>,
     Json(probe): Json<CreateProbe>,
 ) -> Result<(StatusCode, Json<Probe>), Error> {
-    let probe_manager = state.probe_manager.as_ref().ok_or_else(|| Error::Internal {
-        operation: "Probe manager not initialized".to_string(),
-    })?;
-
-    let created = probe_manager.create_probe(&state.db, probe, state.config.clone()).await?;
+    let created = ProbeManager::create_probe(&state.db, probe).await?;
     Ok((StatusCode::CREATED, Json(created)))
 }
 
@@ -128,11 +124,7 @@ pub async fn delete_probe(
     _: RequiresPermission<resource::Probes, operation::DeleteAll>,
     Path(id): Path<Uuid>,
 ) -> Result<StatusCode, Error> {
-    let probe_manager = state.probe_manager.as_ref().ok_or_else(|| Error::Internal {
-        operation: "Probe manager not initialized".to_string(),
-    })?;
-
-    probe_manager.delete_probe(&state.db, id).await?;
+    ProbeManager::delete_probe(&state.db, id).await?;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -161,11 +153,7 @@ pub async fn activate_probe(
     _: RequiresPermission<resource::Probes, operation::UpdateAll>,
     Path(id): Path<Uuid>,
 ) -> Result<Json<Probe>, Error> {
-    let probe_manager = state.probe_manager.as_ref().ok_or_else(|| Error::Internal {
-        operation: "Probe manager not initialized".to_string(),
-    })?;
-
-    let probe = probe_manager.activate_probe(&state.db, id, state.config.clone()).await?;
+    let probe = ProbeManager::activate_probe(&state.db, id).await?;
     Ok(Json(probe))
 }
 
@@ -194,11 +182,7 @@ pub async fn deactivate_probe(
     _: RequiresPermission<resource::Probes, operation::UpdateAll>,
     Path(id): Path<Uuid>,
 ) -> Result<Json<Probe>, Error> {
-    let probe_manager = state.probe_manager.as_ref().ok_or_else(|| Error::Internal {
-        operation: "Probe manager not initialized".to_string(),
-    })?;
-
-    let probe = probe_manager.deactivate_probe(&state.db, id).await?;
+    let probe = ProbeManager::deactivate_probe(&state.db, id).await?;
     Ok(Json(probe))
 }
 
@@ -230,13 +214,7 @@ pub async fn update_probe(
     Path(id): Path<Uuid>,
     Json(update): Json<UpdateProbeRequest>,
 ) -> Result<Json<Probe>, Error> {
-    let probe_manager = state.probe_manager.as_ref().ok_or_else(|| Error::Internal {
-        operation: "Probe manager not initialized".to_string(),
-    })?;
-
-    let probe = probe_manager
-        .update_probe(&state.db, id, update.interval_seconds, state.config.clone())
-        .await?;
+    let probe = ProbeManager::update_probe(&state.db, id, update.interval_seconds).await?;
     Ok(Json(probe))
 }
 

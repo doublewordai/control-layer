@@ -63,7 +63,6 @@ pub struct AppState {
     pub config: Config,
     pub outlet_db: Option<PgPool>,
     pub metrics_recorder: Option<GenAiMetrics>,
-    pub probe_manager: Option<probes::ProbeManager>,
     #[builder(default = false)]
     pub is_leader: bool,
 }
@@ -367,14 +366,23 @@ pub async fn setup_app(
     // Leader election lock ID: 0x44574354_50524F42 (DWCT_PROB in hex for "dwctl probes")
     const LEADER_LOCK_ID: i64 = 0x4457_4354_5052_4F42_i64;
 
-    let probe_manager = probes::ProbeManager::new();
+    let probe_scheduler = probes::ProbeScheduler::new(pool.clone(), config.clone());
     let is_leader: bool;
 
     if skip_leader_election {
         // Skip leader election - just become leader immediately
         is_leader = true;
-        probe_manager.initialize_schedulers(&pool, config.clone()).await?;
-        info!("Skipping leader election - running as leader");
+        probe_scheduler.initialize().await?;
+
+        // Start the scheduler daemon in the background
+        let daemon_scheduler = probe_scheduler.clone();
+        tokio::spawn(async move {
+            // Use LISTEN/NOTIFY in production, but disable in tests to avoid hangs
+            let use_listen_notify = !cfg!(test);
+            daemon_scheduler.run_daemon(use_listen_notify, 300).await; // Fallback sync every 5 minutes
+        });
+
+        info!("Skipping leader election - running as leader with probe scheduler");
     } else {
         // Normal leader election
         is_leader = false;
@@ -384,8 +392,8 @@ pub async fn setup_app(
 
         // Spawn leader election background task
         let leader_election_pool = pool.clone();
-        let leader_election_manager_gain = probe_manager.clone();
-        let leader_election_manager_lose = probe_manager.clone();
+        let leader_election_scheduler_gain = probe_scheduler.clone();
+        let leader_election_scheduler_lose = probe_scheduler.clone();
         let leader_election_config = config.clone();
         let leader_election_flag = is_leader_flag.clone();
         tokio::spawn(async move {
@@ -394,25 +402,36 @@ pub async fn setup_app(
                 leader_election_config,
                 leader_election_flag,
                 LEADER_LOCK_ID,
-                move |pool, config| {
-                    let manager = leader_election_manager_gain.clone();
+                move |_pool, _config| {
+                    let scheduler = leader_election_scheduler_gain.clone();
                     async move {
                         // Wait for the server to be fully up before starting probes
                         tokio::time::sleep(std::time::Duration::from_secs(1)).await;
 
-                        manager
-                            .initialize_schedulers(&pool, config)
+                        scheduler
+                            .initialize()
                             .await
-                            .map_err(|e| anyhow::anyhow!("Failed to initialize schedulers: {}", e))
+                            .map_err(|e| anyhow::anyhow!("Failed to initialize probe scheduler: {}", e))?;
+
+                        // Start the scheduler daemon in the background
+                        let daemon_scheduler = scheduler.clone();
+                        tokio::spawn(async move {
+                            // Use LISTEN/NOTIFY in production, but disable in tests to avoid hangs
+                            let use_listen_notify = !cfg!(test);
+                            daemon_scheduler.run_daemon(use_listen_notify, 300).await;
+                            // Fallback sync every 5 minutes
+                        });
+
+                        Ok(())
                     }
                 },
                 move |_pool, _config| {
-                    let manager = leader_election_manager_lose.clone();
+                    let scheduler = leader_election_scheduler_lose.clone();
                     async move {
-                        manager
-                            .stop_all_schedulers()
+                        scheduler
+                            .stop_all()
                             .await
-                            .map_err(|e| anyhow::anyhow!("Failed to stop schedulers: {}", e))
+                            .map_err(|e| anyhow::anyhow!("Failed to stop probe scheduler: {}", e))
                     }
                 },
             )
@@ -420,12 +439,7 @@ pub async fn setup_app(
         });
     }
 
-    let mut app_state = AppState::builder()
-        .db(pool)
-        .config(config)
-        .probe_manager(probe_manager)
-        .is_leader(is_leader)
-        .build();
+    let mut app_state = AppState::builder().db(pool).config(config).is_leader(is_leader).build();
     let router = build_router(&mut app_state, onwards_router).await?;
 
     Ok((router, onwards_config_sync, drop_guard))

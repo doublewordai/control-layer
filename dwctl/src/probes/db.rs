@@ -1,10 +1,10 @@
 //! Database access layer for the probes monitoring system.
 //!
-//! This module provides the `ProbeManager` struct which manages:
-//! - CRUD operations for probes
-//! - Probe execution and result storage
-//! - Statistics calculation
-//! - Background scheduling of active probes
+//! This module provides the `ProbeManager` struct which handles all database
+//! operations for probes, including CRUD operations, probe execution, and
+//! statistics calculation.
+//!
+//! Background scheduling is handled separately by the `ProbeScheduler`.
 
 use crate::api::models::probes::{CreateProbe, ProbeStatistics};
 use crate::db::models::probes::{Probe, ProbeExecution, ProbeResult};
@@ -12,206 +12,18 @@ use crate::errors::Error as AppError;
 use crate::probes::executor::{ProbeExecutionContext, ProbeExecutor};
 use chrono::{DateTime, Utc};
 use sqlx::{PgPool, Row};
-use std::collections::HashMap;
-use std::sync::Arc;
-use tokio::sync::RwLock;
-use tokio::task::JoinHandle;
 use uuid::Uuid;
 
-/// Main interface for interacting with the probes monitoring system.
+/// Database access layer for probes.
 ///
-/// The `ProbeManager` struct manages probe scheduling and database operations.
-/// It maintains a collection of background tasks that execute probes at
-/// their configured intervals.
-#[derive(Clone)]
-pub struct ProbeManager {
-    schedulers: Arc<RwLock<HashMap<Uuid, JoinHandle<()>>>>,
-}
-
-impl Default for ProbeManager {
-    fn default() -> Self {
-        Self::new()
-    }
-}
+/// This provides pure database operations for probes. Background scheduling
+/// is handled by the separate `ProbeScheduler` which reads probe state from
+/// the database.
+pub struct ProbeManager;
 
 impl ProbeManager {
-    /// Create a new `ProbeManager` instance.
-    ///
-    /// This creates an empty scheduler collection. Call `initialize_schedulers()`
-    /// to start background tasks for all active probes.
-    pub fn new() -> Self {
-        Self {
-            schedulers: Arc::new(RwLock::new(HashMap::new())),
-        }
-    }
-
-    /// Initialize schedulers for all active probes in the database.
-    ///
-    /// This should be called on application startup to resume monitoring
-    /// for all probes that were active when the service last shutdown.
-    pub async fn initialize_schedulers(&self, pool: &PgPool, config: crate::config::Config) -> Result<(), AppError> {
-        let probes = Self::list_active_probes(pool).await?;
-
-        for probe in probes {
-            self.start_scheduler(pool.clone(), probe.id, config.clone()).await?;
-        }
-
-        Ok(())
-    }
-
-    /// Start a scheduler for a probe
-    pub async fn start_scheduler(&self, pool: PgPool, probe_id: Uuid, config: crate::config::Config) -> Result<(), AppError> {
-        // Check if scheduler already exists
-        {
-            let schedulers = self.schedulers.read().await;
-            if schedulers.contains_key(&probe_id) {
-                return Ok(());
-            }
-        }
-
-        // Spawn the scheduler task
-        let handle = tokio::spawn(async move {
-            // Check when the probe last executed to avoid immediate execution on restart
-            let _should_delay = match Self::get_recent_results(&pool, probe_id, 1).await {
-                Ok(results) => {
-                    if let Some(last_result) = results.first() {
-                        let probe = match Self::get_probe(&pool, probe_id).await {
-                            Ok(p) => p,
-                            Err(e) => {
-                                tracing::error!("Error fetching probe {}: {}", probe_id, e);
-                                return;
-                            }
-                        };
-
-                        let now = chrono::Utc::now();
-                        let time_since_last = now - last_result.executed_at;
-                        let interval = chrono::Duration::seconds(probe.interval_seconds as i64);
-
-                        if time_since_last < interval {
-                            // Calculate how long to wait until next scheduled execution
-                            let wait_duration = interval - time_since_last;
-                            let wait_secs = wait_duration.num_seconds().max(0) as u64;
-
-                            tracing::info!(
-                                "Probe {} last executed {}s ago, waiting {}s until next execution",
-                                probe.name,
-                                time_since_last.num_seconds(),
-                                wait_secs
-                            );
-
-                            tokio::time::sleep(tokio::time::Duration::from_secs(wait_secs)).await;
-                            false // Don't delay again
-                        } else {
-                            tracing::info!(
-                                "Probe {} last executed {}s ago (>{}s interval), executing immediately",
-                                probe.name,
-                                time_since_last.num_seconds(),
-                                probe.interval_seconds
-                            );
-                            true // Execute immediately
-                        }
-                    } else {
-                        true // No previous results, execute immediately
-                    }
-                }
-                Err(e) => {
-                    tracing::warn!(
-                        "Error checking last execution for probe {}: {}, will execute immediately",
-                        probe_id,
-                        e
-                    );
-                    true
-                }
-            };
-
-            loop {
-                // Get the probe to check if it's still active and get the interval
-                let probe = match Self::get_probe(&pool, probe_id).await {
-                    Ok(p) => p,
-                    Err(e) => {
-                        tracing::error!("Error fetching probe {}: {}", probe_id, e);
-                        break;
-                    }
-                };
-
-                // If probe is not active, stop the scheduler
-                if !probe.active {
-                    tracing::info!("Probe {} is not active, stopping scheduler", probe.name);
-                    break;
-                }
-
-                // Execute the probe
-                match Self::execute_probe(&pool, probe_id, &config).await {
-                    Ok(result) => {
-                        if result.success {
-                            tracing::debug!(
-                                "Probe {} executed successfully in {}ms",
-                                probe.name,
-                                result.response_time_ms.unwrap_or(0)
-                            );
-                        } else {
-                            tracing::warn!("Probe {} execution failed: {:?}", probe.name, result.error_message);
-                        }
-                    }
-                    Err(e) => {
-                        tracing::error!("Error executing probe {}: {}", probe.name, e);
-                    }
-                }
-
-                // Sleep for the configured interval
-                tokio::time::sleep(tokio::time::Duration::from_secs(probe.interval_seconds as u64)).await;
-            }
-
-            tracing::info!("Scheduler for probe {} has stopped", probe_id);
-        });
-
-        // Store the handle
-        let mut schedulers = self.schedulers.write().await;
-        schedulers.insert(probe_id, handle);
-
-        Ok(())
-    }
-
-    /// Stop a scheduler for a probe
-    pub async fn stop_scheduler(&self, probe_id: Uuid) -> Result<(), AppError> {
-        let mut schedulers = self.schedulers.write().await;
-
-        if let Some(handle) = schedulers.remove(&probe_id) {
-            handle.abort();
-            tracing::info!("Stopped scheduler for probe {}", probe_id);
-        }
-
-        Ok(())
-    }
-
-    /// Stop all running schedulers (used when losing leadership)
-    pub async fn stop_all_schedulers(&self) -> Result<(), AppError> {
-        let mut schedulers = self.schedulers.write().await;
-        let count = schedulers.len();
-
-        for (probe_id, handle) in schedulers.drain() {
-            handle.abort();
-            tracing::debug!("Stopped scheduler for probe {}", probe_id);
-        }
-
-        if count > 0 {
-            tracing::info!("Stopped {} probe schedulers", count);
-        }
-
-        Ok(())
-    }
-
-    /// Check if a scheduler is running for a probe
-    pub async fn is_scheduler_running(&self, probe_id: Uuid) -> bool {
-        let schedulers = self.schedulers.read().await;
-        schedulers.contains_key(&probe_id)
-    }
-
-    /// Create a new probe and start its scheduler.
-    ///
-    /// The probe is created as active by default and a background scheduler
-    /// is started immediately to execute the probe at its configured interval.
-    pub async fn create_probe(&self, pool: &PgPool, probe: CreateProbe, config: crate::config::Config) -> Result<Probe, AppError> {
+    /// Create a new probe
+    pub async fn create_probe(pool: &PgPool, probe: CreateProbe) -> Result<Probe, AppError> {
         let result = sqlx::query_as::<_, Probe>(
             r#"
             INSERT INTO probes (name, deployment_id, interval_seconds, active)
@@ -225,9 +37,6 @@ impl ProbeManager {
         .fetch_one(pool)
         .await
         .map_err(|e| anyhow::anyhow!("Failed to create probe: {}", e))?;
-
-        // Auto-start scheduler for new probes
-        self.start_scheduler(pool.clone(), result.id, config).await?;
 
         Ok(result)
     }
@@ -404,8 +213,8 @@ impl ProbeManager {
         Ok((successful as f64 / total as f64) * 100.0)
     }
 
-    /// Activate a probe and start its scheduler
-    pub async fn activate_probe(&self, pool: &PgPool, id: Uuid, config: crate::config::Config) -> Result<Probe, AppError> {
+    /// Activate a probe
+    pub async fn activate_probe(pool: &PgPool, id: Uuid) -> Result<Probe, AppError> {
         let probe = sqlx::query_as::<_, Probe>(
             r#"
             UPDATE probes SET active = true WHERE id = $1 RETURNING *
@@ -416,14 +225,11 @@ impl ProbeManager {
         .await
         .map_err(|e| anyhow::anyhow!("Failed to activate probe: {}", e))?;
 
-        // Start the scheduler
-        self.start_scheduler(pool.clone(), id, config).await?;
-
         Ok(probe)
     }
 
-    /// Deactivate a probe and stop its scheduler
-    pub async fn deactivate_probe(&self, pool: &PgPool, id: Uuid) -> Result<Probe, AppError> {
+    /// Deactivate a probe
+    pub async fn deactivate_probe(pool: &PgPool, id: Uuid) -> Result<Probe, AppError> {
         let probe = sqlx::query_as::<_, Probe>(
             r#"
             UPDATE probes SET active = false WHERE id = $1 RETURNING *
@@ -434,24 +240,11 @@ impl ProbeManager {
         .await
         .map_err(|e| anyhow::anyhow!("Failed to deactivate probe: {}", e))?;
 
-        // Stop the scheduler
-        self.stop_scheduler(id).await?;
-
         Ok(probe)
     }
 
     /// Update a probe's configuration
-    pub async fn update_probe(
-        &self,
-        pool: &PgPool,
-        id: Uuid,
-        interval_seconds: Option<i32>,
-        config: crate::config::Config,
-    ) -> Result<Probe, AppError> {
-        let probe = Self::get_probe(pool, id).await?;
-        let was_active = probe.active;
-
-        // Update the probe
+    pub async fn update_probe(pool: &PgPool, id: Uuid, interval_seconds: Option<i32>) -> Result<Probe, AppError> {
         let updated_probe = sqlx::query_as::<_, Probe>(
             r#"
             UPDATE probes
@@ -466,20 +259,11 @@ impl ProbeManager {
         .await
         .map_err(|e| anyhow::anyhow!("Failed to update probe: {}", e))?;
 
-        // If the probe was active and interval changed, restart the scheduler
-        if was_active && interval_seconds.is_some() {
-            self.stop_scheduler(id).await?;
-            self.start_scheduler(pool.clone(), id, config).await?;
-        }
-
         Ok(updated_probe)
     }
 
     /// Delete a probe
-    pub async fn delete_probe(&self, pool: &PgPool, id: Uuid) -> Result<(), AppError> {
-        // Stop the scheduler first
-        self.stop_scheduler(id).await?;
-
+    pub async fn delete_probe(pool: &PgPool, id: Uuid) -> Result<(), AppError> {
         sqlx::query(
             r#"
             DELETE FROM probes WHERE id = $1
