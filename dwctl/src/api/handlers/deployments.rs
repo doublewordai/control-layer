@@ -1,6 +1,6 @@
 use crate::{
     api::models::{
-        deployments::{DeployedModelCreate, DeployedModelResponse, DeployedModelUpdate, GetModelQuery, ListModelsQuery},
+        deployments::{DeployedModelCreate, DeployedModelResponse, DeployedModelUpdate, GetModelQuery, ListModelsQuery, ModelProbeStatus},
         users::CurrentUser,
     },
     auth::permissions::{can_read_all_resources, has_permission, operation, resource, RequiresPermission},
@@ -253,7 +253,6 @@ pub async fn list_deployed_models(
                 if let Some((probe_id, active, interval_seconds, last_check, last_success, uptime_percentage)) =
                     statuses.get(&model_response.id)
                 {
-                    use crate::api::models::deployments::ModelProbeStatus;
                     let status = ModelProbeStatus {
                         probe_id: *probe_id,
                         active: *active,
@@ -265,7 +264,6 @@ pub async fn list_deployed_models(
                     model_response = model_response.with_status(status);
                 } else {
                     // No probe for this model - set default status
-                    use crate::api::models::deployments::ModelProbeStatus;
                     let status = ModelProbeStatus {
                         probe_id: None,
                         active: false,
