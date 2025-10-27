@@ -5,7 +5,7 @@
 //! types (chat completions vs embeddings) and measures response times.
 
 use crate::db::models::deployments::ModelType;
-use crate::probes::models::ProbeExecution;
+use crate::db::models::probes::ProbeExecution;
 use anyhow::Result;
 use reqwest::Client;
 use serde_json::json;

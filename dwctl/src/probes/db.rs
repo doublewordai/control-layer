@@ -6,9 +6,10 @@
 //! - Statistics calculation
 //! - Background scheduling of active probes
 
+use crate::api::models::probes::{CreateProbe, ProbeStatistics};
+use crate::db::models::probes::{Probe, ProbeExecution, ProbeResult};
 use crate::errors::Error as AppError;
 use crate::probes::executor::{ProbeExecutionContext, ProbeExecutor};
-use crate::probes::models::{CreateProbe, Probe, ProbeExecution, ProbeResult, ProbeStatistics};
 use chrono::{DateTime, Utc};
 use sqlx::{PgPool, Row};
 use std::collections::HashMap;

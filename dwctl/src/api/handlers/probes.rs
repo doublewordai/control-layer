@@ -1,36 +1,15 @@
+use crate::api::models::probes::{CreateProbe, ProbeStatistics, ProbesQuery, ResultsQuery, StatsQuery, UpdateProbeRequest};
 use crate::auth::permissions::{operation, resource, RequiresPermission};
+use crate::db::models::probes::{Probe, ProbeResult};
 use crate::errors::Error;
 use crate::probes::db::ProbeManager;
-use crate::probes::models::{CreateProbe, Probe, ProbeResult, ProbeStatistics};
 use crate::AppState;
 use axum::{
     extract::{Path, Query, State},
     http::StatusCode,
     Json,
 };
-use chrono::{DateTime, Utc};
-use serde::Deserialize;
 use uuid::Uuid;
-
-// Query parameters for filtering probes
-#[derive(Deserialize)]
-pub struct ProbesQuery {
-    status: Option<String>,
-}
-
-// Query parameters for filtering results
-#[derive(Deserialize)]
-pub struct ResultsQuery {
-    start_time: Option<DateTime<Utc>>,
-    end_time: Option<DateTime<Utc>>,
-    limit: Option<i64>,
-}
-
-#[derive(Deserialize)]
-pub struct StatsQuery {
-    start_time: Option<DateTime<Utc>>,
-    end_time: Option<DateTime<Utc>>,
-}
 
 // POST /probes - Create a new probe
 pub async fn create_probe(
@@ -112,11 +91,6 @@ pub async fn deactivate_probe(
 }
 
 // PATCH /probes/:id - Update a probe
-#[derive(Debug, Deserialize)]
-pub struct UpdateProbeRequest {
-    interval_seconds: Option<i32>,
-}
-
 pub async fn update_probe(
     State(state): State<AppState>,
     _: RequiresPermission<resource::Probes, operation::UpdateAll>,
