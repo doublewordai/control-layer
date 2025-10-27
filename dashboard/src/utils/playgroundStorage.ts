@@ -24,7 +24,7 @@ export interface Message {
   role: "user" | "assistant" | "system";
   content: MessageContent;
   timestamp: Date;
-  modelAlias?: string; // Track which model generated this message (for assistant messages)
+  modelAlias: string; // Track which model generated this message (for assistant messages)
 }
 
 export interface Conversation {
@@ -63,6 +63,10 @@ function generateId(): string {
  */
 function generateTitle(messages: Message[]): string {
   const now = new Date();
+  const dateString = now.toLocaleDateString(undefined, {
+    month: 'short',
+    day: 'numeric'
+  });
   const timeString = now.toLocaleTimeString(undefined, {
     hour: '2-digit',
     minute: '2-digit',
@@ -72,8 +76,8 @@ function generateTitle(messages: Message[]): string {
   const firstUserMessage = messages.find((m) => m.role === "user");
 
   if (!firstUserMessage) {
-    // No message yet: just timestamp
-    return timeString;
+    // No message yet: just date and timestamp
+    return `${dateString} ${timeString}`;
   }
 
   // Extract text from message content
@@ -88,8 +92,8 @@ function generateTitle(messages: Message[]): string {
   // Truncate to 20 characters
   const truncatedText = text.length > 20 ? text.substring(0, 20) + "..." : text;
 
-  // Format: "14:34 - First message..."
-  return `${timeString} - ${truncatedText}`;
+  // Format: "Jan 15 14:34 - First message..."
+  return `${dateString} ${timeString} - ${truncatedText}`;
 }
 
 /**
@@ -270,7 +274,8 @@ export function createConversation(
  */
 export function updateConversation(
   id: string,
-  updates: Partial<Omit<Conversation, "id" | "createdAt">>
+  updates: Partial<Omit<Conversation, "id" | "createdAt">>,
+  options: { skipTimestampUpdate?: boolean } = {}
 ): Conversation | null {
   const store = getStore();
   const index = store.conversations.findIndex((c) => c.id === id);
@@ -280,12 +285,21 @@ export function updateConversation(
   }
 
   const conversation = store.conversations[index];
+
+  // Check if messages are actually being added (not just re-saving the same messages)
+  const isAddingNewMessage =
+    updates.messages &&
+    updates.messages.length > conversation.messages.length;
+
   const updated: Conversation = {
     ...conversation,
     ...updates,
     id: conversation.id, // Ensure ID doesn't change
     createdAt: conversation.createdAt, // Ensure createdAt doesn't change
-    updatedAt: new Date().toISOString(),
+    // Only update timestamp if we're adding new messages or if not skipping
+    updatedAt: (isAddingNewMessage || !options.skipTimestampUpdate)
+      ? new Date().toISOString()
+      : conversation.updatedAt,
   };
 
   store.conversations[index] = updated;

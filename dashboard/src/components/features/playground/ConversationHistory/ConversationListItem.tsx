@@ -1,6 +1,7 @@
 import React, { useState } from "react";
 import { Trash2, Edit2, Check, X } from "lucide-react";
 import * as PlaygroundStorage from "../../../../utils/playgroundStorage";
+import { Button } from "../../../ui/button";
 
 interface ConversationListItemProps {
   conversation: PlaygroundStorage.Conversation;
@@ -150,18 +151,22 @@ const ConversationListItem: React.FC<ConversationListItemProps> = ({
         >
           <p className="text-sm text-gray-900 mb-3">Delete this conversation?</p>
           <div className="flex gap-2">
-            <button
+            <Button
               onClick={handleDeleteConfirm}
-              className="flex-1 px-3 py-1.5 text-sm bg-red-600 text-white rounded hover:bg-red-700 transition-colors"
+              variant="destructive"
+              size="sm"
+              className="flex-1"
             >
               Delete
-            </button>
-            <button
+            </Button>
+            <Button
               onClick={handleDeleteCancel}
-              className="flex-1 px-3 py-1.5 text-sm bg-gray-200 text-gray-900 rounded hover:bg-gray-300 transition-colors"
+              variant="outline"
+              size="sm"
+              className="flex-1"
             >
               Cancel
-            </button>
+            </Button>
           </div>
         </div>
       )}

@@ -1,5 +1,5 @@
 import React, { useRef, useEffect, useState } from "react";
-import { Send, Copy, Play, Trash2, X, Image as ImageIcon } from "lucide-react";
+import { Send, Copy, Play, X, Image as ImageIcon } from "lucide-react";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
 import { Prism as SyntaxHighlighter } from "react-syntax-highlighter";
@@ -26,6 +26,7 @@ interface Message {
   role: "user" | "assistant" | "system";
   content: MessageContent;
   timestamp: Date;
+  modelAlias: string; // Track which model generated this message (for assistant messages)
 }
 
 interface GenerationPlaygroundProps {
@@ -44,7 +45,6 @@ interface GenerationPlaygroundProps {
   onSendMessage: () => void;
   onCopyMessage: (content: string, index: number) => void;
   onKeyDown: (e: React.KeyboardEvent) => void;
-  onClearConversation: () => void;
   onCancelStreaming?: () => void;
 }
 
@@ -64,7 +64,6 @@ const GenerationPlayground: React.FC<GenerationPlaygroundProps> = ({
   onSendMessage,
   onCopyMessage,
   onKeyDown,
-  onClearConversation,
   onCancelStreaming,
 }) => {
   const messagesEndRef = useRef<HTMLDivElement>(null);
@@ -216,7 +215,9 @@ const GenerationPlayground: React.FC<GenerationPlaygroundProps> = ({
                     <div className="w-full">
                       <div className="flex items-center gap-2 mb-3">
                         <span className="text-sm font-medium text-gray-600">
-                          {message.role === "system" ? "System" : "AI"}
+                          {message.role === "system"
+                            ? "System"
+                            : (message.modelAlias)}
                         </span>
                         <span className="text-xs text-gray-400">
                           {message.timestamp.toLocaleTimeString()}
@@ -386,7 +387,8 @@ const GenerationPlayground: React.FC<GenerationPlaygroundProps> = ({
                 <div className="w-full">
                   <div className="flex items-center gap-2 mb-3">
                     <span className="text-sm font-medium text-gray-600">
-                      AI
+                      {/* Use last message model alias, if not messages then use selected model alias */}
+                      {messages[messages.length - 1]?.modelAlias || selectedModel.alias}
                     </span>
                     <div className="flex space-x-1">
                       <div className="w-2 h-2 bg-gray-400 rounded-full animate-bounce"></div>
@@ -408,7 +410,8 @@ const GenerationPlayground: React.FC<GenerationPlaygroundProps> = ({
                 <div className="w-full">
                   <div className="flex items-center gap-2 mb-3">
                     <span className="text-sm font-medium text-gray-600">
-                      AI
+                      {/* Use last message model alias, if not messages then use selected model alias */}
+                      {messages[messages.length - 1]?.modelAlias || selectedModel.alias}
                     </span>
                     <div className="flex space-x-1">
                       <div className="w-1 h-1 bg-gray-600 rounded-full animate-pulse"></div>
@@ -674,16 +677,6 @@ const GenerationPlayground: React.FC<GenerationPlaygroundProps> = ({
                   </Button>
                 </>
               )}
-              <Button
-                onClick={onClearConversation}
-                variant="outline"
-                size="sm"
-                disabled={messages.length === 0 && !streamingContent}
-                aria-label="Clear conversation"
-              >
-                <Trash2 className="w-4 h-4" />
-                Clear chat
-              </Button>
             </div>
           </div>
         </div>

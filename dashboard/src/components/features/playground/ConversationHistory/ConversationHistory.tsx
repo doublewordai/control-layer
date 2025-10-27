@@ -2,6 +2,7 @@ import React, { useState, useEffect } from "react";
 import { X, Plus, MessageSquare } from "lucide-react";
 import * as PlaygroundStorage from "../../../../utils/playgroundStorage";
 import ConversationListItem from "./ConversationListItem";
+import { Button } from "../../../ui/button";
 
 interface ConversationHistoryProps {
   isOpen: boolean;
@@ -23,7 +24,7 @@ const ConversationHistory: React.FC<ConversationHistoryProps> = ({
 
   const loadConversations = () => {
     const allConversations = PlaygroundStorage.getConversations();
-    // Sort by most recently updated first
+    // Sort by last message time (newest first) - order never changes
     const sorted = allConversations.sort(
       (a, b) => new Date(b.updatedAt).getTime() - new Date(a.updatedAt).getTime()
     );
@@ -75,13 +76,14 @@ const ConversationHistory: React.FC<ConversationHistoryProps> = ({
 
         {/* New Conversation Button */}
         <div className="p-3 border-b border-gray-200">
-          <button
+          <Button
             onClick={onNewConversation}
-            className="w-full flex items-center justify-center gap-2 px-4 py-2 border border-doubleword-border bg-white shadow-xs hover:bg-doubleword-neutral-50 text-doubleword-text-primary rounded-md"
+            variant="outline"
+            className="w-full"
           >
             <Plus className="w-4 h-4" />
             New Conversation
-          </button>
+          </Button>
         </div>
 
         {/* Conversation List */}

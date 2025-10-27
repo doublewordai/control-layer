@@ -1,4 +1,4 @@
-import React, { useState, useEffect } from "react";
+import React, { useState, useEffect, useRef } from "react";
 import { useNavigate, useSearchParams } from "react-router-dom";
 import { Play, ArrowLeft, Menu } from "lucide-react";
 import OpenAI from "openai";
@@ -34,6 +34,13 @@ const Playground: React.FC = () => {
   const [selectedModel, setSelectedModel] = useState<Model | null>(null);
   const [modelType, setModelType] = useState<ModelType>("chat");
   const [currentConversationId, setCurrentConversationId] = useState<string | null>(null);
+  const currentConversationIdRef = useRef<string | null>(null);
+
+  // Keep ref in sync with state so async operations can check current value
+  useEffect(() => {
+    currentConversationIdRef.current = currentConversationId;
+  }, [currentConversationId]);
+
   const [isSidebarOpen, setIsSidebarOpen] = useState(true);
   const [textA, setTextA] = useState("");
   const [textB, setTextB] = useState("");
@@ -120,8 +127,10 @@ const Playground: React.FC = () => {
         setMessages(mostRecent.messages);
         PlaygroundStorage.setActiveConversationId(mostRecent.id);
 
-        // Update conversation's current model if needed
-        if (mostRecent.currentModelAlias !== selectedModel.alias) {
+        // Update conversation's current model if needed (only for chat models)
+        const newModelType = (selectedModel.model_type?.toLowerCase() as ModelType) ||
+          getModelType(selectedModel.id, selectedModel.alias);
+        if (mostRecent.currentModelAlias !== selectedModel.alias && newModelType === "chat") {
           PlaygroundStorage.switchConversationModel(mostRecent.id, selectedModel.alias);
         }
       } else {
@@ -139,7 +148,8 @@ const Playground: React.FC = () => {
     if (currentConversationId && messages.length > 0) {
       // Debounce: save after 500ms of no changes
       const timer = setTimeout(() => {
-        PlaygroundStorage.updateConversation(currentConversationId, { messages });
+        // Skip timestamp update - it will be updated when new messages are actually added
+        PlaygroundStorage.updateConversation(currentConversationId, { messages }, { skipTimestampUpdate: true });
       }, 500);
 
       return () => clearTimeout(timer);
@@ -149,16 +159,12 @@ const Playground: React.FC = () => {
   const handleModelChange = (modelId: string) => {
     const model = models.find((m) => m.alias === modelId);
     if (model) {
-      setSelectedModel(model);
-      setModelType(
-        (model.model_type?.toLowerCase() as ModelType) ||
-          getModelType(model.id, model.alias),
-      );
+      const newModelType = (model.model_type?.toLowerCase() as ModelType) ||
+        getModelType(model.id, model.alias);
 
-      // Switch the current conversation's model
-      if (currentConversationId) {
-        PlaygroundStorage.switchConversationModel(currentConversationId, model.alias);
-      }
+      setSelectedModel(model);
+      setModelType(newModelType);
+
 
       navigate(`/playground?model=${encodeURIComponent(modelId)}`);
     }
@@ -376,11 +382,17 @@ const Playground: React.FC = () => {
       return;
 
     // Create conversation on first message if it doesn't exist
-    if (!currentConversationId) {
+    let targetConversationId = currentConversationId;
+    if (!targetConversationId) {
       const newConversation = PlaygroundStorage.createConversation(selectedModel.alias);
+      targetConversationId = newConversation.id;
       setCurrentConversationId(newConversation.id);
       PlaygroundStorage.setActiveConversationId(newConversation.id);
     }
+
+    // Capture the conversation ID at the start - this ensures the response
+    // is saved to the correct conversation even if the user switches away
+    const streamTargetConversationId = targetConversationId;
 
     // Create message content - use multimodal format if images are present
     let messageContent: MessageContent;
@@ -414,6 +426,7 @@ const Playground: React.FC = () => {
       role: "user",
       content: messageContent,
       timestamp: new Date(),
+      modelAlias: "", // User messages don't need model tracking
     };
 
     setMessages((prev) => [...prev, userMessage]);
@@ -462,8 +475,11 @@ const Playground: React.FC = () => {
             `Chunk ${chunkCount}: "${content}" (length: ${content.length})`,
           );
 
-          // Update immediately without requestAnimationFrame to avoid batching
-          setStreamingContent(fullContent);
+          // Only update streaming content if still viewing the same conversation
+          // Use ref to get current value (not closure value)
+          if (currentConversationIdRef.current === streamTargetConversationId) {
+            setStreamingContent(fullContent);
+          }
         }
       }
 
@@ -477,7 +493,19 @@ const Playground: React.FC = () => {
         modelAlias: selectedModel.alias, // Track which model generated this response
       };
 
-      setMessages((prev) => [...prev, assistantMessage]);
+      // Save to the original conversation (even if user switched away)
+      const targetConversation = PlaygroundStorage.getConversation(streamTargetConversationId);
+      if (targetConversation) {
+        // Only add the assistant message - user message is already in the conversation
+        const updatedMessages = [...targetConversation.messages, assistantMessage];
+        PlaygroundStorage.updateConversation(streamTargetConversationId, { messages: updatedMessages });
+      }
+
+      // Only update UI if we're still viewing the same conversation
+      // Use ref to get current value (not closure value)
+      if (currentConversationIdRef.current === streamTargetConversationId) {
+        setMessages((prev) => [...prev, assistantMessage]);
+      }
       setStreamingContent("");
     } catch (err) {
       console.error("Error sending message:", err);
@@ -505,25 +533,6 @@ const Playground: React.FC = () => {
     }
   };
 
-  const clearConversation = () => {
-    // Don't create conversation yet - wait for first message
-    setCurrentConversationId(null);
-    setMessages([]);
-    setStreamingContent("");
-    setSimilarityResult(null);
-    setRerankResult(null);
-    setError(null);
-    setUploadedImages([]);
-    setTextA("");
-    setTextB("");
-    setQuery("What is the capital of France?");
-    setDocuments([
-      "The capital of Brazil is Brasilia.",
-      "The capital of France is Paris.",
-      "Horses and cows are both animals",
-    ]);
-  };
-
   const [copiedMessageIndex, setCopiedMessageIndex] = useState<number | null>(
     null,
   );
@@ -543,6 +552,11 @@ const Playground: React.FC = () => {
       setMessages(conversation.messages);
       PlaygroundStorage.setActiveConversationId(conversation.id);
 
+      // Clear streaming content when switching conversations
+      // This prevents partial streamed content from appearing in the new conversation
+      setStreamingContent("");
+      setError(null);
+
       // Update URL if switching to a different model
       if (conversation.currentModelAlias !== selectedModel?.alias) {
         const model = models.find((m) => m.alias === conversation.currentModelAlias);
@@ -559,20 +573,24 @@ const Playground: React.FC = () => {
   };
 
   const handleNewConversation = () => {
-    clearConversation();
+    // Clear streaming content when creating new conversation
+    setStreamingContent("");
+    setError(null);
   };
 
   return (
     <div className="h-[calc(100vh-4rem)] bg-white flex overflow-hidden">
-      {/* Conversation History Sidebar */}
-      <ConversationHistory
-        isOpen={isSidebarOpen}
-        onClose={() => setIsSidebarOpen(false)}
-        currentConversationId={currentConversationId}
-        onSelectConversation={handleSelectConversation}
-        onNewConversation={handleNewConversation}
-        currentModelAlias={selectedModel?.alias || ""}
-      />
+      {/* Conversation History Sidebar - Only show for chat models */}
+      {modelType === "chat" && (
+        <ConversationHistory
+          isOpen={isSidebarOpen}
+          onClose={() => setIsSidebarOpen(false)}
+          currentConversationId={currentConversationId}
+          onSelectConversation={handleSelectConversation}
+          onNewConversation={handleNewConversation}
+          currentModelAlias={selectedModel?.alias || ""}
+        />
+      )}
 
       {/* Main Content */}
       <div className="flex-1 flex flex-col min-h-0">
@@ -580,14 +598,16 @@ const Playground: React.FC = () => {
         <div className="bg-white border-b border-gray-200 px-8 py-3 flex-shrink-0">
           <div className="flex items-center justify-between">
             <div className="flex items-center gap-4">
-              <button
-                onClick={() => setIsSidebarOpen(!isSidebarOpen)}
-                className="p-2 text-gray-500 hover:bg-gray-100 rounded-lg transition-colors"
-                aria-label="Toggle conversation history"
-                title="Toggle conversation history"
-              >
-                <Menu className="w-5 h-5" />
-              </button>
+              {modelType === "chat" && (
+                <button
+                  onClick={() => setIsSidebarOpen(!isSidebarOpen)}
+                  className="p-2 text-gray-500 hover:bg-gray-100 rounded-lg transition-colors"
+                  aria-label="Toggle conversation history"
+                  title="Toggle conversation history"
+                >
+                  <Menu className="w-5 h-5" />
+                </button>
+              )}
               <button
                 onClick={() => navigate(fromUrl || "/models")}
                 className="p-2 text-gray-500 hover:bg-gray-100 rounded-lg transition-colors"
@@ -710,7 +730,6 @@ const Playground: React.FC = () => {
           onSendMessage={handleSendMessage}
           onCopyMessage={copyMessage}
           onKeyDown={handleKeyDown}
-          onClearConversation={clearConversation}
           onCancelStreaming={cancelStreaming}
         />
       )}
