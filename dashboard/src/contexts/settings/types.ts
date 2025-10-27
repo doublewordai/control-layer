@@ -4,6 +4,8 @@
 export interface FeatureFlags {
   /** Enable demo mode with mock data and service worker */
   demo: boolean;
+  /** Auto-generate conversation titles by summarizing the first message */
+  autoSummarizeTitles: boolean;
 }
 
 /**

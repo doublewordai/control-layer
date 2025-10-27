@@ -18,6 +18,7 @@ import {
 } from "../../../ui/select";
 import * as PlaygroundStorage from "../../../../utils/playgroundStorage";
 import type { Message, MessageContent, ImageContent, TextContent } from "../../../../utils/playgroundStorage";
+import { useSettings } from "../../../../contexts";
 
 const Playground: React.FC = () => {
   const navigate = useNavigate();
@@ -59,10 +60,10 @@ const Playground: React.FC = () => {
   const [rerankResult, setRerankResult] = useState<RerankResponse | null>(null);
 
   const { data: models = [], error: modelsError } = useModels();
+  const { isFeatureEnabled } = useSettings();
 
   // Initialize OpenAI client pointing to our API
   const baseURL = `${window.location.origin}/admin/api/v1/ai/v1`;
-  console.log("OpenAI Base URL:", baseURL);
 
   const openai = new OpenAI({
     baseURL,
@@ -94,6 +95,41 @@ const Playground: React.FC = () => {
       setError("Failed to load models");
     }
   }, [modelsError]);
+
+  // Check for interrupted streaming on mount
+  useEffect(() => {
+    const streamingState = PlaygroundStorage.getStreamingState();
+    if (streamingState) {
+      console.log("Found interrupted streaming state, restoring partial content...");
+
+      // Restore the conversation and partial content
+      const conversation = PlaygroundStorage.getConversation(streamingState.conversationId);
+      if (conversation) {
+        setCurrentConversationId(streamingState.conversationId);
+        setMessages(conversation.messages);
+        PlaygroundStorage.setActiveConversationId(streamingState.conversationId);
+
+        // Add the partial assistant message with an indicator
+        const partialMessage: Message = {
+          role: "assistant",
+          content: streamingState.partialContent + "\n\n*(Stream interrupted - partial response)*",
+          timestamp: new Date(streamingState.timestamp),
+          modelAlias: streamingState.modelAlias,
+        };
+
+        // Save the partial response to the conversation
+        const updatedMessages = [...conversation.messages, partialMessage];
+        PlaygroundStorage.updateConversation(streamingState.conversationId, { messages: updatedMessages });
+        setMessages(updatedMessages);
+
+        // Clear the streaming state
+        PlaygroundStorage.clearStreamingState();
+      } else {
+        // Conversation doesn't exist anymore, just clear the state
+        PlaygroundStorage.clearStreamingState();
+      }
+    }
+  }, []); // Only run once on mount
 
   // Initialize conversation on mount or load active conversation
   useEffect(() => {
@@ -373,6 +409,63 @@ const Playground: React.FC = () => {
     setUploadedImages((prev) => prev.filter((_, i) => i !== index));
   };
 
+  /**
+   * Summarize the first message and update the conversation title
+   */
+  const summarizeConversationTitle = async (
+    conversationId: string,
+    messageContent: MessageContent
+  ) => {
+    try {
+      // Extract text from message content
+      let messageText = "";
+      if (typeof messageContent === "string") {
+        messageText = messageContent;
+      } else {
+        const textContent = messageContent.find((c) => c.type === "text") as TextContent | undefined;
+        messageText = textContent?.text || "";
+      }
+
+      if (!messageText) {
+        console.error("No text content found for summarization");
+        return;
+      }
+      if (!selectedModel) {
+        console.error("No model selected for summarization");
+        return;
+      }
+
+      console.log("Summarizing conversation title for:", conversationId);
+
+      // Call API to summarize the message into a short title
+      const response = await openai.chat.completions.create({
+        model: selectedModel.alias,
+        messages: [
+          {
+            role: "system",
+            content: "You are a helpful assistant that creates very short, concise titles (max 6 words) for conversations. Return ONLY the title, no quotes, no explanation.",
+          },
+          {
+            role: "user",
+            content: `Create a short title (max 6 words) for this message: "${messageText}"`,
+          },
+        ],
+        temperature: 0.7,
+        max_tokens: 20,
+      });
+
+      const summary = response.choices[0]?.message?.content?.trim();
+      if (summary) {
+        console.log("Generated title:", summary);
+        // Update the conversation title
+        PlaygroundStorage.updateConversation(conversationId, { title: summary });
+      }
+    } catch (err) {
+      console.error("Failed to summarize conversation title:", err);
+      // Silently fail - don't disrupt the user experience
+    }
+  };
+
   const handleSendMessage = async () => {
     if (
       (!currentMessage.trim() && uploadedImages.length === 0) ||
@@ -465,6 +558,7 @@ const Playground: React.FC = () => {
 
       let fullContent = "";
       let chunkCount = 0;
+      const SAVE_BATCH_SIZE = 15; // Save to localStorage every 15 chunks
 
       for await (const chunk of stream) {
         const content = chunk.choices[0]?.delta?.content || "";
@@ -479,6 +573,18 @@ const Playground: React.FC = () => {
           // Use ref to get current value (not closure value)
           if (currentConversationIdRef.current === streamTargetConversationId) {
             setStreamingContent(fullContent);
+          }
+
+          // Batched save: Save partial content to localStorage every N chunks
+          // This allows recovery if user refreshes during streaming
+          if (chunkCount % SAVE_BATCH_SIZE === 0) {
+            PlaygroundStorage.saveStreamingState({
+              conversationId: streamTargetConversationId,
+              partialContent: fullContent,
+              userMessage,
+              modelAlias: selectedModel.alias,
+              timestamp: new Date().toISOString(),
+            });
           }
         }
       }
@@ -499,6 +605,13 @@ const Playground: React.FC = () => {
         // Only add the assistant message - user message is already in the conversation
         const updatedMessages = [...targetConversation.messages, assistantMessage];
         PlaygroundStorage.updateConversation(streamTargetConversationId, { messages: updatedMessages });
+
+        // Auto-summarize title if it's the first message and feature is enabled
+        const isFirstMessage = updatedMessages.length === 2; // user message + assistant response
+        if (isFirstMessage && isFeatureEnabled("autoSummarizeTitles")) {
+          // Run summarization in the background
+          summarizeConversationTitle(streamTargetConversationId, userMessage.content);
+        }
       }
 
       // Only update UI if we're still viewing the same conversation
@@ -507,6 +620,9 @@ const Playground: React.FC = () => {
         setMessages((prev) => [...prev, assistantMessage]);
       }
       setStreamingContent("");
+
+      // Clear streaming state from localStorage on successful completion
+      PlaygroundStorage.clearStreamingState();
     } catch (err) {
       console.error("Error sending message:", err);
       if (err instanceof Error && err.name === "AbortError") {
@@ -573,9 +689,12 @@ const Playground: React.FC = () => {
   };
 
   const handleNewConversation = () => {
-    // Clear streaming content when creating new conversation
+    // Clear current conversation - new conversation will be created lazily on first message
+    setCurrentConversationId(null);
+    setMessages([]);
     setStreamingContent("");
     setError(null);
+    PlaygroundStorage.setActiveConversationId(null);
   };
 
   return (

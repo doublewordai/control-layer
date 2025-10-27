@@ -371,25 +371,6 @@ export function clearAllConversations(): void {
 }
 
 /**
- * Get storage usage information
- */
-export function getStorageInfo(): {
-  conversationCount: number;
-  estimatedSize: number;
-  maxSize: number;
-} {
-  const data = localStorage.getItem(STORAGE_KEY);
-  const estimatedSize = data ? new Blob([data]).size : 0;
-  const maxSize = 5 * 1024 * 1024; // 5MB typical localStorage limit
-
-  return {
-    conversationCount: getConversations().length,
-    estimatedSize,
-    maxSize,
-  };
-}
-
-/**
  * Export all conversations as JSON
  */
 export function exportConversations(): string {
@@ -419,4 +400,50 @@ export function importConversations(json: string): boolean {
     console.error("Failed to import conversations:", error);
     return false;
   }
+}
+
+// ============================================================================
+// Streaming State Management
+// ============================================================================
+
+const STREAMING_STATE_KEY = "playground-streaming-state";
+
+export interface StreamingState {
+  conversationId: string;
+  partialContent: string;
+  userMessage: Message;
+  modelAlias: string;
+  timestamp: string;
+}
+
+/**
+ * Save partial streaming content (called periodically during streaming)
+ */
+export function saveStreamingState(state: StreamingState): void {
+  try {
+    localStorage.setItem(STREAMING_STATE_KEY, JSON.stringify(state));
+  } catch (error) {
+    console.error("Failed to save streaming state:", error);
+  }
+}
+
+/**
+ * Get partial streaming state (for recovery after page refresh)
+ */
+export function getStreamingState(): StreamingState | null {
+  try {
+    const data = localStorage.getItem(STREAMING_STATE_KEY);
+    if (!data) return null;
+    return JSON.parse(data) as StreamingState;
+  } catch (error) {
+    console.error("Failed to load streaming state:", error);
+    return null;
+  }
+}
+
+/**
+ * Clear streaming state (called when stream completes successfully)
+ */
+export function clearStreamingState(): void {
+  localStorage.removeItem(STREAMING_STATE_KEY);
 }

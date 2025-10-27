@@ -2,6 +2,14 @@ import React, { useState } from "react";
 import { Trash2, Edit2, Check, X } from "lucide-react";
 import * as PlaygroundStorage from "../../../../utils/playgroundStorage";
 import { Button } from "../../../ui/button";
+import {
+  Dialog,
+  DialogContent,
+  DialogDescription,
+  DialogFooter,
+  DialogHeader,
+  DialogTitle,
+} from "../../../ui/dialog";
 
 interface ConversationListItemProps {
   conversation: PlaygroundStorage.Conversation;
@@ -67,7 +75,7 @@ const ConversationListItem: React.FC<ConversationListItemProps> = ({
     <div
       className={`group relative p-3 rounded-lg cursor-pointer transition-colors ${
         isActive
-          ? "bg-blue-50 border border-blue-200"
+          ? "bg-grey-50 border border-gray-500"
           : "hover:bg-gray-50 border border-transparent"
       }`}
       onClick={() => !isEditing && !showDeleteConfirm && onSelect(conversation.id)}
@@ -144,32 +152,30 @@ const ConversationListItem: React.FC<ConversationListItemProps> = ({
         )}
       </div>
 
-      {showDeleteConfirm && (
-        <div
-          className="absolute inset-0 bg-white rounded-lg p-3 border border-red-200 shadow-lg z-10"
-          onClick={(e) => e.stopPropagation()}
-        >
-          <p className="text-sm text-gray-900 mb-3">Delete this conversation?</p>
-          <div className="flex gap-2">
-            <Button
-              onClick={handleDeleteConfirm}
-              variant="destructive"
-              size="sm"
-              className="flex-1"
-            >
-              Delete
-            </Button>
+      <Dialog open={showDeleteConfirm} onOpenChange={setShowDeleteConfirm}>
+        <DialogContent>
+          <DialogHeader>
+            <DialogTitle>Delete conversation?</DialogTitle>
+            <DialogDescription>
+              This action cannot be undone. This will permanently delete the conversation.
+            </DialogDescription>
+          </DialogHeader>
+          <DialogFooter>
             <Button
               onClick={handleDeleteCancel}
               variant="outline"
-              size="sm"
-              className="flex-1"
             >
               Cancel
             </Button>
-          </div>
-        </div>
-      )}
+            <Button
+              onClick={handleDeleteConfirm}
+              variant="destructive"
+            >
+              Delete
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
     </div>
   );
 };

@@ -148,6 +148,35 @@ export function Settings() {
                 )}
               </div>
             </div>
+
+            {/* Playground Settings Section */}
+            <div className="p-6 border-t border-doubleword-neutral-200">
+              <div className="flex items-center gap-2 mb-4">
+                <h2 className="text-lg font-semibold text-doubleword-neutral-900">
+                  Playground
+                </h2>
+              </div>
+
+              <div className="space-y-6">
+                <div className="flex items-center justify-between">
+                  <div className="flex-1">
+                    <h3 className="text-sm font-medium text-doubleword-neutral-900">
+                      Auto-Summarize Conversation Titles
+                    </h3>
+                    <p className="text-sm text-doubleword-neutral-600 mt-1">
+                      Automatically generate conversation titles by summarizing the first message using AI.
+                    </p>
+                  </div>
+                  <Switch
+                    checked={isFeatureEnabled("autoSummarizeTitles")}
+                    onCheckedChange={(checked) =>
+                      toggleFeature("autoSummarizeTitles", checked)
+                    }
+                    aria-label="Toggle auto-summarize conversation titles"
+                  />
+                </div>
+              </div>
+            </div>
           </div>
         ) : (
           <div className="bg-gray-50 border border-gray-200 rounded-lg p-6">

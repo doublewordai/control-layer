@@ -10,12 +10,13 @@ const DEFAULT_SETTINGS: AppSettings = {
   apiBaseUrl: "/admin/api/v1",
   features: {
     demo: false,
+    autoSummarizeTitles: true,
   },
 };
 
 /**
  * Parse feature flags from URL query parameters
- * Supports: ?flags=demo
+ * Supports: ?flags=demo,autoSummarizeTitles
  */
 function parseUrlFlags(): Partial<AppSettings> {
   const urlParams = new URLSearchParams(window.location.search);
@@ -28,6 +29,7 @@ function parseUrlFlags(): Partial<AppSettings> {
 
     settings.features = {
       demo: flagList.includes("demo"),
+      autoSummarizeTitles: flagList.includes("autoSummarizeTitles"),
     };
   }
 
@@ -61,6 +63,10 @@ function loadSettings(): AppSettings {
         urlSettings.features?.demo ??
         localSettings.features?.demo ??
         DEFAULT_SETTINGS.features.demo,
+      autoSummarizeTitles:
+        urlSettings.features?.autoSummarizeTitles ??
+        localSettings.features?.autoSummarizeTitles ??
+        DEFAULT_SETTINGS.features.autoSummarizeTitles,
     },
     demoConfig: localSettings.demoConfig,
   };
