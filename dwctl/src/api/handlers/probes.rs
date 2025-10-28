@@ -337,3 +337,360 @@ pub async fn get_statistics(
     let stats = ProbeManager::get_statistics(&state.db, id, query.start_time, query.end_time).await?;
     Ok(Json(stats))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{
+        api::models::users::Role,
+        db::models::probes::Probe,
+        test_utils::{add_auth_headers, create_test_admin_user, create_test_app, create_test_user},
+    };
+    use sqlx::PgPool;
+
+    async fn setup_test_deployment(pool: &PgPool, user_id: Uuid) -> Uuid {
+        let unique_id = Uuid::new_v4();
+        let endpoint_name = format!("test-endpoint-{}", unique_id);
+        let model_name = format!("test-model-{}", unique_id);
+
+        let endpoint_id = sqlx::query_scalar!(
+            "INSERT INTO inference_endpoints (name, url, created_by) VALUES ($1, $2, $3) RETURNING id",
+            endpoint_name,
+            "http://localhost:8080",
+            user_id
+        )
+        .fetch_one(pool)
+        .await
+        .unwrap();
+
+        sqlx::query_scalar!(
+            "INSERT INTO deployed_models (model_name, alias, type, hosted_on, created_by) VALUES ($1, $2, $3, $4, $5) RETURNING id",
+            model_name.clone(),
+            model_name,
+            "chat" as _,
+            endpoint_id,
+            user_id
+        )
+        .fetch_one(pool)
+        .await
+        .unwrap()
+    }
+
+    #[sqlx::test]
+    #[test_log::test]
+    async fn test_create_probe(pool: PgPool) {
+        let (app, _) = create_test_app(pool.clone(), false).await;
+        let user = create_test_admin_user(&pool, Role::PlatformManager).await;
+        let deployment_id = setup_test_deployment(&pool, user.id).await;
+
+        let payload = serde_json::json!({
+            "name": "Test Probe",
+            "deployment_id": deployment_id,
+            "interval_seconds": 60
+        });
+
+        let response = app
+            .post("/admin/api/v1/probes")
+            .add_header(add_auth_headers(&user).0, add_auth_headers(&user).1)
+            .json(&payload)
+            .await;
+
+        response.assert_status(axum::http::StatusCode::CREATED);
+        let probe: Probe = response.json();
+        assert_eq!(probe.name, "Test Probe");
+        assert_eq!(probe.deployment_id, deployment_id);
+        assert_eq!(probe.interval_seconds, 60);
+        assert!(probe.active);
+    }
+
+    #[sqlx::test]
+    #[test_log::test]
+    async fn test_create_probe_unauthorized(pool: PgPool) {
+        let (app, _) = create_test_app(pool.clone(), false).await;
+        let user = create_test_user(&pool, Role::StandardUser).await;
+        let deployment_id = setup_test_deployment(&pool, user.id).await;
+
+        let payload = serde_json::json!({
+            "name": "Test Probe",
+            "deployment_id": deployment_id,
+            "interval_seconds": 60
+        });
+
+        let response = app
+            .post("/admin/api/v1/probes")
+            .add_header(add_auth_headers(&user).0, add_auth_headers(&user).1)
+            .json(&payload)
+            .await;
+
+        response.assert_status(axum::http::StatusCode::FORBIDDEN);
+    }
+
+    #[sqlx::test]
+    #[test_log::test]
+    async fn test_list_probes(pool: PgPool) {
+        let (app, _) = create_test_app(pool.clone(), false).await;
+        let user = create_test_admin_user(&pool, Role::PlatformManager).await;
+
+        // Create test probes
+        let deployment_id1 = setup_test_deployment(&pool, user.id).await;
+        let deployment_id2 = setup_test_deployment(&pool, user.id).await;
+
+        ProbeManager::create_probe(
+            &pool,
+            CreateProbe {
+                name: "Probe 1".to_string(),
+                deployment_id: deployment_id1,
+                interval_seconds: 60,
+            },
+        )
+        .await
+        .unwrap();
+
+        ProbeManager::create_probe(
+            &pool,
+            CreateProbe {
+                name: "Probe 2".to_string(),
+                deployment_id: deployment_id2,
+                interval_seconds: 120,
+            },
+        )
+        .await
+        .unwrap();
+
+        let response = app
+            .get("/admin/api/v1/probes")
+            .add_header(add_auth_headers(&user).0, add_auth_headers(&user).1)
+            .await;
+
+        response.assert_status_ok();
+        let probes: Vec<Probe> = response.json();
+        assert_eq!(probes.len(), 2);
+    }
+
+    #[sqlx::test]
+    #[test_log::test]
+    async fn test_get_probe(pool: PgPool) {
+        let (app, _) = create_test_app(pool.clone(), false).await;
+        let user = create_test_admin_user(&pool, Role::PlatformManager).await;
+        let deployment_id = setup_test_deployment(&pool, user.id).await;
+
+        let created = ProbeManager::create_probe(
+            &pool,
+            CreateProbe {
+                name: "Test Probe".to_string(),
+                deployment_id,
+                interval_seconds: 60,
+            },
+        )
+        .await
+        .unwrap();
+
+        let response = app
+            .get(&format!("/admin/api/v1/probes/{}", created.id))
+            .add_header(add_auth_headers(&user).0, add_auth_headers(&user).1)
+            .await;
+
+        response.assert_status_ok();
+        let probe: Probe = response.json();
+        assert_eq!(probe.id, created.id);
+        assert_eq!(probe.name, "Test Probe");
+    }
+
+    #[sqlx::test]
+    #[test_log::test]
+    async fn test_get_probe_not_found(pool: PgPool) {
+        let (app, _) = create_test_app(pool.clone(), false).await;
+        let user = create_test_admin_user(&pool, Role::PlatformManager).await;
+        let non_existent_id = Uuid::new_v4();
+
+        let response = app
+            .get(&format!("/admin/api/v1/probes/{}", non_existent_id))
+            .add_header(add_auth_headers(&user).0, add_auth_headers(&user).1)
+            .await;
+
+        response.assert_status_not_found();
+    }
+
+    #[sqlx::test]
+    #[test_log::test]
+    async fn test_update_probe(pool: PgPool) {
+        let (app, _) = create_test_app(pool.clone(), false).await;
+        let user = create_test_admin_user(&pool, Role::PlatformManager).await;
+        let deployment_id = setup_test_deployment(&pool, user.id).await;
+
+        let created = ProbeManager::create_probe(
+            &pool,
+            CreateProbe {
+                name: "Original Name".to_string(),
+                deployment_id,
+                interval_seconds: 60,
+            },
+        )
+        .await
+        .unwrap();
+
+        let payload = serde_json::json!({
+            "interval_seconds": 120
+        });
+
+        let response = app
+            .patch(&format!("/admin/api/v1/probes/{}", created.id))
+            .add_header(add_auth_headers(&user).0, add_auth_headers(&user).1)
+            .json(&payload)
+            .await;
+
+        response.assert_status_ok();
+        let probe: Probe = response.json();
+        assert_eq!(probe.name, "Original Name"); // Name should not change
+        assert_eq!(probe.interval_seconds, 120);
+    }
+
+    #[sqlx::test]
+    #[test_log::test]
+    async fn test_activate_probe(pool: PgPool) {
+        let (app, _) = create_test_app(pool.clone(), false).await;
+        let user = create_test_admin_user(&pool, Role::PlatformManager).await;
+        let deployment_id = setup_test_deployment(&pool, user.id).await;
+
+        let created = ProbeManager::create_probe(
+            &pool,
+            CreateProbe {
+                name: "Test Probe".to_string(),
+                deployment_id,
+                interval_seconds: 60,
+            },
+        )
+        .await
+        .unwrap();
+
+        // First deactivate it
+        ProbeManager::deactivate_probe(&pool, created.id).await.unwrap();
+
+        let response = app
+            .patch(&format!("/admin/api/v1/probes/{}/activate", created.id))
+            .add_header(add_auth_headers(&user).0, add_auth_headers(&user).1)
+            .await;
+
+        response.assert_status_ok();
+        let probe: Probe = response.json();
+        assert!(probe.active);
+    }
+
+    #[sqlx::test]
+    #[test_log::test]
+    async fn test_deactivate_probe(pool: PgPool) {
+        let (app, _) = create_test_app(pool.clone(), false).await;
+        let user = create_test_admin_user(&pool, Role::PlatformManager).await;
+        let deployment_id = setup_test_deployment(&pool, user.id).await;
+
+        let created = ProbeManager::create_probe(
+            &pool,
+            CreateProbe {
+                name: "Test Probe".to_string(),
+                deployment_id,
+                interval_seconds: 60,
+            },
+        )
+        .await
+        .unwrap();
+
+        let response = app
+            .patch(&format!("/admin/api/v1/probes/{}/deactivate", created.id))
+            .add_header(add_auth_headers(&user).0, add_auth_headers(&user).1)
+            .await;
+
+        response.assert_status_ok();
+        let probe: Probe = response.json();
+        assert!(!probe.active);
+    }
+
+    #[sqlx::test]
+    #[test_log::test]
+    async fn test_delete_probe(pool: PgPool) {
+        let (app, _) = create_test_app(pool.clone(), false).await;
+        let user = create_test_admin_user(&pool, Role::PlatformManager).await;
+        let deployment_id = setup_test_deployment(&pool, user.id).await;
+
+        let created = ProbeManager::create_probe(
+            &pool,
+            CreateProbe {
+                name: "Test Probe".to_string(),
+                deployment_id,
+                interval_seconds: 60,
+            },
+        )
+        .await
+        .unwrap();
+
+        let response = app
+            .delete(&format!("/admin/api/v1/probes/{}", created.id))
+            .add_header(add_auth_headers(&user).0, add_auth_headers(&user).1)
+            .await;
+
+        response.assert_status(axum::http::StatusCode::NO_CONTENT);
+
+        // Verify probe is deleted
+        let get_response = app
+            .get(&format!("/admin/api/v1/probes/{}", created.id))
+            .add_header(add_auth_headers(&user).0, add_auth_headers(&user).1)
+            .await;
+
+        get_response.assert_status_not_found();
+    }
+
+    #[sqlx::test]
+    #[test_log::test]
+    async fn test_get_probe_results(pool: PgPool) {
+        let (app, _) = create_test_app(pool.clone(), false).await;
+        let user = create_test_admin_user(&pool, Role::PlatformManager).await;
+        let deployment_id = setup_test_deployment(&pool, user.id).await;
+
+        let created = ProbeManager::create_probe(
+            &pool,
+            CreateProbe {
+                name: "Test Probe".to_string(),
+                deployment_id,
+                interval_seconds: 60,
+            },
+        )
+        .await
+        .unwrap();
+
+        let response = app
+            .get(&format!("/admin/api/v1/probes/{}/results", created.id))
+            .add_header(add_auth_headers(&user).0, add_auth_headers(&user).1)
+            .await;
+
+        response.assert_status_ok();
+        let results: Vec<ProbeResult> = response.json();
+        assert!(results.is_empty()); // No results initially
+    }
+
+    #[sqlx::test]
+    #[test_log::test]
+    async fn test_get_statistics(pool: PgPool) {
+        let (app, _) = create_test_app(pool.clone(), false).await;
+        let user = create_test_admin_user(&pool, Role::PlatformManager).await;
+        let deployment_id = setup_test_deployment(&pool, user.id).await;
+
+        let created = ProbeManager::create_probe(
+            &pool,
+            CreateProbe {
+                name: "Test Probe".to_string(),
+                deployment_id,
+                interval_seconds: 60,
+            },
+        )
+        .await
+        .unwrap();
+
+        let response = app
+            .get(&format!("/admin/api/v1/probes/{}/statistics", created.id))
+            .add_header(add_auth_headers(&user).0, add_auth_headers(&user).1)
+            .await;
+
+        response.assert_status_ok();
+        let stats: ProbeStatistics = response.json();
+        assert_eq!(stats.total_executions, 0);
+    }
+}

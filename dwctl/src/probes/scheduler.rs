@@ -359,3 +359,200 @@ impl ProbeScheduler {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::api::models::probes::CreateProbe;
+    use crate::probes::db::ProbeManager;
+    use sqlx::PgPool;
+
+    async fn setup_test_deployment(pool: &PgPool) -> Uuid {
+        // Generate unique names using UUID
+        let unique_id = Uuid::new_v4();
+        let endpoint_name = format!("test-endpoint-{}", unique_id);
+        let model_name = format!("test-model-{}", unique_id);
+
+        // Create test endpoint
+        let endpoint_id = sqlx::query_scalar!(
+            "INSERT INTO inference_endpoints (name, url, created_by) VALUES ($1, $2, $3) RETURNING id",
+            endpoint_name,
+            "http://localhost:8080",
+            Uuid::nil()
+        )
+        .fetch_one(pool)
+        .await
+        .unwrap();
+
+        // Create test deployment
+        sqlx::query_scalar!(
+            "INSERT INTO deployed_models (model_name, alias, type, hosted_on, created_by) VALUES ($1, $2, $3, $4, $5) RETURNING id",
+            model_name.clone(),
+            model_name,
+            "chat" as _,
+            endpoint_id,
+            Uuid::nil()
+        )
+        .fetch_one(pool)
+        .await
+        .unwrap()
+    }
+
+    fn create_test_config() -> crate::config::Config {
+        crate::test_utils::create_test_config()
+    }
+
+    #[sqlx::test]
+    async fn test_scheduler_initialize(pool: PgPool) {
+        // Create separate deployments for each probe
+        let deployment_id1 = setup_test_deployment(&pool).await;
+        let deployment_id2 = setup_test_deployment(&pool).await;
+
+        // Create active probes
+        let _probe1 = ProbeManager::create_probe(
+            &pool,
+            CreateProbe {
+                name: "Probe 1".to_string(),
+                deployment_id: deployment_id1,
+                interval_seconds: 60,
+            },
+        )
+        .await
+        .unwrap();
+
+        let _probe2 = ProbeManager::create_probe(
+            &pool,
+            CreateProbe {
+                name: "Probe 2".to_string(),
+                deployment_id: deployment_id2,
+                interval_seconds: 120,
+            },
+        )
+        .await
+        .unwrap();
+
+        let config = create_test_config();
+        let scheduler = ProbeScheduler::new(pool, config);
+
+        scheduler.initialize().await.unwrap();
+
+        // Check that schedulers are running
+        let schedulers = scheduler.schedulers.read().await;
+        assert_eq!(schedulers.len(), 2);
+    }
+
+    #[sqlx::test]
+    async fn test_sync_starts_new_schedulers(pool: PgPool) {
+        let deployment_id = setup_test_deployment(&pool).await;
+
+        let config = create_test_config();
+        let scheduler = ProbeScheduler::new(pool.clone(), config);
+
+        // Initially no schedulers
+        scheduler.initialize().await.unwrap();
+        let initial_count = scheduler.schedulers.read().await.len();
+        assert_eq!(initial_count, 0);
+
+        // Create a new probe
+        let _probe = ProbeManager::create_probe(
+            &pool,
+            CreateProbe {
+                name: "New Probe".to_string(),
+                deployment_id,
+                interval_seconds: 60,
+            },
+        )
+        .await
+        .unwrap();
+
+        // Sync should start the scheduler
+        scheduler.sync_with_database().await.unwrap();
+
+        let new_count = scheduler.schedulers.read().await.len();
+        assert_eq!(new_count, 1);
+    }
+
+    #[sqlx::test]
+    async fn test_sync_stops_deactivated_schedulers(pool: PgPool) {
+        let deployment_id = setup_test_deployment(&pool).await;
+
+        let probe = ProbeManager::create_probe(
+            &pool,
+            CreateProbe {
+                name: "Test Probe".to_string(),
+                deployment_id,
+                interval_seconds: 60,
+            },
+        )
+        .await
+        .unwrap();
+
+        let config = create_test_config();
+        let scheduler = ProbeScheduler::new(pool.clone(), config);
+
+        scheduler.initialize().await.unwrap();
+        assert_eq!(scheduler.schedulers.read().await.len(), 1);
+
+        // Deactivate the probe
+        ProbeManager::deactivate_probe(&pool, probe.id).await.unwrap();
+
+        // Sync should stop the scheduler
+        scheduler.sync_with_database().await.unwrap();
+        assert_eq!(scheduler.schedulers.read().await.len(), 0);
+    }
+
+    #[sqlx::test]
+    async fn test_stop_all_schedulers(pool: PgPool) {
+        // Create separate deployment for each probe
+        for i in 0..3 {
+            let deployment_id = setup_test_deployment(&pool).await;
+            ProbeManager::create_probe(
+                &pool,
+                CreateProbe {
+                    name: format!("Probe {}", i),
+                    deployment_id,
+                    interval_seconds: 60,
+                },
+            )
+            .await
+            .unwrap();
+        }
+
+        let config = create_test_config();
+        let scheduler = ProbeScheduler::new(pool, config);
+
+        scheduler.initialize().await.unwrap();
+        assert_eq!(scheduler.schedulers.read().await.len(), 3);
+
+        // Stop all
+        scheduler.stop_all().await.unwrap();
+        assert_eq!(scheduler.schedulers.read().await.len(), 0);
+    }
+
+    #[sqlx::test]
+    async fn test_scheduler_ignores_inactive_probes(pool: PgPool) {
+        let deployment_id = setup_test_deployment(&pool).await;
+
+        // Create probe and immediately deactivate
+        let probe = ProbeManager::create_probe(
+            &pool,
+            CreateProbe {
+                name: "Inactive Probe".to_string(),
+                deployment_id,
+                interval_seconds: 60,
+            },
+        )
+        .await
+        .unwrap();
+
+        ProbeManager::deactivate_probe(&pool, probe.id).await.unwrap();
+
+        let config = create_test_config();
+        let scheduler = ProbeScheduler::new(pool, config);
+
+        scheduler.initialize().await.unwrap();
+
+        // Should not have any schedulers
+        assert_eq!(scheduler.schedulers.read().await.len(), 0);
+    }
+}

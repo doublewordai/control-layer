@@ -60,25 +60,6 @@ impl ProbeManager {
         Ok(probe)
     }
 
-    /// Get a probe by name
-    pub async fn get_probe_by_name(pool: &PgPool, name: &str) -> Result<Probe, AppError> {
-        let probe = sqlx::query_as::<_, Probe>(
-            r#"
-            SELECT * FROM probes WHERE name = $1
-            "#,
-        )
-        .bind(name)
-        .fetch_optional(pool)
-        .await
-        .map_err(|e| anyhow::anyhow!("Failed to fetch probe by name: {}", e))?
-        .ok_or_else(|| AppError::NotFound {
-            resource: "Probe".to_string(),
-            id: name.to_string(),
-        })?;
-
-        Ok(probe)
-    }
-
     /// List all probes
     pub async fn list_probes(pool: &PgPool) -> Result<Vec<Probe>, AppError> {
         let probes = sqlx::query_as::<_, Probe>(
@@ -587,5 +568,322 @@ impl ProbeManager {
             last_success: row.try_get("last_success").ok(),
             last_failure: row.try_get("last_failure").ok(),
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use sqlx::PgPool;
+
+    async fn setup_test_deployment(pool: &PgPool) -> Uuid {
+        // Generate unique names using UUID
+        let unique_id = Uuid::new_v4();
+        let endpoint_name = format!("test-endpoint-{}", unique_id);
+        let model_name = format!("test-model-{}", unique_id);
+
+        // Create test endpoint
+        let endpoint_id = sqlx::query_scalar!(
+            "INSERT INTO inference_endpoints (name, url, created_by) VALUES ($1, $2, $3) RETURNING id",
+            endpoint_name,
+            "http://localhost:8080",
+            Uuid::nil()
+        )
+        .fetch_one(pool)
+        .await
+        .unwrap();
+
+        // Create test deployment
+        sqlx::query_scalar!(
+            "INSERT INTO deployed_models (model_name, alias, type, hosted_on, created_by) VALUES ($1, $2, $3, $4, $5) RETURNING id",
+            model_name.clone(),
+            model_name,
+            "chat" as _,
+            endpoint_id,
+            Uuid::nil()
+        )
+        .fetch_one(pool)
+        .await
+        .unwrap()
+    }
+
+    #[sqlx::test]
+    async fn test_create_and_get_probe(pool: PgPool) {
+        let deployment_id = setup_test_deployment(&pool).await;
+
+        let probe_create = CreateProbe {
+            name: "Test Probe".to_string(),
+            deployment_id,
+            interval_seconds: 60,
+        };
+
+        let created = ProbeManager::create_probe(&pool, probe_create).await.unwrap();
+
+        assert_eq!(created.name, "Test Probe");
+        assert_eq!(created.deployment_id, deployment_id);
+        assert_eq!(created.interval_seconds, 60);
+        assert!(created.active); // New probes are active by default
+
+        // Test get_probe
+        let fetched = ProbeManager::get_probe(&pool, created.id).await.unwrap();
+        assert_eq!(fetched.id, created.id);
+        assert_eq!(fetched.name, created.name);
+    }
+
+    #[sqlx::test]
+    async fn test_list_probes(pool: PgPool) {
+        // Create separate deployment for each probe
+        for i in 0..3 {
+            let deployment_id = setup_test_deployment(&pool).await;
+            ProbeManager::create_probe(
+                &pool,
+                CreateProbe {
+                    name: format!("Probe {}", i),
+                    deployment_id,
+                    interval_seconds: 60,
+                },
+            )
+            .await
+            .unwrap();
+        }
+
+        let probes = ProbeManager::list_probes(&pool).await.unwrap();
+        assert_eq!(probes.len(), 3);
+    }
+
+    #[sqlx::test]
+    async fn test_list_active_probes(pool: PgPool) {
+        // Create separate deployments for each probe
+        let deployment_id1 = setup_test_deployment(&pool).await;
+        let deployment_id2 = setup_test_deployment(&pool).await;
+
+        // Create probes
+        let probe1 = ProbeManager::create_probe(
+            &pool,
+            CreateProbe {
+                name: "Active Probe".to_string(),
+                deployment_id: deployment_id1,
+                interval_seconds: 60,
+            },
+        )
+        .await
+        .unwrap();
+
+        let probe2 = ProbeManager::create_probe(
+            &pool,
+            CreateProbe {
+                name: "Inactive Probe".to_string(),
+                deployment_id: deployment_id2,
+                interval_seconds: 60,
+            },
+        )
+        .await
+        .unwrap();
+
+        // Deactivate one probe
+        ProbeManager::deactivate_probe(&pool, probe2.id).await.unwrap();
+
+        let active = ProbeManager::list_active_probes(&pool).await.unwrap();
+        assert_eq!(active.len(), 1);
+        assert_eq!(active[0].id, probe1.id);
+    }
+
+    #[sqlx::test]
+    async fn test_activate_deactivate_probe(pool: PgPool) {
+        let deployment_id = setup_test_deployment(&pool).await;
+
+        let probe = ProbeManager::create_probe(
+            &pool,
+            CreateProbe {
+                name: "Test Probe".to_string(),
+                deployment_id,
+                interval_seconds: 60,
+            },
+        )
+        .await
+        .unwrap();
+
+        assert!(probe.active);
+
+        // Deactivate
+        let deactivated = ProbeManager::deactivate_probe(&pool, probe.id).await.unwrap();
+        assert!(!deactivated.active);
+
+        // Reactivate
+        let activated = ProbeManager::activate_probe(&pool, probe.id).await.unwrap();
+        assert!(activated.active);
+    }
+
+    #[sqlx::test]
+    async fn test_update_probe(pool: PgPool) {
+        let deployment_id = setup_test_deployment(&pool).await;
+
+        let probe = ProbeManager::create_probe(
+            &pool,
+            CreateProbe {
+                name: "Test Probe".to_string(),
+                deployment_id,
+                interval_seconds: 60,
+            },
+        )
+        .await
+        .unwrap();
+
+        // Update interval
+        let updated = ProbeManager::update_probe(&pool, probe.id, Some(120)).await.unwrap();
+        assert_eq!(updated.interval_seconds, 120);
+
+        // Update with None should keep existing value
+        let unchanged = ProbeManager::update_probe(&pool, probe.id, None).await.unwrap();
+        assert_eq!(unchanged.interval_seconds, 120);
+    }
+
+    #[sqlx::test]
+    async fn test_delete_probe(pool: PgPool) {
+        let deployment_id = setup_test_deployment(&pool).await;
+
+        let probe = ProbeManager::create_probe(
+            &pool,
+            CreateProbe {
+                name: "Test Probe".to_string(),
+                deployment_id,
+                interval_seconds: 60,
+            },
+        )
+        .await
+        .unwrap();
+
+        ProbeManager::delete_probe(&pool, probe.id).await.unwrap();
+
+        // Verify it's deleted
+        let result = ProbeManager::get_probe(&pool, probe.id).await;
+        assert!(result.is_err());
+    }
+
+    #[sqlx::test]
+    async fn test_get_deployment_statuses(pool: PgPool) {
+        let deployment_id = setup_test_deployment(&pool).await;
+
+        let probe = ProbeManager::create_probe(
+            &pool,
+            CreateProbe {
+                name: "Test Probe".to_string(),
+                deployment_id,
+                interval_seconds: 60,
+            },
+        )
+        .await
+        .unwrap();
+
+        let statuses = ProbeManager::get_deployment_statuses(&pool, &[deployment_id]).await.unwrap();
+
+        assert_eq!(statuses.len(), 1);
+        let (probe_id, active, interval, _, _, _) = statuses.get(&deployment_id).unwrap();
+        assert_eq!(*probe_id, Some(probe.id));
+        assert!(*active);
+        assert_eq!(*interval, Some(60));
+    }
+
+    #[sqlx::test]
+    async fn test_get_statistics_empty(pool: PgPool) {
+        let deployment_id = setup_test_deployment(&pool).await;
+
+        let probe = ProbeManager::create_probe(
+            &pool,
+            CreateProbe {
+                name: "Test Probe".to_string(),
+                deployment_id,
+                interval_seconds: 60,
+            },
+        )
+        .await
+        .unwrap();
+
+        let stats = ProbeManager::get_statistics(&pool, probe.id, None, None).await.unwrap();
+
+        assert_eq!(stats.total_executions, 0);
+        assert_eq!(stats.successful_executions, 0);
+        assert_eq!(stats.failed_executions, 0);
+        assert_eq!(stats.success_rate, 0.0);
+    }
+
+    #[sqlx::test]
+    async fn test_get_probe_results_empty(pool: PgPool) {
+        let deployment_id = setup_test_deployment(&pool).await;
+
+        let probe = ProbeManager::create_probe(
+            &pool,
+            CreateProbe {
+                name: "Test Probe".to_string(),
+                deployment_id,
+                interval_seconds: 60,
+            },
+        )
+        .await
+        .unwrap();
+
+        let results = ProbeManager::get_probe_results(&pool, probe.id, None, None, None).await.unwrap();
+        assert_eq!(results.len(), 0);
+    }
+
+    #[sqlx::test]
+    async fn test_probe_notify_trigger(pool: PgPool) {
+        use sqlx::postgres::PgListener;
+        use tokio::time::{timeout, Duration};
+
+        let deployment_id = setup_test_deployment(&pool).await;
+
+        // Create a listener for probe changes
+        let mut listener = PgListener::connect_with(&pool).await.unwrap();
+        listener.listen("probe_changes").await.unwrap();
+
+        // Test INSERT notification
+        let probe = ProbeManager::create_probe(
+            &pool,
+            CreateProbe {
+                name: "Test Probe".to_string(),
+                deployment_id,
+                interval_seconds: 60,
+            },
+        )
+        .await
+        .unwrap();
+
+        // Wait for and verify INSERT notification
+        let notification = timeout(Duration::from_secs(2), listener.recv())
+            .await
+            .expect("Timeout waiting for INSERT notification")
+            .unwrap();
+
+        let payload: serde_json::Value = serde_json::from_str(notification.payload()).unwrap();
+        assert_eq!(payload["action"], "INSERT");
+        assert_eq!(payload["probe_id"], probe.id.to_string());
+        assert_eq!(payload["active"], true);
+
+        // Test UPDATE notification
+        ProbeManager::update_probe(&pool, probe.id, Some(120)).await.unwrap();
+
+        let notification = timeout(Duration::from_secs(2), listener.recv())
+            .await
+            .expect("Timeout waiting for UPDATE notification")
+            .unwrap();
+
+        let payload: serde_json::Value = serde_json::from_str(notification.payload()).unwrap();
+        assert_eq!(payload["action"], "UPDATE");
+        assert_eq!(payload["probe_id"], probe.id.to_string());
+        assert_eq!(payload["active"], true);
+
+        // Test DELETE notification
+        ProbeManager::delete_probe(&pool, probe.id).await.unwrap();
+
+        let notification = timeout(Duration::from_secs(2), listener.recv())
+            .await
+            .expect("Timeout waiting for DELETE notification")
+            .unwrap();
+
+        let payload: serde_json::Value = serde_json::from_str(notification.payload()).unwrap();
+        assert_eq!(payload["action"], "DELETE");
+        assert_eq!(payload["probe_id"], probe.id.to_string());
+        assert_eq!(payload["active"], true);
     }
 }
