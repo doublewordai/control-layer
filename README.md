@@ -10,9 +10,13 @@ The Doubleword Control Layer (dwctl) is the world’s fastest AI model gateway (
  
 ## Getting started
 
-The Doubleword Control Layer requries Docker to be installed as well as a Postgres Database to run. For information on how to get started with Docker see the docs (here)[https://docs.docker.com/get-started/)]. 
+The Doubleword Control Layer requries Docker to be installed. For information on how to get started with Docker see the docs (here)[https://docs.docker.com/get-started/)]. 
 
-### Docker Compose
+There are two ways to set up the Control Layer:
+1. **Docker Compose** - All-in-one setup with pre-configured Postgres and dwctl. This method automatically provisions a containerized Postgres database with default credentials and connects it to the Control Layer.
+2. **Docker Run** - Bring-your-own-database setup. Use this method to connect the Control Layer to an existing Postgres instance of your choice.
+
+### Option 1. Docker Compose
 
 With docker compose installed, the commands below will start the Control Layer.  
 
@@ -21,7 +25,10 @@ wget https://raw.githubusercontent.com/doublewordai/control-layer/refs/heads/mai
 docker compose up -d
 ```
 
-### PostgresSQL
+Navigate to `http://localhost:3001` to get started. When you get to the login page you will be prompting to sign in with a username and password. Please refer to the configuration section below for how to set up an admin user. You can then refer to the documentation [here](https://docs.doubleword.ai/control-layer/usage/models-and-access) to start playing around with Control Layer features.  
+
+
+### 2. Option 2 Docker Run 
 
 The Doubleword Control Layer requires a PostgreSQL database to run. You can read the documentation (here)[https://postgresapp.com/] on how to get started with a local version of PostGres. After doing this, or if you have one already (for example, via a cloud provider), run:
 
