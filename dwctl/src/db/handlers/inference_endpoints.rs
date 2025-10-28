@@ -7,6 +7,7 @@ use crate::types::{InferenceEndpointId, UserId};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use sqlx::{FromRow, PgConnection};
+use crate::crypto::EncryptedString;
 
 /// Filter for listing inference endpoints
 #[derive(Debug, Clone)]
@@ -55,6 +56,7 @@ impl TryFrom<InferenceEndpoint> for InferenceEndpointDBResponse {
 
 pub struct InferenceEndpoints<'c> {
     db: &'c mut PgConnection,
+    encryption_key: Option<String>
 }
 
 #[async_trait::async_trait] // consider #[async_trait(?Send)] if Send bounds bite
@@ -69,6 +71,13 @@ impl<'c> Repository for InferenceEndpoints<'c> {
         let created_at = Utc::now();
         let updated_at = created_at;
 
+
+        let encrypted_api_key: Option<String> = request.api_key
+                .as_ref()
+                .map(|key| EncryptedString::new(key, self.encryption_key.as_deref()))
+                .transpose()?
+                .map(|e| e.into());
+
         let endpoint = sqlx::query_as!(
             InferenceEndpoint,
             r#"
@@ -79,7 +88,7 @@ impl<'c> Repository for InferenceEndpoints<'c> {
             request.name,
             request.description,
             request.url.as_str(),
-            request.api_key,
+            encrypted_api_key,
             request.model_filter.as_deref(),
             request.created_by,
             created_at,
@@ -144,23 +153,28 @@ impl<'c> Repository for InferenceEndpoints<'c> {
 
     async fn update(&mut self, id: Self::Id, request: &Self::UpdateRequest) -> Result<Self::Response> {
         // Atomic update with conditional field updates
+        let encrypted_api_key: Option<Option<String>> = match &request.api_key {
+            Some(Some(key)) => Some(Some(String::from(EncryptedString::new(key, self.encryption_key.as_deref())?))),
+            Some(None) => Some(None), // Clear the field
+            None => None, // Don't update the field
+        };
         let endpoint = sqlx::query_as!(
             InferenceEndpoint,
             r#"
             UPDATE inference_endpoints SET
                 name = COALESCE($2, name),
-                description = CASE 
+                description = CASE
                     WHEN $3::text IS NOT NULL THEN $3
-                    ELSE description 
+                    ELSE description
                 END,
                 url = COALESCE($4, url),
-                api_key = CASE 
+                api_key = CASE
                     WHEN $5::text IS NOT NULL THEN $5
-                    ELSE api_key 
+                    ELSE api_key
                 END,
-                model_filter = CASE 
+                model_filter = CASE
                     WHEN $6::text[] IS NOT NULL THEN $6
-                    ELSE model_filter 
+                    ELSE model_filter
                 END,
                 updated_at = NOW()
             WHERE id = $1
@@ -170,7 +184,7 @@ impl<'c> Repository for InferenceEndpoints<'c> {
             request.name,
             request.description.as_deref(),
             request.url.as_ref().map(|u| u.as_str()),
-            request.api_key.as_ref().and_then(|opt| opt.as_deref()),
+            encrypted_api_key.as_ref().and_then(|opt| opt.as_deref()),
             request.model_filter.as_ref().and_then(|opt| opt.as_ref().map(|v| v.as_slice()))
         )
         .fetch_optional(&mut *self.db)
@@ -195,8 +209,8 @@ impl<'c> Repository for InferenceEndpoints<'c> {
 }
 
 impl<'c> InferenceEndpoints<'c> {
-    pub fn new(db: &'c mut PgConnection) -> Self {
-        Self { db }
+    pub fn new(db: &'c mut PgConnection, encryption_key: Option<String>) -> Self {
+        Self { db , encryption_key}
     }
 
     /// Returns the ID of the default inference endpoint
@@ -249,7 +263,7 @@ mod tests {
     #[test_log::test]
     async fn test_get_bulk_empty_ids(pool: PgPool) {
         let mut conn = pool.acquire().await.unwrap();
-        let mut repo = InferenceEndpoints::new(&mut conn);
+        let mut repo = InferenceEndpoints::new(&mut conn, None);
         let result = repo.get_bulk(vec![]).await.unwrap();
         assert!(result.is_empty());
     }
@@ -259,7 +273,7 @@ mod tests {
     async fn test_get_bulk_single_endpoint(pool: PgPool) {
         let user = create_test_user(&pool).await;
         let mut conn = pool.acquire().await.unwrap();
-        let mut repo = InferenceEndpoints::new(&mut conn);
+        let mut repo = InferenceEndpoints::new(&mut conn, None);
 
         // Create a test endpoint
         let endpoint_request = create_test_endpoint_request(user.id, "bulk-test-endpoint");
@@ -289,7 +303,7 @@ mod tests {
     async fn test_get_bulk_multiple_endpoints(pool: PgPool) {
         let user = create_test_user(&pool).await;
         let mut conn = pool.acquire().await.unwrap();
-        let mut repo = InferenceEndpoints::new(&mut conn);
+        let mut repo = InferenceEndpoints::new(&mut conn, None);
 
         // Create multiple test endpoints
         let endpoint1_request = create_test_endpoint_request(user.id, "bulk-endpoint-1");
@@ -318,7 +332,7 @@ mod tests {
     async fn test_get_bulk_nonexistent_ids(pool: PgPool) {
         let user = create_test_user(&pool).await;
         let mut conn = pool.acquire().await.unwrap();
-        let mut repo = InferenceEndpoints::new(&mut conn);
+        let mut repo = InferenceEndpoints::new(&mut conn, None);
 
         // Create one endpoint
         let endpoint_request = create_test_endpoint_request(user.id, "existing-endpoint");
@@ -339,7 +353,7 @@ mod tests {
     async fn test_delete_existing_endpoint(pool: PgPool) {
         let user = create_test_user(&pool).await;
         let mut conn = pool.acquire().await.unwrap();
-        let mut repo = InferenceEndpoints::new(&mut conn);
+        let mut repo = InferenceEndpoints::new(&mut conn, None);
 
         // Create a test endpoint
         let endpoint_request = create_test_endpoint_request(user.id, "delete-test-endpoint");
@@ -362,7 +376,7 @@ mod tests {
     #[test_log::test]
     async fn test_delete_nonexistent_endpoint(pool: PgPool) {
         let mut conn = pool.acquire().await.unwrap();
-        let mut repo = InferenceEndpoints::new(&mut conn);
+        let mut repo = InferenceEndpoints::new(&mut conn, None);
         let fake_id = uuid::Uuid::new_v4();
 
         // Try to delete non-existent endpoint
@@ -375,7 +389,7 @@ mod tests {
     async fn test_apply_update_all_fields(pool: PgPool) {
         let user = create_test_user(&pool).await;
         let mut conn = pool.acquire().await.unwrap();
-        let mut repo = InferenceEndpoints::new(&mut conn);
+        let mut repo = InferenceEndpoints::new(&mut conn, None);
 
         // Create a test endpoint
         let endpoint_request = create_test_endpoint_request(user.id, "update-test-endpoint");
@@ -417,7 +431,7 @@ mod tests {
     async fn test_apply_update_partial_fields(pool: PgPool) {
         let user = create_test_user(&pool).await;
         let mut conn = pool.acquire().await.unwrap();
-        let mut repo = InferenceEndpoints::new(&mut conn);
+        let mut repo = InferenceEndpoints::new(&mut conn, None);
 
         // Create a test endpoint
         let endpoint_request = create_test_endpoint_request(user.id, "partial-update-endpoint");
@@ -565,7 +579,7 @@ mod tests {
     #[test_log::test]
     async fn test_update_nonexistent_endpoint_returns_not_found(pool: PgPool) {
         let mut conn = pool.acquire().await.unwrap();
-        let mut repo = InferenceEndpoints::new(&mut conn);
+        let mut repo = InferenceEndpoints::new(&mut conn, None);
         let fake_id = uuid::Uuid::new_v4();
 
         let update_request = InferenceEndpointUpdateDBRequest {

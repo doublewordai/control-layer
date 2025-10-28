@@ -32,6 +32,15 @@ pub enum DbError {
         message: String,
     },
 
+
+    /// Encryption/decryption operation failed
+    #[error("Encryption operation failed: {operation}")]
+    EncryptionError {
+        operation: String,
+        #[source]
+        source: anyhow::Error,
+    },
+
     /// Entity cannot be modified or deleted due to protection rules
     /// NOTE: use this only for DB-level protection rules, not user roles etc. - that's handled at
     /// the API layer.

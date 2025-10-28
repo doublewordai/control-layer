@@ -56,11 +56,13 @@ pub enum DatabaseConfig {
         /// Whether to persist data between restarts (default: false/ephemeral)
         #[serde(default)]
         persistent: bool,
+        encryption_key: Option<String>,
     },
     /// Use external PostgreSQL database
     External {
         /// Connection string for external database
         url: String,
+        encryption_key: Option<String>,
     },
 }
 
@@ -72,12 +74,14 @@ impl Default for DatabaseConfig {
             DatabaseConfig::Embedded {
                 data_dir: None,
                 persistent: false,
+                encryption_key: None,
             }
         }
         #[cfg(not(feature = "embedded-db"))]
         {
             DatabaseConfig::External {
                 url: "postgres://localhost:5432/control_layer".to_string(),
+                encryption_key: None,
             }
         }
     }
@@ -93,7 +97,7 @@ impl DatabaseConfig {
     /// Get external URL if available
     pub fn external_url(&self) -> Option<&str> {
         match self {
-            DatabaseConfig::External { url } => Some(url),
+            DatabaseConfig::External { url, .. } => Some(url),
             DatabaseConfig::Embedded { .. } => None,
         }
     }
@@ -111,6 +115,14 @@ impl DatabaseConfig {
         match self {
             DatabaseConfig::Embedded { persistent, .. } => *persistent,
             DatabaseConfig::External { .. } => false,
+        }
+    }
+
+    /// Get the encryption key
+    pub fn encryption_key(&self) -> &Option<String> {
+        match self {
+            DatabaseConfig::Embedded { encryption_key, .. } => encryption_key,
+            DatabaseConfig::External { encryption_key, .. } => encryption_key,
         }
     }
 }
@@ -392,7 +404,7 @@ impl Config {
 
         // if database_url is set, use it
         if let Some(url) = config.database_url.take() {
-            config.database = DatabaseConfig::External { url };
+            config.database = DatabaseConfig::External { url, encryption_key: None };
         }
 
         config.validate().map_err(|e| figment::Error::from(e.to_string()))?;

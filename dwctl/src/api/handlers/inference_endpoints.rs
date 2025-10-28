@@ -48,7 +48,7 @@ pub async fn list_inference_endpoints(
     _: RequiresPermission<resource::Endpoints, operation::ReadAll>, // Need at least read-own, users with ReadAll can see more
 ) -> Result<Json<Vec<InferenceEndpointResponse>>> {
     let mut conn = state.db.acquire().await.map_err(|e| Error::Database(e.into()))?;
-    let mut repo = InferenceEndpoints::new(&mut conn);
+    let mut repo = InferenceEndpoints::new(&mut conn, state.config.database.encryption_key().clone());
     let skip = query.skip.unwrap_or(0);
     let limit = query.limit.unwrap_or(100).min(1000);
 
@@ -82,7 +82,7 @@ pub async fn get_inference_endpoint(
     _: RequiresPermission<resource::Endpoints, operation::ReadAll>,
 ) -> Result<Json<InferenceEndpointResponse>> {
     let mut conn = state.db.acquire().await.map_err(|e| Error::Database(e.into()))?;
-    let mut repo = InferenceEndpoints::new(&mut conn);
+    let mut repo = InferenceEndpoints::new(&mut conn, state.config.database.encryption_key().clone());
     match repo.get_by_id(id).await? {
         Some(endpoint) => Ok(Json(endpoint.into())),
         None => Err(Error::NotFound {
@@ -121,7 +121,7 @@ pub async fn update_inference_endpoint(
     Json(update): Json<InferenceEndpointUpdate>,
 ) -> Result<Json<InferenceEndpointResponse>> {
     let mut conn = state.db.acquire().await.map_err(|e| Error::Database(e.into()))?;
-    let mut repo = InferenceEndpoints::new(&mut conn);
+    let mut repo = InferenceEndpoints::new(&mut conn, state.config.database.encryption_key().clone());
     let db_request = InferenceEndpointUpdateDBRequest {
         name: update.name,
         description: update.description,
@@ -189,7 +189,7 @@ pub async fn validate_inference_endpoint(
         }
         InferenceEndpointValidate::Existing { endpoint_id } => {
             let mut conn = state.db.acquire().await.map_err(|e| Error::Database(e.into()))?;
-            let mut endpoints_repo = InferenceEndpoints::new(&mut conn);
+            let mut endpoints_repo = InferenceEndpoints::new(&mut conn, state.config.database.encryption_key().clone());
             let endpoint = endpoints_repo.get_by_id(endpoint_id).await?;
 
             let endpoint = endpoint.ok_or_else(|| Error::NotFound {
@@ -239,7 +239,7 @@ pub async fn create_inference_endpoint(
     })?;
 
     let mut conn = state.db.acquire().await.map_err(|e| Error::Database(e.into()))?;
-    let mut repo = InferenceEndpoints::new(&mut conn);
+    let mut repo = InferenceEndpoints::new(&mut conn, state.config.database.encryption_key().clone());
     let db_request = InferenceEndpointCreateDBRequest {
         created_by: current_user.id,
         name: create_request.name,
@@ -301,7 +301,7 @@ pub async fn delete_inference_endpoint(
     _: RequiresPermission<resource::Endpoints, operation::DeleteAll>,
 ) -> Result<StatusCode> {
     let mut conn = state.db.acquire().await.map_err(|e| Error::Database(e.into()))?;
-    let mut repo = InferenceEndpoints::new(&mut conn);
+    let mut repo = InferenceEndpoints::new(&mut conn, state.config.database.encryption_key().clone());
     if repo.delete(id).await? {
         Ok(StatusCode::NO_CONTENT)
     } else {

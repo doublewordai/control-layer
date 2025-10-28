@@ -393,6 +393,7 @@ mod tests {
         config.enable_request_logging = true;
         config.database = crate::config::DatabaseConfig::External {
             url: pool.connect_options().to_url_lossy().to_string(),
+            encryption_key: config.database.encryption_key().clone(),
         };
 
         // Build router with request logging enabled
@@ -429,6 +430,7 @@ mod tests {
         config.enable_request_logging = true;
         config.database = crate::config::DatabaseConfig::External {
             url: pool.connect_options().to_url_lossy().to_string(),
+            encryption_key: config.database.encryption_key().clone(),
         };
 
         // Build router with request logging enabled
@@ -476,6 +478,7 @@ mod tests {
         config.enable_request_logging = true;
         config.database = crate::config::DatabaseConfig::External {
             url: pool.connect_options().to_url_lossy().to_string(),
+            encryption_key: config.database.encryption_key().clone(),
         };
 
         let mut app_state = crate::AppState::builder().db(pool.clone()).config(config).build();
@@ -840,6 +843,7 @@ mod tests {
         config.enable_request_logging = true;
         config.database = crate::config::DatabaseConfig::External {
             url: pool.connect_options().to_url_lossy().to_string(),
+            encryption_key: config.database.encryption_key().clone(),
         };
 
         // Build router with request logging enabled
@@ -877,6 +881,7 @@ mod tests {
         config.enable_request_logging = true;
         config.database = crate::config::DatabaseConfig::External {
             url: pool.connect_options().to_url_lossy().to_string(),
+            encryption_key: config.database.encryption_key().clone(),
         };
 
         // Build router with request logging enabled
@@ -918,6 +923,7 @@ mod tests {
         config.enable_request_logging = true;
         config.database = crate::config::DatabaseConfig::External {
             url: pool.connect_options().to_url_lossy().to_string(),
+            encryption_key: config.database.encryption_key().clone(),
         };
 
         // Build router with request logging enabled
@@ -957,6 +963,7 @@ mod tests {
         config.enable_request_logging = true;
         config.database = crate::config::DatabaseConfig::External {
             url: pool.connect_options().to_url_lossy().to_string(),
+            encryption_key: config.database.encryption_key().clone(),
         };
 
         // Build router with request logging enabled
@@ -1015,6 +1022,7 @@ mod tests {
         config.enable_request_logging = true;
         config.database = crate::config::DatabaseConfig::External {
             url: pool.connect_options().to_url_lossy().to_string(),
+            encryption_key: config.database.encryption_key().clone(),
         };
 
         // Build router with request logging enabled
@@ -1065,6 +1073,7 @@ mod tests {
         config.enable_request_logging = true;
         config.database = crate::config::DatabaseConfig::External {
             url: pool.connect_options().to_url_lossy().to_string(),
+            encryption_key: config.database.encryption_key().clone(),
         };
 
         // Build router with request logging enabled
@@ -1114,6 +1123,7 @@ mod tests {
         config.enable_request_logging = true;
         config.database = crate::config::DatabaseConfig::External {
             url: pool.connect_options().to_url_lossy().to_string(),
+            encryption_key: config.database.encryption_key().clone(),
         };
 
         // Build router with request logging enabled
@@ -1181,6 +1191,7 @@ mod tests {
         config.enable_request_logging = true;
         config.database = crate::config::DatabaseConfig::External {
             url: pool.connect_options().to_url_lossy().to_string(),
+            encryption_key: config.database.encryption_key().clone(),
         };
 
         // Build router with request logging enabled

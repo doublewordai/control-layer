@@ -116,17 +116,23 @@ pub async fn create_initial_admin_user(email: &str, password: Option<&str>, db: 
 /// Migrates existing sensitive data to encrypted format.
 ///
 /// This function should be called after database migrations run to ensure
-/// any existing sensitive data is encrypted with the ENCRYPTION_KEY.
+/// any existing sensitive data is encrypted with the provided encryption key.
 /// It's idempotent and safe to run multiple times.
 ///
-/// If ENCRYPTION_KEY is not set, this will error when trying to encrypt.
-pub async fn migrate_to_encrypted_data(db: &PgPool) -> Result<(), anyhow::Error> {
-    // Check if encryption_key_set marker exists (with encrypted key name)
-    let encrypted_key_name = crypto::encrypt_key_name("encryption_key_set")?;
+/// If encryption_key is None, this function skips the migration.
+pub async fn migrate_to_encrypted_data(db: &PgPool, encryption_key: Option<&str>) -> Result<(), anyhow::Error> {
+    // If no encryption key provided, skip migration
+    if encryption_key.is_none() {
+        debug!("No encryption key provided, skipping encryption migration");
+        return Ok(());
+    }
+
+    // Check if encryption_key_set marker exists (with hashed key name)
+    let hashed_key_name = crypto::hash_key_name(encryption_key, "encryption_key_set")?;
 
     let existing_marker = sqlx::query_scalar!(
         "SELECT value FROM system_config WHERE key = $1",
-        encrypted_key_name
+        hashed_key_name
     )
     .fetch_optional(db)
     .await?;
@@ -142,14 +148,14 @@ pub async fn migrate_to_encrypted_data(db: &PgPool) -> Result<(), anyhow::Error>
     let mut tx = db.begin().await?;
 
     // Encrypt existing API keys in inference_endpoints table
-    let count = crypto::encrypt_table_column(&mut tx, "inference_endpoints", "id", "api_key").await?;
+    let count = crypto::encrypt_table_column(encryption_key, &mut tx, "inference_endpoints", "id", "api_key").await?;
     info!("Encrypted {} endpoint API keys", count);
 
-    // Create the encryption_key_set marker with encrypted key name
+    // Create the encryption_key_set marker with hashed key name
     sqlx::query!(
         "INSERT INTO system_config (key, value, updated_at)
          VALUES ($1, true, NOW())",
-        encrypted_key_name
+        hashed_key_name
     )
     .execute(&mut *tx)
     .await?;
@@ -161,7 +167,7 @@ pub async fn migrate_to_encrypted_data(db: &PgPool) -> Result<(), anyhow::Error>
 }
 
 /// Seed the database with initial configuration (run only once)
-pub async fn seed_database(sources: &[config::ModelSource], db: &PgPool) -> Result<(), anyhow::Error> {
+pub async fn seed_database(sources: &[config::ModelSource], db: &PgPool, encryption_key: Option<&str>) -> Result<(), anyhow::Error> {
     // Use a transaction to ensure atomicity
     let mut tx = db.begin().await?;
 
@@ -202,13 +208,13 @@ pub async fn seed_database(sources: &[config::ModelSource], db: &PgPool) -> Resu
         .execute(&mut *tx)
         .await?;
 
-    // Store encrypted key name marker - the app needs ENCRYPTION_KEY to even find this row
-    let encrypted_key_name = crypto::encrypt_key_name("encryption_key_set")?;
+    // Store hashed key name marker - the app needs encryption_key to even find this row
+    let hashed_key_name = crypto::hash_key_name(encryption_key, "encryption_key_set")?;
     sqlx::query!(
         "INSERT INTO system_config (key, value, updated_at)
          VALUES ($1, true, NOW())
          ON CONFLICT (key) DO UPDATE SET value = true, updated_at = NOW()",
-        encrypted_key_name
+        hashed_key_name
     )
     .execute(&mut *tx)
     .await?;
@@ -307,7 +313,7 @@ pub async fn setup_app(
 ) -> anyhow::Result<(Router, sync::onwards_config::OnwardsConfigSync, tokio_util::sync::DropGuard)> {
     debug!("Setting up application");
     // Seed database with initial configuration (only runs once)
-    seed_database(&config.model_sources, &pool).await?;
+    seed_database(&config.model_sources, &pool, config.database.encryption_key().as_deref()).await?;
 
     // Start onwards integration
     let (onwards_config_sync, initial_targets, onwards_stream, drop_guard) =
@@ -618,7 +624,7 @@ async fn main() -> anyhow::Result<()> {
                 );
             }
         }
-        config::DatabaseConfig::External { url } => {
+        config::DatabaseConfig::External { url, .. } => {
             info!("Using external database");
             (None::<db::embedded::EmbeddedDatabase>, url.clone())
         }
@@ -629,9 +635,6 @@ async fn main() -> anyhow::Result<()> {
     // Run migrations
     sqlx::migrate!("./migrations").run(&pool).await?;
 
-    // Migrate existing data to encrypted format (idempotent)
-    migrate_to_encrypted_data(&pool).await?;
-
     // create admin user if it doesn't exist
     create_initial_admin_user(&config.admin_email, config.admin_password.as_deref(), &pool)
         .await
@@ -639,6 +642,9 @@ async fn main() -> anyhow::Result<()> {
 
     // Setup the complete application
     let (router, onwards_config_sync, _drop_guard) = setup_app(pool.clone(), config.clone()).await?;
+
+    // Migrate for case where database was seeded but data is not yet encrypted
+    migrate_to_encrypted_data(&pool, config.database.encryption_key().as_deref()).await?;
 
     // Apply middleware at root level BEFORE routing decisions are made
     let middleware = from_fn_with_state(
@@ -718,6 +724,7 @@ mod test {
         test_utils::*,
     };
     use axum::ServiceExt as _;
+    use base64::Engine;
     use outlet_postgres::RequestFilter;
     use sqlx::PgPool;
     use tower::Layer as _;
@@ -897,7 +904,8 @@ mod test {
         assert_eq!(initial_seeded, Some(false), "Initial seeded flag should be false");
 
         // First call should seed both endpoints and API key
-        super::seed_database(&sources, &pool).await.expect("First seeding should succeed");
+        let test_encryption_key = base64::engine::general_purpose::STANDARD.encode([0u8; 32]);
+        super::seed_database(&sources, &pool, Some(&test_encryption_key)).await.expect("First seeding should succeed");
 
         // Verify endpoints were created
         let endpoint_count =
@@ -935,7 +943,7 @@ mod test {
             .expect("Should be able to update API key");
 
         // Second call should skip all seeding (because seeded flag is true)
-        super::seed_database(&sources, &pool)
+        super::seed_database(&sources, &pool, Some(&test_encryption_key))
             .await
             .expect("Second seeding should succeed but skip");
 

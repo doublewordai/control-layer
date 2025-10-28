@@ -602,7 +602,7 @@ mod tests {
         }
         // Create inference endpoint for deployments
         let config = crate::test_utils::create_test_config();
-        crate::seed_database(&config.model_sources, &pool).await.unwrap();
+        crate::seed_database(&config.model_sources, &pool, None).await.unwrap();
 
         // Get a valid endpoint ID
         let test_endpoint_id = get_test_endpoint_id(&pool).await;
@@ -700,7 +700,7 @@ mod tests {
 
         // Create inference endpoint for deployments
         let config = crate::test_utils::create_test_config();
-        crate::seed_database(&config.model_sources, &pool).await.unwrap();
+        crate::seed_database(&config.model_sources, &pool, None).await.unwrap();
 
         {
             let mut group_tx = tx.begin().await.unwrap();
@@ -818,7 +818,7 @@ mod tests {
         // Create inference endpoint for deployments
         let config = crate::test_utils::create_test_config();
 
-        crate::seed_database(&config.model_sources, &pool).await.unwrap();
+        crate::seed_database(&config.model_sources, &pool, None).await.unwrap();
 
         {
             let mut group_tx = tx.begin().await.unwrap();
@@ -947,7 +947,7 @@ mod tests {
 
         // Create inference endpoint for deployments
         let config = crate::test_utils::create_test_config();
-        crate::seed_database(&config.model_sources, &pool).await.unwrap();
+        crate::seed_database(&config.model_sources, &pool, None).await.unwrap();
 
         {
             let mut group_tx = tx.begin().await.unwrap();
@@ -1089,7 +1089,7 @@ mod tests {
         {
             // Create inference endpoint for deployments
             let config = crate::test_utils::create_test_config();
-            crate::seed_database(&config.model_sources, &pool).await.unwrap();
+            crate::seed_database(&config.model_sources, &pool, None).await.unwrap();
 
             {
                 let mut group_tx = tx.begin().await.unwrap();
@@ -1229,7 +1229,7 @@ mod tests {
         }
         // Create inference endpoint for deployments
         let config = crate::test_utils::create_test_config();
-        crate::seed_database(&config.model_sources, &pool).await.unwrap();
+        crate::seed_database(&config.model_sources, &pool, None).await.unwrap();
         let test_endpoint_id = get_test_endpoint_id(&pool).await;
         {
             let mut deployment_repo = Deployments::new(tx.acquire().await.unwrap());
@@ -1364,6 +1364,7 @@ mod tests {
             database_url: None,
             database: crate::config::DatabaseConfig::External {
                 url: "postgres://test@localhost/test".to_string(),
+                encryption_key: None
             },
             admin_email: "admin@example.org".to_string(),
             admin_password: None,
@@ -1383,7 +1384,7 @@ mod tests {
             enable_metrics: false,
             enable_request_logging: false,
         };
-        crate::seed_database(&config.model_sources, &pool).await.unwrap();
+        crate::seed_database(&config.model_sources, &pool, None).await.unwrap();
 
         let test_endpoint_id = get_test_endpoint_id(&pool).await;
         let mut deployment_create = DeploymentCreateDBRequest::builder()
@@ -1873,7 +1874,7 @@ mod tests {
 
         // Create inference endpoint for deployments
         let config = crate::test_utils::create_test_config();
-        crate::seed_database(&config.model_sources, &pool).await.unwrap();
+        crate::seed_database(&config.model_sources, &pool, None).await.unwrap();
         let test_endpoint_id = get_test_endpoint_id(&pool).await;
 
         let mut tx = pool.begin().await.unwrap();

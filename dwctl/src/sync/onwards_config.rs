@@ -164,7 +164,7 @@ async fn load_targets_from_db(db: &PgPool) -> Result<Targets, anyhow::Error> {
 
     let endpoints;
     {
-        let mut endpoints_repo = InferenceEndpoints::new(&mut tx);
+        let mut endpoints_repo = InferenceEndpoints::new(&mut tx, None); // TODO: Pass encryption key for decryption
         // Fetch all endpoints to create a mapping
         endpoints = endpoints_repo.get_bulk(models.iter().map(|m| m.hosted_on).collect()).await?;
     }

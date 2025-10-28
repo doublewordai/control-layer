@@ -3,6 +3,7 @@ use crate::db::handlers::inference_endpoints::{InferenceEndpointFilter, Inferenc
 use crate::db::handlers::repository::Repository;
 use crate::errors::Error;
 use crate::types::{GroupId, Operation, Permission, Resource, UserId};
+use base64::Engine;
 use crate::{
     api::models::{
         api_keys::ApiKeyCreate,
@@ -47,9 +48,15 @@ pub async fn create_test_app(pool: PgPool, enable_sync: bool) -> (TestServer, Op
 pub fn create_test_config() -> crate::config::Config {
     let database_url = std::env::var("TEST_DATABASE_URL").unwrap_or_else(|_| "postgres://postgres@localhost/test".to_string());
 
+    // Generate a test encryption key (32 bytes base64 encoded)
+    let test_encryption_key = base64::engine::general_purpose::STANDARD.encode([0u8; 32]);
+
     crate::config::Config {
         database_url: None, // Deprecated field
-        database: crate::config::DatabaseConfig::External { url: database_url },
+        database: crate::config::DatabaseConfig::External {
+            url: database_url,
+            encryption_key: Some(test_encryption_key)
+        },
         host: "127.0.0.1".to_string(),
         port: 0,
         admin_email: "admin@test.com".to_string(),
@@ -236,7 +243,7 @@ pub async fn create_test_deployment(pool: &PgPool, created_by: UserId, model_nam
     // Get a valid endpoint ID
     let mut tx = pool.begin().await.expect("Failed to begin transaction");
 
-    let mut endpoints_repo = InferenceEndpoints::new(&mut tx);
+    let mut endpoints_repo = InferenceEndpoints::new(&mut tx, None);
     let filter = InferenceEndpointFilter::new(0, 100);
     let endpoints = endpoints_repo.list(&filter).await.expect("Failed to list endpoints");
     let test_endpoint_id = endpoints
@@ -269,7 +276,7 @@ pub async fn add_deployment_to_group(pool: &PgPool, deployment_id: crate::types:
 
 pub async fn get_test_endpoint_id(pool: &PgPool) -> uuid::Uuid {
     let mut conn = pool.acquire().await.expect("Failed to acquire connection");
-    let mut endpoints_repo = InferenceEndpoints::new(&mut conn);
+    let mut endpoints_repo = InferenceEndpoints::new(&mut conn, None);
     let filter = crate::db::handlers::inference_endpoints::InferenceEndpointFilter::new(0, 100);
     let endpoints = endpoints_repo.list(&filter).await.expect("Failed to list endpoints");
     endpoints.iter().find(|e| e.name == "test").expect("Test endpoint should exist").id

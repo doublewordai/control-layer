@@ -45,7 +45,7 @@ pub async fn synchronize_endpoint(endpoint_id: InferenceEndpointId, pool: PgPool
     let endpoint_info;
     // Automatically synchronize the endpoint after creating
     {
-        let mut endpoints_repo = InferenceEndpoints::new(&mut tx);
+        let mut endpoints_repo = InferenceEndpoints::new(&mut tx, None); // TODO: Pass encryption key for decryption
 
         // Get endpoint info
         endpoint_info = endpoints_repo

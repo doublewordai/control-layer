@@ -55,6 +55,7 @@ impl Error {
                 DbError::ForeignKeyViolation { .. } => StatusCode::BAD_REQUEST,
                 DbError::CheckViolation { .. } => StatusCode::BAD_REQUEST,
                 DbError::ProtectedEntity { .. } => StatusCode::FORBIDDEN,
+                DbError::EncryptionError { .. } => StatusCode::INTERNAL_SERVER_ERROR,
                 DbError::Other(_) => StatusCode::INTERNAL_SERVER_ERROR,
             },
             Error::Other(_) => StatusCode::INTERNAL_SERVER_ERROR,
@@ -92,6 +93,9 @@ impl Error {
                     ..
                 } => {
                     format!("Cannot {operation:?} {entity_type}: {reason}")
+                }
+                DbError::EncryptionError { operation, .. } => {
+                    format!("Encryption error during {operation}")
                 }
                 DbError::Other(_) => "Database error occurred".to_string(),
             },

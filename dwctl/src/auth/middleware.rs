@@ -138,7 +138,7 @@ mod tests {
         let config = create_test_config();
         let mut inference_conn = pool.acquire().await.unwrap();
         let user = create_test_user(&pool, Role::StandardUser).await;
-        let mut endpoints = InferenceEndpoints::new(&mut inference_conn);
+        let mut endpoints = InferenceEndpoints::new(&mut inference_conn, None);
         let endpoint = endpoints
             .create(&InferenceEndpointCreateDBRequest {
                 name: "Test Endpoint".to_string(),
@@ -187,7 +187,7 @@ mod tests {
         let config = create_test_config();
         let user = create_test_user(&pool, Role::StandardUser).await;
         let mut inference_conn = pool.acquire().await.unwrap();
-        let mut endpoints = InferenceEndpoints::new(&mut inference_conn);
+        let mut endpoints = InferenceEndpoints::new(&mut inference_conn, None);
         let endpoint = endpoints
             .create(&InferenceEndpointCreateDBRequest {
                 name: "Test Endpoint".to_string(),
@@ -344,7 +344,7 @@ mod tests {
         let config = create_test_config();
         let user = create_test_user(&pool, Role::StandardUser).await;
         let mut inference_conn = pool.acquire().await.unwrap();
-        let mut endpoints = InferenceEndpoints::new(&mut inference_conn);
+        let mut endpoints = InferenceEndpoints::new(&mut inference_conn, None);
         let endpoint = endpoints
             .create(&InferenceEndpointCreateDBRequest {
                 name: "Test Endpoint".to_string(),
@@ -408,7 +408,7 @@ mod tests {
         config.auth.native.enabled = true;
         let user = create_test_user(&pool, Role::StandardUser).await;
         let mut inference_conn = pool.acquire().await.unwrap();
-        let mut endpoints = InferenceEndpoints::new(&mut inference_conn);
+        let mut endpoints = InferenceEndpoints::new(&mut inference_conn, None);
         let endpoint = endpoints
             .create(&InferenceEndpointCreateDBRequest {
                 name: "Test Endpoint".to_string(),
@@ -504,7 +504,7 @@ mod tests {
         let header_user = create_test_user(&pool, Role::StandardUser).await;
 
         let mut inference_conn = pool.acquire().await.unwrap();
-        let mut endpoints = InferenceEndpoints::new(&mut inference_conn);
+        let mut endpoints = InferenceEndpoints::new(&mut inference_conn, None);
         let endpoint = endpoints
             .create(&InferenceEndpointCreateDBRequest {
                 name: "Test Endpoint".to_string(),
@@ -602,7 +602,7 @@ mod tests {
 
         let user = create_test_user(&pool, Role::StandardUser).await;
         let mut inference_conn = pool.acquire().await.unwrap();
-        let mut endpoints = InferenceEndpoints::new(&mut inference_conn);
+        let mut endpoints = InferenceEndpoints::new(&mut inference_conn, None);
         let endpoint = endpoints
             .create(&InferenceEndpointCreateDBRequest {
                 name: "Test Endpoint".to_string(),
@@ -698,7 +698,7 @@ mod tests {
 
         let mut tx = pool.begin().await.unwrap();
 
-        let mut endpoints = InferenceEndpoints::new(&mut tx);
+        let mut endpoints = InferenceEndpoints::new(&mut tx, None);
         let endpoint = endpoints
             .create(&InferenceEndpointCreateDBRequest {
                 name: "Test Endpoint".to_string(),
@@ -778,7 +778,7 @@ mod tests {
 
         let mut tx = pool.begin().await.unwrap();
 
-        let mut endpoints = InferenceEndpoints::new(&mut tx);
+        let mut endpoints = InferenceEndpoints::new(&mut tx, None);
         let endpoint = endpoints
             .create(&InferenceEndpointCreateDBRequest {
                 name: "Test Endpoint".to_string(),

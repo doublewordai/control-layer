@@ -78,7 +78,7 @@ pub async fn list_deployed_models(
 
     // Validate endpoint exists if specified
     if let Some(endpoint_id) = query.endpoint {
-        let mut endpoints_repo = InferenceEndpoints::new(tx.acquire().await.map_err(|e| Error::Database(e.into()))?);
+        let mut endpoints_repo = InferenceEndpoints::new(tx.acquire().await.map_err(|e| Error::Database(e.into()))?, state.config.database.encryption_key().clone());
         if endpoints_repo.get_by_id(endpoint_id).await?.is_none() {
             return Err(Error::NotFound {
                 resource: "endpoint".to_string(),
@@ -284,7 +284,7 @@ pub async fn create_deployed_model(
     let mut tx = state.db.begin().await.map_err(|e| Error::Database(e.into()))?;
 
     // Validate endpoint exists
-    let mut endpoints_repo = InferenceEndpoints::new(tx.acquire().await.map_err(|e| Error::Database(e.into()))?);
+    let mut endpoints_repo = InferenceEndpoints::new(tx.acquire().await.map_err(|e| Error::Database(e.into()))?, state.config.database.encryption_key().clone());
     if endpoints_repo.get_by_id(create.hosted_on).await?.is_none() {
         return Err(Error::NotFound {
             resource: "endpoint".to_string(),

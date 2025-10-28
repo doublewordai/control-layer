@@ -551,7 +551,7 @@ mod tests {
             api_key: None,
             sync_interval: std::time::Duration::from_secs(3600),
         }];
-        crate::seed_database(&sources, &pool).await.unwrap();
+        crate::seed_database(&sources, &pool, None).await.unwrap();
 
         let user = create_test_user(&pool).await;
         let test_endpoint_id = get_test_endpoint_id(&pool).await;
@@ -594,7 +594,7 @@ mod tests {
             api_key: None,
             sync_interval: std::time::Duration::from_secs(3600),
         }];
-        crate::seed_database(&sources, &pool).await.unwrap();
+        crate::seed_database(&sources, &pool, None).await.unwrap();
 
         let user = create_test_user(&pool).await;
         let test_endpoint_id = get_test_endpoint_id(&pool).await;
@@ -634,7 +634,7 @@ mod tests {
             api_key: None,
             sync_interval: std::time::Duration::from_secs(3600),
         }];
-        crate::seed_database(&sources, &pool).await.unwrap();
+        crate::seed_database(&sources, &pool, None).await.unwrap();
 
         let user = create_test_user(&pool).await;
         let test_endpoint_id = get_test_endpoint_id(&pool).await;
@@ -686,7 +686,7 @@ mod tests {
             api_key: None,
             sync_interval: std::time::Duration::from_secs(3600),
         }];
-        crate::seed_database(&sources, &pool).await.unwrap();
+        crate::seed_database(&sources, &pool, None).await.unwrap();
 
         let user = create_test_user(&pool).await;
         let test_endpoint_id = get_test_endpoint_id(&pool).await;
@@ -725,7 +725,7 @@ mod tests {
             api_key: None,
             sync_interval: std::time::Duration::from_secs(3600),
         }];
-        crate::seed_database(&sources, &pool).await.unwrap();
+        crate::seed_database(&sources, &pool, None).await.unwrap();
 
         let user = create_test_user(&pool).await;
 
@@ -775,7 +775,7 @@ mod tests {
             api_key: None,
             sync_interval: std::time::Duration::from_secs(3600),
         }];
-        crate::seed_database(&sources, &pool).await.unwrap();
+        crate::seed_database(&sources, &pool, None).await.unwrap();
 
         let user = create_test_user(&pool).await;
 
@@ -815,7 +815,7 @@ mod tests {
             api_key: None,
             sync_interval: std::time::Duration::from_secs(3600),
         }];
-        crate::seed_database(&sources, &pool).await.unwrap();
+        crate::seed_database(&sources, &pool, None).await.unwrap();
 
         let mut pool_conn = pool.acquire().await.unwrap();
         let mut repo = Deployments::new(&mut pool_conn);
@@ -859,7 +859,7 @@ mod tests {
             api_key: None,
             sync_interval: std::time::Duration::from_secs(3600),
         }];
-        crate::seed_database(&sources, &pool).await.unwrap();
+        crate::seed_database(&sources, &pool, None).await.unwrap();
 
         let mut pool_conn = pool.acquire().await.unwrap();
         let mut repo = Deployments::new(&mut pool_conn);
@@ -894,7 +894,7 @@ mod tests {
             api_key: None,
             sync_interval: std::time::Duration::from_secs(3600),
         }];
-        crate::seed_database(&sources, &pool).await.unwrap();
+        crate::seed_database(&sources, &pool, None).await.unwrap();
 
         let mut pool_conn = pool.acquire().await.unwrap();
         let mut repo = Deployments::new(&mut pool_conn);
@@ -933,7 +933,7 @@ mod tests {
             api_key: None,
             sync_interval: std::time::Duration::from_secs(3600),
         }];
-        crate::seed_database(&sources, &pool).await.unwrap();
+        crate::seed_database(&sources, &pool, None).await.unwrap();
 
         let mut pool_conn = pool.acquire().await.unwrap();
         let mut repo = Deployments::new(&mut pool_conn);
@@ -978,7 +978,7 @@ mod tests {
             api_key: None,
             sync_interval: std::time::Duration::from_secs(3600),
         }];
-        crate::seed_database(&sources, &pool).await.unwrap();
+        crate::seed_database(&sources, &pool, None).await.unwrap();
 
         let mut pool_conn = pool.acquire().await.unwrap();
         let mut repo = Deployments::new(&mut pool_conn);
@@ -1051,7 +1051,7 @@ mod tests {
             api_key: None,
             sync_interval: std::time::Duration::from_secs(3600),
         }];
-        crate::seed_database(&sources, &pool).await.unwrap();
+        crate::seed_database(&sources, &pool, None).await.unwrap();
 
         let mut pool_conn = pool.acquire().await.unwrap();
         let mut repo = Deployments::new(&mut pool_conn);
@@ -1107,7 +1107,7 @@ mod tests {
             api_key: None,
             sync_interval: std::time::Duration::from_secs(3600),
         }];
-        crate::seed_database(&sources, &pool).await.unwrap();
+        crate::seed_database(&sources, &pool, None).await.unwrap();
 
         let mut pool_conn = pool.acquire().await.unwrap();
         let mut repo = Deployments::new(&mut pool_conn);
@@ -1152,7 +1152,7 @@ mod tests {
             api_key: None,
             sync_interval: std::time::Duration::from_secs(3600),
         }];
-        crate::seed_database(&sources, &pool).await.unwrap();
+        crate::seed_database(&sources, &pool, None).await.unwrap();
 
         let mut conn = pool.acquire().await.unwrap();
         let mut repo = Deployments::new(&mut conn);
@@ -1189,7 +1189,7 @@ mod tests {
             api_key: None,
             sync_interval: std::time::Duration::from_secs(3600),
         }];
-        crate::seed_database(&sources, &pool).await.unwrap();
+        crate::seed_database(&sources, &pool, None).await.unwrap();
 
         let user = create_test_user(&pool).await;
         let mut conn = pool.acquire().await.unwrap();
@@ -1224,7 +1224,7 @@ mod tests {
             api_key: None,
             sync_interval: std::time::Duration::from_secs(3600),
         }];
-        crate::seed_database(&sources, &pool).await.unwrap();
+        crate::seed_database(&sources, &pool, None).await.unwrap();
 
         let mut conn = pool.acquire().await.unwrap();
         let mut repo = Deployments::new(&mut conn);
@@ -1286,7 +1286,7 @@ mod tests {
             api_key: None,
             sync_interval: std::time::Duration::from_secs(3600),
         }];
-        crate::seed_database(&sources, &pool).await.unwrap();
+        crate::seed_database(&sources, &pool, None).await.unwrap();
         let user = create_test_user(&pool).await;
 
         let mut conn = pool.acquire().await.unwrap();
@@ -1333,7 +1333,7 @@ mod tests {
             api_key: None,
             sync_interval: std::time::Duration::from_secs(3600),
         }];
-        crate::seed_database(&sources, &pool).await.unwrap();
+        crate::seed_database(&sources, &pool, None).await.unwrap();
         let user = create_test_user(&pool).await;
 
         let mut conn = pool.acquire().await.unwrap();
@@ -1372,7 +1372,7 @@ mod tests {
             api_key: None,
             sync_interval: std::time::Duration::from_secs(3600),
         }];
-        crate::seed_database(&sources, &pool).await.unwrap();
+        crate::seed_database(&sources, &pool, None).await.unwrap();
 
         let mut conn = pool.acquire().await.unwrap();
         let mut repo = Deployments::new(&mut conn);
@@ -1414,7 +1414,7 @@ mod tests {
             api_key: None,
             sync_interval: std::time::Duration::from_secs(3600),
         }];
-        crate::seed_database(&sources, &pool).await.unwrap();
+        crate::seed_database(&sources, &pool, None).await.unwrap();
 
         let mut conn = pool.acquire().await.unwrap();
         let mut repo = Deployments::new(&mut conn);
@@ -1434,7 +1434,7 @@ mod tests {
             api_key: None,
             sync_interval: std::time::Duration::from_secs(3600),
         }];
-        crate::seed_database(&sources, &pool).await.unwrap();
+        crate::seed_database(&sources, &pool, None).await.unwrap();
         let mut deploy_conn = pool.acquire().await.unwrap();
         let mut deployment_repo = Deployments::new(&mut deploy_conn);
         let mut group_conn = pool.acquire().await.unwrap();
@@ -1548,7 +1548,7 @@ mod tests {
             api_key: None,
             sync_interval: std::time::Duration::from_secs(3600),
         }];
-        crate::seed_database(&sources, &pool).await.unwrap();
+        crate::seed_database(&sources, &pool, None).await.unwrap();
 
         let user = create_test_user(&pool).await;
         let test_endpoint_id = get_test_endpoint_id(&pool).await;
@@ -1689,7 +1689,7 @@ mod tests {
             api_key: None,
             sync_interval: std::time::Duration::from_secs(3600),
         }];
-        crate::seed_database(&sources, &pool).await.unwrap();
+        crate::seed_database(&sources, &pool, None).await.unwrap();
 
         let user = create_test_user(&pool).await;
         let test_endpoint_id = get_test_endpoint_id(&pool).await;
@@ -1834,7 +1834,7 @@ mod tests {
             api_key: None,
             sync_interval: std::time::Duration::from_secs(3600),
         }];
-        crate::seed_database(&sources, &pool).await.unwrap();
+        crate::seed_database(&sources, &pool, None).await.unwrap();
 
         let user = create_test_user(&pool).await;
         let test_endpoint_id = get_test_endpoint_id(&pool).await;
@@ -1991,7 +1991,7 @@ mod tests {
             api_key: None,
             sync_interval: std::time::Duration::from_secs(3600),
         }];
-        crate::seed_database(&sources, &pool).await.unwrap();
+        crate::seed_database(&sources, &pool, None).await.unwrap();
 
         let mut pool_conn = pool.acquire().await.unwrap();
         let mut repo = Deployments::new(&mut pool_conn);
@@ -2060,7 +2060,7 @@ mod tests {
             api_key: None,
             sync_interval: std::time::Duration::from_secs(3600),
         }];
-        crate::seed_database(&sources, &pool).await.unwrap();
+        crate::seed_database(&sources, &pool, None).await.unwrap();
 
         let mut pool_conn = pool.acquire().await.unwrap();
         let mut repo = Deployments::new(&mut pool_conn);

@@ -555,7 +555,7 @@ mod tests {
 
         // Create inference endpoint for deployments
         let config = crate::test_utils::create_test_config();
-        seed_database(&config.model_sources, pool)
+        seed_database(&config.model_sources, pool, None) // Don't encrypt for test config
             .await
             .expect("Failed to create inference endpoints");
 
