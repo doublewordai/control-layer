@@ -1,7 +1,10 @@
 import { Activity, X, BarChart3, List, ArrowLeft } from "lucide-react";
 import { useState, useEffect } from "react";
 import { useSearchParams, useNavigate } from "react-router-dom";
-import { useRequests, useRequestsAggregate } from "../../../../api/control-layer";
+import {
+  useRequests,
+  useRequestsAggregate,
+} from "../../../../api/control-layer";
 import {
   useMockRequests,
   useMockAggregateData,

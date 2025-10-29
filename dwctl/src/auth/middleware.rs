@@ -475,6 +475,7 @@ mod tests {
             config: config.clone(),
             outlet_db: None,
             metrics_recorder: None,
+            is_leader: false,
         };
 
         let request = axum::http::Request::builder()
@@ -572,6 +573,7 @@ mod tests {
             config: config.clone(),
             outlet_db: None,
             metrics_recorder: None,
+            is_leader: false,
         };
 
         let request = axum::http::Request::builder()
@@ -669,6 +671,7 @@ mod tests {
             config: config.clone(),
             outlet_db: None,
             metrics_recorder: None,
+            is_leader: false,
         };
 
         // Request with JWT cookie - should be ignored since native auth is disabled
@@ -833,6 +836,7 @@ mod tests {
             config: config.clone(),
             outlet_db: None,
             metrics_recorder: None,
+            is_leader: false,
         };
 
         let request = axum::http::Request::builder()

@@ -26,6 +26,16 @@ export interface ModelMetrics {
   time_series?: ModelTimeSeriesPoint[]; // Recent activity for sparklines
 }
 
+// Model probe status (only present when include=status)
+export interface ModelProbeStatus {
+  probe_id?: string;
+  active: boolean;
+  interval_seconds?: number;
+  last_check?: string; // ISO 8601 timestamp
+  last_success?: boolean;
+  uptime_percentage?: number; // Last 24h uptime
+}
+
 // Base model types
 export interface Model {
   id: string;
@@ -39,6 +49,7 @@ export interface Model {
   burst_size?: number | null; // Global rate limiting: burst capacity
   groups?: Group[]; // array of group IDs - only present when include=groups
   metrics?: ModelMetrics; // only present when include=metrics
+  status?: ModelProbeStatus; // only present when include=status
 }
 
 export interface Endpoint {
@@ -112,7 +123,14 @@ export interface ApiKeyCreateResponse extends ApiKey {
 // /admin/api/v1/groups?include=users,models will return user ids and model ids
 // in each element of the groups response. Note that this is only the id; and
 // we need to make another query for the actual data.
-export type ModelsInclude = "groups" | "metrics" | "groups,metrics";
+export type ModelsInclude =
+  | "groups"
+  | "metrics"
+  | "status"
+  | "groups,metrics"
+  | "groups,status"
+  | "metrics,status"
+  | "groups,metrics,status";
 export type GroupsInclude = "users" | "models" | "users,models";
 export type UsersInclude = "groups";
 
@@ -533,3 +551,54 @@ export interface ChangePasswordRequest {
 
 // User response type alias for auth responses
 export type UserResponse = User;
+
+// Probe types
+export interface Probe {
+  id: string;
+  name: string;
+  deployment_id: string;
+  interval_seconds: number;
+  active: boolean;
+  http_method: string;
+  request_path?: string | null;
+  request_body?: Record<string, any> | null;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface CreateProbeRequest {
+  name: string;
+  deployment_id: string;
+  interval_seconds: number;
+  http_method?: string;
+  request_path?: string | null;
+  request_body?: Record<string, any> | null;
+}
+
+export interface ProbeResult {
+  id: string;
+  probe_id: string;
+  executed_at: string;
+  success: boolean;
+  response_time_ms: number | null;
+  status_code: number | null;
+  error_message: string | null;
+  response_data: any | null;
+  metadata: any | null;
+}
+
+export interface ProbeStatistics {
+  total_executions: number;
+  successful_executions: number;
+  failed_executions: number;
+  success_rate: number;
+  avg_response_time_ms: number | null;
+  min_response_time_ms: number | null;
+  max_response_time_ms: number | null;
+  p50_response_time_ms: number | null;
+  p95_response_time_ms: number | null;
+  p99_response_time_ms: number | null;
+  last_execution: string | null;
+  last_success: string | null;
+  last_failure: string | null;
+}

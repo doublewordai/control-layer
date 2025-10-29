@@ -41,6 +41,9 @@ pub mod resource {
     #[derive(Default)]
     pub struct Credits;
 
+    #[derive(Default)]
+    pub struct Probes;
+
     // Convert type-level markers to enum values using Into
     impl From<Users> for Resource {
         fn from(_: Users) -> Resource {
@@ -90,6 +93,11 @@ pub mod resource {
     impl From<Credits> for Resource {
         fn from(_: Credits) -> Resource {
             Resource::Credits
+        }
+    }
+    impl From<Probes> for Resource {
+        fn from(_: Probes) -> Resource {
+            Resource::Probes
         }
     }
 }

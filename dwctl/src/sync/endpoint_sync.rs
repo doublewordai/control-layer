@@ -181,17 +181,31 @@ where
 
         // Now handle models that are in the filter
         match (&existing_model.status, existing_model_present) {
-            // Model is active and present in API - just update sync time
+            // Model is active and present in API - update sync time and detect type if missing
             (ModelStatus::Active, true) => {
-                let update = DeploymentUpdateDBRequest::status_update(None, sync_time);
+                let mut update = DeploymentUpdateDBRequest::status_update(None, sync_time);
+
+                // If model_type is not set, detect and set it
+                if existing_model.model_type.is_none() {
+                    let detected_type = crate::db::models::deployments::ModelType::detect_from_name(&existing_model.model_name);
+                    update.model_type = Some(Some(detected_type));
+                }
+
                 if let Err(e) = deployments_repo.update(existing_model.id, &update).await {
                     warn!("Failed to update sync time for active model {}: {}", existing_model.model_name, e);
                 }
             }
 
-            // Model is inactive but now present in API - reactivate it
+            // Model is inactive but now present in API - reactivate it and detect type if missing
             (ModelStatus::Inactive, true) => {
-                let update = DeploymentUpdateDBRequest::status_update(Some(ModelStatus::Active), sync_time);
+                let mut update = DeploymentUpdateDBRequest::status_update(Some(ModelStatus::Active), sync_time);
+
+                // If model_type is not set, detect and set it
+                if existing_model.model_type.is_none() {
+                    let detected_type = crate::db::models::deployments::ModelType::detect_from_name(&existing_model.model_name);
+                    update.model_type = Some(Some(detected_type));
+                }
+
                 if let Err(e) = deployments_repo.update(existing_model.id, &update).await {
                     warn!("Failed to reactivate model {}: {}", existing_model.model_name, e);
                 } else {
@@ -399,10 +413,14 @@ async fn create_deployment_with_alias<D>(
 where
     D: Repository<CreateRequest = DeploymentCreateDBRequest, Response = DeploymentDBResponse>,
 {
+    // Auto-detect model type from name
+    let detected_type = crate::db::models::deployments::ModelType::detect_from_name(&model.id);
+
     let db_request = DeploymentCreateDBRequest::builder()
         .created_by(created_by)
         .model_name(model.id.clone())
         .alias(alias.clone())
+        .maybe_model_type(Some(detected_type))
         .hosted_on(endpoint_info.id)
         .build();
 
@@ -443,10 +461,14 @@ async fn create_deployment<D>(
 where
     D: Repository<CreateRequest = DeploymentCreateDBRequest, Response = DeploymentDBResponse>,
 {
+    // Auto-detect model type from name
+    let detected_type = crate::db::models::deployments::ModelType::detect_from_name(&model.id);
+
     let db_request = DeploymentCreateDBRequest::builder()
         .created_by(created_by)
         .model_name(model.id.clone())
         .alias(model.id.clone()) // Use model ID as alias by default
+        .maybe_model_type(Some(detected_type))
         .hosted_on(endpoint_info.id)
         .build();
 

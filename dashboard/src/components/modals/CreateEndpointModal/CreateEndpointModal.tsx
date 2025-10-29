@@ -12,7 +12,10 @@ import {
 import { useForm } from "react-hook-form";
 import { zodResolver } from "@hookform/resolvers/zod";
 import * as z from "zod";
-import { useValidateEndpoint, useCreateEndpoint } from "../../../api/control-layer";
+import {
+  useValidateEndpoint,
+  useCreateEndpoint,
+} from "../../../api/control-layer";
 import { Button } from "../../ui/button";
 import {
   Dialog,
@@ -101,7 +104,9 @@ export const CreateEndpointModal: React.FC<CreateEndpointModalProps> = ({
   const [availableModels, setAvailableModels] = useState<AvailableModel[]>([]);
   const [modelAliases, setModelAliases] = useState<Record<string, string>>({});
   const [urlPopoverOpen, setUrlPopoverOpen] = useState(false);
-  const [backendConflicts, setBackendConflicts] = useState<Set<string>>(new Set());
+  const [backendConflicts, setBackendConflicts] = useState<Set<string>>(
+    new Set(),
+  );
   const [localConflicts, setLocalConflicts] = useState<string[]>([]);
 
   const validateEndpointMutation = useValidateEndpoint();
@@ -136,10 +141,10 @@ export const CreateEndpointModal: React.FC<CreateEndpointModalProps> = ({
     // Check for conflicts within current selection
     const selectedModels = form.getValues("selectedModels") || [];
     const localConflict = Object.entries(modelAliases).some(
-      ([modelId, alias]) => 
-        modelId !== currentModelId && 
+      ([modelId, alias]) =>
+        modelId !== currentModelId &&
         alias === aliasToCheck &&
-        selectedModels.includes(modelId)
+        selectedModels.includes(modelId),
     );
 
     // Check for backend conflicts
@@ -152,12 +157,16 @@ export const CreateEndpointModal: React.FC<CreateEndpointModalProps> = ({
     };
   };
 
-  const checkLocalAliasConflicts = (updatedAliases?: Record<string, string>) => {
+  const checkLocalAliasConflicts = (
+    updatedAliases?: Record<string, string>,
+  ) => {
     const selectedModels = form.getValues("selectedModels") || [];
     const aliasesToCheck = updatedAliases || modelAliases;
-    const selectedAliases = selectedModels.map(id => aliasesToCheck[id] || id);
-    const duplicateAliases = selectedAliases.filter((alias, index) => 
-      selectedAliases.indexOf(alias) !== index
+    const selectedAliases = selectedModels.map(
+      (id) => aliasesToCheck[id] || id,
+    );
+    const duplicateAliases = selectedAliases.filter(
+      (alias, index) => selectedAliases.indexOf(alias) !== index,
     );
     return [...new Set(duplicateAliases)]; // Remove duplicates from the conflicts array
   };
@@ -191,15 +200,21 @@ export const CreateEndpointModal: React.FC<CreateEndpointModalProps> = ({
         setValidationState("success");
 
         // Initialize aliases to model names
-        const initialAliases = result.models.data.reduce((acc, model) => ({
-          ...acc,
-          [model.id]: model.id
-        }), {});
+        const initialAliases = result.models.data.reduce(
+          (acc, model) => ({
+            ...acc,
+            [model.id]: model.id,
+          }),
+          {},
+        );
         setModelAliases(initialAliases);
 
         // Select all models by default
-        form.setValue("selectedModels", result.models.data.map((m) => m.id));
-        
+        form.setValue(
+          "selectedModels",
+          result.models.data.map((m) => m.id),
+        );
+
         // Auto-populate name from URL if not set
         if (!form.getValues("name")) {
           try {
@@ -232,7 +247,7 @@ export const CreateEndpointModal: React.FC<CreateEndpointModalProps> = ({
 
     // Build alias mapping - only include entries where alias differs from model name
     const aliasMapping: Record<string, string> = {};
-    data.selectedModels.forEach(modelId => {
+    data.selectedModels.forEach((modelId) => {
       const alias = (modelAliases[modelId] || modelId).trim();
       if (alias !== modelId) {
         aliasMapping[modelId] = alias;
@@ -245,36 +260,45 @@ export const CreateEndpointModal: React.FC<CreateEndpointModalProps> = ({
       ...(data.description?.trim() && { description: data.description.trim() }),
       ...(data.apiKey?.trim() && { api_key: data.apiKey.trim() }),
       model_filter: data.selectedModels, // Which models to import
-      ...(Object.keys(aliasMapping).length > 0 && { alias_mapping: aliasMapping }), // Only include if we have custom aliases
+      ...(Object.keys(aliasMapping).length > 0 && {
+        alias_mapping: aliasMapping,
+      }), // Only include if we have custom aliases
     };
 
     try {
       await createEndpointMutation.mutateAsync(createData);
       onSuccess();
       onClose();
-    } catch (err: any) {      
+    } catch (err: any) {
       // Handle different types of conflicts
       if (err.status === 409 || err.response?.status === 409) {
         const responseData = err.response?.data || err.data;
-        
+
         // Check if this is an endpoint conflict using the simplified response
         if (responseData?.resource === "endpoint") {
           // Set error on the name field specifically (for red border only)
-          form.setError("name", { 
-            message: "endpoint_name_conflict" // Use a special marker instead of user message
+          form.setError("name", {
+            message: "endpoint_name_conflict", // Use a special marker instead of user message
           });
           setValidationError("Please choose a different endpoint name.");
           return; // Don't set backend conflicts
         }
-        
+
         // Check if this is a structured alias conflict (from sync logic)
         if (responseData && responseData.conflicts) {
-          const conflictAliases = responseData.conflicts.map((c: any) => c.attempted_alias || c.alias);
+          const conflictAliases = responseData.conflicts.map(
+            (c: any) => c.attempted_alias || c.alias,
+          );
           setBackendConflicts(new Set(conflictAliases));
-          setValidationError("Some model aliases already exist. Please edit the highlighted aliases.");
+          setValidationError(
+            "Some model aliases already exist. Please edit the highlighted aliases.",
+          );
         } else {
           // Generic 409 handling
-          setValidationError(responseData?.message || "A conflict occurred. Please check your input.");
+          setValidationError(
+            responseData?.message ||
+              "A conflict occurred. Please check your input.",
+          );
         }
       } else {
         // Handle other errors
@@ -321,7 +345,7 @@ export const CreateEndpointModal: React.FC<CreateEndpointModalProps> = ({
       const newAlias = tempAlias.trim() || model.id;
       onAliasChange(newAlias);
       setIsEditing(false);
-      
+
       // Clear backend conflict for this alias if user changed it
       if (hasBackendConflict && newAlias !== alias) {
         onConflictClear(alias);
@@ -336,26 +360,21 @@ export const CreateEndpointModal: React.FC<CreateEndpointModalProps> = ({
     return (
       <div
         className={`grid grid-cols-12 gap-3 p-3 border-b last:border-b-0 hover:bg-gray-50 transition-colors ${
-          hasBackendConflict 
+          hasBackendConflict
             ? "bg-red-50/50 border-l-4 border-l-red-400" // Much more subtle
             : hasLocalConflict
-            ? "bg-orange-50/50 border-l-4 border-l-orange-400" 
-            : ""
+              ? "bg-orange-50/50 border-l-4 border-l-orange-400"
+              : ""
         }`}
       >
         {/* Checkbox */}
         <div className="col-span-1 flex items-center">
-          <Checkbox
-            checked={isSelected}
-            onCheckedChange={onSelectionChange}
-          />
+          <Checkbox checked={isSelected} onCheckedChange={onSelectionChange} />
         </div>
 
         {/* Model Info */}
         <div className="col-span-5 flex flex-col justify-center min-w-0">
-          <p className="text-sm font-medium truncate">
-            {model.id}
-          </p>
+          <p className="text-sm font-medium truncate">{model.id}</p>
           <p className="text-xs text-gray-500 truncate">{model.owned_by}</p>
         </div>
 
@@ -368,10 +387,10 @@ export const CreateEndpointModal: React.FC<CreateEndpointModalProps> = ({
                 onChange={(e) => setTempAlias(e.target.value)}
                 className={`text-sm h-8 ${
                   hasBackendConflict
-                    ? "border-red-400 focus:border-red-500 focus:ring-red-500/20" 
+                    ? "border-red-400 focus:border-red-500 focus:ring-red-500/20"
                     : hasLocalConflict
-                    ? "border-orange-400 focus:border-orange-500 focus:ring-orange-500/20"
-                    : ""
+                      ? "border-orange-400 focus:border-orange-500 focus:ring-orange-500/20"
+                      : ""
                 }`}
                 placeholder={model.id}
                 onKeyDown={(e) => {
@@ -407,10 +426,10 @@ export const CreateEndpointModal: React.FC<CreateEndpointModalProps> = ({
                     hasBackendConflict
                       ? "text-red-700"
                       : hasLocalConflict
-                      ? "text-orange-600"
-                      : alias !== model.id
-                      ? "text-blue-600"
-                      : "text-gray-700"
+                        ? "text-orange-600"
+                        : alias !== model.id
+                          ? "text-blue-600"
+                          : "text-gray-700"
                   }`}
                 >
                   {alias}
@@ -439,18 +458,18 @@ export const CreateEndpointModal: React.FC<CreateEndpointModalProps> = ({
 
   const handleSelectAll = () => {
     const currentSelection = form.getValues("selectedModels") || [];
-    const allModelIds = availableModels.map(m => m.id);
-    
+    const allModelIds = availableModels.map((m) => m.id);
+
     if (currentSelection.length === availableModels.length) {
       // Deselect all
       form.setValue("selectedModels", []);
     } else {
       // Select all
       form.setValue("selectedModels", allModelIds);
-      
+
       // Initialize aliases for any models that don't have them
       const newAliases = { ...modelAliases };
-      allModelIds.forEach(modelId => {
+      allModelIds.forEach((modelId) => {
         if (!newAliases[modelId]) {
           newAliases[modelId] = modelId;
         }
@@ -685,10 +704,13 @@ export const CreateEndpointModal: React.FC<CreateEndpointModalProps> = ({
                       <FormItem>
                         <div className="flex items-center justify-between">
                           <div>
-                            <FormLabel>Select Models & Configure Aliases</FormLabel>
+                            <FormLabel>
+                              Select Models & Configure Aliases
+                            </FormLabel>
                             <FormDescription className="text-xs">
-                              {field.value?.length || 0} of {availableModels.length} selected
-                              • Aliases default to model names but can be customized
+                              {field.value?.length || 0} of{" "}
+                              {availableModels.length} selected • Aliases
+                              default to model names but can be customized
                             </FormDescription>
                           </div>
                           <Button
@@ -706,9 +728,12 @@ export const CreateEndpointModal: React.FC<CreateEndpointModalProps> = ({
                         <div className="max-h-60 overflow-y-auto border rounded-lg mt-2">
                           <div className="sticky top-0 bg-gray-50 border-b px-3 py-2 text-xs font-medium text-gray-600">
                             <div className="grid grid-cols-12 gap-3">
-                              <div className="col-span-1"></div> {/* Checkbox column */}
+                              <div className="col-span-1"></div>{" "}
+                              {/* Checkbox column */}
                               <div className="col-span-5">Model Name</div>
-                              <div className="col-span-6">Alias (used for routing)</div>
+                              <div className="col-span-6">
+                                Alias (used for routing)
+                              </div>
                             </div>
                           </div>
 
@@ -716,7 +741,9 @@ export const CreateEndpointModal: React.FC<CreateEndpointModalProps> = ({
                             <ModelRowWithAlias
                               key={model.id}
                               model={model}
-                              isSelected={field.value?.includes(model.id) || false}
+                              isSelected={
+                                field.value?.includes(model.id) || false
+                              }
                               alias={modelAliases[model.id] || model.id}
                               onSelectionChange={(checked) => {
                                 const current = field.value || [];
@@ -730,7 +757,9 @@ export const CreateEndpointModal: React.FC<CreateEndpointModalProps> = ({
                                     }));
                                   }
                                 } else {
-                                  field.onChange(current.filter((id) => id !== model.id));
+                                  field.onChange(
+                                    current.filter((id) => id !== model.id),
+                                  );
                                 }
                               }}
                               onAliasChange={(newAlias) => {
@@ -740,9 +769,10 @@ export const CreateEndpointModal: React.FC<CreateEndpointModalProps> = ({
                                   [model.id]: trimmedAlias,
                                 };
                                 setModelAliases(updatedAliases);
-                                
+
                                 // Immediately check for local conflicts with the updated aliases
-                                const conflicts = checkLocalAliasConflicts(updatedAliases);
+                                const conflicts =
+                                  checkLocalAliasConflicts(updatedAliases);
                                 setLocalConflicts(conflicts);
                               }}
                               onConflictClear={(oldAlias) => {
@@ -752,7 +782,10 @@ export const CreateEndpointModal: React.FC<CreateEndpointModalProps> = ({
                                   return updated;
                                 });
                               }}
-                              conflictInfo={checkAliasConflict(model.id, modelAliases[model.id] || model.id)}
+                              conflictInfo={checkAliasConflict(
+                                model.id,
+                                modelAliases[model.id] || model.id,
+                              )}
                             />
                           ))}
                         </div>
@@ -770,8 +803,8 @@ export const CreateEndpointModal: React.FC<CreateEndpointModalProps> = ({
                     <FormItem>
                       <FormLabel>Display Name *</FormLabel>
                       <FormControl>
-                        <Input 
-                          placeholder="My API Endpoint" 
+                        <Input
+                          placeholder="My API Endpoint"
                           {...field}
                           onChange={(e) => {
                             field.onChange(e);
@@ -780,10 +813,15 @@ export const CreateEndpointModal: React.FC<CreateEndpointModalProps> = ({
                               form.clearErrors("name");
                             }
                           }}
-                          className={fieldState.error ? "border-red-500 focus:border-red-500" : ""}
+                          className={
+                            fieldState.error
+                              ? "border-red-500 focus:border-red-500"
+                              : ""
+                          }
                         />
                       </FormControl>
-                      {fieldState.error?.message !== "endpoint_name_conflict" && <FormMessage />}
+                      {fieldState.error?.message !==
+                        "endpoint_name_conflict" && <FormMessage />}
                     </FormItem>
                   )}
                 />
@@ -808,12 +846,15 @@ export const CreateEndpointModal: React.FC<CreateEndpointModalProps> = ({
               </>
             )}
 
-            {(form.formState.errors.name?.message === "endpoint_name_conflict" || validationError?.includes("endpoint name")) && (
+            {(form.formState.errors.name?.message ===
+              "endpoint_name_conflict" ||
+              validationError?.includes("endpoint name")) && (
               <div className="p-3 bg-red-50 border border-red-200 rounded-md">
                 <div className="flex items-center space-x-2">
                   <AlertCircle className="w-4 h-4 text-red-500 flex-shrink-0" />
                   <p className="text-sm text-red-700">
-                    <strong>Endpoint name conflict:</strong> Please choose a different display name above.
+                    <strong>Endpoint name conflict:</strong> Please choose a
+                    different display name above.
                   </p>
                 </div>
               </div>
@@ -824,7 +865,9 @@ export const CreateEndpointModal: React.FC<CreateEndpointModalProps> = ({
                 <div className="flex items-center space-x-2">
                   <AlertCircle className="w-4 h-4 text-orange-500 flex-shrink-0" />
                   <p className="text-sm text-orange-700">
-                    <strong>Duplicate aliases detected:</strong> {localConflicts.join(', ')}. Please ensure all aliases are unique.
+                    <strong>Duplicate aliases detected:</strong>{" "}
+                    {localConflicts.join(", ")}. Please ensure all aliases are
+                    unique.
                   </p>
                 </div>
               </div>
@@ -835,7 +878,8 @@ export const CreateEndpointModal: React.FC<CreateEndpointModalProps> = ({
                 <div className="flex items-center space-x-2">
                   <AlertCircle className="w-4 h-4 text-red-500 flex-shrink-0" />
                   <p className="text-sm text-red-700">
-                    <strong>Model alias conflict:</strong> Please edit the highlighted aliases above.
+                    <strong>Model alias conflict:</strong> Please edit the
+                    highlighted aliases above.
                   </p>
                 </div>
               </div>
