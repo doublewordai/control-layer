@@ -1,0 +1,71 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n            SELECT id, user_id, transaction_type as \"transaction_type: CreditTransactionType\", amount, balance_after, description, created_at\n            FROM credit_transactions\n            ORDER BY created_at DESC, id DESC\n            OFFSET $1\n            LIMIT $2\n            ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "id",
+        "type_info": "Int8"
+      },
+      {
+        "ordinal": 1,
+        "name": "user_id",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 2,
+        "name": "transaction_type: CreditTransactionType",
+        "type_info": {
+          "Custom": {
+            "name": "credit_transaction_type",
+            "kind": {
+              "Enum": [
+                "purchase",
+                "admin_grant",
+                "admin_removal",
+                "usage"
+              ]
+            }
+          }
+        }
+      },
+      {
+        "ordinal": 3,
+        "name": "amount",
+        "type_info": "Numeric"
+      },
+      {
+        "ordinal": 4,
+        "name": "balance_after",
+        "type_info": "Numeric"
+      },
+      {
+        "ordinal": 5,
+        "name": "description",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 6,
+        "name": "created_at",
+        "type_info": "Timestamptz"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Int8",
+        "Int8"
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      false,
+      false,
+      false,
+      true,
+      false
+    ]
+  },
+  "hash": "d71ec93a3a4c8e7ca6ed62df29168bad3cf65108005f66a034ea290c2514b039"
+}

@@ -38,6 +38,9 @@ pub mod resource {
     #[derive(Default)]
     pub struct ModelRateLimits;
 
+    #[derive(Default)]
+    pub struct Credits;
+
     // Convert type-level markers to enum values using Into
     impl From<Users> for Resource {
         fn from(_: Users) -> Resource {
@@ -82,6 +85,11 @@ pub mod resource {
     impl From<ModelRateLimits> for Resource {
         fn from(_: ModelRateLimits) -> Resource {
             Resource::ModelRateLimits
+        }
+    }
+    impl From<Credits> for Resource {
+        fn from(_: Credits) -> Resource {
+            Resource::Credits
         }
     }
 }
@@ -253,7 +261,8 @@ pub fn role_has_permission(role: &Role, resource: Resource, operation: Operation
                     | (Resource::ApiKeys, Operation::UpdateOwn)   // Can update own API keys
                     | (Resource::ApiKeys, Operation::DeleteOwn)   // Can delete own API keys
                     | (Resource::Users, Operation::ReadOwn)       // Can read own user data
-                    | (Resource::Users, Operation::UpdateOwn) // Can update own user data
+                    | (Resource::Users, Operation::UpdateOwn)     // Can update own user data
+                    | (Resource::Credits, Operation::ReadOwn)     // Can read own credit balance and transactions
             )
         }
         Role::RequestViewer => {
@@ -267,6 +276,13 @@ pub fn role_has_permission(role: &Role, resource: Resource, operation: Operation
                     | (Resource::Analytics, Operation::ReadOwn)
                     | (Resource::Users, Operation::ReadOwn)
                     | (Resource::Groups, Operation::ReadOwn)
+            )
+        }
+        Role::BillingManager => {
+            // Billing Manager has full access to credit system only
+            matches!(
+                resource,
+                Resource::Credits
             )
         }
     }

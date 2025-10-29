@@ -1,0 +1,86 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n            INSERT INTO credit_transactions (user_id, transaction_type, amount, balance_after, description)\n            VALUES ($1, $2, $3, $4, $5)\n            RETURNING id, user_id, transaction_type as \"transaction_type: CreditTransactionType\", amount, balance_after, description, created_at\n            ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "id",
+        "type_info": "Int8"
+      },
+      {
+        "ordinal": 1,
+        "name": "user_id",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 2,
+        "name": "transaction_type: CreditTransactionType",
+        "type_info": {
+          "Custom": {
+            "name": "credit_transaction_type",
+            "kind": {
+              "Enum": [
+                "purchase",
+                "admin_grant",
+                "admin_removal",
+                "usage"
+              ]
+            }
+          }
+        }
+      },
+      {
+        "ordinal": 3,
+        "name": "amount",
+        "type_info": "Numeric"
+      },
+      {
+        "ordinal": 4,
+        "name": "balance_after",
+        "type_info": "Numeric"
+      },
+      {
+        "ordinal": 5,
+        "name": "description",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 6,
+        "name": "created_at",
+        "type_info": "Timestamptz"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        {
+          "Custom": {
+            "name": "credit_transaction_type",
+            "kind": {
+              "Enum": [
+                "purchase",
+                "admin_grant",
+                "admin_removal",
+                "usage"
+              ]
+            }
+          }
+        },
+        "Numeric",
+        "Numeric",
+        "Text"
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      false,
+      false,
+      false,
+      true,
+      false
+    ]
+  },
+  "hash": "351c3210fd60814bd67b2f4ca6fe44a5555cceb3f2cd206fa1a9777d871c376f"
+}

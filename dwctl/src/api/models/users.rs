@@ -12,6 +12,7 @@ pub enum Role {
     PlatformManager,
     RequestViewer,
     StandardUser,
+    BillingManager,
 }
 
 // User request models
