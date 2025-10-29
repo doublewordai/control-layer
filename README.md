@@ -22,7 +22,7 @@ With docker compose installed, the commands below will start the Control Layer.
 
 ```bash
 wget https://raw.githubusercontent.com/doublewordai/control-layer/refs/heads/main/docker-compose.yml
-docker compose up -d
+docker compose -f docker-compose.yml up -d
 ```
 
 Navigate to `http://localhost:3001` to get started. When you get to the login page you will be prompting to sign in with a username and password. Please refer to the configuration section below for how to set up an admin user. You can then refer to the documentation [here](https://docs.doubleword.ai/control-layer/usage/models-and-access) to start playing around with Control Layer features.  
