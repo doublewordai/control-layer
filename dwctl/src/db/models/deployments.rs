@@ -348,7 +348,7 @@ impl DeploymentCreateDBRequest {
 #[derive(Debug, Clone, Builder)]
 pub struct DeploymentUpdateDBRequest {
     pub model_name: Option<String>,
-    pub deployment_name: Option<String>,
+    pub alias: Option<String>,
     pub description: Option<Option<String>>,
     pub model_type: Option<Option<ModelType>>,
     pub capabilities: Option<Option<Vec<String>>>,
@@ -363,7 +363,6 @@ pub struct DeploymentUpdateDBRequest {
 
 impl From<DeployedModelUpdate> for DeploymentUpdateDBRequest {
     fn from(update: DeployedModelUpdate) -> Self {
-        // Create pricing update if any pricing changes are provided
         let pricing_update = if update.pricing.is_some() || update.downstream_pricing.is_some() {
             Some(ModelPricingUpdate {
                 upstream: update.pricing,
@@ -374,8 +373,7 @@ impl From<DeployedModelUpdate> for DeploymentUpdateDBRequest {
         };
 
         Self::builder()
-            // Don't allow updating model name from the API for now
-            .maybe_deployment_name(update.alias)
+            .maybe_alias(update.alias)
             .maybe_description(update.description)
             .maybe_model_type(update.model_type)
             .maybe_capabilities(update.capabilities)
@@ -395,6 +393,11 @@ impl DeploymentUpdateDBRequest {
     /// Create an update request for hide/unhide operations
     pub fn visibility_update(deleted: bool) -> Self {
         Self::builder().deleted(deleted).build()
+    }
+
+    /// Create an update request for alias changes
+    pub fn alias_update(new_alias: String) -> Self {
+        Self::builder().maybe_alias(Some(new_alias)).build()
     }
 }
 
