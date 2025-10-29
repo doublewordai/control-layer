@@ -7,6 +7,7 @@ use utoipa::ToSchema;
 /// Credit transaction type enum matching the database enum
 #[derive(Debug, Clone, Serialize, Deserialize, sqlx::Type, PartialEq, ToSchema)]
 #[sqlx(type_name = "credit_transaction_type", rename_all = "snake_case")]
+#[serde(rename_all = "snake_case")]
 pub enum CreditTransactionType {
     Purchase,
     AdminGrant,
