@@ -30,7 +30,7 @@ Navigate to `http://localhost:3001` to get started. When you get to the login pa
 
 ### 2. Option 2 Docker Run 
 
-The Doubleword Control Layer requires a PostgreSQL database to run. You can read the documentation (here)[https://postgresapp.com/] on how to get started with a local version of PostGres. After doing this, or if you have one already (for example, via a cloud provider), run:
+The Doubleword Control Layer requires a PostgreSQL database to run. You can read the documentation (here)[https://postgresapp.com/] on how to get started with a local version of Postgres. After doing this, or if you have one already (for example, via a cloud provider), run:
 
 ```bash
 docker run -p 3001:3001 \
