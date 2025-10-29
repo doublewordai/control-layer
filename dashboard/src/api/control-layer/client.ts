@@ -789,9 +789,13 @@ const probesApi = {
     return response.json();
   },
 
-  async test(deploymentId: string): Promise<ProbeResult> {
+  async test(deploymentId: string, params?: { http_method?: string; request_path?: string; request_body?: Record<string, unknown> }): Promise<ProbeResult> {
     const response = await fetch(`/admin/api/v1/probes/test/${deploymentId}`, {
       method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify(params || null),
     });
     if (!response.ok) {
       throw new Error(`Failed to test probe: ${response.status}`);

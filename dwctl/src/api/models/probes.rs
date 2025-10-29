@@ -16,6 +16,28 @@ pub struct CreateProbe {
     pub deployment_id: Uuid,
     /// How often to execute the probe, in seconds
     pub interval_seconds: i32,
+    /// HTTP method to use for the probe request (defaults to POST if not provided)
+    #[serde(default = "default_http_method")]
+    pub http_method: String,
+    /// Path to append to the endpoint URL (e.g., /v1/chat/completions)
+    pub request_path: Option<String>,
+    /// JSON body to send with the probe request
+    pub request_body: Option<serde_json::Value>,
+}
+
+fn default_http_method() -> String {
+    "POST".to_string()
+}
+
+/// Request payload for testing a probe configuration
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct TestProbeRequest {
+    /// HTTP method to use for the test request
+    pub http_method: Option<String>,
+    /// Path to append to the endpoint URL
+    pub request_path: Option<String>,
+    /// JSON body to send with the test request
+    pub request_body: Option<serde_json::Value>,
 }
 
 /// Query parameters for filtering probes
@@ -58,6 +80,12 @@ pub struct StatsQuery {
 pub struct UpdateProbeRequest {
     /// Update probe execution interval in seconds
     pub interval_seconds: Option<i32>,
+    /// Update HTTP method for the probe request
+    pub http_method: Option<String>,
+    /// Update the request path
+    pub request_path: Option<String>,
+    /// Update the request body
+    pub request_body: Option<serde_json::Value>,
 }
 
 /// Aggregated statistics for a probe over a time period.

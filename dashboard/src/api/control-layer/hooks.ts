@@ -506,6 +506,7 @@ export function useCreateProbe() {
     mutationFn: (data: CreateProbeRequest) => dwctlApi.probes.create(data),
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: ["probes"] });
+      queryClient.invalidateQueries({ queryKey: queryKeys.models.all });
     },
   });
 }
@@ -518,6 +519,7 @@ export function useDeleteProbe() {
     mutationFn: (id: string) => dwctlApi.probes.delete(id),
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: ["probes"] });
+      queryClient.invalidateQueries({ queryKey: queryKeys.models.all });
     },
   });
 }
@@ -530,6 +532,7 @@ export function useActivateProbe() {
     mutationFn: (id: string) => dwctlApi.probes.activate(id),
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: ["probes"] });
+      queryClient.invalidateQueries({ queryKey: queryKeys.models.all });
     },
   });
 }
@@ -542,6 +545,7 @@ export function useDeactivateProbe() {
     mutationFn: (id: string) => dwctlApi.probes.deactivate(id),
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: ["probes"] });
+      queryClient.invalidateQueries({ queryKey: queryKeys.models.all });
     },
   });
 }
@@ -562,7 +566,8 @@ export function useExecuteProbe() {
 export function useTestProbe() {
   return useMutation({
     mutationKey: ["probes", "test"],
-    mutationFn: (deploymentId: string) => dwctlApi.probes.test(deploymentId),
+    mutationFn: ({ deploymentId, params }: { deploymentId: string; params?: { http_method?: string; request_path?: string; request_body?: Record<string, unknown> } }) =>
+      dwctlApi.probes.test(deploymentId, params),
   });
 }
 
@@ -571,16 +576,20 @@ export function useUpdateProbe() {
 
   return useMutation({
     mutationKey: ["probes", "update"],
-    mutationFn: ({
-      id,
-      data,
-    }: {
+    mutationFn: ({ id, data }: {
       id: string;
-      data: { interval_seconds?: number };
-    }) => dwctlApi.probes.update(id, data),
+      data: {
+        interval_seconds?: number;
+        http_method?: string;
+        request_path?: string | null;
+        request_body?: Record<string, any> | null;
+      }
+    }) =>
+      dwctlApi.probes.update(id, data),
     onSuccess: (_, variables) => {
       queryClient.invalidateQueries({ queryKey: ["probes"] });
       queryClient.invalidateQueries({ queryKey: ["probes", variables.id] });
+      queryClient.invalidateQueries({ queryKey: queryKeys.models.all });
     },
   });
 }

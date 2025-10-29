@@ -391,6 +391,17 @@ pub async fn setup_app(
         let is_leader_flag = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
 
         // Spawn leader election background task
+        // This is designed to solve a problem that could have been solved by spinning up a
+        // separate service, but we're trying to keep everything in one replicated binary. There
+        // are some tasks that should only be run by one replica of the control layer service - for
+        // example, running the probes scheduler. To figure out which replica should run these
+        // tasks, we use 'leader election'. This is an elaborate name for 'taking a postgres
+        // advisory lock'.
+        //
+        // All the replicas try to take the lock on an interval. The one that succeeds becomes the
+        // leader. If the leader dies, another replica will succeed at the next interval. The
+        // leader election task takes two callbacks: one that runs when we become leader, and one
+        // that runs when we stop being leader.
         let leader_election_pool = pool.clone();
         let leader_election_scheduler_gain = probe_scheduler.clone();
         let leader_election_scheduler_lose = probe_scheduler.clone();
@@ -403,6 +414,7 @@ pub async fn setup_app(
                 leader_election_flag,
                 LEADER_LOCK_ID,
                 move |_pool, _config| {
+                    // This closure is run when a replica becomes the leader
                     let scheduler = leader_election_scheduler_gain.clone();
                     async move {
                         // Wait for the server to be fully up before starting probes
@@ -413,19 +425,20 @@ pub async fn setup_app(
                             .await
                             .map_err(|e| anyhow::anyhow!("Failed to initialize probe scheduler: {}", e))?;
 
-                        // Start the scheduler daemon in the background
+                        // Start the probe scheduler daemon in the background
                         let daemon_scheduler = scheduler.clone();
                         tokio::spawn(async move {
-                            // Use LISTEN/NOTIFY in production, but disable in tests to avoid hangs
+                            // Use LISTEN/NOTIFY in production, but disable in tests, because
+                            // LISTEN/NOTIFY can be annoying in test environments.
                             let use_listen_notify = !cfg!(test);
                             daemon_scheduler.run_daemon(use_listen_notify, 300).await;
-                            // Fallback sync every 5 minutes
                         });
 
                         Ok(())
                     }
                 },
                 move |_pool, _config| {
+                    // This closure is run when a replica stops being the leader
                     let scheduler = leader_election_scheduler_lose.clone();
                     async move {
                         scheduler
@@ -651,7 +664,7 @@ pub async fn build_router(state: &mut AppState, onwards_router: Router) -> anyho
             }),
         )
         .merge(auth_routes)
-        .nest("/ai", onwards_router)
+        .nest("/ai/v1", onwards_router)
         .nest("/admin/api/v1", api_routes)
         .merge(RapiDoc::with_openapi("/api-docs/openapi.json", ApiDoc::openapi()).path("/admin/docs"))
         .merge(RapiDoc::new("/openai-openapi.yaml").path("/ai/docs"))

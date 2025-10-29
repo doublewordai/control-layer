@@ -281,6 +281,50 @@ impl ModelPricing {
 pub enum ModelType {
     Chat,
     Embeddings,
+    Reranker,
+}
+
+impl ModelType {
+    /// Detect model type from model name using common patterns
+    /// This helps automatically classify models when syncing from endpoints
+    pub fn detect_from_name(model_name: &str) -> Self {
+        let name_lower = model_name.to_lowercase();
+
+        // Reranker model patterns - check these first as they're most specific
+        let reranker_patterns = [
+            "rerank",
+            "reranker",
+            "cross-encoder",
+            "bge-reranker",
+            "mixedbread-reranker",
+            "mxbai-rerank",
+        ];
+
+        // Embedding model patterns
+        let embedding_patterns = [
+            "embed",
+            "embedding",
+            "ada", // OpenAI's ada embedding models
+            "text-embedding",
+            "sentence-transformer",
+            "all-minilm",
+            "bge-",
+            "e5-",
+        ];
+
+        // Check if model name contains any reranker patterns
+        if reranker_patterns.iter().any(|pattern| name_lower.contains(pattern)) {
+            return Self::Reranker;
+        }
+
+        // Check if model name contains any embedding patterns
+        if embedding_patterns.iter().any(|pattern| name_lower.contains(pattern)) {
+            return Self::Embeddings;
+        }
+
+        // Default to chat for everything else
+        Self::Chat
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, ToSchema)]

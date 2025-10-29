@@ -3,7 +3,7 @@ import { useNavigate, useSearchParams } from "react-router-dom";
 import { Play, ArrowLeft } from "lucide-react";
 import OpenAI from "openai";
 import { useModels } from "../../../../api/control-layer";
-import { getModelType, type ModelType } from "../../../../utils/modelType";
+import { type ModelType } from "../../../../utils/modelType";
 import type {
   Model,
   RerankResponse,
@@ -90,8 +90,7 @@ const Playground: React.FC = () => {
         if (model) {
           setSelectedModel(model);
           setModelType(
-            (model.model_type?.toLowerCase() as ModelType) ||
-              getModelType(model.id, model.alias),
+            (model.model_type?.toLowerCase() as ModelType) || "chat",
           );
         }
       }
@@ -132,8 +131,7 @@ const Playground: React.FC = () => {
     if (model) {
       setSelectedModel(model);
       setModelType(
-        (model.model_type?.toLowerCase() as ModelType) ||
-          getModelType(model.id, model.alias),
+        (model.model_type?.toLowerCase() as ModelType) || "chat",
       );
       navigate(`/playground?model=${encodeURIComponent(modelId)}`);
     }

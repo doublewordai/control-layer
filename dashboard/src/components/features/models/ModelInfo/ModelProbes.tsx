@@ -37,8 +37,10 @@ import {
 } from "../../../ui/card";
 import { Button } from "../../../ui/button";
 import { Input } from "../../../ui/input";
+import { Textarea } from "../../../ui/textarea";
 import { Badge } from "../../../ui/badge";
 import { Popover, PopoverContent, PopoverTrigger } from "../../../ui/popover";
+import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "../../../ui/select";
 import { toast } from "sonner";
 import { ProbeTimeline } from "./ProbeTimeline";
 
@@ -49,6 +51,10 @@ interface ModelProbesProps {
 const ModelProbes: React.FC<ModelProbesProps> = ({ model }) => {
   const [showCreateForm, setShowCreateForm] = useState(false);
   const [intervalSeconds, setIntervalSeconds] = useState(60);
+  const [pingType, setPingType] = useState<"default" | "custom">("default");
+  const [httpMethod, setHttpMethod] = useState("POST");
+  const [requestPath, setRequestPath] = useState("");
+  const [requestBody, setRequestBody] = useState("");
   const [testResult, setTestResult] = useState<ProbeResult | null>(null);
   const [testPassed, setTestPassed] = useState(false);
   const [editingInterval, setEditingInterval] = useState(false);
@@ -83,8 +89,30 @@ const ModelProbes: React.FC<ModelProbesProps> = ({ model }) => {
   );
 
   const handleTestProbe = async () => {
+    // Build test parameters
+    let params: { http_method?: string; request_path?: string; request_body?: Record<string, unknown> } | undefined;
+
+    if (pingType === "custom") {
+      // Validate and parse custom body if provided
+      let parsedBody: Record<string, unknown> | undefined;
+      if (requestBody.trim()) {
+        try {
+          parsedBody = JSON.parse(requestBody);
+        } catch {
+          toast.error("Invalid JSON in request body");
+          return;
+        }
+      }
+
+      params = {
+        http_method: httpMethod,
+        request_path: requestPath.trim() || undefined,
+        request_body: parsedBody,
+      };
+    }
+
     try {
-      const result = await testProbeMutation.mutateAsync(model.id);
+      const result = await testProbeMutation.mutateAsync({ deploymentId: model.id, params });
       setTestResult(result);
       setTestPassed(result.success);
       if (result.success) {
@@ -106,6 +134,26 @@ const ModelProbes: React.FC<ModelProbesProps> = ({ model }) => {
       return;
     }
 
+    // Only use custom parameters if pingType is custom
+    let parsedBody = null;
+    let finalHttpMethod = "POST";
+    let finalRequestPath = null;
+
+    if (pingType === "custom") {
+      finalHttpMethod = httpMethod;
+      finalRequestPath = requestPath.trim() || null;
+
+      // Parse request body if provided
+      if (requestBody.trim()) {
+        try {
+          parsedBody = JSON.parse(requestBody);
+        } catch {
+          toast.error("Invalid JSON in request body");
+          return;
+        }
+      }
+    }
+
     try {
       // Generate a random name since it's not displayed anywhere
       const randomName = `probe-${model.id.substring(0, 8)}-${Date.now()}`;
@@ -113,12 +161,19 @@ const ModelProbes: React.FC<ModelProbesProps> = ({ model }) => {
         name: randomName,
         deployment_id: model.id,
         interval_seconds: intervalSeconds,
+        http_method: finalHttpMethod,
+        request_path: finalRequestPath,
+        request_body: parsedBody,
       });
       toast.success("Probe created successfully");
       setShowCreateForm(false);
       setTestResult(null);
       setTestPassed(false);
       setIntervalSeconds(60);
+      setPingType("default");
+      setHttpMethod("POST");
+      setRequestPath("");
+      setRequestBody("");
     } catch {
       toast.error("Failed to create probe");
     }
@@ -364,15 +419,108 @@ const ModelProbes: React.FC<ModelProbesProps> = ({ model }) => {
           </CardHeader>
           <CardContent>
             <div className="space-y-6">
+              {/* Ping Type Selection */}
+              <div>
+                <h3 className="text-sm font-medium mb-3">Step 1: Configure Probe Type</h3>
+                <div className="space-y-4">
+                  <div>
+                    <label className="text-sm font-medium mb-2 block">
+                      Ping Type
+                    </label>
+                    <Select value={pingType} onValueChange={(value: "default" | "custom") => {
+                      setPingType(value);
+                      // Reset test when changing ping type
+                      setTestResult(null);
+                      setTestPassed(false);
+                    }}>
+                      <SelectTrigger>
+                        <SelectValue />
+                      </SelectTrigger>
+                      <SelectContent>
+                        <SelectItem value="default">Default (based on model type)</SelectItem>
+                        <SelectItem value="custom">Custom (specify path and body)</SelectItem>
+                      </SelectContent>
+                    </Select>
+                    <p className="text-xs text-gray-500 mt-1">
+                      Use default to automatically probe based on model type, or custom to specify your own request
+                    </p>
+                  </div>
+
+                  {/* Custom ping fields - only show when custom is selected */}
+                  {pingType === "custom" && (
+                    <>
+                      <div>
+                        <label className="text-sm font-medium mb-2 block">
+                          HTTP Method
+                        </label>
+                        <Select value={httpMethod} onValueChange={(value) => {
+                          setHttpMethod(value);
+                          setTestResult(null);
+                          setTestPassed(false);
+                        }}>
+                          <SelectTrigger>
+                            <SelectValue />
+                          </SelectTrigger>
+                          <SelectContent>
+                            <SelectItem value="GET">GET</SelectItem>
+                            <SelectItem value="POST">POST</SelectItem>
+                            <SelectItem value="PUT">PUT</SelectItem>
+                            <SelectItem value="PATCH">PATCH</SelectItem>
+                            <SelectItem value="DELETE">DELETE</SelectItem>
+                          </SelectContent>
+                        </Select>
+                      </div>
+
+                      <div>
+                        <label className="text-sm font-medium mb-2 block">
+                          Request Path
+                        </label>
+                        <Input
+                          type="text"
+                          placeholder="/v1/chat/completions"
+                          value={requestPath}
+                          onChange={(e) => {
+                            setRequestPath(e.target.value);
+                            setTestResult(null);
+                            setTestPassed(false);
+                          }}
+                        />
+                        <p className="text-xs text-gray-500 mt-1">
+                          Path to append to endpoint URL (e.g., /v1/chat/completions)
+                        </p>
+                      </div>
+
+                      <div>
+                        <label className="text-sm font-medium mb-2 block">
+                          Request Body (JSON)
+                        </label>
+                        <Textarea
+                          placeholder='{"model": "gpt-4", "messages": [{"role": "user", "content": "Hello"}]}'
+                          value={requestBody}
+                          onChange={(e) => {
+                            setRequestBody(e.target.value);
+                            setTestResult(null);
+                            setTestPassed(false);
+                          }}
+                          rows={4}
+                          className="font-mono text-sm"
+                        />
+                        <p className="text-xs text-gray-500 mt-1">
+                          JSON body for the request
+                        </p>
+                      </div>
+                    </>
+                  )}
+                </div>
+              </div>
+
               {/* Test Section */}
               <div>
                 <div className="flex items-center justify-between mb-4">
                   <div>
-                    <h3 className="text-sm font-medium mb-1">
-                      Step 1: Test Connection
-                    </h3>
+                    <h3 className="text-sm font-medium mb-1">Step 2: Test Connection</h3>
                     <p className="text-sm text-gray-600">
-                      Verify that the model endpoint is accessible
+                      Verify that the endpoint is accessible with these settings
                     </p>
                   </div>
                   <Button
@@ -439,25 +587,23 @@ const ModelProbes: React.FC<ModelProbesProps> = ({ model }) => {
 
               {/* Configuration Section */}
               <div>
-                <h3 className="text-sm font-medium mb-3">
-                  Step 2: Configure Interval
-                </h3>
-                <div>
-                  <label className="text-sm font-medium mb-2 block">
-                    Check Interval (seconds)
-                  </label>
-                  <Input
-                    type="number"
-                    min="10"
-                    value={intervalSeconds}
-                    onChange={(e) =>
-                      setIntervalSeconds(parseInt(e.target.value))
-                    }
-                    disabled={!testPassed}
-                  />
-                  <p className="text-xs text-gray-500 mt-1">
-                    How often the probe should check the endpoint
-                  </p>
+                <h3 className="text-sm font-medium mb-3">Step 3: Set Interval</h3>
+                <div className="space-y-4">
+                  <div>
+                    <label className="text-sm font-medium mb-2 block">
+                      Check Interval (seconds)
+                    </label>
+                    <Input
+                      type="number"
+                      min="10"
+                      value={intervalSeconds}
+                      onChange={(e) => setIntervalSeconds(parseInt(e.target.value))}
+                      disabled={!testPassed}
+                    />
+                    <p className="text-xs text-gray-500 mt-1">
+                      How often the probe should check the endpoint
+                    </p>
+                  </div>
                 </div>
               </div>
 
@@ -471,6 +617,10 @@ const ModelProbes: React.FC<ModelProbesProps> = ({ model }) => {
                     setTestResult(null);
                     setTestPassed(false);
                     setIntervalSeconds(60);
+                    setPingType("default");
+                    setHttpMethod("POST");
+                    setRequestPath("");
+                    setRequestBody("");
                   }}
                 >
                   Cancel

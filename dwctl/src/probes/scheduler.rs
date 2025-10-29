@@ -415,6 +415,9 @@ mod tests {
                 name: "Probe 1".to_string(),
                 deployment_id: deployment_id1,
                 interval_seconds: 60,
+                http_method: "POST".to_string(),
+                request_path: None,
+                request_body: None,
             },
         )
         .await
@@ -426,6 +429,9 @@ mod tests {
                 name: "Probe 2".to_string(),
                 deployment_id: deployment_id2,
                 interval_seconds: 120,
+                http_method: "POST".to_string(),
+                request_path: None,
+                request_body: None,
             },
         )
         .await
@@ -460,6 +466,9 @@ mod tests {
                 name: "New Probe".to_string(),
                 deployment_id,
                 interval_seconds: 60,
+                http_method: "POST".to_string(),
+                request_path: None,
+                request_body: None,
             },
         )
         .await
@@ -482,6 +491,9 @@ mod tests {
                 name: "Test Probe".to_string(),
                 deployment_id,
                 interval_seconds: 60,
+                http_method: "POST".to_string(),
+                request_path: None,
+                request_body: None,
             },
         )
         .await
@@ -512,6 +524,9 @@ mod tests {
                     name: format!("Probe {}", i),
                     deployment_id,
                     interval_seconds: 60,
+                    http_method: "POST".to_string(),
+                    request_path: None,
+                    request_body: None,
                 },
             )
             .await
@@ -540,6 +555,9 @@ mod tests {
                 name: "Inactive Probe".to_string(),
                 deployment_id,
                 interval_seconds: 60,
+                http_method: "POST".to_string(),
+                request_path: None,
+                request_body: None,
             },
         )
         .await

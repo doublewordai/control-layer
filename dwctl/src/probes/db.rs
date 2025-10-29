@@ -6,12 +6,12 @@
 //!
 //! Background scheduling is handled separately by the `ProbeScheduler`.
 
-use crate::api::models::probes::{CreateProbe, ProbeStatistics};
+use crate::api::models::probes::{CreateProbe, ProbeStatistics, UpdateProbeRequest};
 use crate::db::models::probes::{Probe, ProbeExecution, ProbeResult};
 use crate::errors::Error as AppError;
 use crate::probes::executor::{ProbeExecutionContext, ProbeExecutor};
 use chrono::{DateTime, Utc};
-use sqlx::{PgPool, Row};
+use sqlx::PgPool;
 use uuid::Uuid;
 
 /// Database access layer for probes.
@@ -26,14 +26,17 @@ impl ProbeManager {
     pub async fn create_probe(pool: &PgPool, probe: CreateProbe) -> Result<Probe, AppError> {
         let result = sqlx::query_as::<_, Probe>(
             r#"
-            INSERT INTO probes (name, deployment_id, interval_seconds, active)
-            VALUES ($1, $2, $3, true)
+            INSERT INTO probes (name, deployment_id, interval_seconds, active, http_method, request_path, request_body)
+            VALUES ($1, $2, $3, true, $4, $5, $6)
             RETURNING *
             "#,
         )
         .bind(&probe.name)
         .bind(probe.deployment_id)
         .bind(probe.interval_seconds)
+        .bind(&probe.http_method)
+        .bind(&probe.request_path)
+        .bind(&probe.request_body)
         .fetch_one(pool)
         .await
         .map_err(|e| anyhow::anyhow!("Failed to create probe: {}", e))?;
@@ -112,7 +115,7 @@ impl ProbeManager {
         }
 
         // Get probes for these deployments with their latest result
-        let rows = sqlx::query(
+        let rows = sqlx::query!(
             r#"
             SELECT
                 p.deployment_id,
@@ -131,8 +134,8 @@ impl ProbeManager {
             ) pr ON true
             WHERE p.deployment_id = ANY($1)
             "#,
+            deployment_ids
         )
-        .bind(deployment_ids)
         .fetch_all(pool)
         .await
         .map_err(|e| anyhow::anyhow!("Failed to fetch deployment statuses: {}", e))?;
@@ -140,12 +143,12 @@ impl ProbeManager {
         let mut result = std::collections::HashMap::new();
 
         for row in rows {
-            let deployment_id: Uuid = row.get("deployment_id");
-            let probe_id: Uuid = row.get("probe_id");
-            let active: bool = row.get("active");
-            let interval_seconds: i32 = row.get("interval_seconds");
-            let last_check: Option<chrono::DateTime<chrono::Utc>> = row.get("last_check");
-            let last_success: Option<bool> = row.get("last_success");
+            let deployment_id = row.deployment_id;
+            let probe_id = row.probe_id;
+            let active = row.active;
+            let interval_seconds = row.interval_seconds;
+            let last_check = row.last_check;
+            let last_success = row.last_success;
 
             // Calculate 24h uptime for this probe
             let uptime_24h = if active {
@@ -169,7 +172,7 @@ impl ProbeManager {
     async fn calculate_uptime_percentage(pool: &PgPool, probe_id: Uuid, duration: chrono::Duration) -> Result<f64, AppError> {
         let since = chrono::Utc::now() - duration;
 
-        let row = sqlx::query(
+        let row = sqlx::query!(
             r#"
             SELECT
                 COUNT(*) as total,
@@ -177,15 +180,15 @@ impl ProbeManager {
             FROM probe_results
             WHERE probe_id = $1 AND executed_at >= $2
             "#,
+            probe_id,
+            since
         )
-        .bind(probe_id)
-        .bind(since)
         .fetch_one(pool)
         .await
         .map_err(|e| anyhow::anyhow!("Failed to calculate uptime: {}", e))?;
 
-        let total: i64 = row.get("total");
-        let successful: i64 = row.get("successful");
+        let total = row.total.unwrap_or(0);
+        let successful = row.successful.unwrap_or(0);
 
         if total == 0 {
             return Ok(100.0); // No data = assume operational
@@ -225,17 +228,23 @@ impl ProbeManager {
     }
 
     /// Update a probe's configuration
-    pub async fn update_probe(pool: &PgPool, id: Uuid, interval_seconds: Option<i32>) -> Result<Probe, AppError> {
+    pub async fn update_probe(pool: &PgPool, id: Uuid, update: UpdateProbeRequest) -> Result<Probe, AppError> {
         let updated_probe = sqlx::query_as::<_, Probe>(
             r#"
             UPDATE probes
-            SET interval_seconds = COALESCE($2, interval_seconds)
+            SET interval_seconds = COALESCE($2, interval_seconds),
+                http_method = COALESCE($3, http_method),
+                request_path = COALESCE($4, request_path),
+                request_body = COALESCE($5, request_body)
             WHERE id = $1
             RETURNING *
             "#,
         )
         .bind(id)
-        .bind(interval_seconds)
+        .bind(update.interval_seconds)
+        .bind(update.http_method)
+        .bind(update.request_path)
+        .bind(update.request_body)
         .fetch_one(pool)
         .await
         .map_err(|e| anyhow::anyhow!("Failed to update probe: {}", e))?;
@@ -245,12 +254,12 @@ impl ProbeManager {
 
     /// Delete a probe
     pub async fn delete_probe(pool: &PgPool, id: Uuid) -> Result<(), AppError> {
-        sqlx::query(
+        sqlx::query!(
             r#"
             DELETE FROM probes WHERE id = $1
             "#,
+            id
         )
-        .bind(id)
         .execute(pool)
         .await
         .map_err(|e| anyhow::anyhow!("Failed to delete probe: {}", e))?;
@@ -259,9 +268,16 @@ impl ProbeManager {
     }
 
     /// Test a probe configuration without creating it
-    pub async fn test_probe(pool: &PgPool, deployment_id: Uuid, config: &crate::config::Config) -> Result<ProbeResult, AppError> {
+    pub async fn test_probe(
+        pool: &PgPool,
+        deployment_id: Uuid,
+        config: &crate::config::Config,
+        http_method: Option<String>,
+        request_path: Option<String>,
+        request_body: Option<serde_json::Value>,
+    ) -> Result<ProbeResult, AppError> {
         // Fetch deployment details - use alias to route through control layer
-        let context = sqlx::query(
+        let context = sqlx::query!(
             r#"
             SELECT
                 d.alias,
@@ -271,25 +287,21 @@ impl ProbeManager {
             CROSS JOIN api_keys ak
             WHERE d.id = $1 AND ak.id = '00000000-0000-0000-0000-000000000000'::uuid
             "#,
+            deployment_id
         )
-        .bind(deployment_id)
         .fetch_one(pool)
         .await
         .map_err(|e| anyhow::anyhow!("Failed to fetch deployment for test: {}", e))?;
 
-        let model_name: String = context
-            .try_get("alias")
-            .map_err(|e| anyhow::anyhow!("Failed to get alias: {}", e))?;
-        let model_type_str: Option<String> = context.try_get("model_type").ok();
-        let system_api_key: String = context
-            .try_get("system_api_key")
-            .map_err(|e| anyhow::anyhow!("Failed to get system_api_key: {}", e))?;
+        let model_name = context.alias;
+        let model_type_str = context.model_type;
+        let system_api_key = context.system_api_key;
 
         // Route through control layer's normal AI proxy (not admin path)
         let endpoint_url = format!("http://localhost:{}/ai", config.port);
         let api_key = Some(system_api_key);
 
-        // Parse model type - default to Chat if not specified
+        // Parse model type - use auto-detection if not specified
         let model_type = match model_type_str.as_deref() {
             Some(t) => match t.to_uppercase().as_str() {
                 "CHAT" => crate::db::models::deployments::ModelType::Chat,
@@ -300,7 +312,7 @@ impl ProbeManager {
                     });
                 }
             },
-            None => crate::db::models::deployments::ModelType::Chat, // Default to Chat
+            None => crate::db::models::deployments::ModelType::detect_from_name(&model_name),
         };
 
         let execution_context = ProbeExecutionContext {
@@ -309,6 +321,9 @@ impl ProbeManager {
             model_type,
             endpoint_url,
             api_key,
+            http_method: http_method.unwrap_or_else(|| "POST".to_string()),
+            request_path,
+            request_body,
         };
 
         let executor = ProbeExecutor::new();
@@ -336,11 +351,14 @@ impl ProbeManager {
         // Note: We allow executing inactive probes manually via "Run Now"
         let _probe = Self::get_probe(pool, id).await?;
 
-        // Fetch deployment details - use alias to route through control layer
-        let context = sqlx::query(
+        // Fetch deployment details and probe configuration - use alias to route through control layer
+        let context = sqlx::query!(
             r#"
             SELECT
                 p.id as probe_id,
+                p.http_method,
+                p.request_path,
+                p.request_body,
                 d.alias,
                 d.type as model_type,
                 ak.secret as system_api_key
@@ -349,28 +367,25 @@ impl ProbeManager {
             CROSS JOIN api_keys ak
             WHERE p.id = $1 AND ak.id = '00000000-0000-0000-0000-000000000000'::uuid
             "#,
+            id
         )
-        .bind(id)
         .fetch_one(pool)
         .await
         .map_err(|e| anyhow::anyhow!("Failed to fetch probe execution context: {}", e))?;
 
-        let probe_id: Uuid = context
-            .try_get("probe_id")
-            .map_err(|e| anyhow::anyhow!("Failed to get probe_id: {}", e))?;
-        let model_name: String = context
-            .try_get("alias")
-            .map_err(|e| anyhow::anyhow!("Failed to get alias: {}", e))?;
-        let model_type_str: Option<String> = context.try_get("model_type").ok();
-        let system_api_key: String = context
-            .try_get("system_api_key")
-            .map_err(|e| anyhow::anyhow!("Failed to get system_api_key: {}", e))?;
+        let probe_id = context.probe_id;
+        let http_method = context.http_method;
+        let request_path = context.request_path;
+        let request_body = context.request_body;
+        let model_name = context.alias;
+        let model_type_str = context.model_type;
+        let system_api_key = context.system_api_key;
 
         // Route through control layer's normal AI proxy (not admin path)
         let endpoint_url = format!("http://localhost:{}/ai", config.port);
         let api_key = Some(system_api_key);
 
-        // Parse model type - default to Chat if not specified
+        // Parse model type - use auto-detection if not specified
         let model_type = match model_type_str.as_deref() {
             Some(t) => match t.to_uppercase().as_str() {
                 "CHAT" => crate::db::models::deployments::ModelType::Chat,
@@ -381,7 +396,7 @@ impl ProbeManager {
                     });
                 }
             },
-            None => crate::db::models::deployments::ModelType::Chat, // Default to Chat
+            None => crate::db::models::deployments::ModelType::detect_from_name(&model_name),
         };
 
         let execution_context = ProbeExecutionContext {
@@ -390,6 +405,9 @@ impl ProbeManager {
             model_type,
             endpoint_url,
             api_key,
+            http_method,
+            request_path,
+            request_body,
         };
 
         let executor = ProbeExecutor::new();
@@ -495,58 +513,129 @@ impl ProbeManager {
         start_time: Option<DateTime<Utc>>,
         end_time: Option<DateTime<Utc>>,
     ) -> Result<ProbeStatistics, AppError> {
-        let mut query = String::from(
-            r#"
-            SELECT
-                COUNT(*) as total,
-                COUNT(*) FILTER (WHERE success = true) as successful,
-                COUNT(*) FILTER (WHERE success = false) as failed,
-                AVG(response_time_ms) FILTER (WHERE success = true) as avg_time,
-                MIN(response_time_ms) FILTER (WHERE success = true) as min_time,
-                MAX(response_time_ms) FILTER (WHERE success = true) as max_time,
-                PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY response_time_ms) FILTER (WHERE success = true) as p50,
-                PERCENTILE_CONT(0.95) WITHIN GROUP (ORDER BY response_time_ms) FILTER (WHERE success = true) as p95,
-                PERCENTILE_CONT(0.99) WITHIN GROUP (ORDER BY response_time_ms) FILTER (WHERE success = true) as p99,
-                MAX(executed_at) as last_execution,
-                MAX(executed_at) FILTER (WHERE success = true) as last_success,
-                MAX(executed_at) FILTER (WHERE success = false) as last_failure
-            FROM probe_results
-            WHERE probe_id = $1
-            "#,
-        );
-
-        let mut param_count = 1;
-
-        if start_time.is_some() {
-            param_count += 1;
-            query.push_str(&format!(" AND executed_at >= ${}", param_count));
+        // Define a struct to hold the common query result
+        #[derive(sqlx::FromRow)]
+        struct StatsRow {
+            total: Option<i64>,
+            successful: Option<i64>,
+            failed: Option<i64>,
+            avg_time: Option<f64>,
+            min_time: Option<i32>,
+            max_time: Option<i32>,
+            p50: Option<f64>,
+            p95: Option<f64>,
+            p99: Option<f64>,
+            last_execution: Option<DateTime<Utc>>,
+            last_success: Option<DateTime<Utc>>,
+            last_failure: Option<DateTime<Utc>>,
         }
 
-        if end_time.is_some() {
-            param_count += 1;
-            query.push_str(&format!(" AND executed_at <= ${}", param_count));
-        }
-
-        let mut sql_query = sqlx::query(&query).bind(probe_id);
-
-        if let Some(start) = start_time {
-            sql_query = sql_query.bind(start);
-        }
-
-        if let Some(end) = end_time {
-            sql_query = sql_query.bind(end);
-        }
-
-        let row = sql_query
+        let row = match (start_time, end_time) {
+            (None, None) => sqlx::query_as!(
+                StatsRow,
+                r#"
+                    SELECT
+                        COUNT(*) as total,
+                        COUNT(*) FILTER (WHERE success = true) as successful,
+                        COUNT(*) FILTER (WHERE success = false) as failed,
+                        (AVG(response_time_ms) FILTER (WHERE success = true))::float8 as avg_time,
+                        MIN(response_time_ms) FILTER (WHERE success = true) as min_time,
+                        MAX(response_time_ms) FILTER (WHERE success = true) as max_time,
+                        (PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY response_time_ms) FILTER (WHERE success = true))::float8 as p50,
+                        (PERCENTILE_CONT(0.95) WITHIN GROUP (ORDER BY response_time_ms) FILTER (WHERE success = true))::float8 as p95,
+                        (PERCENTILE_CONT(0.99) WITHIN GROUP (ORDER BY response_time_ms) FILTER (WHERE success = true))::float8 as p99,
+                        MAX(executed_at) as last_execution,
+                        MAX(executed_at) FILTER (WHERE success = true) as last_success,
+                        MAX(executed_at) FILTER (WHERE success = false) as last_failure
+                    FROM probe_results
+                    WHERE probe_id = $1
+                    "#,
+                probe_id
+            )
             .fetch_one(pool)
             .await
-            .map_err(|e| anyhow::anyhow!("Failed to fetch probe statistics: {}", e))?;
+            .map_err(|e| anyhow::anyhow!("Failed to fetch probe statistics: {}", e))?,
+            (Some(start), None) => sqlx::query_as!(
+                StatsRow,
+                r#"
+                    SELECT
+                        COUNT(*) as total,
+                        COUNT(*) FILTER (WHERE success = true) as successful,
+                        COUNT(*) FILTER (WHERE success = false) as failed,
+                        (AVG(response_time_ms) FILTER (WHERE success = true))::float8 as avg_time,
+                        MIN(response_time_ms) FILTER (WHERE success = true) as min_time,
+                        MAX(response_time_ms) FILTER (WHERE success = true) as max_time,
+                        (PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY response_time_ms) FILTER (WHERE success = true))::float8 as p50,
+                        (PERCENTILE_CONT(0.95) WITHIN GROUP (ORDER BY response_time_ms) FILTER (WHERE success = true))::float8 as p95,
+                        (PERCENTILE_CONT(0.99) WITHIN GROUP (ORDER BY response_time_ms) FILTER (WHERE success = true))::float8 as p99,
+                        MAX(executed_at) as last_execution,
+                        MAX(executed_at) FILTER (WHERE success = true) as last_success,
+                        MAX(executed_at) FILTER (WHERE success = false) as last_failure
+                    FROM probe_results
+                    WHERE probe_id = $1 AND executed_at >= $2
+                    "#,
+                probe_id,
+                start
+            )
+            .fetch_one(pool)
+            .await
+            .map_err(|e| anyhow::anyhow!("Failed to fetch probe statistics: {}", e))?,
+            (None, Some(end)) => sqlx::query_as!(
+                StatsRow,
+                r#"
+                    SELECT
+                        COUNT(*) as total,
+                        COUNT(*) FILTER (WHERE success = true) as successful,
+                        COUNT(*) FILTER (WHERE success = false) as failed,
+                        (AVG(response_time_ms) FILTER (WHERE success = true))::float8 as avg_time,
+                        MIN(response_time_ms) FILTER (WHERE success = true) as min_time,
+                        MAX(response_time_ms) FILTER (WHERE success = true) as max_time,
+                        (PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY response_time_ms) FILTER (WHERE success = true))::float8 as p50,
+                        (PERCENTILE_CONT(0.95) WITHIN GROUP (ORDER BY response_time_ms) FILTER (WHERE success = true))::float8 as p95,
+                        (PERCENTILE_CONT(0.99) WITHIN GROUP (ORDER BY response_time_ms) FILTER (WHERE success = true))::float8 as p99,
+                        MAX(executed_at) as last_execution,
+                        MAX(executed_at) FILTER (WHERE success = true) as last_success,
+                        MAX(executed_at) FILTER (WHERE success = false) as last_failure
+                    FROM probe_results
+                    WHERE probe_id = $1 AND executed_at <= $2
+                    "#,
+                probe_id,
+                end
+            )
+            .fetch_one(pool)
+            .await
+            .map_err(|e| anyhow::anyhow!("Failed to fetch probe statistics: {}", e))?,
+            (Some(start), Some(end)) => sqlx::query_as!(
+                StatsRow,
+                r#"
+                    SELECT
+                        COUNT(*) as total,
+                        COUNT(*) FILTER (WHERE success = true) as successful,
+                        COUNT(*) FILTER (WHERE success = false) as failed,
+                        (AVG(response_time_ms) FILTER (WHERE success = true))::float8 as avg_time,
+                        MIN(response_time_ms) FILTER (WHERE success = true) as min_time,
+                        MAX(response_time_ms) FILTER (WHERE success = true) as max_time,
+                        (PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY response_time_ms) FILTER (WHERE success = true))::float8 as p50,
+                        (PERCENTILE_CONT(0.95) WITHIN GROUP (ORDER BY response_time_ms) FILTER (WHERE success = true))::float8 as p95,
+                        (PERCENTILE_CONT(0.99) WITHIN GROUP (ORDER BY response_time_ms) FILTER (WHERE success = true))::float8 as p99,
+                        MAX(executed_at) as last_execution,
+                        MAX(executed_at) FILTER (WHERE success = true) as last_success,
+                        MAX(executed_at) FILTER (WHERE success = false) as last_failure
+                    FROM probe_results
+                    WHERE probe_id = $1 AND executed_at >= $2 AND executed_at <= $3
+                    "#,
+                probe_id,
+                start,
+                end
+            )
+            .fetch_one(pool)
+            .await
+            .map_err(|e| anyhow::anyhow!("Failed to fetch probe statistics: {}", e))?,
+        };
 
-        let total: i64 = row.try_get("total").map_err(|e| anyhow::anyhow!("Failed to get total: {}", e))?;
-        let successful: i64 = row
-            .try_get("successful")
-            .map_err(|e| anyhow::anyhow!("Failed to get successful: {}", e))?;
-        let failed: i64 = row.try_get("failed").map_err(|e| anyhow::anyhow!("Failed to get failed: {}", e))?;
+        let total = row.total.unwrap_or(0);
+        let successful = row.successful.unwrap_or(0);
+        let failed = row.failed.unwrap_or(0);
         let success_rate = if total > 0 {
             (successful as f64 / total as f64) * 100.0
         } else {
@@ -558,15 +647,15 @@ impl ProbeManager {
             successful_executions: successful,
             failed_executions: failed,
             success_rate,
-            avg_response_time_ms: row.try_get("avg_time").ok(),
-            min_response_time_ms: row.try_get("min_time").ok(),
-            max_response_time_ms: row.try_get("max_time").ok(),
-            p50_response_time_ms: row.try_get("p50").ok(),
-            p95_response_time_ms: row.try_get("p95").ok(),
-            p99_response_time_ms: row.try_get("p99").ok(),
-            last_execution: row.try_get("last_execution").ok(),
-            last_success: row.try_get("last_success").ok(),
-            last_failure: row.try_get("last_failure").ok(),
+            avg_response_time_ms: row.avg_time,
+            min_response_time_ms: row.min_time,
+            max_response_time_ms: row.max_time,
+            p50_response_time_ms: row.p50,
+            p95_response_time_ms: row.p95,
+            p99_response_time_ms: row.p99,
+            last_execution: row.last_execution,
+            last_success: row.last_success,
+            last_failure: row.last_failure,
         })
     }
 }
@@ -615,6 +704,9 @@ mod tests {
             name: "Test Probe".to_string(),
             deployment_id,
             interval_seconds: 60,
+            http_method: "POST".to_string(),
+            request_path: None,
+            request_body: None,
         };
 
         let created = ProbeManager::create_probe(&pool, probe_create).await.unwrap();
@@ -641,6 +733,9 @@ mod tests {
                     name: format!("Probe {}", i),
                     deployment_id,
                     interval_seconds: 60,
+                    http_method: "POST".to_string(),
+                    request_path: None,
+                    request_body: None,
                 },
             )
             .await
@@ -664,6 +759,9 @@ mod tests {
                 name: "Active Probe".to_string(),
                 deployment_id: deployment_id1,
                 interval_seconds: 60,
+                http_method: "POST".to_string(),
+                request_path: None,
+                request_body: None,
             },
         )
         .await
@@ -675,6 +773,9 @@ mod tests {
                 name: "Inactive Probe".to_string(),
                 deployment_id: deployment_id2,
                 interval_seconds: 60,
+                http_method: "POST".to_string(),
+                request_path: None,
+                request_body: None,
             },
         )
         .await
@@ -698,6 +799,9 @@ mod tests {
                 name: "Test Probe".to_string(),
                 deployment_id,
                 interval_seconds: 60,
+                http_method: "POST".to_string(),
+                request_path: None,
+                request_body: None,
             },
         )
         .await
@@ -724,17 +828,42 @@ mod tests {
                 name: "Test Probe".to_string(),
                 deployment_id,
                 interval_seconds: 60,
+                http_method: "POST".to_string(),
+                request_path: None,
+                request_body: None,
             },
         )
         .await
         .unwrap();
 
         // Update interval
-        let updated = ProbeManager::update_probe(&pool, probe.id, Some(120)).await.unwrap();
+        let updated = ProbeManager::update_probe(
+            &pool,
+            probe.id,
+            UpdateProbeRequest {
+                interval_seconds: Some(120),
+                http_method: None,
+                request_path: None,
+                request_body: None,
+            },
+        )
+        .await
+        .unwrap();
         assert_eq!(updated.interval_seconds, 120);
 
         // Update with None should keep existing value
-        let unchanged = ProbeManager::update_probe(&pool, probe.id, None).await.unwrap();
+        let unchanged = ProbeManager::update_probe(
+            &pool,
+            probe.id,
+            UpdateProbeRequest {
+                interval_seconds: None,
+                http_method: None,
+                request_path: None,
+                request_body: None,
+            },
+        )
+        .await
+        .unwrap();
         assert_eq!(unchanged.interval_seconds, 120);
     }
 
@@ -748,6 +877,9 @@ mod tests {
                 name: "Test Probe".to_string(),
                 deployment_id,
                 interval_seconds: 60,
+                http_method: "POST".to_string(),
+                request_path: None,
+                request_body: None,
             },
         )
         .await
@@ -770,6 +902,9 @@ mod tests {
                 name: "Test Probe".to_string(),
                 deployment_id,
                 interval_seconds: 60,
+                http_method: "POST".to_string(),
+                request_path: None,
+                request_body: None,
             },
         )
         .await
@@ -794,6 +929,9 @@ mod tests {
                 name: "Test Probe".to_string(),
                 deployment_id,
                 interval_seconds: 60,
+                http_method: "POST".to_string(),
+                request_path: None,
+                request_body: None,
             },
         )
         .await
@@ -817,6 +955,9 @@ mod tests {
                 name: "Test Probe".to_string(),
                 deployment_id,
                 interval_seconds: 60,
+                http_method: "POST".to_string(),
+                request_path: None,
+                request_body: None,
             },
         )
         .await
@@ -844,6 +985,9 @@ mod tests {
                 name: "Test Probe".to_string(),
                 deployment_id,
                 interval_seconds: 60,
+                http_method: "POST".to_string(),
+                request_path: None,
+                request_body: None,
             },
         )
         .await
@@ -861,7 +1005,18 @@ mod tests {
         assert_eq!(payload["active"], true);
 
         // Test UPDATE notification
-        ProbeManager::update_probe(&pool, probe.id, Some(120)).await.unwrap();
+        ProbeManager::update_probe(
+            &pool,
+            probe.id,
+            UpdateProbeRequest {
+                interval_seconds: Some(120),
+                http_method: None,
+                request_path: None,
+                request_body: None,
+            },
+        )
+        .await
+        .unwrap();
 
         let notification = timeout(Duration::from_secs(2), listener.recv())
             .await

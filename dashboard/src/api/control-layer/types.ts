@@ -559,6 +559,9 @@ export interface Probe {
   deployment_id: string;
   interval_seconds: number;
   active: boolean;
+  http_method: string;
+  request_path?: string | null;
+  request_body?: Record<string, any> | null;
   created_at: string;
   updated_at: string;
 }
@@ -567,6 +570,9 @@ export interface CreateProbeRequest {
   name: string;
   deployment_id: string;
   interval_seconds: number;
+  http_method?: string;
+  request_path?: string | null;
+  request_body?: Record<string, any> | null;
 }
 
 export interface ProbeResult {

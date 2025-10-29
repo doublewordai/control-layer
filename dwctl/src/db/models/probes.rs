@@ -23,6 +23,12 @@ pub struct Probe {
     pub interval_seconds: i32,
     /// Whether the probe is currently active and should be scheduled
     pub active: bool,
+    /// HTTP method to use for the probe request (e.g., GET, POST)
+    pub http_method: String,
+    /// Path to append to the endpoint URL (e.g., /v1/chat/completions)
+    pub request_path: Option<String>,
+    /// JSON body to send with the probe request
+    pub request_body: Option<serde_json::Value>,
     /// When the probe was created
     #[schema(value_type = String, format = "date-time")]
     pub created_at: DateTime<Utc>,

@@ -19,6 +19,9 @@ pub struct ProbeExecutionContext {
     pub model_type: ModelType,
     pub endpoint_url: String,
     pub api_key: Option<String>,
+    pub http_method: String,
+    pub request_path: Option<String>,
+    pub request_body: Option<serde_json::Value>,
 }
 
 /// Executes health check requests against API endpoints.
@@ -35,6 +38,35 @@ impl ProbeExecutor {
         Self { client: Client::new() }
     }
 
+    /// Get default URL and payload for a model type
+    fn get_default_config(model_type: &ModelType, model_name: &str, endpoint_url: &str) -> (String, serde_json::Value) {
+        match model_type {
+            ModelType::Chat => (
+                format!("{}/v1/chat/completions", endpoint_url.trim_end_matches('/')),
+                json!({
+                    "model": model_name,
+                    "messages": [{"role": "user", "content": "Hello, this is a health check probe."}],
+                    "max_tokens": 10
+                }),
+            ),
+            ModelType::Embeddings => (
+                format!("{}/v1/embeddings", endpoint_url.trim_end_matches('/')),
+                json!({
+                    "model": model_name,
+                    "input": "Health check probe"
+                }),
+            ),
+            ModelType::Reranker => (
+                format!("{}/v1/rerank", endpoint_url.trim_end_matches('/')),
+                json!({
+                    "model": model_name,
+                    "query": "Health check probe",
+                    "documents": ["test document"]
+                }),
+            ),
+        }
+    }
+
     /// Execute a probe against its configured endpoint.
     ///
     /// Constructs an appropriate test payload based on the model type,
@@ -44,35 +76,26 @@ impl ProbeExecutor {
     pub async fn execute(&self, context: ProbeExecutionContext) -> Result<ProbeExecution> {
         let start = Instant::now();
 
-        // Construct full URL and payload based on model type
-        // Note: Don't add /v1/ here - the endpoint_url from onwards already includes it
-        let (full_url, payload) = match context.model_type {
-            ModelType::Chat => {
-                let url = format!("{}/chat/completions", context.endpoint_url.trim_end_matches('/'));
-                let payload = json!({
-                    "model": context.model_name,
-                    "messages": [
-                        {
-                            "role": "user",
-                            "content": "Hello, this is a health check probe."
-                        }
-                    ],
-                    "max_tokens": 10
-                });
-                (url, payload)
-            }
-            ModelType::Embeddings => {
-                let url = format!("{}/embeddings", context.endpoint_url.trim_end_matches('/'));
-                let payload = json!({
-                    "model": context.model_name,
-                    "input": "Health check probe"
-                });
-                (url, payload)
-            }
-        };
+        // Get default config based on model type, then override with custom values if provided
+        let (default_url, default_payload) = Self::get_default_config(&context.model_type, &context.model_name, &context.endpoint_url);
 
-        // Build and send request
-        let mut request = self.client.post(&full_url).json(&payload);
+        let full_url = context
+            .request_path
+            .as_ref()
+            .map(|path| format!("{}{}", context.endpoint_url.trim_end_matches('/'), path))
+            .unwrap_or(default_url);
+
+        let payload = context.request_body.clone().unwrap_or(default_payload);
+
+        // Build and send request with the configured HTTP method
+        let mut request = match context.http_method.to_uppercase().as_str() {
+            "GET" => self.client.get(&full_url),
+            "POST" => self.client.post(&full_url).json(&payload),
+            "PUT" => self.client.put(&full_url).json(&payload),
+            "PATCH" => self.client.patch(&full_url).json(&payload),
+            "DELETE" => self.client.delete(&full_url),
+            _ => self.client.post(&full_url).json(&payload), // Default to POST
+        };
 
         if let Some(api_key) = &context.api_key {
             request = request.header("Authorization", format!("Bearer {}", api_key));
@@ -105,7 +128,16 @@ impl ProbeExecutor {
                 // Try to parse as JSON
                 match serde_json::from_str::<serde_json::Value>(&body_text) {
                     Ok(response_data) => {
-                        if (200..300).contains(&status_code) {
+                        // Check if the response contains an error, even if HTTP status is 200
+                        // Some OpenAI-compatible APIs (vLLM) return HTTP 200 with error details in the body
+                        let is_error_response = response_data.get("object").and_then(|o| o.as_str()) == Some("error")
+                            || response_data
+                                .get("code")
+                                .and_then(|c| c.as_i64())
+                                .map(|c| c >= 400)
+                                .unwrap_or(false);
+
+                        if (200..300).contains(&status_code) && !is_error_response {
                             Ok(ProbeExecution {
                                 probe_id: context.probe_id,
                                 success: true,
@@ -116,16 +148,18 @@ impl ProbeExecutor {
                                 metadata: None,
                             })
                         } else {
+                            let error_msg = response_data
+                                .get("message")
+                                .or_else(|| response_data.get("error"))
+                                .and_then(|e| e.as_str())
+                                .unwrap_or("Unknown error");
+
                             Ok(ProbeExecution {
                                 probe_id: context.probe_id,
                                 success: false,
                                 response_time_ms: elapsed,
                                 status_code: Some(status_code),
-                                error_message: Some(format!(
-                                    "HTTP {} - {}",
-                                    status_code,
-                                    response_data.get("error").unwrap_or(&response_data)
-                                )),
+                                error_message: Some(format!("HTTP {} - {}", status_code, error_msg)),
                                 response_data: Some(response_data),
                                 metadata: None,
                             })

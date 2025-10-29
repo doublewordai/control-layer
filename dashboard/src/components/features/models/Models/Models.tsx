@@ -140,9 +140,9 @@ const StatusRow: React.FC<StatusRowProps> = ({
             <div
               className={`h-3 w-3 rounded-full ${
                 lastSuccess === true
-                  ? "bg-green-500"
+                  ? "bg-green-500 animate-pulse"
                   : lastSuccess === false
-                    ? "bg-red-500"
+                    ? "bg-red-500 animate-pulse"
                     : "bg-gray-400"
               }`}
             />

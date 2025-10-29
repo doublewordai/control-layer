@@ -17,7 +17,6 @@ import {
   useEndpoints,
   useUpdateModel,
 } from "../../../../api/control-layer";
-import { getModelType } from "../../../../utils/modelType";
 import { useAuthorization } from "../../../../utils";
 import { ApiExamples, AccessManagementModal } from "../../../modals";
 import UserUsageTable from "./UserUsageTable";
@@ -162,7 +161,7 @@ const ModelInfo: React.FC = () => {
     if (model) {
       const effectiveType =
         model.model_type ||
-        getModelType(model.id, model.model_name).toUpperCase();
+        "CHAT";
 
       setUpdateData({
         alias: model.alias,
@@ -218,7 +217,7 @@ const ModelInfo: React.FC = () => {
     if (model) {
       const effectiveType =
         model.model_type ||
-        getModelType(model.id, model.model_name).toUpperCase();
+        "CHAT";
       setUpdateData({
         alias: model.alias,
         description: model.description || "",
@@ -332,7 +331,7 @@ const ModelInfo: React.FC = () => {
               <ArrowLeft className="w-5 h-5" />
             </button>
             <div className="flex-1">
-              <div className="flex items-center justify-between">
+              <div className="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-4">
                 <div>
                   {isEditingAlias ? (
                     <div className="space-y-2">
@@ -396,8 +395,8 @@ const ModelInfo: React.FC = () => {
                     {model.model_name} • {endpoint?.name || "Unknown endpoint"}
                   </p>
                 </div>
-                <div className="flex items-center gap-3">
-                  <TabsList>
+                <div className="flex items-center justify-center sm:justify-start gap-3">
+                  <TabsList className="w-full sm:w-auto">
                     <TabsTrigger
                       value="overview"
                       className="flex items-center gap-2"
@@ -790,11 +789,7 @@ const ModelInfo: React.FC = () => {
                             </HoverCard>
                           </div>
                           <Badge variant="outline">
-                            {model.model_type ||
-                              getModelType(
-                                model.id,
-                                model.model_name,
-                              ).toUpperCase()}
+                            {model.model_type || "UNKNOWN"}
                           </Badge>
                         </div>
                       </div>
@@ -820,8 +815,7 @@ const ModelInfo: React.FC = () => {
                       </div>
 
                       {/* Capabilities Section - only show for CHAT models */}
-                      {(model.model_type === "CHAT" ||
-                        getModelType(model.id, model.model_name) === "chat") &&
+                      {(model.model_type === "CHAT" || !model.model_type) &&
                         canManageGroups && (
                           <div className="border-t pt-6">
                             <div className="flex items-center gap-1 mb-3">

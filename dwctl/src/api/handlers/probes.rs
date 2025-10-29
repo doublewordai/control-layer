@@ -1,4 +1,6 @@
-use crate::api::models::probes::{CreateProbe, ProbeStatistics, ProbesQuery, ResultsQuery, StatsQuery, UpdateProbeRequest};
+use crate::api::models::probes::{
+    CreateProbe, ProbeStatistics, ProbesQuery, ResultsQuery, StatsQuery, TestProbeRequest, UpdateProbeRequest,
+};
 use crate::auth::permissions::{operation, resource, RequiresPermission};
 use crate::db::models::probes::{Probe, ProbeResult};
 use crate::errors::Error;
@@ -214,7 +216,7 @@ pub async fn update_probe(
     Path(id): Path<Uuid>,
     Json(update): Json<UpdateProbeRequest>,
 ) -> Result<Json<Probe>, Error> {
-    let probe = ProbeManager::update_probe(&state.db, id, update.interval_seconds).await?;
+    let probe = ProbeManager::update_probe(&state.db, id, update).await?;
     Ok(Json(probe))
 }
 
@@ -271,8 +273,15 @@ pub async fn test_probe(
     State(state): State<AppState>,
     _: RequiresPermission<resource::Probes, operation::ReadAll>,
     Path(deployment_id): Path<Uuid>,
+    Json(request): Json<Option<TestProbeRequest>>,
 ) -> Result<(StatusCode, Json<ProbeResult>), Error> {
-    let result = ProbeManager::test_probe(&state.db, deployment_id, &state.config).await?;
+    let (http_method, request_path, request_body) = if let Some(req) = request {
+        (req.http_method, req.request_path, req.request_body)
+    } else {
+        (None, None, None)
+    };
+
+    let result = ProbeManager::test_probe(&state.db, deployment_id, &state.config, http_method, request_path, request_body).await?;
     Ok((StatusCode::OK, Json(result)))
 }
 
@@ -441,6 +450,9 @@ mod tests {
                 name: "Probe 1".to_string(),
                 deployment_id: deployment_id1,
                 interval_seconds: 60,
+                http_method: "POST".to_string(),
+                request_path: None,
+                request_body: None,
             },
         )
         .await
@@ -452,6 +464,9 @@ mod tests {
                 name: "Probe 2".to_string(),
                 deployment_id: deployment_id2,
                 interval_seconds: 120,
+                http_method: "POST".to_string(),
+                request_path: None,
+                request_body: None,
             },
         )
         .await
@@ -480,6 +495,9 @@ mod tests {
                 name: "Test Probe".to_string(),
                 deployment_id,
                 interval_seconds: 60,
+                http_method: "POST".to_string(),
+                request_path: None,
+                request_body: None,
             },
         )
         .await
@@ -524,6 +542,9 @@ mod tests {
                 name: "Original Name".to_string(),
                 deployment_id,
                 interval_seconds: 60,
+                http_method: "POST".to_string(),
+                request_path: None,
+                request_body: None,
             },
         )
         .await
@@ -558,6 +579,9 @@ mod tests {
                 name: "Test Probe".to_string(),
                 deployment_id,
                 interval_seconds: 60,
+                http_method: "POST".to_string(),
+                request_path: None,
+                request_body: None,
             },
         )
         .await
@@ -589,6 +613,9 @@ mod tests {
                 name: "Test Probe".to_string(),
                 deployment_id,
                 interval_seconds: 60,
+                http_method: "POST".to_string(),
+                request_path: None,
+                request_body: None,
             },
         )
         .await
@@ -617,6 +644,9 @@ mod tests {
                 name: "Test Probe".to_string(),
                 deployment_id,
                 interval_seconds: 60,
+                http_method: "POST".to_string(),
+                request_path: None,
+                request_body: None,
             },
         )
         .await
@@ -651,6 +681,9 @@ mod tests {
                 name: "Test Probe".to_string(),
                 deployment_id,
                 interval_seconds: 60,
+                http_method: "POST".to_string(),
+                request_path: None,
+                request_body: None,
             },
         )
         .await
@@ -679,6 +712,9 @@ mod tests {
                 name: "Test Probe".to_string(),
                 deployment_id,
                 interval_seconds: 60,
+                http_method: "POST".to_string(),
+                request_path: None,
+                request_body: None,
             },
         )
         .await
