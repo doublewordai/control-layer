@@ -63,7 +63,6 @@ async fn try_proxy_header_auth(
     let mut tx = db.begin().await.unwrap();
     let mut user_repo = Users::new(&mut tx);
 
-    info!("User email from header: {:?}", parts.headers);
     let user_result = match user_repo.get_user_by_email(user_email).await? {
         Some(user) => Some(CurrentUser {
             id: user.id,
