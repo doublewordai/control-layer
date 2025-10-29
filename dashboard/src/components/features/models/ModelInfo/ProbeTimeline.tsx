@@ -35,7 +35,9 @@ export const ProbeTimeline: React.FC<ProbeTimelineProps> = ({
     const windows: TimeWindow[] = [];
 
     const endTime = new Date();
-    const startTime = new Date(endTime.getTime() - LOOKBACK_HOURS * 60 * 60 * 1000);
+    const startTime = new Date(
+      endTime.getTime() - LOOKBACK_HOURS * 60 * 60 * 1000,
+    );
 
     // Round start time to nearest 5-minute window
     let currentTime = new Date(
@@ -46,7 +48,8 @@ export const ProbeTimeline: React.FC<ProbeTimelineProps> = ({
     const sortedResults = results
       ? [...results].sort(
           (a, b) =>
-            new Date(a.executed_at).getTime() - new Date(b.executed_at).getTime(),
+            new Date(a.executed_at).getTime() -
+            new Date(b.executed_at).getTime(),
         )
       : [];
 
@@ -89,7 +92,8 @@ export const ProbeTimeline: React.FC<ProbeTimelineProps> = ({
   const totalChecks = results.length;
   const totalSuccess = results.filter((r) => r.success).length;
   const totalFailure = results.filter((r) => !r.success).length;
-  const successRate = totalChecks > 0 ? ((totalSuccess / totalChecks) * 100).toFixed(1) : "0.0";
+  const successRate =
+    totalChecks > 0 ? ((totalSuccess / totalChecks) * 100).toFixed(1) : "0.0";
 
   const handleMouseEnter = (window: TimeWindow, event: React.MouseEvent) => {
     const rect = event.currentTarget.getBoundingClientRect();
@@ -125,7 +129,9 @@ export const ProbeTimeline: React.FC<ProbeTimelineProps> = ({
 
       {/* Status Timeline */}
       <div className="space-y-1">
-        <div className={`flex gap-0.5 items-center ${compact ? "h-10" : "h-12"}`}>
+        <div
+          className={`flex gap-0.5 items-center ${compact ? "h-10" : "h-12"}`}
+        >
           {windows.map((window, index) => {
             // Show empty pip if no results
             if (window.results.length === 0) {
@@ -206,11 +212,18 @@ export const ProbeTimeline: React.FC<ProbeTimelineProps> = ({
           </div>
           <div className="space-y-1">
             <div className="flex items-center gap-2">
-              <span className="text-green-600">✓ {hoveredWindow.successCount}</span>
-              <span className="text-red-600">✗ {hoveredWindow.failureCount}</span>
+              <span className="text-green-600">
+                ✓ {hoveredWindow.successCount}
+              </span>
+              <span className="text-red-600">
+                ✗ {hoveredWindow.failureCount}
+              </span>
             </div>
             <div className="text-gray-600">
-              Avg: {hoveredWindow.avgResponseTime ? `${Math.round(hoveredWindow.avgResponseTime)}ms` : "N/A"}
+              Avg:{" "}
+              {hoveredWindow.avgResponseTime
+                ? `${Math.round(hoveredWindow.avgResponseTime)}ms`
+                : "N/A"}
             </div>
           </div>
         </div>

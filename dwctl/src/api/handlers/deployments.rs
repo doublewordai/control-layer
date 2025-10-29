@@ -320,6 +320,15 @@ pub async fn create_deployed_model(
     current_user: RequiresPermission<resource::Models, operation::CreateAll>,
     Json(create): Json<DeployedModelCreate>,
 ) -> Result<Json<DeployedModelResponse>> {
+    let model_name = create.model_name.trim();
+    let alias = create.alias.as_deref().unwrap_or(model_name).trim();
+
+    if model_name.is_empty() || alias.is_empty() {
+        return Err(Error::BadRequest {
+            message: "Model name and alias must not be empty or whitespace".to_string(),
+        });
+    }
+
     let mut tx = state.db.begin().await.map_err(|e| Error::Database(e.into()))?;
 
     // Validate endpoint exists

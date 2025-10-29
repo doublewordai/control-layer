@@ -586,4 +586,45 @@ mod tests {
             _ => panic!("Expected NotFound error"),
         }
     }
+
+    #[sqlx::test]
+    #[test_log::test]
+    async fn test_create_endpoint_name_conflict(pool: PgPool) {
+        let user = create_test_user(&pool).await;
+        let mut conn = pool.acquire().await.unwrap();
+        let mut repo = InferenceEndpoints::new(&mut conn);
+
+        // Create the first endpoint with a unique name
+        let endpoint_request = create_test_endpoint_request(user.id, "conflict-endpoint");
+        let created_endpoint = repo.create(&endpoint_request).await.unwrap();
+        assert_eq!(created_endpoint.name, "conflict-endpoint");
+
+        // Try to create another endpoint with the same name
+        let endpoint_request2 = create_test_endpoint_request(user.id, "conflict-endpoint");
+        let result = repo.create(&endpoint_request2).await;
+
+        // Should return a unique violation error
+        match result {
+            Err(crate::db::errors::DbError::UniqueViolation { .. }) => { /* expected */ }
+            _ => panic!("Expected UniqueViolation error"),
+        }
+    }
+
+    #[sqlx::test]
+    #[test_log::test]
+    async fn test_create_endpoint_name_unique(pool: PgPool) {
+        let user = create_test_user(&pool).await;
+        let mut conn = pool.acquire().await.unwrap();
+        let mut repo = InferenceEndpoints::new(&mut conn);
+
+        // Create two endpoints with different names
+        let endpoint_request1 = create_test_endpoint_request(user.id, "unique-endpoint-1");
+        let endpoint_request2 = create_test_endpoint_request(user.id, "unique-endpoint-2");
+
+        let created1 = repo.create(&endpoint_request1).await.unwrap();
+        let created2 = repo.create(&endpoint_request2).await.unwrap();
+
+        assert_eq!(created1.name, "unique-endpoint-1");
+        assert_eq!(created2.name, "unique-endpoint-2");
+    }
 }

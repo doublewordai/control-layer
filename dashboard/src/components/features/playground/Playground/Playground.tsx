@@ -4,7 +4,10 @@ import { Play, ArrowLeft } from "lucide-react";
 import OpenAI from "openai";
 import { useModels } from "../../../../api/control-layer";
 import { getModelType, type ModelType } from "../../../../utils/modelType";
-import type { Model, RerankResponse } from "../../../../api/control-layer/types";
+import type {
+  Model,
+  RerankResponse,
+} from "../../../../api/control-layer/types";
 import EmbeddingPlayground from "./EmbeddingPlayground";
 import GenerationPlayground from "./GenerationPlayground";
 import RerankPlayground from "./RerankPlayground";

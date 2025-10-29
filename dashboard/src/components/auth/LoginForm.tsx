@@ -13,7 +13,10 @@ import {
   CardTitle,
 } from "../ui/card";
 import { useAuth } from "../../contexts/auth";
-import { useRegistrationInfo, useLoginInfo } from "../../api/control-layer/hooks";
+import {
+  useRegistrationInfo,
+  useLoginInfo,
+} from "../../api/control-layer/hooks";
 import { ApiError } from "../../api/control-layer/errors";
 import { toast } from "sonner";
 

@@ -112,12 +112,17 @@ interface StatusRowProps {
   onNavigate: (modelId: string) => void;
 }
 
-const StatusRow: React.FC<StatusRowProps> = ({ model, probesData, endpointsRecord, onNavigate }) => {
-  const probe = probesData?.find(p => p.deployment_id === model.id);
+const StatusRow: React.FC<StatusRowProps> = ({
+  model,
+  probesData,
+  endpointsRecord,
+  onNavigate,
+}) => {
+  const probe = probesData?.find((p) => p.deployment_id === model.id);
   const { data: probeResults } = useProbeResults(
     probe?.id || "",
     { limit: 100 },
-    { enabled: !!probe }
+    { enabled: !!probe },
   );
 
   const uptimePercentage = model.status?.uptime_percentage;
@@ -220,7 +225,7 @@ const Models: React.FC = () => {
     error: modelsError,
   } = useModels({
     include: includeParam as ModelsInclude,
-    accessible: isStatusMode ? true : (!canManageGroups || showAccessibleOnly), // Status mode always filters to accessible, others use existing logic
+    accessible: isStatusMode ? true : !canManageGroups || showAccessibleOnly, // Status mode always filters to accessible, others use existing logic
   });
 
   // TODO: resolve `hosted_on` references in the backend, so we don't need this query.
@@ -359,77 +364,77 @@ const Models: React.FC = () => {
               <div className="flex flex-col sm:flex-row items-stretch sm:items-center gap-3">
                 {/* Access toggle for admins (not shown in status mode) */}
                 {!isStatusMode && canManageGroups && (
+                  <Select
+                    value={showAccessibleOnly ? "accessible" : "all"}
+                    onValueChange={(value) =>
+                      setShowAccessibleOnly(value === "accessible")
+                    }
+                  >
+                    <SelectTrigger
+                      className="w-[180px]"
+                      aria-label="Model access filter"
+                    >
+                      <SelectValue />
+                    </SelectTrigger>
+                    <SelectContent>
+                      <SelectItem value="all">All Models</SelectItem>
+                      <SelectItem value="accessible">
+                        My Accessible Models
+                      </SelectItem>
+                    </SelectContent>
+                  </Select>
+                )}
+                <div className="relative">
+                  <Search className="absolute left-3 top-1/2 transform -translate-y-1/2 text-gray-400 w-4 h-4 z-10" />
+                  <Input
+                    type="text"
+                    placeholder="Search models..."
+                    value={searchQuery}
+                    onChange={(e) => setSearchQuery(e.target.value)}
+                    className="pl-10 w-40 sm:w-48 md:w-64"
+                    aria-label="Search models"
+                  />
+                </div>
                 <Select
-                  value={showAccessibleOnly ? "accessible" : "all"}
-                  onValueChange={(value) =>
-                    setShowAccessibleOnly(value === "accessible")
-                  }
+                  value={filterProvider}
+                  onValueChange={(value) => setFilterProvider(value)}
                 >
                   <SelectTrigger
                     className="w-[180px]"
-                    aria-label="Model access filter"
+                    aria-label="Filter by endpoint provider"
                   >
                     <SelectValue />
                   </SelectTrigger>
                   <SelectContent>
-                    <SelectItem value="all">All Models</SelectItem>
-                    <SelectItem value="accessible">
-                      My Accessible Models
-                    </SelectItem>
+                    {providers.map((provider) => (
+                      <SelectItem key={provider} value={provider}>
+                        {provider === "all" ? "All Endpoints" : provider}
+                      </SelectItem>
+                    ))}
                   </SelectContent>
                 </Select>
-              )}
-              <div className="relative">
-                <Search className="absolute left-3 top-1/2 transform -translate-y-1/2 text-gray-400 w-4 h-4 z-10" />
-                <Input
-                  type="text"
-                  placeholder="Search models..."
-                  value={searchQuery}
-                  onChange={(e) => setSearchQuery(e.target.value)}
-                  className="pl-10 w-40 sm:w-48 md:w-64"
-                  aria-label="Search models"
-                />
-              </div>
-              <Select
-                value={filterProvider}
-                onValueChange={(value) => setFilterProvider(value)}
-              >
-                <SelectTrigger
-                  className="w-[180px]"
-                  aria-label="Filter by endpoint provider"
-                >
-                  <SelectValue />
-                </SelectTrigger>
-                <SelectContent>
-                  {providers.map((provider) => (
-                    <SelectItem key={provider} value={provider}>
-                      {provider === "all" ? "All Endpoints" : provider}
-                    </SelectItem>
-                  ))}
-                </SelectContent>
-              </Select>
 
-              {/* View mode tabs */}
-              <TabsList className="w-full sm:w-auto">
-                <TabsTrigger
-                  value="grid"
-                  className="flex items-center gap-2 flex-1 sm:flex-initial"
-                >
-                  <LayoutGrid className="h-4 w-4" />
-                  Grid
-                </TabsTrigger>
-                <TabsTrigger
-                  value="status"
-                  className="flex items-center gap-2 flex-1 sm:flex-initial"
-                >
-                  <Activity className="h-4 w-4" />
-                  Status
-                </TabsTrigger>
-              </TabsList>
-            </div>
-          )}
+                {/* View mode tabs */}
+                <TabsList className="w-full sm:w-auto">
+                  <TabsTrigger
+                    value="grid"
+                    className="flex items-center gap-2 flex-1 sm:flex-initial"
+                  >
+                    <LayoutGrid className="h-4 w-4" />
+                    Grid
+                  </TabsTrigger>
+                  <TabsTrigger
+                    value="status"
+                    className="flex items-center gap-2 flex-1 sm:flex-initial"
+                  >
+                    <Activity className="h-4 w-4" />
+                    Status
+                  </TabsTrigger>
+                </TabsList>
+              </div>
+            )}
+          </div>
         </div>
-      </div>
 
         {/* True Empty State - No Models */}
         {hasNoModels ? (
@@ -497,7 +502,11 @@ const Models: React.FC = () => {
                       model={model}
                       probesData={probesData}
                       endpointsRecord={endpointsRecord}
-                      onNavigate={(modelId) => navigate(`/models/${modelId}?from=${encodeURIComponent("/models?view=status")}`)}
+                      onNavigate={(modelId) =>
+                        navigate(
+                          `/models/${modelId}?from=${encodeURIComponent("/models?view=status")}`,
+                        )
+                      }
                     />
                   ))}
                 </div>
@@ -539,446 +548,496 @@ const Models: React.FC = () => {
                     role="list"
                     className="grid grid-cols-1 lg:grid-cols-2 2xl:grid-cols-3 gap-6"
                   >
-          {paginatedModels.map((model) => (
-            <Card
-              key={model.id}
-              role="listitem"
-              className="hover:shadow-md transition-shadow rounded-lg p-0 gap-0 overflow-hidden flex flex-col"
-            >
-              <div
-                className="cursor-pointer hover:bg-gray-50 transition-colors group flex-grow flex flex-col"
-                onClick={() => {
-                  navigate(
-                    `/models/${model.id}?from=${encodeURIComponent("/models")}`,
-                  );
-                }}
-              >
-                <CardHeader className="px-6 pt-5 pb-0">
-                  <div className="flex items-start justify-between gap-4">
-                    <div className="flex-1 min-w-0">
-                      <div className="flex items-center gap-2">
-                        <CardTitle className="text-lg">{model.alias}</CardTitle>
-
-                        {/* Status badge - always shown if probe exists */}
-                        {model.status?.probe_id && (
-                          <div
-                            className={`h-2 w-2 rounded-full ${
-                              model.status.last_success === true
-                                ? "bg-green-500"
-                                : model.status.last_success === false
-                                  ? "bg-red-500"
-                                  : "bg-gray-400"
-                            }`}
-                            title={
-                              model.status.last_success === true
-                                ? "Operational"
-                                : model.status.last_success === false
-                                  ? "Down"
-                                  : "Unknown"
-                            }
-                          />
-                        )}
-
-                        <HoverCard openDelay={200} closeDelay={100}>
-                          <HoverCardTrigger asChild>
-                            <button
-                              className="text-gray-500 hover:text-gray-700 transition-colors p-1"
-                              onClick={(e) => e.stopPropagation()}
-                            >
-                              <Info className="h-4 w-4" />
-                              <span className="sr-only">
-                                View model description
-                              </span>
-                            </button>
-                          </HoverCardTrigger>
-                          <HoverCardContent className="w-96" sideOffset={5}>
-                            <p className="text-sm text-muted-foreground">
-                              {model.description || "No description provided"}
-                            </p>
-                          </HoverCardContent>
-                        </HoverCard>
-                      </div>
-                      <CardDescription className="mt-1">
-                        {model.model_name} •{" "}
-                        {endpointsRecord[model.hosted_on]?.name ||
-                          "Unknown endpoint"}
-                      </CardDescription>
-                    </div>
-
-                    {/* Access Groups and Expand Icon (hidden in status mode) */}
-                    {!isStatusMode && (
-                      <div className="flex items-center gap-3">
-                        {canManageGroups && (
+                    {paginatedModels.map((model) => (
+                      <Card
+                        key={model.id}
+                        role="listitem"
+                        className="hover:shadow-md transition-shadow rounded-lg p-0 gap-0 overflow-hidden flex flex-col"
+                      >
                         <div
-                          className="flex items-center gap-1 max-w-[180px]"
-                          onClick={(e) => e.stopPropagation()}
+                          className="cursor-pointer hover:bg-gray-50 transition-colors group flex-grow flex flex-col"
+                          onClick={() => {
+                            navigate(
+                              `/models/${model.id}?from=${encodeURIComponent("/models")}`,
+                            );
+                          }}
                         >
-                          {!model.groups || model.groups.length === 0 ? (
-                            <Button
-                              variant="outline"
-                              size="sm"
-                              onClick={() => {
-                                setAccessModelId(model.id);
-                                setShowAccessModal(true);
-                              }}
-                              className="h-6 px-2 text-xs"
-                            >
-                              <Plus className="h-2.5 w-2.5" />
-                              Add groups
-                            </Button>
-                          ) : (
-                            <>
-                              {model.groups.slice(0, 1).map((group) => (
-                                <Badge
-                                  key={group.id}
-                                  variant="secondary"
-                                  className="text-xs"
-                                  title={`Group: ${group.name}`}
-                                >
-                                  <Users className="h-3 w-3" />
-                                  <span className="max-w-[60px] truncate">
-                                    {group.name}
-                                  </span>
-                                </Badge>
-                              ))}
-                              {model.groups.length > 1 ? (
-                                <HoverCard openDelay={200} closeDelay={100}>
-                                  <HoverCardTrigger asChild>
-                                    <Badge
-                                      variant="outline"
-                                      className="text-xs hover:bg-gray-50 select-none"
-                                      onClick={() => {
-                                        setAccessModelId(model.id);
-                                        setShowAccessModal(true);
-                                      }}
+                          <CardHeader className="px-6 pt-5 pb-0">
+                            <div className="flex items-start justify-between gap-4">
+                              <div className="flex-1 min-w-0">
+                                <div className="flex items-center gap-2">
+                                  <CardTitle className="text-lg">
+                                    {model.alias}
+                                  </CardTitle>
+
+                                  {/* Status badge - always shown if probe exists */}
+                                  {model.status?.probe_id && (
+                                    <div
+                                      className={`h-2 w-2 rounded-full ${
+                                        model.status.last_success === true
+                                          ? "bg-green-500"
+                                          : model.status.last_success === false
+                                            ? "bg-red-500"
+                                            : "bg-gray-400"
+                                      }`}
+                                      title={
+                                        model.status.last_success === true
+                                          ? "Operational"
+                                          : model.status.last_success === false
+                                            ? "Down"
+                                            : "Unknown"
+                                      }
+                                    />
+                                  )}
+
+                                  <HoverCard openDelay={200} closeDelay={100}>
+                                    <HoverCardTrigger asChild>
+                                      <button
+                                        className="text-gray-500 hover:text-gray-700 transition-colors p-1"
+                                        onClick={(e) => e.stopPropagation()}
+                                      >
+                                        <Info className="h-4 w-4" />
+                                        <span className="sr-only">
+                                          View model description
+                                        </span>
+                                      </button>
+                                    </HoverCardTrigger>
+                                    <HoverCardContent
+                                      className="w-96"
+                                      sideOffset={5}
                                     >
-                                      +{model.groups.length - 1} more
-                                    </Badge>
-                                  </HoverCardTrigger>
-                                  <HoverCardContent
-                                    className="w-60"
-                                    align="start"
-                                    sideOffset={5}
-                                  >
-                                    <div className="flex flex-wrap gap-1">
-                                      {model.groups.map((group) => (
-                                        <Badge
-                                          key={group.id}
-                                          variant="secondary"
-                                          className="text-xs"
-                                        >
-                                          <Users className="h-3 w-3" />
-                                          {group.name}
-                                        </Badge>
-                                      ))}
-                                    </div>
-                                  </HoverCardContent>
-                                </HoverCard>
-                              ) : (
-                                <Button
-                                  variant="outline"
-                                  size="icon"
-                                  onClick={() => {
-                                    setAccessModelId(model.id);
-                                    setShowAccessModal(true);
-                                  }}
-                                  className="h-6 w-6"
-                                  title="Manage access groups"
-                                >
-                                  <Plus className="h-2.5 w-2.5" />
-                                </Button>
-                              )}
-                            </>
-                          )}
-                        </div>
-                        )}
-
-                        <ChevronRight className="h-5 w-5 text-gray-400 group-hover:text-gray-600 transition-colors" />
-                      </div>
-                    )}
-                  </div>
-                </CardHeader>
-
-                <CardContent className="flex-grow px-0 pt-0 pb-0 flex flex-col">
-                  {model.metrics ? (
-                    <div
-                      className="flex gap-6 items-center px-6 pb-4"
-                      style={{ minHeight: "90px" }}
-                    >
-                      {/* Left Half - Key Metrics */}
-                      <div className="flex-1">
-                        <div className="grid grid-cols-2 gap-2 text-xs">
-                          <div className="flex items-center gap-1.5">
-                            <HoverCard openDelay={200} closeDelay={100}>
-                              <HoverCardTrigger asChild>
-                                <BarChart3 className="h-3.5 w-3.5 text-gray-500 " />
-                              </HoverCardTrigger>
-                              <HoverCardContent className="w-40" sideOffset={5}>
-                                <p className="text-xs text-muted-foreground">
-                                  Total requests made to this model
-                                </p>
-                              </HoverCardContent>
-                            </HoverCard>
-                            <span className="text-gray-600">
-                              {formatNumber(model.metrics.total_requests)}{" "}
-                              requests
-                            </span>
-                          </div>
-
-                          <div className="flex items-center gap-1.5">
-                            <HoverCard openDelay={200} closeDelay={100}>
-                              <HoverCardTrigger asChild>
-                                <Activity className="h-3.5 w-3.5 text-gray-500 " />
-                              </HoverCardTrigger>
-                              <HoverCardContent className="w-40" sideOffset={5}>
-                                <p className="text-xs text-muted-foreground">
-                                  Average response time across all requests
-                                </p>
-                              </HoverCardContent>
-                            </HoverCard>
-                            <span className="text-gray-600">
-                              {formatLatency(model.metrics.avg_latency_ms)} avg
-                            </span>
-                          </div>
-
-                          <div className="flex items-center gap-1.5">
-                            <HoverCard openDelay={200} closeDelay={100}>
-                              <HoverCardTrigger asChild>
-                                <ArrowUpDown className="h-3.5 w-3.5 text-gray-500 " />
-                              </HoverCardTrigger>
-                              <HoverCardContent className="w-48" sideOffset={5}>
-                                <div className="text-xs text-muted-foreground">
-                                  <p>
-                                    Input:{" "}
-                                    {formatNumber(
-                                      model.metrics.total_input_tokens,
-                                    )}
-                                  </p>
-                                  <p>
-                                    Output:{" "}
-                                    {formatNumber(
-                                      model.metrics.total_output_tokens,
-                                    )}
-                                  </p>
-                                  <p className="mt-1 font-medium">
-                                    Total tokens processed
-                                  </p>
+                                      <p className="text-sm text-muted-foreground">
+                                        {model.description ||
+                                          "No description provided"}
+                                      </p>
+                                    </HoverCardContent>
+                                  </HoverCard>
                                 </div>
-                              </HoverCardContent>
-                            </HoverCard>
-                            <span className="text-gray-600">
-                              {formatNumber(
-                                model.metrics.total_input_tokens +
-                                model.metrics.total_output_tokens,
-                              )}{" "}
-                              tokens
-                            </span>
-                          </div>
+                                <CardDescription className="mt-1">
+                                  {model.model_name} •{" "}
+                                  {endpointsRecord[model.hosted_on]?.name ||
+                                    "Unknown endpoint"}
+                                </CardDescription>
+                              </div>
 
-                          <div className="flex items-center gap-1.5">
-                            <HoverCard openDelay={200} closeDelay={100}>
-                              <HoverCardTrigger asChild>
-                                <Clock className="h-3.5 w-3.5 text-gray-500 " />
-                              </HoverCardTrigger>
-                              <HoverCardContent className="w-36" sideOffset={5}>
-                                <p className="text-xs text-muted-foreground">
-                                  Last request received
+                              {/* Access Groups and Expand Icon (hidden in status mode) */}
+                              {!isStatusMode && (
+                                <div className="flex items-center gap-3">
+                                  {canManageGroups && (
+                                    <div
+                                      className="flex items-center gap-1 max-w-[180px]"
+                                      onClick={(e) => e.stopPropagation()}
+                                    >
+                                      {!model.groups ||
+                                      model.groups.length === 0 ? (
+                                        <Button
+                                          variant="outline"
+                                          size="sm"
+                                          onClick={() => {
+                                            setAccessModelId(model.id);
+                                            setShowAccessModal(true);
+                                          }}
+                                          className="h-6 px-2 text-xs"
+                                        >
+                                          <Plus className="h-2.5 w-2.5" />
+                                          Add groups
+                                        </Button>
+                                      ) : (
+                                        <>
+                                          {model.groups
+                                            .slice(0, 1)
+                                            .map((group) => (
+                                              <Badge
+                                                key={group.id}
+                                                variant="secondary"
+                                                className="text-xs"
+                                                title={`Group: ${group.name}`}
+                                              >
+                                                <Users className="h-3 w-3" />
+                                                <span className="max-w-[60px] truncate">
+                                                  {group.name}
+                                                </span>
+                                              </Badge>
+                                            ))}
+                                          {model.groups.length > 1 ? (
+                                            <HoverCard
+                                              openDelay={200}
+                                              closeDelay={100}
+                                            >
+                                              <HoverCardTrigger asChild>
+                                                <Badge
+                                                  variant="outline"
+                                                  className="text-xs hover:bg-gray-50 select-none"
+                                                  onClick={() => {
+                                                    setAccessModelId(model.id);
+                                                    setShowAccessModal(true);
+                                                  }}
+                                                >
+                                                  +{model.groups.length - 1}{" "}
+                                                  more
+                                                </Badge>
+                                              </HoverCardTrigger>
+                                              <HoverCardContent
+                                                className="w-60"
+                                                align="start"
+                                                sideOffset={5}
+                                              >
+                                                <div className="flex flex-wrap gap-1">
+                                                  {model.groups.map((group) => (
+                                                    <Badge
+                                                      key={group.id}
+                                                      variant="secondary"
+                                                      className="text-xs"
+                                                    >
+                                                      <Users className="h-3 w-3" />
+                                                      {group.name}
+                                                    </Badge>
+                                                  ))}
+                                                </div>
+                                              </HoverCardContent>
+                                            </HoverCard>
+                                          ) : (
+                                            <Button
+                                              variant="outline"
+                                              size="icon"
+                                              onClick={() => {
+                                                setAccessModelId(model.id);
+                                                setShowAccessModal(true);
+                                              }}
+                                              className="h-6 w-6"
+                                              title="Manage access groups"
+                                            >
+                                              <Plus className="h-2.5 w-2.5" />
+                                            </Button>
+                                          )}
+                                        </>
+                                      )}
+                                    </div>
+                                  )}
+
+                                  <ChevronRight className="h-5 w-5 text-gray-400 group-hover:text-gray-600 transition-colors" />
+                                </div>
+                              )}
+                            </div>
+                          </CardHeader>
+
+                          <CardContent className="flex-grow px-0 pt-0 pb-0 flex flex-col">
+                            {model.metrics ? (
+                              <div
+                                className="flex gap-6 items-center px-6 pb-4"
+                                style={{ minHeight: "90px" }}
+                              >
+                                {/* Left Half - Key Metrics */}
+                                <div className="flex-1">
+                                  <div className="grid grid-cols-2 gap-2 text-xs">
+                                    <div className="flex items-center gap-1.5">
+                                      <HoverCard
+                                        openDelay={200}
+                                        closeDelay={100}
+                                      >
+                                        <HoverCardTrigger asChild>
+                                          <BarChart3 className="h-3.5 w-3.5 text-gray-500 " />
+                                        </HoverCardTrigger>
+                                        <HoverCardContent
+                                          className="w-40"
+                                          sideOffset={5}
+                                        >
+                                          <p className="text-xs text-muted-foreground">
+                                            Total requests made to this model
+                                          </p>
+                                        </HoverCardContent>
+                                      </HoverCard>
+                                      <span className="text-gray-600">
+                                        {formatNumber(
+                                          model.metrics.total_requests,
+                                        )}{" "}
+                                        requests
+                                      </span>
+                                    </div>
+
+                                    <div className="flex items-center gap-1.5">
+                                      <HoverCard
+                                        openDelay={200}
+                                        closeDelay={100}
+                                      >
+                                        <HoverCardTrigger asChild>
+                                          <Activity className="h-3.5 w-3.5 text-gray-500 " />
+                                        </HoverCardTrigger>
+                                        <HoverCardContent
+                                          className="w-40"
+                                          sideOffset={5}
+                                        >
+                                          <p className="text-xs text-muted-foreground">
+                                            Average response time across all
+                                            requests
+                                          </p>
+                                        </HoverCardContent>
+                                      </HoverCard>
+                                      <span className="text-gray-600">
+                                        {formatLatency(
+                                          model.metrics.avg_latency_ms,
+                                        )}{" "}
+                                        avg
+                                      </span>
+                                    </div>
+
+                                    <div className="flex items-center gap-1.5">
+                                      <HoverCard
+                                        openDelay={200}
+                                        closeDelay={100}
+                                      >
+                                        <HoverCardTrigger asChild>
+                                          <ArrowUpDown className="h-3.5 w-3.5 text-gray-500 " />
+                                        </HoverCardTrigger>
+                                        <HoverCardContent
+                                          className="w-48"
+                                          sideOffset={5}
+                                        >
+                                          <div className="text-xs text-muted-foreground">
+                                            <p>
+                                              Input:{" "}
+                                              {formatNumber(
+                                                model.metrics
+                                                  .total_input_tokens,
+                                              )}
+                                            </p>
+                                            <p>
+                                              Output:{" "}
+                                              {formatNumber(
+                                                model.metrics
+                                                  .total_output_tokens,
+                                              )}
+                                            </p>
+                                            <p className="mt-1 font-medium">
+                                              Total tokens processed
+                                            </p>
+                                          </div>
+                                        </HoverCardContent>
+                                      </HoverCard>
+                                      <span className="text-gray-600">
+                                        {formatNumber(
+                                          model.metrics.total_input_tokens +
+                                            model.metrics.total_output_tokens,
+                                        )}{" "}
+                                        tokens
+                                      </span>
+                                    </div>
+
+                                    <div className="flex items-center gap-1.5">
+                                      <HoverCard
+                                        openDelay={200}
+                                        closeDelay={100}
+                                      >
+                                        <HoverCardTrigger asChild>
+                                          <Clock className="h-3.5 w-3.5 text-gray-500 " />
+                                        </HoverCardTrigger>
+                                        <HoverCardContent
+                                          className="w-36"
+                                          sideOffset={5}
+                                        >
+                                          <p className="text-xs text-muted-foreground">
+                                            Last request received
+                                          </p>
+                                        </HoverCardContent>
+                                      </HoverCard>
+                                      <span className="text-gray-600">
+                                        {formatRelativeTime(
+                                          model.metrics.last_active_at,
+                                        )}
+                                      </span>
+                                    </div>
+                                  </div>
+                                </div>
+
+                                {/* Right Half - Activity Sparkline */}
+                                <div className="flex-1 flex items-center justify-center px-2">
+                                  <div className="w-full max-w-[200px] min-w-[120px]">
+                                    <Sparkline
+                                      data={model.metrics.time_series || []}
+                                      width={180}
+                                      height={35}
+                                      className="w-full h-auto"
+                                    />
+                                  </div>
+                                </div>
+                              </div>
+                            ) : (
+                              // Fallback when metrics not available - show description
+                              <div
+                                className="flex items-center px-6 pb-4"
+                                style={{ minHeight: "90px" }}
+                              >
+                                <p className="text-sm text-gray-700 line-clamp-3">
+                                  {model.description ||
+                                    "No description provided"}
                                 </p>
-                              </HoverCardContent>
-                            </HoverCard>
-                            <span className="text-gray-600">
-                              {formatRelativeTime(model.metrics.last_active_at)}
-                            </span>
+                              </div>
+                            )}
+                          </CardContent>
+                        </div>
+
+                        <div className="border-t">
+                          <div className="grid grid-cols-2 divide-x">
+                            <button
+                              className="flex items-center justify-center gap-1.5 py-3.5 text-sm font-medium text-gray-600 hover:bg-gray-50 hover:text-gray-700 transition-colors rounded-bl-lg"
+                              onClick={() => {
+                                setApiExamplesModel(model);
+                                setShowApiExamples(true);
+                              }}
+                            >
+                              <Code className="h-4 w-4 text-blue-500" />
+                              <span>API</span>
+                            </button>
+                            <button
+                              className="flex items-center justify-center gap-1.5 py-3.5 text-sm font-medium text-gray-600 hover:bg-gray-50 hover:text-gray-700 transition-colors rounded-br-lg group"
+                              onClick={() => {
+                                navigate(
+                                  `/playground?model=${encodeURIComponent(model.alias)}&from=${encodeURIComponent("/models")}`,
+                                );
+                              }}
+                            >
+                              <ArrowRight className="h-4 w-4 text-purple-500 group-hover:translate-x-0.5 transition-transform" />
+                              <span>Playground</span>
+                            </button>
                           </div>
                         </div>
-                      </div>
-
-                      {/* Right Half - Activity Sparkline */}
-                      <div className="flex-1 flex items-center justify-center px-2">
-                        <div className="w-full max-w-[200px] min-w-[120px]">
-                          <Sparkline
-                            data={model.metrics.time_series || []}
-                            width={180}
-                            height={35}
-                            className="w-full h-auto"
-                          />
-                        </div>
-                      </div>
-                    </div>
-                  ) : (
-                    // Fallback when metrics not available - show description
-                    <div
-                      className="flex items-center px-6 pb-4"
-                      style={{ minHeight: "90px" }}
-                    >
-                      <p className="text-sm text-gray-700 line-clamp-3">
-                        {model.description || "No description provided"}
-                      </p>
-                    </div>
-                  )}
-                </CardContent>
-              </div>
-
-              <div className="border-t">
-                <div className="grid grid-cols-2 divide-x">
-                  <button
-                    className="flex items-center justify-center gap-1.5 py-3.5 text-sm font-medium text-gray-600 hover:bg-gray-50 hover:text-gray-700 transition-colors rounded-bl-lg"
-                    onClick={() => {
-                      setApiExamplesModel(model);
-                      setShowApiExamples(true);
-                    }}
-                  >
-                    <Code className="h-4 w-4 text-blue-500" />
-                    <span>API</span>
-                  </button>
-                  <button
-                    className="flex items-center justify-center gap-1.5 py-3.5 text-sm font-medium text-gray-600 hover:bg-gray-50 hover:text-gray-700 transition-colors rounded-br-lg group"
-                    onClick={() => {
-                      navigate(
-                        `/playground?model=${encodeURIComponent(model.alias)}&from=${encodeURIComponent("/models")}`,
-                      );
-                    }}
-                  >
-                    <ArrowRight className="h-4 w-4 text-purple-500 group-hover:translate-x-0.5 transition-transform" />
-                    <span>Playground</span>
-                  </button>
-                </div>
-              </div>
-            </Card>
-          ))}
+                      </Card>
+                    ))}
                   </div>
 
                   {/* Pagination */}
                   {totalPages > 1 && (
-        <Pagination className="mt-8">
-          <PaginationContent>
-            <PaginationItem>
-              <PaginationPrevious
-                href="#"
-                onClick={(e) => {
-                  e.preventDefault();
-                  setCurrentPage(Math.max(1, currentPage - 1));
-                }}
-                className={
-                  currentPage === 1
-                    ? "pointer-events-none opacity-50"
-                    : "cursor-pointer"
-                }
-              />
-            </PaginationItem>
+                    <Pagination className="mt-8">
+                      <PaginationContent>
+                        <PaginationItem>
+                          <PaginationPrevious
+                            href="#"
+                            onClick={(e) => {
+                              e.preventDefault();
+                              setCurrentPage(Math.max(1, currentPage - 1));
+                            }}
+                            className={
+                              currentPage === 1
+                                ? "pointer-events-none opacity-50"
+                                : "cursor-pointer"
+                            }
+                          />
+                        </PaginationItem>
 
-            {(() => {
-              const items = [];
-              let startPage = 1;
-              let endPage = totalPages;
+                        {(() => {
+                          const items = [];
+                          let startPage = 1;
+                          let endPage = totalPages;
 
-              if (totalPages > 7) {
-                if (currentPage <= 3) {
-                  endPage = 5;
-                } else if (currentPage >= totalPages - 2) {
-                  startPage = totalPages - 4;
-                } else {
-                  startPage = currentPage - 2;
-                  endPage = currentPage + 2;
-                }
-              }
+                          if (totalPages > 7) {
+                            if (currentPage <= 3) {
+                              endPage = 5;
+                            } else if (currentPage >= totalPages - 2) {
+                              startPage = totalPages - 4;
+                            } else {
+                              startPage = currentPage - 2;
+                              endPage = currentPage + 2;
+                            }
+                          }
 
-              // First page
-              if (startPage > 1) {
-                items.push(
-                  <PaginationItem key={1}>
-                    <PaginationLink
-                      href="#"
-                      onClick={(e) => {
-                        e.preventDefault();
-                        setCurrentPage(1);
-                      }}
-                      isActive={currentPage === 1}
-                    >
-                      1
-                    </PaginationLink>
-                  </PaginationItem>,
-                );
+                          // First page
+                          if (startPage > 1) {
+                            items.push(
+                              <PaginationItem key={1}>
+                                <PaginationLink
+                                  href="#"
+                                  onClick={(e) => {
+                                    e.preventDefault();
+                                    setCurrentPage(1);
+                                  }}
+                                  isActive={currentPage === 1}
+                                >
+                                  1
+                                </PaginationLink>
+                              </PaginationItem>,
+                            );
 
-                if (startPage > 2) {
-                  items.push(
-                    <PaginationItem key="ellipsis-start">
-                      <PaginationEllipsis />
-                    </PaginationItem>,
-                  );
-                }
-              }
+                            if (startPage > 2) {
+                              items.push(
+                                <PaginationItem key="ellipsis-start">
+                                  <PaginationEllipsis />
+                                </PaginationItem>,
+                              );
+                            }
+                          }
 
-              // Page numbers
-              for (let i = startPage; i <= endPage; i++) {
-                items.push(
-                  <PaginationItem key={i}>
-                    <PaginationLink
-                      href="#"
-                      onClick={(e) => {
-                        e.preventDefault();
-                        setCurrentPage(i);
-                      }}
-                      isActive={currentPage === i}
-                    >
-                      {i}
-                    </PaginationLink>
-                  </PaginationItem>,
-                );
-              }
+                          // Page numbers
+                          for (let i = startPage; i <= endPage; i++) {
+                            items.push(
+                              <PaginationItem key={i}>
+                                <PaginationLink
+                                  href="#"
+                                  onClick={(e) => {
+                                    e.preventDefault();
+                                    setCurrentPage(i);
+                                  }}
+                                  isActive={currentPage === i}
+                                >
+                                  {i}
+                                </PaginationLink>
+                              </PaginationItem>,
+                            );
+                          }
 
-              // Last page
-              if (endPage < totalPages) {
-                if (endPage < totalPages - 1) {
-                  items.push(
-                    <PaginationItem key="ellipsis-end">
-                      <PaginationEllipsis />
-                    </PaginationItem>,
-                  );
-                }
+                          // Last page
+                          if (endPage < totalPages) {
+                            if (endPage < totalPages - 1) {
+                              items.push(
+                                <PaginationItem key="ellipsis-end">
+                                  <PaginationEllipsis />
+                                </PaginationItem>,
+                              );
+                            }
 
-                items.push(
-                  <PaginationItem key={totalPages}>
-                    <PaginationLink
-                      href="#"
-                      onClick={(e) => {
-                        e.preventDefault();
-                        setCurrentPage(totalPages);
-                      }}
-                      isActive={currentPage === totalPages}
-                    >
-                      {totalPages}
-                    </PaginationLink>
-                  </PaginationItem>,
-                );
-              }
+                            items.push(
+                              <PaginationItem key={totalPages}>
+                                <PaginationLink
+                                  href="#"
+                                  onClick={(e) => {
+                                    e.preventDefault();
+                                    setCurrentPage(totalPages);
+                                  }}
+                                  isActive={currentPage === totalPages}
+                                >
+                                  {totalPages}
+                                </PaginationLink>
+                              </PaginationItem>,
+                            );
+                          }
 
-              return items;
-            })()}
+                          return items;
+                        })()}
 
-            <PaginationItem>
-              <PaginationNext
-                href="#"
-                onClick={(e) => {
-                  e.preventDefault();
-                  setCurrentPage(Math.min(totalPages, currentPage + 1));
-                }}
-                className={
-                  currentPage === totalPages
-                    ? "pointer-events-none opacity-50"
-                    : "cursor-pointer"
-                }
-              />
-            </PaginationItem>
-          </PaginationContent>
-        </Pagination>
+                        <PaginationItem>
+                          <PaginationNext
+                            href="#"
+                            onClick={(e) => {
+                              e.preventDefault();
+                              setCurrentPage(
+                                Math.min(totalPages, currentPage + 1),
+                              );
+                            }}
+                            className={
+                              currentPage === totalPages
+                                ? "pointer-events-none opacity-50"
+                                : "cursor-pointer"
+                            }
+                          />
+                        </PaginationItem>
+                      </PaginationContent>
+                    </Pagination>
                   )}
 
                   {/* Results Info */}
                   {filteredModels.length > 0 && (
                     <div className="flex items-center justify-center mt-4 text-sm text-gray-600">
-                      Showing {startIndex + 1}-{Math.min(endIndex, totalItems)} of{" "}
-                      {totalItems} models
+                      Showing {startIndex + 1}-{Math.min(endIndex, totalItems)}{" "}
+                      of {totalItems} models
                     </div>
                   )}
                 </>

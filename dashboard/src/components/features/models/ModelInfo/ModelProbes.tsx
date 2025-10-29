@@ -1,5 +1,18 @@
 import React, { useState, useMemo } from "react";
-import { Activity, Plus, Pause, Play, StopCircle, RefreshCw, CheckCircle, XCircle, Loader2, Edit2, Check, X } from "lucide-react";
+import {
+  Activity,
+  Plus,
+  Pause,
+  Play,
+  StopCircle,
+  RefreshCw,
+  CheckCircle,
+  XCircle,
+  Loader2,
+  Edit2,
+  Check,
+  X,
+} from "lucide-react";
 import {
   useProbes,
   useProbeResults,
@@ -15,7 +28,13 @@ import {
   type ProbeResult,
   type Model,
 } from "../../../../api/control-layer";
-import { Card, CardContent, CardHeader, CardTitle, CardDescription } from "../../../ui/card";
+import {
+  Card,
+  CardContent,
+  CardHeader,
+  CardTitle,
+  CardDescription,
+} from "../../../ui/card";
 import { Button } from "../../../ui/button";
 import { Input } from "../../../ui/input";
 import { Badge } from "../../../ui/badge";
@@ -48,7 +67,7 @@ const ModelProbes: React.FC<ModelProbesProps> = ({ model }) => {
 
   // Find probe for this model (should only be one due to unique constraint)
   const modelProbe = useMemo(() => {
-    return probes?.find(p => p.deployment_id === model.id);
+    return probes?.find((p) => p.deployment_id === model.id);
   }, [probes, model.id]);
 
   // Only fetch results/stats if probe exists
@@ -69,7 +88,9 @@ const ModelProbes: React.FC<ModelProbesProps> = ({ model }) => {
       setTestResult(result);
       setTestPassed(result.success);
       if (result.success) {
-        toast.success(`Test successful! Response time: ${result.response_time_ms}ms`);
+        toast.success(
+          `Test successful! Response time: ${result.response_time_ms}ms`,
+        );
       } else {
         toast.error(`Test failed: ${result.error_message || "Unknown error"}`);
       }
@@ -132,7 +153,7 @@ const ModelProbes: React.FC<ModelProbesProps> = ({ model }) => {
       // Ensure animation runs for at least 200ms
       await Promise.all([
         executeProbeMutation.mutateAsync(id),
-        new Promise(resolve => setTimeout(resolve, 200))
+        new Promise((resolve) => setTimeout(resolve, 200)),
       ]);
       toast.success("Probe executed");
     } catch {
@@ -163,7 +184,9 @@ const ModelProbes: React.FC<ModelProbesProps> = ({ model }) => {
         <CardContent>
           <div className="text-center py-8">
             <Activity className="h-12 w-12 text-gray-400 mx-auto mb-4" />
-            <p className="text-gray-600 mb-4">Monitoring is not enabled for this model</p>
+            <p className="text-gray-600 mb-4">
+              Monitoring is not enabled for this model
+            </p>
             <Button onClick={() => setShowCreateForm(true)}>
               <Plus className="mr-2 h-4 w-4" />
               Start Monitoring
@@ -183,14 +206,19 @@ const ModelProbes: React.FC<ModelProbesProps> = ({ model }) => {
             <div className="flex items-center justify-between">
               <div>
                 <CardTitle>Uptime Monitoring</CardTitle>
-                <CardDescription>Monitor endpoint availability and response times</CardDescription>
+                <CardDescription>
+                  Monitor endpoint availability and response times
+                </CardDescription>
               </div>
               <div className="flex gap-2">
                 <Button
                   variant="outline"
                   size="sm"
                   onClick={() => handleToggleActive(modelProbe)}
-                  disabled={activateProbeMutation.isPending || deactivateProbeMutation.isPending}
+                  disabled={
+                    activateProbeMutation.isPending ||
+                    deactivateProbeMutation.isPending
+                  }
                 >
                   {modelProbe.active ? (
                     <>
@@ -210,7 +238,9 @@ const ModelProbes: React.FC<ModelProbesProps> = ({ model }) => {
                   onClick={() => handleExecuteNow(modelProbe.id)}
                   disabled={isExecuting}
                 >
-                  <RefreshCw className={`mr-2 h-4 w-4 ${isExecuting ? 'animate-spin' : ''}`} />
+                  <RefreshCw
+                    className={`mr-2 h-4 w-4 ${isExecuting ? "animate-spin" : ""}`}
+                  />
                   Run Now
                 </Button>
                 <Button
@@ -236,8 +266,13 @@ const ModelProbes: React.FC<ModelProbesProps> = ({ model }) => {
               <div>
                 <p className="text-sm text-gray-600 mb-1">Interval</p>
                 <div className="group/edit-cell flex items-center gap-1">
-                  <p className="text-sm font-medium">{modelProbe.interval_seconds}s</p>
-                  <Popover open={editingInterval} onOpenChange={setEditingInterval}>
+                  <p className="text-sm font-medium">
+                    {modelProbe.interval_seconds}s
+                  </p>
+                  <Popover
+                    open={editingInterval}
+                    onOpenChange={setEditingInterval}
+                  >
                     <PopoverTrigger asChild>
                       <Edit2 className="h-3.5 w-3.5 opacity-0 group-hover/edit-cell:opacity-100 transition-opacity cursor-pointer text-gray-600 hover:text-gray-900" />
                     </PopoverTrigger>
@@ -250,20 +285,25 @@ const ModelProbes: React.FC<ModelProbesProps> = ({ model }) => {
                               type="number"
                               min="10"
                               value={newInterval}
-                              onChange={(e) => setNewInterval(parseInt(e.target.value))}
+                              onChange={(e) =>
+                                setNewInterval(parseInt(e.target.value))
+                              }
                               placeholder="Seconds"
                               autoFocus
                               onKeyDown={(e) => {
                                 if (e.key === "Enter") {
-                                  updateProbeMutation.mutateAsync({
-                                    id: modelProbe.id,
-                                    data: { interval_seconds: newInterval },
-                                  }).then(() => {
-                                    setEditingInterval(false);
-                                    toast.success("Interval updated");
-                                  }).catch(() => {
-                                    toast.error("Failed to update interval");
-                                  });
+                                  updateProbeMutation
+                                    .mutateAsync({
+                                      id: modelProbe.id,
+                                      data: { interval_seconds: newInterval },
+                                    })
+                                    .then(() => {
+                                      setEditingInterval(false);
+                                      toast.success("Interval updated");
+                                    })
+                                    .catch(() => {
+                                      toast.error("Failed to update interval");
+                                    });
                                 } else if (e.key === "Escape") {
                                   setEditingInterval(false);
                                   setNewInterval(modelProbe.interval_seconds);
@@ -328,7 +368,9 @@ const ModelProbes: React.FC<ModelProbesProps> = ({ model }) => {
               <div>
                 <div className="flex items-center justify-between mb-4">
                   <div>
-                    <h3 className="text-sm font-medium mb-1">Step 1: Test Connection</h3>
+                    <h3 className="text-sm font-medium mb-1">
+                      Step 1: Test Connection
+                    </h3>
                     <p className="text-sm text-gray-600">
                       Verify that the model endpoint is accessible
                     </p>
@@ -352,11 +394,13 @@ const ModelProbes: React.FC<ModelProbesProps> = ({ model }) => {
                 </div>
 
                 {testResult && (
-                  <div className={`p-4 rounded-lg border ${
-                    testResult.success
-                      ? "bg-green-50 border-green-200"
-                      : "bg-red-50 border-red-200"
-                  }`}>
+                  <div
+                    className={`p-4 rounded-lg border ${
+                      testResult.success
+                        ? "bg-green-50 border-green-200"
+                        : "bg-red-50 border-red-200"
+                    }`}
+                  >
                     <div className="flex items-start gap-3">
                       {testResult.success ? (
                         <CheckCircle className="h-5 w-5 text-green-600 mt-0.5" />
@@ -364,19 +408,27 @@ const ModelProbes: React.FC<ModelProbesProps> = ({ model }) => {
                         <XCircle className="h-5 w-5 text-red-600 mt-0.5" />
                       )}
                       <div className="flex-1">
-                        <p className={`font-medium ${
-                          testResult.success ? "text-green-900" : "text-red-900"
-                        }`}>
-                          {testResult.success ? "Test Successful" : "Test Failed"}
+                        <p
+                          className={`font-medium ${
+                            testResult.success
+                              ? "text-green-900"
+                              : "text-red-900"
+                          }`}
+                        >
+                          {testResult.success
+                            ? "Test Successful"
+                            : "Test Failed"}
                         </p>
                         {testResult.success ? (
                           <p className="text-sm text-green-700 mt-1">
                             Response time: {testResult.response_time_ms}ms
-                            {testResult.status_code && ` • Status: ${testResult.status_code}`}
+                            {testResult.status_code &&
+                              ` • Status: ${testResult.status_code}`}
                           </p>
                         ) : (
                           <p className="text-sm text-red-700 mt-1">
-                            {testResult.error_message || "Unknown error occurred"}
+                            {testResult.error_message ||
+                              "Unknown error occurred"}
                           </p>
                         )}
                       </div>
@@ -387,7 +439,9 @@ const ModelProbes: React.FC<ModelProbesProps> = ({ model }) => {
 
               {/* Configuration Section */}
               <div>
-                <h3 className="text-sm font-medium mb-3">Step 2: Configure Interval</h3>
+                <h3 className="text-sm font-medium mb-3">
+                  Step 2: Configure Interval
+                </h3>
                 <div>
                   <label className="text-sm font-medium mb-2 block">
                     Check Interval (seconds)
@@ -396,7 +450,9 @@ const ModelProbes: React.FC<ModelProbesProps> = ({ model }) => {
                     type="number"
                     min="10"
                     value={intervalSeconds}
-                    onChange={(e) => setIntervalSeconds(parseInt(e.target.value))}
+                    onChange={(e) =>
+                      setIntervalSeconds(parseInt(e.target.value))
+                    }
                     disabled={!testPassed}
                   />
                   <p className="text-xs text-gray-500 mt-1">
@@ -439,17 +495,20 @@ const ModelProbes: React.FC<ModelProbesProps> = ({ model }) => {
       )}
 
       {/* Uptime Timeline */}
-      {modelProbe && probeResults && probeResults.length > 0 && !showCreateForm && (
-        <Card>
-          <CardHeader>
-            <CardTitle>Uptime History</CardTitle>
-            <CardDescription>Recent availability checks</CardDescription>
-          </CardHeader>
-          <CardContent>
-            <ProbeTimeline results={probeResults} />
-          </CardContent>
-        </Card>
-      )}
+      {modelProbe &&
+        probeResults &&
+        probeResults.length > 0 &&
+        !showCreateForm && (
+          <Card>
+            <CardHeader>
+              <CardTitle>Uptime History</CardTitle>
+              <CardDescription>Recent availability checks</CardDescription>
+            </CardHeader>
+            <CardContent>
+              <ProbeTimeline results={probeResults} />
+            </CardContent>
+          </Card>
+        )}
     </div>
   );
 };

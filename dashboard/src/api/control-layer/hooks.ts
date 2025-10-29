@@ -415,8 +415,7 @@ export function useRequestsAggregateByUser(
 ) {
   return useQuery({
     queryKey: queryKeys.requests.aggregateByUser(model, startDate, endDate),
-    queryFn: () =>
-      dwctlApi.requests.aggregateByUser(model, startDate, endDate),
+    queryFn: () => dwctlApi.requests.aggregateByUser(model, startDate, endDate),
     enabled: !!model,
   });
 }
@@ -476,7 +475,7 @@ export function useProbe(id: string) {
 export function useProbeResults(
   id: string,
   params?: { start_time?: string; end_time?: string; limit?: number },
-  options?: { enabled?: boolean }
+  options?: { enabled?: boolean },
 ) {
   return useQuery({
     queryKey: ["probes", id, "results", params],
@@ -489,7 +488,7 @@ export function useProbeResults(
 export function useProbeStatistics(
   id: string,
   params?: { start_time?: string; end_time?: string },
-  options?: { enabled?: boolean }
+  options?: { enabled?: boolean },
 ) {
   return useQuery({
     queryKey: ["probes", id, "statistics", params],
@@ -572,8 +571,13 @@ export function useUpdateProbe() {
 
   return useMutation({
     mutationKey: ["probes", "update"],
-    mutationFn: ({ id, data }: { id: string; data: { interval_seconds?: number } }) =>
-      dwctlApi.probes.update(id, data),
+    mutationFn: ({
+      id,
+      data,
+    }: {
+      id: string;
+      data: { interval_seconds?: number };
+    }) => dwctlApi.probes.update(id, data),
     onSuccess: (_, variables) => {
       queryClient.invalidateQueries({ queryKey: ["probes"] });
       queryClient.invalidateQueries({ queryKey: ["probes", variables.id] });

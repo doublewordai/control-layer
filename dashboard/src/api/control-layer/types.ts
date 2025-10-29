@@ -123,7 +123,14 @@ export interface ApiKeyCreateResponse extends ApiKey {
 // /admin/api/v1/groups?include=users,models will return user ids and model ids
 // in each element of the groups response. Note that this is only the id; and
 // we need to make another query for the actual data.
-export type ModelsInclude = "groups" | "metrics" | "status" | "groups,metrics" | "groups,status" | "metrics,status" | "groups,metrics,status";
+export type ModelsInclude =
+  | "groups"
+  | "metrics"
+  | "status"
+  | "groups,metrics"
+  | "groups,status"
+  | "metrics,status"
+  | "groups,metrics,status";
 export type GroupsInclude = "users" | "models" | "users,models";
 export type UsersInclude = "groups";
 
@@ -201,6 +208,7 @@ export interface EndpointCreateRequest {
   url: string;
   api_key?: string;
   model_filter?: string[]; // Array of model IDs to sync, or null for all models
+  alias_mapping?: Record<string, string>; // model_name -> custom_alias
 }
 
 export interface EndpointUpdateRequest {
@@ -209,6 +217,7 @@ export interface EndpointUpdateRequest {
   url?: string;
   api_key?: string | null;
   model_filter?: string[] | null;
+  alias_mapping?: Record<string, string>;
 }
 
 export type EndpointValidateRequest =
