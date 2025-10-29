@@ -413,10 +413,14 @@ async fn create_deployment_with_alias<D>(
 where
     D: Repository<CreateRequest = DeploymentCreateDBRequest, Response = DeploymentDBResponse>,
 {
+    // Auto-detect model type from name
+    let detected_type = crate::db::models::deployments::ModelType::detect_from_name(&model.id);
+
     let db_request = DeploymentCreateDBRequest::builder()
         .created_by(created_by)
         .model_name(model.id.clone())
         .alias(alias.clone())
+        .maybe_model_type(Some(detected_type))
         .hosted_on(endpoint_info.id)
         .build();
 

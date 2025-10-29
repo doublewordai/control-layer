@@ -572,22 +572,52 @@ const Models: React.FC = () => {
 
                                   {/* Status badge - always shown if probe exists */}
                                   {model.status?.probe_id && (
-                                    <div
-                                      className={`h-2 w-2 rounded-full ${
-                                        model.status.last_success === true
-                                          ? "bg-green-500"
-                                          : model.status.last_success === false
-                                            ? "bg-red-500"
-                                            : "bg-gray-400"
-                                      }`}
-                                      title={
-                                        model.status.last_success === true
-                                          ? "Operational"
-                                          : model.status.last_success === false
-                                            ? "Down"
-                                            : "Unknown"
-                                      }
-                                    />
+                                    <HoverCard openDelay={200} closeDelay={100}>
+                                      <HoverCardTrigger asChild>
+                                        <div
+                                          className={`h-2 w-2 rounded-full ${
+                                            model.status.last_success === true
+                                              ? "bg-green-500 animate-pulse"
+                                              : model.status.last_success === false
+                                                ? "bg-red-500 animate-pulse"
+                                                : "bg-gray-400"
+                                          }`}
+                                          onClick={(e) => e.stopPropagation()}
+                                        />
+                                      </HoverCardTrigger>
+                                      <HoverCardContent
+                                        className="w-56"
+                                        sideOffset={5}
+                                      >
+                                        <div className="space-y-2">
+                                          <div className="flex items-center gap-2">
+                                            <div
+                                              className={`h-2 w-2 rounded-full ${
+                                                model.status.last_success === true
+                                                  ? "bg-green-500"
+                                                  : model.status.last_success === false
+                                                    ? "bg-red-500"
+                                                    : "bg-gray-400"
+                                              }`}
+                                            />
+                                            <span className="font-medium text-sm">
+                                              {model.status.last_success === true
+                                                ? "Operational"
+                                                : model.status.last_success === false
+                                                  ? "Down"
+                                                  : "Unknown"}
+                                            </span>
+                                          </div>
+                                          {model.status.uptime_percentage !== undefined &&
+                                            model.status.uptime_percentage !== null && (
+                                              <p className="text-xs text-muted-foreground">
+                                                {model.status.uptime_percentage.toFixed(2)}% uptime
+                                                (24h)
+                                              </p>
+                                            )}
+                                        </div>
+                                      </HoverCardContent>
+                                    </HoverCard>
                                   )}
 
                                   <HoverCard openDelay={200} closeDelay={100}>
