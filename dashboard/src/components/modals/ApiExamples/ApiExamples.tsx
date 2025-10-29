@@ -3,7 +3,7 @@ import { Copy, Code, Plus, Loader2, Info } from "lucide-react";
 import { Prism as SyntaxHighlighter } from "react-syntax-highlighter";
 import { oneDark } from "react-syntax-highlighter/dist/esm/styles/prism";
 import { useCreateApiKey } from "../../../api/control-layer";
-import { getModelType, type ModelType } from "../../../utils/modelType";
+import { type ModelType } from "../../../utils/modelType";
 import type { Model } from "../../../api/control-layer";
 import {
   Dialog,
@@ -245,7 +245,7 @@ chatCompletion();`;
   const getCurrentCode = () => {
     if (!model) return "";
 
-    const modelType = getModelType(model.id, model.alias);
+    const modelType = (model.model_type?.toLowerCase() || "chat") as ModelType;
 
     switch (selectedLanguage) {
       case "python":
