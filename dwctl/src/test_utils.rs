@@ -26,7 +26,7 @@ use uuid::Uuid;
 
 pub async fn create_test_app(pool: PgPool, enable_sync: bool) -> (TestServer, Option<DropGuard>) {
     let config = create_test_config();
-    let (router, onwards_config_sync, drop_guard) = crate::setup_app(pool, config).await.expect("Failed to setup test app");
+    let (router, onwards_config_sync, drop_guard) = crate::setup_app(pool, config, true).await.expect("Failed to setup test app");
 
     if enable_sync {
         // Start the config sync in background for tests

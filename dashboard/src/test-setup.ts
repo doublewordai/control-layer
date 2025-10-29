@@ -9,7 +9,6 @@ if (typeof window !== "undefined" && !window.ResizeObserver) {
   };
 }
 
-
 // Mock environment variables
 Object.defineProperty(import.meta, "env", {
   value: {

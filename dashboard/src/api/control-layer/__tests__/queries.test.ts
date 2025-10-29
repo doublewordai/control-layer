@@ -192,9 +192,9 @@ describe("dwctlApi.users", () => {
       it("should throw error for non-existent API key", async () => {
         const nonExistentId = "non-existent-key";
 
-        await expect(
-          dwctlApi.users.apiKeys.get(nonExistentId),
-        ).rejects.toThrow("Failed to fetch API key: 404");
+        await expect(dwctlApi.users.apiKeys.get(nonExistentId)).rejects.toThrow(
+          "Failed to fetch API key: 404",
+        );
       });
     });
 
@@ -220,10 +220,7 @@ describe("dwctlApi.users", () => {
           name: "User Key",
         };
 
-        const createdKey = await dwctlApi.users.apiKeys.create(
-          keyData,
-          userId,
-        );
+        const createdKey = await dwctlApi.users.apiKeys.create(keyData, userId);
 
         expect(createdKey).toHaveProperty("key");
         expect(createdKey.name).toBe(keyData.name);
