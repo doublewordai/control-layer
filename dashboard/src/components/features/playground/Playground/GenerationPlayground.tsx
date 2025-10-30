@@ -1,5 +1,22 @@
 import React, { useRef, useEffect, useState, useCallback } from "react";
-import { Send, Copy, Play, Trash2, X, Image as ImageIcon, SplitSquareHorizontal, Square, ArrowLeft, ArrowRight, Timer, Zap, ArrowDown, ArrowUp } from "lucide-react";
+import {
+  Send,
+  Copy,
+  Play,
+  Trash2,
+  X,
+  Image as ImageIcon,
+  SplitSquareHorizontal,
+  Square,
+  ArrowLeft,
+  ArrowRight,
+  Timer,
+  Zap,
+  ArrowDown,
+  ArrowUp,
+  ChevronDown,
+  Settings,
+} from "lucide-react";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
 import { Prism as SyntaxHighlighter } from "react-syntax-highlighter";
@@ -53,6 +70,10 @@ interface GenerationPlaygroundProps {
   error: string | null;
   copiedMessageIndex: number | null;
   supportsImages: boolean;
+  systemPrompt: string;
+  onSystemPromptChange: (value: string) => void;
+  systemPromptModelB?: string;
+  onSystemPromptModelBChange?: (value: string) => void;
   onCurrentMessageChange: (value: string) => void;
   onImageUpload: (event: React.ChangeEvent<HTMLInputElement>) => void;
   onRemoveImage: (index: number) => void;
@@ -86,6 +107,10 @@ const GenerationPlayground: React.FC<GenerationPlaygroundProps> = ({
   error,
   copiedMessageIndex,
   supportsImages,
+  systemPrompt,
+  onSystemPromptChange,
+  systemPromptModelB = "",
+  onSystemPromptModelBChange,
   onCurrentMessageChange,
   onImageUpload,
   onRemoveImage,
@@ -115,6 +140,7 @@ const GenerationPlayground: React.FC<GenerationPlaygroundProps> = ({
   const fileInputRef = useRef<HTMLInputElement>(null);
   const [isHovered, setIsHovered] = useState(false);
   const [copiedCode, setCopiedCode] = useState<string | null>(null);
+  const [isSystemPromptExpanded, setIsSystemPromptExpanded] = useState(false);
 
   const scrollToBottom = useCallback(() => {
     messagesEndRef.current?.scrollIntoView({ behavior: "smooth" });
@@ -644,7 +670,110 @@ const GenerationPlayground: React.FC<GenerationPlaygroundProps> = ({
   );
 
   return (
-    <div className="flex-1 flex flex-col min-h-0">
+    <div className="flex-1 flex flex-col min-h-0 relative">
+      {/* System Prompt Tab - Pokes out from top */}
+      <div className="absolute top-0 left-1/2 -translate-x-1/2 z-30">
+        <button
+          onClick={() => setIsSystemPromptExpanded(!isSystemPromptExpanded)}
+          className="flex items-center gap-1.5 px-2.5 py-1 bg-gray-100 hover:bg-gray-200 border border-gray-300 border-t-0 rounded-b-md transition-colors shadow-sm relative"
+          aria-expanded={isSystemPromptExpanded}
+          aria-label="Toggle system prompt"
+          title={isSystemPromptExpanded ? "Hide system prompt" : "Show system prompt"}
+        >
+          <Settings className="w-3.5 h-3.5 text-gray-600" />
+          {(systemPrompt.trim() || systemPromptModelB.trim()) && !isSystemPromptExpanded && (
+            <span className="absolute -top-0.5 -right-0.5 w-2 h-2 bg-blue-500 rounded-full border border-white" aria-label="System prompt is active" />
+          )}
+          <ChevronDown className={`w-3.5 h-3.5 text-gray-600 transition-transform ${
+            isSystemPromptExpanded ? 'rotate-180' : ''
+          }`} />
+        </button>
+      </div>
+
+      {/* System Prompt Expandable Section */}
+      {isSystemPromptExpanded && (
+        <div className="absolute top-0 left-0 right-0 bg-white border-b border-gray-300 shadow-md z-20 animate-in slide-in-from-top duration-200">
+          <div className="px-8 pt-8 pb-4">
+            {isComparisonMode && comparisonModel ? (
+              /* Side-by-side system prompts for comparison mode */
+              <div className="flex gap-4 relative">
+                <div className="flex-1">
+                  <label className="block text-xs font-medium text-gray-700 mb-2">
+                    {selectedModel.alias}
+                  </label>
+                  <Textarea
+                    value={systemPrompt}
+                    onChange={(e) => onSystemPromptChange(e.target.value)}
+                    placeholder="System prompt for Model A..."
+                    className="text-sm min-h-[100px] resize-y"
+                    disabled={isStreaming}
+                    aria-label="System prompt for Model A"
+                  />
+                </div>
+
+                {/* Copy arrows between system prompts */}
+                <div className="absolute left-1/2 top-1/2 -translate-x-1/2 -translate-y-1/2 flex flex-col gap-2 z-10">
+                  {/* Copy to Model B (right arrow) */}
+                  {systemPrompt.trim() && (
+                    <Button
+                      onClick={() => onSystemPromptModelBChange && onSystemPromptModelBChange(systemPrompt)}
+                      size="icon"
+                      variant="outline"
+                      className="h-7 w-7 bg-white shadow-md hover:bg-gray-50"
+                      aria-label="Copy system prompt to right model"
+                      title={`Copy system prompt to ${comparisonModel.alias}`}
+                    >
+                      <ArrowRight className="w-3.5 h-3.5" />
+                    </Button>
+                  )}
+                  {/* Copy to Model A (left arrow) */}
+                  {systemPromptModelB.trim() && (
+                    <Button
+                      onClick={() => onSystemPromptChange(systemPromptModelB)}
+                      size="icon"
+                      variant="outline"
+                      className="h-7 w-7 bg-white shadow-md hover:bg-gray-50"
+                      aria-label="Copy system prompt to left model"
+                      title={`Copy system prompt to ${selectedModel.alias}`}
+                    >
+                      <ArrowLeft className="w-3.5 h-3.5" />
+                    </Button>
+                  )}
+                </div>
+
+                <div className="flex-1">
+                  <label className="block text-xs font-medium text-gray-700 mb-2">
+                    {comparisonModel.alias}
+                  </label>
+                  <Textarea
+                    value={systemPromptModelB}
+                    onChange={(e) => onSystemPromptModelBChange && onSystemPromptModelBChange(e.target.value)}
+                    placeholder="System prompt for Model B..."
+                    className="text-sm min-h-[100px] resize-y"
+                    disabled={isStreamingModelB}
+                    aria-label="System prompt for Model B"
+                  />
+                </div>
+              </div>
+            ) : (
+              /* Single system prompt for regular mode */
+              <Textarea
+                value={systemPrompt}
+                onChange={(e) => onSystemPromptChange(e.target.value)}
+                placeholder="Enter a system prompt to set the behavior and context for the AI model... (e.g., 'You are a helpful assistant that speaks like a pirate.')"
+                className="text-sm min-h-[100px] resize-y"
+                disabled={isStreaming}
+                aria-label="System prompt input"
+              />
+            )}
+            <p className="text-xs text-gray-500 mt-2">
+              The system prompt sets the behavior and context for the AI model.
+              It will be sent with every message in this conversation.
+            </p>
+          </div>
+        </div>
+      )}
+
       {/* Messages */}
       {isComparisonMode && comparisonModel ? (
         <div className="flex-1 flex relative overflow-hidden min-h-0">

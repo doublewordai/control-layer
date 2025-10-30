@@ -2,6 +2,7 @@ import React, { useState, useEffect } from "react";
 import { useNavigate, useSearchParams } from "react-router-dom";
 import { Play, ArrowLeft, GitCompare, X as XIcon } from "lucide-react";
 import OpenAI from "openai";
+import type { ChatCompletionMessageParam } from "openai/resources/chat/completions";
 import { useModels } from "../../../../api/control-layer";
 import { type ModelType } from "../../../../utils/modelType";
 import type {
@@ -63,6 +64,8 @@ const Playground: React.FC = () => {
   const [error, setError] = useState<string | null>(null);
   const [selectedModel, setSelectedModel] = useState<Model | null>(null);
   const [modelType, setModelType] = useState<ModelType>("chat");
+  const [systemPrompt, setSystemPrompt] = useState("");
+  const [systemPromptModelB, setSystemPromptModelB] = useState("");
   const [textA, setTextA] = useState("");
   const [textB, setTextB] = useState("");
   const [similarityResult, setSimilarityResult] = useState<{
@@ -125,6 +128,8 @@ const Playground: React.FC = () => {
       setError(null);
       setCurrentMessage("");
       setUploadedImages([]);
+      setSystemPrompt("");
+      setSystemPromptModelB("");
       setTextA("");
       setTextB("");
       setQuery("What is the capital of France?");
@@ -425,16 +430,33 @@ const Playground: React.FC = () => {
           let totalTokensB = 0;
           let inputTokensB = 0;
 
+          // Build messages array with optional system prompt for Model B
+          const apiMessagesB: ChatCompletionMessageParam[] = [];
+
+          // Add system prompt if provided (use Model B's system prompt if in comparison mode, otherwise use shared)
+          const systemPromptB = systemPromptModelB.trim() || systemPrompt.trim();
+          if (systemPromptB) {
+            apiMessagesB.push({
+              role: "system",
+              content: systemPromptB,
+            });
+          }
+
+          // Add conversation history
+          messagesModelB.forEach((msg) => {
+            apiMessagesB.push({
+              role: msg.role,
+              content: msg.content,
+            } as ChatCompletionMessageParam);
+          });
+
+          // Add current user message
+          apiMessagesB.push({ role: "user", content: userMessage.content });
+
           const streamB = await openai.chat.completions.create(
             {
               model: comparisonModel.alias,
-              messages: [
-                ...(messagesModelB.map((msg) => ({
-                  role: msg.role,
-                  content: msg.content,
-                })) as any),
-                { role: "user" as const, content: userMessage.content },
-              ],
+              messages: apiMessagesB,
               stream: true,
               stream_options: {
                 include_usage: true,
@@ -506,6 +528,29 @@ const Playground: React.FC = () => {
       console.log("Sending request to model:", selectedModel.alias);
       console.log("Full request URL will be:", `${baseURL}/chat/completions`);
 
+      // Build messages array with optional system prompt
+      const apiMessages: ChatCompletionMessageParam[] = [];
+
+      // Add system prompt if provided
+      if (systemPrompt.trim()) {
+        apiMessages.push({
+          role: "system",
+          content: systemPrompt.trim(),
+        });
+      }
+
+      // Add conversation history
+      messages.forEach((msg) => {
+        apiMessages.push({
+          role: msg.role,
+          content: msg.content,
+        } as ChatCompletionMessageParam);
+      });
+
+      // Add current user message
+      apiMessages.push({ role: "user", content: userMessage.content });
+
+      // Performance tracking
       const startTime = performance.now();
       let firstTokenTime: number | undefined;
       let totalTokens = 0;
@@ -514,13 +559,7 @@ const Playground: React.FC = () => {
       const stream = await openai.chat.completions.create(
         {
           model: selectedModel.alias,
-          messages: [
-            ...(messages.map((msg) => ({
-              role: msg.role,
-              content: msg.content,
-            })) as any),
-            { role: "user" as const, content: userMessage.content },
-          ],
+          messages: apiMessages,
           stream: true,
           stream_options: {
             include_usage: true,
@@ -632,16 +671,33 @@ const Playground: React.FC = () => {
       let totalTokens = 0;
       let inputTokens = 0;
 
+      // Build messages array with optional system prompt for Model B
+      const apiMessagesB: ChatCompletionMessageParam[] = [];
+
+      // Add system prompt if provided (use Model B's system prompt if set, otherwise use shared)
+      const systemPromptB = systemPromptModelB.trim() || systemPrompt.trim();
+      if (systemPromptB) {
+        apiMessagesB.push({
+          role: "system",
+          content: systemPromptB,
+        });
+      }
+
+      // Add conversation history
+      messagesModelB.forEach((msg) => {
+        apiMessagesB.push({
+          role: msg.role,
+          content: msg.content,
+        } as ChatCompletionMessageParam);
+      });
+
+      // Add current user message
+      apiMessagesB.push({ role: "user", content: userMessage.content });
+
       const stream = await openai.chat.completions.create(
         {
           model: comparisonModel.alias,
-          messages: [
-            ...(messagesModelB.map((msg) => ({
-              role: msg.role,
-              content: msg.content,
-            })) as any),
-            { role: "user" as const, content: userMessage.content },
-          ],
+          messages: apiMessagesB,
           stream: true,
           stream_options: {
             include_usage: true,
@@ -730,6 +786,8 @@ const Playground: React.FC = () => {
     setRerankResult(null);
     setError(null);
     setUploadedImages([]);
+    setSystemPrompt("");
+    setSystemPromptModelB("");
     setTextA("");
     setTextB("");
     setQuery("What is the capital of France?");
@@ -974,6 +1032,10 @@ const Playground: React.FC = () => {
           supportsImages={
             selectedModel.capabilities?.includes("vision") ?? false
           }
+          systemPrompt={systemPrompt}
+          onSystemPromptChange={setSystemPrompt}
+          systemPromptModelB={systemPromptModelB}
+          onSystemPromptModelBChange={setSystemPromptModelB}
           onCurrentMessageChange={setCurrentMessage}
           onImageUpload={handleImageUpload}
           onRemoveImage={handleRemoveImage}
