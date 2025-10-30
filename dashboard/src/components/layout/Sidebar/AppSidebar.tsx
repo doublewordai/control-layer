@@ -11,6 +11,7 @@ import {
   ExternalLink,
   LogOut,
   ChevronUp,
+  DollarSign,
 } from "lucide-react";
 import { useUser, useConfig } from "../../../api/control-layer/hooks";
 import { UserAvatar } from "../../ui";
@@ -50,6 +51,7 @@ export function AppSidebar() {
     { path: "/endpoints", icon: Server, label: "Endpoints" },
     { path: "/playground", icon: Play, label: "Playground" },
     { path: "/analytics", icon: Activity, label: "Traffic" },
+    { path: "/cost-management", icon: DollarSign, label: "Cost Management" },
     { path: "/users-groups", icon: Users, label: "Users & Groups" },
     { path: "/api-keys", icon: Key, label: "API Keys" },
     { path: "/settings", icon: Settings, label: "Settings" },

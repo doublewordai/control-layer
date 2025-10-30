@@ -531,3 +531,46 @@ export interface ChangePasswordRequest {
 
 // User response type alias for auth responses
 export type UserResponse = User;
+
+// ===== COST MANAGEMENT TYPES =====
+
+export interface CreditTransaction {
+  id: string;
+  type: "credit" | "debit";
+  amount: number;
+  description: string;
+  timestamp: string; // ISO 8601 timestamp
+  balance_after: number;
+  model?: string; // Optional model name for debit transactions
+}
+
+export interface CreditBalanceResponse {
+  balance: number;
+  currency: string; // e.g., "credits"
+}
+
+export interface TransactionsListResponse {
+  transactions: CreditTransaction[];
+  total: number;
+  limit: number;
+  offset: number;
+}
+
+export interface TransactionsQuery {
+  limit?: number;
+  offset?: number;
+  type?: "credit" | "debit";
+  model?: string;
+  start_date?: string; // ISO 8601 timestamp
+  end_date?: string; // ISO 8601 timestamp
+}
+
+export interface AddCreditsRequest {
+  amount: number;
+  description?: string;
+}
+
+export interface AddCreditsResponse {
+  transaction: CreditTransaction;
+  new_balance: number;
+}

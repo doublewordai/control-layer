@@ -15,6 +15,8 @@ import type {
   ModelsQuery,
   GroupsQuery,
   ListRequestsQuery,
+  TransactionsQuery,
+  AddCreditsRequest,
 } from "./types";
 
 // Config hooks
@@ -453,5 +455,36 @@ export function useConfirmPasswordReset() {
       token: string;
       new_password: string;
     }) => dwctlApi.auth.confirmPasswordReset(data),
+  });
+}
+
+// Cost management hooks
+export function useCreditBalance() {
+  return useQuery({
+    queryKey: ["cost", "balance"],
+    queryFn: () => dwctlApi.cost.getBalance(),
+    staleTime: 30 * 1000, // 30 seconds - balance changes frequently
+  });
+}
+
+export function useTransactions(query?: TransactionsQuery) {
+  return useQuery({
+    queryKey: ["cost", "transactions", query],
+    queryFn: () => dwctlApi.cost.listTransactions(query),
+    staleTime: 30 * 1000, // 30 seconds
+  });
+}
+
+export function useAddCredits() {
+  const queryClient = useQueryClient();
+
+  return useMutation({
+    mutationKey: ["cost", "add-credits"],
+    mutationFn: (data: AddCreditsRequest) => dwctlApi.cost.addCredits(data),
+    onSuccess: () => {
+      // Invalidate and refetch balance and transactions
+      queryClient.invalidateQueries({ queryKey: ["cost", "balance"] });
+      queryClient.invalidateQueries({ queryKey: ["cost", "transactions"] });
+    },
   });
 }

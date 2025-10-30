@@ -34,6 +34,11 @@ import type {
   PasswordResetRequest,
   PasswordResetConfirmRequest,
   ChangePasswordRequest,
+  CreditBalanceResponse,
+  TransactionsListResponse,
+  TransactionsQuery,
+  AddCreditsRequest,
+  AddCreditsResponse,
 } from "./types";
 import { ApiError } from "./errors";
 
@@ -575,6 +580,48 @@ const authApi = {
   },
 };
 
+// Cost management API
+const costApi = {
+  async getBalance(): Promise<CreditBalanceResponse> {
+    const response = await fetch("/admin/api/v1/credits/balance");
+    if (!response.ok) {
+      throw new Error(`Failed to fetch balance: ${response.status}`);
+    }
+    return response.json();
+  },
+
+  async listTransactions(
+    query?: TransactionsQuery,
+  ): Promise<TransactionsListResponse> {
+    const params = new URLSearchParams();
+    if (query?.limit) params.set("limit", query.limit.toString());
+    if (query?.offset) params.set("offset", query.offset.toString());
+    if (query?.type) params.set("type", query.type);
+    if (query?.model) params.set("model", query.model);
+    if (query?.start_date) params.set("start_date", query.start_date);
+    if (query?.end_date) params.set("end_date", query.end_date);
+
+    const url = `/admin/api/v1/credits/transactions${params.toString() ? "?" + params.toString() : ""}`;
+    const response = await fetch(url);
+    if (!response.ok) {
+      throw new Error(`Failed to fetch transactions: ${response.status}`);
+    }
+    return response.json();
+  },
+
+  async addCredits(data: AddCreditsRequest): Promise<AddCreditsResponse> {
+    const response = await fetch("/admin/api/v1/credits/add", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(data),
+    });
+    if (!response.ok) {
+      throw new Error(`Failed to add credits: ${response.status}`);
+    }
+    return response.json();
+  },
+};
+
 // Main nested API object
 export const dwctlApi = {
   users: userApi,
@@ -584,4 +631,5 @@ export const dwctlApi = {
   config: configApi,
   requests: requestsApi,
   auth: authApi,
+  cost: costApi,
 };
