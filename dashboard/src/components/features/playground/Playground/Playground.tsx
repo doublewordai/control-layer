@@ -1,6 +1,6 @@
 import React, { useState, useEffect } from "react";
 import { useNavigate, useSearchParams } from "react-router-dom";
-import { Play, ArrowLeft } from "lucide-react";
+import { Play, ArrowLeft, GitCompare, X as XIcon } from "lucide-react";
 import OpenAI from "openai";
 import { useModels } from "../../../../api/control-layer";
 import { type ModelType } from "../../../../utils/modelType";
@@ -18,6 +18,7 @@ import {
   SelectTrigger,
   SelectValue,
 } from "../../../ui/select";
+import { Button } from "../../../ui/button";
 
 interface ImageContent {
   type: "image_url";
@@ -33,10 +34,19 @@ interface TextContent {
 
 type MessageContent = string | (TextContent | ImageContent)[];
 
+interface MessageMetrics {
+  timeToFirstToken?: number; // milliseconds
+  totalTime?: number; // milliseconds
+  tokensPerSecond?: number;
+  totalTokens?: number;
+  inputTokens?: number;
+}
+
 interface Message {
   role: "user" | "assistant" | "system";
   content: MessageContent;
   timestamp: Date;
+  metrics?: MessageMetrics;
 }
 
 const Playground: React.FC = () => {
@@ -123,6 +133,13 @@ const Playground: React.FC = () => {
         "The capital of France is Paris.",
         "Horses and cows are both animals",
       ]);
+      // Reset comparison mode when switching primary model
+      setIsComparisonMode(false);
+      setComparisonModel(null);
+      setMessagesModelB([]);
+      setStreamingContentModelB("");
+      setCurrentMessageModelB("");
+      setIsSplitInput(false);
     }
   }, [selectedModel]);
 
@@ -392,9 +409,107 @@ const Playground: React.FC = () => {
     const controller = new AbortController();
     setAbortController(controller);
 
+    // If in comparison mode with unified input, also send to Model B
+    if (isComparisonMode && comparisonModel && !isSplitInput) {
+      setMessagesModelB((prev) => [...prev, userMessage]);
+      setIsStreamingModelB(true);
+      setStreamingContentModelB("");
+      const controllerB = new AbortController();
+      setAbortControllerModelB(controllerB);
+
+      // Start streaming for Model B in parallel
+      (async () => {
+        try {
+          const startTimeB = performance.now();
+          let firstTokenTimeB: number | undefined;
+          let totalTokensB = 0;
+          let inputTokensB = 0;
+
+          const streamB = await openai.chat.completions.create(
+            {
+              model: comparisonModel.alias,
+              messages: [
+                ...(messagesModelB.map((msg) => ({
+                  role: msg.role,
+                  content: msg.content,
+                })) as any),
+                { role: "user" as const, content: userMessage.content },
+              ],
+              stream: true,
+              stream_options: {
+                include_usage: true,
+              },
+            },
+            {
+              signal: controllerB.signal,
+            },
+          );
+
+          let fullContentB = "";
+          let chunkCountB = 0;
+
+          for await (const chunk of streamB) {
+            const content = chunk.choices[0]?.delta?.content || "";
+            if (content) {
+              chunkCountB++;
+              fullContentB += content;
+
+              // Track time to first token
+              if (firstTokenTimeB === undefined) {
+                firstTokenTimeB = performance.now() - startTimeB;
+              }
+
+              setStreamingContentModelB(fullContentB);
+            }
+
+            // Track tokens from usage info
+            if (chunk.usage?.completion_tokens) {
+              totalTokensB = chunk.usage.completion_tokens;
+            }
+            if (chunk.usage?.prompt_tokens) {
+              inputTokensB = chunk.usage.prompt_tokens;
+            }
+          }
+
+          const endTimeB = performance.now();
+          const totalTimeB = endTimeB - startTimeB;
+
+          // Calculate metrics
+          const metricsB: MessageMetrics = {
+            timeToFirstToken: firstTokenTimeB,
+            totalTime: totalTimeB,
+            totalTokens: totalTokensB || chunkCountB,
+            inputTokens: inputTokensB || undefined,
+            tokensPerSecond: totalTokensB && totalTimeB > 0
+              ? (totalTokensB / (totalTimeB / 1000))
+              : undefined,
+          };
+
+          const assistantMessageB: Message = {
+            role: "assistant",
+            content: fullContentB,
+            timestamp: new Date(),
+            metrics: metricsB,
+          };
+          setMessagesModelB((prev) => [...prev, assistantMessageB]);
+          setStreamingContentModelB("");
+        } catch (err) {
+          console.error("Error sending message to Model B:", err);
+        } finally {
+          setIsStreamingModelB(false);
+          setAbortControllerModelB(null);
+        }
+      })();
+    }
+
     try {
       console.log("Sending request to model:", selectedModel.alias);
       console.log("Full request URL will be:", `${baseURL}/chat/completions`);
+
+      const startTime = performance.now();
+      let firstTokenTime: number | undefined;
+      let totalTokens = 0;
+      let inputTokens = 0;
 
       const stream = await openai.chat.completions.create(
         {
@@ -424,6 +539,12 @@ const Playground: React.FC = () => {
         if (content) {
           chunkCount++;
           fullContent += content;
+
+          // Track time to first token
+          if (firstTokenTime === undefined) {
+            firstTokenTime = performance.now() - startTime;
+          }
+
           console.log(
             `Chunk ${chunkCount}: "${content}" (length: ${content.length})`,
           );
@@ -431,15 +552,38 @@ const Playground: React.FC = () => {
           // Update immediately without requestAnimationFrame to avoid batching
           setStreamingContent(fullContent);
         }
+
+        // Track tokens from usage info
+        if (chunk.usage?.completion_tokens) {
+          totalTokens = chunk.usage.completion_tokens;
+        }
+        if (chunk.usage?.prompt_tokens) {
+          inputTokens = chunk.usage.prompt_tokens;
+        }
       }
 
+      const endTime = performance.now();
+      const totalTime = endTime - startTime;
+
       console.log(`Total chunks received: ${chunkCount}`);
+
+      // Calculate metrics
+      const metrics: MessageMetrics = {
+        timeToFirstToken: firstTokenTime,
+        totalTime,
+        totalTokens: totalTokens || chunkCount, // Fallback to chunk count if no usage info
+        inputTokens: inputTokens || undefined,
+        tokensPerSecond: totalTokens && totalTime > 0
+          ? (totalTokens / (totalTime / 1000))
+          : undefined,
+      };
 
       // Add the complete assistant message
       const assistantMessage: Message = {
         role: "assistant",
         content: fullContent,
         timestamp: new Date(),
+        metrics,
       };
 
       setMessages((prev) => [...prev, assistantMessage]);
@@ -454,6 +598,115 @@ const Playground: React.FC = () => {
     } finally {
       setIsStreaming(false);
       setAbortController(null);
+    }
+  };
+
+  // Handler for sending messages to Model B in split input mode
+  const handleSendMessageModelB = async () => {
+    if (
+      !currentMessageModelB.trim() ||
+      isStreamingModelB ||
+      !comparisonModel
+    )
+      return;
+
+    const userMessage: Message = {
+      role: "user",
+      content: currentMessageModelB.trim(),
+      timestamp: new Date(),
+    };
+
+    setMessagesModelB((prev) => [...prev, userMessage]);
+    setCurrentMessageModelB("");
+    setIsStreamingModelB(true);
+    setStreamingContentModelB("");
+
+    const controller = new AbortController();
+    setAbortControllerModelB(controller);
+
+    try {
+      console.log("Sending request to model B:", comparisonModel.alias);
+
+      const startTime = performance.now();
+      let firstTokenTime: number | undefined;
+      let totalTokens = 0;
+      let inputTokens = 0;
+
+      const stream = await openai.chat.completions.create(
+        {
+          model: comparisonModel.alias,
+          messages: [
+            ...(messagesModelB.map((msg) => ({
+              role: msg.role,
+              content: msg.content,
+            })) as any),
+            { role: "user" as const, content: userMessage.content },
+          ],
+          stream: true,
+          stream_options: {
+            include_usage: true,
+          },
+        },
+        {
+          signal: controller.signal,
+        },
+      );
+
+      let fullContent = "";
+      let chunkCount = 0;
+
+      for await (const chunk of stream) {
+        const content = chunk.choices[0]?.delta?.content || "";
+        if (content) {
+          chunkCount++;
+          fullContent += content;
+
+          // Track time to first token
+          if (firstTokenTime === undefined) {
+            firstTokenTime = performance.now() - startTime;
+          }
+
+          setStreamingContentModelB(fullContent);
+        }
+
+        // Track tokens from usage info
+        if (chunk.usage?.completion_tokens) {
+          totalTokens = chunk.usage.completion_tokens;
+        }
+        if (chunk.usage?.prompt_tokens) {
+          inputTokens = chunk.usage.prompt_tokens;
+        }
+      }
+
+      const endTime = performance.now();
+      const totalTime = endTime - startTime;
+
+      // Calculate metrics
+      const metrics: MessageMetrics = {
+        timeToFirstToken: firstTokenTime,
+        totalTime,
+        totalTokens: totalTokens || chunkCount,
+        inputTokens: inputTokens || undefined,
+        tokensPerSecond: totalTokens && totalTime > 0
+          ? (totalTokens / (totalTime / 1000))
+          : undefined,
+      };
+
+      const assistantMessage: Message = {
+        role: "assistant",
+        content: fullContent,
+        timestamp: new Date(),
+        metrics,
+      };
+
+      setMessagesModelB((prev) => [...prev, assistantMessage]);
+      setStreamingContentModelB("");
+    } catch (err) {
+      console.error("Error sending message to Model B:", err);
+      setError(err instanceof Error ? err.message : "Failed to send message to Model B");
+    } finally {
+      setIsStreamingModelB(false);
+      setAbortControllerModelB(null);
     }
   };
 
@@ -485,6 +738,52 @@ const Playground: React.FC = () => {
       "The capital of France is Paris.",
       "Horses and cows are both animals",
     ]);
+    // Also clear comparison model messages
+    if (isComparisonMode) {
+      setMessagesModelB([]);
+      setStreamingContentModelB("");
+      setCurrentMessageModelB("");
+    }
+  };
+
+  const handleComparisonModelSelect = (modelId: string) => {
+    const model = models.find((m) => m.alias === modelId);
+    if (model) {
+      setComparisonModel(model);
+      setIsComparisonMode(true);
+      setMessagesModelB([]);
+      setStreamingContentModelB("");
+      setCurrentMessageModelB("");
+    }
+  };
+
+  const handleExitComparisonMode = () => {
+    setIsComparisonMode(false);
+    setComparisonModel(null);
+    setMessagesModelB([]);
+    setStreamingContentModelB("");
+    setCurrentMessageModelB("");
+    setIsSplitInput(false);
+  };
+
+  const handleCopyMessagesToModelB = () => {
+    // Copy messages but exclude metrics since they're model-specific
+    const messagesWithoutMetrics = messages.map(msg => ({
+      ...msg,
+      metrics: undefined,
+    }));
+    setMessagesModelB(messagesWithoutMetrics);
+    setStreamingContentModelB("");
+  };
+
+  const handleCopyMessagesToModelA = () => {
+    // Copy messages but exclude metrics since they're model-specific
+    const messagesWithoutMetrics = messagesModelB.map(msg => ({
+      ...msg,
+      metrics: undefined,
+    }));
+    setMessages(messagesWithoutMetrics);
+    setStreamingContent("");
   };
 
   const [copiedMessageIndex, setCopiedMessageIndex] = useState<number | null>(
@@ -492,6 +791,17 @@ const Playground: React.FC = () => {
   );
   const [abortController, setAbortController] =
     useState<AbortController | null>(null);
+
+  // Comparison mode state
+  const [isComparisonMode, setIsComparisonMode] = useState(false);
+  const [comparisonModel, setComparisonModel] = useState<Model | null>(null);
+  const [messagesModelB, setMessagesModelB] = useState<Message[]>([]);
+  const [streamingContentModelB, setStreamingContentModelB] = useState("");
+  const [isStreamingModelB, setIsStreamingModelB] = useState(false);
+  const [_abortControllerModelB, setAbortControllerModelB] =
+    useState<AbortController | null>(null);
+  const [isSplitInput, setIsSplitInput] = useState(false);
+  const [currentMessageModelB, setCurrentMessageModelB] = useState("");
 
   const copyMessage = (content: string, messageIndex: number) => {
     navigator.clipboard.writeText(content);
@@ -553,6 +863,49 @@ const Playground: React.FC = () => {
                 ))}
               </SelectContent>
             </Select>
+
+            {/* Comparison Mode Button - Only show for chat models */}
+            {selectedModel && modelType === "chat" && (
+              <>
+                {!isComparisonMode ? (
+                  <Select onValueChange={handleComparisonModelSelect}>
+                    <SelectTrigger className="w-[160px]" aria-label="Compare with">
+                      <GitCompare className="w-4 h-4 mr-2" />
+                      <SelectValue placeholder="Compare..." />
+                    </SelectTrigger>
+                    <SelectContent>
+                      {models
+                        .filter(
+                          (model) =>
+                            model.alias !== selectedModel.alias &&
+                            (model.model_type?.toLowerCase() as ModelType) === "chat"
+                        )
+                        .map((model) => (
+                          <SelectItem key={model.id} value={model.alias}>
+                            {model.alias}
+                          </SelectItem>
+                        ))}
+                    </SelectContent>
+                  </Select>
+                ) : (
+                  <div className="flex items-center gap-2">
+                    <div className="text-sm text-gray-600 flex items-center gap-2 bg-gray-100 rounded-lg px-3 py-2">
+                      <GitCompare className="w-4 h-4" />
+                      <span className="font-medium">{comparisonModel?.alias}</span>
+                    </div>
+                    <Button
+                      variant="ghost"
+                      size="icon"
+                      onClick={handleExitComparisonMode}
+                      aria-label="Exit comparison mode"
+                      title="Exit comparison mode"
+                    >
+                      <XIcon className="w-4 h-4" />
+                    </Button>
+                  </div>
+                )}
+              </>
+            )}
           </div>
         </div>
       </div>
@@ -629,6 +982,19 @@ const Playground: React.FC = () => {
           onKeyDown={handleKeyDown}
           onClearConversation={clearConversation}
           onCancelStreaming={cancelStreaming}
+          // Comparison mode props
+          isComparisonMode={isComparisonMode}
+          comparisonModel={comparisonModel}
+          messagesModelB={messagesModelB}
+          streamingContentModelB={streamingContentModelB}
+          isStreamingModelB={isStreamingModelB}
+          isSplitInput={isSplitInput}
+          currentMessageModelB={currentMessageModelB}
+          onCurrentMessageModelBChange={setCurrentMessageModelB}
+          onToggleSplitInput={() => setIsSplitInput(!isSplitInput)}
+          onSendMessageModelB={handleSendMessageModelB}
+          onCopyMessagesToModelB={handleCopyMessagesToModelB}
+          onCopyMessagesToModelA={handleCopyMessagesToModelA}
         />
       )}
     </div>
