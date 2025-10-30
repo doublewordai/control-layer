@@ -10,7 +10,7 @@ The Doubleword Control Layer (dwctl) is the world’s fastest AI model gateway (
  
 ## Getting started
 
-The Doubleword Control Layer requries Docker to be installed. For information on how to get started with Docker see the docs (here)[https://docs.docker.com/get-started/)]. 
+The Doubleword Control Layer requries Docker to be installed. For information on how to get started with Docker see the docs [here](https://docs.docker.com/get-started/). 
 
 There are two ways to set up the Control Layer:
 1. **Docker Compose** - All-in-one setup with pre-configured Postgres and dwctl. This method automatically provisions a containerized Postgres database with default credentials and connects it to the Control Layer.
