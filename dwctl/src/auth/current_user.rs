@@ -12,7 +12,6 @@ use crate::{
 };
 use axum::{extract::FromRequestParts, http::request::Parts};
 use sqlx::PgPool;
-use tracing::info;
 
 /// Extract user from JWT session cookie if present and valid
 fn try_jwt_session_auth(parts: &axum::http::request::Parts, config: &crate::config::Config) -> Result<Option<CurrentUser>> {
