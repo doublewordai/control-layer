@@ -2,6 +2,7 @@ import React, { useState, useEffect } from "react";
 import { useNavigate, useSearchParams } from "react-router-dom";
 import { Play, ArrowLeft } from "lucide-react";
 import OpenAI from "openai";
+import type { ChatCompletionMessageParam } from "openai/resources/chat/completions";
 import { useModels } from "../../../../api/control-layer";
 import { type ModelType } from "../../../../utils/modelType";
 import type {
@@ -399,26 +400,26 @@ const Playground: React.FC = () => {
       console.log("Full request URL will be:", `${baseURL}/chat/completions`);
 
       // Build messages array with optional system prompt
-      const apiMessages: any[] = [];
+      const apiMessages: ChatCompletionMessageParam[] = [];
 
       // Add system prompt if provided
       if (systemPrompt.trim()) {
         apiMessages.push({
-          role: "system" as const,
+          role: "system",
           content: systemPrompt.trim(),
         });
       }
 
       // Add conversation history
-      apiMessages.push(
-        ...(messages.map((msg) => ({
+      messages.forEach((msg) => {
+        apiMessages.push({
           role: msg.role,
           content: msg.content,
-        })) as any),
-      );
+        } as ChatCompletionMessageParam);
+      });
 
       // Add current user message
-      apiMessages.push({ role: "user" as const, content: userMessage.content });
+      apiMessages.push({ role: "user", content: userMessage.content });
 
       const stream = await openai.chat.completions.create(
         {

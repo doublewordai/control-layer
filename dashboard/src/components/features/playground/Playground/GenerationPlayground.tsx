@@ -153,7 +153,10 @@ const GenerationPlayground: React.FC<GenerationPlaygroundProps> = ({
               System Prompt
             </span>
             {systemPrompt.trim() && !isSystemPromptExpanded && (
-              <span className="text-xs text-gray-500 bg-blue-100 px-2 py-0.5 rounded">
+              <span
+                className="text-xs text-gray-500 bg-blue-100 px-2 py-0.5 rounded"
+                aria-label="System prompt is active"
+              >
                 Active
               </span>
             )}
