@@ -1,5 +1,14 @@
 import React, { useRef, useEffect, useState } from "react";
-import { Send, Copy, Play, Trash2, X, Image as ImageIcon } from "lucide-react";
+import {
+  Send,
+  Copy,
+  Play,
+  Trash2,
+  X,
+  Image as ImageIcon,
+  ChevronDown,
+  ChevronRight,
+} from "lucide-react";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
 import { Prism as SyntaxHighlighter } from "react-syntax-highlighter";
@@ -38,6 +47,8 @@ interface GenerationPlaygroundProps {
   error: string | null;
   copiedMessageIndex: number | null;
   supportsImages: boolean;
+  systemPrompt: string;
+  onSystemPromptChange: (value: string) => void;
   onCurrentMessageChange: (value: string) => void;
   onImageUpload: (event: React.ChangeEvent<HTMLInputElement>) => void;
   onRemoveImage: (index: number) => void;
@@ -58,6 +69,8 @@ const GenerationPlayground: React.FC<GenerationPlaygroundProps> = ({
   error,
   copiedMessageIndex,
   supportsImages,
+  systemPrompt,
+  onSystemPromptChange,
   onCurrentMessageChange,
   onImageUpload,
   onRemoveImage,
@@ -72,6 +85,7 @@ const GenerationPlayground: React.FC<GenerationPlaygroundProps> = ({
   const fileInputRef = useRef<HTMLInputElement>(null);
   const [isHovered, setIsHovered] = useState(false);
   const [copiedCode, setCopiedCode] = useState<string | null>(null);
+  const [isSystemPromptExpanded, setIsSystemPromptExpanded] = useState(false);
 
   const scrollToBottom = () => {
     messagesEndRef.current?.scrollIntoView({ behavior: "smooth" });
@@ -121,6 +135,52 @@ const GenerationPlayground: React.FC<GenerationPlaygroundProps> = ({
 
   return (
     <div className="flex-1 flex flex-col">
+      {/* System Prompt Section */}
+      <div className="border-b border-gray-200 bg-gray-50">
+        <button
+          onClick={() => setIsSystemPromptExpanded(!isSystemPromptExpanded)}
+          className="w-full px-8 py-3 flex items-center justify-between text-left hover:bg-gray-100 transition-colors"
+          aria-expanded={isSystemPromptExpanded}
+          aria-label="Toggle system prompt"
+        >
+          <div className="flex items-center gap-2">
+            {isSystemPromptExpanded ? (
+              <ChevronDown className="w-4 h-4 text-gray-600" />
+            ) : (
+              <ChevronRight className="w-4 h-4 text-gray-600" />
+            )}
+            <span className="text-sm font-medium text-gray-700">
+              System Prompt
+            </span>
+            {systemPrompt.trim() && !isSystemPromptExpanded && (
+              <span className="text-xs text-gray-500 bg-blue-100 px-2 py-0.5 rounded">
+                Active
+              </span>
+            )}
+          </div>
+          <span className="text-xs text-gray-500">
+            {isSystemPromptExpanded ? "Click to collapse" : "Click to expand"}
+          </span>
+        </button>
+
+        {isSystemPromptExpanded && (
+          <div className="px-8 pb-4">
+            <Textarea
+              value={systemPrompt}
+              onChange={(e) => onSystemPromptChange(e.target.value)}
+              placeholder="Enter a system prompt to set the behavior and context for the AI model... (e.g., 'You are a helpful assistant that speaks like a pirate.')"
+              className="text-sm min-h-[100px] resize-y"
+              disabled={isStreaming}
+              aria-label="System prompt input"
+            />
+            <p className="text-xs text-gray-500 mt-2">
+              The system prompt sets the behavior and context for the AI model.
+              It will be sent with every message in this conversation.
+            </p>
+          </div>
+        )}
+      </div>
+
       {/* Messages */}
       <div className="flex-1 overflow-y-auto px-8 py-4 bg-white">
         {messages.length === 0 && !streamingContent ? (
