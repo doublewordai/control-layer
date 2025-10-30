@@ -2,6 +2,7 @@ import React, { useState, useEffect } from "react";
 import { useNavigate, useSearchParams } from "react-router-dom";
 import { Play, ArrowLeft } from "lucide-react";
 import OpenAI from "openai";
+import type { ChatCompletionMessageParam } from "openai/resources/chat/completions";
 import { useModels } from "../../../../api/control-layer";
 import { type ModelType } from "../../../../utils/modelType";
 import type {
@@ -53,6 +54,7 @@ const Playground: React.FC = () => {
   const [error, setError] = useState<string | null>(null);
   const [selectedModel, setSelectedModel] = useState<Model | null>(null);
   const [modelType, setModelType] = useState<ModelType>("chat");
+  const [systemPrompt, setSystemPrompt] = useState("");
   const [textA, setTextA] = useState("");
   const [textB, setTextB] = useState("");
   const [similarityResult, setSimilarityResult] = useState<{
@@ -115,6 +117,7 @@ const Playground: React.FC = () => {
       setError(null);
       setCurrentMessage("");
       setUploadedImages([]);
+      setSystemPrompt("");
       setTextA("");
       setTextB("");
       setQuery("What is the capital of France?");
@@ -396,16 +399,32 @@ const Playground: React.FC = () => {
       console.log("Sending request to model:", selectedModel.alias);
       console.log("Full request URL will be:", `${baseURL}/chat/completions`);
 
+      // Build messages array with optional system prompt
+      const apiMessages: ChatCompletionMessageParam[] = [];
+
+      // Add system prompt if provided
+      if (systemPrompt.trim()) {
+        apiMessages.push({
+          role: "system",
+          content: systemPrompt.trim(),
+        });
+      }
+
+      // Add conversation history
+      messages.forEach((msg) => {
+        apiMessages.push({
+          role: msg.role,
+          content: msg.content,
+        } as ChatCompletionMessageParam);
+      });
+
+      // Add current user message
+      apiMessages.push({ role: "user", content: userMessage.content });
+
       const stream = await openai.chat.completions.create(
         {
           model: selectedModel.alias,
-          messages: [
-            ...(messages.map((msg) => ({
-              role: msg.role,
-              content: msg.content,
-            })) as any),
-            { role: "user" as const, content: userMessage.content },
-          ],
+          messages: apiMessages,
           stream: true,
           stream_options: {
             include_usage: true,
@@ -477,6 +496,7 @@ const Playground: React.FC = () => {
     setRerankResult(null);
     setError(null);
     setUploadedImages([]);
+    setSystemPrompt("");
     setTextA("");
     setTextB("");
     setQuery("What is the capital of France?");
@@ -621,6 +641,8 @@ const Playground: React.FC = () => {
           supportsImages={
             selectedModel.capabilities?.includes("vision") ?? false
           }
+          systemPrompt={systemPrompt}
+          onSystemPromptChange={setSystemPrompt}
           onCurrentMessageChange={setCurrentMessage}
           onImageUpload={handleImageUpload}
           onRemoveImage={handleRemoveImage}
