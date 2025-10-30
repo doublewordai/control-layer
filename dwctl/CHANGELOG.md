@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.5.1](https://github.com/doublewordai/control-layer/compare/v0.5.0...v0.5.1) (2025-10-30)
+
+
+### Bug Fixes
+
+* annoying log line ([65c39c3](https://github.com/doublewordai/control-layer/commit/65c39c31afdedf3d3c2ef448d4de34bc036364f7))
+
 ## [0.5.0](https://github.com/doublewordai/control-layer/compare/v0.4.2...v0.5.0) (2025-10-29)
 
 
