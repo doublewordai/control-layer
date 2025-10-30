@@ -566,27 +566,12 @@ pub async fn build_router(state: &mut AppState, onwards_router: Router) -> anyho
             "/users/{user_id}/groups/{group_id}",
             delete(api::handlers::groups::remove_group_from_user),
         )
-        // Credit management - user endpoints
-        .route(
-            "/users/current/credits/balance",
-            get(api::handlers::credits::get_current_user_balance),
-        )
-        .route(
-            "/users/current/credits/transactions",
-            get(api::handlers::credits::list_current_user_transactions),
-        )
-        // Credit management - admin endpoints (BillingManager only)
-        .route("/users/{user_id}/credits", post(api::handlers::credits::add_user_credits))
-        .route(
-            "/users/{user_id}/credits/balance",
-            get(api::handlers::credits::get_user_balance),
-        )
-        .route(
-            "/users/{user_id}/credits/transactions",
-            get(api::handlers::credits::list_user_transactions),
-        )
-        .route("/credits/balances", get(api::handlers::credits::list_all_user_balances))
-        .route("/credits/transactions", get(api::handlers::credits::list_all_transactions))
+        // Transaction management (RESTful credit transactions)
+        .route("/transactions", post(api::handlers::transactions::create_transaction))
+        .route("/transactions/{transaction_id}", get(api::handlers::transactions::get_transaction))
+        .route("/transactions", get(api::handlers::transactions::list_transactions))
+        // User balance (under users resource)
+        .route("/users/{user_id}/balance", get(api::handlers::users::get_user_balance))
         // Inference endpoints management (admin only for write operations)
         .route("/endpoints", get(api::handlers::inference_endpoints::list_inference_endpoints))
         .route("/endpoints", post(api::handlers::inference_endpoints::create_inference_endpoint))

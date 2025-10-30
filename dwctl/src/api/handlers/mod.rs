@@ -1,10 +1,10 @@
 pub mod api_keys;
 pub mod auth;
 pub mod config;
-pub mod credits;
 pub mod deployments;
 pub mod groups;
 pub mod inference_endpoints;
 pub mod probes;
 pub mod requests;
+pub mod transactions;
 pub mod users;

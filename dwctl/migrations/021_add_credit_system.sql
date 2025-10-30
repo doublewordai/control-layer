@@ -16,7 +16,7 @@ CREATE TABLE credit_transactions (
     -- Transaction details
     transaction_type credit_transaction_type NOT NULL,
     amount DECIMAL(12, 8) NOT NULL,  -- Absolute value of transaction
-    balance_after DECIMAL(12, 8) NOT NULL,  -- Running balance after this transaction
+    balance_after DECIMAL(12, 8) NOT NULL CHECK (balance_after >= 0),  -- Running balance after this transaction, cannot be negative
 
     -- Simple description
     description TEXT,

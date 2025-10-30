@@ -1,14 +1,14 @@
 use crate::{
     api::models::{
         groups::GroupResponse,
-        users::{CurrentUser, ListUsersQuery, UserCreate, UserResponse, UserUpdate},
+        users::{CurrentUser, ListUsersQuery, UserBalanceResponse, UserCreate, UserResponse, UserUpdate},
     },
     auth::permissions::{can_read_all_resources, can_read_own_resource, operation, resource, RequiresPermission},
     db::{
-        handlers::{users::UserFilter, Groups, Repository, Users},
+        handlers::{users::UserFilter, Credits, Groups, Repository, Users},
         models::users::{UserCreateDBRequest, UserUpdateDBRequest},
     },
-    errors::Error,
+    errors::{Error, Result},
     types::{GroupId, Operation, Permission, Resource, UserId, UserIdOrCurrent},
     AppState,
 };
@@ -43,7 +43,7 @@ pub async fn list_users(
     State(state): State<AppState>,
     Query(query): Query<ListUsersQuery>,
     _: RequiresPermission<resource::Users, operation::ReadAll>,
-) -> Result<Json<Vec<UserResponse>>, Error> {
+) -> Result<Json<Vec<UserResponse>>> {
     let mut tx = state.db.begin().await.map_err(|e| Error::Database(e.into()))?;
     let skip = query.skip.unwrap_or(0);
     let limit = query.limit.unwrap_or(100).min(1000);
@@ -128,7 +128,7 @@ pub async fn get_user(
     Path(user_id): Path<UserIdOrCurrent>,
     // Can't use RequiresPermission here because we need conditional logic for own vs other users
     current_user: CurrentUser,
-) -> Result<Json<UserResponse>, Error> {
+) -> Result<Json<UserResponse>> {
     let target_user_id = match user_id {
         UserIdOrCurrent::Current(_) => {
             // Even for /current, verify they have permission to read their own user data
@@ -193,7 +193,7 @@ pub async fn create_user(
     State(state): State<AppState>,
     _: RequiresPermission<resource::Users, operation::CreateAll>,
     Json(user_data): Json<UserCreate>,
-) -> Result<(StatusCode, Json<UserResponse>), Error> {
+) -> Result<(StatusCode, Json<UserResponse>)> {
     // Check admin role
 
     let mut conn = state.db.acquire().await.expect("Failed to acquire database connection");
@@ -231,7 +231,7 @@ pub async fn update_user(
     Path(user_id): Path<UserId>,
     _: RequiresPermission<resource::Users, operation::UpdateAll>,
     Json(user_data): Json<UserUpdate>,
-) -> Result<Json<UserResponse>, Error> {
+) -> Result<Json<UserResponse>> {
     // Check admin role
     let mut conn = state.db.acquire().await.expect("Failed to acquire database connection");
 
@@ -268,7 +268,7 @@ pub async fn delete_user(
     State(state): State<AppState>,
     Path(user_id): Path<UserId>,
     current_user: RequiresPermission<resource::Users, operation::DeleteAll>,
-) -> Result<StatusCode, Error> {
+) -> Result<StatusCode> {
     // Prevent self-deletion
     if user_id == current_user.id {
         return Err(Error::BadRequest {
@@ -287,16 +287,77 @@ pub async fn delete_user(
     }
 }
 
+/// Get user's current credit balance
+#[utoipa::path(
+    get,
+    path = "/users/{user_id}/balance",
+    tag = "users",
+    summary = "Get user's credit balance",
+    description = "Get the current credit balance for a user. Users can access their own balance, BillingManager can access any user's balance.",
+    params(
+        ("user_id" = String, Path, description = "User ID (UUID) or 'current' for the authenticated user"),
+    ),
+    responses(
+        (status = 200, description = "User's current balance", body = UserBalanceResponse),
+        (status = 401, description = "Unauthorized"),
+        (status = 403, description = "Forbidden"),
+        (status = 404, description = "User not found"),
+        (status = 500, description = "Internal server error"),
+    ),
+    security(
+        ("X-Doubleword-User" = [])
+    )
+)]
+pub async fn get_user_balance(
+    State(state): State<AppState>,
+    Path(user_id_param): Path<String>,
+    current_user: CurrentUser,
+) -> Result<Json<UserBalanceResponse>> {
+    // Parse user_id or use current user
+    let user_id = if user_id_param == "current" {
+        current_user.id
+    } else {
+        user_id_param.parse::<UserId>().map_err(|_| Error::BadRequest {
+            message: "Invalid user ID format".to_string(),
+        })?
+    };
+
+    // Check permissions
+    let has_read_all =
+        crate::auth::permissions::has_permission(&current_user, crate::types::Resource::Credits, crate::types::Operation::ReadAll);
+
+    if !has_read_all && user_id != current_user.id {
+        return Err(Error::InsufficientPermissions {
+            required: Permission::Allow(crate::types::Resource::Credits, crate::types::Operation::ReadAll),
+            action: crate::types::Operation::ReadAll,
+            resource: "balance".to_string(),
+        });
+    }
+
+    let mut pool_conn = state.db.acquire().await.map_err(|e| Error::Database(e.into()))?;
+    let mut repo = Credits::new(&mut pool_conn);
+
+    let balance = repo.get_user_balance(user_id).await?;
+
+    Ok(Json(UserBalanceResponse {
+        user_id,
+        current_balance: balance,
+    }))
+}
+
 #[cfg(test)]
 mod tests {
-    use std::collections::HashSet;
-
-    use crate::api::models::users::{Role, UserResponse};
-    use crate::db::handlers::{Groups, Repository};
-    use crate::db::models::groups::GroupCreateDBRequest;
+    use super::*;
+    use crate::api::models::users::Role;
+    use crate::db::handlers::{Credits, Groups, Repository};
+    use crate::db::models::credits::CreditTransactionType;
+    use crate::db::models::{credits::CreditTransactionCreateDBRequest, groups::GroupCreateDBRequest};
     use crate::test_utils::*;
+    use rust_decimal::Decimal;
     use serde_json::json;
     use sqlx::PgPool;
+    use std::collections::HashSet;
+    use std::str::FromStr;
 
     #[sqlx::test]
     #[test_log::test]
@@ -1104,5 +1165,184 @@ mod tests {
         // Backend should have automatically added StandardUser role
         assert_eq!(updated_user.roles.len(), 1);
         assert!(updated_user.roles.contains(&Role::StandardUser));
+    }
+
+    async fn create_initial_credit_transaction(pool: &PgPool, user_id: UserId, amount: &str) -> i64 {
+        let mut conn = pool.acquire().await.expect("Failed to acquire connection");
+        let mut credits_repo = Credits::new(&mut conn);
+
+        let amount_decimal = Decimal::from_str(amount).expect("Invalid decimal amount");
+        let request = CreditTransactionCreateDBRequest {
+            user_id,
+            transaction_type: CreditTransactionType::AdminGrant,
+            amount: amount_decimal,
+            description: Some("Initial credit grant".to_string()),
+        };
+
+        credits_repo
+            .create_transaction(&request)
+            .await
+            .expect("Failed to create transaction")
+            .id
+    }
+
+    // Test: GET /users/{user_id}/balance returns own balance for standard user
+    #[sqlx::test]
+    #[test_log::test]
+    async fn test_get_own_balance_as_standard_user(pool: PgPool) {
+        let (app, _) = create_test_app(pool.clone(), false).await;
+        let user = create_test_user(&pool, Role::StandardUser).await;
+
+        // Add some credits
+        create_initial_credit_transaction(&pool, user.id, "150.0").await;
+
+        let response = app
+            .get(&format!("/admin/api/v1/users/{}/balance", user.id))
+            .add_header(add_auth_headers(&user).0, add_auth_headers(&user).1)
+            .await;
+
+        response.assert_status_ok();
+        let balance: UserBalanceResponse = response.json();
+        assert_eq!(balance.user_id, user.id);
+        assert_eq!(balance.current_balance, Decimal::from_str("150.0").unwrap());
+    }
+
+    // Test: GET /users/current/balance works for standard user
+    #[sqlx::test]
+    #[test_log::test]
+    async fn test_get_current_user_balance(pool: PgPool) {
+        let (app, _) = create_test_app(pool.clone(), false).await;
+        let user = create_test_user(&pool, Role::StandardUser).await;
+
+        // Add some credits
+        create_initial_credit_transaction(&pool, user.id, "125.0").await;
+
+        let response = app
+            .get("/admin/api/v1/users/current/balance")
+            .add_header(add_auth_headers(&user).0, add_auth_headers(&user).1)
+            .await;
+
+        response.assert_status_ok();
+        let balance: UserBalanceResponse = response.json();
+        assert_eq!(balance.user_id, user.id);
+        assert_eq!(balance.current_balance, Decimal::from_str("125.0").unwrap());
+    }
+
+    // Test: GET /users/{other_user_id}/balance returns 403 for standard user
+    #[sqlx::test]
+    #[test_log::test]
+    async fn test_get_other_user_balance_forbidden(pool: PgPool) {
+        let (app, _) = create_test_app(pool.clone(), false).await;
+        let user1 = create_test_user(&pool, Role::StandardUser).await;
+        let user2 = create_test_user(&pool, Role::StandardUser).await;
+
+        let response = app
+            .get(&format!("/admin/api/v1/users/{}/balance", user2.id))
+            .add_header(add_auth_headers(&user1).0, add_auth_headers(&user1).1)
+            .await;
+
+        response.assert_status_forbidden();
+    }
+
+    // Test: GET /users/{user_id}/balance works for own balance as RequestViewer
+    #[sqlx::test]
+    #[test_log::test]
+    async fn test_get_own_balance_as_request_viewer(pool: PgPool) {
+        let (app, _) = create_test_app(pool.clone(), false).await;
+        let user = create_test_user(&pool, Role::RequestViewer).await;
+
+        // Add some credits
+        create_initial_credit_transaction(&pool, user.id, "150.0").await;
+
+        let response = app
+            .get(&format!("/admin/api/v1/users/{}/balance", user.id))
+            .add_header(add_auth_headers(&user).0, add_auth_headers(&user).1)
+            .await;
+
+        response.assert_status_ok();
+        let balance: UserBalanceResponse = response.json();
+        assert_eq!(balance.user_id, user.id);
+        assert_eq!(balance.current_balance, Decimal::from_str("150.0").unwrap());
+    }
+
+    // Test: GET /users/current/balance works for RequestViewer
+    #[sqlx::test]
+    #[test_log::test]
+    async fn test_get_current_user_balance_request_viewer(pool: PgPool) {
+        let (app, _) = create_test_app(pool.clone(), false).await;
+        let user = create_test_user(&pool, Role::RequestViewer).await;
+
+        // Add some credits
+        create_initial_credit_transaction(&pool, user.id, "125.0").await;
+
+        let response = app
+            .get("/admin/api/v1/users/current/balance")
+            .add_header(add_auth_headers(&user).0, add_auth_headers(&user).1)
+            .await;
+
+        response.assert_status_ok();
+        let balance: UserBalanceResponse = response.json();
+        assert_eq!(balance.user_id, user.id);
+        assert_eq!(balance.current_balance, Decimal::from_str("125.0").unwrap());
+    }
+
+    // Test: GET /users/{other_user_id}/balance returns 403 for RequestViewer
+    #[sqlx::test]
+    #[test_log::test]
+    async fn test_get_other_user_balance_forbidden_request_viewer(pool: PgPool) {
+        let (app, _) = create_test_app(pool.clone(), false).await;
+        let user1 = create_test_user(&pool, Role::RequestViewer).await;
+        let user2 = create_test_user(&pool, Role::StandardUser).await;
+
+        let response = app
+            .get(&format!("/admin/api/v1/users/{}/balance", user2.id))
+            .add_header(add_auth_headers(&user1).0, add_auth_headers(&user1).1)
+            .await;
+
+        response.assert_status_forbidden();
+    }
+
+    // Test: PlatformManager can view any user's balance (has ReadAll permission)
+    #[sqlx::test]
+    #[test_log::test]
+    async fn test_platform_manager_can_view_any_balance(pool: PgPool) {
+        let (app, _) = create_test_app(pool.clone(), false).await;
+        let platform_manager = create_test_user(&pool, Role::PlatformManager).await;
+        let user = create_test_user(&pool, Role::StandardUser).await;
+
+        // Add some credits to user
+        create_initial_credit_transaction(&pool, user.id, "300.0").await;
+
+        let response = app
+            .get(&format!("/admin/api/v1/users/{}/balance", user.id))
+            .add_header(add_auth_headers(&platform_manager).0, add_auth_headers(&platform_manager).1)
+            .await;
+
+        response.assert_status_ok();
+        let balance: UserBalanceResponse = response.json();
+        assert_eq!(balance.user_id, user.id);
+        assert_eq!(balance.current_balance, Decimal::from_str("300.0").unwrap());
+    }
+
+    // Test: BillingManager can view any user's balance
+    #[sqlx::test]
+    #[test_log::test]
+    async fn test_billing_manager_can_view_any_balance(pool: PgPool) {
+        let (app, _) = create_test_app(pool.clone(), false).await;
+        let billing_manager = create_test_user(&pool, Role::BillingManager).await;
+        let user = create_test_user(&pool, Role::StandardUser).await;
+
+        // Add some credits to user
+        create_initial_credit_transaction(&pool, user.id, "300.0").await;
+
+        let response = app
+            .get(&format!("/admin/api/v1/users/{}/balance", user.id))
+            .add_header(add_auth_headers(&billing_manager).0, add_auth_headers(&billing_manager).1)
+            .await;
+
+        response.assert_status_ok();
+        let balance: UserBalanceResponse = response.json();
+        assert_eq!(balance.user_id, user.id);
+        assert_eq!(balance.current_balance, Decimal::from_str("300.0").unwrap());
     }
 }

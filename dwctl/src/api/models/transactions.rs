@@ -1,5 +1,7 @@
-use crate::db::models::credits::{CreditTransactionDBResponse, CreditTransactionType, UserCreditBalanceDBResponse};
-use crate::types::UserId;
+use crate::{
+    db::models::credits::{CreditTransactionDBResponse, CreditTransactionType},
+    types::UserId,
+};
 use chrono::{DateTime, Utc};
 use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
@@ -8,6 +10,10 @@ use utoipa::{IntoParams, ToSchema};
 // Request models
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct CreditTransactionCreate {
+    /// User ID (required - UUID format)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[schema(value_type = Option<String>, format = "uuid")]
+    pub user_id: Option<UserId>,
     /// Type of transaction (only admin_grant and admin_removal allowed for admin API)
     pub transaction_type: CreditTransactionType,
     /// Amount of credits (absolute value)
@@ -40,25 +46,18 @@ pub struct CreditTransactionResponse {
     pub created_at: DateTime<Utc>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
-pub struct UserBalanceResponse {
-    /// User ID
-    #[schema(value_type = String, format = "uuid")]
-    pub user_id: UserId,
-    /// Current credit balance
-    #[schema(value_type = f64)]
-    pub current_balance: Decimal,
-}
-
 /// Query parameters for listing transactions
-#[derive(Debug, Deserialize, IntoParams, ToSchema)]
+#[derive(Debug, Deserialize, IntoParams)]
 pub struct ListTransactionsQuery {
+    /// Filter by user ID (optional, BillingManager only for other users)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[param(value_type = Option<String>, format = "uuid")]
+    pub user_id: Option<UserId>,
+
     /// Number of items to skip
-    #[param(default = 0, minimum = 0)]
     pub skip: Option<i64>,
 
     /// Maximum number of items to return
-    #[param(default = 100, minimum = 1, maximum = 1000)]
     pub limit: Option<i64>,
 }
 
@@ -73,15 +72,6 @@ impl From<CreditTransactionDBResponse> for CreditTransactionResponse {
             balance_after: db.balance_after,
             description: db.description,
             created_at: db.created_at,
-        }
-    }
-}
-
-impl From<UserCreditBalanceDBResponse> for UserBalanceResponse {
-    fn from(db: UserCreditBalanceDBResponse) -> Self {
-        Self {
-            user_id: db.user_id,
-            current_balance: db.current_balance,
         }
     }
 }

@@ -262,15 +262,15 @@ pub fn role_has_permission(role: &Role, resource: Resource, operation: Operation
             matches!(
                 (resource, operation),
                 (Resource::Models, Operation::ReadOwn)            // Can read accessible models (filtered by groups)
-                    | (Resource::Endpoints, Operation::ReadOwn)  // Can see own endpoints
-                    | (Resource::Endpoints, Operation::ReadAll)  // Can see all endpoints
+                    | (Resource::Endpoints, Operation::ReadOwn)   // Can see own endpoints
+                    | (Resource::Endpoints, Operation::ReadAll)   // Can see all endpoints
                     | (Resource::ApiKeys, Operation::ReadOwn)     // Can read own API keys
                     | (Resource::ApiKeys, Operation::CreateOwn)   // Can create own API keys
                     | (Resource::ApiKeys, Operation::UpdateOwn)   // Can update own API keys
                     | (Resource::ApiKeys, Operation::DeleteOwn)   // Can delete own API keys
                     | (Resource::Users, Operation::ReadOwn)       // Can read own user data
                     | (Resource::Users, Operation::UpdateOwn)     // Can update own user data
-                    | (Resource::Credits, Operation::ReadOwn)     // Can read own credit balance and transactions
+                    | (Resource::Credits, Operation::ReadOwn) // Can read own credit balance and transactions
             )
         }
         Role::RequestViewer => {
@@ -288,10 +288,7 @@ pub fn role_has_permission(role: &Role, resource: Resource, operation: Operation
         }
         Role::BillingManager => {
             // Billing Manager has full access to credit system only
-            matches!(
-                resource,
-                Resource::Credits
-            )
+            matches!(resource, Resource::Credits)
         }
     }
 }

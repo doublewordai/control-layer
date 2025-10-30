@@ -21,7 +21,6 @@ pub struct CreditTransactionCreateDBRequest {
     pub user_id: UserId,
     pub transaction_type: CreditTransactionType,
     pub amount: Decimal,
-    pub balance_after: Decimal,
     pub description: Option<String>,
 }
 

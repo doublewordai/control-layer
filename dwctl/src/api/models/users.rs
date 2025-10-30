@@ -1,7 +1,8 @@
 use crate::api::models::groups::GroupResponse;
-use crate::db::models::users::UserDBResponse;
+use crate::db::models::{credits::UserCreditBalanceDBResponse, users::UserDBResponse};
 use crate::types::UserId;
 use chrono::{DateTime, Utc};
+use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
 use utoipa::{IntoParams, ToSchema};
 
@@ -127,5 +128,24 @@ impl UserResponse {
     pub fn with_groups(mut self, groups: Vec<GroupResponse>) -> Self {
         self.groups = Some(groups);
         self
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct UserBalanceResponse {
+    /// User ID
+    #[schema(value_type = String, format = "uuid")]
+    pub user_id: UserId,
+    /// Current credit balance
+    #[schema(value_type = f64)]
+    pub current_balance: Decimal,
+}
+
+impl From<UserCreditBalanceDBResponse> for UserBalanceResponse {
+    fn from(db: UserCreditBalanceDBResponse) -> Self {
+        Self {
+            user_id: db.user_id,
+            current_balance: db.current_balance,
+        }
     }
 }
