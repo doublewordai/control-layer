@@ -6,14 +6,14 @@ use chrono::{DateTime, Utc};
 use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
 use utoipa::{IntoParams, ToSchema};
+use uuid::Uuid;
 
 // Request models
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct CreditTransactionCreate {
     /// User ID (required - UUID format)
-    #[serde(skip_serializing_if = "Option::is_none")]
-    #[schema(value_type = Option<String>, format = "uuid")]
-    pub user_id: Option<UserId>,
+    #[schema(value_type = String, format = "uuid")]
+    pub user_id: UserId,
     /// Type of transaction (only admin_grant and admin_removal allowed for admin API)
     pub transaction_type: CreditTransactionType,
     /// Amount of credits (absolute value)
@@ -27,8 +27,8 @@ pub struct CreditTransactionCreate {
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct CreditTransactionResponse {
     /// Transaction ID
-    #[schema(value_type = i64)]
-    pub id: i64,
+    #[schema(value_type = String, format = "uuid")]
+    pub id: Uuid,
     /// User ID
     #[schema(value_type = String, format = "uuid")]
     pub user_id: UserId,

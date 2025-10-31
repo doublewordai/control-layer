@@ -387,6 +387,7 @@ mod tests {
     use sqlx::PgPool;
     use std::collections::HashSet;
     use std::str::FromStr;
+    use uuid::Uuid;
 
     #[sqlx::test]
     #[test_log::test]
@@ -1390,7 +1391,7 @@ mod tests {
         assert!(updated_user.roles.contains(&Role::StandardUser));
     }
 
-    async fn create_initial_credit_transaction(pool: &PgPool, user_id: UserId, amount: &str) -> i64 {
+    async fn create_initial_credit_transaction(pool: &PgPool, user_id: UserId, amount: &str) -> Uuid {
         let mut conn = pool.acquire().await.expect("Failed to acquire connection");
         let mut credits_repo = Credits::new(&mut conn);
 

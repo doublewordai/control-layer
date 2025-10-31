@@ -1,6 +1,6 @@
 use crate::{
     db::{
-        errors::{DbError, Result},
+        errors::Result,
         models::credits::{CreditTransactionCreateDBRequest, CreditTransactionDBResponse, CreditTransactionType},
     },
     types::UserId,
@@ -11,11 +11,12 @@ use serde::{Deserialize, Serialize};
 use sqlx::{Connection, FromRow, PgConnection};
 use std::collections::HashMap;
 use tracing::error;
+use uuid::Uuid;
 
 // Database entity model for credit transaction
 #[derive(Debug, Clone, Serialize, Deserialize, FromRow)]
 pub struct CreditTransaction {
-    pub id: i64,
+    pub id: Uuid,
     pub user_id: UserId,
     #[sqlx(rename = "transaction_type")]
     pub transaction_type: CreditTransactionType,
@@ -178,7 +179,7 @@ impl<'c> Credits<'c> {
     }
 
     /// Get a single transaction by its ID
-    pub async fn get_transaction_by_id(&mut self, transaction_id: i64) -> Result<Option<CreditTransactionDBResponse>> {
+    pub async fn get_transaction_by_id(&mut self, transaction_id: Uuid) -> Result<Option<CreditTransactionDBResponse>> {
         let transaction = sqlx::query_as!(
             CreditTransaction,
             r#"
@@ -199,7 +200,7 @@ impl<'c> Credits<'c> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::api::models::users::Role;
+    use crate::{api::models::users::Role, db::errors::DbError};
     use rust_decimal::Decimal;
     use sqlx::PgPool;
     use std::str::FromStr;
@@ -484,7 +485,7 @@ mod tests {
         }
         // Assert non existent transaction ID returns None
         assert!(credits
-            .get_transaction_by_id(99999999999)
+            .get_transaction_by_id(Uuid::new_v4())
             .await
             .expect("Failed to get transaction by ID 99999999999")
             .is_none())

@@ -10,7 +10,7 @@ CREATE TYPE credit_transaction_type AS ENUM (
 
 -- Credit transactions table - simple ledger of all credit movements
 CREATE TABLE credit_transactions (
-    id BIGSERIAL PRIMARY KEY,
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
 
     -- Transaction details

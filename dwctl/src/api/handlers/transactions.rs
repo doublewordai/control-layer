@@ -18,6 +18,7 @@ use axum::{
     response::Json,
 };
 use rust_decimal::Decimal;
+use uuid::Uuid;
 
 /// Create a new credit transaction
 #[utoipa::path(
@@ -61,17 +62,12 @@ pub async fn create_transaction(
         });
     }
 
-    // Validate user_id is provided
-    let user_id = data.user_id.ok_or_else(|| Error::BadRequest {
-        message: "user_id is required".to_string(),
-    })?;
-
     let mut pool_conn = state.db.acquire().await.map_err(|e| Error::Database(e.into()))?;
     let mut repo = Credits::new(&mut pool_conn);
 
     // Create the transaction
     let db_request = CreditTransactionCreateDBRequest {
-        user_id,
+        user_id: data.user_id,
         transaction_type: data.transaction_type,
         amount: data.amount,
         description: data.description,
@@ -104,7 +100,7 @@ pub async fn create_transaction(
 )]
 pub async fn get_transaction(
     State(state): State<AppState>,
-    Path(transaction_id): Path<i64>,
+    Path(transaction_id): Path<Uuid>,
     current_user: CurrentUser,
 ) -> Result<Json<CreditTransactionResponse>> {
     let mut pool_conn = state.db.acquire().await.map_err(|e| Error::Database(e.into()))?;
@@ -217,7 +213,7 @@ mod tests {
     use sqlx::PgPool;
     use std::str::FromStr;
 
-    async fn create_initial_credit_transaction(pool: &PgPool, user_id: UserId, amount: &str) -> i64 {
+    async fn create_initial_credit_transaction(pool: &PgPool, user_id: UserId, amount: &str) -> Uuid {
         let mut conn = pool.acquire().await.expect("Failed to acquire connection");
         let mut credits_repo = CreditsHandler::new(&mut conn);
 
@@ -544,7 +540,7 @@ mod tests {
         response.assert_status_bad_request();
     }
 
-    // Test: Create transaction validates user_id is provided
+    // Test: Create transaction validates user_id is provided, provides 422
     #[sqlx::test]
     #[test_log::test]
     async fn test_create_transaction_requires_user_id(pool: PgPool) {
@@ -563,7 +559,7 @@ mod tests {
             .json(&transaction_data)
             .await;
 
-        response.assert_status_bad_request();
+        response.assert_status_unprocessable_entity();
     }
 
     // Test: Create transaction checks for insufficient balance on removal

@@ -3,6 +3,7 @@ use chrono::{DateTime, Utc};
 use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
 use utoipa::ToSchema;
+use uuid::Uuid;
 
 /// Credit transaction type enum matching the database enum
 #[derive(Debug, Clone, Serialize, Deserialize, sqlx::Type, PartialEq, ToSchema)]
@@ -27,7 +28,7 @@ pub struct CreditTransactionCreateDBRequest {
 /// Database response for a credit transaction
 #[derive(Debug, Clone)]
 pub struct CreditTransactionDBResponse {
-    pub id: i64,
+    pub id: Uuid,
     pub user_id: UserId,
     pub transaction_type: CreditTransactionType,
     pub amount: Decimal,
