@@ -221,7 +221,7 @@ pub async fn seed_database(sources: &[config::ModelSource], db: &PgPool) -> Resu
         .fetch_optional(&mut *tx)
         .await?;
 
-    if let Some(Some(true)) = seeded {
+    if let Some(true) = seeded {
         info!("Database already seeded, skipping seeding operations");
         tx.commit().await?;
         return Ok(());
@@ -1033,7 +1033,7 @@ mod test {
             .fetch_optional(&pool)
             .await
             .expect("Should be able to query system_config");
-        assert_eq!(initial_seeded, Some(Some(false)), "Initial seeded flag should be false");
+        assert_eq!(initial_seeded, Some(false), "Initial seeded flag should be false");
 
         // First call should seed both endpoints and API key
         super::seed_database(&sources, &pool).await.expect("First seeding should succeed");
@@ -1059,7 +1059,7 @@ mod test {
             .fetch_one(&pool)
             .await
             .expect("Should be able to query seeded flag");
-        assert_eq!(seeded_after_first, Some(true), "Seeded flag should be true after first run");
+        assert!(seeded_after_first, "Seeded flag should be true after first run");
 
         // Manually modify one endpoint and the API key to test non-overwrite behavior
         sqlx::query!("UPDATE inference_endpoints SET url = 'http://modified-url:9999' WHERE name = 'test-endpoint-1'")
