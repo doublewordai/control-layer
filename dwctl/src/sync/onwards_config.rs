@@ -169,7 +169,11 @@ async fn load_targets_from_db(db: &PgPool) -> Result<Targets, anyhow::Error> {
         endpoints = endpoints_repo.get_bulk(models.iter().map(|m| m.hosted_on).collect()).await?;
     }
     let endpoint_urls: HashMap<InferenceEndpointId, String> = endpoints.iter().map(|(k, v)| (*k, v.url.to_string())).collect();
-    let endpoint_api_keys: HashMap<InferenceEndpointId, Option<String>> = endpoints.into_iter().map(|(k, v)| (k, v.api_key)).collect();
+    let endpoint_api_keys: HashMap<InferenceEndpointId, Option<String>> = endpoints.iter().map(|(k, v)| (*k, v.api_key.clone())).collect();
+    let endpoint_auth_header_names: HashMap<InferenceEndpointId, String> =
+        endpoints.iter().map(|(k, v)| (*k, v.auth_header_name.clone())).collect();
+    let endpoint_auth_header_prefixes: HashMap<InferenceEndpointId, String> =
+        endpoints.into_iter().map(|(k, v)| (k, v.auth_header_prefix.clone())).collect();
     let mut deployment_api_keys = HashMap::new();
 
     {
@@ -192,19 +196,35 @@ async fn load_targets_from_db(db: &PgPool) -> Result<Targets, anyhow::Error> {
     debug!("Loaded {} deployments from database", models.len());
 
     // Convert to ConfigFile format
-    let config = convert_to_config_file(models, &deployment_api_keys, &endpoint_urls, &endpoint_api_keys);
+    let config = convert_to_config_file(
+        models,
+        &deployment_api_keys,
+        &endpoint_urls,
+        &endpoint_api_keys,
+        &endpoint_auth_header_names,
+        &endpoint_auth_header_prefixes,
+    );
 
     // Convert ConfigFile to Targets
     Targets::from_config(config)
 }
 
 /// Converts database models to the ConfigFile format expected by onwards
-#[tracing::instrument(skip(models, deployment_api_keys, endpoint_urls, endpoint_api_keys))]
+#[tracing::instrument(skip(
+    models,
+    deployment_api_keys,
+    endpoint_urls,
+    endpoint_api_keys,
+    endpoint_auth_header_names,
+    endpoint_auth_header_prefixes
+))]
 fn convert_to_config_file(
     models: Vec<DeploymentDBResponse>,
     deployment_api_keys: &HashMap<DeploymentId, Vec<ApiKeyDBResponse>>,
     endpoint_urls: &HashMap<InferenceEndpointId, String>,
     endpoint_api_keys: &HashMap<InferenceEndpointId, Option<String>>,
+    endpoint_auth_header_names: &HashMap<InferenceEndpointId, String>,
+    endpoint_auth_header_prefixes: &HashMap<InferenceEndpointId, String>,
 ) -> ConfigFile {
     // Build key_definitions for per-API-key rate limits
     let mut key_definitions = HashMap::new();
@@ -288,6 +308,10 @@ fn convert_to_config_file(
             // Get the API key for this endpoint (for downstream authentication)
             let endpoint_api_key = endpoint_api_keys.get(&model.hosted_on).and_then(|k| k.as_ref());
 
+            // Get the auth header configuration for this endpoint
+            let auth_header_name = endpoint_auth_header_names.get(&model.hosted_on).cloned();
+            let auth_header_prefix = endpoint_auth_header_prefixes.get(&model.hosted_on).cloned();
+
             // Build rate limiting parameters if configured
             let rate_limit = match (model.requests_per_second, model.burst_size) {
                 (Some(rps), burst) if rps > 0.0 => {
@@ -309,12 +333,18 @@ fn convert_to_config_file(
             };
 
             // Build target spec with all parameters
+            // Only set custom auth headers if they differ from defaults
+            let upstream_auth_header_name = auth_header_name.and_then(|name| if name != "Authorization" { Some(name) } else { None });
+            let upstream_auth_header_prefix = auth_header_prefix.and_then(|prefix| if prefix != "Bearer " { Some(prefix) } else { None });
+
             let target_spec = TargetSpec {
                 url,
                 keys,
                 onwards_key: endpoint_api_key.cloned(),
                 onwards_model: Some(model.model_name.clone()),
                 rate_limit,
+                upstream_auth_header_name,
+                upstream_auth_header_prefix,
             };
 
             Some((model.alias, target_spec))
@@ -389,8 +419,37 @@ mod tests {
         // Create endpoint API keys
         let endpoint_api_keys = HashMap::new();
 
+        // Create endpoint auth header names (using defaults)
+        let mut endpoint_auth_header_names = HashMap::new();
+        endpoint_auth_header_names.insert(
+            Uuid::parse_str("00000000-0000-0000-0000-000000000001").unwrap(),
+            "Authorization".to_string(),
+        );
+        endpoint_auth_header_names.insert(
+            Uuid::parse_str("00000000-0000-0000-0000-000000000002").unwrap(),
+            "Authorization".to_string(),
+        );
+
+        // Create endpoint auth header prefixes (using defaults)
+        let mut endpoint_auth_header_prefixes = HashMap::new();
+        endpoint_auth_header_prefixes.insert(
+            Uuid::parse_str("00000000-0000-0000-0000-000000000001").unwrap(),
+            "Bearer ".to_string(),
+        );
+        endpoint_auth_header_prefixes.insert(
+            Uuid::parse_str("00000000-0000-0000-0000-000000000002").unwrap(),
+            "Bearer ".to_string(),
+        );
+
         let models = vec![model1.clone(), model2.clone()];
-        let config = convert_to_config_file(models, &deployment_api_keys, &endpoint_urls, &endpoint_api_keys);
+        let config = convert_to_config_file(
+            models,
+            &deployment_api_keys,
+            &endpoint_urls,
+            &endpoint_api_keys,
+            &endpoint_auth_header_names,
+            &endpoint_auth_header_prefixes,
+        );
 
         // Verify the config
         assert_eq!(config.targets.len(), 2);
@@ -431,8 +490,30 @@ mod tests {
 
         let deployment_api_keys = HashMap::new();
         let endpoint_api_keys = HashMap::new();
+
+        // Create endpoint auth header names (using defaults)
+        let mut endpoint_auth_header_names = HashMap::new();
+        endpoint_auth_header_names.insert(
+            Uuid::parse_str("00000000-0000-0000-0000-000000000001").unwrap(),
+            "Authorization".to_string(),
+        );
+
+        // Create endpoint auth header prefixes (using defaults)
+        let mut endpoint_auth_header_prefixes = HashMap::new();
+        endpoint_auth_header_prefixes.insert(
+            Uuid::parse_str("00000000-0000-0000-0000-000000000001").unwrap(),
+            "Bearer ".to_string(),
+        );
+
         let models = vec![model1, model2];
-        let config = convert_to_config_file(models, &deployment_api_keys, &endpoint_urls, &endpoint_api_keys);
+        let config = convert_to_config_file(
+            models,
+            &deployment_api_keys,
+            &endpoint_urls,
+            &endpoint_api_keys,
+            &endpoint_auth_header_names,
+            &endpoint_auth_header_prefixes,
+        );
 
         // Should only have the valid model
         assert_eq!(config.targets.len(), 1);

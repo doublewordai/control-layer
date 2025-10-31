@@ -566,8 +566,17 @@ export function useExecuteProbe() {
 export function useTestProbe() {
   return useMutation({
     mutationKey: ["probes", "test"],
-    mutationFn: ({ deploymentId, params }: { deploymentId: string; params?: { http_method?: string; request_path?: string; request_body?: Record<string, unknown> } }) =>
-      dwctlApi.probes.test(deploymentId, params),
+    mutationFn: ({
+      deploymentId,
+      params,
+    }: {
+      deploymentId: string;
+      params?: {
+        http_method?: string;
+        request_path?: string;
+        request_body?: Record<string, unknown>;
+      };
+    }) => dwctlApi.probes.test(deploymentId, params),
   });
 }
 
@@ -576,16 +585,18 @@ export function useUpdateProbe() {
 
   return useMutation({
     mutationKey: ["probes", "update"],
-    mutationFn: ({ id, data }: {
+    mutationFn: ({
+      id,
+      data,
+    }: {
       id: string;
       data: {
         interval_seconds?: number;
         http_method?: string;
         request_path?: string | null;
         request_body?: Record<string, any> | null;
-      }
-    }) =>
-      dwctlApi.probes.update(id, data),
+      };
+    }) => dwctlApi.probes.update(id, data),
     onSuccess: (_, variables) => {
       queryClient.invalidateQueries({ queryKey: ["probes"] });
       queryClient.invalidateQueries({ queryKey: ["probes", variables.id] });

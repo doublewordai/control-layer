@@ -40,7 +40,13 @@ import { Input } from "../../../ui/input";
 import { Textarea } from "../../../ui/textarea";
 import { Badge } from "../../../ui/badge";
 import { Popover, PopoverContent, PopoverTrigger } from "../../../ui/popover";
-import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "../../../ui/select";
+import {
+  Select,
+  SelectContent,
+  SelectItem,
+  SelectTrigger,
+  SelectValue,
+} from "../../../ui/select";
 import { toast } from "sonner";
 import { ProbeTimeline } from "./ProbeTimeline";
 
@@ -90,7 +96,13 @@ const ModelProbes: React.FC<ModelProbesProps> = ({ model }) => {
 
   const handleTestProbe = async () => {
     // Build test parameters
-    let params: { http_method?: string; request_path?: string; request_body?: Record<string, unknown> } | undefined;
+    let params:
+      | {
+          http_method?: string;
+          request_path?: string;
+          request_body?: Record<string, unknown>;
+        }
+      | undefined;
 
     if (pingType === "custom") {
       // Validate and parse custom body if provided
@@ -112,7 +124,10 @@ const ModelProbes: React.FC<ModelProbesProps> = ({ model }) => {
     }
 
     try {
-      const result = await testProbeMutation.mutateAsync({ deploymentId: model.id, params });
+      const result = await testProbeMutation.mutateAsync({
+        deploymentId: model.id,
+        params,
+      });
       setTestResult(result);
       setTestPassed(result.success);
       if (result.success) {
@@ -421,28 +436,38 @@ const ModelProbes: React.FC<ModelProbesProps> = ({ model }) => {
             <div className="space-y-6">
               {/* Ping Type Selection */}
               <div>
-                <h3 className="text-sm font-medium mb-3">Step 1: Configure Probe Type</h3>
+                <h3 className="text-sm font-medium mb-3">
+                  Step 1: Configure Probe Type
+                </h3>
                 <div className="space-y-4">
                   <div>
                     <label className="text-sm font-medium mb-2 block">
                       Ping Type
                     </label>
-                    <Select value={pingType} onValueChange={(value: "default" | "custom") => {
-                      setPingType(value);
-                      // Reset test when changing ping type
-                      setTestResult(null);
-                      setTestPassed(false);
-                    }}>
+                    <Select
+                      value={pingType}
+                      onValueChange={(value: "default" | "custom") => {
+                        setPingType(value);
+                        // Reset test when changing ping type
+                        setTestResult(null);
+                        setTestPassed(false);
+                      }}
+                    >
                       <SelectTrigger>
                         <SelectValue />
                       </SelectTrigger>
                       <SelectContent>
-                        <SelectItem value="default">Default (based on model type)</SelectItem>
-                        <SelectItem value="custom">Custom (specify path and body)</SelectItem>
+                        <SelectItem value="default">
+                          Default (based on model type)
+                        </SelectItem>
+                        <SelectItem value="custom">
+                          Custom (specify path and body)
+                        </SelectItem>
                       </SelectContent>
                     </Select>
                     <p className="text-xs text-gray-500 mt-1">
-                      Use default to automatically probe based on model type, or custom to specify your own request
+                      Use default to automatically probe based on model type, or
+                      custom to specify your own request
                     </p>
                   </div>
 
@@ -453,11 +478,14 @@ const ModelProbes: React.FC<ModelProbesProps> = ({ model }) => {
                         <label className="text-sm font-medium mb-2 block">
                           HTTP Method
                         </label>
-                        <Select value={httpMethod} onValueChange={(value) => {
-                          setHttpMethod(value);
-                          setTestResult(null);
-                          setTestPassed(false);
-                        }}>
+                        <Select
+                          value={httpMethod}
+                          onValueChange={(value) => {
+                            setHttpMethod(value);
+                            setTestResult(null);
+                            setTestPassed(false);
+                          }}
+                        >
                           <SelectTrigger>
                             <SelectValue />
                           </SelectTrigger>
@@ -486,7 +514,8 @@ const ModelProbes: React.FC<ModelProbesProps> = ({ model }) => {
                           }}
                         />
                         <p className="text-xs text-gray-500 mt-1">
-                          Path to append to endpoint URL (e.g., /v1/chat/completions)
+                          Path to append to endpoint URL (e.g.,
+                          /v1/chat/completions)
                         </p>
                       </div>
 
@@ -518,7 +547,9 @@ const ModelProbes: React.FC<ModelProbesProps> = ({ model }) => {
               <div>
                 <div className="flex items-center justify-between mb-4">
                   <div>
-                    <h3 className="text-sm font-medium mb-1">Step 2: Test Connection</h3>
+                    <h3 className="text-sm font-medium mb-1">
+                      Step 2: Test Connection
+                    </h3>
                     <p className="text-sm text-gray-600">
                       Verify that the endpoint is accessible with these settings
                     </p>
@@ -587,7 +618,9 @@ const ModelProbes: React.FC<ModelProbesProps> = ({ model }) => {
 
               {/* Configuration Section */}
               <div>
-                <h3 className="text-sm font-medium mb-3">Step 3: Set Interval</h3>
+                <h3 className="text-sm font-medium mb-3">
+                  Step 3: Set Interval
+                </h3>
                 <div className="space-y-4">
                   <div>
                     <label className="text-sm font-medium mb-2 block">
@@ -597,7 +630,9 @@ const ModelProbes: React.FC<ModelProbesProps> = ({ model }) => {
                       type="number"
                       min="10"
                       value={intervalSeconds}
-                      onChange={(e) => setIntervalSeconds(parseInt(e.target.value))}
+                      onChange={(e) =>
+                        setIntervalSeconds(parseInt(e.target.value))
+                      }
                       disabled={!testPassed}
                     />
                     <p className="text-xs text-gray-500 mt-1">

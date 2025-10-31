@@ -159,9 +159,7 @@ const ModelInfo: React.FC = () => {
   // Initialize form data when model is loaded
   useEffect(() => {
     if (model) {
-      const effectiveType =
-        model.model_type ||
-        "CHAT";
+      const effectiveType = model.model_type || "CHAT";
 
       setUpdateData({
         alias: model.alias,
@@ -215,9 +213,7 @@ const ModelInfo: React.FC = () => {
   // Model details form handlers
   const handleModelDetailsCancel = () => {
     if (model) {
-      const effectiveType =
-        model.model_type ||
-        "CHAT";
+      const effectiveType = model.model_type || "CHAT";
       setUpdateData({
         alias: model.alias,
         description: model.description || "",
