@@ -45,16 +45,6 @@ pub async fn create_transaction(
     _perm: RequiresPermission<resource::Credits, operation::CreateAll>,
     Json(data): Json<CreditTransactionCreate>,
 ) -> Result<(StatusCode, Json<CreditTransactionResponse>)> {
-    // Validate that only admin_grant or admin_removal are allowed
-    if !matches!(
-        data.transaction_type,
-        CreditTransactionType::AdminGrant | CreditTransactionType::AdminRemoval
-    ) {
-        return Err(Error::BadRequest {
-            message: "Only 'admin_grant' and 'admin_removal' transaction types are allowed for this endpoint".to_string(),
-        });
-    }
-
     // Validate amount is positive
     if data.amount <= Decimal::ZERO {
         return Err(Error::BadRequest {
@@ -68,7 +58,7 @@ pub async fn create_transaction(
     // Create the transaction
     let db_request = CreditTransactionCreateDBRequest {
         user_id: data.user_id,
-        transaction_type: data.transaction_type,
+        transaction_type: CreditTransactionType::from(&data.transaction_type),
         amount: data.amount,
         description: data.description,
     };
@@ -490,10 +480,10 @@ mod tests {
         assert!(transactions.iter().all(|t| t.user_id == user1.id));
     }
 
-    // Test: Create transaction validates amount > 0
+    // Test: Create transaction validates amount > 0 (zero amount)
     #[sqlx::test]
     #[test_log::test]
-    async fn test_create_transaction_validates_amount(pool: PgPool) {
+    async fn test_create_transaction_validates_amount_zero(pool: PgPool) {
         let (app, _) = create_test_app(pool.clone(), false).await;
         let billing_manager = create_test_user(&pool, Role::BillingManager).await;
         let user = create_test_user(&pool, Role::StandardUser).await;
@@ -503,7 +493,7 @@ mod tests {
             "user_id": user.id.to_string(),
             "transaction_type": "admin_grant",
             "amount": "0",
-            "description": "Invalid amount"
+            "description": "Invalid zero amount"
         });
 
         let response = app
@@ -515,7 +505,32 @@ mod tests {
         response.assert_status_bad_request();
     }
 
-    // Test: Create transaction validates transaction type
+    // Test: Create transaction validates amount > 0 (negative amount)
+    #[sqlx::test]
+    #[test_log::test]
+    async fn test_create_transaction_validates_amount_negative(pool: PgPool) {
+        let (app, _) = create_test_app(pool.clone(), false).await;
+        let billing_manager = create_test_user(&pool, Role::BillingManager).await;
+        let user = create_test_user(&pool, Role::StandardUser).await;
+
+        // Try negative amount
+        let transaction_data = json!({
+            "user_id": user.id.to_string(),
+            "transaction_type": "admin_grant",
+            "amount": "-50.0",
+            "description": "Invalid negative amount"
+        });
+
+        let response = app
+            .post("/admin/api/v1/transactions")
+            .add_header(add_auth_headers(&billing_manager).0, add_auth_headers(&billing_manager).1)
+            .json(&transaction_data)
+            .await;
+
+        response.assert_status_bad_request();
+    }
+
+    // Test: Create transaction validates transaction type (rejects invalid types at deserialization)
     #[sqlx::test]
     #[test_log::test]
     async fn test_create_transaction_validates_type(pool: PgPool) {
@@ -523,7 +538,7 @@ mod tests {
         let billing_manager = create_test_user(&pool, Role::BillingManager).await;
         let user = create_test_user(&pool, Role::StandardUser).await;
 
-        // Try invalid transaction type (usage/purchase not allowed)
+        // Try invalid transaction type (usage/purchase not allowed in API model)
         let transaction_data = json!({
             "user_id": user.id.to_string(),
             "transaction_type": "usage",
@@ -537,7 +552,8 @@ mod tests {
             .json(&transaction_data)
             .await;
 
-        response.assert_status_bad_request();
+        // Returns 422 Unprocessable Entity because serde can't deserialize invalid enum value
+        response.assert_status(axum::http::StatusCode::UNPROCESSABLE_ENTITY);
     }
 
     // Test: Create transaction validates user_id is provided, provides 422

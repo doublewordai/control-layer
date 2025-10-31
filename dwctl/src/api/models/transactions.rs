@@ -8,6 +8,23 @@ use serde::{Deserialize, Serialize};
 use utoipa::{IntoParams, ToSchema};
 use uuid::Uuid;
 
+// Subset of the DB Transaction Type enum for API use as only admin transactions are allowed here
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum TransactionType {
+    AdminGrant,
+    AdminRemoval,
+}
+
+impl From<&TransactionType> for CreditTransactionType {
+    fn from(tx_type: &TransactionType) -> Self {
+        match tx_type {
+            TransactionType::AdminGrant => CreditTransactionType::AdminGrant,
+            TransactionType::AdminRemoval => CreditTransactionType::AdminRemoval,
+        }
+    }
+}
+
 // Request models
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct CreditTransactionCreate {
@@ -15,7 +32,7 @@ pub struct CreditTransactionCreate {
     #[schema(value_type = String, format = "uuid")]
     pub user_id: UserId,
     /// Type of transaction (only admin_grant and admin_removal allowed for admin API)
-    pub transaction_type: CreditTransactionType,
+    pub transaction_type: TransactionType,
     /// Amount of credits (absolute value)
     #[schema(value_type = f64)]
     pub amount: Decimal,
