@@ -563,6 +563,7 @@ export interface TransactionsQuery {
   model?: string;
   start_date?: string; // ISO 8601 timestamp
   end_date?: string; // ISO 8601 timestamp
+  userId?: string; // Filter transactions by user
 }
 
 export interface AddCreditsRequest {

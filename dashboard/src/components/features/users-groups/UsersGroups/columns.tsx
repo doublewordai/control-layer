@@ -7,6 +7,7 @@ import {
   Edit2,
   Users,
   Trash2,
+  Receipt,
 } from "lucide-react";
 import { Button } from "../../../ui/button";
 import { Checkbox } from "../../../ui/checkbox";
@@ -25,6 +26,7 @@ interface UserColumnActions {
   onEdit: (user: DisplayUser) => void;
   onDelete: (user: DisplayUser) => void;
   onManageGroups: (user: DisplayUser) => void;
+  onViewTransactions: (user: DisplayUser) => void;
   groups: DisplayGroup[];
 }
 
@@ -186,6 +188,10 @@ export const createUserColumns = (
             <DropdownMenuItem onClick={() => actions.onManageGroups(user)}>
               <Users className="mr-2 h-4 w-4" />
               Manage Groups
+            </DropdownMenuItem>
+            <DropdownMenuItem onClick={() => actions.onViewTransactions(user)}>
+              <Receipt className="mr-2 h-4 w-4" />
+              View Transactions
             </DropdownMenuItem>
             <DropdownMenuSeparator />
             <DropdownMenuItem

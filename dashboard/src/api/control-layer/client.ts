@@ -600,6 +600,7 @@ const costApi = {
     if (query?.model) params.set("model", query.model);
     if (query?.start_date) params.set("start_date", query.start_date);
     if (query?.end_date) params.set("end_date", query.end_date);
+    if (query?.userId) params.set("user_id", query.userId);
 
     const url = `/admin/api/v1/credits/transactions${params.toString() ? "?" + params.toString() : ""}`;
     const response = await fetch(url);

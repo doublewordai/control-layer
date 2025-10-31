@@ -15,8 +15,12 @@ services:
       retries: 10
 
   control-layer:
-    image: ${IMAGE:-ghcr.io/doublewordai/control-layer:${TAG:-latest}}
-    pull_policy: ${PULL_POLICY:-always}
+    # image: ${IMAGE:-ghcr.io/doublewordai/control-layer:${TAG:-latest}}
+    # pull_policy: ${PULL_POLICY:-always}
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: dev
     ports:
       - "3001:3001"
     environment:
@@ -32,6 +36,20 @@ services:
       interval: 100s
       timeout: 3s
       retries: 10
+
+  control-layer-frontend:
+    build:
+      context: ./dashboard
+      dockerfile: Dockerfile
+    ports:
+      - "5173:5173"
+    environment:
+      - BACKEND_URL=http://control-layer:3001
+    volumes:
+      - ./dashboard:/app
+      - /app/node_modules
+    depends_on:
+      - control-layer
 
 volumes:
   postgres_data:
