@@ -11,6 +11,8 @@ pub struct InferenceEndpointCreateDBRequest {
     pub url: Url,
     pub api_key: Option<String>,
     pub model_filter: Option<Vec<String>>,
+    pub auth_header_name: Option<String>,
+    pub auth_header_prefix: Option<String>,
 }
 
 /// Database request for updating an inference endpoint
@@ -21,6 +23,8 @@ pub struct InferenceEndpointUpdateDBRequest {
     pub url: Option<Url>,
     pub api_key: Option<Option<String>>,
     pub model_filter: Option<Option<Vec<String>>>,
+    pub auth_header_name: Option<String>,
+    pub auth_header_prefix: Option<String>,
 }
 
 /// Database response for an inference endpoint
@@ -32,6 +36,8 @@ pub struct InferenceEndpointDBResponse {
     pub url: Url,
     pub api_key: Option<String>,
     pub model_filter: Option<Vec<String>>,
+    pub auth_header_name: String,
+    pub auth_header_prefix: String,
     pub created_by: UserId,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,

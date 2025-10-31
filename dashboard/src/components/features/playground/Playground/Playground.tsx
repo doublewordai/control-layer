@@ -152,9 +152,7 @@ const Playground: React.FC = () => {
     const model = models.find((m) => m.alias === modelId);
     if (model) {
       setSelectedModel(model);
-      setModelType(
-        (model.model_type?.toLowerCase() as ModelType) || "chat",
-      );
+      setModelType((model.model_type?.toLowerCase() as ModelType) || "chat");
       navigate(`/playground?model=${encodeURIComponent(modelId)}`);
     }
   };
@@ -434,7 +432,8 @@ const Playground: React.FC = () => {
           const apiMessagesB: ChatCompletionMessageParam[] = [];
 
           // Add system prompt if provided (use Model B's system prompt if in comparison mode, otherwise use shared)
-          const systemPromptB = systemPromptModelB.trim() || systemPrompt.trim();
+          const systemPromptB =
+            systemPromptModelB.trim() || systemPrompt.trim();
           if (systemPromptB) {
             apiMessagesB.push({
               role: "system",
@@ -502,9 +501,10 @@ const Playground: React.FC = () => {
             totalTime: totalTimeB,
             totalTokens: totalTokensB || chunkCountB,
             inputTokens: inputTokensB || undefined,
-            tokensPerSecond: totalTokensB && totalTimeB > 0
-              ? (totalTokensB / (totalTimeB / 1000))
-              : undefined,
+            tokensPerSecond:
+              totalTokensB && totalTimeB > 0
+                ? totalTokensB / (totalTimeB / 1000)
+                : undefined,
           };
 
           const assistantMessageB: Message = {
@@ -612,9 +612,10 @@ const Playground: React.FC = () => {
         totalTime,
         totalTokens: totalTokens || chunkCount, // Fallback to chunk count if no usage info
         inputTokens: inputTokens || undefined,
-        tokensPerSecond: totalTokens && totalTime > 0
-          ? (totalTokens / (totalTime / 1000))
-          : undefined,
+        tokensPerSecond:
+          totalTokens && totalTime > 0
+            ? totalTokens / (totalTime / 1000)
+            : undefined,
       };
 
       // Add the complete assistant message
@@ -642,11 +643,7 @@ const Playground: React.FC = () => {
 
   // Handler for sending messages to Model B in split input mode
   const handleSendMessageModelB = async () => {
-    if (
-      !currentMessageModelB.trim() ||
-      isStreamingModelB ||
-      !comparisonModel
-    )
+    if (!currentMessageModelB.trim() || isStreamingModelB || !comparisonModel)
       return;
 
     const userMessage: Message = {
@@ -743,9 +740,10 @@ const Playground: React.FC = () => {
         totalTime,
         totalTokens: totalTokens || chunkCount,
         inputTokens: inputTokens || undefined,
-        tokensPerSecond: totalTokens && totalTime > 0
-          ? (totalTokens / (totalTime / 1000))
-          : undefined,
+        tokensPerSecond:
+          totalTokens && totalTime > 0
+            ? totalTokens / (totalTime / 1000)
+            : undefined,
       };
 
       const assistantMessage: Message = {
@@ -759,7 +757,11 @@ const Playground: React.FC = () => {
       setStreamingContentModelB("");
     } catch (err) {
       console.error("Error sending message to Model B:", err);
-      setError(err instanceof Error ? err.message : "Failed to send message to Model B");
+      setError(
+        err instanceof Error
+          ? err.message
+          : "Failed to send message to Model B",
+      );
     } finally {
       setIsStreamingModelB(false);
       setAbortControllerModelB(null);
@@ -826,7 +828,7 @@ const Playground: React.FC = () => {
 
   const handleCopyMessagesToModelB = () => {
     // Copy messages but exclude metrics since they're model-specific
-    const messagesWithoutMetrics = messages.map(msg => ({
+    const messagesWithoutMetrics = messages.map((msg) => ({
       ...msg,
       metrics: undefined,
     }));
@@ -836,7 +838,7 @@ const Playground: React.FC = () => {
 
   const handleCopyMessagesToModelA = () => {
     // Copy messages but exclude metrics since they're model-specific
-    const messagesWithoutMetrics = messagesModelB.map(msg => ({
+    const messagesWithoutMetrics = messagesModelB.map((msg) => ({
       ...msg,
       metrics: undefined,
     }));
@@ -927,7 +929,10 @@ const Playground: React.FC = () => {
               <>
                 {!isComparisonMode ? (
                   <Select onValueChange={handleComparisonModelSelect}>
-                    <SelectTrigger className="w-[160px]" aria-label="Compare with">
+                    <SelectTrigger
+                      className="w-[160px]"
+                      aria-label="Compare with"
+                    >
                       <GitCompare className="w-4 h-4 mr-2" />
                       <SelectValue placeholder="Compare..." />
                     </SelectTrigger>
@@ -936,7 +941,8 @@ const Playground: React.FC = () => {
                         .filter(
                           (model) =>
                             model.alias !== selectedModel.alias &&
-                            (model.model_type?.toLowerCase() as ModelType) === "chat"
+                            (model.model_type?.toLowerCase() as ModelType) ===
+                              "chat",
                         )
                         .map((model) => (
                           <SelectItem key={model.id} value={model.alias}>
@@ -949,7 +955,9 @@ const Playground: React.FC = () => {
                   <div className="flex items-center gap-2">
                     <div className="text-sm text-gray-600 flex items-center gap-2 bg-gray-100 rounded-lg px-3 py-2">
                       <GitCompare className="w-4 h-4" />
-                      <span className="font-medium">{comparisonModel?.alias}</span>
+                      <span className="font-medium">
+                        {comparisonModel?.alias}
+                      </span>
                     </div>
                     <Button
                       variant="ghost"
