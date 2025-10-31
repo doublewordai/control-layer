@@ -54,6 +54,8 @@ pub struct UserResponse {
     #[serde(skip_serializing_if = "Option::is_none")]
     #[schema(no_recursion)]
     pub groups: Option<Vec<GroupResponse>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub credit_balances: Option<f64>,
 }
 
 /// Query parameters for listing users
@@ -117,8 +119,9 @@ impl From<UserDBResponse> for UserResponse {
             created_at: db.created_at,
             updated_at: db.updated_at,
             auth_source: db.auth_source,
-            last_login: None, // UserDBResponse doesn't have last_login
-            groups: None,     // By default, relationships are not included
+            last_login: None,      // UserDBResponse doesn't have last_login
+            groups: None,          // By default, relationships are not included
+            credit_balances: None, // By default, credit balances are not included
         }
     }
 }
@@ -127,6 +130,12 @@ impl UserResponse {
     /// Create a response with groups included
     pub fn with_groups(mut self, groups: Vec<GroupResponse>) -> Self {
         self.groups = Some(groups);
+        self
+    }
+
+    /// Create a response with credit balance included
+    pub fn with_credit_balance(mut self, balance: f64) -> Self {
+        self.credit_balances = Some(balance);
         self
     }
 }

@@ -1,14 +1,16 @@
 use crate::{
     db::{
-        errors::Result,
+        errors::{DbError, Result},
         models::credits::{CreditTransactionCreateDBRequest, CreditTransactionDBResponse, CreditTransactionType},
     },
     types::UserId,
 };
 use chrono::{DateTime, Utc};
-use rust_decimal::Decimal;
+use rust_decimal::{prelude::ToPrimitive, Decimal};
 use serde::{Deserialize, Serialize};
 use sqlx::{Connection, FromRow, PgConnection};
+use std::collections::HashMap;
+use tracing::error;
 
 // Database entity model for credit transaction
 #[derive(Debug, Clone, Serialize, Deserialize, FromRow)]
@@ -86,6 +88,33 @@ impl<'c> Credits<'c> {
     pub async fn get_user_balance(&mut self, user_id: UserId) -> Result<Decimal> {
         let balance = Self::get_user_current_balance_internal(&mut *self.db, user_id).await?;
         Ok(balance)
+    }
+
+    pub async fn get_users_balances_bulk(&mut self, user_ids: &[UserId]) -> Result<HashMap<UserId, f64>> {
+        let rows = sqlx::query!(
+            r#"
+            SELECT DISTINCT ON (user_id) user_id, balance_after
+            FROM credit_transactions
+            WHERE user_id = ANY($1)
+            ORDER BY user_id, created_at DESC, id DESC
+            "#,
+            user_ids
+        )
+        .fetch_all(&mut *self.db)
+        .await?;
+
+        let mut balances_map = HashMap::new();
+        for row in rows {
+            balances_map.insert(
+                row.user_id,
+                row.balance_after.to_f64().unwrap_or_else(|| {
+                    error!("Failed to convert balance to f64 for user_id {}", row.user_id);
+                    0.0
+                }),
+            );
+        }
+
+        Ok(balances_map)
     }
 
     /// Internal helper to get current balance within an existing transaction
@@ -171,7 +200,6 @@ impl<'c> Credits<'c> {
 mod tests {
     use super::*;
     use crate::api::models::users::Role;
-    use crate::db::errors::DbError;
     use rust_decimal::Decimal;
     use sqlx::PgPool;
     use std::str::FromStr;
