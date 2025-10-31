@@ -5,9 +5,9 @@ use serde::{Deserialize, Serialize};
 use utoipa::ToSchema;
 use uuid::Uuid;
 
-/// Credit transaction type enum matching the database enum
+/// Credit transaction type enum stored as TEXT in database
 #[derive(Debug, Clone, Serialize, Deserialize, sqlx::Type, PartialEq, ToSchema)]
-#[sqlx(type_name = "credit_transaction_type", rename_all = "snake_case")]
+#[sqlx(type_name = "text", rename_all = "snake_case")]
 #[serde(rename_all = "snake_case")]
 pub enum CreditTransactionType {
     Purchase,

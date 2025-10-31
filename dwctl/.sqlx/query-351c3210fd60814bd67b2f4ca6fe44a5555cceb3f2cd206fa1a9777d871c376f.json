@@ -16,19 +16,7 @@
       {
         "ordinal": 2,
         "name": "transaction_type: CreditTransactionType",
-        "type_info": {
-          "Custom": {
-            "name": "credit_transaction_type",
-            "kind": {
-              "Enum": [
-                "purchase",
-                "admin_grant",
-                "admin_removal",
-                "usage"
-              ]
-            }
-          }
-        }
+        "type_info": "Text"
       },
       {
         "ordinal": 3,
@@ -54,19 +42,7 @@
     "parameters": {
       "Left": [
         "Uuid",
-        {
-          "Custom": {
-            "name": "credit_transaction_type",
-            "kind": {
-              "Enum": [
-                "purchase",
-                "admin_grant",
-                "admin_removal",
-                "usage"
-              ]
-            }
-          }
-        },
+        "Text",
         "Numeric",
         "Numeric",
         "Text"

@@ -1,20 +1,12 @@
 -- Add credit system for billing and usage tracking
 
--- Create transaction type enum
-CREATE TYPE credit_transaction_type AS ENUM (
-    'purchase',          -- User purchased credits (positive)
-    'admin_grant',       -- Admin granted credits (positive)
-    'admin_removal',     -- Admin removal of credits (negative)
-    'usage'              -- Credits used for API request (negative)
-);
-
 -- Credit transactions table - simple ledger of all credit movements
 CREATE TABLE credit_transactions (
     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
 
     -- Transaction details
-    transaction_type credit_transaction_type NOT NULL,
+    transaction_type TEXT NOT NULL CHECK (transaction_type IN ('purchase', 'admin_grant', 'admin_removal', 'usage')),
     amount DECIMAL(12, 8) NOT NULL,  -- Absolute value of transaction
     balance_after DECIMAL(12, 8) NOT NULL CHECK (balance_after >= 0),  -- Running balance after this transaction, cannot be negative
 
