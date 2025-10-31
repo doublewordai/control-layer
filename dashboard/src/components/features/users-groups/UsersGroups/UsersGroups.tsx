@@ -8,6 +8,7 @@ import {
   useDeleteGroup,
   type Group as BackendGroup,
 } from "../../../../api/control-layer";
+import { useSettings } from "../../../../contexts";
 import {
   CreateUserModal,
   CreateGroupModal,
@@ -57,6 +58,7 @@ const getGroupColor = (_groupId: string, index: number): string => {
 const UsersGroups: React.FC = () => {
   const [searchParams] = useSearchParams();
   const navigate = useNavigate();
+  const { isFeatureEnabled } = useSettings();
 
   // Get tab from URL or default to "users"
   const tabFromUrl = searchParams.get("tab");
@@ -226,6 +228,7 @@ const UsersGroups: React.FC = () => {
       setShowUserTransactionsModal(true);
     },
     groups: groups,
+    showTransactions: isFeatureEnabled("use_billing"),
   });
 
   if (loading) {

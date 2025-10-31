@@ -272,7 +272,7 @@ function AppRoutes() {
           path="/cost-management"
           element={
             <AppLayout>
-              <ProtectedRoute path="/cost-management">
+              <ProtectedRoute path="/cost-management" requiredFeatureFlag="use_billing">
                 <CostManagement />
               </ProtectedRoute>
             </AppLayout>

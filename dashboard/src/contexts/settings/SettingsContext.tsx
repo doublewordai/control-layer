@@ -10,12 +10,13 @@ const DEFAULT_SETTINGS: AppSettings = {
   apiBaseUrl: "/admin/api/v1",
   features: {
     demo: false,
+    use_billing: false,
   },
 };
 
 /**
  * Parse feature flags from URL query parameters
- * Supports: ?flags=demo
+ * Supports: ?flags=demo,use_billing
  */
 function parseUrlFlags(): Partial<AppSettings> {
   const urlParams = new URLSearchParams(window.location.search);
@@ -28,6 +29,7 @@ function parseUrlFlags(): Partial<AppSettings> {
 
     settings.features = {
       demo: flagList.includes("demo"),
+      use_billing: flagList.includes("use_billing"),
     };
   }
 
@@ -61,6 +63,10 @@ function loadSettings(): AppSettings {
         urlSettings.features?.demo ??
         localSettings.features?.demo ??
         DEFAULT_SETTINGS.features.demo,
+      use_billing:
+        urlSettings.features?.use_billing ??
+        localSettings.features?.use_billing ??
+        DEFAULT_SETTINGS.features.use_billing,
     },
     demoConfig: localSettings.demoConfig,
   };
@@ -94,13 +100,22 @@ export function SettingsProvider({ children }: { children: React.ReactNode }) {
     feature: keyof FeatureFlags,
     enabled: boolean,
   ) => {
-    setSettings((prev) => ({
-      ...prev,
-      features: {
+    setSettings((prev) => {
+      const newFeatures = {
         ...prev.features,
         [feature]: enabled,
-      },
-    }));
+      };
+
+      // If disabling demo mode, also disable use_billing
+      if (feature === "demo" && !enabled) {
+        newFeatures.use_billing = false;
+      }
+
+      return {
+        ...prev,
+        features: newFeatures,
+      };
+    });
 
     // Handle service worker for demo mode
     if (feature === "demo") {

@@ -4,6 +4,8 @@
 export interface FeatureFlags {
   /** Enable demo mode with mock data and service worker */
   demo: boolean;
+  /** Enable billing and cost management features */
+  use_billing: boolean;
 }
 
 /**

@@ -28,6 +28,7 @@ interface UserColumnActions {
   onManageGroups: (user: DisplayUser) => void;
   onViewTransactions: (user: DisplayUser) => void;
   groups: DisplayGroup[];
+  showTransactions?: boolean;
 }
 
 // Predefined color classes that Tailwind will include
@@ -189,10 +190,12 @@ export const createUserColumns = (
               <Users className="mr-2 h-4 w-4" />
               Manage Groups
             </DropdownMenuItem>
-            <DropdownMenuItem onClick={() => actions.onViewTransactions(user)}>
-              <Receipt className="mr-2 h-4 w-4" />
-              View Transactions
-            </DropdownMenuItem>
+            {actions.showTransactions && (
+              <DropdownMenuItem onClick={() => actions.onViewTransactions(user)}>
+                <Receipt className="mr-2 h-4 w-4" />
+                View Transactions
+              </DropdownMenuItem>
+            )}
             <DropdownMenuSeparator />
             <DropdownMenuItem
               onClick={() => actions.onDelete(user)}

@@ -1,4 +1,4 @@
-import { Database, Server, AlertCircle, Check } from "lucide-react";
+import { Database, Server, AlertCircle, Check, DollarSign } from "lucide-react";
 import { useSettings } from "../../../../contexts";
 import { useAuthorization } from "../../../../utils";
 import { useState } from "react";
@@ -146,6 +146,42 @@ export function Settings() {
                     )}
                   </div>
                 )}
+              </div>
+            </div>
+
+            {/* Billing Features Section */}
+            <div className="p-6 border-t border-doubleword-neutral-200">
+              <div className="flex items-center gap-2 mb-4">
+                <DollarSign className="w-5 h-5 text-green-600" />
+                <h2 className="text-lg font-semibold text-doubleword-neutral-900">
+                  Billing Features
+                </h2>
+              </div>
+
+              <div className="space-y-6">
+                <div className="flex items-center justify-between">
+                  <div className="flex-1">
+                    <h3 className="text-sm font-medium text-doubleword-neutral-900">
+                      Enable Cost Management
+                    </h3>
+                    <p className="text-sm text-doubleword-neutral-600 mt-1">
+                      Show billing and cost management features including credit balance tracking and transaction history.
+                    </p>
+                    {!isFeatureEnabled("demo") && (
+                      <p className="text-sm text-amber-600 mt-2">
+                        Requires demo mode to be enabled
+                      </p>
+                    )}
+                  </div>
+                  <Switch
+                    checked={isFeatureEnabled("use_billing")}
+                    onCheckedChange={(checked) =>
+                      toggleFeature("use_billing", checked)
+                    }
+                    disabled={!isFeatureEnabled("demo")}
+                    aria-label="Toggle billing features"
+                  />
+                </div>
               </div>
             </div>
           </div>

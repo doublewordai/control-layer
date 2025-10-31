@@ -17,6 +17,7 @@ import { useUser, useConfig } from "../../../api/control-layer/hooks";
 import { UserAvatar } from "../../ui";
 import { useAuthorization } from "../../../utils";
 import { useAuth } from "../../../contexts/auth";
+import { useSettings } from "../../../contexts";
 import onwardsLogo from "../../../assets/onwards-logo.svg";
 import {
   Sidebar,
@@ -45,19 +46,27 @@ export function AppSidebar() {
   const { data: currentUser, isLoading: loading } = useUser("current");
   const { canAccessRoute } = useAuthorization();
   const { logout } = useAuth();
+  const { isFeatureEnabled } = useSettings();
 
   const allNavItems = [
     { path: "/models", icon: Layers, label: "Models" },
     { path: "/endpoints", icon: Server, label: "Endpoints" },
     { path: "/playground", icon: Play, label: "Playground" },
     { path: "/analytics", icon: Activity, label: "Traffic" },
-    { path: "/cost-management", icon: DollarSign, label: "Cost Management" },
+    { path: "/cost-management", icon: DollarSign, label: "Cost Management", featureFlag: "use_billing" },
     { path: "/users-groups", icon: Users, label: "Users & Groups" },
     { path: "/api-keys", icon: Key, label: "API Keys" },
     { path: "/settings", icon: Settings, label: "Settings" },
   ];
 
-  const navItems = allNavItems.filter((item) => canAccessRoute(item.path));
+  const navItems = allNavItems.filter((item) => {
+    // Check feature flag if specified
+    if (item.featureFlag && !isFeatureEnabled(item.featureFlag)) {
+      return false;
+    }
+    // Check route access permissions
+    return canAccessRoute(item.path);
+  });
 
   return (
     <Sidebar>
