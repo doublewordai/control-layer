@@ -69,7 +69,6 @@ impl Modify for SecurityAddon {
         api::handlers::transactions::create_transaction,
         api::handlers::transactions::get_transaction,
         api::handlers::transactions::list_transactions,
-        api::handlers::users::get_user_balance,
     ),
     components(
         schemas(
@@ -107,7 +106,6 @@ impl Modify for SecurityAddon {
             api::models::inference_endpoints::OpenAIModelsResponse,
             api::models::transactions::CreditTransactionCreate,
             api::models::transactions::CreditTransactionResponse,
-            api::models::users::UserBalanceResponse,
             crate::db::models::credits::CreditTransactionType,
             sync::endpoint_sync::EndpointSyncResponse,
         )

@@ -33,13 +33,7 @@ pub struct CreditTransactionDBResponse {
     pub transaction_type: CreditTransactionType,
     pub amount: Decimal,
     pub balance_after: Decimal,
+    pub previous_transaction_id: Option<Uuid>,
     pub description: Option<String>,
     pub created_at: DateTime<Utc>,
-}
-
-/// User balance response
-#[derive(Debug, Clone)]
-pub struct UserCreditBalanceDBResponse {
-    pub user_id: UserId,
-    pub current_balance: Decimal,
 }

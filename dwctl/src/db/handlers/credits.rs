@@ -10,7 +10,7 @@ use rust_decimal::{prelude::ToPrimitive, Decimal};
 use serde::{Deserialize, Serialize};
 use sqlx::{Connection, FromRow, PgConnection};
 use std::collections::HashMap;
-use tracing::error;
+use tracing::{error, trace};
 use uuid::Uuid;
 
 // Database entity model for credit transaction
@@ -22,6 +22,7 @@ pub struct CreditTransaction {
     pub transaction_type: CreditTransactionType,
     pub amount: Decimal,
     pub balance_after: Decimal,
+    pub previous_transaction_id: Option<Uuid>,
     pub description: Option<String>,
     pub created_at: DateTime<Utc>,
 }
@@ -34,6 +35,7 @@ impl From<CreditTransaction> for CreditTransactionDBResponse {
             transaction_type: tx.transaction_type,
             amount: tx.amount,
             balance_after: tx.balance_after,
+            previous_transaction_id: tx.previous_transaction_id,
             description: tx.description,
             created_at: tx.created_at,
         }
@@ -52,10 +54,50 @@ impl<'c> Credits<'c> {
     /// Create a new credit transaction
     /// This method validates the balance_after is correct based on the current balance
     pub async fn create_transaction(&mut self, request: &CreditTransactionCreateDBRequest) -> Result<CreditTransactionDBResponse> {
+        // Start the transaction
         let mut tx = self.db.begin().await?;
 
-        // Get current balance for the user
-        let current_balance = Self::get_user_current_balance_internal(&mut tx, request.user_id).await?;
+        // Convert UUID to int64 for advisory lock
+        // We use the first 8 bytes of the UUID as the lock key
+        let user_uuid_bytes = request.user_id.as_bytes();
+        let lock_key = i64::from_be_bytes([
+            user_uuid_bytes[0],
+            user_uuid_bytes[1],
+            user_uuid_bytes[2],
+            user_uuid_bytes[3],
+            user_uuid_bytes[4],
+            user_uuid_bytes[5],
+            user_uuid_bytes[6],
+            user_uuid_bytes[7],
+        ]);
+
+        // Use pg_advisory_xact_lock which is transaction-scoped (auto-releases on commit/rollback)
+        // This will BLOCK until the lock is available, ensuring serialization
+        sqlx::query_scalar::<_, i32>("SELECT 1 FROM (SELECT pg_advisory_xact_lock($1)) AS _")
+            .bind(lock_key)
+            .fetch_one(&mut *tx)
+            .await?;
+
+        trace!("Acquired lock for user_id {}", request.user_id);
+
+        // Now safely get the current balance - no race condition possible
+        let (current_balance, last_transaction_id) = match sqlx::query!(
+            r#"
+            SELECT balance_after, id
+            FROM credits_transactions
+            WHERE user_id = $1
+            ORDER BY created_at DESC, id DESC
+            LIMIT 1
+            "#,
+            request.user_id
+        )
+        .fetch_one(&mut *tx)
+        .await
+        {
+            Ok(record) => (record.balance_after, Some(record.id)),
+            Err(sqlx::Error::RowNotFound) => (Decimal::ZERO, None),
+            Err(e) => return Err(e.into()),
+        };
 
         // Calculate what the new balance should be based on transaction type
         let new_balance = match request.transaction_type {
@@ -67,14 +109,15 @@ impl<'c> Credits<'c> {
         let transaction = sqlx::query_as!(
             CreditTransaction,
             r#"
-            INSERT INTO credit_transactions (user_id, transaction_type, amount, balance_after, description)
-            VALUES ($1, $2, $3, $4, $5)
-            RETURNING id, user_id, transaction_type as "transaction_type: CreditTransactionType", amount, balance_after, description, created_at
+            INSERT INTO credits_transactions (user_id, transaction_type, amount, balance_after, previous_transaction_id, description)
+            VALUES ($1, $2, $3, $4, $5, $6)
+            RETURNING id, user_id, transaction_type as "transaction_type: CreditTransactionType", amount, balance_after, previous_transaction_id, description, created_at
             "#,
             request.user_id,
             &request.transaction_type as &CreditTransactionType,
             request.amount,
             new_balance,
+            last_transaction_id,
             request.description
         )
         .fetch_one(&mut *tx)
@@ -85,17 +128,30 @@ impl<'c> Credits<'c> {
         Ok(CreditTransactionDBResponse::from(transaction))
     }
 
-    /// Get current balance for a user (latest balance_after from credit_transactions)
+    /// Get current balance for a user (latest balance_after from credits_transactions)
+    /// This is a read-only operation without locking
     pub async fn get_user_balance(&mut self, user_id: UserId) -> Result<Decimal> {
-        let balance = Self::get_user_current_balance_internal(&mut *self.db, user_id).await?;
-        Ok(balance)
+        let result = sqlx::query!(
+            r#"
+            SELECT balance_after
+            FROM credits_transactions
+            WHERE user_id = $1
+            ORDER BY created_at DESC, id DESC
+            LIMIT 1
+            "#,
+            user_id
+        )
+        .fetch_optional(&mut *self.db)
+        .await?;
+
+        Ok(result.map(|r| r.balance_after).unwrap_or(Decimal::ZERO))
     }
 
     pub async fn get_users_balances_bulk(&mut self, user_ids: &[UserId]) -> Result<HashMap<UserId, f64>> {
         let rows = sqlx::query!(
             r#"
             SELECT DISTINCT ON (user_id) user_id, balance_after
-            FROM credit_transactions
+            FROM credits_transactions
             WHERE user_id = ANY($1)
             ORDER BY user_id, created_at DESC, id DESC
             "#,
@@ -118,31 +174,13 @@ impl<'c> Credits<'c> {
         Ok(balances_map)
     }
 
-    /// Internal helper to get current balance within an existing transaction
-    async fn get_user_current_balance_internal(tx: &mut PgConnection, user_id: UserId) -> Result<Decimal> {
-        let result = sqlx::query!(
-            r#"
-            SELECT balance_after
-            FROM credit_transactions
-            WHERE user_id = $1
-            ORDER BY created_at DESC, id DESC
-            LIMIT 1
-            "#,
-            user_id
-        )
-        .fetch_optional(tx)
-        .await?;
-
-        Ok(result.map(|r| r.balance_after).unwrap_or(Decimal::ZERO))
-    }
-
     /// List transactions for a specific user with pagination
     pub async fn list_user_transactions(&mut self, user_id: UserId, skip: i64, limit: i64) -> Result<Vec<CreditTransactionDBResponse>> {
         let transactions = sqlx::query_as!(
             CreditTransaction,
             r#"
-            SELECT id, user_id, transaction_type as "transaction_type: CreditTransactionType", amount, balance_after, description, created_at
-            FROM credit_transactions
+            SELECT id, user_id, transaction_type as "transaction_type: CreditTransactionType", amount, balance_after, previous_transaction_id, description, created_at
+            FROM credits_transactions
             WHERE user_id = $1
             ORDER BY created_at DESC, id DESC
             OFFSET $2
@@ -163,8 +201,8 @@ impl<'c> Credits<'c> {
         let transactions = sqlx::query_as!(
             CreditTransaction,
             r#"
-            SELECT id, user_id, transaction_type as "transaction_type: CreditTransactionType", amount, balance_after, description, created_at
-            FROM credit_transactions
+            SELECT id, user_id, transaction_type as "transaction_type: CreditTransactionType", amount, balance_after, previous_transaction_id, description, created_at
+            FROM credits_transactions
             ORDER BY created_at DESC, id DESC
             OFFSET $1
             LIMIT $2
@@ -184,8 +222,8 @@ impl<'c> Credits<'c> {
             CreditTransaction,
             r#"
             SELECT id, user_id, transaction_type as "transaction_type: CreditTransactionType",
-                amount, balance_after, description, created_at
-            FROM credit_transactions
+                amount, balance_after, previous_transaction_id, description, created_at
+            FROM credits_transactions
             WHERE id = $1
             "#,
             transaction_id
@@ -739,5 +777,315 @@ mod tests {
             .await
             .expect("Failed to list transactions");
         assert_eq!(transactions.len(), 1);
+    }
+
+    /// This test is to check the performance of creating transactions under concurrent load. If one thread
+    /// reads the balance while another is writing, it could lead to incorrect balances as the first one that
+    /// is committed wins and the second calculated its balance based on stale data.
+    #[sqlx::test]
+    #[test_log::test]
+    async fn test_concurrent_transactions_no_race_condition(pool: PgPool) {
+        use std::sync::Arc;
+        use tokio::task;
+
+        let user_id = create_test_user(&pool).await;
+
+        // Create initial balance
+        let mut conn: sqlx::pool::PoolConnection<sqlx::Postgres> = pool.acquire().await.expect("Failed to acquire connection");
+        let mut credits = Credits::new(&mut conn);
+        let initial_request = CreditTransactionCreateDBRequest {
+            user_id,
+            transaction_type: CreditTransactionType::AdminGrant,
+            amount: Decimal::from_str("1000.0").unwrap(),
+            description: Some("Initial balance".to_string()),
+        };
+        credits
+            .create_transaction(&initial_request)
+            .await
+            .expect("Failed to create initial transaction");
+        drop(conn);
+
+        // Spawn 10 concurrent transactions that each add 10 credits
+        let pool = Arc::new(pool);
+        let mut handles = vec![];
+
+        for i in 0..100 {
+            let pool_clone = Arc::clone(&pool);
+            let handle = task::spawn(async move {
+                let mut conn = pool_clone.acquire().await.expect("Failed to acquire connection");
+                let mut credits = Credits::new(&mut conn);
+
+                let request = CreditTransactionCreateDBRequest {
+                    user_id,
+                    transaction_type: if i % 2 == 0 {
+                        CreditTransactionType::AdminGrant
+                    } else {
+                        CreditTransactionType::AdminRemoval
+                    },
+                    amount: if i % 2 == 0 {
+                        Decimal::from_str("10.0").unwrap()
+                    } else {
+                        Decimal::from_str("5.0").unwrap()
+                    },
+                    description: Some(format!("Concurrent transaction {}", i)),
+                };
+
+                credits.create_transaction(&request).await.expect("Failed to create transaction")
+            });
+            handles.push(handle);
+        }
+
+        // Wait for all transactions to complete
+        for handle in handles {
+            handle.await.expect("Task panicked");
+        }
+
+        // Verify we have exactly 11 transactions (1 initial + 10 concurrent)
+        let mut conn = pool.acquire().await.expect("Failed to acquire connection");
+        let mut credits = Credits::new(&mut conn);
+        let transactions = credits
+            .list_user_transactions(user_id, 0, 1000)
+            .await
+            .expect("Failed to list transactions");
+
+        // Build a HashMap of transaction ID -> transaction for O(1) lookups
+        println!("Total transactions: {}", transactions.len());
+
+        use std::collections::HashMap;
+        let tx_map: HashMap<Uuid, &CreditTransactionDBResponse> = transactions.iter().map(|tx| (tx.id, tx)).collect();
+
+        // Find the head of the chain (the most recent transaction with no successor)
+        // This is the transaction that isn't referenced as a previous_transaction_id by any other
+        let mut is_previous = std::collections::HashSet::new();
+        for tx in &transactions {
+            if let Some(prev_id) = tx.previous_transaction_id {
+                is_previous.insert(prev_id);
+            }
+        }
+
+        let head = transactions
+            .iter()
+            .find(|tx| !is_previous.contains(&tx.id))
+            .expect("Failed to find head of transaction chain");
+
+        println!(
+            "Head transaction: id={}, balance={}, type={:?}",
+            head.id, head.balance_after, head.transaction_type
+        );
+
+        // Walk the chain backwards from head to tail, validating each transaction
+        let mut current = Some(head);
+        let mut visited = std::collections::HashSet::new();
+        let mut chain_valid = true;
+
+        while let Some(tx) = current {
+            // Check for cycles
+            if !visited.insert(tx.id) {
+                panic!("Cycle detected in transaction chain at id={}", tx.id);
+            }
+
+            // Helpful debug output if test is failing
+            // println!(
+            //     "Chain: id={}, prev_id={:?}, amount={}, balance_after={}, type={:?}",
+            //     tx.id, tx.previous_transaction_id, tx.amount, tx.balance_after, tx.transaction_type
+            // );
+
+            // Validate this transaction's balance based on the previous one
+            if let Some(prev_id) = tx.previous_transaction_id {
+                let prev_tx = tx_map
+                    .get(&prev_id)
+                    .unwrap_or_else(|| panic!("Previous transaction {} not found in map", prev_id));
+
+                let expected_balance = match tx.transaction_type {
+                    CreditTransactionType::AdminGrant | CreditTransactionType::Purchase => prev_tx.balance_after + tx.amount,
+                    CreditTransactionType::AdminRemoval | CreditTransactionType::Usage => prev_tx.balance_after - tx.amount,
+                };
+
+                if tx.balance_after != expected_balance {
+                    println!(
+                        "ERROR: Transaction {} has balance {} but expected {} (prev={}, amount={}, type={:?})",
+                        tx.id, tx.balance_after, expected_balance, prev_tx.balance_after, tx.amount, tx.transaction_type
+                    );
+                    chain_valid = false;
+                }
+
+                current = Some(prev_tx);
+            } else {
+                // This is the initial transaction, should have balance = amount
+                assert_eq!(
+                    tx.balance_after, tx.amount,
+                    "Initial transaction should have balance_after == amount"
+                );
+                current = None;
+            }
+        }
+
+        assert!(chain_valid, "Transaction chain validation failed - race condition detected!");
+
+        // Verify final balance agrees with last transaction's balance_after
+        let final_balance = credits.get_user_balance(user_id).await.expect("Failed to get balance");
+        assert_eq!(
+            final_balance, transactions[0].balance_after,
+            "Expected {} but got {}",
+            transactions[0].balance_after, final_balance
+        );
+    }
+
+    #[sqlx::test]
+    #[test_log::test]
+    async fn test_multiple_users_concurrent_transactions(pool: PgPool) {
+        use std::sync::Arc;
+        use tokio::task;
+
+        // Create 10 users, each will have their own transaction chain
+        let mut user_ids = Vec::new();
+        for _ in 0..10 {
+            user_ids.push(create_test_user(&pool).await);
+        }
+
+        // Create initial balance for each user
+        for user_id in &user_ids {
+            let mut conn = pool.acquire().await.expect("Failed to acquire connection");
+            let mut credits = Credits::new(&mut conn);
+            let initial_request = CreditTransactionCreateDBRequest {
+                user_id: *user_id,
+                transaction_type: CreditTransactionType::AdminGrant,
+                amount: Decimal::from_str("1000.0").unwrap(),
+                description: Some("Initial balance".to_string()),
+            };
+            credits
+                .create_transaction(&initial_request)
+                .await
+                .expect("Failed to create initial transaction");
+        }
+
+        // Spawn 100 concurrent transactions (10 transactions per user)
+        // This tests that different users can transact concurrently without interfering
+        let pool = Arc::new(pool);
+        let mut handles = vec![];
+
+        for i in 0..1000 {
+            let pool_clone = Arc::clone(&pool);
+            let user_id = user_ids[i % 10]; // Distribute transactions across users
+            let handle = task::spawn(async move {
+                let mut conn = pool_clone.acquire().await.expect("Failed to acquire connection");
+                let mut credits = Credits::new(&mut conn);
+
+                let request = CreditTransactionCreateDBRequest {
+                    user_id,
+                    transaction_type: if i % 2 == 0 {
+                        CreditTransactionType::AdminGrant
+                    } else {
+                        CreditTransactionType::AdminRemoval
+                    },
+                    amount: if i % 2 == 0 {
+                        Decimal::from_str("10.0").unwrap()
+                    } else {
+                        Decimal::from_str("5.0").unwrap()
+                    },
+                    description: Some(format!("Concurrent transaction {}", i)),
+                };
+
+                credits.create_transaction(&request).await.expect("Failed to create transaction")
+            });
+            handles.push(handle);
+        }
+
+        // Wait for all transactions to complete
+        for handle in handles {
+            handle.await.expect("Task panicked");
+        }
+
+        // Verify each user's transaction chain independently
+        for (user_idx, user_id) in user_ids.iter().enumerate() {
+            println!("\n=== Validating user {} (index {}) ===", user_id, user_idx);
+
+            let mut conn = pool.acquire().await.expect("Failed to acquire connection");
+            let mut credits = Credits::new(&mut conn);
+            let transactions = credits
+                .list_user_transactions(*user_id, 0, 10000)
+                .await
+                .expect("Failed to list transactions");
+
+            println!("User {} has {} transactions", user_id, transactions.len());
+            assert_eq!(
+                transactions.len(),
+                101,
+                "Each user should have 101 transactions (1 initial + 100 concurrent)"
+            );
+
+            // Build transaction map for this user
+            use std::collections::HashMap;
+            let tx_map: HashMap<Uuid, &CreditTransactionDBResponse> = transactions.iter().map(|tx| (tx.id, tx)).collect();
+
+            // Find the head of the chain
+            let mut is_previous = std::collections::HashSet::new();
+            for tx in &transactions {
+                if let Some(prev_id) = tx.previous_transaction_id {
+                    is_previous.insert(prev_id);
+                }
+            }
+
+            let head = transactions
+                .iter()
+                .find(|tx| !is_previous.contains(&tx.id))
+                .expect("Failed to find head of transaction chain");
+
+            // Walk the chain backwards, validating each transaction
+            let mut current = Some(head);
+            let mut visited = std::collections::HashSet::new();
+            let mut transaction_count = 0;
+
+            while let Some(tx) = current {
+                // Check for cycles
+                if !visited.insert(tx.id) {
+                    panic!("Cycle detected in transaction chain for user {} at tx id={}", user_id, tx.id);
+                }
+
+                transaction_count += 1;
+
+                // Validate this transaction's balance based on the previous one
+                if let Some(prev_id) = tx.previous_transaction_id {
+                    let prev_tx = tx_map
+                        .get(&prev_id)
+                        .expect(&format!("Previous transaction {} not found for user {}", prev_id, user_id));
+
+                    let expected_balance = match tx.transaction_type {
+                        CreditTransactionType::AdminGrant | CreditTransactionType::Purchase => prev_tx.balance_after + tx.amount,
+                        CreditTransactionType::AdminRemoval | CreditTransactionType::Usage => prev_tx.balance_after - tx.amount,
+                    };
+
+                    assert_eq!(
+                        tx.balance_after, expected_balance,
+                        "User {} transaction {} has balance {} but expected {} (prev={}, amount={}, type={:?})",
+                        user_id, tx.id, tx.balance_after, expected_balance, prev_tx.balance_after, tx.amount, tx.transaction_type
+                    );
+
+                    current = Some(prev_tx);
+                } else {
+                    // This is the initial transaction
+                    assert_eq!(
+                        tx.balance_after, tx.amount,
+                        "User {} initial transaction should have balance_after == amount",
+                        user_id
+                    );
+                    current = None;
+                }
+            }
+
+            assert_eq!(
+                transaction_count, 101,
+                "User {} should have exactly 101 transactions in chain",
+                user_id
+            );
+
+            // Verify final balance
+            let final_balance = credits.get_user_balance(*user_id).await.expect("Failed to get balance");
+            assert_eq!(final_balance, head.balance_after, "User {} final balance mismatch", user_id);
+
+            println!("User {} validation complete. Final balance: {}", user_id, final_balance);
+        }
+
+        println!("\n=== All users validated successfully! ===");
     }
 }

@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "\n            SELECT balance_after\n            FROM credit_transactions\n            WHERE user_id = $1\n            ORDER BY created_at DESC, id DESC\n            LIMIT 1\n            ",
+  "query": "\n            SELECT balance_after\n            FROM credits_transactions\n            WHERE user_id = $1\n            ORDER BY created_at DESC, id DESC\n            LIMIT 1\n            ",
   "describe": {
     "columns": [
       {
@@ -18,5 +18,5 @@
       false
     ]
   },
-  "hash": "ec23392294bfabb18ef43154cd234afd66aa10210b729376dbf30d2776ae6195"
+  "hash": "5866536b84a4359e795b6fcddaf1251fcbe9e5380af9cc6b97cae608d920511a"
 }

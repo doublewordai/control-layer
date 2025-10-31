@@ -1,8 +1,7 @@
 use crate::api::models::groups::GroupResponse;
-use crate::db::models::{credits::UserCreditBalanceDBResponse, users::UserDBResponse};
+use crate::db::models::users::UserDBResponse;
 use crate::types::UserId;
 use chrono::{DateTime, Utc};
-use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
 use utoipa::{IntoParams, ToSchema};
 
@@ -55,7 +54,7 @@ pub struct UserResponse {
     #[schema(no_recursion)]
     pub groups: Option<Vec<GroupResponse>>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub credit_balances: Option<f64>,
+    pub credit_balance: Option<f64>,
 }
 
 /// Query parameters for listing users
@@ -119,9 +118,9 @@ impl From<UserDBResponse> for UserResponse {
             created_at: db.created_at,
             updated_at: db.updated_at,
             auth_source: db.auth_source,
-            last_login: None,      // UserDBResponse doesn't have last_login
-            groups: None,          // By default, relationships are not included
-            credit_balances: None, // By default, credit balances are not included
+            last_login: None,     // UserDBResponse doesn't have last_login
+            groups: None,         // By default, relationships are not included
+            credit_balance: None, // By default, credit balances are not included
         }
     }
 }
@@ -135,26 +134,12 @@ impl UserResponse {
 
     /// Create a response with credit balance included
     pub fn with_credit_balance(mut self, balance: f64) -> Self {
-        self.credit_balances = Some(balance);
+        self.credit_balance = Some(balance);
         self
     }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
-pub struct UserBalanceResponse {
-    /// User ID
-    #[schema(value_type = String, format = "uuid")]
-    pub user_id: UserId,
-    /// Current credit balance
-    #[schema(value_type = f64)]
-    pub current_balance: Decimal,
-}
-
-impl From<UserCreditBalanceDBResponse> for UserBalanceResponse {
-    fn from(db: UserCreditBalanceDBResponse) -> Self {
-        Self {
-            user_id: db.user_id,
-            current_balance: db.current_balance,
-        }
-    }
+pub struct GetUserQuery {
+    pub include: Option<String>,
 }

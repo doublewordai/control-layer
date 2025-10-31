@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "\n            SELECT id, user_id, transaction_type as \"transaction_type: CreditTransactionType\",\n                amount, balance_after, description, created_at\n            FROM credit_transactions\n            WHERE id = $1\n            ",
+  "query": "\n            SELECT id, user_id, transaction_type as \"transaction_type: CreditTransactionType\", amount, balance_after, previous_transaction_id, description, created_at\n            FROM credits_transactions\n            WHERE user_id = $1\n            ORDER BY created_at DESC, id DESC\n            OFFSET $2\n            LIMIT $3\n            ",
   "describe": {
     "columns": [
       {
@@ -30,18 +30,25 @@
       },
       {
         "ordinal": 5,
+        "name": "previous_transaction_id",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 6,
         "name": "description",
         "type_info": "Text"
       },
       {
-        "ordinal": 6,
+        "ordinal": 7,
         "name": "created_at",
         "type_info": "Timestamptz"
       }
     ],
     "parameters": {
       "Left": [
-        "Uuid"
+        "Uuid",
+        "Int8",
+        "Int8"
       ]
     },
     "nullable": [
@@ -51,8 +58,9 @@
       false,
       false,
       true,
+      true,
       false
     ]
   },
-  "hash": "e1c5cc094c607f8871d2e93bfb8470013375953f66ab464ae9bfb296f4e6ca73"
+  "hash": "6cea84477bc9066b6fc8da5d14c0b40e29482d5d4a6c9d8713c1a8cfd8c1745e"
 }

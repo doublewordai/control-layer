@@ -284,11 +284,15 @@ pub fn role_has_permission(role: &Role, resource: Resource, operation: Operation
                     | (Resource::Analytics, Operation::ReadOwn)
                     | (Resource::Users, Operation::ReadOwn)
                     | (Resource::Groups, Operation::ReadOwn)
+                    | (Resource::Credits, Operation::ReadOwn)
             )
         }
         Role::BillingManager => {
-            // Billing Manager has full access to credit system only
-            matches!(resource, Resource::Credits)
+            // Billing Manager has full access to credit system and read all users.
+            matches!(
+                (resource, operation),
+                (Resource::Credits, _) | (Resource::Users, Operation::ReadAll)
+            )
         }
     }
 }

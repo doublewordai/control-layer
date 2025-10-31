@@ -1,7 +1,7 @@
 use crate::{
     api::models::{
         groups::GroupResponse,
-        users::{CurrentUser, ListUsersQuery, UserBalanceResponse, UserCreate, UserResponse, UserUpdate},
+        users::{CurrentUser, GetUserQuery, ListUsersQuery, UserCreate, UserResponse, UserUpdate},
     },
     auth::permissions::{self as permissions, can_read_all_resources, can_read_own_resource, operation, resource, RequiresPermission},
     db::{
@@ -17,6 +17,8 @@ use axum::{
     http::StatusCode,
     response::Json,
 };
+use rust_decimal::prelude::ToPrimitive;
+use tracing::error;
 
 // GET /user - List users (admin only)
 #[utoipa::path(
@@ -140,6 +142,7 @@ pub async fn list_users(
     description = "Get a specific user by ID or current user",
     params(
         ("user_id" = String, Path, description = "User ID (UUID) or 'current' for current user"),
+        ("includes" = Option<String>, Query, description = "Data to include, currently only 'billing' is supported"),
     ),
     responses(
         (status = 200, description = "User information", body = UserResponse),
@@ -155,6 +158,7 @@ pub async fn list_users(
 pub async fn get_user(
     State(state): State<AppState>,
     Path(user_id): Path<UserIdOrCurrent>,
+    Query(query): Query<GetUserQuery>,
     // Can't use RequiresPermission here because we need conditional logic for own vs other users
     current_user: CurrentUser,
 ) -> Result<Json<UserResponse>> {
@@ -197,7 +201,25 @@ pub async fn get_user(
         id: target_user_id.to_string(),
     })?;
 
-    Ok(Json(UserResponse::from(user)))
+    let mut response = UserResponse::from(user);
+
+    // Include groups if requested and permitted
+    // Permitted if:
+    //     1. You have ReadAll on Credits
+    //     2. You are requesting your own data and have ReadOwn on Credits
+    if query.include.as_deref().is_some_and(|includes| includes.contains("billing"))
+        && (permissions::has_permission(&current_user, Resource::Credits, Operation::ReadAll)
+            || (target_user_id == current_user.id && permissions::has_permission(&current_user, Resource::Credits, Operation::ReadOwn)))
+    {
+        let mut credits_repo = Credits::new(&mut pool_conn);
+        let balance = credits_repo.get_user_balance(target_user_id).await?.to_f64().unwrap_or_else(|| {
+            error!("Failed to convert balance to f64 for user_id {}", target_user_id);
+            0.0
+        });
+        response = response.with_credit_balance(balance);
+    }
+
+    Ok(Json(response))
 }
 
 // POST /users - Create user (admin only)
@@ -314,64 +336,6 @@ pub async fn delete_user(
             id: user_id.to_string(),
         }),
     }
-}
-
-/// Get user's current credit balance
-#[utoipa::path(
-    get,
-    path = "/users/{user_id}/balance",
-    tag = "users",
-    summary = "Get user's credit balance",
-    description = "Get the current credit balance for a user. Users can access their own balance, BillingManager can access any user's balance.",
-    params(
-        ("user_id" = String, Path, description = "User ID (UUID) or 'current' for the authenticated user"),
-    ),
-    responses(
-        (status = 200, description = "User's current balance", body = UserBalanceResponse),
-        (status = 401, description = "Unauthorized"),
-        (status = 403, description = "Forbidden"),
-        (status = 404, description = "User not found"),
-        (status = 500, description = "Internal server error"),
-    ),
-    security(
-        ("X-Doubleword-User" = [])
-    )
-)]
-pub async fn get_user_balance(
-    State(state): State<AppState>,
-    Path(user_id_param): Path<String>,
-    current_user: CurrentUser,
-) -> Result<Json<UserBalanceResponse>> {
-    // Parse user_id or use current user
-    let user_id = if user_id_param == "current" {
-        current_user.id
-    } else {
-        user_id_param.parse::<UserId>().map_err(|_| Error::BadRequest {
-            message: "Invalid user ID format".to_string(),
-        })?
-    };
-
-    // Check permissions
-    let has_read_all =
-        crate::auth::permissions::has_permission(&current_user, crate::types::Resource::Credits, crate::types::Operation::ReadAll);
-
-    if !has_read_all && user_id != current_user.id {
-        return Err(Error::InsufficientPermissions {
-            required: Permission::Allow(crate::types::Resource::Credits, crate::types::Operation::ReadAll),
-            action: crate::types::Operation::ReadAll,
-            resource: "balance".to_string(),
-        });
-    }
-
-    let mut pool_conn = state.db.acquire().await.map_err(|e| Error::Database(e.into()))?;
-    let mut repo = Credits::new(&mut pool_conn);
-
-    let balance = repo.get_user_balance(user_id).await?;
-
-    Ok(Json(UserBalanceResponse {
-        user_id,
-        current_balance: balance,
-    }))
 }
 
 #[cfg(test)]
@@ -663,7 +627,7 @@ mod tests {
         response.assert_status_ok();
         let users: Vec<UserResponse> = response.json();
         let found_user = users.iter().find(|u| u.id == regular_user.id).expect("User not found");
-        assert!(found_user.credit_balances.is_none());
+        assert!(found_user.credit_balance.is_none());
 
         // Test with include=billing - should include credit balance
         let response = app
@@ -674,8 +638,8 @@ mod tests {
         response.assert_status_ok();
         let users: Vec<UserResponse> = response.json();
         let found_user = users.iter().find(|u| u.id == regular_user.id).expect("User not found");
-        assert!(found_user.credit_balances.is_some());
-        assert_eq!(found_user.credit_balances.unwrap(), 250.0);
+        assert!(found_user.credit_balance.is_some());
+        assert_eq!(found_user.credit_balance.unwrap(), 250.0);
 
         // Test with include=billing and pagination
         let response = app
@@ -686,8 +650,8 @@ mod tests {
         response.assert_status_ok();
         let users: Vec<UserResponse> = response.json();
         let found_user = users.iter().find(|u| u.id == regular_user.id).expect("User not found");
-        assert!(found_user.credit_balances.is_some());
-        assert_eq!(found_user.credit_balances.unwrap(), 250.0);
+        assert!(found_user.credit_balance.is_some());
+        assert_eq!(found_user.credit_balance.unwrap(), 250.0);
 
         // Test with include=invalid,billing - should ignore invalid and include billing
         let response = app
@@ -698,8 +662,8 @@ mod tests {
         response.assert_status_ok();
         let users: Vec<UserResponse> = response.json();
         let found_user = users.iter().find(|u| u.id == regular_user.id).expect("User not found");
-        assert!(found_user.credit_balances.is_some());
-        assert_eq!(found_user.credit_balances.unwrap(), 250.0);
+        assert!(found_user.credit_balance.is_some());
+        assert_eq!(found_user.credit_balance.unwrap(), 250.0);
     }
 
     #[sqlx::test]
@@ -742,8 +706,8 @@ mod tests {
         assert!(groups.contains(&group.id));
 
         // Verify billing is included
-        assert!(found_user.credit_balances.is_some());
-        assert_eq!(found_user.credit_balances.unwrap(), 500.0);
+        assert!(found_user.credit_balance.is_some());
+        assert_eq!(found_user.credit_balance.unwrap(), 500.0);
     }
 
     #[sqlx::test]
@@ -764,8 +728,8 @@ mod tests {
         response.assert_status_ok();
         let users: Vec<UserResponse> = response.json();
         let found_user = users.iter().find(|u| u.id == regular_user.id).expect("User not found");
-        assert!(found_user.credit_balances.is_some());
-        assert_eq!(found_user.credit_balances.unwrap(), 0.0);
+        assert!(found_user.credit_balance.is_some());
+        assert_eq!(found_user.credit_balance.unwrap(), 0.0);
     }
 
     #[sqlx::test]
@@ -806,13 +770,13 @@ mod tests {
         let users: Vec<UserResponse> = response.json();
 
         let found_user1 = users.iter().find(|u| u.id == user1.id).expect("User1 not found");
-        assert_eq!(found_user1.credit_balances.unwrap(), 150.0); // 100 + 50
+        assert_eq!(found_user1.credit_balance.unwrap(), 150.0); // 100 + 50
 
         let found_user2 = users.iter().find(|u| u.id == user2.id).expect("User2 not found");
-        assert_eq!(found_user2.credit_balances.unwrap(), 200.0);
+        assert_eq!(found_user2.credit_balance.unwrap(), 200.0);
 
         let found_user3 = users.iter().find(|u| u.id == user3.id).expect("User3 not found");
-        assert_eq!(found_user3.credit_balances.unwrap(), 300.0);
+        assert_eq!(found_user3.credit_balance.unwrap(), 300.0);
     }
 
     #[sqlx::test]
@@ -834,8 +798,8 @@ mod tests {
         response.assert_status_ok();
         let users: Vec<UserResponse> = response.json();
         let found_user = users.iter().find(|u| u.id == regular_user.id).expect("User not found");
-        assert!(found_user.credit_balances.is_some());
-        assert_eq!(found_user.credit_balances.unwrap(), 350.0);
+        assert!(found_user.credit_balance.is_some());
+        assert_eq!(found_user.credit_balance.unwrap(), 350.0);
     }
 
     #[sqlx::test]
@@ -1421,17 +1385,17 @@ mod tests {
         create_initial_credit_transaction(&pool, user.id, "150.0").await;
 
         let response = app
-            .get(&format!("/admin/api/v1/users/{}/balance", user.id))
+            .get(&format!("/admin/api/v1/users/{}?include=billing", user.id))
             .add_header(add_auth_headers(&user).0, add_auth_headers(&user).1)
             .await;
 
         response.assert_status_ok();
-        let balance: UserBalanceResponse = response.json();
-        assert_eq!(balance.user_id, user.id);
-        assert_eq!(balance.current_balance, Decimal::from_str("150.0").unwrap());
+        let balance: UserResponse = response.json();
+        assert_eq!(balance.id, user.id);
+        assert_eq!(balance.credit_balance, Some(150.0));
     }
 
-    // Test: GET /users/current/balance works for standard user
+    // Test: GET /users/current/balance works for standard user with billing info
     #[sqlx::test]
     #[test_log::test]
     async fn test_get_current_user_balance(pool: PgPool) {
@@ -1442,17 +1406,17 @@ mod tests {
         create_initial_credit_transaction(&pool, user.id, "125.0").await;
 
         let response = app
-            .get("/admin/api/v1/users/current/balance")
+            .get("/admin/api/v1/users/current?include=billing")
             .add_header(add_auth_headers(&user).0, add_auth_headers(&user).1)
             .await;
 
         response.assert_status_ok();
-        let balance: UserBalanceResponse = response.json();
-        assert_eq!(balance.user_id, user.id);
-        assert_eq!(balance.current_balance, Decimal::from_str("125.0").unwrap());
+        let balance: UserResponse = response.json();
+        assert_eq!(balance.id, user.id);
+        assert_eq!(balance.credit_balance, Some(125.0));
     }
 
-    // Test: GET /users/{other_user_id}/balance returns 403 for standard user
+    // Test: GET /users/{other_user_id} returns 403 for standard user asking for billing
     #[sqlx::test]
     #[test_log::test]
     async fn test_get_other_user_balance_forbidden(pool: PgPool) {
@@ -1461,14 +1425,14 @@ mod tests {
         let user2 = create_test_user(&pool, Role::StandardUser).await;
 
         let response = app
-            .get(&format!("/admin/api/v1/users/{}/balance", user2.id))
+            .get(&format!("/admin/api/v1/users/{}?include=billing", user2.id))
             .add_header(add_auth_headers(&user1).0, add_auth_headers(&user1).1)
             .await;
 
         response.assert_status_forbidden();
     }
 
-    // Test: GET /users/{user_id}/balance works for own balance as RequestViewer
+    // Test: GET /users/{user_id} works for own balance as RequestViewer
     #[sqlx::test]
     #[test_log::test]
     async fn test_get_own_balance_as_request_viewer(pool: PgPool) {
@@ -1479,17 +1443,17 @@ mod tests {
         create_initial_credit_transaction(&pool, user.id, "150.0").await;
 
         let response = app
-            .get(&format!("/admin/api/v1/users/{}/balance", user.id))
+            .get(&format!("/admin/api/v1/users/{}?include=billing", user.id))
             .add_header(add_auth_headers(&user).0, add_auth_headers(&user).1)
             .await;
 
         response.assert_status_ok();
-        let balance: UserBalanceResponse = response.json();
-        assert_eq!(balance.user_id, user.id);
-        assert_eq!(balance.current_balance, Decimal::from_str("150.0").unwrap());
+        let balance: UserResponse = response.json();
+        assert_eq!(balance.id, user.id);
+        assert_eq!(balance.credit_balance, Some(150.0));
     }
 
-    // Test: GET /users/current/balance works for RequestViewer
+    // Test: GET /users/current works for RequestViewer with billing info
     #[sqlx::test]
     #[test_log::test]
     async fn test_get_current_user_balance_request_viewer(pool: PgPool) {
@@ -1500,30 +1464,35 @@ mod tests {
         create_initial_credit_transaction(&pool, user.id, "125.0").await;
 
         let response = app
-            .get("/admin/api/v1/users/current/balance")
+            .get("/admin/api/v1/users/current?include=billing")
             .add_header(add_auth_headers(&user).0, add_auth_headers(&user).1)
             .await;
 
         response.assert_status_ok();
-        let balance: UserBalanceResponse = response.json();
-        assert_eq!(balance.user_id, user.id);
-        assert_eq!(balance.current_balance, Decimal::from_str("125.0").unwrap());
+        let balance: UserResponse = response.json();
+        assert_eq!(balance.id, user.id);
+        assert_eq!(balance.credit_balance, Some(125.0));
     }
 
-    // Test: GET /users/{other_user_id}/balance returns 403 for RequestViewer
+    // Test: GET /users/current works for PlatformManager with billing info
     #[sqlx::test]
     #[test_log::test]
-    async fn test_get_other_user_balance_forbidden_request_viewer(pool: PgPool) {
+    async fn test_get_current_user_balance_platform_manager(pool: PgPool) {
         let (app, _) = create_test_app(pool.clone(), false).await;
-        let user1 = create_test_user(&pool, Role::RequestViewer).await;
-        let user2 = create_test_user(&pool, Role::StandardUser).await;
+        let user = create_test_user(&pool, Role::PlatformManager).await;
+
+        // Add some credits
+        create_initial_credit_transaction(&pool, user.id, "125.0").await;
 
         let response = app
-            .get(&format!("/admin/api/v1/users/{}/balance", user2.id))
-            .add_header(add_auth_headers(&user1).0, add_auth_headers(&user1).1)
+            .get("/admin/api/v1/users/current?include=billing")
+            .add_header(add_auth_headers(&user).0, add_auth_headers(&user).1)
             .await;
 
-        response.assert_status_forbidden();
+        response.assert_status_ok();
+        let balance: UserResponse = response.json();
+        assert_eq!(balance.id, user.id);
+        assert_eq!(balance.credit_balance, Some(125.0));
     }
 
     // Test: PlatformManager can view any user's balance (has ReadAll permission)
@@ -1538,14 +1507,14 @@ mod tests {
         create_initial_credit_transaction(&pool, user.id, "300.0").await;
 
         let response = app
-            .get(&format!("/admin/api/v1/users/{}/balance", user.id))
+            .get(&format!("/admin/api/v1/users/{}?include=billing", user.id))
             .add_header(add_auth_headers(&platform_manager).0, add_auth_headers(&platform_manager).1)
             .await;
 
         response.assert_status_ok();
-        let balance: UserBalanceResponse = response.json();
-        assert_eq!(balance.user_id, user.id);
-        assert_eq!(balance.current_balance, Decimal::from_str("300.0").unwrap());
+        let balance: UserResponse = response.json();
+        assert_eq!(balance.id, user.id);
+        assert_eq!(balance.credit_balance, Some(300.0));
     }
 
     // Test: BillingManager can view any user's balance
@@ -1560,13 +1529,13 @@ mod tests {
         create_initial_credit_transaction(&pool, user.id, "300.0").await;
 
         let response = app
-            .get(&format!("/admin/api/v1/users/{}/balance", user.id))
+            .get(&format!("/admin/api/v1/users/{}?include=billing", user.id))
             .add_header(add_auth_headers(&billing_manager).0, add_auth_headers(&billing_manager).1)
             .await;
 
         response.assert_status_ok();
-        let balance: UserBalanceResponse = response.json();
-        assert_eq!(balance.user_id, user.id);
-        assert_eq!(balance.current_balance, Decimal::from_str("300.0").unwrap());
+        let balance: UserResponse = response.json();
+        assert_eq!(balance.id, user.id);
+        assert_eq!(balance.credit_balance, Some(300.0));
     }
 }

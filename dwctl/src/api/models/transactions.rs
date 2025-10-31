@@ -57,6 +57,9 @@ pub struct CreditTransactionResponse {
     /// Balance after this transaction
     #[schema(value_type = f64)]
     pub balance_after: Decimal,
+    /// Previous transaction ID
+    #[schema(value_type = Option<String>, format = "uuid")]
+    pub previous_transaction_id: Option<Uuid>,
     /// Description
     pub description: Option<String>,
     /// When the transaction was created
@@ -87,6 +90,7 @@ impl From<CreditTransactionDBResponse> for CreditTransactionResponse {
             transaction_type: db.transaction_type,
             amount: db.amount,
             balance_after: db.balance_after,
+            previous_transaction_id: db.previous_transaction_id,
             description: db.description,
             created_at: db.created_at,
         }
