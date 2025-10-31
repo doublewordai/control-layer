@@ -578,7 +578,8 @@ const Models: React.FC = () => {
                                           className={`h-2 w-2 rounded-full ${
                                             model.status.last_success === true
                                               ? "bg-green-500 animate-pulse"
-                                              : model.status.last_success === false
+                                              : model.status.last_success ===
+                                                  false
                                                 ? "bg-red-500 animate-pulse"
                                                 : "bg-gray-400"
                                           }`}
@@ -593,26 +594,34 @@ const Models: React.FC = () => {
                                           <div className="flex items-center gap-2">
                                             <div
                                               className={`h-2 w-2 rounded-full ${
-                                                model.status.last_success === true
+                                                model.status.last_success ===
+                                                true
                                                   ? "bg-green-500"
-                                                  : model.status.last_success === false
+                                                  : model.status
+                                                        .last_success === false
                                                     ? "bg-red-500"
                                                     : "bg-gray-400"
                                               }`}
                                             />
                                             <span className="font-medium text-sm">
-                                              {model.status.last_success === true
+                                              {model.status.last_success ===
+                                              true
                                                 ? "Operational"
-                                                : model.status.last_success === false
+                                                : model.status.last_success ===
+                                                    false
                                                   ? "Down"
                                                   : "Unknown"}
                                             </span>
                                           </div>
-                                          {model.status.uptime_percentage !== undefined &&
-                                            model.status.uptime_percentage !== null && (
+                                          {model.status.uptime_percentage !==
+                                            undefined &&
+                                            model.status.uptime_percentage !==
+                                              null && (
                                               <p className="text-xs text-muted-foreground">
-                                                {model.status.uptime_percentage.toFixed(2)}% uptime
-                                                (24h)
+                                                {model.status.uptime_percentage.toFixed(
+                                                  2,
+                                                )}
+                                                % uptime (24h)
                                               </p>
                                             )}
                                         </div>

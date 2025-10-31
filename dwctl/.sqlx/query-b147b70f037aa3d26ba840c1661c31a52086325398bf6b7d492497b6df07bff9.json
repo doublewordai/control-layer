@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "\n            INSERT INTO inference_endpoints (name, description, url, api_key, model_filter, created_by, created_at, updated_at)\n            VALUES ($1, $2, $3, $4, $5, $6, $7, $8)\n            RETURNING *\n            ",
+  "query": "\n            UPDATE inference_endpoints SET\n                name = COALESCE($2, name),\n                description = CASE\n                    WHEN $3::text IS NOT NULL THEN $3\n                    ELSE description\n                END,\n                url = COALESCE($4, url),\n                api_key = CASE\n                    WHEN $5::text IS NOT NULL THEN $5\n                    ELSE api_key\n                END,\n                model_filter = CASE\n                    WHEN $6::text[] IS NOT NULL THEN $6\n                    ELSE model_filter\n                END,\n                auth_header_name = COALESCE($7, auth_header_name),\n                auth_header_prefix = COALESCE($8, auth_header_prefix),\n                updated_at = NOW()\n            WHERE id = $1\n            RETURNING *\n            ",
   "describe": {
     "columns": [
       {
@@ -47,18 +47,28 @@
         "ordinal": 8,
         "name": "id",
         "type_info": "Uuid"
+      },
+      {
+        "ordinal": 9,
+        "name": "auth_header_name",
+        "type_info": "Varchar"
+      },
+      {
+        "ordinal": 10,
+        "name": "auth_header_prefix",
+        "type_info": "Varchar"
       }
     ],
     "parameters": {
       "Left": [
+        "Uuid",
         "Varchar",
         "Text",
         "Varchar",
         "Text",
         "TextArray",
-        "Uuid",
-        "Timestamptz",
-        "Timestamptz"
+        "Varchar",
+        "Varchar"
       ]
     },
     "nullable": [
@@ -70,8 +80,10 @@
       false,
       true,
       true,
+      false,
+      false,
       false
     ]
   },
-  "hash": "75542fa344c6c0b876e2007ca25729d41ac4a06812124339809b9017db3ec118"
+  "hash": "b147b70f037aa3d26ba840c1661c31a52086325398bf6b7d492497b6df07bff9"
 }

@@ -30,6 +30,8 @@ struct InferenceEndpoint {
     pub url: String,
     pub api_key: Option<String>,
     pub model_filter: Option<Vec<String>>,
+    pub auth_header_name: String,
+    pub auth_header_prefix: String,
     pub created_by: UserId,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
@@ -46,6 +48,8 @@ impl TryFrom<InferenceEndpoint> for InferenceEndpointDBResponse {
             url: src.url.parse()?, // url::Url from String
             api_key: src.api_key,
             model_filter: src.model_filter,
+            auth_header_name: src.auth_header_name,
+            auth_header_prefix: src.auth_header_prefix,
             created_by: src.created_by,
             created_at: src.created_at,
             updated_at: src.updated_at,
@@ -72,8 +76,8 @@ impl<'c> Repository for InferenceEndpoints<'c> {
         let endpoint = sqlx::query_as!(
             InferenceEndpoint,
             r#"
-            INSERT INTO inference_endpoints (name, description, url, api_key, model_filter, created_by, created_at, updated_at)
-            VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+            INSERT INTO inference_endpoints (name, description, url, api_key, model_filter, auth_header_name, auth_header_prefix, created_by, created_at, updated_at)
+            VALUES ($1, $2, $3, $4, $5, COALESCE($6, 'Authorization'), COALESCE($7, 'Bearer '), $8, $9, $10)
             RETURNING *
             "#,
             request.name,
@@ -81,6 +85,8 @@ impl<'c> Repository for InferenceEndpoints<'c> {
             request.url.as_str(),
             request.api_key,
             request.model_filter.as_deref(),
+            request.auth_header_name,
+            request.auth_header_prefix,
             request.created_by,
             created_at,
             updated_at
@@ -120,6 +126,8 @@ impl<'c> Repository for InferenceEndpoints<'c> {
                 url: row.url,
                 api_key: row.api_key,
                 model_filter: row.model_filter,
+                auth_header_name: row.auth_header_name,
+                auth_header_prefix: row.auth_header_prefix,
                 created_by: row.created_by,
                 created_at: row.created_at,
                 updated_at: row.updated_at,
@@ -149,19 +157,21 @@ impl<'c> Repository for InferenceEndpoints<'c> {
             r#"
             UPDATE inference_endpoints SET
                 name = COALESCE($2, name),
-                description = CASE 
+                description = CASE
                     WHEN $3::text IS NOT NULL THEN $3
-                    ELSE description 
+                    ELSE description
                 END,
                 url = COALESCE($4, url),
-                api_key = CASE 
+                api_key = CASE
                     WHEN $5::text IS NOT NULL THEN $5
-                    ELSE api_key 
+                    ELSE api_key
                 END,
-                model_filter = CASE 
+                model_filter = CASE
                     WHEN $6::text[] IS NOT NULL THEN $6
-                    ELSE model_filter 
+                    ELSE model_filter
                 END,
+                auth_header_name = COALESCE($7, auth_header_name),
+                auth_header_prefix = COALESCE($8, auth_header_prefix),
                 updated_at = NOW()
             WHERE id = $1
             RETURNING *
@@ -171,7 +181,9 @@ impl<'c> Repository for InferenceEndpoints<'c> {
             request.description.as_deref(),
             request.url.as_ref().map(|u| u.as_str()),
             request.api_key.as_ref().and_then(|opt| opt.as_deref()),
-            request.model_filter.as_ref().and_then(|opt| opt.as_ref().map(|v| v.as_slice()))
+            request.model_filter.as_ref().and_then(|opt| opt.as_ref().map(|v| v.as_slice())),
+            request.auth_header_name,
+            request.auth_header_prefix
         )
         .fetch_optional(&mut *self.db)
         .await?
@@ -241,6 +253,8 @@ mod tests {
             url: "https://api.example.com".parse().unwrap(),
             api_key: Some("test-api-key".to_string()),
             model_filter: Some(vec!["gpt-4".to_string(), "gpt-3.5-turbo".to_string()]),
+            auth_header_name: None,
+            auth_header_prefix: None,
             created_by,
         }
     }
@@ -388,6 +402,8 @@ mod tests {
             url: Some("https://updated.example.com".parse().unwrap()),
             api_key: Some(Some("updated-api-key".to_string())),
             model_filter: Some(Some(vec!["claude-3".to_string(), "gpt-4-turbo".to_string()])),
+            auth_header_name: None,
+            auth_header_prefix: None,
         };
 
         // Apply update
@@ -430,6 +446,8 @@ mod tests {
             url: None,
             api_key: Some(Some("new-api-key".to_string())),
             model_filter: None,
+            auth_header_name: None,
+            auth_header_prefix: None,
         };
 
         // Apply update
@@ -469,6 +487,12 @@ mod tests {
         if let Some(model_filter) = update_request.model_filter {
             original.model_filter = model_filter;
         }
+        if let Some(auth_header_name) = update_request.auth_header_name {
+            original.auth_header_name = auth_header_name;
+        }
+        if let Some(auth_header_prefix) = update_request.auth_header_prefix {
+            original.auth_header_prefix = auth_header_prefix;
+        }
 
         // Always update the timestamp like COALESCE would with NOW()
         original.updated_at = chrono::Utc::now();
@@ -486,6 +510,8 @@ mod tests {
             url: "https://original.example.com".parse().unwrap(),
             api_key: Some("original-key".to_string()),
             model_filter: Some(vec!["gpt-3.5".to_string()]),
+            auth_header_name: "Authorization".to_string(),
+            auth_header_prefix: "Bearer ".to_string(),
             created_by: uuid::Uuid::new_v4(),
             created_at: chrono::Utc::now(),
             updated_at: chrono::Utc::now(),
@@ -498,6 +524,8 @@ mod tests {
             url: None,
             api_key: Some(Some("trait-updated-key".to_string())),
             model_filter: Some(Some(vec!["claude-3".to_string(), "gpt-4".to_string()])),
+            auth_header_name: None,
+            auth_header_prefix: None,
         };
 
         let updated_response = mock_coalesce_update(update_request, original_response.clone());
@@ -531,6 +559,8 @@ mod tests {
             url: "https://original.example.com".parse().unwrap(),
             api_key: Some("original-key".to_string()),
             model_filter: Some(vec!["gpt-3.5".to_string()]),
+            auth_header_name: "Authorization".to_string(),
+            auth_header_prefix: "Bearer ".to_string(),
             created_by: uuid::Uuid::new_v4(),
             created_at: chrono::Utc::now(),
             updated_at: chrono::Utc::now() - chrono::Duration::seconds(1),
@@ -543,6 +573,8 @@ mod tests {
             url: None,
             api_key: None,
             model_filter: None,
+            auth_header_name: None,
+            auth_header_prefix: None,
         };
 
         let updated_response = mock_coalesce_update(update_request, original_response.clone());
@@ -574,6 +606,8 @@ mod tests {
             url: None,
             api_key: None,
             model_filter: None,
+            auth_header_name: None,
+            auth_header_prefix: None,
         };
 
         let result = repo.update(fake_id, &update_request).await;

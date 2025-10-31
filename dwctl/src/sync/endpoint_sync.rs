@@ -911,6 +911,8 @@ mod tests {
             url: "http://localhost:8080".parse().unwrap(),
             api_key: Some("test-api-key".to_string()),
             model_filter: None, // No filter by default - sync all models
+            auth_header_name: "Authorization".to_string(),
+            auth_header_prefix: "Bearer ".to_string(),
             created_by: uuid::Uuid::nil(),
             created_at: Utc::now(),
             updated_at: Utc::now(),

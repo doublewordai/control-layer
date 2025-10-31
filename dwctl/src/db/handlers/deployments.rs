@@ -2150,6 +2150,8 @@ mod tests {
             api_key: None,
             description: None,
             model_filter: None,
+            auth_header_name: None,
+            auth_header_prefix: None,
             created_by: user.id,
         };
         let endpoint = endpoints_repo.create(&endpoint_create).await.unwrap();
@@ -2194,6 +2196,8 @@ mod tests {
             api_key: None,
             description: None,
             model_filter: None,
+            auth_header_name: None,
+            auth_header_prefix: None,
             created_by: user.id,
         };
         let endpoint = endpoints_repo.create(&endpoint_create).await.unwrap();

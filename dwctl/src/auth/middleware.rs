@@ -146,6 +146,8 @@ mod tests {
                 url: "http://localhost:8000".parse().unwrap(),
                 api_key: None,
                 model_filter: None,
+                auth_header_name: None,
+                auth_header_prefix: None,
                 created_by: user.id,
             })
             .await
@@ -195,6 +197,8 @@ mod tests {
                 url: "http://localhost:8000".parse().unwrap(),
                 api_key: None,
                 model_filter: None,
+                auth_header_name: None,
+                auth_header_prefix: None,
                 created_by: user.id,
             })
             .await
@@ -352,6 +356,8 @@ mod tests {
                 url: "http://localhost:8000".parse().unwrap(),
                 api_key: None,
                 model_filter: None,
+                auth_header_name: None,
+                auth_header_prefix: None,
                 created_by: user.id,
             })
             .await
@@ -416,6 +422,8 @@ mod tests {
                 url: "http://localhost:8000".parse().unwrap(),
                 api_key: None,
                 model_filter: None,
+                auth_header_name: None,
+                auth_header_prefix: None,
                 created_by: user.id,
             })
             .await
@@ -513,6 +521,8 @@ mod tests {
                 url: "http://localhost:8000".parse().unwrap(),
                 api_key: None,
                 model_filter: None,
+                auth_header_name: None,
+                auth_header_prefix: None,
                 created_by: jwt_user.id,
             })
             .await
@@ -612,6 +622,8 @@ mod tests {
                 url: "http://localhost:8000".parse().unwrap(),
                 api_key: None,
                 model_filter: None,
+                auth_header_name: None,
+                auth_header_prefix: None,
                 created_by: user.id,
             })
             .await
@@ -709,6 +721,8 @@ mod tests {
                 url: "http://localhost:8000".parse().unwrap(),
                 api_key: None,
                 model_filter: None,
+                auth_header_name: None,
+                auth_header_prefix: None,
                 created_by: Uuid::nil(), // Use nil for system creation
             })
             .await
@@ -789,6 +803,8 @@ mod tests {
                 url: "http://localhost:8000".parse().unwrap(),
                 api_key: None,
                 model_filter: None,
+                auth_header_name: None,
+                auth_header_prefix: None,
                 created_by: user.id,
             })
             .await
