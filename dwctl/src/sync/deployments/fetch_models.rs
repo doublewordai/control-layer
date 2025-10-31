@@ -11,6 +11,8 @@ use url::Url;
 pub struct SyncConfig {
     pub openai_api_key: Option<String>,
     pub openai_base_url: Url,
+    pub auth_header_name: String,
+    pub auth_header_prefix: String,
     pub(crate) request_timeout: Duration,
 }
 
@@ -24,6 +26,8 @@ impl SyncConfig {
         Self {
             openai_api_key: source.api_key.clone(),
             openai_base_url: source.url.clone(),
+            auth_header_name: source.auth_header_name.clone(),
+            auth_header_prefix: source.auth_header_prefix.clone(),
             request_timeout: Self::DEFAULT_REQUEST_TIMEOUT,
         }
     }
@@ -42,6 +46,8 @@ pub struct FetchModelsReqwest {
     client: Client,
     base_url: Url,
     openai_api_key: Option<String>,
+    auth_header_name: String,
+    auth_header_prefix: String,
     request_timeout: Duration,
 }
 
@@ -53,11 +59,15 @@ impl FetchModelsReqwest {
             .expect("Failed to create HTTP client");
         let base_url = config.openai_base_url.clone();
         let openai_api_key = config.openai_api_key.clone();
+        let auth_header_name = config.auth_header_name.clone();
+        let auth_header_prefix = config.auth_header_prefix.clone();
         let request_timeout = config.request_timeout;
         Self {
             client,
             base_url,
             openai_api_key,
+            auth_header_name,
+            auth_header_prefix,
             request_timeout,
         }
     }
@@ -113,7 +123,7 @@ impl FetchModels for FetchModelsReqwest {
         match fmt {
             ModelFormat::OpenAI => {
                 if let Some(api_key) = &self.openai_api_key {
-                    request = request.header("Authorization", format!("Bearer {api_key}"));
+                    request = request.header(&self.auth_header_name, format!("{}{}", self.auth_header_prefix, api_key));
                 };
 
                 let response = request.timeout(self.request_timeout).send().await?;
@@ -143,7 +153,7 @@ impl FetchModels for FetchModelsReqwest {
             }
             ModelFormat::Anthropic => {
                 if let Some(api_key) = &self.openai_api_key {
-                    request = request.header("x-api-key", api_key.to_string());
+                    request = request.header(&self.auth_header_name, format!("{}{}", self.auth_header_prefix, api_key));
                 };
 
                 // Have to set this
@@ -176,5 +186,40 @@ impl FetchModels for FetchModelsReqwest {
                 }
             }
         }
+    }
+}
+
+/// A static implementation of FetchModels that returns a predefined list of models
+/// Used for endpoints where we have a known list of models (e.g., Snowflake Cortex AI)
+pub struct StaticModelsFetcher {
+    models: OpenAIModelsResponse,
+}
+
+impl StaticModelsFetcher {
+    pub fn new(model_names: Vec<String>) -> Self {
+        let models = model_names
+            .into_iter()
+            .map(|name| crate::api::models::inference_endpoints::OpenAIModel {
+                id: name,
+                object: "model".to_string(),
+                created: Some(0),
+                owned_by: String::new(), // Empty string for static models
+            })
+            .collect();
+
+        Self {
+            models: OpenAIModelsResponse {
+                object: "list".to_string(),
+                data: models,
+            },
+        }
+    }
+}
+
+#[async_trait]
+impl FetchModels for StaticModelsFetcher {
+    async fn fetch(&self) -> anyhow::Result<OpenAIModelsResponse> {
+        debug!("Returning static model list with {} models", self.models.data.len());
+        Ok(self.models.clone())
     }
 }

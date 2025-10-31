@@ -1,5 +1,17 @@
 import React, { useState, useEffect } from "react";
-import { Server, Check, AlertCircle, Loader2, Edit2, X } from "lucide-react";
+import {
+  Server,
+  Check,
+  AlertCircle,
+  Loader2,
+  Edit2,
+  X,
+  Info,
+  ChevronRight,
+  ChevronDown,
+  Eye,
+  EyeOff,
+} from "lucide-react";
 import { useForm } from "react-hook-form";
 import { zodResolver } from "@hookform/resolvers/zod";
 import * as z from "zod";
@@ -22,6 +34,12 @@ import { Input } from "../../ui/input";
 import { Textarea } from "../../ui/textarea";
 import { Checkbox } from "../../ui/checkbox";
 import { Button } from "../../ui/button";
+import {
+  HoverCard,
+  HoverCardContent,
+  HoverCardTrigger,
+} from "../../ui/hover-card";
+import { Popover, PopoverContent, PopoverTrigger } from "../../ui/popover";
 import {
   useValidateEndpoint,
   useUpdateEndpoint,
@@ -49,6 +67,8 @@ const formSchema = z.object({
   name: z.string().min(1, "Endpoint name is required"),
   description: z.string().optional(),
   selectedModels: z.array(z.string()),
+  authHeaderName: z.string().optional(),
+  authHeaderPrefix: z.string().optional(),
 });
 
 type FormData = z.infer<typeof formSchema>;
@@ -74,6 +94,18 @@ export const EditEndpointModal: React.FC<EditEndpointModalProps> = ({
   // Track if URL has changed to require re-validation
   const [urlChanged, setUrlChanged] = useState(false);
 
+  // Manual model configuration
+  const [manualMode, setManualMode] = useState(false);
+  const [manualModelInput, setManualModelInput] = useState("");
+  const [autoDiscoverModels, setAutoDiscoverModels] = useState(true);
+
+  // Step navigation
+  const [currentStep, setCurrentStep] = useState<1 | 2>(1);
+
+  // Advanced configuration
+  const [advancedPopoverOpen, setAdvancedPopoverOpen] = useState(false);
+  const [showApiKey, setShowApiKey] = useState(false);
+
   const validateEndpointMutation = useValidateEndpoint();
   const updateEndpointMutation = useUpdateEndpoint();
 
@@ -85,6 +117,8 @@ export const EditEndpointModal: React.FC<EditEndpointModalProps> = ({
       name: "",
       description: "",
       selectedModels: [],
+      authHeaderName: "",
+      authHeaderPrefix: "",
     },
   });
 
@@ -117,6 +151,8 @@ export const EditEndpointModal: React.FC<EditEndpointModalProps> = ({
         name: endpoint.name,
         description: endpoint.description || "",
         selectedModels: endpoint.model_filter || [],
+        authHeaderName: "",
+        authHeaderPrefix: "",
       });
 
       setValidationState("idle");
@@ -190,6 +226,7 @@ export const EditEndpointModal: React.FC<EditEndpointModalProps> = ({
         setAvailableModels(result.models.data);
         setValidationState("success");
         setUrlChanged(false);
+        setManualMode(false);
 
         // Merge existing aliases with new models from the endpoint
         const updatedAliases = { ...modelAliases };
@@ -208,6 +245,8 @@ export const EditEndpointModal: React.FC<EditEndpointModalProps> = ({
         if (currentSelection.length === 0 && endpoint.model_filter) {
           form.setValue("selectedModels", endpoint.model_filter);
         }
+
+        setCurrentStep(2);
       } else {
         setValidationError(result.error || "Unknown validation error");
         setValidationState("error");
@@ -244,6 +283,68 @@ export const EditEndpointModal: React.FC<EditEndpointModalProps> = ({
     }
   };
 
+  const handleConfigureManually = () => {
+    setManualMode(true);
+    setValidationState("idle");
+    setValidationError(null);
+
+    // Pre-populate with current model filter if available
+    if (endpoint.model_filter && endpoint.model_filter.length > 0) {
+      setManualModelInput(endpoint.model_filter.join("\n"));
+    }
+  };
+
+  const handleApplyManualModels = () => {
+    // Parse manual input
+    const modelNames = manualModelInput
+      .split("\n")
+      .map((s) => s.trim())
+      .filter(Boolean);
+
+    if (modelNames.length === 0) {
+      setValidationError("Please enter at least one model name");
+      return;
+    }
+
+    // Create AvailableModel objects from model names
+    const models: AvailableModel[] = modelNames.map((name) => ({
+      id: name,
+      created: 0,
+      object: "model" as const,
+      owned_by: "",
+    }));
+
+    setAvailableModels(models);
+    setValidationState("success");
+
+    // Initialize aliases to model names
+    const initialAliases = models.reduce(
+      (acc, model) => ({
+        ...acc,
+        [model.id]: model.id,
+      }),
+      {},
+    );
+    setModelAliases(initialAliases);
+
+    // Select all models by default
+    form.setValue(
+      "selectedModels",
+      models.map((m) => m.id),
+    );
+
+    setUrlChanged(false); // Mark as validated since we have models
+    setCurrentStep(2);
+  };
+
+  const handleBack = () => {
+    setCurrentStep(1);
+    setValidationState("idle");
+    setValidationError(null);
+    setBackendConflicts(new Set());
+    setLocalConflicts([]);
+  };
+
   const onSubmit = async (data: FormData) => {
     if (urlChanged && validationState !== "success") {
       setValidationError(
@@ -270,6 +371,12 @@ export const EditEndpointModal: React.FC<EditEndpointModalProps> = ({
         model_filter: data.selectedModels,
       }),
       ...(data.selectedModels.length > 0 && { alias_mapping: aliasMapping }),
+      ...(data.authHeaderName?.trim() && {
+        auth_header_name: data.authHeaderName.trim(),
+      }),
+      ...(data.authHeaderPrefix?.trim() && {
+        auth_header_prefix: data.authHeaderPrefix.trim(),
+      }),
     };
 
     try {
@@ -485,9 +592,6 @@ export const EditEndpointModal: React.FC<EditEndpointModalProps> = ({
     }
   };
 
-  const shouldShowValidation = urlChanged;
-  const shouldShowModels =
-    validationState === "success" && availableModels.length > 0;
   const canUpdate =
     form.watch("name")?.trim() &&
     !updateEndpointMutation.isPending &&
@@ -498,387 +602,591 @@ export const EditEndpointModal: React.FC<EditEndpointModalProps> = ({
 
   return (
     <Dialog open={isOpen} onOpenChange={onClose}>
-      <DialogContent className="sm:max-w-2xl max-h-[90vh] overflow-y-auto">
+      <DialogContent className="sm:max-w-2xl max-h-[90vh] overflow-y-auto [&>button]:hidden">
         <DialogHeader>
-          <div className="flex items-center space-x-3">
-            <div className="p-2 bg-doubleword-accent-blue rounded-lg">
-              <Edit2 className="w-5 h-5 text-white" />
-            </div>
+          <div className="flex items-center justify-between">
             <DialogTitle>Edit Endpoint</DialogTitle>
+
+            {/* Stepper */}
+            <div className="flex items-center space-x-2">
+              {/* Step 1: Connection */}
+              <div
+                className={`flex items-center ${
+                  currentStep === 1
+                    ? "text-gray-700 font-medium"
+                    : currentStep > 1
+                      ? "text-emerald-600 font-medium"
+                      : "text-gray-400"
+                }`}
+              >
+                <div
+                  className={`w-8 h-8 rounded-full flex items-center justify-center border-2 ${
+                    currentStep === 1
+                      ? "border-gray-700 bg-gray-700 text-white"
+                      : currentStep > 1
+                        ? "border-emerald-500 bg-emerald-500 text-white"
+                        : "border-gray-300 text-gray-400"
+                  }`}
+                >
+                  {currentStep > 1 ? <Check className="w-4 h-4" /> : "1"}
+                </div>
+                <span className="ml-2 text-sm">Connection</span>
+              </div>
+
+              {/* Connector Line */}
+              <div
+                className={`w-12 h-0.5 ${currentStep > 1 ? "bg-emerald-500" : "bg-gray-300"}`}
+              />
+
+              {/* Step 2: Models */}
+              <div
+                className={`flex items-center ${
+                  currentStep === 2
+                    ? "text-gray-700 font-medium"
+                    : "text-gray-400"
+                }`}
+              >
+                <div
+                  className={`w-8 h-8 rounded-full flex items-center justify-center border-2 ${
+                    currentStep === 2
+                      ? "border-gray-700 bg-gray-700 text-white"
+                      : "border-gray-300 text-gray-400"
+                  }`}
+                >
+                  2
+                </div>
+                <span className="ml-2 text-sm">Models</span>
+              </div>
+            </div>
           </div>
         </DialogHeader>
 
         <Form {...form}>
           <form onSubmit={form.handleSubmit(onSubmit)} className="space-y-6">
-            <FormField
-              control={form.control}
-              name="name"
-              render={({ field, fieldState }) => (
-                <FormItem>
-                  <FormLabel>Display Name *</FormLabel>
-                  <FormControl>
-                    <Input
-                      placeholder="My API Endpoint"
-                      {...field}
-                      onChange={(e) => {
-                        field.onChange(e);
-                        if (form.formState.errors.name) {
-                          form.clearErrors("name");
-                        }
-                      }}
-                      className={
-                        fieldState.error
-                          ? "border-red-500 focus:border-red-500"
-                          : ""
-                      }
-                    />
-                  </FormControl>
-                  {fieldState.error?.message !== "endpoint_name_conflict" && (
-                    <FormMessage />
+            {/* Step 1: Connection Details */}
+            {currentStep === 1 && (
+              <div className="space-y-6">
+                <FormField
+                  control={form.control}
+                  name="url"
+                  render={({ field }) => (
+                    <FormItem>
+                      <FormLabel>
+                        Endpoint URL *
+                        {urlChanged && (
+                          <span className="text-yellow-600 text-xs ml-2">
+                            (Changed - requires testing)
+                          </span>
+                        )}
+                      </FormLabel>
+                      <FormControl>
+                        <Input
+                          placeholder="https://api.example.com"
+                          {...field}
+                          onChange={(e) => {
+                            field.onChange(e);
+                            handleUrlChange(e.target.value);
+                          }}
+                        />
+                      </FormControl>
+                      <FormMessage />
+                    </FormItem>
                   )}
-                </FormItem>
-              )}
-            />
+                />
 
-            <FormField
-              control={form.control}
-              name="description"
-              render={({ field }) => (
-                <FormItem>
-                  <FormLabel>Description (optional)</FormLabel>
-                  <FormControl>
-                    <Textarea
-                      placeholder="Description of this endpoint..."
-                      className="resize-none"
-                      rows={3}
-                      {...field}
-                    />
-                  </FormControl>
-                </FormItem>
-              )}
-            />
-
-            <FormField
-              control={form.control}
-              name="url"
-              render={({ field }) => (
-                <FormItem>
-                  <FormLabel>
-                    Endpoint URL *
-                    {urlChanged && (
-                      <span className="text-yellow-600 text-xs ml-2">
-                        (Changed - requires testing)
-                      </span>
-                    )}
-                  </FormLabel>
-                  <FormControl>
-                    <Input
-                      placeholder="https://api.example.com"
-                      {...field}
-                      onChange={(e) => {
-                        field.onChange(e);
-                        handleUrlChange(e.target.value);
-                      }}
-                    />
-                  </FormControl>
-                  <FormMessage />
-                </FormItem>
-              )}
-            />
-
-            {endpoint.requires_api_key && (
-              <FormField
-                control={form.control}
-                name="apiKey"
-                render={({ field }) => (
-                  <FormItem>
-                    <FormLabel>
-                      API Key (optional)
-                      <span className="text-xs text-gray-500 ml-2">
-                        Leave empty to keep existing key
-                      </span>
-                    </FormLabel>
-                    <FormControl>
-                      <Input type="password" placeholder="sk-..." {...field} />
-                    </FormControl>
-                  </FormItem>
-                )}
-              />
-            )}
-
-            {validationState === "error" && (
-              <div className="p-4 bg-red-50 border border-red-200 rounded-lg">
-                <div className="flex items-center space-x-2">
-                  <AlertCircle className="w-5 h-5 text-red-600" />
-                  <p className="text-red-800 font-medium">Connection Failed</p>
-                </div>
-                <p className="text-red-700 text-sm mt-1">{validationError}</p>
-              </div>
-            )}
-
-            {validationState === "success" && (
-              <div className="p-2 bg-green-50 border border-green-200 rounded-lg">
-                <div className="flex items-center space-x-2">
-                  <Check className="w-4 h-4 text-green-600" />
-                  <p className="text-sm text-green-800">
-                    Models refreshed • {availableModels.length} found
-                  </p>
-                </div>
-              </div>
-            )}
-
-            {/* Model configuration section */}
-            {!shouldShowModels && (
-              <div className="space-y-4">
-                <div className="flex items-center justify-between">
-                  <div>
-                    <p className="text-sm text-gray-600">
-                      Configure which models to sync from this endpoint
-                    </p>
-                  </div>
-                  <Button
-                    type="button"
-                    onClick={handleTestConnection}
-                    disabled={
-                      !form.watch("url")?.trim() ||
-                      validationState === "testing"
-                    }
-                    variant="secondary"
-                  >
-                    {validationState === "testing" ? (
-                      <>
-                        <Loader2 className="w-4 h-4 mr-2 animate-spin" />
-                        Loading...
-                      </>
-                    ) : (
-                      <>
-                        <Server className="w-4 h-4 mr-2" />
-                        Configure Models
-                      </>
-                    )}
-                  </Button>
-                </div>
-              </div>
-            )}
-
-            {shouldShowModels && (
-              <FormField
-                control={form.control}
-                name="selectedModels"
-                render={({ field }) => (
-                  <FormItem>
-                    <div className="flex items-center justify-between">
-                      <div>
-                        <FormLabel>Select Models & Configure Aliases</FormLabel>
-                        <p className="text-xs text-gray-500">
-                          {field.value?.length || 0} of {availableModels.length}{" "}
-                          selected • Aliases default to model names but can be
-                          customized
-                        </p>
-                      </div>
-                      <div className="flex space-x-2">
-                        <Button
-                          type="button"
-                          variant="link"
-                          onClick={handleSelectAll}
-                          className="h-auto p-0 text-xs"
-                        >
-                          {field.value?.length === availableModels.length
-                            ? "Deselect All"
-                            : "Select All"}
-                        </Button>
-                        <Button
-                          type="button"
-                          onClick={handleTestConnection}
-                          disabled={
-                            !form.watch("url")?.trim() ||
-                            validateEndpointMutation.isPending
-                          }
-                          variant="outline"
-                          size="sm"
-                        >
-                          {validateEndpointMutation.isPending ? (
-                            <>
-                              <Loader2 className="w-4 h-4 mr-2 animate-spin" />
-                              Refreshing...
-                            </>
-                          ) : (
-                            <>
-                              <Server className="w-4 h-4 mr-2" />
-                              Refresh List
-                            </>
-                          )}
-                        </Button>
-                      </div>
-                    </div>
-
-                    <div className="max-h-60 overflow-y-auto border rounded-lg mt-2">
-                      <div className="sticky top-0 bg-gray-50 border-b px-3 py-2 text-xs font-medium text-gray-600">
-                        <div className="grid grid-cols-12 gap-3">
-                          <div className="col-span-1"></div>
-                          <div className="col-span-5">Model Name</div>
-                          <div className="col-span-6">
-                            Alias (used for routing)
+                {endpoint.requires_api_key && (
+                  <FormField
+                    control={form.control}
+                    name="apiKey"
+                    render={({ field }) => (
+                      <FormItem>
+                        <FormLabel>
+                          API Key (optional)
+                          <span className="text-xs text-gray-500 ml-2">
+                            Leave empty to keep existing key
+                          </span>
+                        </FormLabel>
+                        <FormControl>
+                          <div className="relative">
+                            <Input
+                              type={showApiKey ? "text" : "password"}
+                              placeholder="sk-..."
+                              {...field}
+                              className="pr-10"
+                            />
+                            <button
+                              type="button"
+                              className="absolute right-0 top-0 h-full px-3 text-gray-500 hover:text-gray-700 transition-colors"
+                              onClick={() => setShowApiKey(!showApiKey)}
+                            >
+                              {showApiKey ? (
+                                <EyeOff className="h-4 w-4" />
+                              ) : (
+                                <Eye className="h-4 w-4" />
+                              )}
+                              <span className="sr-only">
+                                {showApiKey ? "Hide API key" : "Show API key"}
+                              </span>
+                            </button>
                           </div>
-                        </div>
-                      </div>
+                        </FormControl>
+                      </FormItem>
+                    )}
+                  />
+                )}
 
-                      {availableModels.map((model) => (
-                        <ModelRowWithAlias
-                          key={model.id}
-                          model={model}
-                          isSelected={field.value?.includes(model.id) || false}
-                          alias={modelAliases[model.id] || model.id}
-                          onSelectionChange={(checked) => {
-                            const current = field.value || [];
-                            if (checked) {
-                              field.onChange([...current, model.id]);
-                              if (!modelAliases[model.id]) {
-                                setModelAliases((prev) => ({
-                                  ...prev,
-                                  [model.id]: model.id,
-                                }));
-                              }
-                            } else {
-                              field.onChange(
-                                current.filter((id) => id !== model.id),
-                              );
-                            }
-                          }}
-                          onAliasChange={(newAlias) => {
-                            const trimmedAlias = newAlias.trim();
-                            const updatedAliases = {
-                              ...modelAliases,
-                              [model.id]: trimmedAlias,
-                            };
-                            setModelAliases(updatedAliases);
-
-                            const conflicts =
-                              checkLocalAliasConflicts(updatedAliases);
-                            setLocalConflicts(conflicts);
-                          }}
-                          onConflictClear={(oldAlias) => {
-                            setBackendConflicts((prev) => {
-                              const updated = new Set(prev);
-                              updated.delete(oldAlias);
-                              return updated;
-                            });
-                          }}
-                          conflictInfo={checkAliasConflict(
-                            model.id,
-                            modelAliases[model.id] || model.id,
+                {/* Advanced Configuration and Auto-discover */}
+                <div className="flex items-center justify-between">
+                  <Popover
+                    open={advancedPopoverOpen}
+                    onOpenChange={setAdvancedPopoverOpen}
+                  >
+                    <PopoverTrigger asChild>
+                      <button
+                        type="button"
+                        className="flex items-center gap-2 text-sm font-medium text-gray-700 hover:text-gray-900 transition-colors group"
+                      >
+                        Advanced Configuration
+                        <ChevronDown
+                          className={`w-4 h-4 transition-transform group-hover:translate-y-px ${advancedPopoverOpen ? "rotate-180" : ""}`}
+                        />
+                      </button>
+                    </PopoverTrigger>
+                    <PopoverContent className="w-96 p-4" align="start">
+                      <div className="space-y-4">
+                        <FormField
+                          control={form.control}
+                          name="authHeaderName"
+                          render={({ field }) => (
+                            <FormItem>
+                              <FormLabel>Authorization Header Name</FormLabel>
+                              <FormControl>
+                                <Input
+                                  placeholder='"Authorization"'
+                                  {...field}
+                                />
+                              </FormControl>
+                              <p className="text-xs text-gray-500">
+                                The HTTP header name provided with upstream
+                                requests to this endpoint.
+                              </p>
+                            </FormItem>
                           )}
                         />
-                      ))}
+
+                        <FormField
+                          control={form.control}
+                          name="authHeaderPrefix"
+                          render={({ field }) => (
+                            <FormItem>
+                              <FormLabel>Authorization Header Prefix</FormLabel>
+                              <FormControl>
+                                <Input placeholder='"Bearer "' {...field} />
+                              </FormControl>
+                              <p className="text-xs text-gray-500">
+                                The prefix before the API key header value.
+                                Default is "Bearer " (with trailing space).
+                              </p>
+                            </FormItem>
+                          )}
+                        />
+                      </div>
+                    </PopoverContent>
+                  </Popover>
+
+                  {/* Auto-discover models checkbox */}
+                  <div className="flex items-center space-x-2">
+                    <Checkbox
+                      id="auto-discover-edit"
+                      checked={autoDiscoverModels}
+                      onCheckedChange={(checked) =>
+                        setAutoDiscoverModels(checked === true)
+                      }
+                    />
+                    <label
+                      htmlFor="auto-discover-edit"
+                      className="text-sm font-medium leading-none peer-disabled:cursor-not-allowed peer-disabled:opacity-70 cursor-pointer"
+                    >
+                      Auto-discover models
+                    </label>
+                    <HoverCard openDelay={200} closeDelay={100}>
+                      <HoverCardTrigger asChild>
+                        <button
+                          type="button"
+                          className="text-gray-500 hover:text-gray-700 transition-colors"
+                          onFocus={(e) => e.preventDefault()}
+                          tabIndex={-1}
+                        >
+                          <Info className="h-4 w-4" />
+                          <span className="sr-only">
+                            Auto-discover information
+                          </span>
+                        </button>
+                      </HoverCardTrigger>
+                      <HoverCardContent className="w-80" sideOffset={5}>
+                        <p className="text-sm text-muted-foreground">
+                          When enabled, the endpoint will be queried for
+                          available models via the <code>/v1/models</code> API.
+                          If disabled, you can manually specify the model names.
+                        </p>
+                      </HoverCardContent>
+                    </HoverCard>
+                  </div>
+                </div>
+
+                {/* Validation Error Banner */}
+                {validationState === "error" && (
+                  <div className="p-4 bg-red-50 border border-red-200 rounded-lg">
+                    <div className="flex items-center space-x-2">
+                      <AlertCircle className="w-5 h-5 text-red-600" />
+                      <p className="text-red-800 font-medium">
+                        Connection Failed
+                      </p>
                     </div>
-                    <FormMessage />
-                  </FormItem>
+                    <p className="text-red-700 text-sm mt-1">
+                      {validationError}
+                    </p>
+                  </div>
                 )}
-              />
-            )}
-
-            {/* Error message displays */}
-            {form.formState.errors.name?.type === "endpoint_name_conflict" && (
-              <div className="p-3 bg-red-50 border border-red-200 rounded-md">
-                <div className="flex items-center space-x-2">
-                  <AlertCircle className="w-4 h-4 text-red-500 flex-shrink-0" />
-                  <p className="text-sm text-red-700">
-                    <strong>Endpoint name conflict:</strong> Please choose a
-                    different display name above.
-                  </p>
-                </div>
               </div>
             )}
 
-            {localConflicts.length > 0 && (
-              <div className="p-3 bg-orange-50 border border-orange-200 rounded-md">
-                <div className="flex items-center space-x-2">
-                  <AlertCircle className="w-4 h-4 text-orange-500 flex-shrink-0" />
-                  <p className="text-sm text-orange-700">
-                    <strong>Duplicate aliases detected:</strong>{" "}
-                    {localConflicts.join(", ")}. Please ensure all aliases are
-                    unique.
-                  </p>
-                </div>
+            {/* Step 2: Configure Models */}
+            {currentStep === 2 && (
+              <div className="space-y-6">
+                <FormField
+                  control={form.control}
+                  name="name"
+                  render={({ field, fieldState }) => (
+                    <FormItem>
+                      <FormLabel>Display Name *</FormLabel>
+                      <FormControl>
+                        <Input
+                          placeholder="My API Endpoint"
+                          {...field}
+                          onChange={(e) => {
+                            field.onChange(e);
+                            if (form.formState.errors.name) {
+                              form.clearErrors("name");
+                            }
+                          }}
+                          className={
+                            fieldState.error
+                              ? "border-red-500 focus:border-red-500"
+                              : ""
+                          }
+                        />
+                      </FormControl>
+                      {fieldState.error?.message !==
+                        "endpoint_name_conflict" && <FormMessage />}
+                    </FormItem>
+                  )}
+                />
+
+                <FormField
+                  control={form.control}
+                  name="description"
+                  render={({ field }) => (
+                    <FormItem>
+                      <FormLabel>Description (optional)</FormLabel>
+                      <FormControl>
+                        <Textarea
+                          placeholder="Description of this endpoint..."
+                          className="resize-none"
+                          rows={3}
+                          {...field}
+                        />
+                      </FormControl>
+                    </FormItem>
+                  )}
+                />
+
+                {/* Success Banner */}
+                {validationState === "success" &&
+                  availableModels.length > 0 && (
+                    <div className="p-2 bg-green-50 border border-green-200 rounded-lg">
+                      <div className="flex items-center space-x-2">
+                        <Check className="w-4 h-4 text-green-600" />
+                        <p className="text-sm text-green-800">
+                          {manualMode
+                            ? `${availableModels.length} model${availableModels.length === 1 ? "" : "s"} configured`
+                            : `Models refreshed • ${availableModels.length} model${availableModels.length === 1 ? "" : "s"} found`}
+                        </p>
+                      </div>
+                    </div>
+                  )}
+
+                {/* Manual Model Entry */}
+                {manualMode && validationState !== "success" && (
+                  <div className="space-y-3">
+                    <div>
+                      <label className="text-sm font-medium">
+                        Model Names (one per line)
+                      </label>
+                      <p className="text-xs text-gray-500 mt-1">
+                        Enter the model names available on this endpoint
+                      </p>
+                    </div>
+                    <Textarea
+                      placeholder="gpt-4&#10;gpt-3.5-turbo&#10;my-custom-model"
+                      value={manualModelInput}
+                      onChange={(e) => setManualModelInput(e.target.value)}
+                      rows={8}
+                      className="font-mono text-sm"
+                    />
+                    <Button
+                      type="button"
+                      onClick={handleApplyManualModels}
+                      disabled={!manualModelInput.trim()}
+                      className="w-full"
+                    >
+                      Configure Models
+                    </Button>
+                  </div>
+                )}
+
+                {/* Model Selection */}
+                {validationState === "success" &&
+                  availableModels.length > 0 && (
+                    <FormField
+                      control={form.control}
+                      name="selectedModels"
+                      render={({ field }) => (
+                        <FormItem>
+                          <div className="flex items-center justify-between">
+                            <div>
+                              <FormLabel>
+                                Select Models & Configure Aliases
+                              </FormLabel>
+                              <p className="text-xs text-gray-500">
+                                {field.value?.length || 0} of{" "}
+                                {availableModels.length} selected • Aliases
+                                default to model names but can be customized
+                              </p>
+                            </div>
+                            <div className="flex space-x-2">
+                              <Button
+                                type="button"
+                                variant="link"
+                                onClick={handleSelectAll}
+                                className="h-auto p-0 text-xs"
+                              >
+                                {field.value?.length === availableModels.length
+                                  ? "Deselect All"
+                                  : "Select All"}
+                              </Button>
+                              <Button
+                                type="button"
+                                onClick={handleTestConnection}
+                                disabled={
+                                  !form.watch("url")?.trim() ||
+                                  validateEndpointMutation.isPending
+                                }
+                                variant="outline"
+                                size="sm"
+                              >
+                                {validateEndpointMutation.isPending ? (
+                                  <>
+                                    <Loader2 className="w-4 h-4 mr-2 animate-spin" />
+                                    Refreshing...
+                                  </>
+                                ) : (
+                                  <>
+                                    <Server className="w-4 h-4 mr-2" />
+                                    Refresh List
+                                  </>
+                                )}
+                              </Button>
+                            </div>
+                          </div>
+
+                          <div className="max-h-60 overflow-y-auto border rounded-lg mt-2">
+                            <div className="sticky top-0 bg-gray-50 border-b px-3 py-2 text-xs font-medium text-gray-600">
+                              <div className="grid grid-cols-12 gap-3">
+                                <div className="col-span-1"></div>
+                                <div className="col-span-5">Model Name</div>
+                                <div className="col-span-6">
+                                  Alias (used for routing)
+                                </div>
+                              </div>
+                            </div>
+
+                            {availableModels.map((model) => (
+                              <ModelRowWithAlias
+                                key={model.id}
+                                model={model}
+                                isSelected={
+                                  field.value?.includes(model.id) || false
+                                }
+                                alias={modelAliases[model.id] || model.id}
+                                onSelectionChange={(checked) => {
+                                  const current = field.value || [];
+                                  if (checked) {
+                                    field.onChange([...current, model.id]);
+                                    if (!modelAliases[model.id]) {
+                                      setModelAliases((prev) => ({
+                                        ...prev,
+                                        [model.id]: model.id,
+                                      }));
+                                    }
+                                  } else {
+                                    field.onChange(
+                                      current.filter((id) => id !== model.id),
+                                    );
+                                  }
+                                }}
+                                onAliasChange={(newAlias) => {
+                                  const trimmedAlias = newAlias.trim();
+                                  const updatedAliases = {
+                                    ...modelAliases,
+                                    [model.id]: trimmedAlias,
+                                  };
+                                  setModelAliases(updatedAliases);
+
+                                  const conflicts =
+                                    checkLocalAliasConflicts(updatedAliases);
+                                  setLocalConflicts(conflicts);
+                                }}
+                                onConflictClear={(oldAlias) => {
+                                  setBackendConflicts((prev) => {
+                                    const updated = new Set(prev);
+                                    updated.delete(oldAlias);
+                                    return updated;
+                                  });
+                                }}
+                                conflictInfo={checkAliasConflict(
+                                  model.id,
+                                  modelAliases[model.id] || model.id,
+                                )}
+                              />
+                            ))}
+                          </div>
+                          <FormMessage />
+                        </FormItem>
+                      )}
+                    />
+                  )}
+
+                {/* Error message displays */}
+                {form.formState.errors.name?.type ===
+                  "endpoint_name_conflict" && (
+                  <div className="p-3 bg-red-50 border border-red-200 rounded-md">
+                    <div className="flex items-center space-x-2">
+                      <AlertCircle className="w-4 h-4 text-red-500 flex-shrink-0" />
+                      <p className="text-sm text-red-700">
+                        <strong>Endpoint name conflict:</strong> Please choose a
+                        different display name above.
+                      </p>
+                    </div>
+                  </div>
+                )}
+
+                {localConflicts.length > 0 && (
+                  <div className="p-3 bg-orange-50 border border-orange-200 rounded-md">
+                    <div className="flex items-center space-x-2">
+                      <AlertCircle className="w-4 h-4 text-orange-500 flex-shrink-0" />
+                      <p className="text-sm text-orange-700">
+                        <strong>Duplicate aliases detected:</strong>{" "}
+                        {localConflicts.join(", ")}. Please ensure all aliases
+                        are unique.
+                      </p>
+                    </div>
+                  </div>
+                )}
+
+                {backendConflicts.size > 0 && (
+                  <div className="p-3 bg-red-50 border border-red-200 rounded-md">
+                    <div className="flex items-center space-x-2">
+                      <AlertCircle className="w-4 h-4 text-red-500 flex-shrink-0" />
+                      <p className="text-sm text-red-700">
+                        <strong>Model alias conflict:</strong> Please edit the
+                        highlighted aliases above.
+                      </p>
+                    </div>
+                  </div>
+                )}
+
+                {validationError &&
+                  !validationError.includes("endpoint name") &&
+                  backendConflicts.size === 0 && (
+                    <div className="p-4 bg-red-50 border border-red-200 rounded-lg">
+                      <p className="text-red-800 text-sm">{validationError}</p>
+                    </div>
+                  )}
               </div>
             )}
-
-            {backendConflicts.size > 0 && (
-              <div className="p-3 bg-red-50 border border-red-200 rounded-md">
-                <div className="flex items-center space-x-2">
-                  <AlertCircle className="w-4 h-4 text-red-500 flex-shrink-0" />
-                  <p className="text-sm text-red-700">
-                    <strong>Model alias conflict:</strong> Please edit the
-                    highlighted aliases above.
-                  </p>
-                </div>
-              </div>
-            )}
-
-            {validationError &&
-              !validationError.includes("endpoint name") &&
-              backendConflicts.size === 0 && (
-                <div className="p-4 bg-red-50 border border-red-200 rounded-lg">
-                  <p className="text-red-800 text-sm">{validationError}</p>
-                </div>
-              )}
           </form>
         </Form>
 
         <DialogFooter>
-          <Button onClick={onClose} type="button" variant="outline">
-            Cancel
-          </Button>
-
-          {shouldShowValidation && (
-            <Button
-              type="button"
-              onClick={handleTestConnection}
-              disabled={
-                !form.watch("url")?.trim() || validationState === "testing"
-              }
-              variant="secondary"
-            >
-              {validationState === "testing" ? (
-                <>
-                  <Loader2 className="w-4 h-4 mr-2 animate-spin" />
-                  Testing...
-                </>
-              ) : (
-                <>
-                  <Server className="w-4 h-4 mr-2" />
-                  Test Connection
-                </>
-              )}
-            </Button>
+          {currentStep === 1 ? (
+            <>
+              <Button type="button" variant="outline" onClick={onClose}>
+                Cancel
+              </Button>
+              <Button
+                type="button"
+                onClick={
+                  autoDiscoverModels
+                    ? handleTestConnection
+                    : handleConfigureManually
+                }
+                disabled={
+                  !form.watch("url")?.trim() ||
+                  (autoDiscoverModels && validationState === "testing")
+                }
+              >
+                {validationState === "testing" ? (
+                  <>
+                    <Loader2 className="w-4 h-4 mr-2 animate-spin" />
+                    Testing Connection...
+                  </>
+                ) : autoDiscoverModels ? (
+                  <>
+                    <Server className="w-4 h-4 mr-2" />
+                    Discover Models
+                  </>
+                ) : (
+                  <>
+                    Next
+                    <ChevronRight className="w-4 h-4 ml-2" />
+                  </>
+                )}
+              </Button>
+            </>
+          ) : (
+            <>
+              <Button type="button" variant="outline" onClick={handleBack}>
+                Back
+              </Button>
+              <Button
+                onClick={() => form.handleSubmit(onSubmit)()}
+                disabled={!canUpdate}
+              >
+                {updateEndpointMutation.isPending ? (
+                  <>
+                    <Loader2 className="w-4 h-4 mr-2 animate-spin" />
+                    Updating...
+                  </>
+                ) : backendConflicts.size > 0 ? (
+                  <>
+                    <AlertCircle className="w-4 h-4 mr-2" />
+                    Resolve Conflicts
+                  </>
+                ) : localConflicts.length > 0 ? (
+                  <>
+                    <AlertCircle className="w-4 h-4 mr-2" />
+                    Fix Duplicate Aliases
+                  </>
+                ) : (
+                  <>
+                    <Check className="w-4 h-4 mr-2" />
+                    Update Endpoint
+                  </>
+                )}
+              </Button>
+            </>
           )}
-
-          <Button
-            onClick={() => form.handleSubmit(onSubmit)()}
-            disabled={!canUpdate}
-          >
-            {updateEndpointMutation.isPending ? (
-              <>
-                <Loader2 className="w-4 h-4 mr-2 animate-spin" />
-                Updating...
-              </>
-            ) : backendConflicts.size > 0 ? (
-              <>
-                <AlertCircle className="w-4 h-4 mr-2" />
-                Resolve Conflicts
-              </>
-            ) : localConflicts.length > 0 ? (
-              <>
-                <AlertCircle className="w-4 h-4 mr-2" />
-                Fix Duplicate Aliases
-              </>
-            ) : (
-              <>
-                <Check className="w-4 h-4 mr-2" />
-                Update Endpoint
-              </>
-            )}
-          </Button>
         </DialogFooter>
       </DialogContent>
     </Dialog>

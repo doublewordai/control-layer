@@ -209,6 +209,10 @@ export interface EndpointCreateRequest {
   api_key?: string;
   model_filter?: string[]; // Array of model IDs to sync, or null for all models
   alias_mapping?: Record<string, string>; // model_name -> custom_alias
+  auth_header_name?: string; // Header name for authorization (defaults to "Authorization")
+  auth_header_prefix?: string; // Prefix for authorization header value (defaults to "Bearer ")
+  sync?: boolean; // Whether to sync models during creation (defaults to true)
+  skip_fetch?: boolean; // Create deployments directly from model_filter without fetching (defaults to false)
 }
 
 export interface EndpointUpdateRequest {
@@ -218,6 +222,8 @@ export interface EndpointUpdateRequest {
   api_key?: string | null;
   model_filter?: string[] | null;
   alias_mapping?: Record<string, string>;
+  auth_header_name?: string;
+  auth_header_prefix?: string;
 }
 
 export type EndpointValidateRequest =
@@ -225,6 +231,8 @@ export type EndpointValidateRequest =
       type: "new";
       url: string;
       api_key?: string;
+      auth_header_name?: string;
+      auth_header_prefix?: string;
     }
   | {
       type: "existing";

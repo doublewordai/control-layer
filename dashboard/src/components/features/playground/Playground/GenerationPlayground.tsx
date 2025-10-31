@@ -177,7 +177,13 @@ const GenerationPlayground: React.FC<GenerationPlaygroundProps> = ({
 
   useEffect(() => {
     scrollToBottom();
-  }, [messages, streamingContent, messagesModelB, streamingContentModelB, scrollToBottom]);
+  }, [
+    messages,
+    streamingContent,
+    messagesModelB,
+    streamingContentModelB,
+    scrollToBottom,
+  ]);
 
   useEffect(() => {
     const handleKeyDown = (e: KeyboardEvent) => {
@@ -198,7 +204,7 @@ const GenerationPlayground: React.FC<GenerationPlaygroundProps> = ({
     modelStreamingContent: string,
     modelIsStreaming: boolean,
     messagesEndReference: React.RefObject<HTMLDivElement | null>,
-    modelLabel: string
+    modelLabel: string,
   ) => (
     <div className="flex-1 overflow-y-auto px-8 py-4 bg-white scrollbar-thin scrollbar-thumb-gray-300 scrollbar-track-transparent hover:scrollbar-thumb-gray-400">
       {modelMessages.length === 0 && !modelStreamingContent ? (
@@ -209,12 +215,8 @@ const GenerationPlayground: React.FC<GenerationPlaygroundProps> = ({
             aria-label="Empty conversation"
           >
             <Play className="w-16 h-16 text-gray-400 mx-auto mb-4" />
-            <p className="text-xl text-gray-600 mb-2">
-              {model.alias}
-            </p>
-            <p className="text-gray-500">
-              {modelLabel}
-            </p>
+            <p className="text-xl text-gray-600 mb-2">{model.alias}</p>
+            <p className="text-gray-500">{modelLabel}</p>
           </div>
         </div>
       ) : (
@@ -426,12 +428,16 @@ const GenerationPlayground: React.FC<GenerationPlaygroundProps> = ({
                         {message.metrics && (
                           <TooltipProvider>
                             <div className="flex items-center gap-2 text-xs text-gray-400">
-                              {message.metrics.timeToFirstToken !== undefined && (
+                              {message.metrics.timeToFirstToken !==
+                                undefined && (
                                 <Tooltip>
                                   <TooltipTrigger asChild>
                                     <span className="flex items-center gap-0.5">
                                       <Timer className="w-3 h-3" />
-                                      {Math.round(message.metrics.timeToFirstToken)}ms
+                                      {Math.round(
+                                        message.metrics.timeToFirstToken,
+                                      )}
+                                      ms
                                     </span>
                                   </TooltipTrigger>
                                   <TooltipContent>
@@ -439,12 +445,16 @@ const GenerationPlayground: React.FC<GenerationPlaygroundProps> = ({
                                   </TooltipContent>
                                 </Tooltip>
                               )}
-                              {message.metrics.tokensPerSecond !== undefined && (
+                              {message.metrics.tokensPerSecond !==
+                                undefined && (
                                 <Tooltip>
                                   <TooltipTrigger asChild>
                                     <span className="flex items-center gap-0.5">
                                       <Zap className="w-3 h-3" />
-                                      {message.metrics.tokensPerSecond.toFixed(1)}/s
+                                      {message.metrics.tokensPerSecond.toFixed(
+                                        1,
+                                      )}
+                                      /s
                                     </span>
                                   </TooltipTrigger>
                                   <TooltipContent>
@@ -540,10 +550,7 @@ const GenerationPlayground: React.FC<GenerationPlaygroundProps> = ({
                       code: ({ children, className }) => {
                         const match = /language-(\w+)/.exec(className || "");
                         const language = match ? match[1] : "";
-                        const codeString = String(children).replace(
-                          /\n$/,
-                          "",
-                        );
+                        const codeString = String(children).replace(/\n$/, "");
 
                         if (className && language === "markdown") {
                           return (
@@ -634,9 +641,7 @@ const GenerationPlayground: React.FC<GenerationPlaygroundProps> = ({
                       ),
                       tbody: ({ children }) => <tbody>{children}</tbody>,
                       tr: ({ children }) => (
-                        <tr className="border-b border-gray-200">
-                          {children}
-                        </tr>
+                        <tr className="border-b border-gray-200">{children}</tr>
                       ),
                       th: ({ children }) => (
                         <th className="border border-gray-300 px-4 py-2 text-left font-semibold">
@@ -678,15 +683,23 @@ const GenerationPlayground: React.FC<GenerationPlaygroundProps> = ({
           className="flex items-center gap-1.5 px-2.5 py-1 bg-gray-100 hover:bg-gray-200 border border-gray-300 border-t-0 rounded-b-md transition-colors shadow-sm relative"
           aria-expanded={isSystemPromptExpanded}
           aria-label="Toggle system prompt"
-          title={isSystemPromptExpanded ? "Hide system prompt" : "Show system prompt"}
+          title={
+            isSystemPromptExpanded ? "Hide system prompt" : "Show system prompt"
+          }
         >
           <Settings className="w-3.5 h-3.5 text-gray-600" />
-          {(systemPrompt.trim() || systemPromptModelB.trim()) && !isSystemPromptExpanded && (
-            <span className="absolute -top-0.5 -right-0.5 w-2 h-2 bg-blue-500 rounded-full border border-white" aria-label="System prompt is active" />
-          )}
-          <ChevronDown className={`w-3.5 h-3.5 text-gray-600 transition-transform ${
-            isSystemPromptExpanded ? 'rotate-180' : ''
-          }`} />
+          {(systemPrompt.trim() || systemPromptModelB.trim()) &&
+            !isSystemPromptExpanded && (
+              <span
+                className="absolute -top-0.5 -right-0.5 w-2 h-2 bg-blue-500 rounded-full border border-white"
+                aria-label="System prompt is active"
+              />
+            )}
+          <ChevronDown
+            className={`w-3.5 h-3.5 text-gray-600 transition-transform ${
+              isSystemPromptExpanded ? "rotate-180" : ""
+            }`}
+          />
         </button>
       </div>
 
@@ -716,7 +729,10 @@ const GenerationPlayground: React.FC<GenerationPlaygroundProps> = ({
                   {/* Copy to Model B (right arrow) */}
                   {systemPrompt.trim() && (
                     <Button
-                      onClick={() => onSystemPromptModelBChange && onSystemPromptModelBChange(systemPrompt)}
+                      onClick={() =>
+                        onSystemPromptModelBChange &&
+                        onSystemPromptModelBChange(systemPrompt)
+                      }
                       size="icon"
                       variant="outline"
                       className="h-7 w-7 bg-white shadow-md hover:bg-gray-50"
@@ -747,7 +763,10 @@ const GenerationPlayground: React.FC<GenerationPlaygroundProps> = ({
                   </label>
                   <Textarea
                     value={systemPromptModelB}
-                    onChange={(e) => onSystemPromptModelBChange && onSystemPromptModelBChange(e.target.value)}
+                    onChange={(e) =>
+                      onSystemPromptModelBChange &&
+                      onSystemPromptModelBChange(e.target.value)
+                    }
                     placeholder="System prompt for Model B..."
                     className="text-sm min-h-[100px] resize-y"
                     disabled={isStreamingModelB}
@@ -778,19 +797,22 @@ const GenerationPlayground: React.FC<GenerationPlaygroundProps> = ({
       {isComparisonMode && comparisonModel ? (
         <div className="flex-1 flex relative overflow-hidden min-h-0">
           {/* Centered Empty State - Only show when both models have no messages */}
-          {messages.length === 0 && !streamingContent && messagesModelB.length === 0 && !streamingContentModelB && (
-            <div className="absolute inset-0 flex items-center justify-center pointer-events-none z-10">
-              <div className="text-center bg-white px-8 py-4 rounded-lg">
-                <Play className="w-16 h-16 text-gray-400 mx-auto mb-4" />
-                <p className="text-xl text-gray-600 mb-2">
-                  Compare {selectedModel.alias} and {comparisonModel.alias}
-                </p>
-                <p className="text-gray-500">
-                  Send a message to start a conversation
-                </p>
+          {messages.length === 0 &&
+            !streamingContent &&
+            messagesModelB.length === 0 &&
+            !streamingContentModelB && (
+              <div className="absolute inset-0 flex items-center justify-center pointer-events-none z-10">
+                <div className="text-center bg-white px-8 py-4 rounded-lg">
+                  <Play className="w-16 h-16 text-gray-400 mx-auto mb-4" />
+                  <p className="text-xl text-gray-600 mb-2">
+                    Compare {selectedModel.alias} and {comparisonModel.alias}
+                  </p>
+                  <p className="text-gray-500">
+                    Send a message to start a conversation
+                  </p>
+                </div>
               </div>
-            </div>
-          )}
+            )}
 
           {/* Sync Arrows - Center of divider */}
           <div className="absolute left-1/2 top-1/2 -translate-x-1/2 -translate-y-1/2 z-20 flex flex-col gap-2">
@@ -831,7 +853,7 @@ const GenerationPlayground: React.FC<GenerationPlaygroundProps> = ({
                 streamingContent,
                 isStreaming,
                 messagesEndRef,
-                "Model A"
+                "Model A",
               )
             ) : (
               <div className="flex-1 overflow-y-auto px-8 py-4 bg-white" />
@@ -846,7 +868,7 @@ const GenerationPlayground: React.FC<GenerationPlaygroundProps> = ({
                 streamingContentModelB,
                 isStreamingModelB,
                 messagesEndRefModelB,
-                "Model B"
+                "Model B",
               )
             ) : (
               <div className="flex-1 overflow-y-auto px-8 py-4 bg-white" />
@@ -860,10 +882,9 @@ const GenerationPlayground: React.FC<GenerationPlaygroundProps> = ({
           streamingContent,
           isStreaming,
           messagesEndRef,
-          "Send a message to start a conversation"
+          "Send a message to start a conversation",
         )
       )}
-
 
       {/* Input Area */}
       <div className="bg-white border-t border-gray-200 px-8 py-4 flex-shrink-0">
@@ -896,7 +917,9 @@ const GenerationPlayground: React.FC<GenerationPlaygroundProps> = ({
             <div className="flex gap-4">
               {/* Model A Input */}
               <div className="flex-1 relative">
-                <div className="mb-2 text-xs font-medium text-gray-600">{selectedModel.alias}</div>
+                <div className="mb-2 text-xs font-medium text-gray-600">
+                  {selectedModel.alias}
+                </div>
                 <Textarea
                   ref={textareaRef}
                   value={currentMessage}
@@ -957,11 +980,16 @@ const GenerationPlayground: React.FC<GenerationPlaygroundProps> = ({
 
               {/* Model B Input */}
               <div className="flex-1 relative">
-                <div className="mb-2 text-xs font-medium text-gray-600">{comparisonModel?.alias}</div>
+                <div className="mb-2 text-xs font-medium text-gray-600">
+                  {comparisonModel?.alias}
+                </div>
                 <Textarea
                   ref={textareaRefModelB}
                   value={currentMessageModelB}
-                  onChange={(e) => onCurrentMessageModelBChange && onCurrentMessageModelBChange(e.target.value)}
+                  onChange={(e) =>
+                    onCurrentMessageModelBChange &&
+                    onCurrentMessageModelBChange(e.target.value)
+                  }
                   onKeyDown={(e) => {
                     if (e.key === "Enter" && !e.shiftKey) {
                       e.preventDefault();
@@ -1037,7 +1065,11 @@ const GenerationPlayground: React.FC<GenerationPlaygroundProps> = ({
                       : "Send message"
                   }
                   title={
-                    isStreaming ? (isHovered ? "Cancel" : "Streaming...") : "Send"
+                    isStreaming
+                      ? isHovered
+                        ? "Cancel"
+                        : "Streaming..."
+                      : "Send"
                   }
                 >
                   {isStreaming ? (
@@ -1093,8 +1125,12 @@ const GenerationPlayground: React.FC<GenerationPlaygroundProps> = ({
                   onClick={onToggleSplitInput}
                   variant="outline"
                   size="sm"
-                  aria-label={isSplitInput ? "Merge input boxes" : "Split input boxes"}
-                  title={isSplitInput ? "Merge input boxes" : "Split input boxes"}
+                  aria-label={
+                    isSplitInput ? "Merge input boxes" : "Split input boxes"
+                  }
+                  title={
+                    isSplitInput ? "Merge input boxes" : "Split input boxes"
+                  }
                 >
                   {isSplitInput ? (
                     <>
