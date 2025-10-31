@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "\n            UPDATE inference_endpoints SET\n                name = COALESCE($2, name),\n                description = CASE \n                    WHEN $3::text IS NOT NULL THEN $3\n                    ELSE description \n                END,\n                url = COALESCE($4, url),\n                api_key = CASE \n                    WHEN $5::text IS NOT NULL THEN $5\n                    ELSE api_key \n                END,\n                model_filter = CASE \n                    WHEN $6::text[] IS NOT NULL THEN $6\n                    ELSE model_filter \n                END,\n                updated_at = NOW()\n            WHERE id = $1\n            RETURNING *\n            ",
+  "query": "\n            INSERT INTO inference_endpoints (name, description, url, api_key, model_filter, auth_header_name, auth_header_prefix, created_by, created_at, updated_at)\n            VALUES ($1, $2, $3, $4, $5, COALESCE($6, 'Authorization'), COALESCE($7, 'Bearer '), $8, $9, $10)\n            RETURNING *\n            ",
   "describe": {
     "columns": [
       {
@@ -47,16 +47,30 @@
         "ordinal": 8,
         "name": "id",
         "type_info": "Uuid"
+      },
+      {
+        "ordinal": 9,
+        "name": "auth_header_name",
+        "type_info": "Varchar"
+      },
+      {
+        "ordinal": 10,
+        "name": "auth_header_prefix",
+        "type_info": "Varchar"
       }
     ],
     "parameters": {
       "Left": [
+        "Varchar",
+        "Text",
+        "Varchar",
+        "Text",
+        "TextArray",
+        "Text",
+        "Text",
         "Uuid",
-        "Varchar",
-        "Text",
-        "Varchar",
-        "Text",
-        "TextArray"
+        "Timestamptz",
+        "Timestamptz"
       ]
     },
     "nullable": [
@@ -68,8 +82,10 @@
       false,
       true,
       true,
+      false,
+      false,
       false
     ]
   },
-  "hash": "bb8a330fde21d68d7527538bca629ecd5795fbf088214dde6534a673753b25a9"
+  "hash": "2b36a5920371b8c8d172b3f987c4c271dae0b3a9a5dfe71bb7b392b395672184"
 }

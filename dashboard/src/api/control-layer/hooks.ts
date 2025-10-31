@@ -17,6 +17,7 @@ import type {
   ListRequestsQuery,
   TransactionsQuery,
   AddCreditsRequest,
+  CreateProbeRequest,
 } from "./types";
 
 // Config hooks
@@ -416,8 +417,7 @@ export function useRequestsAggregateByUser(
 ) {
   return useQuery({
     queryKey: queryKeys.requests.aggregateByUser(model, startDate, endDate),
-    queryFn: () =>
-      dwctlApi.requests.aggregateByUser(model, startDate, endDate),
+    queryFn: () => dwctlApi.requests.aggregateByUser(model, startDate, endDate),
     enabled: !!model,
   });
 }
@@ -455,6 +455,155 @@ export function useConfirmPasswordReset() {
       token: string;
       new_password: string;
     }) => dwctlApi.auth.confirmPasswordReset(data),
+  });
+}
+
+// Probes hooks
+export function useProbes(status?: string) {
+  return useQuery({
+    queryKey: ["probes", status],
+    queryFn: () => dwctlApi.probes.list(status),
+    refetchInterval: 10000, // Refetch every 10 seconds for live updates
+  });
+}
+
+export function useProbe(id: string) {
+  return useQuery({
+    queryKey: ["probes", id],
+    queryFn: () => dwctlApi.probes.get(id),
+  });
+}
+
+export function useProbeResults(
+  id: string,
+  params?: { start_time?: string; end_time?: string; limit?: number },
+  options?: { enabled?: boolean },
+) {
+  return useQuery({
+    queryKey: ["probes", id, "results", params],
+    queryFn: () => dwctlApi.probes.getResults(id, params),
+    refetchInterval: 5000, // Refetch every 5 seconds for live updates
+    enabled: options?.enabled ?? true,
+  });
+}
+
+export function useProbeStatistics(
+  id: string,
+  params?: { start_time?: string; end_time?: string },
+  options?: { enabled?: boolean },
+) {
+  return useQuery({
+    queryKey: ["probes", id, "statistics", params],
+    queryFn: () => dwctlApi.probes.getStatistics(id, params),
+    refetchInterval: 10000, // Refetch every 10 seconds
+    enabled: options?.enabled ?? true,
+  });
+}
+
+export function useCreateProbe() {
+  const queryClient = useQueryClient();
+
+  return useMutation({
+    mutationKey: ["probes", "create"],
+    mutationFn: (data: CreateProbeRequest) => dwctlApi.probes.create(data),
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ["probes"] });
+      queryClient.invalidateQueries({ queryKey: queryKeys.models.all });
+    },
+  });
+}
+
+export function useDeleteProbe() {
+  const queryClient = useQueryClient();
+
+  return useMutation({
+    mutationKey: ["probes", "delete"],
+    mutationFn: (id: string) => dwctlApi.probes.delete(id),
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ["probes"] });
+      queryClient.invalidateQueries({ queryKey: queryKeys.models.all });
+    },
+  });
+}
+
+export function useActivateProbe() {
+  const queryClient = useQueryClient();
+
+  return useMutation({
+    mutationKey: ["probes", "activate"],
+    mutationFn: (id: string) => dwctlApi.probes.activate(id),
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ["probes"] });
+      queryClient.invalidateQueries({ queryKey: queryKeys.models.all });
+    },
+  });
+}
+
+export function useDeactivateProbe() {
+  const queryClient = useQueryClient();
+
+  return useMutation({
+    mutationKey: ["probes", "deactivate"],
+    mutationFn: (id: string) => dwctlApi.probes.deactivate(id),
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ["probes"] });
+      queryClient.invalidateQueries({ queryKey: queryKeys.models.all });
+    },
+  });
+}
+
+export function useExecuteProbe() {
+  const queryClient = useQueryClient();
+
+  return useMutation({
+    mutationKey: ["probes", "execute"],
+    mutationFn: (id: string) => dwctlApi.probes.execute(id),
+    onSuccess: (_, id) => {
+      queryClient.invalidateQueries({ queryKey: ["probes", id, "results"] });
+      queryClient.invalidateQueries({ queryKey: ["probes", id, "statistics"] });
+    },
+  });
+}
+
+export function useTestProbe() {
+  return useMutation({
+    mutationKey: ["probes", "test"],
+    mutationFn: ({
+      deploymentId,
+      params,
+    }: {
+      deploymentId: string;
+      params?: {
+        http_method?: string;
+        request_path?: string;
+        request_body?: Record<string, unknown>;
+      };
+    }) => dwctlApi.probes.test(deploymentId, params),
+  });
+}
+
+export function useUpdateProbe() {
+  const queryClient = useQueryClient();
+
+  return useMutation({
+    mutationKey: ["probes", "update"],
+    mutationFn: ({
+      id,
+      data,
+    }: {
+      id: string;
+      data: {
+        interval_seconds?: number;
+        http_method?: string;
+        request_path?: string | null;
+        request_body?: Record<string, any> | null;
+      };
+    }) => dwctlApi.probes.update(id, data),
+    onSuccess: (_, variables) => {
+      queryClient.invalidateQueries({ queryKey: ["probes"] });
+      queryClient.invalidateQueries({ queryKey: ["probes", variables.id] });
+      queryClient.invalidateQueries({ queryKey: queryKeys.models.all });
+    },
   });
 }
 

@@ -1,5 +1,5 @@
 use crate::db::{
-    errors::Result,
+    errors::{DbError, Result},
     handlers::repository::Repository,
     models::deployments::{
         DeploymentCreateDBRequest, DeploymentDBResponse, DeploymentUpdateDBRequest, FlatPricingFields, ModelPricing, ModelStatus, ModelType,
@@ -21,6 +21,7 @@ pub struct DeploymentFilter {
     pub statuses: Option<Vec<ModelStatus>>,
     pub deleted: Option<bool>, // None = show all, Some(false) = show non-deleted only, Some(true) = show deleted only
     pub accessible_to: Option<UserId>, // None = show all deployments, Some(user_id) = show only deployments accessible to that user
+    pub aliases: Option<Vec<String>>,
 }
 
 impl DeploymentFilter {
@@ -32,6 +33,7 @@ impl DeploymentFilter {
             statuses: None,
             deleted: None,       // Default: show all models
             accessible_to: None, // Default: show all deployments
+            aliases: None,
         }
     }
 
@@ -52,6 +54,11 @@ impl DeploymentFilter {
 
     pub fn with_statuses(mut self, statuses: Vec<ModelStatus>) -> Self {
         self.statuses = Some(statuses);
+        self
+    }
+
+    pub fn with_aliases(mut self, aliases: Vec<String>) -> Self {
+        self.aliases = Some(aliases);
         self
     }
 }
@@ -144,9 +151,19 @@ impl<'c> Repository for Deployments<'c> {
         let created_at = Utc::now();
         let updated_at = created_at;
 
+        let model_name = request.model_name.trim();
+        let alias = request.alias.trim();
+        if model_name.is_empty() {
+            return Err(DbError::InvalidModelField { field: "model_name" });
+        }
+        if alias.is_empty() {
+            return Err(DbError::InvalidModelField { field: "alias" });
+        }
+
         let model_type_str = request.model_type.as_ref().map(|t| match t {
             ModelType::Chat => "CHAT",
             ModelType::Embeddings => "EMBEDDINGS",
+            ModelType::Reranker => "RERANKER",
         });
 
         // Convert structured pricing to flat database fields
@@ -164,8 +181,8 @@ impl<'c> Repository for Deployments<'c> {
             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18)
             RETURNING *
             "#,
-            request.model_name,
-            request.alias,
+            request.model_name.trim(),
+            request.alias.trim(),
             request.description,
             model_type_str,
             request.capabilities.as_ref().map(|caps| caps.as_slice()),
@@ -189,6 +206,7 @@ impl<'c> Repository for Deployments<'c> {
         let model_type = model.r#type.as_ref().and_then(|s| match s.as_str() {
             "CHAT" => Some(ModelType::Chat),
             "EMBEDDINGS" => Some(ModelType::Embeddings),
+            "RERANKER" => Some(ModelType::Reranker),
             _ => None,
         });
 
@@ -251,11 +269,23 @@ impl<'c> Repository for Deployments<'c> {
     }
 
     async fn update(&mut self, id: Self::Id, request: &Self::UpdateRequest) -> Result<Self::Response> {
+        if let Some(model_name) = &request.model_name {
+            if model_name.trim().is_empty() {
+                return Err(DbError::InvalidModelField { field: "model_name" });
+            }
+        }
+        if let Some(alias) = &request.alias {
+            if alias.trim().is_empty() {
+                return Err(DbError::InvalidModelField { field: "alias" });
+            }
+        }
+
         // Convert model_type into DB string if provided
         let model_type_str: Option<&str> = request.model_type.as_ref().and_then(|inner| {
             inner.as_ref().map(|t| match t {
                 ModelType::Chat => "CHAT",
                 ModelType::Embeddings => "EMBEDDINGS",
+                ModelType::Reranker => "RERANKER",
             })
         });
 
@@ -356,9 +386,9 @@ impl<'c> Repository for Deployments<'c> {
         WHERE id = $1
         RETURNING *
         "#,
-            id,                               // $1
-            request.model_name.as_ref(),      // $2
-            request.deployment_name.as_ref(), // $3 (alias)
+            id,                                            // $1
+            request.model_name.as_ref().map(|s| s.trim()), // $2
+            request.alias.as_ref().map(|s| s.trim()),      // $3
             // For description
             request.description.is_some() as bool,                         // $4
             request.description.as_ref().and_then(|inner| inner.as_ref()), // $5
@@ -396,16 +426,13 @@ impl<'c> Repository for Deployments<'c> {
             pricing_params.downstream_ratio                 // $31
         )
         .fetch_one(&mut *self.db)
-        .await
-        .map_err(|e| match e {
-            sqlx::Error::RowNotFound => anyhow::anyhow!("Deployment with id {} not found", id),
-            _ => e.into(),
-        })?;
+        .await?;
 
         // Convert DB model_type back to enum
         let model_type = model.r#type.as_deref().and_then(|s| match s {
             "CHAT" => Some(ModelType::Chat),
             "EMBEDDINGS" => Some(ModelType::Embeddings),
+            "RERANKER" => Some(ModelType::Reranker),
             _ => None,
         });
 
@@ -433,6 +460,15 @@ impl<'c> Repository for Deployments<'c> {
         if let Some(deleted) = filter.deleted {
             query.push(" AND deleted = ");
             query.push_bind(deleted);
+        }
+
+        // Add aliases filter if specified
+        if let Some(ref aliases) = filter.aliases {
+            if !aliases.is_empty() {
+                query.push(" AND alias = ANY(");
+                query.push_bind(aliases);
+                query.push(")");
+            }
         }
 
         // Add accessibility filter if specified
@@ -515,15 +551,17 @@ mod tests {
     use crate::{
         api::models::users::{Role, UserCreate, UserResponse},
         db::{
-            handlers::{Groups, Users},
+            handlers::{inference_endpoints::InferenceEndpoints, Groups, Users},
             models::{
                 deployments::{ModelPricing, ModelPricingUpdate, ProviderPricing, ProviderPricingUpdate, TokenPricing, TokenPricingUpdate},
                 groups::GroupCreateDBRequest,
+                inference_endpoints::InferenceEndpointCreateDBRequest,
                 users::UserCreateDBRequest,
             },
         },
         test_utils::get_test_endpoint_id,
     };
+
     use rust_decimal::Decimal;
     use sqlx::{Acquire, PgPool};
     use std::str::FromStr;
@@ -657,7 +695,7 @@ mod tests {
 
                 let update = DeploymentUpdateDBRequest::builder()
                     .model_name("updated-model".to_string())
-                    .deployment_name("updated-deployment".to_string())
+                    .alias("updated-deployment".to_string())
                     .description(Some("Updated description".to_string()))
                     .model_type(Some(ModelType::Embeddings))
                     .capabilities(Some(vec!["embeddings".to_string(), "similarity".to_string()]))
@@ -2097,5 +2135,187 @@ mod tests {
             .with_statuses(vec![ModelStatus::Inactive]);
         let models = repo.list(&filter).await.unwrap();
         assert!(models.iter().any(|m| m.id == deployment.id));
+    }
+
+    #[sqlx::test]
+    #[test_log::test]
+    async fn test_create_deployment_alias_conflict(pool: PgPool) {
+        let user = create_test_user(&pool).await;
+
+        let mut conn = pool.acquire().await.unwrap();
+        let mut endpoints_repo = InferenceEndpoints::new(&mut conn);
+        let endpoint_create = InferenceEndpointCreateDBRequest {
+            name: format!("test-endpoint-{}", uuid::Uuid::new_v4()),
+            url: url::Url::parse("http://localhost:8080").unwrap(),
+            api_key: None,
+            description: None,
+            model_filter: None,
+            auth_header_name: None,
+            auth_header_prefix: None,
+            created_by: user.id,
+        };
+        let endpoint = endpoints_repo.create(&endpoint_create).await.unwrap();
+        let test_endpoint_id = endpoint.id;
+
+        let mut repo = Deployments::new(&mut conn);
+
+        // Create the first deployment with a unique alias
+        let model_create1 = DeploymentCreateDBRequest::builder()
+            .created_by(user.id)
+            .model_name("model-1".to_string())
+            .alias("shared-alias".to_string())
+            .hosted_on(test_endpoint_id)
+            .build();
+        let _ = repo.create(&model_create1).await.unwrap();
+
+        // Try to create another deployment with the same alias (should fail)
+        let model_create2 = DeploymentCreateDBRequest::builder()
+            .created_by(user.id)
+            .model_name("model-2".to_string())
+            .alias("shared-alias".to_string())
+            .hosted_on(test_endpoint_id)
+            .build();
+        let result = repo.create(&model_create2).await;
+
+        match result {
+            Err(crate::db::errors::DbError::UniqueViolation { .. }) => { /* expected */ }
+            _ => panic!("Expected UniqueViolation error for alias"),
+        }
+    }
+
+    #[sqlx::test]
+    #[test_log::test]
+    async fn test_update_deployment_alias_conflict(pool: PgPool) {
+        let user = create_test_user(&pool).await;
+        let mut conn = pool.acquire().await.unwrap();
+
+        let mut endpoints_repo = InferenceEndpoints::new(&mut conn);
+        let endpoint_create = InferenceEndpointCreateDBRequest {
+            name: format!("test-endpoint-{}", uuid::Uuid::new_v4()),
+            url: url::Url::parse("http://localhost:8080").unwrap(),
+            api_key: None,
+            description: None,
+            model_filter: None,
+            auth_header_name: None,
+            auth_header_prefix: None,
+            created_by: user.id,
+        };
+        let endpoint = endpoints_repo.create(&endpoint_create).await.unwrap();
+        let test_endpoint_id = endpoint.id;
+
+        let mut repo = Deployments::new(&mut conn);
+
+        // Create two deployments with unique aliases
+        let model_create1 = DeploymentCreateDBRequest::builder()
+            .created_by(user.id)
+            .model_name("model-1".to_string())
+            .alias("alias-1".to_string())
+            .hosted_on(test_endpoint_id)
+            .build();
+        let _deployment1 = repo.create(&model_create1).await.unwrap();
+
+        let model_create2 = DeploymentCreateDBRequest::builder()
+            .created_by(user.id)
+            .model_name("model-2".to_string())
+            .alias("alias-2".to_string())
+            .hosted_on(test_endpoint_id)
+            .build();
+        let deployment2 = repo.create(&model_create2).await.unwrap();
+
+        // Try to update deployment2 to use alias-1 (should fail)
+        let update = DeploymentUpdateDBRequest::builder().alias("alias-1".to_string()).build();
+        let result = repo.update(deployment2.id, &update).await;
+
+        match result {
+            Err(crate::db::errors::DbError::UniqueViolation { .. }) => { /* expected */ }
+            _ => panic!("Expected UniqueViolation error for alias update"),
+        }
+    }
+
+    #[sqlx::test]
+    #[test_log::test]
+    async fn test_create_deployment_with_empty_model_name_or_alias(pool: PgPool) {
+        let base_url = url::Url::parse("http://localhost:8080").unwrap();
+        let sources = vec![crate::config::ModelSource {
+            name: "test".to_string(),
+            url: base_url.clone(),
+            api_key: None,
+            sync_interval: std::time::Duration::from_secs(3600),
+        }];
+        crate::seed_database(&sources, &pool).await.unwrap();
+
+        let user = create_test_user(&pool).await;
+        let test_endpoint_id = get_test_endpoint_id(&pool).await;
+        let mut conn = pool.acquire().await.unwrap();
+        let mut repo = Deployments::new(&mut conn);
+
+        // Empty model name
+        let model_create = DeploymentCreateDBRequest::builder()
+            .created_by(user.id)
+            .model_name("   ".to_string())
+            .alias("valid-alias".to_string())
+            .hosted_on(test_endpoint_id)
+            .build();
+        let result = repo.create(&model_create).await;
+        match result {
+            Err(DbError::InvalidModelField { field }) => assert_eq!(field, "model_name"),
+            _ => panic!("Expected InvalidModelField error for empty model_name"),
+        }
+
+        // Empty alias
+        let model_create = DeploymentCreateDBRequest::builder()
+            .created_by(user.id)
+            .model_name("valid-model".to_string())
+            .alias("   ".to_string())
+            .hosted_on(test_endpoint_id)
+            .build();
+        let result = repo.create(&model_create).await;
+        match result {
+            Err(DbError::InvalidModelField { field }) => assert_eq!(field, "alias"),
+            _ => panic!("Expected InvalidModelField error for empty alias"),
+        }
+    }
+
+    #[sqlx::test]
+    #[test_log::test]
+    async fn test_update_deployment_with_empty_model_name_or_alias(pool: PgPool) {
+        let base_url = url::Url::parse("http://localhost:8080").unwrap();
+        let sources = vec![crate::config::ModelSource {
+            name: "test".to_string(),
+            url: base_url.clone(),
+            api_key: None,
+            sync_interval: std::time::Duration::from_secs(3600),
+        }];
+        crate::seed_database(&sources, &pool).await.unwrap();
+
+        let user = create_test_user(&pool).await;
+        let test_endpoint_id = get_test_endpoint_id(&pool).await;
+        let mut conn = pool.acquire().await.unwrap();
+        let mut repo = Deployments::new(&mut conn);
+
+        // Create a valid deployment first
+        let model_create = DeploymentCreateDBRequest::builder()
+            .created_by(user.id)
+            .model_name("valid-model".to_string())
+            .alias("valid-alias".to_string())
+            .hosted_on(test_endpoint_id)
+            .build();
+        let deployment = repo.create(&model_create).await.unwrap();
+
+        // Try to update model_name to empty
+        let update = DeploymentUpdateDBRequest::builder().model_name("   ".to_string()).build();
+        let result = repo.update(deployment.id, &update).await;
+        match result {
+            Err(DbError::InvalidModelField { field }) => assert_eq!(field, "model_name"),
+            _ => panic!("Expected InvalidModelField error for empty model_name"),
+        }
+
+        // Try to update alias to empty
+        let update = DeploymentUpdateDBRequest::builder().alias("   ".to_string()).build();
+        let result = repo.update(deployment.id, &update).await;
+        match result {
+            Err(DbError::InvalidModelField { field }) => assert_eq!(field, "alias"),
+            _ => panic!("Expected InvalidModelField error for empty alias"),
+        }
     }
 }

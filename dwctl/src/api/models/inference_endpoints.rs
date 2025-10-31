@@ -2,6 +2,7 @@ use crate::db::models::inference_endpoints::InferenceEndpointDBResponse;
 use crate::types::{InferenceEndpointId, UserId};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use utoipa::{IntoParams, ToSchema};
 
 /// A model from an OpenAI-compatible API
@@ -76,10 +77,23 @@ pub struct InferenceEndpointCreate {
     pub description: Option<String>,
     pub url: String,
     pub api_key: Option<String>,
+    /// List of model names to import from the endpoint (if None, imports all)
     pub model_filter: Option<Vec<String>>,
+    /// Optional mapping of model names to custom aliases
+    /// Key: model_name, Value: desired_alias
+    /// If a model is not in this map, its alias will default to the model_name
+    #[serde(default)]
+    pub alias_mapping: Option<HashMap<String, String>>,
+    /// The name of the authorization header (defaults to "Authorization")
+    pub auth_header_name: Option<String>,
+    /// The prefix for the authorization header value (defaults to "Bearer " with trailing space)
+    pub auth_header_prefix: Option<String>,
     /// Whether to automatically synchronize models after creation (defaults to true)
     #[serde(default = "default_sync")]
     pub sync: bool,
+    /// Create deployments directly from model_filter without fetching from endpoint (defaults to false)
+    #[serde(default)]
+    pub skip_fetch: bool,
 }
 
 fn default_sync() -> bool {
@@ -93,6 +107,12 @@ pub struct InferenceEndpointUpdate {
     pub url: Option<String>,
     pub api_key: Option<Option<String>>,
     pub model_filter: Option<Option<Vec<String>>>,
+    #[serde(default)]
+    pub alias_mapping: Option<HashMap<String, String>>,
+    /// The name of the authorization header
+    pub auth_header_name: Option<String>,
+    /// The prefix for the authorization header value (include trailing space if needed)
+    pub auth_header_prefix: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
@@ -101,6 +121,10 @@ pub enum InferenceEndpointValidate {
     New {
         url: String,
         api_key: Option<String>,
+        /// The name of the authorization header (defaults to "Authorization")
+        auth_header_name: Option<String>,
+        /// The prefix for the authorization header value (defaults to "Bearer " with trailing space)
+        auth_header_prefix: Option<String>,
     },
     Existing {
         #[schema(value_type = String, format = "uuid")]
@@ -125,6 +149,8 @@ pub struct InferenceEndpointResponse {
     pub url: String,
     pub model_filter: Option<Vec<String>>,
     pub requires_api_key: bool,
+    pub auth_header_name: String,
+    pub auth_header_prefix: String,
     #[schema(value_type = String, format = "uuid")]
     pub created_by: UserId,
     pub created_at: DateTime<Utc>,
@@ -140,6 +166,8 @@ impl From<InferenceEndpointDBResponse> for InferenceEndpointResponse {
             url: db.url.to_string(),
             model_filter: db.model_filter,
             requires_api_key: db.api_key.is_some() && !db.api_key.as_ref().unwrap().is_empty(),
+            auth_header_name: db.auth_header_name,
+            auth_header_prefix: db.auth_header_prefix,
             created_by: db.created_by,
             created_at: db.created_at,
             updated_at: db.updated_at,

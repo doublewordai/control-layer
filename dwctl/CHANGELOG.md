@@ -1,5 +1,24 @@
 # Changelog
 
+## [0.5.1](https://github.com/doublewordai/control-layer/compare/v0.5.0...v0.5.1) (2025-10-30)
+
+
+### Bug Fixes
+
+* annoying log line ([65c39c3](https://github.com/doublewordai/control-layer/commit/65c39c31afdedf3d3c2ef448d4de34bc036364f7))
+
+## [0.5.0](https://github.com/doublewordai/control-layer/compare/v0.4.2...v0.5.0) (2025-10-29)
+
+
+### Features
+
+* Uptime monitoring via Probes API ([#40](https://github.com/doublewordai/control-layer/issues/40)) ([ae56133](https://github.com/doublewordai/control-layer/commit/ae56133e982c101244152f6cd67eb740a1c9bb11))
+
+
+### Bug Fixes
+
+* Alias uniqueness enforced across control layer ([#39](https://github.com/doublewordai/control-layer/issues/39)) ([7f3ad57](https://github.com/doublewordai/control-layer/commit/7f3ad57e799498ecc09055aa220813011bde7a49))
+
 ## [0.4.2](https://github.com/doublewordai/control-layer/compare/v0.4.1...v0.4.2) (2025-10-21)
 
 
