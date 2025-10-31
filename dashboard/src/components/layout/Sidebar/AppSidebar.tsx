@@ -18,6 +18,7 @@ import { UserAvatar } from "../../ui";
 import { useAuthorization } from "../../../utils";
 import { useAuth } from "../../../contexts/auth";
 import { useSettings } from "../../../contexts";
+import type { FeatureFlags } from "../../../contexts/settings/types";
 import onwardsLogo from "../../../assets/onwards-logo.svg";
 import {
   Sidebar,
@@ -41,6 +42,13 @@ import {
   DropdownMenuTrigger,
 } from "@/components/ui/dropdown-menu";
 
+interface NavItem {
+  path: string;
+  icon: React.ComponentType<{ className?: string }>;
+  label: string;
+  featureFlag?: keyof FeatureFlags;
+}
+
 export function AppSidebar() {
   const navigate = useNavigate();
   const { data: currentUser, isLoading: loading } = useUser("current");
@@ -48,7 +56,7 @@ export function AppSidebar() {
   const { logout } = useAuth();
   const { isFeatureEnabled } = useSettings();
 
-  const allNavItems = [
+  const allNavItems: NavItem[] = [
     { path: "/models", icon: Layers, label: "Models" },
     { path: "/endpoints", icon: Server, label: "Endpoints" },
     { path: "/playground", icon: Play, label: "Playground" },

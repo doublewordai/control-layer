@@ -3,11 +3,12 @@ import type { ReactNode } from "react";
 import { useAuth } from "../../contexts/auth";
 import { useAuthorization } from "../../utils/authorization";
 import { useSettings } from "../../contexts";
+import type { FeatureFlags } from "../../contexts/settings/types";
 
 interface ProtectedRouteProps {
   children: ReactNode;
   path: string;
-  requiredFeatureFlag?: string;
+  requiredFeatureFlag?: keyof FeatureFlags;
 }
 
 export function ProtectedRoute({ children, path, requiredFeatureFlag }: ProtectedRouteProps) {
