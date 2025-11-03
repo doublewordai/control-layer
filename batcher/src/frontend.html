@@ -1,0 +1,453 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Batcher Demo</title>
+    <style>
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Oxygen, Ubuntu, Cantarell, sans-serif;
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            min-height: 100vh;
+            padding: 20px;
+        }
+
+        .container {
+            max-width: 900px;
+            margin: 0 auto;
+        }
+
+        .header {
+            text-align: center;
+            color: white;
+            margin-bottom: 30px;
+        }
+
+        .header h1 {
+            font-size: 2.5em;
+            margin-bottom: 10px;
+        }
+
+        .header p {
+            font-size: 1.1em;
+            opacity: 0.9;
+        }
+
+        .card {
+            background: white;
+            border-radius: 12px;
+            padding: 25px;
+            margin-bottom: 20px;
+            box-shadow: 0 10px 30px rgba(0,0,0,0.2);
+        }
+
+        .card h2 {
+            color: #667eea;
+            margin-bottom: 15px;
+            font-size: 1.5em;
+        }
+
+        .form-group {
+            margin-bottom: 15px;
+        }
+
+        label {
+            display: block;
+            margin-bottom: 5px;
+            color: #555;
+            font-weight: 500;
+        }
+
+        input, textarea, select {
+            width: 100%;
+            padding: 10px;
+            border: 2px solid #e0e0e0;
+            border-radius: 6px;
+            font-size: 14px;
+            transition: border-color 0.3s;
+        }
+
+        input:focus, textarea:focus, select:focus {
+            outline: none;
+            border-color: #667eea;
+        }
+
+        textarea {
+            min-height: 80px;
+            resize: vertical;
+            font-family: 'Courier New', monospace;
+        }
+
+        button {
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            color: white;
+            border: none;
+            padding: 12px 30px;
+            border-radius: 6px;
+            font-size: 16px;
+            font-weight: 600;
+            cursor: pointer;
+            transition: transform 0.2s, box-shadow 0.2s;
+        }
+
+        button:hover {
+            transform: translateY(-2px);
+            box-shadow: 0 5px 15px rgba(102, 126, 234, 0.4);
+        }
+
+        button:active {
+            transform: translateY(0);
+        }
+
+        button:disabled {
+            opacity: 0.6;
+            cursor: not-allowed;
+            transform: none;
+        }
+
+        .requests-log {
+            max-height: 400px;
+            overflow-y: auto;
+            background: #f8f9fa;
+            border-radius: 6px;
+            padding: 15px;
+        }
+
+        .request-item {
+            background: white;
+            border-left: 4px solid #667eea;
+            padding: 12px;
+            margin-bottom: 10px;
+            border-radius: 4px;
+            font-size: 14px;
+            animation: slideIn 0.3s ease-out;
+        }
+
+        @keyframes slideIn {
+            from {
+                opacity: 0;
+                transform: translateX(-20px);
+            }
+            to {
+                opacity: 1;
+                transform: translateX(0);
+            }
+        }
+
+        .request-id {
+            font-family: 'Courier New', monospace;
+            color: #667eea;
+            font-weight: 600;
+            font-size: 12px;
+        }
+
+        .request-status {
+            display: inline-block;
+            padding: 4px 12px;
+            border-radius: 12px;
+            font-size: 12px;
+            font-weight: 600;
+            margin-left: 10px;
+        }
+
+        .status-pending {
+            background: #ffeaa7;
+            color: #d63031;
+        }
+
+        .status-processing {
+            background: #74b9ff;
+            color: #0984e3;
+        }
+
+        .status-completed {
+            background: #55efc4;
+            color: #00b894;
+        }
+
+        .status-failed {
+            background: #fab1a0;
+            color: #e17055;
+        }
+
+        .connection-status {
+            display: inline-block;
+            width: 10px;
+            height: 10px;
+            border-radius: 50%;
+            margin-right: 8px;
+        }
+
+        .connected {
+            background: #00b894;
+            box-shadow: 0 0 8px #00b894;
+        }
+
+        .disconnected {
+            background: #d63031;
+        }
+
+        .stats {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
+            gap: 15px;
+            margin-bottom: 20px;
+        }
+
+        .stat-box {
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            color: white;
+            padding: 15px;
+            border-radius: 8px;
+            text-align: center;
+        }
+
+        .stat-value {
+            font-size: 2em;
+            font-weight: bold;
+        }
+
+        .stat-label {
+            font-size: 0.9em;
+            opacity: 0.9;
+        }
+
+        .quick-actions {
+            display: flex;
+            gap: 10px;
+            flex-wrap: wrap;
+        }
+
+        .quick-btn {
+            padding: 8px 16px;
+            font-size: 14px;
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <div class="header">
+            <h1>🚀 Batcher Demo</h1>
+            <p>Real-time request batching with SSE updates</p>
+        </div>
+
+        <div class="card">
+            <h2>📊 Statistics</h2>
+            <div class="stats">
+                <div class="stat-box">
+                    <div class="stat-value" id="total-requests">0</div>
+                    <div class="stat-label">Total Requests</div>
+                </div>
+                <div class="stat-box">
+                    <div class="stat-value" id="completed-requests">0</div>
+                    <div class="stat-label">Completed</div>
+                </div>
+                <div class="stat-box">
+                    <div class="stat-value" id="processing-requests">0</div>
+                    <div class="stat-label">Processing</div>
+                </div>
+            </div>
+        </div>
+
+        <div class="card">
+            <h2>📤 Submit Request</h2>
+            <form id="request-form">
+                <div class="form-group">
+                    <label>Endpoint</label>
+                    <input type="text" id="endpoint" value="https://www.google.com" required>
+                </div>
+                <div class="form-group">
+                    <label>Method</label>
+                    <select id="method">
+                        <option value="GET">GET</option>
+                        <option value="POST">POST</option>
+                        <option value="PUT">PUT</option>
+                        <option value="DELETE">DELETE</option>
+                    </select>
+                </div>
+                <div class="form-group">
+                    <label>Path</label>
+                    <input type="text" id="path" value="/" required>
+                </div>
+                <div class="form-group">
+                    <label>Body (JSON)</label>
+                    <textarea id="body">{}</textarea>
+                </div>
+                <div class="form-group">
+                    <label>Model</label>
+                    <input type="text" id="model" value="gpt-4" required>
+                </div>
+                <button type="submit">Submit Request</button>
+            </form>
+
+            <div style="margin-top: 20px;">
+                <p style="color: #666; margin-bottom: 10px;"><strong>Quick Actions:</strong></p>
+                <div class="quick-actions">
+                    <button class="quick-btn" onclick="submitMultiple(3)">Submit 3 Requests</button>
+                    <button class="quick-btn" onclick="submitMultiple(10)">Submit 10 Requests</button>
+                    <button class="quick-btn" onclick="clearLog()">Clear Log</button>
+                </div>
+            </div>
+        </div>
+
+        <div class="card">
+            <h2>
+                📡 Live Updates
+                <span class="connection-status" id="connection-status"></span>
+                <span id="connection-text" style="font-size: 0.8em; color: #666;">Connecting...</span>
+            </h2>
+            <div class="requests-log" id="requests-log">
+                <p style="color: #999; text-align: center; padding: 20px;">No requests yet. Submit a request to see updates!</p>
+            </div>
+        </div>
+    </div>
+
+    <script>
+        const requestsMap = new Map();
+        let totalRequests = 0;
+        let completedRequests = 0;
+        let processingRequests = 0;
+
+        // Connect to SSE endpoint
+        const eventSource = new EventSource('/api/stream');
+
+        eventSource.onopen = () => {
+            document.getElementById('connection-status').className = 'connection-status connected';
+            document.getElementById('connection-text').textContent = 'Connected';
+        };
+
+        eventSource.onerror = () => {
+            document.getElementById('connection-status').className = 'connection-status disconnected';
+            document.getElementById('connection-text').textContent = 'Disconnected';
+        };
+
+        eventSource.onmessage = (event) => {
+            const [requestId, ...statusParts] = event.data.split(':');
+            const status = statusParts.join(':');
+
+            updateRequest(requestId, status);
+        };
+
+        function updateRequest(requestId, status) {
+            const log = document.getElementById('requests-log');
+
+            // Remove "no requests" message
+            if (log.querySelector('p')) {
+                log.innerHTML = '';
+            }
+
+            let requestItem = document.getElementById(`req-${requestId}`);
+
+            if (!requestItem) {
+                requestItem = document.createElement('div');
+                requestItem.className = 'request-item';
+                requestItem.id = `req-${requestId}`;
+                log.insertBefore(requestItem, log.firstChild);
+
+                if (!requestsMap.has(requestId)) {
+                    totalRequests++;
+                    requestsMap.set(requestId, { status: 'pending' });
+                }
+            }
+
+            // Update stats
+            const oldStatus = requestsMap.get(requestId)?.status;
+            if (oldStatus === 'processing' && status.startsWith('completed')) {
+                processingRequests--;
+                completedRequests++;
+            } else if (oldStatus !== 'processing' && status === 'processing') {
+                processingRequests++;
+            }
+
+            requestsMap.set(requestId, { status });
+            updateStats();
+
+            const statusClass = status.split(':')[0];
+            const statusBadge = `<span class="request-status status-${statusClass}">${statusClass.toUpperCase()}</span>`;
+
+            let content = `<div class="request-id">${requestId}</div>`;
+            content += `<div>${statusBadge}</div>`;
+
+            if (status.startsWith('completed')) {
+                const parts = status.split(':');
+                if (parts.length >= 2) {
+                    content += `<div style="margin-top: 5px; color: #666; font-size: 12px;">HTTP ${parts[1]}</div>`;
+                }
+            }
+
+            requestItem.innerHTML = content;
+        }
+
+        function updateStats() {
+            document.getElementById('total-requests').textContent = totalRequests;
+            document.getElementById('completed-requests').textContent = completedRequests;
+            document.getElementById('processing-requests').textContent = processingRequests;
+        }
+
+        document.getElementById('request-form').addEventListener('submit', async (e) => {
+            e.preventDefault();
+
+            const payload = {
+                endpoint: document.getElementById('endpoint').value,
+                method: document.getElementById('method').value,
+                path: document.getElementById('path').value,
+                body: document.getElementById('body').value,
+                model: document.getElementById('model').value,
+            };
+
+            try {
+                const response = await fetch('/api/submit', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify(payload),
+                });
+
+                if (response.ok) {
+                    const data = await response.json();
+                    console.log('Submitted:', data.request_ids);
+                } else {
+                    alert('Error submitting request');
+                }
+            } catch (error) {
+                console.error('Error:', error);
+                alert('Error submitting request');
+            }
+        });
+
+        async function submitMultiple(count) {
+            const payload = {
+                endpoint: document.getElementById('endpoint').value,
+                method: document.getElementById('method').value,
+                path: document.getElementById('path').value,
+                body: document.getElementById('body').value,
+                model: document.getElementById('model').value,
+            };
+
+            for (let i = 0; i < count; i++) {
+                await fetch('/api/submit', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify(payload),
+                });
+                // Small delay to avoid overwhelming
+                await new Promise(resolve => setTimeout(resolve, 50));
+            }
+        }
+
+        function clearLog() {
+            document.getElementById('requests-log').innerHTML = '<p style="color: #999; text-align: center; padding: 20px;">No requests yet. Submit a request to see updates!</p>';
+            requestsMap.clear();
+            totalRequests = 0;
+            completedRequests = 0;
+            processingRequests = 0;
+            updateStats();
+        }
+    </script>
+</body>
+</html>
