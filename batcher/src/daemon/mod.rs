@@ -146,7 +146,10 @@ where
                 continue;
             }
 
-            tracing::debug!(claimed_count = claimed.len(), "Claimed requests from storage");
+            tracing::debug!(
+                claimed_count = claimed.len(),
+                "Claimed requests from storage"
+            );
 
             // Group requests by model for better concurrency control visibility
             let mut by_model: HashMap<String, Vec<_>> = HashMap::new();
@@ -219,15 +222,13 @@ where
 
                             // No capacity for this model - unclaim the request
                             let storage = self.storage.clone();
-                            tokio::spawn(async move {
-                                if let Err(e) = request.unclaim(storage.as_ref()).await {
-                                    tracing::error!(
-                                        request_id = %request_id,
-                                        error = %e,
-                                        "Failed to unclaim request"
-                                    );
-                                }
-                            });
+                            if let Err(e) = request.unclaim(storage.as_ref()).await {
+                                tracing::error!(
+                                    request_id = %request_id,
+                                    error = %e,
+                                    "Failed to unclaim request"
+                                );
+                            };
                         }
                     }
                 }
