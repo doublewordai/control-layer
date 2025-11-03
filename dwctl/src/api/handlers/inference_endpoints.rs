@@ -10,7 +10,7 @@ use crate::{
     },
     errors::{Error, Result},
     sync::{
-        deployments::fetch_models::{FetchModels, FetchModelsReqwest, StaticModelsFetcher, SyncConfig},
+        deployments::fetch_models::{FetchModels, FetchModelsReqwest, SyncConfig},
         endpoint_sync::{self, sync_endpoint_models_with_aliases, update_endpoint_aliases},
     },
     types::InferenceEndpointId,
@@ -26,6 +26,9 @@ struct MockFetchModels;
 
 #[cfg(test)]
 use crate::api::models::inference_endpoints::OpenAIModel;
+
+#[cfg(not(test))]
+use crate::sync::deployments::fetch_models::StaticModelsFetcher;
 
 #[cfg(test)]
 #[async_trait::async_trait]
