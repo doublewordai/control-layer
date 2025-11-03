@@ -4,7 +4,7 @@
 //! for submitting, canceling, and checking the status of batched requests.
 
 use crate::error::Result;
-use crate::request::{AnyRequest, Pending, Request, RequestContext, RequestId};
+use crate::request::{AnyRequest, Pending, Request, RequestId};
 use async_trait::async_trait;
 use futures::stream::Stream;
 use std::pin::Pin;
@@ -36,14 +36,10 @@ pub mod in_memory;
 pub trait RequestManager: Send + Sync {
     /// Submit requests for processing.
     ///
-    /// Each request is paired with a context that defines retry behavior and other
-    /// processing parameters (i.e., API keys, user info).
-    ///
     /// Users submit IDs in the request data. These should be used in the other methods.
-    async fn submit_requests(
-        &self,
-        requests: Vec<(Request<Pending>, RequestContext)>,
-    ) -> Result<Vec<Result<()>>>;
+    /// API keys and other request-specific data should be included in the RequestData.
+    /// Retry behavior is configured at the daemon level.
+    async fn submit_requests(&self, requests: Vec<Request<Pending>>) -> Result<Vec<Result<()>>>;
 
     /// Cancel one or more pending or processing requests.
     ///

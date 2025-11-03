@@ -1,5 +1,4 @@
 //! Daemon for processing batched requests with per-model concurrency control.
-
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
@@ -10,7 +9,7 @@ use tokio::task::JoinSet;
 
 use crate::error::Result;
 use crate::http::HttpClient;
-use crate::request::{DaemonId, RequestContext};
+use crate::request::DaemonId;
 use crate::storage::Storage;
 
 /// Configuration for the daemon.
@@ -28,8 +27,20 @@ pub struct DaemonConfig {
     /// How long to sleep between claim iterations
     pub claim_interval_ms: u64,
 
-    /// Default request context (timeout, retries, etc.)
-    pub default_context: RequestContext,
+    /// Maximum number of retry attempts before giving up
+    pub max_retries: u32,
+
+    /// Base backoff duration in milliseconds (will be exponentially increased)
+    pub backoff_ms: u64,
+
+    /// Factor by which the backoff_ms is increased with each retry
+    pub backoff_factor: u64,
+
+    /// Maximum backoff time in milliseconds
+    pub max_backoff_ms: u64,
+
+    /// Timeout for each individual request attempt in milliseconds
+    pub timeout_ms: u64,
 }
 
 impl Default for DaemonConfig {
@@ -39,14 +50,11 @@ impl Default for DaemonConfig {
             default_model_concurrency: 10,
             model_concurrency_limits: HashMap::new(),
             claim_interval_ms: 100,
-            default_context: RequestContext {
-                max_retries: 3,
-                backoff_ms: 100,
-                backoff_factor: 2,
-                max_backoff_ms: 10000,
-                timeout_ms: 30000,
-                api_key: String::new(),
-            },
+            max_retries: 3,
+            backoff_ms: 100,
+            backoff_factor: 2,
+            max_backoff_ms: 10000,
+            timeout_ms: 30000,
         }
     }
 }
@@ -185,7 +193,8 @@ where
                             // We have capacity - spawn a task
                             let storage = self.storage.clone();
                             let http_client = (*self.http_client).clone();
-                            let context = self.config.default_context.clone();
+                            let timeout_ms = self.config.timeout_ms;
+                            let retry_config = (&self.config).into();
 
                             join_set.spawn(async move {
                                 // Permit is held for the duration of this task
@@ -196,7 +205,7 @@ where
                                 // Process the request
                                 let processing = request.process(
                                     http_client,
-                                    context,
+                                    timeout_ms,
                                     storage.as_ref()
                                 ).await?;
 
@@ -205,8 +214,31 @@ where
                                     Ok(_completed) => {
                                         tracing::info!(request_id = %request_id, "Request completed successfully");
                                     }
-                                    Err(_failed) => {
-                                        tracing::warn!(request_id = %request_id, "Request failed");
+                                    Err(failed) => {
+                                        let retry_attempt = failed.state.retry_attempt;
+                                        tracing::warn!(
+                                            request_id = %request_id,
+                                            retry_attempt,
+                                            "Request failed, attempting retry"
+                                        );
+
+                                        // Attempt to retry
+                                        match failed.retry(retry_attempt, retry_config, storage.as_ref()).await? {
+                                            Some(_pending) => {
+                                                tracing::info!(
+                                                    request_id = %request_id,
+                                                    retry_attempt = retry_attempt + 1,
+                                                    "Request queued for retry"
+                                                );
+                                            }
+                                            None => {
+                                                tracing::warn!(
+                                                    request_id = %request_id,
+                                                    retry_attempt,
+                                                    "Request failed permanently (no retries remaining)"
+                                                );
+                                            }
+                                        }
                                     }
                                 }
 
@@ -260,7 +292,10 @@ mod tests {
 
         // Submit a pending request
         let request = Request {
-            state: Pending {},
+            state: Pending {
+                retry_attempt: 0,
+                not_before: None,
+            },
             data: RequestData {
                 id: RequestId::from(uuid::Uuid::new_v4()),
                 endpoint: "https://api.example.com".to_string(),
@@ -268,23 +303,11 @@ mod tests {
                 path: "/v1/test".to_string(),
                 body: "{}".to_string(),
                 model: "test-model".to_string(),
+                api_key: "test-key".to_string(),
             },
         };
 
-        storage
-            .submit(
-                request,
-                RequestContext {
-                    max_retries: 3,
-                    backoff_ms: 100,
-                    backoff_factor: 2,
-                    max_backoff_ms: 10000,
-                    timeout_ms: 30000,
-                    api_key: "test-key".to_string(),
-                },
-            )
-            .await
-            .unwrap();
+        storage.submit(request).await.unwrap();
 
         // Create and run daemon
         let daemon = Arc::new(Daemon::new(

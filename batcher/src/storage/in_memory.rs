@@ -14,14 +14,6 @@ use crate::request::*;
 
 use super::Storage;
 
-/// Stored request with its context.
-#[derive(Clone)]
-struct StoredRequest {
-    request: AnyRequest,
-    #[allow(dead_code)] // Context stored for future use (e.g., retry logic, monitoring)
-    context: RequestContext,
-}
-
 /// In-memory implementation of the Storage trait.
 ///
 /// Stores all requests in a concurrent HashMap and validates state transitions
@@ -43,7 +35,7 @@ struct StoredRequest {
 /// ```
 #[derive(Clone)]
 pub struct InMemoryStorage {
-    requests: Arc<RwLock<HashMap<RequestId, StoredRequest>>>,
+    requests: Arc<RwLock<HashMap<RequestId, AnyRequest>>>,
     status_tx: Option<broadcast::Sender<AnyRequest>>,
 }
 
@@ -80,8 +72,8 @@ impl Default for InMemoryStorage {
 }
 
 impl Storage for InMemoryStorage {
-    #[tracing::instrument(skip(self, request, context), fields(request_id = %request.data.id, model = %request.data.model))]
-    async fn submit(&self, request: Request<Pending>, context: RequestContext) -> Result<()> {
+    #[tracing::instrument(skip(self, request), fields(request_id = %request.data.id, model = %request.data.model))]
+    async fn submit(&self, request: Request<Pending>) -> Result<()> {
         let request_id = request.data.id;
 
         tracing::debug!(
@@ -102,13 +94,7 @@ impl Storage for InMemoryStorage {
         }
 
         let any_request: AnyRequest = request.into();
-        requests.insert(
-            request_id,
-            StoredRequest {
-                request: any_request.clone(),
-                context,
-            },
-        );
+        requests.insert(request_id, any_request.clone());
 
         // Broadcast the update
         self.broadcast_update(&any_request);
@@ -131,9 +117,26 @@ impl Storage for InMemoryStorage {
 
         let pending_ids: Vec<RequestId> = requests
             .iter()
-            .filter(|(_, stored)| stored.request.is_pending())
+            .filter_map(|(id, stored)| {
+                // Only consider pending requests
+                if let Some(pending_req) = stored.as_pending() {
+                    // Respect not_before - skip if it's in the future
+                    if let Some(not_before) = pending_req.state.not_before {
+                        if not_before > now {
+                            tracing::trace!(
+                                request_id = %id,
+                                not_before = %not_before,
+                                "Skipping request in backoff period"
+                            );
+                            return None;
+                        }
+                    }
+                    Some(*id)
+                } else {
+                    None
+                }
+            })
             .take(limit)
-            .map(|(id, _)| *id)
             .collect();
 
         tracing::debug!(
@@ -147,18 +150,19 @@ impl Storage for InMemoryStorage {
         for id in pending_ids {
             if let Some(stored) = requests.get_mut(&id) {
                 // Extract the pending request and transition to claimed
-                if let Some(pending_req) = stored.request.as_pending() {
+                if let Some(pending_req) = stored.as_pending() {
                     let claimed_req = Request {
                         state: Claimed {
                             daemon_id,
                             claimed_at: now,
+                            retry_attempt: pending_req.state.retry_attempt, // Carry over retry attempt
                         },
                         data: pending_req.data.clone(),
                     };
 
                     // Update storage
                     let any_request: AnyRequest = claimed_req.clone().into();
-                    stored.request = any_request.clone();
+                    *stored = any_request.clone();
 
                     // Broadcast the update
                     self.broadcast_update(&any_request);
@@ -200,8 +204,15 @@ impl Storage for InMemoryStorage {
         let mut requests = self.requests.write();
 
         if let Some(existing) = requests.get_mut(&request_id) {
-            // Don't overwrite terminal states (idempotency protection)
-            if existing.request.is_terminal() {
+            // Convert new request to AnyRequest
+            let any_request: AnyRequest = request.clone().into();
+
+            // Allow Failed -> Pending transition for retries
+            let is_retry_transition = matches!(existing, AnyRequest::Failed(_))
+                && matches!(any_request, AnyRequest::Pending(_));
+
+            // Don't overwrite terminal states (idempotency protection), except for retry transitions
+            if existing.is_terminal() && !is_retry_transition {
                 tracing::warn!(
                     request_id = %request_id,
                     "Attempted to update request in terminal state"
@@ -214,8 +225,7 @@ impl Storage for InMemoryStorage {
             }
 
             // Update the stored request
-            let any_request: AnyRequest = request.clone().into();
-            existing.request = any_request.clone();
+            *existing = any_request.clone();
 
             // Broadcast the update
             self.broadcast_update(&any_request);
@@ -238,7 +248,7 @@ impl Storage for InMemoryStorage {
 
         let pending: Vec<Request<Pending>> = requests
             .values()
-            .filter_map(|stored| stored.request.as_pending().cloned())
+            .filter_map(|stored| stored.as_pending().cloned())
             .take(limit)
             .collect();
 
@@ -252,8 +262,7 @@ impl Storage for InMemoryStorage {
             .into_iter()
             .map(|id| {
                 requests
-                    .get(&id)
-                    .map(|stored| stored.request.clone())
+                    .get(&id).cloned()
                     .ok_or_else(|| BatcherError::RequestNotFound(id))
             })
             .collect();
@@ -274,16 +283,6 @@ mod tests {
             path: "/v1/test".to_string(),
             body: r#"{"test": true}"#.to_string(),
             model: "test-model".to_string(),
-        }
-    }
-
-    fn sample_context() -> RequestContext {
-        RequestContext {
-            max_retries: 3,
-            backoff_ms: 100,
-            backoff_factor: 2,
-            max_backoff_ms: 10000,
-            timeout_ms: 30000,
             api_key: "test-key".to_string(),
         }
     }
@@ -294,11 +293,14 @@ mod tests {
         let id = RequestId::from(uuid::Uuid::new_v4());
 
         let request = Request {
-            state: Pending {},
+            state: Pending {
+                retry_attempt: 0,
+                not_before: None,
+            },
             data: sample_request_data(id),
         };
 
-        let result = storage.submit(request, sample_context()).await;
+        let result = storage.submit(request).await;
         assert!(result.is_ok());
 
         // Verify it's stored
@@ -318,16 +320,22 @@ mod tests {
         let id2 = RequestId::from(uuid::Uuid::new_v4());
 
         let request1 = Request {
-            state: Pending {},
+            state: Pending {
+                retry_attempt: 0,
+                not_before: None,
+            },
             data: sample_request_data(id1),
         };
-        storage.submit(request1, sample_context()).await.unwrap();
+        storage.submit(request1).await.unwrap();
 
         let request2 = Request {
-            state: Pending {},
+            state: Pending {
+                retry_attempt: 0,
+                not_before: None,
+            },
             data: sample_request_data(id2),
         };
-        storage.submit(request2, sample_context()).await.unwrap();
+        storage.submit(request2).await.unwrap();
 
         // Daemon 1 claims both
         let claimed = storage.claim_requests(10, daemon1).await.unwrap();
@@ -348,10 +356,13 @@ mod tests {
 
         // Submit a pending request
         let request = Request {
-            state: Pending {},
+            state: Pending {
+                retry_attempt: 0,
+                not_before: None,
+            },
             data: sample_request_data(id),
         };
-        storage.submit(request, sample_context()).await.unwrap();
+        storage.submit(request).await.unwrap();
 
         // Claim it
         let claimed = storage.claim_requests(1, daemon_id).await.unwrap();
@@ -359,7 +370,10 @@ mod tests {
 
         // Unclaim it
         let unclaimed = Request {
-            state: Pending {},
+            state: Pending {
+                retry_attempt: 0,
+                not_before: None,
+            },
             data: sample_request_data(id),
         };
         storage.persist(&unclaimed).await.unwrap();
@@ -377,10 +391,13 @@ mod tests {
 
         // Submit and claim a request
         let request = Request {
-            state: Pending {},
+            state: Pending {
+                retry_attempt: 0,
+                not_before: None,
+            },
             data: sample_request_data(id),
         };
-        storage.submit(request, sample_context()).await.unwrap();
+        storage.submit(request).await.unwrap();
 
         let claimed = storage.claim_requests(1, daemon_id).await.unwrap();
         assert_eq!(claimed.len(), 1);
@@ -410,10 +427,13 @@ mod tests {
 
         // Submit a pending request
         let request = Request {
-            state: Pending {},
+            state: Pending {
+                retry_attempt: 0,
+                not_before: None,
+            },
             data: sample_request_data(id),
         };
-        storage.submit(request.clone(), sample_context()).await.unwrap();
+        storage.submit(request.clone()).await.unwrap();
 
         // Cancel it
         let canceled = request.cancel(&storage).await.unwrap();
@@ -439,10 +459,13 @@ mod tests {
 
         // Submit and claim a request
         let request = Request {
-            state: Pending {},
+            state: Pending {
+                retry_attempt: 0,
+                not_before: None,
+            },
             data: sample_request_data(id),
         };
-        storage.submit(request, sample_context()).await.unwrap();
+        storage.submit(request).await.unwrap();
 
         let claimed = storage.claim_requests(1, daemon_id).await.unwrap();
         assert_eq!(claimed.len(), 1);

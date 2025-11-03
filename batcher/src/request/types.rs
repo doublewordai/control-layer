@@ -67,29 +67,8 @@ pub struct RequestData {
     /// This is somewhat duplicative (it's also in the body), but materializing
     /// it here provides more flexibility for routing and resource management.
     pub model: String,
-}
 
-/// Configuration and system-supplied context for how a request should be processed.
-///
-/// These parameters control retry behavior, timeouts, and authentication.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct RequestContext {
-    /// Maximum number of retry attempts before giving up
-    pub max_retries: u32,
-
-    /// Base backoff duration in milliseconds (will be exponentially increased)
-    pub backoff_ms: u64,
-
-    /// Factor by which the backoff_ms is increased with each retry
-    pub backoff_factor: u64,
-
-    /// Maximum backoff time in milliseconds
-    pub max_backoff_ms: u64,
-
-    /// Timeout for each individual request attempt in milliseconds
-    pub timeout_ms: u64,
-
-    /// API key, sent in Authorization: Bearer header. Separate from the request.
+    /// API key for authentication (sent in Authorization: Bearer header)
     pub api_key: String,
 }
 
@@ -101,7 +80,14 @@ pub struct RequestContext {
 ///
 /// This is the initial state for all newly submitted requests.
 #[derive(Debug, Clone, Serialize)]
-pub struct Pending {}
+pub struct Pending {
+    /// Number of times this request has been attempted (0 = first attempt)
+    pub retry_attempt: u32,
+
+    /// Earliest time this request can be claimed (for exponential backoff)
+    /// None means it can be claimed immediately
+    pub not_before: Option<DateTime<Utc>>,
+}
 
 impl RequestState for Pending {}
 
@@ -113,6 +99,8 @@ impl RequestState for Pending {}
 pub struct Claimed {
     pub daemon_id: DaemonId,
     pub claimed_at: DateTime<Utc>,
+    /// Number of times this request has been attempted (carried over from Pending)
+    pub retry_attempt: u32,
 }
 
 impl RequestState for Claimed {}
@@ -123,6 +111,8 @@ pub struct Processing {
     pub daemon_id: DaemonId,
     pub claimed_at: DateTime<Utc>,
     pub started_at: DateTime<Utc>,
+    /// Number of times this request has been attempted (carried over from Claimed)
+    pub retry_attempt: u32,
     /// Channel receiver for the HTTP request result (wrapped in Arc<Mutex<>> for Sync)
     #[serde(skip)]
     pub result_rx: Arc<Mutex<mpsc::Receiver<Result<HttpResponse>>>>,
@@ -150,6 +140,8 @@ impl RequestState for Completed {}
 pub struct Failed {
     pub error: String,
     pub failed_at: DateTime<Utc>,
+    /// Number of times this request has been attempted when it failed
+    pub retry_attempt: u32,
 }
 
 impl RequestState for Failed {}

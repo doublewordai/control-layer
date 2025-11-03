@@ -113,8 +113,8 @@ impl HttpClient for ReqwestHttpClient {
 
         // Only add body and Content-Type for methods that support a body
         let method_upper = request.method.to_uppercase();
-        if method_upper != "GET" && method_upper != "HEAD" && method_upper != "DELETE" {
-            if !request.body.is_empty() {
+        if method_upper != "GET" && method_upper != "HEAD" && method_upper != "DELETE"
+            && !request.body.is_empty() {
                 req = req
                     .header("Content-Type", "application/json")
                     .body(request.body.clone());
@@ -124,7 +124,6 @@ impl HttpClient for ReqwestHttpClient {
                     "Added request body"
                 );
             }
-        }
 
         let response = req.send().await.map_err(|e| {
             tracing::error!(
@@ -156,8 +155,8 @@ impl HttpClient for ReqwestHttpClient {
 
 use parking_lot::Mutex;
 use std::collections::HashMap;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Arc;
 use tokio::sync::oneshot;
 
 /// Mock HTTP client for testing.
@@ -391,6 +390,7 @@ mod tests {
             path: "/test".to_string(),
             body: "{}".to_string(),
             model: "test-model".to_string(),
+            api_key: "test-key".to_string(),
         };
 
         let response = mock.execute(&request, "test-key", 5000).await.unwrap();
@@ -430,6 +430,7 @@ mod tests {
             path: "/status".to_string(),
             body: "".to_string(),
             model: "test-model".to_string(),
+            api_key: "test-key".to_string(),
         };
 
         let response1 = mock.execute(&request, "key", 5000).await.unwrap();
@@ -452,6 +453,7 @@ mod tests {
             path: "/unknown".to_string(),
             body: "{}".to_string(),
             model: "test-model".to_string(),
+            api_key: "test-key".to_string(),
         };
 
         let result = mock.execute(&request, "key", 5000).await;
@@ -477,6 +479,7 @@ mod tests {
             path: "/test".to_string(),
             body: "{}".to_string(),
             model: "test-model".to_string(),
+            api_key: "test-key".to_string(),
         };
 
         // Spawn the request execution (it will block waiting for trigger)

@@ -14,7 +14,7 @@ use tokio::task::JoinHandle;
 use crate::daemon::{Daemon, DaemonConfig};
 use crate::error::Result;
 use crate::http::HttpClient;
-use crate::request::{Pending, Request, RequestContext, RequestId};
+use crate::request::{Pending, Request, RequestId};
 use crate::storage::{in_memory::InMemoryStorage, Storage};
 
 use super::RequestManager;
@@ -73,21 +73,22 @@ impl<H: HttpClient + 'static> InMemoryRequestManager<H> {
 #[async_trait]
 impl<H: HttpClient + 'static> RequestManager for InMemoryRequestManager<H> {
     #[tracing::instrument(skip(self, requests), fields(count = requests.len()))]
-    async fn submit_requests(
-        &self,
-        requests: Vec<(Request<Pending>, RequestContext)>,
-    ) -> Result<Vec<Result<()>>> {
+    async fn submit_requests(&self, requests: Vec<Request<Pending>>) -> Result<Vec<Result<()>>> {
         tracing::info!(count = requests.len(), "Submitting batch of requests");
 
         let mut results = Vec::new();
 
-        for (request, context) in requests {
-            let result = self.storage.submit(request, context).await;
+        for request in requests {
+            let result = self.storage.submit(request).await;
             results.push(result);
         }
 
         let successful = results.iter().filter(|r| r.is_ok()).count();
-        tracing::info!(successful = successful, total = results.len(), "Batch submission complete");
+        tracing::info!(
+            successful = successful,
+            total = results.len(),
+            "Batch submission complete"
+        );
 
         Ok(results)
     }

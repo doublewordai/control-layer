@@ -1,3 +1,5 @@
+/// A simple HTTP server using Axum that provides a web interface and API
+/// for the batcher request manager.
 use axum::{
     extract::{Path, State},
     http::StatusCode,
@@ -9,8 +11,8 @@ use axum::{
     Json, Router,
 };
 use batcher::{
-    AnyRequest, DaemonConfig, InMemoryRequestManager, Pending, Request, RequestContext,
-    RequestData, RequestId, RequestManager, ReqwestHttpClient,
+    AnyRequest, DaemonConfig, InMemoryRequestManager, Pending, Request, RequestData, RequestId,
+    RequestManager, ReqwestHttpClient,
 };
 use futures::stream::{Stream, StreamExt};
 use serde::{Deserialize, Serialize};
@@ -32,33 +34,7 @@ struct SubmitRequestBody {
     path: String,
     body: String,
     model: String,
-    #[serde(default = "default_max_retries")]
-    max_retries: u32,
-    #[serde(default = "default_backoff_ms")]
-    backoff_ms: u64,
-    #[serde(default = "default_backoff_factor")]
-    backoff_factor: u64,
-    #[serde(default = "default_max_backoff_ms")]
-    max_backoff_ms: u64,
-    #[serde(default = "default_timeout_ms")]
-    timeout_ms: u64,
     api_key: String,
-}
-
-fn default_max_retries() -> u32 {
-    3
-}
-fn default_backoff_ms() -> u64 {
-    1000
-}
-fn default_backoff_factor() -> u64 {
-    2
-}
-fn default_max_backoff_ms() -> u64 {
-    60000
-}
-fn default_timeout_ms() -> u64 {
-    30000
 }
 
 #[derive(Debug, Serialize)]
@@ -78,7 +54,10 @@ async fn submit_request(
 ) -> Result<Json<SubmitResponse>, AppError> {
     let request_id = RequestId::from(Uuid::new_v4());
     let request = Request {
-        state: Pending {},
+        state: Pending {
+            retry_attempt: 0,
+            not_before: None,
+        },
         data: RequestData {
             id: request_id,
             endpoint: body.endpoint,
@@ -86,21 +65,13 @@ async fn submit_request(
             path: body.path,
             body: body.body,
             model: body.model,
+            api_key: body.api_key,
         },
-    };
-
-    let context = RequestContext {
-        max_retries: body.max_retries,
-        backoff_ms: body.backoff_ms,
-        backoff_factor: body.backoff_factor,
-        max_backoff_ms: body.max_backoff_ms,
-        timeout_ms: body.timeout_ms,
-        api_key: body.api_key,
     };
 
     state
         .manager
-        .submit_requests(vec![(request, context)])
+        .submit_requests(vec![request])
         .await
         .map_err(|e| AppError::Internal(e.to_string()))?
         .into_iter()

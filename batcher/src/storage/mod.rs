@@ -1,9 +1,7 @@
 use std::future::Future;
 
 use crate::error::Result;
-use crate::request::{
-    AnyRequest, Claimed, DaemonId, Pending, Request, RequestContext, RequestId, RequestState,
-};
+use crate::request::{AnyRequest, Claimed, DaemonId, Pending, Request, RequestId, RequestState};
 
 pub mod in_memory;
 
@@ -19,11 +17,7 @@ pub trait Storage: Send + Sync {
     ///
     /// # Errors
     /// - If a request with the same ID already exists
-    fn submit(
-        &self,
-        request: Request<Pending>,
-        context: RequestContext,
-    ) -> impl Future<Output = Result<()>> + Send;
+    fn submit(&self, request: Request<Pending>) -> impl Future<Output = Result<()>> + Send;
 
     /// Atomically claim pending requests for processing.
     ///
