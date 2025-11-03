@@ -75,7 +75,7 @@ where
     /// Create a new daemon.
     pub fn new(storage: Arc<S>, http_client: Arc<H>, config: DaemonConfig) -> Self {
         Self {
-            daemon_id: uuid::Uuid::new_v4(),
+            daemon_id: DaemonId::from(uuid::Uuid::new_v4()),
             storage,
             http_client,
             config,
@@ -111,7 +111,10 @@ where
     ///
     /// This continuously claims and processes requests until an error occurs
     /// or the task is cancelled.
+    #[tracing::instrument(skip(self), fields(daemon_id = %self.daemon_id))]
     pub async fn run(self: Arc<Self>) -> Result<()> {
+        tracing::info!("Daemon starting main processing loop");
+
         let mut join_set: JoinSet<Result<()>> = JoinSet::new();
 
         loop {
@@ -119,15 +122,13 @@ where
             while let Some(result) = join_set.try_join_next() {
                 match result {
                     Ok(Ok(())) => {
-                        // Task completed successfully
+                        tracing::trace!("Task completed successfully");
                     }
                     Ok(Err(e)) => {
-                        // Task failed - log the error
-                        eprintln!("Task failed: {}", e);
+                        tracing::error!(error = %e, "Task failed");
                     }
                     Err(join_error) => {
-                        // Task panicked
-                        eprintln!("Task panicked: {}", join_error);
+                        tracing::error!(error = %join_error, "Task panicked");
                     }
                 }
             }
@@ -139,10 +140,13 @@ where
                 .await?;
 
             if claimed.is_empty() {
+                tracing::trace!("No pending requests, sleeping");
                 // No pending requests, sleep and retry
                 tokio::time::sleep(Duration::from_millis(self.config.claim_interval_ms)).await;
                 continue;
             }
+
+            tracing::debug!(claimed_count = claimed.len(), "Claimed requests from storage");
 
             // Group requests by model for better concurrency control visibility
             let mut by_model: HashMap<String, Vec<_>> = HashMap::new();
@@ -153,12 +157,28 @@ where
                     .push(request);
             }
 
+            tracing::debug!(
+                models = by_model.len(),
+                total_requests = by_model.values().map(|v| v.len()).sum::<usize>(),
+                "Grouped requests by model"
+            );
+
             // Dispatch requests
             for (model, requests) in by_model {
+                tracing::debug!(model = %model, count = requests.len(), "Processing requests for model");
+
                 for request in requests {
+                    let request_id = request.data.id;
+
                     // Try to acquire a semaphore permit for this model
                     match self.try_acquire_permit(&model) {
                         Some(permit) => {
+                            tracing::debug!(
+                                request_id = %request_id,
+                                model = %model,
+                                "Acquired permit, spawning processing task"
+                            );
+
                             // We have capacity - spawn a task
                             let storage = self.storage.clone();
                             let http_client = (*self.http_client).clone();
@@ -167,6 +187,8 @@ where
                             join_set.spawn(async move {
                                 // Permit is held for the duration of this task
                                 let _permit = permit;
+
+                                tracing::info!(request_id = %request_id, "Processing request");
 
                                 // Process the request
                                 let processing = request.process(
@@ -178,10 +200,10 @@ where
                                 // Wait for completion
                                 match processing.complete(storage.as_ref()).await? {
                                     Ok(_completed) => {
-                                        // Successfully completed
+                                        tracing::info!(request_id = %request_id, "Request completed successfully");
                                     }
                                     Err(_failed) => {
-                                        // Failed - already persisted
+                                        tracing::warn!(request_id = %request_id, "Request failed");
                                     }
                                 }
 
@@ -189,11 +211,21 @@ where
                             });
                         }
                         None => {
+                            tracing::debug!(
+                                request_id = %request_id,
+                                model = %model,
+                                "No capacity available, unclaiming request"
+                            );
+
                             // No capacity for this model - unclaim the request
                             let storage = self.storage.clone();
                             tokio::spawn(async move {
                                 if let Err(e) = request.unclaim(storage.as_ref()).await {
-                                    eprintln!("Failed to unclaim request: {}", e);
+                                    tracing::error!(
+                                        request_id = %request_id,
+                                        error = %e,
+                                        "Failed to unclaim request"
+                                    );
                                 }
                             });
                         }
@@ -229,7 +261,7 @@ mod tests {
         let request = Request {
             state: Pending {},
             data: RequestData {
-                id: uuid::Uuid::new_v4(),
+                id: RequestId::from(uuid::Uuid::new_v4()),
                 endpoint: "https://api.example.com".to_string(),
                 method: "POST".to_string(),
                 path: "/v1/test".to_string(),

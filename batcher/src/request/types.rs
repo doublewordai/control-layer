@@ -6,6 +6,7 @@
 use std::sync::Arc;
 
 use chrono::{DateTime, Utc};
+use serde::Serialize;
 use tokio::sync::{mpsc, Mutex};
 use tokio::task::AbortHandle;
 use uuid::Uuid;
@@ -32,7 +33,7 @@ pub trait RequestState: Send + Sync {}
 /// };
 /// // Can only call operations valid for Pending state
 /// ```
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize)]
 pub struct Request<T: RequestState> {
     /// The current state of the request.
     pub state: T,
@@ -44,7 +45,7 @@ pub struct Request<T: RequestState> {
 ///
 /// This contains all the information needed to make an HTTP request
 /// to a target API endpoint.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct RequestData {
     /// The ID with which the request was submitted.
     pub id: RequestId,
@@ -99,7 +100,7 @@ pub struct RequestContext {
 /// Request is waiting to be processed.
 ///
 /// This is the initial state for all newly submitted requests.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize)]
 pub struct Pending {}
 
 impl RequestState for Pending {}
@@ -108,7 +109,7 @@ impl RequestState for Pending {}
 ///
 /// This intermediate state helps track which daemon is responsible for
 /// processing the request.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize)]
 pub struct Claimed {
     pub daemon_id: DaemonId,
     pub claimed_at: DateTime<Utc>,
@@ -117,21 +118,23 @@ pub struct Claimed {
 impl RequestState for Claimed {}
 
 /// Request is currently being processed by a daemon (i.e., HTTP request in flight).
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize)]
 pub struct Processing {
     pub daemon_id: DaemonId,
     pub claimed_at: DateTime<Utc>,
     pub started_at: DateTime<Utc>,
     /// Channel receiver for the HTTP request result (wrapped in Arc<Mutex<>> for Sync)
+    #[serde(skip)]
     pub result_rx: Arc<Mutex<mpsc::Receiver<Result<HttpResponse>>>>,
     /// Handle to abort the in-flight HTTP request
+    #[serde(skip)]
     pub abort_handle: AbortHandle,
 }
 
 impl RequestState for Processing {}
 
 /// Request completed successfully.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize)]
 pub struct Completed {
     pub response_status: u16,
     pub response_body: String,
@@ -143,7 +146,7 @@ pub struct Completed {
 impl RequestState for Completed {}
 
 /// Request failed after exhausting retries.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize)]
 pub struct Failed {
     pub error: String,
     pub failed_at: DateTime<Utc>,
@@ -152,7 +155,7 @@ pub struct Failed {
 impl RequestState for Failed {}
 
 /// Request was canceled by the caller.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize)]
 pub struct Canceled {
     pub canceled_at: DateTime<Utc>,
 }
@@ -160,9 +163,54 @@ pub struct Canceled {
 impl RequestState for Canceled {}
 
 /// Unique identifier for a request in the system.
-pub type RequestId = Uuid;
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize)]
+#[serde(transparent)]
+pub struct RequestId(pub Uuid);
 
-pub type DaemonId = Uuid;
+impl std::fmt::Display for RequestId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // Display only first 8 characters for readability in logs
+        write!(f, "{}", &self.0.to_string()[..8])
+    }
+}
+
+impl From<Uuid> for RequestId {
+    fn from(uuid: Uuid) -> Self {
+        RequestId(uuid)
+    }
+}
+
+impl std::ops::Deref for RequestId {
+    type Target = Uuid;
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+/// Unique identifier for a daemon.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize)]
+#[serde(transparent)]
+pub struct DaemonId(pub Uuid);
+
+impl std::fmt::Display for DaemonId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // Display only first 8 characters for readability in logs
+        write!(f, "{}", &self.0.to_string()[..8])
+    }
+}
+
+impl From<Uuid> for DaemonId {
+    fn from(uuid: Uuid) -> Self {
+        DaemonId(uuid)
+    }
+}
+
+impl std::ops::Deref for DaemonId {
+    type Target = Uuid;
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
 
 // ============================================================================
 // Unified Request Representation
@@ -172,7 +220,8 @@ pub type DaemonId = Uuid;
 ///
 /// This is used for storage and API responses where we need to handle
 /// requests uniformly regardless of their current state.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize)]
+#[serde(tag = "state", content = "request")]
 pub enum AnyRequest {
     Pending(Request<Pending>),
     Claimed(Request<Claimed>),

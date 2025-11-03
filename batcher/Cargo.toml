@@ -8,6 +8,8 @@ name = "batcher"
 path = "src/lib.rs"
 
 [dependencies]
+tokio-stream = { version = "0.1", features = ["sync"] }
+tracing = "0.1"
 tokio = { version = "1", features = ["full"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
@@ -23,3 +25,7 @@ async-stream = "0.3"
 
 [dev-dependencies]
 tokio-test = "0.4"
+axum = "0.7"
+tower = "0.5"
+tower-http = { version = "0.6", features = ["cors", "trace"] }
+tracing-subscriber = "0.3"

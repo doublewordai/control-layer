@@ -7,6 +7,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use parking_lot::RwLock;
+use tokio::sync::broadcast;
 
 use crate::error::{BatcherError, Result};
 use crate::request::*;
@@ -43,6 +44,7 @@ struct StoredRequest {
 #[derive(Clone)]
 pub struct InMemoryStorage {
     requests: Arc<RwLock<HashMap<RequestId, StoredRequest>>>,
+    status_tx: Option<broadcast::Sender<AnyRequest>>,
 }
 
 impl InMemoryStorage {
@@ -50,6 +52,23 @@ impl InMemoryStorage {
     pub fn new() -> Self {
         Self {
             requests: Arc::new(RwLock::new(HashMap::new())),
+            status_tx: None,
+        }
+    }
+
+    /// Create a new in-memory storage with status updates broadcast.
+    pub fn with_status_updates(status_tx: broadcast::Sender<AnyRequest>) -> Self {
+        Self {
+            requests: Arc::new(RwLock::new(HashMap::new())),
+            status_tx: Some(status_tx),
+        }
+    }
+
+    /// Send a status update if a broadcast channel is configured.
+    fn broadcast_update(&self, request: &AnyRequest) {
+        if let Some(tx) = &self.status_tx {
+            // Ignore send errors (no active receivers is fine)
+            let _ = tx.send(request.clone());
         }
     }
 }
@@ -61,13 +80,20 @@ impl Default for InMemoryStorage {
 }
 
 impl Storage for InMemoryStorage {
+    #[tracing::instrument(skip(self, request, context), fields(request_id = %request.data.id, model = %request.data.model))]
     async fn submit(&self, request: Request<Pending>, context: RequestContext) -> Result<()> {
         let request_id = request.data.id;
+
+        tracing::debug!(
+            endpoint = %request.data.endpoint,
+            "Submitting new request to storage"
+        );
 
         let mut requests = self.requests.write();
 
         // Check if request already exists
         if requests.contains_key(&request_id) {
+            tracing::warn!("Attempted to submit duplicate request");
             return Err(BatcherError::InvalidState(
                 request_id,
                 "exists".to_string(),
@@ -75,21 +101,31 @@ impl Storage for InMemoryStorage {
             ));
         }
 
+        let any_request: AnyRequest = request.into();
         requests.insert(
             request_id,
             StoredRequest {
-                request: request.into(),
+                request: any_request.clone(),
                 context,
             },
         );
+
+        // Broadcast the update
+        self.broadcast_update(&any_request);
+
+        tracing::info!("Request submitted to storage successfully");
+
         Ok(())
     }
 
+    #[tracing::instrument(skip(self), fields(daemon_id = %daemon_id))]
     async fn claim_requests(
         &self,
         limit: usize,
         daemon_id: DaemonId,
     ) -> Result<Vec<Request<Claimed>>> {
+        tracing::trace!(limit = limit, "Attempting to claim requests");
+
         let mut requests = self.requests.write();
         let now = chrono::Utc::now();
 
@@ -99,6 +135,12 @@ impl Storage for InMemoryStorage {
             .take(limit)
             .map(|(id, _)| *id)
             .collect();
+
+        tracing::debug!(
+            pending_count = pending_ids.len(),
+            daemon_id = %daemon_id,
+            "Found pending requests to claim"
+        );
 
         let mut claimed_requests = Vec::new();
 
@@ -115,7 +157,17 @@ impl Storage for InMemoryStorage {
                     };
 
                     // Update storage
-                    stored.request = claimed_req.clone().into();
+                    let any_request: AnyRequest = claimed_req.clone().into();
+                    stored.request = any_request.clone();
+
+                    // Broadcast the update
+                    self.broadcast_update(&any_request);
+
+                    tracing::debug!(
+                        request_id = %id,
+                        daemon_id = %daemon_id,
+                        "Request claimed"
+                    );
 
                     // Return the claimed request
                     claimed_requests.push(claimed_req);
@@ -123,20 +175,37 @@ impl Storage for InMemoryStorage {
             }
         }
 
+        if claimed_requests.is_empty() {
+            tracing::trace!(daemon_id = %daemon_id, "No requests claimed");
+        } else {
+            tracing::info!(
+                claimed_count = claimed_requests.len(),
+                daemon_id = %daemon_id,
+                "Claimed requests successfully"
+            );
+        }
+
         Ok(claimed_requests)
     }
 
+    #[tracing::instrument(skip(self, request), fields(request_id = %request.data.id))]
     async fn persist<T: RequestState + Clone>(&self, request: &Request<T>) -> Result<()>
     where
         AnyRequest: From<Request<T>>,
     {
         let request_id = request.data.id;
 
+        tracing::trace!("Persisting request state update");
+
         let mut requests = self.requests.write();
 
         if let Some(existing) = requests.get_mut(&request_id) {
             // Don't overwrite terminal states (idempotency protection)
             if existing.request.is_terminal() {
+                tracing::warn!(
+                    request_id = %request_id,
+                    "Attempted to update request in terminal state"
+                );
                 return Err(BatcherError::InvalidState(
                     request_id,
                     "terminal state".to_string(),
@@ -145,9 +214,17 @@ impl Storage for InMemoryStorage {
             }
 
             // Update the stored request
-            existing.request = request.clone().into();
+            let any_request: AnyRequest = request.clone().into();
+            existing.request = any_request.clone();
+
+            // Broadcast the update
+            self.broadcast_update(&any_request);
+
+            tracing::debug!(request_id = %request_id, "Request state persisted successfully");
+
             Ok(())
         } else {
+            tracing::error!(request_id = %request_id, "Request not found in storage");
             Err(BatcherError::RequestNotFound(request_id))
         }
     }
@@ -214,7 +291,7 @@ mod tests {
     #[tokio::test]
     async fn test_submit_new_pending_request() {
         let storage = InMemoryStorage::new();
-        let id = uuid::Uuid::new_v4();
+        let id = RequestId::from(uuid::Uuid::new_v4());
 
         let request = Request {
             state: Pending {},
@@ -233,12 +310,12 @@ mod tests {
     #[tokio::test]
     async fn test_claim_requests_atomically() {
         let storage = InMemoryStorage::new();
-        let daemon1 = uuid::Uuid::new_v4();
-        let daemon2 = uuid::Uuid::new_v4();
+        let daemon1 = DaemonId::from(uuid::Uuid::new_v4());
+        let daemon2 = DaemonId::from(uuid::Uuid::new_v4());
 
         // Submit two pending requests
-        let id1 = uuid::Uuid::new_v4();
-        let id2 = uuid::Uuid::new_v4();
+        let id1 = RequestId::from(uuid::Uuid::new_v4());
+        let id2 = RequestId::from(uuid::Uuid::new_v4());
 
         let request1 = Request {
             state: Pending {},
@@ -266,8 +343,8 @@ mod tests {
     #[tokio::test]
     async fn test_unclaim_and_reclaim() {
         let storage = InMemoryStorage::new();
-        let daemon_id = uuid::Uuid::new_v4();
-        let id = uuid::Uuid::new_v4();
+        let daemon_id = DaemonId::from(uuid::Uuid::new_v4());
+        let id = RequestId::from(uuid::Uuid::new_v4());
 
         // Submit a pending request
         let request = Request {
@@ -295,8 +372,8 @@ mod tests {
     #[tokio::test]
     async fn test_persist_updates_state() {
         let storage = InMemoryStorage::new();
-        let daemon_id = uuid::Uuid::new_v4();
-        let id = uuid::Uuid::new_v4();
+        let daemon_id = DaemonId::from(uuid::Uuid::new_v4());
+        let id = RequestId::from(uuid::Uuid::new_v4());
 
         // Submit and claim a request
         let request = Request {
@@ -329,7 +406,7 @@ mod tests {
     #[tokio::test]
     async fn test_cancel_pending_request() {
         let storage = InMemoryStorage::new();
-        let id = uuid::Uuid::new_v4();
+        let id = RequestId::from(uuid::Uuid::new_v4());
 
         // Submit a pending request
         let request = Request {
@@ -357,8 +434,8 @@ mod tests {
     #[tokio::test]
     async fn test_cancel_claimed_request() {
         let storage = InMemoryStorage::new();
-        let daemon_id = uuid::Uuid::new_v4();
-        let id = uuid::Uuid::new_v4();
+        let daemon_id = DaemonId::from(uuid::Uuid::new_v4());
+        let id = RequestId::from(uuid::Uuid::new_v4());
 
         // Submit and claim a request
         let request = Request {

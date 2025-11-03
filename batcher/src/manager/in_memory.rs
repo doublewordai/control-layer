@@ -52,10 +52,12 @@ impl<H: HttpClient + 'static> InMemoryRequestManager<H> {
     /// * `http_client` - HTTP client for making requests
     /// * `config` - Daemon configuration (batch size, concurrency limits, etc.)
     pub fn new(http_client: Arc<H>, config: DaemonConfig) -> Self {
-        let (status_tx, _) = broadcast::channel(1000);
+        // Larger buffer to handle batch operations without lagging
+        // Each request goes through ~4 state transitions (Pending->Claimed->Processing->Completed/Failed)
+        let (status_tx, _) = broadcast::channel(10000);
 
         Self {
-            storage: Arc::new(InMemoryStorage::new()),
+            storage: Arc::new(InMemoryStorage::with_status_updates(status_tx.clone())),
             http_client,
             config,
             status_tx,
@@ -70,10 +72,13 @@ impl<H: HttpClient + 'static> InMemoryRequestManager<H> {
 
 #[async_trait]
 impl<H: HttpClient + 'static> RequestManager for InMemoryRequestManager<H> {
+    #[tracing::instrument(skip(self, requests), fields(count = requests.len()))]
     async fn submit_requests(
         &self,
         requests: Vec<(Request<Pending>, RequestContext)>,
     ) -> Result<Vec<Result<()>>> {
+        tracing::info!(count = requests.len(), "Submitting batch of requests");
+
         let mut results = Vec::new();
 
         for (request, context) in requests {
@@ -81,10 +86,16 @@ impl<H: HttpClient + 'static> RequestManager for InMemoryRequestManager<H> {
             results.push(result);
         }
 
+        let successful = results.iter().filter(|r| r.is_ok()).count();
+        tracing::info!(successful = successful, total = results.len(), "Batch submission complete");
+
         Ok(results)
     }
 
+    #[tracing::instrument(skip(self, ids), fields(count = ids.len()))]
     async fn cancel_requests(&self, ids: Vec<RequestId>) -> Result<Vec<Result<()>>> {
+        tracing::info!(count = ids.len(), "Cancelling requests");
+
         let mut results = Vec::new();
 
         for id in ids {
@@ -141,7 +152,7 @@ impl<H: HttpClient + 'static> RequestManager for InMemoryRequestManager<H> {
                     Ok(request) => yield Ok(Ok(request)),
                     Err(broadcast::error::RecvError::Lagged(n)) => {
                         // Missed n messages due to slow consumer
-                        eprintln!("Status update stream lagged by {} messages", n);
+                        tracing::info!(lagged_count = n, "Status update stream lagged");
                     }
                     Err(broadcast::error::RecvError::Closed) => {
                         // Channel closed, end the stream
@@ -153,6 +164,8 @@ impl<H: HttpClient + 'static> RequestManager for InMemoryRequestManager<H> {
     }
 
     fn run(&self) -> Result<JoinHandle<Result<()>>> {
+        tracing::info!("Starting request manager daemon");
+
         let daemon = Arc::new(Daemon::new(
             self.storage.clone(),
             self.http_client.clone(),
@@ -160,6 +173,8 @@ impl<H: HttpClient + 'static> RequestManager for InMemoryRequestManager<H> {
         ));
 
         let handle = tokio::spawn(async move { daemon.run().await });
+
+        tracing::info!("Daemon spawned successfully");
 
         Ok(handle)
     }

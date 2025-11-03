@@ -79,6 +79,7 @@ impl Default for ReqwestHttpClient {
 
 #[async_trait]
 impl HttpClient for ReqwestHttpClient {
+    #[tracing::instrument(skip(self, request, api_key), fields(request_id = %request.id, method = %request.method, model = %request.model))]
     async fn execute(
         &self,
         request: &RequestData,
@@ -87,22 +88,63 @@ impl HttpClient for ReqwestHttpClient {
     ) -> Result<HttpResponse> {
         let url = format!("{}{}", request.endpoint, request.path);
 
-        let req = self
+        tracing::debug!(
+            url = %url,
+            timeout_ms = timeout_ms,
+            "Executing HTTP request"
+        );
+
+        let mut req = self
             .client
             .request(
                 request.method.parse().map_err(|e| {
+                    tracing::error!(method = %request.method, error = %e, "Invalid HTTP method");
                     anyhow::anyhow!("Invalid HTTP method '{}': {}", request.method, e)
                 })?,
                 &url,
             )
-            .header("Authorization", format!("Bearer {}", api_key))
-            .header("Content-Type", "application/json")
-            .body(request.body.clone())
             .timeout(Duration::from_millis(timeout_ms));
 
-        let response = req.send().await?;
+        // Only add Authorization header if api_key is not empty
+        if !api_key.is_empty() {
+            req = req.header("Authorization", format!("Bearer {}", api_key));
+            tracing::trace!(request_id = %request.id, "Added Authorization header");
+        }
+
+        // Only add body and Content-Type for methods that support a body
+        let method_upper = request.method.to_uppercase();
+        if method_upper != "GET" && method_upper != "HEAD" && method_upper != "DELETE" {
+            if !request.body.is_empty() {
+                req = req
+                    .header("Content-Type", "application/json")
+                    .body(request.body.clone());
+                tracing::trace!(
+                    request_id = %request.id,
+                    body_len = request.body.len(),
+                    "Added request body"
+                );
+            }
+        }
+
+        let response = req.send().await.map_err(|e| {
+            tracing::error!(
+                request_id = %request.id,
+                url = %url,
+                error = %e,
+                "HTTP request failed"
+            );
+            e
+        })?;
+
         let status = response.status().as_u16();
         let body = response.text().await?;
+
+        tracing::info!(
+            request_id = %request.id,
+            status = status,
+            response_len = body.len(),
+            "HTTP request completed"
+        );
 
         Ok(HttpResponse { status, body })
     }
@@ -232,6 +274,7 @@ impl HttpClient for MockHttpClient {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::types::RequestId;
 
     #[tokio::test]
     async fn test_mock_client_basic() {
@@ -245,7 +288,7 @@ mod tests {
         );
 
         let request = RequestData {
-            id: uuid::Uuid::new_v4(),
+            id: RequestId::from(uuid::Uuid::new_v4()),
             endpoint: "https://api.example.com".to_string(),
             method: "POST".to_string(),
             path: "/test".to_string(),
@@ -284,7 +327,7 @@ mod tests {
         );
 
         let request = RequestData {
-            id: uuid::Uuid::new_v4(),
+            id: RequestId::from(uuid::Uuid::new_v4()),
             endpoint: "https://api.example.com".to_string(),
             method: "GET".to_string(),
             path: "/status".to_string(),
@@ -306,7 +349,7 @@ mod tests {
         let mock = MockHttpClient::new();
 
         let request = RequestData {
-            id: uuid::Uuid::new_v4(),
+            id: RequestId::from(uuid::Uuid::new_v4()),
             endpoint: "https://api.example.com".to_string(),
             method: "POST".to_string(),
             path: "/unknown".to_string(),
