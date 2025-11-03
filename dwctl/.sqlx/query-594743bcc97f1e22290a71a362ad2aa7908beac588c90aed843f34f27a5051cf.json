@@ -13,7 +13,8 @@
               "Enum": [
                 "PLATFORMMANAGER",
                 "REQUESTVIEWER",
-                "STANDARDUSER"
+                "STANDARDUSER",
+                "BILLINGMANAGER"
               ]
             }
           }
