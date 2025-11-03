@@ -4,22 +4,51 @@
 //! checking their status over time. Behind the scenes, a daemon processes these requests in
 //! batches, retrying failed requests with exponential backoff and enforcing concurrency limits
 //!
-//! // TODO: Make this example runnable
 //! # Example
-//! ```ignore
-//! use batcher::{InMemoryRequestManager, RequestManager, ReqwestHttpClient};
+//! ```no_run
+//! use batcher::{
+//!     InMemoryRequestManager, RequestManager, ReqwestHttpClient,
+//!     DaemonConfig, Request, RequestData, RequestId, Pending
+//! };
+//! use std::sync::Arc;
+//! use uuid::Uuid;
 //!
-//! let http_client = Arc::new(ReqwestHttpClient::new());
-//! let manager = InMemoryRequestManager::new(http_client);
+//! #[tokio::main]
+//! async fn main() -> anyhow::Result<()> {
+//!     // Create HTTP client and request manager
+//!     let http_client = Arc::new(ReqwestHttpClient::new());
+//!     let config = DaemonConfig::default();
+//!     let manager = Arc::new(InMemoryRequestManager::new(http_client, config));
 //!
-//! // Start the daemon
-//! let handle = manager.run()?;
+//!     // Start the daemon
+//!     let _daemon_handle = manager.run()?;
 //!
-//! // Submit requests
-//! let ids = manager.submit_requests(vec![(request, context)]).await?;
+//!     // Create and submit a request
+//!     let request = Request {
+//!         state: Pending {
+//!             retry_attempt: 0,
+//!             not_before: None,
+//!         },
+//!         data: RequestData {
+//!             id: RequestId::from(Uuid::new_v4()),
+//!             endpoint: "https://api.example.com".to_string(),
+//!             method: "POST".to_string(),
+//!             path: "/v1/completions".to_string(),
+//!             body: r#"{"prompt": "Hello"}"#.to_string(),
+//!             model: "gpt-4".to_string(),
+//!             api_key: "your-api-key".to_string(),
+//!         },
+//!     };
 //!
-//! // Check status
-//! let statuses = manager.get_status(ids).await?;
+//!     let results = manager.submit_requests(vec![request]).await?;
+//!     let request_id = results.into_iter().next().unwrap()?;
+//!
+//!     // Check status
+//!     let statuses = manager.get_status(vec![request_id]).await?;
+//!     println!("Status: {:?}", statuses);
+//!
+//!     Ok(())
+//! }
 //! ```
 
 pub mod daemon;
@@ -29,8 +58,15 @@ pub mod manager;
 pub mod request;
 pub mod storage;
 
-// Re-export commonly used types
-// TODO: This isn't very clean - why are these specifically reexported at this top level?
+// Re-export commonly used types at the crate root for convenience.
+// This allows users to write `use batcher::InMemoryRequestManager` instead of
+// `use batcher::manager::in_memory::InMemoryRequestManager`, simplifying the API.
+// These types form the public interface that most users will interact with:
+// - Core traits (RequestManager, Storage, HttpClient)
+// - Main implementations (InMemoryRequestManager, InMemoryStorage, ReqwestHttpClient)
+// - Configuration (DaemonConfig)
+// - Request types and states (Request, RequestData, Pending, Processing, etc.)
+// - Error handling (BatcherError, Result)
 pub use daemon::{Daemon, DaemonConfig};
 pub use error::{BatcherError, Result};
 pub use http::{HttpClient, HttpResponse, MockHttpClient, ReqwestHttpClient};
