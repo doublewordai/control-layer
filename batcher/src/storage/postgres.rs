@@ -385,9 +385,10 @@ impl Storage for PostgresStorage {
                 api_key: row.api_key,
             };
 
-            let state = row.state.as_ref().ok_or_else(|| {
-                BatcherError::Other(anyhow!("Missing state for request"))
-            })?;
+            let state = row
+                .state
+                .as_ref()
+                .ok_or_else(|| BatcherError::Other(anyhow!("Missing state for request")))?;
 
             let any_request = match state.as_str() {
                 "pending" => Ok(AnyRequest::Pending(Request {
@@ -443,11 +444,9 @@ impl Storage for PostgresStorage {
                 })),
                 "failed" => Ok(AnyRequest::Failed(Request {
                     state: Failed {
-                        error: row
-                            .error
-                            .ok_or_else(|| {
-                                BatcherError::Other(anyhow!("Missing error for failed request"))
-                            })?,
+                        error: row.error.ok_or_else(|| {
+                            BatcherError::Other(anyhow!("Missing error for failed request"))
+                        })?,
                         failed_at: row.failed_at.ok_or_else(|| {
                             BatcherError::Other(anyhow!("Missing failed_at for failed request"))
                         })?,
@@ -458,17 +457,12 @@ impl Storage for PostgresStorage {
                 "canceled" => Ok(AnyRequest::Canceled(Request {
                     state: Canceled {
                         canceled_at: row.canceled_at.ok_or_else(|| {
-                            BatcherError::Other(anyhow!(
-                                "Missing canceled_at for canceled request"
-                            ))
+                            BatcherError::Other(anyhow!("Missing canceled_at for canceled request"))
                         })?,
                     },
                     data,
                 })),
-                _ => Err(BatcherError::Other(anyhow!(
-                    "Unknown state: {}",
-                    state
-                ))),
+                _ => Err(BatcherError::Other(anyhow!("Unknown state: {}", state))),
             };
 
             request_map.insert(request_id, any_request);
@@ -483,89 +477,5 @@ impl Storage for PostgresStorage {
                     .unwrap_or_else(|| Err(BatcherError::RequestNotFound(id)))
             })
             .collect())
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    // Helper to create a test pool (requires DATABASE_URL env var)
-    async fn create_test_pool() -> PgPool {
-        let database_url =
-            std::env::var("DATABASE_URL").expect("DATABASE_URL must be set for integration tests");
-        PgPool::connect(&database_url)
-            .await
-            .expect("Failed to connect to test database")
-    }
-
-    #[tokio::test]
-    #[ignore] // Run with: cargo test --features postgres -- --ignored
-    async fn test_submit_and_get() {
-        let pool = create_test_pool().await;
-        let storage = PostgresStorage::new(pool);
-
-        let request_id = RequestId(Uuid::new_v4());
-        let request = Request {
-            state: Pending {
-                retry_attempt: 0,
-                not_before: None,
-            },
-            data: RequestData {
-                id: request_id,
-                endpoint: "https://api.example.com".to_string(),
-                method: "POST".to_string(),
-                path: "/v1/test".to_string(),
-                body: r#"{"key": "value"}"#.to_string(),
-                model: "test-model".to_string(),
-                api_key: "test-key".to_string(),
-            },
-        };
-
-        storage.submit(request.clone()).await.unwrap();
-
-        let results = storage.get_requests(vec![request_id]).await.unwrap();
-        assert_eq!(results.len(), 1);
-        assert!(results[0].is_ok());
-
-        let retrieved = results[0].as_ref().unwrap();
-        assert!(retrieved.is_pending());
-    }
-
-    #[tokio::test]
-    #[ignore]
-    async fn test_claim_requests() {
-        let pool = create_test_pool().await;
-        let storage = PostgresStorage::new(pool);
-
-        let daemon_id = DaemonId(Uuid::new_v4());
-
-        // Submit 5 pending requests
-        for i in 0..5 {
-            let request = Request {
-                state: Pending {
-                    retry_attempt: 0,
-                    not_before: None,
-                },
-                data: RequestData {
-                    id: RequestId(Uuid::new_v4()),
-                    endpoint: "https://api.example.com".to_string(),
-                    method: "POST".to_string(),
-                    path: "/v1/test".to_string(),
-                    body: format!(r#"{{"test": {}}}"#, i),
-                    model: "test-model".to_string(),
-                    api_key: "test-key".to_string(),
-                },
-            };
-            storage.submit(request).await.unwrap();
-        }
-
-        // Claim 3 requests
-        let claimed = storage.claim_requests(3, daemon_id).await.unwrap();
-        assert_eq!(claimed.len(), 3);
-
-        for req in claimed {
-            assert_eq!(req.state.daemon_id, daemon_id);
-        }
     }
 }

@@ -3,11 +3,6 @@ use std::future::Future;
 use crate::error::Result;
 use crate::request::{AnyRequest, Claimed, DaemonId, Pending, Request, RequestId, RequestState};
 
-pub mod in_memory;
-
-#[cfg(feature = "postgres")]
-pub mod postgres;
-
 /// Storage trait for persisting and querying requests.
 ///
 /// This trait provides atomic operations for request lifecycle management.
@@ -83,3 +78,9 @@ pub trait Storage: Send + Sync {
         ids: Vec<RequestId>,
     ) -> impl Future<Output = Result<Vec<Result<AnyRequest>>>> + Send;
 }
+
+pub mod in_memory;
+#[cfg(feature = "postgres")]
+pub mod postgres;
+#[cfg(test)]
+mod tests;

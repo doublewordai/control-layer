@@ -8,7 +8,7 @@ name = "batcher"
 path = "src/lib.rs"
 
 [features]
-default = []
+default = ["postgres"]
 postgres = ["sqlx"]
 
 [dependencies]
@@ -34,3 +34,4 @@ axum = "0.7"
 tower = "0.5"
 tower-http = { version = "0.6", features = ["cors", "trace"] }
 tracing-subscriber = "0.3"
+rstest = "0.23"

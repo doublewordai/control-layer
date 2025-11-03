@@ -262,8 +262,8 @@ mod tests {
     use uuid::Uuid;
 
     async fn create_test_pool() -> PgPool {
-        let database_url = std::env::var("DATABASE_URL")
-            .expect("DATABASE_URL must be set for integration tests");
+        let database_url =
+            std::env::var("DATABASE_URL").expect("DATABASE_URL must be set for integration tests");
         PgPool::connect(&database_url)
             .await
             .expect("Failed to connect to test database")
