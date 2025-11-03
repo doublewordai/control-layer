@@ -22,6 +22,7 @@ pub struct CreditTransactionCreateDBRequest {
     pub user_id: UserId,
     pub transaction_type: CreditTransactionType,
     pub amount: Decimal,
+    pub source_id: String,
     pub description: Option<String>,
 }
 
@@ -34,6 +35,7 @@ pub struct CreditTransactionDBResponse {
     pub amount: Decimal,
     pub balance_after: Decimal,
     pub previous_transaction_id: Option<Uuid>,
+    pub source_id: String,
     pub description: Option<String>,
     pub created_at: DateTime<Utc>,
 }

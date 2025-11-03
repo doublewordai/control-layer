@@ -753,6 +753,7 @@ mod tests {
             user_id: user1.id,
             transaction_type: CreditTransactionType::AdminGrant,
             amount: Decimal::from_str("50.0").unwrap(),
+            source_id: user1.id.to_string(),
             description: Some("Additional grant".to_string()),
         };
         credits_repo
@@ -1364,6 +1365,7 @@ mod tests {
             user_id,
             transaction_type: CreditTransactionType::AdminGrant,
             amount: amount_decimal,
+            source_id: user_id.to_string(),
             description: Some("Initial credit grant".to_string()),
         };
 

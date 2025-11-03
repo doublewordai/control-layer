@@ -8,6 +8,7 @@ CREATE TABLE credits_transactions (
     -- Transaction details
     transaction_type TEXT NOT NULL CHECK (transaction_type IN ('purchase', 'admin_grant', 'admin_removal', 'usage')),
     amount DECIMAL(12, 8) NOT NULL,  -- Absolute value of transaction
+    source_id TEXT NOT NULL, -- E.g., order ID for purchases, or usage ID for usage transactions
 
     -- Running balance after this transaction
     balance_after DECIMAL(12, 8) NOT NULL CHECK (balance_after >= 0),  -- Running balance after this transaction, cannot be negative

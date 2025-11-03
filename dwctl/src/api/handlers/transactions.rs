@@ -60,6 +60,7 @@ pub async fn create_transaction(
         user_id: data.user_id,
         transaction_type: CreditTransactionType::from(&data.transaction_type),
         amount: data.amount,
+        source_id: data.source_id.to_string(),
         description: data.description,
     };
 
@@ -212,6 +213,7 @@ mod tests {
             user_id,
             transaction_type: CreditTransactionType::AdminGrant,
             amount: amount_decimal,
+            source_id: user_id.to_string(),
             description: Some("Initial credit grant".to_string()),
         };
 
@@ -234,6 +236,7 @@ mod tests {
             "user_id": user.id.to_string(),
             "transaction_type": "admin_grant",
             "amount": "100.0",
+            "source_id": user.id.to_string(),
             "description": "Test credit grant"
         });
 
@@ -247,6 +250,9 @@ mod tests {
         let transaction: CreditTransactionResponse = response.json();
         assert_eq!(transaction.user_id, user.id);
         assert_eq!(transaction.amount, Decimal::from_str("100.0").unwrap());
+        assert_eq!(transaction.transaction_type, CreditTransactionType::AdminGrant);
+        assert_eq!(transaction.source_id, user.id.to_string());
+        assert_eq!(transaction.description, Some("Test credit grant".to_string()));
     }
 
     // Test: Standard user cannot create transactions
@@ -261,6 +267,7 @@ mod tests {
             "user_id": other_user.id.to_string(),
             "transaction_type": "admin_grant",
             "amount": "100.0",
+            "source_id": user.id.to_string(),
             "description": "Unauthorized attempt"
         });
 
@@ -285,6 +292,7 @@ mod tests {
             "user_id": user.id.to_string(),
             "transaction_type": "admin_grant",
             "amount": "100.0",
+            "source_id": platform_manager.id.to_string(),
             "description": "Test credit grant from PlatformManager"
         });
 
@@ -298,6 +306,9 @@ mod tests {
         let transaction: CreditTransactionResponse = response.json();
         assert_eq!(transaction.user_id, user.id);
         assert_eq!(transaction.amount, Decimal::from_str("100.0").unwrap());
+        assert_eq!(transaction.transaction_type, CreditTransactionType::AdminGrant);
+        assert_eq!(transaction.source_id, platform_manager.id.to_string());
+        assert_eq!(transaction.description, Some("Test credit grant from PlatformManager".to_string()));
     }
 
     // Test: RequestViewer user cannot create transactions
@@ -312,6 +323,7 @@ mod tests {
             "user_id": other_user.id.to_string(),
             "transaction_type": "admin_grant",
             "amount": "100.0",
+            "source_id": user.id.to_string(),
             "description": "Unauthorized attempt"
         });
 
@@ -343,6 +355,10 @@ mod tests {
         let transaction: CreditTransactionResponse = response.json();
         assert_eq!(transaction.user_id, user.id);
         assert_eq!(transaction.id, transaction_id);
+        assert_eq!(transaction.amount, Decimal::from_str("50.0").unwrap());
+        assert_eq!(transaction.transaction_type, CreditTransactionType::AdminGrant);
+        assert_eq!(transaction.source_id, user.id.to_string());
+        assert_eq!(transaction.description, Some("Initial credit grant".to_string()));
     }
 
     // Test: GET /transactions/{id} returns 404 for other user's transaction (not 403)
@@ -385,6 +401,10 @@ mod tests {
         response.assert_status_ok();
         let transaction: CreditTransactionResponse = response.json();
         assert_eq!(transaction.user_id, user.id);
+        assert_eq!(transaction.amount, Decimal::from_str("75.0").unwrap());
+        assert_eq!(transaction.transaction_type, CreditTransactionType::AdminGrant);
+        assert_eq!(transaction.source_id, user.id.to_string());
+        assert_eq!(transaction.description, Some("Initial credit grant".to_string()));
     }
 
     // Test: GET /transactions without query params returns only own transactions for standard user
@@ -493,6 +513,7 @@ mod tests {
             "user_id": user.id.to_string(),
             "transaction_type": "admin_grant",
             "amount": "0",
+            "source_id": billing_manager.id.to_string(),
             "description": "Invalid zero amount"
         });
 
@@ -518,6 +539,7 @@ mod tests {
             "user_id": user.id.to_string(),
             "transaction_type": "admin_grant",
             "amount": "-50.0",
+            "source_id": billing_manager.id.to_string(),
             "description": "Invalid negative amount"
         });
 
@@ -566,6 +588,7 @@ mod tests {
         let transaction_data = json!({
             "transaction_type": "admin_grant",
             "amount": "100.0",
+            "source_id": billing_manager.id.to_string(),
             "description": "Missing user_id"
         });
 
@@ -594,6 +617,7 @@ mod tests {
             "user_id": user.id.to_string(),
             "transaction_type": "admin_removal",
             "amount": "100.0",
+            "source_id": billing_manager.id.to_string(),
             "description": "Over removal"
         });
 

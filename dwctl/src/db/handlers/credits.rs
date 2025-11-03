@@ -24,6 +24,7 @@ pub struct CreditTransaction {
     pub balance_after: Decimal,
     pub previous_transaction_id: Option<Uuid>,
     pub description: Option<String>,
+    pub source_id: String,
     pub created_at: DateTime<Utc>,
 }
 
@@ -37,6 +38,7 @@ impl From<CreditTransaction> for CreditTransactionDBResponse {
             balance_after: tx.balance_after,
             previous_transaction_id: tx.previous_transaction_id,
             description: tx.description,
+            source_id: tx.source_id,
             created_at: tx.created_at,
         }
     }
@@ -109,15 +111,16 @@ impl<'c> Credits<'c> {
         let transaction = sqlx::query_as!(
             CreditTransaction,
             r#"
-            INSERT INTO credits_transactions (user_id, transaction_type, amount, balance_after, previous_transaction_id, description)
-            VALUES ($1, $2, $3, $4, $5, $6)
-            RETURNING id, user_id, transaction_type as "transaction_type: CreditTransactionType", amount, balance_after, previous_transaction_id, description, created_at
+            INSERT INTO credits_transactions (user_id, transaction_type, amount, balance_after, previous_transaction_id, source_id, description)
+            VALUES ($1, $2, $3, $4, $5, $6, $7)
+            RETURNING id, user_id, transaction_type as "transaction_type: CreditTransactionType", amount, source_id, balance_after, previous_transaction_id, description, created_at
             "#,
             request.user_id,
             &request.transaction_type as &CreditTransactionType,
             request.amount,
             new_balance,
             last_transaction_id,
+            request.source_id,
             request.description
         )
         .fetch_one(&mut *tx)
@@ -179,7 +182,7 @@ impl<'c> Credits<'c> {
         let transactions = sqlx::query_as!(
             CreditTransaction,
             r#"
-            SELECT id, user_id, transaction_type as "transaction_type: CreditTransactionType", amount, balance_after, previous_transaction_id, description, created_at
+            SELECT id, user_id, transaction_type as "transaction_type: CreditTransactionType", amount, balance_after, source_id, previous_transaction_id, description, created_at
             FROM credits_transactions
             WHERE user_id = $1
             ORDER BY created_at DESC, id DESC
@@ -201,7 +204,7 @@ impl<'c> Credits<'c> {
         let transactions = sqlx::query_as!(
             CreditTransaction,
             r#"
-            SELECT id, user_id, transaction_type as "transaction_type: CreditTransactionType", amount, balance_after, previous_transaction_id, description, created_at
+            SELECT id, user_id, transaction_type as "transaction_type: CreditTransactionType", amount, balance_after, source_id, previous_transaction_id, description, created_at
             FROM credits_transactions
             ORDER BY created_at DESC, id DESC
             OFFSET $1
@@ -222,7 +225,7 @@ impl<'c> Credits<'c> {
             CreditTransaction,
             r#"
             SELECT id, user_id, transaction_type as "transaction_type: CreditTransactionType",
-                amount, balance_after, previous_transaction_id, description, created_at
+                amount, balance_after, previous_transaction_id, source_id, description, created_at
             FROM credits_transactions
             WHERE id = $1
             "#,
@@ -288,6 +291,7 @@ mod tests {
             user_id,
             transaction_type: CreditTransactionType::AdminGrant,
             amount: Decimal::from_str("100.50").unwrap(),
+            source_id: user_id.to_string(),
             description: Some("Test grant".to_string()),
         };
 
@@ -312,6 +316,7 @@ mod tests {
             user_id,
             transaction_type: CreditTransactionType::AdminGrant,
             amount: Decimal::from_str("100.0").unwrap(),
+            source_id: user_id.to_string(),
             description: None,
         };
         credits.create_transaction(&request1).await.expect("Failed to create transaction");
@@ -324,6 +329,7 @@ mod tests {
             user_id,
             transaction_type: CreditTransactionType::AdminGrant,
             amount: Decimal::from_str("50.0").unwrap(),
+            source_id: user_id.to_string(),
             description: None,
         };
         credits.create_transaction(&request2).await.expect("Failed to create transaction");
@@ -344,6 +350,7 @@ mod tests {
             user_id,
             transaction_type: CreditTransactionType::AdminRemoval,
             amount: Decimal::from_str("100.0").unwrap(),
+            source_id: user_id.to_string(),
             description: None,
         };
         let result = credits.create_transaction(&request1).await;
@@ -359,6 +366,7 @@ mod tests {
             user_id,
             transaction_type: CreditTransactionType::AdminGrant,
             amount: Decimal::from_str("100.50").unwrap(),
+            source_id: user_id.to_string(),
             description: None,
         };
         let transaction1 = credits
@@ -373,6 +381,7 @@ mod tests {
             user_id,
             transaction_type: CreditTransactionType::Usage,
             amount: Decimal::from_str("1050.0").unwrap(),
+            source_id: user_id.to_string(),
             description: None,
         };
         let result = credits.create_transaction(&request1).await;
@@ -396,6 +405,7 @@ mod tests {
             user_id,
             transaction_type: CreditTransactionType::AdminGrant,
             amount: Decimal::from_str("100.50").unwrap(),
+            source_id: user_id.to_string(),
             description: None,
         };
         let transaction1 = credits
@@ -414,6 +424,7 @@ mod tests {
             user_id,
             transaction_type: CreditTransactionType::AdminGrant,
             amount: Decimal::from_str("50.0").unwrap(),
+            source_id: user_id.to_string(),
             description: None,
         };
 
@@ -433,6 +444,7 @@ mod tests {
             user_id,
             transaction_type: CreditTransactionType::AdminRemoval,
             amount: Decimal::from_str("30.0").unwrap(),
+            source_id: user_id.to_string(),
             description: Some("Usage deduction".to_string()),
         };
 
@@ -461,6 +473,7 @@ mod tests {
                 user_id,
                 transaction_type: CreditTransactionType::AdminGrant,
                 amount: Decimal::from(i * 10),
+                source_id: user_id.to_string(),
                 description: Some(format!("Transaction {}", i + 1)),
             };
             credits.create_transaction(&request).await.expect("Failed to create transaction");
@@ -497,6 +510,7 @@ mod tests {
                 user_id,
                 transaction_type: CreditTransactionType::AdminGrant,
                 amount: Decimal::from(i * 10),
+                source_id: user_id.to_string(),
                 description: Some(format!("Transaction {}", i + 1)),
             };
             transaction_ids.push(credits.create_transaction(&request).await.expect("Failed to create transaction").id);
@@ -545,6 +559,7 @@ mod tests {
                 user_id,
                 transaction_type: CreditTransactionType::AdminGrant,
                 amount,
+                source_id: user_id.to_string(),
                 description: None,
             };
             credits.create_transaction(&request).await.expect("Failed to create transaction");
@@ -585,6 +600,7 @@ mod tests {
             user_id: user1_id,
             transaction_type: CreditTransactionType::AdminGrant,
             amount: Decimal::from_str("100.0").unwrap(),
+            source_id: user1_id.to_string(),
             description: None,
         };
         credits.create_transaction(&request1).await.expect("Failed to create transaction");
@@ -594,6 +610,7 @@ mod tests {
             user_id: user2_id,
             transaction_type: CreditTransactionType::AdminGrant,
             amount: Decimal::from_str("200.0").unwrap(),
+            source_id: user2_id.to_string(),
             description: None,
         };
         credits.create_transaction(&request2).await.expect("Failed to create transaction");
@@ -638,6 +655,7 @@ mod tests {
             user_id: user1_id,
             transaction_type: CreditTransactionType::AdminGrant,
             amount: Decimal::from_str("100.0").unwrap(),
+            source_id: user1_id.to_string(),
             description: Some("User 1 grant".to_string()),
         };
         credits.create_transaction(&request1).await.expect("Failed to create transaction");
@@ -646,6 +664,7 @@ mod tests {
             user_id: user2_id,
             transaction_type: CreditTransactionType::AdminGrant,
             amount: Decimal::from_str("200.0").unwrap(),
+            source_id: user2_id.to_string(),
             description: Some("User 2 grant".to_string()),
         };
         credits.create_transaction(&request2).await.expect("Failed to create transaction");
@@ -671,10 +690,12 @@ mod tests {
         for i in 1..10 {
             let amount = Decimal::from(i * 10);
             cumulative_balance += amount;
+            let user_id = create_test_user(&pool).await;
             let request = CreditTransactionCreateDBRequest {
-                user_id: create_test_user(&pool).await,
+                user_id,
                 transaction_type: CreditTransactionType::AdminGrant,
                 amount,
+                source_id: user_id.to_string(),
                 description: None,
             };
             credits.create_transaction(&request).await.expect("Failed to create transaction");
@@ -701,6 +722,7 @@ mod tests {
             user_id,
             transaction_type: CreditTransactionType::AdminGrant,
             amount: Decimal::from_str("100.0").unwrap(),
+            source_id: user_id.to_string(),
             description: Some("Grant".to_string()),
         };
         let tx = credits.create_transaction(&request).await.expect("Failed to create AdminGrant");
@@ -711,6 +733,7 @@ mod tests {
             user_id,
             transaction_type: CreditTransactionType::Purchase,
             amount: Decimal::from_str("50.0").unwrap(),
+            source_id: user_id.to_string(),
             description: Some("Purchase".to_string()),
         };
         let tx = credits.create_transaction(&request).await.expect("Failed to create Purchase");
@@ -721,6 +744,7 @@ mod tests {
             user_id,
             transaction_type: CreditTransactionType::Usage,
             amount: Decimal::from_str("25.0").unwrap(),
+            source_id: user_id.to_string(),
             description: Some("Usage".to_string()),
         };
         let tx = credits.create_transaction(&request).await.expect("Failed to create Usage");
@@ -731,6 +755,7 @@ mod tests {
             user_id,
             transaction_type: CreditTransactionType::AdminRemoval,
             amount: Decimal::from_str("25.0").unwrap(),
+            source_id: user_id.to_string(),
             description: Some("Removal".to_string()),
         };
         let tx = credits.create_transaction(&request).await.expect("Failed to create AdminRemoval");
@@ -753,6 +778,7 @@ mod tests {
             user_id,
             transaction_type: CreditTransactionType::AdminGrant,
             amount: Decimal::from_str("100.0").unwrap(),
+            source_id: user_id.to_string(),
             description: None,
         };
         credits.create_transaction(&request1).await.expect("Failed to create transaction");
@@ -762,6 +788,7 @@ mod tests {
             user_id,
             transaction_type: CreditTransactionType::AdminRemoval,
             amount: Decimal::from_str("200.0").unwrap(), // More than available balance
+            source_id: user_id.to_string(),
             description: None,
         };
         let result = credits.create_transaction(&request2).await;
@@ -797,6 +824,7 @@ mod tests {
             user_id,
             transaction_type: CreditTransactionType::AdminGrant,
             amount: Decimal::from_str("1000.0").unwrap(),
+            source_id: user_id.to_string(),
             description: Some("Initial balance".to_string()),
         };
         credits
@@ -827,6 +855,7 @@ mod tests {
                     } else {
                         Decimal::from_str("5.0").unwrap()
                     },
+                    source_id: user_id.to_string(),
                     description: Some(format!("Concurrent transaction {}", i)),
                 };
 
@@ -951,6 +980,7 @@ mod tests {
                 user_id: *user_id,
                 transaction_type: CreditTransactionType::AdminGrant,
                 amount: Decimal::from_str("1000.0").unwrap(),
+                source_id: user_id.to_string(),
                 description: Some("Initial balance".to_string()),
             };
             credits
@@ -983,6 +1013,7 @@ mod tests {
                     } else {
                         Decimal::from_str("5.0").unwrap()
                     },
+                    source_id: user_id.to_string(),
                     description: Some(format!("Concurrent transaction {}", i)),
                 };
 
@@ -1048,7 +1079,7 @@ mod tests {
                 if let Some(prev_id) = tx.previous_transaction_id {
                     let prev_tx = tx_map
                         .get(&prev_id)
-                        .expect(&format!("Previous transaction {} not found for user {}", prev_id, user_id));
+                        .unwrap_or_else(|| panic!("Previous transaction {} not found for user {}", prev_id, user_id));
 
                     let expected_balance = match tx.transaction_type {
                         CreditTransactionType::AdminGrant | CreditTransactionType::Purchase => prev_tx.balance_after + tx.amount,

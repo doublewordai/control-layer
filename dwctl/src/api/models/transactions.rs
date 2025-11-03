@@ -36,6 +36,9 @@ pub struct CreditTransactionCreate {
     /// Amount of credits (absolute value)
     #[schema(value_type = f64)]
     pub amount: Decimal,
+    /// Source ID for the transaction, constrained for API to be another user's UUID
+    #[schema(value_type = String, format = "uuid")]
+    pub source_id: UserId,
     /// Optional description of the transaction
     pub description: Option<String>,
 }
@@ -60,6 +63,8 @@ pub struct CreditTransactionResponse {
     /// Previous transaction ID
     #[schema(value_type = Option<String>, format = "uuid")]
     pub previous_transaction_id: Option<Uuid>,
+    /// Source ID
+    pub source_id: String,
     /// Description
     pub description: Option<String>,
     /// When the transaction was created
@@ -91,6 +96,7 @@ impl From<CreditTransactionDBResponse> for CreditTransactionResponse {
             amount: db.amount,
             balance_after: db.balance_after,
             previous_transaction_id: db.previous_transaction_id,
+            source_id: db.source_id,
             description: db.description,
             created_at: db.created_at,
         }
