@@ -1,36 +1,113 @@
+//! Error types for the batching system.
+
 use thiserror::Error;
 
-/// Result type for batcher operations.
+use crate::types::RequestId;
+
+/// Result type alias using the batcher error type.
 pub type Result<T> = std::result::Result<T, BatcherError>;
 
-/// Errors that can occur in the batcher system.
-#[derive(Debug, Error)]
+/// Main error type for the batching system.
+#[derive(Error, Debug)]
 pub enum BatcherError {
-    /// Database operation failed
-    #[error("Database error: {0}")]
-    Database(#[from] sqlx::Error),
-
     /// Request not found
     #[error("Request not found: {0}")]
-    RequestNotFound(String),
+    RequestNotFound(RequestId),
 
-    /// Invalid request parameters
-    #[error("Invalid request: {0}")]
-    InvalidRequest(String),
+    /// Request is in an invalid state for the requested operation
+    #[error("Invalid state transition: request {0} is in state '{1}', expected '{2}'")]
+    InvalidState(RequestId, String, String),
 
-    /// HTTP request failed
-    #[error("HTTP error: {0}")]
-    Http(#[from] reqwest::Error),
+    /// HTTP client error
+    #[error("HTTP request failed: {0}")]
+    HttpClient(#[from] reqwest::Error),
 
-    /// JSON serialization/deserialization failed
-    #[error("JSON error: {0}")]
-    Json(#[from] serde_json::Error),
+    /// Serialization/deserialization error
+    #[error("Serialization error: {0}")]
+    Serialization(#[from] serde_json::Error),
 
-    /// Request was canceled
-    #[error("Request canceled: {0}")]
-    Canceled(String),
+    /// General error from anyhow
+    #[error(transparent)]
+    Other(#[from] anyhow::Error),
+}
 
-    /// Internal error
-    #[error("Internal error: {0}")]
-    Internal(String),
+/// Helper functions for serializing and deserializing errors to/from JSON.
+///
+/// These are used to store error information in the database in a structured format.
+pub mod error_serialization {
+    use anyhow::Error;
+    use serde::{Deserialize, Serialize};
+
+    /// Serialized error format that preserves error message and source chain.
+    #[derive(Debug, Clone, Serialize, Deserialize)]
+    pub struct SerializedError {
+        /// The main error message
+        pub message: String,
+        /// Chain of source errors, if any
+        pub sources: Vec<String>,
+    }
+
+    /// Serializes an anyhow::Error to a JSON string.
+    ///
+    /// Preserves the error message and the chain of source errors.
+    pub fn serialize_error(error: &Error) -> String {
+        let serialized = SerializedError {
+            message: error.to_string(),
+            sources: error.chain().skip(1).map(|e| e.to_string()).collect(),
+        };
+        serde_json::to_string(&serialized).unwrap_or_else(|_| {
+            format!(
+                r#"{{"message":"{}","sources":[]}}"#,
+                error.to_string().replace('"', "\\\"")
+            )
+        })
+    }
+
+    /// Deserializes an error from a JSON string.
+    ///
+    /// Returns an anyhow::Error with the original message.
+    pub fn deserialize_error(json: &str) -> Error {
+        match serde_json::from_str::<SerializedError>(json) {
+            Ok(serialized) => {
+                let mut error_msg = serialized.message;
+                if !serialized.sources.is_empty() {
+                    error_msg.push_str("\nCaused by:\n");
+                    for (i, source) in serialized.sources.iter().enumerate() {
+                        error_msg.push_str(&format!("  {}: {}\n", i + 1, source));
+                    }
+                }
+                anyhow::anyhow!(error_msg)
+            }
+            Err(_) => {
+                // Fallback: treat the entire string as an error message
+                anyhow::anyhow!("Deserialization failed: {}", json)
+            }
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        #[test]
+        fn test_serialize_deserialize_simple_error() {
+            let error = anyhow::anyhow!("Test error");
+            let serialized = serialize_error(&error);
+            let deserialized = deserialize_error(&serialized);
+            assert_eq!(error.to_string(), deserialized.to_string());
+        }
+
+        #[test]
+        fn test_serialize_deserialize_with_context() {
+            let error = anyhow::anyhow!("Root cause")
+                .context("Middle context")
+                .context("Top context");
+            let serialized = serialize_error(&error);
+            let deserialized = deserialize_error(&serialized);
+            // The deserialized error should contain the full chain
+            assert!(deserialized.to_string().contains("Top context"));
+            assert!(deserialized.to_string().contains("Middle context"));
+            assert!(deserialized.to_string().contains("Root cause"));
+        }
+    }
 }
