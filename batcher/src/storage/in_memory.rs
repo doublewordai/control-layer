@@ -19,6 +19,7 @@ use super::Storage;
 /// Stores all requests in a concurrent HashMap and validates state transitions
 /// to prevent race conditions when multiple daemons operate concurrently.
 ///
+/// TODO: make this runnable
 /// # Example
 /// ```ignore
 /// let storage = InMemoryStorage::new();
@@ -39,6 +40,7 @@ pub struct InMemoryStorage {
     status_tx: Option<broadcast::Sender<AnyRequest>>,
 }
 
+// TODO: Document all these methods
 impl InMemoryStorage {
     /// Create a new in-memory storage.
     pub fn new() -> Self {
@@ -66,11 +68,13 @@ impl InMemoryStorage {
 }
 
 impl Default for InMemoryStorage {
+    // TODO: why new and default
     fn default() -> Self {
         Self::new()
     }
 }
 
+// TODO: Document all these methods
 impl Storage for InMemoryStorage {
     #[tracing::instrument(skip(self, request), fields(request_id = %request.data.id, model = %request.data.model))]
     async fn submit(&self, request: Request<Pending>) -> Result<()> {
@@ -262,7 +266,8 @@ impl Storage for InMemoryStorage {
             .into_iter()
             .map(|id| {
                 requests
-                    .get(&id).cloned()
+                    .get(&id)
+                    .cloned()
                     .ok_or_else(|| BatcherError::RequestNotFound(id))
             })
             .collect();

@@ -9,6 +9,8 @@ use async_trait::async_trait;
 use std::time::Duration;
 
 /// Response from an HTTP request.
+/// TODO: How will we deal with streaming responses? Right now we buffer the whole response before
+/// writing it back
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HttpResponse {
     /// HTTP status code
@@ -64,6 +66,7 @@ pub struct ReqwestHttpClient {
 
 impl ReqwestHttpClient {
     /// Create a new reqwest-based HTTP client.
+    /// TODO: Why have this and default
     pub fn new() -> Self {
         Self {
             client: reqwest::Client::new(),
@@ -79,6 +82,7 @@ impl Default for ReqwestHttpClient {
 
 #[async_trait]
 impl HttpClient for ReqwestHttpClient {
+    // TODO: document
     #[tracing::instrument(skip(self, request, api_key), fields(request_id = %request.id, method = %request.method, model = %request.model))]
     async fn execute(
         &self,
@@ -113,17 +117,20 @@ impl HttpClient for ReqwestHttpClient {
 
         // Only add body and Content-Type for methods that support a body
         let method_upper = request.method.to_uppercase();
-        if method_upper != "GET" && method_upper != "HEAD" && method_upper != "DELETE"
-            && !request.body.is_empty() {
-                req = req
-                    .header("Content-Type", "application/json")
-                    .body(request.body.clone());
-                tracing::trace!(
-                    request_id = %request.id,
-                    body_len = request.body.len(),
-                    "Added request body"
-                );
-            }
+        if method_upper != "GET"
+            && method_upper != "HEAD"
+            && method_upper != "DELETE"
+            && !request.body.is_empty()
+        {
+            req = req
+                .header("Content-Type", "application/json")
+                .body(request.body.clone());
+            tracing::trace!(
+                request_id = %request.id,
+                body_len = request.body.len(),
+                "Added request body"
+            );
+        }
 
         let response = req.send().await.map_err(|e| {
             tracing::error!(
@@ -153,6 +160,7 @@ impl HttpClient for ReqwestHttpClient {
 // Test/Mock Implementation
 // ============================================================================
 
+// TODO: this should be a separate file within an http/ module.
 use parking_lot::Mutex;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -289,6 +297,7 @@ impl Default for MockHttpClient {
 
 #[async_trait]
 impl HttpClient for MockHttpClient {
+    // TODO: document
     async fn execute(
         &self,
         request: &RequestData,

@@ -5,6 +5,9 @@ use crate::request::{AnyRequest, Claimed, DaemonId, Pending, Request, RequestId,
 
 pub mod in_memory;
 
+#[cfg(feature = "postgres")]
+pub mod postgres;
+
 /// Storage trait for persisting and querying requests.
 ///
 /// This trait provides atomic operations for request lifecycle management.

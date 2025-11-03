@@ -34,6 +34,8 @@ pub enum BatcherError {
 /// Helper functions for serializing and deserializing errors to/from JSON.
 ///
 /// These are used to store error information in the database in a structured format.
+/// TODO: What's the point of this module? Thisi s just serde logic right? Why can't we just use
+/// serde_json
 pub mod error_serialization {
     use anyhow::Error;
     use serde::{Deserialize, Serialize};

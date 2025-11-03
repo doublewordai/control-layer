@@ -12,7 +12,10 @@ use tokio::task::JoinHandle;
 
 pub mod in_memory;
 
-/// Main trait for the batching system.
+#[cfg(feature = "postgres")]
+pub mod postgres;
+
+/// Client side trait for the batching system.
 ///
 /// This trait defines the interface for submitting, canceling, and checking the status
 /// of batched requests. Implementations can be backed by different storage mechanisms

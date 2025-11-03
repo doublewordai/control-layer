@@ -45,6 +45,9 @@ pub struct InMemoryRequestManager<H: HttpClient> {
     status_tx: broadcast::Sender<AnyRequest>,
 }
 
+// TODO: The default constructor should be easier than this.
+// The reqwest HTTP client should be used by default, and we should have a with_client method to
+// swap it out (or as an alternative constructor).
 impl<H: HttpClient + 'static> InMemoryRequestManager<H> {
     /// Create a new in-memory request manager.
     ///
@@ -65,6 +68,7 @@ impl<H: HttpClient + 'static> InMemoryRequestManager<H> {
     }
 
     /// Create with default daemon configuration.
+    /// TODO: Same as above, make this easier to use with defaults.
     pub fn with_defaults(http_client: Arc<H>) -> Self {
         Self::new(http_client, DaemonConfig::default())
     }
@@ -72,6 +76,7 @@ impl<H: HttpClient + 'static> InMemoryRequestManager<H> {
 
 #[async_trait]
 impl<H: HttpClient + 'static> RequestManager for InMemoryRequestManager<H> {
+    // TODO: Document
     #[tracing::instrument(skip(self, requests), fields(count = requests.len()))]
     async fn submit_requests(&self, requests: Vec<Request<Pending>>) -> Result<Vec<Result<()>>> {
         tracing::info!(count = requests.len(), "Submitting batch of requests");
@@ -93,6 +98,7 @@ impl<H: HttpClient + 'static> RequestManager for InMemoryRequestManager<H> {
         Ok(results)
     }
 
+    // TODO: document
     #[tracing::instrument(skip(self, ids), fields(count = ids.len()))]
     async fn cancel_requests(&self, ids: Vec<RequestId>) -> Result<Vec<Result<()>>> {
         tracing::info!(count = ids.len(), "Cancelling requests");
@@ -135,10 +141,12 @@ impl<H: HttpClient + 'static> RequestManager for InMemoryRequestManager<H> {
         Ok(results)
     }
 
+    // TODO: document
     async fn get_status(&self, ids: Vec<RequestId>) -> Result<Vec<Result<AnyRequest>>> {
         self.storage.get_requests(ids).await
     }
 
+    // TODO: document, plus filtering by ID
     fn get_status_updates(
         &self,
         _id_filter: Option<Vec<RequestId>>,
@@ -147,6 +155,7 @@ impl<H: HttpClient + 'static> RequestManager for InMemoryRequestManager<H> {
         let mut rx = self.status_tx.subscribe();
 
         // Convert the receiver into a stream
+        // TODO: There's a BroadcastStream in tokio-stream that might be cleaner
         Box::pin(async_stream::stream! {
             loop {
                 match rx.recv().await {
@@ -164,6 +173,7 @@ impl<H: HttpClient + 'static> RequestManager for InMemoryRequestManager<H> {
         })
     }
 
+    // TODO: document
     fn run(&self) -> Result<JoinHandle<Result<()>>> {
         tracing::info!("Starting request manager daemon");
 
