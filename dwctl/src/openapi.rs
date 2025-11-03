@@ -66,6 +66,9 @@ impl Modify for SecurityAddon {
         api::handlers::groups::remove_deployment_from_group,
         api::handlers::groups::get_group_deployments,
         api::handlers::groups::get_deployment_groups,
+        api::handlers::transactions::create_transaction,
+        api::handlers::transactions::get_transaction,
+        api::handlers::transactions::list_transactions,
     ),
     components(
         schemas(
@@ -101,6 +104,9 @@ impl Modify for SecurityAddon {
             api::models::inference_endpoints::ListEndpointsQuery,
             api::models::inference_endpoints::OpenAIModel,
             api::models::inference_endpoints::OpenAIModelsResponse,
+            api::models::transactions::CreditTransactionCreate,
+            api::models::transactions::CreditTransactionResponse,
+            crate::db::models::credits::CreditTransactionType,
             sync::endpoint_sync::EndpointSyncResponse,
         )
     ),
@@ -111,6 +117,7 @@ impl Modify for SecurityAddon {
         (name = "endpoints", description = "Endpoint management"),
         (name = "models", description = "Deployed model management"),
         (name = "groups", description = "Group management API"),
+        (name = "transactions", description = "Credit transaction management API"),
     ),
     info(
         title = "Onwards Pilot API",

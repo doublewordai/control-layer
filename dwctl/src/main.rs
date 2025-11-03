@@ -566,6 +566,10 @@ pub async fn build_router(state: &mut AppState, onwards_router: Router) -> anyho
             "/users/{user_id}/groups/{group_id}",
             delete(api::handlers::groups::remove_group_from_user),
         )
+        // Transaction management (RESTful credit transactions)
+        .route("/transactions", post(api::handlers::transactions::create_transaction))
+        .route("/transactions/{transaction_id}", get(api::handlers::transactions::get_transaction))
+        .route("/transactions", get(api::handlers::transactions::list_transactions))
         // Inference endpoints management (admin only for write operations)
         .route("/endpoints", get(api::handlers::inference_endpoints::list_inference_endpoints))
         .route("/endpoints", post(api::handlers::inference_endpoints::create_inference_endpoint))

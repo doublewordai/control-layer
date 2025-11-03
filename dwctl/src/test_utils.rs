@@ -204,6 +204,7 @@ pub async fn get_system_user(pool: &mut PgConnection) -> UserResponse {
         last_login: None,
         auth_source: user.auth_source,
         groups: None, // Groups not included in test users by default
+        credit_balance: None,
     }
 }
 
