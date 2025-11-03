@@ -157,6 +157,8 @@ impl HttpClient for ReqwestHttpClient {
 use parking_lot::Mutex;
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use tokio::sync::oneshot;
 
 /// Mock HTTP client for testing.
 ///
@@ -176,8 +178,20 @@ use std::sync::Arc;
 /// ```
 #[derive(Clone)]
 pub struct MockHttpClient {
-    responses: Arc<Mutex<HashMap<String, Vec<Result<HttpResponse>>>>>,
+    responses: Arc<Mutex<HashMap<String, Vec<MockResponse>>>>,
     calls: Arc<Mutex<Vec<MockCall>>>,
+    in_flight: Arc<AtomicUsize>,
+}
+
+/// A mock response that can optionally wait for a trigger before completing.
+enum MockResponse {
+    /// Immediate response
+    Immediate(Result<HttpResponse>),
+    /// Response that waits for a trigger signal before completing
+    Triggered {
+        response: Result<HttpResponse>,
+        trigger: Arc<Mutex<Option<oneshot::Receiver<()>>>>,
+    },
 }
 
 /// Record of a call made to the mock HTTP client.
@@ -197,6 +211,7 @@ impl MockHttpClient {
         Self {
             responses: Arc::new(Mutex::new(HashMap::new())),
             calls: Arc::new(Mutex::new(Vec::new())),
+            in_flight: Arc::new(AtomicUsize::new(0)),
         }
     }
 
@@ -209,7 +224,38 @@ impl MockHttpClient {
             .lock()
             .entry(key.to_string())
             .or_default()
-            .push(response);
+            .push(MockResponse::Immediate(response));
+    }
+
+    /// Add a response that will wait for a manual trigger before completing.
+    ///
+    /// Returns a sender that when triggered (by sending `()` or dropping) will
+    /// cause the HTTP request to complete with the given response.
+    ///
+    /// # Example
+    /// ```ignore
+    /// let trigger = mock.add_response_with_trigger(
+    ///     "POST /test",
+    ///     Ok(HttpResponse { status: 200, body: "ok".to_string() })
+    /// );
+    /// // ... request is now blocked waiting ...
+    /// trigger.send(()).unwrap(); // Now it completes
+    /// ```
+    pub fn add_response_with_trigger(
+        &self,
+        key: &str,
+        response: Result<HttpResponse>,
+    ) -> oneshot::Sender<()> {
+        let (tx, rx) = oneshot::channel();
+        self.responses
+            .lock()
+            .entry(key.to_string())
+            .or_default()
+            .push(MockResponse::Triggered {
+                response,
+                trigger: Arc::new(Mutex::new(Some(rx))),
+            });
+        tx
     }
 
     /// Get all calls that have been made to this mock client.
@@ -225,6 +271,14 @@ impl MockHttpClient {
     /// Get the number of calls made.
     pub fn call_count(&self) -> usize {
         self.calls.lock().len()
+    }
+
+    /// Get the number of requests currently in-flight (executing).
+    ///
+    /// This is useful for testing cancellation - if a request is aborted,
+    /// the in-flight count will decrease.
+    pub fn in_flight_count(&self) -> usize {
+        self.in_flight.load(Ordering::SeqCst)
     }
 }
 
@@ -242,6 +296,13 @@ impl HttpClient for MockHttpClient {
         api_key: &str,
         timeout_ms: u64,
     ) -> Result<HttpResponse> {
+        // Increment in-flight counter
+        self.in_flight.fetch_add(1, Ordering::SeqCst);
+
+        // Guard to ensure we decrement even if cancelled/panicked
+        let in_flight = self.in_flight.clone();
+        let _guard = InFlightGuard { in_flight };
+
         // Record this call
         self.calls.lock().push(MockCall {
             method: request.method.clone(),
@@ -254,20 +315,56 @@ impl HttpClient for MockHttpClient {
 
         // Look up the response
         let key = format!("{} {}", request.method, request.path);
-        let mut responses = self.responses.lock();
+        let mock_response = {
+            let mut responses = self.responses.lock();
+            if let Some(response_queue) = responses.get_mut(&key) {
+                if !response_queue.is_empty() {
+                    Some(response_queue.remove(0))
+                } else {
+                    None
+                }
+            } else {
+                None
+            }
+        };
 
-        if let Some(response_queue) = responses.get_mut(&key) {
-            if !response_queue.is_empty() {
-                return response_queue.remove(0);
+        match mock_response {
+            Some(MockResponse::Immediate(response)) => response,
+            Some(MockResponse::Triggered { response, trigger }) => {
+                // Wait for the trigger signal before returning the response
+                let rx = {
+                    let mut trigger_guard = trigger.lock();
+                    trigger_guard.take()
+                };
+
+                if let Some(rx) = rx {
+                    // Wait for trigger (ignore the result - we proceed either way)
+                    let _ = rx.await;
+                }
+
+                response
+            }
+            None => {
+                // No response configured - return a default error
+                Err(crate::error::BatcherError::Other(anyhow::anyhow!(
+                    "No mock response configured for {} {}",
+                    request.method,
+                    request.path
+                )))
             }
         }
+    }
+}
 
-        // No response configured - return a default error
-        Err(crate::error::BatcherError::Other(anyhow::anyhow!(
-            "No mock response configured for {} {}",
-            request.method,
-            request.path
-        )))
+/// Guard that decrements the in-flight counter when dropped.
+/// This ensures the counter is decremented even if the task is cancelled or panics.
+struct InFlightGuard {
+    in_flight: Arc<AtomicUsize>,
+}
+
+impl Drop for InFlightGuard {
+    fn drop(&mut self) {
+        self.in_flight.fetch_sub(1, Ordering::SeqCst);
     }
 }
 
@@ -359,5 +456,45 @@ mod tests {
 
         let result = mock.execute(&request, "key", 5000).await;
         assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_mock_client_with_trigger() {
+        let mock = MockHttpClient::new();
+
+        let trigger = mock.add_response_with_trigger(
+            "POST /test",
+            Ok(HttpResponse {
+                status: 200,
+                body: "triggered".to_string(),
+            }),
+        );
+
+        let request = RequestData {
+            id: RequestId::from(uuid::Uuid::new_v4()),
+            endpoint: "https://api.example.com".to_string(),
+            method: "POST".to_string(),
+            path: "/test".to_string(),
+            body: "{}".to_string(),
+            model: "test-model".to_string(),
+        };
+
+        // Spawn the request execution (it will block waiting for trigger)
+        let mock_clone = mock.clone();
+        let handle = tokio::spawn(async move { mock_clone.execute(&request, "key", 5000).await });
+
+        // Give it a moment to start executing
+        tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
+
+        // Verify it hasn't completed yet
+        assert!(!handle.is_finished());
+
+        // Now trigger the response
+        trigger.send(()).unwrap();
+
+        // Wait for completion
+        let response = handle.await.unwrap().unwrap();
+        assert_eq!(response.status, 200);
+        assert_eq!(response.body, "triggered");
     }
 }
