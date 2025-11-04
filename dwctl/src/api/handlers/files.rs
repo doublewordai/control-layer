@@ -168,10 +168,9 @@ pub async fn upload_file(State(state): State<AppState>, mut multipart: Multipart
     let content_type = "application/jsonl".to_string();
     let size_bytes = content.len() as i64;
 
-    // Determine storage backend from config
+    // Determine storage backend from config (just for metadata in DB)
     let storage_backend = match &state.config.file_storage.backend {
         crate::config::FileStorageBackend::Postgres { .. } => StorageBackend::Postgres,
-        crate::config::FileStorageBackend::S3 { .. } => StorageBackend::S3,
         crate::config::FileStorageBackend::Local { .. } => StorageBackend::Local,
     };
 

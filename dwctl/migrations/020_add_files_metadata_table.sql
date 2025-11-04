@@ -21,9 +21,9 @@ CREATE TABLE files (
     size_bytes BIGINT NOT NULL,
     
     -- Storage configuration
-    storage_backend TEXT NOT NULL CHECK (storage_backend IN ('postgres', 's3', 'local')),
-    storage_key TEXT NOT NULL, -- Backend-specific identifier: OID string (postgres), object key (s3), or relative path (local)
-    
+    storage_backend TEXT NOT NULL CHECK (storage_backend IN ('postgres', 'local')),
+    storage_key TEXT NOT NULL, -- Backend-specific identifier: OID string (postgres) or relative path (local)
+
     -- File lifecycle
     status file_status NOT NULL DEFAULT 'active',
     expires_at TIMESTAMPTZ, -- When file should be deleted (NULL = never expires)
@@ -32,7 +32,6 @@ CREATE TABLE files (
     -- File purpose and metadata
     purpose TEXT NOT NULL CHECK (purpose IN ('batch', 'batch_output')),
     uploaded_by UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-    description TEXT,
     
     -- Timestamps
     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),

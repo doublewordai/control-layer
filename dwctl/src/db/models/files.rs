@@ -8,7 +8,6 @@ use chrono::{DateTime, Utc};
 #[serde(rename_all = "lowercase")]
 pub enum StorageBackend {
     Postgres,
-    S3,
     Local,
 }
 
@@ -39,7 +38,6 @@ pub struct FileCreateDBRequest {
     pub expires_at: Option<DateTime<Utc>>,
     /// Storage-specific key/identifier:
     /// - Postgres: OID as string (e.g., "16384")
-    /// - S3: object key (e.g., "batch-files/abc-123.jsonl")
     /// - Local: relative path (e.g., "2024/11/abc-123.jsonl")
     pub storage_key: String,
 }

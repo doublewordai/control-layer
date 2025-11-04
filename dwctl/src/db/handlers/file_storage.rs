@@ -110,28 +110,26 @@ pub struct PostgresFileStorage {
 
 impl PostgresFileStorage {
     /// Create a new PostgreSQL file storage backend with its own connection pool
-    /// 
+    ///
     /// # Arguments
     /// * `database_url` - Base database URL (e.g., postgres://user@host:5432/control_layer)
-    /// 
+    ///
     /// # Behavior
     /// - Extracts host/port/credentials from the URL
     /// - Connects to `{original_db}_files` database (creates if doesn't exist)
     /// - Creates separate connection pool isolated from main app pool
     pub async fn new_with_pool(database_url: &str) -> Result<Self> {
         use sqlx::postgres::PgConnectOptions;
-        
+
         // Parse the base database URL
-        let base_options = PgConnectOptions::from_str(database_url)
-            .map_err(|e| DbError::Other(anyhow::anyhow!("Invalid database URL: {}", e)))?;
-        
+        let base_options =
+            PgConnectOptions::from_str(database_url).map_err(|e| DbError::Other(anyhow::anyhow!("Invalid database URL: {}", e)))?;
+
         // Create options for files database (same host/port/creds, different database name)
         let base_db_name = base_options.get_database().unwrap_or("control_layer");
         let files_db_name = format!("{}_files", base_db_name);
-        let files_options = base_options
-            .clone()
-            .database(&files_db_name);
-        
+        let files_options = base_options.clone().database(&files_db_name);
+
         // Try to connect - if database doesn't exist, create it
         let pool = match sqlx::postgres::PgPoolOptions::new()
             .max_connections(5)
@@ -147,26 +145,27 @@ impl PostgresFileStorage {
             }
             Err(e) if e.to_string().contains("does not exist") => {
                 tracing::info!("Files database '{}' doesn't exist, creating it...", files_db_name);
-                
+
                 // Connect to 'postgres' database to create our files database
-                let admin_options = base_options
-                    .clone()
-                    .database("postgres");
-                
-                let admin_pool = sqlx::PgPool::connect_with(admin_options)
-                    .await
-                    .map_err(|e| DbError::Other(anyhow::anyhow!("Failed to connect to postgres database to create files database: {}", e)))?;
-                
+                let admin_options = base_options.clone().database("postgres");
+
+                let admin_pool = sqlx::PgPool::connect_with(admin_options).await.map_err(|e| {
+                    DbError::Other(anyhow::anyhow!(
+                        "Failed to connect to postgres database to create files database: {}",
+                        e
+                    ))
+                })?;
+
                 // Create the files database
                 let create_db_query = format!(r#"CREATE DATABASE "{}""#, files_db_name);
                 sqlx::query(&create_db_query)
                     .execute(&admin_pool)
                     .await
                     .map_err(|e| DbError::Other(anyhow::anyhow!("Failed to create files database '{}': {}", files_db_name, e)))?;
-                
+
                 tracing::info!("Created files database: {}", files_db_name);
                 admin_pool.close().await;
-                
+
                 // Now connect to the newly created database
                 sqlx::postgres::PgPoolOptions::new()
                     .max_connections(5)
@@ -175,10 +174,20 @@ impl PostgresFileStorage {
                     .idle_timeout(Duration::from_secs(300))
                     .connect_with(files_options)
                     .await
-                    .map_err(|e| DbError::Other(anyhow::anyhow!("Failed to connect to new files database '{}': {}", files_db_name, e)))?
+                    .map_err(|e| {
+                        DbError::Other(anyhow::anyhow!(
+                            "Failed to connect to new files database '{}': {}",
+                            files_db_name,
+                            e
+                        ))
+                    })?
             }
             Err(e) => {
-                return Err(DbError::Other(anyhow::anyhow!("Failed to connect to files database '{}': {}", files_db_name, e)));
+                return Err(DbError::Other(anyhow::anyhow!(
+                    "Failed to connect to files database '{}': {}",
+                    files_db_name,
+                    e
+                )));
             }
         };
 
@@ -187,7 +196,7 @@ impl PostgresFileStorage {
             files_db_name,
             pool.options().get_max_connections()
         );
-        
+
         Ok(Self { pool })
     }
 
@@ -203,9 +212,7 @@ impl FileStorage for PostgresFileStorage {
         let mut tx = self.pool.begin().await?;
 
         // Create large object - Postgres generates the OID, cast to i32
-        let oid: i32 = sqlx::query_scalar("SELECT lo_create(0)::int4")
-            .fetch_one(&mut *tx)
-            .await?;
+        let oid: i32 = sqlx::query_scalar("SELECT lo_create(0)::int4").fetch_one(&mut *tx).await?;
 
         // Open for writing (mode 131072 = INV_WRITE)
         let fd: i32 = sqlx::query_scalar("SELECT lo_open($1, 131072)")
@@ -287,84 +294,6 @@ impl FileStorage for PostgresFileStorage {
 }
 
 // ============================================================================
-// S3 Storage Implementation (Placeholder - To be implemented)
-// ============================================================================
-
-pub struct S3FileStorage {
-    bucket: String,
-    region: String,
-    endpoint: Option<String>,
-    access_key_id: String,
-    secret_access_key: String,
-    prefix: String,
-}
-
-impl S3FileStorage {
-    /// Create a new S3 storage backend with explicit credentials
-    /// TODO: Implement actual AWS SDK integration
-    pub async fn new(
-        bucket: String,
-        region: String,
-        endpoint: Option<String>,
-        access_key_id: String,
-        secret_access_key: String,
-    ) -> Result<Self> {
-        tracing::warn!("S3FileStorage is not yet implemented - this is a placeholder");
-        
-        Ok(Self {
-            bucket,
-            region,
-            endpoint,
-            access_key_id,
-            secret_access_key,
-            prefix: "batch-files/".to_string(),
-        })
-    }
-
-    /// Generate S3 key with prefix
-    fn generate_key(&self) -> String {
-        let file_uuid = uuid::Uuid::new_v4();
-        format!(
-            "{}{}/{}.dat",
-            self.prefix,
-            file_uuid.to_string().chars().take(2).collect::<String>(),
-            file_uuid
-        )
-    }
-}
-
-#[async_trait]
-impl FileStorage for S3FileStorage {
-    async fn store(&self, _request: FileStorageRequest) -> Result<FileStorageResponse> {
-        // TODO: Implement S3 upload using AWS SDK
-        Err(DbError::Other(anyhow::anyhow!(
-            "S3 storage backend not yet implemented. Use 'local' or 'postgres' backend instead."
-        )))
-    }
-
-    async fn retrieve(&self, _storage_key: &str) -> Result<Vec<u8>> {
-        // TODO: Implement S3 download using AWS SDK
-        Err(DbError::Other(anyhow::anyhow!(
-            "S3 storage backend not yet implemented. Use 'local' or 'postgres' backend instead."
-        )))
-    }
-
-    async fn delete(&self, _storage_key: &str) -> Result<()> {
-        // TODO: Implement S3 delete using AWS SDK
-        Err(DbError::Other(anyhow::anyhow!(
-            "S3 storage backend not yet implemented. Use 'local' or 'postgres' backend instead."
-        )))
-    }
-
-    async fn exists(&self, _storage_key: &str) -> Result<bool> {
-        // TODO: Implement S3 head object using AWS SDK
-        Err(DbError::Other(anyhow::anyhow!(
-            "S3 storage backend not yet implemented. Use 'local' or 'postgres' backend instead."
-        )))
-    }
-}
-
-// ============================================================================
 // Noop Storage Implementation (for middleware that doesn't need file storage)
 // ============================================================================
 
@@ -404,40 +333,19 @@ impl FileStorage for NoopFileStorage {
 // ============================================================================
 
 /// Create a file storage backend based on configuration
-pub async fn create_file_storage(
-    config: &crate::config::FileStorageBackend,
-    default_database_url: &str,
-) -> Result<Arc<dyn FileStorage>> {
+pub async fn create_file_storage(config: &crate::config::FileStorageBackend, default_database_url: &str) -> Result<Arc<dyn FileStorage>> {
     match config {
         crate::config::FileStorageBackend::Postgres { database_url } => {
             // Use provided URL for completely separate instance, or derive from main DB
             let db_url = database_url.as_deref().unwrap_or(default_database_url);
-            
+
             if database_url.is_some() {
                 tracing::info!("Creating PostgreSQL file storage with separate database instance");
             } else {
                 tracing::info!("Creating PostgreSQL file storage in same instance as main database");
             }
-            
+
             let storage = PostgresFileStorage::new_with_pool(db_url).await?;
-            Ok(Arc::new(storage))
-        }
-        crate::config::FileStorageBackend::S3 {
-            bucket,
-            region,
-            endpoint,
-            access_key_id,
-            secret_access_key,
-        } => {
-            tracing::info!("Creating S3 file storage backend (bucket: {})", bucket);
-            let storage = S3FileStorage::new(
-                bucket.clone(),
-                region.clone(),
-                endpoint.clone(),
-                access_key_id.clone(),
-                secret_access_key.clone(),
-            )
-            .await?;
             Ok(Arc::new(storage))
         }
         crate::config::FileStorageBackend::Local { path } => {

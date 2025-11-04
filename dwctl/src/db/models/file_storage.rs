@@ -10,7 +10,6 @@ pub struct FileStorageRequest {
 pub struct FileStorageResponse {
     /// Storage key to save in database - format depends on backend
     /// - Postgres: OID as string (e.g., "16384")
-    /// - S3: object key (e.g., "files/abc-123.dat")
     /// - Local: relative path (e.g., "2024/11/abc-123.dat")
     pub storage_key: String,
 }

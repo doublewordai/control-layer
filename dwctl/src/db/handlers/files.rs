@@ -1,7 +1,7 @@
 use crate::db::{
     errors::{DbError, Result},
     handlers::{file_storage::FileStorage, repository::Repository},
-    models::file_storage::{FileStorageRequest},
+    models::file_storage::FileStorageRequest,
     models::files::{FileCreateDBRequest, FileStatus, FileUpdateDBRequest, StorageBackend},
 };
 use crate::types::{FileId, UserId};
@@ -73,13 +73,9 @@ impl FileFilter {
         Self::default()
     }
 
+    #[cfg(test)]
     pub fn uploaded_by(mut self, user_id: UserId) -> Self {
         self.uploaded_by = Some(user_id);
-        self
-    }
-
-    pub fn storage_backend(mut self, backend: StorageBackend) -> Self {
-        self.storage_backend = Some(backend);
         self
     }
 
@@ -128,35 +124,9 @@ pub struct File {
 }
 
 impl File {
-    /// Get storage backend as enum
-    pub fn storage_backend(&self) -> Result<StorageBackend> {
-        match self.storage_backend.as_str() {
-            "postgres" => Ok(StorageBackend::Postgres),
-            "s3" => Ok(StorageBackend::S3),
-            "local" => Ok(StorageBackend::Local),
-            other => Err(DbError::InvalidData {
-                message: format!("Unknown storage backend: {}", other),
-            }),
-        }
-    }
-
-    /// Get purpose as enum
-    pub fn purpose(&self) -> Result<FilePurpose> {
-        self.purpose.parse().map_err(|e: String| DbError::InvalidData { message: e })
-    }
-
     /// Check if file content is available
     pub fn is_content_available(&self) -> bool {
         matches!(self.status, FileStatus::Active)
-    }
-
-    /// Check if file has expired
-    pub fn is_expired(&self) -> bool {
-        if let Some(expires_at) = self.expires_at {
-            Utc::now() >= expires_at
-        } else {
-            false
-        }
     }
 }
 
@@ -238,6 +208,7 @@ impl<'c> Files<'c> {
 
     /// Mark files as expired (called by cron job)
     /// This updates the status but doesn't delete content yet
+    #[cfg(test)]
     pub async fn mark_expired(&mut self) -> Result<Vec<FileId>> {
         let expired_ids = sqlx::query_scalar::<_, FileId>(
             r#"
@@ -256,6 +227,7 @@ impl<'c> Files<'c> {
     }
 
     /// Delete storage for expired/deleted files (called by cleanup job)
+    #[cfg(test)]
     pub async fn cleanup_storage(&mut self, file_ids: Vec<FileId>) -> Result<usize> {
         let files = self.get_bulk(file_ids).await?;
 
@@ -273,6 +245,7 @@ impl<'c> Files<'c> {
     }
 
     /// List files that need storage cleanup
+    #[cfg(test)]
     pub async fn list_pending_cleanup(&mut self, limit: i64) -> Result<Vec<File>> {
         let files = sqlx::query_as::<_, File>(
             r#"
@@ -301,7 +274,6 @@ impl<'c> Repository for Files<'c> {
     async fn create(&mut self, request: &Self::CreateRequest) -> Result<Self::Response> {
         let storage_backend_str = match request.storage_backend {
             StorageBackend::Postgres => "postgres",
-            StorageBackend::S3 => "s3",
             StorageBackend::Local => "local",
         };
 
@@ -372,7 +344,6 @@ impl<'c> Repository for Files<'c> {
         if let Some(backend) = filter.storage_backend {
             let backend_str = match backend {
                 StorageBackend::Postgres => "postgres",
-                StorageBackend::S3 => "s3",
                 StorageBackend::Local => "local",
             };
             query.push(" AND storage_backend = ");
@@ -716,7 +687,7 @@ mod tests {
             };
             let file = repo.create_with_content(&request, content.into_bytes()).await.unwrap();
             file_ids.push(file.id);
-            
+
             // Mark as deleted in DB without removing storage (simulating a failed cleanup)
             sqlx::query(
                 r#"
