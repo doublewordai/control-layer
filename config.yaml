@@ -21,7 +21,7 @@ database:
   # type: external
 
 # Admin user email - will be created on first startup
-admin_email: "test@doubleword.ai"
+admin_email: "hamish.hall@doubleword.ai"
 # TODO: Change this in production!
 admin_password: "hunter2"
 
@@ -94,3 +94,18 @@ enable_request_logging: true # Enable request/response logging to database
 # For arrays like model_sources, use environment-specific config files
 # (e.g., config.production.yaml) rather than env vars.
 
+file_storage:
+  max_file_size: 536870912  # 512MB
+  backend:
+    type: postgres
+    # Option 1: Same instance (creates control_layer_files automatically)
+    # No database_url needed!
+    
+    # Option 2: Separate instance
+    # database_url: postgres://fileuser:password@files-db.example.com:5432/batch_files
+
+# Or local storage - not recommended for production
+# file_storage:
+#   backend:
+#     type: local
+#     path: .dwctl_data/files

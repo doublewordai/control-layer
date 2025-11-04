@@ -180,7 +180,6 @@ mod tests {
         db::handlers::Users,
         test_utils::create_test_config,
         test_utils::require_admin,
-        AppState,
     };
     use axum::{extract::FromRequestParts as _, http::request::Parts};
     use sqlx::PgPool;
@@ -199,7 +198,7 @@ mod tests {
     #[sqlx::test]
     async fn test_existing_user_extraction(pool: PgPool) {
         let config = create_test_config();
-        let state = AppState::builder().db(pool.clone()).config(config).build();
+        let state = crate::test_utils::create_test_app_state(pool.clone(), config).await;
 
         // Create a test user first
         let test_user = crate::test_utils::create_test_user(&pool, Role::StandardUser).await;
@@ -219,7 +218,7 @@ mod tests {
     #[sqlx::test]
     async fn test_auto_create_nonexistent_user(pool: PgPool) {
         let config = create_test_config();
-        let state = AppState::builder().db(pool.clone()).config(config).build();
+        let state = crate::test_utils::create_test_app_state(pool.clone(), config).await;
 
         let new_email = "newuser@example.com";
         let mut parts = create_test_parts_with_header("x-doubleword-user", new_email);
@@ -249,7 +248,7 @@ mod tests {
     #[sqlx::test]
     async fn test_missing_header_returns_unauthorized(pool: PgPool) {
         let config = create_test_config();
-        let state = AppState::builder().db(pool.clone()).config(config).build();
+        let state = crate::test_utils::create_test_app_state(pool.clone(), config).await;
 
         // Create parts without x-doubleword-user header
         let request = axum::http::Request::builder().uri("http://localhost/test").body(()).unwrap();

@@ -8,6 +8,7 @@ pub type ApiKeyId = Uuid;
 pub type DeploymentId = Uuid;
 pub type GroupId = Uuid;
 pub type InferenceEndpointId = Uuid;
+pub type FileId = Uuid;
 
 // Common types for path parameters
 #[derive(Debug, Clone, Deserialize)]
@@ -58,6 +59,7 @@ pub enum Resource {
     Requests,
     Pricing,
     ModelRateLimits,
+    Files,
 }
 
 // Permission types for authorization

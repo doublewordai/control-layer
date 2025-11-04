@@ -10,7 +10,7 @@ default = ["embedded-db"]
 embedded-db = ["dep:postgresql_embedded"]
 
 [dependencies]
-axum = "0.8"
+axum = { version = "0.8", features = ["multipart"] }
 tokio = { version = "1.0", features = ["full"] }
 tokio-util = "0.7"
 sqlx = { version = "0.8", features = [
@@ -90,3 +90,4 @@ sqlx = { version = "0.8", features = [
 tokio-test = "0.4"
 serial_test = "3.0"
 test-log = { version = "0.2", features = ["trace"] }
+tempfile = "3.8"

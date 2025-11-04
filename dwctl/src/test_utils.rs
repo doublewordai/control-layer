@@ -1,4 +1,5 @@
-use crate::config::{NativeAuthConfig, ProxyHeaderAuthConfig, SecurityConfig};
+use crate::config::{Config, NativeAuthConfig, ProxyHeaderAuthConfig, SecurityConfig};
+use crate::db::handlers::file_storage::create_file_storage;
 use crate::db::handlers::inference_endpoints::{InferenceEndpointFilter, InferenceEndpoints};
 use crate::db::handlers::repository::Repository;
 use crate::errors::Error;
@@ -17,10 +18,11 @@ use crate::{
             users::UserCreateDBRequest,
         },
     },
+    AppState,
 };
 
 use axum_test::TestServer;
-use sqlx::{PgConnection, PgPool};
+use sqlx::{ConnectOptions, PgConnection, PgPool};
 use tokio_util::sync::DropGuard;
 use uuid::Uuid;
 
@@ -75,6 +77,7 @@ pub fn create_test_config() -> crate::config::Config {
         },
         enable_metrics: false,
         enable_request_logging: false,
+        file_storage: crate::config::FileStorageConfig::default(),
     }
 }
 
@@ -285,4 +288,13 @@ pub fn require_admin(user: CurrentUser) -> Result<CurrentUser, Error> {
             resource: "admin resource".to_string(),
         })
     }
+}
+
+pub async fn create_test_app_state(pool: PgPool, config: Config) -> AppState {
+    let database_url = pool.connect_options().to_url_lossy().to_string();
+    let file_storage = create_file_storage(&config.file_storage.backend, &database_url)
+        .await
+        .expect("Failed to create test file storage");
+
+    AppState::builder().db(pool).config(config).file_storage(file_storage).build()
 }

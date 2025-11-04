@@ -43,6 +43,8 @@ pub struct Config {
     pub enable_metrics: bool,
     // Request logging configuration
     pub enable_request_logging: bool,
+    // File storage configuration
+    pub file_storage: FileStorageConfig,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -252,6 +254,121 @@ where
     Url::parse(&s).map_err(serde::de::Error::custom)
 }
 
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(default)]
+pub struct FileStorageConfig {
+    /// Maximum file size in bytes (default: 512MB)
+    /// Files larger than this will be rejected
+    pub max_file_size: u64,
+    
+    /// Default expiration in seconds (default: 30 days)
+    /// Used when client doesn't specify an expiration time
+    pub default_expiry_seconds: i64,
+    
+    /// Minimum allowed expiration in seconds (default: 1 hour)
+    /// Client cannot request shorter expiration than this
+    pub min_expiry_seconds: i64,
+    
+    /// Maximum allowed expiration in seconds (default: 30 days)
+    /// Client cannot request longer expiration than this
+    pub max_expiry_seconds: i64,
+    
+    /// Storage backend to use
+    pub backend: FileStorageBackend,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(tag = "type", rename_all = "lowercase")]
+pub enum FileStorageBackend {
+    /// Store files in PostgreSQL large objects
+    /// 
+    /// By default, uses the same PostgreSQL instance as main database but creates
+    /// a separate database called `{main_db}_files` with its own connection pool.
+    /// 
+    /// Example (auto-creates control_layer_files):
+    /// ```yaml
+    /// backend:
+    ///   type: postgres
+    /// ```
+    /// 
+    /// Example (separate PostgreSQL instance):
+    /// ```yaml
+    /// backend:
+    ///   type: postgres
+    ///   database_url: postgres://fileuser@files-db:5432/batch_files
+    /// ```
+    Postgres {
+        /// Optional: Full database URL for completely separate PostgreSQL instance
+        /// If not provided, uses main database connection but creates {dbname}_files database
+        #[serde(skip_serializing_if = "Option::is_none")]
+        database_url: Option<String>,
+    },
+    
+    /// Store files on local filesystem (for testing/development)
+    /// 
+    /// Example:
+    /// ```yaml
+    /// backend:
+    ///   type: local
+    ///   path: /var/lib/dwctl/files
+    /// ```
+    Local {
+        /// Path to directory where files will be stored
+        path: PathBuf,
+    },
+    
+    /// Store files in S3-compatible object storage (requires s3-storage feature)
+    /// 
+    /// Supports AWS S3, MinIO, DigitalOcean Spaces, Cloudflare R2, etc.
+    /// 
+    /// Example (AWS S3):
+    /// ```yaml
+    /// backend:
+    ///   type: s3
+    ///   bucket: my-batch-files
+    ///   region: us-east-1
+    ///   access_key_id: AKIAIOSFODNN7EXAMPLE
+    ///   secret_access_key: wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY
+    /// ```
+    /// 
+    /// Example (MinIO):
+    /// ```yaml
+    /// backend:
+    ///   type: s3
+    ///   bucket: my-files
+    ///   region: us-east-1
+    ///   endpoint: http://minio:9000
+    ///   access_key_id: minioadmin
+    ///   secret_access_key: minioadmin
+    /// ```
+    S3 {
+        /// S3 bucket name
+        bucket: String,
+        /// AWS region (e.g., us-east-1)
+        region: String,
+        /// Optional: Custom endpoint for S3-compatible services (MinIO, Spaces, R2)
+        endpoint: Option<String>,
+        /// AWS access key ID
+        access_key_id: String,
+        /// AWS secret access key
+        secret_access_key: String,
+    },
+}
+
+impl Default for FileStorageConfig {
+    fn default() -> Self {
+        Self {
+            max_file_size: 512 * 1024 * 1024,          // 512MB
+            default_expiry_seconds: 30 * 24 * 60 * 60, // 30 days
+            min_expiry_seconds: 60 * 60,               // 1 hour
+            max_expiry_seconds: 30 * 24 * 60 * 60,     // 30 days
+            backend: FileStorageBackend::Local {
+                path: PathBuf::from(".dwctl_data/files"),
+            },
+        }
+    }
+}
+
 impl Default for Config {
     fn default() -> Self {
         Self {
@@ -267,6 +384,7 @@ impl Default for Config {
             auth: AuthConfig::default(),
             enable_metrics: true,
             enable_request_logging: true,
+            file_storage: FileStorageConfig::default(),
         }
     }
 }
@@ -351,7 +469,7 @@ impl Default for CorsConfig {
     fn default() -> Self {
         Self {
             allowed_origins: vec![
-                CorsOrigin::Url(Url::parse("htt://localhost:3001").unwrap()), // Development frontend (Vite)
+                CorsOrigin::Url(Url::parse("http://localhost:3001").unwrap()),
             ],
             allow_credentials: true,
             max_age: Some(3600), // Cache preflight for 1 hour
@@ -478,6 +596,89 @@ impl Config {
                 operation: "Config validation: CORS cannot use wildcard origin '*' with allow_credentials=true. Specify explicit origins."
                     .to_string(),
             });
+        }
+
+        // Validate file storage configuration
+        if self.file_storage.max_file_size == 0 {
+            return Err(Error::Internal {
+                operation: "Config validation: max_file_size must be greater than 0".to_string(),
+            });
+        }
+
+        // Validate expiry configuration
+        if self.file_storage.min_expiry_seconds < 60 {
+            return Err(Error::Internal {
+                operation: "Config validation: min_expiry_seconds must be at least 60 (1 minute)".to_string(),
+            });
+        }
+
+        if self.file_storage.max_expiry_seconds < self.file_storage.min_expiry_seconds {
+            return Err(Error::Internal {
+                operation: format!(
+                    "Config validation: max_expiry_seconds ({}) must be greater than min_expiry_seconds ({})",
+                    self.file_storage.max_expiry_seconds, self.file_storage.min_expiry_seconds
+                ),
+            });
+        }
+
+        if self.file_storage.default_expiry_seconds < self.file_storage.min_expiry_seconds
+            || self.file_storage.default_expiry_seconds > self.file_storage.max_expiry_seconds
+        {
+            return Err(Error::Internal {
+                operation: format!(
+                    "Config validation: default_expiry_seconds ({}) must be between min ({}) and max ({})",
+                    self.file_storage.default_expiry_seconds, self.file_storage.min_expiry_seconds, self.file_storage.max_expiry_seconds
+                ),
+            });
+        }
+
+        if let FileStorageBackend::S3 {
+            bucket,
+            access_key_id,
+            secret_access_key,
+            ..
+        } = &self.file_storage.backend
+        {
+            if bucket.is_empty() {
+                return Err(Error::Internal {
+                    operation: "Config validation: S3 bucket name cannot be empty".to_string(),
+                });
+            }
+            if access_key_id.is_empty() || secret_access_key.is_empty() {
+                return Err(Error::Internal {
+                    operation: "Config validation: S3 credentials (access_key_id, secret_access_key) cannot be empty".to_string(),
+                });
+            }
+        }
+
+        // Validate Postgres configuration
+        if let FileStorageBackend::Postgres { database_url } = &self.file_storage.backend {
+            if let Some(url) = database_url {
+                // Validate URL format
+                if url.is_empty() {
+                    return Err(Error::Internal {
+                        operation: "Config validation: Postgres database_url cannot be empty".to_string(),
+                    });
+                }
+                // Basic validation that it looks like a postgres URL
+                if !url.starts_with("postgres://") && !url.starts_with("postgresql://") {
+                    return Err(Error::Internal {
+                        operation: format!(
+                            "Config validation: Invalid Postgres URL '{}', must start with postgres:// or postgresql://",
+                            url
+                        ),
+                    });
+                }
+            }
+        }
+
+        // Validate Local configuration
+        if let FileStorageBackend::Local { path } = &self.file_storage.backend {
+            if path.as_os_str().is_empty() {
+                return Err(Error::Internal {
+                    operation: "Config validation: Local storage path cannot be empty".to_string(),
+                });
+            }
         }
 
         Ok(())
@@ -661,5 +862,179 @@ auth:
 
         let result = config.validate();
         assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_file_storage_config() {
+        Jail::expect_with(|jail| {
+            jail.create_file(
+                "test.yaml",
+                r#"
+secret_key: hello
+file_storage:
+  max_file_size: 52428800  # 50MB
+  backend:
+    type: s3
+    bucket: my-files
+    region: us-east-1
+    access_key_id: AKIAIOSFODNN7EXAMPLE
+    secret_access_key: wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY
+"#,
+            )?;
+
+            let args = Args {
+                config: "test.yaml".to_string(),
+            };
+
+            let config = Config::load(&args)?;
+
+            assert_eq!(config.file_storage.max_file_size, 52428800);
+
+            match config.file_storage.backend {
+                FileStorageBackend::S3 { bucket, region, .. } => {
+                    assert_eq!(bucket, "my-files");
+                    assert_eq!(region, "us-east-1");
+                }
+                _ => panic!("Expected S3 backend"),
+            }
+
+            Ok(())
+        });
+    }
+
+    #[test]
+    fn test_file_storage_validation_empty_bucket() {
+        let mut config = Config::default();
+        config.secret_key = Some("test".to_string());
+        config.file_storage.backend = FileStorageBackend::S3 {
+            bucket: "".to_string(),
+            region: "us-east-1".to_string(),
+            endpoint: None,
+            access_key_id: "key".to_string(),
+            secret_access_key: "secret".to_string(),
+        };
+
+        let result = config.validate();
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("bucket name cannot be empty"));
+    }
+
+    #[test]
+    fn test_file_storage_postgres_backend() {
+        Jail::expect_with(|jail| {
+            jail.create_file(
+                "test.yaml",
+                r#"
+secret_key: hello
+file_storage:
+  backend:
+    type: postgres
+    database_url: postgres://localhost:5432/control_layer_files
+"#,
+            )?;
+
+            let args = Args {
+                config: "test.yaml".to_string(),
+            };
+
+            let config = Config::load(&args)?;
+
+            match &config.file_storage.backend {
+                FileStorageBackend::Postgres { database_url } => {
+                    assert_eq!(database_url.as_deref(), Some("postgres://localhost:5432/control_layer_files"));
+                }
+                _ => panic!("Expected Postgres backend"),
+            }
+
+            Ok(())
+        });
+    }
+
+    #[test]
+    fn test_file_storage_postgres_backend_default() {
+        Jail::expect_with(|jail| {
+            jail.create_file(
+                "test.yaml",
+                r#"
+secret_key: hello
+file_storage:
+  backend:
+    type: postgres
+    # No database_url = uses main database
+"#,
+            )?;
+
+            let args = Args {
+                config: "test.yaml".to_string(),
+            };
+
+            let config = Config::load(&args)?;
+
+            match &config.file_storage.backend {
+                FileStorageBackend::Postgres { database_url } => {
+                    assert!(database_url.is_none());
+                }
+                _ => panic!("Expected Postgres backend"),
+            }
+
+            Ok(())
+        });
+    }
+
+    #[test]
+    fn test_file_storage_local_backend() {
+        Jail::expect_with(|jail| {
+            jail.create_file(
+                "test.yaml",
+                r#"
+secret_key: hello
+file_storage:
+  backend:
+    type: local
+    path: /tmp/test_files
+"#,
+            )?;
+
+            let args = Args {
+                config: "test.yaml".to_string(),
+            };
+
+            let config = Config::load(&args)?;
+
+            match &config.file_storage.backend {
+                FileStorageBackend::Local { path } => {
+                    assert_eq!(path, &PathBuf::from("/tmp/test_files"));
+                }
+                _ => panic!("Expected Local backend"),
+            }
+
+            Ok(())
+        });
+    }
+
+    #[test]
+    fn test_file_storage_validation_invalid_postgres_url() {
+        let mut config = Config::default();
+        config.secret_key = Some("test".to_string());
+        config.file_storage.backend = FileStorageBackend::Postgres {
+            database_url: Some("invalid://url".to_string()),
+        };
+
+        let result = config.validate();
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("Invalid Postgres URL"));
+    }
+
+    #[test]
+    fn test_file_storage_validation_empty_local_path() {
+        let mut config = Config::default();
+        config.secret_key = Some("test".to_string());
+        config.file_storage.backend = FileStorageBackend::Local {
+            path: PathBuf::from(""),
+        };
+
+        let result = config.validate();
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("path cannot be empty"));
     }
 }

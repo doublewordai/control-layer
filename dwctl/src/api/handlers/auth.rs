@@ -498,7 +498,7 @@ mod tests {
         config.auth.native.enabled = true;
         config.auth.native.allow_registration = true;
 
-        let state = AppState::builder().db(pool).config(config).build();
+        let state = crate::test_utils::create_test_app_state(pool, config).await;
 
         let app = axum::Router::new()
             .route("/auth/register", axum::routing::post(register))
@@ -528,7 +528,7 @@ mod tests {
         let mut config = create_test_config();
         config.auth.native.enabled = false;
 
-        let state = AppState::builder().db(pool).config(config).build();
+        let state = crate::test_utils::create_test_app_state(pool, config).await;
 
         let app = axum::Router::new()
             .route("/auth/register", axum::routing::post(register))
@@ -553,7 +553,7 @@ mod tests {
         config.auth.native.enabled = true;
         config.auth.native.password.min_length = 10;
 
-        let state = AppState::builder().db(pool).config(config).build();
+        let state = crate::test_utils::create_test_app_state(pool, config).await;
 
         let app = axum::Router::new()
             .route("/auth/register", axum::routing::post(register))

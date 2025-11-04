@@ -47,6 +47,10 @@ pub enum Error {
         message: String,
         conflicts: Option<Vec<AliasConflict>>,
     },
+
+    /// Payload exceeds maximum allowed size
+    #[error("Payload too large: {message}")]
+    PayloadTooLarge { message: String },
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -70,10 +74,13 @@ impl Error {
                 DbError::CheckViolation { .. } => StatusCode::BAD_REQUEST,
                 DbError::ProtectedEntity { .. } => StatusCode::FORBIDDEN,
                 DbError::InvalidModelField { .. } => StatusCode::BAD_REQUEST,
+                DbError::InvalidData { .. } => StatusCode::BAD_REQUEST,
+                DbError::IoError(_) => StatusCode::INTERNAL_SERVER_ERROR,
                 DbError::Other(_) => StatusCode::INTERNAL_SERVER_ERROR,
             },
             Error::Other(_) => StatusCode::INTERNAL_SERVER_ERROR,
             Error::Conflict { .. } => StatusCode::CONFLICT,
+            Error::PayloadTooLarge { .. } => StatusCode::PAYLOAD_TOO_LARGE,
         }
     }
 
@@ -85,6 +92,7 @@ impl Error {
                 format!("Insufficient permissions to {action} {resource}")
             }
             Error::BadRequest { message } => message.clone(),
+            Error::PayloadTooLarge { message } => message.clone(),
             Error::NotFound { resource, id } => {
                 format!("{resource} with ID {id} not found")
             }
@@ -113,6 +121,8 @@ impl Error {
                     format!("Cannot {operation:?} {entity_type}: {reason}")
                 }
                 DbError::InvalidModelField { field } => format!("Field '{field}' must not be empty or whitespace"),
+                DbError::InvalidData { message } => message.clone(),
+                DbError::IoError(_) => "File storage error occurred".to_string(),
                 DbError::Other(_) => "Database error occurred".to_string(),
             },
             Error::Other(_) => "Internal server error".to_string(),
@@ -141,7 +151,7 @@ impl IntoResponse for Error {
             Error::Unauthenticated { .. } | Error::InsufficientPermissions { .. } => {
                 tracing::info!("Authorization error: {}", self);
             }
-            Error::BadRequest { .. } | Error::NotFound { .. } => {
+            Error::BadRequest { .. } | Error::NotFound { .. } | Error::PayloadTooLarge { .. } => {
                 tracing::debug!("Client error: {}", self);
             }
             Error::Conflict { .. } => {

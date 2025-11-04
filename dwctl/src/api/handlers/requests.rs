@@ -396,7 +396,7 @@ mod tests {
         };
 
         // Build router with request logging enabled
-        let mut app_state = crate::AppState::builder().db(pool.clone()).config(config).build();
+        let mut app_state = crate::test_utils::create_test_app_state(pool.clone(), config).await;
         let onwards_router = axum::Router::new();
         let router = crate::build_router(&mut app_state, onwards_router)
             .await
@@ -432,7 +432,7 @@ mod tests {
         };
 
         // Build router with request logging enabled
-        let mut app_state = crate::AppState::builder().db(pool.clone()).config(config).build();
+        let mut app_state = crate::test_utils::create_test_app_state(pool.clone(), config).await;
         let onwards_router = axum::Router::new();
         let router = crate::build_router(&mut app_state, onwards_router)
             .await
@@ -478,7 +478,7 @@ mod tests {
             url: pool.connect_options().to_url_lossy().to_string(),
         };
 
-        let mut app_state = crate::AppState::builder().db(pool.clone()).config(config).build();
+        let mut app_state = crate::test_utils::create_test_app_state(pool.clone(), config).await;
         let onwards_router = axum::Router::new();
         let router = crate::build_router(&mut app_state, onwards_router)
             .await
@@ -843,7 +843,7 @@ mod tests {
         };
 
         // Build router with request logging enabled
-        let mut app_state = crate::AppState::builder().db(pool.clone()).config(config).build();
+        let mut app_state = crate::test_utils::create_test_app_state(pool.clone(), config).await;
         let onwards_router = axum::Router::new();
         let router = crate::build_router(&mut app_state, onwards_router)
             .await
@@ -880,7 +880,7 @@ mod tests {
         };
 
         // Build router with request logging enabled
-        let mut app_state = crate::AppState::builder().db(pool.clone()).config(config).build();
+        let mut app_state = crate::test_utils::create_test_app_state(pool.clone(), config).await;
         let onwards_router = axum::Router::new();
         let router = crate::build_router(&mut app_state, onwards_router)
             .await
@@ -921,7 +921,7 @@ mod tests {
         };
 
         // Build router with request logging enabled
-        let mut app_state = crate::AppState::builder().db(pool.clone()).config(config).build();
+        let mut app_state = crate::test_utils::create_test_app_state(pool.clone(), config).await;
         let onwards_router = axum::Router::new();
         let router = crate::build_router(&mut app_state, onwards_router)
             .await
@@ -960,7 +960,7 @@ mod tests {
         };
 
         // Build router with request logging enabled
-        let mut app_state = crate::AppState::builder().db(pool.clone()).config(config).build();
+        let mut app_state = crate::test_utils::create_test_app_state(pool.clone(), config).await;
         let onwards_router = axum::Router::new();
         let router = crate::build_router(&mut app_state, onwards_router)
             .await
@@ -1018,7 +1018,7 @@ mod tests {
         };
 
         // Build router with request logging enabled
-        let mut app_state = crate::AppState::builder().db(pool.clone()).config(config).build();
+        let mut app_state = crate::test_utils::create_test_app_state(pool.clone(), config).await;
         let onwards_router = axum::Router::new();
         let router = crate::build_router(&mut app_state, onwards_router)
             .await
@@ -1068,7 +1068,7 @@ mod tests {
         };
 
         // Build router with request logging enabled
-        let mut app_state = crate::AppState::builder().db(pool.clone()).config(config).build();
+        let mut app_state = crate::test_utils::create_test_app_state(pool.clone(), config).await;
         let onwards_router = axum::Router::new();
         let router = crate::build_router(&mut app_state, onwards_router)
             .await
@@ -1117,7 +1117,7 @@ mod tests {
         };
 
         // Build router with request logging enabled
-        let mut app_state = crate::AppState::builder().db(pool.clone()).config(config).build();
+        let mut app_state = crate::test_utils::create_test_app_state(pool.clone(), config).await;
         let onwards_router = axum::Router::new();
         let router = crate::build_router(&mut app_state, onwards_router)
             .await
@@ -1184,7 +1184,7 @@ mod tests {
         };
 
         // Build router with request logging enabled
-        let mut app_state = crate::AppState::builder().db(pool.clone()).config(config).build();
+        let mut app_state = crate::test_utils::create_test_app_state(pool.clone(), config).await;
         let onwards_router = axum::Router::new();
         let router = crate::build_router(&mut app_state, onwards_router)
             .await

@@ -1382,6 +1382,7 @@ mod tests {
             auth: Default::default(),
             enable_metrics: false,
             enable_request_logging: false,
+            file_storage: crate::config::FileStorageConfig::default(),
         };
         crate::seed_database(&config.model_sources, &pool).await.unwrap();
 

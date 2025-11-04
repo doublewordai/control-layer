@@ -166,7 +166,7 @@ mod tests {
             .await
             .expect("Failed to create test deployment");
 
-        let state = crate::AppState::builder().db(pool.clone()).config(config).build();
+        let state = crate::test_utils::create_test_app_state(pool.clone(), config).await;
         let request = axum::http::Request::builder()
             .uri("/admin/api/v1/ai/v1/chat/completions")
             .header("x-doubleword-user", user.email)
@@ -237,7 +237,7 @@ mod tests {
             .await
             .expect("Failed to add deployment to group");
 
-        let state = crate::AppState::builder().db(pool.clone()).config(config).build();
+        let state = crate::test_utils::create_test_app_state(pool.clone(), config).await;
         let request = axum::http::Request::builder()
             .uri("/admin/api/v1/ai/v1/chat/completions")
             .header("x-doubleword-user", user.email)
@@ -259,7 +259,7 @@ mod tests {
     #[sqlx::test]
     async fn test_header_must_be_supplied(pool: PgPool) {
         let config = create_test_config();
-        let state = crate::AppState::builder().db(pool.clone()).config(config).build();
+        let state = crate::test_utils::create_test_app_state(pool.clone(), config).await;
         let request = axum::http::Request::builder()
             .uri("/admin/api/v1/ai/v1/chat/completions")
             .body(
@@ -278,7 +278,7 @@ mod tests {
     #[sqlx::test]
     async fn test_unknown_user_no_access(pool: PgPool) {
         let config = create_test_config();
-        let state = crate::AppState::builder().db(pool.clone()).config(config).build();
+        let state = crate::test_utils::create_test_app_state(pool.clone(), config).await;
         let request = axum::http::Request::builder()
             .uri("/admin/api/v1/ai/v1/chat/completions")
             .header("x-doubleword-user", "test@example.org")
@@ -298,7 +298,7 @@ mod tests {
     #[sqlx::test]
     async fn test_unknown_model_not_found(pool: PgPool) {
         let config = create_test_config();
-        let state = crate::AppState::builder().db(pool.clone()).config(config).build();
+        let state = crate::test_utils::create_test_app_state(pool.clone(), config).await;
         let user = create_test_user(&pool, Role::StandardUser).await;
 
         let request = axum::http::Request::builder()
@@ -320,7 +320,7 @@ mod tests {
     #[sqlx::test]
     async fn test_ignored_paths(pool: PgPool) {
         let config = create_test_config();
-        let state = crate::AppState::builder().db(pool.clone()).config(config).build();
+        let state = crate::test_utils::create_test_app_state(pool.clone(), config).await;
         let user = create_test_user(&pool, Role::StandardUser).await;
 
         let request = axum::http::Request::builder()
@@ -382,7 +382,7 @@ mod tests {
             .await
             .expect("Failed to add deployment to Everyone group");
 
-        let state = crate::AppState::builder().db(pool.clone()).config(config).build();
+        let state = crate::test_utils::create_test_app_state(pool.clone(), config).await;
         let request = axum::http::Request::builder()
             .uri("/admin/api/v1/ai/v1/chat/completions")
             .header("x-doubleword-user", user.email)
@@ -470,12 +470,7 @@ mod tests {
         };
         let jwt_token = session::create_session_token(&current_user, &config).unwrap();
 
-        let state = crate::AppState {
-            db: pool.clone(),
-            config: config.clone(),
-            outlet_db: None,
-            metrics_recorder: None,
-        };
+        let state = crate::test_utils::create_test_app_state(pool.clone(), config.clone()).await;
 
         let request = axum::http::Request::builder()
             .uri("/admin/api/v1/ai/v1/chat/completions")
@@ -567,12 +562,7 @@ mod tests {
         };
         let jwt_token = session::create_session_token(&current_user, &config).unwrap();
 
-        let state = crate::AppState {
-            db: pool.clone(),
-            config: config.clone(),
-            outlet_db: None,
-            metrics_recorder: None,
-        };
+        let state = crate::test_utils::create_test_app_state(pool.clone(), config.clone()).await;
 
         let request = axum::http::Request::builder()
             .uri("/admin/api/v1/ai/v1/chat/completions")
@@ -664,12 +654,7 @@ mod tests {
         };
         let jwt_token = session::create_session_token(&current_user, &config).unwrap();
 
-        let state = crate::AppState {
-            db: pool.clone(),
-            config: config.clone(),
-            outlet_db: None,
-            metrics_recorder: None,
-        };
+        let state = crate::test_utils::create_test_app_state(pool.clone(), config.clone()).await;
 
         // Request with JWT cookie - should be ignored since native auth is disabled
         let request = axum::http::Request::builder()
@@ -734,7 +719,7 @@ mod tests {
 
         tx.commit().await.unwrap();
 
-        let state = crate::AppState::builder().db(pool.clone()).config(config).build();
+        let state = crate::test_utils::create_test_app_state(pool.clone(), config).await;
 
         let new_user_email = "auto-created@example.com";
 
@@ -828,12 +813,7 @@ mod tests {
 
         tx.commit().await.unwrap();
 
-        let state = crate::AppState {
-            db: pool.clone(),
-            config: config.clone(),
-            outlet_db: None,
-            metrics_recorder: None,
-        };
+        let state = crate::test_utils::create_test_app_state(pool.clone(), config.clone()).await;
 
         let request = axum::http::Request::builder()
             .uri("/admin/api/v1/ai/v1/chat/completions")

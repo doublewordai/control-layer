@@ -18,7 +18,7 @@ mod test_utils;
 use crate::{
     api::models::users::Role,
     auth::password,
-    db::handlers::{Repository, Users},
+    db::handlers::{create_file_storage, FileStorage, Repository, Users},
     db::models::users::UserCreateDBRequest,
     metrics::GenAiMetrics,
     openapi::ApiDoc,
@@ -42,6 +42,7 @@ use outlet::{RequestLoggerConfig, RequestLoggerLayer};
 use outlet_postgres::PostgresHandler;
 use request_logging::{AiRequest, AiResponse};
 use sqlx::{ConnectOptions, Executor, PgPool};
+use std::sync::Arc;
 use std::time::Duration;
 use tokio::net::TcpListener;
 use tower::Layer;
@@ -60,6 +61,8 @@ pub struct AppState {
     pub config: Config,
     pub outlet_db: Option<PgPool>,
     pub metrics_recorder: Option<GenAiMetrics>,
+
+    pub file_storage: Arc<dyn FileStorage>,
 }
 
 /// Create the initial admin user if it doesn't exist
@@ -264,7 +267,15 @@ pub async fn setup_app(
         let _ = initial_targets.receive_updates(onwards_stream).await;
     });
 
-    let mut app_state = AppState::builder().db(pool).config(config).build();
+    // Create file storage backend with separate connection pool
+    let database_url = pool.connect_options().to_url_lossy().to_string();
+    let file_storage = create_file_storage(&config.file_storage.backend, &database_url)
+        .await
+        .map_err(|e| anyhow::anyhow!("Failed to create file storage: {}", e))?;
+
+    // Now build app_state with all required fields
+    let mut app_state = AppState::builder().db(pool).config(config).file_storage(file_storage).build();
+
     let router = build_router(&mut app_state, onwards_router).await?;
 
     Ok((router, onwards_config_sync, drop_guard))
@@ -335,6 +346,7 @@ pub async fn build_router(state: &mut AppState, onwards_router: Router) -> anyho
     } else {
         None
     };
+
     // Authentication routes (at root level, masked by proxy when deployed behind vouch)
     let auth_routes = Router::new()
         .route(
@@ -431,6 +443,12 @@ pub async fn build_router(state: &mut AppState, onwards_router: Router) -> anyho
         .route("/requests", get(api::handlers::requests::list_requests))
         .route("/requests/aggregate", get(api::handlers::requests::aggregate_requests))
         .route("/requests/aggregate-by-user", get(api::handlers::requests::aggregate_by_user))
+        // Files management - OpenAI-compatible API
+        .route("/files", post(api::handlers::files::upload_file))
+        .route("/files", get(api::handlers::files::list_files))
+        .route("/files/{file_id}", get(api::handlers::files::get_file))
+        .route("/files/{file_id}/content", get(api::handlers::files::get_file_content))
+        .route("/files/{file_id}", delete(api::handlers::files::delete_file))
         .layer(
             TraceLayer::new_for_http()
                 .make_span_with(|request: &Request<_>| {
@@ -580,13 +598,15 @@ async fn main() -> anyhow::Result<()> {
     let (router, onwards_config_sync, _drop_guard) = setup_app(pool.clone(), config.clone()).await?;
 
     // Apply middleware at root level BEFORE routing decisions are made
+    // Middleware doesn't need file_storage - only API endpoints do
     let middleware = from_fn_with_state(
-        AppState::builder().db(pool.clone()).config(config.clone()).build(),
+        AppState::builder()
+            .db(pool.clone())
+            .config(config.clone())
+            .file_storage(Arc::new(crate::db::handlers::file_storage::NoopFileStorage))
+            .build(),
         admin_ai_proxy_middleware,
     );
-
-    // Apply the layer around the whole Router so middleware runs before Router receives the request
-    let app_with_middleware = middleware.layer(router);
 
     // Start the onwards integration task
     tokio::spawn(async move {
@@ -595,6 +615,9 @@ async fn main() -> anyhow::Result<()> {
             tracing::error!("Onwards configuration listener error: {}", e);
         }
     });
+
+    // Apply middleware to the router
+    let app_with_middleware = middleware.layer(router);
 
     let bind_addr = config.bind_address();
     let listener = TcpListener::bind(&bind_addr).await?;
@@ -648,7 +671,7 @@ async fn shutdown_signal() {
 
 #[cfg(test)]
 mod test {
-    use super::{create_initial_admin_user, AppState};
+    use super::create_initial_admin_user;
     use crate::{
         api::models::users::Role,
         auth::middleware::admin_ai_proxy_middleware,
@@ -673,10 +696,8 @@ mod test {
 
         // Apply middleware for this test
         let middleware = admin_ai_proxy_middleware;
-        let app_state = crate::AppState::builder()
-            .db(pool.clone())
-            .config(crate::test_utils::create_test_config())
-            .build();
+        let app_state = crate::test_utils::create_test_app_state(pool.clone(), crate::test_utils::create_test_config()).await;
+
         // TODO: put the middleware application into some function that's shared w/ main.rs. The
         // reason it isn't now is that `Router` is a nice concrete type for setup_app to return,
         // but impl IntoMakeService is a bit tougher
@@ -908,7 +929,7 @@ mod test {
         config.enable_request_logging = true;
 
         // Build router with request logging enabled
-        let mut app_state = AppState::builder().db(pool.clone()).config(config).build();
+        let mut app_state = crate::test_utils::create_test_app_state(pool.clone(), config).await;
         let onwards_router = axum::Router::new().route("/v1/models", axum::routing::get(|| async { "AI Models" })); // Simple
                                                                                                                     // onwards router for testing
         let router = super::build_router(&mut app_state, onwards_router)
@@ -941,7 +962,7 @@ mod test {
         config.enable_request_logging = false;
 
         // Build router with request logging disabled
-        let mut app_state = AppState::builder().db(pool.clone()).config(config).build();
+        let mut app_state = crate::test_utils::create_test_app_state(pool.clone(), config).await;
         let onwards_router = axum::Router::new(); // Empty onwards router for testing
         let router = super::build_router(&mut app_state, onwards_router)
             .await
@@ -1092,7 +1113,7 @@ mod test {
         let mut config = create_test_config();
         config.enable_metrics = false;
 
-        let mut app_state = AppState::builder().db(pool).config(config).build();
+        let mut app_state = crate::test_utils::create_test_app_state(pool, config).await;
 
         let onwards_router = axum::Router::new();
         let router = super::build_router(&mut app_state, onwards_router)
@@ -1112,7 +1133,7 @@ mod test {
         let mut config = create_test_config();
         config.enable_metrics = true;
 
-        let mut app_state = AppState::builder().db(pool).config(config).build();
+        let mut app_state = crate::test_utils::create_test_app_state(pool, config).await;
 
         let onwards_router = axum::Router::new();
         let router = super::build_router(&mut app_state, onwards_router)

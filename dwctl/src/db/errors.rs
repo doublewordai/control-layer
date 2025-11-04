@@ -49,6 +49,14 @@ pub enum DbError {
     #[error("Invalid model field: {field} must not be empty or whitespace")]
     InvalidModelField { field: &'static str },
 
+    /// Invalid data or state
+    #[error("Invalid data: {message}")]
+    InvalidData { message: String },
+
+    /// IO error (file operations)
+    #[error("IO error: {0}")]
+    IoError(#[from] std::io::Error),
+
     /// Catch-all for non-recoverable errors
     #[error(transparent)]
     Other(#[from] anyhow::Error),
