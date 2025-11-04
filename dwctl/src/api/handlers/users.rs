@@ -18,7 +18,8 @@ use axum::{
     response::Json,
 };
 use rust_decimal::prelude::ToPrimitive;
-use tracing::error;
+use tracing::{error, info};
+use tracing::log::warn;
 
 // GET /user - List users (admin only)
 #[utoipa::path(

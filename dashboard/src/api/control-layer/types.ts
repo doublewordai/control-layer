@@ -100,6 +100,7 @@ export interface User {
   created_at: string; // ISO 8601 timestamp
   updated_at: string; // ISO 8601 timestamp
   auth_source: AuthSource;
+  credit_balance?: number; // User's credit balance
 }
 
 export interface ApiKey {
@@ -562,14 +563,23 @@ export type UserResponse = User;
 
 // ===== COST MANAGEMENT TYPES =====
 
+// Backend transaction type enum
+export type CreditTransactionType =
+  | "admin_grant"
+  | "admin_removal"
+  | "usage"
+  | "purchase";
+
 export interface CreditTransaction {
   id: string;
-  type: "credit" | "debit";
+  user_id: string; // UUID
+  transaction_type: CreditTransactionType;
   amount: number;
-  description: string;
-  timestamp: string; // ISO 8601 timestamp
   balance_after: number;
-  model?: string; // Optional model name for debit transactions
+  previous_transaction_id?: string; // UUID
+  source_id: string;
+  description?: string;
+  created_at: string; // ISO 8601 timestamp
 }
 
 export interface CreditBalanceResponse {
@@ -586,23 +596,17 @@ export interface TransactionsListResponse {
 
 export interface TransactionsQuery {
   limit?: number;
-  offset?: number;
-  type?: "credit" | "debit";
-  model?: string;
-  start_date?: string; // ISO 8601 timestamp
-  end_date?: string; // ISO 8601 timestamp
-  userId?: string; // Filter transactions by user
+  skip?: number;
+  userId?: string; // Filter transactions by user (UUID)
 }
 
 export interface AddCreditsRequest {
+  user_id: string; // UUID of the user to add credits to
   amount: number;
   description?: string;
 }
 
-export interface AddCreditsResponse {
-  transaction: CreditTransaction;
-  new_balance: number;
-}
+export interface AddCreditsResponse extends CreditTransaction {}
 
 // Probe types
 export interface Probe {

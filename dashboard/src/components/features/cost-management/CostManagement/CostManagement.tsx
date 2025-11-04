@@ -1,16 +1,13 @@
-import { Plus } from "lucide-react";
-import { Card } from "../../../ui/card";
-import { Button } from "../../../ui/button";
 import { useState } from "react";
 import {
-  useCreditBalance,
-  useAddCredits, useTransactions,
+  useUser,
+  useAddCredits,
+  useTransactions,
 } from "@/api/control-layer";
 import { toast } from "sonner";
 import { useMemo } from "react";
-import {useSettings} from "@/contexts";
-import {useAuth} from "@/contexts/auth";
-import {generateDummyTransactions} from "@/components/features/cost-management/demoTransactions.ts";
+import { useSettings } from "@/contexts";
+import { generateDummyTransactions } from "@/components/features/cost-management/demoTransactions.ts";
 import {
   type Transaction,
   TransactionHistory
@@ -19,13 +16,12 @@ import {
 export function CostManagement() {
   const { isFeatureEnabled } = useSettings();
   const isDemoMode = isFeatureEnabled("demo");
-  const { user } = useAuth();
 
   // Get user's transactions
   const [localTransactions, setLocalTransactions] = useState<Transaction[]>([]);
 
-  // API mode hooks (only fetch when not in demo mode)
-  const { data: balanceData, isLoading: isLoadingBalance } = useCreditBalance();
+  // Fetch current user (includes balance)
+  const { data: user, isLoading: isLoadingUser } = useUser("current");
   const addCreditsMutation = useAddCredits();
   const {
     data: transactionsData,
@@ -42,8 +38,8 @@ export function CostManagement() {
         .filter((t) => t.user_id === user.id)
         .reverse(); // Most recent first
     } else {
-      // API mode: use data from API
-      return transactionsData?.transactions || [];
+      // API mode: use data from API (now returns array directly)
+      return transactionsData || [];
     }
   }, [isDemoMode, user?.id, transactionsData]);
 
@@ -53,13 +49,11 @@ export function CostManagement() {
       : transactions;
 
   const currentBalance = isDemoMode
-    ? displayTransactions[0]?.balance_after || 0
-    : balanceData?.balance || 0;
-  const isLoading = !isDemoMode && (isLoadingBalance || isLoadingTransactions);
+    ? displayTransactions[0]?.balance_after || user?.credit_balance || 0
+    : user?.credit_balance || 0;
+  const isLoading = !isDemoMode && (isLoadingUser || isLoadingTransactions);
+  console.log("userbalance", user)
 
-  const formatCredits = (amount: number) => {
-    return new Intl.NumberFormat("en-US").format(amount);
-  };
 
   const handleAddCredits = async () => {
     if (isDemoMode) {
@@ -68,23 +62,31 @@ export function CostManagement() {
       const newBalance = currentBalance + creditAmount;
       const newTransaction: Transaction = {
         id: `demo-${Date.now()}`,
-        type: "credit",
+        user_id: user?.id || "",
+        transaction_type: "admin_grant",
         amount: creditAmount,
-        description: "Credit purchase - Demo top up",
-        timestamp: new Date().toISOString(),
         balance_after: newBalance,
-        user_id: user?.id,
+        previous_transaction_id: displayTransactions[0]?.id,
+        source_id: "DEMO_GIFT",
+        description: "Credit purchase - Demo top up",
+        created_at: new Date().toISOString(),
       };
       setLocalTransactions([newTransaction, ...localTransactions]);
       toast.success(`Added ${creditAmount} credits`);
     } else {
       // API mode: Call the add credits endpoint
       try {
+        if (!user?.id) {
+          toast.error("User not found. Please refresh and try again.");
+          return;
+        }
+
         const result = await addCreditsMutation.mutateAsync({
+          user_id: user.id,
           amount: 1000,
           description: "Credit purchase - Top up",
         });
-        toast.success(`Added ${result.transaction.amount} credits`);
+        toast.success(`Added ${result.amount} credits`);
       } catch (error) {
         toast.error("Failed to add credits. Please try again.");
         console.error("Failed to add credits:", error);
@@ -106,49 +108,13 @@ export function CostManagement() {
           </div>
         </div>
 
-        {isLoading ? (
-          <Card className="p-8 text-center mb-8">
-            <div className="animate-spin rounded-full h-12 w-12 border-b-2 border-doubleword-accent-blue mx-auto mb-4"></div>
-            <p className="text-doubleword-neutral-600">Loading...</p>
-          </Card>
-        ) : (
-          <>
-
-        {/* Current Balance Card */}
-        <Card className="mb-8 p-6 bg-gradient-to-br from-blue-50 to-indigo-50 border-blue-200">
-          <div className="flex items-center justify-between">
-            <div>
-              <p className="text-sm text-doubleword-neutral-600 mb-1">
-                Current Balance
-              </p>
-              <div className="flex items-baseline gap-2">
-                <h2 className="text-4xl font-bold text-doubleword-neutral-900">
-                  {formatCredits(currentBalance)}
-                </h2>
-                <span className="text-lg text-doubleword-neutral-600">
-                  credits
-                </span>
-              </div>
-            </div>
-            <Button
-              className="bg-blue-600 hover:bg-blue-700"
-              size="lg"
-              onClick={handleAddCredits}
-              disabled={addCreditsMutation.isPending}
-            >
-              <Plus className="w-5 h-5 mr-2" />
-              {addCreditsMutation.isPending ? "Adding..." : "Add Credits"}
-            </Button>
-          </div>
-        </Card>
-
-        {/* Transaction History */}
         <TransactionHistory
           transactions={displayTransactions}
+          balance={currentBalance}
           isLoading={isLoading}
+          onAddCredits={handleAddCredits}
+          isAddingCredits={addCreditsMutation.isPending}
         />
-        </>
-        )}
       </div>
     </div>
   );

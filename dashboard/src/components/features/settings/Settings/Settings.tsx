@@ -167,18 +167,12 @@ export function Settings() {
                     <p className="text-sm text-doubleword-neutral-600 mt-1">
                       Show billing and cost management features including credit balance tracking and transaction history.
                     </p>
-                    {!isFeatureEnabled("demo") && (
-                      <p className="text-sm text-amber-600 mt-2">
-                        Requires demo mode to be enabled
-                      </p>
-                    )}
                   </div>
                   <Switch
                     checked={isFeatureEnabled("use_billing")}
                     onCheckedChange={(checked) =>
                       toggleFeature("use_billing", checked)
                     }
-                    disabled={!isFeatureEnabled("demo")}
                     aria-label="Toggle billing features"
                   />
                 </div>

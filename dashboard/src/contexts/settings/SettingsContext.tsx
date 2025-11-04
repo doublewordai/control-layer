@@ -10,7 +10,7 @@ const DEFAULT_SETTINGS: AppSettings = {
   apiBaseUrl: "/admin/api/v1",
   features: {
     demo: false,
-    use_billing: false,
+    use_billing: true,
   },
 };
 
@@ -100,22 +100,13 @@ export function SettingsProvider({ children }: { children: React.ReactNode }) {
     feature: keyof FeatureFlags,
     enabled: boolean,
   ) => {
-    setSettings((prev) => {
-      const newFeatures = {
+    setSettings((prev) => ({
+      ...prev,
+      features: {
         ...prev.features,
         [feature]: enabled,
-      };
-
-      // If disabling demo mode, also disable use_billing
-      if (feature === "demo" && !enabled) {
-        newFeatures.use_billing = false;
-      }
-
-      return {
-        ...prev,
-        features: newFeatures,
-      };
-    });
+      },
+    }));
 
     // Handle service worker for demo mode
     if (feature === "demo") {

@@ -31,12 +31,17 @@ export function UserTransactionsModal({
   } = useTransactions({ userId: user.id });
 
 
-  const transactions = transactionsData?.transactions || (isDemoMode? (generateDummyTransactions().filter((t) => t.user_id === user.id)) : []);
+  const transactions = transactionsData || (isDemoMode ? (generateDummyTransactions().filter((t) => t.user_id === user.id)) : []);
   const isLoading = !isDemoMode && isLoadingTransactions;
+
+  // Get balance from user (API mode) or from latest transaction (demo mode)
+  const balance = isDemoMode
+    ? transactions[0]?.balance_after || user.credit_balance || 0
+    : user.credit_balance || 0;
 
   return (
     <Dialog open={isOpen} onOpenChange={onClose}>
-      <DialogContent className="max-w-5xl max-h-[80vh] overflow-y-auto">
+      <DialogContent className="!max-w-[50vw] max-h-[80vh] overflow-y-auto">
         <DialogHeader>
           <div className="flex items-center justify-between">
             <div>
@@ -58,6 +63,7 @@ export function UserTransactionsModal({
         <div className="mt-4">
           <TransactionHistory
             transactions={transactions}
+            balance={balance}
             isLoading={isLoading}
             showCard={false}
           />

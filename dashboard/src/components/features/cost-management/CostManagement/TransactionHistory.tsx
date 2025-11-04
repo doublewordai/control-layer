@@ -1,4 +1,4 @@
-import { DollarSign, TrendingDown, TrendingUp, Filter, X } from "lucide-react";
+import { DollarSign, TrendingDown, TrendingUp, Filter, X, Plus } from "lucide-react";
 import { Card } from "../../../ui/card.tsx";
 import { Button } from "@/components";
 import { useState, useMemo } from "react";
@@ -10,44 +10,30 @@ import {
   SelectValue,
 } from "../../../ui/select.tsx";
 import { DateTimeRangeSelector } from "../../../ui/date-time-range-selector.tsx";
+import type { CreditTransaction } from "@/api/control-layer";
 
-export interface Transaction {
-  id: string;
-  type: "credit" | "debit";
-  amount: number;
-  description: string;
-  timestamp: string;
-  balance_after: number;
-  model?: string; // Optional model name for debit transactions
-  user_id?: string; // Optional user ID for user-specific transactions
-}
+export type Transaction = CreditTransaction;
 
 export interface TransactionHistoryProps {
   transactions: Transaction[];
+  balance: number;
   isLoading?: boolean;
   showCard?: boolean;
+  onAddCredits?: () => void;
+  isAddingCredits?: boolean;
 }
 
 export function TransactionHistory({
   transactions,
+  balance,
   isLoading = false,
   showCard = true,
+  onAddCredits,
+  isAddingCredits = false,
 }: TransactionHistoryProps) {
   // Filter states
-  const [selectedModel, setSelectedModel] = useState<string>("all");
   const [transactionType, setTransactionType] = useState<string>("all");
   const [dateRange, setDateRange] = useState<{ from: Date; to: Date } | undefined>();
-
-  // Extract unique models from transactions
-  const availableModels = useMemo(() => {
-    const models = new Set<string>();
-    transactions.forEach((t) => {
-      if (t.model) {
-        models.add(t.model);
-      }
-    });
-    return Array.from(models).sort();
-  }, [transactions]);
 
   // Apply filters
   const filteredTransactions = useMemo(() => {
@@ -55,42 +41,40 @@ export function TransactionHistory({
 
     // Filter by transaction type
     if (transactionType !== "all") {
-      filtered = filtered.filter((t) => t.type === transactionType);
-    }
-
-    // Filter by model
-    if (selectedModel !== "all") {
-      filtered = filtered.filter((t) => t.model === selectedModel);
+      // Map UI filter values to backend transaction types
+      if (transactionType === "credit") {
+        filtered = filtered.filter((t) =>
+          t.transaction_type === "admin_grant" || t.transaction_type === "purchase"
+        );
+      } else if (transactionType === "debit") {
+        filtered = filtered.filter((t) =>
+          t.transaction_type === "admin_removal" || t.transaction_type === "usage"
+        );
+      }
     }
 
     // Filter by date range
     if (dateRange?.from && dateRange?.to) {
       filtered = filtered.filter((t) => {
-        const transactionDate = new Date(t.timestamp);
+        const transactionDate = new Date(t.created_at);
         return transactionDate >= dateRange.from && transactionDate <= dateRange.to;
       });
     }
 
     return filtered;
-  }, [transactions, selectedModel, transactionType, dateRange]);
+  }, [transactions, transactionType, dateRange]);
 
   const hasActiveFilters =
-    selectedModel !== "all" ||
     transactionType !== "all" ||
     dateRange !== undefined;
 
   const clearFilters = () => {
-    setSelectedModel("all");
     setTransactionType("all");
     setDateRange(undefined);
   };
 
-  // Reset model filter when switching to credit transactions (since they don't have models)
   const handleTransactionTypeChange = (value: string) => {
     setTransactionType(value);
-    if (value === "credit") {
-      setSelectedModel("all");
-    }
   };
 
   const formatDate = (isoString: string) => {
@@ -110,6 +94,36 @@ export function TransactionHistory({
 
   const content = (
     <>
+      {/* Current Balance Card */}
+      <Card className="mb-8 p-6 bg-gradient-to-br from-blue-50 to-indigo-50 border-blue-200">
+        <div className="flex items-center justify-between">
+          <div>
+            <p className="text-sm text-doubleword-neutral-600 mb-1">
+              Current Balance
+            </p>
+            <div className="flex items-baseline gap-2">
+              <h2 className="text-4xl font-bold text-doubleword-neutral-900">
+                {formatCredits(balance)}
+              </h2>
+              <span className="text-lg text-doubleword-neutral-600">
+                credits
+              </span>
+            </div>
+          </div>
+          {onAddCredits && (
+            <Button
+              className="bg-blue-600 hover:bg-blue-700"
+              size="lg"
+              onClick={onAddCredits}
+              disabled={isAddingCredits}
+            >
+              <Plus className="w-5 h-5 mr-2" />
+              {isAddingCredits ? "Adding..." : "Add Credits"}
+            </Button>
+          )}
+        </div>
+      </Card>
+
       <div className="flex items-center justify-between mb-6">
         <div className="flex items-center gap-2">
           <DollarSign className="w-5 h-5 text-doubleword-neutral-600" />
@@ -157,34 +171,6 @@ export function TransactionHistory({
             </Select>
           </div>
 
-          {/* Model Filter */}
-          <div className="flex items-center gap-2">
-            <label className={`text-sm whitespace-nowrap ${
-              transactionType === "credit"
-                ? "text-doubleword-neutral-400"
-                : "text-doubleword-neutral-600"
-            }`}>
-              Model:
-            </label>
-            <Select
-              value={selectedModel}
-              onValueChange={setSelectedModel}
-              disabled={transactionType === "credit"}
-            >
-              <SelectTrigger className="w-[200px]">
-                <SelectValue placeholder="All models" />
-              </SelectTrigger>
-              <SelectContent>
-                <SelectItem value="all">All models</SelectItem>
-                {availableModels.map((model) => (
-                  <SelectItem key={model} value={model}>
-                    {model}
-                  </SelectItem>
-                ))}
-              </SelectContent>
-            </Select>
-          </div>
-
           {/* Date Range Filter */}
           <div className="flex items-center gap-2">
             <label className="text-sm text-doubleword-neutral-600 whitespace-nowrap">
@@ -207,51 +193,54 @@ export function TransactionHistory({
       </div>
 
       <div className="space-y-2">
-        {filteredTransactions.map((transaction) => (
-          <div
-            key={transaction.id}
-            className="flex items-center justify-between p-4 border border-doubleword-neutral-200 rounded-lg hover:bg-gray-50 transition-colors"
-          >
-            <div className="flex items-center gap-4 flex-1">
-              <div
-                className={`p-2 rounded-full ${
-                  transaction.type === "credit"
-                    ? "bg-green-100"
-                    : "bg-red-100"
-                }`}
-              >
-                {transaction.type === "credit" ? (
-                  <TrendingUp className="w-5 h-5 text-green-600" />
-                ) : (
-                  <TrendingDown className="w-5 h-5 text-red-600" />
-                )}
+        {filteredTransactions.map((transaction) => {
+          // Determine if transaction is a credit (adds money) or debit (removes money)
+          const isCredit =
+            transaction.transaction_type === "admin_grant" ||
+            transaction.transaction_type === "purchase";
+
+          return (
+            <div
+              key={transaction.id}
+              className="flex items-center justify-between p-4 border border-doubleword-neutral-200 rounded-lg hover:bg-gray-50 transition-colors"
+            >
+              <div className="flex items-center gap-4 flex-1">
+                <div
+                  className={`p-2 rounded-full ${
+                    isCredit ? "bg-green-100" : "bg-red-100"
+                  }`}
+                >
+                  {isCredit ? (
+                    <TrendingUp className="w-5 h-5 text-green-600" />
+                  ) : (
+                    <TrendingDown className="w-5 h-5 text-red-600" />
+                  )}
+                </div>
+                <div className="flex-1">
+                  <p className="font-medium text-doubleword-neutral-900">
+                    {transaction.description || "No description"}
+                  </p>
+                  <p className="text-sm text-doubleword-neutral-600">
+                    {formatDate(transaction.created_at)}
+                  </p>
+                </div>
               </div>
-              <div className="flex-1">
-                <p className="font-medium text-doubleword-neutral-900">
-                  {transaction.description}
+              <div className="text-right">
+                <p
+                  className={`font-semibold ${
+                    isCredit ? "text-green-600" : "text-red-600"
+                  }`}
+                >
+                  {isCredit ? "+" : "-"}
+                  {formatCredits(transaction.amount)}
                 </p>
                 <p className="text-sm text-doubleword-neutral-600">
-                  {formatDate(transaction.timestamp)}
+                  Balance: {formatCredits(transaction.balance_after)}
                 </p>
               </div>
             </div>
-            <div className="text-right">
-              <p
-                className={`font-semibold ${
-                  transaction.type === "credit"
-                    ? "text-green-600"
-                    : "text-red-600"
-                }`}
-              >
-                {transaction.type === "credit" ? "+" : "-"}
-                {formatCredits(transaction.amount)}
-              </p>
-              <p className="text-sm text-doubleword-neutral-600">
-                Balance: {formatCredits(transaction.balance_after)}
-              </p>
-            </div>
-          </div>
-        ))}
+          );
+        })}
       </div>
 
       {filteredTransactions.length === 0 && (

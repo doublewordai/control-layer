@@ -630,10 +630,13 @@ export function useAddCredits() {
   return useMutation({
     mutationKey: ["cost", "add-credits"],
     mutationFn: (data: AddCreditsRequest) => dwctlApi.cost.addCredits(data),
-    onSuccess: () => {
-      // Invalidate and refetch balance and transactions
-      queryClient.invalidateQueries({ queryKey: ["cost", "balance"] });
-      queryClient.invalidateQueries({ queryKey: ["cost", "transactions"] });
+    onSuccess: async (_, variables) => {
+      // Refetch user balance and transactions from server
+      await Promise.all([
+        queryClient.refetchQueries({ queryKey: queryKeys.users.byId(variables.user_id) }),
+        queryClient.refetchQueries({ queryKey: queryKeys.users.byId("current") }),
+        queryClient.refetchQueries({ queryKey: ["cost", "transactions"] }),
+      ]);
     },
   });
 }

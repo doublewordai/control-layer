@@ -35,7 +35,7 @@ import type {
   PasswordResetConfirmRequest,
   ChangePasswordRequest,
   CreditBalanceResponse,
-  TransactionsListResponse,
+  CreditTransaction,
   TransactionsQuery,
   AddCreditsRequest,
   AddCreditsResponse,
@@ -51,6 +51,8 @@ const userApi = {
   async list(options?: UsersQuery): Promise<User[]> {
     const params = new URLSearchParams();
     if (options?.include) params.set("include", options.include);
+    // Always include billing to get balance
+    params.set("include", "billing");
 
     const url = `/admin/api/v1/users${params.toString() ? "?" + params.toString() : ""}`;
     const response = await fetch(url);
@@ -61,7 +63,7 @@ const userApi = {
   },
 
   async get(id: string): Promise<User> {
-    const response = await fetch(`/admin/api/v1/users/${id}`);
+    const response = await fetch(`/admin/api/v1/users/${id}?include=billing`);
     if (!response.ok) {
       throw new Error(`Failed to fetch user: ${response.status}`);
     }
@@ -716,17 +718,13 @@ const costApi = {
 
   async listTransactions(
     query?: TransactionsQuery,
-  ): Promise<TransactionsListResponse> {
+  ): Promise<CreditTransaction[]> {
     const params = new URLSearchParams();
     if (query?.limit) params.set("limit", query.limit.toString());
-    if (query?.offset) params.set("offset", query.offset.toString());
-    if (query?.type) params.set("type", query.type);
-    if (query?.model) params.set("model", query.model);
-    if (query?.start_date) params.set("start_date", query.start_date);
-    if (query?.end_date) params.set("end_date", query.end_date);
+    if (query?.skip) params.set("skip", query.skip.toString());
     if (query?.userId) params.set("user_id", query.userId);
 
-    const url = `/admin/api/v1/credits/transactions${params.toString() ? "?" + params.toString() : ""}`;
+    const url = `/admin/api/v1/transactions${params.toString() ? "?" + params.toString() : ""}`;
     const response = await fetch(url);
     if (!response.ok) {
       throw new Error(`Failed to fetch transactions: ${response.status}`);
@@ -735,10 +733,18 @@ const costApi = {
   },
 
   async addCredits(data: AddCreditsRequest): Promise<AddCreditsResponse> {
-    const response = await fetch("/admin/api/v1/credits/add", {
+    const payload = {
+      user_id: data.user_id,
+      transaction_type: "admin_grant",
+      amount: data.amount,
+      source_id: "550e8400-e29b-41d4-a716-446655440000",
+      description: data.description,
+    };
+
+    const response = await fetch("/admin/api/v1/transactions", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(data),
+      body: JSON.stringify(payload),
     });
     if (!response.ok) {
       throw new Error(`Failed to add credits: ${response.status}`);
