@@ -2,12 +2,10 @@
 
 [Announcement](https://fergusfinn.com/blog/control-layer/) | [Benchmarking](https://fergusfinn.com/blog/control-layer-benchmarking/)
 
-The Doubleword Control Layer (dwctl) is the world’s fastest AI model gateway (450x less overhead than LiteLLM). It provides a single, high-performance interface for routing, managing, and securing inference across model providers, users and deployments - both open-source and proprietary.
+The Doubleword Control Layer (dwctl) is the world's fastest AI model gateway (450x less overhead than LiteLLM). It provides a single, high-performance interface for routing, managing, and securing inference across model providers, users and deployments - both open-source and proprietary.
 - Seamlessly switch between models
 - Turn any model (self-hosted or hosted) into a production-ready API with full auth and user controls
 - Centrally govern, monitor, and audit all inference activity
-
-
 
 ## Getting started
 
@@ -62,7 +60,7 @@ merged with this one, or by supplying environment variables prefixed with
 `DWCTL_`.
 
 Nested sections of the configuration can be specified by joining
-the keys with a double underscore, for example, to disable native
+the keys with a double __, for example, to disable native
 authentication, set `DWCTL_AUTH__NATIVE__ENABLED=false`.
 
 ```yaml
@@ -122,7 +120,7 @@ auth:
     # auth.native.session.timeout # value. That one configures how long the browser
     # will set the cookie for, this one how long the server will accept it for.
     jwt_expiry: "24h"
-    # CORS Settings. In production, make sure your frontend URL is listed here.
+    # CORS Settings. In production, make sure your frontend URL is listed here.
     cors:
       allowed_origins:
         - "http://localhost:3001" # Default - Control Layer server itself
@@ -151,7 +149,6 @@ metadata:
   region: "UK South"
   organization: "ACME Corp"
 
-
 # Server configuration
 # To advertise publically, set to "0.0.0.0", or the specific network interface
 # you've exposed.
@@ -172,6 +169,26 @@ database:
   # data_dir: null  # Optional: directory for database storage
   # persistent: false  # Set to true to persist data between restarts
 
+# File storage configuration
+# Used for OpenAI-compatible batch processing files API
+file_storage:
+  max_file_size: 536870912  # 512MB
+  default_expiry_seconds: 2592000  # 30 days
+  min_expiry_seconds: 3600  # 1 hour
+  max_expiry_seconds: 2592000  # 30 days
+  
+  backend:
+    # Development: Local filesystem (simple, not suitable for multi-instance deployments)
+    type: local
+    path: .dwctl_data/files
+    
+    # Production: PostgreSQL (recommended - transactional, multi-instance safe)
+    # Option 1: Same PostgreSQL instance (automatically creates control_layer_files database)
+    # type: postgres
+    
+    # Option 2: Separate PostgreSQL instance for file storage
+    # type: postgres
+    # database_url: postgres://fileuser:password@files-db.example.com:5432/batch_files
 
 # By default, we log all requests and responses to the database. This is
 # performed asynchronously, so there's very little performance impact. # If
@@ -186,5 +203,38 @@ enable_request_logging: true # Enable request/response logging to database
    `DATABASE_URL` environment variable.
 2. Make sure that the secret key is set to a secure random value. For example, run
    `openssl rand -base64 32` to generate a secure random key.
-3. Make sure user registration is enabled or disabled, as per your requirements.
-4. Make sure the CORS settings are correct for your frontend.
+3. Configure file storage backend (see below).
+4. Make sure user registration is enabled or disabled, as per your requirements.
+5. Make sure the CORS settings are correct for your frontend.
+
+### File Storage
+
+Control Layer stores uploaded files for batch processing. Choose a storage backend:
+
+**Development:**
+```yaml
+file_storage:
+  backend:
+    type: local
+    path: /var/lib/dwctl/files
+```
+
+**Production (recommended):**
+```yaml
+file_storage:
+  backend:
+    type: postgres
+    # Option 1: Same PostgreSQL (auto-creates control_layer_files database)
+    # No additional config needed
+    
+    # Option 2: Separate PostgreSQL for isolation/scaling
+    # database_url: postgres://fileuser:password@files-db:5432/batch_files
+```
+
+**PostgreSQL benefits:**
+- Transactional safety (no orphaned files)
+- Multi-instance safe (load balancing ready)
+- Automatic cleanup on database restore
+- Files stored in separate database for performance isolation
+
+**Note:** Local filesystem storage is not suitable for multi-instance deployments or load-balanced setups.

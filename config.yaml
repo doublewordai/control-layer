@@ -102,9 +102,9 @@ file_storage:
     # No database_url needed!
     
     # Option 2: Separate instance
-    # database_url: postgres://fileuser:password@files-db.example.com:5432/batch_files
+    # database_url: postgres://fileuser:password@files-db.example.com:5432/control_layer
 
-# Or local storage - not recommended for production
+# Option 3: local storage - not recommended for production
 # file_storage:
 #   backend:
 #     type: local
