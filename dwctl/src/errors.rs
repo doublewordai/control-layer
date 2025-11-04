@@ -51,6 +51,10 @@ pub enum Error {
     /// Payload exceeds maximum allowed size
     #[error("Payload too large: {message}")]
     PayloadTooLarge { message: String },
+
+    /// Resource is no longer available
+    #[error("Gone: {resource} '{id}' - {message}")]
+    Gone { resource: String, id: String, message: String },
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -81,6 +85,7 @@ impl Error {
             Error::Other(_) => StatusCode::INTERNAL_SERVER_ERROR,
             Error::Conflict { .. } => StatusCode::CONFLICT,
             Error::PayloadTooLarge { .. } => StatusCode::PAYLOAD_TOO_LARGE,
+            Error::Gone { .. } => StatusCode::GONE,
         }
     }
 
@@ -134,6 +139,9 @@ impl Error {
                     message.clone()
                 }
             }
+            Error::Gone { resource, id, message } => {
+                format!("{} '{}' is no longer available: {}", resource, id, message)
+            }
         }
     }
 }
@@ -157,6 +165,9 @@ impl IntoResponse for Error {
             Error::Conflict { .. } => {
                 tracing::warn!("Conflict error: {}", self);
             }
+            Error::Gone { .. } => {
+                tracing::debug!("Gone error: {}", self);
+            }
         }
 
         let status = self.status_code();
@@ -174,7 +185,7 @@ impl IntoResponse for Error {
                     json!({ "message": message })
                 };
 
-                (status, axum::response::Json(body)).into_response()
+                (status, axum::Json(body)).into_response()
             }
             // Handle database unique violations with minimal structured JSON
             Error::Database(DbError::UniqueViolation { constraint, table, .. }) => {
@@ -204,7 +215,7 @@ impl IntoResponse for Error {
                     "resource": resource
                 });
 
-                (status, axum::response::Json(body)).into_response()
+                (status, axum::Json(body)).into_response()
             }
             _ => {
                 // For all other errors, return simple text message (unchanged)

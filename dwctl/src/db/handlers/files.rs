@@ -73,7 +73,6 @@ impl FileFilter {
         Self::default()
     }
 
-    #[cfg(test)]
     pub fn uploaded_by(mut self, user_id: UserId) -> Self {
         self.uploaded_by = Some(user_id);
         self

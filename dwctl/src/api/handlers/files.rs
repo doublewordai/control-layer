@@ -1,11 +1,14 @@
 use crate::api::models::files::{FileDeleteResponse, FileListResponse, FileResponse, ListFilesQuery};
+use crate::auth::permissions::{
+    can_delete_own_resource, can_read_all_resources, can_read_own_resource, has_permission, operation, resource, RequiresPermission,
+};
 use crate::db::handlers::{
     files::{FileFilter, FilePurpose},
     Files, Repository,
 };
 use crate::db::models::files::{FileCreateDBRequest, FileStatus, StorageBackend};
 use crate::errors::{Error, Result};
-use crate::types::FileId;
+use crate::types::{FileId, Operation, Resource};
 use crate::AppState;
 use axum::{
     body::Body,
@@ -17,11 +20,6 @@ use axum::{
 use bytes::Bytes;
 use chrono::{Duration, Utc};
 use sqlx::Acquire;
-
-// TODO: Replace with actual user ID from auth when implemented
-fn placeholder_user_id() -> uuid::Uuid {
-    uuid::Uuid::parse_str("00000000-0000-0000-0000-000000000000").unwrap()
-}
 
 #[utoipa::path(
     post,
@@ -40,7 +38,11 @@ fn placeholder_user_id() -> uuid::Uuid {
         (status = 500, description = "Internal server error")
     )
 )]
-pub async fn upload_file(State(state): State<AppState>, mut multipart: Multipart) -> Result<(StatusCode, Json<FileResponse>)> {
+pub async fn upload_file(
+    State(state): State<AppState>,
+    current_user: RequiresPermission<resource::Files, operation::CreateOwn>,
+    mut multipart: Multipart,
+) -> Result<(StatusCode, Json<FileResponse>)> {
     let mut file_data: Option<(String, Bytes)> = None; // (filename, content)
     let mut purpose: Option<String> = None;
     let mut expires_after_anchor: Option<String> = None;
@@ -188,7 +190,7 @@ pub async fn upload_file(State(state): State<AppState>, mut multipart: Multipart
             content_type,
             size_bytes,
             storage_backend,
-            uploaded_by: placeholder_user_id(),
+            uploaded_by: current_user.id,
             purpose: file_purpose,
             expires_at: Some(expires_at),
             storage_key: String::new(), // Will be set by create_with_content
@@ -216,7 +218,14 @@ pub async fn upload_file(State(state): State<AppState>, mut multipart: Multipart
         ListFilesQuery
     )
 )]
-pub async fn list_files(State(state): State<AppState>, Query(query): Query<ListFilesQuery>) -> Result<Json<FileListResponse>> {
+pub async fn list_files(
+    State(state): State<AppState>,
+    Query(query): Query<ListFilesQuery>,
+    current_user: RequiresPermission<resource::Files, operation::ReadOwn>,
+) -> Result<Json<FileListResponse>> {
+    let has_system_access = has_permission(&current_user, Resource::Files, Operation::SystemAccess);
+    let can_read_all_files = can_read_all_resources(&current_user, Resource::Files);
+
     // Validate order parameter
     if query.order != "asc" && query.order != "desc" {
         return Err(Error::BadRequest {
@@ -232,6 +241,16 @@ pub async fn list_files(State(state): State<AppState>, Query(query): Query<ListF
         .status(FileStatus::Active)
         .limit(limit + 1) // Fetch one extra to determine has_more
         .order_desc(query.order == "desc");
+
+    // Only admins (SystemAccess) can see deleted/expired files
+    if !has_system_access {
+        filter = filter.status(FileStatus::Active);
+    }
+
+    // Filter by user ownership unless user has ReadAll permission
+    if !can_read_all_files {
+        filter = filter.uploaded_by(current_user.id);
+    }
 
     // Add cursor if provided
     if let Some(after_id) = query.after {
@@ -283,7 +302,14 @@ pub async fn list_files(State(state): State<AppState>, Query(query): Query<ListF
         ("file_id" = String, Path, description = "The ID of the file to retrieve")
     )
 )]
-pub async fn get_file(State(state): State<AppState>, Path(file_id_str): Path<String>) -> Result<Json<FileResponse>> {
+pub async fn get_file(
+    State(state): State<AppState>,
+    Path(file_id_str): Path<String>,
+    current_user: RequiresPermission<resource::Files, operation::ReadOwn>,
+) -> Result<Json<FileResponse>> {
+    let has_system_access = has_permission(&current_user, Resource::Files, Operation::SystemAccess);
+    let can_read_all_files = can_read_all_resources(&current_user, Resource::Files);
+
     let file_id = file_id_str.parse::<FileId>().map_err(|_| Error::BadRequest {
         message: "Invalid file ID format".to_string(),
     })?;
@@ -296,7 +322,21 @@ pub async fn get_file(State(state): State<AppState>, Path(file_id_str): Path<Str
         id: file_id.to_string(),
     })?;
 
-    // TODO: Add permission check when auth is implemented
+    // Check ownership unless user has ReadAll permission
+    if !can_read_all_files && !can_read_own_resource(&current_user, Resource::Files, file.uploaded_by) {
+        return Err(Error::NotFound {
+            resource: "File".to_string(),
+            id: file_id.to_string(),
+        });
+    }
+
+    // Only admins can see deleted/expired files metadata
+    if !has_system_access && file.status != FileStatus::Active {
+        return Err(Error::NotFound {
+            resource: "File".to_string(),
+            id: file_id.to_string(),
+        });
+    }
 
     Ok(Json(FileResponse::from_file(&file)))
 }
@@ -316,7 +356,13 @@ pub async fn get_file(State(state): State<AppState>, Path(file_id_str): Path<Str
         ("file_id" = String, Path, description = "The ID of the file")
     )
 )]
-pub async fn get_file_content(State(state): State<AppState>, Path(file_id_str): Path<String>) -> Result<Response> {
+pub async fn get_file_content(
+    State(state): State<AppState>,
+    Path(file_id_str): Path<String>,
+    current_user: RequiresPermission<resource::Files, operation::ReadOwn>,
+) -> Result<Response> {
+    let can_read_all_files = can_read_all_resources(&current_user, Resource::Files);
+
     let file_id = file_id_str.parse::<FileId>().map_err(|_| Error::BadRequest {
         message: "Invalid file ID format".to_string(),
     })?;
@@ -324,13 +370,27 @@ pub async fn get_file_content(State(state): State<AppState>, Path(file_id_str): 
     let mut pool_conn = state.db.acquire().await.map_err(|e| Error::Database(e.into()))?;
     let mut repo = Files::new(&mut pool_conn, state.file_storage.clone());
 
-    // Get file metadata
     let file = repo.get_by_id(file_id).await?.ok_or_else(|| Error::NotFound {
         resource: "File".to_string(),
         id: file_id.to_string(),
     })?;
 
-    // TODO: Add permission check when auth is implemented
+    // Check ownership unless user has ReadAll permission
+    if !can_read_all_files && !can_read_own_resource(&current_user, Resource::Files, file.uploaded_by) {
+        return Err(Error::NotFound {
+            resource: "File".to_string(),
+            id: file_id.to_string(),
+        });
+    }
+
+    // Content can only be retrieved for active files
+    if file.status != FileStatus::Active {
+        return Err(Error::Gone {
+            resource: "File content".to_string(),
+            id: file_id.to_string(),
+            message: format!("File is {}", file.status.to_string().to_lowercase()),
+        });
+    }
 
     // Get content through repo
     let content = repo.get_content(&file).await?;
@@ -358,7 +418,13 @@ pub async fn get_file_content(State(state): State<AppState>, Path(file_id_str): 
         ("file_id" = String, Path, description = "The ID of the file to delete")
     )
 )]
-pub async fn delete_file(State(state): State<AppState>, Path(file_id_str): Path<String>) -> Result<Json<FileDeleteResponse>> {
+pub async fn delete_file(
+    State(state): State<AppState>,
+    Path(file_id_str): Path<String>,
+    current_user: RequiresPermission<resource::Files, operation::DeleteOwn>,
+) -> Result<Json<FileDeleteResponse>> {
+    let can_delete_all_files = can_read_all_resources(&current_user, Resource::Files);
+
     let file_id = file_id_str.parse::<FileId>().map_err(|_| Error::BadRequest {
         message: "Invalid file ID format".to_string(),
     })?;
@@ -371,13 +437,18 @@ pub async fn delete_file(State(state): State<AppState>, Path(file_id_str): Path<
             state.file_storage.clone(),
         );
 
-        // Check if file exists
-        let _file = repo.get_by_id(file_id).await?.ok_or_else(|| Error::NotFound {
+        let file = repo.get_by_id(file_id).await?.ok_or_else(|| Error::NotFound {
             resource: "File".to_string(),
             id: file_id.to_string(),
         })?;
 
-        // TODO: Add permission check when auth is implemented
+        // Check ownership unless user has DeleteAll permission
+        if !can_delete_all_files && !can_delete_own_resource(&current_user, Resource::Files, file.uploaded_by) {
+            return Err(Error::NotFound {
+                resource: "File".to_string(),
+                id: file_id.to_string(),
+            });
+        }
 
         // Soft delete file (removes content, keeps metadata)
         repo.soft_delete(file_id).await?;

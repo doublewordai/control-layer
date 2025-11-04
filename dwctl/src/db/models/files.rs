@@ -26,6 +26,17 @@ pub enum FileStatus {
     Failed,
 }
 
+impl std::fmt::Display for FileStatus {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            FileStatus::Active => write!(f, "active"),
+            FileStatus::Deleted => write!(f, "deleted"),
+            FileStatus::Expired => write!(f, "expired"),
+            FileStatus::Failed => write!(f, "failed"),
+        }
+    }
+}
+
 /// Database request for creating a new file
 #[derive(Debug, Clone)]
 pub struct FileCreateDBRequest {
