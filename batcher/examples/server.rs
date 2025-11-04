@@ -1,5 +1,9 @@
 /// A simple HTTP server using Axum that provides a web interface and API
 /// for the batcher request manager.
+///
+/// Supports both in-memory and PostgreSQL backends:
+/// - In-memory (default): cargo run --example server
+/// - PostgreSQL: DATABASE_URL=postgresql://user@localhost/batcher cargo run --example server --features postgres
 use axum::{
     extract::{Path, State},
     http::StatusCode,
@@ -20,10 +24,13 @@ use std::{convert::Infallible, sync::Arc};
 use tracing::info;
 use uuid::Uuid;
 
+#[cfg(feature = "postgres")]
+use batcher::PostgresRequestManager;
+
 // Application state
 #[derive(Clone)]
 struct AppState {
-    manager: Arc<InMemoryRequestManager<ReqwestHttpClient>>,
+    manager: Arc<dyn RequestManager>,
 }
 
 // API request/response types
@@ -40,6 +47,18 @@ struct SubmitRequestBody {
 #[derive(Debug, Serialize)]
 struct SubmitResponse {
     id: RequestId,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(tag = "status", rename_all = "lowercase")]
+enum BatchSubmitResult {
+    Success { id: RequestId },
+    Error { error: String },
+}
+
+#[derive(Debug, Serialize)]
+struct BatchSubmitResponse {
+    results: Vec<BatchSubmitResult>,
 }
 
 #[derive(Debug, Serialize)]
@@ -80,6 +99,54 @@ async fn submit_request(
         .map_err(|e| AppError::Internal(e.to_string()))?;
 
     Ok(Json(SubmitResponse { id: request_id }))
+}
+
+async fn submit_batch(
+    State(state): State<AppState>,
+    Json(bodies): Json<Vec<SubmitRequestBody>>,
+) -> Result<Json<BatchSubmitResponse>, AppError> {
+    let mut request_ids = Vec::new();
+    let requests: Vec<Request<Pending>> = bodies
+        .into_iter()
+        .map(|body| {
+            let request_id = RequestId::from(Uuid::new_v4());
+            request_ids.push(request_id);
+            Request {
+                state: Pending {
+                    retry_attempt: 0,
+                    not_before: None,
+                },
+                data: RequestData {
+                    id: request_id,
+                    endpoint: body.endpoint,
+                    method: body.method,
+                    path: body.path,
+                    body: body.body,
+                    model: body.model,
+                    api_key: body.api_key,
+                },
+            }
+        })
+        .collect();
+
+    let submit_results = state
+        .manager
+        .submit_requests(requests)
+        .await
+        .map_err(|e| AppError::Internal(e.to_string()))?;
+
+    let results = request_ids
+        .into_iter()
+        .zip(submit_results)
+        .map(|(request_id, result)| match result {
+            Ok(_) => BatchSubmitResult::Success { id: request_id },
+            Err(e) => BatchSubmitResult::Error {
+                error: e.to_string(),
+            },
+        })
+        .collect();
+
+    Ok(Json(BatchSubmitResponse { results }))
 }
 
 async fn get_request_status(
@@ -174,24 +241,46 @@ async fn main() -> anyhow::Result<()> {
     // Initialize tracing
     tracing_subscriber::fmt::init();
 
-    // Create HTTP client and request manager
+    // Create HTTP client and config
     let http_client = Arc::new(ReqwestHttpClient::new());
-    let config = DaemonConfig::default();
-    let manager = Arc::new(InMemoryRequestManager::new(http_client, config));
+    let config = DaemonConfig {
+        claim_batch_size: 1000,
+        default_model_concurrency: 1000,
+        ..Default::default()
+    };
+
+    // Choose backend based on DATABASE_URL environment variable
+    let manager: Arc<dyn RequestManager> = if let Ok(database_url) = std::env::var("DATABASE_URL") {
+        #[cfg(feature = "postgres")]
+        {
+            info!("Using PostgreSQL backend: {}", database_url);
+            let pool = sqlx::PgPool::connect(&database_url).await?;
+            info!("Connected to PostgreSQL database");
+            Arc::new(PostgresRequestManager::new(pool, http_client, config))
+        }
+        #[cfg(not(feature = "postgres"))]
+        {
+            eprintln!("ERROR: DATABASE_URL is set but postgres feature is not enabled!");
+            eprintln!("Run with: cargo run --example server --features postgres");
+            std::process::exit(1);
+        }
+    } else {
+        info!("Using in-memory backend");
+        Arc::new(InMemoryRequestManager::new(http_client, config))
+    };
 
     // Start the daemon
     let daemon_handle = manager.run()?;
     info!("Daemon started");
 
     // Create application state
-    let state = AppState {
-        manager: manager.clone(),
-    };
+    let state = AppState { manager };
 
     // Build router
     let app = Router::new()
         .route("/", get(serve_frontend))
         .route("/api/requests", post(submit_request))
+        .route("/api/requests/batch", post(submit_batch))
         .route("/api/requests/:id", get(get_request_status))
         .route("/api/requests/:id", delete(cancel_request))
         .route("/api/stream", get(status_updates_stream))
@@ -216,7 +305,7 @@ const HTML: &str = r#"<!DOCTYPE html>
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Batcher - Request Manager</title>
+    <title>Batcher - Request Manager (In-Memory / PostgreSQL)</title>
     <style>
         * {
             margin: 0;
@@ -492,7 +581,7 @@ const HTML: &str = r#"<!DOCTYPE html>
                 <form id="request-form">
                     <div class="form-group">
                         <label for="endpoint">Endpoint URL</label>
-                        <input type="text" id="endpoint" value="https://google.com" placeholder="https://google.com" required>
+                        <input type="text" id="endpoint" value="https://app.doubleword.ai/ai" placeholder="https://app.doubleword.ai/ai" required>
                     </div>
 
                     <div class="form-row">
@@ -500,7 +589,7 @@ const HTML: &str = r#"<!DOCTYPE html>
                             <label for="method">Method</label>
                             <select id="method">
                                 <option>GET</option>
-                                <option>POST</option>
+                                <option selected>POST</option>
                                 <option>PUT</option>
                                 <option>DELETE</option>
                             </select>
@@ -508,25 +597,25 @@ const HTML: &str = r#"<!DOCTYPE html>
 
                         <div class="form-group">
                             <label for="path">Path</label>
-                            <input type="text" id="path" value="/" placeholder="/" required>
+                            <input type="text" id="path" value="/v1/chat/completions" placeholder="/v1/chat/completions" required>
                         </div>
                     </div>
 
                     <div class="form-row">
                         <div class="form-group">
                             <label for="model">Model</label>
-                            <input type="text" id="model" value="default" placeholder="default" required>
+                            <input type="text" id="model" value="google/gemma-3-12b-it" placeholder="google/gemma-3-12b-it" required>
                         </div>
 
                         <div class="form-group">
                             <label for="api-key">API Key</label>
-                            <input type="password" id="api-key" value="" placeholder="(optional for public APIs)">
+                            <input type="password" id="api-key" value="" placeholder="sk-...">
                         </div>
                     </div>
 
                     <div class="form-group">
                         <label for="body">Request Body (JSON)</label>
-                        <textarea id="body" placeholder='Leave empty for GET requests'></textarea>
+                        <textarea id="body" placeholder='{"model":"google/gemma-3-12b-it","messages":[{"role":"user","content":"Hello!"}]}'>{"model":"google/gemma-3-12b-it","messages":[{"role":"user","content":"Hello, how are you?"}]}</textarea>
                     </div>
 
                     <details>
@@ -769,23 +858,28 @@ const HTML: &str = r#"<!DOCTYPE html>
 
             showNotification(`Submitting ${batchCount} requests...`);
 
-            // Fire off all requests in parallel - let the batcher handle it!
-            const promises = [];
-            for (let i = 0; i < batchCount; i++) {
-                promises.push(
-                    fetch('/api/requests', {
-                        method: 'POST',
-                        headers: { 'Content-Type': 'application/json' },
-                        body: JSON.stringify(requestBody),
-                    })
-                );
+            // Create array of identical requests
+            const batch = Array(batchCount).fill(requestBody);
+
+            try {
+                const response = await fetch('/api/requests/batch', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify(batch),
+                });
+
+                if (response.ok) {
+                    const result = await response.json();
+                    const submitted = result.results.filter(r => r.status === 'success').length;
+                    const failed = result.results.filter(r => r.status === 'error').length;
+                    showNotification(`Batch complete: ${submitted} submitted, ${failed} failed`);
+                } else {
+                    const error = await response.json();
+                    showNotification(`Error: ${error.error}`, 'error');
+                }
+            } catch (error) {
+                showNotification(`Network error: ${error.message}`, 'error');
             }
-
-            const results = await Promise.allSettled(promises);
-            const submitted = results.filter(r => r.status === 'fulfilled' && r.value.ok).length;
-            const failed = results.length - submitted;
-
-            showNotification(`Batch complete: ${submitted} submitted, ${failed} failed`);
         }
 
         // Handle form submission

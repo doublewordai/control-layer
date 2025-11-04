@@ -10,12 +10,14 @@
 use anyhow::anyhow;
 use chrono::Utc;
 use sqlx::postgres::{PgListener, PgPool};
+use std::sync::Arc;
+use tokio::sync::Mutex;
 use uuid::Uuid;
 
 use crate::error::{BatcherError, Result};
 use crate::request::{
-    AnyRequest, Canceled, Claimed, Completed, DaemonId, Failed, Pending, Request, RequestData,
-    RequestId, RequestState,
+    AnyRequest, Canceled, Claimed, Completed, DaemonId, Failed, Pending, Processing, Request,
+    RequestData, RequestId, RequestState,
 };
 use crate::storage::Storage;
 
@@ -411,10 +413,29 @@ impl Storage for PostgresStorage {
                     data,
                 })),
                 "processing" => {
-                    // Cannot reconstruct Processing state from database
-                    Err(BatcherError::Other(anyhow!(
-                        "Cannot reconstruct Processing state from database"
-                    )))
+                    // TODO: fix this - creating dummy channels is ugly but works for now
+                    // Create a "read-only" Processing state for status display.
+                    // The channel fields are marked #[serde(skip)] and won't be serialized anyway.
+                    let (_tx, rx) = tokio::sync::mpsc::channel(1);
+                    // Create a dummy abort handle (from a noop task)
+                    let abort_handle = tokio::spawn(async {}).abort_handle();
+                    Ok(AnyRequest::Processing(Request {
+                        state: Processing {
+                            daemon_id: DaemonId(row.daemon_id.ok_or_else(|| {
+                                BatcherError::Other(anyhow!("Missing daemon_id for processing request"))
+                            })?),
+                            claimed_at: row.claimed_at.ok_or_else(|| {
+                                BatcherError::Other(anyhow!("Missing claimed_at for processing request"))
+                            })?,
+                            started_at: row.started_at.ok_or_else(|| {
+                                BatcherError::Other(anyhow!("Missing started_at for processing request"))
+                            })?,
+                            retry_attempt: row.retry_attempt as u32,
+                            result_rx: Arc::new(Mutex::new(rx)),
+                            abort_handle,
+                        },
+                        data,
+                    }))
                 }
                 "completed" => Ok(AnyRequest::Completed(Request {
                     state: Completed {

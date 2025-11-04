@@ -1,5 +1,6 @@
 //! Daemon for processing batched requests with per-model concurrency control.
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -41,6 +42,10 @@ pub struct DaemonConfig {
 
     /// Timeout for each individual request attempt in milliseconds
     pub timeout_ms: u64,
+
+    /// Interval for logging daemon status (requests in flight) in milliseconds
+    /// Set to None to disable periodic status logging
+    pub status_log_interval_ms: Option<u64>,
 }
 
 impl Default for DaemonConfig {
@@ -49,12 +54,13 @@ impl Default for DaemonConfig {
             claim_batch_size: 100,
             default_model_concurrency: 10,
             model_concurrency_limits: HashMap::new(),
-            claim_interval_ms: 100,
-            max_retries: 3,
-            backoff_ms: 100,
+            claim_interval_ms: 1000,
+            max_retries: 5,
+            backoff_ms: 1000,
             backoff_factor: 2,
             max_backoff_ms: 10000,
-            timeout_ms: 30000,
+            timeout_ms: 600000,
+            status_log_interval_ms: Some(2000), // Log every 5 seconds by default
         }
     }
 }
@@ -73,6 +79,7 @@ where
     http_client: Arc<H>,
     config: DaemonConfig,
     semaphores: Arc<RwLock<HashMap<String, Arc<Semaphore>>>>,
+    requests_in_flight: Arc<AtomicUsize>,
 }
 
 impl<S, H> Daemon<S, H>
@@ -88,6 +95,7 @@ where
             http_client,
             config,
             semaphores: Arc::new(RwLock::new(HashMap::new())),
+            requests_in_flight: Arc::new(AtomicUsize::new(0)),
         }
     }
 
@@ -122,6 +130,24 @@ where
     #[tracing::instrument(skip(self), fields(daemon_id = %self.daemon_id))]
     pub async fn run(self: Arc<Self>) -> Result<()> {
         tracing::info!("Daemon starting main processing loop");
+
+        // Spawn periodic status logging task if configured
+        if let Some(interval_ms) = self.config.status_log_interval_ms {
+            let requests_in_flight = self.requests_in_flight.clone();
+            let daemon_id = self.daemon_id;
+            tokio::spawn(async move {
+                let mut interval = tokio::time::interval(Duration::from_millis(interval_ms));
+                loop {
+                    interval.tick().await;
+                    let count = requests_in_flight.load(Ordering::Relaxed);
+                    tracing::debug!(
+                        daemon_id = %daemon_id,
+                        requests_in_flight = count,
+                        "Daemon status"
+                    );
+                }
+            });
+        }
 
         let mut join_set: JoinSet<Result<()>> = JoinSet::new();
 
@@ -195,10 +221,19 @@ where
                             let http_client = (*self.http_client).clone();
                             let timeout_ms = self.config.timeout_ms;
                             let retry_config = (&self.config).into();
+                            let requests_in_flight = self.requests_in_flight.clone();
+
+                            // Increment in-flight counter
+                            requests_in_flight.fetch_add(1, Ordering::Relaxed);
 
                             join_set.spawn(async move {
                                 // Permit is held for the duration of this task
                                 let _permit = permit;
+
+                                // Ensure we decrement the counter when this task completes
+                                let _guard = scopeguard::guard((), |_| {
+                                    requests_in_flight.fetch_sub(1, Ordering::Relaxed);
+                                });
 
                                 tracing::info!(request_id = %request_id, "Processing request");
 
