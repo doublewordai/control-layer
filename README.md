@@ -60,7 +60,7 @@ merged with this one, or by supplying environment variables prefixed with
 `DWCTL_`.
 
 Nested sections of the configuration can be specified by joining
-the keys with a double __, for example, to disable native
+the keys with a double underscore, for example, to disable native
 authentication, set `DWCTL_AUTH__NATIVE__ENABLED=false`.
 
 ```yaml
