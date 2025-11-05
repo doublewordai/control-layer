@@ -14,6 +14,21 @@ use chrono::{DateTime, Utc};
 use sqlx::PgPool;
 use uuid::Uuid;
 
+/// Deployment status information returned by bulk status queries.
+///
+/// Tuple contains: (probe_id, active, interval_seconds, last_check, last_success, uptime_24h)
+type DeploymentStatus = (
+    Option<Uuid>,
+    bool,
+    Option<i32>,
+    Option<chrono::DateTime<chrono::Utc>>,
+    Option<bool>,
+    Option<f64>,
+);
+
+/// Map of deployment IDs to their status information.
+type DeploymentStatusMap = std::collections::HashMap<Uuid, DeploymentStatus>;
+
 /// Database access layer for probes.
 ///
 /// This provides pure database operations for probes. Background scheduling
@@ -97,20 +112,7 @@ impl ProbeManager {
     pub async fn get_deployment_statuses(
         pool: &PgPool,
         deployment_ids: &[Uuid],
-    ) -> Result<
-        std::collections::HashMap<
-            Uuid,
-            (
-                Option<Uuid>,
-                bool,
-                Option<i32>,
-                Option<chrono::DateTime<chrono::Utc>>,
-                Option<bool>,
-                Option<f64>,
-            ),
-        >,
-        AppError,
-    > {
+    ) -> Result<DeploymentStatusMap, AppError> {
         if deployment_ids.is_empty() {
             return Ok(std::collections::HashMap::new());
         }
