@@ -5,12 +5,13 @@ use crate::db::{
         DeploymentCreateDBRequest, DeploymentDBResponse, DeploymentUpdateDBRequest, FlatPricingFields, ModelPricing, ModelStatus, ModelType,
     },
 };
-use crate::types::{DeploymentId, InferenceEndpointId, UserId};
+use crate::types::{abbrev_uuid, DeploymentId, InferenceEndpointId, UserId};
 use chrono::{DateTime, Utc};
 use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
 use sqlx::PgConnection;
 use sqlx::{query_builder::QueryBuilder, FromRow};
+use tracing::instrument;
 
 /// Filter options for listing deployments
 #[derive(Debug, Clone)]
@@ -147,6 +148,7 @@ impl<'c> Repository for Deployments<'c> {
     type Id = DeploymentId;
     type Filter = DeploymentFilter;
 
+    #[instrument(skip(self, request), fields(model_name = %request.model_name, alias = %request.alias), err)]
     async fn create(&mut self, request: &Self::CreateRequest) -> Result<Self::Response> {
         let created_at = Utc::now();
         let updated_at = created_at;
@@ -213,6 +215,7 @@ impl<'c> Repository for Deployments<'c> {
         Ok(DeploymentDBResponse::from((model_type, model)))
     }
 
+    #[instrument(skip(self), fields(deployment_id = %abbrev_uuid(&id)), err)]
     async fn get_by_id(&mut self, id: Self::Id) -> Result<Option<Self::Response>> {
         let model = sqlx::query_as!(
             DeployedModel,
@@ -233,6 +236,7 @@ impl<'c> Repository for Deployments<'c> {
         Ok(model.map(|m| DeploymentDBResponse::from((model_type, m))))
     }
 
+    #[instrument(skip(self, ids), fields(count = ids.len()), err)]
     async fn get_bulk(&mut self, ids: Vec<Self::Id>) -> Result<std::collections::HashMap<Self::Id, DeploymentDBResponse>> {
         if ids.is_empty() {
             return Ok(std::collections::HashMap::new());
@@ -260,6 +264,7 @@ impl<'c> Repository for Deployments<'c> {
         Ok(result)
     }
 
+    #[instrument(skip(self), fields(deployment_id = %abbrev_uuid(&id)), err)]
     async fn delete(&mut self, id: Self::Id) -> Result<bool> {
         let result = sqlx::query!("DELETE FROM deployed_models WHERE id = $1", id)
             .execute(&mut *self.db)
@@ -268,6 +273,7 @@ impl<'c> Repository for Deployments<'c> {
         Ok(result.rows_affected() > 0)
     }
 
+    #[instrument(skip(self, request), fields(deployment_id = %abbrev_uuid(&id)), err)]
     async fn update(&mut self, id: Self::Id, request: &Self::UpdateRequest) -> Result<Self::Response> {
         if let Some(model_name) = &request.model_name {
             if model_name.trim().is_empty() {
@@ -439,6 +445,7 @@ impl<'c> Repository for Deployments<'c> {
         Ok(DeploymentDBResponse::from((model_type, model)))
     }
 
+    #[instrument(skip(self, filter), fields(limit = filter.limit, skip = filter.skip), err)]
     async fn list(&mut self, filter: &Self::Filter) -> Result<Vec<Self::Response>> {
         let mut query = QueryBuilder::new("SELECT * FROM deployed_models WHERE 1=1");
 
@@ -513,6 +520,7 @@ impl<'c> Deployments<'c> {
 
     /// Check if a user has access to a deployment through group membership
     /// Returns deployment info and system API key if access is granted
+    #[instrument(skip(self, user_email), fields(deployment_alias = %deployment_alias), err)]
     pub async fn check_user_access(&mut self, deployment_alias: &str, user_email: &str) -> Result<Option<DeploymentAccessInfo>> {
         let result = sqlx::query_as!(
             DeploymentAccessInfo,

@@ -31,6 +31,7 @@ use crate::{
         (status = 200, description = "Registration info", body = RegistrationInfo),
     )
 )]
+#[tracing::instrument(skip_all)]
 pub async fn get_registration_info(State(state): State<AppState>) -> Result<Json<RegistrationInfo>, Error> {
     Ok(Json(RegistrationInfo {
         enabled: state.config.auth.native.enabled && state.config.auth.native.allow_registration,
@@ -54,6 +55,7 @@ pub async fn get_registration_info(State(state): State<AppState>) -> Result<Json
         (status = 409, description = "User already exists"),
     )
 )]
+#[tracing::instrument(skip_all)]
 pub async fn register(State(state): State<AppState>, Json(request): Json<RegisterRequest>) -> Result<RegisterResponse, Error> {
     // Check if native auth is enabled
     if !state.config.auth.native.enabled {
@@ -138,6 +140,7 @@ pub async fn register(State(state): State<AppState>, Json(request): Json<Registe
         (status = 200, description = "Login info", body = LoginInfo),
     )
 )]
+#[tracing::instrument(skip_all)]
 pub async fn get_login_info(State(state): State<AppState>) -> Result<Json<LoginInfo>, Error> {
     Ok(Json(LoginInfo {
         enabled: state.config.auth.native.enabled,
@@ -160,6 +163,7 @@ pub async fn get_login_info(State(state): State<AppState>) -> Result<Json<LoginI
         (status = 401, description = "Invalid credentials"),
     )
 )]
+#[tracing::instrument(skip_all)]
 pub async fn login(State(state): State<AppState>, Json(request): Json<LoginRequest>) -> Result<LoginResponse, Error> {
     // Check if native auth is enabled
     if !state.config.auth.native.enabled {
@@ -225,6 +229,7 @@ pub async fn login(State(state): State<AppState>, Json(request): Json<LoginReque
         (status = 200, description = "Logout successful", body = AuthSuccessResponse),
     )
 )]
+#[tracing::instrument(skip_all)]
 pub async fn logout(State(state): State<AppState>) -> Result<LogoutResponse, Error> {
     // Create expired cookie to clear session
     let cookie = format!(
@@ -250,6 +255,7 @@ pub async fn logout(State(state): State<AppState>) -> Result<LogoutResponse, Err
         (status = 400, description = "Invalid request"),
     )
 )]
+#[tracing::instrument(skip_all)]
 pub async fn request_password_reset(
     State(state): State<AppState>,
     Json(request): Json<PasswordResetRequest>,
@@ -301,6 +307,7 @@ pub async fn request_password_reset(
         (status = 400, description = "Invalid or expired token"),
     )
 )]
+#[tracing::instrument(skip_all)]
 pub async fn confirm_password_reset(
     State(state): State<AppState>,
     Path(token_id): Path<Uuid>,
@@ -396,6 +403,7 @@ pub async fn confirm_password_reset(
         ("session_token" = [])
     )
 )]
+#[tracing::instrument(skip_all)]
 pub async fn change_password(
     State(state): State<AppState>,
     current_user: CurrentUser,

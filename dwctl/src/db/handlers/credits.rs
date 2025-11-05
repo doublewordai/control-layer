@@ -3,14 +3,14 @@ use crate::{
         errors::Result,
         models::credits::{CreditTransactionCreateDBRequest, CreditTransactionDBResponse, CreditTransactionType},
     },
-    types::UserId,
+    types::{abbrev_uuid, UserId},
 };
 use chrono::{DateTime, Utc};
 use rust_decimal::{prelude::ToPrimitive, Decimal};
 use serde::{Deserialize, Serialize};
 use sqlx::{Connection, FromRow, PgConnection};
 use std::collections::HashMap;
-use tracing::{error, trace};
+use tracing::{error, instrument, trace};
 use uuid::Uuid;
 
 // Database entity model for credit transaction
@@ -55,6 +55,7 @@ impl<'c> Credits<'c> {
 
     /// Create a new credit transaction
     /// This method validates the balance_after is correct based on the current balance
+    #[instrument(skip(self, request), fields(user_id = %abbrev_uuid(&request.user_id), transaction_type = ?request.transaction_type, amount = %request.amount), err)]
     pub async fn create_transaction(&mut self, request: &CreditTransactionCreateDBRequest) -> Result<CreditTransactionDBResponse> {
         // Start the transaction
         let mut tx = self.db.begin().await?;
@@ -133,6 +134,7 @@ impl<'c> Credits<'c> {
 
     /// Get current balance for a user (latest balance_after from credits_transactions)
     /// This is a read-only operation without locking
+    #[instrument(skip(self), fields(user_id = %abbrev_uuid(&user_id)), err)]
     pub async fn get_user_balance(&mut self, user_id: UserId) -> Result<Decimal> {
         let result = sqlx::query!(
             r#"
@@ -150,6 +152,7 @@ impl<'c> Credits<'c> {
         Ok(result.map(|r| r.balance_after).unwrap_or(Decimal::ZERO))
     }
 
+    #[instrument(skip(self, user_ids), fields(count = user_ids.len()), err)]
     pub async fn get_users_balances_bulk(&mut self, user_ids: &[UserId]) -> Result<HashMap<UserId, f64>> {
         let rows = sqlx::query!(
             r#"
@@ -178,6 +181,7 @@ impl<'c> Credits<'c> {
     }
 
     /// List transactions for a specific user with pagination
+    #[instrument(skip(self), fields(user_id = %abbrev_uuid(&user_id), skip = skip, limit = limit), err)]
     pub async fn list_user_transactions(&mut self, user_id: UserId, skip: i64, limit: i64) -> Result<Vec<CreditTransactionDBResponse>> {
         let transactions = sqlx::query_as!(
             CreditTransaction,
@@ -200,6 +204,7 @@ impl<'c> Credits<'c> {
     }
 
     /// List all transactions across all users (admin view)
+    #[instrument(skip(self), fields(skip = skip, limit = limit), err)]
     pub async fn list_all_transactions(&mut self, skip: i64, limit: i64) -> Result<Vec<CreditTransactionDBResponse>> {
         let transactions = sqlx::query_as!(
             CreditTransaction,
@@ -220,6 +225,7 @@ impl<'c> Credits<'c> {
     }
 
     /// Get a single transaction by its ID
+    #[instrument(skip(self), err)]
     pub async fn get_transaction_by_id(&mut self, transaction_id: Uuid) -> Result<Option<CreditTransactionDBResponse>> {
         let transaction = sqlx::query_as!(
             CreditTransaction,

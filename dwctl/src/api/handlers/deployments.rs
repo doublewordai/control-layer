@@ -61,6 +61,7 @@ fn apply_pricing_to_response(
         ("X-Doubleword-User" = [])
     )
 )]
+#[tracing::instrument(skip_all)]
 pub async fn list_deployed_models(
     State(state): State<AppState>,
     Query(query): Query<ListModelsQuery>,
@@ -315,6 +316,7 @@ pub async fn list_deployed_models(
         ("X-Doubleword-User" = [])
     )
 )]
+#[tracing::instrument(skip_all)]
 pub async fn create_deployed_model(
     State(state): State<AppState>,
     current_user: RequiresPermission<resource::Models, operation::CreateAll>,
@@ -369,6 +371,7 @@ pub async fn create_deployed_model(
         ("X-Doubleword-User" = [])
     )
 )]
+#[tracing::instrument(skip_all)]
 pub async fn update_deployed_model(
     State(state): State<AppState>,
     Path(deployment_id): Path<DeploymentId>,
@@ -425,6 +428,7 @@ pub async fn update_deployed_model(
         ("X-Doubleword-User" = [])
     )
 )]
+#[tracing::instrument(skip_all)]
 pub async fn get_deployed_model(
     State(state): State<AppState>,
     Path(deployment_id): Path<DeploymentId>,
@@ -504,6 +508,7 @@ pub async fn get_deployed_model(
         ("X-Doubleword-User" = [])
     )
 )]
+#[tracing::instrument(skip_all)]
 pub async fn delete_deployed_model(
     State(state): State<AppState>,
     Path(deployment_id): Path<DeploymentId>,

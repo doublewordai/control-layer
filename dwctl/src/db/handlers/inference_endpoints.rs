@@ -3,10 +3,11 @@ use crate::db::handlers::repository::Repository;
 use crate::db::models::inference_endpoints::{
     InferenceEndpointCreateDBRequest, InferenceEndpointDBResponse, InferenceEndpointUpdateDBRequest,
 };
-use crate::types::{InferenceEndpointId, UserId};
+use crate::types::{abbrev_uuid, InferenceEndpointId, UserId};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use sqlx::{FromRow, PgConnection};
+use tracing::instrument;
 
 /// Filter for listing inference endpoints
 #[derive(Debug, Clone)]
@@ -69,6 +70,7 @@ impl<'c> Repository for InferenceEndpoints<'c> {
     type Id = InferenceEndpointId;
     type Filter = InferenceEndpointFilter;
 
+    #[instrument(skip(self, request), fields(name = %request.name, url = %request.url), err)]
     async fn create(&mut self, request: &Self::CreateRequest) -> Result<Self::Response> {
         let created_at = Utc::now();
         let updated_at = created_at;
@@ -97,6 +99,7 @@ impl<'c> Repository for InferenceEndpoints<'c> {
         Ok(endpoint.try_into()?)
     }
 
+    #[instrument(skip(self), fields(endpoint_id = %abbrev_uuid(&id)), err)]
     async fn get_by_id(&mut self, id: Self::Id) -> Result<Option<Self::Response>> {
         let endpoint = sqlx::query_as!(InferenceEndpoint, "SELECT * FROM inference_endpoints WHERE id = $1", id)
             .fetch_optional(&mut *self.db)
@@ -108,6 +111,7 @@ impl<'c> Repository for InferenceEndpoints<'c> {
         }
     }
 
+    #[instrument(skip(self, ids), fields(count = ids.len()), err)]
     async fn get_bulk(&mut self, ids: Vec<Self::Id>) -> Result<std::collections::HashMap<Self::Id, Self::Response>> {
         if ids.is_empty() {
             return Ok(std::collections::HashMap::new());
@@ -142,6 +146,7 @@ impl<'c> Repository for InferenceEndpoints<'c> {
         Ok(result)
     }
 
+    #[instrument(skip(self), fields(endpoint_id = %abbrev_uuid(&id)), err)]
     async fn delete(&mut self, id: Self::Id) -> Result<bool> {
         let result = sqlx::query!("DELETE FROM inference_endpoints WHERE id = $1", id)
             .execute(&mut *self.db)
@@ -150,6 +155,7 @@ impl<'c> Repository for InferenceEndpoints<'c> {
         Ok(result.rows_affected() > 0)
     }
 
+    #[instrument(skip(self, request), fields(endpoint_id = %abbrev_uuid(&id)), err)]
     async fn update(&mut self, id: Self::Id, request: &Self::UpdateRequest) -> Result<Self::Response> {
         // Atomic update with conditional field updates
         let endpoint = sqlx::query_as!(
@@ -192,6 +198,7 @@ impl<'c> Repository for InferenceEndpoints<'c> {
         Ok(endpoint.try_into()?)
     }
 
+    #[instrument(skip(self, filter), fields(limit = filter.limit, skip = filter.skip), err)]
     async fn list(&mut self, filter: &Self::Filter) -> Result<Vec<Self::Response>> {
         let endpoints = sqlx::query_as!(
             InferenceEndpoint,

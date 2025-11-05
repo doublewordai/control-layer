@@ -1,4 +1,4 @@
-use crate::types::UserId;
+use crate::types::{abbrev_uuid, UserId};
 use crate::{
     api::models::users::Role,
     db::{
@@ -10,6 +10,7 @@ use crate::{
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use sqlx::{Connection, FromRow, PgConnection};
+use tracing::instrument;
 use uuid::Uuid;
 
 /// Filter for listing users
@@ -71,6 +72,7 @@ impl<'c> Repository for Users<'c> {
     type Id = UserId;
     type Filter = UserFilter;
 
+    #[instrument(skip(self, request), fields(username = %request.username), err)]
     async fn create(&mut self, request: &Self::CreateRequest) -> Result<Self::Response> {
         // Always generate a new ID for users
         let user_id = Uuid::new_v4();
@@ -108,6 +110,7 @@ impl<'c> Repository for Users<'c> {
         Ok(UserDBResponse::from((request.roles.clone(), user)))
     }
 
+    #[instrument(skip(self), fields(user_id = %abbrev_uuid(&id)), err)]
     async fn get_by_id(&mut self, id: Self::Id) -> Result<Option<Self::Response>> {
         let mut tx = self.db.begin().await?;
         let user = sqlx::query_as!(
@@ -135,6 +138,7 @@ impl<'c> Repository for Users<'c> {
         }
     }
 
+    #[instrument(skip(self, ids), fields(count = ids.len()), err)]
     async fn get_bulk(&mut self, ids: Vec<UserId>) -> Result<std::collections::HashMap<Self::Id, UserDBResponse>> {
         if ids.is_empty() {
             return Ok(std::collections::HashMap::new());
@@ -166,6 +170,7 @@ impl<'c> Repository for Users<'c> {
 
         Ok(result)
     }
+    #[instrument(skip(self, filter), fields(limit = filter.limit, skip = filter.skip), err)]
     async fn list(&mut self, filter: &Self::Filter) -> Result<Vec<Self::Response>> {
         let users = sqlx::query_as!(
             User,
@@ -193,12 +198,14 @@ impl<'c> Repository for Users<'c> {
         Ok(result)
     }
 
+    #[instrument(skip(self), fields(user_id = %abbrev_uuid(&id)), err)]
     async fn delete(&mut self, id: Self::Id) -> Result<bool> {
         let result = sqlx::query!("DELETE FROM users WHERE id = $1", id).execute(&mut *self.db).await?;
 
         Ok(result.rows_affected() > 0)
     }
 
+    #[instrument(skip(self, request), fields(user_id = %abbrev_uuid(&id)), err)]
     async fn update(&mut self, id: Self::Id, request: &Self::UpdateRequest) -> Result<Self::Response> {
         // This update touches multiple tables, so regardless of the connection passed in, we still need a transaction.
 
@@ -267,6 +274,7 @@ impl<'c> Users<'c> {
         Self { db }
     }
 
+    #[instrument(skip(self, email), err)]
     pub async fn get_user_by_email(&mut self, email: &str) -> Result<Option<UserDBResponse>> {
         let user = sqlx::query_as!(
             User,

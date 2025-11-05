@@ -45,6 +45,7 @@ use sqlx::Acquire;
         ("X-Doubleword-User" = [])
     )
 )]
+#[tracing::instrument(skip_all)]
 pub async fn create_user_api_key(
     State(state): State<AppState>,
     Path(user_id): Path<UserIdOrCurrent>,
@@ -119,6 +120,7 @@ pub async fn create_user_api_key(
         ("X-Doubleword-User" = [])
     )
 )]
+#[tracing::instrument(skip_all)]
 pub async fn list_user_api_keys(
     State(state): State<AppState>,
     Path(user_id): Path<UserIdOrCurrent>,
@@ -196,6 +198,7 @@ pub async fn list_user_api_keys(
         ("X-Doubleword-User" = [])
     )
 )]
+#[tracing::instrument(skip_all)]
 pub async fn get_user_api_key(
     State(state): State<AppState>,
     Path((user_id, api_key_id)): Path<(UserIdOrCurrent, ApiKeyId)>,
@@ -271,6 +274,7 @@ pub async fn get_user_api_key(
         ("X-Doubleword-User" = [])
     )
 )]
+#[tracing::instrument(skip_all)]
 pub async fn delete_user_api_key(
     State(state): State<AppState>,
     Path((user_id, api_key_id)): Path<(UserIdOrCurrent, ApiKeyId)>,
