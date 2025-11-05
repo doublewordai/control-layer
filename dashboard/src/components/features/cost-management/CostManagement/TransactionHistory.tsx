@@ -1,4 +1,4 @@
-import { DollarSign, TrendingDown, TrendingUp, Filter, X, Plus } from "lucide-react";
+import { TrendingDown, TrendingUp, Filter, X, Plus, DollarSign } from "lucide-react";
 import { Card } from "../../../ui/card.tsx";
 import { Button } from "@/components";
 import { useState, useMemo } from "react";
@@ -11,28 +11,54 @@ import {
 } from "../../../ui/select.tsx";
 import { DateTimeRangeSelector } from "../../../ui/date-time-range-selector.tsx";
 import type { Transaction } from "@/api/control-layer";
+import {
+  useUserBalance,
+  useTransactions,
+} from "@/api/control-layer";
+import { useSettings } from "@/contexts";
 
 export interface TransactionHistoryProps {
-  transactions: Transaction[];
-  balance: number;
-  isLoading?: boolean;
+  userId: string;
   showCard?: boolean;
   onAddFunds?: () => void;
   isAddingFunds?: boolean;
 }
 
 export function TransactionHistory({
-  transactions,
-  balance,
-  isLoading = false,
+  userId,
   showCard = true,
   onAddFunds,
   isAddingFunds = false,
 }: TransactionHistoryProps) {
+  const { isFeatureEnabled } = useSettings();
+  const isDemoMode = isFeatureEnabled("demo");
+
+  // Fetch balance and transactions
+  const { data: balance = 0, isLoading: isLoadingBalance } = useUserBalance(userId);
+
+  // Only pass userId if it's not "current" (which defaults to current user)
+  const transactionsQuery = userId === "current" ? undefined : { userId };
+  const {
+    data: transactionsData,
+    isLoading: isLoadingTransactions,
+  } = useTransactions(transactionsQuery);
+
+  // Get transactions - use fetched data in both demo and API mode
+  // In demo mode, MSW returns data from transactions.json
+  const transactions = useMemo<Transaction[]>(() => {
+    return transactionsData || [];
+  }, [transactionsData]);
+
+  // Calculate current balance (in demo mode, use latest transaction balance)
+  const currentBalance = isDemoMode && transactions.length > 0
+    ? transactions[0]?.balance_after || balance
+    : balance;
+
+  const isLoading = !isDemoMode && (isLoadingBalance || isLoadingTransactions);
+
   // Filter states
   const [transactionType, setTransactionType] = useState<string>("all");
   const [dateRange, setDateRange] = useState<{ from: Date; to: Date } | undefined>();
-
   // Apply filters
   const filteredTransactions = useMemo(() => {
     let filtered = [...transactions];
@@ -96,17 +122,15 @@ export function TransactionHistory({
   const content = (
     <>
       {/* Current Balance Card */}
-      <Card className="mb-8 p-6 bg-gradient-to-br from-blue-50 to-indigo-50 border-blue-200">
+      <Card className="p-6 bg-gradient-to-br from-blue-50 to-indigo-50 border-blue-200 mb-6">
+        <h2 className="text-xl font-semibold text-doubleword-neutral-900 mb-4">
+          Current Balance
+        </h2>
         <div className="flex items-center justify-between">
-          <div>
-            <p className="text-sm text-doubleword-neutral-600 mb-1">
-              Current Balance
-            </p>
-            <div className="flex items-baseline gap-2">
-              <h2 className="text-4xl font-bold text-doubleword-neutral-900">
-                {formatDollars(balance)}
-              </h2>
-            </div>
+          <div className="flex items-baseline gap-2">
+            <span className="text-4xl font-bold text-doubleword-neutral-900">
+              {formatDollars(currentBalance)}
+            </span>
           </div>
           {onAddFunds && (
             <Button
@@ -122,76 +146,74 @@ export function TransactionHistory({
         </div>
       </Card>
 
-      <div className="flex items-center justify-between mb-6">
-        <div className="flex items-center gap-2">
-          <DollarSign className="w-5 h-5 text-doubleword-neutral-600" />
-          <h2 className="text-xl font-semibold text-doubleword-neutral-900">
-            Transaction History
-          </h2>
-        </div>
-      </div>
+      {/* Transaction History Card */}
+      <Card className="p-6">
+        <h2 className="text-xl font-semibold text-doubleword-neutral-900 mb-4">
+          Transaction History
+        </h2>
 
-      {/* Filters */}
-      <div className="mb-6 space-y-4">
-        <div className="flex items-center gap-2">
-          <Filter className="w-4 h-4 text-doubleword-neutral-600" />
-          <h3 className="text-sm font-medium text-doubleword-neutral-700">
-            Filters
-          </h3>
+        {/* Filters */}
+        <div className="mb-4 space-y-4">
+          <div className="flex flex-wrap items-center gap-4">
+            <div className="flex items-center gap-2">
+              <Filter className="w-4 h-4 text-doubleword-neutral-600" />
+              <span className="text-sm font-medium text-doubleword-neutral-700">
+                Filters:
+              </span>
+            </div>
+
+            {/* Transaction Type Filter */}
+            <div className="flex items-center gap-2">
+              <label className="text-sm text-doubleword-neutral-600 whitespace-nowrap">
+                Type:
+              </label>
+              <Select value={transactionType} onValueChange={handleTransactionTypeChange}>
+                <SelectTrigger className="w-[150px]">
+                  <SelectValue placeholder="All types" />
+                </SelectTrigger>
+                <SelectContent>
+                  <SelectItem value="all">All types</SelectItem>
+                  <SelectItem value="credit">Deposits only</SelectItem>
+                  <SelectItem value="debit">Withdrawals only</SelectItem>
+                </SelectContent>
+              </Select>
+            </div>
+
+            {/* Date Range Filter */}
+            <div className="flex items-center gap-2">
+              <label className="text-sm text-doubleword-neutral-600 whitespace-nowrap">
+                Date Range:
+              </label>
+              <DateTimeRangeSelector
+                value={dateRange}
+                onChange={setDateRange}
+              />
+            </div>
+
+            {hasActiveFilters && (
+              <Button
+                variant="ghost"
+                size="sm"
+                onClick={clearFilters}
+                className="h-8 px-3 text-xs"
+              >
+                <X className="w-3 h-3 mr-1" />
+                Clear filters
+              </Button>
+            )}
+          </div>
+
+          {/* Filter Status */}
           {hasActiveFilters && (
-            <Button
-              variant="ghost"
-              size="sm"
-              onClick={clearFilters}
-              className="h-7 px-2 text-xs"
-            >
-              <X className="w-3 h-3 mr-1" />
-              Clear filters
-            </Button>
+            <div className="text-sm text-doubleword-neutral-600">
+              Showing {filteredTransactions.length} of {transactions.length}{" "}
+              transactions
+            </div>
           )}
         </div>
 
-        <div className="flex flex-wrap gap-4">
-          {/* Transaction Type Filter */}
-          <div className="flex items-center gap-2">
-            <label className="text-sm text-doubleword-neutral-600 whitespace-nowrap">
-              Type:
-            </label>
-            <Select value={transactionType} onValueChange={handleTransactionTypeChange}>
-              <SelectTrigger className="w-[150px]">
-                <SelectValue placeholder="All types" />
-              </SelectTrigger>
-              <SelectContent>
-                <SelectItem value="all">All types</SelectItem>
-                <SelectItem value="credit">Deposits only</SelectItem>
-                <SelectItem value="debit">Withdrawals only</SelectItem>
-              </SelectContent>
-            </Select>
-          </div>
-
-          {/* Date Range Filter */}
-          <div className="flex items-center gap-2">
-            <label className="text-sm text-doubleword-neutral-600 whitespace-nowrap">
-              Date Range:
-            </label>
-            <DateTimeRangeSelector
-              value={dateRange}
-              onChange={setDateRange}
-            />
-          </div>
-        </div>
-
-        {/* Filter Status */}
-        {hasActiveFilters && (
-          <div className="text-sm text-doubleword-neutral-600">
-            Showing {filteredTransactions.length} of {transactions.length}{" "}
-            transactions
-          </div>
-        )}
-      </div>
-
-      <div className="space-y-2">
-        {filteredTransactions.map((transaction) => {
+        <div className="space-y-2">
+          {filteredTransactions.map((transaction) => {
           // Determine if transaction is a credit (adds money) or debit (removes money)
           const isCredit =
             transaction.transaction_type === "admin_grant" ||
@@ -239,28 +261,29 @@ export function TransactionHistory({
             </div>
           );
         })}
-      </div>
-
-      {filteredTransactions.length === 0 && (
-        <div className="text-center py-12">
-          <DollarSign className="w-12 h-12 text-doubleword-neutral-300 mx-auto mb-3" />
-          <p className="text-doubleword-neutral-600">
-            {hasActiveFilters
-              ? "No transactions match your filters"
-              : "No transactions yet"}
-          </p>
-          {hasActiveFilters && (
-            <Button
-              variant="outline"
-              size="sm"
-              onClick={clearFilters}
-              className="mt-4"
-            >
-              Clear filters
-            </Button>
-          )}
         </div>
-      )}
+
+        {filteredTransactions.length === 0 && (
+          <div className="text-center py-12">
+            <DollarSign className="w-12 h-12 text-doubleword-neutral-300 mx-auto mb-3" />
+            <p className="text-doubleword-neutral-600">
+              {hasActiveFilters
+                ? "No transactions match your filters"
+                : "No transactions yet"}
+            </p>
+            {hasActiveFilters && (
+              <Button
+                variant="outline"
+                size="sm"
+                onClick={clearFilters}
+                className="mt-4"
+              >
+                Clear filters
+              </Button>
+            )}
+          </div>
+        )}
+      </Card>
     </>
   );
 

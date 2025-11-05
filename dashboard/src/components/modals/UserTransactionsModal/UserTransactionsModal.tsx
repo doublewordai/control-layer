@@ -7,11 +7,8 @@ import {
   DialogTitle,
 } from "../../ui/dialog";
 import { Button } from "../../ui/button";
-import { useTransactions } from "../../../api/control-layer/hooks";
-import { useSettings } from "../../../contexts";
 import type { DisplayUser } from "../../../types/display";
 import {TransactionHistory} from "@/components";
-import {generateDummyTransactions} from "@/components/features/cost-management/demoTransactions.ts";
 import { AddFundsModal } from "../AddCreditsModal";
 
 interface UserTransactionsModalProps {
@@ -25,27 +22,10 @@ export function UserTransactionsModal({
   onClose,
   user,
 }: UserTransactionsModalProps) {
-  const { isFeatureEnabled } = useSettings();
-  const isDemoMode = isFeatureEnabled("demo");
   const [isAddFundsModalOpen, setIsAddFundsModalOpen] = useState(false);
 
-  const {
-    data: transactionsData,
-    isLoading: isLoadingTransactions,
-    refetch: refetchTransactions,
-  } = useTransactions({ userId: user.id });
-
-
-  const transactions = transactionsData || (isDemoMode ? (generateDummyTransactions().filter((t) => t.user_id === user.id)) : []);
-  const isLoading = !isDemoMode && isLoadingTransactions;
-
-  // Get balance from user (API mode) or from latest transaction (demo mode)
-  const balance = isDemoMode
-    ? transactions[0]?.balance_after || user.credit_balance || 0
-    : user.credit_balance || 0;
-
   const handleAddFundsSuccess = () => {
-    refetchTransactions();
+    // TransactionHistory will automatically refetch its data
   };
 
   return (
@@ -61,16 +41,14 @@ export function UserTransactionsModal({
                 </p>
               </div>
               <div className="flex items-center gap-2">
-                {!isDemoMode && (
-                  <Button
-                    className="bg-blue-600 hover:bg-blue-700"
-                    size="sm"
-                    onClick={() => setIsAddFundsModalOpen(true)}
-                  >
-                    <Plus className="w-4 h-4 mr-1" />
-                    Add Funds
-                  </Button>
-                )}
+                <Button
+                  className="bg-blue-600 hover:bg-blue-700"
+                  size="sm"
+                  onClick={() => setIsAddFundsModalOpen(true)}
+                >
+                  <Plus className="w-4 h-4 mr-1" />
+                  Add Funds
+                </Button>
                 <button
                   onClick={onClose}
                   className="text-doubleword-neutral-400 hover:text-doubleword-neutral-600 transition-colors"
@@ -84,9 +62,7 @@ export function UserTransactionsModal({
 
           <div className="mt-4">
             <TransactionHistory
-              transactions={transactions}
-              balance={balance}
-              isLoading={isLoading}
+              userId={user.id}
               showCard={false}
             />
           </div>

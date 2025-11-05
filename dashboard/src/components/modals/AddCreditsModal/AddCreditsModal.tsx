@@ -45,7 +45,9 @@ export function AddFundsModal({
         description: description || `Funds gift from ${currentUser?.display_name || currentUser?.username || "admin"}`,
       });
 
-      toast.success(`Successfully added $${result.amount.toFixed(2)} to ${targetUser.name}`);
+      const sentAmount = Number(result.amount).toFixed(2);
+
+      toast.success(`Successfully added $${sentAmount} to ${targetUser.name}`);
       onSuccess?.();
       onClose();
 

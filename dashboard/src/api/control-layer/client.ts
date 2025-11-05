@@ -38,7 +38,7 @@ import type {
   Probe,
   CreateProbeRequest,
   ProbeResult,
-  ProbeStatistics, Transaction, AddFundsRequest, AddFundsResponse, BalanceResponse,
+  ProbeStatistics, Transaction, AddFundsRequest, AddFundsResponse,
 } from "./types";
 import { ApiError } from "./errors";
 
@@ -706,13 +706,6 @@ const authApi = {
 
 // Cost management API
 const costApi = {
-  async getBalance(): Promise<BalanceResponse> {
-    const response = await fetch("/admin/api/v1/credits/balance");
-    if (!response.ok) {
-      throw new Error(`Failed to fetch balance: ${response.status}`);
-    }
-    return response.json();
-  },
 
   async listTransactions(
     query?: TransactionsQuery,

@@ -39,10 +39,44 @@ export function useUsers(options?: UsersQuery & { enabled?: boolean }) {
 }
 
 export function useUser(id: string) {
+  const queryClient = useQueryClient();
+
   return useQuery({
     queryKey: queryKeys.users.byId(id),
-    queryFn: () => dwctlApi.users.get(id),
+    queryFn: async () => {
+      const user = await dwctlApi.users.get(id);
+
+      // Normalize cache: ensure "current" and the actual user ID are cached together
+      // This ensures useUser("current") and useUser(actualId) return the same cached data
+      if (id === "current" && user.id !== "current") {
+        // Fetched with "current", also cache under actual ID
+        queryClient.setQueryData(queryKeys.users.byId(user.id), user);
+      } else if (id !== "current") {
+        // Fetched with actual ID, also cache under "current" for demo mode
+        // In demo mode, we need to check if this is the current user
+        // For simplicity, we'll also set it under "current" - React Query will handle staleness
+        const currentUser = queryClient.getQueryData(queryKeys.users.byId("current")) as any;
+        if (!currentUser || currentUser.id === user.id) {
+          queryClient.setQueryData(queryKeys.users.byId("current"), user);
+        }
+      }
+
+      return user;
+    },
   });
+}
+
+export function useUserBalance(id: string) {
+  // Reuse the useUser cache to avoid duplicate queries and ensure consistency
+  const userQuery = useUser(id);
+
+  return {
+    data: userQuery.data?.credit_balance || 0,
+    isLoading: userQuery.isLoading,
+    isError: userQuery.isError,
+    error: userQuery.error,
+    refetch: userQuery.refetch,
+  };
 }
 
 export function useCreateUser() {
@@ -607,13 +641,6 @@ export function useUpdateProbe() {
 }
 
 // Cost management hooks
-export function useCreditBalance() {
-  return useQuery({
-    queryKey: ["cost", "balance"],
-    queryFn: () => dwctlApi.cost.getBalance(),
-    staleTime: 30 * 1000, // 30 seconds - balance changes frequently
-  });
-}
 
 export function useTransactions(query?: TransactionsQuery) {
   return useQuery({

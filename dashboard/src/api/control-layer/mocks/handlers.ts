@@ -301,7 +301,10 @@ export const handlers = [
     return HttpResponse.json(users);
   }),
 
-  http.get("/admin/api/v1/users/:id", ({ params }) => {
+  http.get("/admin/api/v1/users/:id", ({ params, request }) => {
+    const url = new URL(request.url);
+    const include = url.searchParams.get("include");
+
     let user;
     if (params.id === "current") {
       // Return the first user as the current user for demo purposes
@@ -313,7 +316,22 @@ export const handlers = [
     if (!user) {
       return HttpResponse.json({ error: "User not found" }, { status: 404 });
     }
-    return HttpResponse.json(user);
+
+    // Add billing information if requested
+    let result = { ...user };
+    if (include?.includes("billing")) {
+      // Get user's last transaction to determine current balance
+      const userTransactions = transactionsData
+        .filter((t) => t.user_id === user.id)
+        .sort(
+          (a, b) =>
+            new Date(b.created_at).getTime() - new Date(a.created_at).getTime(),
+        );
+      const creditBalance = userTransactions[0]?.balance_after || 0;
+      result = { ...result, credit_balance: creditBalance };
+    }
+
+    return HttpResponse.json(result);
   }),
 
   http.post("/admin/api/v1/users", async ({ request }) => {
@@ -1102,14 +1120,17 @@ export const handlers = [
   // Transactions API
   http.get("/admin/api/v1/transactions", ({ request }) => {
     const url = new URL(request.url);
-    const userId = url.searchParams.get("user_id");
+    const userIdParam = url.searchParams.get("user_id");
     const limitParam = url.searchParams.get("limit");
     const skipParam = url.searchParams.get("skip");
 
     const limit = limitParam ? parseInt(limitParam, 10) : undefined;
     const skip = skipParam ? parseInt(skipParam, 10) : 0;
 
-    // Filter by userId if provided
+    // If no userId provided, default to current user (first user in demo)
+    const userId = userIdParam || usersData[0]?.id;
+
+    // Filter by userId
     const filteredTransactions = userId
       ? transactionsData.filter((t) => t.user_id === userId)
       : [...transactionsData];
@@ -1158,6 +1179,9 @@ export const handlers = [
       description: body.description || "Funds added by admin",
       created_at: new Date().toISOString(),
     };
+
+    // Persist the transaction to the mock data array
+    transactionsData.unshift(newTransaction);
 
     return HttpResponse.json(newTransaction, { status: 201 });
   }),
