@@ -722,15 +722,16 @@ pub async fn build_router(state: &mut AppState, onwards_router: Router) -> anyho
 #[tokio::main]
 #[instrument(skip_all)]
 async fn main() -> anyhow::Result<()> {
-    // Initialize telemetry (tracing + optional OpenTelemetry)
-    telemetry::init_telemetry()?;
-
     // Parse CLI args
     let args = Args::parse();
-    debug!("{:?}", args);
 
     // Load configuration
     let config = Config::load(&args)?;
+
+    // Initialize telemetry (tracing + optional OpenTelemetry)
+    telemetry::init_telemetry(config.enable_otel_export)?;
+
+    debug!("{:?}", args);
     debug!("Starting control layer with configuration: {:#?}", config);
 
     // Database connection - handle both embedded and external
