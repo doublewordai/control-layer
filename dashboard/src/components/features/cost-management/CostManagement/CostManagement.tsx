@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useState, useEffect } from "react";
 import {
   useUser,
   useAddCredits,
@@ -14,18 +14,19 @@ import {
 } from "@/components/features/cost-management/CostManagement/TransactionHistory.tsx";
 
 export function CostManagement() {
-  const { isFeatureEnabled } = useSettings();
+  const { isFeatureEnabled, settings } = useSettings();
   const isDemoMode = isFeatureEnabled("demo");
 
   // Get user's transactions
   const [localTransactions, setLocalTransactions] = useState<Transaction[]>([]);
 
   // Fetch current user (includes balance)
-  const { data: user, isLoading: isLoadingUser } = useUser("current");
+  const { data: user, isLoading: isLoadingUser, refetch: refetchUser } = useUser("current");
   const addCreditsMutation = useAddCredits();
   const {
     data: transactionsData,
     isLoading: isLoadingTransactions,
+    refetch: refetchTransactions,
   } = useTransactions();
 
   // Get transactions based on mode
@@ -52,8 +53,26 @@ export function CostManagement() {
     ? displayTransactions[0]?.balance_after || user?.credit_balance || 0
     : user?.credit_balance || 0;
   const isLoading = !isDemoMode && (isLoadingUser || isLoadingTransactions);
-  console.log("userbalance", user)
 
+  // Handle return from payment provider
+  useEffect(() => {
+    if (isDemoMode) return;
+
+    const urlParams = new URLSearchParams(window.location.search);
+    const paymentComplete = urlParams.get('payment_complete');
+
+    if (paymentComplete === 'true') {
+      // Show success message
+      toast.success('Payment completed! Your balance has been updated.');
+
+      // Refetch user data and transactions to get latest balance
+      refetchUser();
+      refetchTransactions();
+
+      // Clean up URL
+      window.history.replaceState({}, '', window.location.pathname);
+    }
+  }, [isDemoMode, refetchUser, refetchTransactions]);
 
   const handleAddCredits = async () => {
     if (isDemoMode) {
@@ -74,25 +93,20 @@ export function CostManagement() {
       setLocalTransactions([newTransaction, ...localTransactions]);
       toast.success(`Added ${creditAmount} credits`);
     } else {
-      // API mode: Call the add credits endpoint
-      try {
-        if (!user?.id) {
-          toast.error("User not found. Please refresh and try again.");
-          return;
-        }
+      // API mode: Redirect to payment provider
+      const paymentProviderUrl = settings.paymentProviderUrl;
 
-        const result = await addCreditsMutation.mutateAsync({
-          user_id: user.id,
-          amount: 1000,
-          description: "Credit purchase - Top up",
-        });
-        toast.success(`Added ${result.amount} credits`);
-      } catch (error) {
-        toast.error("Failed to add credits. Please try again.");
-        console.error("Failed to add credits:", error);
-      }
+      // Build callback URL to return to this page
+      const callbackUrl = `${window.location.origin}${window.location.pathname}?payment_complete=true`;
+
+      // Redirect to payment provider with callback URL
+      const redirectUrl = `${paymentProviderUrl}?callback=${encodeURIComponent(callbackUrl)}`;
+      window.location.href = redirectUrl;
     }
   };
+
+  // Only show Add Credits button if in demo mode or payment provider is configured
+  const canAddCredits = isDemoMode || !!settings.paymentProviderUrl;
 
   return (
     <div className="p-8">
@@ -112,7 +126,7 @@ export function CostManagement() {
           transactions={displayTransactions}
           balance={currentBalance}
           isLoading={isLoading}
-          onAddCredits={handleAddCredits}
+          onAddCredits={canAddCredits ? handleAddCredits : undefined}
           isAddingCredits={addCreditsMutation.isPending}
         />
       </div>
