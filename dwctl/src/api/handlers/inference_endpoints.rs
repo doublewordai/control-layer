@@ -27,6 +27,9 @@ struct MockFetchModels;
 #[cfg(test)]
 use crate::api::models::inference_endpoints::OpenAIModel;
 
+#[cfg(not(test))]
+use crate::sync::deployments::fetch_models::StaticModelsFetcher;
+
 #[cfg(test)]
 #[async_trait::async_trait]
 impl FetchModels for MockFetchModels {
@@ -164,6 +167,8 @@ pub async fn update_inference_endpoint(
             },
             api_key: update.api_key,
             model_filter: update.model_filter.clone(),
+            auth_header_name: update.auth_header_name.clone(),
+            auth_header_prefix: update.auth_header_prefix.clone(),
         };
 
         let endpoint = repo.update(id, &db_request).await?;
@@ -212,6 +217,8 @@ pub async fn update_inference_endpoint(
             },
             api_key: update.api_key,
             model_filter: update.model_filter,
+            auth_header_name: update.auth_header_name,
+            auth_header_prefix: update.auth_header_prefix,
         };
 
         let endpoint = repo.update(id, &db_request).await?;
@@ -257,12 +264,17 @@ pub async fn validate_inference_endpoint(
     _: RequiresPermission<resource::Endpoints, operation::UpdateAll>,
     Json(validate_request): Json<InferenceEndpointValidate>,
 ) -> Result<Json<InferenceEndpointValidateResponse>> {
-    let (url, api_key) = match validate_request {
-        InferenceEndpointValidate::New { url, api_key } => {
+    let (url, api_key, auth_header_name, auth_header_prefix) = match validate_request {
+        InferenceEndpointValidate::New {
+            url,
+            api_key,
+            auth_header_name,
+            auth_header_prefix,
+        } => {
             let parsed_url = url.parse::<url::Url>().map_err(|_| Error::BadRequest {
                 message: "Invalid URL format".to_string(),
             })?;
-            (parsed_url, api_key)
+            (parsed_url, api_key, auth_header_name, auth_header_prefix)
         }
         InferenceEndpointValidate::Existing { endpoint_id } => {
             let mut conn = state.db.acquire().await.map_err(|e| Error::Database(e.into()))?;
@@ -272,11 +284,24 @@ pub async fn validate_inference_endpoint(
                 resource: "Endpoint".to_string(),
                 id: endpoint_id.to_string(),
             })?;
-            (endpoint.url, endpoint.api_key)
+            (
+                endpoint.url,
+                endpoint.api_key,
+                Some(endpoint.auth_header_name),
+                Some(endpoint.auth_header_prefix),
+            )
         }
     };
 
-    let models = validate_endpoint_connection(&url, api_key.as_deref()).await?;
+    tracing::info!(
+        "Validating endpoint: url={}, has_api_key={}, auth_header_name={:?}, auth_header_prefix={:?}",
+        url,
+        api_key.is_some(),
+        auth_header_name,
+        auth_header_prefix
+    );
+
+    let models = validate_endpoint_connection(&url, api_key.as_deref(), auth_header_name, auth_header_prefix).await?;
     Ok(Json(InferenceEndpointValidateResponse {
         status: "success".to_string(),
         models: Some(models),
@@ -324,23 +349,42 @@ pub async fn create_inference_endpoint(
         url,
         api_key: create_request.api_key,
         model_filter: create_request.model_filter.clone(),
+        auth_header_name: create_request.auth_header_name,
+        auth_header_prefix: create_request.auth_header_prefix,
     };
 
     let endpoint = repo.create(&db_request).await?;
 
     // Optionally sync models during creation
     if create_request.sync {
-        // Create sync config from the newly created endpoint
-        #[cfg(test)]
-        let fetcher = MockFetchModels;
-        #[cfg(not(test))]
-        let fetcher = FetchModelsReqwest::new(SyncConfig::from_endpoint(&endpoint));
-
-        // Perform sync within the same transaction with custom aliases
         let mut deployments_repo = Deployments::new(&mut tx);
-        match sync_endpoint_models_with_aliases(endpoint.clone(), &mut deployments_repo, fetcher, &create_request.alias_mapping).await {
-            Ok(sync_result) => {
-                tracing::info!("Sync succeeded: {:?}", sync_result);
+
+        // Choose fetcher and sync based on skip_fetch flag
+        #[cfg(test)]
+        let sync_result = {
+            let fetcher = MockFetchModels;
+            sync_endpoint_models_with_aliases(endpoint.clone(), &mut deployments_repo, fetcher, &create_request.alias_mapping).await
+        };
+
+        #[cfg(not(test))]
+        let sync_result = if create_request.skip_fetch {
+            // Use static model list from model_filter
+            let model_names = create_request.model_filter.clone().unwrap_or_default();
+            if model_names.is_empty() {
+                tracing::warn!("skip_fetch is true but model_filter is empty for endpoint {}", endpoint.id);
+            }
+            tracing::info!("Using static model list for endpoint {}: {:?}", endpoint.id, model_names);
+            let fetcher = StaticModelsFetcher::new(model_names);
+            sync_endpoint_models_with_aliases(endpoint.clone(), &mut deployments_repo, fetcher, &create_request.alias_mapping).await
+        } else {
+            // Fetch models from endpoint
+            let fetcher = FetchModelsReqwest::new(SyncConfig::from_endpoint(&endpoint));
+            sync_endpoint_models_with_aliases(endpoint.clone(), &mut deployments_repo, fetcher, &create_request.alias_mapping).await
+        };
+
+        match sync_result {
+            Ok(result) => {
+                tracing::info!("Sync succeeded: {:?}", result);
             }
             Err(sync_error) => {
                 tracing::error!("Sync failed with error: {:?}", sync_error);
@@ -407,17 +451,48 @@ pub async fn delete_inference_endpoint(
 }
 
 // Helper: Validate endpoint connection and fetch models
-async fn validate_endpoint_connection(url: &url::Url, api_key: Option<&str>) -> Result<OpenAIModelsResponse> {
+async fn validate_endpoint_connection(
+    url: &url::Url,
+    api_key: Option<&str>,
+    auth_header_name: Option<String>,
+    auth_header_prefix: Option<String>,
+) -> Result<OpenAIModelsResponse> {
     use std::time::Duration;
+
+    let auth_header_name = auth_header_name.unwrap_or_else(|| "Authorization".to_string());
+    let auth_header_prefix = auth_header_prefix.unwrap_or_else(|| "Bearer ".to_string());
+
+    tracing::debug!(
+        "Creating SyncConfig for validation: url={}, auth_header_name={}, auth_header_prefix={:?}, has_api_key={}",
+        url,
+        auth_header_name,
+        auth_header_prefix,
+        api_key.is_some()
+    );
+
     let sync_config = SyncConfig {
         openai_api_key: api_key.map(|s| s.to_string()),
         openai_base_url: url.clone(),
+        auth_header_name,
+        auth_header_prefix,
         request_timeout: Duration::from_secs(10),
     };
 
     // Use the existing FetchModelsReqwest implementation
     let fetcher = FetchModelsReqwest::new(sync_config);
-    let models_response = fetcher.fetch().await?;
+
+    tracing::debug!("Fetching models from endpoint...");
+    let models_response = fetcher.fetch().await.map_err(|e| {
+        tracing::error!("Failed to fetch models: {:#}", e);
+        e
+    })?;
+
+    tracing::debug!(
+        "Received models response: object={}, model_count={}",
+        models_response.object,
+        models_response.data.len()
+    );
+
     if models_response.object != "list" {
         return Err(Error::BadRequest {
             message: "Invalid response format - expected 'list' object".to_string(),

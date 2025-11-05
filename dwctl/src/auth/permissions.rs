@@ -40,6 +40,12 @@ pub mod resource {
 
     #[derive(Default)]
     pub struct Files;
+    
+    #[derive(Default)]
+    pub struct Credits;
+
+    #[derive(Default)]
+    pub struct Probes;
 
     // Convert type-level markers to enum values using Into
     impl From<Users> for Resource {
@@ -90,6 +96,16 @@ pub mod resource {
     impl From<Files> for Resource {
         fn from(_: Files) -> Resource {
             Resource::Files
+        }
+    }
+    impl From<Credits> for Resource {
+        fn from(_: Credits) -> Resource {
+            Resource::Credits
+        }
+    }
+    impl From<Probes> for Resource {
+        fn from(_: Probes) -> Resource {
+            Resource::Probes
         }
     }
 }
@@ -254,14 +270,15 @@ pub fn role_has_permission(role: &Role, resource: Resource, operation: Operation
             matches!(
                 (resource, operation),
                 (Resource::Models, Operation::ReadOwn)            // Can read accessible models (filtered by groups)
-                    | (Resource::Endpoints, Operation::ReadOwn)  // Can see own endpoints
-                    | (Resource::Endpoints, Operation::ReadAll)  // Can see all endpoints
+                    | (Resource::Endpoints, Operation::ReadOwn)   // Can see own endpoints
+                    | (Resource::Endpoints, Operation::ReadAll)   // Can see all endpoints
                     | (Resource::ApiKeys, Operation::ReadOwn)     // Can read own API keys
                     | (Resource::ApiKeys, Operation::CreateOwn)   // Can create own API keys
                     | (Resource::ApiKeys, Operation::UpdateOwn)   // Can update own API keys
                     | (Resource::ApiKeys, Operation::DeleteOwn)   // Can delete own API keys
                     | (Resource::Users, Operation::ReadOwn)       // Can read own user data
-                    | (Resource::Users, Operation::UpdateOwn) // Can update own user data
+                    | (Resource::Users, Operation::UpdateOwn)     // Can update own user data
+                    | (Resource::Credits, Operation::ReadOwn) // Can read own credit balance and transactions
             )
         }
         Role::RequestViewer => {
@@ -275,6 +292,14 @@ pub fn role_has_permission(role: &Role, resource: Resource, operation: Operation
                     | (Resource::Analytics, Operation::ReadOwn)
                     | (Resource::Users, Operation::ReadOwn)
                     | (Resource::Groups, Operation::ReadOwn)
+                    | (Resource::Credits, Operation::ReadOwn)
+            )
+        }
+        Role::BillingManager => {
+            // Billing Manager has full access to credit system and read all users.
+            matches!(
+                (resource, operation),
+                (Resource::Credits, _) | (Resource::Users, Operation::ReadAll)
             )
         }
         Role::BatchAPIUser => {

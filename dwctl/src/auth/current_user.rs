@@ -12,7 +12,6 @@ use crate::{
 };
 use axum::{extract::FromRequestParts, http::request::Parts};
 use sqlx::PgPool;
-use tracing::info;
 
 /// Extract user from JWT session cookie if present and valid
 fn try_jwt_session_auth(parts: &axum::http::request::Parts, config: &crate::config::Config) -> Result<Option<CurrentUser>> {
@@ -63,7 +62,6 @@ async fn try_proxy_header_auth(
     let mut tx = db.begin().await.unwrap();
     let mut user_repo = Users::new(&mut tx);
 
-    info!("User email from header: {:?}", parts.headers);
     let user_result = match user_repo.get_user_by_email(user_email).await? {
         Some(user) => Some(CurrentUser {
             id: user.id,

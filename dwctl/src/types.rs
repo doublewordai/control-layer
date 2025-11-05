@@ -60,6 +60,8 @@ pub enum Resource {
     Pricing,
     ModelRateLimits,
     Files,
+    Credits,
+    Probes,
 }
 
 // Permission types for authorization

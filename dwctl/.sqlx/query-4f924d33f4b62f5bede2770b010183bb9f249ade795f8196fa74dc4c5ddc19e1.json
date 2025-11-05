@@ -47,6 +47,16 @@
         "ordinal": 8,
         "name": "id",
         "type_info": "Uuid"
+      },
+      {
+        "ordinal": 9,
+        "name": "auth_header_name",
+        "type_info": "Varchar"
+      },
+      {
+        "ordinal": 10,
+        "name": "auth_header_prefix",
+        "type_info": "Varchar"
       }
     ],
     "parameters": {
@@ -63,6 +73,8 @@
       false,
       true,
       true,
+      false,
+      false,
       false
     ]
   },

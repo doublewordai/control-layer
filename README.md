@@ -1,40 +1,47 @@
 # The Doubleword Control Layer (dwctl)
 
-[Announcement](https://fergusfinn.com/blog/control-layer/) | [Benchmarking](https://fergusfinn.com/blog/control-layer-benchmarking/)
+[Announcement](https://www.doubleword.ai/resources/doubleword-open-sources-the-worlds-fastest-ai-gateway) | [Benchmarking](https://docs.doubleword.ai/conceptual/21-19-2025-dwctl-benchmark) | [Technical Blog](https://fergusfinn.com/blog/control-layer/) | 
+[Documentation](https://docs.doubleword.ai/control-layer/)
 
 The Doubleword Control Layer (dwctl) is the world's fastest AI model gateway (450x less overhead than LiteLLM). It provides a single, high-performance interface for routing, managing, and securing inference across model providers, users and deployments - both open-source and proprietary.
 - Seamlessly switch between models
 - Turn any model (self-hosted or hosted) into a production-ready API with full auth and user controls
 - Centrally govern, monitor, and audit all inference activity
-
+ 
 ## Getting started
 
-### Docker compose
+The Doubleword Control Layer requries Docker to be installed. For information on how to get started with Docker see the docs [here](https://docs.docker.com/get-started/). 
 
-With docker compose installed, these commands will start the Control Layer stack.
+There are two ways to set up the Control Layer:
+1. **Docker Compose** - All-in-one setup with pre-configured Postgres and dwctl. This method automatically provisions a containerized Postgres database with default credentials and connects it to the Control Layer.
+2. **Docker Run** - Bring-your-own-database setup. Use this method to connect the Control Layer to an existing Postgres instance of your choice.
+
+### Option 1. Docker Compose
+
+With docker compose installed, the commands below will start the Control Layer.  
 
 ```bash
 wget https://raw.githubusercontent.com/doublewordai/control-layer/refs/heads/main/docker-compose.yml
-docker compose up -d
+docker compose -f docker-compose.yml up -d
 ```
 
-Navigate to `http://localhost:3001` to get started.
+Navigate to `http://localhost:3001` to get started. When you get to the login page you will be prompting to sign in with a username and password. Please refer to the configuration section below for how to set up an admin user. You can then refer to the documentation [here](https://docs.doubleword.ai/control-layer/usage/models-and-access) to start playing around with Control Layer features.  
 
-### Docker
 
-Control Layer requires a PostgreSQL database to run. If you have one already (for
-example, via a cloud provider), run:
+### Option 2. Docker Run 
+
+The Doubleword Control Layer requires a PostgreSQL database to run. You can read the documentation (here)[https://postgresapp.com/] on how to get started with a local version of Postgres. After doing this, or if you have one already (for example, via a cloud provider), run:
 
 ```bash
 docker run -p 3001:3001 \
     -e DATABASE_URL=<your postgres connection string here> \
-    -e SECRET_KEY="mysupersecretkey" \
+    -e DWCTL_SECRET_KEY="mysupersecretkey" \
     ghcr.io/doublewordai/control-layer:latest
 ```
 
-Make sure to replace the secret key with a secure random value in production.
+Your DATABASE_URL should match the following naming convention `postgres://username:password@localhost:5432/database_name`.  Make sure to replace the secret key with a secure random value in production.
 
-Navigate to `http://localhost:3001` to get started.
+Navigate to `http://localhost:3001` to get started. When you get to the login page you will be prompting to sign in with a username and password. Please refer to the configuration section below for how to set up an admin user. You can then refer to the documentation [here](https://docs.doubleword.ai/control-layer/usage/models-and-access) to start playing around with Control Layer features.  
 
 ## Configuration
 
@@ -64,7 +71,7 @@ the keys with a double underscore, for example, to disable native
 authentication, set `DWCTL_AUTH__NATIVE__ENABLED=false`.
 
 ```yaml
-# Clay configuration
+# dwctl configuration
 # Secret key for jwt signing.
 # TODO: Must be set in production! Required when native auth is enabled.
 # secret_key: null  # Not set by default - must be provided via env var or config
@@ -197,7 +204,7 @@ file_storage:
 enable_request_logging: true # Enable request/response logging to database
 ```
 
-## Production checklist
+## Production Checklist
 
 1. Setup a production-grade Postgres database, and point Control Layer to it via the
    `DATABASE_URL` environment variable.

@@ -1,5 +1,6 @@
 pub mod analytics;
 pub mod api_keys;
+pub mod credits;
 pub mod deployments;
 pub mod file_storage;
 pub mod files;
@@ -9,6 +10,7 @@ pub mod password_reset_tokens;
 pub mod repository;
 pub mod users;
 
+pub use credits::Credits;
 pub use deployments::Deployments;
 pub use file_storage::{create_file_storage, FileStorage};
 pub use files::Files;

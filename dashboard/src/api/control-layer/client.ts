@@ -34,6 +34,10 @@ import type {
   PasswordResetRequest,
   PasswordResetConfirmRequest,
   ChangePasswordRequest,
+  Probe,
+  CreateProbeRequest,
+  ProbeResult,
+  ProbeStatistics,
 } from "./types";
 import { ApiError } from "./errors";
 
@@ -171,18 +175,20 @@ const modelApi = {
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify(data),
     });
-    
+
     if (!response.ok) {
       if (response.status === 409) {
         // For 409 conflicts, try to get the actual server error message
         const errorText = await response.text();
-        throw new Error(errorText || `Failed to update model: ${response.status}`);
+        throw new Error(
+          errorText || `Failed to update model: ${response.status}`,
+        );
       }
-      
+
       // Generic error for all other cases
       throw new Error(`Failed to update model: ${response.status}`);
     }
-    
+
     return response.json();
   },
 };
@@ -219,134 +225,148 @@ const endpointApi = {
   },
 
   async create(data: EndpointCreateRequest): Promise<Endpoint> {
-  const response = await fetch("/admin/api/v1/endpoints", {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify(data),
-  });
-  
-  if (!response.ok) {
-    
-    try {
-      // Always try to get the response body first
-      const responseText = await response.text();
-      
-      // Try to parse as JSON
-      let responseData;
-      try {
-        responseData = JSON.parse(responseText);
-      } catch {
-        const error = new Error(responseText || `Failed to create endpoint: ${response.status}`);
-        (error as any).status = response.status;
-        throw error;
-      }
-      
-      // Create a structured error object
-      const error = new Error(responseData.message || `Failed to create endpoint: ${response.status}`);
-      (error as any).status = response.status;
-      (error as any).response = {
-        status: response.status,
-        data: responseData
-      };
-      (error as any).data = responseData; // Also add direct data property
-      
-      // Handle conflicts specifically
-      if (response.status === 409) {
-        if (responseData.conflicts) {
-          (error as any).isConflict = true;
-          (error as any).conflicts = responseData.conflicts;
-        }
-      }
-      
-      throw error;
-      
-    } catch (error) {
-      // If it's already our custom error, re-throw it
-      if (isApiErrorObject(error)) {
-        throw error;
-      }
-      
-      // Otherwise create a structured error
-      const structuredError = new Error(error instanceof Error ? error.message : 'Unknown error');
-      (structuredError as any).status = response.status;
-      throw structuredError;
-    }
-  }
-  
-  return response.json();
-},
-
-async update(id: string, data: EndpointUpdateRequest): Promise<Endpoint> {
-  const response = await fetch(`/admin/api/v1/endpoints/${id}`, {
-    method: "PATCH",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify(data),
-  });
-  
-  if (!response.ok) {
-    
-    try {
-      // Always try to get the response body first
-      const responseText = await response.text();
-      
-      // Try to parse as JSON
-      let responseData;
-      try {
-        responseData = JSON.parse(responseText);
-      } catch {
-        const error = new Error(responseText || `Failed to update endpoint: ${response.status}`);
-        (error as any).status = response.status;
-        throw error;
-      }
-      
-      // Create a structured error object that matches what your frontend expects
-      const error = new Error(responseData.message || `Failed to update endpoint: ${response.status}`);
-      (error as any).status = response.status;
-      (error as any).response = {
-        status: response.status,
-        data: responseData
-      };
-      (error as any).data = responseData; // Also add direct data property
-      
-      // Handle conflicts specifically
-      if (response.status === 409) {
-        if (responseData.conflicts) {
-          (error as any).isConflict = true;
-          (error as any).conflicts = responseData.conflicts;
-        }
-      }
-      
-      throw error;
-      
-    } catch (error) {
-      // If it's already our custom error, re-throw it
-      if (error && typeof error === 'object' && ('status' in error || 'isConflict' in error)) {
-        throw error;
-      }
-      
-      // Otherwise create a structured error
-      const structuredError = new Error(error instanceof Error ? error.message : 'Unknown error');
-      (structuredError as any).status = response.status;
-      throw structuredError;
-    }
-  }
-  
-  return response.json();
-},
-
-async synchronize(id: string): Promise<EndpointSyncResponse> {
-    const response = await fetch(`/admin/api/v1/endpoints/${id}/synchronize`, {
+    const response = await fetch("/admin/api/v1/endpoints", {
       method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(data),
     });
-    
+
     if (!response.ok) {
-      throw new Error(`Failed to synchronize endpoint: ${response.status}`);
+      try {
+        // Always try to get the response body first
+        const responseText = await response.text();
+
+        // Try to parse as JSON
+        let responseData;
+        try {
+          responseData = JSON.parse(responseText);
+        } catch {
+          const error = new Error(
+            responseText || `Failed to create endpoint: ${response.status}`,
+          );
+          (error as any).status = response.status;
+          throw error;
+        }
+
+        // Create a structured error object
+        const error = new Error(
+          responseData.message ||
+            `Failed to create endpoint: ${response.status}`,
+        );
+        (error as any).status = response.status;
+        (error as any).response = {
+          status: response.status,
+          data: responseData,
+        };
+        (error as any).data = responseData; // Also add direct data property
+
+        // Handle conflicts specifically
+        if (response.status === 409) {
+          if (responseData.conflicts) {
+            (error as any).isConflict = true;
+            (error as any).conflicts = responseData.conflicts;
+          }
+        }
+
+        throw error;
+      } catch (error) {
+        // If it's already our custom error, re-throw it
+        if (isApiErrorObject(error)) {
+          throw error;
+        }
+
+        // Otherwise create a structured error
+        const structuredError = new Error(
+          error instanceof Error ? error.message : "Unknown error",
+        );
+        (structuredError as any).status = response.status;
+        throw structuredError;
+      }
     }
-    
+
     return response.json();
   },
 
-async delete(id: string): Promise<void> {
+  async update(id: string, data: EndpointUpdateRequest): Promise<Endpoint> {
+    const response = await fetch(`/admin/api/v1/endpoints/${id}`, {
+      method: "PATCH",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(data),
+    });
+
+    if (!response.ok) {
+      try {
+        // Always try to get the response body first
+        const responseText = await response.text();
+
+        // Try to parse as JSON
+        let responseData;
+        try {
+          responseData = JSON.parse(responseText);
+        } catch {
+          const error = new Error(
+            responseText || `Failed to update endpoint: ${response.status}`,
+          );
+          (error as any).status = response.status;
+          throw error;
+        }
+
+        // Create a structured error object that matches what your frontend expects
+        const error = new Error(
+          responseData.message ||
+            `Failed to update endpoint: ${response.status}`,
+        );
+        (error as any).status = response.status;
+        (error as any).response = {
+          status: response.status,
+          data: responseData,
+        };
+        (error as any).data = responseData; // Also add direct data property
+
+        // Handle conflicts specifically
+        if (response.status === 409) {
+          if (responseData.conflicts) {
+            (error as any).isConflict = true;
+            (error as any).conflicts = responseData.conflicts;
+          }
+        }
+
+        throw error;
+      } catch (error) {
+        // If it's already our custom error, re-throw it
+        if (
+          error &&
+          typeof error === "object" &&
+          ("status" in error || "isConflict" in error)
+        ) {
+          throw error;
+        }
+
+        // Otherwise create a structured error
+        const structuredError = new Error(
+          error instanceof Error ? error.message : "Unknown error",
+        );
+        (structuredError as any).status = response.status;
+        throw structuredError;
+      }
+    }
+
+    return response.json();
+  },
+
+  async synchronize(id: string): Promise<EndpointSyncResponse> {
+    const response = await fetch(`/admin/api/v1/endpoints/${id}/synchronize`, {
+      method: "POST",
+    });
+
+    if (!response.ok) {
+      throw new Error(`Failed to synchronize endpoint: ${response.status}`);
+    }
+
+    return response.json();
+  },
+
+  async delete(id: string): Promise<void> {
     const response = await fetch(`/admin/api/v1/endpoints/${id}`, {
       method: "DELETE",
     });
@@ -679,7 +699,154 @@ const authApi = {
   },
 };
 
-function isApiErrorObject(error: unknown): error is { status?: number; isConflict?: boolean } {
+// Probes API
+const probesApi = {
+  async list(status?: string): Promise<Probe[]> {
+    const params = new URLSearchParams();
+    if (status) params.set("status", status);
+
+    const url = `/admin/api/v1/probes${params.toString() ? "?" + params.toString() : ""}`;
+    const response = await fetch(url);
+    if (!response.ok) {
+      throw new Error(`Failed to fetch probes: ${response.status}`);
+    }
+    return response.json();
+  },
+
+  async get(id: string): Promise<Probe> {
+    const response = await fetch(`/admin/api/v1/probes/${id}`);
+    if (!response.ok) {
+      throw new Error(`Failed to fetch probe: ${response.status}`);
+    }
+    return response.json();
+  },
+
+  async create(data: CreateProbeRequest): Promise<Probe> {
+    const response = await fetch("/admin/api/v1/probes", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(data),
+    });
+    if (!response.ok) {
+      throw new Error(`Failed to create probe: ${response.status}`);
+    }
+    return response.json();
+  },
+
+  async delete(id: string): Promise<void> {
+    const response = await fetch(`/admin/api/v1/probes/${id}`, {
+      method: "DELETE",
+    });
+    if (!response.ok) {
+      throw new Error(`Failed to delete probe: ${response.status}`);
+    }
+  },
+
+  async activate(id: string): Promise<Probe> {
+    const response = await fetch(`/admin/api/v1/probes/${id}/activate`, {
+      method: "PATCH",
+    });
+    if (!response.ok) {
+      throw new Error(`Failed to activate probe: ${response.status}`);
+    }
+    return response.json();
+  },
+
+  async deactivate(id: string): Promise<Probe> {
+    const response = await fetch(`/admin/api/v1/probes/${id}/deactivate`, {
+      method: "PATCH",
+    });
+    if (!response.ok) {
+      throw new Error(`Failed to deactivate probe: ${response.status}`);
+    }
+    return response.json();
+  },
+
+  async update(
+    id: string,
+    data: { interval_seconds?: number },
+  ): Promise<Probe> {
+    const response = await fetch(`/admin/api/v1/probes/${id}`, {
+      method: "PATCH",
+      headers: {
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify(data),
+    });
+    if (!response.ok) {
+      throw new Error(`Failed to update probe: ${response.status}`);
+    }
+    return response.json();
+  },
+
+  async execute(id: string): Promise<ProbeResult> {
+    const response = await fetch(`/admin/api/v1/probes/${id}/execute`, {
+      method: "POST",
+    });
+    if (!response.ok) {
+      throw new Error(`Failed to execute probe: ${response.status}`);
+    }
+    return response.json();
+  },
+
+  async test(
+    deploymentId: string,
+    params?: {
+      http_method?: string;
+      request_path?: string;
+      request_body?: Record<string, unknown>;
+    },
+  ): Promise<ProbeResult> {
+    const response = await fetch(`/admin/api/v1/probes/test/${deploymentId}`, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify(params || null),
+    });
+    if (!response.ok) {
+      throw new Error(`Failed to test probe: ${response.status}`);
+    }
+    return response.json();
+  },
+
+  async getResults(
+    id: string,
+    params?: { start_time?: string; end_time?: string; limit?: number },
+  ): Promise<ProbeResult[]> {
+    const queryParams = new URLSearchParams();
+    if (params?.start_time) queryParams.set("start_time", params.start_time);
+    if (params?.end_time) queryParams.set("end_time", params.end_time);
+    if (params?.limit) queryParams.set("limit", params.limit.toString());
+
+    const url = `/admin/api/v1/probes/${id}/results${queryParams.toString() ? "?" + queryParams.toString() : ""}`;
+    const response = await fetch(url);
+    if (!response.ok) {
+      throw new Error(`Failed to fetch probe results: ${response.status}`);
+    }
+    return response.json();
+  },
+
+  async getStatistics(
+    id: string,
+    params?: { start_time?: string; end_time?: string },
+  ): Promise<ProbeStatistics> {
+    const queryParams = new URLSearchParams();
+    if (params?.start_time) queryParams.set("start_time", params.start_time);
+    if (params?.end_time) queryParams.set("end_time", params.end_time);
+
+    const url = `/admin/api/v1/probes/${id}/statistics${queryParams.toString() ? "?" + queryParams.toString() : ""}`;
+    const response = await fetch(url);
+    if (!response.ok) {
+      throw new Error(`Failed to fetch probe statistics: ${response.status}`);
+    }
+    return response.json();
+  },
+};
+
+function isApiErrorObject(
+  error: unknown,
+): error is { status?: number; isConflict?: boolean } {
   return (
     typeof error === "object" &&
     error !== null &&
@@ -696,4 +863,5 @@ export const dwctlApi = {
   config: configApi,
   requests: requestsApi,
   auth: authApi,
+  probes: probesApi,
 };

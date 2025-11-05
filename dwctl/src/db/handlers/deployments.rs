@@ -163,6 +163,7 @@ impl<'c> Repository for Deployments<'c> {
         let model_type_str = request.model_type.as_ref().map(|t| match t {
             ModelType::Chat => "CHAT",
             ModelType::Embeddings => "EMBEDDINGS",
+            ModelType::Reranker => "RERANKER",
         });
 
         // Convert structured pricing to flat database fields
@@ -205,6 +206,7 @@ impl<'c> Repository for Deployments<'c> {
         let model_type = model.r#type.as_ref().and_then(|s| match s.as_str() {
             "CHAT" => Some(ModelType::Chat),
             "EMBEDDINGS" => Some(ModelType::Embeddings),
+            "RERANKER" => Some(ModelType::Reranker),
             _ => None,
         });
 
@@ -283,6 +285,7 @@ impl<'c> Repository for Deployments<'c> {
             inner.as_ref().map(|t| match t {
                 ModelType::Chat => "CHAT",
                 ModelType::Embeddings => "EMBEDDINGS",
+                ModelType::Reranker => "RERANKER",
             })
         });
 
@@ -429,6 +432,7 @@ impl<'c> Repository for Deployments<'c> {
         let model_type = model.r#type.as_deref().and_then(|s| match s {
             "CHAT" => Some(ModelType::Chat),
             "EMBEDDINGS" => Some(ModelType::Embeddings),
+            "RERANKER" => Some(ModelType::Reranker),
             _ => None,
         });
 
@@ -2146,6 +2150,8 @@ mod tests {
             api_key: None,
             description: None,
             model_filter: None,
+            auth_header_name: None,
+            auth_header_prefix: None,
             created_by: user.id,
         };
         let endpoint = endpoints_repo.create(&endpoint_create).await.unwrap();
@@ -2190,6 +2196,8 @@ mod tests {
             api_key: None,
             description: None,
             model_filter: None,
+            auth_header_name: None,
+            auth_header_prefix: None,
             created_by: user.id,
         };
         let endpoint = endpoints_repo.create(&endpoint_create).await.unwrap();
