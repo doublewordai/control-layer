@@ -109,10 +109,7 @@ impl ProbeManager {
     /// Get probe status for multiple deployments (bulk operation)
     /// Returns a map of deployment_id -> (probe_id, active, interval_seconds, last_check, last_success, uptime_24h)
     #[tracing::instrument(skip(pool, deployment_ids), fields(count = deployment_ids.len()), err)]
-    pub async fn get_deployment_statuses(
-        pool: &PgPool,
-        deployment_ids: &[Uuid],
-    ) -> Result<DeploymentStatusMap, AppError> {
+    pub async fn get_deployment_statuses(pool: &PgPool, deployment_ids: &[Uuid]) -> Result<DeploymentStatusMap, AppError> {
         if deployment_ids.is_empty() {
             return Ok(std::collections::HashMap::new());
         }
