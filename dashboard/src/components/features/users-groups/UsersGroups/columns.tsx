@@ -9,8 +9,7 @@ import {
   Trash2,
   Receipt,
 } from "lucide-react";
-import { Button } from "../../../ui/button";
-import { Checkbox } from "../../../ui/checkbox";
+import { Button, Checkbox, UserAvatar } from "@/components";
 import {
   DropdownMenu,
   DropdownMenuContent,
@@ -19,8 +18,7 @@ import {
   DropdownMenuSeparator,
   DropdownMenuTrigger,
 } from "../../../ui/dropdown-menu";
-import { UserAvatar } from "../../../ui/user-avatar";
-import type { DisplayUser, DisplayGroup } from "../../../../types/display";
+import type { DisplayUser, DisplayGroup } from "@/types/display.ts";
 
 interface UserColumnActions {
   onEdit: (user: DisplayUser) => void;
