@@ -193,7 +193,7 @@ export const createUserColumns = (
             {actions.showTransactions && (
               <DropdownMenuItem onClick={() => actions.onViewTransactions(user)}>
                 <Receipt className="mr-2 h-4 w-4" />
-                View Transactions
+                Manage Billing
               </DropdownMenuItem>
             )}
             <DropdownMenuSeparator />

@@ -282,7 +282,7 @@ export const handlers = [
 
     let users = [...usersData];
 
-    if (include === "groups") {
+    if (include?.includes("groups")) {
       const userGroupsData = getUserGroupsData();
       users = users.map((user) => ({
         ...user,

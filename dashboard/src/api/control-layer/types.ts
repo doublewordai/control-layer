@@ -606,7 +606,7 @@ export interface AddFundsRequest {
   description?: string;
 }
 
-export interface AddFundsResponse extends Transaction {}
+export type AddFundsResponse = Transaction
 
 // Probe types
 export interface Probe {

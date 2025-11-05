@@ -16,8 +16,7 @@ import type {
   GroupsQuery,
   ListRequestsQuery,
   TransactionsQuery,
-  AddCreditsRequest,
-  CreateProbeRequest,
+  CreateProbeRequest, AddFundsRequest,
 } from "./types";
 
 // Config hooks

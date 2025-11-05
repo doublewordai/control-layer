@@ -34,15 +34,11 @@ import type {
   PasswordResetRequest,
   PasswordResetConfirmRequest,
   ChangePasswordRequest,
-  CreditBalanceResponse,
-  CreditTransaction,
   TransactionsQuery,
-  AddCreditsRequest,
-  AddCreditsResponse,
   Probe,
   CreateProbeRequest,
   ProbeResult,
-  ProbeStatistics,
+  ProbeStatistics, Transaction, AddFundsRequest, AddFundsResponse, BalanceResponse,
 } from "./types";
 import { ApiError } from "./errors";
 
@@ -50,9 +46,11 @@ import { ApiError } from "./errors";
 const userApi = {
   async list(options?: UsersQuery): Promise<User[]> {
     const params = new URLSearchParams();
-    if (options?.include) params.set("include", options.include);
-    // Always include billing to get balance
-    params.set("include", "billing");
+    // Combine existing include with billing
+    const includeParams = options?.include
+      ? `${options.include},billing`
+      : "billing";
+    params.set("include", includeParams);
 
     const url = `/admin/api/v1/users${params.toString() ? "?" + params.toString() : ""}`;
     const response = await fetch(url);
@@ -708,7 +706,7 @@ const authApi = {
 
 // Cost management API
 const costApi = {
-  async getBalance(): Promise<CreditBalanceResponse> {
+  async getBalance(): Promise<BalanceResponse> {
     const response = await fetch("/admin/api/v1/credits/balance");
     if (!response.ok) {
       throw new Error(`Failed to fetch balance: ${response.status}`);
