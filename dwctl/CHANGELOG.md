@@ -1,5 +1,20 @@
 # Changelog
 
+## [0.6.0](https://github.com/doublewordai/control-layer/compare/v0.5.1...v0.6.0) (2025-11-05)
+
+
+### Features
+
+* backend Credit API ([#46](https://github.com/doublewordai/control-layer/issues/46)) ([9ea9453](https://github.com/doublewordai/control-layer/commit/9ea9453f17df18d613481e64193c5d61a08280e3))
+* OTEL tracing export ([#57](https://github.com/doublewordai/control-layer/issues/57)) ([ced2e12](https://github.com/doublewordai/control-layer/commit/ced2e124e12eb3a1a25d92dba45f398dbea024b6))
+* support Cortex AI and SPCS, and also add the ability to manually configure model endpoints. Also, overhaul design of endpoint creation flow ([#51](https://github.com/doublewordai/control-layer/issues/51)) ([5419e31](https://github.com/doublewordai/control-layer/commit/5419e310fd65542d58be76a09ffc130ea8a3f57c))
+
+
+### Bug Fixes
+
+* an issue where transient db disconnects could kill the onwards listener task ([#59](https://github.com/doublewordai/control-layer/issues/59)) ([5950883](https://github.com/doublewordai/control-layer/commit/5950883b1203abf4b017db9fdd1cdce1039c23a9))
+* make tracing configurable ([#58](https://github.com/doublewordai/control-layer/issues/58)) ([b4bea00](https://github.com/doublewordai/control-layer/commit/b4bea004e40270d9a90435496ddd33da22019356))
+
 ## [0.5.1](https://github.com/doublewordai/control-layer/compare/v0.5.0...v0.5.1) (2025-10-30)
 
 
