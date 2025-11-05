@@ -1391,6 +1391,7 @@ mod tests {
             auth: Default::default(),
             enable_metrics: false,
             enable_request_logging: false,
+            enable_otel_export: false,
         };
         crate::seed_database(&config.model_sources, &pool).await.unwrap();
 
