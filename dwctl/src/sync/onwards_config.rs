@@ -31,14 +31,9 @@ pub struct OnwardsConfigSync {
     shutdown_token: CancellationToken,
 }
 
+#[derive(Default)]
 pub struct SyncConfig {
     status_tx: Option<mpsc::Sender<SyncStatus>>,
-}
-
-impl Default for SyncConfig {
-    fn default() -> Self {
-        Self { status_tx: None }
-    }
 }
 
 impl OnwardsConfigSync {
