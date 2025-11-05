@@ -1,7 +1,7 @@
 import { useState, useEffect } from "react";
 import {
   useUser,
-  useAddCredits,
+  useAddFunds,
   useTransactions,
 } from "@/api/control-layer";
 import { toast } from "sonner";
@@ -9,9 +9,9 @@ import { useMemo } from "react";
 import { useSettings } from "@/contexts";
 import { generateDummyTransactions } from "@/components/features/cost-management/demoTransactions.ts";
 import {
-  type Transaction,
   TransactionHistory
 } from "@/components/features/cost-management/CostManagement/TransactionHistory.tsx";
+import type { Transaction } from "@/api/control-layer";
 
 export function CostManagement() {
   const { isFeatureEnabled, settings } = useSettings();
@@ -22,7 +22,7 @@ export function CostManagement() {
 
   // Fetch current user (includes balance)
   const { data: user, isLoading: isLoadingUser, refetch: refetchUser } = useUser("current");
-  const addCreditsMutation = useAddCredits();
+  const addFundsMutation = useAddFunds();
   const {
     data: transactionsData,
     isLoading: isLoadingTransactions,
@@ -74,24 +74,24 @@ export function CostManagement() {
     }
   }, [isDemoMode, refetchUser, refetchTransactions]);
 
-  const handleAddCredits = async () => {
+  const handleAddFunds = async () => {
     if (isDemoMode) {
       // Demo mode: Add transaction locally
-      const creditAmount = 1000;
-      const newBalance = currentBalance + creditAmount;
+      const fundAmount = 100.00;
+      const newBalance = currentBalance + fundAmount;
       const newTransaction: Transaction = {
         id: `demo-${Date.now()}`,
         user_id: user?.id || "",
         transaction_type: "admin_grant",
-        amount: creditAmount,
+        amount: fundAmount,
         balance_after: newBalance,
         previous_transaction_id: displayTransactions[0]?.id,
         source_id: "DEMO_GIFT",
-        description: "Credit purchase - Demo top up",
+        description: "Funds purchase - Demo top up",
         created_at: new Date().toISOString(),
       };
       setLocalTransactions([newTransaction, ...localTransactions]);
-      toast.success(`Added ${creditAmount} credits`);
+      toast.success(`Added $${fundAmount.toFixed(2)}`);
     } else {
       // API mode: Redirect to payment provider
       const paymentProviderUrl = settings.paymentProviderUrl;
@@ -105,8 +105,8 @@ export function CostManagement() {
     }
   };
 
-  // Only show Add Credits button if in demo mode or payment provider is configured
-  const canAddCredits = isDemoMode || !!settings.paymentProviderUrl;
+  // Only show Add Funds button if in demo mode or payment provider is configured
+  const canAddFunds = isDemoMode || !!settings.paymentProviderUrl;
 
   return (
     <div className="p-8">
@@ -126,8 +126,8 @@ export function CostManagement() {
           transactions={displayTransactions}
           balance={currentBalance}
           isLoading={isLoading}
-          onAddCredits={canAddCredits ? handleAddCredits : undefined}
-          isAddingCredits={addCreditsMutation.isPending}
+          onAddFunds={canAddFunds ? handleAddFunds : undefined}
+          isAddingFunds={addFundsMutation.isPending}
         />
       </div>
     </div>

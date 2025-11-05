@@ -12,7 +12,7 @@ import { useSettings } from "../../../contexts";
 import type { DisplayUser } from "../../../types/display";
 import {TransactionHistory} from "@/components";
 import {generateDummyTransactions} from "@/components/features/cost-management/demoTransactions.ts";
-import { AddCreditsModal } from "../AddCreditsModal";
+import { AddFundsModal } from "../AddCreditsModal";
 
 interface UserTransactionsModalProps {
   isOpen: boolean;
@@ -27,7 +27,7 @@ export function UserTransactionsModal({
 }: UserTransactionsModalProps) {
   const { isFeatureEnabled } = useSettings();
   const isDemoMode = isFeatureEnabled("demo");
-  const [isAddCreditsModalOpen, setIsAddCreditsModalOpen] = useState(false);
+  const [isAddFundsModalOpen, setIsAddFundsModalOpen] = useState(false);
 
   const {
     data: transactionsData,
@@ -44,7 +44,7 @@ export function UserTransactionsModal({
     ? transactions[0]?.balance_after || user.credit_balance || 0
     : user.credit_balance || 0;
 
-  const handleAddCreditsSuccess = () => {
+  const handleAddFundsSuccess = () => {
     refetchTransactions();
   };
 
@@ -65,10 +65,10 @@ export function UserTransactionsModal({
                   <Button
                     className="bg-blue-600 hover:bg-blue-700"
                     size="sm"
-                    onClick={() => setIsAddCreditsModalOpen(true)}
+                    onClick={() => setIsAddFundsModalOpen(true)}
                   >
                     <Plus className="w-4 h-4 mr-1" />
-                    Add Credits
+                    Add Funds
                   </Button>
                 )}
                 <button
@@ -93,11 +93,11 @@ export function UserTransactionsModal({
         </DialogContent>
       </Dialog>
 
-      <AddCreditsModal
-        isOpen={isAddCreditsModalOpen}
-        onClose={() => setIsAddCreditsModalOpen(false)}
+      <AddFundsModal
+        isOpen={isAddFundsModalOpen}
+        onClose={() => setIsAddFundsModalOpen(false)}
         targetUser={user}
-        onSuccess={handleAddCreditsSuccess}
+        onSuccess={handleAddFundsSuccess}
       />
     </>
   );

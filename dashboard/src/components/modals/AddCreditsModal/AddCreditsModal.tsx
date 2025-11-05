@@ -7,26 +7,26 @@ import {
   DialogTitle,
 } from "../../ui/dialog";
 import { Button } from "../../ui/button";
-import { useAddCredits, useUser } from "../../../api/control-layer/hooks";
+import { useAddFunds, useUser } from "../../../api/control-layer/hooks";
 import { toast } from "sonner";
 import type { DisplayUser } from "../../../types/display";
 
-interface AddCreditsModalProps {
+interface AddFundsModalProps {
   isOpen: boolean;
   onClose: () => void;
   targetUser: DisplayUser;
   onSuccess?: () => void;
 }
 
-export function AddCreditsModal({
+export function AddFundsModal({
   isOpen,
   onClose,
   targetUser,
   onSuccess,
-}: AddCreditsModalProps) {
-  const [amount, setAmount] = useState<string>("1000");
+}: AddFundsModalProps) {
+  const [amount, setAmount] = useState<string>("10.00");
   const [description, setDescription] = useState<string>("");
-  const addCreditsMutation = useAddCredits();
+  const addFundsMutation = useAddFunds();
   const { data: currentUser } = useUser("current");
 
   const handleSubmit = async (e: React.FormEvent) => {
@@ -39,22 +39,22 @@ export function AddCreditsModal({
     }
 
     try {
-      const result = await addCreditsMutation.mutateAsync({
+      const result = await addFundsMutation.mutateAsync({
         user_id: targetUser.id,
         amount: amountNum,
-        description: description || `Credit gift from ${currentUser?.display_name || currentUser?.username || "admin"}`,
+        description: description || `Funds gift from ${currentUser?.display_name || currentUser?.username || "admin"}`,
       });
 
-      toast.success(`Successfully added ${result.amount} credits to ${targetUser.name}`);
+      toast.success(`Successfully added $${result.amount.toFixed(2)} to ${targetUser.name}`);
       onSuccess?.();
       onClose();
 
       // Reset form
-      setAmount("1000");
+      setAmount("10.00");
       setDescription("");
     } catch (error) {
-      toast.error("Failed to add credits. Please try again.");
-      console.error("Failed to add credits:", error);
+      toast.error("Failed to add funds. Please try again.");
+      console.error("Failed to add funds:", error);
     }
   };
 
@@ -63,7 +63,7 @@ export function AddCreditsModal({
       <DialogContent className="sm:max-w-md">
         <DialogHeader>
           <div className="flex items-center justify-between">
-            <DialogTitle className="text-2xl">Gift Credits</DialogTitle>
+            <DialogTitle className="text-2xl">Add Funds</DialogTitle>
             <button
               onClick={onClose}
               className="text-doubleword-neutral-400 hover:text-doubleword-neutral-600 transition-colors"
@@ -77,7 +77,7 @@ export function AddCreditsModal({
         <form onSubmit={handleSubmit} className="space-y-4 mt-4">
           <div>
             <p className="text-sm text-doubleword-neutral-600 mb-4">
-              You are about to gift credits to{" "}
+              You are about to add funds to{" "}
               <strong>{targetUser.name}</strong> ({targetUser.email})
             </p>
           </div>
@@ -87,7 +87,7 @@ export function AddCreditsModal({
               htmlFor="amount"
               className="block text-sm font-medium text-doubleword-neutral-700 mb-1"
             >
-              Amount
+              Amount (USD)
             </label>
             <input
               id="amount"
@@ -97,7 +97,7 @@ export function AddCreditsModal({
               value={amount}
               onChange={(e) => setAmount(e.target.value)}
               className="w-full px-3 py-2 border border-doubleword-neutral-300 rounded-md focus:outline-none focus:ring-2 focus:ring-blue-500"
-              placeholder="Enter amount"
+              placeholder="10.00"
               required
             />
           </div>
@@ -124,16 +124,16 @@ export function AddCreditsModal({
               type="button"
               variant="outline"
               onClick={onClose}
-              disabled={addCreditsMutation.isPending}
+              disabled={addFundsMutation.isPending}
             >
               Cancel
             </Button>
             <Button
               type="submit"
               className="bg-blue-600 hover:bg-blue-700"
-              disabled={addCreditsMutation.isPending}
+              disabled={addFundsMutation.isPending}
             >
-              {addCreditsMutation.isPending ? "Adding..." : "Gift Credits"}
+              {addFundsMutation.isPending ? "Adding..." : "Add Funds"}
             </Button>
           </div>
         </form>

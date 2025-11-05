@@ -718,7 +718,7 @@ const costApi = {
 
   async listTransactions(
     query?: TransactionsQuery,
-  ): Promise<CreditTransaction[]> {
+  ): Promise<Transaction[]> {
     const params = new URLSearchParams();
     if (query?.limit) params.set("limit", query.limit.toString());
     if (query?.skip) params.set("skip", query.skip.toString());
@@ -732,7 +732,7 @@ const costApi = {
     return response.json();
   },
 
-  async addCredits(data: AddCreditsRequest): Promise<AddCreditsResponse> {
+  async addFunds(data: AddFundsRequest): Promise<AddFundsResponse> {
     const payload = {
       user_id: data.user_id,
       transaction_type: "admin_grant",
@@ -747,7 +747,7 @@ const costApi = {
       body: JSON.stringify(payload),
     });
     if (!response.ok) {
-      throw new Error(`Failed to add credits: ${response.status}`);
+      throw new Error(`Failed to add funds: ${response.status}`);
     }
     return response.json();
   },

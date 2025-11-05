@@ -624,12 +624,12 @@ export function useTransactions(query?: TransactionsQuery) {
   });
 }
 
-export function useAddCredits() {
+export function useAddFunds() {
   const queryClient = useQueryClient();
 
   return useMutation({
-    mutationKey: ["cost", "add-credits"],
-    mutationFn: (data: AddCreditsRequest) => dwctlApi.cost.addCredits(data),
+    mutationKey: ["cost", "add-funds"],
+    mutationFn: (data: AddFundsRequest) => dwctlApi.cost.addFunds(data),
     onSuccess: async (_, variables) => {
       // Refetch user balance and transactions from server
       await Promise.all([

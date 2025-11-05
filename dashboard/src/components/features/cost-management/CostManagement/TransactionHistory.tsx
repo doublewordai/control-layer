@@ -10,17 +10,15 @@ import {
   SelectValue,
 } from "../../../ui/select.tsx";
 import { DateTimeRangeSelector } from "../../../ui/date-time-range-selector.tsx";
-import type { CreditTransaction } from "@/api/control-layer";
-
-export type Transaction = CreditTransaction;
+import type { Transaction } from "@/api/control-layer";
 
 export interface TransactionHistoryProps {
   transactions: Transaction[];
   balance: number;
   isLoading?: boolean;
   showCard?: boolean;
-  onAddCredits?: () => void;
-  isAddingCredits?: boolean;
+  onAddFunds?: () => void;
+  isAddingFunds?: boolean;
 }
 
 export function TransactionHistory({
@@ -28,8 +26,8 @@ export function TransactionHistory({
   balance,
   isLoading = false,
   showCard = true,
-  onAddCredits,
-  isAddingCredits = false,
+  onAddFunds,
+  isAddingFunds = false,
 }: TransactionHistoryProps) {
   // Filter states
   const [transactionType, setTransactionType] = useState<string>("all");
@@ -88,8 +86,11 @@ export function TransactionHistory({
     }).format(date);
   };
 
-  const formatCredits = (amount: number) => {
-    return new Intl.NumberFormat("en-US").format(amount);
+  const formatDollars = (amount: number) => {
+    return new Intl.NumberFormat("en-US", {
+      style: "currency",
+      currency: "USD",
+    }).format(amount);
   };
 
   const content = (
@@ -103,22 +104,19 @@ export function TransactionHistory({
             </p>
             <div className="flex items-baseline gap-2">
               <h2 className="text-4xl font-bold text-doubleword-neutral-900">
-                {formatCredits(balance)}
+                {formatDollars(balance)}
               </h2>
-              <span className="text-lg text-doubleword-neutral-600">
-                credits
-              </span>
             </div>
           </div>
-          {onAddCredits && (
+          {onAddFunds && (
             <Button
               className="bg-blue-600 hover:bg-blue-700"
               size="lg"
-              onClick={onAddCredits}
-              disabled={isAddingCredits}
+              onClick={onAddFunds}
+              disabled={isAddingFunds}
             >
               <Plus className="w-5 h-5 mr-2" />
-              {isAddingCredits ? "Adding..." : "Add Credits"}
+              {isAddingFunds ? "Adding..." : "Add Funds"}
             </Button>
           )}
         </div>
@@ -165,8 +163,8 @@ export function TransactionHistory({
               </SelectTrigger>
               <SelectContent>
                 <SelectItem value="all">All types</SelectItem>
-                <SelectItem value="credit">Credits only</SelectItem>
-                <SelectItem value="debit">Debits only</SelectItem>
+                <SelectItem value="credit">Deposits only</SelectItem>
+                <SelectItem value="debit">Withdrawals only</SelectItem>
               </SelectContent>
             </Select>
           </div>
@@ -232,10 +230,10 @@ export function TransactionHistory({
                   }`}
                 >
                   {isCredit ? "+" : "-"}
-                  {formatCredits(transaction.amount)}
+                  {formatDollars(transaction.amount)}
                 </p>
                 <p className="text-sm text-doubleword-neutral-600">
-                  Balance: {formatCredits(transaction.balance_after)}
+                  Balance: {formatDollars(transaction.balance_after)}
                 </p>
               </div>
             </div>

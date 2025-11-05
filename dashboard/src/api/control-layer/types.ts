@@ -100,7 +100,7 @@ export interface User {
   created_at: string; // ISO 8601 timestamp
   updated_at: string; // ISO 8601 timestamp
   auth_source: AuthSource;
-  credit_balance?: number; // User's credit balance
+  credit_balance?: number; // User's balance in dollars (backend field name is credit_balance)
 }
 
 export interface ApiKey {
@@ -564,31 +564,31 @@ export type UserResponse = User;
 // ===== COST MANAGEMENT TYPES =====
 
 // Backend transaction type enum
-export type CreditTransactionType =
+export type TransactionType =
   | "admin_grant"
   | "admin_removal"
   | "usage"
   | "purchase";
 
-export interface CreditTransaction {
+export interface Transaction {
   id: string;
   user_id: string; // UUID
-  transaction_type: CreditTransactionType;
-  amount: number;
-  balance_after: number;
+  transaction_type: TransactionType;
+  amount: number; // Amount in dollars
+  balance_after: number; // Balance in dollars
   previous_transaction_id?: string; // UUID
   source_id: string;
   description?: string;
   created_at: string; // ISO 8601 timestamp
 }
 
-export interface CreditBalanceResponse {
-  balance: number;
-  currency: string; // e.g., "credits"
+export interface BalanceResponse {
+  balance: number; // Balance in dollars
+  currency: string; // e.g., "USD"
 }
 
 export interface TransactionsListResponse {
-  transactions: CreditTransaction[];
+  transactions: Transaction[];
   total: number;
   limit: number;
   offset: number;
@@ -600,13 +600,13 @@ export interface TransactionsQuery {
   userId?: string; // Filter transactions by user (UUID)
 }
 
-export interface AddCreditsRequest {
-  user_id: string; // UUID of the user to add credits to
-  amount: number;
+export interface AddFundsRequest {
+  user_id: string; // UUID of the user to add funds to
+  amount: number; // Amount in dollars
   description?: string;
 }
 
-export interface AddCreditsResponse extends CreditTransaction {}
+export interface AddFundsResponse extends Transaction {}
 
 // Probe types
 export interface Probe {

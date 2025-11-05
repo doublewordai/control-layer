@@ -165,7 +165,7 @@ export function Settings() {
                       Enable Cost Management
                     </h3>
                     <p className="text-sm text-doubleword-neutral-600 mt-1">
-                      Show billing and cost management features including credit balance tracking and transaction history.
+                      Show billing and cost management features including account balance tracking and transaction history.
                     </p>
                   </div>
                   <Switch
