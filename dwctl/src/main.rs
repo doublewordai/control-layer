@@ -788,7 +788,7 @@ async fn main() -> anyhow::Result<()> {
     // Start the onwards integration task
     tokio::spawn(async move {
         info!("Starting onwards configuration listener");
-        if let Err(e) = onwards_config_sync.start().await {
+        if let Err(e) = onwards_config_sync.start(Default::default()).await {
             tracing::error!("Onwards configuration listener error: {}", e);
         }
     });
@@ -889,7 +889,7 @@ mod test {
 
         // Start the config sync in background for test
         tokio::spawn(async move {
-            if let Err(e) = onwards_config_sync.start().await {
+            if let Err(e) = onwards_config_sync.start(Default::default()).await {
                 eprintln!("Config sync error in test: {e}");
             }
         });
