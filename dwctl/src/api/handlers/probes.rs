@@ -32,6 +32,7 @@ use uuid::Uuid;
         ("X-Doubleword-User" = [])
     )
 )]
+#[tracing::instrument(skip_all)]
 pub async fn create_probe(
     State(state): State<AppState>,
     _: RequiresPermission<resource::Probes, operation::CreateAll>,
@@ -60,6 +61,7 @@ pub async fn create_probe(
         ("X-Doubleword-User" = [])
     )
 )]
+#[tracing::instrument(skip_all)]
 pub async fn list_probes(
     State(state): State<AppState>,
     _: RequiresPermission<resource::Probes, operation::ReadAll>,
@@ -92,6 +94,7 @@ pub async fn list_probes(
         ("X-Doubleword-User" = [])
     )
 )]
+#[tracing::instrument(skip_all)]
 pub async fn get_probe(
     State(state): State<AppState>,
     _: RequiresPermission<resource::Probes, operation::ReadAll>,
@@ -121,6 +124,7 @@ pub async fn get_probe(
         ("X-Doubleword-User" = [])
     )
 )]
+#[tracing::instrument(skip_all)]
 pub async fn delete_probe(
     State(state): State<AppState>,
     _: RequiresPermission<resource::Probes, operation::DeleteAll>,
@@ -150,6 +154,7 @@ pub async fn delete_probe(
         ("X-Doubleword-User" = [])
     )
 )]
+#[tracing::instrument(skip_all)]
 pub async fn activate_probe(
     State(state): State<AppState>,
     _: RequiresPermission<resource::Probes, operation::UpdateAll>,
@@ -179,6 +184,7 @@ pub async fn activate_probe(
         ("X-Doubleword-User" = [])
     )
 )]
+#[tracing::instrument(skip_all)]
 pub async fn deactivate_probe(
     State(state): State<AppState>,
     _: RequiresPermission<resource::Probes, operation::UpdateAll>,
@@ -210,6 +216,7 @@ pub async fn deactivate_probe(
         ("X-Doubleword-User" = [])
     )
 )]
+#[tracing::instrument(skip_all)]
 pub async fn update_probe(
     State(state): State<AppState>,
     _: RequiresPermission<resource::Probes, operation::UpdateAll>,
@@ -240,6 +247,7 @@ pub async fn update_probe(
         ("X-Doubleword-User" = [])
     )
 )]
+#[tracing::instrument(skip_all)]
 pub async fn execute_probe(
     State(state): State<AppState>,
     _: RequiresPermission<resource::Probes, operation::UpdateAll>,
@@ -269,6 +277,7 @@ pub async fn execute_probe(
         ("X-Doubleword-User" = [])
     )
 )]
+#[tracing::instrument(skip_all)]
 pub async fn test_probe(
     State(state): State<AppState>,
     _: RequiresPermission<resource::Probes, operation::ReadAll>,
@@ -306,6 +315,7 @@ pub async fn test_probe(
         ("X-Doubleword-User" = [])
     )
 )]
+#[tracing::instrument(skip_all)]
 pub async fn get_probe_results(
     State(state): State<AppState>,
     _: RequiresPermission<resource::Probes, operation::ReadAll>,
@@ -337,6 +347,7 @@ pub async fn get_probe_results(
         ("X-Doubleword-User" = [])
     )
 )]
+#[tracing::instrument(skip_all)]
 pub async fn get_statistics(
     State(state): State<AppState>,
     _: RequiresPermission<resource::Probes, operation::ReadAll>,

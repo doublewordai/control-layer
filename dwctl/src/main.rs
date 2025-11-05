@@ -11,6 +11,7 @@ mod probes;
 mod request_logging;
 mod static_assets;
 mod sync;
+mod telemetry;
 mod types;
 
 #[cfg(test)]
@@ -29,7 +30,7 @@ use auth::middleware::admin_ai_proxy_middleware;
 use axum::http::HeaderValue;
 use axum::{
     body::Body,
-    http::{Request, Response, StatusCode, Uri},
+    http::{Response, StatusCode, Uri},
     middleware::from_fn_with_state,
     response::{Html, IntoResponse},
     routing::{delete, get, patch, post},
@@ -45,12 +46,14 @@ use request_logging::{AiRequest, AiResponse};
 use sqlx::{ConnectOptions, Executor, PgPool};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
-use std::time::Duration;
 use tokio::net::TcpListener;
 use tower::Layer;
 use tower::ServiceBuilder;
-use tower_http::{cors::CorsLayer, trace::TraceLayer};
-use tracing::{debug, info, instrument, Span};
+use tower_http::{
+    cors::CorsLayer,
+    trace::{DefaultMakeSpan, DefaultOnRequest, DefaultOnResponse, TraceLayer},
+};
+use tracing::{debug, info, instrument, Level};
 use utoipa::OpenApi;
 use utoipa_rapidoc::RapiDoc;
 use uuid::Uuid;
@@ -68,6 +71,7 @@ pub struct AppState {
 }
 
 /// Create the initial admin user if it doesn't exist
+#[instrument(skip_all)]
 pub async fn create_initial_admin_user(email: &str, password: Option<&str>, db: &PgPool) -> Result<UserId, sqlx::Error> {
     // Hash password if provided
     let password_hash = if let Some(pwd) = password {
@@ -212,6 +216,7 @@ async fn leader_election_task<F1, F2, Fut1, Fut2>(
 }
 
 /// Seed the database with initial configuration (run only once)
+#[instrument(skip_all)]
 pub async fn seed_database(sources: &[config::ModelSource], db: &PgPool) -> Result<(), anyhow::Error> {
     // Use a transaction to ensure atomicity
     let mut tx = db.begin().await?;
@@ -340,7 +345,7 @@ async fn spa_fallback(uri: Uri) -> Result<Html<String>, StatusCode> {
 
 /// Setup the complete application with onwards integration
 /// Returns router, onwards config sync handle, and optional drop guard for shutdown
-#[instrument(skip(pool, config))]
+#[instrument(skip_all)]
 pub async fn setup_app(
     pool: PgPool,
     config: Config,
@@ -458,7 +463,7 @@ pub async fn setup_app(
     Ok((router, onwards_config_sync, drop_guard))
 }
 
-#[instrument(skip(state, onwards_router))]
+#[instrument(skip_all)]
 pub async fn build_router(state: &mut AppState, onwards_router: Router) -> anyhow::Result<Router> {
     // Setup request logging if enabled
     let outlet_layer = if state.config.enable_request_logging {
@@ -635,23 +640,6 @@ pub async fn build_router(state: &mut AppState, onwards_router: Router) -> anyho
         .route("/probes/{id}/execute", post(api::handlers::probes::execute_probe))
         .route("/probes/{id}/results", get(api::handlers::probes::get_probe_results))
         .route("/probes/{id}/statistics", get(api::handlers::probes::get_statistics))
-        .layer(
-            TraceLayer::new_for_http()
-                .make_span_with(|request: &Request<_>| {
-                    tracing::info_span!(
-                        "request",
-                        method = %request.method(),
-                        uri = %request.uri(),
-                    )
-                })
-                .on_response(|response: &Response<_>, latency: Duration, _span: &Span| {
-                    tracing::info!(
-                        status = %response.status(),
-                        latency = ?latency,
-                        "request completed"
-                    );
-                }),
-        )
         .with_state(state.clone());
 
     // Serve embedded static assets, falling back to SPA for unmatched routes
@@ -720,18 +708,22 @@ pub async fn build_router(state: &mut AppState, onwards_router: Router) -> anyho
             .layer(prometheus_layer);
     }
 
+    // Add tracing layer
+    let router = router.layer(
+        TraceLayer::new_for_http()
+            .make_span_with(DefaultMakeSpan::new().level(Level::INFO))
+            .on_request(DefaultOnRequest::new().level(Level::INFO))
+            .on_response(DefaultOnResponse::new().level(Level::INFO)),
+    );
+
     Ok(router)
 }
 
 #[tokio::main]
+#[instrument(skip_all)]
 async fn main() -> anyhow::Result<()> {
-    // Initialize tracing with environment filter
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info,onwards_pilot::sync=warn")),
-        )
-        .init();
+    // Initialize telemetry (tracing + optional OpenTelemetry)
+    telemetry::init_telemetry()?;
 
     // Parse CLI args
     let args = Args::parse();
@@ -812,6 +804,10 @@ async fn main() -> anyhow::Result<()> {
         .with_graceful_shutdown(shutdown_signal())
         .await?;
 
+    // Shutdown telemetry
+    info!("Shutting down telemetry...");
+    telemetry::shutdown_telemetry();
+
     // Clean up embedded database if it exists
     if let Some(embedded_db) = _embedded_db {
         info!("Shutting down embedded database...");
@@ -822,6 +818,7 @@ async fn main() -> anyhow::Result<()> {
 }
 
 /// Wait for shutdown signal (SIGTERM or Ctrl+C)
+#[instrument(skip_all)]
 async fn shutdown_signal() {
     use tokio::signal;
 

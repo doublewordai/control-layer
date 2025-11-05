@@ -42,6 +42,7 @@ use tracing::error;
         ("X-Doubleword-User" = [])
     )
 )]
+#[tracing::instrument(skip_all)]
 pub async fn list_users(
     State(state): State<AppState>,
     Query(query): Query<ListUsersQuery>,
@@ -155,6 +156,7 @@ pub async fn list_users(
         ("X-Doubleword-User" = [])
     )
 )]
+#[tracing::instrument(skip_all)]
 pub async fn get_user(
     State(state): State<AppState>,
     Path(user_id): Path<UserIdOrCurrent>,
@@ -240,6 +242,7 @@ pub async fn get_user(
         ("X-Doubleword-User" = [])
     )
 )]
+#[tracing::instrument(skip_all)]
 pub async fn create_user(
     State(state): State<AppState>,
     _: RequiresPermission<resource::Users, operation::CreateAll>,
@@ -277,6 +280,7 @@ pub async fn create_user(
         ("X-Doubleword-User" = [])
     )
 )]
+#[tracing::instrument(skip_all)]
 pub async fn update_user(
     State(state): State<AppState>,
     Path(user_id): Path<UserId>,
@@ -315,6 +319,7 @@ pub async fn update_user(
         ("X-Doubleword-User" = [])
     )
 )]
+#[tracing::instrument(skip_all)]
 pub async fn delete_user(
     State(state): State<AppState>,
     Path(user_id): Path<UserId>,

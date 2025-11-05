@@ -35,6 +35,7 @@ use sqlx::Acquire;
         ("X-Doubleword-User" = [])
     )
 )]
+#[tracing::instrument(skip_all)]
 pub async fn list_groups(
     State(state): State<AppState>,
     Query(query): Query<ListGroupsQuery>,
@@ -173,6 +174,7 @@ pub async fn list_groups(
         ("X-Doubleword-User" = [])
     )
 )]
+#[tracing::instrument(skip_all)]
 pub async fn create_group(
     State(state): State<AppState>,
     current_user: RequiresPermission<resource::Groups, operation::CreateAll>,
@@ -204,6 +206,7 @@ pub async fn create_group(
         ("X-Doubleword-User" = [])
     )
 )]
+#[tracing::instrument(skip_all)]
 pub async fn get_group(
     State(state): State<AppState>,
     Path(group_id): Path<GroupId>,
@@ -241,6 +244,7 @@ pub async fn get_group(
         ("X-Doubleword-User" = [])
     )
 )]
+#[tracing::instrument(skip_all)]
 pub async fn update_group(
     State(state): State<AppState>,
     Path(group_id): Path<GroupId>,
@@ -273,6 +277,7 @@ pub async fn update_group(
         ("X-Doubleword-User" = [])
     )
 )]
+#[tracing::instrument(skip_all)]
 pub async fn delete_group(
     State(state): State<AppState>,
     Path(group_id): Path<GroupId>,
@@ -309,6 +314,7 @@ pub async fn delete_group(
         ("X-Doubleword-User" = [])
     )
 )]
+#[tracing::instrument(skip_all)]
 pub async fn add_user_to_group(
     State(state): State<AppState>,
     Path((group_id, user_id)): Path<(GroupId, UserId)>,
@@ -339,6 +345,7 @@ pub async fn add_user_to_group(
         ("X-Doubleword-User" = [])
     )
 )]
+#[tracing::instrument(skip_all)]
 pub async fn remove_user_from_group(
     State(state): State<AppState>,
     Path((group_id, user_id)): Path<(GroupId, UserId)>,
@@ -368,6 +375,7 @@ pub async fn remove_user_from_group(
         ("X-Doubleword-User" = [])
     )
 )]
+#[tracing::instrument(skip_all)]
 pub async fn add_group_to_user(
     State(state): State<AppState>,
     Path((user_id, group_id)): Path<(UserId, GroupId)>,
@@ -398,6 +406,7 @@ pub async fn add_group_to_user(
         ("X-Doubleword-User" = [])
     )
 )]
+#[tracing::instrument(skip_all)]
 pub async fn remove_group_from_user(
     State(state): State<AppState>,
     Path((user_id, group_id)): Path<(UserId, GroupId)>,
@@ -427,6 +436,7 @@ pub async fn remove_group_from_user(
         ("X-Doubleword-User" = [])
     )
 )]
+#[tracing::instrument(skip_all)]
 pub async fn get_group_users(
     State(state): State<AppState>,
     Path(group_id): Path<GroupId>,
@@ -456,6 +466,7 @@ pub async fn get_group_users(
         ("X-Doubleword-User" = [])
     )
 )]
+#[tracing::instrument(skip_all)]
 pub async fn get_user_groups(
     State(state): State<AppState>,
     Path(user_id): Path<UserId>,
@@ -503,6 +514,7 @@ pub async fn get_user_groups(
         ("X-Doubleword-User" = [])
     )
 )]
+#[tracing::instrument(skip_all)]
 pub async fn add_deployment_to_group(
     State(state): State<AppState>,
     Path((group_id, deployment_id)): Path<(GroupId, DeploymentId)>,
@@ -532,6 +544,7 @@ pub async fn add_deployment_to_group(
         ("X-Doubleword-User" = [])
     )
 )]
+#[tracing::instrument(skip_all)]
 pub async fn remove_deployment_from_group(
     State(state): State<AppState>,
     Path((group_id, deployment_id)): Path<(GroupId, DeploymentId)>,
@@ -561,6 +574,7 @@ pub async fn remove_deployment_from_group(
         ("X-Doubleword-User" = [])
     )
 )]
+#[tracing::instrument(skip_all)]
 pub async fn get_group_deployments(
     State(state): State<AppState>,
     Path(group_id): Path<GroupId>,
@@ -590,6 +604,7 @@ pub async fn get_group_deployments(
         ("X-Doubleword-User" = [])
     )
 )]
+#[tracing::instrument(skip_all)]
 pub async fn get_deployment_groups(
     State(state): State<AppState>,
     Path(deployment_id): Path<DeploymentId>,
