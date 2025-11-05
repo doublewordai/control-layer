@@ -1,19 +1,20 @@
-//! Telemetry initialization module for OpenTelemetry tracing
+//! Telemetry initialization module for OpenTelemetry-compatible tracing (+normal rust tracing, fmt
+//! subscriber, etc.)
 //!
 //! This module provides functionality to initialize OpenTelemetry tracing with OTLP exporters.
 //! Configuration is done via standard OpenTelemetry environment variables:
 //!
 //! - `OTEL_EXPORTER_OTLP_ENDPOINT` - The OTLP endpoint URL
 //! - `OTEL_EXPORTER_OTLP_PROTOCOL` - Protocol (grpc, http/protobuf, http/json)
-//! - `OTEL_EXPORTER_OTLP_HEADERS` - Headers as comma-separated key=value pairs
+//! - `OTEL_EXPORTER_OTLP_HEADERS` - Headers as comma-separated key=value pairs. The values can have their spaces encoded URL style - i.e. replace %20 with space.
 //! - `OTEL_SERVICE_NAME` - Service name for resource identification
 //!
-//! Example:
+//! Example - to send traces to a custom OTLP HTTP endpoint with basic authorization header:
 //! ```bash
 //! export OTEL_SERVICE_NAME="dwctl"
 //! export OTEL_EXPORTER_OTLP_PROTOCOL="http/protobuf"
 //! export OTEL_EXPORTER_OTLP_ENDPOINT="https://otlp-gateway.example.com/otlp"
-//! export OTEL_EXPORTER_OTLP_HEADERS="Authorization=Basic <token>"
+//! export OTEL_EXPORTER_OTLP_HEADERS="Authorization=Basic%20<token>"
 //! ```
 
 use opentelemetry::trace::TracerProvider as _;
@@ -38,8 +39,6 @@ pub fn init_telemetry() -> anyhow::Result<()> {
     // Try to create OTLP tracer - if env vars aren't set, this will fail gracefully
     match create_otlp_tracer() {
         Ok(tracer) => {
-            info!("Initializing telemetry with OTLP export");
-
             // Build subscriber with both fmt and OpenTelemetry layers
             tracing_subscriber::registry()
                 .with(env_filter)
@@ -78,8 +77,9 @@ fn create_otlp_tracer() -> anyhow::Result<opentelemetry_sdk::trace::Tracer> {
     // Get endpoint
     let endpoint = std::env::var("OTEL_EXPORTER_OTLP_ENDPOINT").unwrap_or_else(|_| "http://localhost:4318".to_string());
 
+    eprintln!("[OTLP] Initializing OTLP tracer with the following configuration:");
+    eprintln!("[OTLP] Service Name: {}", service_name);
     eprintln!("[OTLP] Endpoint: {}", endpoint);
-
     // Parse headers from environment variable
     let mut headers = HashMap::new();
     if let Ok(headers_str) = std::env::var("OTEL_EXPORTER_OTLP_HEADERS") {
@@ -95,6 +95,7 @@ fn create_otlp_tracer() -> anyhow::Result<opentelemetry_sdk::trace::Tracer> {
                 headers.insert(key, value);
             }
         }
+        eprintln!("[OTLP] Custom headers, length: {}", headers.len());
     }
 
     // Determine protocol
