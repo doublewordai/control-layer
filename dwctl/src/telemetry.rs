@@ -2,14 +2,24 @@
 //! subscriber, etc.)
 //!
 //! This module provides functionality to initialize OpenTelemetry tracing with OTLP exporters.
-//! Configuration is done via standard OpenTelemetry environment variables:
+//! OTLP export is **disabled by default** and must be explicitly enabled via the `enable_otel_export`
+//! configuration flag.
+//!
+//! When enabled, configuration is done via standard OpenTelemetry environment variables:
 //!
 //! - `OTEL_EXPORTER_OTLP_ENDPOINT` - The OTLP endpoint URL
 //! - `OTEL_EXPORTER_OTLP_PROTOCOL` - Protocol (grpc, http/protobuf, http/json)
 //! - `OTEL_EXPORTER_OTLP_HEADERS` - Headers as comma-separated key=value pairs. The values can have their spaces encoded URL style - i.e. replace %20 with space.
 //! - `OTEL_SERVICE_NAME` - Service name for resource identification
 //!
-//! Example - to send traces to a custom OTLP HTTP endpoint with basic authorization header:
+//! Example - to enable OTLP export and send traces to a custom OTLP HTTP endpoint with basic authorization header:
+//!
+//! In config.yaml:
+//! ```yaml
+//! enable_otel_export: true
+//! ```
+//!
+//! Environment variables:
 //! ```bash
 //! export OTEL_SERVICE_NAME="dwctl"
 //! export OTEL_EXPORTER_OTLP_PROTOCOL="http/protobuf"
@@ -26,37 +36,48 @@ use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::util::SubscriberInitExt;
 use tracing_subscriber::EnvFilter;
 
-/// Initialize tracing with OpenTelemetry support
+/// Initialize tracing with optional OpenTelemetry support
 ///
 /// This function sets up tracing-subscriber with:
 /// - Console output (fmt layer)
-/// - OpenTelemetry OTLP export (configured via environment variables)
+/// - OpenTelemetry OTLP export (only if `enable_otel_export` is true and configured via environment variables)
 ///
-/// If OTLP environment variables are not set, only console logging will be enabled.
-pub fn init_telemetry() -> anyhow::Result<()> {
+/// Parameters:
+/// - `enable_otel_export`: If true, attempts to configure OTLP export using environment variables
+pub fn init_telemetry(enable_otel_export: bool) -> anyhow::Result<()> {
     let env_filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
 
-    // Try to create OTLP tracer - if env vars aren't set, this will fail gracefully
-    match create_otlp_tracer() {
-        Ok(tracer) => {
-            // Build subscriber with both fmt and OpenTelemetry layers
-            tracing_subscriber::registry()
-                .with(env_filter)
-                .with(tracing_subscriber::fmt::layer())
-                .with(tracing_opentelemetry::layer().with_tracer(tracer))
-                .try_init()?;
+    if enable_otel_export {
+        // Try to create OTLP tracer - if env vars aren't set, this will fail gracefully
+        match create_otlp_tracer() {
+            Ok(tracer) => {
+                // Build subscriber with both fmt and OpenTelemetry layers
+                tracing_subscriber::registry()
+                    .with(env_filter)
+                    .with(tracing_subscriber::fmt::layer())
+                    .with(tracing_opentelemetry::layer().with_tracer(tracer))
+                    .try_init()?;
 
-            info!("Telemetry initialized with OTLP export enabled");
-        }
-        Err(e) => {
-            // If OTLP setup fails, just use fmt layer without OpenTelemetry
-            tracing_subscriber::registry()
-                .with(env_filter)
-                .with(tracing_subscriber::fmt::layer())
-                .try_init()?;
+                info!("Telemetry initialized with OTLP export enabled");
+            }
+            Err(e) => {
+                // If OTLP setup fails, just use fmt layer without OpenTelemetry
+                tracing_subscriber::registry()
+                    .with(env_filter)
+                    .with(tracing_subscriber::fmt::layer())
+                    .try_init()?;
 
-            info!("Telemetry initialized without OTLP export: {}", e);
+                info!("Telemetry initialized without OTLP export: {}", e);
+            }
         }
+    } else {
+        // OTLP export disabled - use only console logging
+        tracing_subscriber::registry()
+            .with(env_filter)
+            .with(tracing_subscriber::fmt::layer())
+            .try_init()?;
+
+        info!("Telemetry initialized (OTLP export disabled)");
     }
 
     Ok(())
