@@ -14,12 +14,17 @@ import type {
   ApiKey,
   Endpoint,
   Group,
+  Transaction,
+  AddFundsRequest,
 } from "../types";
 import usersDataRaw from "./users.json";
 import groupsDataRaw from "./groups.json";
 import endpointsDataRaw from "./endpoints.json";
 import modelsDataRaw from "./models.json";
 import apiKeysDataRaw from "./api-keys.json";
+// Mock transactions for MSW test handlers
+// For demo mode UI data, see: src/components/features/cost-management/demoTransactions.ts
+import transactionsDataRaw from "./transactions.json";
 import userGroups from "./user-groups.json";
 import modelsGroups from "./models-groups.json";
 import requestsDataRaw from "../../demo/data/requests.json";
@@ -56,6 +61,7 @@ const groupsData = groupsDataRaw as Group[];
 const endpointsData = endpointsDataRaw as Endpoint[];
 const modelsData = modelsDataRaw.data as Model[];
 const apiKeysData = apiKeysDataRaw as ApiKey[];
+const transactionsData = transactionsDataRaw as Transaction[];
 const userGroupsInitial = userGroups as Record<string, string[]>;
 const modelsGroupsInitial = modelsGroups as Record<string, string[]>;
 const requestsData = requestsDataRaw as DemoRequest[];
@@ -1091,6 +1097,69 @@ export const handlers = [
 
     const result = computeUserUsageByModel(model, startDate, endDate);
     return HttpResponse.json(result);
+  }),
+
+  // Transactions API
+  http.get("/admin/api/v1/transactions", ({ request }) => {
+    const url = new URL(request.url);
+    const userId = url.searchParams.get("user_id");
+    const limitParam = url.searchParams.get("limit");
+    const skipParam = url.searchParams.get("skip");
+
+    const limit = limitParam ? parseInt(limitParam, 10) : undefined;
+    const skip = skipParam ? parseInt(skipParam, 10) : 0;
+
+    // Filter by userId if provided
+    const filteredTransactions = userId
+      ? transactionsData.filter((t) => t.user_id === userId)
+      : [...transactionsData];
+
+    // Sort by created_at descending (newest first)
+    filteredTransactions.sort(
+      (a, b) =>
+        new Date(b.created_at).getTime() - new Date(a.created_at).getTime(),
+    );
+
+    // Apply pagination
+    const paginatedTransactions = limit
+      ? filteredTransactions.slice(skip, skip + limit)
+      : filteredTransactions.slice(skip);
+
+    return HttpResponse.json(paginatedTransactions);
+  }),
+
+  http.post("/admin/api/v1/transactions", async ({ request }) => {
+    const body = (await request.json()) as AddFundsRequest;
+
+    // Validate user exists
+    const user = usersData.find((u) => u.id === body.user_id);
+    if (!user) {
+      return HttpResponse.json({ error: "User not found" }, { status: 404 });
+    }
+
+    // Get user's last transaction to determine current balance
+    const userTransactions = transactionsData
+      .filter((t) => t.user_id === body.user_id)
+      .sort(
+        (a, b) =>
+          new Date(b.created_at).getTime() - new Date(a.created_at).getTime(),
+      );
+    const currentBalance = userTransactions[0]?.balance_after || 0;
+
+    // Create new transaction
+    const newTransaction: Transaction = {
+      id: `txn-${Date.now()}`,
+      user_id: body.user_id,
+      transaction_type: "admin_grant",
+      amount: body.amount,
+      balance_after: currentBalance + body.amount,
+      previous_transaction_id: userTransactions[0]?.id,
+      source_id: "admin",
+      description: body.description || "Funds added by admin",
+      created_at: new Date().toISOString(),
+    };
+
+    return HttpResponse.json(newTransaction, { status: 201 });
   }),
 
   // Probes API

@@ -1,3 +1,12 @@
+/**
+ * Demo Transactions for UI Demo Mode
+ *
+ * This file provides transaction data for the frontend when running in demo mode
+ * (i.e., when users are exploring the UI without a real backend).
+ *
+ * For test mock data used by MSW in the test suite, see:
+ * src/api/control-layer/mocks/transactions.json
+ */
 
 // Demo user IDs
 import type {Transaction} from "@/api/control-layer";
