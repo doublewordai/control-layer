@@ -15,6 +15,7 @@ use crate::{api::models::users::CurrentUser, AppState};
         ("X-Doubleword-User" = [])
     )
 )]
+#[tracing::instrument(skip_all)]
 pub async fn get_config(State(state): State<AppState>, _user: CurrentUser) -> impl IntoResponse {
     let mut metadata = state.config.metadata.clone();
 

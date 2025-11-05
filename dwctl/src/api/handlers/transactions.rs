@@ -40,6 +40,7 @@ use uuid::Uuid;
         ("X-Doubleword-User" = [])
     )
 )]
+#[tracing::instrument(skip_all)]
 pub async fn create_transaction(
     State(state): State<AppState>,
     _perm: RequiresPermission<resource::Credits, operation::CreateAll>,
@@ -89,6 +90,7 @@ pub async fn create_transaction(
         ("X-Doubleword-User" = [])
     )
 )]
+#[tracing::instrument(skip_all)]
 pub async fn get_transaction(
     State(state): State<AppState>,
     Path(transaction_id): Path<Uuid>,
@@ -144,6 +146,7 @@ pub async fn get_transaction(
         ("X-Doubleword-User" = [])
     )
 )]
+#[tracing::instrument(skip_all)]
 pub async fn list_transactions(
     State(state): State<AppState>,
     Query(query): Query<ListTransactionsQuery>,
