@@ -11,7 +11,7 @@ use tokio::task::JoinSet;
 use crate::error::Result;
 use crate::http::HttpClient;
 use crate::request::DaemonId;
-use crate::storage::Storage;
+use crate::manager::Storage;
 
 /// Configuration for the daemon.
 #[derive(Debug, Clone)]
@@ -304,67 +304,3 @@ where
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::http::MockHttpClient;
-    use crate::request::*;
-    use crate::storage::in_memory::InMemoryStorage;
-
-    #[tokio::test]
-    async fn test_daemon_processes_requests() {
-        let storage = Arc::new(InMemoryStorage::new());
-        let http_client = Arc::new(MockHttpClient::new());
-
-        // Set up a mock response
-        http_client.add_response(
-            "POST /v1/test",
-            Ok(crate::http::HttpResponse {
-                status: 200,
-                body: "OK".to_string(),
-            }),
-        );
-
-        // Submit a pending request
-        let request = Request {
-            state: Pending {
-                retry_attempt: 0,
-                not_before: None,
-            },
-            data: RequestData {
-                id: RequestId::from(uuid::Uuid::new_v4()),
-                endpoint: "https://api.example.com".to_string(),
-                method: "POST".to_string(),
-                path: "/v1/test".to_string(),
-                body: "{}".to_string(),
-                model: "test-model".to_string(),
-                api_key: "test-key".to_string(),
-            },
-        };
-
-        storage.submit(request).await.unwrap();
-
-        // Create and run daemon
-        let daemon = Arc::new(Daemon::new(
-            storage.clone(),
-            http_client,
-            DaemonConfig::default(),
-        ));
-
-        // Run daemon for a short time
-        let daemon_handle = tokio::spawn({
-            let daemon = daemon.clone();
-            async move { daemon.run().await }
-        });
-
-        // Give it time to process
-        tokio::time::sleep(Duration::from_millis(500)).await;
-
-        // Stop the daemon
-        daemon_handle.abort();
-
-        // Verify no more pending requests
-        let pending = storage.view_pending_requests(10, None).await.unwrap();
-        assert_eq!(pending.len(), 0);
-    }
-}

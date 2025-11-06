@@ -394,6 +394,8 @@ mod tests {
 
         let request = RequestData {
             id: RequestId::from(uuid::Uuid::new_v4()),
+            batch_id: crate::batch::BatchId::from(uuid::Uuid::new_v4()),
+            template_id: crate::batch::TemplateId::from(uuid::Uuid::new_v4()),
             endpoint: "https://api.example.com".to_string(),
             method: "POST".to_string(),
             path: "/test".to_string(),
@@ -434,6 +436,8 @@ mod tests {
 
         let request = RequestData {
             id: RequestId::from(uuid::Uuid::new_v4()),
+            batch_id: crate::batch::BatchId::from(uuid::Uuid::new_v4()),
+            template_id: crate::batch::TemplateId::from(uuid::Uuid::new_v4()),
             endpoint: "https://api.example.com".to_string(),
             method: "GET".to_string(),
             path: "/status".to_string(),
@@ -457,6 +461,8 @@ mod tests {
 
         let request = RequestData {
             id: RequestId::from(uuid::Uuid::new_v4()),
+            batch_id: crate::batch::BatchId::from(uuid::Uuid::new_v4()),
+            template_id: crate::batch::TemplateId::from(uuid::Uuid::new_v4()),
             endpoint: "https://api.example.com".to_string(),
             method: "POST".to_string(),
             path: "/unknown".to_string(),
@@ -483,6 +489,8 @@ mod tests {
 
         let request = RequestData {
             id: RequestId::from(uuid::Uuid::new_v4()),
+            batch_id: crate::batch::BatchId::from(uuid::Uuid::new_v4()),
+            template_id: crate::batch::TemplateId::from(uuid::Uuid::new_v4()),
             endpoint: "https://api.example.com".to_string(),
             method: "POST".to_string(),
             path: "/test".to_string(),

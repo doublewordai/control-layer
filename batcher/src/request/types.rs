@@ -11,6 +11,7 @@ use tokio::sync::{mpsc, Mutex};
 use tokio::task::AbortHandle;
 use uuid::Uuid;
 
+use crate::batch::{BatchId, TemplateId};
 use crate::error::Result;
 use crate::http::HttpResponse;
 
@@ -49,6 +50,12 @@ pub struct Request<T: RequestState> {
 pub struct RequestData {
     /// The ID with which the request was submitted.
     pub id: RequestId,
+
+    /// The batch this execution belongs to
+    pub batch_id: BatchId,
+
+    /// The template this execution was created from
+    pub template_id: TemplateId,
 
     /// The base URL of the target endpoint (e.g., "https://api.openai.com")
     pub endpoint: String,

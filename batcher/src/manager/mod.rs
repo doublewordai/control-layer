@@ -1,50 +1,68 @@
-//! Main trait for the batching system.
+//! Main traits for the batching system.
 //!
-//! This module defines the `RequestManager` trait, which provides the interface
-//! for submitting, canceling, and checking the status of batched requests.
+//! This module defines the `Storage` and `RequestManager` traits, which provide the interface
+//! for persisting requests, creating files, launching batches, and checking execution status.
 
+use crate::batch::{BatchId, BatchStatus, File, FileId, RequestTemplate, RequestTemplateInput};
 use crate::error::Result;
-use crate::request::{AnyRequest, Pending, Request, RequestId};
+use crate::http::HttpClient;
+use crate::request::{AnyRequest, Claimed, DaemonId, Pending, Request, RequestId, RequestState};
 use async_trait::async_trait;
 use futures::stream::Stream;
 use std::pin::Pin;
+use std::sync::Arc;
 use tokio::task::JoinHandle;
-
-pub mod in_memory;
 
 #[cfg(feature = "postgres")]
 pub mod postgres;
 
-/// Client side trait for the batching system.
+/// Storage trait for persisting and querying requests.
 ///
-/// This trait defines the interface for submitting, canceling, and checking the status
-/// of batched requests. Implementations can be backed by different storage mechanisms
-/// (e.g., in-memory, PostgreSQL).
-///
-/// # Example
-/// ```ignore
-/// let manager = PostgresRequestManager::new(pool).await?;
-///
-/// // Submit a batch of requests
-/// let requests = vec![(pending_request, request_context)];
-/// let ids = manager.submit_requests(requests).await?;
-///
-/// // Check status
-/// let statuses = manager.get_status(ids.clone()).await?;
-///
-/// // Cancel if needed
-/// manager.cancel_requests(ids).await?;
-/// ```
+/// This trait provides atomic operations for request lifecycle management.
+/// The type system ensures valid state transitions, so implementations don't
+/// need to validate them.
 #[async_trait]
-pub trait RequestManager: Send + Sync {
-    /// Submit requests for processing.
-    ///
-    /// Users submit IDs in the request data. These should be used in the other methods.
-    /// API keys and other request-specific data should be included in the RequestData.
-    /// Retry behavior is configured at the daemon level.
-    async fn submit_requests(&self, requests: Vec<Request<Pending>>) -> Result<Vec<Result<()>>>;
+pub trait Storage: Send + Sync {
+    /// Create a new file with templates.
+    async fn create_file(
+        &self,
+        name: String,
+        description: Option<String>,
+        templates: Vec<RequestTemplateInput>,
+    ) -> Result<FileId>;
 
-    /// Cancel one or more pending or processing requests.
+    /// Get a file by ID.
+    async fn get_file(&self, file_id: FileId) -> Result<File>;
+
+    /// List all files.
+    async fn list_files(&self) -> Result<Vec<File>>;
+
+    /// Get all templates for a file.
+    async fn get_file_templates(&self, file_id: FileId) -> Result<Vec<RequestTemplate>>;
+
+    /// Delete a file (cascades to batches and executions).
+    async fn delete_file(&self, file_id: FileId) -> Result<()>;
+
+    /// Create a batch from a file's current templates.
+    /// This will spawn requests in the Pending state for all templates in the file.
+    async fn create_batch(&self, file_id: FileId) -> Result<BatchId>;
+
+    /// Get batch status.
+    async fn get_batch_status(&self, batch_id: BatchId) -> Result<BatchStatus>;
+
+    /// List all batches for a file.
+    async fn list_file_batches(&self, file_id: FileId) -> Result<Vec<BatchStatus>>;
+
+    /// Get all requests for a batch.
+    async fn get_batch_requests(&self, batch_id: BatchId) -> Result<Vec<AnyRequest>>;
+
+    /// Cancel all pending/in-progress requests for a batch.
+    async fn cancel_batch(&self, batch_id: BatchId) -> Result<()>;
+
+    /// Directly submit a new pending request to storage with its processing context.
+    async fn submit(&self, request: Request<Pending>) -> Result<()>;
+
+    /// Cancel one or more individual pending or in-progress requests.
     ///
     /// Requests that have already completed or failed cannot be canceled.
     /// This is a best-effort operation - some requests may have already been processed.
@@ -55,48 +73,92 @@ pub trait RequestManager: Send + Sync {
     /// Individual cancellation results may fail if:
     /// - Request ID doesn't exist
     /// - Request is already in a terminal state (completed/failed)
-    async fn cancel_requests(&self, ids: Vec<RequestId>) -> Result<Vec<Result<()>>>;
+    #[tracing::instrument(skip(self, ids), fields(count = ids.len()))]
+    async fn cancel_requests(&self, ids: Vec<RequestId>) -> Result<Vec<Result<()>>> {
+        tracing::info!(count = ids.len(), "Cancelling requests");
 
-    /// Get the current status of one or more requests.
-    ///
-    /// Returns the status for each requested ID. If a request ID doesn't exist,
-    /// an error will be returned for that specific request.
-    ///
-    /// # Errors
-    /// Individual status results may fail if:
-    /// - Request ID doesn't exist
-    /// - Database error occurs
-    async fn get_status(&self, ids: Vec<RequestId>) -> Result<Vec<Result<AnyRequest>>>;
+        let mut results = Vec::new();
 
-    /// Get a stream of updates for a set of requests.
+        for id in ids {
+            // Get the request from storage
+            let get_results = self.get_requests(vec![id]).await?;
+            let request_result = get_results.into_iter().next().unwrap();
+
+            let result = match request_result {
+                Ok(any_request) => match any_request {
+                    AnyRequest::Pending(req) => {
+                        req.cancel(self).await?;
+                        Ok(())
+                    }
+                    AnyRequest::Claimed(req) => {
+                        req.cancel(self).await?;
+                        Ok(())
+                    }
+                    AnyRequest::Processing(req) => {
+                        req.cancel(self).await?;
+                        Ok(())
+                    }
+                    AnyRequest::Completed(_) | AnyRequest::Failed(_) | AnyRequest::Canceled(_) => {
+                        Err(crate::error::BatcherError::InvalidState(
+                            id,
+                            "terminal state".to_string(),
+                            "cancellable state".to_string(),
+                        ))
+                    }
+                },
+                Err(e) => Err(e),
+            };
+
+            results.push(result);
+        }
+
+        Ok(results)
+    }
+
+    /// Get in progress requests by IDs.
+    async fn get_requests(&self, ids: Vec<RequestId>) -> Result<Vec<Result<AnyRequest>>>;
+
+    /// Get a stream of updates for requests.
     ///
-    /// Returns requests as each request changes status.
-    /// `None` for `id_filter` implies getting all status updates.
+    /// Returns requests as they change status, if possible.
+    /// `None` for `id_filter` implies getting all request updates.
     ///
     /// The stream continues indefinitely, emitting updates as they occur.
     /// The outer Result represents stream-level errors (e.g., connection loss),
     /// while the inner Result represents per-update errors.
-    ///
-    /// # Example
-    /// ```ignore
-    /// let mut updates = manager.get_status_updates(Some(vec![request_id]));
-    /// while let Some(result) = updates.next().await {
-    ///     match result {
-    ///         Ok(Ok(request)) => println!("Request {} updated: {:?}", request.id(), request),
-    ///         Ok(Err(e)) => eprintln!("Update error: {}", e),
-    ///         Err(e) => {
-    ///             eprintln!("Stream error: {}", e);
-    ///             break;
-    ///         }
-    ///     }
-    /// }
-    /// ```
-    fn get_status_updates(
+    fn get_request_updates(
         &self,
         id_filter: Option<Vec<RequestId>>,
     ) -> Pin<Box<dyn Stream<Item = Result<Result<AnyRequest>>> + Send>>;
 
-    /// Run the Request Manager daemon thread.
+    // These methods are used by the DaemonExecutor for processing requests.
+
+    /// Atomically claim pending requests for processing.
+    async fn claim_requests(
+        &self,
+        limit: usize,
+        daemon_id: DaemonId,
+    ) -> Result<Vec<Request<Claimed>>>;
+
+    /// Update an existing request's state in storage.
+    async fn persist<T: RequestState + Clone>(&self, request: &Request<T>) -> Result<()>
+    where
+        AnyRequest: From<Request<T>>;
+}
+
+/// Daemon executor trait for runtime orchestration.
+///
+/// This trait handles only the daemon lifecycle - spawning the background worker
+/// that processes requests. All data operations are on the Storage trait.
+#[async_trait]
+pub trait DaemonExecutor<H: HttpClient>: Storage + Send + Sync {
+    /// Get a reference to the HTTP client.
+    fn http_client(&self) -> &Arc<H>;
+
+    /// Get a reference to the daemon configuration.
+    fn config(&self) -> &crate::daemon::DaemonConfig;
+
+    /// Run the daemon thread.
     ///
     /// This spawns a background task responsible for actually doing the work of moving
     /// requests from one state to another, and broadcasting those status changes.
@@ -113,6 +175,7 @@ pub trait RequestManager: Send + Sync {
     ///
     /// # Example
     /// ```ignore
+    /// let manager = Arc::new(manager);
     /// let handle = manager.run()?;
     ///
     /// // Do work...
@@ -120,5 +183,7 @@ pub trait RequestManager: Send + Sync {
     /// // Shutdown gracefully (implementation-specific)
     /// handle.abort();
     /// ```
-    fn run(&self) -> Result<JoinHandle<Result<()>>>;
+    fn run(self: Arc<Self>) -> Result<JoinHandle<Result<()>>>;
+
+    // File and Batch Management methods are inherited from the Storage trait
 }
