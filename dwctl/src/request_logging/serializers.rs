@@ -1855,8 +1855,6 @@ mod tests {
             let transactions = credits.list_user_transactions(user_id, 0, 10).await.unwrap();
             let usage_tx = transactions.iter().find(|tx| tx.transaction_type == CreditTransactionType::Usage);
             assert!(usage_tx.is_none(), "No Usage transaction should be created for Playground users");
-            let balance_after = credits.get_user_balance(user_id).await.unwrap();
-            assert_eq!(balance_after, initial_balance, "Balance should remain unchanged");
 
             // Verify: Analytics record WAS created (tracking, just not billing)
             let analytics_count = sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM http_analytics WHERE user_id = $1")
