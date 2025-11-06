@@ -403,11 +403,8 @@ mod tests {
     use std::{collections::HashMap, str::FromStr, time::Duration};
 
     use chrono::Utc;
-    use tokio::sync::{watch, mpsc};
+    use tokio::{sync::{watch, mpsc}, time::timeout};
     use tokio_util::sync::CancellationToken;
-
-    use chrono::Utc;
-    use tokio::time::timeout;
     use uuid::Uuid;
 
     use crate::{
@@ -647,8 +644,12 @@ mod tests {
         );
 
         // Start the sync task in the background
+        let (status_tx, mut status_rx) = mpsc::channel(10);
+        let config = SyncConfig {
+            status_tx: Some(status_tx),
+        };
         tokio::spawn(async move {
-            if let Err(e) = sync.start().await {
+            if let Err(e) = sync.start(config).await {
                 eprintln!("Sync task failed: {}", e);
             }
         });
