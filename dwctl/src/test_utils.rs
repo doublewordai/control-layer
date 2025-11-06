@@ -31,7 +31,7 @@ pub async fn create_test_app(pool: PgPool, enable_sync: bool) -> (TestServer, Op
     if enable_sync {
         // Start the config sync in background for tests
         tokio::spawn(async move {
-            if let Err(e) = onwards_config_sync.start().await {
+            if let Err(e) = onwards_config_sync.start(Default::default()).await {
                 eprintln!("Config sync error in test: {e}");
             }
         });
@@ -75,6 +75,7 @@ pub fn create_test_config() -> crate::config::Config {
         },
         enable_metrics: false,
         enable_request_logging: false,
+        enable_otel_export: false,
     }
 }
 

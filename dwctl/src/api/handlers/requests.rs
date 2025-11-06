@@ -8,7 +8,7 @@ use axum::{
 };
 // Remove unused chrono imports
 use outlet_postgres::{RequestFilter, RequestRepository};
-use tracing::{debug, error, instrument};
+use tracing::{debug, error};
 
 use crate::{
     api::models::requests::{
@@ -114,7 +114,7 @@ fn convert_outlet_pairs_to_api(outlet_pairs: Vec<outlet_postgres::RequestRespons
     ),
     tag = "requests",
 )]
-#[instrument(skip(state, query), err)]
+#[tracing::instrument(skip_all)]
 pub async fn list_requests(
     Query(query): Query<ListRequestsQuery>,
     State(state): State<AppState>,
@@ -212,7 +212,7 @@ pub async fn list_requests(
     ),
     tag = "requests",
 )]
-#[instrument(skip(state, query), err)]
+#[tracing::instrument(skip_all)]
 pub async fn aggregate_requests(
     Query(query): Query<AggregateRequestsQuery>,
     State(state): State<AppState>,
@@ -264,7 +264,7 @@ pub struct AggregateByUserQuery {
     ),
     tag = "requests",
 )]
-#[instrument(skip(state, query), err)]
+#[tracing::instrument(skip_all)]
 pub async fn aggregate_by_user(
     Query(query): Query<AggregateByUserQuery>,
     State(state): State<AppState>,

@@ -1,8 +1,18 @@
 {
   "packages": {
+    "fusillade": {
+      "release-type": "rust",
+      "include-component-in-tag": true
+    },
     "dwctl": {
       "release-type": "rust"
     }
   },
-  "include-component-in-tag": false
+  "plugins": [
+    {
+      "type": "cargo-workspace"
+    }
+  ],
+  "include-component-in-tag": false,
+  "separate-pull-requests": true
 }

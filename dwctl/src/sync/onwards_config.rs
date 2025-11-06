@@ -2,10 +2,19 @@ use std::{collections::HashMap, num::NonZeroU32};
 
 use onwards::target::{Auth, ConfigFile, KeyDefinition, RateLimitParameters, TargetSpec, Targets, WatchTargetsStream};
 use sqlx::{postgres::PgListener, PgPool};
-use tokio::sync::watch;
+use tokio::sync::{mpsc, watch};
 use tokio_util::sync::{CancellationToken, DropGuard};
 use tracing::{debug, error, info, instrument, warn};
 use url::Url;
+
+/// Status events for testing/observability
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SyncStatus {
+    Connecting,
+    Connected,
+    Disconnected,
+    Reconnecting,
+}
 
 use crate::{
     config::{ONWARDS_CONFIG_CHANGED_CHANNEL, ONWARDS_INPUT_TOKEN_PRICE_HEADER, ONWARDS_OUTPUT_TOKEN_PRICE_HEADER},
@@ -17,11 +26,15 @@ use crate::{
 };
 
 /// Manages the integration between onwards-pilot and the onwards proxy
-#[derive(Debug)]
 pub struct OnwardsConfigSync {
     db: PgPool,
     sender: watch::Sender<Targets>,
     shutdown_token: CancellationToken,
+}
+
+#[derive(Default)]
+pub struct SyncConfig {
+    status_tx: Option<mpsc::Sender<SyncStatus>>,
 }
 
 impl OnwardsConfigSync {
@@ -49,94 +62,109 @@ impl OnwardsConfigSync {
     }
 
     /// Starts the background task that listens for database changes and updates the configuration
-    #[instrument(skip(self))]
-    pub async fn start(self) -> Result<(), anyhow::Error> {
-        let mut listener = PgListener::connect_with(&self.db).await?;
-
-        // Listen to onwards config changes
-        listener.listen(ONWARDS_CONFIG_CHANGED_CHANNEL).await?;
-
-        debug!("Started onwards configuration listener");
-
+    #[instrument(skip(self, config), err)]
+    pub async fn start(self, config: SyncConfig) -> Result<(), anyhow::Error> {
         // Debouncing: prevent rapid-fire reloads
         let mut last_reload_time = std::time::Instant::now();
         const MIN_RELOAD_INTERVAL: std::time::Duration = std::time::Duration::from_millis(100);
 
-        // Listen for notifications with graceful shutdown
-        loop {
-            tokio::select! {
-                // Handle shutdown signal
-                _ = self.shutdown_token.cancelled() => {
-                    info!("Received shutdown signal, stopping onwards configuration listener");
-                    break;
-                }
+        'outer: loop {
+            if let Some(tx) = &config.status_tx {
+                tx.send(SyncStatus::Connecting).await?;
+            }
+            let mut listener = PgListener::connect_with(&self.db).await?;
+            // Listen to auth config changes
+            listener.listen(ONWARDS_CONFIG_CHANGED_CHANNEL).await?;
 
-                // Handle database notifications
-                notification_result = listener.recv() => {
-                    match notification_result {
-                        Ok(notification) => {
-                            debug!("Received notification on channel: {} with payload: {:?}",
-                                  notification.channel(), notification.payload());
+            if let Some(tx) = &config.status_tx {
+                tx.send(SyncStatus::Connected).await?;
+            }
+            info!("Started onwards configuration listener");
+            // Listen for notifications with graceful shutdown
+            loop {
+                tokio::select! {
+                    // Handle shutdown signal
+                    _ = self.shutdown_token.cancelled() => {
+                        info!("Received shutdown signal, stopping onwards configuration listener");
+                        break 'outer;
+                    }
 
-                            // Debounce: skip if we just reloaded recently
-                            if last_reload_time.elapsed() < MIN_RELOAD_INTERVAL {
-                                debug!("Skipping reload due to debouncing (last reload was {:?} ago)",
-                                       last_reload_time.elapsed());
-                                continue;
+                    // Handle database notifications
+                    notification_result = listener.try_recv() => {
+                        info!("Received notification from database");
+                        match notification_result {
+                            Ok(None) => {
+                                info!("Connection lost, attempting to reconnect");
+                                if let Some(tx) = &config.status_tx {
+                                    info!("Sending Disconnected status");
+                                    tx.send(SyncStatus::Disconnected).await?;
+                                }
+                                // Try to reconnect for other errors
+                                if let Some(tx) = &config.status_tx {
+                                    info!("Sending Reconnecting status");
+                                    tx.send(SyncStatus::Reconnecting).await?;
+                                }
+                                break;
+
+                            },
+                            Ok(Some(notification)) => {
+                                debug!("Received notification on channel: {} with payload: {:?}",
+                                      notification.channel(), notification.payload());
+
+                                // Debounce: skip if we just reloaded recently
+                                if last_reload_time.elapsed() < MIN_RELOAD_INTERVAL {
+                                    debug!("Skipping reload due to debouncing (last reload was {:?} ago)",
+                                           last_reload_time.elapsed());
+                                    continue;
+                                }
+
+                                // Reload configuration from database
+                                last_reload_time = std::time::Instant::now();
+                                match load_targets_from_db(&self.db).await {
+                                    Ok(new_targets) => {
+                                        info!("Loaded {} targets from database", new_targets.targets.len());
+                                        for entry in new_targets.targets.iter() {
+                                            let alias = entry.key();
+                                            let target = entry.value();
+                                            debug!("Target '{}': {} keys configured", alias,
+                                                  target.keys.as_ref().map(|k| k.len()).unwrap_or(0));
+                                        }
+
+                                        // Send update through watch channel
+                                        if let Err(e) = self.sender.send(new_targets) {
+                                            error!("Failed to send targets update: {}", e);
+                                            // If all receivers are dropped, we can exit
+                                            break;
+                                        }
+                                        info!("Updated onwards configuration successfully");
+                                    }
+                                    Err(e) => {
+                                        error!("Failed to load targets from database: {}", e);
+                                        // Return error if database operations fail consistently
+                                        if e.to_string().contains("closed pool") || e.to_string().contains("connection closed") {
+                                            error!("Database pool closed, exiting sync task");
+                                            return Err(e);
+                                        }
+                                        // Continue listening for other types of errors
+                                    }
+                                }
                             }
-
-                            // Reload configuration from database
-                            last_reload_time = std::time::Instant::now();
-                            match load_targets_from_db(&self.db).await {
-                                Ok(new_targets) => {
-                                    info!("Loaded {} targets from database", new_targets.targets.len());
-                                    for entry in new_targets.targets.iter() {
-                                        let alias = entry.key();
-                                        let target = entry.value();
-                                        debug!("Target '{}': {} keys configured", alias,
-                                              target.keys.as_ref().map(|k| k.len()).unwrap_or(0));
-                                    }
-
-                                    // Send update through watch channel
-                                    if let Err(e) = self.sender.send(new_targets) {
-                                        error!("Failed to send targets update: {}", e);
-                                        // If all receivers are dropped, we can exit
-                                        break;
-                                    }
-                                    info!("Updated onwards configuration successfully");
+                            Err(e) => {
+                                error!("Error receiving notification: {}", e);
+                                if let Some(tx) = &config.status_tx {
+                                    tx.send(SyncStatus::Disconnected).await?;
                                 }
-                                Err(e) => {
-                                    error!("Failed to load targets from database: {}", e);
-                                    // Return error if database operations fail consistently
-                                    if e.to_string().contains("closed pool") || e.to_string().contains("connection closed") {
-                                        error!("Database pool closed, exiting sync task");
-                                        return Err(e);
-                                    }
-                                    // Continue listening for other types of errors
+                                // Try to reconnect for other errors
+                                if let Some(tx) = &config.status_tx {
+                                    tx.send(SyncStatus::Reconnecting).await?;
                                 }
-                            }
-                        }
-                        Err(e) => {
-                            error!("Error receiving notification: {}", e);
 
-                            // Check if this is a fatal error that should propagate
-                            if e.to_string().contains("closed pool") || e.to_string().contains("connection closed") {
-                                error!("Database connection closed, exiting sync task");
-                                return Err(e.into());
-                            }
-
-                            // Try to reconnect for other errors
-                            tokio::select! {
-                                _ = self.shutdown_token.cancelled() => {
-                                    info!("Received shutdown signal during reconnect, stopping");
-                                    break;
+                                // Check if this is a fatal error that should propagate
+                                if e.to_string().contains("closed pool") || e.to_string().contains("connection closed") {
+                                    error!("Database connection closed, exiting sync task");
+                                    return Err(e.into());
                                 }
-                                _ = tokio::time::sleep(std::time::Duration::from_secs(5)) => {
-                                    // Try to reconnect after delay
-                                    if let Err(e) = listener.listen(ONWARDS_CONFIG_CHANGED_CHANNEL).await {
-                                        error!("Failed to re-listen to PostgreSQL channel: {}", e);
-                                    }
-                                }
+                                break;
                             }
                         }
                     }
@@ -372,16 +400,19 @@ fn convert_to_config_file(
 
 #[cfg(test)]
 mod tests {
-    use std::{collections::HashMap, str::FromStr};
+    use std::{collections::HashMap, str::FromStr, time::Duration};
 
     use chrono::Utc;
-    use tokio::sync::watch;
+    use tokio::sync::{watch, mpsc};
     use tokio_util::sync::CancellationToken;
+
+    use chrono::Utc;
+    use tokio::time::timeout;
     use uuid::Uuid;
 
     use crate::{
         db::models::deployments::{DeploymentDBResponse, ModelStatus},
-        sync::onwards_config::convert_to_config_file,
+        sync::onwards_config::{convert_to_config_file, SyncConfig},
     };
 
     // Helper function to create a test deployed model
@@ -687,5 +718,94 @@ mod tests {
             "Config should have updated output price, got: {}",
             output_price_header
         );
+    }
+
+    /// Regression test: onwards_config should reconnect after connection loss
+    /// and successfully resume receiving notifications.
+    #[sqlx::test]
+    #[test_log::test]
+    async fn test_onwards_config_reconnects_after_connection_loss(pool: sqlx::PgPool) {
+        // Start the onwards config sync with status channel
+        let (sync, _initial_targets, _stream, _drop_guard) = super::OnwardsConfigSync::new(pool.clone())
+            .await
+            .expect("Failed to create OnwardsConfigSync");
+
+        let (status_tx, mut status_rx) = mpsc::channel(10);
+        let config = SyncConfig {
+            status_tx: Some(status_tx),
+        };
+        let mut sync_handle = tokio::spawn(async move { sync.start(config).await });
+
+        // Wait for initial connection
+        println!("Waiting for Connecting status...");
+        assert_eq!(status_rx.recv().await, Some(super::SyncStatus::Connecting));
+        println!("Waiting for Connected status...");
+        assert_eq!(status_rx.recv().await, Some(super::SyncStatus::Connected));
+        println!("Initial connection established");
+
+        // Kill the LISTEN connection to simulate network interruption
+        // First, get the PIDs of LISTEN connections
+        let pids: Vec<i32> = sqlx::query_scalar(
+            "SELECT pid FROM pg_stat_activity
+             WHERE query LIKE '%LISTEN%auth_config_changed%'
+             AND pid != pg_backend_pid()",
+        )
+        .fetch_all(&pool)
+        .await
+        .expect("Failed to find LISTEN connections");
+
+        assert!(!pids.is_empty(), "Should have found at least one LISTEN connection");
+        println!("Found {} LISTEN connections to kill: {:?}", pids.len(), pids);
+
+        // Now kill them one by one
+        for pid in &pids {
+            let _: bool = sqlx::query_scalar("SELECT pg_terminate_backend($1)")
+                .bind(pid)
+                .fetch_one(&pool)
+                .await
+                .expect("Failed to terminate backend");
+        }
+        println!("Killed LISTEN connections");
+
+        // Give the connection time to detect it's been terminated
+        tokio::time::sleep(Duration::from_millis(500)).await;
+
+        // Wait for reconnection status events
+        println!("Waiting for Disconnected status...");
+        // Add a timeout in case the Disconnected status never arrives
+        let status = timeout(Duration::from_secs(2), status_rx.recv())
+            .await
+            .expect("Timeout waiting for Disconnected status - the dead connection wasn't detected");
+        assert_eq!(
+            status,
+            Some(super::SyncStatus::Disconnected),
+            "Should receive Disconnected after kill"
+        );
+
+        println!("Waiting for Reconnecting status...");
+        let status = status_rx.recv().await;
+        assert_eq!(status, Some(super::SyncStatus::Reconnecting), "Should receive Reconnecting");
+
+        // Wait up to 7 seconds for successful reconnection (5s delay + 2s buffer)
+        let reconnected = timeout(Duration::from_secs(7), async {
+            loop {
+                match status_rx.recv().await {
+                    Some(super::SyncStatus::Connected) => return true,
+                    Some(status) => println!("Received status: {:?}", status),
+                    None => return false,
+                }
+            }
+        })
+        .await;
+
+        assert!(
+            reconnected.is_ok(),
+            "Should reconnect after connection loss (BUG: current code calls listen() on broken connection)"
+        );
+
+        // Verify task is still running
+        let result = timeout(Duration::from_millis(100), &mut sync_handle).await;
+        assert!(result.is_err(), "Task should still be running after reconnection");
+        sync_handle.abort();
     }
 }

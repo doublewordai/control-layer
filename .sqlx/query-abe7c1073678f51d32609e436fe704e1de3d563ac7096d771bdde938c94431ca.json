@@ -1,0 +1,22 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT dg.deployment_id FROM deployment_groups dg \n             JOIN deployed_models dm ON dg.deployment_id = dm.id \n             WHERE dg.group_id = $1 AND dm.deleted = false",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "deployment_id",
+        "type_info": "Uuid"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid"
+      ]
+    },
+    "nullable": [
+      false
+    ]
+  },
+  "hash": "abe7c1073678f51d32609e436fe704e1de3d563ac7096d771bdde938c94431ca"
+}
