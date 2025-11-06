@@ -78,12 +78,14 @@ export function CostManagement() {
         </p>
       </div>
 
-      <TransactionHistory
-        userId="current"
-        onAddFunds={canAddFunds ? handleAddFunds : undefined}
-        isAddingFunds={addFundsMutation.isPending}
-        showCard={false}
-      />
+      {user && (
+        <TransactionHistory
+          userId={user.id}
+          onAddFunds={canAddFunds ? handleAddFunds : undefined}
+          isAddingFunds={addFundsMutation.isPending}
+          showCard={false}
+        />
+      )}
     </div>
   );
 }

@@ -39,30 +39,9 @@ export function useUsers(options?: UsersQuery & { enabled?: boolean }) {
 }
 
 export function useUser(id: string) {
-  const queryClient = useQueryClient();
-
   return useQuery({
     queryKey: queryKeys.users.byId(id),
-    queryFn: async () => {
-      const user = await dwctlApi.users.get(id);
-
-      // Normalize cache: ensure "current" and the actual user ID are cached together
-      // This ensures useUser("current") and useUser(actualId) return the same cached data
-      if (id === "current" && user.id !== "current") {
-        // Fetched with "current", also cache under actual ID
-        queryClient.setQueryData(queryKeys.users.byId(user.id), user);
-      } else if (id !== "current") {
-        // Fetched with actual ID, also cache under "current" for demo mode
-        // In demo mode, we need to check if this is the current user
-        // For simplicity, we'll also set it under "current" - React Query will handle staleness
-        const currentUser = queryClient.getQueryData(queryKeys.users.byId("current")) as any;
-        if (!currentUser || currentUser.id === user.id) {
-          queryClient.setQueryData(queryKeys.users.byId("current"), user);
-        }
-      }
-
-      return user;
-    },
+    queryFn: () => dwctlApi.users.get(id),
   });
 }
 
@@ -660,7 +639,6 @@ export function useAddFunds() {
       // Refetch user balance and transactions from server
       await Promise.all([
         queryClient.refetchQueries({ queryKey: queryKeys.users.byId(variables.user_id) }),
-        queryClient.refetchQueries({ queryKey: queryKeys.users.byId("current") }),
         queryClient.refetchQueries({ queryKey: ["cost", "transactions"] }),
       ]);
     },

@@ -10,7 +10,7 @@ const DEFAULT_SETTINGS: AppSettings = {
   apiBaseUrl: "/admin/api/v1",
   features: {
     demo: false,
-    use_billing: true,
+    use_billing: false,
   },
   paymentProviderUrl: undefined,
 };
