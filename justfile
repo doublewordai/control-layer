@@ -473,7 +473,6 @@ lint target *args="":
             npm run lint -- --max-warnings 0 {{args}}
             ;;
         rust)
-            cd dwctl
             echo "Checking Cargo.lock sync..."
             cargo metadata --locked > /dev/null
             echo "Running cargo fmt --check..."
@@ -481,17 +480,8 @@ lint target *args="":
             echo "Running cargo clippy..."
             cargo clippy {{args}}
             echo "Checking SQLx prepared queries..."
-            SQLX_OFFLINE=true cargo sqlx prepare --check
-
-            cd ../fusillade
-            echo "Checking Cargo.lock sync..."
-            cargo metadata --locked > /dev/null
-            echo "Running cargo fmt --check..."
-            cargo fmt --check
-            echo "Running cargo clippy..."
-            cargo clippy {{args}}
-            echo "Checking SQLx prepared queries..."
-            SQLX_OFFLINE=true cargo sqlx prepare --check
+            cd dwctl && SQLX_OFFLINE=true cargo sqlx prepare --check && cd ..
+            cd fusillade && SQLX_OFFLINE=true cargo sqlx prepare --check && cd ..
             ;;
         *)
             echo "Usage: just lint [ts|rust]"
@@ -614,7 +604,6 @@ ci target *args="":
             cd fusillade && sqlx migrate run && cd ..
 
             echo "📋 Setting up llvm-cov environment for consistent compilation..."
-            cd dwctl
             echo "🧪 Step 1/2: Running tests with coverage..."
             just test rust --coverage {{args}}
             eval "$(cargo llvm-cov show-env --export-prefix)"

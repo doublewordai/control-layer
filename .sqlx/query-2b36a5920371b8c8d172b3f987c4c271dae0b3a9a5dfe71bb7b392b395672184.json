@@ -1,0 +1,91 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n            INSERT INTO inference_endpoints (name, description, url, api_key, model_filter, auth_header_name, auth_header_prefix, created_by, created_at, updated_at)\n            VALUES ($1, $2, $3, $4, $5, COALESCE($6, 'Authorization'), COALESCE($7, 'Bearer '), $8, $9, $10)\n            RETURNING *\n            ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "name",
+        "type_info": "Varchar"
+      },
+      {
+        "ordinal": 1,
+        "name": "description",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 2,
+        "name": "url",
+        "type_info": "Varchar"
+      },
+      {
+        "ordinal": 3,
+        "name": "created_by",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 4,
+        "name": "created_at",
+        "type_info": "Timestamptz"
+      },
+      {
+        "ordinal": 5,
+        "name": "updated_at",
+        "type_info": "Timestamptz"
+      },
+      {
+        "ordinal": 6,
+        "name": "model_filter",
+        "type_info": "TextArray"
+      },
+      {
+        "ordinal": 7,
+        "name": "api_key",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 8,
+        "name": "id",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 9,
+        "name": "auth_header_name",
+        "type_info": "Varchar"
+      },
+      {
+        "ordinal": 10,
+        "name": "auth_header_prefix",
+        "type_info": "Varchar"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Varchar",
+        "Text",
+        "Varchar",
+        "Text",
+        "TextArray",
+        "Text",
+        "Text",
+        "Uuid",
+        "Timestamptz",
+        "Timestamptz"
+      ]
+    },
+    "nullable": [
+      false,
+      true,
+      false,
+      false,
+      false,
+      false,
+      true,
+      true,
+      false,
+      false,
+      false
+    ]
+  },
+  "hash": "2b36a5920371b8c8d172b3f987c4c271dae0b3a9a5dfe71bb7b392b395672184"
+}
