@@ -388,27 +388,7 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v4
 
-      - name: Detect which package to publish
-        id: detect-package
-        run: |
-          TAG="${{ github.event.release.tag_name }}"
-          echo "Tag: $TAG"
-
-          if [[ "$TAG" == fusillade-v* ]]; then
-            echo "package=fusillade" >> $GITHUB_OUTPUT
-            echo "build_frontend=false" >> $GITHUB_OUTPUT
-            echo "Publishing fusillade"
-          elif [[ "$TAG" == v* ]]; then
-            echo "package=dwctl" >> $GITHUB_OUTPUT
-            echo "build_frontend=true" >> $GITHUB_OUTPUT
-            echo "Publishing dwctl"
-          else
-            echo "Unknown tag format: $TAG"
-            exit 1
-          fi
-
       - name: Setup Node.js
-        if: steps.detect-package.outputs.build_frontend == 'true'
         uses: actions/setup-node@v4
         with:
           node-version: "20"
@@ -420,20 +400,10 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
 
-      - name: Build frontend and copy to dwctl/static
-        if: steps.detect-package.outputs.build_frontend == 'true'
-        run: |
-          echo "Building frontend for crates.io package..."
-          cd dashboard
-          npm ci
-          npm run build
-          echo "Copying built files to dwctl/static..."
-          rm -rf ../dwctl/static
-          cp -r dist ../dwctl/static
-          echo "✅ Frontend built and copied to dwctl/static"
-          ls -la ../dwctl/static
+      - name: Install just
+        uses: extractions/setup-just@v2
 
       - name: Publish to crates.io
-        run: cargo publish -p ${{ steps.detect-package.outputs.package }} --token ${{ secrets.CARGO_REGISTRY_TOKEN }}
+        run: just release
         env:
           CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}

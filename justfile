@@ -728,6 +728,87 @@ security-scan target="latest" *args="":
         echo "✅ No critical or high severity vulnerabilities found."
     fi
 
+# Publish packages to crates.io: 'just release'
+#
+# Publishes both fusillade and dwctl packages to crates.io in an idempotent way.
+# If a version is already published, it will be skipped gracefully.
+#
+# Prerequisites:
+# - Authentication: Either run 'cargo login' or set CARGO_REGISTRY_TOKEN environment variable
+# - Node.js and npm installed (for building dwctl frontend)
+#
+# The release process:
+# 1. Attempts to publish fusillade (skips if version already exists)
+# 2. Builds frontend and bundles it into dwctl/static
+# 3. Attempts to publish dwctl (skips if version already exists)
+#
+# Examples:
+#   just release                              # Use stored credentials from 'cargo login'
+#   CARGO_REGISTRY_TOKEN=<token> just release # Use token from environment
+release:
+    #!/usr/bin/env bash
+    set -euo pipefail
+
+    echo "📦 Publishing packages to crates.io..."
+    echo ""
+
+    # Build cargo publish command with optional token
+    PUBLISH_CMD="cargo publish --allow-dirty --color always"
+    if [ -n "${CARGO_REGISTRY_TOKEN:-}" ]; then
+        echo "Using CARGO_REGISTRY_TOKEN from environment"
+        PUBLISH_CMD="$PUBLISH_CMD --token $CARGO_REGISTRY_TOKEN"
+    else
+        echo "Using stored credentials from 'cargo login'"
+    fi
+    echo ""
+
+    # Function to publish a package and handle errors gracefully
+    publish_package() {
+        local package=$1
+
+        echo "Publishing $package..."
+        if $PUBLISH_CMD -p "$package" 2>&1 | tee /tmp/cargo-publish-$package.log; then
+            echo "✅ Successfully published $package"
+            return 0
+        else
+            # Check if the error is because the version already exists
+            if grep -q "already uploaded" /tmp/cargo-publish-$package.log || \
+               grep -q "crate version .* is already uploaded" /tmp/cargo-publish-$package.log; then
+                echo "ℹ️  $package version already published, skipping"
+                return 0
+            else
+                echo "❌ Failed to publish $package"
+                cat /tmp/cargo-publish-$package.log
+                return 1
+            fi
+        fi
+    }
+
+    # Publish fusillade
+    echo "Step 1/2: Publishing fusillade..."
+    publish_package "fusillade" || exit 1
+    echo ""
+
+    # Build frontend for dwctl
+    echo "Step 2/2: Building frontend and publishing dwctl..."
+    echo "Building frontend..."
+    cd dashboard
+    npm ci
+    npm run build
+    cd ..
+
+    echo "Copying frontend to dwctl/static..."
+    rm -rf dwctl/static
+    cp -r dashboard/dist dwctl/static
+    echo "✅ Frontend built and bundled"
+    echo ""
+
+    # Publish dwctl
+    publish_package "dwctl" || exit 1
+
+    echo ""
+    echo "🎉 Release process completed successfully!"
+
 # Hidden recipes for internal use
 _drop-test-users:
     @./scripts/drop-test-users.sh
