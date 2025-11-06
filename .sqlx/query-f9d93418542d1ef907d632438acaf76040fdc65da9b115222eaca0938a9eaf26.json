@@ -1,0 +1,78 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n            UPDATE requests\n            SET\n                state = 'claimed',\n                daemon_id = $1,\n                claimed_at = $2\n            WHERE id IN (\n                SELECT id\n                FROM requests\n                WHERE state = 'pending'\n                    AND (not_before IS NULL OR not_before <= $2)\n                ORDER BY created_at ASC\n                LIMIT $3\n                FOR UPDATE SKIP LOCKED\n            )\n            RETURNING id, batch_id, template_id, endpoint, method, path, body, model, api_key, retry_attempt\n            ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "id",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 1,
+        "name": "batch_id",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 2,
+        "name": "template_id",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 3,
+        "name": "endpoint",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 4,
+        "name": "method",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 5,
+        "name": "path",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 6,
+        "name": "body",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 7,
+        "name": "model",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 8,
+        "name": "api_key",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 9,
+        "name": "retry_attempt",
+        "type_info": "Int4"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Timestamptz",
+        "Int8"
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false
+    ]
+  },
+  "hash": "f9d93418542d1ef907d632438acaf76040fdc65da9b115222eaca0938a9eaf26"
+}
