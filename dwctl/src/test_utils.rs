@@ -75,6 +75,7 @@ pub fn create_test_config() -> crate::config::Config {
         },
         enable_metrics: false,
         enable_request_logging: false,
+        enable_otel_export: false,
     }
 }
 
@@ -204,6 +205,7 @@ pub async fn get_system_user(pool: &mut PgConnection) -> UserResponse {
         last_login: None,
         auth_source: user.auth_source,
         groups: None, // Groups not included in test users by default
+        credit_balance: None,
     }
 }
 

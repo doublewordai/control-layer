@@ -43,6 +43,8 @@ pub struct Config {
     pub enable_metrics: bool,
     // Request logging configuration
     pub enable_request_logging: bool,
+    // OpenTelemetry OTLP export configuration
+    pub enable_otel_export: bool,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -267,6 +269,7 @@ impl Default for Config {
             auth: AuthConfig::default(),
             enable_metrics: true,
             enable_request_logging: true,
+            enable_otel_export: false,
         }
     }
 }

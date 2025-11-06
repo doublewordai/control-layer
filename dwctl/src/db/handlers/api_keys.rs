@@ -5,11 +5,12 @@ use crate::db::errors::DbError;
 use crate::db::errors::Result;
 use crate::db::handlers::repository::Repository;
 use crate::db::models::api_keys::{ApiKeyCreateDBRequest, ApiKeyDBResponse, ApiKeyUpdateDBRequest};
-use crate::types::{ApiKeyId, DeploymentId, UserId};
+use crate::types::{abbrev_uuid, ApiKeyId, DeploymentId, UserId};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use sqlx::FromRow;
 use sqlx::PgConnection;
+use tracing::instrument;
 use uuid::Uuid;
 
 /// Filter for listing API keys
@@ -71,6 +72,7 @@ impl<'c> Repository for ApiKeys<'c> {
     type Id = ApiKeyId;
     type Filter = ApiKeyFilter;
 
+    #[instrument(skip(self, request), fields(name = %request.name), err)]
     async fn create(&mut self, request: &Self::CreateRequest) -> Result<Self::Response> {
         // Generate a secure API key
         let secret = generate_api_key();
@@ -95,6 +97,7 @@ impl<'c> Repository for ApiKeys<'c> {
         Ok(ApiKeyDBResponse::from((self.get_api_key_deployments(api_key.id).await?, api_key)))
     }
 
+    #[instrument(skip(self), fields(api_key_id = %abbrev_uuid(&id)), err)]
     async fn get_by_id(&mut self, id: Self::Id) -> Result<Option<Self::Response>> {
         let api_key = sqlx::query_as!(
             ApiKey,
@@ -110,6 +113,7 @@ impl<'c> Repository for ApiKeys<'c> {
         }
     }
 
+    #[instrument(skip(self, ids), fields(count = ids.len()), err)]
     async fn get_bulk(&mut self, ids: Vec<Self::Id>) -> Result<HashMap<Self::Id, Self::Response>> {
         let api_keys = sqlx::query_as!(
             ApiKey,
@@ -127,6 +131,7 @@ impl<'c> Repository for ApiKeys<'c> {
         Ok(responses)
     }
 
+    #[instrument(skip(self, filter), fields(limit = filter.limit, skip = filter.skip), err)]
     async fn list(&mut self, filter: &Self::Filter) -> Result<Vec<Self::Response>> {
         let api_keys = if let Some(user_id) = filter.user_id {
             sqlx::query_as!(
@@ -158,6 +163,7 @@ impl<'c> Repository for ApiKeys<'c> {
         Ok(responses)
     }
 
+    #[instrument(skip(self), fields(api_key_id = %abbrev_uuid(&id)), err)]
     async fn delete(&mut self, id: Self::Id) -> Result<bool> {
         let result = sqlx::query!("DELETE FROM api_keys WHERE id = $1", id)
             .execute(&mut *self.db)
@@ -166,6 +172,7 @@ impl<'c> Repository for ApiKeys<'c> {
         Ok(result.rows_affected() > 0)
     }
 
+    #[instrument(skip(self, request), fields(api_key_id = %abbrev_uuid(&id)), err)]
     async fn update(&mut self, id: Self::Id, request: &Self::UpdateRequest) -> Result<Self::Response> {
         // Atomic update with conditional field updates
         let api_key = sqlx::query_as!(
@@ -209,6 +216,7 @@ impl<'c> ApiKeys<'c> {
     }
 
     /// Get specific deployment IDs that an API key has access to
+    #[instrument(skip(self), fields(api_key_id = %abbrev_uuid(&api_key_id)), err)]
     async fn get_api_key_deployments(&mut self, api_key_id: ApiKeyId) -> Result<Vec<DeploymentId>> {
         let deployment_ids = sqlx::query_scalar!(
             r#"
@@ -235,6 +243,7 @@ impl<'c> ApiKeys<'c> {
     }
 
     /// Get all API keys that can access the specified deployment with full response data
+    #[instrument(skip(self), fields(deployment_id = %abbrev_uuid(&deployment_id)), err)]
     pub async fn get_api_keys_for_deployment(&mut self, deployment_id: DeploymentId) -> Result<Vec<ApiKeyDBResponse>> {
         let api_keys = sqlx::query_as!(
             ApiKey,
@@ -1382,6 +1391,7 @@ mod tests {
             auth: Default::default(),
             enable_metrics: false,
             enable_request_logging: false,
+            enable_otel_export: false,
         };
         crate::seed_database(&config.model_sources, &pool).await.unwrap();
 

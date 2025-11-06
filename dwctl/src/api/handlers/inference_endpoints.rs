@@ -10,7 +10,7 @@ use crate::{
     },
     errors::{Error, Result},
     sync::{
-        deployments::fetch_models::{FetchModels, FetchModelsReqwest, StaticModelsFetcher, SyncConfig},
+        deployments::fetch_models::{FetchModels, FetchModelsReqwest, SyncConfig},
         endpoint_sync::{self, sync_endpoint_models_with_aliases, update_endpoint_aliases},
     },
     types::InferenceEndpointId,
@@ -26,6 +26,9 @@ struct MockFetchModels;
 
 #[cfg(test)]
 use crate::api::models::inference_endpoints::OpenAIModel;
+
+#[cfg(not(test))]
+use crate::sync::deployments::fetch_models::StaticModelsFetcher;
 
 #[cfg(test)]
 #[async_trait::async_trait]
@@ -71,6 +74,7 @@ impl FetchModels for MockFetchModels {
         ("X-Doubleword-User" = [])
     )
 )]
+#[tracing::instrument(skip_all)]
 pub async fn list_inference_endpoints(
     State(state): State<AppState>,
     Query(query): Query<ListEndpointsQuery>,
@@ -105,6 +109,7 @@ pub async fn list_inference_endpoints(
         ("X-Doubleword-User" = [])
     )
 )]
+#[tracing::instrument(skip_all)]
 pub async fn get_inference_endpoint(
     State(state): State<AppState>,
     Path(id): Path<InferenceEndpointId>,
@@ -143,6 +148,7 @@ pub async fn get_inference_endpoint(
         ("X-Doubleword-User" = [])
     )
 )]
+#[tracing::instrument(skip_all)]
 pub async fn update_inference_endpoint(
     State(state): State<AppState>,
     Path(id): Path<InferenceEndpointId>,
@@ -256,6 +262,7 @@ pub async fn update_inference_endpoint(
         ("X-Doubleword-User" = [])
     )
 )]
+#[tracing::instrument(skip_all)]
 pub async fn validate_inference_endpoint(
     State(state): State<AppState>,
     _: RequiresPermission<resource::Endpoints, operation::UpdateAll>,
@@ -325,6 +332,7 @@ pub async fn validate_inference_endpoint(
         ("X-Doubleword-User" = [])
     )
 )]
+#[tracing::instrument(skip_all)]
 pub async fn create_inference_endpoint(
     State(state): State<AppState>,
     current_user: RequiresPermission<resource::Endpoints, operation::CreateAll>,
@@ -430,6 +438,7 @@ pub async fn create_inference_endpoint(
         ("X-Doubleword-User" = [])
     )
 )]
+#[tracing::instrument(skip_all)]
 pub async fn delete_inference_endpoint(
     State(state): State<AppState>,
     Path(id): Path<InferenceEndpointId>,
@@ -526,6 +535,7 @@ async fn validate_endpoint_connection(
         ("X-Doubleword-User" = [])
     )
 )]
+#[tracing::instrument(skip_all)]
 pub async fn synchronize_endpoint(
     State(state): State<AppState>,
     Path(id): Path<InferenceEndpointId>,

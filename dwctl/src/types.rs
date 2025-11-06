@@ -9,6 +9,12 @@ pub type DeploymentId = Uuid;
 pub type GroupId = Uuid;
 pub type InferenceEndpointId = Uuid;
 
+/// Abbreviate a UUID to its first 8 characters for more readable logs and traces
+/// Example: "550e8400-e29b-41d4-a716-446655440000" -> "550e8400"
+pub fn abbrev_uuid(uuid: &Uuid) -> String {
+    uuid.to_string().chars().take(8).collect()
+}
+
 // Common types for path parameters
 #[derive(Debug, Clone, Deserialize)]
 pub enum CurrentKeyword {
@@ -58,6 +64,7 @@ pub enum Resource {
     Requests,
     Pricing,
     ModelRateLimits,
+    Credits,
     Probes,
 }
 
