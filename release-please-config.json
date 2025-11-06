@@ -8,5 +8,6 @@
       "release-type": "rust"
     }
   },
-  "include-component-in-tag": false
+  "include-component-in-tag": false,
+  "separate-pull-requests": true
 }
