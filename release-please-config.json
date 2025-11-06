@@ -1,7 +1,8 @@
 {
   "packages": {
     "fusillade": {
-      "release-type": "rust"
+      "release-type": "rust",
+      "include-component-in-tag": true
     },
     "dwctl": {
       "release-type": "rust"
