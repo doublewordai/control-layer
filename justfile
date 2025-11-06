@@ -403,7 +403,7 @@ test target="" *args="":
                 fi
                 # Remove --watch from args and pass remaining to cargo test
                 remaining_args=$(echo "{{args}}" | sed 's/--watch//g' | xargs)
-                cd dwctl && cargo watch -x "test $remaining_args"
+                cargo watch -x "test $remaining_args"
             elif [[ "{{args}}" == *"--coverage"* ]]; then
                 if ! command -v cargo-llvm-cov >/dev/null 2>&1; then
                     echo "❌ Error: cargo-llvm-cov not found. Install with:"
@@ -412,9 +412,10 @@ test target="" *args="":
                     echo "  cargo binstall cargo-llvm-cov"
                     exit 1
                 fi
-                cd dwctl && cargo llvm-cov --fail-under-lines 60 --lcov --output-path lcov.info
+                cargo llvm-cov --fail-under-lines 60 --lcov --output-path lcov.info
+                cargo llvm-cov --fail-under-lines 60 --lcov --output-path lcov.info
             else
-                cd dwctl && cargo test {{args}}
+                cargo test {{args}}
             fi
             ;;
         ts)
