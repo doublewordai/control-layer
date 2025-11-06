@@ -480,8 +480,7 @@ lint target *args="":
             echo "Running cargo clippy..."
             cargo clippy {{args}}
             echo "Checking SQLx prepared queries..."
-            cd dwctl && SQLX_OFFLINE=true cargo sqlx prepare --check && cd ..
-            cd fusillade && SQLX_OFFLINE=true cargo sqlx prepare --check && cd ..
+            cargo sqlx prepare --check --workspace
             ;;
         *)
             echo "Usage: just lint [ts|rust]"
