@@ -1051,6 +1051,7 @@ dependencies = [
  "jsonwebtoken",
  "lettre",
  "mime_guess",
+ "once_cell",
  "onwards",
  "outlet",
  "outlet-postgres",
@@ -2438,9 +2439,9 @@ checksum = "a4895175b425cb1f87721b59f0f286c2092bd4af812243672510e1ac53e2e0ad"
 
 [[package]]
 name = "onwards"
-version = "0.9.0"
+version = "0.9.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e1f7a0fe568c6824b724258b2b2aa50623309b353c584a11a136ffdf6e838773"
+checksum = "463df0b3915b44556c9355839bf3892cb8c5ff1a370e7c6b9b9592544d39354f"
 dependencies = [
  "anyhow",
  "async-trait",
