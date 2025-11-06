@@ -481,10 +481,7 @@ lint target *args="":
             echo "Running cargo clippy..."
             cargo clippy {{args}}
             echo "Checking SQLx prepared queries..."
-            if [ -f .env ]; then
-                export $(grep -v '^#' .env | xargs)
-            fi
-            cargo sqlx prepare --check
+            SQLX_OFFLINE=true cargo sqlx prepare --check
 
             cd ../fusillade
             echo "Checking Cargo.lock sync..."
@@ -494,10 +491,7 @@ lint target *args="":
             echo "Running cargo clippy..."
             cargo clippy {{args}}
             echo "Checking SQLx prepared queries..."
-            if [ -f .env ]; then
-                export $(grep -v '^#' .env | xargs)
-            fi
-            cargo sqlx prepare --check
+            SQLX_OFFLINE=true cargo sqlx prepare --check
             ;;
         *)
             echo "Usage: just lint [ts|rust]"
