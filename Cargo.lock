@@ -525,7 +525,7 @@ dependencies = [
  "heck",
  "proc-macro-error2",
  "quote",
- "syn 2.0.108",
+ "syn 2.0.109",
  "ubyte",
 ]
 
@@ -1135,6 +1135,7 @@ dependencies = [
  "anyhow",
  "argon2",
  "async-openai",
+ "async-stream",
  "async-trait",
  "axum 0.8.6",
  "axum-prometheus 0.9.0",
@@ -1148,6 +1149,7 @@ dependencies = [
  "clap",
  "figment",
  "fusillade",
+ "futures",
  "humantime",
  "humantime-serde",
  "jsonwebtoken",
@@ -3156,7 +3158,7 @@ dependencies = [
  "proc-macro-error-attr2",
  "proc-macro2",
  "quote",
- "syn 2.0.108",
+ "syn 2.0.109",
 ]
 
 [[package]]

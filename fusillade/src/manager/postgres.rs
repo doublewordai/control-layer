@@ -6,6 +6,8 @@
 use crate::request::AnyRequest;
 use std::sync::Arc;
 
+use futures::StreamExt;
+
 use anyhow::anyhow;
 use async_trait::async_trait;
 use chrono::Utc;
@@ -17,7 +19,8 @@ use uuid::Uuid;
 
 use super::Storage;
 use crate::batch::{
-    BatchId, BatchStatus, File, FileId, RequestTemplate, RequestTemplateInput, TemplateId,
+    BatchId, BatchStatus, File, FileId, FileMetadata, FileStreamItem, RequestTemplate,
+    RequestTemplateInput, TemplateId,
 };
 use crate::daemon::{Daemon, DaemonConfig};
 use crate::error::{FusilladeError, Result};
@@ -610,10 +613,178 @@ impl<H: HttpClient + 'static> Storage for PostgresRequestManager<H> {
         Ok(FileId(file_id))
     }
 
+    async fn create_file_stream<S: Stream<Item = FileStreamItem> + Send + Unpin>(
+        &self,
+        mut stream: S,
+    ) -> Result<FileId> {
+        use futures::StreamExt;
+
+        // Start a transaction for atomic file + templates creation
+        let mut tx =
+            self.pool.begin().await.map_err(|e| {
+                FusilladeError::Other(anyhow!("Failed to begin transaction: {}", e))
+            })?;
+
+        // Accumulate metadata as we encounter it
+        let mut metadata = FileMetadata::default();
+        let mut file_id: Option<Uuid> = None;
+        let mut template_count = 0;
+
+        while let Some(item) = stream.next().await {
+            match item {
+                FileStreamItem::Metadata(meta) => {
+                    // Accumulate metadata (later values override earlier ones)
+                    if meta.filename.is_some() {
+                        metadata.filename = meta.filename;
+                    }
+                    if meta.purpose.is_some() {
+                        metadata.purpose = meta.purpose;
+                    }
+                    if meta.expires_after_anchor.is_some() {
+                        metadata.expires_after_anchor = meta.expires_after_anchor;
+                    }
+                    if meta.expires_after_seconds.is_some() {
+                        metadata.expires_after_seconds = meta.expires_after_seconds;
+                    }
+                    if meta.size_bytes.is_some() {
+                        metadata.size_bytes = meta.size_bytes;
+                    }
+                    if meta.uploaded_by.is_some() {
+                        metadata.uploaded_by = meta.uploaded_by;
+                    }
+                }
+                FileStreamItem::Template(template) => {
+                    // Create file stub on first template with minimal metadata
+                    if file_id.is_none() {
+                        let name = metadata
+                            .filename
+                            .clone()
+                            .unwrap_or_else(|| format!("file_{}", uuid::Uuid::new_v4()));
+
+                        let created_file_id = sqlx::query_scalar!(
+                            r#"
+                            INSERT INTO files (name)
+                            VALUES ($1)
+                            RETURNING id
+                            "#,
+                            name,
+                        )
+                        .fetch_one(&mut *tx)
+                        .await
+                        .map_err(|e| {
+                            FusilladeError::Other(anyhow!("Failed to create file: {}", e))
+                        })?;
+
+                        file_id = Some(created_file_id);
+                        tracing::debug!(
+                            "Created file stub {} for streaming upload",
+                            created_file_id
+                        );
+                    }
+
+                    // Insert the template immediately
+                    let fid = file_id.unwrap();
+                    sqlx::query!(
+                        r#"
+                        INSERT INTO request_templates (file_id, endpoint, method, path, body, model, api_key)
+                        VALUES ($1, $2, $3, $4, $5, $6, $7)
+                        "#,
+                        fid,
+                        template.endpoint,
+                        template.method,
+                        template.path,
+                        template.body,
+                        template.model,
+                        template.api_key,
+                    )
+                    .execute(&mut *tx)
+                    .await
+                    .map_err(|e| FusilladeError::Other(anyhow!("Failed to create template: {}", e)))?;
+
+                    template_count += 1;
+                }
+            }
+        }
+
+        // If no templates were received, still create an empty file with whatever metadata we have
+        let fid = if let Some(id) = file_id {
+            id
+        } else {
+            let name = metadata
+                .filename
+                .unwrap_or_else(|| format!("file_{}", uuid::Uuid::new_v4()));
+
+            sqlx::query_scalar!(
+                r#"
+                INSERT INTO files (name)
+                VALUES ($1)
+                RETURNING id
+                "#,
+                name,
+            )
+            .fetch_one(&mut *tx)
+            .await
+            .map_err(|e| FusilladeError::Other(anyhow!("Failed to create file: {}", e)))?
+        };
+
+        // Now update the file with all the final metadata
+        let size_bytes = metadata.size_bytes.unwrap_or(0);
+        let status = "processed".to_string();
+        let purpose = metadata.purpose.clone();
+
+        // Calculate expires_at from expires_after if provided
+        let expires_at = if let (Some(anchor), Some(seconds)) = (
+            &metadata.expires_after_anchor,
+            metadata.expires_after_seconds,
+        ) {
+            // For now, we'll calculate from creation time
+            // TODO: Support "last_request_at" anchor once batch execution is tracked
+            if anchor == "created_at" || anchor == "last_request_at" {
+                Some(Utc::now() + chrono::Duration::seconds(seconds))
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+
+        let uploaded_by = metadata.uploaded_by.clone();
+
+        sqlx::query!(
+            r#"
+            UPDATE files
+            SET size_bytes = $2, status = $3, purpose = $4, expires_at = $5, uploaded_by = $6
+            WHERE id = $1
+            "#,
+            fid,
+            size_bytes,
+            status,
+            purpose,
+            expires_at,
+            uploaded_by,
+        )
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| FusilladeError::Other(anyhow!("Failed to update file metadata: {}", e)))?;
+
+        // Commit the transaction
+        tx.commit()
+            .await
+            .map_err(|e| FusilladeError::Other(anyhow!("Failed to commit transaction: {}", e)))?;
+
+        tracing::info!(
+            "File {} created with {} templates via streaming upload",
+            fid,
+            template_count
+        );
+
+        Ok(FileId(fid))
+    }
+
     async fn get_file(&self, file_id: FileId) -> Result<File> {
         let row = sqlx::query!(
             r#"
-            SELECT id, name, description, created_at, updated_at
+            SELECT id, name, description, size_bytes, status, error_message, purpose, expires_at, deleted_at, uploaded_by, created_at, updated_at
             FROM files
             WHERE id = $1
             "#,
@@ -628,6 +799,13 @@ impl<H: HttpClient + 'static> Storage for PostgresRequestManager<H> {
             id: FileId(row.id),
             name: row.name,
             description: row.description,
+            size_bytes: row.size_bytes,
+            status: row.status,
+            error_message: row.error_message,
+            purpose: row.purpose,
+            expires_at: row.expires_at,
+            deleted_at: row.deleted_at,
+            uploaded_by: row.uploaded_by,
             created_at: row.created_at,
             updated_at: row.updated_at,
         })
@@ -636,7 +814,7 @@ impl<H: HttpClient + 'static> Storage for PostgresRequestManager<H> {
     async fn list_files(&self) -> Result<Vec<File>> {
         let rows = sqlx::query!(
             r#"
-            SELECT id, name, description, created_at, updated_at
+            SELECT id, name, description, size_bytes, status, error_message, purpose, expires_at, deleted_at, uploaded_by, created_at, updated_at
             FROM files
             ORDER BY created_at DESC
             "#,
@@ -651,6 +829,13 @@ impl<H: HttpClient + 'static> Storage for PostgresRequestManager<H> {
                 id: FileId(row.id),
                 name: row.name,
                 description: row.description,
+                size_bytes: row.size_bytes,
+                status: row.status,
+                error_message: row.error_message,
+                purpose: row.purpose,
+                expires_at: row.expires_at,
+                deleted_at: row.deleted_at,
+                uploaded_by: row.uploaded_by,
                 created_at: row.created_at,
                 updated_at: row.updated_at,
             })

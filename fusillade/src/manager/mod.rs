@@ -3,7 +3,9 @@
 //! This module defines the `Storage` and `RequestManager` traits, which provide the interface
 //! for persisting requests, creating files, launching batches, and checking execution status.
 
-use crate::batch::{BatchId, BatchStatus, File, FileId, RequestTemplate, RequestTemplateInput};
+use crate::batch::{
+    BatchId, BatchStatus, File, FileId, FileStreamItem, RequestTemplate, RequestTemplateInput,
+};
 use crate::error::Result;
 use crate::http::HttpClient;
 use crate::request::{AnyRequest, Claimed, DaemonId, Request, RequestId, RequestState};
@@ -29,6 +31,16 @@ pub trait Storage: Send + Sync {
         name: String,
         description: Option<String>,
         templates: Vec<RequestTemplateInput>,
+    ) -> Result<FileId>;
+
+    /// Create a new file with templates from a stream.
+    ///
+    /// The stream yields FileStreamItem which can be either:
+    /// - Metadata: File metadata (can appear anywhere, will be accumulated)
+    /// - Template: Request templates (processed as they arrive)
+    async fn create_file_stream<S: Stream<Item = FileStreamItem> + Send + Unpin>(
+        &self,
+        stream: S,
     ) -> Result<FileId>;
 
     /// Get a file by ID.

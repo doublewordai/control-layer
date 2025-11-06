@@ -1,4 +1,3 @@
-use crate::db::models::files::FileDBResponse;
 use serde::{Deserialize, Serialize};
 use utoipa::{IntoParams, ToSchema};
 
@@ -46,20 +45,6 @@ pub enum ObjectType {
 #[serde(rename_all = "lowercase")]
 pub enum Purpose {
     Batch,
-}
-
-impl FileResponse {
-    /// Convert from database file response
-    pub fn from_db_response(file: &FileDBResponse) -> Self {
-        Self {
-            id: file.id.to_string(),
-            object_type: ObjectType::File,
-            bytes: file.size_bytes,
-            created_at: file.created_at.timestamp(),
-            filename: file.filename.clone(),
-            purpose: Purpose::Batch,
-        }
-    }
 }
 
 /// Response for file deletion

@@ -90,6 +90,13 @@ pub struct File {
     pub id: FileId,
     pub name: String,
     pub description: Option<String>,
+    pub size_bytes: i64,
+    pub status: String,
+    pub error_message: Option<String>,
+    pub purpose: Option<String>,
+    pub expires_at: Option<DateTime<Utc>>,
+    pub deleted_at: Option<DateTime<Utc>>,
+    pub uploaded_by: Option<String>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
 }
@@ -113,7 +120,7 @@ pub struct RequestTemplate {
 }
 
 /// Input for creating a new request template.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, serde::Deserialize)]
 pub struct RequestTemplateInput {
     pub endpoint: String,
     pub method: String,
@@ -121,6 +128,26 @@ pub struct RequestTemplateInput {
     pub body: String,
     pub model: String,
     pub api_key: String,
+}
+
+/// Metadata for creating a file from a stream
+#[derive(Debug, Clone, Default)]
+pub struct FileMetadata {
+    pub filename: Option<String>,
+    pub purpose: Option<String>,
+    pub expires_after_anchor: Option<String>,
+    pub expires_after_seconds: Option<i64>,
+    pub size_bytes: Option<i64>,
+    pub uploaded_by: Option<String>,
+}
+
+/// Items that can be yielded from a file upload stream
+#[derive(Debug, Clone)]
+pub enum FileStreamItem {
+    /// File metadata (should be first item in stream)
+    Metadata(FileMetadata),
+    /// A request template parsed from JSONL
+    Template(RequestTemplateInput),
 }
 
 /// A batch represents one execution of all of a file's templates.

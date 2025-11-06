@@ -13,6 +13,7 @@ mod static_assets;
 mod sync;
 mod telemetry;
 mod types;
+use crate::config::CorsOrigin;
 
 #[cfg(test)]
 mod test_utils;
@@ -68,6 +69,7 @@ pub struct AppState {
     pub metrics_recorder: Option<GenAiMetrics>,
     #[builder(default = false)]
     pub is_leader: bool,
+    pub request_manager: Arc<fusillade::PostgresRequestManager<fusillade::ReqwestHttpClient>>,
 }
 
 /// Create the initial admin user if it doesn't exist
@@ -276,8 +278,6 @@ pub async fn seed_database(sources: &[config::ModelSource], db: &PgPool) -> Resu
 
 /// Create CORS layer from configuration
 fn create_cors_layer(config: &Config) -> anyhow::Result<CorsLayer> {
-    use crate::config::CorsOrigin;
-
     let mut origins = Vec::new();
     for origin in &config.auth.security.cors.allowed_origins {
         let header_value = match origin {
@@ -372,6 +372,10 @@ pub async fn setup_app(
     const LEADER_LOCK_ID: i64 = 0x4457_4354_5052_4F42_i64;
 
     let probe_scheduler = probes::ProbeScheduler::new(pool.clone(), config.clone());
+
+    // Initialize the fusillade request manager (for batch processing)
+    let request_manager = Arc::new(fusillade::PostgresRequestManager::new(pool.clone()));
+
     let is_leader: bool;
 
     if skip_leader_election {
@@ -387,7 +391,16 @@ pub async fn setup_app(
             daemon_scheduler.run_daemon(use_listen_notify, 300).await; // Fallback sync every 5 minutes
         });
 
-        info!("Skipping leader election - running as leader with probe scheduler");
+        // Start the fusillade batch processing daemon
+        use fusillade::DaemonExecutor;
+        let daemon_manager = request_manager.clone();
+        tokio::spawn(async move {
+            if let Err(e) = daemon_manager.run() {
+                tracing::error!("Fusillade daemon error: {}", e);
+            }
+        });
+
+        info!("Skipping leader election - running as leader with probe scheduler and fusillade daemon");
     } else {
         // Normal leader election
         is_leader = false;
@@ -410,8 +423,16 @@ pub async fn setup_app(
         let leader_election_pool = pool.clone();
         let leader_election_scheduler_gain = probe_scheduler.clone();
         let leader_election_scheduler_lose = probe_scheduler.clone();
+        let leader_election_request_manager_gain = request_manager.clone();
         let leader_election_config = config.clone();
         let leader_election_flag = is_leader_flag.clone();
+
+        // Store daemon handle for cleanup on leadership loss
+        let daemon_handle: Arc<tokio::sync::Mutex<Option<tokio::task::JoinHandle<fusillade::Result<()>>>>> =
+            Arc::new(tokio::sync::Mutex::new(None));
+        let daemon_handle_gain = daemon_handle.clone();
+        let daemon_handle_lose = daemon_handle.clone();
+
         tokio::spawn(async move {
             leader_election_task(
                 leader_election_pool,
@@ -421,6 +442,8 @@ pub async fn setup_app(
                 move |_pool, _config| {
                     // This closure is run when a replica becomes the leader
                     let scheduler = leader_election_scheduler_gain.clone();
+                    let request_manager = leader_election_request_manager_gain.clone();
+                    let daemon_handle = daemon_handle_gain.clone();
                     async move {
                         // Wait for the server to be fully up before starting probes
                         tokio::time::sleep(std::time::Duration::from_secs(1)).await;
@@ -439,17 +462,37 @@ pub async fn setup_app(
                             daemon_scheduler.run_daemon(use_listen_notify, 300).await;
                         });
 
+                        // Start the fusillade batch processing daemon
+                        use fusillade::DaemonExecutor;
+                        let handle = request_manager
+                            .run()
+                            .map_err(|e| anyhow::anyhow!("Failed to start fusillade daemon: {}", e))?;
+
+                        // Store the handle so we can abort it when losing leadership
+                        *daemon_handle.lock().await = Some(handle);
+
+                        tracing::info!("Fusillade batch daemon started on elected leader");
+
                         Ok(())
                     }
                 },
                 move |_pool, _config| {
                     // This closure is run when a replica stops being the leader
                     let scheduler = leader_election_scheduler_lose.clone();
+                    let daemon_handle = daemon_handle_lose.clone();
                     async move {
                         scheduler
                             .stop_all()
                             .await
-                            .map_err(|e| anyhow::anyhow!("Failed to stop probe scheduler: {}", e))
+                            .map_err(|e| anyhow::anyhow!("Failed to stop probe scheduler: {}", e))?;
+
+                        // Stop the fusillade daemon
+                        if let Some(handle) = daemon_handle.lock().await.take() {
+                            handle.abort();
+                            tracing::info!("Fusillade batch daemon stopped (lost leadership)");
+                        }
+
+                        Ok(())
                     }
                 },
             )
@@ -457,7 +500,12 @@ pub async fn setup_app(
         });
     }
 
-    let mut app_state = AppState::builder().db(pool).config(config).is_leader(is_leader).build();
+    let mut app_state = AppState::builder()
+        .db(pool)
+        .config(config)
+        .is_leader(is_leader)
+        .request_manager(request_manager)
+        .build();
     let router = build_router(&mut app_state, onwards_router).await?;
 
     Ok((router, onwards_config_sync, drop_guard))
@@ -800,8 +848,13 @@ async fn main() -> anyhow::Result<()> {
     let (router, onwards_config_sync, _drop_guard) = setup_app(pool.clone(), config.clone(), false).await?;
 
     // Apply middleware at root level BEFORE routing decisions are made
+    let request_manager = Arc::new(fusillade::PostgresRequestManager::new(pool.clone()));
     let middleware = from_fn_with_state(
-        AppState::builder().db(pool.clone()).config(config.clone()).build(),
+        AppState::builder()
+            .db(pool.clone())
+            .config(config.clone())
+            .request_manager(request_manager)
+            .build(),
         admin_ai_proxy_middleware,
     );
 
