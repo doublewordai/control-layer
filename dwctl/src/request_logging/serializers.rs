@@ -467,7 +467,7 @@ pub async fn store_analytics_record(pool: &PgPool, metrics: &UsageMetrics, auth:
     // =======================================================================
     // Deduct credits for API usage if applicable
     // =======================================================================
-    // Skip credit deduction for Playground access, Auth::None will also be implicitly skipped as well as they'll be no user id
+    // Skip credit deduction for Playground access, Auth::None will also be implicitly skipped as they'll have no user id
     if !matches!(auth, Auth::Playground { .. }) {
         // Deduct credits if applicable (user_id present and at least one price is set)
         if let (Some(user_id), Some(model)) = (row.user_id, &row.request_model) {
