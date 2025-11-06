@@ -95,33 +95,6 @@ impl<H: HttpClient + 'static> PostgresRequestManager<H> {
 // Implement Storage trait directly (no delegation)
 #[async_trait]
 impl<H: HttpClient + 'static> Storage for PostgresRequestManager<H> {
-    async fn submit(&self, request: Request<Pending>) -> Result<()> {
-        sqlx::query!(
-            r#"
-            INSERT INTO requests (
-                id, batch_id, template_id, state, endpoint, method, path, body, model, api_key,
-                retry_attempt, not_before
-            ) VALUES ($1, $2, $3, 'pending', $4, $5, $6, $7, $8, $9, $10, $11)
-            "#,
-            *request.data.id as Uuid,
-            *request.data.batch_id as Uuid,
-            *request.data.template_id as Uuid,
-            request.data.endpoint,
-            request.data.method,
-            request.data.path,
-            request.data.body,
-            request.data.model,
-            request.data.api_key,
-            request.state.retry_attempt as i32,
-            request.state.not_before,
-        )
-        .execute(&self.pool)
-        .await
-        .map_err(|e| BatcherError::Other(anyhow!("Failed to submit request: {}", e)))?;
-
-        Ok(())
-    }
-
     async fn claim_requests(
         &self,
         limit: usize,
@@ -1165,5 +1138,429 @@ impl<H: HttpClient + 'static> DaemonExecutor<H> for PostgresRequestManager<H> {
         tracing::info!("Daemon spawned successfully");
 
         Ok(handle)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::http::MockHttpClient;
+
+    #[sqlx::test]
+    async fn test_create_and_get_file(pool: sqlx::PgPool) {
+        let http_client = Arc::new(MockHttpClient::new());
+        let manager = PostgresRequestManager::with_defaults(pool.clone(), http_client);
+
+        // Create a file with templates
+        let file_id = manager
+            .create_file(
+                "test-file".to_string(),
+                Some("A test file".to_string()),
+                vec![
+                    RequestTemplateInput {
+                        endpoint: "https://api.example.com".to_string(),
+                        method: "POST".to_string(),
+                        path: "/v1/completions".to_string(),
+                        body: r#"{"model":"gpt-4"}"#.to_string(),
+                        model: "gpt-4".to_string(),
+                        api_key: "key1".to_string(),
+                    },
+                    RequestTemplateInput {
+                        endpoint: "https://api.example.com".to_string(),
+                        method: "POST".to_string(),
+                        path: "/v1/completions".to_string(),
+                        body: r#"{"model":"gpt-3.5"}"#.to_string(),
+                        model: "gpt-3.5".to_string(),
+                        api_key: "key2".to_string(),
+                    },
+                ],
+            )
+            .await
+            .expect("Failed to create file");
+
+        // Get the file back
+        let file = manager.get_file(file_id).await.expect("Failed to get file");
+
+        assert_eq!(file.id, file_id);
+        assert_eq!(file.name, "test-file");
+        assert_eq!(file.description, Some("A test file".to_string()));
+
+        // Get templates for the file
+        let templates = manager
+            .get_file_templates(file_id)
+            .await
+            .expect("Failed to get templates");
+
+        assert_eq!(templates.len(), 2);
+        assert_eq!(templates[0].model, "gpt-4");
+        assert_eq!(templates[1].model, "gpt-3.5");
+    }
+
+    #[sqlx::test]
+    async fn test_create_batch_and_get_status(pool: sqlx::PgPool) {
+        let http_client = Arc::new(MockHttpClient::new());
+        let manager = PostgresRequestManager::with_defaults(pool.clone(), http_client);
+
+        // Create a file with 3 templates
+        let file_id = manager
+            .create_file(
+                "batch-test".to_string(),
+                None,
+                vec![
+                    RequestTemplateInput {
+                        endpoint: "https://api.example.com".to_string(),
+                        method: "POST".to_string(),
+                        path: "/v1/test".to_string(),
+                        body: r#"{"prompt":"1"}"#.to_string(),
+                        model: "gpt-4".to_string(),
+                        api_key: "key".to_string(),
+                    },
+                    RequestTemplateInput {
+                        endpoint: "https://api.example.com".to_string(),
+                        method: "POST".to_string(),
+                        path: "/v1/test".to_string(),
+                        body: r#"{"prompt":"2"}"#.to_string(),
+                        model: "gpt-4".to_string(),
+                        api_key: "key".to_string(),
+                    },
+                    RequestTemplateInput {
+                        endpoint: "https://api.example.com".to_string(),
+                        method: "POST".to_string(),
+                        path: "/v1/test".to_string(),
+                        body: r#"{"prompt":"3"}"#.to_string(),
+                        model: "gpt-4".to_string(),
+                        api_key: "key".to_string(),
+                    },
+                ],
+            )
+            .await
+            .expect("Failed to create file");
+
+        // Create a batch
+        let batch_id = manager
+            .create_batch(file_id)
+            .await
+            .expect("Failed to create batch");
+
+        // Get batch status
+        let status = manager
+            .get_batch_status(batch_id)
+            .await
+            .expect("Failed to get batch status");
+
+        assert_eq!(status.batch_id, batch_id);
+        assert_eq!(status.file_id, file_id);
+        assert_eq!(status.file_name, "batch-test");
+        assert_eq!(status.total_requests, 3);
+        assert_eq!(status.pending_requests, 3);
+        assert_eq!(status.completed_requests, 0);
+        assert_eq!(status.failed_requests, 0);
+
+        // Get batch requests
+        let requests = manager
+            .get_batch_requests(batch_id)
+            .await
+            .expect("Failed to get batch requests");
+
+        assert_eq!(requests.len(), 3);
+        for request in requests {
+            assert!(request.is_pending());
+        }
+    }
+
+    #[sqlx::test]
+    async fn test_claim_requests(pool: sqlx::PgPool) {
+        let http_client = Arc::new(MockHttpClient::new());
+        let manager = PostgresRequestManager::with_defaults(pool.clone(), http_client);
+
+        // Create a file with 5 templates
+        let file_id = manager
+            .create_file(
+                "claim-test".to_string(),
+                None,
+                (0..5)
+                    .map(|i| RequestTemplateInput {
+                        endpoint: "https://api.example.com".to_string(),
+                        method: "POST".to_string(),
+                        path: "/test".to_string(),
+                        body: format!(r#"{{"n":{}}}"#, i),
+                        model: "test".to_string(),
+                        api_key: "key".to_string(),
+                    })
+                    .collect(),
+            )
+            .await
+            .unwrap();
+
+        let batch_id = manager.create_batch(file_id).await.unwrap();
+
+        let daemon_id = DaemonId::from(Uuid::new_v4());
+
+        // Claim 3 requests
+        let claimed = manager
+            .claim_requests(3, daemon_id)
+            .await
+            .expect("Failed to claim requests");
+
+        assert_eq!(claimed.len(), 3);
+        for request in &claimed {
+            assert_eq!(request.state.daemon_id, daemon_id);
+            assert_eq!(request.state.retry_attempt, 0);
+        }
+
+        // Try to claim again - should get the remaining 2
+        let claimed2 = manager
+            .claim_requests(10, daemon_id)
+            .await
+            .expect("Failed to claim requests");
+
+        assert_eq!(claimed2.len(), 2);
+
+        // Verify batch status shows claimed requests
+        let status = manager.get_batch_status(batch_id).await.unwrap();
+        assert_eq!(status.total_requests, 5);
+        assert_eq!(status.pending_requests, 0);
+        assert_eq!(status.in_progress_requests, 5); // All claimed
+    }
+
+    #[sqlx::test]
+    async fn test_cancel_batch(pool: sqlx::PgPool) {
+        let http_client = Arc::new(MockHttpClient::new());
+        let manager = PostgresRequestManager::with_defaults(pool.clone(), http_client);
+
+        // Create a file with 3 templates
+        let file_id = manager
+            .create_file(
+                "cancel-test".to_string(),
+                None,
+                (0..3)
+                    .map(|i| RequestTemplateInput {
+                        endpoint: "https://api.example.com".to_string(),
+                        method: "POST".to_string(),
+                        path: "/test".to_string(),
+                        body: format!(r#"{{"n":{}}}"#, i),
+                        model: "test".to_string(),
+                        api_key: "key".to_string(),
+                    })
+                    .collect(),
+            )
+            .await
+            .unwrap();
+
+        let batch_id = manager.create_batch(file_id).await.unwrap();
+
+        // Verify all are pending
+        let status_before = manager.get_batch_status(batch_id).await.unwrap();
+        assert_eq!(status_before.pending_requests, 3);
+        assert_eq!(status_before.canceled_requests, 0);
+
+        // Cancel the batch
+        manager.cancel_batch(batch_id).await.unwrap();
+
+        // Verify all are canceled
+        let status_after = manager.get_batch_status(batch_id).await.unwrap();
+        assert_eq!(status_after.pending_requests, 0);
+        assert_eq!(status_after.canceled_requests, 3);
+
+        // Get the actual requests to verify their state
+        let requests = manager.get_batch_requests(batch_id).await.unwrap();
+        assert_eq!(requests.len(), 3);
+        for request in requests {
+            assert!(matches!(request, AnyRequest::Canceled(_)));
+        }
+    }
+
+    #[sqlx::test]
+    async fn test_cancel_individual_requests(pool: sqlx::PgPool) {
+        let http_client = Arc::new(MockHttpClient::new());
+        let manager = PostgresRequestManager::with_defaults(pool.clone(), http_client);
+
+        // Create a file with 5 templates
+        let file_id = manager
+            .create_file(
+                "individual-cancel-test".to_string(),
+                None,
+                (0..5)
+                    .map(|i| RequestTemplateInput {
+                        endpoint: "https://api.example.com".to_string(),
+                        method: "POST".to_string(),
+                        path: "/test".to_string(),
+                        body: format!(r#"{{"n":{}}}"#, i),
+                        model: "test".to_string(),
+                        api_key: "key".to_string(),
+                    })
+                    .collect(),
+            )
+            .await
+            .unwrap();
+
+        let batch_id = manager.create_batch(file_id).await.unwrap();
+
+        // Get all request IDs
+        let requests = manager.get_batch_requests(batch_id).await.unwrap();
+        let request_ids: Vec<_> = requests.iter().map(|r| r.id()).collect();
+
+        // Cancel the first 3 requests
+        let results = manager
+            .cancel_requests(request_ids[0..3].to_vec())
+            .await
+            .unwrap();
+
+        // All 3 cancellations should succeed
+        for result in results {
+            assert!(result.is_ok());
+        }
+
+        // Verify batch status
+        let status = manager.get_batch_status(batch_id).await.unwrap();
+        assert_eq!(status.pending_requests, 2);
+        assert_eq!(status.canceled_requests, 3);
+
+        // Verify the requests
+        let all_requests = manager.get_batch_requests(batch_id).await.unwrap();
+        let canceled_count = all_requests
+            .iter()
+            .filter(|r| matches!(r, AnyRequest::Canceled(_)))
+            .count();
+        assert_eq!(canceled_count, 3);
+    }
+
+    #[sqlx::test]
+    async fn test_list_files(pool: sqlx::PgPool) {
+        let http_client = Arc::new(MockHttpClient::new());
+        let manager = PostgresRequestManager::with_defaults(pool.clone(), http_client);
+
+        // Create 3 files
+        let file1_id = manager
+            .create_file("file1".to_string(), Some("First".to_string()), vec![])
+            .await
+            .unwrap();
+
+        let file2_id = manager
+            .create_file("file2".to_string(), Some("Second".to_string()), vec![])
+            .await
+            .unwrap();
+
+        let file3_id = manager
+            .create_file("file3".to_string(), None, vec![])
+            .await
+            .unwrap();
+
+        // List all files
+        let files = manager.list_files().await.unwrap();
+
+        // Should have at least our 3 files (may have more from other tests)
+        assert!(files.len() >= 3);
+
+        // Verify our files are present
+        let file_ids: Vec<_> = files.iter().map(|f| f.id).collect();
+        assert!(file_ids.contains(&file1_id));
+        assert!(file_ids.contains(&file2_id));
+        assert!(file_ids.contains(&file3_id));
+
+        // Verify names and descriptions
+        let file1 = files.iter().find(|f| f.id == file1_id).unwrap();
+        assert_eq!(file1.name, "file1");
+        assert_eq!(file1.description, Some("First".to_string()));
+
+        let file3 = files.iter().find(|f| f.id == file3_id).unwrap();
+        assert_eq!(file3.name, "file3");
+        assert_eq!(file3.description, None);
+    }
+
+    #[sqlx::test]
+    async fn test_list_file_batches(pool: sqlx::PgPool) {
+        let http_client = Arc::new(MockHttpClient::new());
+        let manager = PostgresRequestManager::with_defaults(pool.clone(), http_client);
+
+        // Create a file with templates
+        let file_id = manager
+            .create_file(
+                "batch-list-test".to_string(),
+                None,
+                vec![RequestTemplateInput {
+                    endpoint: "https://api.example.com".to_string(),
+                    method: "POST".to_string(),
+                    path: "/test".to_string(),
+                    body: "{}".to_string(),
+                    model: "test".to_string(),
+                    api_key: "key".to_string(),
+                }],
+            )
+            .await
+            .unwrap();
+
+        // Create 3 batches
+        let batch1_id = manager.create_batch(file_id).await.unwrap();
+        let batch2_id = manager.create_batch(file_id).await.unwrap();
+        let batch3_id = manager.create_batch(file_id).await.unwrap();
+
+        // List batches for this file
+        let batches = manager.list_file_batches(file_id).await.unwrap();
+
+        assert_eq!(batches.len(), 3);
+
+        // Verify all batch IDs are present
+        let batch_ids: Vec<_> = batches.iter().map(|b| b.batch_id).collect();
+        assert!(batch_ids.contains(&batch1_id));
+        assert!(batch_ids.contains(&batch2_id));
+        assert!(batch_ids.contains(&batch3_id));
+
+        // Verify each batch has 1 pending request
+        for batch in batches {
+            assert_eq!(batch.total_requests, 1);
+            assert_eq!(batch.pending_requests, 1);
+        }
+    }
+
+    #[sqlx::test]
+    async fn test_delete_file_cascade(pool: sqlx::PgPool) {
+        let http_client = Arc::new(MockHttpClient::new());
+        let manager = PostgresRequestManager::with_defaults(pool.clone(), http_client);
+
+        // Create a file with templates
+        let file_id = manager
+            .create_file(
+                "delete-test".to_string(),
+                None,
+                vec![
+                    RequestTemplateInput {
+                        endpoint: "https://api.example.com".to_string(),
+                        method: "POST".to_string(),
+                        path: "/test".to_string(),
+                        body: r#"{"n":1}"#.to_string(),
+                        model: "test".to_string(),
+                        api_key: "key".to_string(),
+                    },
+                    RequestTemplateInput {
+                        endpoint: "https://api.example.com".to_string(),
+                        method: "POST".to_string(),
+                        path: "/test".to_string(),
+                        body: r#"{"n":2}"#.to_string(),
+                        model: "test".to_string(),
+                        api_key: "key".to_string(),
+                    },
+                ],
+            )
+            .await
+            .unwrap();
+
+        // Create a batch
+        let batch_id = manager.create_batch(file_id).await.unwrap();
+
+        // Verify the batch exists
+        let status_before = manager.get_batch_status(batch_id).await;
+        assert!(status_before.is_ok());
+
+        // Delete the file
+        manager.delete_file(file_id).await.unwrap();
+
+        // Verify file is gone
+        let file_result = manager.get_file(file_id).await;
+        assert!(file_result.is_err());
+
+        // Verify batch is gone (cascade delete)
+        let status_after = manager.get_batch_status(batch_id).await;
+        assert!(status_after.is_err());
     }
 }

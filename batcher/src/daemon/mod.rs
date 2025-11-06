@@ -756,7 +756,10 @@ mod tests {
                 if let crate::AnyRequest::Completed(req) = any_request {
                     // Verify the request eventually completed successfully
                     assert_eq!(req.state.response_status, 200);
-                    assert_eq!(req.state.response_body, r#"{"result":"success after retries"}"#);
+                    assert_eq!(
+                        req.state.response_body,
+                        r#"{"result":"success after retries"}"#
+                    );
                     completed = true;
                     break;
                 }
@@ -768,10 +771,7 @@ mod tests {
         // Stop the daemon
         daemon_handle.abort();
 
-        assert!(
-            completed,
-            "Request should have completed after retries"
-        );
+        assert!(completed, "Request should have completed after retries");
 
         // Verify the request was attempted 3 times (2 failures + 1 success)
         assert_eq!(

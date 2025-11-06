@@ -6,7 +6,7 @@
 use crate::batch::{BatchId, BatchStatus, File, FileId, RequestTemplate, RequestTemplateInput};
 use crate::error::Result;
 use crate::http::HttpClient;
-use crate::request::{AnyRequest, Claimed, DaemonId, Pending, Request, RequestId, RequestState};
+use crate::request::{AnyRequest, Claimed, DaemonId, Request, RequestId, RequestState};
 use async_trait::async_trait;
 use futures::stream::Stream;
 use std::pin::Pin;
@@ -59,9 +59,9 @@ pub trait Storage: Send + Sync {
     /// Cancel all pending/in-progress requests for a batch.
     async fn cancel_batch(&self, batch_id: BatchId) -> Result<()>;
 
-    /// Directly submit a new pending request to storage with its processing context.
-    async fn submit(&self, request: Request<Pending>) -> Result<()>;
-
+    /// The following methods are defined specifically for requests - i.e. independent of the
+    /// files/batches they belong to.
+    ///
     /// Cancel one or more individual pending or in-progress requests.
     ///
     /// Requests that have already completed or failed cannot be canceled.
@@ -131,7 +131,8 @@ pub trait Storage: Send + Sync {
         id_filter: Option<Vec<RequestId>>,
     ) -> Pin<Box<dyn Stream<Item = Result<Result<AnyRequest>>> + Send>>;
 
-    // These methods are used by the DaemonExecutor for processing requests.
+    // These methods are used by the DaemonExecutor for pulling requests, and then persisting their
+    // states as they iterate through them
 
     /// Atomically claim pending requests for processing.
     async fn claim_requests(
