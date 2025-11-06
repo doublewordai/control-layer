@@ -92,6 +92,55 @@ impl<H: HttpClient + 'static> PostgresRequestManager<H> {
     }
 }
 
+// Additional methods for PostgresRequestManager (not part of Storage trait)
+impl<H: HttpClient + 'static> PostgresRequestManager<H> {
+    /// Unclaim stale requests that have been stuck in "claimed" or "processing" states
+    /// for longer than the configured timeouts. This handles daemon crashes.
+    ///
+    /// Returns the number of requests that were unclaimed.
+    async fn unclaim_stale_requests(&self) -> Result<usize> {
+        let claim_timeout_ms = self.config.claim_timeout_ms as i64;
+        let processing_timeout_ms = self.config.processing_timeout_ms as i64;
+
+        // Unclaim requests that are stuck in claimed or processing states
+        let result = sqlx::query!(
+            r#"
+            UPDATE requests
+            SET
+                state = 'pending',
+                daemon_id = NULL,
+                claimed_at = NULL,
+                started_at = NULL
+            WHERE
+                (state = 'claimed' AND claimed_at < NOW() - ($1 || ' milliseconds')::INTERVAL)
+                OR
+                (state = 'processing' AND started_at < NOW() - ($2 || ' milliseconds')::INTERVAL)
+            RETURNING id
+            "#,
+            claim_timeout_ms.to_string(),
+            processing_timeout_ms.to_string(),
+        )
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|e| BatcherError::Other(anyhow!("Failed to unclaim stale requests: {}", e)))?;
+
+        let count = result.len();
+
+        if count > 0 {
+            let request_ids: Vec<_> = result.iter().map(|r| r.id).collect();
+            tracing::warn!(
+                count = count,
+                request_ids = ?request_ids,
+                claim_timeout_ms,
+                processing_timeout_ms,
+                "Unclaimed stale requests (likely due to daemon crash)"
+            );
+        }
+
+        Ok(count)
+    }
+}
+
 // Implement Storage trait directly (no delegation)
 #[async_trait]
 impl<H: HttpClient + 'static> Storage for PostgresRequestManager<H> {
@@ -100,6 +149,15 @@ impl<H: HttpClient + 'static> Storage for PostgresRequestManager<H> {
         limit: usize,
         daemon_id: DaemonId,
     ) -> Result<Vec<Request<Claimed>>> {
+        // First, unclaim any stale requests (self-healing for daemon crashes)
+        let unclaimed_count = self.unclaim_stale_requests().await?;
+        if unclaimed_count > 0 {
+            tracing::info!(
+                unclaimed_count,
+                "Unclaimed stale requests before claiming new ones"
+            );
+        }
+
         let now = Utc::now();
 
         // Atomically claim pending executions using SELECT FOR UPDATE
@@ -1562,5 +1620,269 @@ mod tests {
         // Verify batch is gone (cascade delete)
         let status_after = manager.get_batch_status(batch_id).await;
         assert!(status_after.is_err());
+    }
+
+    #[sqlx::test]
+    async fn test_unclaim_stale_claimed_requests(pool: sqlx::PgPool) {
+        let http_client = Arc::new(MockHttpClient::new());
+
+        // Create manager with 1-second claim timeout for testing
+        let config = crate::daemon::DaemonConfig {
+            claim_timeout_ms: 1000,       // 1 second
+            processing_timeout_ms: 60000, // 1 minute
+            ..Default::default()
+        };
+        let manager = Arc::new(PostgresRequestManager::new(
+            pool.clone(),
+            http_client,
+            config,
+        ));
+
+        // Create a file and batch
+        let file_id = manager
+            .create_file(
+                "stale-test".to_string(),
+                None,
+                vec![RequestTemplateInput {
+                    endpoint: "https://api.example.com".to_string(),
+                    method: "POST".to_string(),
+                    path: "/test".to_string(),
+                    body: "{}".to_string(),
+                    model: "test".to_string(),
+                    api_key: "key".to_string(),
+                }],
+            )
+            .await
+            .unwrap();
+
+        let batch_id = manager.create_batch(file_id).await.unwrap();
+
+        // Claim the request with daemon1
+        let daemon1_id = DaemonId::from(Uuid::new_v4());
+        let claimed = manager.claim_requests(1, daemon1_id).await.unwrap();
+        assert_eq!(claimed.len(), 1);
+        let request_id = claimed[0].data.id;
+
+        // Manually set claimed_at to 3 seconds ago (past the 1s timeout)
+        sqlx::query!(
+            "UPDATE requests SET claimed_at = NOW() - INTERVAL '3 seconds' WHERE id = $1",
+            *request_id as Uuid
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        // Now daemon2 tries to claim - should unclaim the stale request and re-claim it
+        let daemon2_id = DaemonId::from(Uuid::new_v4());
+        let reclaimed = manager.claim_requests(1, daemon2_id).await.unwrap();
+
+        assert_eq!(reclaimed.len(), 1);
+        assert_eq!(reclaimed[0].data.id, request_id);
+        assert_eq!(reclaimed[0].state.daemon_id, daemon2_id);
+
+        // Verify the request is now claimed by daemon2
+        let status = manager.get_batch_status(batch_id).await.unwrap();
+        assert_eq!(status.in_progress_requests, 1);
+    }
+
+    #[sqlx::test]
+    async fn test_unclaim_stale_processing_requests(pool: sqlx::PgPool) {
+        let http_client = Arc::new(MockHttpClient::new());
+
+        // Create manager with 1-second processing timeout for testing
+        let config = crate::daemon::DaemonConfig {
+            claim_timeout_ms: 60000,     // 1 minute
+            processing_timeout_ms: 1000, // 1 second
+            ..Default::default()
+        };
+        let manager = Arc::new(PostgresRequestManager::new(
+            pool.clone(),
+            http_client,
+            config,
+        ));
+
+        // Create a file and batch
+        let file_id = manager
+            .create_file(
+                "stale-processing-test".to_string(),
+                None,
+                vec![RequestTemplateInput {
+                    endpoint: "https://api.example.com".to_string(),
+                    method: "POST".to_string(),
+                    path: "/test".to_string(),
+                    body: "{}".to_string(),
+                    model: "test".to_string(),
+                    api_key: "key".to_string(),
+                }],
+            )
+            .await
+            .unwrap();
+
+        let batch_id = manager.create_batch(file_id).await.unwrap();
+
+        // Claim and manually set to processing state
+        let daemon1_id = DaemonId::from(Uuid::new_v4());
+        let claimed = manager.claim_requests(1, daemon1_id).await.unwrap();
+        assert_eq!(claimed.len(), 1);
+        let request_id = claimed[0].data.id;
+
+        // Manually set to processing state with started_at 3 seconds ago
+        sqlx::query!(
+            r#"
+            UPDATE requests
+            SET
+                state = 'processing',
+                started_at = NOW() - INTERVAL '3 seconds'
+            WHERE id = $1
+            "#,
+            *request_id as Uuid
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        // Verify it's in processing state
+        let status_before = manager.get_batch_status(batch_id).await.unwrap();
+        assert_eq!(status_before.in_progress_requests, 1);
+
+        // Now daemon2 tries to claim - should unclaim the stale processing request
+        let daemon2_id = DaemonId::from(Uuid::new_v4());
+        let reclaimed = manager.claim_requests(1, daemon2_id).await.unwrap();
+
+        assert_eq!(reclaimed.len(), 1);
+        assert_eq!(reclaimed[0].data.id, request_id);
+        assert_eq!(reclaimed[0].state.daemon_id, daemon2_id);
+    }
+
+    #[sqlx::test]
+    async fn test_dont_unclaim_recent_requests(pool: sqlx::PgPool) {
+        let http_client = Arc::new(MockHttpClient::new());
+
+        // Create manager with long timeouts
+        let config = crate::daemon::DaemonConfig {
+            claim_timeout_ms: 60000,       // 1 minute
+            processing_timeout_ms: 600000, // 10 minutes
+            ..Default::default()
+        };
+        let manager = Arc::new(PostgresRequestManager::new(
+            pool.clone(),
+            http_client,
+            config,
+        ));
+
+        // Create a file with 2 templates
+        let file_id = manager
+            .create_file(
+                "recent-test".to_string(),
+                None,
+                vec![
+                    RequestTemplateInput {
+                        endpoint: "https://api.example.com".to_string(),
+                        method: "POST".to_string(),
+                        path: "/test".to_string(),
+                        body: r#"{"n":1}"#.to_string(),
+                        model: "test".to_string(),
+                        api_key: "key".to_string(),
+                    },
+                    RequestTemplateInput {
+                        endpoint: "https://api.example.com".to_string(),
+                        method: "POST".to_string(),
+                        path: "/test".to_string(),
+                        body: r#"{"n":2}"#.to_string(),
+                        model: "test".to_string(),
+                        api_key: "key".to_string(),
+                    },
+                ],
+            )
+            .await
+            .unwrap();
+
+        manager.create_batch(file_id).await.unwrap();
+
+        // Daemon1 claims first request
+        let daemon1_id = DaemonId::from(Uuid::new_v4());
+        let claimed1 = manager.claim_requests(1, daemon1_id).await.unwrap();
+        assert_eq!(claimed1.len(), 1);
+
+        // Daemon2 immediately tries to claim - should get the second request, not steal the first
+        let daemon2_id = DaemonId::from(Uuid::new_v4());
+        let claimed2 = manager.claim_requests(1, daemon2_id).await.unwrap();
+        assert_eq!(claimed2.len(), 1);
+
+        // Verify they got different requests
+        assert_ne!(claimed1[0].data.id, claimed2[0].data.id);
+
+        // Verify first request still belongs to daemon1
+        let results = manager
+            .get_requests(vec![claimed1[0].data.id])
+            .await
+            .unwrap();
+        if let Ok(crate::AnyRequest::Claimed(req)) = &results[0] {
+            assert_eq!(req.state.daemon_id, daemon1_id);
+        } else {
+            panic!("Request should still be claimed by daemon1");
+        }
+    }
+
+    #[sqlx::test]
+    async fn test_preserve_retry_attempt_on_unclaim(pool: sqlx::PgPool) {
+        let http_client = Arc::new(MockHttpClient::new());
+
+        // Create manager with 1-second claim timeout
+        let config = crate::daemon::DaemonConfig {
+            claim_timeout_ms: 1000,
+            processing_timeout_ms: 60000,
+            ..Default::default()
+        };
+        let manager = Arc::new(PostgresRequestManager::new(
+            pool.clone(),
+            http_client,
+            config,
+        ));
+
+        // Create a file and batch
+        let file_id = manager
+            .create_file(
+                "retry-test".to_string(),
+                None,
+                vec![RequestTemplateInput {
+                    endpoint: "https://api.example.com".to_string(),
+                    method: "POST".to_string(),
+                    path: "/test".to_string(),
+                    body: "{}".to_string(),
+                    model: "test".to_string(),
+                    api_key: "key".to_string(),
+                }],
+            )
+            .await
+            .unwrap();
+
+        manager.create_batch(file_id).await.unwrap();
+
+        // Manually set a request to claimed with retry_attempt=2
+        sqlx::query!(
+            r#"
+            UPDATE requests
+            SET
+                retry_attempt = 2,
+                state = 'claimed',
+                daemon_id = $1,
+                claimed_at = NOW() - INTERVAL '3 seconds'
+            WHERE id IN (SELECT id FROM requests WHERE state = 'pending' LIMIT 1)
+            RETURNING id
+            "#,
+            Uuid::new_v4()
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+
+        // Claim should unclaim the stale request and reclaim it
+        let daemon_id = DaemonId::from(Uuid::new_v4());
+        let claimed = manager.claim_requests(1, daemon_id).await.unwrap();
+
+        assert_eq!(claimed.len(), 1);
+        // Verify retry_attempt is preserved
+        assert_eq!(claimed[0].state.retry_attempt, 2);
     }
 }

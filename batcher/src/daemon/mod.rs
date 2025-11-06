@@ -59,6 +59,14 @@ pub struct DaemonConfig {
     /// Predicate function to determine if a response should be retried.
     /// Defaults to retrying 5xx, 429, and 408 status codes.
     pub should_retry: ShouldRetryFn,
+
+    /// Maximum time a request can stay in "claimed" state before being unclaimed
+    /// and returned to pending (milliseconds). This handles daemon crashes.
+    pub claim_timeout_ms: u64,
+
+    /// Maximum time a request can stay in "processing" state before being unclaimed
+    /// and returned to pending (milliseconds). This handles daemon crashes during execution.
+    pub processing_timeout_ms: u64,
 }
 
 impl Default for DaemonConfig {
@@ -75,6 +83,8 @@ impl Default for DaemonConfig {
             timeout_ms: 600000,
             status_log_interval_ms: Some(2000), // Log every 5 seconds by default
             should_retry: Arc::new(default_should_retry),
+            claim_timeout_ms: 60000,       // 1 minute
+            processing_timeout_ms: 600000, // 10 minutes
         }
     }
 }
@@ -353,6 +363,8 @@ mod tests {
             timeout_ms: 5000,
             status_log_interval_ms: None, // Disable status logging in tests
             should_retry: Arc::new(default_should_retry),
+            claim_timeout_ms: 60000,
+            processing_timeout_ms: 600000,
         };
 
         let manager = Arc::new(PostgresRequestManager::new(
@@ -500,6 +512,8 @@ mod tests {
             timeout_ms: 5000,
             status_log_interval_ms: None,
             should_retry: Arc::new(default_should_retry),
+            claim_timeout_ms: 60000,
+            processing_timeout_ms: 600000,
         };
 
         let manager = Arc::new(PostgresRequestManager::new(
@@ -701,6 +715,8 @@ mod tests {
             timeout_ms: 5000,
             status_log_interval_ms: None,
             should_retry: Arc::new(default_should_retry),
+            claim_timeout_ms: 60000,
+            processing_timeout_ms: 600000,
         };
 
         let manager = Arc::new(PostgresRequestManager::new(
@@ -810,6 +826,8 @@ mod tests {
             timeout_ms: 5000,
             status_log_interval_ms: None,
             should_retry: Arc::new(default_should_retry),
+            claim_timeout_ms: 60000,
+            processing_timeout_ms: 600000,
         };
 
         let manager = Arc::new(PostgresRequestManager::new(
