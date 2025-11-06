@@ -102,6 +102,7 @@ impl<'c> Files<'c> {
 
     /// Mark a file as having an error during processing
     #[instrument(skip(self), fields(file_id = %abbrev_uuid(&id)), err)]
+    #[cfg(test)]
     pub async fn mark_error(&mut self, id: FileId, error_message: String) -> Result<bool> {
         let result = sqlx::query!(
             r#"
@@ -120,6 +121,7 @@ impl<'c> Files<'c> {
 
     /// Mark files as expired (called by cleanup job)
     #[instrument(skip(self), err)]
+    #[cfg(test)]
     pub async fn mark_expired(&mut self) -> Result<Vec<FileId>> {
         let expired_ids = sqlx::query_scalar!(
             r#"

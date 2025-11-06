@@ -209,7 +209,7 @@ pub async fn upload_file(
                         line_length = incomplete_line.len(),
                         "Processing final incomplete line"
                     );
-                    
+
                     let trimmed = incomplete_line.trim();
                     if !trimmed.is_empty() {
                         let _json_value = serde_json::from_str::<serde_json::Value>(trimmed).map_err(|e| {

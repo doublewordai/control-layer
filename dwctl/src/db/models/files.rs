@@ -13,7 +13,7 @@ pub enum FileStatus {
 }
 
 impl FileStatus {
-    pub fn to_db_string(&self) -> &'static str {
+    pub fn to_db_string(self) -> &'static str {
         match self {
             FileStatus::Processed => "processed",
             FileStatus::Error => "error",
@@ -55,6 +55,7 @@ pub struct FileUpdateDBRequest {
 }
 
 /// Database response for a file
+#[allow(dead_code)] // some fields are in the database but not currently used, will be useful internally later
 #[derive(Debug, Clone)]
 pub struct FileDBResponse {
     pub id: FileId,
