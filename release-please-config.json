@@ -8,6 +8,11 @@
       "release-type": "rust"
     }
   },
+  "plugins": [
+    {
+      "type": "cargo-workspace"
+    }
+  ],
   "include-component-in-tag": false,
   "separate-pull-requests": true
 }
