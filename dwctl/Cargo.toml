@@ -82,6 +82,7 @@ postgresql_embedded = { version = "0.20", optional = true, features = [
 # Embedded static assets
 rust-embed = { version = "8.5", features = ["debug-embed"] }
 mime_guess = "2.0"
+axum_typed_multipart = "0.16.4"
 
 [dev-dependencies]
 axum-test = "17.3"

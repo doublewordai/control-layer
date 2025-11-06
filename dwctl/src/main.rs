@@ -601,6 +601,11 @@ pub async fn build_router(state: &mut AppState, onwards_router: Router) -> anyho
         .route("/models/{id}", get(api::handlers::deployments::get_deployed_model))
         .route("/models/{id}", patch(api::handlers::deployments::update_deployed_model))
         .route("/models/{id}", delete(api::handlers::deployments::delete_deployed_model))
+        // Files management
+        .route("/files", post(api::handlers::files::upload_file))
+        .route("/files", get(api::handlers::files::list_files))
+        .route("/files/{file_id}", get(api::handlers::files::get_file))
+        .route("/files/{file_id}", delete(api::handlers::files::delete_file))
         // Groups management
         .route("/groups", get(api::handlers::groups::list_groups))
         .route("/groups", post(api::handlers::groups::create_group))

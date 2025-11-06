@@ -94,3 +94,5 @@ enable_request_logging: true # Enable request/response logging to database
 # For arrays like model_sources, use environment-specific config files
 # (e.g., config.production.yaml) rather than env vars.
 
+files:
+  max_file_size: 104857600 # 100 MB

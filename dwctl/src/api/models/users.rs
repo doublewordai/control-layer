@@ -13,6 +13,7 @@ pub enum Role {
     RequestViewer,
     StandardUser,
     BillingManager,
+    BatchAPIUser,
 }
 
 // User request models
