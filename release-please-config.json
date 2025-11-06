@@ -1,5 +1,8 @@
 {
   "packages": {
+    "fusillade": {
+      "release-type": "rust"
+    },
     "dwctl": {
       "release-type": "rust"
     }

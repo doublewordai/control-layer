@@ -1,0 +1,142 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n                                                SELECT\n                                                    id, batch_id, template_id, state, endpoint, method, path, body, model, api_key,\n                                                    retry_attempt, not_before, daemon_id, claimed_at, started_at,\n                                                    response_status, response_body, completed_at, error, failed_at, canceled_at\n                                                FROM requests\n                                                WHERE id = ANY($1)\n                                                ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "id",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 1,
+        "name": "batch_id",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 2,
+        "name": "template_id",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 3,
+        "name": "state",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 4,
+        "name": "endpoint",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 5,
+        "name": "method",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 6,
+        "name": "path",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 7,
+        "name": "body",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 8,
+        "name": "model",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 9,
+        "name": "api_key",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 10,
+        "name": "retry_attempt",
+        "type_info": "Int4"
+      },
+      {
+        "ordinal": 11,
+        "name": "not_before",
+        "type_info": "Timestamptz"
+      },
+      {
+        "ordinal": 12,
+        "name": "daemon_id",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 13,
+        "name": "claimed_at",
+        "type_info": "Timestamptz"
+      },
+      {
+        "ordinal": 14,
+        "name": "started_at",
+        "type_info": "Timestamptz"
+      },
+      {
+        "ordinal": 15,
+        "name": "response_status",
+        "type_info": "Int2"
+      },
+      {
+        "ordinal": 16,
+        "name": "response_body",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 17,
+        "name": "completed_at",
+        "type_info": "Timestamptz"
+      },
+      {
+        "ordinal": 18,
+        "name": "error",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 19,
+        "name": "failed_at",
+        "type_info": "Timestamptz"
+      },
+      {
+        "ordinal": 20,
+        "name": "canceled_at",
+        "type_info": "Timestamptz"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "UuidArray"
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      true,
+      true,
+      true,
+      true,
+      true,
+      true,
+      true,
+      true,
+      true,
+      true
+    ]
+  },
+  "hash": "1eaee75b28ba32501b4a2f1bdda2bf9d456c3f69260203d1881637d56c07d688"
+}

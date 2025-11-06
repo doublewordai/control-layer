@@ -1,5 +1,3 @@
-set dotenv-load
-
 # Display available commands
 default:
     @just --list
@@ -405,7 +403,7 @@ test target="" *args="":
                 fi
                 # Remove --watch from args and pass remaining to cargo test
                 remaining_args=$(echo "{{args}}" | sed 's/--watch//g' | xargs)
-                cd dwctl && cargo watch -x "test $remaining_args"
+                cargo watch -x "test $remaining_args"
             elif [[ "{{args}}" == *"--coverage"* ]]; then
                 if ! command -v cargo-llvm-cov >/dev/null 2>&1; then
                     echo "❌ Error: cargo-llvm-cov not found. Install with:"
@@ -414,9 +412,9 @@ test target="" *args="":
                     echo "  cargo binstall cargo-llvm-cov"
                     exit 1
                 fi
-                cd dwctl && cargo llvm-cov --fail-under-lines 60 --lcov --output-path lcov.info
+                cargo llvm-cov --fail-under-lines 60 --lcov --output-path lcov.info
             else
-                cd dwctl && cargo test {{args}}
+                cargo test {{args}}
             fi
             ;;
         ts)
@@ -475,7 +473,6 @@ lint target *args="":
             npm run lint -- --max-warnings 0 {{args}}
             ;;
         rust)
-            cd dwctl
             echo "Checking Cargo.lock sync..."
             cargo metadata --locked > /dev/null
             echo "Running cargo fmt --check..."
@@ -483,7 +480,7 @@ lint target *args="":
             echo "Running cargo clippy..."
             cargo clippy {{args}}
             echo "Checking SQLx prepared queries..."
-            cargo sqlx prepare --check
+            cargo sqlx prepare --check --workspace
             ;;
         *)
             echo "Usage: just lint [ts|rust]"
@@ -520,7 +517,7 @@ fmt target *args="":
             ;;
         rust)
             echo "Running cargo fmt for dwctl..."
-            cd dwctl && cargo fmt {{args}}
+            cargo fmt {{args}}
             ;;
         *)
             echo "Usage: just fmt [ts|rust]"
@@ -585,9 +582,28 @@ ci target *args="":
     case "{{target}}" in
         rust)
             echo "🦀 Running Rust CI pipeline..."
+
+            # Generate random database names
+            DWCTL_DB="dwctl_test_$(openssl rand -hex 4)"
+            FUSILLADE_DB="fusillade_test_$(openssl rand -hex 4)"
+
+            echo "📦 Setting up test databases: $DWCTL_DB, $FUSILLADE_DB"
+
+            # Create databases (PGPASSWORD works in CI, fallback to no password for local)
+            PGPASSWORD=postgres psql -U postgres -h localhost -c "CREATE DATABASE $DWCTL_DB;" 2>/dev/null || psql -h localhost -c "CREATE DATABASE $DWCTL_DB;"
+            PGPASSWORD=postgres psql -U postgres -h localhost -c "CREATE DATABASE $FUSILLADE_DB;" 2>/dev/null || psql -h localhost -c "CREATE DATABASE $FUSILLADE_DB;"
+
+            # Write DATABASE_URL to .env files for sqlx compile-time verification
+            echo "DATABASE_URL=postgres://postgres:postgres@localhost:5432/$DWCTL_DB" > dwctl/.env
+            echo "DATABASE_URL=postgres://postgres:postgres@localhost:5432/$FUSILLADE_DB" > fusillade/.env
+
+            # Run migrations (sqlx will pick up DATABASE_URL from .env files)
+            echo "🔄 Running migrations..."
+            cd dwctl && sqlx migrate run && cd ..
+            cd fusillade && sqlx migrate run && cd ..
+
             echo "📋 Setting up llvm-cov environment for consistent compilation..."
-            cd dwctl
-            echo "🧪 Step 1/1: Running tests with coverage..."
+            echo "🧪 Step 1/2: Running tests with coverage..."
             just test rust --coverage {{args}}
             eval "$(cargo llvm-cov show-env --export-prefix)"
             echo "📋 Step 2/2: Linting"
