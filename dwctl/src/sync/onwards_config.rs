@@ -403,7 +403,10 @@ mod tests {
     use std::{collections::HashMap, str::FromStr, time::Duration};
 
     use chrono::Utc;
-    use tokio::{sync::{watch, mpsc}, time::timeout};
+    use tokio::{
+        sync::{mpsc, watch},
+        time::timeout,
+    };
     use tokio_util::sync::CancellationToken;
     use uuid::Uuid;
 
