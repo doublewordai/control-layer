@@ -768,6 +768,24 @@ async fn main() -> anyhow::Result<()> {
     // Run migrations
     sqlx::migrate!("./migrations").run(&pool).await?;
 
+    // Setup fusillade schema and run migrations
+    // Run fusillade migrations in separate schema
+    let fusillade_pool = sqlx::postgres::PgPoolOptions::new()
+        .max_connections(20)
+        .after_connect(|conn, _meta| {
+            Box::pin(async move {
+                // Set search path to fusillade schema for all connections in this pool
+                conn.execute("SET search_path = 'fusillade'").await?;
+                Ok(())
+            })
+        })
+        .connect(&database_url)
+        .await?;
+
+    fusillade_pool.execute("CREATE SCHEMA IF NOT EXISTS fusillade").await?;
+
+    fusillade::migrator().run(&fusillade_pool).await?;
+
     // create admin user if it doesn't exist
     create_initial_admin_user(&config.admin_email, config.admin_password.as_deref(), &pool)
         .await
