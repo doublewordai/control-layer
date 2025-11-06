@@ -607,7 +607,7 @@ ci target *args="":
 
             # Write DATABASE_URL to .env files for sqlx compile-time verification
             echo "DATABASE_URL=postgres://postgres:postgres@localhost:5432/$DWCTL_DB" > dwctl/.env
-            echo "DATABASE_URL=postgres://postgres@localhost:5432/$FUSILLADE_DB" > fusillade/.env
+            echo "DATABASE_URL=postgres://postgres:postgres@localhost:5432/$FUSILLADE_DB" > fusillade/.env
 
             # Run migrations (sqlx will pick up DATABASE_URL from .env files)
             echo "🔄 Running migrations..."
