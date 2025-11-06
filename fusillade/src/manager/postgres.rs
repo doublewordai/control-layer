@@ -36,19 +36,18 @@ use super::DaemonExecutor;
 ///
 /// # Example
 /// ```ignore
-/// use fusillade::{PostgresRequestManager, ReqwestHttpClient, DaemonConfig};
+/// use fusillade::PostgresRequestManager;
 /// use sqlx::PgPool;
 ///
 /// let pool = PgPool::connect("postgresql://localhost/fusillade").await?;
-/// let http_client = Arc::new(ReqwestHttpClient::new());
-/// let config = DaemonConfig::default();
-/// let manager = PostgresRequestManager::new(pool, http_client, config).await?;
+/// let manager = Arc::new(PostgresRequestManager::new(pool));
 ///
 /// // Start processing
-/// let handle = manager.run()?;
+/// let handle = manager.clone().run()?;
 ///
-/// // Submit requests
-/// manager.submit_requests(vec![request]).await?;
+/// // Create files and batches
+/// let file_id = manager.create_file(name, description, templates).await?;
+/// let batch_id = manager.create_batch(file_id).await?;
 /// ```
 pub struct PostgresRequestManager<H: HttpClient> {
     pool: PgPool,
@@ -56,24 +55,50 @@ pub struct PostgresRequestManager<H: HttpClient> {
     config: DaemonConfig,
 }
 
-impl<H: HttpClient + 'static> PostgresRequestManager<H> {
-    /// Create a new PostgreSQL request manager.
+impl PostgresRequestManager<crate::http::ReqwestHttpClient> {
+    /// Create a new PostgreSQL request manager with default settings.
     ///
-    /// # Arguments
-    /// * `pool` - PostgreSQL connection pool
-    /// * `http_client` - HTTP client for making requests
-    /// * `config` - Daemon configuration (batch size, concurrency limits, etc.)
-    pub fn new(pool: PgPool, http_client: Arc<H>, config: DaemonConfig) -> Self {
+    /// Uses the default Reqwest HTTP client and default daemon configuration.
+    /// Customize with `.with_config()` if needed.
+    ///
+    /// # Example
+    /// ```ignore
+    /// let manager = PostgresRequestManager::new(pool)
+    ///     .with_config(my_config);
+    /// ```
+    pub fn new(pool: PgPool) -> Self {
+        Self {
+            pool,
+            http_client: Arc::new(crate::http::ReqwestHttpClient::default()),
+            config: DaemonConfig::default(),
+        }
+    }
+}
+
+impl<H: HttpClient + 'static> PostgresRequestManager<H> {
+    /// Create a PostgreSQL request manager with a custom HTTP client.
+    ///
+    /// Uses the default daemon configuration. Customize with `.with_config()` if needed.
+    ///
+    /// # Example
+    /// ```ignore
+    /// let manager = PostgresRequestManager::with_client(pool, Arc::new(my_client))
+    ///     .with_config(my_config);
+    /// ```
+    pub fn with_client(pool: PgPool, http_client: Arc<H>) -> Self {
         Self {
             pool,
             http_client,
-            config,
+            config: DaemonConfig::default(),
         }
     }
 
-    /// Create with default daemon configuration.
-    pub fn with_defaults(pool: PgPool, http_client: Arc<H>) -> Self {
-        Self::new(pool, http_client, DaemonConfig::default())
+    /// Set a custom daemon configuration.
+    ///
+    /// This is a builder method that can be chained after `new()` or `with_client()`.
+    pub fn with_config(mut self, config: DaemonConfig) -> Self {
+        self.config = config;
+        self
     }
 
     /// Get the connection pool.
@@ -1215,7 +1240,7 @@ mod tests {
     #[sqlx::test]
     async fn test_create_and_get_file(pool: sqlx::PgPool) {
         let http_client = Arc::new(MockHttpClient::new());
-        let manager = PostgresRequestManager::with_defaults(pool.clone(), http_client);
+        let manager = PostgresRequestManager::with_client(pool.clone(), http_client);
 
         // Create a file with templates
         let file_id = manager
@@ -1265,7 +1290,7 @@ mod tests {
     #[sqlx::test]
     async fn test_create_batch_and_get_status(pool: sqlx::PgPool) {
         let http_client = Arc::new(MockHttpClient::new());
-        let manager = PostgresRequestManager::with_defaults(pool.clone(), http_client);
+        let manager = PostgresRequestManager::with_client(pool.clone(), http_client);
 
         // Create a file with 3 templates
         let file_id = manager
@@ -1337,7 +1362,7 @@ mod tests {
     #[sqlx::test]
     async fn test_claim_requests(pool: sqlx::PgPool) {
         let http_client = Arc::new(MockHttpClient::new());
-        let manager = PostgresRequestManager::with_defaults(pool.clone(), http_client);
+        let manager = PostgresRequestManager::with_client(pool.clone(), http_client);
 
         // Create a file with 5 templates
         let file_id = manager
@@ -1392,7 +1417,7 @@ mod tests {
     #[sqlx::test]
     async fn test_cancel_batch(pool: sqlx::PgPool) {
         let http_client = Arc::new(MockHttpClient::new());
-        let manager = PostgresRequestManager::with_defaults(pool.clone(), http_client);
+        let manager = PostgresRequestManager::with_client(pool.clone(), http_client);
 
         // Create a file with 3 templates
         let file_id = manager
@@ -1439,7 +1464,7 @@ mod tests {
     #[sqlx::test]
     async fn test_cancel_individual_requests(pool: sqlx::PgPool) {
         let http_client = Arc::new(MockHttpClient::new());
-        let manager = PostgresRequestManager::with_defaults(pool.clone(), http_client);
+        let manager = PostgresRequestManager::with_client(pool.clone(), http_client);
 
         // Create a file with 5 templates
         let file_id = manager
@@ -1494,7 +1519,7 @@ mod tests {
     #[sqlx::test]
     async fn test_list_files(pool: sqlx::PgPool) {
         let http_client = Arc::new(MockHttpClient::new());
-        let manager = PostgresRequestManager::with_defaults(pool.clone(), http_client);
+        let manager = PostgresRequestManager::with_client(pool.clone(), http_client);
 
         // Create 3 files
         let file1_id = manager
@@ -1537,7 +1562,7 @@ mod tests {
     #[sqlx::test]
     async fn test_list_file_batches(pool: sqlx::PgPool) {
         let http_client = Arc::new(MockHttpClient::new());
-        let manager = PostgresRequestManager::with_defaults(pool.clone(), http_client);
+        let manager = PostgresRequestManager::with_client(pool.clone(), http_client);
 
         // Create a file with templates
         let file_id = manager
@@ -1582,7 +1607,7 @@ mod tests {
     #[sqlx::test]
     async fn test_delete_file_cascade(pool: sqlx::PgPool) {
         let http_client = Arc::new(MockHttpClient::new());
-        let manager = PostgresRequestManager::with_defaults(pool.clone(), http_client);
+        let manager = PostgresRequestManager::with_client(pool.clone(), http_client);
 
         // Create a file with templates
         let file_id = manager
@@ -1640,11 +1665,9 @@ mod tests {
             processing_timeout_ms: 60000, // 1 minute
             ..Default::default()
         };
-        let manager = Arc::new(PostgresRequestManager::new(
-            pool.clone(),
-            http_client,
-            config,
-        ));
+        let manager = Arc::new(
+            PostgresRequestManager::with_client(pool.clone(), http_client).with_config(config),
+        );
 
         // Create a file and batch
         let file_id = manager
@@ -1703,11 +1726,9 @@ mod tests {
             processing_timeout_ms: 1000, // 1 second
             ..Default::default()
         };
-        let manager = Arc::new(PostgresRequestManager::new(
-            pool.clone(),
-            http_client,
-            config,
-        ));
+        let manager = Arc::new(
+            PostgresRequestManager::with_client(pool.clone(), http_client).with_config(config),
+        );
 
         // Create a file and batch
         let file_id = manager
@@ -1772,11 +1793,9 @@ mod tests {
             processing_timeout_ms: 600000, // 10 minutes
             ..Default::default()
         };
-        let manager = Arc::new(PostgresRequestManager::new(
-            pool.clone(),
-            http_client,
-            config,
-        ));
+        let manager = Arc::new(
+            PostgresRequestManager::with_client(pool.clone(), http_client).with_config(config),
+        );
 
         // Create a file with 2 templates
         let file_id = manager
@@ -1842,11 +1861,9 @@ mod tests {
             processing_timeout_ms: 60000,
             ..Default::default()
         };
-        let manager = Arc::new(PostgresRequestManager::new(
-            pool.clone(),
-            http_client,
-            config,
-        ));
+        let manager = Arc::new(
+            PostgresRequestManager::with_client(pool.clone(), http_client).with_config(config),
+        );
 
         // Create a file and batch
         let file_id = manager

@@ -367,11 +367,10 @@ mod tests {
             processing_timeout_ms: 600000,
         };
 
-        let manager = Arc::new(PostgresRequestManager::new(
-            pool.clone(),
-            http_client.clone(),
-            config,
-        ));
+        let manager = Arc::new(
+            PostgresRequestManager::with_client(pool.clone(), http_client.clone())
+                .with_config(config),
+        );
 
         // Setup: Create a file and batch to associate with our request
         let file_id = manager
@@ -516,11 +515,10 @@ mod tests {
             processing_timeout_ms: 600000,
         };
 
-        let manager = Arc::new(PostgresRequestManager::new(
-            pool.clone(),
-            http_client.clone(),
-            config,
-        ));
+        let manager = Arc::new(
+            PostgresRequestManager::with_client(pool.clone(), http_client.clone())
+                .with_config(config),
+        );
 
         // Setup: Create a file with 5 templates, all using "gpt-4"
         let file_id = manager
@@ -719,11 +717,10 @@ mod tests {
             processing_timeout_ms: 600000,
         };
 
-        let manager = Arc::new(PostgresRequestManager::new(
-            pool.clone(),
-            http_client.clone(),
-            config,
-        ));
+        let manager = Arc::new(
+            PostgresRequestManager::with_client(pool.clone(), http_client.clone())
+                .with_config(config),
+        );
 
         // Setup: Create a file and batch
         let file_id = manager
@@ -830,11 +827,10 @@ mod tests {
             processing_timeout_ms: 600000,
         };
 
-        let manager = Arc::new(PostgresRequestManager::new(
-            pool.clone(),
-            http_client.clone(),
-            config,
-        ));
+        let manager = Arc::new(
+            PostgresRequestManager::with_client(pool.clone(), http_client.clone())
+                .with_config(config),
+        );
 
         // Setup: Create a file and batch
         let file_id = manager
