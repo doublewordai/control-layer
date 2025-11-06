@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.1.1](https://github.com/doublewordai/control-layer/compare/fusillade-v0.1.0...fusillade-v0.1.1) (2025-11-06)
+
+
+### Bug Fixes
+
+* add just release target, setup idempotent publishing ([3084ce1](https://github.com/doublewordai/control-layer/commit/3084ce18c95ddabc23a9716e9918dcb244e51141))
+
 ## 0.1.0 (2025-11-06)
 
 
