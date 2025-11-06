@@ -13,6 +13,7 @@ import {
   Requests,
   Settings,
   UsersGroups,
+  Batches
 } from "./components/features";
 import { AppLayout } from "./components/layout";
 import {
@@ -183,6 +184,16 @@ function AppRoutes() {
             <AppLayout>
               <ProtectedRoute path="/analytics">
                 <Requests />
+              </ProtectedRoute>
+            </AppLayout>
+          }
+        />
+        <Route
+          path="/batches"
+          element={
+            <AppLayout>
+              <ProtectedRoute path="/batches">
+                <Batches />
               </ProtectedRoute>
             </AppLayout>
           }

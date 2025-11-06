@@ -38,6 +38,19 @@ import type {
   CreateProbeRequest,
   ProbeResult,
   ProbeStatistics,
+  FileObject,
+  FileListResponse,
+  FileDeleteResponse,
+  FileUploadRequest,
+  FilesListQuery,
+  FileRequestsListQuery,
+  FileRequestsListResponse,
+  Batch,
+  BatchCreateRequest,
+  BatchListResponse,
+  BatchRequestsListQuery,
+  BatchRequestsListResponse,
+  BatchesListQuery,
 } from "./types";
 import { ApiError } from "./errors";
 
@@ -854,6 +867,164 @@ function isApiErrorObject(
   );
 }
 
+// Add these new API sections to the dwctlApi object at the bottom
+
+const filesApi = {
+  async list(options?: FilesListQuery): Promise<FileListResponse> {
+    const params = new URLSearchParams();
+    if (options?.after) params.set("after", options.after);
+    if (options?.limit) params.set("limit", options.limit.toString());
+    if (options?.order) params.set("order", options.order);
+    if (options?.purpose) params.set("purpose", options.purpose);
+
+    const url = `/admin/api/v1/files${params.toString() ? "?" + params.toString() : ""}`;
+    const response = await fetch(url);
+    if (!response.ok) {
+      throw new Error(`Failed to fetch files: ${response.status}`);
+    }
+    return response.json();
+  },
+
+  async get(id: string): Promise<FileObject> {
+    const response = await fetch(`/admin/api/v1/files/${id}`);
+    if (!response.ok) {
+      throw new Error(`Failed to fetch file: ${response.status}`);
+    }
+    return response.json();
+  },
+
+  async upload(data: FileUploadRequest): Promise<FileObject> {
+    const formData = new FormData();
+    formData.append("file", data.file);
+    formData.append("purpose", data.purpose);
+    
+    if (data.expires_after) {
+      formData.append("expires_after[anchor]", data.expires_after.anchor);
+      formData.append("expires_after[seconds]", data.expires_after.seconds.toString());
+    }
+
+    const response = await fetch("/admin/api/v1/files", {
+      method: "POST",
+      body: formData,
+    });
+    
+    if (!response.ok) {
+      const errorText = await response.text();
+      throw new ApiError(
+        response.status,
+        errorText || `Failed to upload file: ${response.status}`,
+        response,
+      );
+    }
+    return response.json();
+  },
+
+  async delete(id: string): Promise<FileDeleteResponse> {
+    const response = await fetch(`/admin/api/v1/files/${id}`, {
+      method: "DELETE",
+    });
+    if (!response.ok) {
+      throw new Error(`Failed to delete file: ${response.status}`);
+    }
+    return response.json();
+  },
+
+  // Custom endpoint - get requests in a file
+  async getRequests(
+    id: string,
+    options?: FileRequestsListQuery,
+  ): Promise<FileRequestsListResponse> {
+    const params = new URLSearchParams();
+    if (options?.limit) params.set("limit", options.limit.toString());
+    if (options?.skip) params.set("skip", options.skip.toString());
+
+    const url = `/admin/api/v1/files/${id}/requests${params.toString() ? "?" + params.toString() : ""}`;
+    const response = await fetch(url);
+    if (!response.ok) {
+      throw new Error(`Failed to fetch file requests: ${response.status}`);
+    }
+    return response.json();
+  },
+};
+
+const batchesApi = {
+  async list(options?: BatchesListQuery): Promise<BatchListResponse> {
+    const params = new URLSearchParams();
+    if (options?.after) params.set("after", options.after);
+    if (options?.limit) params.set("limit", options.limit.toString());
+
+    const url = `/admin/api/v1/batches${params.toString() ? "?" + params.toString() : ""}`;
+    const response = await fetch(url);
+    if (!response.ok) {
+      throw new Error(`Failed to fetch batches: ${response.status}`);
+    }
+    return response.json();
+  },
+
+  async get(id: string): Promise<Batch> {
+    const response = await fetch(`/admin/api/v1/batches/${id}`);
+    if (!response.ok) {
+      throw new Error(`Failed to fetch batch: ${response.status}`);
+    }
+    return response.json();
+  },
+
+  async create(data: BatchCreateRequest): Promise<Batch> {
+    const response = await fetch("/admin/api/v1/batches", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(data),
+    });
+
+    if (!response.ok) {
+      const errorText = await response.text();
+      throw new ApiError(
+        response.status,
+        errorText || `Failed to create batch: ${response.status}`,
+        response,
+      );
+    }
+    return response.json();
+  },
+
+  async cancel(id: string): Promise<Batch> {
+    const response = await fetch(`/admin/api/v1/batches/${id}/cancel`, {
+      method: "POST",
+    });
+    if (!response.ok) {
+      throw new Error(`Failed to cancel batch: ${response.status}`);
+    }
+    return response.json();
+  },
+
+  // Custom endpoint - get requests in a batch
+  async getRequests(
+    id: string,
+    options?: BatchRequestsListQuery,
+  ): Promise<BatchRequestsListResponse> {
+    const params = new URLSearchParams();
+    if (options?.limit) params.set("limit", options.limit.toString());
+    if (options?.skip) params.set("skip", options.skip.toString());
+    if (options?.status) params.set("status", options.status);
+
+    const url = `/admin/api/v1/batches/${id}/requests${params.toString() ? "?" + params.toString() : ""}`;
+    const response = await fetch(url);
+    if (!response.ok) {
+      throw new Error(`Failed to fetch batch requests: ${response.status}`);
+    }
+    return response.json();
+  },
+
+  // Custom endpoint - download results
+  async downloadResults(id: string): Promise<Blob> {
+    const response = await fetch(`/admin/api/v1/batches/${id}/results/download`);
+    if (!response.ok) {
+      throw new Error(`Failed to download results: ${response.status}`);
+    }
+    return response.blob();
+  },
+};
+
 // Main nested API object
 export const dwctlApi = {
   users: userApi,
@@ -864,4 +1035,6 @@ export const dwctlApi = {
   requests: requestsApi,
   auth: authApi,
   probes: probesApi,
+  files: filesApi,
+  batches: batchesApi,
 };

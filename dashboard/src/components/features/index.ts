@@ -6,3 +6,4 @@ export * from "./profile";
 export * from "./requests";
 export * from "./settings";
 export * from "./users-groups";
+export * from "./batches"

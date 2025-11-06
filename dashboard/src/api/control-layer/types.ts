@@ -610,3 +610,205 @@ export interface ProbeStatistics {
   last_success: string | null;
   last_failure: string | null;
 }
+
+export interface FileObject {
+  id: string;
+  object: "file";
+  bytes: number;
+  created_at: number; // Unix timestamp
+  expires_at?: number; // Unix timestamp
+  filename: string;
+  purpose: "batch" | "fine-tune" | "assistants" | "vision" | "user_data" | "evals";
+}
+
+export interface FileListResponse {
+  object: "list";
+  data: FileObject[];
+  first_id: string;
+  last_id: string;
+  has_more: boolean;
+}
+
+export interface FileUploadRequest {
+  file: File;
+  purpose: string;
+  expires_after?: {
+    anchor: "created_at";
+    seconds: number;
+  };
+}
+
+export interface FileDeleteResponse {
+  id: string;
+  object: "file";
+  deleted: boolean;
+}
+
+export interface FilesListQuery {
+  after?: string;
+  limit?: number;
+  order?: "asc" | "desc";
+  purpose?: string;
+}
+
+export interface BatchRequestCounts {
+  total: number;
+  completed: number;
+  failed: number;
+}
+
+export interface BatchUsage {
+  input_tokens: number;
+  input_tokens_details?: {
+    cached_tokens?: number;
+    text_tokens?: number;
+    audio_tokens?: number;
+  };
+  output_tokens: number;
+  output_tokens_details?: {
+    text_tokens?: number;
+    audio_tokens?: number;
+    reasoning_tokens?: number;
+  };
+  total_tokens: number;
+}
+
+export interface BatchError {
+  code: string;
+  line?: number;
+  message: string;
+  param?: string;
+}
+
+export interface BatchErrors {
+  object: "list";
+  data: BatchError[];
+}
+
+export type BatchStatus =
+  | "validating"
+  | "failed"
+  | "in_progress"
+  | "finalizing"
+  | "completed"
+  | "expired"
+  | "cancelling"
+  | "cancelled";
+
+export interface Batch {
+  id: string;
+  object: "batch";
+  endpoint: string;
+  errors?: BatchErrors | null;
+  input_file_id: string;
+  completion_window: "24h";
+  status: BatchStatus;
+  output_file_id?: string | null;
+  error_file_id?: string | null;
+  created_at: number; // Unix timestamp
+  in_progress_at?: number | null;
+  expires_at?: number | null;
+  finalizing_at?: number | null;
+  completed_at?: number | null;
+  failed_at?: number | null;
+  expired_at?: number | null;
+  cancelling_at?: number | null;
+  cancelled_at?: number | null;
+  request_counts: BatchRequestCounts;
+  metadata?: Record<string, string>;
+  usage?: BatchUsage;
+}
+
+export interface BatchListResponse {
+  object: "list";
+  data: Batch[];
+  first_id?: string;
+  last_id?: string;
+  has_more: boolean;
+}
+
+export interface BatchCreateRequest {
+  input_file_id: string;
+  endpoint: string;
+  completion_window: "24h";
+  metadata?: Record<string, string>;
+  output_expires_after?: {
+    anchor: "created_at";
+    seconds: number;
+  };
+}
+
+export interface BatchesListQuery {
+  after?: string;
+  limit?: number;
+}
+
+// ===== BATCH REQUESTS (Custom endpoints beyond OpenAI spec) =====
+
+export type RequestStatus =
+  | "pending"
+  | "in_progress"
+  | "completed"
+  | "failed"
+  | "cancelled";
+
+export interface BatchRequest {
+  id: string;
+  batch_id: string;
+  custom_id: string;
+  status: RequestStatus;
+  request: {
+    method: string;
+    url: string;
+    body: any;
+  };
+  response?: {
+    status_code: number;
+    body: any;
+  } | null;
+  error?: {
+    code: string;
+    message: string;
+  } | null;
+  created_at: number;
+  started_at?: number | null;
+  completed_at?: number | null;
+  usage?: {
+    prompt_tokens: number;
+    completion_tokens: number;
+    total_tokens: number;
+  };
+}
+
+export interface BatchRequestsListResponse {
+  object: "list";
+  data: BatchRequest[];
+  has_more: boolean;
+  total: number;
+}
+
+export interface BatchRequestsListQuery {
+  limit?: number;
+  skip?: number;
+  status?: RequestStatus;
+}
+
+// File requests (templates in a file, before batch creation)
+export interface FileRequest {
+  custom_id: string;
+  method: string;
+  url: string;
+  body: any;
+}
+
+export interface FileRequestsListResponse {
+  object: "list";
+  data: FileRequest[];
+  has_more: boolean;
+  total: number;
+}
+
+export interface FileRequestsListQuery {
+  limit?: number;
+  skip?: number;
+}

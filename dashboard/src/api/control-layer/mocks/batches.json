@@ -1,0 +1,99 @@
+[
+  {
+    "id": "batch-demo-1",
+    "object": "batch",
+    "endpoint": "/v1/chat/completions",
+    "errors": null,
+    "input_file_id": "file-demo-1",
+    "completion_window": "24h",
+    "status": "completed",
+    "output_file_id": "file-output-1",
+    "error_file_id": null,
+    "created_at": 1730822400,
+    "in_progress_at": 1730824200,
+    "expires_at": 1731427200,
+    "finalizing_at": 1730865600,
+    "completed_at": 1730869200,
+    "failed_at": null,
+    "expired_at": null,
+    "cancelling_at": null,
+    "cancelled_at": null,
+    "request_counts": {
+      "total": 250,
+      "completed": 248,
+      "failed": 2
+    },
+    "metadata": {
+      "customer_id": "user_123",
+      "batch_description": "Daily evaluation batch"
+    },
+    "usage": {
+      "input_tokens": 125000,
+      "output_tokens": 89000,
+      "total_tokens": 214000
+    }
+  },
+  {
+    "id": "batch-demo-2",
+    "object": "batch",
+    "endpoint": "/v1/chat/completions",
+    "errors": null,
+    "input_file_id": "file-demo-2",
+    "completion_window": "24h",
+    "status": "in_progress",
+    "output_file_id": null,
+    "error_file_id": null,
+    "created_at": 1730901600,
+    "in_progress_at": 1730903400,
+    "expires_at": 1730980800,
+    "finalizing_at": null,
+    "completed_at": null,
+    "failed_at": null,
+    "expired_at": null,
+    "cancelling_at": null,
+    "cancelled_at": null,
+    "request_counts": {
+      "total": 150,
+      "completed": 87,
+      "failed": 1
+    },
+    "metadata": {
+      "batch_description": "Current processing batch"
+    }
+  },
+  {
+    "id": "batch-demo-3",
+    "object": "batch",
+    "endpoint": "/v1/chat/completions",
+    "errors": {
+      "object": "list",
+      "data": [
+        {
+          "code": "invalid_request",
+          "line": 42,
+          "message": "Invalid JSON format on line 42",
+          "param": "body"
+        }
+      ]
+    },
+    "input_file_id": "file-demo-3",
+    "completion_window": "24h",
+    "status": "failed",
+    "output_file_id": null,
+    "error_file_id": "file-error-3",
+    "created_at": 1730649600,
+    "in_progress_at": 1730651400,
+    "expires_at": null,
+    "finalizing_at": null,
+    "completed_at": null,
+    "failed_at": 1730653200,
+    "expired_at": null,
+    "cancelling_at": null,
+    "cancelled_at": null,
+    "request_counts": {
+      "total": 400,
+      "completed": 0,
+      "failed": 1
+    }
+  }
+]

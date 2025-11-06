@@ -1,0 +1,80 @@
+{
+  "file-demo-1": [
+    {
+      "custom_id": "request-001",
+      "method": "POST",
+      "url": "/v1/chat/completions",
+      "body": {
+        "model": "gpt-4o-mini",
+        "messages": [
+          { "role": "system", "content": "You are a helpful assistant." },
+          { "role": "user", "content": "What is 2+2?" }
+        ]
+      }
+    },
+    {
+      "custom_id": "request-002",
+      "method": "POST",
+      "url": "/v1/chat/completions",
+      "body": {
+        "model": "gpt-4o-mini",
+        "messages": [
+          { "role": "system", "content": "You are a helpful assistant." },
+          { "role": "user", "content": "What is the capital of France?" }
+        ]
+      }
+    },
+    {
+      "custom_id": "request-003",
+      "method": "POST",
+      "url": "/v1/chat/completions",
+      "body": {
+        "model": "gpt-4o-mini",
+        "messages": [
+          { "role": "system", "content": "You are a helpful assistant." },
+          { "role": "user", "content": "Explain quantum computing in simple terms." }
+        ]
+      }
+    }
+  ],
+  "file-demo-2": [
+    {
+      "custom_id": "request-004",
+      "method": "POST",
+      "url": "/v1/chat/completions",
+      "body": {
+        "model": "gpt-4o-mini",
+        "messages": [
+          { "role": "system", "content": "You are a helpful assistant." },
+          { "role": "user", "content": "What is machine learning?" }
+        ]
+      }
+    },
+    {
+      "custom_id": "request-005",
+      "method": "POST",
+      "url": "/v1/chat/completions",
+      "body": {
+        "model": "gpt-4o-mini",
+        "messages": [
+          { "role": "system", "content": "You are a helpful assistant." },
+          { "role": "user", "content": "Describe neural networks." }
+        ]
+      }
+    }
+  ],
+  "file-demo-3": [
+    {
+      "custom_id": "request-006",
+      "method": "POST",
+      "url": "/v1/chat/completions",
+      "body": {
+        "model": "gpt-4o-mini",
+        "messages": [
+          { "role": "system", "content": "You are a helpful assistant." },
+          { "role": "user", "content": "What is deep learning?" }
+        ]
+      }
+    }
+  ]
+}

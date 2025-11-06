@@ -53,6 +53,7 @@ export function AppSidebar() {
     { path: "/users-groups", icon: Users, label: "Users & Groups" },
     { path: "/api-keys", icon: Key, label: "API Keys" },
     { path: "/settings", icon: Settings, label: "Settings" },
+    { path: "/batches", icon: Activity, label: "Batches" }, // New Batches item
   ];
 
   const navItems = allNavItems.filter((item) => canAccessRoute(item.path));

@@ -1,0 +1,29 @@
+[
+  {
+    "id": "file-demo-1",
+    "object": "file",
+    "bytes": 145600,
+    "created_at": 1730822400,
+    "expires_at": 1733241600,
+    "filename": "chat_completions_batch.jsonl",
+    "purpose": "batch"
+  },
+  {
+    "id": "file-demo-2",
+    "object": "file",
+    "bytes": 89200,
+    "created_at": 1730908800,
+    "expires_at": 1733500800,
+    "filename": "evaluation_prompts.jsonl",
+    "purpose": "batch"
+  },
+  {
+    "id": "file-demo-3",
+    "object": "file",
+    "bytes": 234800,
+    "created_at": 1730736000,
+    "expires_at": 1733155200,
+    "filename": "large_batch_requests.jsonl",
+    "purpose": "batch"
+  }
+]
