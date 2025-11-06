@@ -473,10 +473,14 @@ impl<H: HttpClient + 'static> Storage for PostgresRequestManager<H> {
                             ))
                         })?,
                         claimed_at: row.claimed_at.ok_or_else(|| {
-                            FusilladeError::Other(anyhow!("Missing claimed_at for completed request"))
+                            FusilladeError::Other(anyhow!(
+                                "Missing claimed_at for completed request"
+                            ))
                         })?,
                         started_at: row.started_at.ok_or_else(|| {
-                            FusilladeError::Other(anyhow!("Missing started_at for completed request"))
+                            FusilladeError::Other(anyhow!(
+                                "Missing started_at for completed request"
+                            ))
                         })?,
                         completed_at: row.completed_at.ok_or_else(|| {
                             FusilladeError::Other(anyhow!(
@@ -501,7 +505,9 @@ impl<H: HttpClient + 'static> Storage for PostgresRequestManager<H> {
                 "canceled" => Ok(AnyRequest::Canceled(Request {
                     state: Canceled {
                         canceled_at: row.canceled_at.ok_or_else(|| {
-                            FusilladeError::Other(anyhow!("Missing canceled_at for canceled request"))
+                            FusilladeError::Other(anyhow!(
+                                "Missing canceled_at for canceled request"
+                            ))
                         })?,
                     },
                     data,
@@ -533,11 +539,10 @@ impl<H: HttpClient + 'static> Storage for PostgresRequestManager<H> {
         description: Option<String>,
         templates: Vec<RequestTemplateInput>,
     ) -> Result<FileId> {
-        let mut tx = self
-            .pool
-            .begin()
-            .await
-            .map_err(|e| FusilladeError::Other(anyhow!("Failed to begin transaction: {}", e)))?;
+        let mut tx =
+            self.pool.begin().await.map_err(|e| {
+                FusilladeError::Other(anyhow!("Failed to begin transaction: {}", e))
+            })?;
 
         // Insert file
         let file_id = sqlx::query_scalar!(
@@ -679,11 +684,10 @@ impl<H: HttpClient + 'static> Storage for PostgresRequestManager<H> {
     }
 
     async fn create_batch(&self, file_id: FileId) -> Result<BatchId> {
-        let mut tx = self
-            .pool
-            .begin()
-            .await
-            .map_err(|e| FusilladeError::Other(anyhow!("Failed to begin transaction: {}", e)))?;
+        let mut tx =
+            self.pool.begin().await.map_err(|e| {
+                FusilladeError::Other(anyhow!("Failed to begin transaction: {}", e))
+            })?;
 
         // Get templates
         let templates = sqlx::query!(
@@ -885,10 +889,14 @@ impl<H: HttpClient + 'static> Storage for PostgresRequestManager<H> {
                 "claimed" => AnyRequest::Claimed(Request {
                     state: Claimed {
                         daemon_id: DaemonId(row.daemon_id.ok_or_else(|| {
-                            FusilladeError::Other(anyhow!("Missing daemon_id for claimed execution"))
+                            FusilladeError::Other(anyhow!(
+                                "Missing daemon_id for claimed execution"
+                            ))
                         })?),
                         claimed_at: row.claimed_at.ok_or_else(|| {
-                            FusilladeError::Other(anyhow!("Missing claimed_at for claimed execution"))
+                            FusilladeError::Other(anyhow!(
+                                "Missing claimed_at for claimed execution"
+                            ))
                         })?,
                         retry_attempt: row.retry_attempt as u32,
                     },

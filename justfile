@@ -1,5 +1,3 @@
-set dotenv-load
-
 # Display available commands
 default:
     @just --list
@@ -484,6 +482,16 @@ lint target *args="":
             cargo clippy {{args}}
             echo "Checking SQLx prepared queries..."
             cargo sqlx prepare --check
+
+            cd ../fusillade
+            echo "Checking Cargo.lock sync..."
+            cargo metadata --locked > /dev/null
+            echo "Running cargo fmt --check..."
+            cargo fmt --check
+            echo "Running cargo clippy..."
+            cargo clippy {{args}}
+            echo "Checking SQLx prepared queries..."
+            cargo sqlx prepare --check
             ;;
         *)
             echo "Usage: just lint [ts|rust]"
@@ -520,7 +528,7 @@ fmt target *args="":
             ;;
         rust)
             echo "Running cargo fmt for dwctl..."
-            cd dwctl && cargo fmt {{args}}
+            cargo fmt {{args}}
             ;;
         *)
             echo "Usage: just fmt [ts|rust]"

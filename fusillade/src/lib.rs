@@ -21,3 +21,11 @@ pub use http::{HttpClient, HttpResponse, MockHttpClient, ReqwestHttpClient};
 pub use manager::postgres::PostgresRequestManager;
 pub use manager::{DaemonExecutor, Storage};
 pub use request::*;
+
+/// Get the fusillade database migrator
+///
+/// Returns a migrator that can be run against a connection pool.
+#[cfg(feature = "postgres")]
+pub fn migrator() -> sqlx::migrate::Migrator {
+    sqlx::migrate!("./migrations")
+}
