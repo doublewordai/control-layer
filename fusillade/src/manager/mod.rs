@@ -99,7 +99,7 @@ pub trait Storage: Send + Sync {
                         Ok(())
                     }
                     AnyRequest::Completed(_) | AnyRequest::Failed(_) | AnyRequest::Canceled(_) => {
-                        Err(crate::error::BatcherError::InvalidState(
+                        Err(crate::error::FusilladeError::InvalidState(
                             id,
                             "terminal state".to_string(),
                             "cancellable state".to_string(),

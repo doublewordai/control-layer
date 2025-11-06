@@ -1,10 +1,10 @@
 [package]
-name = "batcher"
+name = "fusillade"
 version = "0.1.0"
 edition = "2021"
 
 [lib]
-name = "batcher"
+name = "fusillade"
 path = "src/lib.rs"
 
 [features]

@@ -1,4 +1,4 @@
--- Complete schema for the batcher system
+-- Complete schema for the fusillade system
 -- Tables: files, request_templates, batches, requests
 
 -- Files: Lightweight metadata for grouping templates

@@ -21,7 +21,7 @@ use crate::http::HttpResponse;
 /// are only performed on requests in valid states.
 pub trait RequestState: Send + Sync {}
 
-/// A request to be processed by the batcher system.
+/// A request to be processed by the fusillade system.
 ///
 /// Uses the typestate pattern to ensure type-safe state transitions.
 /// The generic parameter `T` represents the current state of the request.
@@ -42,7 +42,7 @@ pub struct Request<T: RequestState> {
     pub data: RequestData,
 }
 
-/// User-supplied data for a request to be processed by the batcher system.
+/// User-supplied data for a request to be processed by the fusillade system.
 ///
 /// This contains all the information needed to make an HTTP request
 /// to a target API endpoint.

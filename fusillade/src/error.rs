@@ -4,12 +4,12 @@ use thiserror::Error;
 
 use crate::types::RequestId;
 
-/// Result type alias using the batcher error type.
-pub type Result<T> = std::result::Result<T, BatcherError>;
+/// Result type alias using the fusillade error type.
+pub type Result<T> = std::result::Result<T, FusilladeError>;
 
 /// Main error type for the batching system.
 #[derive(Error, Debug)]
-pub enum BatcherError {
+pub enum FusilladeError {
     /// Request not found
     #[error("Request not found: {0}")]
     RequestNotFound(RequestId),

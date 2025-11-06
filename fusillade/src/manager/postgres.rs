@@ -20,7 +20,7 @@ use crate::batch::{
     BatchId, BatchStatus, File, FileId, RequestTemplate, RequestTemplateInput, TemplateId,
 };
 use crate::daemon::{Daemon, DaemonConfig};
-use crate::error::{BatcherError, Result};
+use crate::error::{FusilladeError, Result};
 use crate::http::HttpClient;
 use crate::request::{
     Canceled, Claimed, Completed, DaemonId, Failed, Pending, Processing, Request, RequestData,
@@ -36,10 +36,10 @@ use super::DaemonExecutor;
 ///
 /// # Example
 /// ```ignore
-/// use batcher::{PostgresRequestManager, ReqwestHttpClient, DaemonConfig};
+/// use fusillade::{PostgresRequestManager, ReqwestHttpClient, DaemonConfig};
 /// use sqlx::PgPool;
 ///
-/// let pool = PgPool::connect("postgresql://localhost/batcher").await?;
+/// let pool = PgPool::connect("postgresql://localhost/fusillade").await?;
 /// let http_client = Arc::new(ReqwestHttpClient::new());
 /// let config = DaemonConfig::default();
 /// let manager = PostgresRequestManager::new(pool, http_client, config).await?;
@@ -88,7 +88,7 @@ impl<H: HttpClient + 'static> PostgresRequestManager<H> {
     pub async fn create_listener(&self) -> Result<PgListener> {
         PgListener::connect_with(&self.pool)
             .await
-            .map_err(|e| BatcherError::Other(anyhow!("Failed to create listener: {}", e)))
+            .map_err(|e| FusilladeError::Other(anyhow!("Failed to create listener: {}", e)))
     }
 }
 
@@ -122,7 +122,7 @@ impl<H: HttpClient + 'static> PostgresRequestManager<H> {
         )
         .fetch_all(&self.pool)
         .await
-        .map_err(|e| BatcherError::Other(anyhow!("Failed to unclaim stale requests: {}", e)))?;
+        .map_err(|e| FusilladeError::Other(anyhow!("Failed to unclaim stale requests: {}", e)))?;
 
         let count = result.len();
 
@@ -185,7 +185,7 @@ impl<H: HttpClient + 'static> Storage for PostgresRequestManager<H> {
         )
         .fetch_all(&self.pool)
         .await
-        .map_err(|e| BatcherError::Other(anyhow!("Failed to claim requests: {}", e)))?;
+        .map_err(|e| FusilladeError::Other(anyhow!("Failed to claim requests: {}", e)))?;
 
         Ok(rows
             .into_iter()
@@ -235,11 +235,11 @@ impl<H: HttpClient + 'static> Storage for PostgresRequestManager<H> {
                 )
                 .execute(&self.pool)
                 .await
-                .map_err(|e| BatcherError::Other(anyhow!("Failed to update request: {}", e)))?
+                .map_err(|e| FusilladeError::Other(anyhow!("Failed to update request: {}", e)))?
                 .rows_affected();
 
                 if rows_affected == 0 {
-                    return Err(BatcherError::RequestNotFound(req.data.id));
+                    return Err(FusilladeError::RequestNotFound(req.data.id));
                 }
             }
             AnyRequest::Claimed(req) => {
@@ -261,11 +261,11 @@ impl<H: HttpClient + 'static> Storage for PostgresRequestManager<H> {
                 )
                 .execute(&self.pool)
                 .await
-                .map_err(|e| BatcherError::Other(anyhow!("Failed to update request: {}", e)))?
+                .map_err(|e| FusilladeError::Other(anyhow!("Failed to update request: {}", e)))?
                 .rows_affected();
 
                 if rows_affected == 0 {
-                    return Err(BatcherError::RequestNotFound(req.data.id));
+                    return Err(FusilladeError::RequestNotFound(req.data.id));
                 }
             }
             AnyRequest::Processing(req) => {
@@ -287,11 +287,11 @@ impl<H: HttpClient + 'static> Storage for PostgresRequestManager<H> {
                 )
                 .execute(&self.pool)
                 .await
-                .map_err(|e| BatcherError::Other(anyhow!("Failed to update request: {}", e)))?
+                .map_err(|e| FusilladeError::Other(anyhow!("Failed to update request: {}", e)))?
                 .rows_affected();
 
                 if rows_affected == 0 {
-                    return Err(BatcherError::RequestNotFound(req.data.id));
+                    return Err(FusilladeError::RequestNotFound(req.data.id));
                 }
             }
             AnyRequest::Completed(req) => {
@@ -315,11 +315,11 @@ impl<H: HttpClient + 'static> Storage for PostgresRequestManager<H> {
                 )
                 .execute(&self.pool)
                 .await
-                .map_err(|e| BatcherError::Other(anyhow!("Failed to update request: {}", e)))?
+                .map_err(|e| FusilladeError::Other(anyhow!("Failed to update request: {}", e)))?
                 .rows_affected();
 
                 if rows_affected == 0 {
-                    return Err(BatcherError::RequestNotFound(req.data.id));
+                    return Err(FusilladeError::RequestNotFound(req.data.id));
                 }
             }
             AnyRequest::Failed(req) => {
@@ -339,11 +339,11 @@ impl<H: HttpClient + 'static> Storage for PostgresRequestManager<H> {
                 )
                 .execute(&self.pool)
                 .await
-                .map_err(|e| BatcherError::Other(anyhow!("Failed to update request: {}", e)))?
+                .map_err(|e| FusilladeError::Other(anyhow!("Failed to update request: {}", e)))?
                 .rows_affected();
 
                 if rows_affected == 0 {
-                    return Err(BatcherError::RequestNotFound(req.data.id));
+                    return Err(FusilladeError::RequestNotFound(req.data.id));
                 }
             }
             AnyRequest::Canceled(req) => {
@@ -359,11 +359,11 @@ impl<H: HttpClient + 'static> Storage for PostgresRequestManager<H> {
                 )
                 .execute(&self.pool)
                 .await
-                .map_err(|e| BatcherError::Other(anyhow!("Failed to update request: {}", e)))?
+                .map_err(|e| FusilladeError::Other(anyhow!("Failed to update request: {}", e)))?
                 .rows_affected();
 
                 if rows_affected == 0 {
-                    return Err(BatcherError::RequestNotFound(req.data.id));
+                    return Err(FusilladeError::RequestNotFound(req.data.id));
                 }
             }
         }
@@ -387,7 +387,7 @@ impl<H: HttpClient + 'static> Storage for PostgresRequestManager<H> {
         )
         .fetch_all(&self.pool)
         .await
-        .map_err(|e| BatcherError::Other(anyhow!("Failed to fetch requests: {}", e)))?;
+        .map_err(|e| FusilladeError::Other(anyhow!("Failed to fetch requests: {}", e)))?;
 
         // Build a map of id -> request for efficient lookup
         let mut request_map: std::collections::HashMap<RequestId, Result<AnyRequest>> =
@@ -420,10 +420,10 @@ impl<H: HttpClient + 'static> Storage for PostgresRequestManager<H> {
                 "claimed" => Ok(AnyRequest::Claimed(Request {
                     state: Claimed {
                         daemon_id: DaemonId(row.daemon_id.ok_or_else(|| {
-                            BatcherError::Other(anyhow!("Missing daemon_id for claimed request"))
+                            FusilladeError::Other(anyhow!("Missing daemon_id for claimed request"))
                         })?),
                         claimed_at: row.claimed_at.ok_or_else(|| {
-                            BatcherError::Other(anyhow!("Missing claimed_at for claimed request"))
+                            FusilladeError::Other(anyhow!("Missing claimed_at for claimed request"))
                         })?,
                         retry_attempt: row.retry_attempt as u32,
                     },
@@ -439,17 +439,17 @@ impl<H: HttpClient + 'static> Storage for PostgresRequestManager<H> {
                     Ok(AnyRequest::Processing(Request {
                         state: Processing {
                             daemon_id: DaemonId(row.daemon_id.ok_or_else(|| {
-                                BatcherError::Other(anyhow!(
+                                FusilladeError::Other(anyhow!(
                                     "Missing daemon_id for processing request"
                                 ))
                             })?),
                             claimed_at: row.claimed_at.ok_or_else(|| {
-                                BatcherError::Other(anyhow!(
+                                FusilladeError::Other(anyhow!(
                                     "Missing claimed_at for processing request"
                                 ))
                             })?,
                             started_at: row.started_at.ok_or_else(|| {
-                                BatcherError::Other(anyhow!(
+                                FusilladeError::Other(anyhow!(
                                     "Missing started_at for processing request"
                                 ))
                             })?,
@@ -463,23 +463,23 @@ impl<H: HttpClient + 'static> Storage for PostgresRequestManager<H> {
                 "completed" => Ok(AnyRequest::Completed(Request {
                     state: Completed {
                         response_status: row.response_status.ok_or_else(|| {
-                            BatcherError::Other(anyhow!(
+                            FusilladeError::Other(anyhow!(
                                 "Missing response_status for completed request"
                             ))
                         })? as u16,
                         response_body: row.response_body.ok_or_else(|| {
-                            BatcherError::Other(anyhow!(
+                            FusilladeError::Other(anyhow!(
                                 "Missing response_body for completed request"
                             ))
                         })?,
                         claimed_at: row.claimed_at.ok_or_else(|| {
-                            BatcherError::Other(anyhow!("Missing claimed_at for completed request"))
+                            FusilladeError::Other(anyhow!("Missing claimed_at for completed request"))
                         })?,
                         started_at: row.started_at.ok_or_else(|| {
-                            BatcherError::Other(anyhow!("Missing started_at for completed request"))
+                            FusilladeError::Other(anyhow!("Missing started_at for completed request"))
                         })?,
                         completed_at: row.completed_at.ok_or_else(|| {
-                            BatcherError::Other(anyhow!(
+                            FusilladeError::Other(anyhow!(
                                 "Missing completed_at for completed request"
                             ))
                         })?,
@@ -489,10 +489,10 @@ impl<H: HttpClient + 'static> Storage for PostgresRequestManager<H> {
                 "failed" => Ok(AnyRequest::Failed(Request {
                     state: Failed {
                         error: row.error.ok_or_else(|| {
-                            BatcherError::Other(anyhow!("Missing error for failed request"))
+                            FusilladeError::Other(anyhow!("Missing error for failed request"))
                         })?,
                         failed_at: row.failed_at.ok_or_else(|| {
-                            BatcherError::Other(anyhow!("Missing failed_at for failed request"))
+                            FusilladeError::Other(anyhow!("Missing failed_at for failed request"))
                         })?,
                         retry_attempt: row.retry_attempt as u32,
                     },
@@ -501,12 +501,12 @@ impl<H: HttpClient + 'static> Storage for PostgresRequestManager<H> {
                 "canceled" => Ok(AnyRequest::Canceled(Request {
                     state: Canceled {
                         canceled_at: row.canceled_at.ok_or_else(|| {
-                            BatcherError::Other(anyhow!("Missing canceled_at for canceled request"))
+                            FusilladeError::Other(anyhow!("Missing canceled_at for canceled request"))
                         })?,
                     },
                     data,
                 })),
-                _ => Err(BatcherError::Other(anyhow!("Unknown state: {}", state))),
+                _ => Err(FusilladeError::Other(anyhow!("Unknown state: {}", state))),
             };
 
             request_map.insert(request_id, any_request);
@@ -518,7 +518,7 @@ impl<H: HttpClient + 'static> Storage for PostgresRequestManager<H> {
             .map(|id| {
                 request_map
                     .remove(&id)
-                    .unwrap_or_else(|| Err(BatcherError::RequestNotFound(id)))
+                    .unwrap_or_else(|| Err(FusilladeError::RequestNotFound(id)))
             })
             .collect())
     }
@@ -537,7 +537,7 @@ impl<H: HttpClient + 'static> Storage for PostgresRequestManager<H> {
             .pool
             .begin()
             .await
-            .map_err(|e| BatcherError::Other(anyhow!("Failed to begin transaction: {}", e)))?;
+            .map_err(|e| FusilladeError::Other(anyhow!("Failed to begin transaction: {}", e)))?;
 
         // Insert file
         let file_id = sqlx::query_scalar!(
@@ -551,7 +551,7 @@ impl<H: HttpClient + 'static> Storage for PostgresRequestManager<H> {
         )
         .fetch_one(&mut *tx)
         .await
-        .map_err(|e| BatcherError::Other(anyhow!("Failed to create file: {}", e)))?;
+        .map_err(|e| FusilladeError::Other(anyhow!("Failed to create file: {}", e)))?;
 
         // Insert templates
         for template in templates {
@@ -570,12 +570,12 @@ impl<H: HttpClient + 'static> Storage for PostgresRequestManager<H> {
             )
             .execute(&mut *tx)
             .await
-            .map_err(|e| BatcherError::Other(anyhow!("Failed to create template: {}", e)))?;
+            .map_err(|e| FusilladeError::Other(anyhow!("Failed to create template: {}", e)))?;
         }
 
         tx.commit()
             .await
-            .map_err(|e| BatcherError::Other(anyhow!("Failed to commit transaction: {}", e)))?;
+            .map_err(|e| FusilladeError::Other(anyhow!("Failed to commit transaction: {}", e)))?;
 
         Ok(FileId(file_id))
     }
@@ -591,8 +591,8 @@ impl<H: HttpClient + 'static> Storage for PostgresRequestManager<H> {
         )
         .fetch_optional(&self.pool)
         .await
-        .map_err(|e| BatcherError::Other(anyhow!("Failed to fetch file: {}", e)))?
-        .ok_or_else(|| BatcherError::Other(anyhow!("File not found")))?;
+        .map_err(|e| FusilladeError::Other(anyhow!("Failed to fetch file: {}", e)))?
+        .ok_or_else(|| FusilladeError::Other(anyhow!("File not found")))?;
 
         Ok(File {
             id: FileId(row.id),
@@ -613,7 +613,7 @@ impl<H: HttpClient + 'static> Storage for PostgresRequestManager<H> {
         )
         .fetch_all(&self.pool)
         .await
-        .map_err(|e| BatcherError::Other(anyhow!("Failed to list files: {}", e)))?;
+        .map_err(|e| FusilladeError::Other(anyhow!("Failed to list files: {}", e)))?;
 
         Ok(rows
             .into_iter()
@@ -639,7 +639,7 @@ impl<H: HttpClient + 'static> Storage for PostgresRequestManager<H> {
         )
         .fetch_all(&self.pool)
         .await
-        .map_err(|e| BatcherError::Other(anyhow!("Failed to fetch templates: {}", e)))?;
+        .map_err(|e| FusilladeError::Other(anyhow!("Failed to fetch templates: {}", e)))?;
 
         Ok(rows
             .into_iter()
@@ -668,11 +668,11 @@ impl<H: HttpClient + 'static> Storage for PostgresRequestManager<H> {
         )
         .execute(&self.pool)
         .await
-        .map_err(|e| BatcherError::Other(anyhow!("Failed to delete file: {}", e)))?
+        .map_err(|e| FusilladeError::Other(anyhow!("Failed to delete file: {}", e)))?
         .rows_affected();
 
         if rows_affected == 0 {
-            return Err(BatcherError::Other(anyhow!("File not found")));
+            return Err(FusilladeError::Other(anyhow!("File not found")));
         }
 
         Ok(())
@@ -683,7 +683,7 @@ impl<H: HttpClient + 'static> Storage for PostgresRequestManager<H> {
             .pool
             .begin()
             .await
-            .map_err(|e| BatcherError::Other(anyhow!("Failed to begin transaction: {}", e)))?;
+            .map_err(|e| FusilladeError::Other(anyhow!("Failed to begin transaction: {}", e)))?;
 
         // Get templates
         let templates = sqlx::query!(
@@ -696,10 +696,10 @@ impl<H: HttpClient + 'static> Storage for PostgresRequestManager<H> {
         )
         .fetch_all(&mut *tx)
         .await
-        .map_err(|e| BatcherError::Other(anyhow!("Failed to fetch templates: {}", e)))?;
+        .map_err(|e| FusilladeError::Other(anyhow!("Failed to fetch templates: {}", e)))?;
 
         if templates.is_empty() {
-            return Err(BatcherError::Other(anyhow!(
+            return Err(FusilladeError::Other(anyhow!(
                 "Cannot create batch from file with no templates"
             )));
         }
@@ -715,7 +715,7 @@ impl<H: HttpClient + 'static> Storage for PostgresRequestManager<H> {
         )
         .fetch_one(&mut *tx)
         .await
-        .map_err(|e| BatcherError::Other(anyhow!("Failed to create batch: {}", e)))?;
+        .map_err(|e| FusilladeError::Other(anyhow!("Failed to create batch: {}", e)))?;
 
         // Create executions from templates
         for template in templates {
@@ -739,12 +739,12 @@ impl<H: HttpClient + 'static> Storage for PostgresRequestManager<H> {
             )
             .execute(&mut *tx)
             .await
-            .map_err(|e| BatcherError::Other(anyhow!("Failed to create execution: {}", e)))?;
+            .map_err(|e| FusilladeError::Other(anyhow!("Failed to create execution: {}", e)))?;
         }
 
         tx.commit()
             .await
-            .map_err(|e| BatcherError::Other(anyhow!("Failed to commit transaction: {}", e)))?;
+            .map_err(|e| FusilladeError::Other(anyhow!("Failed to commit transaction: {}", e)))?;
 
         Ok(BatchId(batch_id))
     }
@@ -759,18 +759,18 @@ impl<H: HttpClient + 'static> Storage for PostgresRequestManager<H> {
         )
         .fetch_optional(&self.pool)
         .await
-        .map_err(|e| BatcherError::Other(anyhow!("Failed to fetch batch status: {}", e)))?
-        .ok_or_else(|| BatcherError::Other(anyhow!("Batch not found")))?;
+        .map_err(|e| FusilladeError::Other(anyhow!("Failed to fetch batch status: {}", e)))?
+        .ok_or_else(|| FusilladeError::Other(anyhow!("Batch not found")))?;
 
         Ok(BatchStatus {
             batch_id: BatchId(row.batch_id.ok_or_else(|| {
-                BatcherError::Other(anyhow!("Batch status view missing batch_id"))
+                FusilladeError::Other(anyhow!("Batch status view missing batch_id"))
             })?),
             file_id: FileId(row.file_id.ok_or_else(|| {
-                BatcherError::Other(anyhow!("Batch status view missing file_id"))
+                FusilladeError::Other(anyhow!("Batch status view missing file_id"))
             })?),
             file_name: row.file_name.ok_or_else(|| {
-                BatcherError::Other(anyhow!("Batch status view missing file_name"))
+                FusilladeError::Other(anyhow!("Batch status view missing file_name"))
             })?,
             total_requests: row.total_requests.unwrap_or(0),
             pending_requests: row.pending_requests.unwrap_or(0),
@@ -781,7 +781,7 @@ impl<H: HttpClient + 'static> Storage for PostgresRequestManager<H> {
             started_at: row.started_at,
             last_updated_at: row.last_updated_at,
             created_at: row.created_at.ok_or_else(|| {
-                BatcherError::Other(anyhow!("Batch status view missing created_at"))
+                FusilladeError::Other(anyhow!("Batch status view missing created_at"))
             })?,
         })
     }
@@ -797,7 +797,7 @@ impl<H: HttpClient + 'static> Storage for PostgresRequestManager<H> {
         )
         .fetch_all(&self.pool)
         .await
-        .map_err(|e| BatcherError::Other(anyhow!("Failed to list batches: {}", e)))?;
+        .map_err(|e| FusilladeError::Other(anyhow!("Failed to list batches: {}", e)))?;
 
         Ok(rows
             .into_iter()
@@ -835,7 +835,7 @@ impl<H: HttpClient + 'static> Storage for PostgresRequestManager<H> {
         )
         .execute(&self.pool)
         .await
-        .map_err(|e| BatcherError::Other(anyhow!("Failed to cancel batch: {}", e)))?;
+        .map_err(|e| FusilladeError::Other(anyhow!("Failed to cancel batch: {}", e)))?;
 
         Ok(())
     }
@@ -855,7 +855,7 @@ impl<H: HttpClient + 'static> Storage for PostgresRequestManager<H> {
         )
         .fetch_all(&self.pool)
         .await
-        .map_err(|e| BatcherError::Other(anyhow!("Failed to fetch batch executions: {}", e)))?;
+        .map_err(|e| FusilladeError::Other(anyhow!("Failed to fetch batch executions: {}", e)))?;
 
         let mut results = Vec::new();
 
@@ -885,10 +885,10 @@ impl<H: HttpClient + 'static> Storage for PostgresRequestManager<H> {
                 "claimed" => AnyRequest::Claimed(Request {
                     state: Claimed {
                         daemon_id: DaemonId(row.daemon_id.ok_or_else(|| {
-                            BatcherError::Other(anyhow!("Missing daemon_id for claimed execution"))
+                            FusilladeError::Other(anyhow!("Missing daemon_id for claimed execution"))
                         })?),
                         claimed_at: row.claimed_at.ok_or_else(|| {
-                            BatcherError::Other(anyhow!("Missing claimed_at for claimed execution"))
+                            FusilladeError::Other(anyhow!("Missing claimed_at for claimed execution"))
                         })?,
                         retry_attempt: row.retry_attempt as u32,
                     },
@@ -900,17 +900,17 @@ impl<H: HttpClient + 'static> Storage for PostgresRequestManager<H> {
                     AnyRequest::Processing(Request {
                         state: Processing {
                             daemon_id: DaemonId(row.daemon_id.ok_or_else(|| {
-                                BatcherError::Other(anyhow!(
+                                FusilladeError::Other(anyhow!(
                                     "Missing daemon_id for processing execution"
                                 ))
                             })?),
                             claimed_at: row.claimed_at.ok_or_else(|| {
-                                BatcherError::Other(anyhow!(
+                                FusilladeError::Other(anyhow!(
                                     "Missing claimed_at for processing execution"
                                 ))
                             })?,
                             started_at: row.started_at.ok_or_else(|| {
-                                BatcherError::Other(anyhow!(
+                                FusilladeError::Other(anyhow!(
                                     "Missing started_at for processing execution"
                                 ))
                             })?,
@@ -924,27 +924,27 @@ impl<H: HttpClient + 'static> Storage for PostgresRequestManager<H> {
                 "completed" => AnyRequest::Completed(Request {
                     state: Completed {
                         response_status: row.response_status.ok_or_else(|| {
-                            BatcherError::Other(anyhow!(
+                            FusilladeError::Other(anyhow!(
                                 "Missing response_status for completed execution"
                             ))
                         })? as u16,
                         response_body: row.response_body.ok_or_else(|| {
-                            BatcherError::Other(anyhow!(
+                            FusilladeError::Other(anyhow!(
                                 "Missing response_body for completed execution"
                             ))
                         })?,
                         claimed_at: row.claimed_at.ok_or_else(|| {
-                            BatcherError::Other(anyhow!(
+                            FusilladeError::Other(anyhow!(
                                 "Missing claimed_at for completed execution"
                             ))
                         })?,
                         started_at: row.started_at.ok_or_else(|| {
-                            BatcherError::Other(anyhow!(
+                            FusilladeError::Other(anyhow!(
                                 "Missing started_at for completed execution"
                             ))
                         })?,
                         completed_at: row.completed_at.ok_or_else(|| {
-                            BatcherError::Other(anyhow!(
+                            FusilladeError::Other(anyhow!(
                                 "Missing completed_at for completed execution"
                             ))
                         })?,
@@ -954,10 +954,10 @@ impl<H: HttpClient + 'static> Storage for PostgresRequestManager<H> {
                 "failed" => AnyRequest::Failed(Request {
                     state: Failed {
                         error: row.error.ok_or_else(|| {
-                            BatcherError::Other(anyhow!("Missing error for failed execution"))
+                            FusilladeError::Other(anyhow!("Missing error for failed execution"))
                         })?,
                         failed_at: row.failed_at.ok_or_else(|| {
-                            BatcherError::Other(anyhow!("Missing failed_at for failed execution"))
+                            FusilladeError::Other(anyhow!("Missing failed_at for failed execution"))
                         })?,
                         retry_attempt: row.retry_attempt as u32,
                     },
@@ -966,7 +966,7 @@ impl<H: HttpClient + 'static> Storage for PostgresRequestManager<H> {
                 "canceled" => AnyRequest::Canceled(Request {
                     state: Canceled {
                         canceled_at: row.canceled_at.ok_or_else(|| {
-                            BatcherError::Other(anyhow!(
+                            FusilladeError::Other(anyhow!(
                                 "Missing canceled_at for canceled execution"
                             ))
                         })?,
@@ -974,7 +974,7 @@ impl<H: HttpClient + 'static> Storage for PostgresRequestManager<H> {
                     data,
                 }),
                 _ => {
-                    return Err(BatcherError::Other(anyhow!("Unknown state: {}", state)));
+                    return Err(FusilladeError::Other(anyhow!("Unknown state: {}", state)));
                 }
             };
 
@@ -994,7 +994,7 @@ impl<H: HttpClient + 'static> Storage for PostgresRequestManager<H> {
             // Create a listener for Postgres NOTIFY events
             let mut listener = match PgListener::connect_with(&pool)
                 .await
-                .map_err(|e| BatcherError::Other(anyhow!("Failed to create listener: {}", e))) {
+                .map_err(|e| FusilladeError::Other(anyhow!("Failed to create listener: {}", e))) {
                 Ok(l) => l,
                 Err(e) => {
                     tracing::error!(error = %e, "Failed to create listener");
@@ -1006,7 +1006,7 @@ impl<H: HttpClient + 'static> Storage for PostgresRequestManager<H> {
             // Listen on the request_updates channel
             if let Err(e) = listener.listen("request_updates").await {
                 tracing::error!(error = %e, "Failed to listen on request_updates channel");
-                yield Err(BatcherError::Other(anyhow::anyhow!("Failed to listen: {}", e)));
+                yield Err(FusilladeError::Other(anyhow::anyhow!("Failed to listen: {}", e)));
                 return;
             }
 
@@ -1053,7 +1053,7 @@ impl<H: HttpClient + 'static> Storage for PostgresRequestManager<H> {
                                             )
                                             .fetch_all(&pool)
                                             .await
-                                            .map_err(|e| BatcherError::Other(anyhow!("Failed to fetch requests: {}", e)))?;
+                                            .map_err(|e| FusilladeError::Other(anyhow!("Failed to fetch requests: {}", e)))?;
 
                                             let mut results = Vec::new();
                                             for row in rows {
@@ -1077,8 +1077,8 @@ impl<H: HttpClient + 'static> Storage for PostgresRequestManager<H> {
                                                     })),
                                                     "claimed" => Ok(AnyRequest::Claimed(Request {
                                                         state: Claimed {
-                                                            daemon_id: DaemonId(row.daemon_id.ok_or_else(|| BatcherError::Other(anyhow!("Missing daemon_id")))?),
-                                                            claimed_at: row.claimed_at.ok_or_else(|| BatcherError::Other(anyhow!("Missing claimed_at")))?,
+                                                            daemon_id: DaemonId(row.daemon_id.ok_or_else(|| FusilladeError::Other(anyhow!("Missing daemon_id")))?),
+                                                            claimed_at: row.claimed_at.ok_or_else(|| FusilladeError::Other(anyhow!("Missing claimed_at")))?,
                                                             retry_attempt: row.retry_attempt as u32,
                                                         },
                                                         data,
@@ -1088,9 +1088,9 @@ impl<H: HttpClient + 'static> Storage for PostgresRequestManager<H> {
                                                         let abort_handle = tokio::spawn(async {}).abort_handle();
                                                         Ok(AnyRequest::Processing(Request {
                                                             state: Processing {
-                                                                daemon_id: DaemonId(row.daemon_id.ok_or_else(|| BatcherError::Other(anyhow!("Missing daemon_id")))?),
-                                                                claimed_at: row.claimed_at.ok_or_else(|| BatcherError::Other(anyhow!("Missing claimed_at")))?,
-                                                                started_at: row.started_at.ok_or_else(|| BatcherError::Other(anyhow!("Missing started_at")))?,
+                                                                daemon_id: DaemonId(row.daemon_id.ok_or_else(|| FusilladeError::Other(anyhow!("Missing daemon_id")))?),
+                                                                claimed_at: row.claimed_at.ok_or_else(|| FusilladeError::Other(anyhow!("Missing claimed_at")))?,
+                                                                started_at: row.started_at.ok_or_else(|| FusilladeError::Other(anyhow!("Missing started_at")))?,
                                                                 retry_attempt: row.retry_attempt as u32,
                                                                 result_rx: Arc::new(Mutex::new(rx)),
                                                                 abort_handle,
@@ -1100,29 +1100,29 @@ impl<H: HttpClient + 'static> Storage for PostgresRequestManager<H> {
                                                     }
                                                     "completed" => Ok(AnyRequest::Completed(Request {
                                                         state: Completed {
-                                                            response_status: row.response_status.ok_or_else(|| BatcherError::Other(anyhow!("Missing response_status")))? as u16,
-                                                            response_body: row.response_body.ok_or_else(|| BatcherError::Other(anyhow!("Missing response_body")))?,
-                                                            claimed_at: row.claimed_at.ok_or_else(|| BatcherError::Other(anyhow!("Missing claimed_at")))?,
-                                                            started_at: row.started_at.ok_or_else(|| BatcherError::Other(anyhow!("Missing started_at")))?,
-                                                            completed_at: row.completed_at.ok_or_else(|| BatcherError::Other(anyhow!("Missing completed_at")))?,
+                                                            response_status: row.response_status.ok_or_else(|| FusilladeError::Other(anyhow!("Missing response_status")))? as u16,
+                                                            response_body: row.response_body.ok_or_else(|| FusilladeError::Other(anyhow!("Missing response_body")))?,
+                                                            claimed_at: row.claimed_at.ok_or_else(|| FusilladeError::Other(anyhow!("Missing claimed_at")))?,
+                                                            started_at: row.started_at.ok_or_else(|| FusilladeError::Other(anyhow!("Missing started_at")))?,
+                                                            completed_at: row.completed_at.ok_or_else(|| FusilladeError::Other(anyhow!("Missing completed_at")))?,
                                                         },
                                                         data,
                                                     })),
                                                     "failed" => Ok(AnyRequest::Failed(Request {
                                                         state: Failed {
-                                                            error: row.error.ok_or_else(|| BatcherError::Other(anyhow!("Missing error")))?,
-                                                            failed_at: row.failed_at.ok_or_else(|| BatcherError::Other(anyhow!("Missing failed_at")))?,
+                                                            error: row.error.ok_or_else(|| FusilladeError::Other(anyhow!("Missing error")))?,
+                                                            failed_at: row.failed_at.ok_or_else(|| FusilladeError::Other(anyhow!("Missing failed_at")))?,
                                                             retry_attempt: row.retry_attempt as u32,
                                                         },
                                                         data,
                                                     })),
                                                     "canceled" => Ok(AnyRequest::Canceled(Request {
                                                         state: Canceled {
-                                                            canceled_at: row.canceled_at.ok_or_else(|| BatcherError::Other(anyhow!("Missing canceled_at")))?,
+                                                            canceled_at: row.canceled_at.ok_or_else(|| FusilladeError::Other(anyhow!("Missing canceled_at")))?,
                                                         },
                                                         data,
                                                     })),
-                                                    _ => Err(BatcherError::Other(anyhow!("Unknown state: {}", state))),
+                                                    _ => Err(FusilladeError::Other(anyhow!("Unknown state: {}", state))),
                                                 };
                                                 results.push(any_request);
                                             }
@@ -1162,7 +1162,7 @@ impl<H: HttpClient + 'static> Storage for PostgresRequestManager<H> {
                     }
                     Err(e) => {
                         tracing::error!(error = %e, "Error receiving notification");
-                        yield Err(BatcherError::Other(anyhow::anyhow!("Notification error: {}", e)));
+                        yield Err(FusilladeError::Other(anyhow::anyhow!("Notification error: {}", e)));
                         // Don't return - keep trying to receive notifications
                     }
                 }

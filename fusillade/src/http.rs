@@ -354,7 +354,7 @@ impl HttpClient for MockHttpClient {
             }
             None => {
                 // No response configured - return a default error
-                Err(crate::error::BatcherError::Other(anyhow::anyhow!(
+                Err(crate::error::FusilladeError::Other(anyhow::anyhow!(
                     "No mock response configured for {} {}",
                     request.method,
                     request.path

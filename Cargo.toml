@@ -1,4 +1,4 @@
 [workspace]
-members = ["batcher","dwctl"]
+members = ["fusillade","dwctl"]
 default-members = ["dwctl"]
 resolver = "2"
