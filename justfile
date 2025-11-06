@@ -481,6 +481,9 @@ lint target *args="":
             echo "Running cargo clippy..."
             cargo clippy {{args}}
             echo "Checking SQLx prepared queries..."
+            if [ -f .env ]; then
+                export $(grep -v '^#' .env | xargs)
+            fi
             cargo sqlx prepare --check
 
             cd ../fusillade
@@ -491,6 +494,9 @@ lint target *args="":
             echo "Running cargo clippy..."
             cargo clippy {{args}}
             echo "Checking SQLx prepared queries..."
+            if [ -f .env ]; then
+                export $(grep -v '^#' .env | xargs)
+            fi
             cargo sqlx prepare --check
             ;;
         *)
