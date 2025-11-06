@@ -26,8 +26,8 @@ static CREDITS_DEDUCTION_ERRORS: Lazy<IntCounter> = Lazy::new(|| {
 pub fn record_credit_deduction(user_id: &str, model: &str, amount: f64) {
     // Convert dollars to cents for the counter (easier to work with integers)
     let cents = (amount * 100.0).round() as i64;
-    CREDITS_DEDUCTED.with_label_values(&[user_id, model]).inc_by(cents.max(0) as u64);
     // Ensure non-negative
+    CREDITS_DEDUCTED.with_label_values(&[user_id, model]).inc_by(cents.max(0) as u64);
 }
 
 /// Record a failed credit deduction
