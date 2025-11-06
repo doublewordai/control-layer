@@ -647,7 +647,7 @@ mod tests {
         );
 
         // Start the sync task in the background
-        let (status_tx, mut status_rx) = mpsc::channel(10);
+        let (status_tx, _status_rx) = mpsc::channel(10);
         let config = SyncConfig {
             status_tx: Some(status_tx),
         };
