@@ -413,7 +413,6 @@ test target="" *args="":
                     exit 1
                 fi
                 cargo llvm-cov --fail-under-lines 60 --lcov --output-path lcov.info
-                cargo llvm-cov --fail-under-lines 60 --lcov --output-path lcov.info
             else
                 cargo test {{args}}
             fi
