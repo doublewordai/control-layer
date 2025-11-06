@@ -1101,6 +1101,7 @@ dependencies = [
  "chrono",
  "clap",
  "figment",
+ "fusillade",
  "humantime",
  "humantime-serde",
  "jsonwebtoken",

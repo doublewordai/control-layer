@@ -123,8 +123,6 @@ jobs:
 
       # used only for caching binary installs
       - uses: Swatinem/rust-cache@v2
-        with:
-          workspaces: dwctl
 
       - name: Install just
         uses: extractions/setup-just@v2
@@ -411,8 +409,6 @@ jobs:
         uses: dtolnay/rust-toolchain@stable
 
       - uses: Swatinem/rust-cache@v2
-        with:
-          workspaces: dwctl
 
       - name: Build frontend and copy to dwctl/static
         run: |
@@ -426,8 +422,7 @@ jobs:
           echo "✅ Frontend built and copied to dwctl/static"
           ls -la ../dwctl/static
 
-      - name: Publish dwctl to crates.io
-        working-directory: ./dwctl
+      - name: Publish workspace to crates.io
         run: cargo publish --token ${{ secrets.CARGO_REGISTRY_TOKEN }}
         env:
           CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}

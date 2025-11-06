@@ -16,8 +16,9 @@ WORKDIR /app
 # Install cargo-watch for auto-reloading in dev
 RUN cargo install cargo-watch
 
-# Copy workspace and dwctl code
+# Copy workspace code (fusillade, dwctl, dashboard)
 COPY Cargo.toml Cargo.lock ./
+COPY fusillade/ fusillade/
 COPY dwctl/ dwctl/
 COPY dashboard/ dashboard/
 
