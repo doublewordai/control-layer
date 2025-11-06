@@ -601,9 +601,9 @@ ci target *args="":
 
             echo "📦 Setting up test databases: $DWCTL_DB, $FUSILLADE_DB"
 
-            # Create databases
-            psql -U postgres -h localhost -c "CREATE DATABASE $DWCTL_DB;" 2>/dev/null || psql -h localhost -c "CREATE DATABASE $DWCTL_DB;"
-            psql -U postgres -h localhost -c "CREATE DATABASE $FUSILLADE_DB;" 2>/dev/null || psql -h localhost -c "CREATE DATABASE $FUSILLADE_DB;"
+            # Create databases (PGPASSWORD works in CI, fallback to no password for local)
+            PGPASSWORD=postgres psql -U postgres -h localhost -c "CREATE DATABASE $DWCTL_DB;" 2>/dev/null || psql -h localhost -c "CREATE DATABASE $DWCTL_DB;"
+            PGPASSWORD=postgres psql -U postgres -h localhost -c "CREATE DATABASE $FUSILLADE_DB;" 2>/dev/null || psql -h localhost -c "CREATE DATABASE $FUSILLADE_DB;"
 
             # Write DATABASE_URL to .env files for sqlx compile-time verification
             echo "DATABASE_URL=postgres://postgres:postgres@localhost:5432/$DWCTL_DB" > dwctl/.env
