@@ -132,18 +132,8 @@ jobs:
           cargo install sqlx-cli --no-default-features --features native-tls,postgres --locked
           cargo install cargo-llvm-cov --locked
 
-      - name: Run database migrations
-        working-directory: ./dwctl
-        env:
-          DATABASE_URL: postgres://postgres:postgres@localhost:5432/test
-        run: |
-          sqlx migrate run
-
       - name: Run backend CI pipeline
         id: ci-step
-        env:
-          DATABASE_URL: postgres://postgres:postgres@localhost:5432/test
-          TEST_DATABASE_URL: postgres://postgres:postgres@localhost:5432/test
         run: |
           START_TIME=$(date +%s)
           just ci rust -- -D warnings

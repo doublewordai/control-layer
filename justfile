@@ -594,9 +594,29 @@ ci target *args="":
     case "{{target}}" in
         rust)
             echo "🦀 Running Rust CI pipeline..."
+
+            # Generate random database names
+            DWCTL_DB="dwctl_test_$(openssl rand -hex 4)"
+            FUSILLADE_DB="fusillade_test_$(openssl rand -hex 4)"
+
+            echo "📦 Setting up test databases: $DWCTL_DB, $FUSILLADE_DB"
+
+            # Create databases
+            psql -U postgres -h localhost -c "CREATE DATABASE $DWCTL_DB;" 2>/dev/null || psql -h localhost -c "CREATE DATABASE $DWCTL_DB;"
+            psql -U postgres -h localhost -c "CREATE DATABASE $FUSILLADE_DB;" 2>/dev/null || psql -h localhost -c "CREATE DATABASE $FUSILLADE_DB;"
+
+            # Write DATABASE_URL to .env files for sqlx compile-time verification
+            echo "DATABASE_URL=postgres://postgres:postgres@localhost:5432/$DWCTL_DB" > dwctl/.env
+            echo "DATABASE_URL=postgres://postgres@localhost:5432/$FUSILLADE_DB" > fusillade/.env
+
+            # Run migrations (sqlx will pick up DATABASE_URL from .env files)
+            echo "🔄 Running migrations..."
+            cd dwctl && sqlx migrate run && cd ..
+            cd fusillade && sqlx migrate run && cd ..
+
             echo "📋 Setting up llvm-cov environment for consistent compilation..."
             cd dwctl
-            echo "🧪 Step 1/1: Running tests with coverage..."
+            echo "🧪 Step 1/2: Running tests with coverage..."
             just test rust --coverage {{args}}
             eval "$(cargo llvm-cov show-env --export-prefix)"
             echo "📋 Step 2/2: Linting"

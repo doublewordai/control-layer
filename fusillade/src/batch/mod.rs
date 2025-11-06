@@ -4,6 +4,9 @@
 //! - Files: Collections of request templates
 //! - Request templates: Mutable request definitions
 //! - Batches: Execution triggers for files
+//!
+//! See request/ for the types for requests, since they have their logic more tightly coupled to
+//! their models.
 
 use chrono::{DateTime, Utc};
 use serde::Serialize;
