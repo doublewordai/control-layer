@@ -188,13 +188,20 @@ impl Request<Processing> {
     /// This method awaits the result from the spawned HTTP task and transitions
     /// the request to either `Completed` or `Failed` state.
     ///
+    /// The `should_retry` predicate determines whether a response should be considered
+    /// a failure (and thus eligible for retry) or a success.
+    ///
     /// Returns:
     /// - `Ok(completed_request)` if the HTTP request succeeded
-    /// - `Err(failed_request)` if the HTTP request failed
-    pub async fn complete<S: Storage + ?Sized>(
+    /// - `Err(failed_request)` if the HTTP request failed or should be retried
+    pub async fn complete<S: Storage + ?Sized, F>(
         self,
         storage: &S,
-    ) -> Result<std::result::Result<Request<Completed>, Request<Failed>>> {
+        should_retry: F,
+    ) -> Result<std::result::Result<Request<Completed>, Request<Failed>>>
+    where
+        F: Fn(&crate::http::HttpResponse) -> bool,
+    {
         // Await the result from the channel (lock the mutex to access the receiver)
         let result = {
             let mut rx = self.state.result_rx.lock().await;
@@ -203,20 +210,39 @@ impl Request<Processing> {
 
         match result {
             Some(Ok(http_response)) => {
-                // HTTP request completed successfully
-                let completed_state = Completed {
-                    response_status: http_response.status,
-                    response_body: http_response.body,
-                    claimed_at: self.state.claimed_at,
-                    started_at: self.state.started_at,
-                    completed_at: chrono::Utc::now(),
-                };
-                let request = Request {
-                    data: self.data,
-                    state: completed_state,
-                };
-                storage.persist(&request).await?;
-                Ok(Ok(request))
+                // Check if this response should be retried
+                if should_retry(&http_response) {
+                    // Treat as failure for retry purposes
+                    let failed_state = Failed {
+                        error: format!(
+                            "HTTP request returned retriable status code: {}",
+                            http_response.status
+                        ),
+                        failed_at: chrono::Utc::now(),
+                        retry_attempt: self.state.retry_attempt,
+                    };
+                    let request = Request {
+                        data: self.data,
+                        state: failed_state,
+                    };
+                    storage.persist(&request).await?;
+                    Ok(Err(request))
+                } else {
+                    // HTTP request completed successfully
+                    let completed_state = Completed {
+                        response_status: http_response.status,
+                        response_body: http_response.body,
+                        claimed_at: self.state.claimed_at,
+                        started_at: self.state.started_at,
+                        completed_at: chrono::Utc::now(),
+                    };
+                    let request = Request {
+                        data: self.data,
+                        state: completed_state,
+                    };
+                    storage.persist(&request).await?;
+                    Ok(Ok(request))
+                }
             }
             Some(Err(e)) => {
                 // HTTP request failed

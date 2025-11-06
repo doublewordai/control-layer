@@ -4,17 +4,26 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
-use parking_lot::RwLock;
-use tokio::sync::Semaphore;
+use tokio::sync::{RwLock, Semaphore};
 use tokio::task::JoinSet;
 
 use crate::error::Result;
-use crate::http::HttpClient;
-use crate::request::DaemonId;
+use crate::http::{HttpClient, HttpResponse};
 use crate::manager::Storage;
+use crate::request::DaemonId;
+
+/// Predicate function to determine if a response should be retried.
+///
+/// Takes an HTTP response and returns true if the request should be retried.
+pub type ShouldRetryFn = Arc<dyn Fn(&HttpResponse) -> bool + Send + Sync>;
+
+/// Default retry predicate: retry on server errors (5xx), rate limits (429), and timeouts (408).
+pub fn default_should_retry(response: &HttpResponse) -> bool {
+    response.status >= 500 || response.status == 429 || response.status == 408
+}
 
 /// Configuration for the daemon.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct DaemonConfig {
     /// Maximum number of requests to claim in each iteration
     pub claim_batch_size: usize,
@@ -46,6 +55,10 @@ pub struct DaemonConfig {
     /// Interval for logging daemon status (requests in flight) in milliseconds
     /// Set to None to disable periodic status logging
     pub status_log_interval_ms: Option<u64>,
+
+    /// Predicate function to determine if a response should be retried.
+    /// Defaults to retrying 5xx, 429, and 408 status codes.
+    pub should_retry: ShouldRetryFn,
 }
 
 impl Default for DaemonConfig {
@@ -61,6 +74,7 @@ impl Default for DaemonConfig {
             max_backoff_ms: 10000,
             timeout_ms: 600000,
             status_log_interval_ms: Some(2000), // Log every 5 seconds by default
+            should_retry: Arc::new(default_should_retry),
         }
     }
 }
@@ -100,8 +114,8 @@ where
     }
 
     /// Get or create a semaphore for a model.
-    fn get_semaphore(&self, model: &str) -> Arc<Semaphore> {
-        let mut semaphores = self.semaphores.write();
+    async fn get_semaphore(&self, model: &str) -> Arc<Semaphore> {
+        let mut semaphores = self.semaphores.write().await;
 
         semaphores
             .entry(model.to_string())
@@ -118,8 +132,8 @@ where
     }
 
     /// Try to acquire a permit for a model (non-blocking).
-    fn try_acquire_permit(&self, model: &str) -> Option<tokio::sync::OwnedSemaphorePermit> {
-        let semaphore = self.get_semaphore(model);
+    async fn try_acquire_permit(&self, model: &str) -> Option<tokio::sync::OwnedSemaphorePermit> {
+        let semaphore = self.get_semaphore(model).await;
         semaphore.clone().try_acquire_owned().ok()
     }
 
@@ -208,7 +222,7 @@ where
                     let request_id = request.data.id;
 
                     // Try to acquire a semaphore permit for this model
-                    match self.try_acquire_permit(&model) {
+                    match self.try_acquire_permit(&model).await {
                         Some(permit) => {
                             tracing::debug!(
                                 request_id = %request_id,
@@ -222,6 +236,7 @@ where
                             let timeout_ms = self.config.timeout_ms;
                             let retry_config = (&self.config).into();
                             let requests_in_flight = self.requests_in_flight.clone();
+                            let should_retry = self.config.should_retry.clone();
 
                             // Increment in-flight counter
                             requests_in_flight.fetch_add(1, Ordering::Relaxed);
@@ -245,7 +260,9 @@ where
                                 ).await?;
 
                                 // Wait for completion
-                                match processing.complete(storage.as_ref()).await? {
+                                match processing.complete(storage.as_ref(), |response| {
+                                    (should_retry)(response)
+                                }).await? {
                                     Ok(_completed) => {
                                         tracing::info!(request_id = %request_id, "Request completed successfully");
                                     }
@@ -304,3 +321,575 @@ where
     }
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::http::{HttpResponse, MockHttpClient};
+    use crate::manager::{postgres::PostgresRequestManager, DaemonExecutor};
+    use std::time::Duration;
+
+    #[sqlx::test]
+    async fn test_daemon_claims_and_completes_request(pool: sqlx::PgPool) {
+        // Setup: Create HTTP client with mock response
+        let http_client = Arc::new(MockHttpClient::new());
+        http_client.add_response(
+            "POST /v1/test",
+            Ok(HttpResponse {
+                status: 200,
+                body: r#"{"result":"success"}"#.to_string(),
+            }),
+        );
+
+        // Setup: Create manager with fast claim interval (no sleeping)
+        let config = DaemonConfig {
+            claim_batch_size: 10,
+            claim_interval_ms: 10, // Very fast for testing
+            default_model_concurrency: 10,
+            model_concurrency_limits: HashMap::new(),
+            max_retries: 3,
+            backoff_ms: 100,
+            backoff_factor: 2,
+            max_backoff_ms: 1000,
+            timeout_ms: 5000,
+            status_log_interval_ms: None, // Disable status logging in tests
+            should_retry: Arc::new(default_should_retry),
+        };
+
+        let manager = Arc::new(PostgresRequestManager::new(
+            pool.clone(),
+            http_client.clone(),
+            config,
+        ));
+
+        // Setup: Create a file and batch to associate with our request
+        let file_id = manager
+            .create_file(
+                "test-file".to_string(),
+                Some("Test file".to_string()),
+                vec![crate::RequestTemplateInput {
+                    endpoint: "https://api.example.com".to_string(),
+                    method: "POST".to_string(),
+                    path: "/v1/test".to_string(),
+                    body: r#"{"prompt":"test"}"#.to_string(),
+                    model: "test-model".to_string(),
+                    api_key: "test-key".to_string(),
+                }],
+            )
+            .await
+            .expect("Failed to create file");
+
+        let batch_id = manager
+            .create_batch(file_id)
+            .await
+            .expect("Failed to create batch");
+
+        // Get the created request from the batch
+        let requests = manager
+            .get_batch_requests(batch_id)
+            .await
+            .expect("Failed to get batch requests");
+        assert_eq!(requests.len(), 1);
+        let request_id = requests[0].id();
+
+        // Start the daemon
+        let daemon_handle = manager.clone().run().expect("Failed to start daemon");
+
+        // Poll for completion (with timeout)
+        let start = tokio::time::Instant::now();
+        let timeout = Duration::from_secs(5);
+        let mut completed = false;
+
+        while start.elapsed() < timeout {
+            let results = manager
+                .get_requests(vec![request_id])
+                .await
+                .expect("Failed to get request");
+
+            if let Some(Ok(any_request)) = results.first() {
+                if any_request.is_terminal() {
+                    if let crate::AnyRequest::Completed(req) = any_request {
+                        // Verify the request was completed successfully
+                        assert_eq!(req.state.response_status, 200);
+                        assert_eq!(req.state.response_body, r#"{"result":"success"}"#);
+                        completed = true;
+                        break;
+                    } else {
+                        panic!(
+                            "Request reached terminal state but was not completed: {:?}",
+                            any_request
+                        );
+                    }
+                }
+            }
+
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+
+        // Stop the daemon
+        daemon_handle.abort();
+
+        // Assert that the request completed
+        assert!(
+            completed,
+            "Request did not complete within timeout. Check daemon processing."
+        );
+
+        // Verify HTTP client was called exactly once
+        assert_eq!(http_client.call_count(), 1);
+        let calls = http_client.get_calls();
+        assert_eq!(calls[0].method, "POST");
+        assert_eq!(calls[0].path, "/v1/test");
+        assert_eq!(calls[0].api_key, "test-key");
+    }
+
+    #[sqlx::test]
+    async fn test_daemon_respects_per_model_concurrency_limits(pool: sqlx::PgPool) {
+        // Setup: Create HTTP client with triggered responses
+        let http_client = Arc::new(MockHttpClient::new());
+
+        // Add 5 triggered responses for our 5 requests
+        let trigger1 = http_client.add_response_with_trigger(
+            "POST /v1/test",
+            Ok(HttpResponse {
+                status: 200,
+                body: r#"{"result":"1"}"#.to_string(),
+            }),
+        );
+        let trigger2 = http_client.add_response_with_trigger(
+            "POST /v1/test",
+            Ok(HttpResponse {
+                status: 200,
+                body: r#"{"result":"2"}"#.to_string(),
+            }),
+        );
+        let trigger3 = http_client.add_response_with_trigger(
+            "POST /v1/test",
+            Ok(HttpResponse {
+                status: 200,
+                body: r#"{"result":"3"}"#.to_string(),
+            }),
+        );
+        let trigger4 = http_client.add_response_with_trigger(
+            "POST /v1/test",
+            Ok(HttpResponse {
+                status: 200,
+                body: r#"{"result":"4"}"#.to_string(),
+            }),
+        );
+        let trigger5 = http_client.add_response_with_trigger(
+            "POST /v1/test",
+            Ok(HttpResponse {
+                status: 200,
+                body: r#"{"result":"5"}"#.to_string(),
+            }),
+        );
+
+        // Setup: Create manager with concurrency limit of 2 for "gpt-4"
+        let mut model_concurrency_limits = HashMap::new();
+        model_concurrency_limits.insert("gpt-4".to_string(), 2);
+
+        let config = DaemonConfig {
+            claim_batch_size: 10,
+            claim_interval_ms: 10,
+            default_model_concurrency: 10,
+            model_concurrency_limits,
+            max_retries: 3,
+            backoff_ms: 100,
+            backoff_factor: 2,
+            max_backoff_ms: 1000,
+            timeout_ms: 5000,
+            status_log_interval_ms: None,
+            should_retry: Arc::new(default_should_retry),
+        };
+
+        let manager = Arc::new(PostgresRequestManager::new(
+            pool.clone(),
+            http_client.clone(),
+            config,
+        ));
+
+        // Setup: Create a file with 5 templates, all using "gpt-4"
+        let file_id = manager
+            .create_file(
+                "test-file".to_string(),
+                Some("Test concurrency limits".to_string()),
+                vec![
+                    crate::RequestTemplateInput {
+                        endpoint: "https://api.example.com".to_string(),
+                        method: "POST".to_string(),
+                        path: "/v1/test".to_string(),
+                        body: r#"{"prompt":"test1"}"#.to_string(),
+                        model: "gpt-4".to_string(),
+                        api_key: "test-key".to_string(),
+                    },
+                    crate::RequestTemplateInput {
+                        endpoint: "https://api.example.com".to_string(),
+                        method: "POST".to_string(),
+                        path: "/v1/test".to_string(),
+                        body: r#"{"prompt":"test2"}"#.to_string(),
+                        model: "gpt-4".to_string(),
+                        api_key: "test-key".to_string(),
+                    },
+                    crate::RequestTemplateInput {
+                        endpoint: "https://api.example.com".to_string(),
+                        method: "POST".to_string(),
+                        path: "/v1/test".to_string(),
+                        body: r#"{"prompt":"test3"}"#.to_string(),
+                        model: "gpt-4".to_string(),
+                        api_key: "test-key".to_string(),
+                    },
+                    crate::RequestTemplateInput {
+                        endpoint: "https://api.example.com".to_string(),
+                        method: "POST".to_string(),
+                        path: "/v1/test".to_string(),
+                        body: r#"{"prompt":"test4"}"#.to_string(),
+                        model: "gpt-4".to_string(),
+                        api_key: "test-key".to_string(),
+                    },
+                    crate::RequestTemplateInput {
+                        endpoint: "https://api.example.com".to_string(),
+                        method: "POST".to_string(),
+                        path: "/v1/test".to_string(),
+                        body: r#"{"prompt":"test5"}"#.to_string(),
+                        model: "gpt-4".to_string(),
+                        api_key: "test-key".to_string(),
+                    },
+                ],
+            )
+            .await
+            .expect("Failed to create file");
+
+        let batch_id = manager
+            .create_batch(file_id)
+            .await
+            .expect("Failed to create batch");
+
+        // Start the daemon
+        let daemon_handle = manager.clone().run().expect("Failed to start daemon");
+
+        // Wait for exactly 2 requests to be in-flight (respecting concurrency limit)
+        let start = tokio::time::Instant::now();
+        let timeout = Duration::from_secs(2);
+        let mut reached_limit = false;
+
+        while start.elapsed() < timeout {
+            let in_flight = http_client.in_flight_count();
+            if in_flight == 2 {
+                reached_limit = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+
+        assert!(
+            reached_limit,
+            "Expected exactly 2 requests in-flight, got {}",
+            http_client.in_flight_count()
+        );
+
+        // Verify exactly 2 are in-flight (not more)
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert_eq!(
+            http_client.in_flight_count(),
+            2,
+            "Concurrency limit violated: more than 2 requests in-flight"
+        );
+
+        // Trigger completion of first request
+        trigger1.send(()).unwrap();
+
+        // Wait for the third request to start
+        let start = tokio::time::Instant::now();
+        let timeout = Duration::from_secs(2);
+        let mut third_started = false;
+
+        while start.elapsed() < timeout {
+            if http_client.call_count() >= 3 {
+                third_started = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+
+        assert!(
+            third_started,
+            "Third request should have started after first completed"
+        );
+
+        // Verify still only 2 in-flight
+        assert_eq!(
+            http_client.in_flight_count(),
+            2,
+            "Should maintain concurrency limit of 2"
+        );
+
+        // Complete remaining requests to clean up
+        trigger2.send(()).unwrap();
+        trigger3.send(()).unwrap();
+        trigger4.send(()).unwrap();
+        trigger5.send(()).unwrap();
+
+        // Wait for all requests to complete
+        let start = tokio::time::Instant::now();
+        let timeout = Duration::from_secs(5);
+        let mut all_completed = false;
+
+        while start.elapsed() < timeout {
+            let status = manager
+                .get_batch_status(batch_id)
+                .await
+                .expect("Failed to get batch status");
+
+            if status.completed_requests == 5 {
+                all_completed = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+
+        // Stop the daemon
+        daemon_handle.abort();
+
+        assert!(all_completed, "All 5 requests should have completed");
+
+        // Verify all 5 HTTP calls were made
+        assert_eq!(http_client.call_count(), 5);
+    }
+
+    #[sqlx::test]
+    async fn test_daemon_retries_failed_requests(pool: sqlx::PgPool) {
+        // Setup: Create HTTP client with failing responses, then success
+        let http_client = Arc::new(MockHttpClient::new());
+
+        // First attempt: fails with 500
+        http_client.add_response(
+            "POST /v1/test",
+            Ok(HttpResponse {
+                status: 500,
+                body: r#"{"error":"internal error"}"#.to_string(),
+            }),
+        );
+
+        // Second attempt: fails with 503
+        http_client.add_response(
+            "POST /v1/test",
+            Ok(HttpResponse {
+                status: 503,
+                body: r#"{"error":"service unavailable"}"#.to_string(),
+            }),
+        );
+
+        // Third attempt: succeeds
+        http_client.add_response(
+            "POST /v1/test",
+            Ok(HttpResponse {
+                status: 200,
+                body: r#"{"result":"success after retries"}"#.to_string(),
+            }),
+        );
+
+        // Setup: Create manager with fast backoff for testing
+        let config = DaemonConfig {
+            claim_batch_size: 10,
+            claim_interval_ms: 10,
+            default_model_concurrency: 10,
+            model_concurrency_limits: HashMap::new(),
+            max_retries: 5,
+            backoff_ms: 10, // Very fast backoff for testing
+            backoff_factor: 2,
+            max_backoff_ms: 100,
+            timeout_ms: 5000,
+            status_log_interval_ms: None,
+            should_retry: Arc::new(default_should_retry),
+        };
+
+        let manager = Arc::new(PostgresRequestManager::new(
+            pool.clone(),
+            http_client.clone(),
+            config,
+        ));
+
+        // Setup: Create a file and batch
+        let file_id = manager
+            .create_file(
+                "test-file".to_string(),
+                Some("Test retry logic".to_string()),
+                vec![crate::RequestTemplateInput {
+                    endpoint: "https://api.example.com".to_string(),
+                    method: "POST".to_string(),
+                    path: "/v1/test".to_string(),
+                    body: r#"{"prompt":"test"}"#.to_string(),
+                    model: "test-model".to_string(),
+                    api_key: "test-key".to_string(),
+                }],
+            )
+            .await
+            .expect("Failed to create file");
+
+        let batch_id = manager
+            .create_batch(file_id)
+            .await
+            .expect("Failed to create batch");
+
+        let requests = manager
+            .get_batch_requests(batch_id)
+            .await
+            .expect("Failed to get batch requests");
+        assert_eq!(requests.len(), 1);
+        let request_id = requests[0].id();
+
+        // Start the daemon
+        let daemon_handle = manager.clone().run().expect("Failed to start daemon");
+
+        // Poll for completion (with timeout)
+        let start = tokio::time::Instant::now();
+        let timeout = Duration::from_secs(5);
+        let mut completed = false;
+
+        while start.elapsed() < timeout {
+            let results = manager
+                .get_requests(vec![request_id])
+                .await
+                .expect("Failed to get request");
+
+            if let Some(Ok(any_request)) = results.first() {
+                if let crate::AnyRequest::Completed(req) = any_request {
+                    // Verify the request eventually completed successfully
+                    assert_eq!(req.state.response_status, 200);
+                    assert_eq!(req.state.response_body, r#"{"result":"success after retries"}"#);
+                    completed = true;
+                    break;
+                }
+            }
+
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+
+        // Stop the daemon
+        daemon_handle.abort();
+
+        assert!(
+            completed,
+            "Request should have completed after retries"
+        );
+
+        // Verify the request was attempted 3 times (2 failures + 1 success)
+        assert_eq!(
+            http_client.call_count(),
+            3,
+            "Expected 3 HTTP calls (2 failed attempts + 1 success)"
+        );
+    }
+
+    #[sqlx::test]
+    async fn test_daemon_permanent_failure_after_max_retries(pool: sqlx::PgPool) {
+        // Setup: Create HTTP client that always returns 500
+        let http_client = Arc::new(MockHttpClient::new());
+
+        // Add 10 failing responses (more than max_retries)
+        for i in 0..10 {
+            http_client.add_response(
+                "POST /v1/test",
+                Ok(HttpResponse {
+                    status: 500,
+                    body: format!(r#"{{"error":"attempt {}}}"#, i),
+                }),
+            );
+        }
+
+        // Setup: Create manager with max_retries = 2 (so 3 total attempts: initial + 2 retries)
+        let config = DaemonConfig {
+            claim_batch_size: 10,
+            claim_interval_ms: 10,
+            default_model_concurrency: 10,
+            model_concurrency_limits: HashMap::new(),
+            max_retries: 2, // Only allow 2 retries (3 total attempts)
+            backoff_ms: 10,
+            backoff_factor: 2,
+            max_backoff_ms: 100,
+            timeout_ms: 5000,
+            status_log_interval_ms: None,
+            should_retry: Arc::new(default_should_retry),
+        };
+
+        let manager = Arc::new(PostgresRequestManager::new(
+            pool.clone(),
+            http_client.clone(),
+            config,
+        ));
+
+        // Setup: Create a file and batch
+        let file_id = manager
+            .create_file(
+                "test-file".to_string(),
+                Some("Test permanent failure".to_string()),
+                vec![crate::RequestTemplateInput {
+                    endpoint: "https://api.example.com".to_string(),
+                    method: "POST".to_string(),
+                    path: "/v1/test".to_string(),
+                    body: r#"{"prompt":"test"}"#.to_string(),
+                    model: "test-model".to_string(),
+                    api_key: "test-key".to_string(),
+                }],
+            )
+            .await
+            .expect("Failed to create file");
+
+        let batch_id = manager
+            .create_batch(file_id)
+            .await
+            .expect("Failed to create batch");
+
+        let requests = manager
+            .get_batch_requests(batch_id)
+            .await
+            .expect("Failed to get batch requests");
+        assert_eq!(requests.len(), 1);
+        let request_id = requests[0].id();
+
+        // Start the daemon
+        let daemon_handle = manager.clone().run().expect("Failed to start daemon");
+
+        // Poll for permanent failure (with timeout)
+        let start = tokio::time::Instant::now();
+        let timeout = Duration::from_secs(5);
+        let mut permanently_failed = false;
+
+        while start.elapsed() < timeout {
+            let results = manager
+                .get_requests(vec![request_id])
+                .await
+                .expect("Failed to get request");
+
+            if let Some(Ok(any_request)) = results.first() {
+                if let crate::AnyRequest::Failed(req) = any_request {
+                    // Verify it's in Failed state (not Pending for retry)
+                    permanently_failed = true;
+                    // Verify it exhausted retries
+                    assert_eq!(
+                        req.state.retry_attempt, 2,
+                        "Should have failed after 2 retry attempts"
+                    );
+                    break;
+                }
+            }
+
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+
+        // Stop the daemon
+        daemon_handle.abort();
+
+        assert!(
+            permanently_failed,
+            "Request should have permanently failed after exhausting retries"
+        );
+
+        // Verify exactly 3 HTTP calls were made (1 initial + 2 retries)
+        assert_eq!(
+            http_client.call_count(),
+            3,
+            "Expected 3 HTTP calls (1 initial attempt + 2 retries)"
+        );
+    }
+}
