@@ -1,0 +1,21 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n                        INSERT INTO request_templates (file_id, custom_id, endpoint, method, path, body, model, api_key)\n                        VALUES ($1, $2, $3, $4, $5, $6, $7, $8)\n                        ",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Text",
+        "Text",
+        "Text",
+        "Text",
+        "Text",
+        "Text",
+        "Text"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "62bdc2371f6d95ffa8b4245b78fbf4fcbad70b1ca9b61b3f22aca7a9cc984275"
+}

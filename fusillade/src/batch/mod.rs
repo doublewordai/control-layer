@@ -183,6 +183,7 @@ pub struct File {
 pub struct RequestTemplate {
     pub id: TemplateId,
     pub file_id: FileId,
+    pub custom_id: Option<String>, // OpenAI Batch API custom identifier
     pub endpoint: String,
     pub method: String,
     pub path: String,
@@ -196,6 +197,7 @@ pub struct RequestTemplate {
 /// Input for creating a new request template.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, serde::Deserialize)]
 pub struct RequestTemplateInput {
+    pub custom_id: Option<String>, // OpenAI Batch API custom identifier
     pub endpoint: String,
     pub method: String,
     pub path: String,

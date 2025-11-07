@@ -1,14 +1,16 @@
+//! This file deals with the Files API.
+//! This is designed to match (as far as possible) the OpenAI Files
+//! [API](https://platform.openai.com/docs/api-reference/files/).
+//!
+//! Repository methods are delegated to the fusillade/ crate - which (as of 04/11/2025) stores
+//! files disaggregated in postgres.
+
 use crate::api::models::files::{FileDeleteResponse, FileListResponse, FileResponse, ListFilesQuery, ListObject, ObjectType, Purpose};
 use crate::auth::permissions::{can_read_all_resources, has_permission, operation, resource, RequiresPermission};
+use crate::db::handlers::{api_keys::ApiKeys, repository::Repository};
 use crate::errors::{Error, Result};
 use crate::types::{Operation, Resource};
 use crate::AppState;
-/// This file deals with the Files API.
-/// This is designed to match (as far as possible) the OpenAI Files
-/// [API](https://platform.openai.com/docs/api-reference/files/).
-///
-/// Repository methods are delegated to the fusillade/ crate - which (as of 04/11/2025) stores
-/// files disaggregated in postgres.
 use axum::body::Body;
 use axum::response::IntoResponse;
 use axum::{
@@ -19,15 +21,84 @@ use axum::{
 use fusillade::Storage;
 use futures::stream::Stream;
 use futures::StreamExt;
+use serde::{Deserialize, Serialize};
 use std::pin::Pin;
 use uuid::Uuid;
 
+/// OpenAI Batch API request format
+/// See: https://platform.openai.com/docs/api-reference/batch
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct OpenAIBatchRequest {
+    custom_id: String,
+    method: String,
+    url: String,
+    body: serde_json::Value,
+}
+
+impl OpenAIBatchRequest {
+    /// Transform OpenAI format to internal format
+    ///
+    /// # Arguments
+    /// * `endpoint` - The target endpoint (e.g., "http://localhost:8080/ai")
+    /// * `api_key` - The API key to inject for request execution
+    fn to_internal(&self, endpoint: &str, api_key: String) -> Result<fusillade::RequestTemplateInput> {
+        // Extract model from body if present
+        let model = self
+            .body
+            .get("model")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| Error::BadRequest {
+                message: "Missing 'model' field in request body".to_string(),
+            })?
+            .to_string();
+
+        // Serialize body back to string
+        let body = serde_json::to_string(&self.body).map_err(|e| Error::BadRequest {
+            message: format!("Invalid JSON body: {}", e),
+        })?;
+
+        Ok(fusillade::RequestTemplateInput {
+            custom_id: Some(self.custom_id.clone()),
+            endpoint: endpoint.to_string(),
+            method: self.method.clone(),
+            path: self.url.clone(),
+            body,
+            model,
+            api_key,
+        })
+    }
+
+    /// Transform internal format to OpenAI format
+    fn from_internal(internal: &fusillade::RequestTemplateInput) -> Result<Self> {
+        // Parse body string to JSON
+        let body: serde_json::Value = serde_json::from_str(&internal.body).map_err(|e| Error::Internal {
+            operation: format!("Failed to parse stored body as JSON: {}", e),
+        })?;
+
+        Ok(OpenAIBatchRequest {
+            custom_id: internal
+                .custom_id
+                .clone()
+                .unwrap_or_else(|| format!("req-{}", uuid::Uuid::new_v4())),
+            method: internal.method.clone(),
+            url: internal.path.clone(),
+            body,
+        })
+    }
+}
+
 /// Helper function to create a stream of FileStreamItem from multipart upload
 /// This handles the entire multipart parsing inside the stream
+///
+/// # Arguments
+/// * `endpoint` - Target endpoint for batch requests (e.g., "http://localhost:8080/ai")
+/// * `api_key` - API key to inject for request execution
 fn create_file_stream(
     mut multipart: Multipart,
     max_file_size: u64,
     uploaded_by: Option<String>,
+    endpoint: String,
+    api_key: String,
 ) -> Pin<Box<dyn Stream<Item = fusillade::FileStreamItem> + Send>> {
     Box::pin(async_stream::stream! {
         let mut total_size = 0i64;
@@ -116,12 +187,21 @@ fn create_file_stream(
                                 continue;
                             }
 
-                            // Parse JSON line into RequestTemplateInput
-                            match serde_json::from_str::<fusillade::RequestTemplateInput>(trimmed) {
-                                Ok(template) => {
-                                    line_count += 1;
-                                    incomplete_line.clear();
-                                    yield fusillade::FileStreamItem::Template(template);
+                            // Parse JSON line as OpenAI Batch format, then transform to internal
+                            match serde_json::from_str::<OpenAIBatchRequest>(trimmed) {
+                                Ok(openai_req) => {
+                                    // Transform to internal format
+                                    match openai_req.to_internal(&endpoint, api_key.clone()) {
+                                        Ok(template) => {
+                                            line_count += 1;
+                                            incomplete_line.clear();
+                                            yield fusillade::FileStreamItem::Template(template);
+                                        }
+                                        Err(e) => {
+                                            tracing::error!("Failed to transform request on line {}: {:?}", line_count + 1, e);
+                                            return;
+                                        }
+                                    }
                                 }
                                 Err(e) => {
                                     tracing::error!("Invalid JSON on line {}: {}", line_count + 1, e);
@@ -135,8 +215,15 @@ fn create_file_stream(
                     if !incomplete_line.is_empty() {
                         let trimmed = incomplete_line.trim();
                         if !trimmed.is_empty() {
-                            match serde_json::from_str::<fusillade::RequestTemplateInput>(trimmed) {
-                                Ok(template) => yield fusillade::FileStreamItem::Template(template),
+                            match serde_json::from_str::<OpenAIBatchRequest>(trimmed) {
+                                Ok(openai_req) => {
+                                    match openai_req.to_internal(&endpoint, api_key.clone()) {
+                                        Ok(template) => yield fusillade::FileStreamItem::Template(template),
+                                        Err(e) => {
+                                            tracing::error!("Failed to transform final line: {:?}", e);
+                                        }
+                                    }
+                                }
                                 Err(e) => {
                                     tracing::error!("Invalid JSON on final line: {}", e);
                                 }
@@ -184,8 +271,22 @@ pub async fn upload_file(
     let max_file_size = state.config.files.max_file_size;
     let uploaded_by = Some(current_user.id.to_string());
 
+    // Fetch system API key for batch request execution
+    let mut conn = state.db.acquire().await.map_err(|e| Error::Database(e.into()))?;
+    let mut api_keys_repo = ApiKeys::new(&mut conn);
+    let system_key = api_keys_repo
+        .get_by_id(Uuid::nil())
+        .await
+        .map_err(Error::Database)?
+        .ok_or_else(|| Error::Internal {
+            operation: "System API key not found".to_string(),
+        })?;
+
+    // Construct batch execution endpoint (where fusillade will send requests)
+    let endpoint = format!("http://{}:{}/ai", state.config.host, state.config.port);
+
     // Create a stream that parses the multipart upload and yields FileStreamItems
-    let file_stream = create_file_stream(multipart, max_file_size, uploaded_by);
+    let file_stream = create_file_stream(multipart, max_file_size, uploaded_by, endpoint, system_key.secret);
 
     // Create file via request manager with streaming
     let created_file_id = state
@@ -430,11 +531,17 @@ pub async fn get_file_content(
     // Stream the file content as JSONL
     let content_stream = state.request_manager.get_file_content_stream(fusillade::FileId(file_id));
 
-    // Convert RequestTemplateInput to JSONL (one per line)
+    // Convert RequestTemplateInput to OpenAI format JSONL (one per line)
     let jsonl_stream = content_stream.map(|template_result| {
         template_result
             .and_then(|template| {
-                serde_json::to_string(&template)
+                // Transform to OpenAI format (drops api_key, endpoint)
+                OpenAIBatchRequest::from_internal(&template)
+                    .map_err(|e| fusillade::FusilladeError::Other(anyhow::anyhow!("Failed to transform to OpenAI format: {:?}", e)))
+            })
+            .and_then(|openai_req| {
+                // Serialize to JSON
+                serde_json::to_string(&openai_req)
                     .map(|json| format!("{}\n", json))
                     .map_err(|e| fusillade::FusilladeError::Other(anyhow::anyhow!("JSON serialization failed: {}", e)))
             })
@@ -451,7 +558,7 @@ pub async fn get_file_content(
     path = "/files/{file_id}",
     tag = "files",
     summary = "Delete file",
-    description = "Delete a file by ID. This performs a soft delete, marking the file as deleted while retaining metadata.",
+    description = "Delete a file by ID",
     responses(
         (status = 200, description = "File deleted successfully", body = FileDeleteResponse),
         (status = 404, description = "File not found"),
@@ -527,10 +634,10 @@ mod tests {
         let group = create_test_group(&pool).await;
         add_user_to_group(&pool, user.id, group.id).await;
 
-        // Create test JSONL content with 3 request templates
-        let jsonl_content = r#"{"endpoint":"https://api.example.com","method":"POST","path":"/v1/chat/completions","body":"{\"model\":\"gpt-4\",\"messages\":[{\"role\":\"user\",\"content\":\"Hello 1\"}]}","model":"gpt-4","api_key":"sk-test-key-1"}
-{"endpoint":"https://api.example.com","method":"POST","path":"/v1/chat/completions","body":"{\"model\":\"gpt-4\",\"messages\":[{\"role\":\"user\",\"content\":\"Hello 2\"}]}","model":"gpt-4","api_key":"sk-test-key-2"}
-{"endpoint":"https://api.example.com","method":"POST","path":"/v1/chat/completions","body":"{\"model\":\"gpt-4\",\"messages\":[{\"role\":\"user\",\"content\":\"Hello 3\"}]}","model":"gpt-4","api_key":"sk-test-key-3"}
+        // Create test JSONL content with 3 request templates in OpenAI Batch API format
+        let jsonl_content = r#"{"custom_id":"request-1","method":"POST","url":"/v1/chat/completions","body":{"model":"gpt-4","messages":[{"role":"user","content":"Hello 1"}]}}
+{"custom_id":"request-2","method":"POST","url":"/v1/chat/completions","body":{"model":"gpt-4","messages":[{"role":"user","content":"Hello 2"}]}}
+{"custom_id":"request-3","method":"POST","url":"/v1/chat/completions","body":{"model":"gpt-4","messages":[{"role":"user","content":"Hello 3"}]}}
 "#;
 
         // Upload the file

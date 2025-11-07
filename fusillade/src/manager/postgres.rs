@@ -686,10 +686,11 @@ impl<H: HttpClient + 'static> Storage for PostgresRequestManager<H> {
                     let fid = file_id.unwrap();
                     sqlx::query!(
                         r#"
-                        INSERT INTO request_templates (file_id, endpoint, method, path, body, model, api_key)
-                        VALUES ($1, $2, $3, $4, $5, $6, $7)
+                        INSERT INTO request_templates (file_id, custom_id, endpoint, method, path, body, model, api_key)
+                        VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
                         "#,
                         fid,
+                        template.custom_id,
                         template.endpoint,
                         template.method,
                         template.path,
@@ -951,7 +952,7 @@ impl<H: HttpClient + 'static> Storage for PostgresRequestManager<H> {
     async fn get_file_templates(&self, file_id: FileId) -> Result<Vec<RequestTemplate>> {
         let rows = sqlx::query!(
             r#"
-            SELECT id, file_id, endpoint, method, path, body, model, api_key, created_at, updated_at
+            SELECT id, file_id, custom_id, endpoint, method, path, body, model, api_key, created_at, updated_at
             FROM request_templates
             WHERE file_id = $1
             ORDER BY created_at ASC
@@ -967,6 +968,7 @@ impl<H: HttpClient + 'static> Storage for PostgresRequestManager<H> {
             .map(|row| RequestTemplate {
                 id: TemplateId(row.id),
                 file_id: FileId(row.file_id),
+                custom_id: row.custom_id,
                 endpoint: row.endpoint,
                 method: row.method,
                 path: row.path,
@@ -989,7 +991,7 @@ impl<H: HttpClient + 'static> Storage for PostgresRequestManager<H> {
             // Stream templates directly as JSONL content
             let mut template_stream = sqlx::query!(
                 r#"
-                SELECT endpoint, method, path, body, model, api_key
+                SELECT custom_id, endpoint, method, path, body, model, api_key
                 FROM request_templates
                 WHERE file_id = $1
                 ORDER BY created_at ASC
@@ -1003,6 +1005,7 @@ impl<H: HttpClient + 'static> Storage for PostgresRequestManager<H> {
                 match row_result {
                     Ok(row) => {
                         let template = RequestTemplateInput {
+                            custom_id: row.custom_id,
                             endpoint: row.endpoint,
                             method: row.method,
                             path: row.path,
@@ -1050,7 +1053,7 @@ impl<H: HttpClient + 'static> Storage for PostgresRequestManager<H> {
         // Get templates
         let templates = sqlx::query!(
             r#"
-            SELECT id, endpoint, method, path, body, model, api_key
+            SELECT id, custom_id, endpoint, method, path, body, model, api_key
             FROM request_templates
             WHERE file_id = $1
             "#,
@@ -1085,13 +1088,14 @@ impl<H: HttpClient + 'static> Storage for PostgresRequestManager<H> {
                 r#"
                 INSERT INTO requests (
                     batch_id, template_id, state,
-                    endpoint, method, path, body, model, api_key,
+                    custom_id, endpoint, method, path, body, model, api_key,
                     retry_attempt
                 )
-                VALUES ($1, $2, 'pending', $3, $4, $5, $6, $7, $8, 0)
+                VALUES ($1, $2, 'pending', $3, $4, $5, $6, $7, $8, $9, 0)
                 "#,
                 batch_id,
                 template.id,
+                template.custom_id,
                 template.endpoint,
                 template.method,
                 template.path,
@@ -1582,6 +1586,7 @@ mod tests {
                 Some("A test file".to_string()),
                 vec![
                     RequestTemplateInput {
+                        custom_id: None,
                         endpoint: "https://api.example.com".to_string(),
                         method: "POST".to_string(),
                         path: "/v1/completions".to_string(),
@@ -1590,6 +1595,7 @@ mod tests {
                         api_key: "key1".to_string(),
                     },
                     RequestTemplateInput {
+                        custom_id: None,
                         endpoint: "https://api.example.com".to_string(),
                         method: "POST".to_string(),
                         path: "/v1/completions".to_string(),
@@ -1632,6 +1638,7 @@ mod tests {
                 None,
                 vec![
                     RequestTemplateInput {
+                        custom_id: None,
                         endpoint: "https://api.example.com".to_string(),
                         method: "POST".to_string(),
                         path: "/v1/test".to_string(),
@@ -1640,6 +1647,7 @@ mod tests {
                         api_key: "key".to_string(),
                     },
                     RequestTemplateInput {
+                        custom_id: None,
                         endpoint: "https://api.example.com".to_string(),
                         method: "POST".to_string(),
                         path: "/v1/test".to_string(),
@@ -1648,6 +1656,7 @@ mod tests {
                         api_key: "key".to_string(),
                     },
                     RequestTemplateInput {
+                        custom_id: None,
                         endpoint: "https://api.example.com".to_string(),
                         method: "POST".to_string(),
                         path: "/v1/test".to_string(),
@@ -1704,6 +1713,7 @@ mod tests {
                 None,
                 (0..5)
                     .map(|i| RequestTemplateInput {
+                        custom_id: None,
                         endpoint: "https://api.example.com".to_string(),
                         method: "POST".to_string(),
                         path: "/test".to_string(),
@@ -1759,6 +1769,7 @@ mod tests {
                 None,
                 (0..3)
                     .map(|i| RequestTemplateInput {
+                        custom_id: None,
                         endpoint: "https://api.example.com".to_string(),
                         method: "POST".to_string(),
                         path: "/test".to_string(),
@@ -1806,6 +1817,7 @@ mod tests {
                 None,
                 (0..5)
                     .map(|i| RequestTemplateInput {
+                        custom_id: None,
                         endpoint: "https://api.example.com".to_string(),
                         method: "POST".to_string(),
                         path: "/test".to_string(),
@@ -1906,6 +1918,7 @@ mod tests {
                 "batch-list-test".to_string(),
                 None,
                 vec![RequestTemplateInput {
+                    custom_id: None,
                     endpoint: "https://api.example.com".to_string(),
                     method: "POST".to_string(),
                     path: "/test".to_string(),
@@ -1952,6 +1965,7 @@ mod tests {
                 None,
                 vec![
                     RequestTemplateInput {
+                        custom_id: None,
                         endpoint: "https://api.example.com".to_string(),
                         method: "POST".to_string(),
                         path: "/test".to_string(),
@@ -1960,6 +1974,7 @@ mod tests {
                         api_key: "key".to_string(),
                     },
                     RequestTemplateInput {
+                        custom_id: None,
                         endpoint: "https://api.example.com".to_string(),
                         method: "POST".to_string(),
                         path: "/test".to_string(),
@@ -2011,6 +2026,7 @@ mod tests {
                 "stale-test".to_string(),
                 None,
                 vec![RequestTemplateInput {
+                    custom_id: None,
                     endpoint: "https://api.example.com".to_string(),
                     method: "POST".to_string(),
                     path: "/test".to_string(),
@@ -2072,6 +2088,7 @@ mod tests {
                 "stale-processing-test".to_string(),
                 None,
                 vec![RequestTemplateInput {
+                    custom_id: None,
                     endpoint: "https://api.example.com".to_string(),
                     method: "POST".to_string(),
                     path: "/test".to_string(),
@@ -2140,6 +2157,7 @@ mod tests {
                 None,
                 vec![
                     RequestTemplateInput {
+                        custom_id: None,
                         endpoint: "https://api.example.com".to_string(),
                         method: "POST".to_string(),
                         path: "/test".to_string(),
@@ -2148,6 +2166,7 @@ mod tests {
                         api_key: "key".to_string(),
                     },
                     RequestTemplateInput {
+                        custom_id: None,
                         endpoint: "https://api.example.com".to_string(),
                         method: "POST".to_string(),
                         path: "/test".to_string(),
@@ -2207,6 +2226,7 @@ mod tests {
                 "retry-test".to_string(),
                 None,
                 vec![RequestTemplateInput {
+                    custom_id: None,
                     endpoint: "https://api.example.com".to_string(),
                     method: "POST".to_string(),
                     path: "/test".to_string(),
