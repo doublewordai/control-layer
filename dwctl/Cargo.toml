@@ -5,14 +5,24 @@ edition = "2021"
 description = "The Doubleword Control Layer - A self-hostable observability and analytics platform for LLM applications"
 license = "MIT OR Apache-2.0"
 
+[lib]
+name = "dwctl"
+path = "src/lib.rs"
+
+[[bin]]
+name = "dwctl"
+path = "src/main.rs"
+
 [features]
 default = ["embedded-db"]
 embedded-db = ["dep:postgresql_embedded"]
+test-utils = ["dep:axum-test"]
 
 [dependencies]
+axum = { version = "0.8", features = ["multipart"] }
 fusillade = { path = "../fusillade", version = "0.1" }
-axum = "0.8"
 tokio = { version = "1.0", features = ["full"] }
+tokio-stream = { version = "0.1", features = ["sync"] }
 tokio-util = "0.7"
 sqlx = { version = "0.8", features = [
   "runtime-tokio-rustls",
@@ -32,7 +42,10 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 # OpenTelemetry
 opentelemetry = "0.27"
 opentelemetry_sdk = { version = "0.27", features = ["rt-tokio"] }
-opentelemetry-otlp = { version = "0.27", features = ["http-proto", "reqwest-client"] }
+opentelemetry-otlp = { version = "0.27", features = [
+  "http-proto",
+  "reqwest-client",
+] }
 tracing-opentelemetry = "0.28"
 tower = "0.5"
 tower-http = { version = "0.6", features = ["cors", "fs", "trace"] }
@@ -59,8 +72,8 @@ bytes = "1.5"
 onwards = "0.9.0"
 thiserror = "2.0.14"
 axum-prometheus = "0.9"
-outlet = "0.4.0"
-outlet-postgres = "0.4.1"
+outlet = "0.4.1"
+outlet-postgres = "0.4.2"
 async-openai = { version = "0.29.2", default-features = false }
 brotli = "7.0"
 lettre = { version = "0.11", features = [
@@ -83,9 +96,12 @@ postgresql_embedded = { version = "0.20", optional = true, features = [
 # Embedded static assets
 rust-embed = { version = "8.5", features = ["debug-embed"] }
 mime_guess = "2.0"
+futures = "0.3.31"
+# axum-test is optional and only used for tests and benchmarks
+axum-test = { version = "17.3", optional = true }
 
 [dev-dependencies]
-axum-test = "17.3"
+axum-test = { version = "17.3" }
 sqlx = { version = "0.8", features = [
   "postgres",
   "runtime-tokio-rustls",
@@ -96,3 +112,5 @@ sqlx = { version = "0.8", features = [
 tokio-test = "0.4"
 serial_test = "3.0"
 test-log = { version = "0.2", features = ["trace"] }
+criterion = { version = "0.5", features = ["async_tokio"] }
+tempfile = "3.0"

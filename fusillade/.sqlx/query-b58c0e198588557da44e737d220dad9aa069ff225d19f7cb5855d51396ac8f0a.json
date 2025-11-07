@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "\n            SELECT id, file_id, endpoint, method, path, body, model, api_key, created_at, updated_at\n            FROM request_templates\n            WHERE file_id = $1\n            ORDER BY created_at ASC\n            ",
+  "query": "\n            SELECT id, file_id, custom_id, endpoint, method, path, body, model, api_key, created_at, updated_at\n            FROM request_templates\n            WHERE file_id = $1\n            ORDER BY line_number ASC\n            ",
   "describe": {
     "columns": [
       {
@@ -15,41 +15,46 @@
       },
       {
         "ordinal": 2,
-        "name": "endpoint",
+        "name": "custom_id",
         "type_info": "Text"
       },
       {
         "ordinal": 3,
-        "name": "method",
+        "name": "endpoint",
         "type_info": "Text"
       },
       {
         "ordinal": 4,
-        "name": "path",
+        "name": "method",
         "type_info": "Text"
       },
       {
         "ordinal": 5,
-        "name": "body",
+        "name": "path",
         "type_info": "Text"
       },
       {
         "ordinal": 6,
-        "name": "model",
+        "name": "body",
         "type_info": "Text"
       },
       {
         "ordinal": 7,
-        "name": "api_key",
+        "name": "model",
         "type_info": "Text"
       },
       {
         "ordinal": 8,
+        "name": "api_key",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 9,
         "name": "created_at",
         "type_info": "Timestamptz"
       },
       {
-        "ordinal": 9,
+        "ordinal": 10,
         "name": "updated_at",
         "type_info": "Timestamptz"
       }
@@ -62,6 +67,7 @@
     "nullable": [
       false,
       false,
+      true,
       false,
       false,
       false,
@@ -72,5 +78,5 @@
       false
     ]
   },
-  "hash": "690439e12d5931bd294d548451ac41820d549ab62ebaa92c921c0f9b91d73924"
+  "hash": "b58c0e198588557da44e737d220dad9aa069ff225d19f7cb5855d51396ac8f0a"
 }

@@ -39,6 +39,8 @@ pub struct Config {
     pub metadata: Metadata,
     // Authentication configuration
     pub auth: AuthConfig,
+    // Files configuration
+    pub files: FilesConfig,
     // Metrics configuration
     pub enable_metrics: bool,
     // Request logging configuration
@@ -226,6 +228,36 @@ pub struct PasswordResetEmailConfig {
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(default)]
+pub struct FilesConfig {
+    /// Maximum file size in bytes (default: 100MB)
+    pub max_file_size: u64,
+    /// Default expiration time in seconds (default: 24 hours)
+    pub default_expiry_seconds: i64,
+    /// Minimum expiration time in seconds (default: 1 hour)
+    pub min_expiry_seconds: i64,
+    /// Maximum expiration time in seconds (default: 30 days)
+    pub max_expiry_seconds: i64,
+    /// Buffer size for file upload streams (default: 100)
+    pub upload_buffer_size: usize,
+    /// Buffer size for file download streams (default: 100)
+    pub download_buffer_size: usize,
+}
+
+impl Default for FilesConfig {
+    fn default() -> Self {
+        Self {
+            max_file_size: 100 * 1024 * 1024,      // 100MB
+            default_expiry_seconds: 24 * 60 * 60,  // 24 hours
+            min_expiry_seconds: 60 * 60,           // 1 hour
+            max_expiry_seconds: 30 * 24 * 60 * 60, // 30 days
+            upload_buffer_size: 100,
+            download_buffer_size: 100,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(untagged)]
 pub enum CorsOrigin {
     #[serde(deserialize_with = "parse_wildcard")]
@@ -267,6 +299,7 @@ impl Default for Config {
             model_sources: vec![],
             metadata: Metadata::default(),
             auth: AuthConfig::default(),
+            files: FilesConfig::default(),
             enable_metrics: true,
             enable_request_logging: true,
             enable_otel_export: false,

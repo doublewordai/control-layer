@@ -378,6 +378,7 @@ mod tests {
                 "test-file".to_string(),
                 Some("Test file".to_string()),
                 vec![crate::RequestTemplateInput {
+                    custom_id: None,
                     endpoint: "https://api.example.com".to_string(),
                     method: "POST".to_string(),
                     path: "/v1/test".to_string(),
@@ -527,6 +528,7 @@ mod tests {
                 Some("Test concurrency limits".to_string()),
                 vec![
                     crate::RequestTemplateInput {
+                        custom_id: None,
                         endpoint: "https://api.example.com".to_string(),
                         method: "POST".to_string(),
                         path: "/v1/test".to_string(),
@@ -535,6 +537,7 @@ mod tests {
                         api_key: "test-key".to_string(),
                     },
                     crate::RequestTemplateInput {
+                        custom_id: None,
                         endpoint: "https://api.example.com".to_string(),
                         method: "POST".to_string(),
                         path: "/v1/test".to_string(),
@@ -543,6 +546,7 @@ mod tests {
                         api_key: "test-key".to_string(),
                     },
                     crate::RequestTemplateInput {
+                        custom_id: None,
                         endpoint: "https://api.example.com".to_string(),
                         method: "POST".to_string(),
                         path: "/v1/test".to_string(),
@@ -551,6 +555,7 @@ mod tests {
                         api_key: "test-key".to_string(),
                     },
                     crate::RequestTemplateInput {
+                        custom_id: None,
                         endpoint: "https://api.example.com".to_string(),
                         method: "POST".to_string(),
                         path: "/v1/test".to_string(),
@@ -559,6 +564,7 @@ mod tests {
                         api_key: "test-key".to_string(),
                     },
                     crate::RequestTemplateInput {
+                        custom_id: None,
                         endpoint: "https://api.example.com".to_string(),
                         method: "POST".to_string(),
                         path: "/v1/test".to_string(),
@@ -728,6 +734,7 @@ mod tests {
                 "test-file".to_string(),
                 Some("Test retry logic".to_string()),
                 vec![crate::RequestTemplateInput {
+                    custom_id: None,
                     endpoint: "https://api.example.com".to_string(),
                     method: "POST".to_string(),
                     path: "/v1/test".to_string(),

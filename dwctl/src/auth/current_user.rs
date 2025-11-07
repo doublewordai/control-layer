@@ -197,7 +197,14 @@ mod tests {
     #[sqlx::test]
     async fn test_existing_user_extraction(pool: PgPool) {
         let config = create_test_config();
-        let state = AppState::builder().db(pool.clone()).config(config).build();
+        let state = {
+            let request_manager = std::sync::Arc::new(fusillade::PostgresRequestManager::new(pool.clone()));
+            AppState::builder()
+                .db(pool.clone())
+                .config(config)
+                .request_manager(request_manager)
+                .build()
+        };
 
         // Create a test user first
         let test_user = crate::test_utils::create_test_user(&pool, Role::StandardUser).await;
@@ -217,7 +224,14 @@ mod tests {
     #[sqlx::test]
     async fn test_auto_create_nonexistent_user(pool: PgPool) {
         let config = create_test_config();
-        let state = AppState::builder().db(pool.clone()).config(config).build();
+        let state = {
+            let request_manager = std::sync::Arc::new(fusillade::PostgresRequestManager::new(pool.clone()));
+            AppState::builder()
+                .db(pool.clone())
+                .config(config)
+                .request_manager(request_manager)
+                .build()
+        };
 
         let new_email = "newuser@example.com";
         let mut parts = create_test_parts_with_header("x-doubleword-user", new_email);
@@ -247,7 +261,14 @@ mod tests {
     #[sqlx::test]
     async fn test_missing_header_returns_unauthorized(pool: PgPool) {
         let config = create_test_config();
-        let state = AppState::builder().db(pool.clone()).config(config).build();
+        let state = {
+            let request_manager = std::sync::Arc::new(fusillade::PostgresRequestManager::new(pool.clone()));
+            AppState::builder()
+                .db(pool.clone())
+                .config(config)
+                .request_manager(request_manager)
+                .build()
+        };
 
         // Create parts without x-doubleword-user header
         let request = axum::http::Request::builder().uri("http://localhost/test").body(()).unwrap();

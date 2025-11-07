@@ -12,7 +12,7 @@ use rand::{thread_rng, Rng};
 ///
 /// # Examples
 ///
-/// ```
+/// ```ignore
 /// use your_crate::crypto::generate_api_key;
 ///
 /// let api_key = generate_api_key();

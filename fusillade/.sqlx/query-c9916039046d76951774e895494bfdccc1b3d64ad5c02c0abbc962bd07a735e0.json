@@ -1,12 +1,12 @@
 {
   "db_name": "PostgreSQL",
-  "query": "\n            SELECT id, endpoint, method, path, body, model, api_key\n            FROM request_templates\n            WHERE file_id = $1\n            ",
+  "query": "\n                    SELECT custom_id, endpoint, method, path, body, model, api_key, line_number\n                    FROM request_templates\n                    WHERE file_id = $1 AND line_number > $2\n                    ORDER BY line_number ASC\n                    LIMIT $3\n                    ",
   "describe": {
     "columns": [
       {
         "ordinal": 0,
-        "name": "id",
-        "type_info": "Uuid"
+        "name": "custom_id",
+        "type_info": "Text"
       },
       {
         "ordinal": 1,
@@ -37,14 +37,22 @@
         "ordinal": 6,
         "name": "api_key",
         "type_info": "Text"
+      },
+      {
+        "ordinal": 7,
+        "name": "line_number",
+        "type_info": "Int4"
       }
     ],
     "parameters": {
       "Left": [
-        "Uuid"
+        "Uuid",
+        "Int4",
+        "Int8"
       ]
     },
     "nullable": [
+      true,
       false,
       false,
       false,
@@ -54,5 +62,5 @@
       false
     ]
   },
-  "hash": "eb4f317dc4af548f536ade8d0aa78e5dc6bfa71cb18e7edf304e04392c5071d1"
+  "hash": "c9916039046d76951774e895494bfdccc1b3d64ad5c02c0abbc962bd07a735e0"
 }

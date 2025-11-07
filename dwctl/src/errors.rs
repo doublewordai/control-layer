@@ -47,6 +47,10 @@ pub enum Error {
         message: String,
         conflicts: Option<Vec<AliasConflict>>,
     },
+
+    /// Payload exceeds maximum allowed size
+    #[error("Payload too large: {message}")]
+    PayloadTooLarge { message: String },
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -74,6 +78,7 @@ impl Error {
             },
             Error::Other(_) => StatusCode::INTERNAL_SERVER_ERROR,
             Error::Conflict { .. } => StatusCode::CONFLICT,
+            Error::PayloadTooLarge { .. } => StatusCode::PAYLOAD_TOO_LARGE,
         }
     }
 
@@ -85,6 +90,7 @@ impl Error {
                 format!("Insufficient permissions to {action} {resource}")
             }
             Error::BadRequest { message } => message.clone(),
+            Error::PayloadTooLarge { message } => message.clone(),
             Error::NotFound { resource, id } => {
                 format!("{resource} with ID {id} not found")
             }
@@ -141,7 +147,7 @@ impl IntoResponse for Error {
             Error::Unauthenticated { .. } | Error::InsufficientPermissions { .. } => {
                 tracing::info!("Authorization error: {}", self);
             }
-            Error::BadRequest { .. } | Error::NotFound { .. } => {
+            Error::BadRequest { .. } | Error::NotFound { .. } | Error::PayloadTooLarge { .. } => {
                 tracing::debug!("Client error: {}", self);
             }
             Error::Conflict { .. } => {
