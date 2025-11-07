@@ -2,7 +2,7 @@ use serde::{Deserialize, Serialize};
 use utoipa::{IntoParams, ToSchema};
 
 /// Query parameters for listing files
-#[derive(Debug, Deserialize, IntoParams)]
+#[derive(Debug, Deserialize, IntoParams, ToSchema)]
 pub struct ListFilesQuery {
     /// Maximum number of files to return (1-10000, default 20)
     #[param(default = 20, minimum = 1, maximum = 10000)]

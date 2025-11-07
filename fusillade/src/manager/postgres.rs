@@ -13,8 +13,10 @@ use chrono::Utc;
 use futures::stream::Stream;
 use sqlx::postgres::{PgListener, PgPool};
 use sqlx::Row;
-use tokio::sync::Mutex;
+use tokio::sync::{mpsc, Mutex};
 use tokio::task::JoinHandle;
+use tokio_stream::wrappers::ReceiverStream;
+use tracing::debug;
 use uuid::Uuid;
 
 use super::Storage;
@@ -56,6 +58,7 @@ pub struct PostgresRequestManager<H: HttpClient> {
     pool: PgPool,
     http_client: Arc<H>,
     config: DaemonConfig,
+    download_buffer_size: usize,
 }
 
 impl PostgresRequestManager<crate::http::ReqwestHttpClient> {
@@ -74,6 +77,7 @@ impl PostgresRequestManager<crate::http::ReqwestHttpClient> {
             pool,
             http_client: Arc::new(crate::http::ReqwestHttpClient::default()),
             config: DaemonConfig::default(),
+            download_buffer_size: 100,
         }
     }
 }
@@ -93,6 +97,7 @@ impl<H: HttpClient + 'static> PostgresRequestManager<H> {
             pool,
             http_client,
             config: DaemonConfig::default(),
+            download_buffer_size: 100,
         }
     }
 
@@ -101,6 +106,15 @@ impl<H: HttpClient + 'static> PostgresRequestManager<H> {
     /// This is a builder method that can be chained after `new()` or `with_client()`.
     pub fn with_config(mut self, config: DaemonConfig) -> Self {
         self.config = config;
+        self
+    }
+
+    /// Set the download buffer size for file content streams.
+    ///
+    /// This is a builder method that can be chained after `new()` or `with_client()`.
+    /// Default is 100.
+    pub fn with_download_buffer_size(mut self, buffer_size: usize) -> Self {
+        self.download_buffer_size = buffer_size;
         self
     }
 
@@ -668,6 +682,7 @@ impl<H: HttpClient + 'static> Storage for PostgresRequestManager<H> {
         let mut template_count = 0;
 
         while let Some(item) = stream.next().await {
+            debug!("Received stream item, template count {}", template_count);
             match item {
                 FileStreamItem::Metadata(meta) => {
                     // Accumulate metadata (later values override earlier ones)
@@ -714,6 +729,15 @@ impl<H: HttpClient + 'static> Storage for PostgresRequestManager<H> {
                         .fetch_one(&mut *tx)
                         .await
                         .map_err(|e| {
+                            // Check for unique constraint violation (PostgreSQL error code 23505)
+                            if let sqlx::Error::Database(db_err) = &e {
+                                if db_err.code().as_deref() == Some("23505") {
+                                    return FusilladeError::ValidationError(format!(
+                                        "A file with the name '{}' already exists",
+                                        name
+                                    ));
+                                }
+                            }
                             FusilladeError::Other(anyhow!("Failed to create file: {}", e))
                         })?;
 
@@ -724,12 +748,12 @@ impl<H: HttpClient + 'static> Storage for PostgresRequestManager<H> {
                         );
                     }
 
-                    // Insert the template immediately
+                    // Insert the template immediately with line_number for ordering
                     let fid = file_id.unwrap();
                     sqlx::query!(
                         r#"
-                        INSERT INTO request_templates (file_id, custom_id, endpoint, method, path, body, model, api_key)
-                        VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+                        INSERT INTO request_templates (file_id, custom_id, endpoint, method, path, body, model, api_key, line_number)
+                        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
                         "#,
                         fid,
                         template.custom_id,
@@ -739,6 +763,7 @@ impl<H: HttpClient + 'static> Storage for PostgresRequestManager<H> {
                         template.body,
                         template.model,
                         template.api_key,
+                        template_count as i32,
                     )
                     .execute(&mut *tx)
                     .await
@@ -763,11 +788,22 @@ impl<H: HttpClient + 'static> Storage for PostgresRequestManager<H> {
                 VALUES ($1)
                 RETURNING id
                 "#,
-                name,
+                name.clone(),
             )
             .fetch_one(&mut *tx)
             .await
-            .map_err(|e| FusilladeError::Other(anyhow!("Failed to create file: {}", e)))?
+            .map_err(|e| {
+                // Check for unique constraint violation (PostgreSQL error code 23505)
+                if let sqlx::Error::Database(db_err) = &e {
+                    if db_err.code().as_deref() == Some("23505") {
+                        return FusilladeError::ValidationError(format!(
+                            "A file with the name '{}' already exists",
+                            name
+                        ));
+                    }
+                }
+                FusilladeError::Other(anyhow!("Failed to create file: {}", e))
+            })?
         };
 
         // Now update the file with all the final metadata
@@ -1004,7 +1040,7 @@ impl<H: HttpClient + 'static> Storage for PostgresRequestManager<H> {
             SELECT id, file_id, custom_id, endpoint, method, path, body, model, api_key, created_at, updated_at
             FROM request_templates
             WHERE file_id = $1
-            ORDER BY created_at ASC
+            ORDER BY line_number ASC
             "#,
             *file_id as Uuid,
         )
@@ -1036,42 +1072,76 @@ impl<H: HttpClient + 'static> Storage for PostgresRequestManager<H> {
         file_id: FileId,
     ) -> Pin<Box<dyn Stream<Item = Result<RequestTemplateInput>> + Send>> {
         let pool = self.pool.clone();
+        let (tx, rx) = mpsc::channel(self.download_buffer_size);
 
-        Box::pin(async_stream::stream! {
-            // Stream templates directly as JSONL content
-            let mut template_stream = sqlx::query!(
-                r#"
-                SELECT custom_id, endpoint, method, path, body, model, api_key
-                FROM request_templates
-                WHERE file_id = $1
-                ORDER BY created_at ASC
-                "#,
-                *file_id as Uuid,
-            )
-            .fetch(&pool);
+        tokio::spawn(async move {
+            // Use keyset pagination to fetch in batches with back-pressure
+            const BATCH_SIZE: i64 = 1000;
+            let mut last_line_number: i32 = -1;
 
-            use futures::StreamExt;
-            while let Some(row_result) = template_stream.next().await {
-                match row_result {
-                    Ok(row) => {
-                        let template = RequestTemplateInput {
-                            custom_id: row.custom_id,
-                            endpoint: row.endpoint,
-                            method: row.method,
-                            path: row.path,
-                            body: row.body,
-                            model: row.model,
-                            api_key: row.api_key,
-                        };
-                        yield Ok(template);
+            loop {
+                // Fetch next batch using keyset pagination
+                let template_batch = sqlx::query!(
+                    r#"
+                    SELECT custom_id, endpoint, method, path, body, model, api_key, line_number
+                    FROM request_templates
+                    WHERE file_id = $1 AND line_number > $2
+                    ORDER BY line_number ASC
+                    LIMIT $3
+                    "#,
+                    *file_id as Uuid,
+                    last_line_number,
+                    BATCH_SIZE,
+                )
+                .fetch_all(&pool)
+                .await;
+
+                match template_batch {
+                    Ok(templates) => {
+                        if templates.is_empty() {
+                            // No more rows, we're done
+                            break;
+                        }
+
+                        tracing::debug!(
+                            "Fetched batch of {} templates, line_numbers {}-{}",
+                            templates.len(),
+                            templates.first().map(|r| r.line_number).unwrap_or(0),
+                            templates.last().map(|r| r.line_number).unwrap_or(0)
+                        );
+
+                        // Send each template in the batch
+                        for row in templates {
+                            last_line_number = row.line_number;
+
+                            let template = RequestTemplateInput {
+                                custom_id: row.custom_id,
+                                endpoint: row.endpoint,
+                                method: row.method,
+                                path: row.path,
+                                body: row.body,
+                                model: row.model,
+                                api_key: row.api_key,
+                            };
+                            if tx.send(Ok(template)).await.is_err() {
+                                return;
+                            }
+                        }
                     }
                     Err(e) => {
-                        yield Err(FusilladeError::Other(anyhow!("Failed to fetch template: {}", e)));
+                        let _ = tx
+                            .send(Err(FusilladeError::Other(anyhow!(
+                                "Failed to fetch template batch: {}",
+                                e
+                            ))))
+                            .await;
                         return;
                     }
                 }
             }
-        })
+        });
+
+        Box::pin(ReceiverStream::new(rx))
     }
 
     #[tracing::instrument(skip(self), fields(file_id = %file_id))]
@@ -1410,16 +1480,18 @@ impl<H: HttpClient + 'static> Storage for PostgresRequestManager<H> {
         id_filter: Option<Vec<RequestId>>,
     ) -> std::pin::Pin<Box<dyn Stream<Item = Result<Result<AnyRequest>>> + Send>> {
         let pool = self.pool.clone();
+        let (tx, rx) = mpsc::channel(100);
 
-        Box::pin(async_stream::stream! {
+        tokio::spawn(async move {
             // Create a listener for Postgres NOTIFY events
             let mut listener = match PgListener::connect_with(&pool)
                 .await
-                .map_err(|e| FusilladeError::Other(anyhow!("Failed to create listener: {}", e))) {
+                .map_err(|e| FusilladeError::Other(anyhow!("Failed to create listener: {}", e)))
+            {
                 Ok(l) => l,
                 Err(e) => {
                     tracing::error!(error = %e, "Failed to create listener");
-                    yield Err(e);
+                    let _ = tx.send(Err(e)).await;
                     return;
                 }
             };
@@ -1427,7 +1499,12 @@ impl<H: HttpClient + 'static> Storage for PostgresRequestManager<H> {
             // Listen on the request_updates channel
             if let Err(e) = listener.listen("request_updates").await {
                 tracing::error!(error = %e, "Failed to listen on request_updates channel");
-                yield Err(FusilladeError::Other(anyhow::anyhow!("Failed to listen: {}", e)));
+                let _ = tx
+                    .send(Err(FusilladeError::Other(anyhow::anyhow!(
+                        "Failed to listen: {}",
+                        e
+                    ))))
+                    .await;
                 return;
             }
 
@@ -1441,7 +1518,8 @@ impl<H: HttpClient + 'static> Storage for PostgresRequestManager<H> {
 
                         // The payload contains: { "id": "...", "state": "...", "updated_at": "..." }
                         // We need to parse the ID and fetch the full request from storage
-                        let parsed: serde_json::Result<serde_json::Value> = serde_json::from_str(payload);
+                        let parsed: serde_json::Result<serde_json::Value> =
+                            serde_json::from_str(payload);
 
                         match parsed {
                             Ok(json) => {
@@ -1459,10 +1537,11 @@ impl<H: HttpClient + 'static> Storage for PostgresRequestManager<H> {
                                         }
 
                                         // Fetch the full request from storage by querying directly
-                                        let fetch_result: Result<Vec<Result<AnyRequest>>> = async {
-                                            let uuid_ids = [*request_id];
-                                            let rows = sqlx::query!(
-                                                r#"
+                                        let fetch_result: Result<Vec<Result<AnyRequest>>> =
+                                            async {
+                                                let uuid_ids = [*request_id];
+                                                let rows = sqlx::query!(
+                                                    r#"
                                                 SELECT
                                                     id, batch_id, template_id, state, endpoint, method, path, body, model, api_key,
                                                     retry_attempt, not_before, daemon_id, claimed_at, started_at,
@@ -1470,90 +1549,124 @@ impl<H: HttpClient + 'static> Storage for PostgresRequestManager<H> {
                                                 FROM requests
                                                 WHERE id = ANY($1)
                                                 "#,
-                                                &uuid_ids[..],
-                                            )
-                                            .fetch_all(&pool)
-                                            .await
-                                            .map_err(|e| FusilladeError::Other(anyhow!("Failed to fetch requests: {}", e)))?;
+                                                    &uuid_ids[..],
+                                                )
+                                                .fetch_all(&pool)
+                                                .await
+                                                .map_err(|e| FusilladeError::Other(anyhow!("Failed to fetch requests: {}", e)))?;
 
-                                            let mut results = Vec::new();
-                                            for row in rows {
-                                                let data = RequestData {
-                                                    id: RequestId(row.id),
-                                                    batch_id: BatchId(row.batch_id),
-                                                    template_id: TemplateId(row.template_id),
-                                                    endpoint: row.endpoint,
-                                                    method: row.method,
-                                                    path: row.path,
-                                                    body: row.body,
-                                                    model: row.model,
-                                                    api_key: row.api_key,
-                                                };
+                                                let mut results = Vec::new();
+                                                for row in rows {
+                                                    let data = RequestData {
+                                                        id: RequestId(row.id),
+                                                        batch_id: BatchId(row.batch_id),
+                                                        template_id: TemplateId(row.template_id),
+                                                        endpoint: row.endpoint,
+                                                        method: row.method,
+                                                        path: row.path,
+                                                        body: row.body,
+                                                        model: row.model,
+                                                        api_key: row.api_key,
+                                                    };
 
-                                                let state = &row.state;
-                                                let any_request = match state.as_str() {
-                                                    "pending" => Ok(AnyRequest::Pending(Request {
-                                                        state: Pending { retry_attempt: row.retry_attempt as u32, not_before: row.not_before },
-                                                        data,
-                                                    })),
-                                                    "claimed" => Ok(AnyRequest::Claimed(Request {
-                                                        state: Claimed {
-                                                            daemon_id: DaemonId(row.daemon_id.ok_or_else(|| FusilladeError::Other(anyhow!("Missing daemon_id")))?),
-                                                            claimed_at: row.claimed_at.ok_or_else(|| FusilladeError::Other(anyhow!("Missing claimed_at")))?,
-                                                            retry_attempt: row.retry_attempt as u32,
-                                                        },
-                                                        data,
-                                                    })),
-                                                    "processing" => {
-                                                        let (_tx, rx) = tokio::sync::mpsc::channel(1);
-                                                        let abort_handle = tokio::spawn(async {}).abort_handle();
-                                                        Ok(AnyRequest::Processing(Request {
-                                                            state: Processing {
-                                                                daemon_id: DaemonId(row.daemon_id.ok_or_else(|| FusilladeError::Other(anyhow!("Missing daemon_id")))?),
-                                                                claimed_at: row.claimed_at.ok_or_else(|| FusilladeError::Other(anyhow!("Missing claimed_at")))?,
-                                                                started_at: row.started_at.ok_or_else(|| FusilladeError::Other(anyhow!("Missing started_at")))?,
-                                                                retry_attempt: row.retry_attempt as u32,
-                                                                result_rx: Arc::new(Mutex::new(rx)),
-                                                                abort_handle,
-                                                            },
-                                                            data,
-                                                        }))
-                                                    }
-                                                    "completed" => Ok(AnyRequest::Completed(Request {
-                                                        state: Completed {
-                                                            response_status: row.response_status.ok_or_else(|| FusilladeError::Other(anyhow!("Missing response_status")))? as u16,
-                                                            response_body: row.response_body.ok_or_else(|| FusilladeError::Other(anyhow!("Missing response_body")))?,
-                                                            claimed_at: row.claimed_at.ok_or_else(|| FusilladeError::Other(anyhow!("Missing claimed_at")))?,
-                                                            started_at: row.started_at.ok_or_else(|| FusilladeError::Other(anyhow!("Missing started_at")))?,
-                                                            completed_at: row.completed_at.ok_or_else(|| FusilladeError::Other(anyhow!("Missing completed_at")))?,
-                                                        },
-                                                        data,
-                                                    })),
-                                                    "failed" => Ok(AnyRequest::Failed(Request {
-                                                        state: Failed {
-                                                            error: row.error.ok_or_else(|| FusilladeError::Other(anyhow!("Missing error")))?,
-                                                            failed_at: row.failed_at.ok_or_else(|| FusilladeError::Other(anyhow!("Missing failed_at")))?,
-                                                            retry_attempt: row.retry_attempt as u32,
-                                                        },
-                                                        data,
-                                                    })),
-                                                    "canceled" => Ok(AnyRequest::Canceled(Request {
-                                                        state: Canceled {
-                                                            canceled_at: row.canceled_at.ok_or_else(|| FusilladeError::Other(anyhow!("Missing canceled_at")))?,
-                                                        },
-                                                        data,
-                                                    })),
-                                                    _ => Err(FusilladeError::Other(anyhow!("Unknown state: {}", state))),
-                                                };
-                                                results.push(any_request);
+                                                    let state = &row.state;
+                                                    let any_request =
+                                                        match state.as_str() {
+                                                            "pending" => Ok(AnyRequest::Pending(Request {
+                                                                state: Pending {
+                                                                    retry_attempt: row.retry_attempt as u32,
+                                                                    not_before: row.not_before,
+                                                                },
+                                                                data,
+                                                            })),
+                                                            "claimed" => Ok(AnyRequest::Claimed(Request {
+                                                                state: Claimed {
+                                                                    daemon_id: DaemonId(row.daemon_id.ok_or_else(|| {
+                                                                        FusilladeError::Other(anyhow!("Missing daemon_id"))
+                                                                    })?),
+                                                                    claimed_at: row.claimed_at.ok_or_else(|| {
+                                                                        FusilladeError::Other(anyhow!("Missing claimed_at"))
+                                                                    })?,
+                                                                    retry_attempt: row.retry_attempt as u32,
+                                                                },
+                                                                data,
+                                                            })),
+                                                            "processing" => {
+                                                                let (_tx, rx) = mpsc::channel(1);
+                                                                let abort_handle = tokio::spawn(async {}).abort_handle();
+                                                                Ok(AnyRequest::Processing(Request {
+                                                                    state: Processing {
+                                                                        daemon_id: DaemonId(row.daemon_id.ok_or_else(|| {
+                                                                            FusilladeError::Other(anyhow!("Missing daemon_id"))
+                                                                        })?),
+                                                                        claimed_at: row.claimed_at.ok_or_else(|| {
+                                                                            FusilladeError::Other(anyhow!("Missing claimed_at"))
+                                                                        })?,
+                                                                        started_at: row.started_at.ok_or_else(|| {
+                                                                            FusilladeError::Other(anyhow!("Missing started_at"))
+                                                                        })?,
+                                                                        retry_attempt: row.retry_attempt as u32,
+                                                                        result_rx: Arc::new(Mutex::new(rx)),
+                                                                        abort_handle,
+                                                                    },
+                                                                    data,
+                                                                }))
+                                                            }
+                                                            "completed" => Ok(AnyRequest::Completed(Request {
+                                                                state: Completed {
+                                                                    response_status: row.response_status.ok_or_else(|| {
+                                                                        FusilladeError::Other(anyhow!("Missing response_status"))
+                                                                    })?
+                                                                        as u16,
+                                                                    response_body: row.response_body.ok_or_else(|| {
+                                                                        FusilladeError::Other(anyhow!("Missing response_body"))
+                                                                    })?,
+                                                                    claimed_at: row.claimed_at.ok_or_else(|| {
+                                                                        FusilladeError::Other(anyhow!("Missing claimed_at"))
+                                                                    })?,
+                                                                    started_at: row.started_at.ok_or_else(|| {
+                                                                        FusilladeError::Other(anyhow!("Missing started_at"))
+                                                                    })?,
+                                                                    completed_at: row.completed_at.ok_or_else(|| {
+                                                                        FusilladeError::Other(anyhow!("Missing completed_at"))
+                                                                    })?,
+                                                                },
+                                                                data,
+                                                            })),
+                                                            "failed" => Ok(AnyRequest::Failed(Request {
+                                                                state: Failed {
+                                                                    error: row
+                                                                        .error
+                                                                        .ok_or_else(|| FusilladeError::Other(anyhow!("Missing error")))?,
+                                                                    failed_at: row.failed_at.ok_or_else(|| {
+                                                                        FusilladeError::Other(anyhow!("Missing failed_at"))
+                                                                    })?,
+                                                                    retry_attempt: row.retry_attempt as u32,
+                                                                },
+                                                                data,
+                                                            })),
+                                                            "canceled" => Ok(AnyRequest::Canceled(Request {
+                                                                state: Canceled {
+                                                                    canceled_at: row.canceled_at.ok_or_else(|| {
+                                                                        FusilladeError::Other(anyhow!("Missing canceled_at"))
+                                                                    })?,
+                                                                },
+                                                                data,
+                                                            })),
+                                                            _ => Err(FusilladeError::Other(anyhow!("Unknown state: {}", state))),
+                                                        };
+                                                    results.push(any_request);
+                                                }
+                                                Ok(results)
                                             }
-                                            Ok(results)
-                                        }.await;
+                                            .await;
 
                                         match fetch_result {
                                             Ok(results) => {
                                                 if let Some(result) = results.into_iter().next() {
-                                                    yield Ok(result);
+                                                    if tx.send(Ok(result)).await.is_err() {
+                                                        return;
+                                                    }
                                                 }
                                             }
                                             Err(e) => {
@@ -1562,14 +1675,22 @@ impl<H: HttpClient + 'static> Storage for PostgresRequestManager<H> {
                                                     request_id = %request_id,
                                                     "Failed to fetch request after notification"
                                                 );
-                                                yield Err(e);
+                                                if tx.send(Err(e)).await.is_err() {
+                                                    return;
+                                                }
                                             }
                                         }
                                     } else {
-                                        tracing::warn!(id_str = id_str, "Failed to parse UUID from notification");
+                                        tracing::warn!(
+                                            id_str = id_str,
+                                            "Failed to parse UUID from notification"
+                                        );
                                     }
                                 } else {
-                                    tracing::warn!(payload = payload, "Notification payload missing 'id' field");
+                                    tracing::warn!(
+                                        payload = payload,
+                                        "Notification payload missing 'id' field"
+                                    );
                                 }
                             }
                             Err(e) => {
@@ -1583,12 +1704,23 @@ impl<H: HttpClient + 'static> Storage for PostgresRequestManager<H> {
                     }
                     Err(e) => {
                         tracing::error!(error = %e, "Error receiving notification");
-                        yield Err(FusilladeError::Other(anyhow::anyhow!("Notification error: {}", e)));
+                        if tx
+                            .send(Err(FusilladeError::Other(anyhow::anyhow!(
+                                "Notification error: {}",
+                                e
+                            ))))
+                            .await
+                            .is_err()
+                        {
+                            return;
+                        }
                         // Don't return - keep trying to receive notifications
                     }
                 }
             }
-        })
+        });
+
+        Box::pin(ReceiverStream::new(rx))
     }
 }
 

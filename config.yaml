@@ -13,12 +13,8 @@ database:
   # random port, and data is stored in $HOME/.dwctl_data/
   # To have data not persists across restarts, set persistent=false.
   # We strongly recommend setting up external postgres in production!
-  type: embedded
-  data_dir: null
-  persistent: true
-
-  # TODO: Use an external database in production
-  # type: external
+  type: external
+  url: postgres://postgres:postgres@localhost:5432/dwctl
 
 # Admin user email - will be created on first startup
 admin_email: "test@doubleword.ai"
@@ -67,7 +63,7 @@ auth:
   # Proxy header authentication. Will accept & autocreate users based on emails
   # supplied in a header. Lets you use an upstream proxy to authenticate users.
   proxy_header:
-    enabled: false # X-Doubleword-User header auth
+    enabled: true # X-Doubleword-User header auth
     header_name: "x-doubleword-user"
     auto_create_users: true
 
@@ -95,4 +91,7 @@ enable_request_logging: true # Enable request/response logging to database
 # (e.g., config.production.yaml) rather than env vars.
 
 files:
-  max_file_size: 104857600 # 100 MB
+  max_file_size: 2147483648 # 2 GB
+  upload_buffer_size: 100 # Buffer size for file upload streams (default: 100)
+  download_buffer_size: 100 # Buffer size for file download streams (default: 100)
+

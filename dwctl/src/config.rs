@@ -238,6 +238,10 @@ pub struct FilesConfig {
     pub min_expiry_seconds: i64,
     /// Maximum expiration time in seconds (default: 30 days)
     pub max_expiry_seconds: i64,
+    /// Buffer size for file upload streams (default: 100)
+    pub upload_buffer_size: usize,
+    /// Buffer size for file download streams (default: 100)
+    pub download_buffer_size: usize,
 }
 
 impl Default for FilesConfig {
@@ -247,6 +251,8 @@ impl Default for FilesConfig {
             default_expiry_seconds: 24 * 60 * 60,  // 24 hours
             min_expiry_seconds: 60 * 60,           // 1 hour
             max_expiry_seconds: 30 * 24 * 60 * 60, // 30 days
+            upload_buffer_size: 100,
+            download_buffer_size: 100,
         }
     }
 }

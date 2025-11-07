@@ -23,6 +23,8 @@ use futures::stream::Stream;
 use futures::StreamExt;
 use serde::{Deserialize, Serialize};
 use std::pin::Pin;
+use tokio::sync::mpsc;
+use tokio_stream::wrappers::ReceiverStream;
 use uuid::Uuid;
 
 /// OpenAI Batch API request format
@@ -95,15 +97,18 @@ impl OpenAIBatchRequest {
 /// # Arguments
 /// * `endpoint` - Target endpoint for batch requests (e.g., "http://localhost:8080/ai")
 /// * `api_key` - API key to inject for request execution
-#[tracing::instrument(skip(multipart, api_key), fields(max_file_size, uploaded_by = ?uploaded_by, endpoint = %endpoint))]
+#[tracing::instrument(skip(multipart, api_key), fields(max_file_size, uploaded_by = ?uploaded_by, endpoint = %endpoint, buffer_size))]
 fn create_file_stream(
     mut multipart: Multipart,
     max_file_size: u64,
     uploaded_by: Option<String>,
     endpoint: String,
     api_key: String,
+    buffer_size: usize,
 ) -> Pin<Box<dyn Stream<Item = fusillade::FileStreamItem> + Send>> {
-    Box::pin(async_stream::stream! {
+    let (tx, rx) = mpsc::channel(buffer_size);
+
+    tokio::spawn(async move {
         let mut total_size = 0i64;
         let mut line_count = 0u64;
         let mut incomplete_line = String::new();
@@ -139,8 +144,10 @@ fn create_file_stream(
                     // Extract filename from the field
                     metadata.filename = field.file_name().map(|s| s.to_string());
 
-                    // Yield metadata before processing file content
-                    yield fusillade::FileStreamItem::Metadata(metadata.clone());
+                    // Send metadata before processing file content
+                    if tx.send(fusillade::FileStreamItem::Metadata(metadata.clone())).await.is_err() {
+                        return;
+                    }
 
                     // Now stream and parse the file content
                     let mut field = field;
@@ -149,9 +156,21 @@ fn create_file_stream(
                         let chunk_size = chunk.len() as i64;
                         total_size += chunk_size;
 
+                        tracing::debug!(
+                            "Processing chunk: {} bytes, total: {} bytes, lines so far: {}",
+                            chunk_size,
+                            total_size,
+                            line_count
+                        );
+
                         // Check size limit
                         if total_size > max_file_size as i64 {
-                            yield fusillade::FileStreamItem::Error(format!("File size exceeds maximum: {} > {}", total_size, max_file_size));
+                            let _ = tx
+                                .send(fusillade::FileStreamItem::Error(format!(
+                                    "File size exceeds maximum: {} > {}",
+                                    total_size, max_file_size
+                                )))
+                                .await;
                             return;
                         }
 
@@ -159,7 +178,9 @@ fn create_file_stream(
                         let chunk_str = match std::str::from_utf8(&chunk) {
                             Ok(s) => s,
                             Err(_) => {
-                                yield fusillade::FileStreamItem::Error("File contains invalid UTF-8".to_string());
+                                let _ = tx
+                                    .send(fusillade::FileStreamItem::Error("File contains invalid UTF-8".to_string()))
+                                    .await;
                                 return;
                             }
                         };
@@ -198,16 +219,30 @@ fn create_file_stream(
                                         Ok(template) => {
                                             line_count += 1;
                                             incomplete_line.clear();
-                                            yield fusillade::FileStreamItem::Template(template);
+                                            if tx.send(fusillade::FileStreamItem::Template(template)).await.is_err() {
+                                                return;
+                                            }
                                         }
                                         Err(e) => {
-                                            yield fusillade::FileStreamItem::Error(format!("Failed to transform request on line {}: {:?}", line_count + 1, e));
+                                            let _ = tx
+                                                .send(fusillade::FileStreamItem::Error(format!(
+                                                    "Failed to transform request on line {}: {:?}",
+                                                    line_count + 1,
+                                                    e
+                                                )))
+                                                .await;
                                             return;
                                         }
                                     }
                                 }
                                 Err(e) => {
-                                    yield fusillade::FileStreamItem::Error(format!("Invalid JSON on line {}: {}", line_count + 1, e));
+                                    let _ = tx
+                                        .send(fusillade::FileStreamItem::Error(format!(
+                                            "Invalid JSON on line {}: {}",
+                                            line_count + 1,
+                                            e
+                                        )))
+                                        .await;
                                     return;
                                 }
                             }
@@ -219,20 +254,24 @@ fn create_file_stream(
                         let trimmed = incomplete_line.trim();
                         if !trimmed.is_empty() {
                             match serde_json::from_str::<OpenAIBatchRequest>(trimmed) {
-                                Ok(openai_req) => {
-                                    match openai_req.to_internal(&endpoint, api_key.clone()) {
-                                        Ok(template) => {
-                                            line_count += 1;
-                                            yield fusillade::FileStreamItem::Template(template);
-                                        }
-                                        Err(e) => {
-                                            yield fusillade::FileStreamItem::Error(format!("Failed to transform final line: {:?}", e));
+                                Ok(openai_req) => match openai_req.to_internal(&endpoint, api_key.clone()) {
+                                    Ok(template) => {
+                                        line_count += 1;
+                                        if tx.send(fusillade::FileStreamItem::Template(template)).await.is_err() {
                                             return;
                                         }
                                     }
-                                }
+                                    Err(e) => {
+                                        let _ = tx
+                                            .send(fusillade::FileStreamItem::Error(format!("Failed to transform final line: {:?}", e)))
+                                            .await;
+                                        return;
+                                    }
+                                },
                                 Err(e) => {
-                                    yield fusillade::FileStreamItem::Error(format!("Invalid JSON on final line: {}", e));
+                                    let _ = tx
+                                        .send(fusillade::FileStreamItem::Error(format!("Invalid JSON on final line: {}", e)))
+                                        .await;
                                     return;
                                 }
                             }
@@ -241,7 +280,11 @@ fn create_file_stream(
 
                     // Check if file is empty (no templates parsed)
                     if line_count == 0 {
-                        yield fusillade::FileStreamItem::Error("File contains no valid request templates".to_string());
+                        let _ = tx
+                            .send(fusillade::FileStreamItem::Error(
+                                "File contains no valid request templates".to_string(),
+                            ))
+                            .await;
                         return;
                     }
 
@@ -259,13 +302,19 @@ fn create_file_stream(
 
         // After all fields are processed, check if we got a file
         if !file_processed {
-            yield fusillade::FileStreamItem::Error("No file field found in multipart upload".to_string());
+            let _ = tx
+                .send(fusillade::FileStreamItem::Error(
+                    "No file field found in multipart upload".to_string(),
+                ))
+                .await;
             return;
         }
 
-        // Yield final metadata with all fields (including any that came after the file)
-        yield fusillade::FileStreamItem::Metadata(metadata.clone());
-    })
+        // Send final metadata with all fields (including any that came after the file)
+        let _ = tx.send(fusillade::FileStreamItem::Metadata(metadata.clone())).await;
+    });
+
+    Box::pin(ReceiverStream::new(rx))
 }
 
 #[utoipa::path(
@@ -309,7 +358,14 @@ pub async fn upload_file(
     let endpoint = format!("http://{}:{}/ai", state.config.host, state.config.port);
 
     // Create a stream that parses the multipart upload and yields FileStreamItems
-    let file_stream = create_file_stream(multipart, max_file_size, uploaded_by, endpoint, system_key.secret);
+    let file_stream = create_file_stream(
+        multipart,
+        max_file_size,
+        uploaded_by,
+        endpoint,
+        system_key.secret,
+        state.config.files.upload_buffer_size,
+    );
 
     // Create file via request manager with streaming
     let created_file_id = state.request_manager.create_file_stream(file_stream).await.map_err(|e| match e {
@@ -881,5 +937,53 @@ mod tests {
         get_response.assert_status(axum::http::StatusCode::OK);
         let retrieved_file: FileResponse = get_response.json();
         assert_eq!(retrieved_file.purpose, crate::api::models::files::Purpose::Batch);
+    }
+
+    #[sqlx::test]
+    #[test_log::test]
+    async fn test_upload_duplicate_filename(pool: PgPool) {
+        let (app, _) = create_test_app(pool.clone(), false).await;
+        let user = create_test_user_with_roles(&pool, vec![Role::StandardUser, Role::BatchAPIUser]).await;
+
+        // Create test JSONL content
+        let jsonl_content = r#"{"custom_id":"request-1","method":"POST","url":"/v1/chat/completions","body":{"model":"gpt-4","messages":[{"role":"user","content":"Hello"}]}}"#;
+
+        // Upload first file with a specific filename
+        let file_part1 = axum_test::multipart::Part::bytes(jsonl_content.as_bytes()).file_name("duplicate-test.jsonl");
+
+        let upload_response1 = app
+            .post("/admin/api/v1/files")
+            .add_header(add_auth_headers(&user).0, add_auth_headers(&user).1)
+            .multipart(
+                axum_test::multipart::MultipartForm::new()
+                    .add_text("purpose", "batch")
+                    .add_part("file", file_part1),
+            )
+            .await;
+
+        // First upload should succeed
+        upload_response1.assert_status(axum::http::StatusCode::CREATED);
+
+        // Try to upload another file with the same filename
+        let file_part2 = axum_test::multipart::Part::bytes(jsonl_content.as_bytes()).file_name("duplicate-test.jsonl");
+
+        let upload_response2 = app
+            .post("/admin/api/v1/files")
+            .add_header(add_auth_headers(&user).0, add_auth_headers(&user).1)
+            .multipart(
+                axum_test::multipart::MultipartForm::new()
+                    .add_text("purpose", "batch")
+                    .add_part("file", file_part2),
+            )
+            .await;
+
+        // Second upload should fail with 400 Bad Request
+        upload_response2.assert_status(axum::http::StatusCode::BAD_REQUEST);
+        let error_body = upload_response2.text();
+        assert!(
+            error_body.contains("already exists"),
+            "Error message should mention file already exists: {}",
+            error_body
+        );
     }
 }

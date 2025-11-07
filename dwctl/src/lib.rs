@@ -1,8 +1,14 @@
-mod api;
+// TODO: This file has gotten way too big. We need to refactor it into smaller modules.
+// The router should be a builder pattern. CTRL-C logic should be in main.
+// Embedded asset handlers should be in api/handlers/
+// Leader election should be in its own module.
+// The constructors in test_utils should be unified with the actual constructors: right now they're
+// actually the best lib way to construct things, which is bad.
+pub mod api;
 mod auth;
 pub mod config;
 mod crypto;
-mod db;
+pub mod db;
 mod email;
 mod errors;
 mod metrics;
@@ -15,8 +21,8 @@ pub mod telemetry;
 mod types;
 use crate::config::CorsOrigin;
 
-#[cfg(test)]
-mod test_utils;
+#[cfg(any(test, feature = "test-utils"))]
+pub mod test_utils;
 
 use crate::{
     api::models::users::Role,
@@ -41,7 +47,7 @@ use axum::{
 use axum_prometheus::PrometheusMetricLayer;
 use bon::Builder;
 pub use config::Config;
-use outlet::{RequestLoggerConfig, RequestLoggerLayer};
+use outlet::{PathFilter, RequestLoggerConfig, RequestLoggerLayer};
 use outlet_postgres::PostgresHandler;
 use request_logging::{AiRequest, AiResponse};
 use sqlx::{ConnectOptions, Executor, PgPool};
@@ -70,6 +76,11 @@ pub struct AppState {
     #[builder(default = false)]
     pub is_leader: bool,
     pub request_manager: Arc<fusillade::PostgresRequestManager<fusillade::ReqwestHttpClient>>,
+}
+
+/// Get the dwctl database migrator
+pub fn migrator() -> sqlx::migrate::Migrator {
+    sqlx::migrate!("./migrations")
 }
 
 /// Create the initial admin user if it doesn't exist
@@ -376,7 +387,9 @@ pub async fn setup_app(
 
     // Initialize the fusillade request manager (for batch processing)
     // Use the fusillade_pool which has search_path set to 'fusillade' schema
-    let request_manager = Arc::new(fusillade::PostgresRequestManager::new(fusillade_pool.clone()));
+    let request_manager = Arc::new(
+        fusillade::PostgresRequestManager::new(fusillade_pool.clone()).with_download_buffer_size(config.files.download_buffer_size),
+    );
 
     let is_leader: bool;
 
@@ -563,7 +576,6 @@ pub async fn build_router(state: &mut AppState, onwards_router: Router) -> anyho
         let postgres_handler = PostgresHandler::<AiRequest, AiResponse>::from_pool(outlet_pool.clone())
             .await
             .expect("Failed to create PostgresHandler for request logging")
-            .with_path_prefix("/ai/")
             .with_request_serializer(parse_ai_request)
             .with_response_serializer(analytics_serializer.create_serializer());
 
@@ -572,6 +584,10 @@ pub async fn build_router(state: &mut AppState, onwards_router: Router) -> anyho
         let outlet_config = RequestLoggerConfig {
             capture_request_body: true,
             capture_response_body: true,
+            path_filter: Some(PathFilter {
+                allowed_prefixes: vec!["/ai/".to_string()],
+                blocked_prefixes: vec![],
+            }),
         };
 
         Some(RequestLoggerLayer::new(outlet_config, postgres_handler))
@@ -817,7 +833,7 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
     let pool = PgPool::connect(&database_url).await?;
 
     // Run migrations
-    sqlx::migrate!("./migrations").run(&pool).await?;
+    migrator().run(&pool).await?;
 
     // Setup fusillade schema and run migrations
     // Run fusillade migrations in separate schema
@@ -846,7 +862,9 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
     let (router, onwards_config_sync, _drop_guard) = setup_app(pool.clone(), fusillade_pool.clone(), config.clone(), false).await?;
 
     // Apply middleware at root level BEFORE routing decisions are made
-    let request_manager = Arc::new(fusillade::PostgresRequestManager::new(fusillade_pool.clone()));
+    let request_manager = Arc::new(
+        fusillade::PostgresRequestManager::new(fusillade_pool.clone()).with_download_buffer_size(config.files.download_buffer_size),
+    );
     let middleware = from_fn_with_state(
         AppState::builder()
             .db(pool.clone())

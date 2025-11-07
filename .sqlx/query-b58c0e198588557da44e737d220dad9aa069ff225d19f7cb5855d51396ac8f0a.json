@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "\n            SELECT id, file_id, custom_id, endpoint, method, path, body, model, api_key, created_at, updated_at\n            FROM request_templates\n            WHERE file_id = $1\n            ORDER BY created_at ASC\n            ",
+  "query": "\n            SELECT id, file_id, custom_id, endpoint, method, path, body, model, api_key, created_at, updated_at\n            FROM request_templates\n            WHERE file_id = $1\n            ORDER BY line_number ASC\n            ",
   "describe": {
     "columns": [
       {
@@ -78,5 +78,5 @@
       false
     ]
   },
-  "hash": "da91d28daf6915fb223654e2bdd3effc6b1e6ce2c8c3fdec2e2c8d9dbe957d6e"
+  "hash": "b58c0e198588557da44e737d220dad9aa069ff225d19f7cb5855d51396ac8f0a"
 }
