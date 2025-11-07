@@ -4,6 +4,7 @@ import {
   Rocket,
   FileText,
   Activity,
+  Box,
   Trash2,
   Download,
 } from "lucide-react";
@@ -217,7 +218,7 @@ export function Batches() {
               </p>
             </div>
             <div className="p-3 bg-purple-100 rounded-lg">
-              <Activity className="w-6 h-6 text-purple-600" />
+              <Box className="w-6 h-6 text-purple-600" />
             </div>
           </div>
         </div>

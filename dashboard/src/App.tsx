@@ -18,6 +18,7 @@ import {
 import { AppLayout } from "./components/layout";
 import {
   ProtectedRoute,
+  DemoOnlyRoute,
   LoginForm,
   RegisterForm,
   AuthGuard,
@@ -193,7 +194,9 @@ function AppRoutes() {
           element={
             <AppLayout>
               <ProtectedRoute path="/batches">
-                <Batches />
+                <DemoOnlyRoute featureName="Batch processing">
+                  <Batches />
+                </DemoOnlyRoute>
               </ProtectedRoute>
             </AppLayout>
           }
