@@ -7,6 +7,7 @@
 
 use crate::api::models::files::{FileDeleteResponse, FileListResponse, FileResponse, ListFilesQuery, ListObject, ObjectType, Purpose};
 use crate::auth::permissions::{can_read_all_resources, has_permission, operation, resource, RequiresPermission};
+
 use crate::db::handlers::{api_keys::ApiKeys, repository::Repository};
 use crate::errors::{Error, Result};
 use crate::types::{Operation, Resource};
@@ -18,6 +19,7 @@ use axum::{
     http::StatusCode,
     Json,
 };
+use fusillade::Storage;
 use fusillade::Storage;
 use futures::stream::Stream;
 use futures::StreamExt;
@@ -660,8 +662,6 @@ pub async fn delete_file(
     let file_id = Uuid::parse_str(&file_id_str).map_err(|_| Error::BadRequest {
         message: "Invalid file ID format".to_string(),
     })?;
-
-    use fusillade::Storage;
 
     // First, get the file to check ownership
     let file = state
