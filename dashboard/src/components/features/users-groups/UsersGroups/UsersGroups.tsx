@@ -8,6 +8,7 @@ import {
   useDeleteGroup,
   type Group as BackendGroup,
 } from "../../../../api/control-layer";
+import { useSettings } from "../../../../contexts";
 import {
   CreateUserModal,
   CreateGroupModal,
@@ -17,6 +18,7 @@ import {
   DeleteUserModal,
   GroupManagementModal,
   DeleteGroupModal,
+  UserTransactionsModal,
 } from "../../../modals";
 import { GroupActionsDropdown } from "../";
 import { UserAvatar, Button } from "../../../ui";
@@ -56,6 +58,7 @@ const getGroupColor = (_groupId: string, index: number): string => {
 const UsersGroups: React.FC = () => {
   const [searchParams] = useSearchParams();
   const navigate = useNavigate();
+  const { isFeatureEnabled } = useSettings();
 
   // Get tab from URL or default to "users"
   const tabFromUrl = searchParams.get("tab");
@@ -112,6 +115,8 @@ const UsersGroups: React.FC = () => {
   const [showEditGroupModal, setShowEditGroupModal] = useState(false);
   const [showBulkDeleteModal, setShowBulkDeleteModal] = useState(false);
   const [showBulkDeleteGroupsModal, setShowBulkDeleteGroupsModal] =
+    useState(false);
+  const [showUserTransactionsModal, setShowUserTransactionsModal] =
     useState(false);
 
   // 'active' means the 3 dots have been clicked on a user or group, vs. selected in the table.
@@ -218,7 +223,12 @@ const UsersGroups: React.FC = () => {
       setActiveUser(user);
       setShowUserGroupsModal(true);
     },
+    onViewTransactions: (user) => {
+      setActiveUser(user);
+      setShowUserTransactionsModal(true);
+    },
     groups: groups,
+    showTransactions: isFeatureEnabled("use_billing"),
   });
 
   if (loading) {
@@ -619,6 +629,16 @@ const UsersGroups: React.FC = () => {
             name: activeGroup.name,
             description: activeGroup.description || "",
           }}
+        />
+      )}
+      {activeUser && (
+        <UserTransactionsModal
+          isOpen={showUserTransactionsModal}
+          onClose={() => {
+            setShowUserTransactionsModal(false);
+            setActiveUser(null);
+          }}
+          user={activeUser}
         />
       )}
 
