@@ -111,6 +111,7 @@ fn create_file_stream(
             uploaded_by,
             ..Default::default()
         };
+        let mut file_processed = false;
 
         // Parse multipart fields
         while let Ok(Some(field)) = multipart.next_field().await {
@@ -136,7 +137,6 @@ fn create_file_stream(
                 }
                 "file" => {
                     // Extract filename from the field
-                    // TODO: What happens if the metadata fields are sent after the file field?
                     metadata.filename = field.file_name().map(|s| s.to_string());
 
                     // Yield metadata before processing file content
@@ -221,7 +221,10 @@ fn create_file_stream(
                             match serde_json::from_str::<OpenAIBatchRequest>(trimmed) {
                                 Ok(openai_req) => {
                                     match openai_req.to_internal(&endpoint, api_key.clone()) {
-                                        Ok(template) => yield fusillade::FileStreamItem::Template(template),
+                                        Ok(template) => {
+                                            line_count += 1;
+                                            yield fusillade::FileStreamItem::Template(template);
+                                        }
                                         Err(e) => {
                                             yield fusillade::FileStreamItem::Error(format!("Failed to transform final line: {:?}", e));
                                             return;
@@ -242,18 +245,26 @@ fn create_file_stream(
                         return;
                     }
 
-                    // Yield final metadata with size
+                    // Set the size and mark file as processed
                     metadata.size_bytes = Some(total_size);
-                    yield fusillade::FileStreamItem::Metadata(metadata.clone());
+                    file_processed = true;
 
-                    // File field processed, we're done
-                    return;
+                    // Continue processing remaining fields (metadata after file)
                 }
                 _ => {
                     // Unknown field, skip it
                 }
             }
         }
+
+        // After all fields are processed, check if we got a file
+        if !file_processed {
+            yield fusillade::FileStreamItem::Error("No file field found in multipart upload".to_string());
+            return;
+        }
+
+        // Yield final metadata with all fields (including any that came after the file)
+        yield fusillade::FileStreamItem::Metadata(metadata.clone());
     })
 }
 
@@ -828,5 +839,47 @@ mod tests {
 
         // Should reject with 400 Bad Request
         upload_response.assert_status(axum::http::StatusCode::BAD_REQUEST);
+    }
+
+    #[sqlx::test]
+    #[test_log::test]
+    async fn test_upload_with_metadata_after_file_field(pool: PgPool) {
+        let (app, _) = create_test_app(pool.clone(), false).await;
+        let user = create_test_user_with_roles(&pool, vec![Role::StandardUser, Role::BatchAPIUser]).await;
+
+        // Create test JSONL content
+        let jsonl_content = r#"{"custom_id":"request-1","method":"POST","url":"/v1/chat/completions","body":{"model":"gpt-4","messages":[{"role":"user","content":"Hello"}]}}"#;
+
+        let file_part = axum_test::multipart::Part::bytes(jsonl_content.as_bytes()).file_name("test-batch.jsonl");
+
+        // NOTE: The file field is added BEFORE the metadata fields (purpose, expires_after)
+        // This tests whether the handler correctly processes metadata regardless of field order
+        let upload_response = app
+            .post("/admin/api/v1/files")
+            .add_header(add_auth_headers(&user).0, add_auth_headers(&user).1)
+            .multipart(
+                axum_test::multipart::MultipartForm::new()
+                    .add_part("file", file_part)
+                    .add_text("purpose", "batch")
+                    .add_text("expires_after[anchor]", "processing_complete")
+                    .add_text("expires_after[seconds]", "86400"),
+            )
+            .await;
+
+        // Should succeed
+        upload_response.assert_status(axum::http::StatusCode::CREATED);
+        let file: FileResponse = upload_response.json();
+
+        // Verify the file was created - now let's check if metadata was captured
+        // We need to query the database or fusillade to verify the metadata was stored
+        // For now, we verify the upload succeeded and the file exists
+        let get_response = app
+            .get(&format!("/admin/api/v1/files/{}", file.id))
+            .add_header(add_auth_headers(&user).0, add_auth_headers(&user).1)
+            .await;
+
+        get_response.assert_status(axum::http::StatusCode::OK);
+        let retrieved_file: FileResponse = get_response.json();
+        assert_eq!(retrieved_file.purpose, crate::api::models::files::Purpose::Batch);
     }
 }

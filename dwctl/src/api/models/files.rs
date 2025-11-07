@@ -42,7 +42,7 @@ pub enum ObjectType {
 }
 
 /// Purpose - always "batch" for our use case
-#[derive(Debug, Serialize, Deserialize, ToSchema)]
+#[derive(Debug, Serialize, Deserialize, ToSchema, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
 pub enum Purpose {
     Batch,
