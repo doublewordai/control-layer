@@ -17,7 +17,7 @@ import { useUser, useConfig } from "../../../api/control-layer/hooks";
 import { UserAvatar } from "../../ui";
 import { useAuthorization } from "../../../utils";
 import { useAuth } from "../../../contexts/auth";
-import { useSettings } from "../../../contexts"; // Add this import
+import { useSettings } from "../../../contexts";
 import onwardsLogo from "../../../assets/onwards-logo.svg";
 import {
   Sidebar,
@@ -46,13 +46,13 @@ export function AppSidebar() {
   const { data: currentUser, isLoading: loading } = useUser("current");
   const { canAccessRoute } = useAuthorization();
   const { logout } = useAuth();
-  const { isFeatureEnabled } = useSettings(); // Add this hook
+  const { isFeatureEnabled } = useSettings();
 
   const allNavItems = [
     { path: "/models", icon: Layers, label: "Models" },
     { path: "/endpoints", icon: Server, label: "Endpoints" },
     { path: "/playground", icon: Play, label: "Playground" },
-    { path: "/batches", icon: Box, label: "Batches", demoOnly: true }, // Add demoOnly flag
+    { path: "/batches", icon: Box, label: "Batches", demoOnly: true },
     { path: "/analytics", icon: Activity, label: "Traffic" },
     { path: "/users-groups", icon: Users, label: "Users & Groups" },
     { path: "/api-keys", icon: Key, label: "API Keys" },

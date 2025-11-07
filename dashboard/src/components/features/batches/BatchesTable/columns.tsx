@@ -22,7 +22,7 @@ import {
   DropdownMenuTrigger,
 } from "../../../ui/dropdown-menu";
 import { Progress } from "../../../ui/progress"; 
-import { formatTimestamp, formatLongDuration } from "../../../../utils"; // Change here
+import { formatTimestamp, formatLongDuration } from "../../../../utils";
 import type { Batch, BatchStatus } from "../types";
 
 interface ColumnActions {
@@ -190,7 +190,7 @@ export const createBatchColumns = (
       return (
         <div className="flex items-center gap-1 text-sm text-gray-700">
           <Clock className="w-3 h-3" />
-          {formatLongDuration(duration)} {/* Use new formatter */}
+          {formatLongDuration(duration)}
         </div>
       );
     },
