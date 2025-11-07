@@ -11,3 +11,4 @@ export * from "./EditGroupModal";
 export * from "./EditUserModal";
 export * from "./GroupManagementModal";
 export * from "./UserGroupsModal";
+export * from "./UserTransactionsModal";

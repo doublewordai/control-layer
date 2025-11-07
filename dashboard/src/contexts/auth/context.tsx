@@ -9,12 +9,16 @@ import type {
   LoginCredentials,
   RegisterCredentials,
 } from "./types";
+import {useSettings} from "@/contexts";
 
 interface AuthProviderProps {
   children: ReactNode;
 }
 
 export function AuthProvider({ children }: AuthProviderProps) {
+  const { isFeatureEnabled, isMswReady } = useSettings();
+  const isDemoMode = isFeatureEnabled("demo");
+
   const [authState, setAuthState] = useState<AuthState>({
     user: null,
     isAuthenticated: false,
@@ -24,10 +28,15 @@ export function AuthProvider({ children }: AuthProviderProps) {
 
   const queryClient = useQueryClient();
 
-  // Check authentication status on mount
+  // Check authentication status on mount, but wait for MSW in demo mode
   useEffect(() => {
+    // If in demo mode, wait for MSW to be ready before checking auth
+    if (isDemoMode && !isMswReady) {
+      return;
+    }
+
     checkAuthStatus();
-  }, []);
+  }, [isDemoMode, isMswReady]);
 
   const checkAuthStatus = async () => {
     try {

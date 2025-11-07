@@ -7,6 +7,7 @@ export type PagePermission =
   | "endpoints"
   | "playground"
   | "analytics"
+  | "cost-management"
   | "users-groups"
   | "api-keys"
   | "settings"
@@ -20,14 +21,15 @@ const ROLE_PERMISSIONS: Record<Role, PagePermission[]> = {
     "endpoints",
     "playground",
     "analytics",
+    "cost-management",
     "users-groups",
     "api-keys",
     "settings",
     "profile",
     "manage-groups",
   ],
-  StandardUser: ["models", "api-keys", "playground", "profile"],
-  RequestViewer: ["models", "endpoints", "analytics", "profile", "settings"],
+  StandardUser: ["models", "api-keys", "playground", "cost-management", "profile"],
+  RequestViewer: ["models", "endpoints", "analytics", "cost-management", "profile", "settings"],
 };
 
 // Map route paths to permissions
@@ -36,6 +38,7 @@ export const ROUTE_PERMISSIONS: Record<string, PagePermission> = {
   "/endpoints": "endpoints",
   "/playground": "playground",
   "/analytics": "analytics",
+  "/cost-management": "cost-management",
   "/users-groups": "users-groups",
   "/api-keys": "api-keys",
   "/settings": "settings",
