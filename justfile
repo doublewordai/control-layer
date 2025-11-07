@@ -479,8 +479,6 @@ lint target *args="":
             cargo fmt --check
             echo "Running cargo clippy..."
             cargo clippy {{args}}
-            # echo "Checking SQLx prepared queries..."
-            # cargo sqlx prepare --check --workspace
             ;;
         *)
             echo "Usage: just lint [ts|rust]"

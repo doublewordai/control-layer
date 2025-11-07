@@ -210,7 +210,7 @@ async fn load_targets_from_db(db: &PgPool) -> Result<Targets, anyhow::Error> {
 
         // Fetch API keys for each deployment
         for model in &models {
-            match api_keys_repo.get_api_keys_for_deployment(model.id).await {
+            match api_keys_repo.get_api_keys_for_deployment_with_sufficient_credit(model.id).await {
                 Ok(keys) => {
                     debug!("Found {} API keys for deployment '{}' ({})", keys.len(), model.alias, model.id);
                     deployment_api_keys.insert(model.id, keys);

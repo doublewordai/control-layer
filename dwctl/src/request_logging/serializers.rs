@@ -1692,7 +1692,7 @@ mod tests {
 
         #[sqlx::test]
         #[test_log::test]
-        async fn test_insufficient_balance_blocks_transaction(pool: sqlx::PgPool) {
+        async fn test_insufficient_balance_still_accrues_usage_transaction(pool: sqlx::PgPool) {
             // Setup: User with insufficient balance (0.01)
             let initial_balance = Decimal::from_str("0.01").unwrap();
             let user_id = setup_user_with_balance(&pool, initial_balance).await;
@@ -1708,23 +1708,20 @@ mod tests {
             // Analytics record should still be created successfully
             assert!(result.is_ok(), "Analytics record should be created even if credit deduction fails");
 
-            // Verify: Balance should remain unchanged (transaction blocked by CHECK constraint)
+            // Verify: Balance should go negative as used more than available
             let mut conn = pool.acquire().await.unwrap();
             let mut credits = Credits::new(&mut conn);
             let final_balance = credits.get_user_balance(user_id).await.unwrap();
 
-            // Balance should remain unchanged because the transaction was rejected
-            assert_eq!(
-                final_balance, initial_balance,
-                "Balance should remain unchanged when transaction is blocked"
-            );
-
-            // Verify: No Usage transaction was created (failed due to constraint)
+            let expected_cost = Decimal::from_str("0.025").unwrap();
+            let expected_balance = initial_balance - expected_cost;
+            assert_eq!(final_balance, expected_balance, "Balance should reflect overdraft");
+            // Verify: Usage transaction was created
             let transactions = credits.list_user_transactions(user_id, 0, 10).await.unwrap();
             let usage_tx = transactions.iter().find(|tx| tx.transaction_type == CreditTransactionType::Usage);
             assert!(
-                usage_tx.is_none(),
-                "Usage transaction should not be created when balance would go negative"
+                usage_tx.is_some(),
+                "Usage transaction should be created even with insufficient balance"
             );
         }
 

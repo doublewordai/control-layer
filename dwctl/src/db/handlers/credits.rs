@@ -247,7 +247,7 @@ impl<'c> Credits<'c> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{api::models::users::Role, db::errors::DbError};
+    use crate::api::models::users::Role;
     use rust_decimal::Decimal;
     use sqlx::PgPool;
     use std::str::FromStr;
@@ -346,57 +346,36 @@ mod tests {
 
     #[sqlx::test]
     #[test_log::test]
-    async fn test_rejection_if_balance_is_insufficient(pool: PgPool) {
+    async fn test_get_user_balance_after_transactions_negative_balance(pool: PgPool) {
         let user_id = create_test_user(&pool).await;
         let mut conn = pool.acquire().await.expect("Failed to acquire connection");
         let mut credits = Credits::new(&mut conn);
 
-        // Try to remove credits from admin removal when balance is zero
+        // Add credits
         let request1 = CreditTransactionCreateDBRequest {
             user_id,
-            transaction_type: CreditTransactionType::AdminRemoval,
+            transaction_type: CreditTransactionType::AdminGrant,
             amount: Decimal::from_str("100.0").unwrap(),
             source_id: user_id.to_string(),
             description: None,
         };
-        let result = credits.create_transaction(&request1).await;
-        match result {
-            Err(DbError::CheckViolation { .. }) => {
-                // Expected error
-            }
-            _ => panic!("Expected CheckViolation error due to insufficient balance"),
-        }
+        credits.create_transaction(&request1).await.expect("Failed to create transaction");
 
-        // Create first transaction with positive balance
-        let request1 = CreditTransactionCreateDBRequest {
+        let balance = credits.get_user_balance(user_id).await.expect("Failed to get balance");
+        assert_eq!(balance, Decimal::from_str("100.0").unwrap());
+
+        // Add more credits
+        let request2 = CreditTransactionCreateDBRequest {
             user_id,
-            transaction_type: CreditTransactionType::AdminGrant,
-            amount: Decimal::from_str("100.50").unwrap(),
+            transaction_type: CreditTransactionType::AdminRemoval,
+            amount: Decimal::from_str("500.0").unwrap(),
             source_id: user_id.to_string(),
             description: None,
         };
-        let transaction1 = credits
-            .create_transaction(&request1)
-            .await
-            .expect("Failed to create first transaction");
+        credits.create_transaction(&request2).await.expect("Failed to create transaction");
 
-        assert_eq!(transaction1.balance_after, Decimal::from_str("100.50").unwrap());
-
-        // Try to remove credits from usage that exceeds balance
-        let request1 = CreditTransactionCreateDBRequest {
-            user_id,
-            transaction_type: CreditTransactionType::Usage,
-            amount: Decimal::from_str("1050.0").unwrap(),
-            source_id: user_id.to_string(),
-            description: None,
-        };
-        let result = credits.create_transaction(&request1).await;
-        match result {
-            Err(DbError::CheckViolation { .. }) => {
-                // Expected error
-            }
-            _ => panic!("Expected CheckViolation error due to insufficient balance"),
-        }
+        let balance = credits.get_user_balance(user_id).await.expect("Failed to get balance");
+        assert_eq!(balance, Decimal::from_str("-400.0").unwrap());
     }
 
     #[sqlx::test]
@@ -792,8 +771,8 @@ mod tests {
         // Try to create an invalid transaction (insufficient balance for removal)
         let request2 = CreditTransactionCreateDBRequest {
             user_id,
-            transaction_type: CreditTransactionType::AdminRemoval,
-            amount: Decimal::from_str("200.0").unwrap(), // More than available balance
+            transaction_type: CreditTransactionType::AdminGrant,
+            amount: Decimal::from_str("-200.0").unwrap(), // Invalid negative amount
             source_id: user_id.to_string(),
             description: None,
         };

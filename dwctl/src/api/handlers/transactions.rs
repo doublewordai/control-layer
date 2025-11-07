@@ -630,7 +630,14 @@ mod tests {
             .json(&transaction_data)
             .await;
 
-        response.assert_status_bad_request();
+        response.assert_status(axum::http::StatusCode::CREATED);
+        let transaction: CreditTransactionResponse = response.json();
+        assert_eq!(transaction.user_id, user.id);
+        assert_eq!(transaction.amount, Decimal::from_str("100.0").unwrap());
+        assert_eq!(transaction.transaction_type, CreditTransactionType::AdminRemoval);
+        assert_eq!(transaction.source_id, billing_manager.id.to_string());
+        assert_eq!(transaction.description, Some("Over removal".to_string()));
+        assert_eq!(transaction.balance_after, Decimal::from_str("-50.0").unwrap());
     }
 
     // Test: GET /transactions/{id} returns own transaction for RequestViewer
