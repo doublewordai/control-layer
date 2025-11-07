@@ -28,6 +28,7 @@ use crate::{
     request_logging::serializers::{parse_ai_request, AnalyticsResponseSerializer},
 };
 use auth::middleware::admin_ai_proxy_middleware;
+use axum::extract::DefaultBodyLimit;
 use axum::http::HeaderValue;
 use axum::{
     body::Body,
@@ -597,6 +598,13 @@ pub async fn build_router(state: &mut AppState, onwards_router: Router) -> anyho
         .route("/authentication/password-change", post(api::handlers::auth::change_password))
         .with_state(state.clone());
 
+    // File upload route with custom body limit (other routes use default)
+    let file_upload_limit = state.config.files.max_file_size;
+    let file_upload_routes = Router::new()
+        .route("/files", post(api::handlers::files::upload_file))
+        .layer(DefaultBodyLimit::max(file_upload_limit as usize))
+        .with_state(state.clone());
+
     // API routes
     let api_routes = Router::new()
         .route("/config", get(api::handlers::config::get_config))
@@ -651,8 +659,8 @@ pub async fn build_router(state: &mut AppState, onwards_router: Router) -> anyho
         .route("/models/{id}", get(api::handlers::deployments::get_deployed_model))
         .route("/models/{id}", patch(api::handlers::deployments::update_deployed_model))
         .route("/models/{id}", delete(api::handlers::deployments::delete_deployed_model))
-        // Files management
-        .route("/files", post(api::handlers::files::upload_file))
+        // Files management - merge file upload route with custom body limit
+        .merge(file_upload_routes)
         .route("/files", get(api::handlers::files::list_files))
         .route("/files/{file_id}", get(api::handlers::files::get_file))
         .route("/files/{file_id}/content", get(api::handlers::files::get_file_content))
