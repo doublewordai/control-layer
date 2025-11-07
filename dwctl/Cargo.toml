@@ -32,7 +32,10 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 # OpenTelemetry
 opentelemetry = "0.27"
 opentelemetry_sdk = { version = "0.27", features = ["rt-tokio"] }
-opentelemetry-otlp = { version = "0.27", features = ["http-proto", "reqwest-client"] }
+opentelemetry-otlp = { version = "0.27", features = [
+  "http-proto",
+  "reqwest-client",
+] }
 tracing-opentelemetry = "0.28"
 tower = "0.5"
 tower-http = { version = "0.6", features = ["cors", "fs", "trace"] }
@@ -83,7 +86,6 @@ postgresql_embedded = { version = "0.20", optional = true, features = [
 # Embedded static assets
 rust-embed = { version = "8.5", features = ["debug-embed"] }
 mime_guess = "2.0"
-axum_typed_multipart = "0.16.4"
 futures = "0.3.31"
 async-stream = "0.3.6"
 
