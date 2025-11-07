@@ -16,7 +16,7 @@ import {
   DialogTitle,
 } from "../../ui/dialog";
 import { Button } from "../../ui/button";
-import { ScrollArea } from "../../ui/scroll-area.tsx";
+import { ScrollArea } from "../../ui/scroll-area";
 import {
   Select,
   SelectContent,

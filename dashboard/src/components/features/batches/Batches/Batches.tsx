@@ -31,7 +31,6 @@ import {
   useBatches,
   useDeleteFile,
   useCancelBatch,
-  useDownloadBatchResults,
 } from "../../../../api/control-layer/hooks";
 import { toast } from "sonner";
 import type { FileObject, Batch } from "../types";
@@ -65,10 +64,6 @@ export function Batches() {
   // Active tab
   const [activeTab, setActiveTab] = useState<"files" | "batches">("files");
 
-  // Pagination state
-  const [filesPage, setFilesPage] = useState(0);
-  const [batchesPage, setBatchesPage] = useState(0);
-
   // API queries
   const { data: filesResponse, isLoading: filesLoading } = useFiles({
     purpose: "batch",
@@ -78,7 +73,6 @@ export function Batches() {
   // Mutations
   const deleteMutation = useDeleteFile();
   const cancelMutation = useCancelBatch();
-  const downloadMutation = useDownloadBatchResults();
 
   const files = filesResponse?.data || [];
   const batches = batchesResponse?.data || [];

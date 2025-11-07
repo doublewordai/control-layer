@@ -1165,7 +1165,6 @@ export const handlers = [
     const formData = await request.formData();
     const file = formData.get("file") as File;
     const purpose = formData.get("purpose") as string;
-    const expiresAfterAnchor = formData.get("expires_after[anchor]");
     const expiresAfterSeconds = formData.get("expires_after[seconds]");
 
     if (!file || !purpose) {

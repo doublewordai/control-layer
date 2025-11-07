@@ -7,7 +7,7 @@ import {
   DialogTitle,
 } from "../../ui/dialog";
 import { Button } from "../../ui/button";
-import { ScrollArea } from "../../ui/scroll-area.tsx";
+import { ScrollArea } from "../../ui/scroll-area";
 import { useFileRequests } from "../../../api/control-layer/hooks";
 import type { FileObject, FileRequest } from "../../../api/control-layer/types";
 

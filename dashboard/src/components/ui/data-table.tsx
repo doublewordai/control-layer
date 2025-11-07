@@ -250,7 +250,7 @@ export function DataTable<TData, TValue>({
                       className="hover:bg-transparent"
                       style={{ height: rowHeight }}
                     >
-                      {columns.map((column, cellIndex) => (
+                      {columns.map((_, cellIndex) => (
                         <TableCell
                           key={`empty-${index}-${cellIndex}`}
                           className={cellIndex === 0 ? "pl-6" : ""}
