@@ -167,6 +167,41 @@ impl<H: HttpClient + 'static> PostgresRequestManager<H> {
 
         Ok(count)
     }
+
+    /// Check if a file should be expired and mark it as such.
+    /// Returns true if the file was marked as expired.
+    async fn check_and_mark_expired(&self, file: &mut File) -> Result<bool> {
+        // Only check files that are currently in 'processed' status
+        if file.status != crate::batch::FileStatus::Processed {
+            return Ok(false);
+        }
+
+        // Check if file has an expiration date and it has passed
+        if let Some(expires_at) = file.expires_at {
+            if Utc::now() > expires_at {
+                // Mark as expired in the database
+                sqlx::query!(
+                    r#"
+                    UPDATE files
+                    SET status = 'expired'
+                    WHERE id = $1 AND status = 'processed'
+                    "#,
+                    *file.id as Uuid,
+                )
+                .execute(&self.pool)
+                .await
+                .map_err(|e| {
+                    FusilladeError::Other(anyhow!("Failed to mark file as expired: {}", e))
+                })?;
+
+                // Update the in-memory file object
+                file.status = crate::batch::FileStatus::Expired;
+                return Ok(true);
+            }
+        }
+
+        Ok(false)
+    }
 }
 
 // Implement Storage trait directly (no delegation)
@@ -561,6 +596,7 @@ impl<H: HttpClient + 'static> Storage for PostgresRequestManager<H> {
     // File and Batch Management
     // ===================================================================
 
+    #[tracing::instrument(skip(self, templates), fields(name = %name, template_count = templates.len()))]
     async fn create_file(
         &self,
         name: String,
@@ -613,6 +649,7 @@ impl<H: HttpClient + 'static> Storage for PostgresRequestManager<H> {
         Ok(FileId(file_id))
     }
 
+    #[tracing::instrument(skip(self, stream))]
     async fn create_file_stream<S: Stream<Item = FileStreamItem> + Send + Unpin>(
         &self,
         mut stream: S,
@@ -652,6 +689,11 @@ impl<H: HttpClient + 'static> Storage for PostgresRequestManager<H> {
                     if meta.uploaded_by.is_some() {
                         metadata.uploaded_by = meta.uploaded_by;
                     }
+                }
+                FileStreamItem::Error(error_message) => {
+                    // Rollback transaction and return validation error
+                    tx.rollback().await.ok(); // Ignore rollback errors
+                    return Err(FusilladeError::ValidationError(error_message));
                 }
                 FileStreamItem::Template(template) => {
                     // Create file stub on first template with minimal metadata
@@ -738,9 +780,8 @@ impl<H: HttpClient + 'static> Storage for PostgresRequestManager<H> {
             &metadata.expires_after_anchor,
             metadata.expires_after_seconds,
         ) {
-            // For now, we'll calculate from creation time
-            // TODO: Support "last_request_at" anchor once batch execution is tracked
-            if anchor == "created_at" || anchor == "last_request_at" {
+            // Calculate from creation time
+            if anchor == "created_at" {
                 Some(Utc::now() + chrono::Duration::seconds(seconds))
             } else {
                 None
@@ -782,6 +823,7 @@ impl<H: HttpClient + 'static> Storage for PostgresRequestManager<H> {
         Ok(FileId(fid))
     }
 
+    #[tracing::instrument(skip(self), fields(file_id = %file_id))]
     async fn get_file(&self, file_id: FileId) -> Result<File> {
         let row = sqlx::query!(
             r#"
@@ -808,7 +850,7 @@ impl<H: HttpClient + 'static> Storage for PostgresRequestManager<H> {
             .transpose()
             .map_err(|e| FusilladeError::Other(anyhow!("Invalid purpose: {}", e)))?;
 
-        Ok(File {
+        let mut file = File {
             id: FileId(row.id),
             name: row.name,
             description: row.description,
@@ -821,9 +863,15 @@ impl<H: HttpClient + 'static> Storage for PostgresRequestManager<H> {
             uploaded_by: row.uploaded_by,
             created_at: row.created_at,
             updated_at: row.updated_at,
-        })
+        };
+
+        // Check and mark as expired if needed (passive expiration)
+        self.check_and_mark_expired(&mut file).await?;
+
+        Ok(file)
     }
 
+    #[tracing::instrument(skip(self, filter), fields(uploaded_by = ?filter.uploaded_by, status = ?filter.status, purpose = ?filter.purpose))]
     async fn list_files(&self, filter: crate::batch::FileFilter) -> Result<Vec<File>> {
         // Build WHERE clause based on filter
         let mut where_clauses = Vec::new();
@@ -877,76 +925,77 @@ impl<H: HttpClient + 'static> Storage for PostgresRequestManager<H> {
             .await
             .map_err(|e| FusilladeError::Other(anyhow!("Failed to list files: {}", e)))?;
 
-        rows.into_iter()
-            .map(|row| {
-                let id: Uuid = row
-                    .try_get("id")
-                    .map_err(|e| FusilladeError::Other(anyhow!("Failed to read id: {}", e)))?;
-                let name: String = row
-                    .try_get("name")
-                    .map_err(|e| FusilladeError::Other(anyhow!("Failed to read name: {}", e)))?;
-                let description: Option<String> = row.try_get("description").map_err(|e| {
-                    FusilladeError::Other(anyhow!("Failed to read description: {}", e))
-                })?;
-                let size_bytes: i64 = row.try_get("size_bytes").map_err(|e| {
-                    FusilladeError::Other(anyhow!("Failed to read size_bytes: {}", e))
-                })?;
-                let status_str: String = row
-                    .try_get("status")
-                    .map_err(|e| FusilladeError::Other(anyhow!("Failed to read status: {}", e)))?;
-                let status = status_str
-                    .parse::<crate::batch::FileStatus>()
-                    .map_err(|e| {
-                        FusilladeError::Other(anyhow!(
-                            "Invalid file status '{}': {}",
-                            status_str,
-                            e
-                        ))
-                    })?;
-                let error_message: Option<String> = row.try_get("error_message").map_err(|e| {
-                    FusilladeError::Other(anyhow!("Failed to read error_message: {}", e))
-                })?;
-                let purpose_str: Option<String> = row
-                    .try_get("purpose")
-                    .map_err(|e| FusilladeError::Other(anyhow!("Failed to read purpose: {}", e)))?;
-                let purpose = purpose_str
-                    .map(|s| s.parse::<crate::batch::Purpose>())
-                    .transpose()
-                    .map_err(|e| FusilladeError::Other(anyhow!("Invalid purpose: {}", e)))?;
-                let expires_at: Option<chrono::DateTime<Utc>> =
-                    row.try_get("expires_at").map_err(|e| {
-                        FusilladeError::Other(anyhow!("Failed to read expires_at: {}", e))
-                    })?;
-                let deleted_at: Option<chrono::DateTime<Utc>> =
-                    row.try_get("deleted_at").map_err(|e| {
-                        FusilladeError::Other(anyhow!("Failed to read deleted_at: {}", e))
-                    })?;
-                let uploaded_by: Option<String> = row.try_get("uploaded_by").map_err(|e| {
-                    FusilladeError::Other(anyhow!("Failed to read uploaded_by: {}", e))
-                })?;
-                let created_at: chrono::DateTime<Utc> = row.try_get("created_at").map_err(|e| {
-                    FusilladeError::Other(anyhow!("Failed to read created_at: {}", e))
-                })?;
-                let updated_at: chrono::DateTime<Utc> = row.try_get("updated_at").map_err(|e| {
-                    FusilladeError::Other(anyhow!("Failed to read updated_at: {}", e))
-                })?;
+        let mut files = Vec::new();
 
-                Ok(File {
-                    id: FileId(id),
-                    name,
-                    description,
-                    size_bytes,
-                    status,
-                    error_message,
-                    purpose,
-                    expires_at,
-                    deleted_at,
-                    uploaded_by,
-                    created_at,
-                    updated_at,
-                })
-            })
-            .collect::<Result<Vec<_>>>()
+        for row in rows {
+            let id: Uuid = row
+                .try_get("id")
+                .map_err(|e| FusilladeError::Other(anyhow!("Failed to read id: {}", e)))?;
+            let name: String = row
+                .try_get("name")
+                .map_err(|e| FusilladeError::Other(anyhow!("Failed to read name: {}", e)))?;
+            let description: Option<String> = row
+                .try_get("description")
+                .map_err(|e| FusilladeError::Other(anyhow!("Failed to read description: {}", e)))?;
+            let size_bytes: i64 = row
+                .try_get("size_bytes")
+                .map_err(|e| FusilladeError::Other(anyhow!("Failed to read size_bytes: {}", e)))?;
+            let status_str: String = row
+                .try_get("status")
+                .map_err(|e| FusilladeError::Other(anyhow!("Failed to read status: {}", e)))?;
+            let status = status_str
+                .parse::<crate::batch::FileStatus>()
+                .map_err(|e| {
+                    FusilladeError::Other(anyhow!("Invalid file status '{}': {}", status_str, e))
+                })?;
+            let error_message: Option<String> = row.try_get("error_message").map_err(|e| {
+                FusilladeError::Other(anyhow!("Failed to read error_message: {}", e))
+            })?;
+            let purpose_str: Option<String> = row
+                .try_get("purpose")
+                .map_err(|e| FusilladeError::Other(anyhow!("Failed to read purpose: {}", e)))?;
+            let purpose = purpose_str
+                .map(|s| s.parse::<crate::batch::Purpose>())
+                .transpose()
+                .map_err(|e| FusilladeError::Other(anyhow!("Invalid purpose: {}", e)))?;
+            let expires_at: Option<chrono::DateTime<Utc>> = row
+                .try_get("expires_at")
+                .map_err(|e| FusilladeError::Other(anyhow!("Failed to read expires_at: {}", e)))?;
+            let deleted_at: Option<chrono::DateTime<Utc>> = row
+                .try_get("deleted_at")
+                .map_err(|e| FusilladeError::Other(anyhow!("Failed to read deleted_at: {}", e)))?;
+            let uploaded_by: Option<String> = row
+                .try_get("uploaded_by")
+                .map_err(|e| FusilladeError::Other(anyhow!("Failed to read uploaded_by: {}", e)))?;
+            let created_at: chrono::DateTime<Utc> = row
+                .try_get("created_at")
+                .map_err(|e| FusilladeError::Other(anyhow!("Failed to read created_at: {}", e)))?;
+            let updated_at: chrono::DateTime<Utc> = row
+                .try_get("updated_at")
+                .map_err(|e| FusilladeError::Other(anyhow!("Failed to read updated_at: {}", e)))?;
+
+            let mut file = File {
+                id: FileId(id),
+                name,
+                description,
+                size_bytes,
+                status,
+                error_message,
+                purpose,
+                expires_at,
+                deleted_at,
+                uploaded_by,
+                created_at,
+                updated_at,
+            };
+
+            // Check and mark as expired if needed (passive expiration)
+            self.check_and_mark_expired(&mut file).await?;
+
+            files.push(file);
+        }
+
+        Ok(files)
     }
 
     async fn get_file_templates(&self, file_id: FileId) -> Result<Vec<RequestTemplate>> {
@@ -981,6 +1030,7 @@ impl<H: HttpClient + 'static> Storage for PostgresRequestManager<H> {
             .collect())
     }
 
+    #[tracing::instrument(skip(self), fields(file_id = %file_id))]
     fn get_file_content_stream(
         &self,
         file_id: FileId,
@@ -1024,6 +1074,7 @@ impl<H: HttpClient + 'static> Storage for PostgresRequestManager<H> {
         })
     }
 
+    #[tracing::instrument(skip(self), fields(file_id = %file_id))]
     async fn delete_file(&self, file_id: FileId) -> Result<()> {
         let rows_affected = sqlx::query!(
             r#"

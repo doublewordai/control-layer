@@ -41,6 +41,7 @@ impl OpenAIBatchRequest {
     /// # Arguments
     /// * `endpoint` - The target endpoint (e.g., "http://localhost:8080/ai")
     /// * `api_key` - The API key to inject for request execution
+    #[tracing::instrument(skip(self, api_key), fields(custom_id = %self.custom_id, method = %self.method, url = %self.url))]
     fn to_internal(&self, endpoint: &str, api_key: String) -> Result<fusillade::RequestTemplateInput> {
         // Extract model from body if present
         let model = self
@@ -69,6 +70,7 @@ impl OpenAIBatchRequest {
     }
 
     /// Transform internal format to OpenAI format
+    #[tracing::instrument(skip(internal), fields(custom_id = ?internal.custom_id, method = %internal.method, path = %internal.path))]
     fn from_internal(internal: &fusillade::RequestTemplateInput) -> Result<Self> {
         // Parse body string to JSON
         let body: serde_json::Value = serde_json::from_str(&internal.body).map_err(|e| Error::Internal {
@@ -93,6 +95,7 @@ impl OpenAIBatchRequest {
 /// # Arguments
 /// * `endpoint` - Target endpoint for batch requests (e.g., "http://localhost:8080/ai")
 /// * `api_key` - API key to inject for request execution
+#[tracing::instrument(skip(multipart, api_key), fields(max_file_size, uploaded_by = ?uploaded_by, endpoint = %endpoint))]
 fn create_file_stream(
     mut multipart: Multipart,
     max_file_size: u64,
@@ -146,9 +149,9 @@ fn create_file_stream(
                         let chunk_size = chunk.len() as i64;
                         total_size += chunk_size;
 
-                        // Check size limit - just log and stop, don't yield error
+                        // Check size limit
                         if total_size > max_file_size as i64 {
-                            tracing::error!("File size exceeds maximum: {} > {}", total_size, max_file_size);
+                            yield fusillade::FileStreamItem::Error(format!("File size exceeds maximum: {} > {}", total_size, max_file_size));
                             return;
                         }
 
@@ -156,7 +159,7 @@ fn create_file_stream(
                         let chunk_str = match std::str::from_utf8(&chunk) {
                             Ok(s) => s,
                             Err(_) => {
-                                tracing::error!("File contains invalid UTF-8");
+                                yield fusillade::FileStreamItem::Error("File contains invalid UTF-8".to_string());
                                 return;
                             }
                         };
@@ -198,13 +201,13 @@ fn create_file_stream(
                                             yield fusillade::FileStreamItem::Template(template);
                                         }
                                         Err(e) => {
-                                            tracing::error!("Failed to transform request on line {}: {:?}", line_count + 1, e);
+                                            yield fusillade::FileStreamItem::Error(format!("Failed to transform request on line {}: {:?}", line_count + 1, e));
                                             return;
                                         }
                                     }
                                 }
                                 Err(e) => {
-                                    tracing::error!("Invalid JSON on line {}: {}", line_count + 1, e);
+                                    yield fusillade::FileStreamItem::Error(format!("Invalid JSON on line {}: {}", line_count + 1, e));
                                     return;
                                 }
                             }
@@ -220,15 +223,23 @@ fn create_file_stream(
                                     match openai_req.to_internal(&endpoint, api_key.clone()) {
                                         Ok(template) => yield fusillade::FileStreamItem::Template(template),
                                         Err(e) => {
-                                            tracing::error!("Failed to transform final line: {:?}", e);
+                                            yield fusillade::FileStreamItem::Error(format!("Failed to transform final line: {:?}", e));
+                                            return;
                                         }
                                     }
                                 }
                                 Err(e) => {
-                                    tracing::error!("Invalid JSON on final line: {}", e);
+                                    yield fusillade::FileStreamItem::Error(format!("Invalid JSON on final line: {}", e));
+                                    return;
                                 }
                             }
                         }
+                    }
+
+                    // Check if file is empty (no templates parsed)
+                    if line_count == 0 {
+                        yield fusillade::FileStreamItem::Error("File contains no valid request templates".to_string());
+                        return;
                     }
 
                     // Yield final metadata with size
@@ -263,6 +274,7 @@ fn create_file_stream(
         (status = 500, description = "Internal server error")
     )
 )]
+#[tracing::instrument(skip(state, current_user, multipart), fields(user_id = %current_user.id))]
 pub async fn upload_file(
     State(state): State<AppState>,
     current_user: RequiresPermission<resource::Files, operation::CreateOwn>,
@@ -289,13 +301,12 @@ pub async fn upload_file(
     let file_stream = create_file_stream(multipart, max_file_size, uploaded_by, endpoint, system_key.secret);
 
     // Create file via request manager with streaming
-    let created_file_id = state
-        .request_manager
-        .create_file_stream(file_stream)
-        .await
-        .map_err(|e| Error::Internal {
+    let created_file_id = state.request_manager.create_file_stream(file_stream).await.map_err(|e| match e {
+        fusillade::FusilladeError::ValidationError(msg) => Error::BadRequest { message: msg },
+        _ => Error::Internal {
             operation: format!("create file: {}", e),
-        })?;
+        },
+    })?;
 
     tracing::info!("File {} uploaded successfully", created_file_id);
 
@@ -340,6 +351,7 @@ pub async fn upload_file(
         ListFilesQuery
     )
 )]
+#[tracing::instrument(skip(state, current_user), fields(user_id = %current_user.id, limit = ?query.limit, order = %query.order))]
 pub async fn list_files(
     State(state): State<AppState>,
     Query(query): Query<ListFilesQuery>,
@@ -420,6 +432,7 @@ pub async fn list_files(
         ("file_id" = String, Path, description = "The ID of the file to retrieve")
     )
 )]
+#[tracing::instrument(skip(state, current_user), fields(user_id = %current_user.id, file_id = %file_id_str))]
 pub async fn get_file(
     State(state): State<AppState>,
     Path(file_id_str): Path<String>,
@@ -485,6 +498,7 @@ pub async fn get_file(
         ("file_id" = String, Path, description = "The ID of the file to retrieve content from")
     )
 )]
+#[tracing::instrument(skip(state, current_user), fields(user_id = %current_user.id, file_id = %file_id_str))]
 pub async fn get_file_content(
     State(state): State<AppState>,
     Path(file_id_str): Path<String>,
@@ -568,6 +582,7 @@ pub async fn get_file_content(
         ("file_id" = String, Path, description = "The ID of the file to delete")
     )
 )]
+#[tracing::instrument(skip(state, current_user), fields(user_id = %current_user.id, file_id = %file_id_str))]
 pub async fn delete_file(
     State(state): State<AppState>,
     Path(file_id_str): Path<String>,
@@ -681,5 +696,137 @@ mod tests {
                 serde_json::from_str(down).unwrap_or_else(|_| panic!("Failed to parse downloaded line {}", i));
             assert_eq!(orig_json, down_json, "Line {} should match (orig: {}, down: {})", i, orig, down);
         }
+    }
+
+    #[sqlx::test]
+    #[test_log::test]
+    async fn test_upload_missing_model_field(pool: PgPool) {
+        let (app, _) = create_test_app(pool.clone(), false).await;
+        let user = create_test_user_with_roles(&pool, vec![Role::StandardUser, Role::BatchAPIUser]).await;
+
+        // Missing model field in body
+        let jsonl_content = r#"{"custom_id":"request-1","method":"POST","url":"/v1/chat/completions","body":{"messages":[{"role":"user","content":"Hello"}]}}"#;
+
+        let file_part = axum_test::multipart::Part::bytes(jsonl_content.as_bytes()).file_name("test-batch.jsonl");
+
+        let upload_response = app
+            .post("/admin/api/v1/files")
+            .add_header(add_auth_headers(&user).0, add_auth_headers(&user).1)
+            .multipart(
+                axum_test::multipart::MultipartForm::new()
+                    .add_text("purpose", "batch")
+                    .add_part("file", file_part),
+            )
+            .await;
+
+        // Should reject with 400 Bad Request
+        upload_response.assert_status(axum::http::StatusCode::BAD_REQUEST);
+        let error_body = upload_response.text();
+        assert!(error_body.contains("model"));
+    }
+
+    #[sqlx::test]
+    #[test_log::test]
+    async fn test_upload_missing_custom_id(pool: PgPool) {
+        let (app, _) = create_test_app(pool.clone(), false).await;
+        let user = create_test_user_with_roles(&pool, vec![Role::StandardUser, Role::BatchAPIUser]).await;
+
+        // Missing custom_id field
+        let jsonl_content =
+            r#"{"method":"POST","url":"/v1/chat/completions","body":{"model":"gpt-4","messages":[{"role":"user","content":"Hello"}]}}"#;
+
+        let file_part = axum_test::multipart::Part::bytes(jsonl_content.as_bytes()).file_name("test-batch.jsonl");
+
+        let upload_response = app
+            .post("/admin/api/v1/files")
+            .add_header(add_auth_headers(&user).0, add_auth_headers(&user).1)
+            .multipart(
+                axum_test::multipart::MultipartForm::new()
+                    .add_text("purpose", "batch")
+                    .add_part("file", file_part),
+            )
+            .await;
+
+        // Should reject with 400 Bad Request since custom_id is required
+        upload_response.assert_status(axum::http::StatusCode::BAD_REQUEST);
+        let error_body = upload_response.text();
+        assert!(error_body.contains("custom_id"));
+    }
+
+    #[sqlx::test]
+    #[test_log::test]
+    async fn test_upload_invalid_json_body(pool: PgPool) {
+        let (app, _) = create_test_app(pool.clone(), false).await;
+        let user = create_test_user_with_roles(&pool, vec![Role::StandardUser, Role::BatchAPIUser]).await;
+
+        // Invalid JSON in body field (not an object)
+        let jsonl_content = r#"{"custom_id":"request-1","method":"POST","url":"/v1/chat/completions","body":"not a json object"}"#;
+
+        let file_part = axum_test::multipart::Part::bytes(jsonl_content.as_bytes()).file_name("test-batch.jsonl");
+
+        let upload_response = app
+            .post("/admin/api/v1/files")
+            .add_header(add_auth_headers(&user).0, add_auth_headers(&user).1)
+            .multipart(
+                axum_test::multipart::MultipartForm::new()
+                    .add_text("purpose", "batch")
+                    .add_part("file", file_part),
+            )
+            .await;
+
+        // Should reject with 400 Bad Request
+        upload_response.assert_status(axum::http::StatusCode::BAD_REQUEST);
+        let error_body = upload_response.text();
+        assert!(error_body.contains("model"));
+    }
+
+    #[sqlx::test]
+    #[test_log::test]
+    async fn test_upload_malformed_jsonl(pool: PgPool) {
+        let (app, _) = create_test_app(pool.clone(), false).await;
+        let user = create_test_user_with_roles(&pool, vec![Role::StandardUser, Role::BatchAPIUser]).await;
+
+        // Malformed JSONL - not valid JSON
+        let jsonl_content = "this is not json at all\n{also not json}";
+
+        let file_part = axum_test::multipart::Part::bytes(jsonl_content.as_bytes()).file_name("test-batch.jsonl");
+
+        let upload_response = app
+            .post("/admin/api/v1/files")
+            .add_header(add_auth_headers(&user).0, add_auth_headers(&user).1)
+            .multipart(
+                axum_test::multipart::MultipartForm::new()
+                    .add_text("purpose", "batch")
+                    .add_part("file", file_part),
+            )
+            .await;
+
+        // Should reject with 400 Bad Request
+        upload_response.assert_status(axum::http::StatusCode::BAD_REQUEST);
+    }
+
+    #[sqlx::test]
+    #[test_log::test]
+    async fn test_upload_empty_file(pool: PgPool) {
+        let (app, _) = create_test_app(pool.clone(), false).await;
+        let user = create_test_user_with_roles(&pool, vec![Role::StandardUser, Role::BatchAPIUser]).await;
+
+        // Empty file
+        let jsonl_content = "";
+
+        let file_part = axum_test::multipart::Part::bytes(jsonl_content.as_bytes()).file_name("test-batch.jsonl");
+
+        let upload_response = app
+            .post("/admin/api/v1/files")
+            .add_header(add_auth_headers(&user).0, add_auth_headers(&user).1)
+            .multipart(
+                axum_test::multipart::MultipartForm::new()
+                    .add_text("purpose", "batch")
+                    .add_part("file", file_part),
+            )
+            .await;
+
+        // Should reject with 400 Bad Request
+        upload_response.assert_status(axum::http::StatusCode::BAD_REQUEST);
     }
 }

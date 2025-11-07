@@ -237,6 +237,8 @@ pub enum FileStreamItem {
     Metadata(FileMetadata),
     /// A request template parsed from JSONL
     Template(RequestTemplateInput),
+    /// An error occurred during parsing
+    Error(String),
 }
 
 /// A batch represents one execution of all of a file's templates.
