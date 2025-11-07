@@ -91,6 +91,15 @@ export const createFileColumns = (
         "file-demo-1": 3,
         "file-demo-2": 2,
         "file-demo-3": 5,
+        "file-demo-4": 2,
+        "file-demo-5": 1,
+        "file-demo-6": 3,
+        "file-demo-7": 1,
+        "file-demo-8": 2,
+        "file-demo-9": 3,
+        "file-demo-10": 1,
+        "file-demo-11": 2,
+        "file-demo-12": 3,
       };
       const count = requestCounts[file.id] || 0;
       return (

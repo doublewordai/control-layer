@@ -40,6 +40,8 @@ interface DataTableProps<TData, TValue> {
   showColumnToggle?: boolean;
   showPagination?: boolean;
   pageSize?: number;
+  minRows?: number; // Optional: Minimum number of rows to display (pads with empty rows)
+  rowHeight?: string; // Optional: Height for each row (e.g., "65px", "49px")
   onSelectionChange?: (selectedRows: TData[]) => void;
   actionBar?: React.ReactNode;
   headerActions?: React.ReactNode;
@@ -54,6 +56,8 @@ export function DataTable<TData, TValue>({
   showColumnToggle = true,
   showPagination = true,
   pageSize = 10,
+  minRows,
+  rowHeight = "53px", // Default row height
   onSelectionChange,
   actionBar,
   headerActions,
@@ -105,6 +109,12 @@ export function DataTable<TData, TValue>({
     // Only depend on the actual selection state, not the rows themselves
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [rowSelection, onSelectionChange]);
+
+  // Calculate how many empty rows we need to pad
+  const currentPageRows = table.getRowModel().rows;
+  const emptyRowsCount = minRows
+    ? Math.max(0, minRows - currentPageRows.length)
+    : 0;
 
   return (
     <div className="space-y-4">
@@ -204,33 +214,54 @@ export function DataTable<TData, TValue>({
           </TableHeader>
           <TableBody>
             {table.getRowModel().rows?.length ? (
-              table.getRowModel().rows.map((row) => (
-                <TableRow
-                  key={row.id}
-                  data-state={row.getIsSelected() && "selected"}
-                  className="group"
-                >
-                  {row.getVisibleCells().map((cell) => (
-                    <TableCell
-                      key={cell.id}
-                      className={
-                        cell.column.id === "select"
-                          ? "pl-6 w-[50px]"
-                          : cell.column.getIndex() === 0
-                            ? "pl-6"
-                            : cell.column.id === "actions"
-                              ? "pr-6"
-                              : ""
-                      }
+              <>
+                {table.getRowModel().rows.map((row) => (
+                  <TableRow
+                    key={row.id}
+                    data-state={row.getIsSelected() && "selected"}
+                    className="group"
+                  >
+                    {row.getVisibleCells().map((cell) => (
+                      <TableCell
+                        key={cell.id}
+                        className={
+                          cell.column.id === "select"
+                            ? "pl-6 w-[50px]"
+                            : cell.column.getIndex() === 0
+                              ? "pl-6"
+                              : cell.column.id === "actions"
+                                ? "pr-6"
+                                : ""
+                        }
+                      >
+                        {flexRender(
+                          cell.column.columnDef.cell,
+                          cell.getContext(),
+                        )}
+                      </TableCell>
+                    ))}
+                  </TableRow>
+                ))}
+                {/* Render empty padding rows if minRows is set */}
+                {emptyRowsCount > 0 &&
+                  Array.from({ length: emptyRowsCount }).map((_, index) => (
+                    <TableRow
+                      key={`empty-${index}`}
+                      className="hover:bg-transparent"
+                      style={{ height: rowHeight }}
                     >
-                      {flexRender(
-                        cell.column.columnDef.cell,
-                        cell.getContext(),
-                      )}
-                    </TableCell>
+                      {columns.map((column, cellIndex) => (
+                        <TableCell
+                          key={`empty-${index}-${cellIndex}`}
+                          className={cellIndex === 0 ? "pl-6" : ""}
+                          style={{ height: rowHeight }}
+                        >
+                          {/* Empty cell */}
+                        </TableCell>
+                      ))}
+                    </TableRow>
                   ))}
-                </TableRow>
-              ))
+              </>
             ) : (
               <TableRow>
                 <TableCell
@@ -256,7 +287,7 @@ export function DataTable<TData, TValue>({
               (table.getState().pagination.pageIndex + 1) *
                 table.getState().pagination.pageSize,
               table.getFilteredRowModel().rows.length,
-            )}{" "}
+            )}
             of {table.getFilteredRowModel().rows.length} results
           </div>
           <div className="flex items-center space-x-2">

@@ -65,6 +65,10 @@ export function Batches() {
   // Active tab
   const [activeTab, setActiveTab] = useState<"files" | "batches">("files");
 
+  // Pagination state
+  const [filesPage, setFilesPage] = useState(0);
+  const [batchesPage, setBatchesPage] = useState(0);
+
   // API queries
   const { data: filesResponse, isLoading: filesLoading } = useFiles({
     purpose: "batch",
@@ -81,15 +85,18 @@ export function Batches() {
 
   // File actions
   const handleViewFileRequests = (file: FileObject) => {
+    if ((file as any)._isEmpty) return;
     setSelectedFile(file);
     setViewFileRequestsModalOpen(true);
   };
 
   const handleDeleteFile = (file: FileObject) => {
+    if ((file as any)._isEmpty) return;
     setFileToDelete(file);
   };
 
   const handleDownloadFileCode = (file: FileObject) => {
+    if ((file as any)._isEmpty) return;
     setDownloadResource({
       type: "file",
       id: file.id,
@@ -117,11 +124,13 @@ export function Batches() {
 
   // Batch actions
   const handleViewBatchRequests = (batch: Batch) => {
+    if ((batch as any)._isEmpty) return;
     setSelectedBatch(batch);
     setViewBatchRequestsModalOpen(true);
   };
 
   const handleCancelBatch = (batch: Batch) => {
+    if ((batch as any)._isEmpty) return;
     setBatchToCancel(batch);
   };
 
@@ -143,6 +152,7 @@ export function Batches() {
   };
 
   const handleDownloadResults = async (batch: Batch) => {
+    if ((batch as any)._isEmpty) return;
     setDownloadResource({
       type: "batch-results",
       id: batch.id,
@@ -189,7 +199,7 @@ export function Batches() {
       <div className="mb-4 flex flex-col sm:flex-row sm:items-end sm:justify-between gap-4">
         <div>
           <h1 className="text-3xl font-bold text-doubleword-neutral-900">
-            Batch 
+            Batch Processing
           </h1>
           <p className="text-doubleword-neutral-600 mt-2">
             Upload files and create batches to process requests at scale
@@ -318,6 +328,8 @@ export function Batches() {
               showPagination={files.length > 10}
               showColumnToggle={true}
               pageSize={10}
+              minRows={10}
+              rowHeight="49px"
             />
           )}
         </TabsContent>
@@ -348,12 +360,14 @@ export function Batches() {
               showPagination={batches.length > 10}
               showColumnToggle={true}
               pageSize={10}
+              minRows={10}
+              rowHeight="65px"
             />
           )}
         </TabsContent>
       </Tabs>
 
-      {/* Modals */}
+      {/* Modals - keeping existing modal code */}
       <UploadFileModal
         isOpen={uploadModalOpen}
         onClose={() => setUploadModalOpen(false)}

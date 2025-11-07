@@ -104,5 +104,203 @@
         "max_tokens": 150
       }
     }
+  ],
+  "file-demo-4": [
+    {
+      "custom_id": "train-1",
+      "method": "POST",
+      "url": "/v1/chat/completions",
+      "body": {
+        "model": "gpt-4",
+        "messages": [{"role": "user", "content": "Training example 1"}],
+        "max_tokens": 100
+      }
+    },
+    {
+      "custom_id": "train-2",
+      "method": "POST",
+      "url": "/v1/chat/completions",
+      "body": {
+        "model": "gpt-4",
+        "messages": [{"role": "user", "content": "Training example 2"}],
+        "max_tokens": 100
+      }
+    }
+  ],
+  "file-demo-5": [
+    {
+      "custom_id": "sentiment-1",
+      "method": "POST",
+      "url": "/v1/chat/completions",
+      "body": {
+        "model": "gpt-3.5-turbo",
+        "messages": [{"role": "user", "content": "Analyze sentiment: I love this!"}],
+        "max_tokens": 50
+      }
+    }
+  ],
+  "file-demo-6": [
+    {
+      "custom_id": "translate-1",
+      "method": "POST",
+      "url": "/v1/chat/completions",
+      "body": {
+        "model": "gpt-4",
+        "messages": [{"role": "user", "content": "Translate to French: Good morning"}],
+        "max_tokens": 50
+      }
+    },
+    {
+      "custom_id": "translate-2",
+      "method": "POST",
+      "url": "/v1/chat/completions",
+      "body": {
+        "model": "gpt-4",
+        "messages": [{"role": "user", "content": "Translate to German: Thank you"}],
+        "max_tokens": 50
+      }
+    },
+    {
+      "custom_id": "translate-3",
+      "method": "POST",
+      "url": "/v1/chat/completions",
+      "body": {
+        "model": "gpt-4",
+        "messages": [{"role": "user", "content": "Translate to Italian: Hello"}],
+        "max_tokens": 50
+      }
+    }
+  ],
+  "file-demo-7": [
+    {
+      "custom_id": "summary-1",
+      "method": "POST",
+      "url": "/v1/chat/completions",
+      "body": {
+        "model": "gpt-4",
+        "messages": [{"role": "user", "content": "Summarize this article..."}],
+        "max_tokens": 200
+      }
+    }
+  ],
+  "file-demo-8": [
+    {
+      "custom_id": "qa-1",
+      "method": "POST",
+      "url": "/v1/chat/completions",
+      "body": {
+        "model": "gpt-4",
+        "messages": [{"role": "user", "content": "What is AI?"}],
+        "max_tokens": 150
+      }
+    },
+    {
+      "custom_id": "qa-2",
+      "method": "POST",
+      "url": "/v1/chat/completions",
+      "body": {
+        "model": "gpt-4",
+        "messages": [{"role": "user", "content": "Explain machine learning"}],
+        "max_tokens": 150
+      }
+    }
+  ],
+  "file-demo-9": [
+    {
+      "custom_id": "code-1",
+      "method": "POST",
+      "url": "/v1/chat/completions",
+      "body": {
+        "model": "gpt-4",
+        "messages": [{"role": "user", "content": "Write Python function to sort array"}],
+        "max_tokens": 300
+      }
+    },
+    {
+      "custom_id": "code-2",
+      "method": "POST",
+      "url": "/v1/chat/completions",
+      "body": {
+        "model": "gpt-4",
+        "messages": [{"role": "user", "content": "Create React component"}],
+        "max_tokens": 300
+      }
+    },
+    {
+      "custom_id": "code-3",
+      "method": "POST",
+      "url": "/v1/chat/completions",
+      "body": {
+        "model": "gpt-4",
+        "messages": [{"role": "user", "content": "SQL query to join tables"}],
+        "max_tokens": 200
+      }
+    }
+  ],
+  "file-demo-10": [
+    {
+      "custom_id": "mod-1",
+      "method": "POST",
+      "url": "/v1/chat/completions",
+      "body": {
+        "model": "gpt-3.5-turbo",
+        "messages": [{"role": "user", "content": "Check if this is appropriate..."}],
+        "max_tokens": 100
+      }
+    }
+  ],
+  "file-demo-11": [
+    {
+      "custom_id": "class-1",
+      "method": "POST",
+      "url": "/v1/chat/completions",
+      "body": {
+        "model": "gpt-4",
+        "messages": [{"role": "user", "content": "Classify: This is a positive review"}],
+        "max_tokens": 50
+      }
+    },
+    {
+      "custom_id": "class-2",
+      "method": "POST",
+      "url": "/v1/chat/completions",
+      "body": {
+        "model": "gpt-4",
+        "messages": [{"role": "user", "content": "Classify: Neutral statement"}],
+        "max_tokens": 50
+      }
+    }
+  ],
+  "file-demo-12": [
+    {
+      "custom_id": "entity-1",
+      "method": "POST",
+      "url": "/v1/chat/completions",
+      "body": {
+        "model": "gpt-4",
+        "messages": [{"role": "user", "content": "Extract entities from: John works at Apple"}],
+        "max_tokens": 100
+      }
+    },
+    {
+      "custom_id": "entity-2",
+      "method": "POST",
+      "url": "/v1/chat/completions",
+      "body": {
+        "model": "gpt-4",
+        "messages": [{"role": "user", "content": "Extract entities from: Meeting in Paris"}],
+        "max_tokens": 100
+      }
+    },
+    {
+      "custom_id": "entity-3",
+      "method": "POST",
+      "url": "/v1/chat/completions",
+      "body": {
+        "model": "gpt-4",
+        "messages": [{"role": "user", "content": "Extract entities from: Tesla announced..."}],
+        "max_tokens": 100
+      }
+    }
   ]
 }
