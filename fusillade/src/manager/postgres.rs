@@ -16,7 +16,6 @@ use sqlx::Row;
 use tokio::sync::{mpsc, Mutex};
 use tokio::task::JoinHandle;
 use tokio_stream::wrappers::ReceiverStream;
-use tracing::debug;
 use uuid::Uuid;
 
 use super::Storage;
