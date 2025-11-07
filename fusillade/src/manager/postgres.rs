@@ -682,7 +682,6 @@ impl<H: HttpClient + 'static> Storage for PostgresRequestManager<H> {
         let mut template_count = 0;
 
         while let Some(item) = stream.next().await {
-            debug!("Received stream item, template count {}", template_count);
             match item {
                 FileStreamItem::Metadata(meta) => {
                     // Accumulate metadata (later values override earlier ones)
