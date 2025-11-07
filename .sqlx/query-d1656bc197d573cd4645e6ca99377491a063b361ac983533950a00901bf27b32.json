@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "\n            INSERT INTO files (id, filename, size_bytes, uploaded_by, status, error_message, expires_at, created_at, updated_at)\n            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)\n            RETURNING *\n            ",
+  "query": "\n            SELECT id, name, description, size_bytes, status, error_message, purpose, expires_at, deleted_at, uploaded_by, created_at, updated_at\n            FROM files\n            WHERE id = $1\n            ",
   "describe": {
     "columns": [
       {
@@ -10,75 +10,79 @@
       },
       {
         "ordinal": 1,
-        "name": "filename",
+        "name": "name",
         "type_info": "Text"
       },
       {
         "ordinal": 2,
+        "name": "description",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 3,
         "name": "size_bytes",
         "type_info": "Int8"
       },
       {
-        "ordinal": 3,
+        "ordinal": 4,
         "name": "status",
         "type_info": "Text"
       },
       {
-        "ordinal": 4,
+        "ordinal": 5,
         "name": "error_message",
         "type_info": "Text"
       },
       {
-        "ordinal": 5,
+        "ordinal": 6,
+        "name": "purpose",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 7,
         "name": "expires_at",
         "type_info": "Timestamptz"
       },
       {
-        "ordinal": 6,
+        "ordinal": 8,
         "name": "deleted_at",
         "type_info": "Timestamptz"
       },
       {
-        "ordinal": 7,
+        "ordinal": 9,
         "name": "uploaded_by",
-        "type_info": "Uuid"
+        "type_info": "Text"
       },
       {
-        "ordinal": 8,
+        "ordinal": 10,
         "name": "created_at",
         "type_info": "Timestamptz"
       },
       {
-        "ordinal": 9,
+        "ordinal": 11,
         "name": "updated_at",
         "type_info": "Timestamptz"
       }
     ],
     "parameters": {
       "Left": [
-        "Uuid",
-        "Text",
-        "Int8",
-        "Uuid",
-        "Text",
-        "Text",
-        "Timestamptz",
-        "Timestamptz",
-        "Timestamptz"
+        "Uuid"
       ]
     },
     "nullable": [
       false,
       false,
+      true,
       false,
       false,
       true,
       true,
       true,
-      false,
+      true,
+      true,
       false,
       false
     ]
   },
-  "hash": "fc6bc414cf9377c2c068c6ec93b84d1d2a7e9dcf19ac55f3f359573037141962"
+  "hash": "d1656bc197d573cd4645e6ca99377491a063b361ac983533950a00901bf27b32"
 }

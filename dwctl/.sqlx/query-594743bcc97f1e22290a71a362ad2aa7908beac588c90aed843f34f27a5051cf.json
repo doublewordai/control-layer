@@ -14,8 +14,7 @@
                 "PLATFORMMANAGER",
                 "REQUESTVIEWER",
                 "STANDARDUSER",
-                "BILLINGMANAGER",
-                "BATCHAPIUSER"
+                "BILLINGMANAGER"
               ]
             }
           }

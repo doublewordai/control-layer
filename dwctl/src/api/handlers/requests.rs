@@ -396,7 +396,14 @@ mod tests {
         };
 
         // Build router with request logging enabled
-        let mut app_state = crate::AppState::builder().db(pool.clone()).config(config).build();
+        let mut app_state = {
+            let request_manager = std::sync::Arc::new(fusillade::PostgresRequestManager::new(pool.clone()));
+            crate::AppState::builder()
+                .db(pool.clone())
+                .config(config)
+                .request_manager(request_manager)
+                .build()
+        };
         let onwards_router = axum::Router::new();
         let router = crate::build_router(&mut app_state, onwards_router)
             .await
@@ -432,7 +439,14 @@ mod tests {
         };
 
         // Build router with request logging enabled
-        let mut app_state = crate::AppState::builder().db(pool.clone()).config(config).build();
+        let mut app_state = {
+            let request_manager = std::sync::Arc::new(fusillade::PostgresRequestManager::new(pool.clone()));
+            crate::AppState::builder()
+                .db(pool.clone())
+                .config(config)
+                .request_manager(request_manager)
+                .build()
+        };
         let onwards_router = axum::Router::new();
         let router = crate::build_router(&mut app_state, onwards_router)
             .await
@@ -478,7 +492,14 @@ mod tests {
             url: pool.connect_options().to_url_lossy().to_string(),
         };
 
-        let mut app_state = crate::AppState::builder().db(pool.clone()).config(config).build();
+        let mut app_state = {
+            let request_manager = std::sync::Arc::new(fusillade::PostgresRequestManager::new(pool.clone()));
+            crate::AppState::builder()
+                .db(pool.clone())
+                .config(config)
+                .request_manager(request_manager)
+                .build()
+        };
         let onwards_router = axum::Router::new();
         let router = crate::build_router(&mut app_state, onwards_router)
             .await
@@ -843,7 +864,14 @@ mod tests {
         };
 
         // Build router with request logging enabled
-        let mut app_state = crate::AppState::builder().db(pool.clone()).config(config).build();
+        let mut app_state = {
+            let request_manager = std::sync::Arc::new(fusillade::PostgresRequestManager::new(pool.clone()));
+            crate::AppState::builder()
+                .db(pool.clone())
+                .config(config)
+                .request_manager(request_manager)
+                .build()
+        };
         let onwards_router = axum::Router::new();
         let router = crate::build_router(&mut app_state, onwards_router)
             .await
@@ -880,7 +908,14 @@ mod tests {
         };
 
         // Build router with request logging enabled
-        let mut app_state = crate::AppState::builder().db(pool.clone()).config(config).build();
+        let mut app_state = {
+            let request_manager = std::sync::Arc::new(fusillade::PostgresRequestManager::new(pool.clone()));
+            crate::AppState::builder()
+                .db(pool.clone())
+                .config(config)
+                .request_manager(request_manager)
+                .build()
+        };
         let onwards_router = axum::Router::new();
         let router = crate::build_router(&mut app_state, onwards_router)
             .await
@@ -921,7 +956,14 @@ mod tests {
         };
 
         // Build router with request logging enabled
-        let mut app_state = crate::AppState::builder().db(pool.clone()).config(config).build();
+        let mut app_state = {
+            let request_manager = std::sync::Arc::new(fusillade::PostgresRequestManager::new(pool.clone()));
+            crate::AppState::builder()
+                .db(pool.clone())
+                .config(config)
+                .request_manager(request_manager)
+                .build()
+        };
         let onwards_router = axum::Router::new();
         let router = crate::build_router(&mut app_state, onwards_router)
             .await
@@ -960,7 +1002,14 @@ mod tests {
         };
 
         // Build router with request logging enabled
-        let mut app_state = crate::AppState::builder().db(pool.clone()).config(config).build();
+        let mut app_state = {
+            let request_manager = std::sync::Arc::new(fusillade::PostgresRequestManager::new(pool.clone()));
+            crate::AppState::builder()
+                .db(pool.clone())
+                .config(config)
+                .request_manager(request_manager)
+                .build()
+        };
         let onwards_router = axum::Router::new();
         let router = crate::build_router(&mut app_state, onwards_router)
             .await
@@ -1018,7 +1067,14 @@ mod tests {
         };
 
         // Build router with request logging enabled
-        let mut app_state = crate::AppState::builder().db(pool.clone()).config(config).build();
+        let mut app_state = {
+            let request_manager = std::sync::Arc::new(fusillade::PostgresRequestManager::new(pool.clone()));
+            crate::AppState::builder()
+                .db(pool.clone())
+                .config(config)
+                .request_manager(request_manager)
+                .build()
+        };
         let onwards_router = axum::Router::new();
         let router = crate::build_router(&mut app_state, onwards_router)
             .await
@@ -1068,7 +1124,14 @@ mod tests {
         };
 
         // Build router with request logging enabled
-        let mut app_state = crate::AppState::builder().db(pool.clone()).config(config).build();
+        let mut app_state = {
+            let request_manager = std::sync::Arc::new(fusillade::PostgresRequestManager::new(pool.clone()));
+            crate::AppState::builder()
+                .db(pool.clone())
+                .config(config)
+                .request_manager(request_manager)
+                .build()
+        };
         let onwards_router = axum::Router::new();
         let router = crate::build_router(&mut app_state, onwards_router)
             .await
@@ -1117,7 +1180,14 @@ mod tests {
         };
 
         // Build router with request logging enabled
-        let mut app_state = crate::AppState::builder().db(pool.clone()).config(config).build();
+        let mut app_state = {
+            let request_manager = std::sync::Arc::new(fusillade::PostgresRequestManager::new(pool.clone()));
+            crate::AppState::builder()
+                .db(pool.clone())
+                .config(config)
+                .request_manager(request_manager)
+                .build()
+        };
         let onwards_router = axum::Router::new();
         let router = crate::build_router(&mut app_state, onwards_router)
             .await
@@ -1184,7 +1254,14 @@ mod tests {
         };
 
         // Build router with request logging enabled
-        let mut app_state = crate::AppState::builder().db(pool.clone()).config(config).build();
+        let mut app_state = {
+            let request_manager = std::sync::Arc::new(fusillade::PostgresRequestManager::new(pool.clone()));
+            crate::AppState::builder()
+                .db(pool.clone())
+                .config(config)
+                .request_manager(request_manager)
+                .build()
+        };
         let onwards_router = axum::Router::new();
         let router = crate::build_router(&mut app_state, onwards_router)
             .await

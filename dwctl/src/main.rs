@@ -951,9 +951,11 @@ mod test {
 
         // Apply middleware for this test
         let middleware = admin_ai_proxy_middleware;
+        let request_manager = std::sync::Arc::new(fusillade::PostgresRequestManager::new(pool.clone()));
         let app_state = crate::AppState::builder()
             .db(pool.clone())
             .config(crate::test_utils::create_test_config())
+            .request_manager(request_manager)
             .build();
         // TODO: put the middleware application into some function that's shared w/ main.rs. The
         // reason it isn't now is that `Router` is a nice concrete type for setup_app to return,
@@ -1186,7 +1188,12 @@ mod test {
         config.enable_request_logging = true;
 
         // Build router with request logging enabled
-        let mut app_state = AppState::builder().db(pool.clone()).config(config).build();
+        let request_manager = std::sync::Arc::new(fusillade::PostgresRequestManager::new(pool.clone()));
+        let mut app_state = AppState::builder()
+            .db(pool.clone())
+            .config(config)
+            .request_manager(request_manager)
+            .build();
         let onwards_router = axum::Router::new().route("/v1/models", axum::routing::get(|| async { "AI Models" })); // Simple
                                                                                                                     // onwards router for testing
         let router = super::build_router(&mut app_state, onwards_router)
@@ -1219,7 +1226,12 @@ mod test {
         config.enable_request_logging = false;
 
         // Build router with request logging disabled
-        let mut app_state = AppState::builder().db(pool.clone()).config(config).build();
+        let request_manager = std::sync::Arc::new(fusillade::PostgresRequestManager::new(pool.clone()));
+        let mut app_state = AppState::builder()
+            .db(pool.clone())
+            .config(config)
+            .request_manager(request_manager)
+            .build();
         let onwards_router = axum::Router::new(); // Empty onwards router for testing
         let router = super::build_router(&mut app_state, onwards_router)
             .await
@@ -1370,7 +1382,8 @@ mod test {
         let mut config = create_test_config();
         config.enable_metrics = false;
 
-        let mut app_state = AppState::builder().db(pool).config(config).build();
+        let request_manager = std::sync::Arc::new(fusillade::PostgresRequestManager::new(pool.clone()));
+        let mut app_state = AppState::builder().db(pool).config(config).request_manager(request_manager).build();
 
         let onwards_router = axum::Router::new();
         let router = super::build_router(&mut app_state, onwards_router)
@@ -1390,7 +1403,8 @@ mod test {
         let mut config = create_test_config();
         config.enable_metrics = true;
 
-        let mut app_state = AppState::builder().db(pool).config(config).build();
+        let request_manager = std::sync::Arc::new(fusillade::PostgresRequestManager::new(pool.clone()));
+        let mut app_state = AppState::builder().db(pool).config(config).request_manager(request_manager).build();
 
         let onwards_router = axum::Router::new();
         let router = super::build_router(&mut app_state, onwards_router)

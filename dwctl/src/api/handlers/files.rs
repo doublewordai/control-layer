@@ -1,3 +1,9 @@
+/// This file deals with the Files API.
+/// This is designed to match (as far as possible) the OpenAI Files
+/// [API](https://platform.openai.com/docs/api-reference/files/).
+///
+/// Repository methods are delegated to the fusillade/ crate - which (as of 04/11/2025) stores
+/// files disaggregated in postgres.
 use crate::api::models::files::{FileDeleteResponse, FileListResponse, FileResponse, ListFilesQuery, ListObject, ObjectType, Purpose};
 use crate::auth::permissions::{can_read_all_resources, has_permission, operation, resource, RequiresPermission};
 use crate::errors::{Error, Result};
@@ -24,10 +30,10 @@ fn create_file_stream(
         let mut total_size = 0i64;
         let mut line_count = 0u64;
         let mut incomplete_line = String::new();
-        let mut metadata = fusillade::FileMetadata::default();
-
-        // Set uploaded_by from parameter
-        metadata.uploaded_by = uploaded_by;
+        let mut metadata = fusillade::FileMetadata {
+            uploaded_by,
+            ..Default::default()
+        };
 
         // Parse multipart fields
         while let Ok(Some(field)) = multipart.next_field().await {
@@ -226,8 +232,8 @@ pub async fn list_files(
     Query(query): Query<ListFilesQuery>,
     current_user: RequiresPermission<resource::Files, operation::ReadOwn>,
 ) -> Result<Json<FileListResponse>> {
-    let has_system_access = has_permission(&current_user, Resource::Files, Operation::SystemAccess);
-    let can_read_all_files = can_read_all_resources(&current_user, Resource::Files);
+    let _has_system_access = has_permission(&current_user, Resource::Files, Operation::SystemAccess);
+    let _can_read_all_files = can_read_all_resources(&current_user, Resource::Files);
 
     // TODO: Add ownership filtering once fusillade supports uploaded_by:
     // - Filter by uploaded_by if !can_read_all_files
@@ -297,8 +303,8 @@ pub async fn get_file(
     Path(file_id_str): Path<String>,
     current_user: RequiresPermission<resource::Files, operation::ReadOwn>,
 ) -> Result<Json<FileResponse>> {
-    let has_system_access = has_permission(&current_user, Resource::Files, Operation::SystemAccess);
-    let can_read_all_files = can_read_all_resources(&current_user, Resource::Files);
+    let _has_system_access = has_permission(&current_user, Resource::Files, Operation::SystemAccess);
+    let _can_read_all_files = can_read_all_resources(&current_user, Resource::Files);
 
     // TODO: Add ownership check once fusillade supports uploaded_by:
     // if !can_read_all_files && !can_read_own_resource(&current_user, Resource::Files, file.uploaded_by) {
@@ -318,7 +324,7 @@ pub async fn get_file(
         .request_manager
         .get_file(fusillade::FileId(file_id))
         .await
-        .map_err(|e| Error::NotFound {
+        .map_err(|_e| Error::NotFound {
             resource: "File".to_string(),
             id: file_id_str,
         })?;
@@ -353,7 +359,7 @@ pub async fn delete_file(
     Path(file_id_str): Path<String>,
     current_user: RequiresPermission<resource::Files, operation::DeleteOwn>,
 ) -> Result<Json<FileDeleteResponse>> {
-    let can_delete_all_files = can_read_all_resources(&current_user, Resource::Files);
+    let _can_delete_all_files = can_read_all_resources(&current_user, Resource::Files);
 
     // TODO: Add ownership check once fusillade supports uploaded_by:
     // if !can_delete_all_files && !can_delete_own_resource(&current_user, Resource::Files, file.uploaded_by) {

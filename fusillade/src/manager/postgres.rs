@@ -6,8 +6,6 @@
 use crate::request::AnyRequest;
 use std::sync::Arc;
 
-use futures::StreamExt;
-
 use anyhow::anyhow;
 use async_trait::async_trait;
 use chrono::Utc;

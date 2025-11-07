@@ -8,6 +8,7 @@ pub type ApiKeyId = Uuid;
 pub type DeploymentId = Uuid;
 pub type GroupId = Uuid;
 pub type InferenceEndpointId = Uuid;
+#[allow(dead_code)] // TODO: Remove if not needed (currently using fusillade::FileId instead)
 pub type FileId = Uuid;
 
 /// Abbreviate a UUID to its first 8 characters for more readable logs and traces

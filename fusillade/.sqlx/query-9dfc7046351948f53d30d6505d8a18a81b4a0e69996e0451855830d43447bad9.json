@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "SELECT * FROM files WHERE id = $1",
+  "query": "\n            SELECT id, name, description, size_bytes, status, error_message, purpose, expires_at, deleted_at, uploaded_by, created_at, updated_at\n            FROM files\n            ORDER BY created_at DESC\n            ",
   "describe": {
     "columns": [
       {
@@ -10,67 +10,77 @@
       },
       {
         "ordinal": 1,
-        "name": "filename",
+        "name": "name",
         "type_info": "Text"
       },
       {
         "ordinal": 2,
+        "name": "description",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 3,
         "name": "size_bytes",
         "type_info": "Int8"
       },
       {
-        "ordinal": 3,
+        "ordinal": 4,
         "name": "status",
         "type_info": "Text"
       },
       {
-        "ordinal": 4,
+        "ordinal": 5,
         "name": "error_message",
         "type_info": "Text"
       },
       {
-        "ordinal": 5,
+        "ordinal": 6,
+        "name": "purpose",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 7,
         "name": "expires_at",
         "type_info": "Timestamptz"
       },
       {
-        "ordinal": 6,
+        "ordinal": 8,
         "name": "deleted_at",
         "type_info": "Timestamptz"
       },
       {
-        "ordinal": 7,
+        "ordinal": 9,
         "name": "uploaded_by",
-        "type_info": "Uuid"
+        "type_info": "Text"
       },
       {
-        "ordinal": 8,
+        "ordinal": 10,
         "name": "created_at",
         "type_info": "Timestamptz"
       },
       {
-        "ordinal": 9,
+        "ordinal": 11,
         "name": "updated_at",
         "type_info": "Timestamptz"
       }
     ],
     "parameters": {
-      "Left": [
-        "Uuid"
-      ]
+      "Left": []
     },
     "nullable": [
       false,
       false,
+      true,
       false,
       false,
       true,
       true,
       true,
-      false,
+      true,
+      true,
       false,
       false
     ]
   },
-  "hash": "d169c558df910c04f98627f46d1f0ee4fbbab4c51667ccbcee9cf966ba8db9b1"
+  "hash": "9dfc7046351948f53d30d6505d8a18a81b4a0e69996e0451855830d43447bad9"
 }

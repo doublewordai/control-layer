@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "\n            UPDATE files\n            SET\n                filename = COALESCE($2, filename),\n                status = COALESCE($3, status),\n                error_message = CASE\n                    WHEN $4 THEN $5\n                    ELSE error_message\n                END,\n                deleted_at = COALESCE($6, deleted_at),\n                updated_at = NOW()\n            WHERE id = $1\n            RETURNING *\n            ",
+  "query": "\n            SELECT id, name, description, size_bytes, status, error_message, purpose, expires_at, deleted_at, uploaded_by, created_at, updated_at\n            FROM files\n            WHERE id = $1\n            ",
   "describe": {
     "columns": [
       {
@@ -10,72 +10,79 @@
       },
       {
         "ordinal": 1,
-        "name": "filename",
+        "name": "name",
         "type_info": "Text"
       },
       {
         "ordinal": 2,
+        "name": "description",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 3,
         "name": "size_bytes",
         "type_info": "Int8"
       },
       {
-        "ordinal": 3,
+        "ordinal": 4,
         "name": "status",
         "type_info": "Text"
       },
       {
-        "ordinal": 4,
+        "ordinal": 5,
         "name": "error_message",
         "type_info": "Text"
       },
       {
-        "ordinal": 5,
+        "ordinal": 6,
+        "name": "purpose",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 7,
         "name": "expires_at",
         "type_info": "Timestamptz"
       },
       {
-        "ordinal": 6,
+        "ordinal": 8,
         "name": "deleted_at",
         "type_info": "Timestamptz"
       },
       {
-        "ordinal": 7,
+        "ordinal": 9,
         "name": "uploaded_by",
-        "type_info": "Uuid"
+        "type_info": "Text"
       },
       {
-        "ordinal": 8,
+        "ordinal": 10,
         "name": "created_at",
         "type_info": "Timestamptz"
       },
       {
-        "ordinal": 9,
+        "ordinal": 11,
         "name": "updated_at",
         "type_info": "Timestamptz"
       }
     ],
     "parameters": {
       "Left": [
-        "Uuid",
-        "Text",
-        "Text",
-        "Bool",
-        "Text",
-        "Timestamptz"
+        "Uuid"
       ]
     },
     "nullable": [
       false,
       false,
+      true,
       false,
       false,
       true,
       true,
       true,
-      false,
+      true,
+      true,
       false,
       false
     ]
   },
-  "hash": "5e168743a099845e84100aa23fc5f5d2ff6402a9f8bf21bddea12e822b7a15a9"
+  "hash": "d1656bc197d573cd4645e6ca99377491a063b361ac983533950a00901bf27b32"
 }

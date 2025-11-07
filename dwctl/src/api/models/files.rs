@@ -10,6 +10,7 @@ pub struct ListFilesQuery {
 
     /// Number of files to skip (for pagination, default 0)
     #[param(default = 0, minimum = 0)]
+    #[allow(dead_code)] // TODO: Implement offset-based pagination or remove this field
     pub skip: Option<i64>,
 
     /// Sort order by created_at (asc or desc, default desc)
