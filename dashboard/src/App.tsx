@@ -5,6 +5,7 @@ import { ReactQueryDevtools } from "@tanstack/react-query-devtools";
 import { Toaster } from "./components/ui/sonner";
 import {
   ApiKeys,
+  CostManagement,
   Endpoints,
   Models,
   ModelInfo,
@@ -263,6 +264,16 @@ function AppRoutes() {
             <AppLayout>
               <ProtectedRoute path="/api-keys">
                 <ApiKeys />
+              </ProtectedRoute>
+            </AppLayout>
+          }
+        />
+        <Route
+          path="/cost-management"
+          element={
+            <AppLayout>
+              <ProtectedRoute path="/cost-management" requiredFeatureFlag="use_billing">
+                <CostManagement />
               </ProtectedRoute>
             </AppLayout>
           }
