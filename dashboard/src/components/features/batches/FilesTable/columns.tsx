@@ -6,9 +6,9 @@ import {
   MoreHorizontal,
   Trash2,
   Eye,
-  Download,
   Clock,
   FileText,
+  Code,
 } from "lucide-react";
 import { Button } from "../../../ui/button";
 import {
@@ -25,6 +25,7 @@ import type { FileObject } from "../types";
 interface ColumnActions {
   onView: (file: FileObject) => void;
   onDelete: (file: FileObject) => void;
+  onDownloadCode: (file: FileObject) => void;
 }
 
 export const createFileColumns = (
@@ -58,9 +59,7 @@ export const createFileColumns = (
     header: "File ID",
     cell: ({ row }) => {
       const id = row.getValue("id") as string;
-      return (
-        <span className="font-mono text-xs text-gray-600">{id}</span>
-      );
+      return <span className="font-mono text-xs text-gray-600">{id}</span>;
     },
   },
   {
@@ -82,13 +81,21 @@ export const createFileColumns = (
     },
   },
   {
-    accessorKey: "purpose",
-    header: "Purpose",
+    id: "request_count",
+    header: "Requests",
     cell: ({ row }) => {
-      const purpose = row.getValue("purpose") as string;
+      const file = row.original;
+      // In a real app, this would come from the API
+      // For demo, we'll use mock data based on file ID
+      const requestCounts: Record<string, number> = {
+        "file-demo-1": 3,
+        "file-demo-2": 2,
+        "file-demo-3": 5,
+      };
+      const count = requestCounts[file.id] || 0;
       return (
-        <span className="inline-flex items-center px-2.5 py-0.5 rounded-full text-xs font-medium bg-blue-100 text-blue-800">
-          {purpose}
+        <span className="inline-flex items-center px-2.5 py-0.5 rounded-full text-xs font-medium bg-gray-100 text-gray-800">
+          {count} {count === 1 ? "request" : "requests"}
         </span>
       );
     },
@@ -121,15 +128,26 @@ export const createFileColumns = (
     cell: ({ row }) => {
       const timestamp = row.getValue("expires_at") as number | undefined;
       if (!timestamp) return <span className="text-gray-400">Never</span>;
-      
+
       const expiresDate = new Date(timestamp * 1000);
       const now = new Date();
       const isExpired = expiresDate < now;
-      
+
+      if (isExpired) {
+        return (
+          <div className="flex items-center gap-1">
+            <Clock className="w-3 h-3 text-red-500" />
+            <span className="text-red-600 font-medium">
+              Expired {formatTimestamp(expiresDate.toISOString())}
+            </span>
+          </div>
+        );
+      }
+
       return (
         <div className="flex items-center gap-1">
-          <Clock className={`w-3 h-3 ${isExpired ? 'text-red-500' : 'text-gray-500'}`} />
-          <span className={isExpired ? 'text-red-600' : 'text-gray-700'}>
+          <Clock className="w-3 h-3 text-blue-500" />
+          <span className="text-gray-700">
             {formatTimestamp(expiresDate.toISOString())}
           </span>
         </div>
@@ -140,6 +158,8 @@ export const createFileColumns = (
     id: "actions",
     cell: ({ row }) => {
       const file = row.original;
+      const isExpired =
+        file.expires_at && new Date(file.expires_at * 1000) < new Date();
 
       return (
         <DropdownMenu>
@@ -155,6 +175,12 @@ export const createFileColumns = (
               <Eye className="mr-2 h-4 w-4" />
               View Requests
             </DropdownMenuItem>
+            {!isExpired && (
+              <DropdownMenuItem onClick={() => actions.onDownloadCode(file)}>
+                <Code className="mr-2 h-4 w-4" />
+                Download File
+              </DropdownMenuItem>
+            )}
             <DropdownMenuSeparator />
             <DropdownMenuItem
               onClick={() => actions.onDelete(file)}

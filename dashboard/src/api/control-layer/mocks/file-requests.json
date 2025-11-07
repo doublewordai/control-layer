@@ -1,79 +1,107 @@
 {
   "file-demo-1": [
     {
-      "custom_id": "request-001",
+      "custom_id": "request-1",
       "method": "POST",
       "url": "/v1/chat/completions",
       "body": {
-        "model": "gpt-4o-mini",
-        "messages": [
-          { "role": "system", "content": "You are a helpful assistant." },
-          { "role": "user", "content": "What is 2+2?" }
-        ]
+        "model": "gpt-4",
+        "messages": [{"role": "user", "content": "What is 2+2?"}],
+        "max_tokens": 100
       }
     },
     {
-      "custom_id": "request-002",
+      "custom_id": "request-2",
       "method": "POST",
       "url": "/v1/chat/completions",
       "body": {
-        "model": "gpt-4o-mini",
-        "messages": [
-          { "role": "system", "content": "You are a helpful assistant." },
-          { "role": "user", "content": "What is the capital of France?" }
-        ]
+        "model": "gpt-4",
+        "messages": [{"role": "user", "content": "Explain quantum computing"}],
+        "max_tokens": 200
       }
     },
     {
-      "custom_id": "request-003",
+      "custom_id": "request-3",
       "method": "POST",
       "url": "/v1/chat/completions",
       "body": {
-        "model": "gpt-4o-mini",
-        "messages": [
-          { "role": "system", "content": "You are a helpful assistant." },
-          { "role": "user", "content": "Explain quantum computing in simple terms." }
-        ]
+        "model": "gpt-4",
+        "messages": [{"role": "user", "content": "Write a haiku"}],
+        "max_tokens": 50
       }
     }
   ],
   "file-demo-2": [
     {
-      "custom_id": "request-004",
+      "custom_id": "eval-1",
       "method": "POST",
       "url": "/v1/chat/completions",
       "body": {
-        "model": "gpt-4o-mini",
-        "messages": [
-          { "role": "system", "content": "You are a helpful assistant." },
-          { "role": "user", "content": "What is machine learning?" }
-        ]
+        "model": "gpt-3.5-turbo",
+        "messages": [{"role": "user", "content": "Translate to Spanish: Hello"}],
+        "max_tokens": 50
       }
     },
     {
-      "custom_id": "request-005",
+      "custom_id": "eval-2",
       "method": "POST",
       "url": "/v1/chat/completions",
       "body": {
-        "model": "gpt-4o-mini",
-        "messages": [
-          { "role": "system", "content": "You are a helpful assistant." },
-          { "role": "user", "content": "Describe neural networks." }
-        ]
+        "model": "gpt-3.5-turbo",
+        "messages": [{"role": "user", "content": "Summarize: AI is transforming"}],
+        "max_tokens": 100
       }
     }
   ],
   "file-demo-3": [
     {
-      "custom_id": "request-006",
+      "custom_id": "large-1",
       "method": "POST",
       "url": "/v1/chat/completions",
       "body": {
-        "model": "gpt-4o-mini",
-        "messages": [
-          { "role": "system", "content": "You are a helpful assistant." },
-          { "role": "user", "content": "What is deep learning?" }
-        ]
+        "model": "gpt-4",
+        "messages": [{"role": "user", "content": "Question 1"}],
+        "max_tokens": 150
+      }
+    },
+    {
+      "custom_id": "large-2",
+      "method": "POST",
+      "url": "/v1/chat/completions",
+      "body": {
+        "model": "gpt-4",
+        "messages": [{"role": "user", "content": "Question 2"}],
+        "max_tokens": 150
+      }
+    },
+    {
+      "custom_id": "large-3",
+      "method": "POST",
+      "url": "/v1/chat/completions",
+      "body": {
+        "model": "gpt-4",
+        "messages": [{"role": "user", "content": "Question 3"}],
+        "max_tokens": 150
+      }
+    },
+    {
+      "custom_id": "large-4",
+      "method": "POST",
+      "url": "/v1/chat/completions",
+      "body": {
+        "model": "gpt-4",
+        "messages": [{"role": "user", "content": "Question 4"}],
+        "max_tokens": 150
+      }
+    },
+    {
+      "custom_id": "large-5",
+      "method": "POST",
+      "url": "/v1/chat/completions",
+      "body": {
+        "model": "gpt-4",
+        "messages": [{"role": "user", "content": "Question 5"}],
+        "max_tokens": 150
       }
     }
   ]
