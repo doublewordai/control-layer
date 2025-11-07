@@ -280,6 +280,7 @@ impl<'c> ApiKeys<'c> {
             FROM api_keys ak
             INNER JOIN user_groups ug ON ak.user_id = ug.user_id
             INNER JOIN deployment_groups dg ON ug.group_id = dg.group_id
+            INNER JOIN deployed_models dm ON dg.deployment_id = dm.id
             WHERE dg.deployment_id = $1
             AND (
                 ak.user_id = $2  -- System user always has access
@@ -301,6 +302,12 @@ impl<'c> ApiKeys<'c> {
                         AND (ct2.created_at > ct.created_at OR (ct2.created_at = ct.created_at AND ct2.id > ct.id))
                     )
                 )
+                OR (
+                    -- Free models are accessible to all users (zero balance OK)
+                    -- A model is free if pricing is NULL OR both prices are 0
+                    (dm.upstream_input_price_per_token IS NULL OR dm.upstream_input_price_per_token = 0)
+                    AND (dm.upstream_output_price_per_token IS NULL OR dm.upstream_output_price_per_token = 0)
+                )
             )
 
             UNION
@@ -317,6 +324,7 @@ impl<'c> ApiKeys<'c> {
                 ak.burst_size
             FROM api_keys ak
             INNER JOIN deployment_groups dg ON dg.group_id = '00000000-0000-0000-0000-000000000000'
+            INNER JOIN deployed_models dm ON dg.deployment_id = dm.id
             WHERE dg.deployment_id = $1
             AND ak.user_id != '00000000-0000-0000-0000-000000000000'  -- Exclude system user (already covered above)
             AND (
@@ -338,6 +346,12 @@ impl<'c> ApiKeys<'c> {
                         WHERE ct2.user_id = ct.user_id
                         AND (ct2.created_at > ct.created_at OR (ct2.created_at = ct.created_at AND ct2.id > ct.id))
                     )
+                )
+                OR (
+                    -- Free models are accessible to all users (zero balance OK)
+                    -- A model is free if pricing is NULL OR both prices are 0
+                    (dm.upstream_input_price_per_token IS NULL OR dm.upstream_input_price_per_token = 0)
+                    AND (dm.upstream_output_price_per_token IS NULL OR dm.upstream_output_price_per_token = 0)
                 )
             )
             "#,
@@ -2305,15 +2319,28 @@ mod tests {
         crate::seed_database(&config.model_sources, pool).await.unwrap();
         let test_endpoint_id = get_test_endpoint_id(pool).await;
 
-        // Create deployment
+        // Create deployment with pricing (paid model by default for credit tests)
         let deployment;
         {
+            use crate::db::models::deployments::{ModelPricing, TokenPricing};
+
             let mut deployment_tx = tx.begin().await.unwrap();
             let mut deployment_repo = Deployments::new(deployment_tx.acquire().await.unwrap());
+
+            // Default to a paid model for credit filtering tests
+            let pricing = ModelPricing {
+                upstream: Some(TokenPricing {
+                    input_price_per_token: Some(Decimal::new(1, 6)),  // $0.000001 per token
+                    output_price_per_token: Some(Decimal::new(2, 6)), // $0.000002 per token
+                }),
+                downstream: None,
+            };
+
             let mut deployment_create = DeploymentCreateDBRequest::builder()
                 .created_by(admin_user.id)
                 .model_name(format!("test-model-{}", uuid::Uuid::new_v4()))
                 .alias(format!("test-alias-{}", uuid::Uuid::new_v4()))
+                .pricing(pricing)
                 .build();
             deployment_create.hosted_on = test_endpoint_id;
             deployment = deployment_repo.create(&deployment_create).await.unwrap();
@@ -2398,15 +2425,27 @@ mod tests {
         crate::seed_database(&config.model_sources, &pool).await.unwrap();
         let test_endpoint_id = get_test_endpoint_id(&pool).await;
 
-        // Create deployment
+        // Create deployment with pricing (paid model)
         let deployment;
         {
+            use crate::db::models::deployments::{ModelPricing, TokenPricing};
+
             let mut deployment_tx = tx.begin().await.unwrap();
             let mut deployment_repo = Deployments::new(deployment_tx.acquire().await.unwrap());
+
+            let pricing = ModelPricing {
+                upstream: Some(TokenPricing {
+                    input_price_per_token: Some(Decimal::new(1, 6)),  // $0.000001 per token
+                    output_price_per_token: Some(Decimal::new(2, 6)), // $0.000002 per token
+                }),
+                downstream: None,
+            };
+
             let mut deployment_create = DeploymentCreateDBRequest::builder()
                 .created_by(admin_user.id)
                 .model_name("test-model".to_string())
                 .alias("test-alias".to_string())
+                .pricing(pricing)
                 .build();
             deployment_create.hosted_on = test_endpoint_id;
             deployment = deployment_repo.create(&deployment_create).await.unwrap();
@@ -2821,6 +2860,376 @@ mod tests {
         assert!(
             keys_with_access.iter().any(|k| k.secret == key.secret),
             "User should regain access after adding credits"
+        );
+    }
+
+    #[sqlx::test]
+    #[test_log::test]
+    async fn test_zero_credit_user_can_access_free_model(pool: PgPool) {
+        // This test will FAIL initially - demonstrating that zero-credit users
+        // currently cannot access free models (but they should be able to)
+        let mut tx = pool.begin().await.unwrap();
+
+        // Create users
+        let admin_user;
+        let user_no_credits;
+        {
+            let mut user_repo = Users::new(tx.acquire().await.unwrap());
+
+            let admin_create = UserCreateDBRequest::from(UserCreate {
+                username: "admin".to_string(),
+                email: "admin@example.com".to_string(),
+                display_name: None,
+                avatar_url: None,
+                roles: vec![Role::PlatformManager],
+            });
+            admin_user = user_repo.create(&admin_create).await.unwrap();
+
+            let user_create = UserCreateDBRequest::from(UserCreate {
+                username: "zerocredits".to_string(),
+                email: "zerocredits@example.com".to_string(),
+                display_name: None,
+                avatar_url: None,
+                roles: vec![Role::StandardUser],
+            });
+            user_no_credits = user_repo.create(&user_create).await.unwrap();
+        }
+
+        // Create group
+        let group;
+        {
+            let mut group_tx = tx.begin().await.unwrap();
+            let mut group_repo = Groups::new(group_tx.acquire().await.unwrap());
+            let group_create = GroupCreateDBRequest {
+                name: "Free Model Test Group".to_string(),
+                description: Some("Testing free model access".to_string()),
+                created_by: admin_user.id,
+            };
+            group = group_repo.create(&group_create).await.unwrap();
+            group_tx.commit().await.unwrap();
+        }
+
+        // Seed database and get endpoint ID
+        let config = crate::test_utils::create_test_config();
+        crate::seed_database(&config.model_sources, &pool).await.unwrap();
+        let test_endpoint_id = get_test_endpoint_id(&pool).await;
+
+        // Create deployment with NO pricing (free model)
+        let deployment;
+        {
+            let mut deployment_tx = tx.begin().await.unwrap();
+            let mut deployment_repo = Deployments::new(deployment_tx.acquire().await.unwrap());
+            let mut deployment_create = DeploymentCreateDBRequest::builder()
+                .created_by(admin_user.id)
+                .model_name("free-model".to_string())
+                .alias("free-alias".to_string())
+                .build();
+            deployment_create.hosted_on = test_endpoint_id;
+            deployment = deployment_repo.create(&deployment_create).await.unwrap();
+            deployment_tx.commit().await.unwrap();
+        }
+
+        // Add user to group and deployment to group
+        {
+            let mut group_tx = tx.begin().await.unwrap();
+            let mut group_repo = Groups::new(group_tx.acquire().await.unwrap());
+            group_repo.add_user_to_group(user_no_credits.id, group.id).await.unwrap();
+            group_repo
+                .add_deployment_to_group(deployment.id, group.id, admin_user.id)
+                .await
+                .unwrap();
+            group_tx.commit().await.unwrap();
+        }
+
+        // Create API key for zero-credit user
+        let mut api_repo = ApiKeys::new(&mut tx);
+        let key_no_credits = api_repo
+            .create(&ApiKeyCreateDBRequest {
+                name: "Zero Credits Key".to_string(),
+                description: Some("User with no credits".to_string()),
+                user_id: user_no_credits.id,
+                requests_per_second: None,
+                burst_size: None,
+            })
+            .await
+            .unwrap();
+
+        tx.commit().await.unwrap();
+
+        // User has NO credit transactions - balance is 0
+
+        // Get API keys for the free deployment
+        let mut pool_conn = pool.acquire().await.unwrap();
+        let mut api_repo = ApiKeys::new(&mut pool_conn);
+        let keys_for_deployment = api_repo
+            .get_api_keys_for_deployment_with_sufficient_credit(deployment.id)
+            .await
+            .unwrap();
+
+        // Debug output
+        println!("Keys returned for free model: {}", keys_for_deployment.len());
+        for key in &keys_for_deployment {
+            println!("  - {} (user: {})", key.name, key.user_id);
+        }
+
+        // Zero-credit user SHOULD have access to free models
+        assert!(
+            keys_for_deployment.iter().any(|k| k.secret == key_no_credits.secret),
+            "User with zero credits SHOULD have access to FREE models"
+        );
+    }
+
+    #[sqlx::test]
+    #[test_log::test]
+    async fn test_zero_credit_user_cannot_access_paid_model(pool: PgPool) {
+        // This test should PASS - demonstrating that zero-credit users
+        // correctly cannot access paid models
+        let mut tx = pool.begin().await.unwrap();
+
+        // Create users
+        let admin_user;
+        let user_no_credits;
+        {
+            let mut user_repo = Users::new(tx.acquire().await.unwrap());
+
+            let admin_create = UserCreateDBRequest::from(UserCreate {
+                username: "admin".to_string(),
+                email: "admin@example.com".to_string(),
+                display_name: None,
+                avatar_url: None,
+                roles: vec![Role::PlatformManager],
+            });
+            admin_user = user_repo.create(&admin_create).await.unwrap();
+
+            let user_create = UserCreateDBRequest::from(UserCreate {
+                username: "zerocredits".to_string(),
+                email: "zerocredits@example.com".to_string(),
+                display_name: None,
+                avatar_url: None,
+                roles: vec![Role::StandardUser],
+            });
+            user_no_credits = user_repo.create(&user_create).await.unwrap();
+        }
+
+        // Create group
+        let group;
+        {
+            let mut group_tx = tx.begin().await.unwrap();
+            let mut group_repo = Groups::new(group_tx.acquire().await.unwrap());
+            let group_create = GroupCreateDBRequest {
+                name: "Paid Model Test Group".to_string(),
+                description: Some("Testing paid model access".to_string()),
+                created_by: admin_user.id,
+            };
+            group = group_repo.create(&group_create).await.unwrap();
+            group_tx.commit().await.unwrap();
+        }
+
+        // Seed database and get endpoint ID
+        let config = crate::test_utils::create_test_config();
+        crate::seed_database(&config.model_sources, &pool).await.unwrap();
+        let test_endpoint_id = get_test_endpoint_id(&pool).await;
+
+        // Create deployment WITH pricing (paid model)
+        let deployment;
+        {
+            let mut deployment_tx = tx.begin().await.unwrap();
+            let mut deployment_repo = Deployments::new(deployment_tx.acquire().await.unwrap());
+
+            use crate::db::models::deployments::{ModelPricing, TokenPricing};
+            let pricing = ModelPricing {
+                upstream: Some(TokenPricing {
+                    input_price_per_token: Some(Decimal::new(1, 6)),  // $0.000001 per token
+                    output_price_per_token: Some(Decimal::new(2, 6)), // $0.000002 per token
+                }),
+                downstream: None,
+            };
+
+            let mut deployment_create = DeploymentCreateDBRequest::builder()
+                .created_by(admin_user.id)
+                .model_name("paid-model".to_string())
+                .alias("paid-alias".to_string())
+                .pricing(pricing) // Paid model - has pricing
+                .build();
+            deployment_create.hosted_on = test_endpoint_id;
+            deployment = deployment_repo.create(&deployment_create).await.unwrap();
+            deployment_tx.commit().await.unwrap();
+        }
+
+        // Add user to group and deployment to group
+        {
+            let mut group_tx = tx.begin().await.unwrap();
+            let mut group_repo = Groups::new(group_tx.acquire().await.unwrap());
+            group_repo.add_user_to_group(user_no_credits.id, group.id).await.unwrap();
+            group_repo
+                .add_deployment_to_group(deployment.id, group.id, admin_user.id)
+                .await
+                .unwrap();
+            group_tx.commit().await.unwrap();
+        }
+
+        // Create API key for zero-credit user
+        let mut api_repo = ApiKeys::new(&mut tx);
+        let key_no_credits = api_repo
+            .create(&ApiKeyCreateDBRequest {
+                name: "Zero Credits Key".to_string(),
+                description: Some("User with no credits".to_string()),
+                user_id: user_no_credits.id,
+                requests_per_second: None,
+                burst_size: None,
+            })
+            .await
+            .unwrap();
+
+        tx.commit().await.unwrap();
+
+        // User has NO credit transactions - balance is 0
+
+        // Get API keys for the paid deployment
+        let mut pool_conn = pool.acquire().await.unwrap();
+        let mut api_repo = ApiKeys::new(&mut pool_conn);
+        let keys_for_deployment = api_repo
+            .get_api_keys_for_deployment_with_sufficient_credit(deployment.id)
+            .await
+            .unwrap();
+
+        // Debug output
+        println!("Keys returned for paid model: {}", keys_for_deployment.len());
+        for key in &keys_for_deployment {
+            println!("  - {} (user: {})", key.name, key.user_id);
+        }
+
+        // Zero-credit user should NOT have access to paid models
+        assert!(
+            !keys_for_deployment.iter().any(|k| k.secret == key_no_credits.secret),
+            "User with zero credits should NOT have access to PAID models"
+        );
+    }
+
+    #[sqlx::test]
+    #[test_log::test]
+    async fn test_zero_credit_user_can_access_zero_price_model(pool: PgPool) {
+        // This test verifies that models with explicit $0.00 pricing (not NULL)
+        // are also accessible to zero-credit users
+        let mut tx = pool.begin().await.unwrap();
+
+        // Create users
+        let admin_user;
+        let user_no_credits;
+        {
+            let mut user_repo = Users::new(tx.acquire().await.unwrap());
+
+            let admin_create = UserCreateDBRequest::from(UserCreate {
+                username: "admin".to_string(),
+                email: "admin@example.com".to_string(),
+                display_name: None,
+                avatar_url: None,
+                roles: vec![Role::PlatformManager],
+            });
+            admin_user = user_repo.create(&admin_create).await.unwrap();
+
+            let user_create = UserCreateDBRequest::from(UserCreate {
+                username: "zerocredits".to_string(),
+                email: "zerocredits@example.com".to_string(),
+                display_name: None,
+                avatar_url: None,
+                roles: vec![Role::StandardUser],
+            });
+            user_no_credits = user_repo.create(&user_create).await.unwrap();
+        }
+
+        // Create group
+        let group;
+        {
+            let mut group_tx = tx.begin().await.unwrap();
+            let mut group_repo = Groups::new(group_tx.acquire().await.unwrap());
+            let group_create = GroupCreateDBRequest {
+                name: "Zero Price Model Test Group".to_string(),
+                description: Some("Testing zero-price model access".to_string()),
+                created_by: admin_user.id,
+            };
+            group = group_repo.create(&group_create).await.unwrap();
+            group_tx.commit().await.unwrap();
+        }
+
+        // Seed database and get endpoint ID
+        let config = crate::test_utils::create_test_config();
+        crate::seed_database(&config.model_sources, &pool).await.unwrap();
+        let test_endpoint_id = get_test_endpoint_id(&pool).await;
+
+        // Create deployment with explicit zero pricing (free model)
+        let deployment;
+        {
+            let mut deployment_tx = tx.begin().await.unwrap();
+            let mut deployment_repo = Deployments::new(deployment_tx.acquire().await.unwrap());
+
+            use crate::db::models::deployments::{ModelPricing, TokenPricing};
+            let pricing = ModelPricing {
+                upstream: Some(TokenPricing {
+                    input_price_per_token: Some(Decimal::ZERO),  // Explicit $0.00
+                    output_price_per_token: Some(Decimal::ZERO), // Explicit $0.00
+                }),
+                downstream: None,
+            };
+
+            let mut deployment_create = DeploymentCreateDBRequest::builder()
+                .created_by(admin_user.id)
+                .model_name("zero-price-model".to_string())
+                .alias("zero-price-alias".to_string())
+                .pricing(pricing) // Free model with explicit zero pricing
+                .build();
+            deployment_create.hosted_on = test_endpoint_id;
+            deployment = deployment_repo.create(&deployment_create).await.unwrap();
+            deployment_tx.commit().await.unwrap();
+        }
+
+        // Add user to group and deployment to group
+        {
+            let mut group_tx = tx.begin().await.unwrap();
+            let mut group_repo = Groups::new(group_tx.acquire().await.unwrap());
+            group_repo.add_user_to_group(user_no_credits.id, group.id).await.unwrap();
+            group_repo
+                .add_deployment_to_group(deployment.id, group.id, admin_user.id)
+                .await
+                .unwrap();
+            group_tx.commit().await.unwrap();
+        }
+
+        // Create API key for zero-credit user
+        let mut api_repo = ApiKeys::new(&mut tx);
+        let key_no_credits = api_repo
+            .create(&ApiKeyCreateDBRequest {
+                name: "Zero Credits Key".to_string(),
+                description: Some("User with no credits".to_string()),
+                user_id: user_no_credits.id,
+                requests_per_second: None,
+                burst_size: None,
+            })
+            .await
+            .unwrap();
+
+        tx.commit().await.unwrap();
+
+        // User has NO credit transactions - balance is 0
+
+        // Get API keys for the zero-price deployment
+        let mut pool_conn = pool.acquire().await.unwrap();
+        let mut api_repo = ApiKeys::new(&mut pool_conn);
+        let keys_for_deployment = api_repo
+            .get_api_keys_for_deployment_with_sufficient_credit(deployment.id)
+            .await
+            .unwrap();
+
+        // Debug output
+        println!("Keys returned for zero-price model: {}", keys_for_deployment.len());
+        for key in &keys_for_deployment {
+            println!("  - {} (user: {})", key.name, key.user_id);
+        }
+
+        // Zero-credit user SHOULD have access to models with explicit $0.00 pricing
+        assert!(
+            keys_for_deployment.iter().any(|k| k.secret == key_no_credits.secret),
+            "User with zero credits SHOULD have access to models with explicit $0.00 pricing"
         );
     }
 }
