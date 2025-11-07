@@ -38,16 +38,17 @@ export function useUsers(options?: UsersQuery & { enabled?: boolean }) {
   });
 }
 
-export function useUser(id: string) {
+export function useUser(id: string, options?: { include?: string }) {
   return useQuery({
-    queryKey: queryKeys.users.byId(id),
-    queryFn: () => dwctlApi.users.get(id),
+    queryKey: queryKeys.users.byId(id, options?.include),
+    queryFn: () => dwctlApi.users.get(id, options),
   });
 }
 
 export function useUserBalance(id: string) {
   // Reuse the useUser cache to avoid duplicate queries and ensure consistency
-  const userQuery = useUser(id);
+  // Explicitly request billing data for this hook
+  const userQuery = useUser(id, { include: "billing" });
 
   return {
     data: userQuery.data?.credit_balance || 0,
@@ -638,7 +639,7 @@ export function useAddFunds() {
     onSuccess: async (_, variables) => {
       // Refetch user balance and transactions from server
       await Promise.all([
-        queryClient.refetchQueries({ queryKey: queryKeys.users.byId(variables.user_id) }),
+        queryClient.refetchQueries({ queryKey: queryKeys.users.byId(variables.user_id, "billing") }),
         queryClient.refetchQueries({ queryKey: ["cost", "transactions"] }),
       ]);
     },

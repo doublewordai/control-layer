@@ -46,11 +46,9 @@ import { ApiError } from "./errors";
 const userApi = {
   async list(options?: UsersQuery): Promise<User[]> {
     const params = new URLSearchParams();
-    // Combine existing include with billing
-    const includeParams = options?.include
-      ? `${options.include},billing`
-      : "billing";
-    params.set("include", includeParams);
+      if (options?.include) {
+      params.set("include", options.include);
+    }
 
     const url = `/admin/api/v1/users${params.toString() ? "?" + params.toString() : ""}`;
     const response = await fetch(url);
@@ -60,8 +58,13 @@ const userApi = {
     return response.json();
   },
 
-  async get(id: string): Promise<User> {
-    const response = await fetch(`/admin/api/v1/users/${id}?include=billing`);
+  async get(id: string, options?: { include?: string }): Promise<User> {
+    const params = new URLSearchParams();
+    if (options?.include) {
+      params.set("include", options.include);
+    }
+    const url = `/admin/api/v1/users/${id}${params.toString() ? "?" + params.toString() : ""}`;
+    const response = await fetch(url);
     if (!response.ok) {
       throw new Error(`Failed to fetch user: ${response.status}`);
     }
