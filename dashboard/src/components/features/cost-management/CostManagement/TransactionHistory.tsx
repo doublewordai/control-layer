@@ -75,7 +75,7 @@ export function TransactionHistory({
 
   // Pagination state
   const [currentPage, setCurrentPage] = useState(1);
-  const itemsPerPage = 10;
+  const itemsPerPage = 6;
 
   // Helper functions
   const formatDate = (isoString: string) => {
@@ -175,40 +175,34 @@ export function TransactionHistory({
 
   const content = (
     <>
-      {/* Current Balance Card */}
-      <Card className="p-6 bg-gradient-to-br from-blue-50 to-indigo-50 border-blue-200 mb-6">
-        <h2 className="text-xl font-semibold text-doubleword-neutral-900 mb-4">
-          Current Balance
-        </h2>
-        <div className="flex items-center justify-between">
-          <div className="flex items-baseline gap-2">
-            <span className="text-4xl font-bold text-doubleword-neutral-900">
-              {formatDollars(currentBalance)}
-            </span>
-          </div>
-          {onAddFunds && (
-            <Button
-              className="bg-blue-600 hover:bg-blue-700"
-              size="lg"
-              onClick={onAddFunds}
-              disabled={isAddingFunds}
-            >
-              <Plus className="w-5 h-5 mr-2" />
-              {isAddingFunds ? "Adding..." : "Add Funds"}
-            </Button>
-          )}
-        </div>
-      </Card>
-
       {/* Transaction History Card */}
-      <Card className="p-6">
-        <h2 className="text-xl font-semibold text-doubleword-neutral-900 mb-4">
-          Transaction History
-        </h2>
+      <Card className="p-4">
+        <div className="flex items-center justify-between mb-2">
+          <h2 className="text-2xl font-semibold text-doubleword-neutral-900">
+            Transactions
+          </h2>
+          <div className="flex items-stretch border border-doubleword-neutral-300 rounded-lg overflow-hidden">
+            <div className="flex items-center gap-2 px-3 py-1.5 bg-doubleword-neutral-100">
+              <span className="text-xs font-medium text-doubleword-neutral-600 uppercase tracking-wide">Balance</span>
+              <span className="text-lg font-bold text-doubleword-neutral-900">
+                {formatDollars(currentBalance)}
+              </span>
+            </div>
+            {onAddFunds && (
+              <button
+                onClick={onAddFunds}
+                disabled={isAddingFunds}
+                className="flex items-center px-3 py-1.5 bg-white hover:bg-doubleword-neutral-50 border-l border-doubleword-neutral-300 disabled:opacity-50 disabled:cursor-not-allowed transition-colors"
+              >
+                <Plus className="w-4 h-4 text-doubleword-neutral-700" />
+              </button>
+            )}
+          </div>
+        </div>
 
         {/* Search and Filters */}
-        <div className="mb-4 space-y-3">
-          <div className="flex flex-wrap items-center gap-3">
+        <div className="space-y-2">
+          <div className="flex flex-wrap items-center gap-2">
             {/* Search Bar */}
             <div className="relative flex-1 min-w-[250px]">
               <Search className="absolute left-3 top-1/2 -translate-y-1/2 w-4 h-4 text-doubleword-neutral-400" />
@@ -260,8 +254,9 @@ export function TransactionHistory({
           )}
         </div>
 
-        <Table>
-          <TableHeader>
+        <div className="mb-0">
+          <Table>
+            <TableHeader>
             <TableRow>
               <TableHead className="w-[50px]"></TableHead>
               <TableHead>Description</TableHead>
@@ -321,10 +316,11 @@ export function TransactionHistory({
               );
             })}
           </TableBody>
-        </Table>
+          </Table>
+        </div>
 
         {filteredTransactions.length === 0 && (
-          <div className="text-center py-12">
+          <div className="text-center py-8">
             <DollarSign className="w-12 h-12 text-doubleword-neutral-300 mx-auto mb-3" />
             <p className="text-doubleword-neutral-600">
               {hasActiveFilters
@@ -346,7 +342,7 @@ export function TransactionHistory({
 
         {/* Pagination Controls */}
         {filteredTransactions.length > itemsPerPage && (
-          <div className="flex items-center justify-between mt-4 border-t border-doubleword-neutral-200 pt-4">
+          <div className="flex items-center justify-between border-t border-doubleword-neutral-200 pt-2">
             <div className="text-sm text-doubleword-neutral-600">
               Showing {((currentPage - 1) * itemsPerPage) + 1} to{" "}
               {Math.min(currentPage * itemsPerPage, filteredTransactions.length)} of{" "}
