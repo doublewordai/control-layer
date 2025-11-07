@@ -127,7 +127,7 @@ pub async fn register(State(state): State<AppState>, Json(request): Json<Registe
                 transaction_type: CreditTransactionType::AdminGrant,
                 amount: initial_credits,
                 source_id: uuid::Uuid::nil().to_string(), // System ID for initial credits
-                description: Some(format!("Initial credits on account creation")),
+                description: Some("Initial credits on account creation".to_string()),
             })
             .await?;
     }
