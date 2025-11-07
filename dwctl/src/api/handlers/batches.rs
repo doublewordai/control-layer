@@ -5,8 +5,7 @@
 //! Repository methods are delegated to the fusillade/ crate.
 
 use crate::api::models::batches::{
-    BatchListResponse, BatchObjectType, BatchResponse, CreateBatchRequest, ListBatchesQuery,
-    ListObjectType, RequestCounts,
+    BatchListResponse, BatchObjectType, BatchResponse, CreateBatchRequest, ListBatchesQuery, ListObjectType, RequestCounts,
 };
 use crate::auth::permissions::{operation, resource, RequiresPermission};
 use crate::errors::{Error, Result};
@@ -21,10 +20,7 @@ use std::collections::HashMap;
 use uuid::Uuid;
 
 /// Helper function to convert fusillade Batch + BatchStatus to OpenAI BatchResponse
-fn to_batch_response(
-    batch: fusillade::Batch,
-    status: fusillade::BatchStatus,
-) -> BatchResponse {
+fn to_batch_response(batch: fusillade::Batch, status: fusillade::BatchStatus) -> BatchResponse {
     // Convert metadata from serde_json::Value to HashMap<String, String>
     let metadata: Option<HashMap<String, String>> = batch.metadata.and_then(|m| {
         m.as_object().map(|obj| {
@@ -122,12 +118,7 @@ pub async fn create_batch(
     }
 
     // Validate endpoint
-    let supported_endpoints = vec![
-        "/v1/chat/completions",
-        "/v1/completions",
-        "/v1/embeddings",
-        "/v1/moderations",
-    ];
+    let supported_endpoints = ["/v1/chat/completions", "/v1/completions", "/v1/embeddings", "/v1/moderations"];
     if !supported_endpoints.contains(&req.endpoint.as_str()) {
         return Err(Error::BadRequest {
             message: format!(
@@ -156,10 +147,7 @@ pub async fn create_batch(
     // TODO: Check file ownership if user doesn't have ReadAll permission
 
     // Convert metadata to serde_json::Value
-    let metadata = req
-        .metadata
-        .map(|m| serde_json::to_value(m).ok())
-        .flatten();
+    let metadata = req.metadata.and_then(|m| serde_json::to_value(m).ok());
 
     // Create batch input
     let batch_input = fusillade::BatchInput {
@@ -170,13 +158,9 @@ pub async fn create_batch(
     };
 
     // Create the batch
-    let batch = state
-        .request_manager
-        .create_batch(batch_input)
-        .await
-        .map_err(|e| Error::Internal {
-            operation: format!("create batch: {}", e),
-        })?;
+    let batch = state.request_manager.create_batch(batch_input).await.map_err(|e| Error::Internal {
+        operation: format!("create batch: {}", e),
+    })?;
 
     // Get batch status
     let status = state

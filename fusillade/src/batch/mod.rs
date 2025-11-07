@@ -314,7 +314,8 @@ impl BatchStatus {
             return "validating";
         }
 
-        let terminal_count = self.completed_requests + self.failed_requests + self.canceled_requests;
+        let terminal_count =
+            self.completed_requests + self.failed_requests + self.canceled_requests;
 
         if terminal_count == 0 {
             // Nothing has started yet
