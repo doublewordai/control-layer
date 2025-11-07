@@ -3,7 +3,10 @@
 //! This module defines the `Storage` and `RequestManager` traits, which provide the interface
 //! for persisting requests, creating files, launching batches, and checking execution status.
 
-use crate::batch::{BatchId, BatchStatus, File, FileId, RequestTemplate, RequestTemplateInput};
+use crate::batch::{
+    BatchId, BatchStatus, File, FileFilter, FileId, FileStreamItem, RequestTemplate,
+    RequestTemplateInput,
+};
 use crate::error::Result;
 use crate::http::HttpClient;
 use crate::request::{AnyRequest, Claimed, DaemonId, Request, RequestId, RequestState};
@@ -31,14 +34,31 @@ pub trait Storage: Send + Sync {
         templates: Vec<RequestTemplateInput>,
     ) -> Result<FileId>;
 
+    /// Create a new file with templates from a stream.
+    ///
+    /// The stream yields FileStreamItem which can be either:
+    /// - Metadata: File metadata (can appear anywhere, will be accumulated)
+    /// - Template: Request templates (processed as they arrive)
+    async fn create_file_stream<S: Stream<Item = FileStreamItem> + Send + Unpin>(
+        &self,
+        stream: S,
+    ) -> Result<FileId>;
+
     /// Get a file by ID.
     async fn get_file(&self, file_id: FileId) -> Result<File>;
 
-    /// List all files.
-    async fn list_files(&self) -> Result<Vec<File>>;
+    /// List files with optional filtering.
+    async fn list_files(&self, filter: FileFilter) -> Result<Vec<File>>;
 
     /// Get all templates for a file.
     async fn get_file_templates(&self, file_id: FileId) -> Result<Vec<RequestTemplate>>;
+
+    /// Stream file content as request templates.
+    /// Returns the raw JSONL file content - one RequestTemplateInput per line.
+    fn get_file_content_stream(
+        &self,
+        file_id: FileId,
+    ) -> Pin<Box<dyn Stream<Item = Result<RequestTemplateInput>> + Send>>;
 
     /// Delete a file (cascades to batches and executions).
     async fn delete_file(&self, file_id: FileId) -> Result<()>;

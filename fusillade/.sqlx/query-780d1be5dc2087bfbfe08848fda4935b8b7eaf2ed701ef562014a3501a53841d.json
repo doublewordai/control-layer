@@ -1,0 +1,14 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n                    UPDATE files\n                    SET status = 'expired'\n                    WHERE id = $1 AND status = 'processed'\n                    ",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Uuid"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "780d1be5dc2087bfbfe08848fda4935b8b7eaf2ed701ef562014a3501a53841d"
+}

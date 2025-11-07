@@ -4,6 +4,7 @@
 //! a production-ready batching system with persistent storage and real-time updates.
 
 use crate::request::AnyRequest;
+use std::pin::Pin;
 use std::sync::Arc;
 
 use anyhow::anyhow;
@@ -11,13 +12,16 @@ use async_trait::async_trait;
 use chrono::Utc;
 use futures::stream::Stream;
 use sqlx::postgres::{PgListener, PgPool};
-use tokio::sync::Mutex;
+use sqlx::Row;
+use tokio::sync::{mpsc, Mutex};
 use tokio::task::JoinHandle;
+use tokio_stream::wrappers::ReceiverStream;
 use uuid::Uuid;
 
 use super::Storage;
 use crate::batch::{
-    BatchId, BatchStatus, File, FileId, RequestTemplate, RequestTemplateInput, TemplateId,
+    BatchId, BatchStatus, File, FileId, FileMetadata, FileStreamItem, RequestTemplate,
+    RequestTemplateInput, TemplateId,
 };
 use crate::daemon::{Daemon, DaemonConfig};
 use crate::error::{FusilladeError, Result};
@@ -53,6 +57,7 @@ pub struct PostgresRequestManager<H: HttpClient> {
     pool: PgPool,
     http_client: Arc<H>,
     config: DaemonConfig,
+    download_buffer_size: usize,
 }
 
 impl PostgresRequestManager<crate::http::ReqwestHttpClient> {
@@ -71,6 +76,7 @@ impl PostgresRequestManager<crate::http::ReqwestHttpClient> {
             pool,
             http_client: Arc::new(crate::http::ReqwestHttpClient::default()),
             config: DaemonConfig::default(),
+            download_buffer_size: 100,
         }
     }
 }
@@ -90,6 +96,7 @@ impl<H: HttpClient + 'static> PostgresRequestManager<H> {
             pool,
             http_client,
             config: DaemonConfig::default(),
+            download_buffer_size: 100,
         }
     }
 
@@ -98,6 +105,15 @@ impl<H: HttpClient + 'static> PostgresRequestManager<H> {
     /// This is a builder method that can be chained after `new()` or `with_client()`.
     pub fn with_config(mut self, config: DaemonConfig) -> Self {
         self.config = config;
+        self
+    }
+
+    /// Set the download buffer size for file content streams.
+    ///
+    /// This is a builder method that can be chained after `new()` or `with_client()`.
+    /// Default is 100.
+    pub fn with_download_buffer_size(mut self, buffer_size: usize) -> Self {
+        self.download_buffer_size = buffer_size;
         self
     }
 
@@ -163,6 +179,41 @@ impl<H: HttpClient + 'static> PostgresRequestManager<H> {
         }
 
         Ok(count)
+    }
+
+    /// Check if a file should be expired and mark it as such.
+    /// Returns true if the file was marked as expired.
+    async fn check_and_mark_expired(&self, file: &mut File) -> Result<bool> {
+        // Only check files that are currently in 'processed' status
+        if file.status != crate::batch::FileStatus::Processed {
+            return Ok(false);
+        }
+
+        // Check if file has an expiration date and it has passed
+        if let Some(expires_at) = file.expires_at {
+            if Utc::now() > expires_at {
+                // Mark as expired in the database
+                sqlx::query!(
+                    r#"
+                    UPDATE files
+                    SET status = 'expired'
+                    WHERE id = $1 AND status = 'processed'
+                    "#,
+                    *file.id as Uuid,
+                )
+                .execute(&self.pool)
+                .await
+                .map_err(|e| {
+                    FusilladeError::Other(anyhow!("Failed to mark file as expired: {}", e))
+                })?;
+
+                // Update the in-memory file object
+                file.status = crate::batch::FileStatus::Expired;
+                return Ok(true);
+            }
+        }
+
+        Ok(false)
     }
 }
 
@@ -558,6 +609,7 @@ impl<H: HttpClient + 'static> Storage for PostgresRequestManager<H> {
     // File and Batch Management
     // ===================================================================
 
+    #[tracing::instrument(skip(self, templates), fields(name = %name, template_count = templates.len()))]
     async fn create_file(
         &self,
         name: String,
@@ -610,10 +662,206 @@ impl<H: HttpClient + 'static> Storage for PostgresRequestManager<H> {
         Ok(FileId(file_id))
     }
 
+    #[tracing::instrument(skip(self, stream))]
+    async fn create_file_stream<S: Stream<Item = FileStreamItem> + Send + Unpin>(
+        &self,
+        mut stream: S,
+    ) -> Result<FileId> {
+        use futures::StreamExt;
+
+        // Start a transaction for atomic file + templates creation
+        let mut tx =
+            self.pool.begin().await.map_err(|e| {
+                FusilladeError::Other(anyhow!("Failed to begin transaction: {}", e))
+            })?;
+
+        // Accumulate metadata as we encounter it
+        let mut metadata = FileMetadata::default();
+        let mut file_id: Option<Uuid> = None;
+        let mut template_count = 0;
+
+        while let Some(item) = stream.next().await {
+            match item {
+                FileStreamItem::Metadata(meta) => {
+                    // Accumulate metadata (later values override earlier ones)
+                    if meta.filename.is_some() {
+                        metadata.filename = meta.filename;
+                    }
+                    if meta.purpose.is_some() {
+                        metadata.purpose = meta.purpose;
+                    }
+                    if meta.expires_after_anchor.is_some() {
+                        metadata.expires_after_anchor = meta.expires_after_anchor;
+                    }
+                    if meta.expires_after_seconds.is_some() {
+                        metadata.expires_after_seconds = meta.expires_after_seconds;
+                    }
+                    if meta.size_bytes.is_some() {
+                        metadata.size_bytes = meta.size_bytes;
+                    }
+                    if meta.uploaded_by.is_some() {
+                        metadata.uploaded_by = meta.uploaded_by;
+                    }
+                }
+                FileStreamItem::Error(error_message) => {
+                    // Rollback transaction and return validation error
+                    tx.rollback().await.ok(); // Ignore rollback errors
+                    return Err(FusilladeError::ValidationError(error_message));
+                }
+                FileStreamItem::Template(template) => {
+                    // Create file stub on first template with minimal metadata
+                    if file_id.is_none() {
+                        let name = metadata
+                            .filename
+                            .clone()
+                            .unwrap_or_else(|| format!("file_{}", uuid::Uuid::new_v4()));
+
+                        let created_file_id = sqlx::query_scalar!(
+                            r#"
+                            INSERT INTO files (name)
+                            VALUES ($1)
+                            RETURNING id
+                            "#,
+                            name,
+                        )
+                        .fetch_one(&mut *tx)
+                        .await
+                        .map_err(|e| {
+                            // Check for unique constraint violation (PostgreSQL error code 23505)
+                            if let sqlx::Error::Database(db_err) = &e {
+                                if db_err.code().as_deref() == Some("23505") {
+                                    return FusilladeError::ValidationError(format!(
+                                        "A file with the name '{}' already exists",
+                                        name
+                                    ));
+                                }
+                            }
+                            FusilladeError::Other(anyhow!("Failed to create file: {}", e))
+                        })?;
+
+                        file_id = Some(created_file_id);
+                        tracing::debug!(
+                            "Created file stub {} for streaming upload",
+                            created_file_id
+                        );
+                    }
+
+                    // Insert the template immediately with line_number for ordering
+                    let fid = file_id.unwrap();
+                    sqlx::query!(
+                        r#"
+                        INSERT INTO request_templates (file_id, custom_id, endpoint, method, path, body, model, api_key, line_number)
+                        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+                        "#,
+                        fid,
+                        template.custom_id,
+                        template.endpoint,
+                        template.method,
+                        template.path,
+                        template.body,
+                        template.model,
+                        template.api_key,
+                        template_count as i32,
+                    )
+                    .execute(&mut *tx)
+                    .await
+                    .map_err(|e| FusilladeError::Other(anyhow!("Failed to create template: {}", e)))?;
+
+                    template_count += 1;
+                }
+            }
+        }
+
+        // If no templates were received, still create an empty file with whatever metadata we have
+        let fid = if let Some(id) = file_id {
+            id
+        } else {
+            let name = metadata
+                .filename
+                .unwrap_or_else(|| format!("file_{}", uuid::Uuid::new_v4()));
+
+            sqlx::query_scalar!(
+                r#"
+                INSERT INTO files (name)
+                VALUES ($1)
+                RETURNING id
+                "#,
+                name.clone(),
+            )
+            .fetch_one(&mut *tx)
+            .await
+            .map_err(|e| {
+                // Check for unique constraint violation (PostgreSQL error code 23505)
+                if let sqlx::Error::Database(db_err) = &e {
+                    if db_err.code().as_deref() == Some("23505") {
+                        return FusilladeError::ValidationError(format!(
+                            "A file with the name '{}' already exists",
+                            name
+                        ));
+                    }
+                }
+                FusilladeError::Other(anyhow!("Failed to create file: {}", e))
+            })?
+        };
+
+        // Now update the file with all the final metadata
+        let size_bytes = metadata.size_bytes.unwrap_or(0);
+        let status = crate::batch::FileStatus::Processed.to_string();
+        let purpose = metadata.purpose.clone();
+
+        // Calculate expires_at from expires_after if provided
+        let expires_at = if let (Some(anchor), Some(seconds)) = (
+            &metadata.expires_after_anchor,
+            metadata.expires_after_seconds,
+        ) {
+            // Calculate from creation time
+            if anchor == "created_at" {
+                Some(Utc::now() + chrono::Duration::seconds(seconds))
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+
+        let uploaded_by = metadata.uploaded_by.clone();
+
+        sqlx::query!(
+            r#"
+            UPDATE files
+            SET size_bytes = $2, status = $3, purpose = $4, expires_at = $5, uploaded_by = $6
+            WHERE id = $1
+            "#,
+            fid,
+            size_bytes,
+            status,
+            purpose,
+            expires_at,
+            uploaded_by,
+        )
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| FusilladeError::Other(anyhow!("Failed to update file metadata: {}", e)))?;
+
+        // Commit the transaction
+        tx.commit()
+            .await
+            .map_err(|e| FusilladeError::Other(anyhow!("Failed to commit transaction: {}", e)))?;
+
+        tracing::info!(
+            "File {} created with {} templates via streaming upload",
+            fid,
+            template_count
+        );
+
+        Ok(FileId(fid))
+    }
+
+    #[tracing::instrument(skip(self), fields(file_id = %file_id))]
     async fn get_file(&self, file_id: FileId) -> Result<File> {
         let row = sqlx::query!(
             r#"
-            SELECT id, name, description, created_at, updated_at
+            SELECT id, name, description, size_bytes, status, error_message, purpose, expires_at, deleted_at, uploaded_by, created_at, updated_at
             FROM files
             WHERE id = $1
             "#,
@@ -624,46 +872,173 @@ impl<H: HttpClient + 'static> Storage for PostgresRequestManager<H> {
         .map_err(|e| FusilladeError::Other(anyhow!("Failed to fetch file: {}", e)))?
         .ok_or_else(|| FusilladeError::Other(anyhow!("File not found")))?;
 
-        Ok(File {
+        let status = row
+            .status
+            .parse::<crate::batch::FileStatus>()
+            .map_err(|e| {
+                FusilladeError::Other(anyhow!("Invalid file status '{}': {}", row.status, e))
+            })?;
+        let purpose = row
+            .purpose
+            .map(|s| s.parse::<crate::batch::Purpose>())
+            .transpose()
+            .map_err(|e| FusilladeError::Other(anyhow!("Invalid purpose: {}", e)))?;
+
+        let mut file = File {
             id: FileId(row.id),
             name: row.name,
             description: row.description,
+            size_bytes: row.size_bytes,
+            status,
+            error_message: row.error_message,
+            purpose,
+            expires_at: row.expires_at,
+            deleted_at: row.deleted_at,
+            uploaded_by: row.uploaded_by,
             created_at: row.created_at,
             updated_at: row.updated_at,
-        })
+        };
+
+        // Check and mark as expired if needed (passive expiration)
+        self.check_and_mark_expired(&mut file).await?;
+
+        Ok(file)
     }
 
-    async fn list_files(&self) -> Result<Vec<File>> {
-        let rows = sqlx::query!(
+    #[tracing::instrument(skip(self, filter), fields(uploaded_by = ?filter.uploaded_by, status = ?filter.status, purpose = ?filter.purpose))]
+    async fn list_files(&self, filter: crate::batch::FileFilter) -> Result<Vec<File>> {
+        // Build WHERE clause based on filter
+        let mut where_clauses = Vec::new();
+        let mut params: Vec<Option<&str>> = Vec::new();
+
+        if filter.uploaded_by.is_some() {
+            where_clauses.push(format!("uploaded_by = ${}", params.len() + 1));
+            params.push(filter.uploaded_by.as_deref());
+        }
+
+        if filter.status.is_some() {
+            where_clauses.push(format!("status = ${}", params.len() + 1));
+            params.push(filter.status.as_deref());
+        }
+
+        if filter.purpose.is_some() {
+            where_clauses.push(format!("purpose = ${}", params.len() + 1));
+            params.push(filter.purpose.as_deref());
+        }
+
+        let where_clause = if where_clauses.is_empty() {
+            String::new()
+        } else {
+            format!("WHERE {}", where_clauses.join(" AND "))
+        };
+
+        let query = format!(
             r#"
-            SELECT id, name, description, created_at, updated_at
+            SELECT id, name, description, size_bytes, status, error_message, purpose, expires_at, deleted_at, uploaded_by, created_at, updated_at
             FROM files
+            {}
             ORDER BY created_at DESC
             "#,
-        )
-        .fetch_all(&self.pool)
-        .await
-        .map_err(|e| FusilladeError::Other(anyhow!("Failed to list files: {}", e)))?;
+            where_clause
+        );
 
-        Ok(rows
-            .into_iter()
-            .map(|row| File {
-                id: FileId(row.id),
-                name: row.name,
-                description: row.description,
-                created_at: row.created_at,
-                updated_at: row.updated_at,
-            })
-            .collect())
+        let mut query_builder = sqlx::query(&query);
+
+        if let Some(uploaded_by) = filter.uploaded_by {
+            query_builder = query_builder.bind(uploaded_by);
+        }
+        if let Some(status) = filter.status {
+            query_builder = query_builder.bind(status);
+        }
+        if let Some(purpose) = filter.purpose {
+            query_builder = query_builder.bind(purpose);
+        }
+
+        let rows = query_builder
+            .fetch_all(&self.pool)
+            .await
+            .map_err(|e| FusilladeError::Other(anyhow!("Failed to list files: {}", e)))?;
+
+        let mut files = Vec::new();
+
+        for row in rows {
+            let id: Uuid = row
+                .try_get("id")
+                .map_err(|e| FusilladeError::Other(anyhow!("Failed to read id: {}", e)))?;
+            let name: String = row
+                .try_get("name")
+                .map_err(|e| FusilladeError::Other(anyhow!("Failed to read name: {}", e)))?;
+            let description: Option<String> = row
+                .try_get("description")
+                .map_err(|e| FusilladeError::Other(anyhow!("Failed to read description: {}", e)))?;
+            let size_bytes: i64 = row
+                .try_get("size_bytes")
+                .map_err(|e| FusilladeError::Other(anyhow!("Failed to read size_bytes: {}", e)))?;
+            let status_str: String = row
+                .try_get("status")
+                .map_err(|e| FusilladeError::Other(anyhow!("Failed to read status: {}", e)))?;
+            let status = status_str
+                .parse::<crate::batch::FileStatus>()
+                .map_err(|e| {
+                    FusilladeError::Other(anyhow!("Invalid file status '{}': {}", status_str, e))
+                })?;
+            let error_message: Option<String> = row.try_get("error_message").map_err(|e| {
+                FusilladeError::Other(anyhow!("Failed to read error_message: {}", e))
+            })?;
+            let purpose_str: Option<String> = row
+                .try_get("purpose")
+                .map_err(|e| FusilladeError::Other(anyhow!("Failed to read purpose: {}", e)))?;
+            let purpose = purpose_str
+                .map(|s| s.parse::<crate::batch::Purpose>())
+                .transpose()
+                .map_err(|e| FusilladeError::Other(anyhow!("Invalid purpose: {}", e)))?;
+            let expires_at: Option<chrono::DateTime<Utc>> = row
+                .try_get("expires_at")
+                .map_err(|e| FusilladeError::Other(anyhow!("Failed to read expires_at: {}", e)))?;
+            let deleted_at: Option<chrono::DateTime<Utc>> = row
+                .try_get("deleted_at")
+                .map_err(|e| FusilladeError::Other(anyhow!("Failed to read deleted_at: {}", e)))?;
+            let uploaded_by: Option<String> = row
+                .try_get("uploaded_by")
+                .map_err(|e| FusilladeError::Other(anyhow!("Failed to read uploaded_by: {}", e)))?;
+            let created_at: chrono::DateTime<Utc> = row
+                .try_get("created_at")
+                .map_err(|e| FusilladeError::Other(anyhow!("Failed to read created_at: {}", e)))?;
+            let updated_at: chrono::DateTime<Utc> = row
+                .try_get("updated_at")
+                .map_err(|e| FusilladeError::Other(anyhow!("Failed to read updated_at: {}", e)))?;
+
+            let mut file = File {
+                id: FileId(id),
+                name,
+                description,
+                size_bytes,
+                status,
+                error_message,
+                purpose,
+                expires_at,
+                deleted_at,
+                uploaded_by,
+                created_at,
+                updated_at,
+            };
+
+            // Check and mark as expired if needed (passive expiration)
+            self.check_and_mark_expired(&mut file).await?;
+
+            files.push(file);
+        }
+
+        Ok(files)
     }
 
     async fn get_file_templates(&self, file_id: FileId) -> Result<Vec<RequestTemplate>> {
         let rows = sqlx::query!(
             r#"
-            SELECT id, file_id, endpoint, method, path, body, model, api_key, created_at, updated_at
+            SELECT id, file_id, custom_id, endpoint, method, path, body, model, api_key, created_at, updated_at
             FROM request_templates
             WHERE file_id = $1
-            ORDER BY created_at ASC
+            ORDER BY line_number ASC
             "#,
             *file_id as Uuid,
         )
@@ -676,6 +1051,7 @@ impl<H: HttpClient + 'static> Storage for PostgresRequestManager<H> {
             .map(|row| RequestTemplate {
                 id: TemplateId(row.id),
                 file_id: FileId(row.file_id),
+                custom_id: row.custom_id,
                 endpoint: row.endpoint,
                 method: row.method,
                 path: row.path,
@@ -688,6 +1064,85 @@ impl<H: HttpClient + 'static> Storage for PostgresRequestManager<H> {
             .collect())
     }
 
+    #[tracing::instrument(skip(self), fields(file_id = %file_id))]
+    fn get_file_content_stream(
+        &self,
+        file_id: FileId,
+    ) -> Pin<Box<dyn Stream<Item = Result<RequestTemplateInput>> + Send>> {
+        let pool = self.pool.clone();
+        let (tx, rx) = mpsc::channel(self.download_buffer_size);
+
+        tokio::spawn(async move {
+            // Use keyset pagination to fetch in batches with back-pressure
+            const BATCH_SIZE: i64 = 1000;
+            let mut last_line_number: i32 = -1;
+
+            loop {
+                // Fetch next batch using keyset pagination
+                let template_batch = sqlx::query!(
+                    r#"
+                    SELECT custom_id, endpoint, method, path, body, model, api_key, line_number
+                    FROM request_templates
+                    WHERE file_id = $1 AND line_number > $2
+                    ORDER BY line_number ASC
+                    LIMIT $3
+                    "#,
+                    *file_id as Uuid,
+                    last_line_number,
+                    BATCH_SIZE,
+                )
+                .fetch_all(&pool)
+                .await;
+
+                match template_batch {
+                    Ok(templates) => {
+                        if templates.is_empty() {
+                            // No more rows, we're done
+                            break;
+                        }
+
+                        tracing::debug!(
+                            "Fetched batch of {} templates, line_numbers {}-{}",
+                            templates.len(),
+                            templates.first().map(|r| r.line_number).unwrap_or(0),
+                            templates.last().map(|r| r.line_number).unwrap_or(0)
+                        );
+
+                        // Send each template in the batch
+                        for row in templates {
+                            last_line_number = row.line_number;
+
+                            let template = RequestTemplateInput {
+                                custom_id: row.custom_id,
+                                endpoint: row.endpoint,
+                                method: row.method,
+                                path: row.path,
+                                body: row.body,
+                                model: row.model,
+                                api_key: row.api_key,
+                            };
+                            if tx.send(Ok(template)).await.is_err() {
+                                return;
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        let _ = tx
+                            .send(Err(FusilladeError::Other(anyhow!(
+                                "Failed to fetch template batch: {}",
+                                e
+                            ))))
+                            .await;
+                        return;
+                    }
+                }
+            }
+        });
+
+        Box::pin(ReceiverStream::new(rx))
+    }
+
+    #[tracing::instrument(skip(self), fields(file_id = %file_id))]
     async fn delete_file(&self, file_id: FileId) -> Result<()> {
         let rows_affected = sqlx::query!(
             r#"
@@ -717,7 +1172,7 @@ impl<H: HttpClient + 'static> Storage for PostgresRequestManager<H> {
         // Get templates
         let templates = sqlx::query!(
             r#"
-            SELECT id, endpoint, method, path, body, model, api_key
+            SELECT id, custom_id, endpoint, method, path, body, model, api_key
             FROM request_templates
             WHERE file_id = $1
             "#,
@@ -752,13 +1207,14 @@ impl<H: HttpClient + 'static> Storage for PostgresRequestManager<H> {
                 r#"
                 INSERT INTO requests (
                     batch_id, template_id, state,
-                    endpoint, method, path, body, model, api_key,
+                    custom_id, endpoint, method, path, body, model, api_key,
                     retry_attempt
                 )
-                VALUES ($1, $2, 'pending', $3, $4, $5, $6, $7, $8, 0)
+                VALUES ($1, $2, 'pending', $3, $4, $5, $6, $7, $8, $9, 0)
                 "#,
                 batch_id,
                 template.id,
+                template.custom_id,
                 template.endpoint,
                 template.method,
                 template.path,
@@ -1022,16 +1478,18 @@ impl<H: HttpClient + 'static> Storage for PostgresRequestManager<H> {
         id_filter: Option<Vec<RequestId>>,
     ) -> std::pin::Pin<Box<dyn Stream<Item = Result<Result<AnyRequest>>> + Send>> {
         let pool = self.pool.clone();
+        let (tx, rx) = mpsc::channel(100);
 
-        Box::pin(async_stream::stream! {
+        tokio::spawn(async move {
             // Create a listener for Postgres NOTIFY events
             let mut listener = match PgListener::connect_with(&pool)
                 .await
-                .map_err(|e| FusilladeError::Other(anyhow!("Failed to create listener: {}", e))) {
+                .map_err(|e| FusilladeError::Other(anyhow!("Failed to create listener: {}", e)))
+            {
                 Ok(l) => l,
                 Err(e) => {
                     tracing::error!(error = %e, "Failed to create listener");
-                    yield Err(e);
+                    let _ = tx.send(Err(e)).await;
                     return;
                 }
             };
@@ -1039,7 +1497,12 @@ impl<H: HttpClient + 'static> Storage for PostgresRequestManager<H> {
             // Listen on the request_updates channel
             if let Err(e) = listener.listen("request_updates").await {
                 tracing::error!(error = %e, "Failed to listen on request_updates channel");
-                yield Err(FusilladeError::Other(anyhow::anyhow!("Failed to listen: {}", e)));
+                let _ = tx
+                    .send(Err(FusilladeError::Other(anyhow::anyhow!(
+                        "Failed to listen: {}",
+                        e
+                    ))))
+                    .await;
                 return;
             }
 
@@ -1053,7 +1516,8 @@ impl<H: HttpClient + 'static> Storage for PostgresRequestManager<H> {
 
                         // The payload contains: { "id": "...", "state": "...", "updated_at": "..." }
                         // We need to parse the ID and fetch the full request from storage
-                        let parsed: serde_json::Result<serde_json::Value> = serde_json::from_str(payload);
+                        let parsed: serde_json::Result<serde_json::Value> =
+                            serde_json::from_str(payload);
 
                         match parsed {
                             Ok(json) => {
@@ -1071,10 +1535,11 @@ impl<H: HttpClient + 'static> Storage for PostgresRequestManager<H> {
                                         }
 
                                         // Fetch the full request from storage by querying directly
-                                        let fetch_result: Result<Vec<Result<AnyRequest>>> = async {
-                                            let uuid_ids = [*request_id];
-                                            let rows = sqlx::query!(
-                                                r#"
+                                        let fetch_result: Result<Vec<Result<AnyRequest>>> =
+                                            async {
+                                                let uuid_ids = [*request_id];
+                                                let rows = sqlx::query!(
+                                                    r#"
                                                 SELECT
                                                     id, batch_id, template_id, state, endpoint, method, path, body, model, api_key,
                                                     retry_attempt, not_before, daemon_id, claimed_at, started_at,
@@ -1082,90 +1547,124 @@ impl<H: HttpClient + 'static> Storage for PostgresRequestManager<H> {
                                                 FROM requests
                                                 WHERE id = ANY($1)
                                                 "#,
-                                                &uuid_ids[..],
-                                            )
-                                            .fetch_all(&pool)
-                                            .await
-                                            .map_err(|e| FusilladeError::Other(anyhow!("Failed to fetch requests: {}", e)))?;
+                                                    &uuid_ids[..],
+                                                )
+                                                .fetch_all(&pool)
+                                                .await
+                                                .map_err(|e| FusilladeError::Other(anyhow!("Failed to fetch requests: {}", e)))?;
 
-                                            let mut results = Vec::new();
-                                            for row in rows {
-                                                let data = RequestData {
-                                                    id: RequestId(row.id),
-                                                    batch_id: BatchId(row.batch_id),
-                                                    template_id: TemplateId(row.template_id),
-                                                    endpoint: row.endpoint,
-                                                    method: row.method,
-                                                    path: row.path,
-                                                    body: row.body,
-                                                    model: row.model,
-                                                    api_key: row.api_key,
-                                                };
+                                                let mut results = Vec::new();
+                                                for row in rows {
+                                                    let data = RequestData {
+                                                        id: RequestId(row.id),
+                                                        batch_id: BatchId(row.batch_id),
+                                                        template_id: TemplateId(row.template_id),
+                                                        endpoint: row.endpoint,
+                                                        method: row.method,
+                                                        path: row.path,
+                                                        body: row.body,
+                                                        model: row.model,
+                                                        api_key: row.api_key,
+                                                    };
 
-                                                let state = &row.state;
-                                                let any_request = match state.as_str() {
-                                                    "pending" => Ok(AnyRequest::Pending(Request {
-                                                        state: Pending { retry_attempt: row.retry_attempt as u32, not_before: row.not_before },
-                                                        data,
-                                                    })),
-                                                    "claimed" => Ok(AnyRequest::Claimed(Request {
-                                                        state: Claimed {
-                                                            daemon_id: DaemonId(row.daemon_id.ok_or_else(|| FusilladeError::Other(anyhow!("Missing daemon_id")))?),
-                                                            claimed_at: row.claimed_at.ok_or_else(|| FusilladeError::Other(anyhow!("Missing claimed_at")))?,
-                                                            retry_attempt: row.retry_attempt as u32,
-                                                        },
-                                                        data,
-                                                    })),
-                                                    "processing" => {
-                                                        let (_tx, rx) = tokio::sync::mpsc::channel(1);
-                                                        let abort_handle = tokio::spawn(async {}).abort_handle();
-                                                        Ok(AnyRequest::Processing(Request {
-                                                            state: Processing {
-                                                                daemon_id: DaemonId(row.daemon_id.ok_or_else(|| FusilladeError::Other(anyhow!("Missing daemon_id")))?),
-                                                                claimed_at: row.claimed_at.ok_or_else(|| FusilladeError::Other(anyhow!("Missing claimed_at")))?,
-                                                                started_at: row.started_at.ok_or_else(|| FusilladeError::Other(anyhow!("Missing started_at")))?,
-                                                                retry_attempt: row.retry_attempt as u32,
-                                                                result_rx: Arc::new(Mutex::new(rx)),
-                                                                abort_handle,
-                                                            },
-                                                            data,
-                                                        }))
-                                                    }
-                                                    "completed" => Ok(AnyRequest::Completed(Request {
-                                                        state: Completed {
-                                                            response_status: row.response_status.ok_or_else(|| FusilladeError::Other(anyhow!("Missing response_status")))? as u16,
-                                                            response_body: row.response_body.ok_or_else(|| FusilladeError::Other(anyhow!("Missing response_body")))?,
-                                                            claimed_at: row.claimed_at.ok_or_else(|| FusilladeError::Other(anyhow!("Missing claimed_at")))?,
-                                                            started_at: row.started_at.ok_or_else(|| FusilladeError::Other(anyhow!("Missing started_at")))?,
-                                                            completed_at: row.completed_at.ok_or_else(|| FusilladeError::Other(anyhow!("Missing completed_at")))?,
-                                                        },
-                                                        data,
-                                                    })),
-                                                    "failed" => Ok(AnyRequest::Failed(Request {
-                                                        state: Failed {
-                                                            error: row.error.ok_or_else(|| FusilladeError::Other(anyhow!("Missing error")))?,
-                                                            failed_at: row.failed_at.ok_or_else(|| FusilladeError::Other(anyhow!("Missing failed_at")))?,
-                                                            retry_attempt: row.retry_attempt as u32,
-                                                        },
-                                                        data,
-                                                    })),
-                                                    "canceled" => Ok(AnyRequest::Canceled(Request {
-                                                        state: Canceled {
-                                                            canceled_at: row.canceled_at.ok_or_else(|| FusilladeError::Other(anyhow!("Missing canceled_at")))?,
-                                                        },
-                                                        data,
-                                                    })),
-                                                    _ => Err(FusilladeError::Other(anyhow!("Unknown state: {}", state))),
-                                                };
-                                                results.push(any_request);
+                                                    let state = &row.state;
+                                                    let any_request =
+                                                        match state.as_str() {
+                                                            "pending" => Ok(AnyRequest::Pending(Request {
+                                                                state: Pending {
+                                                                    retry_attempt: row.retry_attempt as u32,
+                                                                    not_before: row.not_before,
+                                                                },
+                                                                data,
+                                                            })),
+                                                            "claimed" => Ok(AnyRequest::Claimed(Request {
+                                                                state: Claimed {
+                                                                    daemon_id: DaemonId(row.daemon_id.ok_or_else(|| {
+                                                                        FusilladeError::Other(anyhow!("Missing daemon_id"))
+                                                                    })?),
+                                                                    claimed_at: row.claimed_at.ok_or_else(|| {
+                                                                        FusilladeError::Other(anyhow!("Missing claimed_at"))
+                                                                    })?,
+                                                                    retry_attempt: row.retry_attempt as u32,
+                                                                },
+                                                                data,
+                                                            })),
+                                                            "processing" => {
+                                                                let (_tx, rx) = mpsc::channel(1);
+                                                                let abort_handle = tokio::spawn(async {}).abort_handle();
+                                                                Ok(AnyRequest::Processing(Request {
+                                                                    state: Processing {
+                                                                        daemon_id: DaemonId(row.daemon_id.ok_or_else(|| {
+                                                                            FusilladeError::Other(anyhow!("Missing daemon_id"))
+                                                                        })?),
+                                                                        claimed_at: row.claimed_at.ok_or_else(|| {
+                                                                            FusilladeError::Other(anyhow!("Missing claimed_at"))
+                                                                        })?,
+                                                                        started_at: row.started_at.ok_or_else(|| {
+                                                                            FusilladeError::Other(anyhow!("Missing started_at"))
+                                                                        })?,
+                                                                        retry_attempt: row.retry_attempt as u32,
+                                                                        result_rx: Arc::new(Mutex::new(rx)),
+                                                                        abort_handle,
+                                                                    },
+                                                                    data,
+                                                                }))
+                                                            }
+                                                            "completed" => Ok(AnyRequest::Completed(Request {
+                                                                state: Completed {
+                                                                    response_status: row.response_status.ok_or_else(|| {
+                                                                        FusilladeError::Other(anyhow!("Missing response_status"))
+                                                                    })?
+                                                                        as u16,
+                                                                    response_body: row.response_body.ok_or_else(|| {
+                                                                        FusilladeError::Other(anyhow!("Missing response_body"))
+                                                                    })?,
+                                                                    claimed_at: row.claimed_at.ok_or_else(|| {
+                                                                        FusilladeError::Other(anyhow!("Missing claimed_at"))
+                                                                    })?,
+                                                                    started_at: row.started_at.ok_or_else(|| {
+                                                                        FusilladeError::Other(anyhow!("Missing started_at"))
+                                                                    })?,
+                                                                    completed_at: row.completed_at.ok_or_else(|| {
+                                                                        FusilladeError::Other(anyhow!("Missing completed_at"))
+                                                                    })?,
+                                                                },
+                                                                data,
+                                                            })),
+                                                            "failed" => Ok(AnyRequest::Failed(Request {
+                                                                state: Failed {
+                                                                    error: row
+                                                                        .error
+                                                                        .ok_or_else(|| FusilladeError::Other(anyhow!("Missing error")))?,
+                                                                    failed_at: row.failed_at.ok_or_else(|| {
+                                                                        FusilladeError::Other(anyhow!("Missing failed_at"))
+                                                                    })?,
+                                                                    retry_attempt: row.retry_attempt as u32,
+                                                                },
+                                                                data,
+                                                            })),
+                                                            "canceled" => Ok(AnyRequest::Canceled(Request {
+                                                                state: Canceled {
+                                                                    canceled_at: row.canceled_at.ok_or_else(|| {
+                                                                        FusilladeError::Other(anyhow!("Missing canceled_at"))
+                                                                    })?,
+                                                                },
+                                                                data,
+                                                            })),
+                                                            _ => Err(FusilladeError::Other(anyhow!("Unknown state: {}", state))),
+                                                        };
+                                                    results.push(any_request);
+                                                }
+                                                Ok(results)
                                             }
-                                            Ok(results)
-                                        }.await;
+                                            .await;
 
                                         match fetch_result {
                                             Ok(results) => {
                                                 if let Some(result) = results.into_iter().next() {
-                                                    yield Ok(result);
+                                                    if tx.send(Ok(result)).await.is_err() {
+                                                        return;
+                                                    }
                                                 }
                                             }
                                             Err(e) => {
@@ -1174,14 +1673,22 @@ impl<H: HttpClient + 'static> Storage for PostgresRequestManager<H> {
                                                     request_id = %request_id,
                                                     "Failed to fetch request after notification"
                                                 );
-                                                yield Err(e);
+                                                if tx.send(Err(e)).await.is_err() {
+                                                    return;
+                                                }
                                             }
                                         }
                                     } else {
-                                        tracing::warn!(id_str = id_str, "Failed to parse UUID from notification");
+                                        tracing::warn!(
+                                            id_str = id_str,
+                                            "Failed to parse UUID from notification"
+                                        );
                                     }
                                 } else {
-                                    tracing::warn!(payload = payload, "Notification payload missing 'id' field");
+                                    tracing::warn!(
+                                        payload = payload,
+                                        "Notification payload missing 'id' field"
+                                    );
                                 }
                             }
                             Err(e) => {
@@ -1195,12 +1702,23 @@ impl<H: HttpClient + 'static> Storage for PostgresRequestManager<H> {
                     }
                     Err(e) => {
                         tracing::error!(error = %e, "Error receiving notification");
-                        yield Err(FusilladeError::Other(anyhow::anyhow!("Notification error: {}", e)));
+                        if tx
+                            .send(Err(FusilladeError::Other(anyhow::anyhow!(
+                                "Notification error: {}",
+                                e
+                            ))))
+                            .await
+                            .is_err()
+                        {
+                            return;
+                        }
                         // Don't return - keep trying to receive notifications
                     }
                 }
             }
-        })
+        });
+
+        Box::pin(ReceiverStream::new(rx))
     }
 }
 
@@ -1249,6 +1767,7 @@ mod tests {
                 Some("A test file".to_string()),
                 vec![
                     RequestTemplateInput {
+                        custom_id: None,
                         endpoint: "https://api.example.com".to_string(),
                         method: "POST".to_string(),
                         path: "/v1/completions".to_string(),
@@ -1257,6 +1776,7 @@ mod tests {
                         api_key: "key1".to_string(),
                     },
                     RequestTemplateInput {
+                        custom_id: None,
                         endpoint: "https://api.example.com".to_string(),
                         method: "POST".to_string(),
                         path: "/v1/completions".to_string(),
@@ -1299,6 +1819,7 @@ mod tests {
                 None,
                 vec![
                     RequestTemplateInput {
+                        custom_id: None,
                         endpoint: "https://api.example.com".to_string(),
                         method: "POST".to_string(),
                         path: "/v1/test".to_string(),
@@ -1307,6 +1828,7 @@ mod tests {
                         api_key: "key".to_string(),
                     },
                     RequestTemplateInput {
+                        custom_id: None,
                         endpoint: "https://api.example.com".to_string(),
                         method: "POST".to_string(),
                         path: "/v1/test".to_string(),
@@ -1315,6 +1837,7 @@ mod tests {
                         api_key: "key".to_string(),
                     },
                     RequestTemplateInput {
+                        custom_id: None,
                         endpoint: "https://api.example.com".to_string(),
                         method: "POST".to_string(),
                         path: "/v1/test".to_string(),
@@ -1371,6 +1894,7 @@ mod tests {
                 None,
                 (0..5)
                     .map(|i| RequestTemplateInput {
+                        custom_id: None,
                         endpoint: "https://api.example.com".to_string(),
                         method: "POST".to_string(),
                         path: "/test".to_string(),
@@ -1426,6 +1950,7 @@ mod tests {
                 None,
                 (0..3)
                     .map(|i| RequestTemplateInput {
+                        custom_id: None,
                         endpoint: "https://api.example.com".to_string(),
                         method: "POST".to_string(),
                         path: "/test".to_string(),
@@ -1473,6 +1998,7 @@ mod tests {
                 None,
                 (0..5)
                     .map(|i| RequestTemplateInput {
+                        custom_id: None,
                         endpoint: "https://api.example.com".to_string(),
                         method: "POST".to_string(),
                         path: "/test".to_string(),
@@ -1538,7 +2064,10 @@ mod tests {
             .unwrap();
 
         // List all files
-        let files = manager.list_files().await.unwrap();
+        let files = manager
+            .list_files(crate::batch::FileFilter::default())
+            .await
+            .unwrap();
 
         // Should have at least our 3 files (may have more from other tests)
         assert!(files.len() >= 3);
@@ -1570,6 +2099,7 @@ mod tests {
                 "batch-list-test".to_string(),
                 None,
                 vec![RequestTemplateInput {
+                    custom_id: None,
                     endpoint: "https://api.example.com".to_string(),
                     method: "POST".to_string(),
                     path: "/test".to_string(),
@@ -1616,6 +2146,7 @@ mod tests {
                 None,
                 vec![
                     RequestTemplateInput {
+                        custom_id: None,
                         endpoint: "https://api.example.com".to_string(),
                         method: "POST".to_string(),
                         path: "/test".to_string(),
@@ -1624,6 +2155,7 @@ mod tests {
                         api_key: "key".to_string(),
                     },
                     RequestTemplateInput {
+                        custom_id: None,
                         endpoint: "https://api.example.com".to_string(),
                         method: "POST".to_string(),
                         path: "/test".to_string(),
@@ -1675,6 +2207,7 @@ mod tests {
                 "stale-test".to_string(),
                 None,
                 vec![RequestTemplateInput {
+                    custom_id: None,
                     endpoint: "https://api.example.com".to_string(),
                     method: "POST".to_string(),
                     path: "/test".to_string(),
@@ -1736,6 +2269,7 @@ mod tests {
                 "stale-processing-test".to_string(),
                 None,
                 vec![RequestTemplateInput {
+                    custom_id: None,
                     endpoint: "https://api.example.com".to_string(),
                     method: "POST".to_string(),
                     path: "/test".to_string(),
@@ -1804,6 +2338,7 @@ mod tests {
                 None,
                 vec![
                     RequestTemplateInput {
+                        custom_id: None,
                         endpoint: "https://api.example.com".to_string(),
                         method: "POST".to_string(),
                         path: "/test".to_string(),
@@ -1812,6 +2347,7 @@ mod tests {
                         api_key: "key".to_string(),
                     },
                     RequestTemplateInput {
+                        custom_id: None,
                         endpoint: "https://api.example.com".to_string(),
                         method: "POST".to_string(),
                         path: "/test".to_string(),
@@ -1871,6 +2407,7 @@ mod tests {
                 "retry-test".to_string(),
                 None,
                 vec![RequestTemplateInput {
+                    custom_id: None,
                     endpoint: "https://api.example.com".to_string(),
                     method: "POST".to_string(),
                     path: "/test".to_string(),
