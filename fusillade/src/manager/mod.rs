@@ -4,7 +4,8 @@
 //! for persisting requests, creating files, launching batches, and checking execution status.
 
 use crate::batch::{
-    BatchId, BatchStatus, File, FileId, FileStreamItem, RequestTemplate, RequestTemplateInput,
+    BatchId, BatchStatus, File, FileFilter, FileId, FileStreamItem, RequestTemplate,
+    RequestTemplateInput,
 };
 use crate::error::Result;
 use crate::http::HttpClient;
@@ -46,8 +47,8 @@ pub trait Storage: Send + Sync {
     /// Get a file by ID.
     async fn get_file(&self, file_id: FileId) -> Result<File>;
 
-    /// List all files.
-    async fn list_files(&self) -> Result<Vec<File>>;
+    /// List files with optional filtering.
+    async fn list_files(&self, filter: FileFilter) -> Result<Vec<File>>;
 
     /// Get all templates for a file.
     async fn get_file_templates(&self, file_id: FileId) -> Result<Vec<RequestTemplate>>;

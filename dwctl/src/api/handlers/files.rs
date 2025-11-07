@@ -15,6 +15,7 @@ use axum::{
     Json,
 };
 use fusillade::Storage;
+use fusillade::Storage;
 use futures::stream::Stream;
 use std::pin::Pin;
 use uuid::Uuid;
@@ -200,6 +201,15 @@ pub async fn upload_file(
         operation: format!("retrieve created file: {}", e),
     })?;
 
+    // Validate purpose
+    // TODO: Can we do this more rustily? I.e. using an enum in fusillade?
+    let purpose_str = file.purpose.as_deref().unwrap_or("batch");
+    if purpose_str != "batch" {
+        return Err(Error::BadRequest {
+            message: format!("Invalid purpose '{}'. Only 'batch' is supported.", purpose_str),
+        });
+    }
+
     Ok((
         StatusCode::CREATED,
         Json(FileResponse {
@@ -232,13 +242,8 @@ pub async fn list_files(
     Query(query): Query<ListFilesQuery>,
     current_user: RequiresPermission<resource::Files, operation::ReadOwn>,
 ) -> Result<Json<FileListResponse>> {
-    let _has_system_access = has_permission(&current_user, Resource::Files, Operation::SystemAccess);
-    let _can_read_all_files = can_read_all_resources(&current_user, Resource::Files);
-
-    // TODO: Add ownership filtering once fusillade supports uploaded_by:
-    // - Filter by uploaded_by if !can_read_all_files
-    // TODO: Add status filtering once fusillade supports status field:
-    // - Filter by status if !has_system_access
+    let has_system_access = has_permission(&current_user, Resource::Files, Operation::SystemAccess);
+    let can_read_all_files = can_read_all_resources(&current_user, Resource::Files);
 
     if query.order != "asc" && query.order != "desc" {
         return Err(Error::BadRequest {
@@ -248,8 +253,22 @@ pub async fn list_files(
 
     let limit = query.limit.unwrap_or(20).clamp(1, 10000);
 
+    // Build filter based on permissions
+    let filter = fusillade::FileFilter {
+        // Filter by ownership if user can't read all files
+        uploaded_by: if !can_read_all_files {
+            Some(current_user.id.to_string())
+        } else {
+            None
+        },
+        // Filter by status if user doesn't have system access
+        // TODO: What is the point of this 'status' field?
+        status: if !has_system_access { Some("processed".to_string()) } else { None },
+        purpose: None,
+    };
+
     use fusillade::Storage;
-    let mut files = state.request_manager.list_files().await.map_err(|e| Error::Internal {
+    let mut files = state.request_manager.list_files(filter).await.map_err(|e| Error::Internal {
         operation: format!("list files: {}", e),
     })?;
 
@@ -298,36 +317,48 @@ pub async fn list_files(
         ("file_id" = String, Path, description = "The ID of the file to retrieve")
     )
 )]
+// TODO: Does get file just get the stub? I.e. not the actual jsonl file?
+// That sounds right, but we should also figure out a streaming download method for actually
+// getting the file contents.
 pub async fn get_file(
     State(state): State<AppState>,
     Path(file_id_str): Path<String>,
     current_user: RequiresPermission<resource::Files, operation::ReadOwn>,
 ) -> Result<Json<FileResponse>> {
-    let _has_system_access = has_permission(&current_user, Resource::Files, Operation::SystemAccess);
-    let _can_read_all_files = can_read_all_resources(&current_user, Resource::Files);
-
-    // TODO: Add ownership check once fusillade supports uploaded_by:
-    // if !can_read_all_files && !can_read_own_resource(&current_user, Resource::Files, file.uploaded_by) {
-    //     return Err(Error::NotFound { ... });
-    // }
-    // TODO: Add status check once fusillade supports status field:
-    // if !has_system_access && file.status != FileStatus::Processed {
-    //     return Err(Error::NotFound { ... });
-    // }
+    let has_system_access = has_permission(&current_user, Resource::Files, Operation::SystemAccess);
+    let can_read_all_files = can_read_all_resources(&current_user, Resource::Files);
 
     let file_id = Uuid::parse_str(&file_id_str).map_err(|_| Error::BadRequest {
         message: "Invalid file ID format".to_string(),
     })?;
 
-    use fusillade::Storage;
     let file = state
         .request_manager
         .get_file(fusillade::FileId(file_id))
         .await
         .map_err(|_e| Error::NotFound {
             resource: "File".to_string(),
-            id: file_id_str,
+            id: file_id_str.clone(),
         })?;
+
+    // Check ownership: users without ReadAll permission can only see their own files
+    if !can_read_all_files {
+        let user_id = current_user.id.to_string();
+        if file.uploaded_by.as_deref() != Some(user_id.as_str()) {
+            return Err(Error::NotFound {
+                resource: "File".to_string(),
+                id: file_id_str,
+            });
+        }
+    }
+
+    // Check status: users without SystemAccess can only see processed files
+    if !has_system_access && file.status != "processed" {
+        return Err(Error::NotFound {
+            resource: "File".to_string(),
+            id: file_id_str,
+        });
+    }
 
     Ok(Json(FileResponse {
         id: file.id.to_string(),
@@ -359,20 +390,36 @@ pub async fn delete_file(
     Path(file_id_str): Path<String>,
     current_user: RequiresPermission<resource::Files, operation::DeleteOwn>,
 ) -> Result<Json<FileDeleteResponse>> {
-    let _can_delete_all_files = can_read_all_resources(&current_user, Resource::Files);
-
-    // TODO: Add ownership check once fusillade supports uploaded_by:
-    // if !can_delete_all_files && !can_delete_own_resource(&current_user, Resource::Files, file.uploaded_by) {
-    //     return Err(Error::NotFound { ... });
-    // }
-    // TODO: fusillade does hard delete (cascades to batches and requests),
-    // but we may want soft delete for audit trails
+    let can_delete_all_files = can_read_all_resources(&current_user, Resource::Files);
 
     let file_id = Uuid::parse_str(&file_id_str).map_err(|_| Error::BadRequest {
         message: "Invalid file ID format".to_string(),
     })?;
 
     use fusillade::Storage;
+
+    // First, get the file to check ownership
+    let file = state
+        .request_manager
+        .get_file(fusillade::FileId(file_id))
+        .await
+        .map_err(|_e| Error::NotFound {
+            resource: "File".to_string(),
+            id: file_id_str.clone(),
+        })?;
+
+    // Check ownership: users without DeleteAll permission can only delete their own files
+    if !can_delete_all_files {
+        let user_id = current_user.id.to_string();
+        if file.uploaded_by.as_deref() != Some(user_id.as_str()) {
+            return Err(Error::NotFound {
+                resource: "File".to_string(),
+                id: file_id_str.clone(),
+            });
+        }
+    }
+
+    // Perform the deletion (hard delete - cascades to batches and requests)
     state
         .request_manager
         .delete_file(fusillade::FileId(file_id))

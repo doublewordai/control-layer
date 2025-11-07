@@ -10,8 +10,8 @@ default = ["embedded-db"]
 embedded-db = ["dep:postgresql_embedded"]
 
 [dependencies]
+axum = { version = "0.8", features = ["multipart"] }
 fusillade = { path = "../fusillade", version = "0.1" }
-axum = "0.8"
 tokio = { version = "1.0", features = ["full"] }
 tokio-util = "0.7"
 sqlx = { version = "0.8", features = [

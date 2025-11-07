@@ -11,6 +11,7 @@ use async_trait::async_trait;
 use chrono::Utc;
 use futures::stream::Stream;
 use sqlx::postgres::{PgListener, PgPool};
+use sqlx::Row;
 use tokio::sync::Mutex;
 use tokio::task::JoinHandle;
 use uuid::Uuid;
@@ -809,33 +810,93 @@ impl<H: HttpClient + 'static> Storage for PostgresRequestManager<H> {
         })
     }
 
-    async fn list_files(&self) -> Result<Vec<File>> {
-        let rows = sqlx::query!(
+    async fn list_files(&self, filter: crate::batch::FileFilter) -> Result<Vec<File>> {
+        // Build WHERE clause based on filter
+        let mut where_clauses = Vec::new();
+        let mut params: Vec<Option<&str>> = Vec::new();
+
+        if filter.uploaded_by.is_some() {
+            where_clauses.push(format!("uploaded_by = ${}", params.len() + 1));
+            params.push(filter.uploaded_by.as_deref());
+        }
+
+        if filter.status.is_some() {
+            where_clauses.push(format!("status = ${}", params.len() + 1));
+            params.push(filter.status.as_deref());
+        }
+
+        if filter.purpose.is_some() {
+            where_clauses.push(format!("purpose = ${}", params.len() + 1));
+            params.push(filter.purpose.as_deref());
+        }
+
+        let where_clause = if where_clauses.is_empty() {
+            String::new()
+        } else {
+            format!("WHERE {}", where_clauses.join(" AND "))
+        };
+
+        let query = format!(
             r#"
             SELECT id, name, description, size_bytes, status, error_message, purpose, expires_at, deleted_at, uploaded_by, created_at, updated_at
             FROM files
+            {}
             ORDER BY created_at DESC
             "#,
-        )
-        .fetch_all(&self.pool)
-        .await
-        .map_err(|e| FusilladeError::Other(anyhow!("Failed to list files: {}", e)))?;
+            where_clause
+        );
 
+        let mut query_builder = sqlx::query(&query);
+
+        if let Some(uploaded_by) = filter.uploaded_by {
+            query_builder = query_builder.bind(uploaded_by);
+        }
+        if let Some(status) = filter.status {
+            query_builder = query_builder.bind(status);
+        }
+        if let Some(purpose) = filter.purpose {
+            query_builder = query_builder.bind(purpose);
+        }
+
+        let rows = query_builder
+            .fetch_all(&self.pool)
+            .await
+            .map_err(|e| FusilladeError::Other(anyhow!("Failed to list files: {}", e)))?;
+
+        // TODO: we've moved from statically chekced queries to dynamic ones here,
+        // Which is fine, because the where clauses are really difficult to do statically.
+        // But we probably shouldn't unwrap? And if we're not getting compile time verification, we
+        // shoult unit test
         Ok(rows
             .into_iter()
-            .map(|row| File {
-                id: FileId(row.id),
-                name: row.name,
-                description: row.description,
-                size_bytes: row.size_bytes,
-                status: row.status,
-                error_message: row.error_message,
-                purpose: row.purpose,
-                expires_at: row.expires_at,
-                deleted_at: row.deleted_at,
-                uploaded_by: row.uploaded_by,
-                created_at: row.created_at,
-                updated_at: row.updated_at,
+            .map(|row| {
+                let id: Uuid = row.try_get("id").unwrap();
+                let name: String = row.try_get("name").unwrap();
+                let description: Option<String> = row.try_get("description").unwrap();
+                let size_bytes: i64 = row.try_get("size_bytes").unwrap();
+                let status: String = row.try_get("status").unwrap();
+                let error_message: Option<String> = row.try_get("error_message").unwrap();
+                let purpose: Option<String> = row.try_get("purpose").unwrap();
+                let expires_at: Option<chrono::DateTime<Utc>> = row.try_get("expires_at").unwrap();
+                let deleted_at: Option<chrono::DateTime<Utc>> = row.try_get("deleted_at").unwrap();
+                let uploaded_by: Option<String> = row.try_get("uploaded_by").unwrap();
+                let created_at: chrono::DateTime<Utc> = row.try_get("created_at").unwrap();
+                let updated_at: chrono::DateTime<Utc> = row.try_get("updated_at").unwrap();
+
+                File {
+                    id: FileId(id),
+                    name,
+                    description,
+                    size_bytes,
+                    status,
+                    error_message,
+                    purpose,
+                    expires_at,
+                    deleted_at,
+                    uploaded_by,
+                    created_at,
+                    updated_at,
+                }
             })
             .collect())
     }
@@ -1721,7 +1782,10 @@ mod tests {
             .unwrap();
 
         // List all files
-        let files = manager.list_files().await.unwrap();
+        let files = manager
+            .list_files(crate::batch::FileFilter::default())
+            .await
+            .unwrap();
 
         // Should have at least our 3 files (may have more from other tests)
         assert!(files.len() >= 3);

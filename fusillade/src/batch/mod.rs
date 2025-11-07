@@ -141,6 +141,19 @@ pub struct FileMetadata {
     pub uploaded_by: Option<String>,
 }
 
+/// Filter parameters for listing files
+#[derive(Debug, Clone, Default)]
+pub struct FileFilter {
+    /// Filter by user who uploaded the file
+    /// TODO: We use a string here, because this crate is decoupled from the dwctl one which uses a
+    /// UUID. Is this fine? This just needs to be a unique identifier per user.
+    pub uploaded_by: Option<String>,
+    /// Filter by file status (processed, error, deleted, expired)
+    pub status: Option<String>,
+    /// Filter by purpose
+    pub purpose: Option<String>,
+}
+
 /// Items that can be yielded from a file upload stream
 #[derive(Debug, Clone)]
 pub enum FileStreamItem {
