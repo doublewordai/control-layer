@@ -179,12 +179,12 @@ export function TransactionHistory({
       <Card className="p-4">
         <div className="flex items-center justify-between mb-2">
           <h2 className="text-2xl font-semibold text-doubleword-neutral-900">
-            Transactions
+            Transaction History
           </h2>
-          <div className="flex items-stretch border border-doubleword-neutral-300 rounded-lg overflow-hidden">
-            <div className="flex items-center gap-2 px-3 py-1.5 bg-doubleword-neutral-100">
-              <span className="text-xs font-medium text-doubleword-neutral-600 uppercase tracking-wide">Balance</span>
-              <span className="text-lg font-bold text-doubleword-neutral-900">
+          <div className="flex items-stretch border border-blue-200 rounded-lg overflow-hidden bg-gradient-to-br from-blue-50 to-indigo-50">
+            <div className="flex items-center gap-3 px-4 py-2">
+              <span className="text-sm font-medium text-blue-700">Balance</span>
+              <span className="text-2xl font-bold text-blue-900">
                 {formatDollars(currentBalance)}
               </span>
             </div>
@@ -192,9 +192,10 @@ export function TransactionHistory({
               <button
                 onClick={onAddFunds}
                 disabled={isAddingFunds}
-                className="flex items-center px-3 py-1.5 bg-white hover:bg-doubleword-neutral-50 border-l border-doubleword-neutral-300 disabled:opacity-50 disabled:cursor-not-allowed transition-colors"
+                className="flex items-center px-4 py-2 bg-blue-600 hover:bg-blue-700 text-white border-l border-blue-500 disabled:opacity-50 disabled:cursor-not-allowed transition-colors"
               >
-                <Plus className="w-4 h-4 text-doubleword-neutral-700" />
+                <Plus className="w-5 h-5 mr-2" />
+                <span className="font-medium">{isAddingFunds ? "Adding..." : "Add Funds"}</span>
               </button>
             )}
           </div>
