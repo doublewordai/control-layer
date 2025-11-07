@@ -1,0 +1,52 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n                SELECT endpoint, method, path, body, model, api_key\n                FROM request_templates\n                WHERE file_id = $1\n                ORDER BY created_at ASC\n                ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "endpoint",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 1,
+        "name": "method",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 2,
+        "name": "path",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 3,
+        "name": "body",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 4,
+        "name": "model",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 5,
+        "name": "api_key",
+        "type_info": "Text"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid"
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      false,
+      false,
+      false,
+      false
+    ]
+  },
+  "hash": "de1bc3b4f28e8dc84adbbe2895441319993f8962a73719cba35ccc71634b85e4"
+}

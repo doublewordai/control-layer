@@ -348,6 +348,7 @@ async fn spa_fallback(uri: Uri) -> Result<Html<String>, StatusCode> {
 #[instrument(skip_all)]
 pub async fn setup_app(
     pool: PgPool,
+    fusillade_pool: PgPool,
     config: Config,
     skip_leader_election: bool,
 ) -> anyhow::Result<(Router, sync::onwards_config::OnwardsConfigSync, tokio_util::sync::DropGuard)> {
@@ -374,7 +375,8 @@ pub async fn setup_app(
     let probe_scheduler = probes::ProbeScheduler::new(pool.clone(), config.clone());
 
     // Initialize the fusillade request manager (for batch processing)
-    let request_manager = Arc::new(fusillade::PostgresRequestManager::new(pool.clone()));
+    // Use the fusillade_pool which has search_path set to 'fusillade' schema
+    let request_manager = Arc::new(fusillade::PostgresRequestManager::new(fusillade_pool.clone()));
 
     let is_leader: bool;
 
@@ -653,6 +655,7 @@ pub async fn build_router(state: &mut AppState, onwards_router: Router) -> anyho
         .route("/files", post(api::handlers::files::upload_file))
         .route("/files", get(api::handlers::files::list_files))
         .route("/files/{file_id}", get(api::handlers::files::get_file))
+        .route("/files/{file_id}/content", get(api::handlers::files::get_file_content))
         .route("/files/{file_id}", delete(api::handlers::files::delete_file))
         // Groups management
         .route("/groups", get(api::handlers::groups::list_groups))
@@ -845,10 +848,10 @@ async fn main() -> anyhow::Result<()> {
         .map_err(|e| anyhow::anyhow!("Failed to create initial admin user: {}", e))?;
 
     // Setup the complete application
-    let (router, onwards_config_sync, _drop_guard) = setup_app(pool.clone(), config.clone(), false).await?;
+    let (router, onwards_config_sync, _drop_guard) = setup_app(pool.clone(), fusillade_pool.clone(), config.clone(), false).await?;
 
     // Apply middleware at root level BEFORE routing decisions are made
-    let request_manager = Arc::new(fusillade::PostgresRequestManager::new(pool.clone()));
+    let request_manager = Arc::new(fusillade::PostgresRequestManager::new(fusillade_pool.clone()));
     let middleware = from_fn_with_state(
         AppState::builder()
             .db(pool.clone())
@@ -944,10 +947,14 @@ mod test {
     #[sqlx::test]
     #[test_log::test]
     async fn test_admin_ai_proxy_middleware_with_user_access(pool: PgPool) {
+        // Create fusillade pool for test
+        let fusillade_pool = crate::test_utils::setup_fusillade_for_tests(&pool).await;
+
         // Create test app with sync enabled
-        let (router, onwards_config_sync, _drop_guard) = crate::setup_app(pool.clone(), crate::test_utils::create_test_config(), true)
-            .await
-            .expect("Failed to setup test app");
+        let (router, onwards_config_sync, _drop_guard) =
+            crate::setup_app(pool.clone(), fusillade_pool, crate::test_utils::create_test_config(), true)
+                .await
+                .expect("Failed to setup test app");
 
         // Apply middleware for this test
         let middleware = admin_ai_proxy_middleware;
@@ -1354,8 +1361,11 @@ mod test {
     async fn test_setup_app_integration(pool: PgPool) {
         let config = create_test_config();
 
+        // Create fusillade pool for test
+        let fusillade_pool = crate::test_utils::setup_fusillade_for_tests(&pool).await;
+
         // Call setup_app
-        let result = super::setup_app(pool.clone(), config, true).await;
+        let result = super::setup_app(pool.clone(), fusillade_pool, config, true).await;
         assert!(result.is_ok(), "setup_app should succeed");
 
         let (router, _onwards_sync, _drop_guard) = result.unwrap();

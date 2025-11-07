@@ -20,13 +20,52 @@ use crate::{
 };
 
 use axum_test::TestServer;
-use sqlx::{PgConnection, PgPool};
+use sqlx::{Executor, PgConnection, PgPool};
 use tokio_util::sync::DropGuard;
 use uuid::Uuid;
 
+/// Set up fusillade schema and run migrations for tests
+/// Only call this for tests that need fusillade (e.g., files tests)
+/// Returns a pool with search_path set to fusillade schema
+pub async fn setup_fusillade_for_tests(pool: &PgPool) -> PgPool {
+    // Create fusillade schema
+    pool.execute("CREATE SCHEMA IF NOT EXISTS fusillade")
+        .await
+        .expect("Failed to create fusillade schema");
+
+    // Get connection options from the existing pool
+    let conn_options = pool.connect_options();
+
+    // Create a pool with search_path set to fusillade
+    let fusillade_pool = sqlx::postgres::PgPoolOptions::new()
+        .max_connections(5)
+        .after_connect(|conn, _meta| {
+            Box::pin(async move {
+                conn.execute("SET search_path = 'fusillade'").await?;
+                Ok(())
+            })
+        })
+        .connect_with((*conn_options).clone())
+        .await
+        .expect("Failed to create fusillade pool");
+
+    // Run fusillade migrations
+    fusillade::migrator()
+        .run(&fusillade_pool)
+        .await
+        .expect("Failed to run fusillade migrations");
+
+    fusillade_pool
+}
+
 pub async fn create_test_app(pool: PgPool, enable_sync: bool) -> (TestServer, Option<DropGuard>) {
+    // Create a default fusillade pool for tests that don't explicitly set it up
+    let fusillade_pool = setup_fusillade_for_tests(&pool).await;
+
     let config = create_test_config();
-    let (router, onwards_config_sync, drop_guard) = crate::setup_app(pool, config, true).await.expect("Failed to setup test app");
+    let (router, onwards_config_sync, drop_guard) = crate::setup_app(pool, fusillade_pool, config, true)
+        .await
+        .expect("Failed to setup test app");
 
     if enable_sync {
         // Start the config sync in background for tests

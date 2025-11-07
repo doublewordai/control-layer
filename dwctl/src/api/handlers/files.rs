@@ -1,14 +1,16 @@
+use crate::api::models::files::{FileDeleteResponse, FileListResponse, FileResponse, ListFilesQuery, ListObject, ObjectType, Purpose};
+use crate::auth::permissions::{can_read_all_resources, has_permission, operation, resource, RequiresPermission};
+use crate::errors::{Error, Result};
+use crate::types::{Operation, Resource};
+use crate::AppState;
 /// This file deals with the Files API.
 /// This is designed to match (as far as possible) the OpenAI Files
 /// [API](https://platform.openai.com/docs/api-reference/files/).
 ///
 /// Repository methods are delegated to the fusillade/ crate - which (as of 04/11/2025) stores
 /// files disaggregated in postgres.
-use crate::api::models::files::{FileDeleteResponse, FileListResponse, FileResponse, ListFilesQuery, ListObject, ObjectType, Purpose};
-use crate::auth::permissions::{can_read_all_resources, has_permission, operation, resource, RequiresPermission};
-use crate::errors::{Error, Result};
-use crate::types::{Operation, Resource};
-use crate::AppState;
+use axum::body::Body;
+use axum::response::IntoResponse;
 use axum::{
     extract::{Multipart, Path, Query, State},
     http::StatusCode,
@@ -16,6 +18,7 @@ use axum::{
 };
 use fusillade::Storage;
 use futures::stream::Stream;
+use futures::StreamExt;
 use std::pin::Pin;
 use uuid::Uuid;
 
@@ -212,7 +215,7 @@ pub async fn upload_file(
     Ok((
         StatusCode::CREATED,
         Json(FileResponse {
-            id: file.id.to_string(),
+            id: file.id.0.to_string(), // Use full UUID, not Display truncation
             object_type: ObjectType::File,
             bytes: file.size_bytes,
             created_at: file.created_at.timestamp(),
@@ -277,13 +280,13 @@ pub async fn list_files(
         files.truncate(limit as usize);
     }
 
-    let first_id = files.first().map(|f| f.id.to_string());
-    let last_id = files.last().map(|f| f.id.to_string());
+    let first_id = files.first().map(|f| f.id.0.to_string());
+    let last_id = files.last().map(|f| f.id.0.to_string());
 
     let data: Vec<FileResponse> = files
         .iter()
         .map(|f| FileResponse {
-            id: f.id.to_string(),
+            id: f.id.0.to_string(), // Use full UUID, not Display truncation
             object_type: ObjectType::File,
             bytes: f.size_bytes,
             created_at: f.created_at.timestamp(),
@@ -316,9 +319,6 @@ pub async fn list_files(
         ("file_id" = String, Path, description = "The ID of the file to retrieve")
     )
 )]
-// TODO: Does get file just get the stub? I.e. not the actual jsonl file?
-// That sounds right, but we should also figure out a streaming download method for actually
-// getting the file contents.
 pub async fn get_file(
     State(state): State<AppState>,
     Path(file_id_str): Path<String>,
@@ -360,13 +360,90 @@ pub async fn get_file(
     }
 
     Ok(Json(FileResponse {
-        id: file.id.to_string(),
+        id: file.id.0.to_string(), // Use full UUID, not Display truncation
         object_type: ObjectType::File,
         bytes: file.size_bytes,
         created_at: file.created_at.timestamp(),
         filename: file.name,
         purpose: Purpose::Batch,
     }))
+}
+
+#[utoipa::path(
+    get,
+    path = "/files/{file_id}/content",
+    tag = "files",
+    summary = "Retrieve file content",
+    description = "Download the content of a file as JSONL. Returns the file metadata and request templates.",
+    responses(
+        (status = 200, description = "File content", content_type = "application/x-ndjson"),
+        (status = 404, description = "File not found"),
+        (status = 500, description = "Internal server error")
+    ),
+    params(
+        ("file_id" = String, Path, description = "The ID of the file to retrieve content from")
+    )
+)]
+pub async fn get_file_content(
+    State(state): State<AppState>,
+    Path(file_id_str): Path<String>,
+    current_user: RequiresPermission<resource::Files, operation::ReadOwn>,
+) -> Result<axum::response::Response> {
+    let has_system_access = has_permission(&current_user, Resource::Files, Operation::SystemAccess);
+    let can_read_all_files = can_read_all_resources(&current_user, Resource::Files);
+
+    let file_id = Uuid::parse_str(&file_id_str).map_err(|_| Error::BadRequest {
+        message: "Invalid file ID format".to_string(),
+    })?;
+
+    use fusillade::Storage;
+
+    // First, get the file to check ownership and status
+    let file = state
+        .request_manager
+        .get_file(fusillade::FileId(file_id))
+        .await
+        .map_err(|_e| Error::NotFound {
+            resource: "File".to_string(),
+            id: file_id_str.clone(),
+        })?;
+
+    // Check ownership: users without ReadAll permission can only see their own files
+    if !can_read_all_files {
+        let user_id = current_user.id.to_string();
+        if file.uploaded_by.as_deref() != Some(user_id.as_str()) {
+            return Err(Error::NotFound {
+                resource: "File".to_string(),
+                id: file_id_str,
+            });
+        }
+    }
+
+    // Check status: users without SystemAccess can only see processed files
+    if !has_system_access && file.status != fusillade::FileStatus::Processed {
+        return Err(Error::NotFound {
+            resource: "File".to_string(),
+            id: file_id_str,
+        });
+    }
+
+    // Stream the file content as JSONL
+    let content_stream = state.request_manager.get_file_content_stream(fusillade::FileId(file_id));
+
+    // Convert RequestTemplateInput to JSONL (one per line)
+    let jsonl_stream = content_stream.map(|template_result| {
+        template_result
+            .and_then(|template| {
+                serde_json::to_string(&template)
+                    .map(|json| format!("{}\n", json))
+                    .map_err(|e| fusillade::FusilladeError::Other(anyhow::anyhow!("JSON serialization failed: {}", e)))
+            })
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))
+    });
+
+    let body = Body::from_stream(jsonl_stream);
+
+    Ok((StatusCode::OK, [("content-type", "application/x-ndjson")], body).into_response())
 }
 
 #[utoipa::path(
@@ -432,4 +509,70 @@ pub async fn delete_file(
         object_type: ObjectType::File,
         deleted: true,
     }))
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::api::models::files::FileResponse;
+    use crate::api::models::users::Role;
+    use crate::test_utils::*;
+    use sqlx::PgPool;
+
+    #[sqlx::test]
+    #[test_log::test]
+    async fn test_upload_and_download_file_content(pool: PgPool) {
+        let (app, _) = create_test_app(pool.clone(), false).await;
+        // User needs BatchAPIUser role to create/read files
+        let user = create_test_user_with_roles(&pool, vec![Role::StandardUser, Role::BatchAPIUser]).await;
+        let group = create_test_group(&pool).await;
+        add_user_to_group(&pool, user.id, group.id).await;
+
+        // Create test JSONL content with 3 request templates
+        let jsonl_content = r#"{"endpoint":"https://api.example.com","method":"POST","path":"/v1/chat/completions","body":"{\"model\":\"gpt-4\",\"messages\":[{\"role\":\"user\",\"content\":\"Hello 1\"}]}","model":"gpt-4","api_key":"sk-test-key-1"}
+{"endpoint":"https://api.example.com","method":"POST","path":"/v1/chat/completions","body":"{\"model\":\"gpt-4\",\"messages\":[{\"role\":\"user\",\"content\":\"Hello 2\"}]}","model":"gpt-4","api_key":"sk-test-key-2"}
+{"endpoint":"https://api.example.com","method":"POST","path":"/v1/chat/completions","body":"{\"model\":\"gpt-4\",\"messages\":[{\"role\":\"user\",\"content\":\"Hello 3\"}]}","model":"gpt-4","api_key":"sk-test-key-3"}
+"#;
+
+        // Upload the file
+        let file_part = axum_test::multipart::Part::bytes(jsonl_content.as_bytes()).file_name("test-batch.jsonl");
+
+        let upload_response = app
+            .post("/admin/api/v1/files")
+            .add_header(add_auth_headers(&user).0, add_auth_headers(&user).1)
+            .multipart(
+                axum_test::multipart::MultipartForm::new()
+                    .add_text("purpose", "batch")
+                    .add_part("file", file_part),
+            )
+            .await;
+
+        upload_response.assert_status(axum::http::StatusCode::CREATED);
+        let file: FileResponse = upload_response.json();
+        let file_id = file.id;
+
+        // Download the file content
+        let download_response = app
+            .get(&format!("/admin/api/v1/files/{}/content", file_id))
+            .add_header(add_auth_headers(&user).0, add_auth_headers(&user).1)
+            .await;
+
+        download_response.assert_status(axum::http::StatusCode::OK);
+        download_response.assert_header("content-type", "application/x-ndjson");
+
+        let downloaded_content = download_response.text();
+
+        // Verify the downloaded content matches the uploaded content
+        // Note: lines might have different whitespace, so compare each line as JSON
+        // TODO: We want byte-identical files, so we should change this later.
+        let original_lines: Vec<&str> = jsonl_content.trim().lines().collect();
+        let downloaded_lines: Vec<&str> = downloaded_content.trim().lines().collect();
+
+        assert_eq!(original_lines.len(), downloaded_lines.len(), "Number of lines should match");
+
+        for (i, (orig, down)) in original_lines.iter().zip(downloaded_lines.iter()).enumerate() {
+            let orig_json: serde_json::Value = serde_json::from_str(orig).expect(&format!("Failed to parse original line {}", i));
+            let down_json: serde_json::Value = serde_json::from_str(down).expect(&format!("Failed to parse downloaded line {}", i));
+            assert_eq!(orig_json, down_json, "Line {} should match (orig: {}, down: {})", i, orig, down);
+        }
+    }
 }

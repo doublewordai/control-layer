@@ -205,7 +205,7 @@ pub struct RequestTemplateInput {
 }
 
 /// Metadata for creating a file from a stream
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, Serialize)]
 pub struct FileMetadata {
     pub filename: Option<String>,
     pub purpose: Option<String>,
@@ -229,7 +229,7 @@ pub struct FileFilter {
 }
 
 /// Items that can be yielded from a file upload stream
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize)]
 pub enum FileStreamItem {
     /// File metadata (should be first item in stream)
     Metadata(FileMetadata),

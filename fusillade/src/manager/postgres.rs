@@ -4,6 +4,7 @@
 //! a production-ready batching system with persistent storage and real-time updates.
 
 use crate::request::AnyRequest;
+use std::pin::Pin;
 use std::sync::Arc;
 
 use anyhow::anyhow;
@@ -18,7 +19,7 @@ use uuid::Uuid;
 
 use super::Storage;
 use crate::batch::{
-    BatchId, BatchStatus, File, FileId, FileMetadata, FileStreamItem, Purpose, RequestTemplate,
+    BatchId, BatchStatus, File, FileId, FileMetadata, FileStreamItem, RequestTemplate,
     RequestTemplateInput, TemplateId,
 };
 use crate::daemon::{Daemon, DaemonConfig};
@@ -802,7 +803,7 @@ impl<H: HttpClient + 'static> Storage for PostgresRequestManager<H> {
             })?;
         let purpose = row
             .purpose
-            .map(|s| s.parse::<Purpose>())
+            .map(|s| s.parse::<crate::batch::Purpose>())
             .transpose()
             .map_err(|e| FusilladeError::Other(anyhow!("Invalid purpose: {}", e)))?;
 
@@ -908,7 +909,7 @@ impl<H: HttpClient + 'static> Storage for PostgresRequestManager<H> {
                     .try_get("purpose")
                     .map_err(|e| FusilladeError::Other(anyhow!("Failed to read purpose: {}", e)))?;
                 let purpose = purpose_str
-                    .map(|s| s.parse::<Purpose>())
+                    .map(|s| s.parse::<crate::batch::Purpose>())
                     .transpose()
                     .map_err(|e| FusilladeError::Other(anyhow!("Invalid purpose: {}", e)))?;
                 let expires_at: Option<chrono::DateTime<Utc>> =
@@ -976,6 +977,48 @@ impl<H: HttpClient + 'static> Storage for PostgresRequestManager<H> {
                 updated_at: row.updated_at,
             })
             .collect())
+    }
+
+    fn get_file_content_stream(
+        &self,
+        file_id: FileId,
+    ) -> Pin<Box<dyn Stream<Item = Result<RequestTemplateInput>> + Send>> {
+        let pool = self.pool.clone();
+
+        Box::pin(async_stream::stream! {
+            // Stream templates directly as JSONL content
+            let mut template_stream = sqlx::query!(
+                r#"
+                SELECT endpoint, method, path, body, model, api_key
+                FROM request_templates
+                WHERE file_id = $1
+                ORDER BY created_at ASC
+                "#,
+                *file_id as Uuid,
+            )
+            .fetch(&pool);
+
+            use futures::StreamExt;
+            while let Some(row_result) = template_stream.next().await {
+                match row_result {
+                    Ok(row) => {
+                        let template = RequestTemplateInput {
+                            endpoint: row.endpoint,
+                            method: row.method,
+                            path: row.path,
+                            body: row.body,
+                            model: row.model,
+                            api_key: row.api_key,
+                        };
+                        yield Ok(template);
+                    }
+                    Err(e) => {
+                        yield Err(FusilladeError::Other(anyhow!("Failed to fetch template: {}", e)));
+                        return;
+                    }
+                }
+            }
+        })
     }
 
     async fn delete_file(&self, file_id: FileId) -> Result<()> {

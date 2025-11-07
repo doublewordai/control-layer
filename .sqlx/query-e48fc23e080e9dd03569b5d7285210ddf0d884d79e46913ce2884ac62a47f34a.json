@@ -1,0 +1,12 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "UPDATE system_config SET value = true, updated_at = NOW() \n         WHERE key = 'endpoints_seeded'",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": []
+    },
+    "nullable": []
+  },
+  "hash": "e48fc23e080e9dd03569b5d7285210ddf0d884d79e46913ce2884ac62a47f34a"
+}

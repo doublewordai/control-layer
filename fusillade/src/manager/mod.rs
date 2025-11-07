@@ -53,6 +53,13 @@ pub trait Storage: Send + Sync {
     /// Get all templates for a file.
     async fn get_file_templates(&self, file_id: FileId) -> Result<Vec<RequestTemplate>>;
 
+    /// Stream file content as request templates.
+    /// Returns the raw JSONL file content - one RequestTemplateInput per line.
+    fn get_file_content_stream(
+        &self,
+        file_id: FileId,
+    ) -> Pin<Box<dyn Stream<Item = Result<RequestTemplateInput>> + Send>>;
+
     /// Delete a file (cascades to batches and executions).
     async fn delete_file(&self, file_id: FileId) -> Result<()>;
 
