@@ -680,6 +680,11 @@ pub async fn build_router(state: &mut AppState, onwards_router: Router) -> anyho
         .route("/files/{file_id}", get(api::handlers::files::get_file))
         .route("/files/{file_id}/content", get(api::handlers::files::get_file_content))
         .route("/files/{file_id}", delete(api::handlers::files::delete_file))
+        // Batches management
+        .route("/batches", post(api::handlers::batches::create_batch))
+        .route("/batches", get(api::handlers::batches::list_batches))
+        .route("/batches/{batch_id}", get(api::handlers::batches::get_batch))
+        .route("/batches/{batch_id}/cancel", post(api::handlers::batches::cancel_batch))
         // Groups management
         .route("/groups", get(api::handlers::groups::list_groups))
         .route("/groups", post(api::handlers::groups::create_group))

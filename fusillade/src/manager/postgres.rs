@@ -20,8 +20,8 @@ use uuid::Uuid;
 
 use super::Storage;
 use crate::batch::{
-    BatchId, BatchStatus, File, FileId, FileMetadata, FileStreamItem, RequestTemplate,
-    RequestTemplateInput, TemplateId,
+    Batch, BatchId, BatchInput, BatchStatus, File, FileId, FileMetadata, FileStreamItem,
+    RequestTemplate, RequestTemplateInput, TemplateId,
 };
 use crate::daemon::{Daemon, DaemonConfig};
 use crate::error::{FusilladeError, Result};
@@ -1163,7 +1163,7 @@ impl<H: HttpClient + 'static> Storage for PostgresRequestManager<H> {
         Ok(())
     }
 
-    async fn create_batch(&self, file_id: FileId) -> Result<BatchId> {
+    async fn create_batch(&self, input: BatchInput) -> Result<Batch> {
         let mut tx =
             self.pool.begin().await.map_err(|e| {
                 FusilladeError::Other(anyhow!("Failed to begin transaction: {}", e))
@@ -1176,7 +1176,7 @@ impl<H: HttpClient + 'static> Storage for PostgresRequestManager<H> {
             FROM request_templates
             WHERE file_id = $1
             "#,
-            *file_id as Uuid,
+            *input.file_id as Uuid,
         )
         .fetch_all(&mut *tx)
         .await
@@ -1188,18 +1188,23 @@ impl<H: HttpClient + 'static> Storage for PostgresRequestManager<H> {
             )));
         }
 
-        // Create batch
-        let batch_id = sqlx::query_scalar!(
+        // Create batch with new fields
+        let row = sqlx::query!(
             r#"
-            INSERT INTO batches (file_id)
-            VALUES ($1)
-            RETURNING id
+            INSERT INTO batches (file_id, endpoint, completion_window, metadata)
+            VALUES ($1, $2, $3, $4)
+            RETURNING id, file_id, endpoint, completion_window, metadata, output_file_id, error_file_id, created_at
             "#,
-            *file_id as Uuid,
+            *input.file_id as Uuid,
+            input.endpoint,
+            input.completion_window,
+            input.metadata,
         )
         .fetch_one(&mut *tx)
         .await
         .map_err(|e| FusilladeError::Other(anyhow!("Failed to create batch: {}", e)))?;
+
+        let batch_id = row.id;
 
         // Create executions from templates
         for template in templates {
@@ -1231,7 +1236,42 @@ impl<H: HttpClient + 'static> Storage for PostgresRequestManager<H> {
             .await
             .map_err(|e| FusilladeError::Other(anyhow!("Failed to commit transaction: {}", e)))?;
 
-        Ok(BatchId(batch_id))
+        Ok(Batch {
+            id: BatchId(batch_id),
+            file_id: FileId(row.file_id),
+            created_at: row.created_at,
+            metadata: row.metadata,
+            completion_window: row.completion_window,
+            endpoint: row.endpoint,
+            output_file_id: row.output_file_id.map(FileId),
+            error_file_id: row.error_file_id.map(FileId),
+        })
+    }
+
+    async fn get_batch(&self, batch_id: BatchId) -> Result<Batch> {
+        let row = sqlx::query!(
+            r#"
+            SELECT id, file_id, endpoint, completion_window, metadata, output_file_id, error_file_id, created_at
+            FROM batches
+            WHERE id = $1
+            "#,
+            *batch_id as Uuid,
+        )
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(|e| FusilladeError::Other(anyhow!("Failed to fetch batch: {}", e)))?
+        .ok_or_else(|| FusilladeError::Other(anyhow!("Batch not found")))?;
+
+        Ok(Batch {
+            id: BatchId(row.id),
+            file_id: FileId(row.file_id),
+            created_at: row.created_at,
+            metadata: row.metadata,
+            completion_window: row.completion_window,
+            endpoint: row.endpoint,
+            output_file_id: row.output_file_id.map(FileId),
+            error_file_id: row.error_file_id.map(FileId),
+        })
     }
 
     async fn get_batch_status(&self, batch_id: BatchId) -> Result<BatchStatus> {

@@ -4,8 +4,8 @@
 //! for persisting requests, creating files, launching batches, and checking execution status.
 
 use crate::batch::{
-    BatchId, BatchStatus, File, FileFilter, FileId, FileStreamItem, RequestTemplate,
-    RequestTemplateInput,
+    Batch, BatchId, BatchInput, BatchStatus, File, FileFilter, FileId, FileStreamItem,
+    RequestTemplate, RequestTemplateInput,
 };
 use crate::error::Result;
 use crate::http::HttpClient;
@@ -65,7 +65,10 @@ pub trait Storage: Send + Sync {
 
     /// Create a batch from a file's current templates.
     /// This will spawn requests in the Pending state for all templates in the file.
-    async fn create_batch(&self, file_id: FileId) -> Result<BatchId>;
+    async fn create_batch(&self, input: BatchInput) -> Result<Batch>;
+
+    /// Get a batch by ID.
+    async fn get_batch(&self, batch_id: BatchId) -> Result<Batch>;
 
     /// Get batch status.
     async fn get_batch_status(&self, batch_id: BatchId) -> Result<BatchStatus>;

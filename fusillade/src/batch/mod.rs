@@ -15,7 +15,7 @@ use std::str::FromStr;
 use uuid::Uuid;
 
 /// Unique identifier for a file.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(transparent)]
 pub struct FileId(pub Uuid);
 
@@ -241,12 +241,35 @@ pub enum FileStreamItem {
     Error(String),
 }
 
+/// Input parameters for creating a new batch.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BatchInput {
+    /// The file containing request templates
+    pub file_id: FileId,
+    /// The API endpoint to use for all requests (e.g., "/v1/chat/completions")
+    pub endpoint: String,
+    /// Completion window (e.g., "24h")
+    pub completion_window: String,
+    /// Optional metadata key-value pairs (OpenAI allows up to 16 pairs)
+    pub metadata: Option<serde_json::Value>,
+}
+
 /// A batch represents one execution of all of a file's templates.
 #[derive(Debug, Clone, Serialize)]
 pub struct Batch {
     pub id: BatchId,
     pub file_id: FileId,
     pub created_at: DateTime<Utc>,
+    /// Metadata key-value pairs (OpenAI allows up to 16 pairs)
+    pub metadata: Option<serde_json::Value>,
+    /// Completion window (e.g., "24h")
+    pub completion_window: String,
+    /// The API endpoint to use for all requests (e.g., "/v1/chat/completions")
+    pub endpoint: String,
+    /// File ID containing the successful results
+    pub output_file_id: Option<FileId>,
+    /// File ID containing the error results
+    pub error_file_id: Option<FileId>,
 }
 
 /// Status information for a batch, computed from its executions.
@@ -276,5 +299,41 @@ impl BatchStatus {
     /// Check if the batch is still running.
     pub fn is_running(&self) -> bool {
         !self.is_finished()
+    }
+
+    /// Get OpenAI-compatible status string.
+    /// Maps internal state to OpenAI's status values:
+    /// - "validating" - batch just created, no requests started yet
+    /// - "in_progress" - batch is being processed
+    /// - "finalizing" - nearly all requests done (95%+ complete)
+    /// - "completed" - all requests in terminal state and at least one succeeded
+    /// - "failed" - all requests in terminal state and all failed
+    /// - "cancelled" - all requests cancelled
+    pub fn openai_status(&self) -> &'static str {
+        if self.total_requests == 0 {
+            return "validating";
+        }
+
+        let terminal_count = self.completed_requests + self.failed_requests + self.canceled_requests;
+
+        if terminal_count == 0 {
+            // Nothing has started yet
+            "validating"
+        } else if terminal_count == self.total_requests {
+            // All done - determine outcome
+            if self.canceled_requests == self.total_requests {
+                "cancelled"
+            } else if self.completed_requests == 0 {
+                "failed"
+            } else {
+                "completed"
+            }
+        } else if terminal_count as f64 / self.total_requests as f64 >= 0.95 {
+            // Nearly done (95%+)
+            "finalizing"
+        } else {
+            // In progress
+            "in_progress"
+        }
     }
 }
