@@ -29,7 +29,6 @@ export function DownloadFileModal({
   isOpen,
   onClose,
   title,
-  description,
   resourceType,
   resourceId,
   filename,

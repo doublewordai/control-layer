@@ -19,7 +19,6 @@ import {
 import { Input } from "../../ui/input";
 import { useCreateBatch, useFiles } from "../../../api/control-layer/hooks";
 import { toast } from "sonner";
-import type { FileObject } from "../../../api/control-layer/types";
 
 interface CreateBatchModalProps {
   isOpen: boolean;
