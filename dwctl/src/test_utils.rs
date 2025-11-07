@@ -76,6 +76,7 @@ pub fn create_test_config() -> crate::config::Config {
         enable_metrics: false,
         enable_request_logging: false,
         enable_otel_export: false,
+        credits: crate::config::CreditsConfig::default(),
     }
 }
 
