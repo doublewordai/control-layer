@@ -15,7 +15,6 @@ use axum::{
     Json,
 };
 use fusillade::Storage;
-use fusillade::Storage;
 use futures::stream::Stream;
 use std::pin::Pin;
 use uuid::Uuid;
@@ -201,13 +200,13 @@ pub async fn upload_file(
         operation: format!("retrieve created file: {}", e),
     })?;
 
-    // Validate purpose
-    // TODO: Can we do this more rustily? I.e. using an enum in fusillade?
-    let purpose_str = file.purpose.as_deref().unwrap_or("batch");
-    if purpose_str != "batch" {
-        return Err(Error::BadRequest {
-            message: format!("Invalid purpose '{}'. Only 'batch' is supported.", purpose_str),
-        });
+    // Validate purpose (only batch is supported)
+    if let Some(purpose) = file.purpose {
+        if purpose != fusillade::Purpose::Batch {
+            return Err(Error::BadRequest {
+                message: format!("Invalid purpose '{}'. Only 'batch' is supported.", purpose),
+            });
+        }
     }
 
     Ok((
@@ -353,7 +352,7 @@ pub async fn get_file(
     }
 
     // Check status: users without SystemAccess can only see processed files
-    if !has_system_access && file.status != "processed" {
+    if !has_system_access && file.status != fusillade::FileStatus::Processed {
         return Err(Error::NotFound {
             resource: "File".to_string(),
             id: file_id_str,

@@ -9,7 +9,9 @@
 //! their models.
 
 use chrono::{DateTime, Utc};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
+use std::fmt;
+use std::str::FromStr;
 use uuid::Uuid;
 
 /// Unique identifier for a file.
@@ -84,6 +86,78 @@ impl std::fmt::Display for TemplateId {
     }
 }
 
+/// Purpose for which a file was created.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Purpose {
+    /// File contains batch API request templates
+    Batch,
+}
+
+impl fmt::Display for Purpose {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Purpose::Batch => write!(f, "batch"),
+        }
+    }
+}
+
+impl FromStr for Purpose {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s.to_lowercase().as_str() {
+            "batch" => Ok(Purpose::Batch),
+            _ => Err(format!("Invalid purpose: {}", s)),
+        }
+    }
+}
+
+/// File status tracking lifecycle and health.
+///
+/// Status tracks the file's lifecycle:
+/// - `Processed`: Successfully uploaded and parsed into templates (users can access)
+/// - `Error`: Failed to process during upload (only visible to admins with SystemAccess)
+/// - `Deleted`: Soft-deleted by user (metadata retained for audit, only visible to admins)
+/// - `Expired`: Past its expiration date (metadata retained for audit, only visible to admins)
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum FileStatus {
+    /// File was successfully processed and templates created
+    Processed,
+    /// File processing failed (see error_message for details)
+    Error,
+    /// File was soft-deleted by user (metadata retained for audit)
+    Deleted,
+    /// File has passed its expiration date
+    Expired,
+}
+
+impl fmt::Display for FileStatus {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            FileStatus::Processed => write!(f, "processed"),
+            FileStatus::Error => write!(f, "error"),
+            FileStatus::Deleted => write!(f, "deleted"),
+            FileStatus::Expired => write!(f, "expired"),
+        }
+    }
+}
+
+impl FromStr for FileStatus {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s.to_lowercase().as_str() {
+            "processed" => Ok(FileStatus::Processed),
+            "error" => Ok(FileStatus::Error),
+            "deleted" => Ok(FileStatus::Deleted),
+            "expired" => Ok(FileStatus::Expired),
+            _ => Err(format!("Invalid file status: {}", s)),
+        }
+    }
+}
+
 /// A file containing a collection of request templates.
 #[derive(Debug, Clone, Serialize)]
 pub struct File {
@@ -91,9 +165,9 @@ pub struct File {
     pub name: String,
     pub description: Option<String>,
     pub size_bytes: i64,
-    pub status: String,
+    pub status: FileStatus,
     pub error_message: Option<String>,
-    pub purpose: Option<String>,
+    pub purpose: Option<Purpose>,
     pub expires_at: Option<DateTime<Utc>>,
     pub deleted_at: Option<DateTime<Utc>>,
     pub uploaded_by: Option<String>,

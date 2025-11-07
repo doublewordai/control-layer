@@ -18,7 +18,7 @@ use uuid::Uuid;
 
 use super::Storage;
 use crate::batch::{
-    BatchId, BatchStatus, File, FileId, FileMetadata, FileStreamItem, RequestTemplate,
+    BatchId, BatchStatus, File, FileId, FileMetadata, FileStreamItem, Purpose, RequestTemplate,
     RequestTemplateInput, TemplateId,
 };
 use crate::daemon::{Daemon, DaemonConfig};
@@ -728,7 +728,7 @@ impl<H: HttpClient + 'static> Storage for PostgresRequestManager<H> {
 
         // Now update the file with all the final metadata
         let size_bytes = metadata.size_bytes.unwrap_or(0);
-        let status = "processed".to_string();
+        let status = crate::batch::FileStatus::Processed.to_string();
         let purpose = metadata.purpose.clone();
 
         // Calculate expires_at from expires_after if provided
@@ -794,14 +794,26 @@ impl<H: HttpClient + 'static> Storage for PostgresRequestManager<H> {
         .map_err(|e| FusilladeError::Other(anyhow!("Failed to fetch file: {}", e)))?
         .ok_or_else(|| FusilladeError::Other(anyhow!("File not found")))?;
 
+        let status = row
+            .status
+            .parse::<crate::batch::FileStatus>()
+            .map_err(|e| {
+                FusilladeError::Other(anyhow!("Invalid file status '{}': {}", row.status, e))
+            })?;
+        let purpose = row
+            .purpose
+            .map(|s| s.parse::<Purpose>())
+            .transpose()
+            .map_err(|e| FusilladeError::Other(anyhow!("Invalid purpose: {}", e)))?;
+
         Ok(File {
             id: FileId(row.id),
             name: row.name,
             description: row.description,
             size_bytes: row.size_bytes,
-            status: row.status,
+            status,
             error_message: row.error_message,
-            purpose: row.purpose,
+            purpose,
             expires_at: row.expires_at,
             deleted_at: row.deleted_at,
             uploaded_by: row.uploaded_by,
@@ -863,27 +875,61 @@ impl<H: HttpClient + 'static> Storage for PostgresRequestManager<H> {
             .await
             .map_err(|e| FusilladeError::Other(anyhow!("Failed to list files: {}", e)))?;
 
-        // TODO: we've moved from statically chekced queries to dynamic ones here,
-        // Which is fine, because the where clauses are really difficult to do statically.
-        // But we probably shouldn't unwrap? And if we're not getting compile time verification, we
-        // shoult unit test
-        Ok(rows
-            .into_iter()
+        rows.into_iter()
             .map(|row| {
-                let id: Uuid = row.try_get("id").unwrap();
-                let name: String = row.try_get("name").unwrap();
-                let description: Option<String> = row.try_get("description").unwrap();
-                let size_bytes: i64 = row.try_get("size_bytes").unwrap();
-                let status: String = row.try_get("status").unwrap();
-                let error_message: Option<String> = row.try_get("error_message").unwrap();
-                let purpose: Option<String> = row.try_get("purpose").unwrap();
-                let expires_at: Option<chrono::DateTime<Utc>> = row.try_get("expires_at").unwrap();
-                let deleted_at: Option<chrono::DateTime<Utc>> = row.try_get("deleted_at").unwrap();
-                let uploaded_by: Option<String> = row.try_get("uploaded_by").unwrap();
-                let created_at: chrono::DateTime<Utc> = row.try_get("created_at").unwrap();
-                let updated_at: chrono::DateTime<Utc> = row.try_get("updated_at").unwrap();
+                let id: Uuid = row
+                    .try_get("id")
+                    .map_err(|e| FusilladeError::Other(anyhow!("Failed to read id: {}", e)))?;
+                let name: String = row
+                    .try_get("name")
+                    .map_err(|e| FusilladeError::Other(anyhow!("Failed to read name: {}", e)))?;
+                let description: Option<String> = row.try_get("description").map_err(|e| {
+                    FusilladeError::Other(anyhow!("Failed to read description: {}", e))
+                })?;
+                let size_bytes: i64 = row.try_get("size_bytes").map_err(|e| {
+                    FusilladeError::Other(anyhow!("Failed to read size_bytes: {}", e))
+                })?;
+                let status_str: String = row
+                    .try_get("status")
+                    .map_err(|e| FusilladeError::Other(anyhow!("Failed to read status: {}", e)))?;
+                let status = status_str
+                    .parse::<crate::batch::FileStatus>()
+                    .map_err(|e| {
+                        FusilladeError::Other(anyhow!(
+                            "Invalid file status '{}': {}",
+                            status_str,
+                            e
+                        ))
+                    })?;
+                let error_message: Option<String> = row.try_get("error_message").map_err(|e| {
+                    FusilladeError::Other(anyhow!("Failed to read error_message: {}", e))
+                })?;
+                let purpose_str: Option<String> = row
+                    .try_get("purpose")
+                    .map_err(|e| FusilladeError::Other(anyhow!("Failed to read purpose: {}", e)))?;
+                let purpose = purpose_str
+                    .map(|s| s.parse::<Purpose>())
+                    .transpose()
+                    .map_err(|e| FusilladeError::Other(anyhow!("Invalid purpose: {}", e)))?;
+                let expires_at: Option<chrono::DateTime<Utc>> =
+                    row.try_get("expires_at").map_err(|e| {
+                        FusilladeError::Other(anyhow!("Failed to read expires_at: {}", e))
+                    })?;
+                let deleted_at: Option<chrono::DateTime<Utc>> =
+                    row.try_get("deleted_at").map_err(|e| {
+                        FusilladeError::Other(anyhow!("Failed to read deleted_at: {}", e))
+                    })?;
+                let uploaded_by: Option<String> = row.try_get("uploaded_by").map_err(|e| {
+                    FusilladeError::Other(anyhow!("Failed to read uploaded_by: {}", e))
+                })?;
+                let created_at: chrono::DateTime<Utc> = row.try_get("created_at").map_err(|e| {
+                    FusilladeError::Other(anyhow!("Failed to read created_at: {}", e))
+                })?;
+                let updated_at: chrono::DateTime<Utc> = row.try_get("updated_at").map_err(|e| {
+                    FusilladeError::Other(anyhow!("Failed to read updated_at: {}", e))
+                })?;
 
-                File {
+                Ok(File {
                     id: FileId(id),
                     name,
                     description,
@@ -896,9 +942,9 @@ impl<H: HttpClient + 'static> Storage for PostgresRequestManager<H> {
                     uploaded_by,
                     created_at,
                     updated_at,
-                }
+                })
             })
-            .collect())
+            .collect::<Result<Vec<_>>>()
     }
 
     async fn get_file_templates(&self, file_id: FileId) -> Result<Vec<RequestTemplate>> {
