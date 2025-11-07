@@ -438,7 +438,7 @@ pub async fn get_file_content(
                     .map(|json| format!("{}\n", json))
                     .map_err(|e| fusillade::FusilladeError::Other(anyhow::anyhow!("JSON serialization failed: {}", e)))
             })
-            .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))
+            .map_err(|e| std::io::Error::other(e.to_string()))
     });
 
     let body = Body::from_stream(jsonl_stream);
@@ -563,15 +563,15 @@ mod tests {
 
         // Verify the downloaded content matches the uploaded content
         // Note: lines might have different whitespace, so compare each line as JSON
-        // TODO: We want byte-identical files, so we should change this later.
         let original_lines: Vec<&str> = jsonl_content.trim().lines().collect();
         let downloaded_lines: Vec<&str> = downloaded_content.trim().lines().collect();
 
         assert_eq!(original_lines.len(), downloaded_lines.len(), "Number of lines should match");
 
         for (i, (orig, down)) in original_lines.iter().zip(downloaded_lines.iter()).enumerate() {
-            let orig_json: serde_json::Value = serde_json::from_str(orig).expect(&format!("Failed to parse original line {}", i));
-            let down_json: serde_json::Value = serde_json::from_str(down).expect(&format!("Failed to parse downloaded line {}", i));
+            let orig_json: serde_json::Value = serde_json::from_str(orig).unwrap_or_else(|_| panic!("Failed to parse original line {}", i));
+            let down_json: serde_json::Value =
+                serde_json::from_str(down).unwrap_or_else(|_| panic!("Failed to parse downloaded line {}", i));
             assert_eq!(orig_json, down_json, "Line {} should match (orig: {}, down: {})", i, orig, down);
         }
     }
