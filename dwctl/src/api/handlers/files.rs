@@ -341,7 +341,7 @@ pub async fn upload_file(
     current_user: RequiresPermission<resource::Files, operation::CreateOwn>,
     multipart: Multipart,
 ) -> Result<(StatusCode, Json<FileResponse>)> {
-    let max_file_size = state.config.files.max_file_size;
+    let max_file_size = state.config.batches.files.max_file_size;
     let uploaded_by = Some(current_user.id.to_string());
 
     // Fetch system API key for batch request execution
@@ -365,7 +365,7 @@ pub async fn upload_file(
         uploaded_by,
         endpoint,
         system_key.secret,
-        state.config.files.upload_buffer_size,
+        state.config.batches.files.upload_buffer_size,
     );
 
     // Create file via request manager with streaming

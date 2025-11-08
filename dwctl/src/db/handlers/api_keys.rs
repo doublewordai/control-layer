@@ -1392,7 +1392,7 @@ mod tests {
             enable_metrics: false,
             enable_request_logging: false,
             enable_otel_export: false,
-            files: Default::default(),
+            batches: Default::default(),
         };
         crate::seed_database(&config.model_sources, &pool).await.unwrap();
 

@@ -1,4 +1,4 @@
-use crate::config::{FilesConfig, NativeAuthConfig, ProxyHeaderAuthConfig, SecurityConfig};
+use crate::config::{BatchConfig, FilesConfig, NativeAuthConfig, ProxyHeaderAuthConfig, SecurityConfig};
 use crate::db::handlers::inference_endpoints::{InferenceEndpointFilter, InferenceEndpoints};
 use crate::db::handlers::repository::Repository;
 use crate::errors::Error;
@@ -115,8 +115,11 @@ pub fn create_test_config() -> crate::config::Config {
         enable_metrics: false,
         enable_request_logging: false,
         enable_otel_export: false,
-        files: FilesConfig {
-            max_file_size: 1000 * 1024 * 1024, //1GB
+        batches: BatchConfig {
+            files: FilesConfig {
+                max_file_size: 1000 * 1024 * 1024, //1GB
+                ..Default::default()
+            },
             ..Default::default()
         },
     }
