@@ -640,10 +640,11 @@ impl<H: HttpClient + 'static> Storage for PostgresRequestManager<H> {
         for template in templates {
             sqlx::query!(
                 r#"
-                INSERT INTO request_templates (file_id, endpoint, method, path, body, model, api_key)
-                VALUES ($1, $2, $3, $4, $5, $6, $7)
+                INSERT INTO request_templates (file_id, custom_id, endpoint, method, path, body, model, api_key)
+                VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
                 "#,
                 file_id,
+                template.custom_id,
                 template.endpoint,
                 template.method,
                 template.path,
@@ -1252,8 +1253,8 @@ impl<H: HttpClient + 'static> Storage for PostgresRequestManager<H> {
             metadata: row.metadata,
             completion_window: row.completion_window,
             endpoint: row.endpoint,
-            output_file_id: row.output_file_id.map(FileId),
-            error_file_id: row.error_file_id.map(FileId),
+            output_file_id: Some(FileId(output_file_id)),
+            error_file_id: Some(FileId(error_file_id)),
             created_by: row.created_by,
             expires_at: row.expires_at,
             cancelling_at: row.cancelling_at,
@@ -3015,5 +3016,213 @@ mod tests {
         assert_eq!(claimed.len(), 1);
         // Verify retry_attempt is preserved
         assert_eq!(claimed[0].state.retry_attempt, 2);
+    }
+
+    #[sqlx::test]
+    async fn test_batch_output_and_error_streaming(pool: sqlx::PgPool) {
+        use futures::StreamExt;
+
+        let http_client = Arc::new(MockHttpClient::new());
+        let manager = PostgresRequestManager::with_client(pool.clone(), http_client);
+
+        // Create a file with 3 templates
+        let file_id = manager
+            .create_file(
+                "streaming-test".to_string(),
+                None,
+                vec![
+                    RequestTemplateInput {
+                        custom_id: Some("req-1".to_string()),
+                        endpoint: "https://api.example.com".to_string(),
+                        method: "POST".to_string(),
+                        path: "/v1/chat/completions".to_string(),
+                        body: r#"{"prompt":"first"}"#.to_string(),
+                        model: "gpt-4".to_string(),
+                        api_key: "key".to_string(),
+                    },
+                    RequestTemplateInput {
+                        custom_id: Some("req-2".to_string()),
+                        endpoint: "https://api.example.com".to_string(),
+                        method: "POST".to_string(),
+                        path: "/v1/chat/completions".to_string(),
+                        body: r#"{"prompt":"second"}"#.to_string(),
+                        model: "gpt-4".to_string(),
+                        api_key: "key".to_string(),
+                    },
+                    RequestTemplateInput {
+                        custom_id: Some("req-3".to_string()),
+                        endpoint: "https://api.example.com".to_string(),
+                        method: "POST".to_string(),
+                        path: "/v1/chat/completions".to_string(),
+                        body: r#"{"prompt":"third"}"#.to_string(),
+                        model: "gpt-4".to_string(),
+                        api_key: "key".to_string(),
+                    },
+                ],
+            )
+            .await
+            .expect("Failed to create file");
+
+        // Create a batch
+        let batch = manager
+            .create_batch(crate::batch::BatchInput {
+                file_id,
+                endpoint: "/v1/chat/completions".to_string(),
+                completion_window: "24h".to_string(),
+                metadata: None,
+                created_by: Some("test-user".to_string()),
+            })
+            .await
+            .expect("Failed to create batch");
+
+        // Verify virtual output and error files were created
+        assert!(batch.output_file_id.is_some());
+        assert!(batch.error_file_id.is_some());
+        let output_file_id = batch.output_file_id.unwrap();
+        let error_file_id = batch.error_file_id.unwrap();
+
+        // Get the virtual files and verify they exist
+        let output_file = manager
+            .get_file(output_file_id)
+            .await
+            .expect("Failed to get output file");
+        let error_file = manager
+            .get_file(error_file_id)
+            .await
+            .expect("Failed to get error file");
+
+        assert_eq!(
+            output_file.name,
+            format!("batch-{}-output.jsonl", batch.id.0)
+        );
+        assert_eq!(error_file.name, format!("batch-{}-error.jsonl", batch.id.0));
+
+        // Manually mark 2 requests as completed and 1 as failed
+        // This simulates what the daemon would do after processing
+        let requests = manager
+            .get_batch_requests(batch.id)
+            .await
+            .expect("Failed to get requests");
+        assert_eq!(requests.len(), 3);
+
+        // Mark first request as completed
+        sqlx::query!(
+            r#"
+            UPDATE requests
+            SET state = 'completed',
+                response_status = 200,
+                response_body = $2,
+                completed_at = NOW()
+            WHERE id = $1
+            "#,
+            *requests[0].id() as Uuid,
+            r#"{"id":"chatcmpl-123","choices":[{"message":{"content":"Response 1"}}]}"#,
+        )
+        .execute(&pool)
+        .await
+        .expect("Failed to mark request as completed");
+
+        // Mark second request as completed
+        sqlx::query!(
+            r#"
+            UPDATE requests
+            SET state = 'completed',
+                response_status = 200,
+                response_body = $2,
+                completed_at = NOW()
+            WHERE id = $1
+            "#,
+            *requests[1].id() as Uuid,
+            r#"{"id":"chatcmpl-456","choices":[{"message":{"content":"Response 2"}}]}"#,
+        )
+        .execute(&pool)
+        .await
+        .expect("Failed to mark request as completed");
+
+        // Mark third request as failed
+        sqlx::query!(
+            r#"
+            UPDATE requests
+            SET state = 'failed',
+                error = $2,
+                failed_at = NOW()
+            WHERE id = $1
+            "#,
+            *requests[2].id() as Uuid,
+            "Rate limit exceeded",
+        )
+        .execute(&pool)
+        .await
+        .expect("Failed to mark request as failed");
+
+        // Stream the output file - should contain 2 completed requests
+        let output_stream = manager.get_file_content_stream(output_file_id);
+        let output_items: Vec<_> = output_stream.collect().await;
+
+        assert_eq!(output_items.len(), 2, "Should have 2 output items");
+
+        // Collect and verify custom_ids (order doesn't matter)
+        let mut found_custom_ids = Vec::new();
+        for item_result in output_items.iter() {
+            let item = item_result.as_ref().expect("Output item should be Ok");
+
+            match item {
+                FileContentItem::Output(output) => {
+                    found_custom_ids.push(output.custom_id.clone());
+
+                    // Verify response structure
+                    assert_eq!(output.response.status_code, 200);
+                    assert!(output.response.body.is_object());
+                    assert!(output.error.is_none());
+
+                    // Verify ID format
+                    assert!(output.id.starts_with("batch_req_"));
+                }
+                _ => panic!("Expected FileContentItem::Output, got different type"),
+            }
+        }
+
+        // Verify we got both custom IDs (order doesn't matter)
+        found_custom_ids.sort();
+        assert_eq!(
+            found_custom_ids,
+            vec![Some("req-1".to_string()), Some("req-2".to_string())]
+        );
+
+        // Stream the error file - should contain 1 failed request
+        let error_stream = manager.get_file_content_stream(error_file_id);
+        let error_items: Vec<_> = error_stream.collect().await;
+
+        assert_eq!(error_items.len(), 1, "Should have 1 error item");
+
+        // Verify the error item
+        let error_result = &error_items[0];
+        let error_item = error_result.as_ref().expect("Error item should be Ok");
+
+        match error_item {
+            FileContentItem::Error(error) => {
+                assert_eq!(error.custom_id, Some("req-3".to_string()));
+                assert_eq!(error.error.message, "Rate limit exceeded");
+                assert!(error.response.is_none());
+                assert!(error.id.starts_with("batch_req_"));
+            }
+            _ => panic!("Expected FileContentItem::Error, got different type"),
+        }
+
+        // Verify that streaming a regular input file still works
+        let input_stream = manager.get_file_content_stream(file_id);
+        let input_items: Vec<_> = input_stream.collect().await;
+
+        assert_eq!(input_items.len(), 3, "Input file should have 3 templates");
+
+        for item_result in input_items {
+            let item = item_result.expect("Input item should be Ok");
+            match item {
+                FileContentItem::Template(_) => {
+                    // Expected - input files contain templates
+                }
+                _ => panic!("Expected FileContentItem::Template for input file"),
+            }
+        }
     }
 }
