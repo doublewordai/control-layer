@@ -88,16 +88,22 @@ impl std::fmt::Display for TemplateId {
 
 /// Purpose for which a file was created.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
+#[serde(rename_all = "snake_case")]
 pub enum Purpose {
     /// File contains batch API request templates
     Batch,
+    /// Virtual file that streams batch output (completed requests)
+    BatchOutput,
+    /// Virtual file that streams batch errors (failed requests)
+    BatchError,
 }
 
 impl fmt::Display for Purpose {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Purpose::Batch => write!(f, "batch"),
+            Purpose::BatchOutput => write!(f, "batch_output"),
+            Purpose::BatchError => write!(f, "batch_error"),
         }
     }
 }
@@ -108,6 +114,8 @@ impl FromStr for Purpose {
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         match s.to_lowercase().as_str() {
             "batch" => Ok(Purpose::Batch),
+            "batch_output" => Ok(Purpose::BatchOutput),
+            "batch_error" => Ok(Purpose::BatchError),
             _ => Err(format!("Invalid purpose: {}", s)),
         }
     }
@@ -204,6 +212,64 @@ pub struct RequestTemplateInput {
     pub body: String,
     pub model: String,
     pub api_key: String,
+}
+
+/// Batch output item - represents a completed request in OpenAI format.
+#[derive(Debug, Clone, Serialize, serde::Deserialize)]
+pub struct BatchOutputItem {
+    /// Request ID
+    pub id: String,
+    /// Custom ID from the original request
+    pub custom_id: Option<String>,
+    /// Response details
+    pub response: BatchResponseDetails,
+    /// Error (should be null for successful responses)
+    pub error: Option<serde_json::Value>,
+}
+
+/// Batch error item - represents a failed request in OpenAI format.
+#[derive(Debug, Clone, Serialize, serde::Deserialize)]
+pub struct BatchErrorItem {
+    /// Request ID
+    pub id: String,
+    /// Custom ID from the original request
+    pub custom_id: Option<String>,
+    /// Response (should be null for errors)
+    pub response: Option<serde_json::Value>,
+    /// Error details
+    pub error: BatchErrorDetails,
+}
+
+/// Response details for a batch output item.
+#[derive(Debug, Clone, Serialize, serde::Deserialize)]
+pub struct BatchResponseDetails {
+    /// HTTP status code
+    pub status_code: i16,
+    /// Request ID from the upstream API
+    pub request_id: Option<String>,
+    /// Response body (e.g., ChatCompletion, Embedding, etc.)
+    pub body: serde_json::Value,
+}
+
+/// Error details for a batch error item.
+#[derive(Debug, Clone, Serialize, serde::Deserialize)]
+pub struct BatchErrorDetails {
+    /// Error code
+    pub code: Option<String>,
+    /// Error message
+    pub message: String,
+}
+
+/// Enum for different types of file content that can be streamed.
+#[derive(Debug, Clone, Serialize)]
+#[serde(untagged)]
+pub enum FileContentItem {
+    /// Request template (for input files with purpose='batch')
+    Template(RequestTemplateInput),
+    /// Batch output (for output files with purpose='batch_output')
+    Output(BatchOutputItem),
+    /// Batch error (for error files with purpose='batch_error')
+    Error(BatchErrorItem),
 }
 
 /// Metadata for creating a file from a stream

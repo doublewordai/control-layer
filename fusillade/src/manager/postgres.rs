@@ -20,7 +20,8 @@ use uuid::Uuid;
 
 use super::Storage;
 use crate::batch::{
-    Batch, BatchId, BatchInput, BatchStatus, File, FileId, FileMetadata, FileStreamItem,
+    Batch, BatchErrorDetails, BatchErrorItem, BatchId, BatchInput, BatchOutputItem,
+    BatchResponseDetails, BatchStatus, File, FileContentItem, FileId, FileMetadata, FileStreamItem,
     RequestTemplate, RequestTemplateInput, TemplateId,
 };
 use crate::daemon::{Daemon, DaemonConfig};
@@ -1068,73 +1069,47 @@ impl<H: HttpClient + 'static> Storage for PostgresRequestManager<H> {
     fn get_file_content_stream(
         &self,
         file_id: FileId,
-    ) -> Pin<Box<dyn Stream<Item = Result<RequestTemplateInput>> + Send>> {
+    ) -> Pin<Box<dyn Stream<Item = Result<FileContentItem>> + Send>> {
         let pool = self.pool.clone();
         let (tx, rx) = mpsc::channel(self.download_buffer_size);
 
         tokio::spawn(async move {
-            // Use keyset pagination to fetch in batches with back-pressure
-            const BATCH_SIZE: i64 = 1000;
-            let mut last_line_number: i32 = -1;
+            // First, get the file to determine its purpose
+            let file_result = sqlx::query!(
+                r#"
+                SELECT purpose
+                FROM files
+                WHERE id = $1
+                "#,
+                *file_id as Uuid,
+            )
+            .fetch_one(&pool)
+            .await;
 
-            loop {
-                // Fetch next batch using keyset pagination
-                let template_batch = sqlx::query!(
-                    r#"
-                    SELECT custom_id, endpoint, method, path, body, model, api_key, line_number
-                    FROM request_templates
-                    WHERE file_id = $1 AND line_number > $2
-                    ORDER BY line_number ASC
-                    LIMIT $3
-                    "#,
-                    *file_id as Uuid,
-                    last_line_number,
-                    BATCH_SIZE,
-                )
-                .fetch_all(&pool)
-                .await;
+            let purpose = match file_result {
+                Ok(row) => row.purpose,
+                Err(e) => {
+                    let _ = tx
+                        .send(Err(FusilladeError::Other(anyhow!(
+                            "Failed to fetch file: {}",
+                            e
+                        ))))
+                        .await;
+                    return;
+                }
+            };
 
-                match template_batch {
-                    Ok(templates) => {
-                        if templates.is_empty() {
-                            // No more rows, we're done
-                            break;
-                        }
-
-                        tracing::debug!(
-                            "Fetched batch of {} templates, line_numbers {}-{}",
-                            templates.len(),
-                            templates.first().map(|r| r.line_number).unwrap_or(0),
-                            templates.last().map(|r| r.line_number).unwrap_or(0)
-                        );
-
-                        // Send each template in the batch
-                        for row in templates {
-                            last_line_number = row.line_number;
-
-                            let template = RequestTemplateInput {
-                                custom_id: row.custom_id,
-                                endpoint: row.endpoint,
-                                method: row.method,
-                                path: row.path,
-                                body: row.body,
-                                model: row.model,
-                                api_key: row.api_key,
-                            };
-                            if tx.send(Ok(template)).await.is_err() {
-                                return;
-                            }
-                        }
-                    }
-                    Err(e) => {
-                        let _ = tx
-                            .send(Err(FusilladeError::Other(anyhow!(
-                                "Failed to fetch template batch: {}",
-                                e
-                            ))))
-                            .await;
-                        return;
-                    }
+            // Route to appropriate streaming logic based on purpose
+            match purpose.as_deref() {
+                Some("batch_output") => {
+                    Self::stream_batch_output(pool, file_id, tx).await;
+                }
+                Some("batch_error") => {
+                    Self::stream_batch_error(pool, file_id, tx).await;
+                }
+                _ => {
+                    // Regular file or purpose='batch': stream request templates
+                    Self::stream_request_templates(pool, file_id, tx).await;
                 }
             }
         });
@@ -1214,6 +1189,31 @@ impl<H: HttpClient + 'static> Storage for PostgresRequestManager<H> {
         .map_err(|e| FusilladeError::Other(anyhow!("Failed to create batch: {}", e)))?;
 
         let batch_id = row.id;
+
+        // Create virtual output and error files
+        let output_file_id = self
+            .create_virtual_output_file(&mut tx, batch_id, &input.created_by)
+            .await?;
+        let error_file_id = self
+            .create_virtual_error_file(&mut tx, batch_id, &input.created_by)
+            .await?;
+
+        // Update batch with file IDs
+        sqlx::query!(
+            r#"
+            UPDATE batches
+            SET output_file_id = $2, error_file_id = $3
+            WHERE id = $1
+            "#,
+            batch_id,
+            output_file_id,
+            error_file_id,
+        )
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| {
+            FusilladeError::Other(anyhow!("Failed to update batch with file IDs: {}", e))
+        })?;
 
         // Create executions from templates
         for template in templates {
@@ -1362,17 +1362,45 @@ impl<H: HttpClient + 'static> Storage for PostgresRequestManager<H> {
             .collect())
     }
 
-    async fn list_batches(&self, created_by: Option<String>, limit: i64) -> Result<Vec<Batch>> {
+    async fn list_batches(
+        &self,
+        created_by: Option<String>,
+        after: Option<BatchId>,
+        limit: i64,
+    ) -> Result<Vec<Batch>> {
+        // If after is provided, get the created_at timestamp of that batch for cursor-based pagination
+        let (after_created_at, after_id) = if let Some(after_id) = after {
+            let row = sqlx::query!(
+                r#"
+                SELECT created_at
+                FROM batches
+                WHERE id = $1
+                "#,
+                *after_id as Uuid,
+            )
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(|e| FusilladeError::Other(anyhow!("Failed to fetch after batch: {}", e)))?;
+
+            (row.map(|r| r.created_at), Some(*after_id as Uuid))
+        } else {
+            (None, None)
+        };
+
+        // Use a single query with optional cursor filtering
         let rows = sqlx::query!(
             r#"
             SELECT id, file_id, endpoint, completion_window, metadata, output_file_id, error_file_id, created_by, created_at, expires_at, cancelling_at, errors
             FROM batches
             WHERE ($1::TEXT IS NULL OR created_by = $1)
-            ORDER BY created_at DESC
+              AND ($3::TIMESTAMPTZ IS NULL OR created_at < $3 OR (created_at = $3 AND id < $4))
+            ORDER BY created_at DESC, id DESC
             LIMIT $2
             "#,
             created_by,
             limit,
+            after_created_at,
+            after_id,
         )
         .fetch_all(&self.pool)
         .await
@@ -1826,6 +1854,335 @@ impl<H: HttpClient + 'static> Storage for PostgresRequestManager<H> {
         });
 
         Box::pin(ReceiverStream::new(rx))
+    }
+}
+
+// Helper methods for file streaming and virtual file creation
+impl<H: HttpClient + 'static> PostgresRequestManager<H> {
+    /// Stream request templates from a regular file
+    async fn stream_request_templates(
+        pool: sqlx::PgPool,
+        file_id: FileId,
+        tx: mpsc::Sender<Result<FileContentItem>>,
+    ) {
+        const BATCH_SIZE: i64 = 1000;
+        let mut last_line_number: i32 = -1;
+
+        loop {
+            let template_batch = sqlx::query!(
+                r#"
+                SELECT custom_id, endpoint, method, path, body, model, api_key, line_number
+                FROM request_templates
+                WHERE file_id = $1 AND line_number > $2
+                ORDER BY line_number ASC
+                LIMIT $3
+                "#,
+                *file_id as Uuid,
+                last_line_number,
+                BATCH_SIZE,
+            )
+            .fetch_all(&pool)
+            .await;
+
+            match template_batch {
+                Ok(templates) => {
+                    if templates.is_empty() {
+                        break;
+                    }
+
+                    tracing::debug!(
+                        "Fetched batch of {} templates, line_numbers {}-{}",
+                        templates.len(),
+                        templates.first().map(|r| r.line_number).unwrap_or(0),
+                        templates.last().map(|r| r.line_number).unwrap_or(0)
+                    );
+
+                    for row in templates {
+                        last_line_number = row.line_number;
+
+                        let template = RequestTemplateInput {
+                            custom_id: row.custom_id,
+                            endpoint: row.endpoint,
+                            method: row.method,
+                            path: row.path,
+                            body: row.body,
+                            model: row.model,
+                            api_key: row.api_key,
+                        };
+                        if tx
+                            .send(Ok(FileContentItem::Template(template)))
+                            .await
+                            .is_err()
+                        {
+                            return;
+                        }
+                    }
+                }
+                Err(e) => {
+                    let _ = tx
+                        .send(Err(FusilladeError::Other(anyhow!(
+                            "Failed to fetch template batch: {}",
+                            e
+                        ))))
+                        .await;
+                    return;
+                }
+            }
+        }
+    }
+
+    /// Stream batch output (completed requests) for a virtual output file
+    async fn stream_batch_output(
+        pool: sqlx::PgPool,
+        file_id: FileId,
+        tx: mpsc::Sender<Result<FileContentItem>>,
+    ) {
+        // First, find the batch that owns this output file
+        let batch_result = sqlx::query!(
+            r#"
+            SELECT id
+            FROM batches
+            WHERE output_file_id = $1
+            "#,
+            *file_id as Uuid,
+        )
+        .fetch_one(&pool)
+        .await;
+
+        let batch_id = match batch_result {
+            Ok(row) => row.id,
+            Err(e) => {
+                let _ = tx
+                    .send(Err(FusilladeError::Other(anyhow!(
+                        "Failed to find batch for output file: {}",
+                        e
+                    ))))
+                    .await;
+                return;
+            }
+        };
+
+        // Stream completed requests
+        const BATCH_SIZE: i64 = 1000;
+        let mut last_id: Uuid = Uuid::nil();
+
+        loop {
+            let request_batch = sqlx::query!(
+                r#"
+                SELECT id, custom_id, response_status, response_body
+                FROM requests
+                WHERE batch_id = $1 AND state = 'completed' AND id > $2
+                ORDER BY id ASC
+                LIMIT $3
+                "#,
+                batch_id,
+                last_id,
+                BATCH_SIZE,
+            )
+            .fetch_all(&pool)
+            .await;
+
+            match request_batch {
+                Ok(requests) => {
+                    if requests.is_empty() {
+                        break;
+                    }
+
+                    tracing::debug!("Fetched batch of {} completed requests", requests.len());
+
+                    for row in requests {
+                        last_id = row.id;
+
+                        let response_body: serde_json::Value = match row.response_body {
+                            Some(body) => match serde_json::from_str(&body) {
+                                Ok(json) => json,
+                                Err(e) => {
+                                    tracing::warn!("Failed to parse response body as JSON: {}", e);
+                                    serde_json::Value::String(body)
+                                }
+                            },
+                            None => serde_json::Value::Null,
+                        };
+
+                        let output_item = BatchOutputItem {
+                            id: format!("batch_req_{}", row.id),
+                            custom_id: row.custom_id,
+                            response: BatchResponseDetails {
+                                status_code: row.response_status.unwrap_or(200),
+                                request_id: None, // Could be extracted from response if available
+                                body: response_body,
+                            },
+                            error: None,
+                        };
+
+                        if tx
+                            .send(Ok(FileContentItem::Output(output_item)))
+                            .await
+                            .is_err()
+                        {
+                            return;
+                        }
+                    }
+                }
+                Err(e) => {
+                    let _ = tx
+                        .send(Err(FusilladeError::Other(anyhow!(
+                            "Failed to fetch completed requests: {}",
+                            e
+                        ))))
+                        .await;
+                    return;
+                }
+            }
+        }
+    }
+
+    /// Stream batch errors (failed requests) for a virtual error file
+    async fn stream_batch_error(
+        pool: sqlx::PgPool,
+        file_id: FileId,
+        tx: mpsc::Sender<Result<FileContentItem>>,
+    ) {
+        // First, find the batch that owns this error file
+        let batch_result = sqlx::query!(
+            r#"
+            SELECT id
+            FROM batches
+            WHERE error_file_id = $1
+            "#,
+            *file_id as Uuid,
+        )
+        .fetch_one(&pool)
+        .await;
+
+        let batch_id = match batch_result {
+            Ok(row) => row.id,
+            Err(e) => {
+                let _ = tx
+                    .send(Err(FusilladeError::Other(anyhow!(
+                        "Failed to find batch for error file: {}",
+                        e
+                    ))))
+                    .await;
+                return;
+            }
+        };
+
+        // Stream failed requests
+        const BATCH_SIZE: i64 = 1000;
+        let mut last_id: Uuid = Uuid::nil();
+
+        loop {
+            let request_batch = sqlx::query!(
+                r#"
+                SELECT id, custom_id, error
+                FROM requests
+                WHERE batch_id = $1 AND state = 'failed' AND id > $2
+                ORDER BY id ASC
+                LIMIT $3
+                "#,
+                batch_id,
+                last_id,
+                BATCH_SIZE,
+            )
+            .fetch_all(&pool)
+            .await;
+
+            match request_batch {
+                Ok(requests) => {
+                    if requests.is_empty() {
+                        break;
+                    }
+
+                    tracing::debug!("Fetched batch of {} failed requests", requests.len());
+
+                    for row in requests {
+                        last_id = row.id;
+
+                        let error_item = BatchErrorItem {
+                            id: format!("batch_req_{}", row.id),
+                            custom_id: row.custom_id,
+                            response: None,
+                            error: BatchErrorDetails {
+                                code: None, // Could parse from error field if structured
+                                message: row.error.unwrap_or_else(|| "Unknown error".to_string()),
+                            },
+                        };
+
+                        if tx
+                            .send(Ok(FileContentItem::Error(error_item)))
+                            .await
+                            .is_err()
+                        {
+                            return;
+                        }
+                    }
+                }
+                Err(e) => {
+                    let _ = tx
+                        .send(Err(FusilladeError::Other(anyhow!(
+                            "Failed to fetch failed requests: {}",
+                            e
+                        ))))
+                        .await;
+                    return;
+                }
+            }
+        }
+    }
+
+    /// Create a virtual output file for a batch (stores no data, streams from requests table)
+    async fn create_virtual_output_file(
+        &self,
+        tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+        batch_id: Uuid,
+        created_by: &Option<String>,
+    ) -> Result<Uuid> {
+        let name = format!("batch-{}-output.jsonl", batch_id);
+        let description = format!("Output file for batch {}", batch_id);
+
+        let file_id = sqlx::query_scalar!(
+            r#"
+            INSERT INTO files (name, description, size_bytes, status, purpose, uploaded_by)
+            VALUES ($1, $2, 0, 'processed', 'batch_output', $3)
+            RETURNING id
+            "#,
+            name,
+            description,
+            created_by.as_deref(),
+        )
+        .fetch_one(&mut **tx)
+        .await
+        .map_err(|e| FusilladeError::Other(anyhow!("Failed to create output file: {}", e)))?;
+
+        Ok(file_id)
+    }
+
+    /// Create a virtual error file for a batch (stores no data, streams from requests table)
+    async fn create_virtual_error_file(
+        &self,
+        tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+        batch_id: Uuid,
+        created_by: &Option<String>,
+    ) -> Result<Uuid> {
+        let name = format!("batch-{}-error.jsonl", batch_id);
+        let description = format!("Error file for batch {}", batch_id);
+
+        let file_id = sqlx::query_scalar!(
+            r#"
+            INSERT INTO files (name, description, size_bytes, status, purpose, uploaded_by)
+            VALUES ($1, $2, 0, 'processed', 'batch_error', $3)
+            RETURNING id
+            "#,
+            name,
+            description,
+            created_by.as_deref(),
+        )
+        .fetch_one(&mut **tx)
+        .await
+        .map_err(|e| FusilladeError::Other(anyhow!("Failed to create error file: {}", e)))?;
+
+        Ok(file_id)
     }
 }
 

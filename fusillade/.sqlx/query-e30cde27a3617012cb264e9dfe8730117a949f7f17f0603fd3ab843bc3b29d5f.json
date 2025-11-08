@@ -1,0 +1,42 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n                SELECT id, custom_id, response_status, response_body\n                FROM requests\n                WHERE batch_id = $1 AND state = 'completed' AND id > $2\n                ORDER BY id ASC\n                LIMIT $3\n                ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "id",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 1,
+        "name": "custom_id",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 2,
+        "name": "response_status",
+        "type_info": "Int2"
+      },
+      {
+        "ordinal": 3,
+        "name": "response_body",
+        "type_info": "Text"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Uuid",
+        "Int8"
+      ]
+    },
+    "nullable": [
+      false,
+      true,
+      true,
+      true
+    ]
+  },
+  "hash": "e30cde27a3617012cb264e9dfe8730117a949f7f17f0603fd3ab843bc3b29d5f"
+}

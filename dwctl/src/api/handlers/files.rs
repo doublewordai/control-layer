@@ -613,19 +613,35 @@ pub async fn get_file_content(
     // Stream the file content as JSONL
     let content_stream = state.request_manager.get_file_content_stream(fusillade::FileId(file_id));
 
-    // Convert RequestTemplateInput to OpenAI format JSONL (one per line)
-    let jsonl_stream = content_stream.map(|template_result| {
-        template_result
-            .and_then(|template| {
-                // Transform to OpenAI format (drops api_key, endpoint)
-                OpenAIBatchRequest::from_internal(&template)
-                    .map_err(|e| fusillade::FusilladeError::Other(anyhow::anyhow!("Failed to transform to OpenAI format: {:?}", e)))
-            })
-            .and_then(|openai_req| {
-                // Serialize to JSON
-                serde_json::to_string(&openai_req)
-                    .map(|json| format!("{}\n", json))
-                    .map_err(|e| fusillade::FusilladeError::Other(anyhow::anyhow!("JSON serialization failed: {}", e)))
+    // Convert FileContentItem to JSONL (one per line)
+    let jsonl_stream = content_stream.map(|content_result| {
+        content_result
+            .and_then(|content_item| {
+                // Handle different content types
+                match content_item {
+                    fusillade::FileContentItem::Template(template) => {
+                        // Transform to OpenAI format (drops api_key, endpoint)
+                        OpenAIBatchRequest::from_internal(&template)
+                            .map_err(|e| fusillade::FusilladeError::Other(anyhow::anyhow!("Failed to transform to OpenAI format: {:?}", e)))
+                            .and_then(|openai_req| {
+                                serde_json::to_string(&openai_req)
+                                    .map(|json| format!("{}\n", json))
+                                    .map_err(|e| fusillade::FusilladeError::Other(anyhow::anyhow!("JSON serialization failed: {}", e)))
+                            })
+                    }
+                    fusillade::FileContentItem::Output(output) => {
+                        // Already in OpenAI format, just serialize
+                        serde_json::to_string(&output)
+                            .map(|json| format!("{}\n", json))
+                            .map_err(|e| fusillade::FusilladeError::Other(anyhow::anyhow!("JSON serialization failed: {}", e)))
+                    }
+                    fusillade::FileContentItem::Error(error) => {
+                        // Already in OpenAI format, just serialize
+                        serde_json::to_string(&error)
+                            .map(|json| format!("{}\n", json))
+                            .map_err(|e| fusillade::FusilladeError::Other(anyhow::anyhow!("JSON serialization failed: {}", e)))
+                    }
+                }
             })
             .map_err(|e| std::io::Error::other(e.to_string()))
     });

@@ -73,6 +73,15 @@ fn to_batch_response(batch: fusillade::Batch, status: fusillade::BatchStatus) ->
     // Parse errors from JSON if present
     let errors = batch.errors.and_then(|e| serde_json::from_value::<BatchErrors>(e).ok());
 
+    // Check if batch has expired
+    let expired_at = batch.expires_at.and_then(|expires| {
+        if chrono::Utc::now() > expires {
+            Some(expires.timestamp())
+        } else {
+            None
+        }
+    });
+
     BatchResponse {
         id: batch.id.0.to_string(),
         object_type: BatchObjectType::Batch,
@@ -89,7 +98,7 @@ fn to_batch_response(batch: fusillade::Batch, status: fusillade::BatchStatus) ->
         finalizing_at,
         completed_at,
         failed_at,
-        expired_at: None, // TODO: Detect expired batches
+        expired_at,
         cancelling_at: batch.cancelling_at.map(|dt| dt.timestamp()),
         cancelled_at,
         request_counts: RequestCounts {
@@ -146,7 +155,7 @@ pub async fn create_batch(
     })?;
 
     // Verify file exists and user has access
-    let _file = state
+    let file = state
         .request_manager
         .get_file(fusillade::FileId(file_id))
         .await
@@ -155,7 +164,21 @@ pub async fn create_batch(
             id: req.input_file_id.clone(),
         })?;
 
-    // TODO: Check file ownership if user doesn't have ReadAll permission
+    // Check file ownership if user doesn't have ReadAll permission
+    use crate::types::Resource;
+    let has_read_all = can_read_all_resources(&current_user, Resource::Files);
+    if !has_read_all {
+        // Verify user owns the file
+        let user_id_str = current_user.id.to_string();
+        if file.uploaded_by.as_deref() != Some(&user_id_str) {
+            use crate::types::{Operation, Permission};
+            return Err(Error::InsufficientPermissions {
+                required: Permission::Allow(Resource::Files, Operation::ReadAll),
+                action: Operation::CreateOwn,
+                resource: format!("batch using file {}", req.input_file_id),
+            });
+        }
+    }
 
     // Convert metadata to serde_json::Value
     let metadata = req.metadata.and_then(|m| serde_json::to_value(m).ok());
@@ -339,14 +362,20 @@ pub async fn list_batches(
 ) -> Result<Json<BatchListResponse>> {
     let limit = query.limit.unwrap_or(20).clamp(1, 100);
 
+    // Parse the after cursor if provided
+    let after = query
+        .after
+        .as_ref()
+        .and_then(|after_str| Uuid::parse_str(after_str).ok().map(fusillade::BatchId));
+
     // Determine if user can read all batches or just their own
     let can_read_all = can_read_all_resources(&current_user, Resource::Batches);
     let created_by = if can_read_all { None } else { Some(current_user.id.to_string()) };
 
-    // Fetch batches with ownership filtering
+    // Fetch batches with ownership filtering and cursor-based pagination
     let batches = state
         .request_manager
-        .list_batches(created_by, limit + 1) // Fetch one extra to determine has_more
+        .list_batches(created_by, after, limit + 1) // Fetch one extra to determine has_more
         .await
         .map_err(|e| Error::Internal {
             operation: format!("list batches: {}", e),

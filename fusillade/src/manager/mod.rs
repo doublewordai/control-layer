@@ -4,8 +4,8 @@
 //! for persisting requests, creating files, launching batches, and checking execution status.
 
 use crate::batch::{
-    Batch, BatchId, BatchInput, BatchStatus, File, FileFilter, FileId, FileStreamItem,
-    RequestTemplate, RequestTemplateInput,
+    Batch, BatchId, BatchInput, BatchStatus, File, FileContentItem, FileFilter, FileId,
+    FileStreamItem, RequestTemplate, RequestTemplateInput,
 };
 use crate::error::Result;
 use crate::http::HttpClient;
@@ -53,12 +53,15 @@ pub trait Storage: Send + Sync {
     /// Get all templates for a file.
     async fn get_file_templates(&self, file_id: FileId) -> Result<Vec<RequestTemplate>>;
 
-    /// Stream file content as request templates.
-    /// Returns the raw JSONL file content - one RequestTemplateInput per line.
+    /// Stream file content.
+    /// Returns different content types based on the file's purpose:
+    /// - Regular files (purpose='batch'): RequestTemplateInput
+    /// - Batch output files (purpose='batch_output'): BatchOutputItem
+    /// - Batch error files (purpose='batch_error'): BatchErrorItem
     fn get_file_content_stream(
         &self,
         file_id: FileId,
-    ) -> Pin<Box<dyn Stream<Item = Result<RequestTemplateInput>> + Send>>;
+    ) -> Pin<Box<dyn Stream<Item = Result<FileContentItem>> + Send>>;
 
     /// Delete a file (cascades to batches and executions).
     async fn delete_file(&self, file_id: FileId) -> Result<()>;
@@ -76,9 +79,15 @@ pub trait Storage: Send + Sync {
     /// List all batches for a file.
     async fn list_file_batches(&self, file_id: FileId) -> Result<Vec<BatchStatus>>;
 
-    /// List batches with optional filtering by creator.
+    /// List batches with optional filtering by creator and cursor-based pagination.
     /// Returns batches sorted by created_at DESC.
-    async fn list_batches(&self, created_by: Option<String>, limit: i64) -> Result<Vec<Batch>>;
+    /// The `after` parameter is a cursor for pagination (returns batches created before this ID).
+    async fn list_batches(
+        &self,
+        created_by: Option<String>,
+        after: Option<BatchId>,
+        limit: i64,
+    ) -> Result<Vec<Batch>>;
 
     /// Get all requests for a batch.
     async fn get_batch_requests(&self, batch_id: BatchId) -> Result<Vec<AnyRequest>>;
