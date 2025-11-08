@@ -666,7 +666,7 @@ mod tests {
 
         while start.elapsed() < timeout {
             let status = manager
-                .get_batch_status(batch_id)
+                .get_batch_status(batch.id)
                 .await
                 .expect("Failed to get batch status");
 
@@ -758,13 +758,19 @@ mod tests {
             .await
             .expect("Failed to create file");
 
-        let batch_id = manager
-            .create_batch(file_id)
+        let batch = manager
+            .create_batch(crate::batch::BatchInput {
+                file_id,
+                endpoint: "/v1/chat/completions".to_string(),
+                completion_window: "24h".to_string(),
+                metadata: None,
+                created_by: None,
+            })
             .await
             .expect("Failed to create batch");
 
         let requests = manager
-            .get_batch_requests(batch_id)
+            .get_batch_requests(batch.id)
             .await
             .expect("Failed to get batch requests");
         assert_eq!(requests.len(), 1);

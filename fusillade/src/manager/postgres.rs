@@ -1188,18 +1188,26 @@ impl<H: HttpClient + 'static> Storage for PostgresRequestManager<H> {
             )));
         }
 
+        // Calculate expires_at from completion_window
+        let now = Utc::now();
+        let expires_at = humantime::parse_duration(&input.completion_window)
+            .ok()
+            .and_then(|std_duration| chrono::Duration::from_std(std_duration).ok())
+            .and_then(|duration| now.checked_add_signed(duration));
+
         // Create batch with new fields
         let row = sqlx::query!(
             r#"
-            INSERT INTO batches (file_id, endpoint, completion_window, metadata, created_by)
-            VALUES ($1, $2, $3, $4, $5)
-            RETURNING id, file_id, endpoint, completion_window, metadata, output_file_id, error_file_id, created_by, created_at
+            INSERT INTO batches (file_id, endpoint, completion_window, metadata, created_by, expires_at)
+            VALUES ($1, $2, $3, $4, $5, $6)
+            RETURNING id, file_id, endpoint, completion_window, metadata, output_file_id, error_file_id, created_by, created_at, expires_at, cancelling_at, errors
             "#,
             *input.file_id as Uuid,
             input.endpoint,
             input.completion_window,
             input.metadata,
             input.created_by,
+            expires_at,
         )
         .fetch_one(&mut *tx)
         .await
@@ -1247,13 +1255,16 @@ impl<H: HttpClient + 'static> Storage for PostgresRequestManager<H> {
             output_file_id: row.output_file_id.map(FileId),
             error_file_id: row.error_file_id.map(FileId),
             created_by: row.created_by,
+            expires_at: row.expires_at,
+            cancelling_at: row.cancelling_at,
+            errors: row.errors,
         })
     }
 
     async fn get_batch(&self, batch_id: BatchId) -> Result<Batch> {
         let row = sqlx::query!(
             r#"
-            SELECT id, file_id, endpoint, completion_window, metadata, output_file_id, error_file_id, created_by, created_at
+            SELECT id, file_id, endpoint, completion_window, metadata, output_file_id, error_file_id, created_by, created_at, expires_at, cancelling_at, errors
             FROM batches
             WHERE id = $1
             "#,
@@ -1274,6 +1285,9 @@ impl<H: HttpClient + 'static> Storage for PostgresRequestManager<H> {
             output_file_id: row.output_file_id.map(FileId),
             error_file_id: row.error_file_id.map(FileId),
             created_by: row.created_by,
+            expires_at: row.expires_at,
+            cancelling_at: row.cancelling_at,
+            errors: row.errors,
         })
     }
 
@@ -1351,7 +1365,7 @@ impl<H: HttpClient + 'static> Storage for PostgresRequestManager<H> {
     async fn list_batches(&self, created_by: Option<String>, limit: i64) -> Result<Vec<Batch>> {
         let rows = sqlx::query!(
             r#"
-            SELECT id, file_id, endpoint, completion_window, metadata, output_file_id, error_file_id, created_by, created_at
+            SELECT id, file_id, endpoint, completion_window, metadata, output_file_id, error_file_id, created_by, created_at, expires_at, cancelling_at, errors
             FROM batches
             WHERE ($1::TEXT IS NULL OR created_by = $1)
             ORDER BY created_at DESC
@@ -1376,6 +1390,9 @@ impl<H: HttpClient + 'static> Storage for PostgresRequestManager<H> {
                 output_file_id: row.output_file_id.map(FileId),
                 error_file_id: row.error_file_id.map(FileId),
                 created_by: row.created_by,
+                expires_at: row.expires_at,
+                cancelling_at: row.cancelling_at,
+                errors: row.errors,
             })
             .collect())
     }
@@ -1383,6 +1400,21 @@ impl<H: HttpClient + 'static> Storage for PostgresRequestManager<H> {
     async fn cancel_batch(&self, batch_id: BatchId) -> Result<()> {
         let now = Utc::now();
 
+        // Set cancelling_at on the batch
+        sqlx::query!(
+            r#"
+            UPDATE batches
+            SET cancelling_at = $2
+            WHERE id = $1 AND cancelling_at IS NULL
+            "#,
+            *batch_id as Uuid,
+            now,
+        )
+        .execute(&self.pool)
+        .await
+        .map_err(|e| FusilladeError::Other(anyhow!("Failed to set cancelling_at: {}", e)))?;
+
+        // Cancel all pending/in-progress requests
         sqlx::query!(
             r#"
             UPDATE requests

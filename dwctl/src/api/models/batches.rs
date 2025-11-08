@@ -2,6 +2,32 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use utoipa::{IntoParams, ToSchema};
 
+/// Batch-level errors
+#[derive(Debug, Serialize, Deserialize, ToSchema, Clone)]
+pub struct BatchErrors {
+    /// Array of error details
+    pub data: Vec<BatchError>,
+}
+
+/// Individual error in a batch
+#[derive(Debug, Serialize, Deserialize, ToSchema, Clone)]
+pub struct BatchError {
+    /// An error code identifying the error type
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub code: Option<String>,
+
+    /// The line number of the input file where the error occurred, if applicable
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub line: Option<i32>,
+
+    /// A human-readable message providing more details about the error
+    pub message: String,
+
+    /// The name of the parameter that caused the error, if applicable
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub param: Option<String>,
+}
+
 /// Request body for creating a batch
 #[derive(Debug, Deserialize, ToSchema)]
 pub struct CreateBatchRequest {
@@ -31,7 +57,7 @@ pub struct BatchResponse {
     pub endpoint: String,
 
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub errors: Option<serde_json::Value>,
+    pub errors: Option<BatchErrors>,
 
     pub input_file_id: String,
 

@@ -5,7 +5,7 @@
 //! Repository methods are delegated to the fusillade/ crate.
 
 use crate::api::models::batches::{
-    BatchListResponse, BatchObjectType, BatchResponse, CreateBatchRequest, ListBatchesQuery, ListObjectType, RequestCounts,
+    BatchErrors, BatchListResponse, BatchObjectType, BatchResponse, CreateBatchRequest, ListBatchesQuery, ListObjectType, RequestCounts,
 };
 use crate::auth::permissions::{can_read_all_resources, has_permission, operation, resource, RequiresPermission};
 use crate::errors::{Error, Result};
@@ -31,8 +31,15 @@ fn to_batch_response(batch: fusillade::Batch, status: fusillade::BatchStatus) ->
         })
     });
 
+    // Determine OpenAI status - override if cancelling
+    let base_status = status.openai_status();
+    let openai_status = if batch.cancelling_at.is_some() && base_status != "cancelled" {
+        "cancelling"
+    } else {
+        base_status
+    };
+
     // Compute timestamps based on status
-    let openai_status = status.openai_status();
     let in_progress_at = if openai_status != "validating" {
         status.started_at.map(|dt| dt.timestamp())
     } else {
@@ -63,11 +70,14 @@ fn to_batch_response(batch: fusillade::Batch, status: fusillade::BatchStatus) ->
         None
     };
 
+    // Parse errors from JSON if present
+    let errors = batch.errors.and_then(|e| serde_json::from_value::<BatchErrors>(e).ok());
+
     BatchResponse {
         id: batch.id.0.to_string(),
         object_type: BatchObjectType::Batch,
         endpoint: batch.endpoint.clone(),
-        errors: None, // TODO: Implement error tracking
+        errors,
         input_file_id: batch.file_id.0.to_string(),
         completion_window: batch.completion_window.clone(),
         status: openai_status.to_string(),
@@ -75,12 +85,12 @@ fn to_batch_response(batch: fusillade::Batch, status: fusillade::BatchStatus) ->
         error_file_id: batch.error_file_id.map(|id| id.0.to_string()),
         created_at: batch.created_at.timestamp(),
         in_progress_at,
-        expires_at: None, // TODO: Calculate expiration based on completion_window
+        expires_at: batch.expires_at.map(|dt| dt.timestamp()),
         finalizing_at,
         completed_at,
         failed_at,
-        expired_at: None,
-        cancelling_at: None, // TODO: Track cancelling state
+        expired_at: None, // TODO: Detect expired batches
+        cancelling_at: batch.cancelling_at.map(|dt| dt.timestamp()),
         cancelled_at,
         request_counts: RequestCounts {
             total: status.total_requests,
