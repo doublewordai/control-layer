@@ -252,6 +252,8 @@ pub struct BatchInput {
     pub completion_window: String,
     /// Optional metadata key-value pairs (OpenAI allows up to 16 pairs)
     pub metadata: Option<serde_json::Value>,
+    /// User who created this batch (for ownership tracking)
+    pub created_by: Option<String>,
 }
 
 /// A batch represents one execution of all of a file's templates.
@@ -270,6 +272,8 @@ pub struct Batch {
     pub output_file_id: Option<FileId>,
     /// File ID containing the error results
     pub error_file_id: Option<FileId>,
+    /// User who created this batch
+    pub created_by: Option<String>,
 }
 
 /// Status information for a batch, computed from its executions.

@@ -7,8 +7,9 @@
 use crate::api::models::batches::{
     BatchListResponse, BatchObjectType, BatchResponse, CreateBatchRequest, ListBatchesQuery, ListObjectType, RequestCounts,
 };
-use crate::auth::permissions::{operation, resource, RequiresPermission};
+use crate::auth::permissions::{can_read_all_resources, has_permission, operation, resource, RequiresPermission};
 use crate::errors::{Error, Result};
+use crate::types::{Operation, Resource};
 use crate::AppState;
 use axum::{
     extract::{Path, Query, State},
@@ -155,6 +156,7 @@ pub async fn create_batch(
         endpoint: req.endpoint.clone(),
         completion_window: req.completion_window.clone(),
         metadata,
+        created_by: Some(current_user.id.to_string()),
     };
 
     // Create the batch
@@ -211,7 +213,17 @@ pub async fn get_batch(
             id: batch_id_str.clone(),
         })?;
 
-    // TODO: Check batch ownership if user doesn't have ReadAll permission
+    // Check ownership: users without ReadAll permission can only see their own batches
+    let can_read_all = can_read_all_resources(&current_user, Resource::Batches);
+    if !can_read_all {
+        let user_id = current_user.id.to_string();
+        if batch.created_by.as_deref() != Some(user_id.as_str()) {
+            return Err(Error::NotFound {
+                resource: "Batch".to_string(),
+                id: batch_id_str,
+            });
+        }
+    }
 
     // Get batch status
     let status = state
@@ -260,7 +272,17 @@ pub async fn cancel_batch(
             id: batch_id_str.clone(),
         })?;
 
-    // TODO: Check batch ownership if user doesn't have UpdateAll permission
+    // Check ownership: users without UpdateAll permission can only cancel their own batches
+    let can_update_all = has_permission(&current_user, Resource::Batches, Operation::UpdateAll);
+    if !can_update_all {
+        let user_id = current_user.id.to_string();
+        if batch.created_by.as_deref() != Some(user_id.as_str()) {
+            return Err(Error::NotFound {
+                resource: "Batch".to_string(),
+                id: batch_id_str.clone(),
+            });
+        }
+    }
 
     // Cancel the batch
     state
@@ -299,31 +321,54 @@ pub async fn cancel_batch(
         ListBatchesQuery
     )
 )]
-#[tracing::instrument(skip(_state, current_user), fields(user_id = %current_user.id, limit = ?query.limit, after = ?query.after))]
+#[tracing::instrument(skip(state, current_user), fields(user_id = %current_user.id, limit = ?query.limit, after = ?query.after))]
 pub async fn list_batches(
-    State(_state): State<AppState>,
+    State(state): State<AppState>,
     Query(query): Query<ListBatchesQuery>,
     current_user: RequiresPermission<resource::Batches, operation::ReadOwn>,
 ) -> Result<Json<BatchListResponse>> {
-    let _limit = query.limit.unwrap_or(20).clamp(1, 100);
+    let limit = query.limit.unwrap_or(20).clamp(1, 100);
 
-    // TODO: Implement proper pagination with cursor
-    // TODO: Filter by ownership if user doesn't have ReadAll permission
+    // Determine if user can read all batches or just their own
+    let can_read_all = can_read_all_resources(&current_user, Resource::Batches);
+    let created_by = if can_read_all { None } else { Some(current_user.id.to_string()) };
 
-    // For now, get all batches (this is inefficient for large datasets)
-    // In production, you'd want a proper list_batches method with filtering
-    // We'll need to add this to the Storage trait
+    // Fetch batches with ownership filtering
+    let batches = state
+        .request_manager
+        .list_batches(created_by, limit + 1) // Fetch one extra to determine has_more
+        .await
+        .map_err(|e| Error::Internal {
+            operation: format!("list batches: {}", e),
+        })?;
 
-    // Temporary workaround: Since we don't have a list_batches method yet,
-    // return an empty list. This needs to be implemented properly.
-    let data = vec![];
-    let has_more = false;
+    // Check if there are more results
+    let has_more = batches.len() > limit as usize;
+    let batches: Vec<_> = batches.into_iter().take(limit as usize).collect();
+
+    // Get first and last IDs
+    let first_id = batches.first().map(|b| b.id.0.to_string());
+    let last_id = batches.last().map(|b| b.id.0.to_string());
+
+    // Convert batches to responses (need to get status for each)
+    let mut data = Vec::new();
+    for batch in batches {
+        let status = state
+            .request_manager
+            .get_batch_status(batch.id)
+            .await
+            .map_err(|e| Error::Internal {
+                operation: format!("get batch status: {}", e),
+            })?;
+
+        data.push(to_batch_response(batch, status));
+    }
 
     Ok(Json(BatchListResponse {
         object_type: ListObjectType::List,
         data,
-        first_id: None,
-        last_id: None,
+        first_id,
+        last_id,
         has_more,
     }))
 }

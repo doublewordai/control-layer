@@ -76,6 +76,10 @@ pub trait Storage: Send + Sync {
     /// List all batches for a file.
     async fn list_file_batches(&self, file_id: FileId) -> Result<Vec<BatchStatus>>;
 
+    /// List batches with optional filtering by creator.
+    /// Returns batches sorted by created_at DESC.
+    async fn list_batches(&self, created_by: Option<String>, limit: i64) -> Result<Vec<Batch>>;
+
     /// Get all requests for a batch.
     async fn get_batch_requests(&self, batch_id: BatchId) -> Result<Vec<AnyRequest>>;
 

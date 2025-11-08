@@ -1191,14 +1191,15 @@ impl<H: HttpClient + 'static> Storage for PostgresRequestManager<H> {
         // Create batch with new fields
         let row = sqlx::query!(
             r#"
-            INSERT INTO batches (file_id, endpoint, completion_window, metadata)
-            VALUES ($1, $2, $3, $4)
-            RETURNING id, file_id, endpoint, completion_window, metadata, output_file_id, error_file_id, created_at
+            INSERT INTO batches (file_id, endpoint, completion_window, metadata, created_by)
+            VALUES ($1, $2, $3, $4, $5)
+            RETURNING id, file_id, endpoint, completion_window, metadata, output_file_id, error_file_id, created_by, created_at
             "#,
             *input.file_id as Uuid,
             input.endpoint,
             input.completion_window,
             input.metadata,
+            input.created_by,
         )
         .fetch_one(&mut *tx)
         .await
@@ -1245,13 +1246,14 @@ impl<H: HttpClient + 'static> Storage for PostgresRequestManager<H> {
             endpoint: row.endpoint,
             output_file_id: row.output_file_id.map(FileId),
             error_file_id: row.error_file_id.map(FileId),
+            created_by: row.created_by,
         })
     }
 
     async fn get_batch(&self, batch_id: BatchId) -> Result<Batch> {
         let row = sqlx::query!(
             r#"
-            SELECT id, file_id, endpoint, completion_window, metadata, output_file_id, error_file_id, created_at
+            SELECT id, file_id, endpoint, completion_window, metadata, output_file_id, error_file_id, created_by, created_at
             FROM batches
             WHERE id = $1
             "#,
@@ -1271,6 +1273,7 @@ impl<H: HttpClient + 'static> Storage for PostgresRequestManager<H> {
             endpoint: row.endpoint,
             output_file_id: row.output_file_id.map(FileId),
             error_file_id: row.error_file_id.map(FileId),
+            created_by: row.created_by,
         })
     }
 
@@ -1341,6 +1344,38 @@ impl<H: HttpClient + 'static> Storage for PostgresRequestManager<H> {
                     last_updated_at: row.last_updated_at,
                     created_at: row.created_at?,
                 })
+            })
+            .collect())
+    }
+
+    async fn list_batches(&self, created_by: Option<String>, limit: i64) -> Result<Vec<Batch>> {
+        let rows = sqlx::query!(
+            r#"
+            SELECT id, file_id, endpoint, completion_window, metadata, output_file_id, error_file_id, created_by, created_at
+            FROM batches
+            WHERE ($1::TEXT IS NULL OR created_by = $1)
+            ORDER BY created_at DESC
+            LIMIT $2
+            "#,
+            created_by,
+            limit,
+        )
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|e| FusilladeError::Other(anyhow!("Failed to list batches: {}", e)))?;
+
+        Ok(rows
+            .into_iter()
+            .map(|row| Batch {
+                id: BatchId(row.id),
+                file_id: FileId(row.file_id),
+                created_at: row.created_at,
+                metadata: row.metadata,
+                completion_window: row.completion_window,
+                endpoint: row.endpoint,
+                output_file_id: row.output_file_id.map(FileId),
+                error_file_id: row.error_file_id.map(FileId),
+                created_by: row.created_by,
             })
             .collect())
     }
@@ -1891,18 +1926,24 @@ mod tests {
             .expect("Failed to create file");
 
         // Create a batch
-        let batch_id = manager
-            .create_batch(file_id)
+        let batch = manager
+            .create_batch(crate::batch::BatchInput {
+                file_id,
+                endpoint: "/v1/chat/completions".to_string(),
+                completion_window: "24h".to_string(),
+                metadata: None,
+                created_by: None,
+            })
             .await
             .expect("Failed to create batch");
 
         // Get batch status
         let status = manager
-            .get_batch_status(batch_id)
+            .get_batch_status(batch.id)
             .await
             .expect("Failed to get batch status");
 
-        assert_eq!(status.batch_id, batch_id);
+        assert_eq!(status.batch_id, batch.id);
         assert_eq!(status.file_id, file_id);
         assert_eq!(status.file_name, "batch-test");
         assert_eq!(status.total_requests, 3);
@@ -1912,7 +1953,7 @@ mod tests {
 
         // Get batch requests
         let requests = manager
-            .get_batch_requests(batch_id)
+            .get_batch_requests(batch.id)
             .await
             .expect("Failed to get batch requests");
 
@@ -1947,7 +1988,16 @@ mod tests {
             .await
             .unwrap();
 
-        let batch_id = manager.create_batch(file_id).await.unwrap();
+        let batch = manager
+            .create_batch(crate::batch::BatchInput {
+                file_id,
+                endpoint: "/v1/chat/completions".to_string(),
+                completion_window: "24h".to_string(),
+                metadata: None,
+                created_by: None,
+            })
+            .await
+            .unwrap();
 
         let daemon_id = DaemonId::from(Uuid::new_v4());
 
@@ -1972,7 +2022,7 @@ mod tests {
         assert_eq!(claimed2.len(), 2);
 
         // Verify batch status shows claimed requests
-        let status = manager.get_batch_status(batch_id).await.unwrap();
+        let status = manager.get_batch_status(batch.id).await.unwrap();
         assert_eq!(status.total_requests, 5);
         assert_eq!(status.pending_requests, 0);
         assert_eq!(status.in_progress_requests, 5); // All claimed
@@ -2003,23 +2053,32 @@ mod tests {
             .await
             .unwrap();
 
-        let batch_id = manager.create_batch(file_id).await.unwrap();
+        let batch = manager
+            .create_batch(crate::batch::BatchInput {
+                file_id,
+                endpoint: "/v1/chat/completions".to_string(),
+                completion_window: "24h".to_string(),
+                metadata: None,
+                created_by: None,
+            })
+            .await
+            .unwrap();
 
         // Verify all are pending
-        let status_before = manager.get_batch_status(batch_id).await.unwrap();
+        let status_before = manager.get_batch_status(batch.id).await.unwrap();
         assert_eq!(status_before.pending_requests, 3);
         assert_eq!(status_before.canceled_requests, 0);
 
         // Cancel the batch
-        manager.cancel_batch(batch_id).await.unwrap();
+        manager.cancel_batch(batch.id).await.unwrap();
 
         // Verify all are canceled
-        let status_after = manager.get_batch_status(batch_id).await.unwrap();
+        let status_after = manager.get_batch_status(batch.id).await.unwrap();
         assert_eq!(status_after.pending_requests, 0);
         assert_eq!(status_after.canceled_requests, 3);
 
         // Get the actual requests to verify their state
-        let requests = manager.get_batch_requests(batch_id).await.unwrap();
+        let requests = manager.get_batch_requests(batch.id).await.unwrap();
         assert_eq!(requests.len(), 3);
         for request in requests {
             assert!(matches!(request, AnyRequest::Canceled(_)));
@@ -2051,10 +2110,19 @@ mod tests {
             .await
             .unwrap();
 
-        let batch_id = manager.create_batch(file_id).await.unwrap();
+        let batch = manager
+            .create_batch(crate::batch::BatchInput {
+                file_id,
+                endpoint: "/v1/chat/completions".to_string(),
+                completion_window: "24h".to_string(),
+                metadata: None,
+                created_by: None,
+            })
+            .await
+            .unwrap();
 
         // Get all request IDs
-        let requests = manager.get_batch_requests(batch_id).await.unwrap();
+        let requests = manager.get_batch_requests(batch.id).await.unwrap();
         let request_ids: Vec<_> = requests.iter().map(|r| r.id()).collect();
 
         // Cancel the first 3 requests
@@ -2069,12 +2137,12 @@ mod tests {
         }
 
         // Verify batch status
-        let status = manager.get_batch_status(batch_id).await.unwrap();
+        let status = manager.get_batch_status(batch.id).await.unwrap();
         assert_eq!(status.pending_requests, 2);
         assert_eq!(status.canceled_requests, 3);
 
         // Verify the requests
-        let all_requests = manager.get_batch_requests(batch_id).await.unwrap();
+        let all_requests = manager.get_batch_requests(batch.id).await.unwrap();
         let canceled_count = all_requests
             .iter()
             .filter(|r| matches!(r, AnyRequest::Canceled(_)))
@@ -2152,9 +2220,36 @@ mod tests {
             .unwrap();
 
         // Create 3 batches
-        let batch1_id = manager.create_batch(file_id).await.unwrap();
-        let batch2_id = manager.create_batch(file_id).await.unwrap();
-        let batch3_id = manager.create_batch(file_id).await.unwrap();
+        let batch1 = manager
+            .create_batch(crate::batch::BatchInput {
+                file_id,
+                endpoint: "/v1/chat/completions".to_string(),
+                completion_window: "24h".to_string(),
+                metadata: None,
+                created_by: None,
+            })
+            .await
+            .unwrap();
+        let batch2 = manager
+            .create_batch(crate::batch::BatchInput {
+                file_id,
+                endpoint: "/v1/chat/completions".to_string(),
+                completion_window: "24h".to_string(),
+                metadata: None,
+                created_by: None,
+            })
+            .await
+            .unwrap();
+        let batch3 = manager
+            .create_batch(crate::batch::BatchInput {
+                file_id,
+                endpoint: "/v1/chat/completions".to_string(),
+                completion_window: "24h".to_string(),
+                metadata: None,
+                created_by: None,
+            })
+            .await
+            .unwrap();
 
         // List batches for this file
         let batches = manager.list_file_batches(file_id).await.unwrap();
@@ -2163,9 +2258,9 @@ mod tests {
 
         // Verify all batch IDs are present
         let batch_ids: Vec<_> = batches.iter().map(|b| b.batch_id).collect();
-        assert!(batch_ids.contains(&batch1_id));
-        assert!(batch_ids.contains(&batch2_id));
-        assert!(batch_ids.contains(&batch3_id));
+        assert!(batch_ids.contains(&batch1.id));
+        assert!(batch_ids.contains(&batch2.id));
+        assert!(batch_ids.contains(&batch3.id));
 
         // Verify each batch has 1 pending request
         for batch in batches {
@@ -2209,10 +2304,19 @@ mod tests {
             .unwrap();
 
         // Create a batch
-        let batch_id = manager.create_batch(file_id).await.unwrap();
+        let batch = manager
+            .create_batch(crate::batch::BatchInput {
+                file_id,
+                endpoint: "/v1/chat/completions".to_string(),
+                completion_window: "24h".to_string(),
+                metadata: None,
+                created_by: None,
+            })
+            .await
+            .unwrap();
 
         // Verify the batch exists
-        let status_before = manager.get_batch_status(batch_id).await;
+        let status_before = manager.get_batch_status(batch.id).await;
         assert!(status_before.is_ok());
 
         // Delete the file
@@ -2223,7 +2327,7 @@ mod tests {
         assert!(file_result.is_err());
 
         // Verify batch is gone (cascade delete)
-        let status_after = manager.get_batch_status(batch_id).await;
+        let status_after = manager.get_batch_status(batch.id).await;
         assert!(status_after.is_err());
     }
 
@@ -2259,7 +2363,16 @@ mod tests {
             .await
             .unwrap();
 
-        let batch_id = manager.create_batch(file_id).await.unwrap();
+        let batch = manager
+            .create_batch(crate::batch::BatchInput {
+                file_id,
+                endpoint: "/v1/chat/completions".to_string(),
+                completion_window: "24h".to_string(),
+                metadata: None,
+                created_by: None,
+            })
+            .await
+            .unwrap();
 
         // Claim the request with daemon1
         let daemon1_id = DaemonId::from(Uuid::new_v4());
@@ -2285,7 +2398,7 @@ mod tests {
         assert_eq!(reclaimed[0].state.daemon_id, daemon2_id);
 
         // Verify the request is now claimed by daemon2
-        let status = manager.get_batch_status(batch_id).await.unwrap();
+        let status = manager.get_batch_status(batch.id).await.unwrap();
         assert_eq!(status.in_progress_requests, 1);
     }
 
@@ -2321,7 +2434,16 @@ mod tests {
             .await
             .unwrap();
 
-        let batch_id = manager.create_batch(file_id).await.unwrap();
+        let batch = manager
+            .create_batch(crate::batch::BatchInput {
+                file_id,
+                endpoint: "/v1/chat/completions".to_string(),
+                completion_window: "24h".to_string(),
+                metadata: None,
+                created_by: None,
+            })
+            .await
+            .unwrap();
 
         // Claim and manually set to processing state
         let daemon1_id = DaemonId::from(Uuid::new_v4());
@@ -2345,7 +2467,7 @@ mod tests {
         .unwrap();
 
         // Verify it's in processing state
-        let status_before = manager.get_batch_status(batch_id).await.unwrap();
+        let status_before = manager.get_batch_status(batch.id).await.unwrap();
         assert_eq!(status_before.in_progress_requests, 1);
 
         // Now daemon2 tries to claim - should unclaim the stale processing request
@@ -2400,7 +2522,16 @@ mod tests {
             .await
             .unwrap();
 
-        manager.create_batch(file_id).await.unwrap();
+        manager
+            .create_batch(crate::batch::BatchInput {
+                file_id,
+                endpoint: "/v1/chat/completions".to_string(),
+                completion_window: "24h".to_string(),
+                metadata: None,
+                created_by: None,
+            })
+            .await
+            .unwrap();
 
         // Daemon1 claims first request
         let daemon1_id = DaemonId::from(Uuid::new_v4());
@@ -2459,7 +2590,16 @@ mod tests {
             .await
             .unwrap();
 
-        manager.create_batch(file_id).await.unwrap();
+        manager
+            .create_batch(crate::batch::BatchInput {
+                file_id,
+                endpoint: "/v1/chat/completions".to_string(),
+                completion_window: "24h".to_string(),
+                metadata: None,
+                created_by: None,
+            })
+            .await
+            .unwrap();
 
         // Manually set a request to claimed with retry_attempt=2
         sqlx::query!(
