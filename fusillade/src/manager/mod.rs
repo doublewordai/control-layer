@@ -5,7 +5,7 @@
 
 use crate::batch::{
     Batch, BatchId, BatchInput, BatchStatus, File, FileContentItem, FileFilter, FileId,
-    FileStreamItem, RequestTemplate, RequestTemplateInput,
+    FileStreamItem, OutputFileType, RequestTemplate, RequestTemplateInput,
 };
 use crate::error::Result;
 use crate::http::HttpClient;
@@ -88,6 +88,14 @@ pub trait Storage: Send + Sync {
         after: Option<BatchId>,
         limit: i64,
     ) -> Result<Vec<Batch>>;
+
+    /// Get a batch by its output or error file ID.
+    /// Uses indexed lookup on output_file_id or error_file_id.
+    async fn get_batch_by_output_file_id(
+        &self,
+        file_id: FileId,
+        file_type: OutputFileType,
+    ) -> Result<Option<Batch>>;
 
     /// Get all requests for a batch.
     async fn get_batch_requests(&self, batch_id: BatchId) -> Result<Vec<AnyRequest>>;

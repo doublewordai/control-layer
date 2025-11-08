@@ -615,22 +615,20 @@ pub async fn get_file_content(
         file.purpose,
         Some(fusillade::Purpose::BatchOutput) | Some(fusillade::Purpose::BatchError)
     ) {
-        // Find the batch that owns this file
-        let batches = state
+        // Find the batch that owns this file using indexed lookup
+        let file_type = if file.purpose == Some(fusillade::Purpose::BatchOutput) {
+            fusillade::OutputFileType::Output
+        } else {
+            fusillade::OutputFileType::Error
+        };
+
+        let batch = state
             .request_manager
-            .list_batches(None, None, 1000) // Search through batches
+            .get_batch_by_output_file_id(fusillade::FileId(file_id), file_type)
             .await
             .map_err(|e| Error::Internal {
-                operation: format!("list batches: {}", e),
+                operation: format!("get batch by output file: {}", e),
             })?;
-
-        let batch = batches.into_iter().find(|b| {
-            if file.purpose == Some(fusillade::Purpose::BatchOutput) {
-                b.output_file_id == Some(fusillade::FileId(file_id))
-            } else {
-                b.error_file_id == Some(fusillade::FileId(file_id))
-            }
-        });
 
         if let Some(batch) = batch {
             // Get batch status to check if it's complete

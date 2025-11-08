@@ -22,7 +22,7 @@ use super::Storage;
 use crate::batch::{
     Batch, BatchErrorDetails, BatchErrorItem, BatchId, BatchInput, BatchOutputItem,
     BatchResponseDetails, BatchStatus, File, FileContentItem, FileId, FileMetadata, FileStreamItem,
-    RequestTemplate, RequestTemplateInput, TemplateId,
+    OutputFileType, RequestTemplate, RequestTemplateInput, TemplateId,
 };
 use crate::daemon::{Daemon, DaemonConfig};
 use crate::error::{FusilladeError, Result};
@@ -1361,6 +1361,71 @@ impl<H: HttpClient + 'static> Storage for PostgresRequestManager<H> {
                 })
             })
             .collect())
+    }
+
+    async fn get_batch_by_output_file_id(
+        &self,
+        file_id: FileId,
+        file_type: OutputFileType,
+    ) -> Result<Option<Batch>> {
+        match file_type {
+            OutputFileType::Output => {
+                let row = sqlx::query!(
+                    r#"
+                    SELECT id, file_id, endpoint, completion_window, metadata, output_file_id, error_file_id, created_by, created_at, expires_at, cancelling_at, errors
+                    FROM batches
+                    WHERE output_file_id = $1
+                    "#,
+                    *file_id as Uuid,
+                )
+                .fetch_optional(&self.pool)
+                .await
+                .map_err(|e| FusilladeError::Other(anyhow!("Failed to get batch by output file: {}", e)))?;
+
+                Ok(row.map(|row| Batch {
+                    id: BatchId(row.id),
+                    file_id: FileId(row.file_id),
+                    created_at: row.created_at,
+                    metadata: row.metadata,
+                    completion_window: row.completion_window,
+                    endpoint: row.endpoint,
+                    output_file_id: row.output_file_id.map(FileId),
+                    error_file_id: row.error_file_id.map(FileId),
+                    created_by: row.created_by,
+                    expires_at: row.expires_at,
+                    cancelling_at: row.cancelling_at,
+                    errors: row.errors,
+                }))
+            }
+            OutputFileType::Error => {
+                let row = sqlx::query!(
+                    r#"
+                    SELECT id, file_id, endpoint, completion_window, metadata, output_file_id, error_file_id, created_by, created_at, expires_at, cancelling_at, errors
+                    FROM batches
+                    WHERE error_file_id = $1
+                    "#,
+                    *file_id as Uuid,
+                )
+                .fetch_optional(&self.pool)
+                .await
+                .map_err(|e| FusilladeError::Other(anyhow!("Failed to get batch by error file: {}", e)))?;
+
+                Ok(row.map(|row| Batch {
+                    id: BatchId(row.id),
+                    file_id: FileId(row.file_id),
+                    created_at: row.created_at,
+                    metadata: row.metadata,
+                    completion_window: row.completion_window,
+                    endpoint: row.endpoint,
+                    output_file_id: row.output_file_id.map(FileId),
+                    error_file_id: row.error_file_id.map(FileId),
+                    created_by: row.created_by,
+                    expires_at: row.expires_at,
+                    cancelling_at: row.cancelling_at,
+                    errors: row.errors,
+                }))
+            }
+        }
     }
 
     async fn list_batches(

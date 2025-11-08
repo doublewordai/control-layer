@@ -98,6 +98,15 @@ pub enum Purpose {
     BatchError,
 }
 
+/// Type of batch output file for lookup purposes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OutputFileType {
+    /// Output file containing completed requests
+    Output,
+    /// Error file containing failed requests
+    Error,
+}
+
 impl fmt::Display for Purpose {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
