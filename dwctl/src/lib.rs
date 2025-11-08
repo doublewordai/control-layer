@@ -388,7 +388,9 @@ pub async fn setup_app(
     // Initialize the fusillade request manager (for batch processing)
     // Use the fusillade_pool which has search_path set to 'fusillade' schema
     let request_manager = Arc::new(
-        fusillade::PostgresRequestManager::new(fusillade_pool.clone()).with_download_buffer_size(config.files.download_buffer_size),
+        fusillade::PostgresRequestManager::new(fusillade_pool.clone())
+            .with_config(config.batches.daemon.to_fusillade_config())
+            .with_download_buffer_size(config.batches.files.download_buffer_size),
     );
 
     let is_leader: bool;
@@ -406,20 +408,40 @@ pub async fn setup_app(
             daemon_scheduler.run_daemon(use_listen_notify, 300).await; // Fallback sync every 5 minutes
         });
 
-        // Start the fusillade batch processing daemon
+        // Start the fusillade batch processing daemon based on config
+        use crate::config::DaemonEnabled;
         use fusillade::DaemonExecutor;
-        let daemon_manager = request_manager.clone();
-        tokio::spawn(async move {
-            if let Err(e) = daemon_manager.run() {
-                tracing::error!("Fusillade daemon error: {}", e);
+        match config.batches.daemon.enabled {
+            DaemonEnabled::Always | DaemonEnabled::Leader => {
+                let daemon_manager = request_manager.clone();
+                tokio::spawn(async move {
+                    if let Err(e) = daemon_manager.run() {
+                        tracing::error!("Fusillade daemon error: {}", e);
+                    }
+                });
+                info!("Skipping leader election - running as leader with probe scheduler and fusillade daemon");
             }
-        });
-
-        info!("Skipping leader election - running as leader with probe scheduler and fusillade daemon");
+            DaemonEnabled::Never => {
+                info!("Skipping leader election - running as leader with probe scheduler (fusillade daemon disabled)");
+            }
+        }
     } else {
         // Normal leader election
         is_leader = false;
         info!("Starting leader election - will attempt to acquire leadership");
+
+        // If daemon is set to "Always", start it immediately regardless of leader election
+        use crate::config::DaemonEnabled;
+        if config.batches.daemon.enabled == DaemonEnabled::Always {
+            use fusillade::DaemonExecutor;
+            let daemon_manager = request_manager.clone();
+            tokio::spawn(async move {
+                if let Err(e) = daemon_manager.run() {
+                    tracing::error!("Fusillade daemon error: {}", e);
+                }
+            });
+            info!("Fusillade batch daemon started (configured to always run)");
+        }
 
         let is_leader_flag = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
 
@@ -454,7 +476,7 @@ pub async fn setup_app(
                 leader_election_config,
                 leader_election_flag,
                 LEADER_LOCK_ID,
-                move |_pool, _config| {
+                move |_pool, config| {
                     // This closure is run when a replica becomes the leader
                     let scheduler = leader_election_scheduler_gain.clone();
                     let request_manager = leader_election_request_manager_gain.clone();
@@ -477,16 +499,24 @@ pub async fn setup_app(
                             daemon_scheduler.run_daemon(use_listen_notify, 300).await;
                         });
 
-                        // Start the fusillade batch processing daemon
+                        // Start the fusillade batch processing daemon based on config
+                        use crate::config::DaemonEnabled;
                         use fusillade::DaemonExecutor;
-                        let handle = request_manager
-                            .run()
-                            .map_err(|e| anyhow::anyhow!("Failed to start fusillade daemon: {}", e))?;
+                        match config.batches.daemon.enabled {
+                            DaemonEnabled::Always | DaemonEnabled::Leader => {
+                                let handle = request_manager
+                                    .run()
+                                    .map_err(|e| anyhow::anyhow!("Failed to start fusillade daemon: {}", e))?;
 
-                        // Store the handle so we can abort it when losing leadership
-                        *daemon_handle.lock().await = Some(handle);
+                                // Store the handle so we can abort it when losing leadership
+                                *daemon_handle.lock().await = Some(handle);
 
-                        tracing::info!("Fusillade batch daemon started on elected leader");
+                                tracing::info!("Fusillade batch daemon started on elected leader");
+                            }
+                            DaemonEnabled::Never => {
+                                tracing::info!("Fusillade batch daemon disabled by configuration");
+                            }
+                        }
 
                         Ok(())
                     }
@@ -613,15 +643,8 @@ pub async fn build_router(state: &mut AppState, onwards_router: Router) -> anyho
         .route("/authentication/password-change", post(api::handlers::auth::change_password))
         .with_state(state.clone());
 
-    // File upload route with custom body limit (other routes use default)
-    let file_upload_limit = state.config.files.max_file_size;
-    let file_upload_routes = Router::new()
-        .route("/files", post(api::handlers::files::upload_file))
-        .layer(DefaultBodyLimit::max(file_upload_limit as usize))
-        .with_state(state.clone());
-
     // API routes
-    let api_routes = Router::new()
+    let mut api_routes = Router::new()
         .route("/config", get(api::handlers::config::get_config))
         // User management (admin only for collection operations)
         .route("/users", get(api::handlers::users::list_users))
@@ -674,12 +697,6 @@ pub async fn build_router(state: &mut AppState, onwards_router: Router) -> anyho
         .route("/models/{id}", get(api::handlers::deployments::get_deployed_model))
         .route("/models/{id}", patch(api::handlers::deployments::update_deployed_model))
         .route("/models/{id}", delete(api::handlers::deployments::delete_deployed_model))
-        // Files management - merge file upload route with custom body limit
-        .merge(file_upload_routes)
-        .route("/files", get(api::handlers::files::list_files))
-        .route("/files/{file_id}", get(api::handlers::files::get_file))
-        .route("/files/{file_id}/content", get(api::handlers::files::get_file_content))
-        .route("/files/{file_id}", delete(api::handlers::files::delete_file))
         // Groups management
         .route("/groups", get(api::handlers::groups::list_groups))
         .route("/groups", post(api::handlers::groups::create_group))
@@ -718,8 +735,32 @@ pub async fn build_router(state: &mut AppState, onwards_router: Router) -> anyho
         .route("/probes/{id}/deactivate", patch(api::handlers::probes::deactivate_probe))
         .route("/probes/{id}/execute", post(api::handlers::probes::execute_probe))
         .route("/probes/{id}/results", get(api::handlers::probes::get_probe_results))
-        .route("/probes/{id}/statistics", get(api::handlers::probes::get_statistics))
-        .with_state(state.clone());
+        .route("/probes/{id}/statistics", get(api::handlers::probes::get_statistics));
+
+    // Batches API routes (files + batches) - conditionally enabled
+    if state.config.batches.enabled {
+        // File upload route with custom body limit (other routes use default)
+        let file_upload_limit = state.config.batches.files.max_file_size;
+        let file_router = Router::new().route(
+            "/files",
+            post(api::handlers::files::upload_file).layer(DefaultBodyLimit::max(file_upload_limit as usize)),
+        );
+
+        api_routes = api_routes
+            // Files management - merge file upload route with custom body limit
+            .merge(file_router)
+            .route("/files", get(api::handlers::files::list_files))
+            .route("/files/{file_id}", get(api::handlers::files::get_file))
+            .route("/files/{file_id}/content", get(api::handlers::files::get_file_content))
+            .route("/files/{file_id}", delete(api::handlers::files::delete_file))
+            // Batches management
+            .route("/batches", post(api::handlers::batches::create_batch))
+            .route("/batches", get(api::handlers::batches::list_batches))
+            .route("/batches/{batch_id}", get(api::handlers::batches::get_batch))
+            .route("/batches/{batch_id}/cancel", post(api::handlers::batches::cancel_batch));
+    }
+
+    let api_routes_with_state = api_routes.with_state(state.clone());
 
     // Serve embedded static assets, falling back to SPA for unmatched routes
     let fallback = get(serve_embedded_asset).fallback(get(spa_fallback));
@@ -736,7 +777,7 @@ pub async fn build_router(state: &mut AppState, onwards_router: Router) -> anyho
         )
         .merge(auth_routes)
         .nest("/ai/v1", onwards_router)
-        .nest("/admin/api/v1", api_routes)
+        .nest("/admin/api/v1", api_routes_with_state)
         .merge(RapiDoc::with_openapi("/api-docs/openapi.json", ApiDoc::openapi()).path("/admin/docs"))
         .merge(RapiDoc::new("/openai-openapi.yaml").path("/ai/docs"))
         .fallback_service(fallback);
@@ -863,7 +904,9 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
 
     // Apply middleware at root level BEFORE routing decisions are made
     let request_manager = Arc::new(
-        fusillade::PostgresRequestManager::new(fusillade_pool.clone()).with_download_buffer_size(config.files.download_buffer_size),
+        fusillade::PostgresRequestManager::new(fusillade_pool.clone())
+            .with_config(config.batches.daemon.to_fusillade_config())
+            .with_download_buffer_size(config.batches.files.download_buffer_size),
     );
     let middleware = from_fn_with_state(
         AppState::builder()

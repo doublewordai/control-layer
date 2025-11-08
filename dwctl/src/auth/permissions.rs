@@ -47,6 +47,9 @@ pub mod resource {
     #[derive(Default)]
     pub struct Probes;
 
+    #[derive(Default)]
+    pub struct Batches;
+
     // Convert type-level markers to enum values using Into
     impl From<Users> for Resource {
         fn from(_: Users) -> Resource {
@@ -106,6 +109,11 @@ pub mod resource {
     impl From<Probes> for Resource {
         fn from(_: Probes) -> Resource {
             Resource::Probes
+        }
+    }
+    impl From<Batches> for Resource {
+        fn from(_: Batches) -> Resource {
+            Resource::Batches
         }
     }
 }
@@ -262,7 +270,7 @@ pub fn role_has_permission(role: &Role, resource: Resource, operation: Operation
         Role::PlatformManager => {
             // Platform Manager has full access to platform data except Requests (sensitive request logs)
             // But they can access Analytics (aggregated data without sensitive details)
-            // They also have access to ModelRateLimits and Files
+            // They also have access to ModelRateLimits, Files, and Batches
             !matches!(resource, Resource::Requests)
         }
         Role::StandardUser => {
@@ -303,13 +311,16 @@ pub fn role_has_permission(role: &Role, resource: Resource, operation: Operation
             )
         }
         Role::BatchAPIUser => {
-            // Batch API User can manage their own files for batch processing
+            // Batch API User can manage their own files and batches for batch processing
             // This role is typically given IN ADDITION to StandardUser
             matches!(
                 (resource, operation),
                 (Resource::Files, Operation::CreateOwn)   // Can upload own files
                     | (Resource::Files, Operation::ReadOwn)    // Can read own files
                     | (Resource::Files, Operation::DeleteOwn) // Can delete own files
+                    | (Resource::Batches, Operation::CreateOwn) // Can create own batches
+                    | (Resource::Batches, Operation::ReadOwn)   // Can read own batches
+                    | (Resource::Batches, Operation::UpdateOwn) // Can cancel own batches
             )
         }
     }

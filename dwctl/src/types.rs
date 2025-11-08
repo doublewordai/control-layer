@@ -69,6 +69,7 @@ pub enum Resource {
     Credits,
     Probes,
     Files,
+    Batches,
 }
 
 // Permission types for authorization

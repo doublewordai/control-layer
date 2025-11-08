@@ -20,8 +20,9 @@ use uuid::Uuid;
 
 use super::Storage;
 use crate::batch::{
-    BatchId, BatchStatus, File, FileId, FileMetadata, FileStreamItem, RequestTemplate,
-    RequestTemplateInput, TemplateId,
+    Batch, BatchErrorDetails, BatchErrorItem, BatchId, BatchInput, BatchOutputItem,
+    BatchResponseDetails, BatchStatus, File, FileContentItem, FileId, FileMetadata, FileStreamItem,
+    OutputFileType, RequestTemplate, RequestTemplateInput, TemplateId,
 };
 use crate::daemon::{Daemon, DaemonConfig};
 use crate::error::{FusilladeError, Result};
@@ -639,10 +640,11 @@ impl<H: HttpClient + 'static> Storage for PostgresRequestManager<H> {
         for template in templates {
             sqlx::query!(
                 r#"
-                INSERT INTO request_templates (file_id, endpoint, method, path, body, model, api_key)
-                VALUES ($1, $2, $3, $4, $5, $6, $7)
+                INSERT INTO request_templates (file_id, custom_id, endpoint, method, path, body, model, api_key)
+                VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
                 "#,
                 file_id,
+                template.custom_id,
                 template.endpoint,
                 template.method,
                 template.path,
@@ -1068,73 +1070,47 @@ impl<H: HttpClient + 'static> Storage for PostgresRequestManager<H> {
     fn get_file_content_stream(
         &self,
         file_id: FileId,
-    ) -> Pin<Box<dyn Stream<Item = Result<RequestTemplateInput>> + Send>> {
+    ) -> Pin<Box<dyn Stream<Item = Result<FileContentItem>> + Send>> {
         let pool = self.pool.clone();
         let (tx, rx) = mpsc::channel(self.download_buffer_size);
 
         tokio::spawn(async move {
-            // Use keyset pagination to fetch in batches with back-pressure
-            const BATCH_SIZE: i64 = 1000;
-            let mut last_line_number: i32 = -1;
+            // First, get the file to determine its purpose
+            let file_result = sqlx::query!(
+                r#"
+                SELECT purpose
+                FROM files
+                WHERE id = $1
+                "#,
+                *file_id as Uuid,
+            )
+            .fetch_one(&pool)
+            .await;
 
-            loop {
-                // Fetch next batch using keyset pagination
-                let template_batch = sqlx::query!(
-                    r#"
-                    SELECT custom_id, endpoint, method, path, body, model, api_key, line_number
-                    FROM request_templates
-                    WHERE file_id = $1 AND line_number > $2
-                    ORDER BY line_number ASC
-                    LIMIT $3
-                    "#,
-                    *file_id as Uuid,
-                    last_line_number,
-                    BATCH_SIZE,
-                )
-                .fetch_all(&pool)
-                .await;
+            let purpose = match file_result {
+                Ok(row) => row.purpose,
+                Err(e) => {
+                    let _ = tx
+                        .send(Err(FusilladeError::Other(anyhow!(
+                            "Failed to fetch file: {}",
+                            e
+                        ))))
+                        .await;
+                    return;
+                }
+            };
 
-                match template_batch {
-                    Ok(templates) => {
-                        if templates.is_empty() {
-                            // No more rows, we're done
-                            break;
-                        }
-
-                        tracing::debug!(
-                            "Fetched batch of {} templates, line_numbers {}-{}",
-                            templates.len(),
-                            templates.first().map(|r| r.line_number).unwrap_or(0),
-                            templates.last().map(|r| r.line_number).unwrap_or(0)
-                        );
-
-                        // Send each template in the batch
-                        for row in templates {
-                            last_line_number = row.line_number;
-
-                            let template = RequestTemplateInput {
-                                custom_id: row.custom_id,
-                                endpoint: row.endpoint,
-                                method: row.method,
-                                path: row.path,
-                                body: row.body,
-                                model: row.model,
-                                api_key: row.api_key,
-                            };
-                            if tx.send(Ok(template)).await.is_err() {
-                                return;
-                            }
-                        }
-                    }
-                    Err(e) => {
-                        let _ = tx
-                            .send(Err(FusilladeError::Other(anyhow!(
-                                "Failed to fetch template batch: {}",
-                                e
-                            ))))
-                            .await;
-                        return;
-                    }
+            // Route to appropriate streaming logic based on purpose
+            match purpose.as_deref() {
+                Some("batch_output") => {
+                    Self::stream_batch_output(pool, file_id, tx).await;
+                }
+                Some("batch_error") => {
+                    Self::stream_batch_error(pool, file_id, tx).await;
+                }
+                _ => {
+                    // Regular file or purpose='batch': stream request templates
+                    Self::stream_request_templates(pool, file_id, tx).await;
                 }
             }
         });
@@ -1163,7 +1139,7 @@ impl<H: HttpClient + 'static> Storage for PostgresRequestManager<H> {
         Ok(())
     }
 
-    async fn create_batch(&self, file_id: FileId) -> Result<BatchId> {
+    async fn create_batch(&self, input: BatchInput) -> Result<Batch> {
         let mut tx =
             self.pool.begin().await.map_err(|e| {
                 FusilladeError::Other(anyhow!("Failed to begin transaction: {}", e))
@@ -1176,7 +1152,7 @@ impl<H: HttpClient + 'static> Storage for PostgresRequestManager<H> {
             FROM request_templates
             WHERE file_id = $1
             "#,
-            *file_id as Uuid,
+            *input.file_id as Uuid,
         )
         .fetch_all(&mut *tx)
         .await
@@ -1188,18 +1164,57 @@ impl<H: HttpClient + 'static> Storage for PostgresRequestManager<H> {
             )));
         }
 
-        // Create batch
-        let batch_id = sqlx::query_scalar!(
+        // Calculate expires_at from completion_window
+        let now = Utc::now();
+        let expires_at = humantime::parse_duration(&input.completion_window)
+            .ok()
+            .and_then(|std_duration| chrono::Duration::from_std(std_duration).ok())
+            .and_then(|duration| now.checked_add_signed(duration));
+
+        // Create batch with new fields
+        let row = sqlx::query!(
             r#"
-            INSERT INTO batches (file_id)
-            VALUES ($1)
-            RETURNING id
+            INSERT INTO batches (file_id, endpoint, completion_window, metadata, created_by, expires_at)
+            VALUES ($1, $2, $3, $4, $5, $6)
+            RETURNING id, file_id, endpoint, completion_window, metadata, output_file_id, error_file_id, created_by, created_at, expires_at, cancelling_at, errors
             "#,
-            *file_id as Uuid,
+            *input.file_id as Uuid,
+            input.endpoint,
+            input.completion_window,
+            input.metadata,
+            input.created_by,
+            expires_at,
         )
         .fetch_one(&mut *tx)
         .await
         .map_err(|e| FusilladeError::Other(anyhow!("Failed to create batch: {}", e)))?;
+
+        let batch_id = row.id;
+
+        // Create virtual output and error files
+        let output_file_id = self
+            .create_virtual_output_file(&mut tx, batch_id, &input.created_by)
+            .await?;
+        let error_file_id = self
+            .create_virtual_error_file(&mut tx, batch_id, &input.created_by)
+            .await?;
+
+        // Update batch with file IDs
+        sqlx::query!(
+            r#"
+            UPDATE batches
+            SET output_file_id = $2, error_file_id = $3
+            WHERE id = $1
+            "#,
+            batch_id,
+            output_file_id,
+            error_file_id,
+        )
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| {
+            FusilladeError::Other(anyhow!("Failed to update batch with file IDs: {}", e))
+        })?;
 
         // Create executions from templates
         for template in templates {
@@ -1231,7 +1246,50 @@ impl<H: HttpClient + 'static> Storage for PostgresRequestManager<H> {
             .await
             .map_err(|e| FusilladeError::Other(anyhow!("Failed to commit transaction: {}", e)))?;
 
-        Ok(BatchId(batch_id))
+        Ok(Batch {
+            id: BatchId(batch_id),
+            file_id: FileId(row.file_id),
+            created_at: row.created_at,
+            metadata: row.metadata,
+            completion_window: row.completion_window,
+            endpoint: row.endpoint,
+            output_file_id: Some(FileId(output_file_id)),
+            error_file_id: Some(FileId(error_file_id)),
+            created_by: row.created_by,
+            expires_at: row.expires_at,
+            cancelling_at: row.cancelling_at,
+            errors: row.errors,
+        })
+    }
+
+    async fn get_batch(&self, batch_id: BatchId) -> Result<Batch> {
+        let row = sqlx::query!(
+            r#"
+            SELECT id, file_id, endpoint, completion_window, metadata, output_file_id, error_file_id, created_by, created_at, expires_at, cancelling_at, errors
+            FROM batches
+            WHERE id = $1
+            "#,
+            *batch_id as Uuid,
+        )
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(|e| FusilladeError::Other(anyhow!("Failed to fetch batch: {}", e)))?
+        .ok_or_else(|| FusilladeError::Other(anyhow!("Batch not found")))?;
+
+        Ok(Batch {
+            id: BatchId(row.id),
+            file_id: FileId(row.file_id),
+            created_at: row.created_at,
+            metadata: row.metadata,
+            completion_window: row.completion_window,
+            endpoint: row.endpoint,
+            output_file_id: row.output_file_id.map(FileId),
+            error_file_id: row.error_file_id.map(FileId),
+            created_by: row.created_by,
+            expires_at: row.expires_at,
+            cancelling_at: row.cancelling_at,
+            errors: row.errors,
+        })
     }
 
     async fn get_batch_status(&self, batch_id: BatchId) -> Result<BatchStatus> {
@@ -1305,9 +1363,152 @@ impl<H: HttpClient + 'static> Storage for PostgresRequestManager<H> {
             .collect())
     }
 
+    async fn get_batch_by_output_file_id(
+        &self,
+        file_id: FileId,
+        file_type: OutputFileType,
+    ) -> Result<Option<Batch>> {
+        match file_type {
+            OutputFileType::Output => {
+                let row = sqlx::query!(
+                    r#"
+                    SELECT id, file_id, endpoint, completion_window, metadata, output_file_id, error_file_id, created_by, created_at, expires_at, cancelling_at, errors
+                    FROM batches
+                    WHERE output_file_id = $1
+                    "#,
+                    *file_id as Uuid,
+                )
+                .fetch_optional(&self.pool)
+                .await
+                .map_err(|e| FusilladeError::Other(anyhow!("Failed to get batch by output file: {}", e)))?;
+
+                Ok(row.map(|row| Batch {
+                    id: BatchId(row.id),
+                    file_id: FileId(row.file_id),
+                    created_at: row.created_at,
+                    metadata: row.metadata,
+                    completion_window: row.completion_window,
+                    endpoint: row.endpoint,
+                    output_file_id: row.output_file_id.map(FileId),
+                    error_file_id: row.error_file_id.map(FileId),
+                    created_by: row.created_by,
+                    expires_at: row.expires_at,
+                    cancelling_at: row.cancelling_at,
+                    errors: row.errors,
+                }))
+            }
+            OutputFileType::Error => {
+                let row = sqlx::query!(
+                    r#"
+                    SELECT id, file_id, endpoint, completion_window, metadata, output_file_id, error_file_id, created_by, created_at, expires_at, cancelling_at, errors
+                    FROM batches
+                    WHERE error_file_id = $1
+                    "#,
+                    *file_id as Uuid,
+                )
+                .fetch_optional(&self.pool)
+                .await
+                .map_err(|e| FusilladeError::Other(anyhow!("Failed to get batch by error file: {}", e)))?;
+
+                Ok(row.map(|row| Batch {
+                    id: BatchId(row.id),
+                    file_id: FileId(row.file_id),
+                    created_at: row.created_at,
+                    metadata: row.metadata,
+                    completion_window: row.completion_window,
+                    endpoint: row.endpoint,
+                    output_file_id: row.output_file_id.map(FileId),
+                    error_file_id: row.error_file_id.map(FileId),
+                    created_by: row.created_by,
+                    expires_at: row.expires_at,
+                    cancelling_at: row.cancelling_at,
+                    errors: row.errors,
+                }))
+            }
+        }
+    }
+
+    async fn list_batches(
+        &self,
+        created_by: Option<String>,
+        after: Option<BatchId>,
+        limit: i64,
+    ) -> Result<Vec<Batch>> {
+        // If after is provided, get the created_at timestamp of that batch for cursor-based pagination
+        let (after_created_at, after_id) = if let Some(after_id) = after {
+            let row = sqlx::query!(
+                r#"
+                SELECT created_at
+                FROM batches
+                WHERE id = $1
+                "#,
+                *after_id as Uuid,
+            )
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(|e| FusilladeError::Other(anyhow!("Failed to fetch after batch: {}", e)))?;
+
+            (row.map(|r| r.created_at), Some(*after_id as Uuid))
+        } else {
+            (None, None)
+        };
+
+        // Use a single query with optional cursor filtering
+        let rows = sqlx::query!(
+            r#"
+            SELECT id, file_id, endpoint, completion_window, metadata, output_file_id, error_file_id, created_by, created_at, expires_at, cancelling_at, errors
+            FROM batches
+            WHERE ($1::TEXT IS NULL OR created_by = $1)
+              AND ($3::TIMESTAMPTZ IS NULL OR created_at < $3 OR (created_at = $3 AND id < $4))
+            ORDER BY created_at DESC, id DESC
+            LIMIT $2
+            "#,
+            created_by,
+            limit,
+            after_created_at,
+            after_id,
+        )
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|e| FusilladeError::Other(anyhow!("Failed to list batches: {}", e)))?;
+
+        Ok(rows
+            .into_iter()
+            .map(|row| Batch {
+                id: BatchId(row.id),
+                file_id: FileId(row.file_id),
+                created_at: row.created_at,
+                metadata: row.metadata,
+                completion_window: row.completion_window,
+                endpoint: row.endpoint,
+                output_file_id: row.output_file_id.map(FileId),
+                error_file_id: row.error_file_id.map(FileId),
+                created_by: row.created_by,
+                expires_at: row.expires_at,
+                cancelling_at: row.cancelling_at,
+                errors: row.errors,
+            })
+            .collect())
+    }
+
     async fn cancel_batch(&self, batch_id: BatchId) -> Result<()> {
         let now = Utc::now();
 
+        // Set cancelling_at on the batch
+        sqlx::query!(
+            r#"
+            UPDATE batches
+            SET cancelling_at = $2
+            WHERE id = $1 AND cancelling_at IS NULL
+            "#,
+            *batch_id as Uuid,
+            now,
+        )
+        .execute(&self.pool)
+        .await
+        .map_err(|e| FusilladeError::Other(anyhow!("Failed to set cancelling_at: {}", e)))?;
+
+        // Cancel all pending/in-progress requests
         sqlx::query!(
             r#"
             UPDATE requests
@@ -1722,6 +1923,347 @@ impl<H: HttpClient + 'static> Storage for PostgresRequestManager<H> {
     }
 }
 
+// Helper methods for file streaming and virtual file creation
+impl<H: HttpClient + 'static> PostgresRequestManager<H> {
+    /// Stream request templates from a regular file
+    async fn stream_request_templates(
+        pool: sqlx::PgPool,
+        file_id: FileId,
+        tx: mpsc::Sender<Result<FileContentItem>>,
+    ) {
+        const BATCH_SIZE: i64 = 1000;
+        let mut last_line_number: i32 = -1;
+
+        loop {
+            let template_batch = sqlx::query!(
+                r#"
+                SELECT custom_id, endpoint, method, path, body, model, api_key, line_number
+                FROM request_templates
+                WHERE file_id = $1 AND line_number > $2
+                ORDER BY line_number ASC
+                LIMIT $3
+                "#,
+                *file_id as Uuid,
+                last_line_number,
+                BATCH_SIZE,
+            )
+            .fetch_all(&pool)
+            .await;
+
+            match template_batch {
+                Ok(templates) => {
+                    if templates.is_empty() {
+                        break;
+                    }
+
+                    tracing::debug!(
+                        "Fetched batch of {} templates, line_numbers {}-{}",
+                        templates.len(),
+                        templates.first().map(|r| r.line_number).unwrap_or(0),
+                        templates.last().map(|r| r.line_number).unwrap_or(0)
+                    );
+
+                    for row in templates {
+                        last_line_number = row.line_number;
+
+                        let template = RequestTemplateInput {
+                            custom_id: row.custom_id,
+                            endpoint: row.endpoint,
+                            method: row.method,
+                            path: row.path,
+                            body: row.body,
+                            model: row.model,
+                            api_key: row.api_key,
+                        };
+                        if tx
+                            .send(Ok(FileContentItem::Template(template)))
+                            .await
+                            .is_err()
+                        {
+                            return;
+                        }
+                    }
+                }
+                Err(e) => {
+                    let _ = tx
+                        .send(Err(FusilladeError::Other(anyhow!(
+                            "Failed to fetch template batch: {}",
+                            e
+                        ))))
+                        .await;
+                    return;
+                }
+            }
+        }
+    }
+
+    /// Stream batch output (completed requests) for a virtual output file
+    async fn stream_batch_output(
+        pool: sqlx::PgPool,
+        file_id: FileId,
+        tx: mpsc::Sender<Result<FileContentItem>>,
+    ) {
+        // First, find the batch that owns this output file
+        let batch_result = sqlx::query!(
+            r#"
+            SELECT id
+            FROM batches
+            WHERE output_file_id = $1
+            "#,
+            *file_id as Uuid,
+        )
+        .fetch_one(&pool)
+        .await;
+
+        let batch_id = match batch_result {
+            Ok(row) => row.id,
+            Err(e) => {
+                let _ = tx
+                    .send(Err(FusilladeError::Other(anyhow!(
+                        "Failed to find batch for output file: {}",
+                        e
+                    ))))
+                    .await;
+                return;
+            }
+        };
+
+        // Stream completed requests, ordered by completion time
+        // This ensures new completions always append (no out-of-order issues)
+        const BATCH_SIZE: i64 = 1000;
+        let mut last_completed_at: Option<chrono::DateTime<chrono::Utc>> = None;
+        let mut last_id: Uuid = Uuid::nil();
+
+        loop {
+            let request_batch = sqlx::query!(
+                r#"
+                SELECT id, custom_id, response_status, response_body, completed_at
+                FROM requests
+                WHERE batch_id = $1
+                  AND state = 'completed'
+                  AND ($2::TIMESTAMPTZ IS NULL OR completed_at > $2 OR (completed_at = $2 AND id > $3))
+                ORDER BY completed_at ASC, id ASC
+                LIMIT $4
+                "#,
+                batch_id,
+                last_completed_at,
+                last_id,
+                BATCH_SIZE,
+            )
+            .fetch_all(&pool)
+            .await;
+
+            match request_batch {
+                Ok(requests) => {
+                    if requests.is_empty() {
+                        break;
+                    }
+
+                    tracing::debug!("Fetched batch of {} completed requests", requests.len());
+
+                    for row in requests {
+                        last_completed_at = row.completed_at;
+                        last_id = row.id;
+
+                        let response_body: serde_json::Value = match row.response_body {
+                            Some(body) => match serde_json::from_str(&body) {
+                                Ok(json) => json,
+                                Err(e) => {
+                                    tracing::warn!("Failed to parse response body as JSON: {}", e);
+                                    serde_json::Value::String(body)
+                                }
+                            },
+                            None => serde_json::Value::Null,
+                        };
+
+                        let output_item = BatchOutputItem {
+                            id: format!("batch_req_{}", row.id),
+                            custom_id: row.custom_id,
+                            response: BatchResponseDetails {
+                                status_code: row.response_status.unwrap_or(200),
+                                request_id: None, // Could be extracted from response if available
+                                body: response_body,
+                            },
+                            error: None,
+                        };
+
+                        if tx
+                            .send(Ok(FileContentItem::Output(output_item)))
+                            .await
+                            .is_err()
+                        {
+                            return;
+                        }
+                    }
+                }
+                Err(e) => {
+                    let _ = tx
+                        .send(Err(FusilladeError::Other(anyhow!(
+                            "Failed to fetch completed requests: {}",
+                            e
+                        ))))
+                        .await;
+                    return;
+                }
+            }
+        }
+    }
+
+    /// Stream batch errors (failed requests) for a virtual error file
+    async fn stream_batch_error(
+        pool: sqlx::PgPool,
+        file_id: FileId,
+        tx: mpsc::Sender<Result<FileContentItem>>,
+    ) {
+        // First, find the batch that owns this error file
+        let batch_result = sqlx::query!(
+            r#"
+            SELECT id
+            FROM batches
+            WHERE error_file_id = $1
+            "#,
+            *file_id as Uuid,
+        )
+        .fetch_one(&pool)
+        .await;
+
+        let batch_id = match batch_result {
+            Ok(row) => row.id,
+            Err(e) => {
+                let _ = tx
+                    .send(Err(FusilladeError::Other(anyhow!(
+                        "Failed to find batch for error file: {}",
+                        e
+                    ))))
+                    .await;
+                return;
+            }
+        };
+
+        // Stream failed requests, ordered by failure time
+        // This ensures new failures always append (no out-of-order issues)
+        const BATCH_SIZE: i64 = 1000;
+        let mut last_failed_at: Option<chrono::DateTime<chrono::Utc>> = None;
+        let mut last_id: Uuid = Uuid::nil();
+
+        loop {
+            let request_batch = sqlx::query!(
+                r#"
+                SELECT id, custom_id, error, failed_at
+                FROM requests
+                WHERE batch_id = $1
+                  AND state = 'failed'
+                  AND ($2::TIMESTAMPTZ IS NULL OR failed_at > $2 OR (failed_at = $2 AND id > $3))
+                ORDER BY failed_at ASC, id ASC
+                LIMIT $4
+                "#,
+                batch_id,
+                last_failed_at,
+                last_id,
+                BATCH_SIZE,
+            )
+            .fetch_all(&pool)
+            .await;
+
+            match request_batch {
+                Ok(requests) => {
+                    if requests.is_empty() {
+                        break;
+                    }
+
+                    tracing::debug!("Fetched batch of {} failed requests", requests.len());
+
+                    for row in requests {
+                        last_failed_at = row.failed_at;
+                        last_id = row.id;
+
+                        let error_item = BatchErrorItem {
+                            id: format!("batch_req_{}", row.id),
+                            custom_id: row.custom_id,
+                            response: None,
+                            error: BatchErrorDetails {
+                                code: None, // Could parse from error field if structured
+                                message: row.error.unwrap_or_else(|| "Unknown error".to_string()),
+                            },
+                        };
+
+                        if tx
+                            .send(Ok(FileContentItem::Error(error_item)))
+                            .await
+                            .is_err()
+                        {
+                            return;
+                        }
+                    }
+                }
+                Err(e) => {
+                    let _ = tx
+                        .send(Err(FusilladeError::Other(anyhow!(
+                            "Failed to fetch failed requests: {}",
+                            e
+                        ))))
+                        .await;
+                    return;
+                }
+            }
+        }
+    }
+
+    /// Create a virtual output file for a batch (stores no data, streams from requests table)
+    async fn create_virtual_output_file(
+        &self,
+        tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+        batch_id: Uuid,
+        created_by: &Option<String>,
+    ) -> Result<Uuid> {
+        let name = format!("batch-{}-output.jsonl", batch_id);
+        let description = format!("Output file for batch {}", batch_id);
+
+        let file_id = sqlx::query_scalar!(
+            r#"
+            INSERT INTO files (name, description, size_bytes, status, purpose, uploaded_by)
+            VALUES ($1, $2, 0, 'processed', 'batch_output', $3)
+            RETURNING id
+            "#,
+            name,
+            description,
+            created_by.as_deref(),
+        )
+        .fetch_one(&mut **tx)
+        .await
+        .map_err(|e| FusilladeError::Other(anyhow!("Failed to create output file: {}", e)))?;
+
+        Ok(file_id)
+    }
+
+    /// Create a virtual error file for a batch (stores no data, streams from requests table)
+    async fn create_virtual_error_file(
+        &self,
+        tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+        batch_id: Uuid,
+        created_by: &Option<String>,
+    ) -> Result<Uuid> {
+        let name = format!("batch-{}-error.jsonl", batch_id);
+        let description = format!("Error file for batch {}", batch_id);
+
+        let file_id = sqlx::query_scalar!(
+            r#"
+            INSERT INTO files (name, description, size_bytes, status, purpose, uploaded_by)
+            VALUES ($1, $2, 0, 'processed', 'batch_error', $3)
+            RETURNING id
+            "#,
+            name,
+            description,
+            created_by.as_deref(),
+        )
+        .fetch_one(&mut **tx)
+        .await
+        .map_err(|e| FusilladeError::Other(anyhow!("Failed to create error file: {}", e)))?;
+
+        Ok(file_id)
+    }
+}
+
 // Implement DaemonExecutor trait
 #[async_trait]
 impl<H: HttpClient + 'static> DaemonExecutor<H> for PostgresRequestManager<H> {
@@ -1851,18 +2393,24 @@ mod tests {
             .expect("Failed to create file");
 
         // Create a batch
-        let batch_id = manager
-            .create_batch(file_id)
+        let batch = manager
+            .create_batch(crate::batch::BatchInput {
+                file_id,
+                endpoint: "/v1/chat/completions".to_string(),
+                completion_window: "24h".to_string(),
+                metadata: None,
+                created_by: None,
+            })
             .await
             .expect("Failed to create batch");
 
         // Get batch status
         let status = manager
-            .get_batch_status(batch_id)
+            .get_batch_status(batch.id)
             .await
             .expect("Failed to get batch status");
 
-        assert_eq!(status.batch_id, batch_id);
+        assert_eq!(status.batch_id, batch.id);
         assert_eq!(status.file_id, file_id);
         assert_eq!(status.file_name, "batch-test");
         assert_eq!(status.total_requests, 3);
@@ -1872,7 +2420,7 @@ mod tests {
 
         // Get batch requests
         let requests = manager
-            .get_batch_requests(batch_id)
+            .get_batch_requests(batch.id)
             .await
             .expect("Failed to get batch requests");
 
@@ -1907,7 +2455,16 @@ mod tests {
             .await
             .unwrap();
 
-        let batch_id = manager.create_batch(file_id).await.unwrap();
+        let batch = manager
+            .create_batch(crate::batch::BatchInput {
+                file_id,
+                endpoint: "/v1/chat/completions".to_string(),
+                completion_window: "24h".to_string(),
+                metadata: None,
+                created_by: None,
+            })
+            .await
+            .unwrap();
 
         let daemon_id = DaemonId::from(Uuid::new_v4());
 
@@ -1932,7 +2489,7 @@ mod tests {
         assert_eq!(claimed2.len(), 2);
 
         // Verify batch status shows claimed requests
-        let status = manager.get_batch_status(batch_id).await.unwrap();
+        let status = manager.get_batch_status(batch.id).await.unwrap();
         assert_eq!(status.total_requests, 5);
         assert_eq!(status.pending_requests, 0);
         assert_eq!(status.in_progress_requests, 5); // All claimed
@@ -1963,23 +2520,32 @@ mod tests {
             .await
             .unwrap();
 
-        let batch_id = manager.create_batch(file_id).await.unwrap();
+        let batch = manager
+            .create_batch(crate::batch::BatchInput {
+                file_id,
+                endpoint: "/v1/chat/completions".to_string(),
+                completion_window: "24h".to_string(),
+                metadata: None,
+                created_by: None,
+            })
+            .await
+            .unwrap();
 
         // Verify all are pending
-        let status_before = manager.get_batch_status(batch_id).await.unwrap();
+        let status_before = manager.get_batch_status(batch.id).await.unwrap();
         assert_eq!(status_before.pending_requests, 3);
         assert_eq!(status_before.canceled_requests, 0);
 
         // Cancel the batch
-        manager.cancel_batch(batch_id).await.unwrap();
+        manager.cancel_batch(batch.id).await.unwrap();
 
         // Verify all are canceled
-        let status_after = manager.get_batch_status(batch_id).await.unwrap();
+        let status_after = manager.get_batch_status(batch.id).await.unwrap();
         assert_eq!(status_after.pending_requests, 0);
         assert_eq!(status_after.canceled_requests, 3);
 
         // Get the actual requests to verify their state
-        let requests = manager.get_batch_requests(batch_id).await.unwrap();
+        let requests = manager.get_batch_requests(batch.id).await.unwrap();
         assert_eq!(requests.len(), 3);
         for request in requests {
             assert!(matches!(request, AnyRequest::Canceled(_)));
@@ -2011,10 +2577,19 @@ mod tests {
             .await
             .unwrap();
 
-        let batch_id = manager.create_batch(file_id).await.unwrap();
+        let batch = manager
+            .create_batch(crate::batch::BatchInput {
+                file_id,
+                endpoint: "/v1/chat/completions".to_string(),
+                completion_window: "24h".to_string(),
+                metadata: None,
+                created_by: None,
+            })
+            .await
+            .unwrap();
 
         // Get all request IDs
-        let requests = manager.get_batch_requests(batch_id).await.unwrap();
+        let requests = manager.get_batch_requests(batch.id).await.unwrap();
         let request_ids: Vec<_> = requests.iter().map(|r| r.id()).collect();
 
         // Cancel the first 3 requests
@@ -2029,12 +2604,12 @@ mod tests {
         }
 
         // Verify batch status
-        let status = manager.get_batch_status(batch_id).await.unwrap();
+        let status = manager.get_batch_status(batch.id).await.unwrap();
         assert_eq!(status.pending_requests, 2);
         assert_eq!(status.canceled_requests, 3);
 
         // Verify the requests
-        let all_requests = manager.get_batch_requests(batch_id).await.unwrap();
+        let all_requests = manager.get_batch_requests(batch.id).await.unwrap();
         let canceled_count = all_requests
             .iter()
             .filter(|r| matches!(r, AnyRequest::Canceled(_)))
@@ -2112,9 +2687,36 @@ mod tests {
             .unwrap();
 
         // Create 3 batches
-        let batch1_id = manager.create_batch(file_id).await.unwrap();
-        let batch2_id = manager.create_batch(file_id).await.unwrap();
-        let batch3_id = manager.create_batch(file_id).await.unwrap();
+        let batch1 = manager
+            .create_batch(crate::batch::BatchInput {
+                file_id,
+                endpoint: "/v1/chat/completions".to_string(),
+                completion_window: "24h".to_string(),
+                metadata: None,
+                created_by: None,
+            })
+            .await
+            .unwrap();
+        let batch2 = manager
+            .create_batch(crate::batch::BatchInput {
+                file_id,
+                endpoint: "/v1/chat/completions".to_string(),
+                completion_window: "24h".to_string(),
+                metadata: None,
+                created_by: None,
+            })
+            .await
+            .unwrap();
+        let batch3 = manager
+            .create_batch(crate::batch::BatchInput {
+                file_id,
+                endpoint: "/v1/chat/completions".to_string(),
+                completion_window: "24h".to_string(),
+                metadata: None,
+                created_by: None,
+            })
+            .await
+            .unwrap();
 
         // List batches for this file
         let batches = manager.list_file_batches(file_id).await.unwrap();
@@ -2123,9 +2725,9 @@ mod tests {
 
         // Verify all batch IDs are present
         let batch_ids: Vec<_> = batches.iter().map(|b| b.batch_id).collect();
-        assert!(batch_ids.contains(&batch1_id));
-        assert!(batch_ids.contains(&batch2_id));
-        assert!(batch_ids.contains(&batch3_id));
+        assert!(batch_ids.contains(&batch1.id));
+        assert!(batch_ids.contains(&batch2.id));
+        assert!(batch_ids.contains(&batch3.id));
 
         // Verify each batch has 1 pending request
         for batch in batches {
@@ -2169,10 +2771,19 @@ mod tests {
             .unwrap();
 
         // Create a batch
-        let batch_id = manager.create_batch(file_id).await.unwrap();
+        let batch = manager
+            .create_batch(crate::batch::BatchInput {
+                file_id,
+                endpoint: "/v1/chat/completions".to_string(),
+                completion_window: "24h".to_string(),
+                metadata: None,
+                created_by: None,
+            })
+            .await
+            .unwrap();
 
         // Verify the batch exists
-        let status_before = manager.get_batch_status(batch_id).await;
+        let status_before = manager.get_batch_status(batch.id).await;
         assert!(status_before.is_ok());
 
         // Delete the file
@@ -2183,7 +2794,7 @@ mod tests {
         assert!(file_result.is_err());
 
         // Verify batch is gone (cascade delete)
-        let status_after = manager.get_batch_status(batch_id).await;
+        let status_after = manager.get_batch_status(batch.id).await;
         assert!(status_after.is_err());
     }
 
@@ -2219,7 +2830,16 @@ mod tests {
             .await
             .unwrap();
 
-        let batch_id = manager.create_batch(file_id).await.unwrap();
+        let batch = manager
+            .create_batch(crate::batch::BatchInput {
+                file_id,
+                endpoint: "/v1/chat/completions".to_string(),
+                completion_window: "24h".to_string(),
+                metadata: None,
+                created_by: None,
+            })
+            .await
+            .unwrap();
 
         // Claim the request with daemon1
         let daemon1_id = DaemonId::from(Uuid::new_v4());
@@ -2245,7 +2865,7 @@ mod tests {
         assert_eq!(reclaimed[0].state.daemon_id, daemon2_id);
 
         // Verify the request is now claimed by daemon2
-        let status = manager.get_batch_status(batch_id).await.unwrap();
+        let status = manager.get_batch_status(batch.id).await.unwrap();
         assert_eq!(status.in_progress_requests, 1);
     }
 
@@ -2281,7 +2901,16 @@ mod tests {
             .await
             .unwrap();
 
-        let batch_id = manager.create_batch(file_id).await.unwrap();
+        let batch = manager
+            .create_batch(crate::batch::BatchInput {
+                file_id,
+                endpoint: "/v1/chat/completions".to_string(),
+                completion_window: "24h".to_string(),
+                metadata: None,
+                created_by: None,
+            })
+            .await
+            .unwrap();
 
         // Claim and manually set to processing state
         let daemon1_id = DaemonId::from(Uuid::new_v4());
@@ -2305,7 +2934,7 @@ mod tests {
         .unwrap();
 
         // Verify it's in processing state
-        let status_before = manager.get_batch_status(batch_id).await.unwrap();
+        let status_before = manager.get_batch_status(batch.id).await.unwrap();
         assert_eq!(status_before.in_progress_requests, 1);
 
         // Now daemon2 tries to claim - should unclaim the stale processing request
@@ -2360,7 +2989,16 @@ mod tests {
             .await
             .unwrap();
 
-        manager.create_batch(file_id).await.unwrap();
+        manager
+            .create_batch(crate::batch::BatchInput {
+                file_id,
+                endpoint: "/v1/chat/completions".to_string(),
+                completion_window: "24h".to_string(),
+                metadata: None,
+                created_by: None,
+            })
+            .await
+            .unwrap();
 
         // Daemon1 claims first request
         let daemon1_id = DaemonId::from(Uuid::new_v4());
@@ -2419,7 +3057,16 @@ mod tests {
             .await
             .unwrap();
 
-        manager.create_batch(file_id).await.unwrap();
+        manager
+            .create_batch(crate::batch::BatchInput {
+                file_id,
+                endpoint: "/v1/chat/completions".to_string(),
+                completion_window: "24h".to_string(),
+                metadata: None,
+                created_by: None,
+            })
+            .await
+            .unwrap();
 
         // Manually set a request to claimed with retry_attempt=2
         sqlx::query!(
@@ -2446,5 +3093,213 @@ mod tests {
         assert_eq!(claimed.len(), 1);
         // Verify retry_attempt is preserved
         assert_eq!(claimed[0].state.retry_attempt, 2);
+    }
+
+    #[sqlx::test]
+    async fn test_batch_output_and_error_streaming(pool: sqlx::PgPool) {
+        use futures::StreamExt;
+
+        let http_client = Arc::new(MockHttpClient::new());
+        let manager = PostgresRequestManager::with_client(pool.clone(), http_client);
+
+        // Create a file with 3 templates
+        let file_id = manager
+            .create_file(
+                "streaming-test".to_string(),
+                None,
+                vec![
+                    RequestTemplateInput {
+                        custom_id: Some("req-1".to_string()),
+                        endpoint: "https://api.example.com".to_string(),
+                        method: "POST".to_string(),
+                        path: "/v1/chat/completions".to_string(),
+                        body: r#"{"prompt":"first"}"#.to_string(),
+                        model: "gpt-4".to_string(),
+                        api_key: "key".to_string(),
+                    },
+                    RequestTemplateInput {
+                        custom_id: Some("req-2".to_string()),
+                        endpoint: "https://api.example.com".to_string(),
+                        method: "POST".to_string(),
+                        path: "/v1/chat/completions".to_string(),
+                        body: r#"{"prompt":"second"}"#.to_string(),
+                        model: "gpt-4".to_string(),
+                        api_key: "key".to_string(),
+                    },
+                    RequestTemplateInput {
+                        custom_id: Some("req-3".to_string()),
+                        endpoint: "https://api.example.com".to_string(),
+                        method: "POST".to_string(),
+                        path: "/v1/chat/completions".to_string(),
+                        body: r#"{"prompt":"third"}"#.to_string(),
+                        model: "gpt-4".to_string(),
+                        api_key: "key".to_string(),
+                    },
+                ],
+            )
+            .await
+            .expect("Failed to create file");
+
+        // Create a batch
+        let batch = manager
+            .create_batch(crate::batch::BatchInput {
+                file_id,
+                endpoint: "/v1/chat/completions".to_string(),
+                completion_window: "24h".to_string(),
+                metadata: None,
+                created_by: Some("test-user".to_string()),
+            })
+            .await
+            .expect("Failed to create batch");
+
+        // Verify virtual output and error files were created
+        assert!(batch.output_file_id.is_some());
+        assert!(batch.error_file_id.is_some());
+        let output_file_id = batch.output_file_id.unwrap();
+        let error_file_id = batch.error_file_id.unwrap();
+
+        // Get the virtual files and verify they exist
+        let output_file = manager
+            .get_file(output_file_id)
+            .await
+            .expect("Failed to get output file");
+        let error_file = manager
+            .get_file(error_file_id)
+            .await
+            .expect("Failed to get error file");
+
+        assert_eq!(
+            output_file.name,
+            format!("batch-{}-output.jsonl", batch.id.0)
+        );
+        assert_eq!(error_file.name, format!("batch-{}-error.jsonl", batch.id.0));
+
+        // Manually mark 2 requests as completed and 1 as failed
+        // This simulates what the daemon would do after processing
+        let requests = manager
+            .get_batch_requests(batch.id)
+            .await
+            .expect("Failed to get requests");
+        assert_eq!(requests.len(), 3);
+
+        // Mark first request as completed
+        sqlx::query!(
+            r#"
+            UPDATE requests
+            SET state = 'completed',
+                response_status = 200,
+                response_body = $2,
+                completed_at = NOW()
+            WHERE id = $1
+            "#,
+            *requests[0].id() as Uuid,
+            r#"{"id":"chatcmpl-123","choices":[{"message":{"content":"Response 1"}}]}"#,
+        )
+        .execute(&pool)
+        .await
+        .expect("Failed to mark request as completed");
+
+        // Mark second request as completed
+        sqlx::query!(
+            r#"
+            UPDATE requests
+            SET state = 'completed',
+                response_status = 200,
+                response_body = $2,
+                completed_at = NOW()
+            WHERE id = $1
+            "#,
+            *requests[1].id() as Uuid,
+            r#"{"id":"chatcmpl-456","choices":[{"message":{"content":"Response 2"}}]}"#,
+        )
+        .execute(&pool)
+        .await
+        .expect("Failed to mark request as completed");
+
+        // Mark third request as failed
+        sqlx::query!(
+            r#"
+            UPDATE requests
+            SET state = 'failed',
+                error = $2,
+                failed_at = NOW()
+            WHERE id = $1
+            "#,
+            *requests[2].id() as Uuid,
+            "Rate limit exceeded",
+        )
+        .execute(&pool)
+        .await
+        .expect("Failed to mark request as failed");
+
+        // Stream the output file - should contain 2 completed requests
+        let output_stream = manager.get_file_content_stream(output_file_id);
+        let output_items: Vec<_> = output_stream.collect().await;
+
+        assert_eq!(output_items.len(), 2, "Should have 2 output items");
+
+        // Collect and verify custom_ids (order doesn't matter)
+        let mut found_custom_ids = Vec::new();
+        for item_result in output_items.iter() {
+            let item = item_result.as_ref().expect("Output item should be Ok");
+
+            match item {
+                FileContentItem::Output(output) => {
+                    found_custom_ids.push(output.custom_id.clone());
+
+                    // Verify response structure
+                    assert_eq!(output.response.status_code, 200);
+                    assert!(output.response.body.is_object());
+                    assert!(output.error.is_none());
+
+                    // Verify ID format
+                    assert!(output.id.starts_with("batch_req_"));
+                }
+                _ => panic!("Expected FileContentItem::Output, got different type"),
+            }
+        }
+
+        // Verify we got both custom IDs (order doesn't matter)
+        found_custom_ids.sort();
+        assert_eq!(
+            found_custom_ids,
+            vec![Some("req-1".to_string()), Some("req-2".to_string())]
+        );
+
+        // Stream the error file - should contain 1 failed request
+        let error_stream = manager.get_file_content_stream(error_file_id);
+        let error_items: Vec<_> = error_stream.collect().await;
+
+        assert_eq!(error_items.len(), 1, "Should have 1 error item");
+
+        // Verify the error item
+        let error_result = &error_items[0];
+        let error_item = error_result.as_ref().expect("Error item should be Ok");
+
+        match error_item {
+            FileContentItem::Error(error) => {
+                assert_eq!(error.custom_id, Some("req-3".to_string()));
+                assert_eq!(error.error.message, "Rate limit exceeded");
+                assert!(error.response.is_none());
+                assert!(error.id.starts_with("batch_req_"));
+            }
+            _ => panic!("Expected FileContentItem::Error, got different type"),
+        }
+
+        // Verify that streaming a regular input file still works
+        let input_stream = manager.get_file_content_stream(file_id);
+        let input_items: Vec<_> = input_stream.collect().await;
+
+        assert_eq!(input_items.len(), 3, "Input file should have 3 templates");
+
+        for item_result in input_items {
+            let item = item_result.expect("Input item should be Ok");
+            match item {
+                FileContentItem::Template(_) => {
+                    // Expected - input files contain templates
+                }
+                _ => panic!("Expected FileContentItem::Template for input file"),
+            }
+        }
     }
 }
