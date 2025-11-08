@@ -1,18 +1,20 @@
 # The Doubleword Control Layer (dwctl)
 
-[Announcement](https://www.doubleword.ai/resources/doubleword-open-sources-the-worlds-fastest-ai-gateway) | [Benchmarking](https://docs.doubleword.ai/conceptual/21-19-2025-dwctl-benchmark) | [Technical Blog](https://fergusfinn.com/blog/control-layer/) | 
+[Announcement](https://www.doubleword.ai/resources/doubleword-open-sources-the-worlds-fastest-ai-gateway) | [Benchmarking](https://docs.doubleword.ai/conceptual/21-19-2025-dwctl-benchmark) | [Technical Blog](https://fergusfinn.com/blog/control-layer/) |
 [Documentation](https://docs.doubleword.ai/control-layer/)
 
 The Doubleword Control Layer (dwctl) is the world’s fastest AI model gateway (450x less overhead than LiteLLM). It provides a single, high-performance interface for routing, managing, and securing inference across model providers, users and deployments - both open-source and proprietary.
+
 - Seamlessly switch between models
 - Turn any model (self-hosted or hosted) into a production-ready API with full auth and user controls
 - Centrally govern, monitor, and audit all inference activity
- 
+
 ## Getting started
 
-The Doubleword Control Layer requries Docker to be installed. For information on how to get started with Docker see the docs [here](https://docs.docker.com/get-started/). 
+The Doubleword Control Layer requries Docker to be installed. For information on how to get started with Docker see the docs [here](https://docs.docker.com/get-started/).
 
 There are two ways to set up the Control Layer:
+
 1. **Docker Compose** - All-in-one setup with pre-configured Postgres and dwctl. This method automatically provisions a containerized Postgres database with default credentials and connects it to the Control Layer.
 2. **Docker Run** - Bring-your-own-database setup. Use this method to connect the Control Layer to an existing Postgres instance of your choice.
 
@@ -27,10 +29,9 @@ docker compose -f docker-compose.yml up -d
 
 Navigate to `http://localhost:3001` to get started. When you get to the login page you will be prompting to sign in with a username and password. Please refer to the configuration section below for how to set up an admin user. You can then refer to the documentation [here](https://docs.doubleword.ai/control-layer/usage/models-and-access) to start playing around with Control Layer features.  
 
+### Option 2. Docker Run
 
-### Option 2. Docker Run 
-
-The Doubleword Control Layer requires a PostgreSQL database to run. You can read the documentation (here)[https://postgresapp.com/] on how to get started with a local version of Postgres. After doing this, or if you have one already (for example, via a cloud provider), run:
+The Doubleword Control Layer requires a PostgreSQL database to run. You can read the documentation [here](https://postgresapp.com/) on how to get started with a local version of Postgres. After doing this, or if you have one already (for example, via a cloud provider), run:
 
 ```bash
 docker run -p 3001:3001 \
@@ -183,6 +184,54 @@ database:
 # you'd like to disable this (if you have sensitive data in your
 # request/responses, for example), toggle this flag.
 enable_request_logging: true # Enable request/response logging to database
+
+# Batches API configuration
+# The batches API provides OpenAI-compatible batch processing endpoints
+# Batches can be sent containing requests to any model configured in the
+# control layer, and they'll be executed asynchronously over the course of 24
+# hours.
+# NOTE: this is in an alpha state. Users with the BatchAPIUser role can create
+# batches that send to any model source configured in the control layer -
+# regardless of their configured access.
+batches:
+  # Enable batches API endpoints (/files, /batches)
+  # These are mounted with the /admin endpoints - so can only be accessed via
+  # session or header auth, for now
+  # When disabled, these endpoints will not be available (default: false).
+  enabled: false
+
+  # Daemon configuration for processing batch requests
+  daemon:
+    # Controls when the batch processing daemon runs
+    # - "leader": Only run on the elected leader instance (default, recommended for multi-instance deployments)
+    # - "always": Run on all instances (use for single-instance deployments)
+    # - "never": Never run the daemon (useful for testing or when using external processors)
+    enabled: leader
+
+    # Performance & Concurrency Settings
+    claim_batch_size: 100 # Maximum number of requests to claim in each iteration
+    default_model_concurrency: 10 # Default concurrent requests per model
+    claim_interval_ms: 1000 # Milliseconds to sleep between claim iterations
+
+    # Retry & Backoff Settings
+    max_retries: 5 # Maximum retry attempts before giving up
+    backoff_ms: 1000 # Initial backoff duration in milliseconds
+    backoff_factor: 2 # Exponential backoff multiplier
+    max_backoff_ms: 10000 # Maximum backoff duration in milliseconds
+
+    # Timeout Settings
+    timeout_ms: 600000 # Timeout per request attempt (10 minutes)
+    claim_timeout_ms: 60000 # Max time in "claimed" state before auto-unclaim (1 minute)
+    processing_timeout_ms: 600000 # Max time in "processing" state before auto-unclaim (10 minutes)
+
+    # Observability
+    status_log_interval_ms: 2000 # Interval for logging daemon status (set to null to disable)
+
+  # Files configuration for batch file uploads/downloads
+  files:
+    max_file_size: 2147483648 # 2 GB - maximum size for file uploads
+    upload_buffer_size: 100 # Buffer size for file upload streams
+    download_buffer_size: 100 # Buffer size for file download streams
 ```
 
 ## Production Checklist

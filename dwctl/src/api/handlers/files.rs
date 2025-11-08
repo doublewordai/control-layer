@@ -341,7 +341,7 @@ pub async fn upload_file(
     current_user: RequiresPermission<resource::Files, operation::CreateOwn>,
     multipart: Multipart,
 ) -> Result<(StatusCode, Json<FileResponse>)> {
-    let max_file_size = state.config.files.max_file_size;
+    let max_file_size = state.config.batches.files.max_file_size;
     let uploaded_by = Some(current_user.id.to_string());
 
     // Fetch system API key for batch request execution
@@ -365,7 +365,7 @@ pub async fn upload_file(
         uploaded_by,
         endpoint,
         system_key.secret,
-        state.config.files.upload_buffer_size,
+        state.config.batches.files.upload_buffer_size,
     );
 
     // Create file via request manager with streaming
@@ -610,22 +610,82 @@ pub async fn get_file_content(
         });
     }
 
+    // For batch output/error files, verify the batch is complete before allowing download
+    if matches!(
+        file.purpose,
+        Some(fusillade::Purpose::BatchOutput) | Some(fusillade::Purpose::BatchError)
+    ) {
+        // Find the batch that owns this file using indexed lookup
+        let file_type = if file.purpose == Some(fusillade::Purpose::BatchOutput) {
+            fusillade::OutputFileType::Output
+        } else {
+            fusillade::OutputFileType::Error
+        };
+
+        let batch = state
+            .request_manager
+            .get_batch_by_output_file_id(fusillade::FileId(file_id), file_type)
+            .await
+            .map_err(|e| Error::Internal {
+                operation: format!("get batch by output file: {}", e),
+            })?;
+
+        if let Some(batch) = batch {
+            // Get batch status to check if it's complete
+            let status = state
+                .request_manager
+                .get_batch_status(batch.id)
+                .await
+                .map_err(|e| Error::Internal {
+                    operation: format!("get batch status: {}", e),
+                })?;
+
+            let openai_status = status.openai_status();
+
+            // Only allow download if batch is in a terminal state
+            if openai_status != "completed" && openai_status != "failed" && openai_status != "cancelled" && openai_status != "expired" {
+                return Err(Error::BadRequest {
+                    message: format!(
+                        "Batch is still processing (status: {}). Wait for completion before downloading results.",
+                        openai_status
+                    ),
+                });
+            }
+        }
+    }
+
     // Stream the file content as JSONL
     let content_stream = state.request_manager.get_file_content_stream(fusillade::FileId(file_id));
 
-    // Convert RequestTemplateInput to OpenAI format JSONL (one per line)
-    let jsonl_stream = content_stream.map(|template_result| {
-        template_result
-            .and_then(|template| {
-                // Transform to OpenAI format (drops api_key, endpoint)
-                OpenAIBatchRequest::from_internal(&template)
-                    .map_err(|e| fusillade::FusilladeError::Other(anyhow::anyhow!("Failed to transform to OpenAI format: {:?}", e)))
-            })
-            .and_then(|openai_req| {
-                // Serialize to JSON
-                serde_json::to_string(&openai_req)
-                    .map(|json| format!("{}\n", json))
-                    .map_err(|e| fusillade::FusilladeError::Other(anyhow::anyhow!("JSON serialization failed: {}", e)))
+    // Convert FileContentItem to JSONL (one per line)
+    let jsonl_stream = content_stream.map(|content_result| {
+        content_result
+            .and_then(|content_item| {
+                // Handle different content types
+                match content_item {
+                    fusillade::FileContentItem::Template(template) => {
+                        // Transform to OpenAI format (drops api_key, endpoint)
+                        OpenAIBatchRequest::from_internal(&template)
+                            .map_err(|e| fusillade::FusilladeError::Other(anyhow::anyhow!("Failed to transform to OpenAI format: {:?}", e)))
+                            .and_then(|openai_req| {
+                                serde_json::to_string(&openai_req)
+                                    .map(|json| format!("{}\n", json))
+                                    .map_err(|e| fusillade::FusilladeError::Other(anyhow::anyhow!("JSON serialization failed: {}", e)))
+                            })
+                    }
+                    fusillade::FileContentItem::Output(output) => {
+                        // Already in OpenAI format, just serialize
+                        serde_json::to_string(&output)
+                            .map(|json| format!("{}\n", json))
+                            .map_err(|e| fusillade::FusilladeError::Other(anyhow::anyhow!("JSON serialization failed: {}", e)))
+                    }
+                    fusillade::FileContentItem::Error(error) => {
+                        // Already in OpenAI format, just serialize
+                        serde_json::to_string(&error)
+                            .map(|json| format!("{}\n", json))
+                            .map_err(|e| fusillade::FusilladeError::Other(anyhow::anyhow!("JSON serialization failed: {}", e)))
+                    }
+                }
             })
             .map_err(|e| std::io::Error::other(e.to_string()))
     });
