@@ -116,6 +116,7 @@ pub fn create_test_config() -> crate::config::Config {
         enable_request_logging: false,
         enable_otel_export: false,
         batches: BatchConfig {
+            enabled: true,
             files: FilesConfig {
                 max_file_size: 1000 * 1024 * 1024, //1GB
                 ..Default::default()
