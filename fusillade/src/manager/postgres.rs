@@ -1963,20 +1963,25 @@ impl<H: HttpClient + 'static> PostgresRequestManager<H> {
             }
         };
 
-        // Stream completed requests
+        // Stream completed requests, ordered by completion time
+        // This ensures new completions always append (no out-of-order issues)
         const BATCH_SIZE: i64 = 1000;
+        let mut last_completed_at: Option<chrono::DateTime<chrono::Utc>> = None;
         let mut last_id: Uuid = Uuid::nil();
 
         loop {
             let request_batch = sqlx::query!(
                 r#"
-                SELECT id, custom_id, response_status, response_body
+                SELECT id, custom_id, response_status, response_body, completed_at
                 FROM requests
-                WHERE batch_id = $1 AND state = 'completed' AND id > $2
-                ORDER BY id ASC
-                LIMIT $3
+                WHERE batch_id = $1
+                  AND state = 'completed'
+                  AND ($2::TIMESTAMPTZ IS NULL OR completed_at > $2 OR (completed_at = $2 AND id > $3))
+                ORDER BY completed_at ASC, id ASC
+                LIMIT $4
                 "#,
                 batch_id,
+                last_completed_at,
                 last_id,
                 BATCH_SIZE,
             )
@@ -1992,6 +1997,7 @@ impl<H: HttpClient + 'static> PostgresRequestManager<H> {
                     tracing::debug!("Fetched batch of {} completed requests", requests.len());
 
                     for row in requests {
+                        last_completed_at = row.completed_at;
                         last_id = row.id;
 
                         let response_body: serde_json::Value = match row.response_body {
@@ -2069,20 +2075,25 @@ impl<H: HttpClient + 'static> PostgresRequestManager<H> {
             }
         };
 
-        // Stream failed requests
+        // Stream failed requests, ordered by failure time
+        // This ensures new failures always append (no out-of-order issues)
         const BATCH_SIZE: i64 = 1000;
+        let mut last_failed_at: Option<chrono::DateTime<chrono::Utc>> = None;
         let mut last_id: Uuid = Uuid::nil();
 
         loop {
             let request_batch = sqlx::query!(
                 r#"
-                SELECT id, custom_id, error
+                SELECT id, custom_id, error, failed_at
                 FROM requests
-                WHERE batch_id = $1 AND state = 'failed' AND id > $2
-                ORDER BY id ASC
-                LIMIT $3
+                WHERE batch_id = $1
+                  AND state = 'failed'
+                  AND ($2::TIMESTAMPTZ IS NULL OR failed_at > $2 OR (failed_at = $2 AND id > $3))
+                ORDER BY failed_at ASC, id ASC
+                LIMIT $4
                 "#,
                 batch_id,
+                last_failed_at,
                 last_id,
                 BATCH_SIZE,
             )
@@ -2098,6 +2109,7 @@ impl<H: HttpClient + 'static> PostgresRequestManager<H> {
                     tracing::debug!("Fetched batch of {} failed requests", requests.len());
 
                     for row in requests {
+                        last_failed_at = row.failed_at;
                         last_id = row.id;
 
                         let error_item = BatchErrorItem {

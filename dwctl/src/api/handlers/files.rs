@@ -610,6 +610,52 @@ pub async fn get_file_content(
         });
     }
 
+    // For batch output/error files, verify the batch is complete before allowing download
+    if matches!(
+        file.purpose,
+        Some(fusillade::Purpose::BatchOutput) | Some(fusillade::Purpose::BatchError)
+    ) {
+        // Find the batch that owns this file
+        let batches = state
+            .request_manager
+            .list_batches(None, None, 1000) // Search through batches
+            .await
+            .map_err(|e| Error::Internal {
+                operation: format!("list batches: {}", e),
+            })?;
+
+        let batch = batches.into_iter().find(|b| {
+            if file.purpose == Some(fusillade::Purpose::BatchOutput) {
+                b.output_file_id == Some(fusillade::FileId(file_id))
+            } else {
+                b.error_file_id == Some(fusillade::FileId(file_id))
+            }
+        });
+
+        if let Some(batch) = batch {
+            // Get batch status to check if it's complete
+            let status = state
+                .request_manager
+                .get_batch_status(batch.id)
+                .await
+                .map_err(|e| Error::Internal {
+                    operation: format!("get batch status: {}", e),
+                })?;
+
+            let openai_status = status.openai_status();
+
+            // Only allow download if batch is in a terminal state
+            if openai_status != "completed" && openai_status != "failed" && openai_status != "cancelled" && openai_status != "expired" {
+                return Err(Error::BadRequest {
+                    message: format!(
+                        "Batch is still processing (status: {}). Wait for completion before downloading results.",
+                        openai_status
+                    ),
+                });
+            }
+        }
+    }
+
     // Stream the file content as JSONL
     let content_stream = state.request_manager.get_file_content_stream(fusillade::FileId(file_id));
 
