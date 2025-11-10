@@ -100,50 +100,82 @@ check-db:
 #
 # IMPORTANT: Rust development requires a running PostgreSQL database!
 #
-# The Control Layer service stores user/group/model data in PostgreSQL, &:
+# The Control Layer service stores user/group/model data in PostgreSQL:
 #
-# - SQLx (our database library) performs compile-time SQL validation, & so even
+# - SQLx (our database library) performs compile-time SQL validation, so even
 #   compiling Rust code requires database connectivity.
-# - For testing, we uses sqlx's test harness which requires a database to run.
+# - For testing, we use sqlx's test harness which requires a database to run.
 #
-# This command verifies:
-# - PostgreSQL client tools are installed (psql, createdb)
-# - 'postgres' user exists and can create databases
-# - 'test' database is accessible for running tests
+# This command:
+# - Creates dwctl and fusillade databases
+# - Writes DATABASE_URL to .env files for sqlx compile-time verification
+# - Runs migrations to set up the schema
 #
-# If checks fail, run 'just db-setup' to fix the configuration
+# Connection settings can be overridden with environment variables:
+# - DB_HOST (default: localhost)
+# - DB_PORT (default: 5432)
+# - DB_USER (default: postgres)
+# - DB_PASS (default: password)
+#
+# Examples:
+#   just db-setup                          # Use defaults (localhost:5432, postgres/password)
+#   DB_PASS=postgres just db-setup         # Override password (for CI)
+#   just db-start && just db-setup         # Start local Docker postgres and setup
 db-setup:
     #!/usr/bin/env bash
     set -euo pipefail
-    echo "Setting up test databases..."
-    if command -v createdb >/dev/null 2>&1; then
-        # Ensure postgres user exists with appropriate privileges
-        echo "Checking postgres user..."
-        if ! psql -d postgres -c "SELECT 1 FROM pg_roles WHERE rolname='postgres';" | grep -q 1; then
-            echo "Creating postgres user with createdb privileges..."
-            createuser -s postgres 2>/dev/null || createuser --createdb postgres 2>/dev/null || echo "  - postgres user creation failed, may already exist"
-        else
-            echo "  - postgres user already exists"
-            # Ensure postgres user has createdb privileges
-            psql -d postgres -c "ALTER USER postgres CREATEDB;" 2>/dev/null || echo "  - postgres user already has necessary privileges"
-        fi
 
-        # Create test database if it doesn't exist
-        echo "Creating test database..."
-        createdb -O postgres test 2>/dev/null || echo "  - test database already exists"
-        echo "✅ Test database ready"
-        echo ""
-        echo "Database URLs configured:"
-        echo "  DATABASE_URL=postgres://postgres:postgres@localhost:5432/test"
-        echo "  TEST_DATABASE_URL=postgres://postgres:postgres@localhost:5432/test"
-    else
-        echo "❌ Error: createdb not found. Install PostgreSQL tools:"
-        echo "  brew install postgresql"
-        echo ""
-        echo "Or manually create test databases:"
-        echo "  createdb test"
+    echo "Setting up development databases..."
+
+    # Database connection settings (can be overridden with environment variables)
+    DB_HOST="${DB_HOST:-localhost}"
+    DB_PORT="${DB_PORT:-5432}"
+    DB_USER="${DB_USER:-postgres}"
+    DB_PASS="${DB_PASS:-password}"
+
+    # Check if postgres is running
+    if ! pg_isready -h "$DB_HOST" -p "$DB_PORT" >/dev/null 2>&1; then
+        echo "❌ PostgreSQL is not running on $DB_HOST:$DB_PORT"
+        echo "Run 'just db-start' to start Docker postgres"
         exit 1
     fi
+
+    echo "✅ PostgreSQL is running"
+
+    # Create databases
+    echo "Creating databases..."
+    PGPASSWORD="$DB_PASS" psql -h "$DB_HOST" -p "$DB_PORT" -U "$DB_USER" -d postgres -c "CREATE DATABASE dwctl;" 2>/dev/null || echo "  - dwctl database already exists"
+    PGPASSWORD="$DB_PASS" psql -h "$DB_HOST" -p "$DB_PORT" -U "$DB_USER" -d postgres -c "CREATE DATABASE fusillade;" 2>/dev/null || echo "  - fusillade database already exists"
+
+    # Write .env files for sqlx compile-time verification
+    echo "Writing .env files..."
+    echo "DATABASE_URL=postgres://$DB_USER:$DB_PASS@$DB_HOST:$DB_PORT/dwctl" > dwctl/.env
+    echo "DATABASE_URL=postgres://$DB_USER:$DB_PASS@$DB_HOST:$DB_PORT/fusillade" > fusillade/.env
+
+    # Run migrations
+    echo "Running migrations..."
+    echo "Running dwctl migrations..."
+    if (cd dwctl && sqlx migrate run); then
+        echo "  ✅ dwctl migrations complete"
+    else
+        echo "  ❌ dwctl migrations failed"
+        exit 1
+    fi
+
+    echo "Running fusillade migrations..."
+    if (cd fusillade && sqlx migrate run); then
+        echo "  ✅ fusillade migrations complete"
+    else
+        echo "  ❌ fusillade migrations failed"
+        exit 1
+    fi
+
+    echo ""
+    echo "✅ Database setup complete!"
+    echo ""
+    echo "Database URLs configured:"
+    echo "  dwctl:     postgres://$DB_USER:$DB_PASS@$DB_HOST:$DB_PORT/dwctl"
+    echo "  fusillade: postgres://$DB_USER:$DB_PASS@$DB_HOST:$DB_PORT/fusillade"
 
 # Start the full development stack with hot reload
 #
@@ -583,24 +615,8 @@ ci target *args="":
         rust)
             echo "🦀 Running Rust CI pipeline..."
 
-            # Generate random database names
-            DWCTL_DB="dwctl_test_$(openssl rand -hex 4)"
-            FUSILLADE_DB="fusillade_test_$(openssl rand -hex 4)"
-
-            echo "📦 Setting up test databases: $DWCTL_DB, $FUSILLADE_DB"
-
-            # Create databases (PGPASSWORD works in CI, fallback to no password for local)
-            PGPASSWORD=postgres psql -U postgres -h localhost -c "CREATE DATABASE $DWCTL_DB;" 2>/dev/null || psql -h localhost -c "CREATE DATABASE $DWCTL_DB;"
-            PGPASSWORD=postgres psql -U postgres -h localhost -c "CREATE DATABASE $FUSILLADE_DB;" 2>/dev/null || psql -h localhost -c "CREATE DATABASE $FUSILLADE_DB;"
-
-            # Write DATABASE_URL to .env files for sqlx compile-time verification
-            echo "DATABASE_URL=postgres://postgres:postgres@localhost:5432/$DWCTL_DB" > dwctl/.env
-            echo "DATABASE_URL=postgres://postgres:postgres@localhost:5432/$FUSILLADE_DB" > fusillade/.env
-
-            # Run migrations (sqlx will pick up DATABASE_URL from .env files)
-            echo "🔄 Running migrations..."
-            cd dwctl && sqlx migrate run && cd ..
-            cd fusillade && sqlx migrate run && cd ..
+            # Setup databases using db-setup target
+            just db-setup
 
             echo "📋 Setting up llvm-cov environment for consistent compilation..."
             echo "🧪 Step 1/2: Running tests with coverage..."
@@ -808,6 +824,82 @@ release:
 
     echo ""
     echo "🎉 Release process completed successfully!"
+
+# Start Docker PostgreSQL with fsync disabled for fast testing
+#
+# This starts a PostgreSQL container optimized for testing:
+# - fsync disabled for faster writes (TESTING ONLY - never use in production!)
+# - Runs on port 5432
+# - Credentials: postgres/password
+# - Container name: test-postgres
+#
+# Examples:
+#   just db-start
+db-start:
+    #!/usr/bin/env bash
+    set -euo pipefail
+
+    # Check if container already exists
+    if docker ps -a --format '{{{{.Names}}' | grep -q "^test-postgres$"; then
+        if docker ps --format '{{{{.Names}}' | grep -q "^test-postgres$"; then
+            echo "✅ test-postgres container is already running"
+        else
+            echo "Starting existing test-postgres container..."
+            docker start test-postgres
+        fi
+    else
+        echo "Creating new test-postgres container with fsync disabled..."
+        docker run --name test-postgres \
+          -e POSTGRES_PASSWORD=password \
+          -p 5432:5432 \
+          -d postgres:latest \
+          postgres -c fsync=off
+    fi
+
+    echo "Waiting for postgres to be ready..."
+    sleep 2
+
+    # Verify it's up
+    if pg_isready -h localhost -p 5432 >/dev/null 2>&1; then
+        echo "✅ PostgreSQL is ready on localhost:5432"
+        echo "   Credentials: postgres/password"
+        echo "   ⚠️  fsync is disabled - for testing only!"
+    else
+        echo "❌ PostgreSQL not responding"
+        exit 1
+    fi
+
+# Stop Docker PostgreSQL container
+#
+# Stops the test-postgres container. Add --remove to also delete the container.
+#
+# Examples:
+#   just db-stop          # Stop container
+#   just db-stop --remove # Stop and remove container
+db-stop *args="":
+    #!/usr/bin/env bash
+    set -euo pipefail
+
+    if docker ps --format '{{{{.Names}}' | grep -q "^test-postgres$"; then
+        echo "Stopping test-postgres container..."
+        docker stop test-postgres
+
+        if [[ "{{args}}" == *"--remove"* ]]; then
+            echo "Removing test-postgres container..."
+            docker rm test-postgres
+        fi
+        echo "✅ Done"
+    elif docker ps -a --format '{{{{.Names}}' | grep -q "^test-postgres$"; then
+        if [[ "{{args}}" == *"--remove"* ]]; then
+            echo "Removing stopped test-postgres container..."
+            docker rm test-postgres
+            echo "✅ Done"
+        else
+            echo "ℹ️  test-postgres container is already stopped"
+        fi
+    else
+        echo "ℹ️  test-postgres container does not exist"
+    fi
 
 # Hidden recipes for internal use
 _drop-test-users:
