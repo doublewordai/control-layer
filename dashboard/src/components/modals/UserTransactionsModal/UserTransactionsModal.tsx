@@ -8,7 +8,7 @@ import {
 } from "../../ui/dialog";
 import { Button } from "../../ui/button";
 import type { DisplayUser } from "../../../types/display";
-import {TransactionHistory} from "@/components";
+import { TransactionHistory } from "@/components";
 import { AddFundsModal } from "../AddCreditsModal";
 
 interface UserTransactionsModalProps {
@@ -35,9 +35,12 @@ export function UserTransactionsModal({
           <DialogHeader>
             <div className="flex items-center justify-between">
               <div className="flex-1">
-                <DialogTitle className="text-2xl">Transaction History</DialogTitle>
+                <DialogTitle className="text-2xl">
+                  Transaction History
+                </DialogTitle>
                 <p className="text-sm text-doubleword-neutral-600 mt-1">
-                  Viewing transactions for <strong>{user.name}</strong> ({user.email})
+                  Viewing transactions for <strong>{user.name}</strong> (
+                  {user.email})
                 </p>
               </div>
               <div className="flex items-center gap-2">
@@ -61,10 +64,7 @@ export function UserTransactionsModal({
           </DialogHeader>
 
           <div className="mt-4">
-            <TransactionHistory
-              userId={user.id}
-              showCard={false}
-            />
+            <TransactionHistory userId={user.id} showCard={false} />
           </div>
         </DialogContent>
       </Dialog>

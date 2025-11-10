@@ -38,7 +38,10 @@ import type {
   Probe,
   CreateProbeRequest,
   ProbeResult,
-  ProbeStatistics, Transaction, AddFundsRequest, AddFundsResponse,
+  ProbeStatistics,
+  Transaction,
+  AddFundsRequest,
+  AddFundsResponse,
 } from "./types";
 import { ApiError } from "./errors";
 
@@ -46,7 +49,7 @@ import { ApiError } from "./errors";
 const userApi = {
   async list(options?: UsersQuery): Promise<User[]> {
     const params = new URLSearchParams();
-      if (options?.include) {
+    if (options?.include) {
       params.set("include", options.include);
     }
 
@@ -709,10 +712,7 @@ const authApi = {
 
 // Cost management API
 const costApi = {
-
-  async listTransactions(
-    query?: TransactionsQuery,
-  ): Promise<Transaction[]> {
+  async listTransactions(query?: TransactionsQuery): Promise<Transaction[]> {
     const params = new URLSearchParams();
     if (query?.limit) params.set("limit", query.limit.toString());
     if (query?.skip) params.set("skip", query.skip.toString());

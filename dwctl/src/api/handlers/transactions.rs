@@ -37,6 +37,8 @@ use uuid::Uuid;
         (status = 500, description = "Internal server error"),
     ),
     security(
+        ("BearerAuth" = []),
+        ("CookieAuth" = []),
         ("X-Doubleword-User" = [])
     )
 )]
@@ -87,6 +89,8 @@ pub async fn create_transaction(
         (status = 500, description = "Internal server error"),
     ),
     security(
+        ("BearerAuth" = []),
+        ("CookieAuth" = []),
         ("X-Doubleword-User" = [])
     )
 )]
@@ -143,6 +147,8 @@ pub async fn get_transaction(
         (status = 500, description = "Internal server error"),
     ),
     security(
+        ("BearerAuth" = []),
+        ("CookieAuth" = []),
         ("X-Doubleword-User" = [])
     )
 )]

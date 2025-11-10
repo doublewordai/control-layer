@@ -1,4 +1,4 @@
-use crate::db::models::api_keys::ApiKeyDBResponse;
+use crate::db::models::api_keys::{ApiKeyDBResponse, ApiKeyPurpose};
 use crate::types::{ApiKeyId, DeploymentId, UserId};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
@@ -9,6 +9,8 @@ use utoipa::{IntoParams, ToSchema};
 pub struct ApiKeyCreate {
     pub name: String,
     pub description: Option<String>,
+    /// Purpose of the API key: 'platform' for /admin/api/* access, 'inference' for /ai/* access
+    pub purpose: ApiKeyPurpose,
     /// Per-API-key rate limit: requests per second (null = no limit)
     pub requests_per_second: Option<f32>,
     /// Per-API-key rate limit: maximum burst size (null = no limit)
@@ -34,6 +36,7 @@ pub struct ApiKeyResponse {
     pub name: String,
     pub description: Option<String>,
     pub key: String,
+    pub purpose: ApiKeyPurpose,
     #[schema(value_type = String, format = "uuid")]
     pub user_id: UserId,
     pub created_at: DateTime<Utc>,
@@ -52,6 +55,7 @@ pub struct ApiKeyInfoResponse {
     pub id: ApiKeyId,
     pub name: String,
     pub description: Option<String>,
+    pub purpose: ApiKeyPurpose,
     #[schema(value_type = String, format = "uuid")]
     pub user_id: UserId,
     pub created_at: DateTime<Utc>,
@@ -82,6 +86,7 @@ impl From<ApiKeyDBResponse> for ApiKeyResponse {
             name: db.name,
             description: db.description,
             key: db.secret,
+            purpose: db.purpose,
             user_id: db.user_id,
             created_at: db.created_at,
             last_used: db.last_used,
@@ -98,6 +103,7 @@ impl From<ApiKeyDBResponse> for ApiKeyInfoResponse {
             id: db.id,
             name: db.name,
             description: db.description,
+            purpose: db.purpose,
             user_id: db.user_id,
             created_at: db.created_at,
             last_used: db.last_used,

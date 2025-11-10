@@ -42,6 +42,8 @@ use sqlx::Acquire;
         (status = 500, description = "Internal server error"),
     ),
     security(
+        ("BearerAuth" = []),
+        ("CookieAuth" = []),
         ("X-Doubleword-User" = [])
     )
 )]
@@ -117,6 +119,8 @@ pub async fn create_user_api_key(
         (status = 500, description = "Internal server error"),
     ),
     security(
+        ("BearerAuth" = []),
+        ("CookieAuth" = []),
         ("X-Doubleword-User" = [])
     )
 )]
@@ -195,6 +199,8 @@ pub async fn list_user_api_keys(
         (status = 500, description = "Internal server error"),
     ),
     security(
+        ("BearerAuth" = []),
+        ("CookieAuth" = []),
         ("X-Doubleword-User" = [])
     )
 )]
@@ -271,6 +277,8 @@ pub async fn get_user_api_key(
         (status = 500, description = "Internal server error"),
     ),
     security(
+        ("BearerAuth" = []),
+        ("CookieAuth" = []),
         ("X-Doubleword-User" = [])
     )
 )]
@@ -349,7 +357,8 @@ mod tests {
 
         let api_key_data = json!({
             "name": "Test API Key",
-            "description": "A test API key"
+            "description": "A test API key",
+            "purpose": "inference"
         });
 
         let response = app
@@ -376,7 +385,8 @@ mod tests {
 
         let api_key_data = json!({
             "name": "Admin Created Key",
-            "description": "Created by admin for user"
+            "description": "Created by admin for user",
+            "purpose": "inference"
         });
 
         let response = app
@@ -400,7 +410,8 @@ mod tests {
 
         let api_key_data = json!({
             "name": "Forbidden Key",
-            "description": "This should not work"
+            "description": "This should not work",
+            "purpose": "inference"
         });
 
         let response = app
@@ -445,7 +456,8 @@ mod tests {
         for i in 1..=5 {
             let api_key_data = json!({
                 "name": format!("Test API Key {}", i),
-                "description": format!("Description for key {}", i)
+                "description": format!("Description for key {}", i),
+                "purpose": "inference"
             });
 
             app.post("/admin/api/v1/users/current/api-keys")
@@ -703,7 +715,8 @@ mod tests {
         // RequestViewer should not be able to create API keys for themselves
         let api_key_data = json!({
             "name": "RequestViewer Key",
-            "description": "Should not work"
+            "description": "Should not work",
+            "purpose": "inference"
         });
 
         let response = app
@@ -744,7 +757,8 @@ mod tests {
         // Should be able to create API keys (from StandardUser role)
         let api_key_data = json!({
             "name": "Multi Role Key",
-            "description": "Should work due to StandardUser role"
+            "description": "Should work due to StandardUser role",
+            "purpose": "inference"
         });
 
         let response = app
@@ -796,7 +810,8 @@ mod tests {
         // Platform manager should be able to create API keys for other users
         let api_key_data = json!({
             "name": "Manager Created Key",
-            "description": "Created by platform manager"
+            "description": "Created by platform manager",
+            "purpose": "inference"
         });
 
         let response = app
@@ -935,7 +950,8 @@ mod tests {
         // Create API key - should return the actual key value
         let api_key_data = json!({
             "name": "Test Key for Security",
-            "description": "Testing key exposure"
+            "description": "Testing key exposure",
+            "purpose": "inference"
         });
 
         let create_response = app

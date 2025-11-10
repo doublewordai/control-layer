@@ -12,6 +12,8 @@ use crate::{api::models::users::CurrentUser, AppState};
         (status = 200, description = "Got metadata"),
     ),
     security(
+        ("BearerAuth" = []),
+        ("CookieAuth" = []),
         ("X-Doubleword-User" = [])
     )
 )]

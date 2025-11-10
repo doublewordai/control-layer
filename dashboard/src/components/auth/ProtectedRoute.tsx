@@ -11,7 +11,11 @@ interface ProtectedRouteProps {
   requiredFeatureFlag?: keyof FeatureFlags;
 }
 
-export function ProtectedRoute({ children, path, requiredFeatureFlag }: ProtectedRouteProps) {
+export function ProtectedRoute({
+  children,
+  path,
+  requiredFeatureFlag,
+}: ProtectedRouteProps) {
   const { isAuthenticated, isLoading: authLoading } = useAuth();
   const {
     canAccessRoute,

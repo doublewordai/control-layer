@@ -1,0 +1,58 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n        SELECT ak.user_id, ak.purpose, u.username, u.email, u.is_admin, u.display_name, u.avatar_url\n        FROM api_keys ak\n        INNER JOIN users u ON ak.user_id = u.id\n        WHERE ak.secret = $1\n        ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "user_id",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 1,
+        "name": "purpose",
+        "type_info": "Varchar"
+      },
+      {
+        "ordinal": 2,
+        "name": "username",
+        "type_info": "Varchar"
+      },
+      {
+        "ordinal": 3,
+        "name": "email",
+        "type_info": "Varchar"
+      },
+      {
+        "ordinal": 4,
+        "name": "is_admin",
+        "type_info": "Bool"
+      },
+      {
+        "ordinal": 5,
+        "name": "display_name",
+        "type_info": "Varchar"
+      },
+      {
+        "ordinal": 6,
+        "name": "avatar_url",
+        "type_info": "Varchar"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Text"
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      false,
+      false,
+      false,
+      true,
+      true
+    ]
+  },
+  "hash": "5b9f3e7ec8176f2dcf45e5d5282a6e15e8d8924efa73d5e1381429e15ed5cb44"
+}

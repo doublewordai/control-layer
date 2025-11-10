@@ -1,10 +1,20 @@
 import React, { useState } from "react";
-import { Key, Plus, Trash2, Copy, Loader2, Check } from "lucide-react";
+import {
+  Key,
+  Plus,
+  Trash2,
+  Copy,
+  Loader2,
+  Check,
+  ChevronDown,
+  Info,
+} from "lucide-react";
 import {
   useApiKeys,
   useCreateApiKey,
   useDeleteApiKey,
   type ApiKeyCreateResponse,
+  type ApiKeyPurpose,
 } from "../../../../api/control-layer";
 import { useUser } from "../../../../api/control-layer/hooks";
 import { DataTable } from "../../../ui/data-table";
@@ -20,12 +30,31 @@ import { Button } from "../../../ui/button";
 import { Input } from "../../../ui/input";
 import { Textarea } from "../../../ui/textarea";
 import { Label } from "../../../ui/label";
+import {
+  Select,
+  SelectContent,
+  SelectItem,
+  SelectTrigger,
+  SelectValue,
+} from "../../../ui/select";
+import {
+  Collapsible,
+  CollapsibleContent,
+  CollapsibleTrigger,
+} from "../../../ui/collapsible";
+import {
+  HoverCard,
+  HoverCardContent,
+  HoverCardTrigger,
+} from "../../../ui/hover-card";
 
 export const ApiKeys: React.FC = () => {
   const { data: user } = useUser("current");
   const [showCreateForm, setShowCreateForm] = useState(false);
   const [newKeyName, setNewKeyName] = useState("");
   const [newKeyDescription, setNewKeyDescription] = useState("");
+  const [newKeyPurpose, setNewKeyPurpose] =
+    useState<ApiKeyPurpose>("inference");
   const [newKeyRequestsPerSecond, setNewKeyRequestsPerSecond] = useState<
     number | ""
   >("");
@@ -39,6 +68,10 @@ export const ApiKeys: React.FC = () => {
   const [copiedKey, setCopiedKey] = useState<string | null>(null);
   const [selectedKeys, setSelectedKeys] = useState<any[]>([]);
   const [showBulkDeleteModal, setShowBulkDeleteModal] = useState(false);
+  const [advancedOpen, setAdvancedOpen] = useState(false);
+
+  // Check if user is a platform manager
+  const isPlatformManager = user?.roles?.includes("PlatformManager") || false;
 
   const {
     data: apiKeys = [],
@@ -56,6 +89,7 @@ export const ApiKeys: React.FC = () => {
       data: {
         name: newKeyName.trim(),
         description: newKeyDescription.trim() || undefined,
+        purpose: newKeyPurpose,
         requests_per_second:
           newKeyRequestsPerSecond === ""
             ? null
@@ -120,6 +154,7 @@ export const ApiKeys: React.FC = () => {
 
   const columns = createColumns({
     onDelete: handleDeleteFromTable,
+    isPlatformManager,
   });
 
   if (isLoading) {
@@ -255,9 +290,11 @@ export const ApiKeys: React.FC = () => {
             setShowCreateForm(false);
             setNewKeyName("");
             setNewKeyDescription("");
+            setNewKeyPurpose("inference");
             setNewKeyRequestsPerSecond("");
             setNewKeyBurstSize("");
             setNewKeyResponse(null);
+            setAdvancedOpen(false);
           } else {
             setShowCreateForm(true);
           }
@@ -327,9 +364,11 @@ export const ApiKeys: React.FC = () => {
                     setShowCreateForm(false);
                     setNewKeyName("");
                     setNewKeyDescription("");
+                    setNewKeyPurpose("inference");
                     setNewKeyRequestsPerSecond("");
                     setNewKeyBurstSize("");
                     setNewKeyResponse(null);
+                    setAdvancedOpen(false);
                   }}
                   className="w-full sm:w-auto"
                 >
@@ -368,54 +407,171 @@ export const ApiKeys: React.FC = () => {
                   />
                 </div>
 
-                {/* Rate Limiting Section */}
-                <div className="space-y-4 border-t pt-4">
-                  <div className="space-y-1">
-                    <Label className="text-sm font-medium">Rate Limiting</Label>
-                    <p className="text-xs text-gray-600">
-                      Optional limits for this API key. Leave blank for no
-                      limits.
-                    </p>
-                  </div>
+                {/* Advanced Settings (Purpose & Rate Limiting) - Collapsible */}
+                {isPlatformManager && (
+                  <Collapsible
+                    open={advancedOpen}
+                    onOpenChange={setAdvancedOpen}
+                  >
+                    <CollapsibleTrigger asChild>
+                      <button
+                        type="button"
+                        className="flex items-center gap-2 w-full text-sm font-medium text-gray-700 hover:text-gray-900 transition-colors group"
+                      >
+                        <ChevronDown
+                          className={`h-4 w-4 text-gray-400 transition-transform duration-200 ${
+                            advancedOpen ? "transform rotate-180" : ""
+                          }`}
+                        />
+                        <span>Advanced Settings</span>
+                        <div className="flex-1 h-px bg-gray-200 group-hover:bg-gray-300 transition-colors" />
+                      </button>
+                    </CollapsibleTrigger>
+                    <CollapsibleContent className="space-y-3 pt-4">
+                      {/* Purpose Selection */}
+                      <div className="space-y-2">
+                        <div className="flex items-center gap-1">
+                          <Label htmlFor="purpose">Purpose</Label>
+                          <HoverCard openDelay={200} closeDelay={100}>
+                            <HoverCardTrigger asChild>
+                              <button
+                                type="button"
+                                className="text-gray-400 hover:text-gray-600 transition-colors"
+                                onFocus={(e) => e.preventDefault()}
+                                tabIndex={-1}
+                              >
+                                <Info className="h-4 w-4" />
+                                <span className="sr-only">Purpose information</span>
+                              </button>
+                            </HoverCardTrigger>
+                            <HoverCardContent className="w-80" sideOffset={5}>
+                              <p className="text-sm text-muted-foreground">
+                                Choose the API access level for this key. Inference keys can access AI endpoints (/ai/*), while Platform keys can access management APIs (/admin/api/*).
+                              </p>
+                            </HoverCardContent>
+                          </HoverCard>
+                        </div>
+                        <Select
+                          value={newKeyPurpose}
+                          onValueChange={(value) =>
+                            setNewKeyPurpose(value as ApiKeyPurpose)
+                          }
+                        >
+                          <SelectTrigger id="purpose" className="w-full">
+                            <SelectValue placeholder="Select purpose">
+                              {newKeyPurpose === "inference"
+                                ? "Inference"
+                                : "Platform"}
+                            </SelectValue>
+                          </SelectTrigger>
+                          <SelectContent>
+                            <SelectItem value="inference">
+                              <div className="flex flex-col gap-0.5">
+                                <span>Inference</span>
+                                <span className="text-xs text-muted-foreground">
+                                  For AI inference endpoints (/ai/*)
+                                </span>
+                              </div>
+                            </SelectItem>
+                            <SelectItem value="platform">
+                              <div className="flex flex-col gap-0.5">
+                                <span>Platform</span>
+                                <span className="text-xs text-muted-foreground">
+                                  For platform management APIs (/admin/api/*)
+                                </span>
+                              </div>
+                            </SelectItem>
+                          </SelectContent>
+                        </Select>
+                      </div>
 
-                  <div className="grid grid-cols-2 gap-3">
-                    <div className="space-y-2">
-                      <Label htmlFor="requestsPerSecond">Requests/Second</Label>
-                      <Input
-                        id="requestsPerSecond"
-                        type="number"
-                        min="1"
-                        max="10000"
-                        step="1"
-                        value={newKeyRequestsPerSecond}
-                        onChange={(e) =>
-                          setNewKeyRequestsPerSecond(
-                            e.target.value === "" ? "" : Number(e.target.value),
-                          )
-                        }
-                        placeholder="None"
-                      />
-                    </div>
+                      {/* Rate Limiting */}
+                      <div className="grid grid-cols-2 gap-3">
+                        <div className="space-y-2">
+                          <div className="flex items-center gap-1">
+                            <Label htmlFor="requestsPerSecond">
+                              Requests/Second
+                            </Label>
+                            <HoverCard openDelay={200} closeDelay={100}>
+                              <HoverCardTrigger asChild>
+                                <button
+                                  type="button"
+                                  className="text-gray-400 hover:text-gray-600 transition-colors"
+                                  onFocus={(e) => e.preventDefault()}
+                                  tabIndex={-1}
+                                >
+                                  <Info className="h-4 w-4" />
+                                  <span className="sr-only">Requests per second information</span>
+                                </button>
+                              </HoverCardTrigger>
+                              <HoverCardContent className="w-80" sideOffset={5}>
+                                <p className="text-sm text-muted-foreground">
+                                  Maximum number of requests allowed per second for this API key. Leave blank for no limit.
+                                </p>
+                              </HoverCardContent>
+                            </HoverCard>
+                          </div>
+                          <Input
+                            id="requestsPerSecond"
+                            type="number"
+                            min="1"
+                            max="10000"
+                            step="1"
+                            value={newKeyRequestsPerSecond}
+                            onChange={(e) =>
+                              setNewKeyRequestsPerSecond(
+                                e.target.value === ""
+                                  ? ""
+                                  : Number(e.target.value),
+                              )
+                            }
+                            placeholder="None"
+                          />
+                        </div>
 
-                    <div className="space-y-2">
-                      <Label htmlFor="burstSize">Burst Size</Label>
-                      <Input
-                        id="burstSize"
-                        type="number"
-                        min="1"
-                        max="50000"
-                        step="1"
-                        value={newKeyBurstSize}
-                        onChange={(e) =>
-                          setNewKeyBurstSize(
-                            e.target.value === "" ? "" : Number(e.target.value),
-                          )
-                        }
-                        placeholder="None"
-                      />
-                    </div>
-                  </div>
-                </div>
+                        <div className="space-y-2">
+                          <div className="flex items-center gap-1">
+                            <Label htmlFor="burstSize">Burst Size</Label>
+                            <HoverCard openDelay={200} closeDelay={100}>
+                              <HoverCardTrigger asChild>
+                                <button
+                                  type="button"
+                                  className="text-gray-400 hover:text-gray-600 transition-colors"
+                                  onFocus={(e) => e.preventDefault()}
+                                  tabIndex={-1}
+                                >
+                                  <Info className="h-4 w-4" />
+                                  <span className="sr-only">Burst size information</span>
+                                </button>
+                              </HoverCardTrigger>
+                              <HoverCardContent className="w-80" sideOffset={5}>
+                                <p className="text-sm text-muted-foreground">
+                                  Maximum burst capacity for rate limiting. This allows temporary spikes above the per-second rate. Leave blank for no limit.
+                                </p>
+                              </HoverCardContent>
+                            </HoverCard>
+                          </div>
+                          <Input
+                            id="burstSize"
+                            type="number"
+                            min="1"
+                            max="50000"
+                            step="1"
+                            value={newKeyBurstSize}
+                            onChange={(e) =>
+                              setNewKeyBurstSize(
+                                e.target.value === ""
+                                  ? ""
+                                  : Number(e.target.value),
+                              )
+                            }
+                            placeholder="None"
+                          />
+                        </div>
+                      </div>
+                    </CollapsibleContent>
+                  </Collapsible>
+                )}
               </form>
 
               <DialogFooter>
@@ -426,8 +582,10 @@ export const ApiKeys: React.FC = () => {
                     setShowCreateForm(false);
                     setNewKeyName("");
                     setNewKeyDescription("");
+                    setNewKeyPurpose("inference");
                     setNewKeyRequestsPerSecond("");
                     setNewKeyBurstSize("");
+                    setAdvancedOpen(false);
                   }}
                 >
                   Cancel
