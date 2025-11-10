@@ -1,4 +1,13 @@
-import { TrendingDown, TrendingUp, X, Plus, DollarSign, ChevronLeft, ChevronRight, Search } from "lucide-react";
+import {
+  TrendingDown,
+  TrendingUp,
+  X,
+  Plus,
+  DollarSign,
+  ChevronLeft,
+  ChevronRight,
+  Search,
+} from "lucide-react";
 import { Card } from "../../../ui/card.tsx";
 import { Button } from "@/components";
 import { useState, useMemo } from "react";
@@ -19,11 +28,7 @@ import {
   TableRow,
 } from "../../../ui/table.tsx";
 import type { Transaction } from "@/api/control-layer";
-import {
-  useUser,
-  useUserBalance,
-  useTransactions,
-} from "@/api/control-layer";
+import { useUser, useUserBalance, useTransactions } from "@/api/control-layer";
 import { useSettings } from "@/contexts";
 
 export interface TransactionHistoryProps {
@@ -46,14 +51,13 @@ export function TransactionHistory({
   const { data: currentUser } = useUser("current");
 
   // Fetch balance and transactions
-  const { data: balance = 0, isLoading: isLoadingBalance } = useUserBalance(userId);
+  const { data: balance = 0, isLoading: isLoadingBalance } =
+    useUserBalance(userId);
 
   // Only pass userId if it's not the current user (omit param for current user)
   const transactionsQuery = userId === currentUser?.id ? undefined : { userId };
-  const {
-    data: transactionsData,
-    isLoading: isLoadingTransactions,
-  } = useTransactions(transactionsQuery);
+  const { data: transactionsData, isLoading: isLoadingTransactions } =
+    useTransactions(transactionsQuery);
 
   // Get transactions - use fetched data in both demo and API mode
   // In demo mode, MSW returns data from transactions.json
@@ -62,15 +66,18 @@ export function TransactionHistory({
   }, [transactionsData]);
 
   // Calculate current balance (in demo mode, use latest transaction balance)
-  const currentBalance = isDemoMode && transactions.length > 0
-    ? transactions[0]?.balance_after || balance
-    : balance;
+  const currentBalance =
+    isDemoMode && transactions.length > 0
+      ? transactions[0]?.balance_after || balance
+      : balance;
 
   const isLoading = !isDemoMode && (isLoadingBalance || isLoadingTransactions);
 
   // Filter states
   const [transactionType, setTransactionType] = useState<string>("all");
-  const [dateRange, setDateRange] = useState<{ from: Date; to: Date } | undefined>();
+  const [dateRange, setDateRange] = useState<
+    { from: Date; to: Date } | undefined
+  >();
   const [searchTerm, setSearchTerm] = useState<string>("");
 
   // Pagination state
@@ -106,7 +113,9 @@ export function TransactionHistory({
       filtered = filtered.filter((t) => {
         const description = (t.description || "").toLowerCase();
         const amount = formatDollars(t.amount).toLowerCase();
-        return description.includes(lowerSearch) || amount.includes(lowerSearch);
+        return (
+          description.includes(lowerSearch) || amount.includes(lowerSearch)
+        );
       });
     }
 
@@ -114,12 +123,16 @@ export function TransactionHistory({
     if (transactionType !== "all") {
       // Map UI filter values to backend transaction types
       if (transactionType === "credit") {
-        filtered = filtered.filter((t) =>
-          t.transaction_type === "admin_grant" || t.transaction_type === "purchase"
+        filtered = filtered.filter(
+          (t) =>
+            t.transaction_type === "admin_grant" ||
+            t.transaction_type === "purchase",
         );
       } else if (transactionType === "debit") {
-        filtered = filtered.filter((t) =>
-          t.transaction_type === "admin_removal" || t.transaction_type === "usage"
+        filtered = filtered.filter(
+          (t) =>
+            t.transaction_type === "admin_removal" ||
+            t.transaction_type === "usage",
         );
       }
     }
@@ -128,7 +141,9 @@ export function TransactionHistory({
     if (dateRange?.from && dateRange?.to) {
       filtered = filtered.filter((t) => {
         const transactionDate = new Date(t.created_at);
-        return transactionDate >= dateRange.from && transactionDate <= dateRange.to;
+        return (
+          transactionDate >= dateRange.from && transactionDate <= dateRange.to
+        );
       });
     }
 
@@ -145,9 +160,7 @@ export function TransactionHistory({
   const totalPages = Math.ceil(filteredTransactions.length / itemsPerPage);
 
   const hasActiveFilters =
-    transactionType !== "all" ||
-    dateRange !== undefined ||
-    searchTerm !== "";
+    transactionType !== "all" || dateRange !== undefined || searchTerm !== "";
 
   const clearFilters = () => {
     setTransactionType("all");
@@ -162,7 +175,9 @@ export function TransactionHistory({
   };
 
   // Reset to page 1 when date range changes
-  const handleDateRangeChange = (range: { from: Date; to: Date } | undefined) => {
+  const handleDateRangeChange = (
+    range: { from: Date; to: Date } | undefined,
+  ) => {
     setDateRange(range);
     setCurrentPage(1);
   };
@@ -195,7 +210,9 @@ export function TransactionHistory({
                 className="flex items-center px-4 py-2 bg-blue-600 hover:bg-blue-700 text-white border-l border-blue-500 disabled:opacity-50 disabled:cursor-not-allowed transition-colors"
               >
                 <Plus className="w-5 h-5 mr-2" />
-                <span className="font-medium">{isAddingFunds ? "Adding..." : "Add Funds"}</span>
+                <span className="font-medium">
+                  {isAddingFunds ? "Adding..." : "Add Funds"}
+                </span>
               </button>
             )}
           </div>
@@ -217,7 +234,10 @@ export function TransactionHistory({
             </div>
 
             {/* Transaction Type Filter */}
-            <Select value={transactionType} onValueChange={handleTransactionTypeChange}>
+            <Select
+              value={transactionType}
+              onValueChange={handleTransactionTypeChange}
+            >
               <SelectTrigger className="w-[150px]">
                 <SelectValue placeholder="All types" />
               </SelectTrigger>
@@ -258,65 +278,65 @@ export function TransactionHistory({
         <div className="mb-0">
           <Table>
             <TableHeader>
-            <TableRow>
-              <TableHead className="w-[50px]"></TableHead>
-              <TableHead>Description</TableHead>
-              <TableHead>Date</TableHead>
-              <TableHead className="text-right">Amount</TableHead>
-              <TableHead className="text-right">Balance</TableHead>
-            </TableRow>
-          </TableHeader>
-          <TableBody>
-            {paginatedTransactions.map((transaction) => {
-              // Determine if transaction is a credit (adds money) or debit (removes money)
-              const isCredit =
-                transaction.transaction_type === "admin_grant" ||
-                transaction.transaction_type === "purchase";
+              <TableRow>
+                <TableHead className="w-[50px]"></TableHead>
+                <TableHead>Description</TableHead>
+                <TableHead>Date</TableHead>
+                <TableHead className="text-right">Amount</TableHead>
+                <TableHead className="text-right">Balance</TableHead>
+              </TableRow>
+            </TableHeader>
+            <TableBody>
+              {paginatedTransactions.map((transaction) => {
+                // Determine if transaction is a credit (adds money) or debit (removes money)
+                const isCredit =
+                  transaction.transaction_type === "admin_grant" ||
+                  transaction.transaction_type === "purchase";
 
-              return (
-                <TableRow key={transaction.id}>
-                  <TableCell>
-                    <div
-                      className={`p-2 rounded-full ${
-                        isCredit ? "bg-green-100" : "bg-red-100"
-                      }`}
-                    >
-                      {isCredit ? (
-                        <TrendingUp className="w-4 h-4 text-green-600" />
-                      ) : (
-                        <TrendingDown className="w-4 h-4 text-red-600" />
-                      )}
-                    </div>
-                  </TableCell>
-                  <TableCell>
-                    <p className="font-medium text-doubleword-neutral-900">
-                      {transaction.description || "No description"}
-                    </p>
-                  </TableCell>
-                  <TableCell>
-                    <p className="text-sm text-doubleword-neutral-600">
-                      {formatDate(transaction.created_at)}
-                    </p>
-                  </TableCell>
-                  <TableCell className="text-right">
-                    <p
-                      className={`font-semibold ${
-                        isCredit ? "text-green-600" : "text-red-600"
-                      }`}
-                    >
-                      {isCredit ? "+" : ""}
-                      {formatDollars(transaction.amount)}
-                    </p>
-                  </TableCell>
-                  <TableCell className="text-right">
-                    <p className="text-sm text-doubleword-neutral-600">
-                      {formatDollars(transaction.balance_after)}
-                    </p>
-                  </TableCell>
-                </TableRow>
-              );
-            })}
-          </TableBody>
+                return (
+                  <TableRow key={transaction.id}>
+                    <TableCell>
+                      <div
+                        className={`p-2 rounded-full ${
+                          isCredit ? "bg-green-100" : "bg-red-100"
+                        }`}
+                      >
+                        {isCredit ? (
+                          <TrendingUp className="w-4 h-4 text-green-600" />
+                        ) : (
+                          <TrendingDown className="w-4 h-4 text-red-600" />
+                        )}
+                      </div>
+                    </TableCell>
+                    <TableCell>
+                      <p className="font-medium text-doubleword-neutral-900">
+                        {transaction.description || "No description"}
+                      </p>
+                    </TableCell>
+                    <TableCell>
+                      <p className="text-sm text-doubleword-neutral-600">
+                        {formatDate(transaction.created_at)}
+                      </p>
+                    </TableCell>
+                    <TableCell className="text-right">
+                      <p
+                        className={`font-semibold ${
+                          isCredit ? "text-green-600" : "text-red-600"
+                        }`}
+                      >
+                        {isCredit ? "+" : ""}
+                        {formatDollars(transaction.amount)}
+                      </p>
+                    </TableCell>
+                    <TableCell className="text-right">
+                      <p className="text-sm text-doubleword-neutral-600">
+                        {formatDollars(transaction.balance_after)}
+                      </p>
+                    </TableCell>
+                  </TableRow>
+                );
+              })}
+            </TableBody>
           </Table>
         </div>
 
@@ -345,15 +365,18 @@ export function TransactionHistory({
         {filteredTransactions.length > itemsPerPage && (
           <div className="flex items-center justify-between border-t border-doubleword-neutral-200 pt-2">
             <div className="text-sm text-doubleword-neutral-600">
-              Showing {((currentPage - 1) * itemsPerPage) + 1} to{" "}
-              {Math.min(currentPage * itemsPerPage, filteredTransactions.length)} of{" "}
-              {filteredTransactions.length} transactions
+              Showing {(currentPage - 1) * itemsPerPage + 1} to{" "}
+              {Math.min(
+                currentPage * itemsPerPage,
+                filteredTransactions.length,
+              )}{" "}
+              of {filteredTransactions.length} transactions
             </div>
             <div className="flex items-center gap-2">
               <Button
                 variant="outline"
                 size="sm"
-                onClick={() => setCurrentPage(p => Math.max(1, p - 1))}
+                onClick={() => setCurrentPage((p) => Math.max(1, p - 1))}
                 disabled={currentPage === 1}
               >
                 <ChevronLeft className="w-4 h-4" />
@@ -365,7 +388,9 @@ export function TransactionHistory({
               <Button
                 variant="outline"
                 size="sm"
-                onClick={() => setCurrentPage(p => Math.min(totalPages, p + 1))}
+                onClick={() =>
+                  setCurrentPage((p) => Math.min(totalPages, p + 1))
+                }
                 disabled={currentPage === totalPages}
               >
                 Next

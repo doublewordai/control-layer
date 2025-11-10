@@ -58,6 +58,8 @@ fn apply_pricing_to_response(
         (status = 500, description = "Internal server error"),
     ),
     security(
+        ("BearerAuth" = []),
+        ("CookieAuth" = []),
         ("X-Doubleword-User" = [])
     )
 )]
@@ -313,6 +315,8 @@ pub async fn list_deployed_models(
         (status = 500, description = "Internal server error"),
     ),
     security(
+        ("BearerAuth" = []),
+        ("CookieAuth" = []),
         ("X-Doubleword-User" = [])
     )
 )]
@@ -368,6 +372,8 @@ pub async fn create_deployed_model(
         (status = 500, description = "Internal server error"),
     ),
     security(
+        ("BearerAuth" = []),
+        ("CookieAuth" = []),
         ("X-Doubleword-User" = [])
     )
 )]
@@ -425,6 +431,8 @@ pub async fn update_deployed_model(
         (status = 500, description = "Internal server error"),
     ),
     security(
+        ("BearerAuth" = []),
+        ("CookieAuth" = []),
         ("X-Doubleword-User" = [])
     )
 )]
@@ -505,6 +513,8 @@ pub async fn get_deployed_model(
         (status = 500, description = "Internal server error"),
     ),
     security(
+        ("BearerAuth" = []),
+        ("CookieAuth" = []),
         ("X-Doubleword-User" = [])
     )
 )]

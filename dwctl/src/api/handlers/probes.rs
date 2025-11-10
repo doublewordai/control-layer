@@ -29,6 +29,8 @@ use uuid::Uuid;
         (status = 500, description = "Internal server error"),
     ),
     security(
+        ("BearerAuth" = []),
+        ("CookieAuth" = []),
         ("X-Doubleword-User" = [])
     )
 )]
@@ -58,6 +60,8 @@ pub async fn create_probe(
         (status = 500, description = "Internal server error"),
     ),
     security(
+        ("BearerAuth" = []),
+        ("CookieAuth" = []),
         ("X-Doubleword-User" = [])
     )
 )]
@@ -91,6 +95,8 @@ pub async fn list_probes(
         (status = 500, description = "Internal server error"),
     ),
     security(
+        ("BearerAuth" = []),
+        ("CookieAuth" = []),
         ("X-Doubleword-User" = [])
     )
 )]
@@ -121,6 +127,8 @@ pub async fn get_probe(
         (status = 500, description = "Internal server error"),
     ),
     security(
+        ("BearerAuth" = []),
+        ("CookieAuth" = []),
         ("X-Doubleword-User" = [])
     )
 )]
@@ -151,6 +159,8 @@ pub async fn delete_probe(
         (status = 500, description = "Internal server error"),
     ),
     security(
+        ("BearerAuth" = []),
+        ("CookieAuth" = []),
         ("X-Doubleword-User" = [])
     )
 )]
@@ -181,6 +191,8 @@ pub async fn activate_probe(
         (status = 500, description = "Internal server error"),
     ),
     security(
+        ("BearerAuth" = []),
+        ("CookieAuth" = []),
         ("X-Doubleword-User" = [])
     )
 )]
@@ -213,6 +225,8 @@ pub async fn deactivate_probe(
         (status = 500, description = "Internal server error"),
     ),
     security(
+        ("BearerAuth" = []),
+        ("CookieAuth" = []),
         ("X-Doubleword-User" = [])
     )
 )]
@@ -244,6 +258,8 @@ pub async fn update_probe(
         (status = 500, description = "Internal server error"),
     ),
     security(
+        ("BearerAuth" = []),
+        ("CookieAuth" = []),
         ("X-Doubleword-User" = [])
     )
 )]
@@ -274,6 +290,8 @@ pub async fn execute_probe(
         (status = 500, description = "Internal server error"),
     ),
     security(
+        ("BearerAuth" = []),
+        ("CookieAuth" = []),
         ("X-Doubleword-User" = [])
     )
 )]
@@ -312,6 +330,8 @@ pub async fn test_probe(
         (status = 500, description = "Internal server error"),
     ),
     security(
+        ("BearerAuth" = []),
+        ("CookieAuth" = []),
         ("X-Doubleword-User" = [])
     )
 )]
@@ -344,6 +364,8 @@ pub async fn get_probe_results(
         (status = 500, description = "Internal server error"),
     ),
     security(
+        ("BearerAuth" = []),
+        ("CookieAuth" = []),
         ("X-Doubleword-User" = [])
     )
 )]

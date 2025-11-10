@@ -32,6 +32,8 @@ use sqlx::Acquire;
         ("limit" = Option<i64>, Query, description = "Maximum number of groups to return"),
     ),
     security(
+        ("BearerAuth" = []),
+        ("CookieAuth" = []),
         ("X-Doubleword-User" = [])
     )
 )]
@@ -171,6 +173,8 @@ pub async fn list_groups(
         (status = 500, description = "Internal server error")
     ),
     security(
+        ("BearerAuth" = []),
+        ("CookieAuth" = []),
         ("X-Doubleword-User" = [])
     )
 )]
@@ -203,6 +207,8 @@ pub async fn create_group(
         ("group_id" = uuid::Uuid, Path, description = "Group ID")
     ),
     security(
+        ("BearerAuth" = []),
+        ("CookieAuth" = []),
         ("X-Doubleword-User" = [])
     )
 )]
@@ -241,6 +247,8 @@ pub async fn get_group(
         ("group_id" = uuid::Uuid, Path, description = "Group ID")
     ),
     security(
+        ("BearerAuth" = []),
+        ("CookieAuth" = []),
         ("X-Doubleword-User" = [])
     )
 )]
@@ -274,6 +282,8 @@ pub async fn update_group(
         ("group_id" = uuid::Uuid, Path, description = "Group ID")
     ),
     security(
+        ("BearerAuth" = []),
+        ("CookieAuth" = []),
         ("X-Doubleword-User" = [])
     )
 )]
@@ -311,6 +321,8 @@ pub async fn delete_group(
         ("user_id" = uuid::Uuid, Path, description = "User ID")
     ),
     security(
+        ("BearerAuth" = []),
+        ("CookieAuth" = []),
         ("X-Doubleword-User" = [])
     )
 )]
@@ -342,6 +354,8 @@ pub async fn add_user_to_group(
         ("user_id" = uuid::Uuid, Path, description = "User ID")
     ),
     security(
+        ("BearerAuth" = []),
+        ("CookieAuth" = []),
         ("X-Doubleword-User" = [])
     )
 )]
@@ -372,6 +386,8 @@ pub async fn remove_user_from_group(
         ("group_id" = uuid::Uuid, Path, description = "Group ID")
     ),
     security(
+        ("BearerAuth" = []),
+        ("CookieAuth" = []),
         ("X-Doubleword-User" = [])
     )
 )]
@@ -403,6 +419,8 @@ pub async fn add_group_to_user(
         ("group_id" = uuid::Uuid, Path, description = "Group ID")
     ),
     security(
+        ("BearerAuth" = []),
+        ("CookieAuth" = []),
         ("X-Doubleword-User" = [])
     )
 )]
@@ -433,6 +451,8 @@ pub async fn remove_group_from_user(
         ("group_id" = uuid::Uuid, Path, description = "Group ID")
     ),
     security(
+        ("BearerAuth" = []),
+        ("CookieAuth" = []),
         ("X-Doubleword-User" = [])
     )
 )]
@@ -463,6 +483,8 @@ pub async fn get_group_users(
         ("user_id" = uuid::Uuid, Path, description = "User ID")
     ),
     security(
+        ("BearerAuth" = []),
+        ("CookieAuth" = []),
         ("X-Doubleword-User" = [])
     )
 )]
@@ -511,6 +533,8 @@ pub async fn get_user_groups(
         ("deployment_id" = uuid::Uuid, Path, description = "Deployment ID")
     ),
     security(
+        ("BearerAuth" = []),
+        ("CookieAuth" = []),
         ("X-Doubleword-User" = [])
     )
 )]
@@ -541,6 +565,8 @@ pub async fn add_deployment_to_group(
         ("deployment_id" = uuid::Uuid, Path, description = "Deployment ID")
     ),
     security(
+        ("BearerAuth" = []),
+        ("CookieAuth" = []),
         ("X-Doubleword-User" = [])
     )
 )]
@@ -571,6 +597,8 @@ pub async fn remove_deployment_from_group(
         ("group_id" = uuid::Uuid, Path, description = "Group ID")
     ),
     security(
+        ("BearerAuth" = []),
+        ("CookieAuth" = []),
         ("X-Doubleword-User" = [])
     )
 )]
@@ -601,6 +629,8 @@ pub async fn get_group_deployments(
         ("deployment_id" = uuid::Uuid, Path, description = "Deployment ID")
     ),
     security(
+        ("BearerAuth" = []),
+        ("CookieAuth" = []),
         ("X-Doubleword-User" = [])
     )
 )]

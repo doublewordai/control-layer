@@ -42,7 +42,9 @@ export function AddFundsModal({
       const result = await addFundsMutation.mutateAsync({
         user_id: targetUser.id,
         amount: amountNum,
-        description: description || `Funds gift from ${currentUser?.display_name || currentUser?.username || "admin"}`,
+        description:
+          description ||
+          `Funds gift from ${currentUser?.display_name || currentUser?.username || "admin"}`,
       });
 
       const sentAmount = Number(result.amount).toFixed(2);
@@ -79,8 +81,8 @@ export function AddFundsModal({
         <form onSubmit={handleSubmit} className="space-y-4 mt-4">
           <div>
             <p className="text-sm text-doubleword-neutral-600 mb-4">
-              You are about to add funds to{" "}
-              <strong>{targetUser.name}</strong> ({targetUser.email})
+              You are about to add funds to <strong>{targetUser.name}</strong> (
+              {targetUser.email})
             </p>
           </div>
 

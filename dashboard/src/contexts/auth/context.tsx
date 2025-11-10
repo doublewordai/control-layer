@@ -9,7 +9,7 @@ import type {
   LoginCredentials,
   RegisterCredentials,
 } from "./types";
-import {useSettings} from "@/contexts";
+import { useSettings } from "@/contexts";
 
 interface AuthProviderProps {
   children: ReactNode;

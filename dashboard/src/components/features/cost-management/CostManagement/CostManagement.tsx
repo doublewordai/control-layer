@@ -1,13 +1,8 @@
 import { useEffect } from "react";
-import {
-  useUser,
-  useAddFunds,
-} from "@/api/control-layer";
+import { useUser, useAddFunds } from "@/api/control-layer";
 import { toast } from "sonner";
 import { useSettings } from "@/contexts";
-import {
-  TransactionHistory
-} from "@/components/features/cost-management/CostManagement/TransactionHistory.tsx";
+import { TransactionHistory } from "@/components/features/cost-management/CostManagement/TransactionHistory.tsx";
 
 export function CostManagement() {
   const { isFeatureEnabled, settings } = useSettings();
@@ -22,24 +17,24 @@ export function CostManagement() {
     if (isDemoMode) return;
 
     const urlParams = new URLSearchParams(window.location.search);
-    const paymentComplete = urlParams.get('payment_complete');
+    const paymentComplete = urlParams.get("payment_complete");
 
-    if (paymentComplete === 'true') {
+    if (paymentComplete === "true") {
       // Show success message
-      toast.success('Payment completed! Your balance has been updated.');
+      toast.success("Payment completed! Your balance has been updated.");
 
       // Refetch user data to get latest balance
       refetchUser();
 
       // Clean up URL
-      window.history.replaceState({}, '', window.location.pathname);
+      window.history.replaceState({}, "", window.location.pathname);
     }
   }, [isDemoMode, refetchUser]);
 
   const handleAddFunds = async () => {
     if (isDemoMode) {
       // Demo mode: Call the API (which will be intercepted by MSW)
-      const fundAmount = 100.00;
+      const fundAmount = 100.0;
       try {
         await addFundsMutation.mutateAsync({
           user_id: user?.id || "",

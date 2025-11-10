@@ -1,5 +1,5 @@
 use utoipa::{
-    openapi::security::{ApiKey, ApiKeyValue, SecurityScheme},
+    openapi::security::{ApiKey, ApiKeyValue, HttpAuthScheme, HttpBuilder, SecurityScheme},
     Modify, OpenApi,
 };
 
@@ -10,6 +10,25 @@ struct SecurityAddon;
 impl Modify for SecurityAddon {
     fn modify(&self, openapi: &mut utoipa::openapi::OpenApi) {
         if let Some(components) = openapi.components.as_mut() {
+            // Add Bearer token authentication (API keys)
+            components.security_schemes.insert(
+                "BearerAuth".to_string(),
+                SecurityScheme::Http(
+                    HttpBuilder::new()
+                        .scheme(HttpAuthScheme::Bearer)
+                        .bearer_format("API Key")
+                        .description(Some("Enter your API key"))
+                        .build(),
+                ),
+            );
+
+            // Add session cookie authentication (JWT)
+            components.security_schemes.insert(
+                "CookieAuth".to_string(),
+                SecurityScheme::ApiKey(ApiKey::Cookie(ApiKeyValue::new("session"))),
+            );
+
+            // Add proxy header authentication (legacy)
             components.security_schemes.insert(
                 "X-Doubleword-User".to_string(),
                 SecurityScheme::ApiKey(ApiKey::Header(ApiKeyValue::new("X-Doubleword-User"))),
