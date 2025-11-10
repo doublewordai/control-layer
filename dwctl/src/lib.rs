@@ -554,6 +554,8 @@ pub struct BackgroundServices {
     onwards_targets: onwards::target::Targets,
     background_tasks: Vec<tokio::task::JoinHandle<()>>,
     shutdown_token: tokio_util::sync::CancellationToken,
+    // Pub so that we can disarm it if we want to
+    pub drop_guard: Option<tokio_util::sync::DropGuard>,
 }
 
 impl BackgroundServices {
@@ -576,6 +578,7 @@ async fn setup_background_services(
     config: Config,
     shutdown_token: tokio_util::sync::CancellationToken,
 ) -> anyhow::Result<BackgroundServices> {
+    let drop_guard = shutdown_token.clone().drop_guard();
     // Track all background task handles for graceful shutdown
     let mut background_tasks = Vec::new();
 
@@ -783,6 +786,7 @@ async fn setup_background_services(
         onwards_targets: initial_targets,
         background_tasks,
         shutdown_token,
+        drop_guard: Some(drop_guard),
     })
 }
 
@@ -909,7 +913,7 @@ mod test {
     #[test_log::test]
     async fn test_admin_ai_proxy_middleware_with_user_access(pool: PgPool) {
         // Create test app (handles all setup including database seeding)
-        let (server, bg_services) = crate::test_utils::create_test_app(pool.clone(), true).await;
+        let (server, _bg_services) = crate::test_utils::create_test_app(pool.clone(), true).await;
 
         // Create test users
         let admin_user = create_test_admin_user(&pool, Role::PlatformManager).await;
@@ -1009,7 +1013,7 @@ mod test {
         );
 
         // Manually trigger shutdown to clean up background tasks
-        bg_services.shutdown().await;
+        // bg_services.shutdown().await;
     }
 
     #[sqlx::test]

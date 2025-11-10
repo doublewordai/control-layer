@@ -386,6 +386,8 @@ mod tests {
         db::models::deployments::{DeploymentDBResponse, ModelStatus},
         sync::onwards_config::{convert_to_config_file, SyncConfig},
     };
+    use tokio::sync::mpsc;
+    use tokio_util::sync::CancellationToken;
 
     // Helper function to create a test deployed model
     fn create_test_model(name: &str, alias: &str, endpoint_id: Uuid) -> DeploymentDBResponse {
@@ -547,9 +549,6 @@ mod tests {
     #[sqlx::test]
     #[test_log::test]
     async fn test_onwards_config_reconnects_after_connection_loss(pool: sqlx::PgPool) {
-        use tokio::sync::mpsc;
-        use tokio_util::sync::CancellationToken;
-
         // Start the onwards config sync with status channel
         let (sync, _initial_targets, _stream) = super::OnwardsConfigSync::new(pool.clone())
             .await
@@ -595,9 +594,6 @@ mod tests {
                 .expect("Failed to terminate backend");
         }
         println!("Killed LISTEN connections");
-
-        // Give the connection time to detect it's been terminated
-        tokio::time::sleep(Duration::from_millis(500)).await;
 
         // Wait for reconnection status events
         println!("Waiting for Disconnected status...");
