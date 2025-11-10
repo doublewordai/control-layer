@@ -405,8 +405,6 @@ mod tests {
         db::models::deployments::{DeploymentDBResponse, ModelStatus},
         sync::onwards_config::{convert_to_config_file, SyncConfig},
     };
-    use tokio::sync::mpsc;
-    use tokio_util::sync::CancellationToken;
 
     // Helper function to create a test deployed model
     fn create_test_model(name: &str, alias: &str, endpoint_id: Uuid) -> DeploymentDBResponse {
@@ -615,11 +613,7 @@ mod tests {
         let shutdown_token = CancellationToken::new();
         let _drop_guard = shutdown_token.clone().drop_guard();
 
-        let sync = super::OnwardsConfigSync {
-            db: pool.clone(),
-            sender,
-            shutdown_token: shutdown_token.clone(),
-        };
+        let sync = super::OnwardsConfigSync { db: pool.clone(), sender };
 
         // Verify initial pricing
         let initial_target = initial_targets
@@ -645,7 +639,7 @@ mod tests {
             status_tx: Some(status_tx),
         };
         tokio::spawn(async move {
-            if let Err(e) = sync.start(config).await {
+            if let Err(e) = sync.start(config, shutdown_token).await {
                 eprintln!("Sync task failed: {}", e);
             }
         });

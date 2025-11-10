@@ -2595,6 +2595,7 @@ mod tests {
                 user_id: user_with_credits.id,
                 requests_per_second: None,
                 burst_size: None,
+                purpose: ApiKeyPurpose::Inference,
             })
             .await
             .unwrap();
@@ -2606,6 +2607,7 @@ mod tests {
                 user_id: user_without_credits.id,
                 requests_per_second: None,
                 burst_size: None,
+                purpose: ApiKeyPurpose::Inference,
             })
             .await
             .unwrap();
@@ -2727,6 +2729,7 @@ mod tests {
                     description: None,
                     requests_per_second: None,
                     burst_size: None,
+                    purpose: ApiKeyPurpose::Inference,
                 })
                 .await
                 .unwrap();
@@ -2786,6 +2789,7 @@ mod tests {
                     description: None,
                     requests_per_second: None,
                     burst_size: None,
+                    purpose: ApiKeyPurpose::Inference,
                 })
                 .await
                 .unwrap();
@@ -2847,6 +2851,7 @@ mod tests {
                     description: None,
                     requests_per_second: None,
                     burst_size: None,
+                    purpose: ApiKeyPurpose::Inference,
                 })
                 .await
                 .unwrap();
@@ -2933,6 +2938,7 @@ mod tests {
                     description: None,
                     requests_per_second: None,
                     burst_size: None,
+                    purpose: ApiKeyPurpose::Inference,
                 })
                 .await
                 .unwrap();
@@ -3071,6 +3077,7 @@ mod tests {
                 user_id: user_no_credits.id,
                 requests_per_second: None,
                 burst_size: None,
+                purpose: ApiKeyPurpose::Inference,
             })
             .await
             .unwrap();
@@ -3198,6 +3205,7 @@ mod tests {
                 user_id: user_no_credits.id,
                 requests_per_second: None,
                 burst_size: None,
+                purpose: ApiKeyPurpose::Inference,
             })
             .await
             .unwrap();
@@ -3325,6 +3333,7 @@ mod tests {
                 user_id: user_no_credits.id,
                 requests_per_second: None,
                 burst_size: None,
+                purpose: ApiKeyPurpose::Inference,
             })
             .await
             .unwrap();
