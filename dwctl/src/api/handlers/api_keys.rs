@@ -342,7 +342,7 @@ mod tests {
     #[sqlx::test]
     #[test_log::test]
     async fn test_create_api_key_for_self(pool: PgPool) {
-        let (app, _) = create_test_app(pool.clone(), false).await;
+        let (app, _bg_services) = create_test_app(pool.clone(), false).await;
         let user = create_test_user(&pool, Role::StandardUser).await;
         let group = create_test_group(&pool).await;
         add_user_to_group(&pool, user.id, group.id).await;
@@ -368,7 +368,7 @@ mod tests {
     #[sqlx::test]
     #[test_log::test]
     async fn test_create_api_key_for_other_user_as_admin(pool: PgPool) {
-        let (app, _) = create_test_app(pool.clone(), false).await;
+        let (app, _bg_services) = create_test_app(pool.clone(), false).await;
         let admin_user = create_test_admin_user(&pool, Role::PlatformManager).await;
         let regular_user = create_test_user(&pool, Role::StandardUser).await;
         let group = create_test_group(&pool).await;
@@ -394,7 +394,7 @@ mod tests {
     #[sqlx::test]
     #[test_log::test]
     async fn test_create_api_key_for_other_user_as_non_admin_forbidden(pool: PgPool) {
-        let (app, _) = create_test_app(pool.clone(), false).await;
+        let (app, _bg_services) = create_test_app(pool.clone(), false).await;
         let user1 = create_test_user(&pool, Role::StandardUser).await;
         let user2 = create_test_user(&pool, Role::StandardUser).await;
 
@@ -415,7 +415,7 @@ mod tests {
     #[sqlx::test]
     #[test_log::test]
     async fn test_list_user_api_keys(pool: PgPool) {
-        let (app, _) = create_test_app(pool.clone(), false).await;
+        let (app, _bg_services) = create_test_app(pool.clone(), false).await;
         let user = create_test_user(&pool, Role::StandardUser).await;
         let group = create_test_group(&pool).await;
         add_user_to_group(&pool, user.id, group.id).await;
@@ -436,7 +436,7 @@ mod tests {
     #[sqlx::test]
     #[test_log::test]
     async fn test_list_user_api_keys_with_pagination_query_params(pool: PgPool) {
-        let (app, _) = create_test_app(pool.clone(), false).await;
+        let (app, _bg_services) = create_test_app(pool.clone(), false).await;
         let user = create_test_user(&pool, Role::StandardUser).await;
         let group = create_test_group(&pool).await;
         add_user_to_group(&pool, user.id, group.id).await;
@@ -489,7 +489,7 @@ mod tests {
     #[sqlx::test]
     #[test_log::test]
     async fn test_delete_user_api_key_for_self(pool: PgPool) {
-        let (app, _) = create_test_app(pool.clone(), false).await;
+        let (app, _bg_services) = create_test_app(pool.clone(), false).await;
         let user = create_test_user(&pool, Role::StandardUser).await;
         let group = create_test_group(&pool).await;
         add_user_to_group(&pool, user.id, group.id).await;
@@ -516,7 +516,7 @@ mod tests {
     #[sqlx::test]
     #[test_log::test]
     async fn test_delete_user_api_key_for_other_user_as_admin(pool: PgPool) {
-        let (app, _) = create_test_app(pool.clone(), false).await;
+        let (app, _bg_services) = create_test_app(pool.clone(), false).await;
         let admin_user = create_test_admin_user(&pool, Role::PlatformManager).await;
         let regular_user = create_test_user(&pool, Role::StandardUser).await;
         let group = create_test_group(&pool).await;
@@ -544,7 +544,7 @@ mod tests {
     #[sqlx::test]
     #[test_log::test]
     async fn test_delete_user_api_key_for_other_user_as_non_admin_forbidden(pool: PgPool) {
-        let (app, _) = create_test_app(pool.clone(), false).await;
+        let (app, _bg_services) = create_test_app(pool.clone(), false).await;
         let user1 = create_test_user(&pool, Role::StandardUser).await;
         let user2 = create_test_user(&pool, Role::StandardUser).await;
         let group = create_test_group(&pool).await;
@@ -572,7 +572,7 @@ mod tests {
     #[sqlx::test]
     #[test_log::test]
     async fn test_delete_nonexistent_api_key_returns_not_found(pool: PgPool) {
-        let (app, _) = create_test_app(pool.clone(), false).await;
+        let (app, _bg_services) = create_test_app(pool.clone(), false).await;
         let user = create_test_user(&pool, Role::StandardUser).await;
         let group = create_test_group(&pool).await;
         add_user_to_group(&pool, user.id, group.id).await;
@@ -589,7 +589,7 @@ mod tests {
     #[sqlx::test]
     #[test_log::test]
     async fn test_delete_api_key_belonging_to_different_user_returns_not_found(pool: PgPool) {
-        let (app, _) = create_test_app(pool.clone(), false).await;
+        let (app, _bg_services) = create_test_app(pool.clone(), false).await;
         let user1 = create_test_user(&pool, Role::StandardUser).await;
         let user2 = create_test_user(&pool, Role::StandardUser).await;
         let group = create_test_group(&pool).await;
@@ -611,7 +611,7 @@ mod tests {
     #[sqlx::test]
     #[test_log::test]
     async fn test_list_api_keys_for_other_user_as_admin(pool: PgPool) {
-        let (app, _) = create_test_app(pool.clone(), false).await;
+        let (app, _bg_services) = create_test_app(pool.clone(), false).await;
         let admin_user = create_test_admin_user(&pool, Role::PlatformManager).await;
         let regular_user = create_test_user(&pool, Role::StandardUser).await;
         let group = create_test_group(&pool).await;
@@ -639,7 +639,7 @@ mod tests {
     #[sqlx::test]
     #[test_log::test]
     async fn test_list_api_keys_for_other_user_as_non_admin_forbidden(pool: PgPool) {
-        let (app, _) = create_test_app(pool.clone(), false).await;
+        let (app, _bg_services) = create_test_app(pool.clone(), false).await;
         let user1 = create_test_user(&pool, Role::StandardUser).await;
         let user2 = create_test_user(&pool, Role::StandardUser).await;
         let group = create_test_group(&pool).await;
@@ -657,7 +657,7 @@ mod tests {
     #[sqlx::test]
     #[test_log::test]
     async fn test_get_api_key_for_other_user_as_admin(pool: PgPool) {
-        let (app, _) = create_test_app(pool.clone(), false).await;
+        let (app, _bg_services) = create_test_app(pool.clone(), false).await;
         let admin_user = create_test_admin_user(&pool, Role::PlatformManager).await;
         let regular_user = create_test_user(&pool, Role::StandardUser).await;
         let group = create_test_group(&pool).await;
@@ -678,7 +678,7 @@ mod tests {
     #[sqlx::test]
     #[test_log::test]
     async fn test_get_api_key_for_other_user_as_non_admin_forbidden(pool: PgPool) {
-        let (app, _) = create_test_app(pool.clone(), false).await;
+        let (app, _bg_services) = create_test_app(pool.clone(), false).await;
         let user1 = create_test_user(&pool, Role::StandardUser).await;
         let user2 = create_test_user(&pool, Role::StandardUser).await;
         let group = create_test_group(&pool).await;
@@ -696,7 +696,7 @@ mod tests {
     #[sqlx::test]
     #[test_log::test]
     async fn test_request_viewer_cannot_manage_api_keys(pool: PgPool) {
-        let (app, _) = create_test_app(pool.clone(), false).await;
+        let (app, _bg_services) = create_test_app(pool.clone(), false).await;
         let request_viewer = create_test_user(&pool, Role::RequestViewer).await;
         let standard_user = create_test_user(&pool, Role::StandardUser).await;
 
@@ -734,7 +734,7 @@ mod tests {
     #[sqlx::test]
     #[test_log::test]
     async fn test_multi_role_user_api_key_permissions(pool: PgPool) {
-        let (app, _) = create_test_app(pool.clone(), false).await;
+        let (app, _bg_services) = create_test_app(pool.clone(), false).await;
 
         // Create a user with both StandardUser and RequestViewer roles
         let multi_role_user = create_test_user_with_roles(&pool, vec![Role::StandardUser, Role::RequestViewer]).await;
@@ -787,7 +787,7 @@ mod tests {
     #[sqlx::test]
     #[test_log::test]
     async fn test_platform_manager_full_api_key_access(pool: PgPool) {
-        let (app, _) = create_test_app(pool.clone(), false).await;
+        let (app, _bg_services) = create_test_app(pool.clone(), false).await;
         let platform_manager = create_test_user(&pool, Role::PlatformManager).await;
         let standard_user = create_test_user(&pool, Role::StandardUser).await;
         let group = create_test_group(&pool).await;
@@ -838,7 +838,7 @@ mod tests {
     #[sqlx::test]
     #[test_log::test]
     async fn test_api_key_isolation_between_users(pool: PgPool) {
-        let (app, _) = create_test_app(pool.clone(), false).await;
+        let (app, _bg_services) = create_test_app(pool.clone(), false).await;
         let user1 = create_test_user(&pool, Role::StandardUser).await;
         let user2 = create_test_user(&pool, Role::StandardUser).await;
         let group = create_test_group(&pool).await;
@@ -883,7 +883,7 @@ mod tests {
     #[sqlx::test]
     #[test_log::test]
     async fn test_error_messages_are_user_friendly(pool: PgPool) {
-        let (app, _) = create_test_app(pool.clone(), false).await;
+        let (app, _bg_services) = create_test_app(pool.clone(), false).await;
         let user1 = create_test_user(&pool, Role::StandardUser).await;
         let user2 = create_test_user(&pool, Role::StandardUser).await;
 
@@ -905,7 +905,7 @@ mod tests {
     #[sqlx::test]
     #[test_log::test]
     async fn test_get_specific_api_key_for_self(pool: PgPool) {
-        let (app, _) = create_test_app(pool.clone(), false).await;
+        let (app, _bg_services) = create_test_app(pool.clone(), false).await;
         let user = create_test_user(&pool, Role::StandardUser).await;
         let group = create_test_group(&pool).await;
         add_user_to_group(&pool, user.id, group.id).await;
@@ -927,7 +927,7 @@ mod tests {
     #[sqlx::test]
     #[test_log::test]
     async fn test_api_key_creation_returns_key_value_only_once(pool: PgPool) {
-        let (app, _) = create_test_app(pool.clone(), false).await;
+        let (app, _bg_services) = create_test_app(pool.clone(), false).await;
         let user = create_test_user(&pool, Role::StandardUser).await;
         let group = create_test_group(&pool).await;
         add_user_to_group(&pool, user.id, group.id).await;

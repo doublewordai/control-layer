@@ -2275,13 +2275,17 @@ impl<H: HttpClient + 'static> DaemonExecutor<H> for PostgresRequestManager<H> {
         &self.config
     }
 
-    fn run(self: Arc<Self>) -> Result<JoinHandle<Result<()>>> {
+    fn run(
+        self: Arc<Self>,
+        shutdown_token: tokio_util::sync::CancellationToken,
+    ) -> Result<JoinHandle<Result<()>>> {
         tracing::info!("Starting PostgreSQL request manager daemon");
 
         let daemon = Arc::new(Daemon::new(
             self.clone(),
             self.http_client.clone(),
             self.config.clone(),
+            shutdown_token,
         ));
 
         let handle = tokio::spawn(async move { daemon.run().await });
