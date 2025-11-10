@@ -47,6 +47,16 @@
         "ordinal": 8,
         "name": "burst_size",
         "type_info": "Int4"
+      },
+      {
+        "ordinal": 9,
+        "name": "purpose",
+        "type_info": "Varchar"
+      },
+      {
+        "ordinal": 10,
+        "name": "hidden",
+        "type_info": "Bool"
       }
     ],
     "parameters": {
@@ -67,7 +77,9 @@
       false,
       true,
       true,
-      true
+      true,
+      false,
+      false
     ]
   },
   "hash": "09139014124c382fced3c0e35c87b437d5d1ba4b5a17788b3b5352428151128f"

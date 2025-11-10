@@ -28,8 +28,21 @@ const ROLE_PERMISSIONS: Record<Role, PagePermission[]> = {
     "profile",
     "manage-groups",
   ],
-  StandardUser: ["models", "api-keys", "playground", "cost-management", "profile"],
-  RequestViewer: ["models", "endpoints", "analytics", "cost-management", "profile", "settings"],
+  StandardUser: [
+    "models",
+    "api-keys",
+    "playground",
+    "cost-management",
+    "profile",
+  ],
+  RequestViewer: [
+    "models",
+    "endpoints",
+    "analytics",
+    "cost-management",
+    "profile",
+    "settings",
+  ],
 };
 
 // Map route paths to permissions
