@@ -637,3 +637,115 @@ describe("Type Safety", () => {
     expect(Object.values(modelsWithGroups)[0].groups).toBeDefined();
   });
 });
+
+describe("dwctlApi.cost", () => {
+  describe("listTransactions", () => {
+    it("should fetch transactions without query parameters", async () => {
+      const transactions = await dwctlApi.cost.listTransactions();
+
+      expect(transactions).toBeInstanceOf(Array);
+      expect(transactions.length).toBeGreaterThan(0);
+      expect(transactions[0]).toHaveProperty("id");
+      expect(transactions[0]).toHaveProperty("user_id");
+      expect(transactions[0]).toHaveProperty("transaction_type");
+      expect(transactions[0]).toHaveProperty("amount");
+      expect(transactions[0]).toHaveProperty("balance_after");
+      expect(transactions[0]).toHaveProperty("created_at");
+    });
+
+    it("should fetch transactions with userId filter", async () => {
+      const userId = "550e8400-e29b-41d4-a716-446655440001";
+      const transactions = await dwctlApi.cost.listTransactions({
+        userId,
+      });
+
+      expect(transactions).toBeInstanceOf(Array);
+      expect(transactions.every((t) => t.user_id === userId)).toBe(true);
+    });
+
+    it("should fetch transactions with pagination", async () => {
+      const transactions = await dwctlApi.cost.listTransactions({
+        limit: 5,
+        skip: 0,
+      });
+
+      expect(transactions).toBeInstanceOf(Array);
+      expect(transactions.length).toBeLessThanOrEqual(5);
+    });
+
+    it("should return transactions with correct types", async () => {
+      const transactions = await dwctlApi.cost.listTransactions();
+      const transaction = transactions[0];
+
+      expect(typeof transaction.id).toBe("string");
+      expect(typeof transaction.user_id).toBe("string");
+      expect(typeof transaction.amount).toBe("number");
+      expect(typeof transaction.balance_after).toBe("number");
+      expect(typeof transaction.created_at).toBe("string");
+      expect(["admin_grant", "admin_removal", "usage", "purchase"]).toContain(
+        transaction.transaction_type,
+      );
+    });
+  });
+
+  describe("addFunds", () => {
+    it("should add funds to a user account", async () => {
+      const userId = "550e8400-e29b-41d4-a716-446655440001";
+      const amount = 100.0;
+
+      const result = await dwctlApi.cost.addFunds({
+        user_id: userId,
+        amount,
+        description: "Test fund addition",
+      });
+
+      expect(result).toHaveProperty("id");
+      expect(result.user_id).toBe(userId);
+      expect(result.amount).toBe(amount);
+      expect(result.transaction_type).toBe("admin_grant");
+      expect(result.balance_after).toBeGreaterThan(0);
+    });
+
+    it("should handle funds addition without description", async () => {
+      const userId = "550e8400-e29b-41d4-a716-446655440002";
+      const amount = 50.0;
+
+      const result = await dwctlApi.cost.addFunds({
+        user_id: userId,
+        amount,
+      });
+
+      expect(result).toHaveProperty("id");
+      expect(result.user_id).toBe(userId);
+      expect(result.amount).toBe(amount);
+    });
+
+    it("should throw error for invalid user", async () => {
+      await expect(
+        dwctlApi.cost.addFunds({
+          user_id: "non-existent-user",
+          amount: 100,
+        }),
+      ).rejects.toThrow();
+    });
+  });
+});
+
+describe("User Billing Integration", () => {
+  it("should include billing data when requested", async () => {
+    const userId = "550e8400-e29b-41d4-a716-446655440001";
+    const user = await dwctlApi.users.get(userId);
+
+    // Billing should be included by default now
+    expect(user).toHaveProperty("credit_balance");
+    expect(typeof user.credit_balance).toBe("number");
+  });
+
+  it("should include billing with groups when both requested", async () => {
+    const users = await dwctlApi.users.list({ include: "groups" });
+
+    expect(users[0]).toHaveProperty("credit_balance");
+    expect(users[0]).toHaveProperty("groups");
+    expect(Array.isArray(users[0].groups)).toBe(true);
+  });
+});

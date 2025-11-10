@@ -3,6 +3,7 @@ import { z } from "zod";
 export type ModelType = "CHAT" | "EMBEDDINGS" | "RERANKER";
 export type AuthSource = "vouch" | "native" | "system" | "proxy-header";
 export type Role = "PlatformManager" | "RequestViewer" | "StandardUser";
+export type ApiKeyPurpose = "platform" | "inference";
 
 // Config/Metadata types
 export interface ConfigResponse {
@@ -100,12 +101,14 @@ export interface User {
   created_at: string; // ISO 8601 timestamp
   updated_at: string; // ISO 8601 timestamp
   auth_source: AuthSource;
+  credit_balance?: number; // User's balance in dollars (backend field name is credit_balance)
 }
 
 export interface ApiKey {
   id: string;
   name: string;
   description?: string;
+  purpose: ApiKeyPurpose; // Purpose of the key: platform (for /admin/api/*) or inference (for /ai/*)
   created_at: string; // ISO 8601 timestamp
   last_used?: string; // ISO 8601 timestamp
   requests_per_second?: number | null; // Rate limiting: requests per second
@@ -176,6 +179,7 @@ export interface GroupCreateRequest {
 export interface ApiKeyCreateRequest {
   name: string;
   description?: string;
+  purpose: ApiKeyPurpose; // Required: purpose of the key
   requests_per_second?: number | null;
   burst_size?: number | null;
 }
@@ -559,6 +563,53 @@ export interface ChangePasswordRequest {
 
 // User response type alias for auth responses
 export type UserResponse = User;
+
+// ===== COST MANAGEMENT TYPES =====
+
+// Backend transaction type enum
+export type TransactionType =
+  | "admin_grant"
+  | "admin_removal"
+  | "usage"
+  | "purchase";
+
+export interface Transaction {
+  id: string;
+  user_id: string; // UUID
+  transaction_type: TransactionType;
+  amount: number; // Amount in dollars
+  balance_after: number; // Balance in dollars
+  previous_transaction_id?: string; // UUID
+  source_id: string;
+  description?: string;
+  created_at: string; // ISO 8601 timestamp
+}
+
+export interface BalanceResponse {
+  balance: number; // Balance in dollars
+  currency: string; // e.g., "USD"
+}
+
+export interface TransactionsListResponse {
+  transactions: Transaction[];
+  total: number;
+  limit: number;
+  offset: number;
+}
+
+export interface TransactionsQuery {
+  limit?: number;
+  skip?: number;
+  userId?: string; // Filter transactions by user (UUID)
+}
+
+export interface AddFundsRequest {
+  user_id: string; // UUID of the user to add funds to
+  amount: number; // Amount in dollars
+  description?: string;
+}
+
+export type AddFundsResponse = Transaction;
 
 // Probe types
 export interface Probe {

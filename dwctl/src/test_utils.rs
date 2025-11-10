@@ -1,4 +1,4 @@
-use crate::config::{NativeAuthConfig, ProxyHeaderAuthConfig, SecurityConfig};
+use crate::config::{BatchConfig, FilesConfig, NativeAuthConfig, ProxyHeaderAuthConfig, SecurityConfig};
 use crate::db::handlers::inference_endpoints::{InferenceEndpointFilter, InferenceEndpoints};
 use crate::db::handlers::repository::Repository;
 use crate::errors::Error;
@@ -18,30 +18,60 @@ use crate::{
         },
     },
 };
+use sqlx::ConnectOptions;
 
 use axum_test::TestServer;
-use sqlx::{PgConnection, PgPool};
-use tokio_util::sync::DropGuard;
+use sqlx::{Executor, PgConnection, PgPool};
 use uuid::Uuid;
 
-pub async fn create_test_app(pool: PgPool, enable_sync: bool) -> (TestServer, Option<DropGuard>) {
-    let config = create_test_config();
-    let (router, onwards_config_sync, drop_guard) = crate::setup_app(pool, config, true).await.expect("Failed to setup test app");
+/// Set up fusillade schema and run migrations for tests
+/// Only call this for tests that need fusillade (e.g., files tests)
+/// Returns a pool with search_path set to fusillade schema
+pub async fn setup_fusillade_for_tests(pool: &PgPool) -> PgPool {
+    // Create fusillade schema
+    pool.execute("CREATE SCHEMA IF NOT EXISTS fusillade")
+        .await
+        .expect("Failed to create fusillade schema");
 
-    if enable_sync {
-        // Start the config sync in background for tests
-        tokio::spawn(async move {
-            if let Err(e) = onwards_config_sync.start(Default::default()).await {
-                eprintln!("Config sync error in test: {e}");
-            }
-        });
+    // Get connection options from the existing pool
+    let conn_options = pool.connect_options();
 
-        let server = TestServer::new(router).expect("Failed to create test server");
-        (server, Some(drop_guard))
-    } else {
-        let server = TestServer::new(router).expect("Failed to create test server");
-        (server, None)
-    }
+    // Create a pool with search_path set to fusillade
+    let fusillade_pool = sqlx::postgres::PgPoolOptions::new()
+        .max_connections(5)
+        .after_connect(|conn, _meta| {
+            Box::pin(async move {
+                conn.execute("SET search_path = 'fusillade'").await?;
+                Ok(())
+            })
+        })
+        .connect_with((*conn_options).clone())
+        .await
+        .expect("Failed to create fusillade pool");
+
+    // Run fusillade migrations
+    fusillade::migrator()
+        .run(&fusillade_pool)
+        .await
+        .expect("Failed to run fusillade migrations");
+
+    fusillade_pool
+}
+
+pub async fn create_test_app(pool: PgPool, _enable_sync: bool) -> (TestServer, crate::BackgroundServices) {
+    let mut config = create_test_config();
+    // Override database config to use the test pool
+    config.database = crate::config::DatabaseConfig::External {
+        url: pool.connect_options().to_url_lossy().to_string(),
+    };
+    // Disable leader election for tests
+    config.leader_election.enabled = false;
+
+    // Create application using the same infrastructure as production
+    let app = crate::Application::new(config).await.expect("Failed to create application");
+
+    // Convert to test server (sync is always enabled in new())
+    app.into_test_server()
 }
 
 pub fn create_test_config() -> crate::config::Config {
@@ -76,6 +106,15 @@ pub fn create_test_config() -> crate::config::Config {
         enable_metrics: false,
         enable_request_logging: false,
         enable_otel_export: false,
+        batches: BatchConfig {
+            enabled: true,
+            files: FilesConfig {
+                max_file_size: 1000 * 1024 * 1024, //1GB
+                ..Default::default()
+            },
+            ..Default::default()
+        },
+        leader_election: crate::config::LeaderElectionConfig::default(),
     }
 }
 
@@ -226,6 +265,7 @@ pub async fn create_test_api_key_for_user(pool: &PgPool, user_id: UserId) -> Api
         ApiKeyCreate {
             name: "Test API Key".to_string(),
             description: Some("Test description".to_string()),
+            purpose: crate::db::models::api_keys::ApiKeyPurpose::Inference,
             requests_per_second: None,
             burst_size: None,
         },

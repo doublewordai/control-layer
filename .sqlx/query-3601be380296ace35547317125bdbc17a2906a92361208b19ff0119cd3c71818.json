@@ -1,0 +1,58 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n            SELECT\n                p.id as probe_id,\n                p.http_method,\n                p.request_path,\n                p.request_body,\n                d.alias,\n                d.type as model_type,\n                ak.secret as system_api_key\n            FROM probes p\n            JOIN deployed_models d ON p.deployment_id = d.id\n            CROSS JOIN api_keys ak\n            WHERE p.id = $1 AND ak.id = '00000000-0000-0000-0000-000000000000'::uuid\n            ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "probe_id",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 1,
+        "name": "http_method",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 2,
+        "name": "request_path",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 3,
+        "name": "request_body",
+        "type_info": "Jsonb"
+      },
+      {
+        "ordinal": 4,
+        "name": "alias",
+        "type_info": "Varchar"
+      },
+      {
+        "ordinal": 5,
+        "name": "model_type",
+        "type_info": "Varchar"
+      },
+      {
+        "ordinal": 6,
+        "name": "system_api_key",
+        "type_info": "Varchar"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid"
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      true,
+      true,
+      false,
+      true,
+      false
+    ]
+  },
+  "hash": "3601be380296ace35547317125bdbc17a2906a92361208b19ff0119cd3c71818"
+}

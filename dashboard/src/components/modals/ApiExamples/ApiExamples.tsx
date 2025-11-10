@@ -54,6 +54,7 @@ const ApiExamplesModal: React.FC<ApiExamplesModalProps> = ({
         data: {
           name: newKeyName.trim(),
           description: newKeyDescription.trim() || undefined,
+          purpose: "inference",
         },
       });
 

@@ -1,0 +1,88 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n            SELECT * FROM batch_status\n            WHERE file_id = $1\n            ORDER BY created_at DESC\n            ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "batch_id",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 1,
+        "name": "file_id",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 2,
+        "name": "file_name",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 3,
+        "name": "total_requests",
+        "type_info": "Int8"
+      },
+      {
+        "ordinal": 4,
+        "name": "pending_requests",
+        "type_info": "Int8"
+      },
+      {
+        "ordinal": 5,
+        "name": "in_progress_requests",
+        "type_info": "Int8"
+      },
+      {
+        "ordinal": 6,
+        "name": "completed_requests",
+        "type_info": "Int8"
+      },
+      {
+        "ordinal": 7,
+        "name": "failed_requests",
+        "type_info": "Int8"
+      },
+      {
+        "ordinal": 8,
+        "name": "canceled_requests",
+        "type_info": "Int8"
+      },
+      {
+        "ordinal": 9,
+        "name": "started_at",
+        "type_info": "Timestamptz"
+      },
+      {
+        "ordinal": 10,
+        "name": "last_updated_at",
+        "type_info": "Timestamptz"
+      },
+      {
+        "ordinal": 11,
+        "name": "created_at",
+        "type_info": "Timestamptz"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid"
+      ]
+    },
+    "nullable": [
+      true,
+      true,
+      true,
+      true,
+      true,
+      true,
+      true,
+      true,
+      true,
+      true,
+      true,
+      true
+    ]
+  },
+  "hash": "fbf96a79ebe7906c11815063d59a8aef1c28012d256038ef9fde8367d3dd4759"
+}

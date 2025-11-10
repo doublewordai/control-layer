@@ -12,12 +12,14 @@ import {
   ExternalLink,
   LogOut,
   ChevronUp,
+  DollarSign,
 } from "lucide-react";
 import { useUser, useConfig } from "../../../api/control-layer/hooks";
 import { UserAvatar } from "../../ui";
 import { useAuthorization } from "../../../utils";
 import { useAuth } from "../../../contexts/auth";
 import { useSettings } from "../../../contexts";
+import type { FeatureFlags } from "../../../contexts/settings/types";
 import onwardsLogo from "../../../assets/onwards-logo.svg";
 import {
   Sidebar,
@@ -41,6 +43,14 @@ import {
   DropdownMenuTrigger,
 } from "@/components/ui/dropdown-menu";
 
+interface NavItem {
+  path: string;
+  icon: React.ComponentType<{ className?: string }>;
+  label: string;
+  featureFlag?: keyof FeatureFlags;
+  demoOnly?: boolean;
+}
+
 export function AppSidebar() {
   const navigate = useNavigate();
   const { data: currentUser, isLoading: loading } = useUser("current");
@@ -48,25 +58,34 @@ export function AppSidebar() {
   const { logout } = useAuth();
   const { isFeatureEnabled } = useSettings();
 
-  const allNavItems = [
+  const allNavItems: NavItem[] = [
     { path: "/models", icon: Layers, label: "Models" },
     { path: "/endpoints", icon: Server, label: "Endpoints" },
     { path: "/playground", icon: Play, label: "Playground" },
     { path: "/batches", icon: Box, label: "Batches", demoOnly: true },
     { path: "/analytics", icon: Activity, label: "Traffic" },
+    {
+      path: "/cost-management",
+      icon: DollarSign,
+      label: "Cost Management",
+      featureFlag: "use_billing",
+    },
     { path: "/users-groups", icon: Users, label: "Users & Groups" },
     { path: "/api-keys", icon: Key, label: "API Keys" },
     { path: "/settings", icon: Settings, label: "Settings" },
   ];
 
   const navItems = allNavItems.filter((item) => {
-    // Filter by authorization
-    if (!canAccessRoute(item.path)) return false;
-
+    // Check feature flag if specified
+    if (item.featureFlag && !isFeatureEnabled(item.featureFlag)) {
+      return false;
+    }
     // Filter demo-only items when not in demo mode
-    if (item.demoOnly && !isFeatureEnabled("demo")) return false;
-
-    return true;
+    if (item.demoOnly && !isFeatureEnabled("demo")) {
+      return false;
+    }
+    // Check route access permissions
+    return canAccessRoute(item.path);
   });
 
   return (

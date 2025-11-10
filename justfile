@@ -1,5 +1,3 @@
-set dotenv-load
-
 # Display available commands
 default:
     @just --list
@@ -102,50 +100,82 @@ check-db:
 #
 # IMPORTANT: Rust development requires a running PostgreSQL database!
 #
-# The Control Layer service stores user/group/model data in PostgreSQL, &:
+# The Control Layer service stores user/group/model data in PostgreSQL:
 #
-# - SQLx (our database library) performs compile-time SQL validation, & so even
+# - SQLx (our database library) performs compile-time SQL validation, so even
 #   compiling Rust code requires database connectivity.
-# - For testing, we uses sqlx's test harness which requires a database to run.
+# - For testing, we use sqlx's test harness which requires a database to run.
 #
-# This command verifies:
-# - PostgreSQL client tools are installed (psql, createdb)
-# - 'postgres' user exists and can create databases
-# - 'test' database is accessible for running tests
+# This command:
+# - Creates dwctl and fusillade databases
+# - Writes DATABASE_URL to .env files for sqlx compile-time verification
+# - Runs migrations to set up the schema
 #
-# If checks fail, run 'just db-setup' to fix the configuration
+# Connection settings can be overridden with environment variables:
+# - DB_HOST (default: localhost)
+# - DB_PORT (default: 5432)
+# - DB_USER (default: postgres)
+# - DB_PASS (default: password)
+#
+# Examples:
+#   just db-setup                          # Use defaults (localhost:5432, postgres/password)
+#   DB_PASS=postgres just db-setup         # Override password (for CI)
+#   just db-start && just db-setup         # Start local Docker postgres and setup
 db-setup:
     #!/usr/bin/env bash
     set -euo pipefail
-    echo "Setting up test databases..."
-    if command -v createdb >/dev/null 2>&1; then
-        # Ensure postgres user exists with appropriate privileges
-        echo "Checking postgres user..."
-        if ! psql -d postgres -c "SELECT 1 FROM pg_roles WHERE rolname='postgres';" | grep -q 1; then
-            echo "Creating postgres user with createdb privileges..."
-            createuser -s postgres 2>/dev/null || createuser --createdb postgres 2>/dev/null || echo "  - postgres user creation failed, may already exist"
-        else
-            echo "  - postgres user already exists"
-            # Ensure postgres user has createdb privileges
-            psql -d postgres -c "ALTER USER postgres CREATEDB;" 2>/dev/null || echo "  - postgres user already has necessary privileges"
-        fi
 
-        # Create test database if it doesn't exist
-        echo "Creating test database..."
-        createdb -O postgres test 2>/dev/null || echo "  - test database already exists"
-        echo "✅ Test database ready"
-        echo ""
-        echo "Database URLs configured:"
-        echo "  DATABASE_URL=postgres://postgres:postgres@localhost:5432/test"
-        echo "  TEST_DATABASE_URL=postgres://postgres:postgres@localhost:5432/test"
-    else
-        echo "❌ Error: createdb not found. Install PostgreSQL tools:"
-        echo "  brew install postgresql"
-        echo ""
-        echo "Or manually create test databases:"
-        echo "  createdb test"
+    echo "Setting up development databases..."
+
+    # Database connection settings (can be overridden with environment variables)
+    DB_HOST="${DB_HOST:-localhost}"
+    DB_PORT="${DB_PORT:-5432}"
+    DB_USER="${DB_USER:-postgres}"
+    DB_PASS="${DB_PASS:-password}"
+
+    # Check if postgres is running
+    if ! pg_isready -h "$DB_HOST" -p "$DB_PORT" >/dev/null 2>&1; then
+        echo "❌ PostgreSQL is not running on $DB_HOST:$DB_PORT"
+        echo "Run 'just db-start' to start Docker postgres"
         exit 1
     fi
+
+    echo "✅ PostgreSQL is running"
+
+    # Create databases
+    echo "Creating databases..."
+    PGPASSWORD="$DB_PASS" psql -h "$DB_HOST" -p "$DB_PORT" -U "$DB_USER" -d postgres -c "CREATE DATABASE dwctl;" 2>/dev/null || echo "  - dwctl database already exists"
+    PGPASSWORD="$DB_PASS" psql -h "$DB_HOST" -p "$DB_PORT" -U "$DB_USER" -d postgres -c "CREATE DATABASE fusillade;" 2>/dev/null || echo "  - fusillade database already exists"
+
+    # Write .env files for sqlx compile-time verification
+    echo "Writing .env files..."
+    echo "DATABASE_URL=postgres://$DB_USER:$DB_PASS@$DB_HOST:$DB_PORT/dwctl" > dwctl/.env
+    echo "DATABASE_URL=postgres://$DB_USER:$DB_PASS@$DB_HOST:$DB_PORT/fusillade" > fusillade/.env
+
+    # Run migrations
+    echo "Running migrations..."
+    echo "Running dwctl migrations..."
+    if (cd dwctl && sqlx migrate run); then
+        echo "  ✅ dwctl migrations complete"
+    else
+        echo "  ❌ dwctl migrations failed"
+        exit 1
+    fi
+
+    echo "Running fusillade migrations..."
+    if (cd fusillade && sqlx migrate run); then
+        echo "  ✅ fusillade migrations complete"
+    else
+        echo "  ❌ fusillade migrations failed"
+        exit 1
+    fi
+
+    echo ""
+    echo "✅ Database setup complete!"
+    echo ""
+    echo "Database URLs configured:"
+    echo "  dwctl:     postgres://$DB_USER:$DB_PASS@$DB_HOST:$DB_PORT/dwctl"
+    echo "  fusillade: postgres://$DB_USER:$DB_PASS@$DB_HOST:$DB_PORT/fusillade"
 
 # Start the full development stack with hot reload
 #
@@ -405,7 +435,7 @@ test target="" *args="":
                 fi
                 # Remove --watch from args and pass remaining to cargo test
                 remaining_args=$(echo "{{args}}" | sed 's/--watch//g' | xargs)
-                cd dwctl && cargo watch -x "test $remaining_args"
+                cargo watch -x "test $remaining_args"
             elif [[ "{{args}}" == *"--coverage"* ]]; then
                 if ! command -v cargo-llvm-cov >/dev/null 2>&1; then
                     echo "❌ Error: cargo-llvm-cov not found. Install with:"
@@ -414,9 +444,9 @@ test target="" *args="":
                     echo "  cargo binstall cargo-llvm-cov"
                     exit 1
                 fi
-                cd dwctl && cargo llvm-cov --fail-under-lines 60 --lcov --output-path lcov.info
+                cargo llvm-cov --fail-under-lines 60 --lcov --output-path lcov.info
             else
-                cd dwctl && cargo test {{args}}
+                cargo test {{args}}
             fi
             ;;
         ts)
@@ -475,7 +505,6 @@ lint target *args="":
             npm run lint -- --max-warnings 0 {{args}}
             ;;
         rust)
-            cd dwctl
             echo "Checking Cargo.lock sync..."
             cargo metadata --locked > /dev/null
             echo "Running cargo fmt --check..."
@@ -483,7 +512,7 @@ lint target *args="":
             echo "Running cargo clippy..."
             cargo clippy {{args}}
             echo "Checking SQLx prepared queries..."
-            cargo sqlx prepare --check
+            cargo sqlx prepare --check --workspace
             ;;
         *)
             echo "Usage: just lint [ts|rust]"
@@ -520,7 +549,7 @@ fmt target *args="":
             ;;
         rust)
             echo "Running cargo fmt for dwctl..."
-            cd dwctl && cargo fmt {{args}}
+            cargo fmt {{args}}
             ;;
         *)
             echo "Usage: just fmt [ts|rust]"
@@ -585,9 +614,12 @@ ci target *args="":
     case "{{target}}" in
         rust)
             echo "🦀 Running Rust CI pipeline..."
+
+            # Setup databases using db-setup target
+            just db-setup
+
             echo "📋 Setting up llvm-cov environment for consistent compilation..."
-            cd dwctl
-            echo "🧪 Step 1/1: Running tests with coverage..."
+            echo "🧪 Step 1/2: Running tests with coverage..."
             just test rust --coverage {{args}}
             eval "$(cargo llvm-cov show-env --export-prefix)"
             echo "📋 Step 2/2: Linting"
@@ -710,6 +742,163 @@ security-scan target="latest" *args="":
     else
         echo ""
         echo "✅ No critical or high severity vulnerabilities found."
+    fi
+
+# Publish packages to crates.io: 'just release'
+#
+# Publishes both fusillade and dwctl packages to crates.io in an idempotent way.
+# If a version is already published, it will be skipped gracefully.
+#
+# Prerequisites:
+# - Authentication: Either run 'cargo login' or set CARGO_REGISTRY_TOKEN environment variable
+# - Node.js and npm installed (for building dwctl frontend)
+#
+# The release process:
+# 1. Attempts to publish fusillade (skips if version already exists)
+# 2. Builds frontend and bundles it into dwctl/static
+# 3. Attempts to publish dwctl (skips if version already exists)
+#
+# Examples:
+#   just release                              # Use stored credentials from 'cargo login'
+#   CARGO_REGISTRY_TOKEN=<token> just release # Use token from environment
+release:
+    #!/usr/bin/env bash
+    set -euo pipefail
+
+    echo "📦 Publishing packages to crates.io..."
+    echo ""
+
+    # Build cargo publish command with optional token
+    PUBLISH_CMD="cargo publish --allow-dirty --color always"
+    if [ -n "${CARGO_REGISTRY_TOKEN:-}" ]; then
+        echo "Using CARGO_REGISTRY_TOKEN from environment"
+        PUBLISH_CMD="$PUBLISH_CMD --token $CARGO_REGISTRY_TOKEN"
+    else
+        echo "Using stored credentials from 'cargo login'"
+    fi
+    echo ""
+
+    # Function to publish a package and handle errors gracefully
+    publish_package() {
+        local package=$1
+
+        echo "Publishing $package..."
+        if $PUBLISH_CMD -p "$package" 2>&1 | tee /tmp/cargo-publish-$package.log; then
+            echo "✅ Successfully published $package"
+            return 0
+        else
+            # Check if the error is because the version already exists
+            if grep -q "already uploaded" /tmp/cargo-publish-$package.log || \
+               grep -q "crate version .* is already uploaded" /tmp/cargo-publish-$package.log; then
+                echo "ℹ️  $package version already published, skipping"
+                return 0
+            else
+                echo "❌ Failed to publish $package"
+                cat /tmp/cargo-publish-$package.log
+                return 1
+            fi
+        fi
+    }
+
+    # Publish fusillade
+    echo "Step 1/2: Publishing fusillade..."
+    publish_package "fusillade" || exit 1
+    echo ""
+
+    # Build frontend for dwctl
+    echo "Step 2/2: Building frontend and publishing dwctl..."
+    echo "Building frontend..."
+    cd dashboard
+    npm ci
+    npm run build
+    cd ..
+
+    echo "Copying frontend to dwctl/static..."
+    rm -rf dwctl/static
+    cp -r dashboard/dist dwctl/static
+    echo "✅ Frontend built and bundled"
+    echo ""
+
+    # Publish dwctl
+    publish_package "dwctl" || exit 1
+
+    echo ""
+    echo "🎉 Release process completed successfully!"
+
+# Start Docker PostgreSQL with fsync disabled for fast testing
+#
+# This starts a PostgreSQL container optimized for testing:
+# - fsync disabled for faster writes (TESTING ONLY - never use in production!)
+# - Runs on port 5432
+# - Credentials: postgres/password
+# - Container name: test-postgres
+#
+# Examples:
+#   just db-start
+db-start:
+    #!/usr/bin/env bash
+    set -euo pipefail
+
+    # Check if container already exists
+    if docker ps -a --format '{{{{.Names}}' | grep -q "^test-postgres$"; then
+        if docker ps --format '{{{{.Names}}' | grep -q "^test-postgres$"; then
+            echo "✅ test-postgres container is already running"
+        else
+            echo "Starting existing test-postgres container..."
+            docker start test-postgres
+        fi
+    else
+        echo "Creating new test-postgres container with fsync disabled..."
+        docker run --name test-postgres \
+          -e POSTGRES_PASSWORD=password \
+          -p 5432:5432 \
+          -d postgres:latest \
+          postgres -c fsync=off
+    fi
+
+    echo "Waiting for postgres to be ready..."
+    sleep 2
+
+    # Verify it's up
+    if pg_isready -h localhost -p 5432 >/dev/null 2>&1; then
+        echo "✅ PostgreSQL is ready on localhost:5432"
+        echo "   Credentials: postgres/password"
+        echo "   ⚠️  fsync is disabled - for testing only!"
+    else
+        echo "❌ PostgreSQL not responding"
+        exit 1
+    fi
+
+# Stop Docker PostgreSQL container
+#
+# Stops the test-postgres container. Add --remove to also delete the container.
+#
+# Examples:
+#   just db-stop          # Stop container
+#   just db-stop --remove # Stop and remove container
+db-stop *args="":
+    #!/usr/bin/env bash
+    set -euo pipefail
+
+    if docker ps --format '{{{{.Names}}' | grep -q "^test-postgres$"; then
+        echo "Stopping test-postgres container..."
+        docker stop test-postgres
+
+        if [[ "{{args}}" == *"--remove"* ]]; then
+            echo "Removing test-postgres container..."
+            docker rm test-postgres
+        fi
+        echo "✅ Done"
+    elif docker ps -a --format '{{{{.Names}}' | grep -q "^test-postgres$"; then
+        if [[ "{{args}}" == *"--remove"* ]]; then
+            echo "Removing stopped test-postgres container..."
+            docker rm test-postgres
+            echo "✅ Done"
+        else
+            echo "ℹ️  test-postgres container is already stopped"
+        fi
+    else
+        echo "ℹ️  test-postgres container does not exist"
     fi
 
 # Hidden recipes for internal use

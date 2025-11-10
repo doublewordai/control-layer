@@ -339,7 +339,7 @@ mod tests {
     #[sqlx::test]
     #[test_log::test]
     async fn test_list_requests_outlet_disabled(pool: PgPool) {
-        let (app, _) = create_test_app(pool.clone(), false).await; // Request logging disabled
+        let (app, _bg_services) = create_test_app(pool.clone(), false).await; // Request logging disabled
         let admin_user = create_test_admin_user(&pool, Role::PlatformManager).await;
 
         let response = app
@@ -354,7 +354,7 @@ mod tests {
     #[sqlx::test]
     #[test_log::test]
     async fn test_list_requests_unauthorized(pool: PgPool) {
-        let (app, _) = create_test_app(pool.clone(), true).await; // Request logging enabled
+        let (app, _bg_services) = create_test_app(pool.clone(), true).await; // Request logging enabled
         let user = create_test_user(&pool, Role::StandardUser).await; // Non-admin user
 
         let response = app
@@ -369,7 +369,7 @@ mod tests {
     #[sqlx::test]
     #[test_log::test]
     async fn test_aggregate_requests_outlet_disabled(pool: PgPool) {
-        let (app, _) = create_test_app(pool.clone(), false).await; // Request logging disabled
+        let (app, _bg_services) = create_test_app(pool.clone(), false).await; // Request logging disabled
         let admin_user = create_test_admin_user(&pool, Role::PlatformManager).await;
 
         let response = app
@@ -388,21 +388,17 @@ mod tests {
         let base_time = Utc::now() - Duration::hours(1);
         insert_test_analytics_data(&pool, base_time, "gpt-4", 200, 100.0, 50, 25).await;
 
-        // Create config with request logging enabled (like in main.rs test)
+        // Create config with request logging enabled
         let mut config = create_test_config();
         config.enable_request_logging = true;
         config.database = crate::config::DatabaseConfig::External {
             url: pool.connect_options().to_url_lossy().to_string(),
         };
+        config.leader_election.enabled = false;
 
-        // Build router with request logging enabled
-        let mut app_state = crate::AppState::builder().db(pool.clone()).config(config).build();
-        let onwards_router = axum::Router::new();
-        let router = crate::build_router(&mut app_state, onwards_router)
-            .await
-            .expect("Failed to build router");
-
-        let server = axum_test::TestServer::new(router).expect("Failed to create test server");
+        // Use Application::new to properly set up outlet_db
+        let app = crate::Application::new(config).await.expect("Failed to create application");
+        let (server, _drop_guard) = app.into_test_server();
         let admin_user = create_test_admin_user(&pool, Role::PlatformManager).await;
 
         let response = server
@@ -424,21 +420,17 @@ mod tests {
         insert_test_analytics_data(&pool, base_time, "gpt-4", 200, 100.0, 50, 25).await;
         insert_test_analytics_data(&pool, base_time, "claude-3", 200, 150.0, 75, 35).await;
 
-        // Create config with request logging enabled (like in main.rs test)
+        // Create config with request logging enabled
         let mut config = create_test_config();
         config.enable_request_logging = true;
         config.database = crate::config::DatabaseConfig::External {
             url: pool.connect_options().to_url_lossy().to_string(),
         };
+        config.leader_election.enabled = false;
 
-        // Build router with request logging enabled
-        let mut app_state = crate::AppState::builder().db(pool.clone()).config(config).build();
-        let onwards_router = axum::Router::new();
-        let router = crate::build_router(&mut app_state, onwards_router)
-            .await
-            .expect("Failed to build router");
-
-        let server = axum_test::TestServer::new(router).expect("Failed to create test server");
+        // Use Application::new to properly set up outlet_db
+        let app = crate::Application::new(config).await.expect("Failed to create application");
+        let (server, _drop_guard) = app.into_test_server();
         let admin_user = create_test_admin_user(&pool, Role::PlatformManager).await;
 
         let response = server
@@ -455,7 +447,7 @@ mod tests {
     #[sqlx::test]
     #[test_log::test]
     async fn test_aggregate_requests_unauthorized(pool: PgPool) {
-        let (app, _) = create_test_app(pool.clone(), true).await; // Request logging enabled
+        let (app, _bg_services) = create_test_app(pool.clone(), true).await; // Request logging enabled
         let user = create_test_user(&pool, Role::StandardUser).await; // Non-admin user
 
         let response = app
@@ -477,13 +469,11 @@ mod tests {
         config.database = crate::config::DatabaseConfig::External {
             url: pool.connect_options().to_url_lossy().to_string(),
         };
+        config.leader_election.enabled = false;
 
-        let mut app_state = crate::AppState::builder().db(pool.clone()).config(config).build();
-        let onwards_router = axum::Router::new();
-        let router = crate::build_router(&mut app_state, onwards_router)
-            .await
-            .expect("Failed to build router");
-        let server = axum_test::TestServer::new(router).expect("Failed to create test server");
+        // Use Application::new to properly set up outlet_db
+        let app = crate::Application::new(config).await.expect("Failed to create application");
+        let (server, _drop_guard) = app.into_test_server();
         let admin_user = create_test_admin_user(&pool, Role::PlatformManager).await;
 
         let response = server
@@ -841,15 +831,11 @@ mod tests {
         config.database = crate::config::DatabaseConfig::External {
             url: pool.connect_options().to_url_lossy().to_string(),
         };
+        config.leader_election.enabled = false;
 
-        // Build router with request logging enabled
-        let mut app_state = crate::AppState::builder().db(pool.clone()).config(config).build();
-        let onwards_router = axum::Router::new();
-        let router = crate::build_router(&mut app_state, onwards_router)
-            .await
-            .expect("Failed to build router");
-
-        let app = axum_test::TestServer::new(router).expect("Failed to create test server");
+        // Use Application::new to properly set up outlet_db
+        let app = crate::Application::new(config).await.expect("Failed to create application");
+        let (app, _drop_guard) = app.into_test_server();
         let standard_user = create_test_user(&pool, Role::StandardUser).await;
 
         // StandardUser should NOT be able to list requests (no Requests permissions)
@@ -878,15 +864,11 @@ mod tests {
         config.database = crate::config::DatabaseConfig::External {
             url: pool.connect_options().to_url_lossy().to_string(),
         };
+        config.leader_election.enabled = false;
 
-        // Build router with request logging enabled
-        let mut app_state = crate::AppState::builder().db(pool.clone()).config(config).build();
-        let onwards_router = axum::Router::new();
-        let router = crate::build_router(&mut app_state, onwards_router)
-            .await
-            .expect("Failed to build router");
-
-        let app = axum_test::TestServer::new(router).expect("Failed to create test server");
+        // Use Application::new to properly set up outlet_db
+        let app = crate::Application::new(config).await.expect("Failed to create application");
+        let (app, _drop_guard) = app.into_test_server();
         let request_viewer = create_test_user(&pool, Role::RequestViewer).await;
 
         // RequestViewer should be able to list requests (has ReadAll for Requests)
@@ -919,15 +901,11 @@ mod tests {
         config.database = crate::config::DatabaseConfig::External {
             url: pool.connect_options().to_url_lossy().to_string(),
         };
+        config.leader_election.enabled = false;
 
-        // Build router with request logging enabled
-        let mut app_state = crate::AppState::builder().db(pool.clone()).config(config).build();
-        let onwards_router = axum::Router::new();
-        let router = crate::build_router(&mut app_state, onwards_router)
-            .await
-            .expect("Failed to build router");
-
-        let app = axum_test::TestServer::new(router).expect("Failed to create test server");
+        // Use Application::new to properly set up outlet_db
+        let app = crate::Application::new(config).await.expect("Failed to create application");
+        let (app, _drop_guard) = app.into_test_server();
 
         // Create a NON-ADMIN PlatformManager (so role permissions are checked)
         let platform_manager = create_test_user(&pool, Role::PlatformManager).await; // Not create_test_admin_user!
@@ -958,15 +936,11 @@ mod tests {
         config.database = crate::config::DatabaseConfig::External {
             url: pool.connect_options().to_url_lossy().to_string(),
         };
+        config.leader_election.enabled = false;
 
-        // Build router with request logging enabled
-        let mut app_state = crate::AppState::builder().db(pool.clone()).config(config).build();
-        let onwards_router = axum::Router::new();
-        let router = crate::build_router(&mut app_state, onwards_router)
-            .await
-            .expect("Failed to build router");
-
-        let app = axum_test::TestServer::new(router).expect("Failed to create test server");
+        // Use Application::new to properly set up outlet_db
+        let app = crate::Application::new(config).await.expect("Failed to create application");
+        let (app, _drop_guard) = app.into_test_server();
 
         // User with StandardUser + RequestViewer should have monitoring access
         let monitoring_user = create_test_user_with_roles(&pool, vec![Role::StandardUser, Role::RequestViewer]).await;
@@ -1016,15 +990,11 @@ mod tests {
         config.database = crate::config::DatabaseConfig::External {
             url: pool.connect_options().to_url_lossy().to_string(),
         };
+        config.leader_election.enabled = false;
 
-        // Build router with request logging enabled
-        let mut app_state = crate::AppState::builder().db(pool.clone()).config(config).build();
-        let onwards_router = axum::Router::new();
-        let router = crate::build_router(&mut app_state, onwards_router)
-            .await
-            .expect("Failed to build router");
-
-        let app = axum_test::TestServer::new(router).expect("Failed to create test server");
+        // Use Application::new to properly set up outlet_db
+        let app = crate::Application::new(config).await.expect("Failed to create application");
+        let (app, _drop_guard) = app.into_test_server();
         let request_viewer = create_test_user(&pool, Role::RequestViewer).await;
         let standard_user = create_test_user(&pool, Role::StandardUser).await;
 
@@ -1066,15 +1036,11 @@ mod tests {
         config.database = crate::config::DatabaseConfig::External {
             url: pool.connect_options().to_url_lossy().to_string(),
         };
+        config.leader_election.enabled = false;
 
-        // Build router with request logging enabled
-        let mut app_state = crate::AppState::builder().db(pool.clone()).config(config).build();
-        let onwards_router = axum::Router::new();
-        let router = crate::build_router(&mut app_state, onwards_router)
-            .await
-            .expect("Failed to build router");
-
-        let app = axum_test::TestServer::new(router).expect("Failed to create test server");
+        // Use Application::new to properly set up outlet_db
+        let app = crate::Application::new(config).await.expect("Failed to create application");
+        let (app, _drop_guard) = app.into_test_server();
         let request_viewer = create_test_user(&pool, Role::RequestViewer).await;
         let platform_manager = create_test_admin_user(&pool, Role::PlatformManager).await;
         let standard_user = create_test_user(&pool, Role::StandardUser).await;
@@ -1115,15 +1081,11 @@ mod tests {
         config.database = crate::config::DatabaseConfig::External {
             url: pool.connect_options().to_url_lossy().to_string(),
         };
+        config.leader_election.enabled = false;
 
-        // Build router with request logging enabled
-        let mut app_state = crate::AppState::builder().db(pool.clone()).config(config).build();
-        let onwards_router = axum::Router::new();
-        let router = crate::build_router(&mut app_state, onwards_router)
-            .await
-            .expect("Failed to build router");
-
-        let app = axum_test::TestServer::new(router).expect("Failed to create test server");
+        // Use Application::new to properly set up outlet_db
+        let app = crate::Application::new(config).await.expect("Failed to create application");
+        let (app, _drop_guard) = app.into_test_server();
 
         // Test different role combinations for monitoring access
         let role_tests = vec![
@@ -1182,15 +1144,11 @@ mod tests {
         config.database = crate::config::DatabaseConfig::External {
             url: pool.connect_options().to_url_lossy().to_string(),
         };
+        config.leader_election.enabled = false;
 
-        // Build router with request logging enabled
-        let mut app_state = crate::AppState::builder().db(pool.clone()).config(config).build();
-        let onwards_router = axum::Router::new();
-        let router = crate::build_router(&mut app_state, onwards_router)
-            .await
-            .expect("Failed to build router");
-
-        let app = axum_test::TestServer::new(router).expect("Failed to create test server");
+        // Use Application::new to properly set up outlet_db
+        let app = crate::Application::new(config).await.expect("Failed to create application");
+        let (app, _drop_guard) = app.into_test_server();
         let request_viewer = create_test_user(&pool, Role::RequestViewer).await;
 
         // Test boundary conditions for query parameters

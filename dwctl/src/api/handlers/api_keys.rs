@@ -42,6 +42,8 @@ use sqlx::Acquire;
         (status = 500, description = "Internal server error"),
     ),
     security(
+        ("BearerAuth" = []),
+        ("CookieAuth" = []),
         ("X-Doubleword-User" = [])
     )
 )]
@@ -117,6 +119,8 @@ pub async fn create_user_api_key(
         (status = 500, description = "Internal server error"),
     ),
     security(
+        ("BearerAuth" = []),
+        ("CookieAuth" = []),
         ("X-Doubleword-User" = [])
     )
 )]
@@ -195,6 +199,8 @@ pub async fn list_user_api_keys(
         (status = 500, description = "Internal server error"),
     ),
     security(
+        ("BearerAuth" = []),
+        ("CookieAuth" = []),
         ("X-Doubleword-User" = [])
     )
 )]
@@ -271,6 +277,8 @@ pub async fn get_user_api_key(
         (status = 500, description = "Internal server error"),
     ),
     security(
+        ("BearerAuth" = []),
+        ("CookieAuth" = []),
         ("X-Doubleword-User" = [])
     )
 )]
@@ -342,14 +350,15 @@ mod tests {
     #[sqlx::test]
     #[test_log::test]
     async fn test_create_api_key_for_self(pool: PgPool) {
-        let (app, _) = create_test_app(pool.clone(), false).await;
+        let (app, _bg_services) = create_test_app(pool.clone(), false).await;
         let user = create_test_user(&pool, Role::StandardUser).await;
         let group = create_test_group(&pool).await;
         add_user_to_group(&pool, user.id, group.id).await;
 
         let api_key_data = json!({
             "name": "Test API Key",
-            "description": "A test API key"
+            "description": "A test API key",
+            "purpose": "inference"
         });
 
         let response = app
@@ -368,7 +377,7 @@ mod tests {
     #[sqlx::test]
     #[test_log::test]
     async fn test_create_api_key_for_other_user_as_admin(pool: PgPool) {
-        let (app, _) = create_test_app(pool.clone(), false).await;
+        let (app, _bg_services) = create_test_app(pool.clone(), false).await;
         let admin_user = create_test_admin_user(&pool, Role::PlatformManager).await;
         let regular_user = create_test_user(&pool, Role::StandardUser).await;
         let group = create_test_group(&pool).await;
@@ -376,7 +385,8 @@ mod tests {
 
         let api_key_data = json!({
             "name": "Admin Created Key",
-            "description": "Created by admin for user"
+            "description": "Created by admin for user",
+            "purpose": "inference"
         });
 
         let response = app
@@ -394,13 +404,14 @@ mod tests {
     #[sqlx::test]
     #[test_log::test]
     async fn test_create_api_key_for_other_user_as_non_admin_forbidden(pool: PgPool) {
-        let (app, _) = create_test_app(pool.clone(), false).await;
+        let (app, _bg_services) = create_test_app(pool.clone(), false).await;
         let user1 = create_test_user(&pool, Role::StandardUser).await;
         let user2 = create_test_user(&pool, Role::StandardUser).await;
 
         let api_key_data = json!({
             "name": "Forbidden Key",
-            "description": "This should not work"
+            "description": "This should not work",
+            "purpose": "inference"
         });
 
         let response = app
@@ -415,7 +426,7 @@ mod tests {
     #[sqlx::test]
     #[test_log::test]
     async fn test_list_user_api_keys(pool: PgPool) {
-        let (app, _) = create_test_app(pool.clone(), false).await;
+        let (app, _bg_services) = create_test_app(pool.clone(), false).await;
         let user = create_test_user(&pool, Role::StandardUser).await;
         let group = create_test_group(&pool).await;
         add_user_to_group(&pool, user.id, group.id).await;
@@ -436,7 +447,7 @@ mod tests {
     #[sqlx::test]
     #[test_log::test]
     async fn test_list_user_api_keys_with_pagination_query_params(pool: PgPool) {
-        let (app, _) = create_test_app(pool.clone(), false).await;
+        let (app, _bg_services) = create_test_app(pool.clone(), false).await;
         let user = create_test_user(&pool, Role::StandardUser).await;
         let group = create_test_group(&pool).await;
         add_user_to_group(&pool, user.id, group.id).await;
@@ -445,7 +456,8 @@ mod tests {
         for i in 1..=5 {
             let api_key_data = json!({
                 "name": format!("Test API Key {}", i),
-                "description": format!("Description for key {}", i)
+                "description": format!("Description for key {}", i),
+                "purpose": "inference"
             });
 
             app.post("/admin/api/v1/users/current/api-keys")
@@ -489,7 +501,7 @@ mod tests {
     #[sqlx::test]
     #[test_log::test]
     async fn test_delete_user_api_key_for_self(pool: PgPool) {
-        let (app, _) = create_test_app(pool.clone(), false).await;
+        let (app, _bg_services) = create_test_app(pool.clone(), false).await;
         let user = create_test_user(&pool, Role::StandardUser).await;
         let group = create_test_group(&pool).await;
         add_user_to_group(&pool, user.id, group.id).await;
@@ -516,7 +528,7 @@ mod tests {
     #[sqlx::test]
     #[test_log::test]
     async fn test_delete_user_api_key_for_other_user_as_admin(pool: PgPool) {
-        let (app, _) = create_test_app(pool.clone(), false).await;
+        let (app, _bg_services) = create_test_app(pool.clone(), false).await;
         let admin_user = create_test_admin_user(&pool, Role::PlatformManager).await;
         let regular_user = create_test_user(&pool, Role::StandardUser).await;
         let group = create_test_group(&pool).await;
@@ -544,7 +556,7 @@ mod tests {
     #[sqlx::test]
     #[test_log::test]
     async fn test_delete_user_api_key_for_other_user_as_non_admin_forbidden(pool: PgPool) {
-        let (app, _) = create_test_app(pool.clone(), false).await;
+        let (app, _bg_services) = create_test_app(pool.clone(), false).await;
         let user1 = create_test_user(&pool, Role::StandardUser).await;
         let user2 = create_test_user(&pool, Role::StandardUser).await;
         let group = create_test_group(&pool).await;
@@ -572,7 +584,7 @@ mod tests {
     #[sqlx::test]
     #[test_log::test]
     async fn test_delete_nonexistent_api_key_returns_not_found(pool: PgPool) {
-        let (app, _) = create_test_app(pool.clone(), false).await;
+        let (app, _bg_services) = create_test_app(pool.clone(), false).await;
         let user = create_test_user(&pool, Role::StandardUser).await;
         let group = create_test_group(&pool).await;
         add_user_to_group(&pool, user.id, group.id).await;
@@ -589,7 +601,7 @@ mod tests {
     #[sqlx::test]
     #[test_log::test]
     async fn test_delete_api_key_belonging_to_different_user_returns_not_found(pool: PgPool) {
-        let (app, _) = create_test_app(pool.clone(), false).await;
+        let (app, _bg_services) = create_test_app(pool.clone(), false).await;
         let user1 = create_test_user(&pool, Role::StandardUser).await;
         let user2 = create_test_user(&pool, Role::StandardUser).await;
         let group = create_test_group(&pool).await;
@@ -611,7 +623,7 @@ mod tests {
     #[sqlx::test]
     #[test_log::test]
     async fn test_list_api_keys_for_other_user_as_admin(pool: PgPool) {
-        let (app, _) = create_test_app(pool.clone(), false).await;
+        let (app, _bg_services) = create_test_app(pool.clone(), false).await;
         let admin_user = create_test_admin_user(&pool, Role::PlatformManager).await;
         let regular_user = create_test_user(&pool, Role::StandardUser).await;
         let group = create_test_group(&pool).await;
@@ -639,7 +651,7 @@ mod tests {
     #[sqlx::test]
     #[test_log::test]
     async fn test_list_api_keys_for_other_user_as_non_admin_forbidden(pool: PgPool) {
-        let (app, _) = create_test_app(pool.clone(), false).await;
+        let (app, _bg_services) = create_test_app(pool.clone(), false).await;
         let user1 = create_test_user(&pool, Role::StandardUser).await;
         let user2 = create_test_user(&pool, Role::StandardUser).await;
         let group = create_test_group(&pool).await;
@@ -657,7 +669,7 @@ mod tests {
     #[sqlx::test]
     #[test_log::test]
     async fn test_get_api_key_for_other_user_as_admin(pool: PgPool) {
-        let (app, _) = create_test_app(pool.clone(), false).await;
+        let (app, _bg_services) = create_test_app(pool.clone(), false).await;
         let admin_user = create_test_admin_user(&pool, Role::PlatformManager).await;
         let regular_user = create_test_user(&pool, Role::StandardUser).await;
         let group = create_test_group(&pool).await;
@@ -678,7 +690,7 @@ mod tests {
     #[sqlx::test]
     #[test_log::test]
     async fn test_get_api_key_for_other_user_as_non_admin_forbidden(pool: PgPool) {
-        let (app, _) = create_test_app(pool.clone(), false).await;
+        let (app, _bg_services) = create_test_app(pool.clone(), false).await;
         let user1 = create_test_user(&pool, Role::StandardUser).await;
         let user2 = create_test_user(&pool, Role::StandardUser).await;
         let group = create_test_group(&pool).await;
@@ -696,14 +708,15 @@ mod tests {
     #[sqlx::test]
     #[test_log::test]
     async fn test_request_viewer_cannot_manage_api_keys(pool: PgPool) {
-        let (app, _) = create_test_app(pool.clone(), false).await;
+        let (app, _bg_services) = create_test_app(pool.clone(), false).await;
         let request_viewer = create_test_user(&pool, Role::RequestViewer).await;
         let standard_user = create_test_user(&pool, Role::StandardUser).await;
 
         // RequestViewer should not be able to create API keys for themselves
         let api_key_data = json!({
             "name": "RequestViewer Key",
-            "description": "Should not work"
+            "description": "Should not work",
+            "purpose": "inference"
         });
 
         let response = app
@@ -734,7 +747,7 @@ mod tests {
     #[sqlx::test]
     #[test_log::test]
     async fn test_multi_role_user_api_key_permissions(pool: PgPool) {
-        let (app, _) = create_test_app(pool.clone(), false).await;
+        let (app, _bg_services) = create_test_app(pool.clone(), false).await;
 
         // Create a user with both StandardUser and RequestViewer roles
         let multi_role_user = create_test_user_with_roles(&pool, vec![Role::StandardUser, Role::RequestViewer]).await;
@@ -744,7 +757,8 @@ mod tests {
         // Should be able to create API keys (from StandardUser role)
         let api_key_data = json!({
             "name": "Multi Role Key",
-            "description": "Should work due to StandardUser role"
+            "description": "Should work due to StandardUser role",
+            "purpose": "inference"
         });
 
         let response = app
@@ -787,7 +801,7 @@ mod tests {
     #[sqlx::test]
     #[test_log::test]
     async fn test_platform_manager_full_api_key_access(pool: PgPool) {
-        let (app, _) = create_test_app(pool.clone(), false).await;
+        let (app, _bg_services) = create_test_app(pool.clone(), false).await;
         let platform_manager = create_test_user(&pool, Role::PlatformManager).await;
         let standard_user = create_test_user(&pool, Role::StandardUser).await;
         let group = create_test_group(&pool).await;
@@ -796,7 +810,8 @@ mod tests {
         // Platform manager should be able to create API keys for other users
         let api_key_data = json!({
             "name": "Manager Created Key",
-            "description": "Created by platform manager"
+            "description": "Created by platform manager",
+            "purpose": "inference"
         });
 
         let response = app
@@ -838,7 +853,7 @@ mod tests {
     #[sqlx::test]
     #[test_log::test]
     async fn test_api_key_isolation_between_users(pool: PgPool) {
-        let (app, _) = create_test_app(pool.clone(), false).await;
+        let (app, _bg_services) = create_test_app(pool.clone(), false).await;
         let user1 = create_test_user(&pool, Role::StandardUser).await;
         let user2 = create_test_user(&pool, Role::StandardUser).await;
         let group = create_test_group(&pool).await;
@@ -883,7 +898,7 @@ mod tests {
     #[sqlx::test]
     #[test_log::test]
     async fn test_error_messages_are_user_friendly(pool: PgPool) {
-        let (app, _) = create_test_app(pool.clone(), false).await;
+        let (app, _bg_services) = create_test_app(pool.clone(), false).await;
         let user1 = create_test_user(&pool, Role::StandardUser).await;
         let user2 = create_test_user(&pool, Role::StandardUser).await;
 
@@ -905,7 +920,7 @@ mod tests {
     #[sqlx::test]
     #[test_log::test]
     async fn test_get_specific_api_key_for_self(pool: PgPool) {
-        let (app, _) = create_test_app(pool.clone(), false).await;
+        let (app, _bg_services) = create_test_app(pool.clone(), false).await;
         let user = create_test_user(&pool, Role::StandardUser).await;
         let group = create_test_group(&pool).await;
         add_user_to_group(&pool, user.id, group.id).await;
@@ -927,7 +942,7 @@ mod tests {
     #[sqlx::test]
     #[test_log::test]
     async fn test_api_key_creation_returns_key_value_only_once(pool: PgPool) {
-        let (app, _) = create_test_app(pool.clone(), false).await;
+        let (app, _bg_services) = create_test_app(pool.clone(), false).await;
         let user = create_test_user(&pool, Role::StandardUser).await;
         let group = create_test_group(&pool).await;
         add_user_to_group(&pool, user.id, group.id).await;
@@ -935,7 +950,8 @@ mod tests {
         // Create API key - should return the actual key value
         let api_key_data = json!({
             "name": "Test Key for Security",
-            "description": "Testing key exposure"
+            "description": "Testing key exposure",
+            "purpose": "inference"
         });
 
         let create_response = app

@@ -21,6 +21,8 @@ import {
   useDeleteUser,
   useAddUserToGroup,
   useAddModelToGroup,
+  useTransactions,
+  useAddFunds,
 } from "../hooks";
 
 // Setup MSW server
@@ -454,6 +456,192 @@ describe("User Hooks", () => {
         queryKey: ["models"],
       });
       expect(invalidateQueriesSpy).toHaveBeenCalledTimes(2);
+    });
+  });
+});
+
+describe("Billing Hooks", () => {
+  describe("useTransactions", () => {
+    it("should fetch transactions successfully", async () => {
+      const { result } = renderHook(() => useTransactions(), {
+        wrapper: createWrapper(),
+      });
+
+      // Initially loading
+      expect(result.current.isLoading).toBe(true);
+      expect(result.current.data).toBeUndefined();
+
+      // Wait for the query to resolve
+      await waitFor(() => {
+        expect(result.current.isSuccess).toBe(true);
+      });
+
+      expect(result.current.data).toBeDefined();
+      expect(Array.isArray(result.current.data)).toBe(true);
+      expect(result.current.data!.length).toBeGreaterThan(0);
+      expect(result.current.data![0]).toHaveProperty("id");
+      expect(result.current.data![0]).toHaveProperty("user_id");
+      expect(result.current.data![0]).toHaveProperty("transaction_type");
+      expect(result.current.data![0]).toHaveProperty("amount");
+      expect(result.current.data![0]).toHaveProperty("balance_after");
+    });
+
+    it("should fetch transactions with userId filter", async () => {
+      const userId = "550e8400-e29b-41d4-a716-446655440001";
+      const { result } = renderHook(() => useTransactions({ userId }), {
+        wrapper: createWrapper(),
+      });
+
+      await waitFor(() => {
+        expect(result.current.isSuccess).toBe(true);
+      });
+
+      expect(result.current.data).toBeDefined();
+      expect(Array.isArray(result.current.data)).toBe(true);
+      // All transactions should belong to the specified user
+      expect(result.current.data!.every((t) => t.user_id === userId)).toBe(
+        true,
+      );
+    });
+
+    it("should fetch transactions with pagination", async () => {
+      const { result } = renderHook(
+        () => useTransactions({ limit: 3, skip: 0 }),
+        {
+          wrapper: createWrapper(),
+        },
+      );
+
+      await waitFor(() => {
+        expect(result.current.isSuccess).toBe(true);
+      });
+
+      expect(result.current.data).toBeDefined();
+      expect(result.current.data!.length).toBeLessThanOrEqual(3);
+    });
+
+    it("should handle errors", async () => {
+      // Mock an error response
+      server.use(
+        http.get("/admin/api/v1/transactions", () => {
+          return HttpResponse.json({ error: "Server error" }, { status: 500 });
+        }),
+      );
+
+      const { result } = renderHook(() => useTransactions(), {
+        wrapper: createWrapper(),
+      });
+
+      await waitFor(() => {
+        expect(result.current.isError).toBe(true);
+      });
+
+      expect(result.current.error).toBeDefined();
+    });
+  });
+
+  describe("useAddFunds", () => {
+    it("should add funds successfully", async () => {
+      const { result } = renderHook(() => useAddFunds(), {
+        wrapper: createWrapper(),
+      });
+
+      const fundsData = {
+        user_id: "550e8400-e29b-41d4-a716-446655440001",
+        amount: 100.0,
+        description: "Test funds addition",
+      };
+
+      result.current.mutate(fundsData);
+
+      await waitFor(() => {
+        expect(result.current.isSuccess).toBe(true);
+      });
+
+      expect(result.current.data).toBeDefined();
+      expect(result.current.data!.user_id).toBe(fundsData.user_id);
+      expect(result.current.data!.amount).toBe(fundsData.amount);
+      expect(result.current.data!.transaction_type).toBe("admin_grant");
+      expect(result.current.data!.balance_after).toBeGreaterThan(0);
+    });
+
+    it("should add funds without description", async () => {
+      const { result } = renderHook(() => useAddFunds(), {
+        wrapper: createWrapper(),
+      });
+
+      const fundsData = {
+        user_id: "550e8400-e29b-41d4-a716-446655440002",
+        amount: 50.0,
+      };
+
+      result.current.mutate(fundsData);
+
+      await waitFor(() => {
+        expect(result.current.isSuccess).toBe(true);
+      });
+
+      expect(result.current.data).toBeDefined();
+      expect(result.current.data!.user_id).toBe(fundsData.user_id);
+      expect(result.current.data!.amount).toBe(fundsData.amount);
+    });
+
+    it("should handle errors when adding funds", async () => {
+      // Mock an error response for non-existent user
+      server.use(
+        http.post("/admin/api/v1/transactions", () => {
+          return HttpResponse.json(
+            { error: "User not found" },
+            { status: 404 },
+          );
+        }),
+      );
+
+      const { result } = renderHook(() => useAddFunds(), {
+        wrapper: createWrapper(),
+      });
+
+      result.current.mutate({
+        user_id: "non-existent-user",
+        amount: 100,
+      });
+
+      await waitFor(() => {
+        expect(result.current.isError).toBe(true);
+      });
+
+      expect(result.current.error).toBeDefined();
+    });
+
+    it("should invalidate queries after adding funds", async () => {
+      const queryClient = new QueryClient({
+        defaultOptions: { queries: { retry: false } },
+      });
+
+      const refetchQueriesSpy = vi.spyOn(queryClient, "refetchQueries");
+
+      const wrapper = ({ children }: { children: ReactNode }) => (
+        <QueryClientProvider client={queryClient}>
+          {children}
+        </QueryClientProvider>
+      );
+
+      const { result } = renderHook(() => useAddFunds(), { wrapper });
+
+      const userId = "550e8400-e29b-41d4-a716-446655440001";
+      result.current.mutate({
+        user_id: userId,
+        amount: 100,
+        description: "Test invalidation",
+      });
+
+      await waitFor(() => {
+        expect(result.current.isSuccess).toBe(true);
+      });
+
+      // Should refetch user data and transactions
+      expect(refetchQueriesSpy).toHaveBeenCalled();
+      expect(refetchQueriesSpy.mock.calls.length).toBeGreaterThan(0);
     });
   });
 });

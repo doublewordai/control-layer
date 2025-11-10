@@ -1,6 +1,9 @@
 use crate::{
     api::models::users::CurrentUser,
-    db::handlers::Deployments,
+    db::{
+        handlers::{api_keys::ApiKeys, Deployments},
+        models::api_keys::ApiKeyPurpose,
+    },
     errors::Error,
     types::{Operation, Permission},
     AppState,
@@ -68,7 +71,15 @@ pub(crate) async fn admin_ai_proxy(state: AppState, mut request: Request) -> Res
 
     trace!("Access info for user {}: {:?}", user_email, access_info);
 
-    let access_info = access_info?;
+    let _access_info = access_info?;
+
+    // Get or create user-specific hidden API key for this request
+    let mut api_key_conn = state.db.acquire().await.unwrap();
+    let mut api_keys_repo = ApiKeys::new(&mut api_key_conn);
+    let user_api_key = api_keys_repo
+        .get_or_create_hidden_key(current_user.id, ApiKeyPurpose::Inference)
+        .await
+        .with_context(|| format!("Failed to get or create hidden API key for user {}", current_user.id))?;
 
     // Rewrite the path from /admin/api/v1/ai/* to /ai/*
     debug!("User has access to model: {}", model_name);
@@ -88,12 +99,11 @@ pub(crate) async fn admin_ai_proxy(state: AppState, mut request: Request) -> Res
     // Update the request URI
     *request.uri_mut() = new_uri;
 
-    // Add system API key as Authorization header for the AI proxy (from optimized query)
+    // Add user-specific hidden API key as Authorization header for the AI proxy
     let headers = request.headers_mut();
     headers.insert(
         "authorization",
-        HeaderValue::from_str(&format!("Bearer {}", access_info.system_api_key))
-            .with_context(|| "Failed to create authorization header value")?,
+        HeaderValue::from_str(&format!("Bearer {}", user_api_key)).with_context(|| "Failed to create authorization header value")?,
     );
 
     // Restore the body to the request
@@ -168,7 +178,14 @@ mod tests {
             .await
             .expect("Failed to create test deployment");
 
-        let state = crate::AppState::builder().db(pool.clone()).config(config).build();
+        let state = {
+            let request_manager = std::sync::Arc::new(fusillade::PostgresRequestManager::new(pool.clone()));
+            crate::AppState::builder()
+                .db(pool.clone())
+                .config(config)
+                .request_manager(request_manager)
+                .build()
+        };
         let request = axum::http::Request::builder()
             .uri("/admin/api/v1/ai/v1/chat/completions")
             .header("x-doubleword-user", user.email)
@@ -241,7 +258,14 @@ mod tests {
             .await
             .expect("Failed to add deployment to group");
 
-        let state = crate::AppState::builder().db(pool.clone()).config(config).build();
+        let state = {
+            let request_manager = std::sync::Arc::new(fusillade::PostgresRequestManager::new(pool.clone()));
+            crate::AppState::builder()
+                .db(pool.clone())
+                .config(config)
+                .request_manager(request_manager)
+                .build()
+        };
         let request = axum::http::Request::builder()
             .uri("/admin/api/v1/ai/v1/chat/completions")
             .header("x-doubleword-user", user.email)
@@ -263,7 +287,14 @@ mod tests {
     #[sqlx::test]
     async fn test_header_must_be_supplied(pool: PgPool) {
         let config = create_test_config();
-        let state = crate::AppState::builder().db(pool.clone()).config(config).build();
+        let state = {
+            let request_manager = std::sync::Arc::new(fusillade::PostgresRequestManager::new(pool.clone()));
+            crate::AppState::builder()
+                .db(pool.clone())
+                .config(config)
+                .request_manager(request_manager)
+                .build()
+        };
         let request = axum::http::Request::builder()
             .uri("/admin/api/v1/ai/v1/chat/completions")
             .body(
@@ -282,7 +313,14 @@ mod tests {
     #[sqlx::test]
     async fn test_unknown_user_no_access(pool: PgPool) {
         let config = create_test_config();
-        let state = crate::AppState::builder().db(pool.clone()).config(config).build();
+        let state = {
+            let request_manager = std::sync::Arc::new(fusillade::PostgresRequestManager::new(pool.clone()));
+            crate::AppState::builder()
+                .db(pool.clone())
+                .config(config)
+                .request_manager(request_manager)
+                .build()
+        };
         let request = axum::http::Request::builder()
             .uri("/admin/api/v1/ai/v1/chat/completions")
             .header("x-doubleword-user", "test@example.org")
@@ -302,7 +340,14 @@ mod tests {
     #[sqlx::test]
     async fn test_unknown_model_not_found(pool: PgPool) {
         let config = create_test_config();
-        let state = crate::AppState::builder().db(pool.clone()).config(config).build();
+        let state = {
+            let request_manager = std::sync::Arc::new(fusillade::PostgresRequestManager::new(pool.clone()));
+            crate::AppState::builder()
+                .db(pool.clone())
+                .config(config)
+                .request_manager(request_manager)
+                .build()
+        };
         let user = create_test_user(&pool, Role::StandardUser).await;
 
         let request = axum::http::Request::builder()
@@ -324,7 +369,14 @@ mod tests {
     #[sqlx::test]
     async fn test_ignored_paths(pool: PgPool) {
         let config = create_test_config();
-        let state = crate::AppState::builder().db(pool.clone()).config(config).build();
+        let state = {
+            let request_manager = std::sync::Arc::new(fusillade::PostgresRequestManager::new(pool.clone()));
+            crate::AppState::builder()
+                .db(pool.clone())
+                .config(config)
+                .request_manager(request_manager)
+                .build()
+        };
         let user = create_test_user(&pool, Role::StandardUser).await;
 
         let request = axum::http::Request::builder()
@@ -388,7 +440,14 @@ mod tests {
             .await
             .expect("Failed to add deployment to Everyone group");
 
-        let state = crate::AppState::builder().db(pool.clone()).config(config).build();
+        let state = {
+            let request_manager = std::sync::Arc::new(fusillade::PostgresRequestManager::new(pool.clone()));
+            crate::AppState::builder()
+                .db(pool.clone())
+                .config(config)
+                .request_manager(request_manager)
+                .build()
+        };
         let request = axum::http::Request::builder()
             .uri("/admin/api/v1/ai/v1/chat/completions")
             .header("x-doubleword-user", user.email)
@@ -478,12 +537,14 @@ mod tests {
         };
         let jwt_token = session::create_session_token(&current_user, &config).unwrap();
 
+        let request_manager = std::sync::Arc::new(fusillade::PostgresRequestManager::new(pool.clone()));
         let state = crate::AppState {
             db: pool.clone(),
             config: config.clone(),
             outlet_db: None,
             metrics_recorder: None,
             is_leader: false,
+            request_manager,
         };
 
         let request = axum::http::Request::builder()
@@ -578,12 +639,14 @@ mod tests {
         };
         let jwt_token = session::create_session_token(&current_user, &config).unwrap();
 
+        let request_manager = std::sync::Arc::new(fusillade::PostgresRequestManager::new(pool.clone()));
         let state = crate::AppState {
             db: pool.clone(),
             config: config.clone(),
             outlet_db: None,
             metrics_recorder: None,
             is_leader: false,
+            request_manager,
         };
 
         let request = axum::http::Request::builder()
@@ -678,12 +741,14 @@ mod tests {
         };
         let jwt_token = session::create_session_token(&current_user, &config).unwrap();
 
+        let request_manager = std::sync::Arc::new(fusillade::PostgresRequestManager::new(pool.clone()));
         let state = crate::AppState {
             db: pool.clone(),
             config: config.clone(),
             outlet_db: None,
             metrics_recorder: None,
             is_leader: false,
+            request_manager,
         };
 
         // Request with JWT cookie - should be ignored since native auth is disabled
@@ -751,7 +816,14 @@ mod tests {
 
         tx.commit().await.unwrap();
 
-        let state = crate::AppState::builder().db(pool.clone()).config(config).build();
+        let state = {
+            let request_manager = std::sync::Arc::new(fusillade::PostgresRequestManager::new(pool.clone()));
+            crate::AppState::builder()
+                .db(pool.clone())
+                .config(config)
+                .request_manager(request_manager)
+                .build()
+        };
 
         let new_user_email = "auto-created@example.com";
 
@@ -847,12 +919,14 @@ mod tests {
 
         tx.commit().await.unwrap();
 
+        let request_manager = std::sync::Arc::new(fusillade::PostgresRequestManager::new(pool.clone()));
         let state = crate::AppState {
             db: pool.clone(),
             config: config.clone(),
             outlet_db: None,
             metrics_recorder: None,
             is_leader: false,
+            request_manager,
         };
 
         let request = axum::http::Request::builder()

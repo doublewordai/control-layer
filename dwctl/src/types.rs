@@ -8,6 +8,8 @@ pub type ApiKeyId = Uuid;
 pub type DeploymentId = Uuid;
 pub type GroupId = Uuid;
 pub type InferenceEndpointId = Uuid;
+#[allow(dead_code)] // TODO: Remove if not needed (currently using fusillade::FileId instead)
+pub type FileId = Uuid;
 
 /// Abbreviate a UUID to its first 8 characters for more readable logs and traces
 /// Example: "550e8400-e29b-41d4-a716-446655440000" -> "550e8400"
@@ -66,6 +68,8 @@ pub enum Resource {
     ModelRateLimits,
     Credits,
     Probes,
+    Files,
+    Batches,
 }
 
 // Permission types for authorization

@@ -15,6 +15,7 @@ import type {
   ModelsQuery,
   GroupsQuery,
   ListRequestsQuery,
+  TransactionsQuery,
   CreateProbeRequest,
   FilesListQuery,
   FileRequestsListQuery,
@@ -24,6 +25,7 @@ import type {
   Batch,
   FileUploadRequest,
   BatchRequestsListResponse,
+  AddFundsRequest,
 } from "./types";
 
 // Config hooks
@@ -45,11 +47,25 @@ export function useUsers(options?: UsersQuery & { enabled?: boolean }) {
   });
 }
 
-export function useUser(id: string) {
+export function useUser(id: string, options?: { include?: string }) {
   return useQuery({
-    queryKey: queryKeys.users.byId(id),
-    queryFn: () => dwctlApi.users.get(id),
+    queryKey: queryKeys.users.byId(id, options?.include),
+    queryFn: () => dwctlApi.users.get(id, options),
   });
+}
+
+export function useUserBalance(id: string) {
+  // Reuse the useUser cache to avoid duplicate queries and ensure consistency
+  // Explicitly request billing data for this hook
+  const userQuery = useUser(id, { include: "billing" });
+
+  return {
+    data: userQuery.data?.credit_balance || 0,
+    isLoading: userQuery.isLoading,
+    isError: userQuery.isError,
+    error: userQuery.error,
+    refetch: userQuery.refetch,
+  };
 }
 
 export function useCreateUser() {
@@ -750,6 +766,34 @@ export function useDownloadBatchResults() {
       a.click();
       window.URL.revokeObjectURL(url);
       document.body.removeChild(a);
+    },
+  });
+}
+
+// Cost management hooks
+
+export function useTransactions(query?: TransactionsQuery) {
+  return useQuery({
+    queryKey: ["cost", "transactions", query],
+    queryFn: () => dwctlApi.cost.listTransactions(query),
+    staleTime: 30 * 1000, // 30 seconds
+  });
+}
+
+export function useAddFunds() {
+  const queryClient = useQueryClient();
+
+  return useMutation({
+    mutationKey: ["cost", "add-funds"],
+    mutationFn: (data: AddFundsRequest) => dwctlApi.cost.addFunds(data),
+    onSuccess: async (_, variables) => {
+      // Refetch user balance and transactions from server
+      await Promise.all([
+        queryClient.refetchQueries({
+          queryKey: queryKeys.users.byId(variables.user_id, "billing"),
+        }),
+        queryClient.refetchQueries({ queryKey: ["cost", "transactions"] }),
+      ]);
     },
   });
 }

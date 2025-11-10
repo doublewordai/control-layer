@@ -8,6 +8,7 @@ import { describe, it, expect, beforeAll, afterEach, afterAll } from "vitest";
 import userEvent from "@testing-library/user-event";
 import UsersGroups from "./UsersGroups";
 import { handlers } from "../../../../api/control-layer/mocks/handlers";
+import { SettingsProvider } from "../../../../contexts";
 
 // Setup MSW server
 const server = setupServer(...handlers);
@@ -16,7 +17,7 @@ beforeAll(() => server.listen({ onUnhandledRequest: "error" }));
 afterEach(() => server.resetHandlers());
 afterAll(() => server.close());
 
-// Test wrapper with QueryClient and Router
+// Test wrapper with QueryClient, Router, and SettingsProvider
 function createWrapper() {
   const queryClient = new QueryClient({
     defaultOptions: {
@@ -27,9 +28,11 @@ function createWrapper() {
   });
 
   return ({ children }: { children: ReactNode }) => (
-    <QueryClientProvider client={queryClient}>
-      <BrowserRouter>{children}</BrowserRouter>
-    </QueryClientProvider>
+    <SettingsProvider>
+      <QueryClientProvider client={queryClient}>
+        <BrowserRouter>{children}</BrowserRouter>
+      </QueryClientProvider>
+    </SettingsProvider>
   );
 }
 

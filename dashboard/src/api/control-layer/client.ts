@@ -34,6 +34,7 @@ import type {
   PasswordResetRequest,
   PasswordResetConfirmRequest,
   ChangePasswordRequest,
+  TransactionsQuery,
   Probe,
   CreateProbeRequest,
   ProbeResult,
@@ -51,6 +52,9 @@ import type {
   BatchRequestsListQuery,
   BatchRequestsListResponse,
   BatchesListQuery,
+  Transaction,
+  AddFundsRequest,
+  AddFundsResponse,
 } from "./types";
 import { ApiError } from "./errors";
 
@@ -58,7 +62,9 @@ import { ApiError } from "./errors";
 const userApi = {
   async list(options?: UsersQuery): Promise<User[]> {
     const params = new URLSearchParams();
-    if (options?.include) params.set("include", options.include);
+    if (options?.include) {
+      params.set("include", options.include);
+    }
 
     const url = `/admin/api/v1/users${params.toString() ? "?" + params.toString() : ""}`;
     const response = await fetch(url);
@@ -68,8 +74,13 @@ const userApi = {
     return response.json();
   },
 
-  async get(id: string): Promise<User> {
-    const response = await fetch(`/admin/api/v1/users/${id}`);
+  async get(id: string, options?: { include?: string }): Promise<User> {
+    const params = new URLSearchParams();
+    if (options?.include) {
+      params.set("include", options.include);
+    }
+    const url = `/admin/api/v1/users/${id}${params.toString() ? "?" + params.toString() : ""}`;
+    const response = await fetch(url);
     if (!response.ok) {
       throw new Error(`Failed to fetch user: ${response.status}`);
     }
@@ -712,6 +723,43 @@ const authApi = {
   },
 };
 
+// Cost management API
+const costApi = {
+  async listTransactions(query?: TransactionsQuery): Promise<Transaction[]> {
+    const params = new URLSearchParams();
+    if (query?.limit) params.set("limit", query.limit.toString());
+    if (query?.skip) params.set("skip", query.skip.toString());
+    if (query?.userId) params.set("user_id", query.userId);
+
+    const url = `/admin/api/v1/transactions${params.toString() ? "?" + params.toString() : ""}`;
+    const response = await fetch(url);
+    if (!response.ok) {
+      throw new Error(`Failed to fetch transactions: ${response.status}`);
+    }
+    return response.json();
+  },
+
+  async addFunds(data: AddFundsRequest): Promise<AddFundsResponse> {
+    const payload = {
+      user_id: data.user_id,
+      transaction_type: "admin_grant",
+      amount: data.amount,
+      source_id: "550e8400-e29b-41d4-a716-446655440000",
+      description: data.description,
+    };
+
+    const response = await fetch("/admin/api/v1/transactions", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(payload),
+    });
+    if (!response.ok) {
+      throw new Error(`Failed to add funds: ${response.status}`);
+    }
+    return response.json();
+  },
+};
+
 // Probes API
 const probesApi = {
   async list(status?: string): Promise<Probe[]> {
@@ -1034,6 +1082,7 @@ export const dwctlApi = {
   config: configApi,
   requests: requestsApi,
   auth: authApi,
+  cost: costApi,
   probes: probesApi,
   files: filesApi,
   batches: batchesApi,

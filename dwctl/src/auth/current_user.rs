@@ -148,12 +148,104 @@ async fn try_proxy_header_auth(
     Ok(user_result)
 }
 
+/// Extract user from API key in Authorization header if present and valid
+async fn try_api_key_auth(parts: &axum::http::request::Parts, db: &PgPool) -> Result<Option<CurrentUser>> {
+    // Extract Authorization header
+    let auth_header = match parts.headers.get(axum::http::header::AUTHORIZATION) {
+        Some(header) => header,
+        None => return Ok(None),
+    };
+
+    let auth_str = auth_header.to_str().map_err(|e| Error::BadRequest {
+        message: format!("Invalid authorization header: {e}"),
+    })?;
+
+    // Check for Bearer token format
+    let api_key = match auth_str.strip_prefix("Bearer ") {
+        Some(key) => key,
+        None => return Ok(None), // Not a Bearer token, try other auth methods
+    };
+
+    // Look up API key in database
+    let mut conn = db.acquire().await.map_err(DbError::from)?;
+    let api_key_result = sqlx::query!(
+        r#"
+        SELECT ak.user_id, ak.purpose, u.username, u.email, u.is_admin, u.display_name, u.avatar_url
+        FROM api_keys ak
+        INNER JOIN users u ON ak.user_id = u.id
+        WHERE ak.secret = $1
+        "#,
+        api_key
+    )
+    .fetch_optional(&mut *conn)
+    .await
+    .map_err(DbError::from)?;
+
+    let api_key_data = match api_key_result {
+        Some(data) => data,
+        None => {
+            return Err(Error::Unauthenticated {
+                message: Some("Invalid API key".to_string()),
+            })
+        }
+    };
+
+    // Check purpose matches the endpoint path
+    let path = parts.uri.path();
+    let purpose_str = &api_key_data.purpose;
+
+    let expected_purpose = if path.starts_with("/admin/api/") {
+        "platform"
+    } else if path.starts_with("/ai/") {
+        "inference"
+    } else {
+        // For other paths, allow any purpose
+        purpose_str.as_str()
+    };
+
+    if purpose_str != expected_purpose {
+        return Err(Error::InsufficientPermissions {
+            required: crate::types::Permission::Granted,
+            action: crate::types::Operation::ReadAll,
+            resource: format!("endpoint {} with API key purpose '{}'", path, purpose_str),
+        });
+    }
+
+    // Get user roles
+    let roles = sqlx::query_scalar!(
+        r#"
+        SELECT role as "role!: Role"
+        FROM user_roles
+        WHERE user_id = $1
+        "#,
+        api_key_data.user_id
+    )
+    .fetch_all(&mut *conn)
+    .await
+    .map_err(DbError::from)?;
+
+    Ok(Some(CurrentUser {
+        id: api_key_data.user_id,
+        username: api_key_data.username,
+        email: api_key_data.email,
+        is_admin: api_key_data.is_admin,
+        roles,
+        display_name: api_key_data.display_name,
+        avatar_url: api_key_data.avatar_url,
+    }))
+}
+
 impl FromRequestParts<AppState> for CurrentUser {
     type Rejection = Error;
 
     async fn from_request_parts(parts: &mut Parts, state: &AppState) -> Result<Self> {
         // Try authentication methods in order, returning the first successful one
-        // Native authentication first (JWT sessions)
+        // Try API key authentication first (most specific)
+        if let Some(user) = try_api_key_auth(parts, &state.db).await? {
+            return Ok(user);
+        }
+
+        // Native authentication (JWT sessions)
         if state.config.auth.native.enabled {
             if let Some(user) = try_jwt_session_auth(parts, &state.config)? {
                 return Ok(user);
@@ -197,7 +289,14 @@ mod tests {
     #[sqlx::test]
     async fn test_existing_user_extraction(pool: PgPool) {
         let config = create_test_config();
-        let state = AppState::builder().db(pool.clone()).config(config).build();
+        let state = {
+            let request_manager = std::sync::Arc::new(fusillade::PostgresRequestManager::new(pool.clone()));
+            AppState::builder()
+                .db(pool.clone())
+                .config(config)
+                .request_manager(request_manager)
+                .build()
+        };
 
         // Create a test user first
         let test_user = crate::test_utils::create_test_user(&pool, Role::StandardUser).await;
@@ -217,7 +316,14 @@ mod tests {
     #[sqlx::test]
     async fn test_auto_create_nonexistent_user(pool: PgPool) {
         let config = create_test_config();
-        let state = AppState::builder().db(pool.clone()).config(config).build();
+        let state = {
+            let request_manager = std::sync::Arc::new(fusillade::PostgresRequestManager::new(pool.clone()));
+            AppState::builder()
+                .db(pool.clone())
+                .config(config)
+                .request_manager(request_manager)
+                .build()
+        };
 
         let new_email = "newuser@example.com";
         let mut parts = create_test_parts_with_header("x-doubleword-user", new_email);
@@ -247,7 +353,14 @@ mod tests {
     #[sqlx::test]
     async fn test_missing_header_returns_unauthorized(pool: PgPool) {
         let config = create_test_config();
-        let state = AppState::builder().db(pool.clone()).config(config).build();
+        let state = {
+            let request_manager = std::sync::Arc::new(fusillade::PostgresRequestManager::new(pool.clone()));
+            AppState::builder()
+                .db(pool.clone())
+                .config(config)
+                .request_manager(request_manager)
+                .build()
+        };
 
         // Create parts without x-doubleword-user header
         let request = axum::http::Request::builder().uri("http://localhost/test").body(()).unwrap();

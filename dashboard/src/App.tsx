@@ -1,20 +1,8 @@
 import { BrowserRouter, Routes, Route, Navigate } from "react-router-dom";
-import { useEffect } from "react";
+import { useEffect, lazy, Suspense } from "react";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { ReactQueryDevtools } from "@tanstack/react-query-devtools";
 import { Toaster } from "./components/ui/sonner";
-import {
-  ApiKeys,
-  Endpoints,
-  Models,
-  ModelInfo,
-  Playground,
-  Profile,
-  Requests,
-  Settings,
-  UsersGroups,
-  Batches
-} from "./components/features";
 import { AppLayout } from "./components/layout";
 import {
   ProtectedRoute,
@@ -29,6 +17,70 @@ import { SettingsProvider, useSettings } from "./contexts";
 import { AuthProvider, useAuth } from "./contexts/auth";
 import { useAuthorization } from "./utils";
 import { useRegistrationInfo } from "./api/control-layer/hooks";
+
+// Lazy load route components
+const ApiKeys = lazy(() =>
+  import("./components/features/api-keys").then((m) => ({
+    default: m.ApiKeys,
+  })),
+);
+const CostManagement = lazy(() =>
+  import("./components/features/cost-management").then((m) => ({
+    default: m.CostManagement,
+  })),
+);
+const Endpoints = lazy(() =>
+  import("./components/features/endpoints").then((m) => ({
+    default: m.Endpoints,
+  })),
+);
+const Models = lazy(() =>
+  import("./components/features/models").then((m) => ({ default: m.Models })),
+);
+const ModelInfo = lazy(() =>
+  import("./components/features/models").then((m) => ({
+    default: m.ModelInfo,
+  })),
+);
+const Playground = lazy(() =>
+  import("./components/features/playground").then((m) => ({
+    default: m.Playground,
+  })),
+);
+const Profile = lazy(() =>
+  import("./components/features/profile").then((m) => ({
+    default: m.Profile,
+  })),
+);
+const Requests = lazy(() =>
+  import("./components/features/requests").then((m) => ({
+    default: m.Requests,
+  })),
+);
+const Settings = lazy(() =>
+  import("./components/features/settings").then((m) => ({
+    default: m.Settings,
+  })),
+);
+const UsersGroups = lazy(() =>
+  import("./components/features/users-groups").then((m) => ({
+    default: m.UsersGroups,
+  })),
+);
+const Batches = lazy(() =>
+  import("./components/features/batches").then((m) => ({
+    default: m.Batches,
+  })),
+);
+
+// Loading component for lazy-loaded routes
+function RouteLoader() {
+  return (
+    <div className="flex items-center justify-center h-64">
+      <div className="animate-spin rounded-full h-12 w-12 border-b-2 border-doubleword-accent-blue"></div>
+    </div>
+  );
+}
 
 // Create a client
 const queryClient = new QueryClient({
@@ -184,7 +236,9 @@ function AppRoutes() {
           element={
             <AppLayout>
               <ProtectedRoute path="/analytics">
-                <Requests />
+                <Suspense fallback={<RouteLoader />}>
+                  <Requests />
+                </Suspense>
               </ProtectedRoute>
             </AppLayout>
           }
@@ -206,7 +260,9 @@ function AppRoutes() {
           element={
             <AppLayout>
               <ProtectedRoute path="/endpoints">
-                <Endpoints />
+                <Suspense fallback={<RouteLoader />}>
+                  <Endpoints />
+                </Suspense>
               </ProtectedRoute>
             </AppLayout>
           }
@@ -216,7 +272,9 @@ function AppRoutes() {
           element={
             <AppLayout>
               <ProtectedRoute path="/models">
-                <Models />
+                <Suspense fallback={<RouteLoader />}>
+                  <Models />
+                </Suspense>
               </ProtectedRoute>
             </AppLayout>
           }
@@ -226,7 +284,9 @@ function AppRoutes() {
           element={
             <AppLayout>
               <ProtectedRoute path="/models/:modelId">
-                <ModelInfo />
+                <Suspense fallback={<RouteLoader />}>
+                  <ModelInfo />
+                </Suspense>
               </ProtectedRoute>
             </AppLayout>
           }
@@ -236,7 +296,9 @@ function AppRoutes() {
           element={
             <AppLayout>
               <ProtectedRoute path="/playground">
-                <Playground />
+                <Suspense fallback={<RouteLoader />}>
+                  <Playground />
+                </Suspense>
               </ProtectedRoute>
             </AppLayout>
           }
@@ -246,7 +308,9 @@ function AppRoutes() {
           element={
             <AppLayout>
               <ProtectedRoute path="/users-groups">
-                <UsersGroups />
+                <Suspense fallback={<RouteLoader />}>
+                  <UsersGroups />
+                </Suspense>
               </ProtectedRoute>
             </AppLayout>
           }
@@ -256,7 +320,9 @@ function AppRoutes() {
           element={
             <AppLayout>
               <ProtectedRoute path="/settings">
-                <Settings />
+                <Suspense fallback={<RouteLoader />}>
+                  <Settings />
+                </Suspense>
               </ProtectedRoute>
             </AppLayout>
           }
@@ -266,7 +332,9 @@ function AppRoutes() {
           element={
             <AppLayout>
               <ProtectedRoute path="/profile">
-                <Profile />
+                <Suspense fallback={<RouteLoader />}>
+                  <Profile />
+                </Suspense>
               </ProtectedRoute>
             </AppLayout>
           }
@@ -276,7 +344,24 @@ function AppRoutes() {
           element={
             <AppLayout>
               <ProtectedRoute path="/api-keys">
-                <ApiKeys />
+                <Suspense fallback={<RouteLoader />}>
+                  <ApiKeys />
+                </Suspense>
+              </ProtectedRoute>
+            </AppLayout>
+          }
+        />
+        <Route
+          path="/cost-management"
+          element={
+            <AppLayout>
+              <ProtectedRoute
+                path="/cost-management"
+                requiredFeatureFlag="use_billing"
+              >
+                <Suspense fallback={<RouteLoader />}>
+                  <CostManagement />
+                </Suspense>
               </ProtectedRoute>
             </AppLayout>
           }
@@ -294,7 +379,7 @@ function App() {
           <AppRoutes />
         </AuthProvider>
       </SettingsProvider>
-      <ReactQueryDevtools initialIsOpen={false} />
+      {import.meta.env.DEV && <ReactQueryDevtools initialIsOpen={false} />}
       <Toaster />
     </QueryClientProvider>
   );

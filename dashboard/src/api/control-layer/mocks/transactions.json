@@ -1,0 +1,87 @@
+[
+  {
+    "id": "txn-001",
+    "user_id": "550e8400-e29b-41d4-a716-446655440001",
+    "transaction_type": "admin_grant",
+    "amount": 100.0,
+    "balance_after": 100.0,
+    "source_id": "admin",
+    "description": "Initial credit allocation",
+    "created_at": "2024-01-15T10:00:00Z"
+  },
+  {
+    "id": "txn-002",
+    "user_id": "550e8400-e29b-41d4-a716-446655440001",
+    "transaction_type": "usage",
+    "amount": -5.25,
+    "balance_after": 94.75,
+    "previous_transaction_id": "txn-001",
+    "source_id": "request-123",
+    "description": "API usage for gpt-4",
+    "created_at": "2024-01-15T14:30:00Z"
+  },
+  {
+    "id": "txn-003",
+    "user_id": "550e8400-e29b-41d4-a716-446655440002",
+    "transaction_type": "admin_grant",
+    "amount": 50.0,
+    "balance_after": 50.0,
+    "source_id": "admin",
+    "description": "Welcome bonus",
+    "created_at": "2024-01-16T09:00:00Z"
+  },
+  {
+    "id": "txn-004",
+    "user_id": "550e8400-e29b-41d4-a716-446655440001",
+    "transaction_type": "usage",
+    "amount": -2.5,
+    "balance_after": 92.25,
+    "previous_transaction_id": "txn-002",
+    "source_id": "request-124",
+    "description": "API usage for claude-3-sonnet",
+    "created_at": "2024-01-16T11:20:00Z"
+  },
+  {
+    "id": "txn-005",
+    "user_id": "550e8400-e29b-41d4-a716-446655440002",
+    "transaction_type": "usage",
+    "amount": -1.75,
+    "balance_after": 48.25,
+    "previous_transaction_id": "txn-003",
+    "source_id": "request-125",
+    "description": "API usage for gpt-3.5-turbo",
+    "created_at": "2024-01-16T15:45:00Z"
+  },
+  {
+    "id": "txn-006",
+    "user_id": "550e8400-e29b-41d4-a716-446655440003",
+    "transaction_type": "purchase",
+    "amount": 200.0,
+    "balance_after": 200.0,
+    "source_id": "payment-001",
+    "description": "Credit purchase via Stripe",
+    "created_at": "2024-01-17T08:30:00Z"
+  },
+  {
+    "id": "txn-007",
+    "user_id": "550e8400-e29b-41d4-a716-446655440001",
+    "transaction_type": "admin_removal",
+    "amount": -10.0,
+    "balance_after": 82.25,
+    "previous_transaction_id": "txn-004",
+    "source_id": "admin",
+    "description": "Account adjustment",
+    "created_at": "2024-01-17T12:00:00Z"
+  },
+  {
+    "id": "txn-008",
+    "user_id": "550e8400-e29b-41d4-a716-446655440003",
+    "transaction_type": "usage",
+    "amount": -8.5,
+    "balance_after": 191.5,
+    "previous_transaction_id": "txn-006",
+    "source_id": "request-126",
+    "description": "API usage for gpt-4-vision",
+    "created_at": "2024-01-17T14:15:00Z"
+  }
+]

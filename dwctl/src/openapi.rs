@@ -1,5 +1,5 @@
 use utoipa::{
-    openapi::security::{ApiKey, ApiKeyValue, SecurityScheme},
+    openapi::security::{ApiKey, ApiKeyValue, HttpAuthScheme, HttpBuilder, SecurityScheme},
     Modify, OpenApi,
 };
 
@@ -10,6 +10,25 @@ struct SecurityAddon;
 impl Modify for SecurityAddon {
     fn modify(&self, openapi: &mut utoipa::openapi::OpenApi) {
         if let Some(components) = openapi.components.as_mut() {
+            // Add Bearer token authentication (API keys)
+            components.security_schemes.insert(
+                "BearerAuth".to_string(),
+                SecurityScheme::Http(
+                    HttpBuilder::new()
+                        .scheme(HttpAuthScheme::Bearer)
+                        .bearer_format("API Key")
+                        .description(Some("Enter your API key"))
+                        .build(),
+                ),
+            );
+
+            // Add session cookie authentication (JWT)
+            components.security_schemes.insert(
+                "CookieAuth".to_string(),
+                SecurityScheme::ApiKey(ApiKey::Cookie(ApiKeyValue::new("session"))),
+            );
+
+            // Add proxy header authentication (legacy)
             components.security_schemes.insert(
                 "X-Doubleword-User".to_string(),
                 SecurityScheme::ApiKey(ApiKey::Header(ApiKeyValue::new("X-Doubleword-User"))),
@@ -69,6 +88,26 @@ impl Modify for SecurityAddon {
         api::handlers::transactions::create_transaction,
         api::handlers::transactions::get_transaction,
         api::handlers::transactions::list_transactions,
+        api::handlers::files::upload_file,
+        api::handlers::files::list_files,
+        api::handlers::files::get_file,
+        api::handlers::files::get_file_content,
+        api::handlers::files::delete_file,
+        api::handlers::config::get_config,
+        api::handlers::probes::create_probe,
+        api::handlers::probes::list_probes,
+        api::handlers::probes::get_probe,
+        api::handlers::probes::delete_probe,
+        api::handlers::probes::activate_probe,
+        api::handlers::probes::deactivate_probe,
+        api::handlers::probes::update_probe,
+        api::handlers::probes::execute_probe,
+        api::handlers::probes::test_probe,
+        api::handlers::probes::get_probe_results,
+        api::handlers::probes::get_statistics,
+        api::handlers::requests::list_requests,
+        api::handlers::requests::aggregate_requests,
+        api::handlers::requests::aggregate_by_user,
     ),
     components(
         schemas(
@@ -108,6 +147,36 @@ impl Modify for SecurityAddon {
             api::models::transactions::CreditTransactionResponse,
             crate::db::models::credits::CreditTransactionType,
             sync::endpoint_sync::EndpointSyncResponse,
+            api::models::files::ListFilesQuery,
+            api::models::files::FileResponse,
+            api::models::files::FileDeleteResponse,
+            api::models::files::FileListResponse,
+            api::models::files::ObjectType,
+            api::models::files::Purpose,
+            api::models::files::ListObject,
+            api::models::probes::CreateProbe,
+            api::models::probes::TestProbeRequest,
+            api::models::probes::ProbesQuery,
+            api::models::probes::ResultsQuery,
+            api::models::probes::StatsQuery,
+            api::models::probes::UpdateProbeRequest,
+            api::models::probes::ProbeStatistics,
+            crate::db::models::probes::Probe,
+            crate::db::models::probes::ProbeResult,
+            api::models::requests::ApiAiRequest,
+            api::models::requests::ApiAiResponse,
+            api::models::requests::AggregateRequestsQuery,
+            api::models::requests::ListRequestsQuery,
+            api::models::requests::HttpRequest,
+            api::models::requests::HttpResponse,
+            api::models::requests::RequestResponsePair,
+            api::models::requests::ListRequestsResponse,
+            api::models::requests::StatusCodeBreakdown,
+            api::models::requests::ModelUsage,
+            api::models::requests::UserUsage,
+            api::models::requests::ModelUserUsageResponse,
+            api::models::requests::TimeSeriesPoint,
+            api::models::requests::RequestsAggregateResponse,
         )
     ),
     tags(
@@ -118,6 +187,10 @@ impl Modify for SecurityAddon {
         (name = "models", description = "Deployed model management"),
         (name = "groups", description = "Group management API"),
         (name = "transactions", description = "Credit transaction management API"),
+        (name = "files", description = "File management API"),
+        (name = "config", description = "Configuration API"),
+        (name = "probes", description = "Probe monitoring API"),
+        (name = "requests", description = "Request logging and analytics API"),
     ),
     info(
         title = "Onwards Pilot API",

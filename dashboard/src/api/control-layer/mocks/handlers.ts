@@ -19,12 +19,17 @@ import type {
   BatchRequest,
   FileRequest,
   BatchCreateRequest,
+  Transaction,
+  AddFundsRequest,
 } from "../types";
 import usersDataRaw from "./users.json";
 import groupsDataRaw from "./groups.json";
 import endpointsDataRaw from "./endpoints.json";
 import modelsDataRaw from "./models.json";
 import apiKeysDataRaw from "./api-keys.json";
+// Mock transactions for MSW test handlers
+// For demo mode UI data, see: src/components/features/cost-management/demoTransactions.ts
+import transactionsDataRaw from "./transactions.json";
 import userGroups from "./user-groups.json";
 import modelsGroups from "./models-groups.json";
 import requestsDataRaw from "../../demo/data/requests.json";
@@ -65,6 +70,7 @@ const groupsData = groupsDataRaw as Group[];
 const endpointsData = endpointsDataRaw as Endpoint[];
 const modelsData = modelsDataRaw.data as Model[];
 const apiKeysData = apiKeysDataRaw as ApiKey[];
+const transactionsData = transactionsDataRaw as Transaction[];
 const userGroupsInitial = userGroups as Record<string, string[]>;
 const modelsGroupsInitial = modelsGroups as Record<string, string[]>;
 const requestsData = requestsDataRaw as DemoRequest[];
@@ -295,7 +301,7 @@ export const handlers = [
 
     let users = [...usersData];
 
-    if (include === "groups") {
+    if (include?.includes("groups")) {
       const userGroupsData = getUserGroupsData();
       users = users.map((user) => ({
         ...user,
@@ -308,7 +314,10 @@ export const handlers = [
     return HttpResponse.json(users);
   }),
 
-  http.get("/admin/api/v1/users/:id", ({ params }) => {
+  http.get("/admin/api/v1/users/:id", ({ params, request }) => {
+    const url = new URL(request.url);
+    const include = url.searchParams.get("include");
+
     let user;
     if (params.id === "current") {
       // Return the first user as the current user for demo purposes
@@ -320,7 +329,22 @@ export const handlers = [
     if (!user) {
       return HttpResponse.json({ error: "User not found" }, { status: 404 });
     }
-    return HttpResponse.json(user);
+
+    // Add billing information if requested
+    let result = { ...user };
+    if (include?.includes("billing")) {
+      // Get user's last transaction to determine current balance
+      const userTransactions = transactionsData
+        .filter((t) => t.user_id === user.id)
+        .sort(
+          (a, b) =>
+            new Date(b.created_at).getTime() - new Date(a.created_at).getTime(),
+        );
+      const creditBalance = userTransactions[0]?.balance_after || 0;
+      result = { ...result, credit_balance: creditBalance };
+    }
+
+    return HttpResponse.json(result);
   }),
 
   http.post("/admin/api/v1/users", async ({ request }) => {
@@ -1104,6 +1128,75 @@ export const handlers = [
 
     const result = computeUserUsageByModel(model, startDate, endDate);
     return HttpResponse.json(result);
+  }),
+
+  // Transactions API
+  http.get("/admin/api/v1/transactions", ({ request }) => {
+    const url = new URL(request.url);
+    const userIdParam = url.searchParams.get("user_id");
+    const limitParam = url.searchParams.get("limit");
+    const skipParam = url.searchParams.get("skip");
+
+    const limit = limitParam ? parseInt(limitParam, 10) : undefined;
+    const skip = skipParam ? parseInt(skipParam, 10) : 0;
+
+    // If no userId provided, default to current user (first user in demo)
+    const userId = userIdParam || usersData[0]?.id;
+
+    // Filter by userId
+    const filteredTransactions = userId
+      ? transactionsData.filter((t) => t.user_id === userId)
+      : [...transactionsData];
+
+    // Sort by created_at descending (newest first)
+    filteredTransactions.sort(
+      (a, b) =>
+        new Date(b.created_at).getTime() - new Date(a.created_at).getTime(),
+    );
+
+    // Apply pagination
+    const paginatedTransactions = limit
+      ? filteredTransactions.slice(skip, skip + limit)
+      : filteredTransactions.slice(skip);
+
+    return HttpResponse.json(paginatedTransactions);
+  }),
+
+  http.post("/admin/api/v1/transactions", async ({ request }) => {
+    const body = (await request.json()) as AddFundsRequest;
+
+    // Validate user exists
+    const user = usersData.find((u) => u.id === body.user_id);
+    if (!user) {
+      return HttpResponse.json({ error: "User not found" }, { status: 404 });
+    }
+
+    // Get user's last transaction to determine current balance
+    const userTransactions = transactionsData
+      .filter((t) => t.user_id === body.user_id)
+      .sort(
+        (a, b) =>
+          new Date(b.created_at).getTime() - new Date(a.created_at).getTime(),
+      );
+    const currentBalance = userTransactions[0]?.balance_after || 0;
+
+    // Create new transaction
+    const newTransaction: Transaction = {
+      id: `txn-${Date.now()}`,
+      user_id: body.user_id,
+      transaction_type: "admin_grant",
+      amount: body.amount,
+      balance_after: currentBalance + body.amount,
+      previous_transaction_id: userTransactions[0]?.id,
+      source_id: "admin",
+      description: body.description || "Funds added by admin",
+      created_at: new Date().toISOString(),
+    };
+
+    // Persist the transaction to the mock data array
+    transactionsData.unshift(newTransaction);
+
+    return HttpResponse.json(newTransaction, { status: 201 });
   }),
 
   // Probes API

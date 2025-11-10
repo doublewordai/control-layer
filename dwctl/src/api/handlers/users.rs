@@ -39,6 +39,8 @@ use tracing::error;
         (status = 500, description = "Internal server error"),
     ),
     security(
+        ("BearerAuth" = []),
+        ("CookieAuth" = []),
         ("X-Doubleword-User" = [])
     )
 )]
@@ -153,6 +155,8 @@ pub async fn list_users(
         (status = 500, description = "Internal server error")
     ),
     security(
+        ("BearerAuth" = []),
+        ("CookieAuth" = []),
         ("X-Doubleword-User" = [])
     )
 )]
@@ -239,6 +243,8 @@ pub async fn get_user(
         (status = 500, description = "Internal server error"),
     ),
     security(
+        ("BearerAuth" = []),
+        ("CookieAuth" = []),
         ("X-Doubleword-User" = [])
     )
 )]
@@ -277,6 +283,8 @@ pub async fn create_user(
         (status = 500, description = "Internal server error"),
     ),
     security(
+        ("BearerAuth" = []),
+        ("CookieAuth" = []),
         ("X-Doubleword-User" = [])
     )
 )]
@@ -316,6 +324,8 @@ pub async fn update_user(
         (status = 500, description = "Internal server error"),
     ),
     security(
+        ("BearerAuth" = []),
+        ("CookieAuth" = []),
         ("X-Doubleword-User" = [])
     )
 )]
@@ -361,7 +371,7 @@ mod tests {
     #[sqlx::test]
     #[test_log::test]
     async fn test_get_current_user_info(pool: PgPool) {
-        let (app, _) = create_test_app(pool.clone(), false).await;
+        let (app, _bg_services) = create_test_app(pool.clone(), false).await;
         let user = create_test_user(&pool, Role::StandardUser).await;
 
         let response = app
@@ -379,7 +389,7 @@ mod tests {
     #[sqlx::test]
     #[test_log::test]
     async fn test_list_users_as_admin(pool: PgPool) {
-        let (app, _) = create_test_app(pool.clone(), false).await;
+        let (app, _bg_services) = create_test_app(pool.clone(), false).await;
         let admin_user = create_test_admin_user(&pool, Role::PlatformManager).await;
 
         let response = app
@@ -395,7 +405,7 @@ mod tests {
     #[sqlx::test]
     #[test_log::test]
     async fn test_list_users_as_non_admin_forbidden(pool: PgPool) {
-        let (app, _) = create_test_app(pool.clone(), false).await;
+        let (app, _bg_services) = create_test_app(pool.clone(), false).await;
         let user = create_test_user(&pool, Role::StandardUser).await;
 
         let response = app
@@ -409,7 +419,7 @@ mod tests {
     #[sqlx::test]
     #[test_log::test]
     async fn test_create_user_as_admin(pool: PgPool) {
-        let (app, _) = create_test_app(pool.clone(), false).await;
+        let (app, _bg_services) = create_test_app(pool.clone(), false).await;
         let admin_user = create_test_admin_user(&pool, Role::PlatformManager).await;
 
         let new_user = json!({
@@ -435,7 +445,7 @@ mod tests {
     #[sqlx::test]
     #[test_log::test]
     async fn test_unauthenticated_request(pool: PgPool) {
-        let (app, _) = create_test_app(pool, false).await;
+        let (app, _bg_services) = create_test_app(pool, false).await;
 
         let response = app.get("/admin/api/v1/users/current").await;
         response.assert_status_unauthorized();
@@ -444,7 +454,7 @@ mod tests {
     #[sqlx::test]
     #[test_log::test]
     async fn test_list_users_with_pagination(pool: PgPool) {
-        let (app, _) = create_test_app(pool.clone(), false).await;
+        let (app, _bg_services) = create_test_app(pool.clone(), false).await;
         let admin_user = create_test_admin_user(&pool, Role::PlatformManager).await;
 
         // Create additional test users
@@ -496,7 +506,7 @@ mod tests {
     #[sqlx::test]
     #[test_log::test]
     async fn test_get_other_user_as_admin(pool: PgPool) {
-        let (app, _) = create_test_app(pool.clone(), false).await;
+        let (app, _bg_services) = create_test_app(pool.clone(), false).await;
         let admin_user = create_test_admin_user(&pool, Role::PlatformManager).await;
         let regular_user = create_test_user(&pool, Role::StandardUser).await;
 
@@ -514,7 +524,7 @@ mod tests {
     #[sqlx::test]
     #[test_log::test]
     async fn test_get_other_user_as_non_admin_forbidden(pool: PgPool) {
-        let (app, _) = create_test_app(pool.clone(), false).await;
+        let (app, _bg_services) = create_test_app(pool.clone(), false).await;
         let user1 = create_test_user(&pool, Role::StandardUser).await;
         let user2 = create_test_user(&pool, Role::StandardUser).await;
 
@@ -529,7 +539,7 @@ mod tests {
     #[sqlx::test]
     #[test_log::test]
     async fn test_get_user_not_found(pool: PgPool) {
-        let (app, _) = create_test_app(pool.clone(), false).await;
+        let (app, _bg_services) = create_test_app(pool.clone(), false).await;
         let admin_user = create_test_admin_user(&pool, Role::PlatformManager).await;
         let nonexistent_id = uuid::Uuid::new_v4();
 
@@ -544,7 +554,7 @@ mod tests {
     #[sqlx::test]
     #[test_log::test]
     async fn test_list_users_with_groups_include(pool: PgPool) {
-        let (app, _) = create_test_app(pool.clone(), false).await;
+        let (app, _bg_services) = create_test_app(pool.clone(), false).await;
         let admin_user = create_test_admin_user(&pool, Role::PlatformManager).await;
         let regular_user = create_test_user(&pool, Role::StandardUser).await;
 
@@ -616,7 +626,7 @@ mod tests {
     #[sqlx::test]
     #[test_log::test]
     async fn test_list_users_with_billing_include(pool: PgPool) {
-        let (app, _) = create_test_app(pool.clone(), false).await;
+        let (app, _bg_services) = create_test_app(pool.clone(), false).await;
         let admin_user = create_test_admin_user(&pool, Role::PlatformManager).await;
         let regular_user = create_test_user(&pool, Role::StandardUser).await;
 
@@ -674,7 +684,7 @@ mod tests {
     #[sqlx::test]
     #[test_log::test]
     async fn test_list_users_with_groups_and_billing_include(pool: PgPool) {
-        let (app, _) = create_test_app(pool.clone(), false).await;
+        let (app, _bg_services) = create_test_app(pool.clone(), false).await;
         let admin_user = create_test_admin_user(&pool, Role::PlatformManager).await;
         let regular_user = create_test_user(&pool, Role::StandardUser).await;
 
@@ -718,7 +728,7 @@ mod tests {
     #[sqlx::test]
     #[test_log::test]
     async fn test_list_users_billing_with_zero_balance(pool: PgPool) {
-        let (app, _) = create_test_app(pool.clone(), false).await;
+        let (app, _bg_services) = create_test_app(pool.clone(), false).await;
         let admin_user = create_test_admin_user(&pool, Role::PlatformManager).await;
         let regular_user = create_test_user(&pool, Role::StandardUser).await;
 
@@ -740,7 +750,7 @@ mod tests {
     #[sqlx::test]
     #[test_log::test]
     async fn test_list_users_billing_with_multiple_transactions(pool: PgPool) {
-        let (app, _) = create_test_app(pool.clone(), false).await;
+        let (app, _bg_services) = create_test_app(pool.clone(), false).await;
         let admin_user = create_test_admin_user(&pool, Role::PlatformManager).await;
         let user1 = create_test_user(&pool, Role::StandardUser).await;
         let user2 = create_test_user(&pool, Role::StandardUser).await;
@@ -788,7 +798,7 @@ mod tests {
     #[sqlx::test]
     #[test_log::test]
     async fn test_list_users_billing_manager_can_view_billing(pool: PgPool) {
-        let (app, _) = create_test_app(pool.clone(), false).await;
+        let (app, _bg_services) = create_test_app(pool.clone(), false).await;
         let billing_manager = create_test_admin_user(&pool, Role::BillingManager).await;
         let regular_user = create_test_user(&pool, Role::StandardUser).await;
 
@@ -811,7 +821,7 @@ mod tests {
     #[sqlx::test]
     #[test_log::test]
     async fn test_update_user_as_admin(pool: PgPool) {
-        let (app, _) = create_test_app(pool.clone(), false).await;
+        let (app, _bg_services) = create_test_app(pool.clone(), false).await;
         let admin_user = create_test_admin_user(&pool, Role::PlatformManager).await;
         let regular_user = create_test_user(&pool, Role::StandardUser).await;
 
@@ -836,7 +846,7 @@ mod tests {
     #[sqlx::test]
     #[test_log::test]
     async fn test_update_user_as_non_admin_forbidden(pool: PgPool) {
-        let (app, _) = create_test_app(pool.clone(), false).await;
+        let (app, _bg_services) = create_test_app(pool.clone(), false).await;
         let user1 = create_test_user(&pool, Role::StandardUser).await;
         let user2 = create_test_user(&pool, Role::StandardUser).await;
 
@@ -856,7 +866,7 @@ mod tests {
     #[sqlx::test]
     #[test_log::test]
     async fn test_update_nonexistent_user(pool: PgPool) {
-        let (app, _) = create_test_app(pool.clone(), false).await;
+        let (app, _bg_services) = create_test_app(pool.clone(), false).await;
         let admin_user = create_test_admin_user(&pool, Role::PlatformManager).await;
         let nonexistent_id = uuid::Uuid::new_v4();
 
@@ -876,7 +886,7 @@ mod tests {
     #[sqlx::test]
     #[test_log::test]
     async fn test_delete_user_as_admin(pool: PgPool) {
-        let (app, _) = create_test_app(pool.clone(), false).await;
+        let (app, _bg_services) = create_test_app(pool.clone(), false).await;
         let admin_user = create_test_admin_user(&pool, Role::PlatformManager).await;
         let regular_user = create_test_user(&pool, Role::StandardUser).await;
 
@@ -899,7 +909,7 @@ mod tests {
     #[sqlx::test]
     #[test_log::test]
     async fn test_delete_user_as_non_admin_forbidden(pool: PgPool) {
-        let (app, _) = create_test_app(pool.clone(), false).await;
+        let (app, _bg_services) = create_test_app(pool.clone(), false).await;
         let user1 = create_test_user(&pool, Role::StandardUser).await;
         let user2 = create_test_user(&pool, Role::StandardUser).await;
 
@@ -914,7 +924,7 @@ mod tests {
     #[sqlx::test]
     #[test_log::test]
     async fn test_delete_nonexistent_user(pool: PgPool) {
-        let (app, _) = create_test_app(pool.clone(), false).await;
+        let (app, _bg_services) = create_test_app(pool.clone(), false).await;
         let admin_user = create_test_admin_user(&pool, Role::PlatformManager).await;
         let nonexistent_id = uuid::Uuid::new_v4();
 
@@ -929,7 +939,7 @@ mod tests {
     #[sqlx::test]
     #[test_log::test]
     async fn test_delete_self_forbidden(pool: PgPool) {
-        let (app, _) = create_test_app(pool.clone(), false).await;
+        let (app, _bg_services) = create_test_app(pool.clone(), false).await;
         let admin_user = create_test_admin_user(&pool, Role::PlatformManager).await;
 
         let response = app
@@ -943,7 +953,7 @@ mod tests {
     #[sqlx::test]
     #[test_log::test]
     async fn test_standard_user_permissions(pool: PgPool) {
-        let (app, _) = create_test_app(pool.clone(), false).await;
+        let (app, _bg_services) = create_test_app(pool.clone(), false).await;
         let standard_user = create_test_user(&pool, Role::StandardUser).await;
         let other_user = create_test_user(&pool, Role::StandardUser).await;
 
@@ -1008,7 +1018,7 @@ mod tests {
     #[sqlx::test]
     #[test_log::test]
     async fn test_request_viewer_permissions(pool: PgPool) {
-        let (app, _) = create_test_app(pool.clone(), false).await;
+        let (app, _bg_services) = create_test_app(pool.clone(), false).await;
         let request_viewer = create_test_user(&pool, Role::RequestViewer).await;
         let other_user = create_test_user(&pool, Role::StandardUser).await;
 
@@ -1051,7 +1061,7 @@ mod tests {
     #[sqlx::test]
     #[test_log::test]
     async fn test_platform_manager_user_permissions(pool: PgPool) {
-        let (app, _) = create_test_app(pool.clone(), false).await;
+        let (app, _bg_services) = create_test_app(pool.clone(), false).await;
         let platform_manager = create_test_user(&pool, Role::PlatformManager).await; // Non-admin PlatformManager
         let standard_user = create_test_user(&pool, Role::StandardUser).await;
 
@@ -1104,7 +1114,7 @@ mod tests {
     #[sqlx::test]
     #[test_log::test]
     async fn test_multi_role_user_permissions(pool: PgPool) {
-        let (app, _) = create_test_app(pool.clone(), false).await;
+        let (app, _bg_services) = create_test_app(pool.clone(), false).await;
 
         // User with StandardUser + RequestViewer should have additive permissions
         let multi_role_user = create_test_user_with_roles(&pool, vec![Role::StandardUser, Role::RequestViewer]).await;
@@ -1165,7 +1175,7 @@ mod tests {
     #[sqlx::test]
     #[test_log::test]
     async fn test_user_access_isolation(pool: PgPool) {
-        let (app, _) = create_test_app(pool.clone(), false).await;
+        let (app, _bg_services) = create_test_app(pool.clone(), false).await;
         let user1 = create_test_user(&pool, Role::StandardUser).await;
         let user2 = create_test_user(&pool, Role::StandardUser).await;
         let user3 = create_test_user(&pool, Role::RequestViewer).await;
@@ -1197,7 +1207,7 @@ mod tests {
     #[sqlx::test]
     #[test_log::test]
     async fn test_role_layering_user_access(pool: PgPool) {
-        let (app, _) = create_test_app(pool.clone(), false).await;
+        let (app, _bg_services) = create_test_app(pool.clone(), false).await;
 
         // Test different role combinations for user access
         let role_tests = vec![
@@ -1284,7 +1294,7 @@ mod tests {
     #[sqlx::test]
     #[test_log::test]
     async fn test_admin_bypass_vs_role_permissions(pool: PgPool) {
-        let (app, _) = create_test_app(pool.clone(), false).await;
+        let (app, _bg_services) = create_test_app(pool.clone(), false).await;
 
         // Test that admin users bypass role restrictions
         let admin_user = create_test_admin_user(&pool, Role::RequestViewer).await; // Admin with minimal role
@@ -1318,7 +1328,7 @@ mod tests {
     #[sqlx::test]
     #[test_log::test]
     async fn test_update_user_roles_backend_protection(pool: PgPool) {
-        let (app, _) = create_test_app(pool.clone(), false).await;
+        let (app, _bg_services) = create_test_app(pool.clone(), false).await;
         let admin_user = create_test_admin_user(&pool, Role::PlatformManager).await;
         let regular_user = create_test_user_with_roles(&pool, vec![Role::StandardUser, Role::PlatformManager]).await;
 
@@ -1385,7 +1395,7 @@ mod tests {
     #[sqlx::test]
     #[test_log::test]
     async fn test_get_own_balance_as_standard_user(pool: PgPool) {
-        let (app, _) = create_test_app(pool.clone(), false).await;
+        let (app, _bg_services) = create_test_app(pool.clone(), false).await;
         let user = create_test_user(&pool, Role::StandardUser).await;
 
         // Add some credits
@@ -1406,7 +1416,7 @@ mod tests {
     #[sqlx::test]
     #[test_log::test]
     async fn test_get_current_user_balance(pool: PgPool) {
-        let (app, _) = create_test_app(pool.clone(), false).await;
+        let (app, _bg_services) = create_test_app(pool.clone(), false).await;
         let user = create_test_user(&pool, Role::StandardUser).await;
 
         // Add some credits
@@ -1427,7 +1437,7 @@ mod tests {
     #[sqlx::test]
     #[test_log::test]
     async fn test_get_other_user_balance_forbidden(pool: PgPool) {
-        let (app, _) = create_test_app(pool.clone(), false).await;
+        let (app, _bg_services) = create_test_app(pool.clone(), false).await;
         let user1 = create_test_user(&pool, Role::StandardUser).await;
         let user2 = create_test_user(&pool, Role::StandardUser).await;
 
@@ -1443,7 +1453,7 @@ mod tests {
     #[sqlx::test]
     #[test_log::test]
     async fn test_get_own_balance_as_request_viewer(pool: PgPool) {
-        let (app, _) = create_test_app(pool.clone(), false).await;
+        let (app, _bg_services) = create_test_app(pool.clone(), false).await;
         let user = create_test_user(&pool, Role::RequestViewer).await;
 
         // Add some credits
@@ -1464,7 +1474,7 @@ mod tests {
     #[sqlx::test]
     #[test_log::test]
     async fn test_get_current_user_balance_request_viewer(pool: PgPool) {
-        let (app, _) = create_test_app(pool.clone(), false).await;
+        let (app, _bg_services) = create_test_app(pool.clone(), false).await;
         let user = create_test_user(&pool, Role::RequestViewer).await;
 
         // Add some credits
@@ -1485,7 +1495,7 @@ mod tests {
     #[sqlx::test]
     #[test_log::test]
     async fn test_get_current_user_balance_platform_manager(pool: PgPool) {
-        let (app, _) = create_test_app(pool.clone(), false).await;
+        let (app, _bg_services) = create_test_app(pool.clone(), false).await;
         let user = create_test_user(&pool, Role::PlatformManager).await;
 
         // Add some credits
@@ -1506,7 +1516,7 @@ mod tests {
     #[sqlx::test]
     #[test_log::test]
     async fn test_platform_manager_can_view_any_balance(pool: PgPool) {
-        let (app, _) = create_test_app(pool.clone(), false).await;
+        let (app, _bg_services) = create_test_app(pool.clone(), false).await;
         let platform_manager = create_test_user(&pool, Role::PlatformManager).await;
         let user = create_test_user(&pool, Role::StandardUser).await;
 
@@ -1528,7 +1538,7 @@ mod tests {
     #[sqlx::test]
     #[test_log::test]
     async fn test_billing_manager_can_view_any_balance(pool: PgPool) {
-        let (app, _) = create_test_app(pool.clone(), false).await;
+        let (app, _bg_services) = create_test_app(pool.clone(), false).await;
         let billing_manager = create_test_user(&pool, Role::BillingManager).await;
         let user = create_test_user(&pool, Role::StandardUser).await;
 
