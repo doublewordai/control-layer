@@ -66,7 +66,6 @@ pub struct ReqwestHttpClient {
 
 impl ReqwestHttpClient {
     /// Create a new reqwest-based HTTP client.
-    /// TODO: Why have this and default
     pub fn new() -> Self {
         Self {
             client: reqwest::Client::new(),

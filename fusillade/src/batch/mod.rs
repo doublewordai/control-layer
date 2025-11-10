@@ -295,9 +295,9 @@ pub struct FileMetadata {
 /// Filter parameters for listing files
 #[derive(Debug, Clone, Default)]
 pub struct FileFilter {
-    /// Filter by user who uploaded the file
-    /// TODO: We use a string here, because this crate is decoupled from the dwctl one which uses a
-    /// UUID. Is this fine? This just needs to be a unique identifier per user.
+    /// Filter by user who uploaded the file.
+    /// Note: We use a string here because this crate is decoupled from dwctl which uses UUIDs.
+    /// This just needs to be a unique identifier per user.
     pub uploaded_by: Option<String>,
     /// Filter by file status (processed, error, deleted, expired)
     pub status: Option<String>,

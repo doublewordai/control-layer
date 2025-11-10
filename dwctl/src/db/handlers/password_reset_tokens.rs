@@ -139,8 +139,8 @@ impl<'c> PasswordResetTokens<'c> {
         Self { db }
     }
 
-    /// Create a password reset token for a user
-    /// TODO: why does this return the token, and then an object that wraps the token
+    /// Create a password reset token for a user.
+    /// Returns both the raw token (to send to user) and the PasswordResetToken object (with hashed token for DB).
     #[instrument(skip(self, config), fields(user_id = %abbrev_uuid(&user_id)), err)]
     pub async fn create_for_user(&mut self, user_id: UserId, config: &Config) -> Result<(String, PasswordResetToken)> {
         let raw_token = password::generate_reset_token();

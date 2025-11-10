@@ -444,8 +444,7 @@ pub async fn list_files(
         } else {
             None
         },
-        // Filter by status if user doesn't have system access
-        // TODO: What is the point of this 'status' field?
+        // Filter by status if user doesn't have system access (hide error/deleted files from regular users)
         status: if !has_system_access { Some("processed".to_string()) } else { None },
         purpose: None,
     };

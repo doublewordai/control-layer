@@ -81,7 +81,7 @@ const UsersGroups: React.FC = () => {
     newParams.set("tab", tab);
     navigate(`/users-groups?${newParams.toString()}`, { replace: true });
   };
-  // Data from the API: uses the tanstack query hooks to fetch both users and groups TODO: (this is a bit redundant right now, but we can optimize later)
+  // Data from the API: uses the tanstack query hooks to fetch both users and groups
   const {
     data: usersData,
     isLoading: usersLoading,
