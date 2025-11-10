@@ -1,0 +1,28 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n            SELECT DISTINCT ON (user_id) user_id, balance_after\n            FROM credits_transactions\n            WHERE user_id = ANY($1)\n            ORDER BY user_id, created_at DESC, id DESC\n            ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "user_id",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 1,
+        "name": "balance_after",
+        "type_info": "Numeric"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "UuidArray"
+      ]
+    },
+    "nullable": [
+      false,
+      false
+    ]
+  },
+  "hash": "b4bec4524845881cb8c3551a0bd23776657881d484ebfca0e19b72ba2e7af167"
+}
