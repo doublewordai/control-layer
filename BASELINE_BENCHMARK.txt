@@ -1,0 +1,28 @@
+=== Baseline Build Performance ===
+Date: $(date)
+Configuration: --no-default-features (no embedded-db)
+
+Clean Build:
+  Real time: 1m 28.410s (88.4 seconds)
+  User time: 7m 38.230s (458 seconds)
+  Sys time:  2m 9.130s (129 seconds)
+  
+Parallelization: 6.6x (458 user / 88.4 real)
+Crates compiled: 370
+
+Key findings:
+- Build is well parallelized (6.6x speedup)
+- Main bottlenecks are proc-macro heavy crates:
+  * sqlx-macros
+  * utoipa-gen  
+  * bon-macros
+  * Multiple tokio/serde derive macros
+  
+- Duplicate dependencies:
+  * axum v0.7.9 and v0.8.6
+  * axum-prometheus v0.8.0 and v0.9.0
+  
+- Heavy feature flags:
+  * tokio features = ["full"]
+
+Next: Test optimizations and compare against this baseline

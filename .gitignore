@@ -9,6 +9,8 @@ yarn-error.log*
 pnpm-debug.log*
 lerna-debug.log*
 build_output.txt
+benchmark_*.txt
+baseline_build.log
 
 node_modules
 dist
