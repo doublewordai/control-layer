@@ -1525,7 +1525,10 @@ mod tests {
     mod credit_deduction_tests {
         use super::super::*;
         use crate::api::models::users::Role;
+        use crate::db::handlers::api_keys::ApiKeys;
         use crate::db::handlers::credits::Credits;
+        use crate::db::handlers::Repository;
+        use crate::db::models::api_keys::{ApiKeyCreateDBRequest, ApiKeyPurpose};
         use crate::db::models::credits::{CreditTransactionCreateDBRequest, CreditTransactionType};
         use crate::test_utils::create_test_user;
         use rust_decimal::Decimal;
@@ -1589,20 +1592,21 @@ mod tests {
         /// Helper: Create test Auth for API key with valid user
         async fn create_test_auth_for_user(pool: &sqlx::PgPool, user_id: Uuid) -> Auth {
             // Create an API key for this user
-            let api_key_secret = format!("test_key_{}", Uuid::new_v4());
-            sqlx::query!(
-                "INSERT INTO api_keys (user_id, secret, name) VALUES ($1, $2, $3)",
-                user_id,
-                api_key_secret,
-                "Test API Key"
-            )
-            .execute(pool)
-            .await
-            .expect("Failed to create API key");
+            let mut conn = pool.acquire().await.expect("Failed to acquire connection");
+            let mut api_key_repo = ApiKeys::new(&mut conn);
+            let key = api_key_repo
+                .create(&ApiKeyCreateDBRequest {
+                    user_id,
+                    name: "Test API key".to_string(),
+                    description: None,
+                    purpose: ApiKeyPurpose::Inference,
+                    requests_per_second: None,
+                    burst_size: None,
+                })
+                .await
+                .unwrap();
 
-            Auth::ApiKey {
-                bearer_token: api_key_secret,
-            }
+            Auth::ApiKey { bearer_token: key.secret }
         }
 
         #[sqlx::test]
