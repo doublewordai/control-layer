@@ -21,7 +21,7 @@ test-utils = ["dep:axum-test"]
 [dependencies]
 axum = { version = "0.8", features = ["multipart"] }
 fusillade = { path = "../fusillade", version = "0.1" }
-tokio = { version = "1.0", features = ["full"] }
+tokio = { version = "1.0", features = ["macros", "rt-multi-thread", "net", "fs", "io-util", "signal", "sync", "time"] }
 tokio-stream = { version = "0.1", features = ["sync"] }
 tokio-util = "0.7"
 sqlx = { version = "0.8", features = [
