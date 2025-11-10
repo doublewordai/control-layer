@@ -1,5 +1,4 @@
 // TODO: This file has gotten way too big. We need to refactor it into smaller modules.
-// The router should be a builder pattern.
 // The constructors in test_utils should be unified with the actual constructors: right now they're
 // actually the best lib way to construct things, which is bad.
 pub mod api;
