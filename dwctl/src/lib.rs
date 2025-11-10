@@ -481,7 +481,7 @@ pub async fn build_router(state: &mut AppState, onwards_router: Router) -> anyho
     // Build the app with admin API and onwards proxy nested. serve the (restricted) openai spec.
     // Batches routes are merged with onwards router under /ai/v1 (batches match first)
     let ai_router = if let Some(batches) = batches_routes {
-        onwards_router.merge(batches)
+        batches.merge(onwards_router)
     } else {
         onwards_router
     };
