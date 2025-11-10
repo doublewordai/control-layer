@@ -13,12 +13,8 @@ database:
   # random port, and data is stored in $HOME/.dwctl_data/
   # To have data not persists across restarts, set persistent=false.
   # We strongly recommend setting up external postgres in production!
-  type: embedded
-  data_dir: null
-  persistent: true
-
-  # TODO: Use an external database in production
-  # type: external
+  type: external
+  url: postgres://postgres:postgres@localhost:5432/dwctl
 
 # Admin user email - will be created on first startup
 admin_email: "test@doubleword.ai"
@@ -67,7 +63,7 @@ auth:
   # Proxy header authentication. Will accept & autocreate users based on emails
   # supplied in a header. Lets you use an upstream proxy to authenticate users.
   proxy_header:
-    enabled: false # X-Doubleword-User header auth
+    enabled: true # X-Doubleword-User header auth
     header_name: "x-doubleword-user"
     auto_create_users: true
 
@@ -100,4 +96,43 @@ enable_request_logging: true # Enable request/response logging to database
 #
 # For arrays like model_sources, use environment-specific config files
 # (e.g., config.production.yaml) rather than env vars.
+
+# Batches API configuration
+batches:
+  # Enable batches API endpoints (/files, /batches)
+  # When disabled, these endpoints will not be available (default: false)
+  enabled: false
+
+  # Daemon configuration for processing batch requests
+  daemon:
+    # Controls when the batch processing daemon runs
+    # - "leader": Only run on the elected leader instance (default, recommended for multi-instance deployments)
+    # - "always": Run on all instances (use for single-instance deployments)
+    # - "never": Never run the daemon (useful for testing or when using external processors)
+    enabled: leader
+
+    # Performance & Concurrency Settings
+    claim_batch_size: 100 # Maximum number of requests to claim in each iteration
+    default_model_concurrency: 10 # Default concurrent requests per model
+    claim_interval_ms: 1000 # Milliseconds to sleep between claim iterations
+
+    # Retry & Backoff Settings
+    max_retries: 5 # Maximum retry attempts before giving up
+    backoff_ms: 1000 # Initial backoff duration in milliseconds
+    backoff_factor: 2 # Exponential backoff multiplier
+    max_backoff_ms: 10000 # Maximum backoff duration in milliseconds
+
+    # Timeout Settings
+    timeout_ms: 600000 # Timeout per request attempt (10 minutes)
+    claim_timeout_ms: 60000 # Max time in "claimed" state before auto-unclaim (1 minute)
+    processing_timeout_ms: 600000 # Max time in "processing" state before auto-unclaim (10 minutes)
+
+    # Observability
+    status_log_interval_ms: 2000 # Interval for logging daemon status (set to null to disable)
+
+  # Files configuration for batch file uploads/downloads
+  files:
+    max_file_size: 2147483648 # 2 GB - maximum size for file uploads
+    upload_buffer_size: 100 # Buffer size for file upload streams (default: 100)
+    download_buffer_size: 100 # Buffer size for file download streams (default: 100)
 

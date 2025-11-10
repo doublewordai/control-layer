@@ -10,12 +10,14 @@ const DEFAULT_SETTINGS: AppSettings = {
   apiBaseUrl: "/admin/api/v1",
   features: {
     demo: false,
+    use_billing: false,
   },
+  paymentProviderUrl: undefined,
 };
 
 /**
  * Parse feature flags from URL query parameters
- * Supports: ?flags=demo
+ * Supports: ?flags=demo,use_billing
  */
 function parseUrlFlags(): Partial<AppSettings> {
   const urlParams = new URLSearchParams(window.location.search);
@@ -28,6 +30,7 @@ function parseUrlFlags(): Partial<AppSettings> {
 
     settings.features = {
       demo: flagList.includes("demo"),
+      use_billing: flagList.includes("use_billing"),
     };
   }
 
@@ -61,8 +64,16 @@ function loadSettings(): AppSettings {
         urlSettings.features?.demo ??
         localSettings.features?.demo ??
         DEFAULT_SETTINGS.features.demo,
+      use_billing:
+        urlSettings.features?.use_billing ??
+        localSettings.features?.use_billing ??
+        DEFAULT_SETTINGS.features.use_billing,
     },
     demoConfig: localSettings.demoConfig,
+    paymentProviderUrl:
+      import.meta.env.VITE_PAYMENT_PROVIDER_URL ||
+      localSettings.paymentProviderUrl ||
+      DEFAULT_SETTINGS.paymentProviderUrl,
   };
 }
 

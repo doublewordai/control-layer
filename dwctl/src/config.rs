@@ -45,6 +45,8 @@ pub struct Config {
     pub metadata: Metadata,
     // Authentication configuration
     pub auth: AuthConfig,
+    // Batches API configuration
+    pub batches: BatchConfig,
     // Metrics configuration
     pub enable_metrics: bool,
     // Request logging configuration
@@ -234,6 +236,141 @@ pub struct PasswordResetEmailConfig {
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(default)]
+pub struct FilesConfig {
+    /// Maximum file size in bytes (default: 100MB)
+    pub max_file_size: u64,
+    /// Default expiration time in seconds (default: 24 hours)
+    pub default_expiry_seconds: i64,
+    /// Minimum expiration time in seconds (default: 1 hour)
+    pub min_expiry_seconds: i64,
+    /// Maximum expiration time in seconds (default: 30 days)
+    pub max_expiry_seconds: i64,
+    /// Buffer size for file upload streams (default: 100)
+    pub upload_buffer_size: usize,
+    /// Buffer size for file download streams (default: 100)
+    pub download_buffer_size: usize,
+}
+
+impl Default for FilesConfig {
+    fn default() -> Self {
+        Self {
+            max_file_size: 100 * 1024 * 1024,      // 100MB
+            default_expiry_seconds: 24 * 60 * 60,  // 24 hours
+            min_expiry_seconds: 60 * 60,           // 1 hour
+            max_expiry_seconds: 30 * 24 * 60 * 60, // 30 days
+            upload_buffer_size: 100,
+            download_buffer_size: 100,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(default)]
+#[derive(Default)]
+pub struct BatchConfig {
+    /// Enable batches API endpoints (default: false)
+    pub enabled: bool,
+    /// Daemon configuration for processing batch requests
+    pub daemon: DaemonConfig,
+    /// Files configuration for batch file uploads/downloads
+    pub files: FilesConfig,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(default)]
+pub struct DaemonConfig {
+    /// When to run the daemon (default: "leader")
+    /// - "always": Always run the daemon
+    /// - "never": Never run the daemon
+    /// - "leader": Only run if this instance is the leader
+    pub enabled: DaemonEnabled,
+
+    /// Maximum number of requests to claim in each iteration (default: 100)
+    pub claim_batch_size: usize,
+
+    /// Default concurrency limit per model (default: 10)
+    pub default_model_concurrency: usize,
+
+    /// How long to sleep between claim iterations in milliseconds (default: 1000)
+    pub claim_interval_ms: u64,
+
+    /// Maximum number of retry attempts before giving up (default: 5)
+    pub max_retries: u32,
+
+    /// Base backoff duration in milliseconds (will be exponentially increased) (default: 1000)
+    pub backoff_ms: u64,
+
+    /// Factor by which the backoff_ms is increased with each retry (default: 2)
+    pub backoff_factor: u64,
+
+    /// Maximum backoff time in milliseconds (default: 10000)
+    pub max_backoff_ms: u64,
+
+    /// Timeout for each individual request attempt in milliseconds (default: 600000 = 10 minutes)
+    pub timeout_ms: u64,
+
+    /// Interval for logging daemon status (requests in flight) in milliseconds
+    /// Set to None to disable periodic status logging (default: Some(2000))
+    pub status_log_interval_ms: Option<u64>,
+
+    /// Maximum time a request can stay in "claimed" state before being unclaimed
+    /// and returned to pending (milliseconds). This handles daemon crashes. (default: 60000 = 1 minute)
+    pub claim_timeout_ms: u64,
+
+    /// Maximum time a request can stay in "processing" state before being unclaimed
+    /// and returned to pending (milliseconds). This handles daemon crashes during execution. (default: 600000 = 10 minutes)
+    pub processing_timeout_ms: u64,
+}
+
+impl Default for DaemonConfig {
+    fn default() -> Self {
+        Self {
+            enabled: DaemonEnabled::Leader,
+            claim_batch_size: 100,
+            default_model_concurrency: 10,
+            claim_interval_ms: 1000,
+            max_retries: 5,
+            backoff_ms: 1000,
+            backoff_factor: 2,
+            max_backoff_ms: 10000,
+            timeout_ms: 600000,
+            status_log_interval_ms: Some(2000),
+            claim_timeout_ms: 60000,
+            processing_timeout_ms: 600000,
+        }
+    }
+}
+
+impl DaemonConfig {
+    /// Convert to fusillade daemon config
+    pub fn to_fusillade_config(&self) -> fusillade::daemon::DaemonConfig {
+        fusillade::daemon::DaemonConfig {
+            claim_batch_size: self.claim_batch_size,
+            default_model_concurrency: self.default_model_concurrency,
+            claim_interval_ms: self.claim_interval_ms,
+            max_retries: self.max_retries,
+            backoff_ms: self.backoff_ms,
+            backoff_factor: self.backoff_factor,
+            max_backoff_ms: self.max_backoff_ms,
+            timeout_ms: self.timeout_ms,
+            status_log_interval_ms: self.status_log_interval_ms,
+            claim_timeout_ms: self.claim_timeout_ms,
+            processing_timeout_ms: self.processing_timeout_ms,
+            ..Default::default()
+        }
+    }
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum DaemonEnabled {
+    Always,
+    Never,
+    Leader,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(untagged)]
 pub enum CorsOrigin {
     #[serde(deserialize_with = "parse_wildcard")]
@@ -291,6 +428,7 @@ impl Default for Config {
             model_sources: vec![],
             metadata: Metadata::default(),
             auth: AuthConfig::default(),
+            batches: BatchConfig::default(),
             enable_metrics: true,
             enable_request_logging: true,
             enable_otel_export: false,

@@ -39,10 +39,16 @@ pub mod resource {
     pub struct ModelRateLimits;
 
     #[derive(Default)]
+    pub struct Files;
+
+    #[derive(Default)]
     pub struct Credits;
 
     #[derive(Default)]
     pub struct Probes;
+
+    #[derive(Default)]
+    pub struct Batches;
 
     // Convert type-level markers to enum values using Into
     impl From<Users> for Resource {
@@ -90,6 +96,11 @@ pub mod resource {
             Resource::ModelRateLimits
         }
     }
+    impl From<Files> for Resource {
+        fn from(_: Files) -> Resource {
+            Resource::Files
+        }
+    }
     impl From<Credits> for Resource {
         fn from(_: Credits) -> Resource {
             Resource::Credits
@@ -98,6 +109,11 @@ pub mod resource {
     impl From<Probes> for Resource {
         fn from(_: Probes) -> Resource {
             Resource::Probes
+        }
+    }
+    impl From<Batches> for Resource {
+        fn from(_: Batches) -> Resource {
+            Resource::Batches
         }
     }
 }
@@ -254,7 +270,7 @@ pub fn role_has_permission(role: &Role, resource: Resource, operation: Operation
         Role::PlatformManager => {
             // Platform Manager has full access to platform data except Requests (sensitive request logs)
             // But they can access Analytics (aggregated data without sensitive details)
-            // They also have access to ModelRateLimits
+            // They also have access to ModelRateLimits, Files, and Batches
             !matches!(resource, Resource::Requests)
         }
         Role::StandardUser => {
@@ -292,6 +308,19 @@ pub fn role_has_permission(role: &Role, resource: Resource, operation: Operation
             matches!(
                 (resource, operation),
                 (Resource::Credits, _) | (Resource::Users, Operation::ReadAll)
+            )
+        }
+        Role::BatchAPIUser => {
+            // Batch API User can manage their own files and batches for batch processing
+            // This role is typically given IN ADDITION to StandardUser
+            matches!(
+                (resource, operation),
+                (Resource::Files, Operation::CreateOwn)   // Can upload own files
+                    | (Resource::Files, Operation::ReadOwn)    // Can read own files
+                    | (Resource::Files, Operation::DeleteOwn) // Can delete own files
+                    | (Resource::Batches, Operation::CreateOwn) // Can create own batches
+                    | (Resource::Batches, Operation::ReadOwn)   // Can read own batches
+                    | (Resource::Batches, Operation::UpdateOwn) // Can cancel own batches
             )
         }
     }
@@ -472,5 +501,65 @@ mod tests {
         assert_eq!(requires_permission.id, user.id);
         assert_eq!(requires_permission.username, user.username);
         assert_eq!(requires_permission.is_admin(), user.is_admin());
+    }
+
+    #[test]
+    fn test_batch_api_user_role() {
+        let batch_user = create_user_with_roles(vec![Role::BatchAPIUser], false);
+
+        // Should have file management permissions
+        assert!(has_permission(&batch_user, Resource::Files, Operation::CreateOwn));
+        assert!(has_permission(&batch_user, Resource::Files, Operation::ReadOwn));
+        assert!(has_permission(&batch_user, Resource::Files, Operation::DeleteOwn));
+
+        // Should NOT have permissions to other resources
+        assert!(!has_permission(&batch_user, Resource::Files, Operation::ReadAll));
+        assert!(!has_permission(&batch_user, Resource::ApiKeys, Operation::CreateOwn));
+        assert!(!has_permission(&batch_user, Resource::Models, Operation::ReadOwn));
+        assert!(!has_permission(&batch_user, Resource::Requests, Operation::ReadAll));
+    }
+
+    #[test]
+    fn test_batch_api_user_with_standard_user() {
+        // Typical combination: StandardUser + BatchAPIUser
+        let user = create_user_with_roles(vec![Role::StandardUser, Role::BatchAPIUser], false);
+
+        // Should have both StandardUser permissions
+        assert!(has_permission(&user, Resource::ApiKeys, Operation::CreateOwn));
+        assert!(has_permission(&user, Resource::Models, Operation::ReadOwn));
+        assert!(has_permission(&user, Resource::Endpoints, Operation::ReadAll));
+        assert!(has_permission(&user, Resource::Users, Operation::ReadOwn));
+
+        // And BatchAPIUser permissions
+        assert!(has_permission(&user, Resource::Files, Operation::CreateOwn));
+        assert!(has_permission(&user, Resource::Files, Operation::ReadOwn));
+        assert!(has_permission(&user, Resource::Files, Operation::DeleteOwn));
+
+        // But still not admin-level permissions
+        assert!(!has_permission(&user, Resource::Files, Operation::ReadAll));
+        assert!(!has_permission(&user, Resource::Users, Operation::CreateAll));
+    }
+
+    #[test]
+    fn test_platform_manager_has_file_access() {
+        let pm = create_user_with_roles(vec![Role::PlatformManager], false);
+
+        // Platform Manager should have full access to files
+        assert!(has_permission(&pm, Resource::Files, Operation::CreateAll));
+        assert!(has_permission(&pm, Resource::Files, Operation::ReadAll));
+        assert!(has_permission(&pm, Resource::Files, Operation::UpdateAll));
+        assert!(has_permission(&pm, Resource::Files, Operation::DeleteAll));
+    }
+
+    #[test]
+    fn test_admin_sees_deleted_files() {
+        let admin = create_user_with_roles(vec![Role::BatchAPIUser], true);
+        let regular_user = create_user_with_roles(vec![Role::BatchAPIUser], false);
+
+        // Admin should have SystemAccess (bypass kicks in)
+        assert!(has_permission(&admin, Resource::Files, Operation::SystemAccess));
+
+        // Regular user should not have SystemAccess
+        assert!(!has_permission(&regular_user, Resource::Files, Operation::SystemAccess));
     }
 }

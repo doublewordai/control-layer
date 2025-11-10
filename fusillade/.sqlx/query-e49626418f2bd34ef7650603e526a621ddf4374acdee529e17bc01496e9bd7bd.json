@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "\n            SELECT id, endpoint, method, path, body, model, api_key\n            FROM request_templates\n            WHERE file_id = $1\n            ",
+  "query": "\n            SELECT id, custom_id, endpoint, method, path, body, model, api_key\n            FROM request_templates\n            WHERE file_id = $1\n            ",
   "describe": {
     "columns": [
       {
@@ -10,31 +10,36 @@
       },
       {
         "ordinal": 1,
-        "name": "endpoint",
+        "name": "custom_id",
         "type_info": "Text"
       },
       {
         "ordinal": 2,
-        "name": "method",
+        "name": "endpoint",
         "type_info": "Text"
       },
       {
         "ordinal": 3,
-        "name": "path",
+        "name": "method",
         "type_info": "Text"
       },
       {
         "ordinal": 4,
-        "name": "body",
+        "name": "path",
         "type_info": "Text"
       },
       {
         "ordinal": 5,
-        "name": "model",
+        "name": "body",
         "type_info": "Text"
       },
       {
         "ordinal": 6,
+        "name": "model",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 7,
         "name": "api_key",
         "type_info": "Text"
       }
@@ -46,6 +51,7 @@
     },
     "nullable": [
       false,
+      true,
       false,
       false,
       false,
@@ -54,5 +60,5 @@
       false
     ]
   },
-  "hash": "eb4f317dc4af548f536ade8d0aa78e5dc6bfa71cb18e7edf304e04392c5071d1"
+  "hash": "e49626418f2bd34ef7650603e526a621ddf4374acdee529e17bc01496e9bd7bd"
 }

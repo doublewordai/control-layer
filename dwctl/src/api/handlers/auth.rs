@@ -525,7 +525,8 @@ mod tests {
         config.auth.native.enabled = true;
         config.auth.native.allow_registration = true;
 
-        let state = AppState::builder().db(pool).config(config).build();
+        let request_manager = std::sync::Arc::new(fusillade::PostgresRequestManager::new(pool.clone()));
+        let state = AppState::builder().db(pool).config(config).request_manager(request_manager).build();
 
         let app = axum::Router::new()
             .route("/auth/register", axum::routing::post(register))
@@ -555,7 +556,8 @@ mod tests {
         let mut config = create_test_config();
         config.auth.native.enabled = false;
 
-        let state = AppState::builder().db(pool).config(config).build();
+        let request_manager = std::sync::Arc::new(fusillade::PostgresRequestManager::new(pool.clone()));
+        let state = AppState::builder().db(pool).config(config).request_manager(request_manager).build();
 
         let app = axum::Router::new()
             .route("/auth/register", axum::routing::post(register))
@@ -580,7 +582,8 @@ mod tests {
         config.auth.native.enabled = true;
         config.auth.native.password.min_length = 10;
 
-        let state = AppState::builder().db(pool).config(config).build();
+        let request_manager = std::sync::Arc::new(fusillade::PostgresRequestManager::new(pool.clone()));
+        let state = AppState::builder().db(pool).config(config).request_manager(request_manager).build();
 
         let app = axum::Router::new()
             .route("/auth/register", axum::routing::post(register))

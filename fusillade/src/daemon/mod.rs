@@ -378,6 +378,7 @@ mod tests {
                 "test-file".to_string(),
                 Some("Test file".to_string()),
                 vec![crate::RequestTemplateInput {
+                    custom_id: None,
                     endpoint: "https://api.example.com".to_string(),
                     method: "POST".to_string(),
                     path: "/v1/test".to_string(),
@@ -389,14 +390,20 @@ mod tests {
             .await
             .expect("Failed to create file");
 
-        let batch_id = manager
-            .create_batch(file_id)
+        let batch = manager
+            .create_batch(crate::batch::BatchInput {
+                file_id,
+                endpoint: "/v1/chat/completions".to_string(),
+                completion_window: "24h".to_string(),
+                metadata: None,
+                created_by: None,
+            })
             .await
             .expect("Failed to create batch");
 
         // Get the created request from the batch
         let requests = manager
-            .get_batch_requests(batch_id)
+            .get_batch_requests(batch.id)
             .await
             .expect("Failed to get batch requests");
         assert_eq!(requests.len(), 1);
@@ -527,6 +534,7 @@ mod tests {
                 Some("Test concurrency limits".to_string()),
                 vec![
                     crate::RequestTemplateInput {
+                        custom_id: None,
                         endpoint: "https://api.example.com".to_string(),
                         method: "POST".to_string(),
                         path: "/v1/test".to_string(),
@@ -535,6 +543,7 @@ mod tests {
                         api_key: "test-key".to_string(),
                     },
                     crate::RequestTemplateInput {
+                        custom_id: None,
                         endpoint: "https://api.example.com".to_string(),
                         method: "POST".to_string(),
                         path: "/v1/test".to_string(),
@@ -543,6 +552,7 @@ mod tests {
                         api_key: "test-key".to_string(),
                     },
                     crate::RequestTemplateInput {
+                        custom_id: None,
                         endpoint: "https://api.example.com".to_string(),
                         method: "POST".to_string(),
                         path: "/v1/test".to_string(),
@@ -551,6 +561,7 @@ mod tests {
                         api_key: "test-key".to_string(),
                     },
                     crate::RequestTemplateInput {
+                        custom_id: None,
                         endpoint: "https://api.example.com".to_string(),
                         method: "POST".to_string(),
                         path: "/v1/test".to_string(),
@@ -559,6 +570,7 @@ mod tests {
                         api_key: "test-key".to_string(),
                     },
                     crate::RequestTemplateInput {
+                        custom_id: None,
                         endpoint: "https://api.example.com".to_string(),
                         method: "POST".to_string(),
                         path: "/v1/test".to_string(),
@@ -571,8 +583,14 @@ mod tests {
             .await
             .expect("Failed to create file");
 
-        let batch_id = manager
-            .create_batch(file_id)
+        let batch = manager
+            .create_batch(crate::batch::BatchInput {
+                file_id,
+                endpoint: "/v1/chat/completions".to_string(),
+                completion_window: "24h".to_string(),
+                metadata: None,
+                created_by: None,
+            })
             .await
             .expect("Failed to create batch");
 
@@ -648,7 +666,7 @@ mod tests {
 
         while start.elapsed() < timeout {
             let status = manager
-                .get_batch_status(batch_id)
+                .get_batch_status(batch.id)
                 .await
                 .expect("Failed to get batch status");
 
@@ -728,6 +746,7 @@ mod tests {
                 "test-file".to_string(),
                 Some("Test retry logic".to_string()),
                 vec![crate::RequestTemplateInput {
+                    custom_id: None,
                     endpoint: "https://api.example.com".to_string(),
                     method: "POST".to_string(),
                     path: "/v1/test".to_string(),
@@ -739,13 +758,19 @@ mod tests {
             .await
             .expect("Failed to create file");
 
-        let batch_id = manager
-            .create_batch(file_id)
+        let batch = manager
+            .create_batch(crate::batch::BatchInput {
+                file_id,
+                endpoint: "/v1/chat/completions".to_string(),
+                completion_window: "24h".to_string(),
+                metadata: None,
+                created_by: None,
+            })
             .await
             .expect("Failed to create batch");
 
         let requests = manager
-            .get_batch_requests(batch_id)
+            .get_batch_requests(batch.id)
             .await
             .expect("Failed to get batch requests");
         assert_eq!(requests.len(), 1);

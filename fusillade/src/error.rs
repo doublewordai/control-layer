@@ -18,6 +18,10 @@ pub enum FusilladeError {
     #[error("Invalid state transition: request {0} is in state '{1}', expected '{2}'")]
     InvalidState(RequestId, String, String),
 
+    /// Validation error (e.g., invalid file format, missing required fields)
+    #[error("Validation error: {0}")]
+    ValidationError(String),
+
     /// HTTP client error
     #[error("HTTP request failed: {0}")]
     HttpClient(#[from] reqwest::Error),

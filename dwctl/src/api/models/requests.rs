@@ -142,7 +142,7 @@ pub struct RequestResponsePair {
 }
 
 /// Response containing a list of requests and pagination metadata
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, ToSchema)]
 pub struct ListRequestsResponse {
     /// List of HTTP requests
     pub requests: Vec<RequestResponsePair>,

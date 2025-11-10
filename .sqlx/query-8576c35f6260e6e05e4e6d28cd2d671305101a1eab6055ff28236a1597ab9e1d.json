@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "\n            SELECT id, file_id, endpoint, method, path, body, model, api_key, created_at, updated_at\n            FROM request_templates\n            WHERE file_id = $1\n            ORDER BY created_at ASC\n            ",
+  "query": "\n                    SELECT id, file_id, endpoint, completion_window, metadata, output_file_id, error_file_id, created_by, created_at, expires_at, cancelling_at, errors\n                    FROM batches\n                    WHERE error_file_id = $1\n                    ",
   "describe": {
     "columns": [
       {
@@ -20,27 +20,27 @@
       },
       {
         "ordinal": 3,
-        "name": "method",
+        "name": "completion_window",
         "type_info": "Text"
       },
       {
         "ordinal": 4,
-        "name": "path",
-        "type_info": "Text"
+        "name": "metadata",
+        "type_info": "Jsonb"
       },
       {
         "ordinal": 5,
-        "name": "body",
-        "type_info": "Text"
+        "name": "output_file_id",
+        "type_info": "Uuid"
       },
       {
         "ordinal": 6,
-        "name": "model",
-        "type_info": "Text"
+        "name": "error_file_id",
+        "type_info": "Uuid"
       },
       {
         "ordinal": 7,
-        "name": "api_key",
+        "name": "created_by",
         "type_info": "Text"
       },
       {
@@ -50,8 +50,18 @@
       },
       {
         "ordinal": 9,
-        "name": "updated_at",
+        "name": "expires_at",
         "type_info": "Timestamptz"
+      },
+      {
+        "ordinal": 10,
+        "name": "cancelling_at",
+        "type_info": "Timestamptz"
+      },
+      {
+        "ordinal": 11,
+        "name": "errors",
+        "type_info": "Jsonb"
       }
     ],
     "parameters": {
@@ -64,13 +74,15 @@
       false,
       false,
       false,
+      true,
+      true,
+      true,
+      true,
       false,
-      false,
-      false,
-      false,
-      false,
-      false
+      true,
+      true,
+      true
     ]
   },
-  "hash": "690439e12d5931bd294d548451ac41820d549ab62ebaa92c921c0f9b91d73924"
+  "hash": "8576c35f6260e6e05e4e6d28cd2d671305101a1eab6055ff28236a1597ab9e1d"
 }
