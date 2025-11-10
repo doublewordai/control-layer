@@ -134,6 +134,8 @@ jobs:
 
       - name: Run backend CI pipeline
         id: ci-step
+        env:
+          DB_PASS: postgres
         run: |
           START_TIME=$(date +%s)
           just ci rust -- -D warnings

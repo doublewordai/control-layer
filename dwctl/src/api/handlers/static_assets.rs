@@ -1,0 +1,53 @@
+use axum::{
+    body::Body,
+    http::{Response, StatusCode, Uri},
+    response::{Html, IntoResponse},
+};
+use tracing::{debug, instrument};
+
+use crate::static_assets;
+
+/// Serve embedded static assets with SPA fallback
+#[instrument]
+pub async fn serve_embedded_asset(uri: Uri) -> impl IntoResponse {
+    let mut path = uri.path().trim_start_matches('/');
+
+    // If path is empty or ends with /, serve index.html
+    if path.is_empty() || path.ends_with('/') {
+        path = "index.html";
+    }
+
+    // Try to serve the requested file
+    if let Some(content) = static_assets::Assets::get(path) {
+        let mime = mime_guess::from_path(path).first_or_octet_stream();
+        return Response::builder()
+            .header(axum::http::header::CONTENT_TYPE, mime.as_ref())
+            .body(Body::from(content.data.into_owned()))
+            .unwrap();
+    }
+
+    // If not found, serve index.html for SPA client-side routing
+    if let Some(index) = static_assets::Assets::get("index.html") {
+        return Response::builder()
+            .header(axum::http::header::CONTENT_TYPE, "text/html")
+            .body(Body::from(index.data.into_owned()))
+            .unwrap();
+    }
+
+    // If even index.html is missing, return 404
+    Response::builder().status(StatusCode::NOT_FOUND).body(Body::empty()).unwrap()
+}
+
+/// SPA fallback handler - serves index.html for client-side routes
+#[instrument(err)]
+pub async fn spa_fallback(uri: Uri) -> Result<Html<String>, StatusCode> {
+    debug!("Hitting SPA fallback for: {}", uri.path());
+
+    // Serve embedded index.html
+    if let Some(index) = static_assets::Assets::get("index.html") {
+        let content = String::from_utf8_lossy(&index.data).to_string();
+        Ok(Html(content))
+    } else {
+        Err(StatusCode::INTERNAL_SERVER_ERROR)
+    }
+}
