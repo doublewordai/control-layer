@@ -231,7 +231,7 @@ mod tests {
     #[sqlx::test]
     #[test_log::test]
     async fn test_billing_manager_can_create_transaction(pool: PgPool) {
-        let (app, _) = create_test_app(pool.clone(), false).await;
+        let (app, _bg_services) = create_test_app(pool.clone(), false).await;
         let billing_manager = create_test_user(&pool, Role::BillingManager).await;
         let user = create_test_user(&pool, Role::StandardUser).await;
 
@@ -262,7 +262,7 @@ mod tests {
     #[sqlx::test]
     #[test_log::test]
     async fn test_standard_user_cannot_create_transaction(pool: PgPool) {
-        let (app, _) = create_test_app(pool.clone(), false).await;
+        let (app, _bg_services) = create_test_app(pool.clone(), false).await;
         let user = create_test_user(&pool, Role::StandardUser).await;
         let other_user = create_test_user(&pool, Role::StandardUser).await;
 
@@ -287,7 +287,7 @@ mod tests {
     #[sqlx::test]
     #[test_log::test]
     async fn test_platform_manager_can_create_transaction(pool: PgPool) {
-        let (app, _) = create_test_app(pool.clone(), false).await;
+        let (app, _bg_services) = create_test_app(pool.clone(), false).await;
         let platform_manager = create_test_user(&pool, Role::PlatformManager).await;
         let user = create_test_user(&pool, Role::StandardUser).await;
 
@@ -318,7 +318,7 @@ mod tests {
     #[sqlx::test]
     #[test_log::test]
     async fn test_request_viewer_cannot_create_transaction(pool: PgPool) {
-        let (app, _) = create_test_app(pool.clone(), false).await;
+        let (app, _bg_services) = create_test_app(pool.clone(), false).await;
         let user = create_test_user(&pool, Role::RequestViewer).await;
         let other_user = create_test_user(&pool, Role::StandardUser).await;
 
@@ -343,7 +343,7 @@ mod tests {
     #[sqlx::test]
     #[test_log::test]
     async fn test_get_own_transaction_as_standard_user(pool: PgPool) {
-        let (app, _) = create_test_app(pool.clone(), false).await;
+        let (app, _bg_services) = create_test_app(pool.clone(), false).await;
         let user = create_test_user(&pool, Role::StandardUser).await;
 
         // Create a transaction for the user
@@ -368,7 +368,7 @@ mod tests {
     #[sqlx::test]
     #[test_log::test]
     async fn test_get_other_user_transaction_returns_404(pool: PgPool) {
-        let (app, _) = create_test_app(pool.clone(), false).await;
+        let (app, _bg_services) = create_test_app(pool.clone(), false).await;
         let user1 = create_test_user(&pool, Role::StandardUser).await;
         let user2 = create_test_user(&pool, Role::StandardUser).await;
 
@@ -389,7 +389,7 @@ mod tests {
     #[sqlx::test]
     #[test_log::test]
     async fn test_billing_manager_can_view_any_transaction(pool: PgPool) {
-        let (app, _) = create_test_app(pool.clone(), false).await;
+        let (app, _bg_services) = create_test_app(pool.clone(), false).await;
         let billing_manager = create_test_user(&pool, Role::BillingManager).await;
         let user = create_test_user(&pool, Role::StandardUser).await;
 
@@ -414,7 +414,7 @@ mod tests {
     #[sqlx::test]
     #[test_log::test]
     async fn test_list_transactions_returns_own_for_standard_user(pool: PgPool) {
-        let (app, _) = create_test_app(pool.clone(), false).await;
+        let (app, _bg_services) = create_test_app(pool.clone(), false).await;
         let user1 = create_test_user(&pool, Role::StandardUser).await;
         let user2 = create_test_user(&pool, Role::StandardUser).await;
 
@@ -439,7 +439,7 @@ mod tests {
     #[sqlx::test]
     #[test_log::test]
     async fn test_list_transactions_with_other_user_id_forbidden(pool: PgPool) {
-        let (app, _) = create_test_app(pool.clone(), false).await;
+        let (app, _bg_services) = create_test_app(pool.clone(), false).await;
         let user1 = create_test_user(&pool, Role::StandardUser).await;
         let user2 = create_test_user(&pool, Role::StandardUser).await;
 
@@ -456,7 +456,7 @@ mod tests {
     #[sqlx::test]
     #[test_log::test]
     async fn test_billing_manager_can_list_all_transactions(pool: PgPool) {
-        let (app, _) = create_test_app(pool.clone(), false).await;
+        let (app, _bg_services) = create_test_app(pool.clone(), false).await;
         let billing_manager = create_test_user(&pool, Role::BillingManager).await;
         let user1 = create_test_user(&pool, Role::StandardUser).await;
         let user2 = create_test_user(&pool, Role::StandardUser).await;
@@ -482,7 +482,7 @@ mod tests {
     #[sqlx::test]
     #[test_log::test]
     async fn test_billing_manager_can_filter_by_user_id(pool: PgPool) {
-        let (app, _) = create_test_app(pool.clone(), false).await;
+        let (app, _bg_services) = create_test_app(pool.clone(), false).await;
         let billing_manager = create_test_user(&pool, Role::BillingManager).await;
         let user1 = create_test_user(&pool, Role::StandardUser).await;
         let user2 = create_test_user(&pool, Role::StandardUser).await;
@@ -507,7 +507,7 @@ mod tests {
     #[sqlx::test]
     #[test_log::test]
     async fn test_create_transaction_validates_amount_zero(pool: PgPool) {
-        let (app, _) = create_test_app(pool.clone(), false).await;
+        let (app, _bg_services) = create_test_app(pool.clone(), false).await;
         let billing_manager = create_test_user(&pool, Role::BillingManager).await;
         let user = create_test_user(&pool, Role::StandardUser).await;
 
@@ -533,7 +533,7 @@ mod tests {
     #[sqlx::test]
     #[test_log::test]
     async fn test_create_transaction_validates_amount_negative(pool: PgPool) {
-        let (app, _) = create_test_app(pool.clone(), false).await;
+        let (app, _bg_services) = create_test_app(pool.clone(), false).await;
         let billing_manager = create_test_user(&pool, Role::BillingManager).await;
         let user = create_test_user(&pool, Role::StandardUser).await;
 
@@ -559,7 +559,7 @@ mod tests {
     #[sqlx::test]
     #[test_log::test]
     async fn test_create_transaction_validates_type(pool: PgPool) {
-        let (app, _) = create_test_app(pool.clone(), false).await;
+        let (app, _bg_services) = create_test_app(pool.clone(), false).await;
         let billing_manager = create_test_user(&pool, Role::BillingManager).await;
         let user = create_test_user(&pool, Role::StandardUser).await;
 
@@ -585,7 +585,7 @@ mod tests {
     #[sqlx::test]
     #[test_log::test]
     async fn test_create_transaction_requires_user_id(pool: PgPool) {
-        let (app, _) = create_test_app(pool.clone(), false).await;
+        let (app, _bg_services) = create_test_app(pool.clone(), false).await;
         let billing_manager = create_test_user(&pool, Role::BillingManager).await;
 
         let transaction_data = json!({
@@ -608,7 +608,7 @@ mod tests {
     #[sqlx::test]
     #[test_log::test]
     async fn test_create_transaction_insufficient_balance(pool: PgPool) {
-        let (app, _) = create_test_app(pool.clone(), false).await;
+        let (app, _bg_services) = create_test_app(pool.clone(), false).await;
         let billing_manager = create_test_user(&pool, Role::BillingManager).await;
         let user = create_test_user(&pool, Role::StandardUser).await;
 
@@ -637,7 +637,7 @@ mod tests {
     #[sqlx::test]
     #[test_log::test]
     async fn test_get_own_transaction_as_request_viewer(pool: PgPool) {
-        let (app, _) = create_test_app(pool.clone(), false).await;
+        let (app, _bg_services) = create_test_app(pool.clone(), false).await;
         let user = create_test_user(&pool, Role::RequestViewer).await;
 
         // Create a transaction for the user
@@ -658,7 +658,7 @@ mod tests {
     #[sqlx::test]
     #[test_log::test]
     async fn test_get_other_user_transaction_returns_404_request_viewer(pool: PgPool) {
-        let (app, _) = create_test_app(pool.clone(), false).await;
+        let (app, _bg_services) = create_test_app(pool.clone(), false).await;
         let user1 = create_test_user(&pool, Role::RequestViewer).await;
         let user2 = create_test_user(&pool, Role::StandardUser).await;
 
@@ -679,7 +679,7 @@ mod tests {
     #[sqlx::test]
     #[test_log::test]
     async fn test_platform_manager_can_view_any_transaction(pool: PgPool) {
-        let (app, _) = create_test_app(pool.clone(), false).await;
+        let (app, _bg_services) = create_test_app(pool.clone(), false).await;
         let platform_manager = create_test_user(&pool, Role::PlatformManager).await;
         let user = create_test_user(&pool, Role::StandardUser).await;
 
@@ -700,7 +700,7 @@ mod tests {
     #[sqlx::test]
     #[test_log::test]
     async fn test_list_transactions_returns_own_for_request_viewer(pool: PgPool) {
-        let (app, _) = create_test_app(pool.clone(), false).await;
+        let (app, _bg_services) = create_test_app(pool.clone(), false).await;
         let user1 = create_test_user(&pool, Role::RequestViewer).await;
         let user2 = create_test_user(&pool, Role::StandardUser).await;
 
@@ -725,7 +725,7 @@ mod tests {
     #[sqlx::test]
     #[test_log::test]
     async fn test_platform_manager_can_list_all_transactions(pool: PgPool) {
-        let (app, _) = create_test_app(pool.clone(), false).await;
+        let (app, _bg_services) = create_test_app(pool.clone(), false).await;
         let platform_manager = create_test_user(&pool, Role::PlatformManager).await;
         let user1 = create_test_user(&pool, Role::StandardUser).await;
         let user2 = create_test_user(&pool, Role::StandardUser).await;
@@ -751,7 +751,7 @@ mod tests {
     #[sqlx::test]
     #[test_log::test]
     async fn test_list_transactions_with_other_user_id_forbidden_request_viewer(pool: PgPool) {
-        let (app, _) = create_test_app(pool.clone(), false).await;
+        let (app, _bg_services) = create_test_app(pool.clone(), false).await;
         let user1 = create_test_user(&pool, Role::RequestViewer).await;
         let user2 = create_test_user(&pool, Role::StandardUser).await;
 
@@ -768,7 +768,7 @@ mod tests {
     #[sqlx::test]
     #[test_log::test]
     async fn test_platform_manager_can_filter_by_user_id(pool: PgPool) {
-        let (app, _) = create_test_app(pool.clone(), false).await;
+        let (app, _bg_services) = create_test_app(pool.clone(), false).await;
         let platform_manager = create_test_user(&pool, Role::PlatformManager).await;
         let user1 = create_test_user(&pool, Role::StandardUser).await;
         let user2 = create_test_user(&pool, Role::StandardUser).await;
@@ -793,7 +793,7 @@ mod tests {
     #[sqlx::test]
     #[test_log::test]
     async fn test_list_transactions_pagination(pool: PgPool) {
-        let (app, _) = create_test_app(pool.clone(), false).await;
+        let (app, _bg_services) = create_test_app(pool.clone(), false).await;
         let user = create_test_user(&pool, Role::StandardUser).await;
 
         // Create 5 transactions

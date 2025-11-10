@@ -1,5 +1,5 @@
 use clap::Parser;
-use dwctl::{telemetry, Config};
+use dwctl::{telemetry, Application, Config};
 
 /// Wait for shutdown signal (SIGTERM or Ctrl+C)
 async fn shutdown_signal() {
@@ -44,5 +44,6 @@ async fn main() -> anyhow::Result<()> {
     tracing::debug!("{:?}", args);
 
     // Run the application with graceful shutdown on SIGTERM/Ctrl+C
-    dwctl::run(config, shutdown_signal()).await
+    let shutdown = shutdown_signal();
+    Application::new(config).await?.serve(shutdown).await
 }

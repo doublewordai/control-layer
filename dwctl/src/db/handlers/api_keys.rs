@@ -1393,6 +1393,7 @@ mod tests {
             enable_request_logging: false,
             enable_otel_export: false,
             batches: Default::default(),
+            leader_election: crate::config::LeaderElectionConfig::default(),
         };
         crate::seed_database(&config.model_sources, &pool).await.unwrap();
 
