@@ -104,6 +104,7 @@ where
     config: DaemonConfig,
     semaphores: Arc<RwLock<HashMap<String, Arc<Semaphore>>>>,
     requests_in_flight: Arc<AtomicUsize>,
+    shutdown_token: tokio_util::sync::CancellationToken,
 }
 
 impl<S, H> Daemon<S, H>
@@ -112,7 +113,12 @@ where
     H: HttpClient + 'static,
 {
     /// Create a new daemon.
-    pub fn new(storage: Arc<S>, http_client: Arc<H>, config: DaemonConfig) -> Self {
+    pub fn new(
+        storage: Arc<S>,
+        http_client: Arc<H>,
+        config: DaemonConfig,
+        shutdown_token: tokio_util::sync::CancellationToken,
+    ) -> Self {
         Self {
             daemon_id: DaemonId::from(uuid::Uuid::new_v4()),
             storage,
@@ -120,6 +126,7 @@ where
             config,
             semaphores: Arc::new(RwLock::new(HashMap::new())),
             requests_in_flight: Arc::new(AtomicUsize::new(0)),
+            shutdown_token,
         }
     }
 
@@ -176,6 +183,12 @@ where
         let mut join_set: JoinSet<Result<()>> = JoinSet::new();
 
         loop {
+            // Check for shutdown signal
+            if self.shutdown_token.is_cancelled() {
+                tracing::info!("Shutdown signal received, stopping daemon");
+                return Ok(());
+            }
+
             // Poll for completed tasks (non-blocking)
             while let Some(result) = join_set.try_join_next() {
                 match result {
@@ -199,8 +212,14 @@ where
 
             if claimed.is_empty() {
                 tracing::trace!("No pending requests, sleeping");
-                // No pending requests, sleep and retry
-                tokio::time::sleep(Duration::from_millis(self.config.claim_interval_ms)).await;
+                // No pending requests, sleep and retry with cancellation check
+                tokio::select! {
+                    _ = tokio::time::sleep(Duration::from_millis(self.config.claim_interval_ms)) => {},
+                    _ = self.shutdown_token.cancelled() => {
+                        tracing::info!("Shutdown signal received, stopping daemon");
+                        return Ok(());
+                    }
+                }
                 continue;
             }
 
@@ -410,7 +429,11 @@ mod tests {
         let request_id = requests[0].id();
 
         // Start the daemon
-        let daemon_handle = manager.clone().run().expect("Failed to start daemon");
+        let shutdown_token = tokio_util::sync::CancellationToken::new();
+        let daemon_handle = manager
+            .clone()
+            .run(shutdown_token.clone())
+            .expect("Failed to start daemon");
 
         // Poll for completion (with timeout)
         let start = tokio::time::Instant::now();
@@ -595,7 +618,11 @@ mod tests {
             .expect("Failed to create batch");
 
         // Start the daemon
-        let daemon_handle = manager.clone().run().expect("Failed to start daemon");
+        let shutdown_token = tokio_util::sync::CancellationToken::new();
+        let daemon_handle = manager
+            .clone()
+            .run(shutdown_token.clone())
+            .expect("Failed to start daemon");
 
         // Wait for exactly 2 requests to be in-flight (respecting concurrency limit)
         let start = tokio::time::Instant::now();
@@ -777,7 +804,11 @@ mod tests {
         let request_id = requests[0].id();
 
         // Start the daemon
-        let daemon_handle = manager.clone().run().expect("Failed to start daemon");
+        let shutdown_token = tokio_util::sync::CancellationToken::new();
+        let daemon_handle = manager
+            .clone()
+            .run(shutdown_token.clone())
+            .expect("Failed to start daemon");
 
         // Poll for completion (with timeout)
         let start = tokio::time::Instant::now();

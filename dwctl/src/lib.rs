@@ -45,7 +45,7 @@ pub use config::Config;
 use outlet::{PathFilter, RequestLoggerConfig, RequestLoggerLayer};
 use outlet_postgres::PostgresHandler;
 use request_logging::{AiRequest, AiResponse};
-use sqlx::{ConnectOptions, Executor, PgPool};
+use sqlx::{Executor, PgPool};
 use std::sync::Arc;
 use tokio::net::TcpListener;
 use tower::Layer;
@@ -188,6 +188,90 @@ pub async fn seed_database(sources: &[config::ModelSource], db: &PgPool) -> Resu
     Ok(())
 }
 
+/// Setup database connections, run migrations, and initialize data
+/// Returns: (embedded_db, main_pool, fusillade_pool, outlet_pool)
+async fn setup_database(config: &Config) -> anyhow::Result<(Option<db::embedded::EmbeddedDatabase>, PgPool, PgPool, Option<PgPool>)> {
+    // Database connection - handle both embedded and external
+    let (_embedded_db, database_url) = match &config.database {
+        config::DatabaseConfig::Embedded { .. } => {
+            let persistent = config.database.embedded_persistent();
+            info!("Starting with embedded database (persistent: {})", persistent);
+            if !persistent {
+                info!("persistent=false: database will be ephemeral and data will be lost on shutdown");
+            }
+            #[cfg(feature = "embedded-db")]
+            {
+                let data_dir = config.database.embedded_data_dir();
+                let embedded_db = db::embedded::EmbeddedDatabase::start(data_dir, persistent).await?;
+                let url = embedded_db.connection_string().to_string();
+                (Some(embedded_db), url)
+            }
+            #[cfg(not(feature = "embedded-db"))]
+            {
+                anyhow::bail!(
+                    "Embedded database is configured but the feature is not enabled. \
+                     Rebuild with --features embedded-db to use embedded database."
+                );
+            }
+        }
+        config::DatabaseConfig::External { url } => {
+            info!("Using external database");
+            (None::<db::embedded::EmbeddedDatabase>, url.clone())
+        }
+    };
+
+    let pool = PgPool::connect(&database_url).await?;
+    migrator().run(&pool).await?;
+
+    // Setup fusillade schema and pool
+    let fusillade_pool = sqlx::postgres::PgPoolOptions::new()
+        .max_connections(20)
+        .after_connect(|conn, _meta| {
+            Box::pin(async move {
+                // Set search path to fusillade schema for all connections in this pool
+                conn.execute("SET search_path = 'fusillade'").await?;
+                Ok(())
+            })
+        })
+        .connect(&database_url)
+        .await?;
+
+    fusillade_pool.execute("CREATE SCHEMA IF NOT EXISTS fusillade").await?;
+    fusillade::migrator().run(&fusillade_pool).await?;
+
+    // Setup outlet schema and pool if request logging is enabled
+    let outlet_pool = if config.enable_request_logging {
+        let outlet_pool = sqlx::postgres::PgPoolOptions::new()
+            .max_connections(5) // Smaller pool for logging
+            .after_connect(|conn, _meta| {
+                Box::pin(async move {
+                    // Set search path to outlet schema for all connections in this pool
+                    conn.execute("SET search_path = 'outlet'").await?;
+                    Ok(())
+                })
+            })
+            .connect(&database_url)
+            .await?;
+
+        outlet_pool.execute("CREATE SCHEMA IF NOT EXISTS outlet").await?;
+        outlet_postgres::migrator().run(&outlet_pool).await?;
+
+        Some(outlet_pool)
+    } else {
+        None
+    };
+
+    // Create initial admin user if it doesn't exist
+    create_initial_admin_user(&config.admin_email, config.admin_password.as_deref(), &pool)
+        .await
+        .map_err(|e| anyhow::anyhow!("Failed to create initial admin user: {}", e))?;
+
+    // Seed database with initial configuration (only runs once)
+    seed_database(&config.model_sources, &pool).await?;
+
+    Ok((_embedded_db, pool, fusillade_pool, outlet_pool))
+}
+
 /// Create CORS layer from configuration
 fn create_cors_layer(config: &Config) -> anyhow::Result<CorsLayer> {
     let mut origins = Vec::new();
@@ -210,240 +294,10 @@ fn create_cors_layer(config: &Config) -> anyhow::Result<CorsLayer> {
     Ok(cors)
 }
 
-/// Setup the complete application with onwards integration
-/// Returns router, onwards config sync handle, and optional drop guard for shutdown
-#[instrument(skip_all)]
-pub async fn setup_app(
-    pool: PgPool,
-    fusillade_pool: PgPool,
-    config: Config,
-    skip_leader_election: bool,
-) -> anyhow::Result<(Router, sync::onwards_config::OnwardsConfigSync, tokio_util::sync::DropGuard)> {
-    debug!("Setting up application");
-    // Seed database with initial configuration (only runs once)
-    seed_database(&config.model_sources, &pool).await?;
-
-    // Start onwards integration
-    let (onwards_config_sync, initial_targets, onwards_stream, drop_guard) =
-        sync::onwards_config::OnwardsConfigSync::new(pool.clone()).await?;
-
-    // Build the onwards router
-    let onwards_app_state = onwards::AppState::new(initial_targets.clone());
-    let onwards_router = onwards::build_router(onwards_app_state);
-
-    // Start target updates (infallible task, handle internally)
-    tokio::spawn(async move {
-        let _ = initial_targets.receive_updates(onwards_stream).await;
-    });
-
-    // Leader election lock ID: 0x44574354_50524F42 (DWCT_PROB in hex for "dwctl probes")
-    const LEADER_LOCK_ID: i64 = 0x4457_4354_5052_4F42_i64;
-
-    let probe_scheduler = probes::ProbeScheduler::new(pool.clone(), config.clone());
-
-    // Initialize the fusillade request manager (for batch processing)
-    // Use the fusillade_pool which has search_path set to 'fusillade' schema
-    let request_manager = Arc::new(
-        fusillade::PostgresRequestManager::new(fusillade_pool.clone())
-            .with_config(config.batches.daemon.to_fusillade_config())
-            .with_download_buffer_size(config.batches.files.download_buffer_size),
-    );
-
-    let is_leader: bool;
-
-    if skip_leader_election {
-        // Skip leader election - just become leader immediately
-        is_leader = true;
-        probe_scheduler.initialize().await?;
-
-        // Start the scheduler daemon in the background
-        let daemon_scheduler = probe_scheduler.clone();
-        tokio::spawn(async move {
-            // Use LISTEN/NOTIFY in production, but disable in tests to avoid hangs
-            let use_listen_notify = !cfg!(test);
-            daemon_scheduler.run_daemon(use_listen_notify, 300).await; // Fallback sync every 5 minutes
-        });
-
-        // Start the fusillade batch processing daemon based on config
-        use crate::config::DaemonEnabled;
-        use fusillade::DaemonExecutor;
-        match config.batches.daemon.enabled {
-            DaemonEnabled::Always | DaemonEnabled::Leader => {
-                let daemon_manager = request_manager.clone();
-                tokio::spawn(async move {
-                    if let Err(e) = daemon_manager.run() {
-                        tracing::error!("Fusillade daemon error: {}", e);
-                    }
-                });
-                info!("Skipping leader election - running as leader with probe scheduler and fusillade daemon");
-            }
-            DaemonEnabled::Never => {
-                info!("Skipping leader election - running as leader with probe scheduler (fusillade daemon disabled)");
-            }
-        }
-    } else {
-        // Normal leader election
-        is_leader = false;
-        info!("Starting leader election - will attempt to acquire leadership");
-
-        // If daemon is set to "Always", start it immediately regardless of leader election
-        use crate::config::DaemonEnabled;
-        if config.batches.daemon.enabled == DaemonEnabled::Always {
-            use fusillade::DaemonExecutor;
-            let daemon_manager = request_manager.clone();
-            tokio::spawn(async move {
-                if let Err(e) = daemon_manager.run() {
-                    tracing::error!("Fusillade daemon error: {}", e);
-                }
-            });
-            info!("Fusillade batch daemon started (configured to always run)");
-        }
-
-        let is_leader_flag = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-
-        // Spawn leader election background task
-        // This is designed to solve a problem that could have been solved by spinning up a
-        // separate service, but we're trying to keep everything in one replicated binary. There
-        // are some tasks that should only be run by one replica of the control layer service - for
-        // example, running the probes scheduler. To figure out which replica should run these
-        // tasks, we use 'leader election'. This is an elaborate name for 'taking a postgres
-        // advisory lock'.
-        //
-        // All the replicas try to take the lock on an interval. The one that succeeds becomes the
-        // leader. If the leader dies, another replica will succeed at the next interval. The
-        // leader election task takes two callbacks: one that runs when we become leader, and one
-        // that runs when we stop being leader.
-        let leader_election_pool = pool.clone();
-        let leader_election_scheduler_gain = probe_scheduler.clone();
-        let leader_election_scheduler_lose = probe_scheduler.clone();
-        let leader_election_request_manager_gain = request_manager.clone();
-        let leader_election_config = config.clone();
-        let leader_election_flag = is_leader_flag.clone();
-
-        // Store daemon handle for cleanup on leadership loss
-        let daemon_handle: Arc<tokio::sync::Mutex<Option<tokio::task::JoinHandle<fusillade::Result<()>>>>> =
-            Arc::new(tokio::sync::Mutex::new(None));
-        let daemon_handle_gain = daemon_handle.clone();
-        let daemon_handle_lose = daemon_handle.clone();
-
-        tokio::spawn(async move {
-            leader_election::leader_election_task(
-                leader_election_pool,
-                leader_election_config,
-                leader_election_flag,
-                LEADER_LOCK_ID,
-                move |_pool, config| {
-                    // This closure is run when a replica becomes the leader
-                    let scheduler = leader_election_scheduler_gain.clone();
-                    let request_manager = leader_election_request_manager_gain.clone();
-                    let daemon_handle = daemon_handle_gain.clone();
-                    async move {
-                        // Wait for the server to be fully up before starting probes
-                        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
-
-                        scheduler
-                            .initialize()
-                            .await
-                            .map_err(|e| anyhow::anyhow!("Failed to initialize probe scheduler: {}", e))?;
-
-                        // Start the probe scheduler daemon in the background
-                        let daemon_scheduler = scheduler.clone();
-                        tokio::spawn(async move {
-                            // Use LISTEN/NOTIFY in production, but disable in tests, because
-                            // LISTEN/NOTIFY can be annoying in test environments.
-                            let use_listen_notify = !cfg!(test);
-                            daemon_scheduler.run_daemon(use_listen_notify, 300).await;
-                        });
-
-                        // Start the fusillade batch processing daemon based on config
-                        use crate::config::DaemonEnabled;
-                        use fusillade::DaemonExecutor;
-                        match config.batches.daemon.enabled {
-                            DaemonEnabled::Always | DaemonEnabled::Leader => {
-                                let handle = request_manager
-                                    .run()
-                                    .map_err(|e| anyhow::anyhow!("Failed to start fusillade daemon: {}", e))?;
-
-                                // Store the handle so we can abort it when losing leadership
-                                *daemon_handle.lock().await = Some(handle);
-
-                                tracing::info!("Fusillade batch daemon started on elected leader");
-                            }
-                            DaemonEnabled::Never => {
-                                tracing::info!("Fusillade batch daemon disabled by configuration");
-                            }
-                        }
-
-                        Ok(())
-                    }
-                },
-                move |_pool, _config| {
-                    // This closure is run when a replica stops being the leader
-                    let scheduler = leader_election_scheduler_lose.clone();
-                    let daemon_handle = daemon_handle_lose.clone();
-                    async move {
-                        scheduler
-                            .stop_all()
-                            .await
-                            .map_err(|e| anyhow::anyhow!("Failed to stop probe scheduler: {}", e))?;
-
-                        // Stop the fusillade daemon
-                        if let Some(handle) = daemon_handle.lock().await.take() {
-                            handle.abort();
-                            tracing::info!("Fusillade batch daemon stopped (lost leadership)");
-                        }
-
-                        Ok(())
-                    }
-                },
-            )
-            .await;
-        });
-    }
-
-    let mut app_state = AppState::builder()
-        .db(pool)
-        .config(config)
-        .is_leader(is_leader)
-        .request_manager(request_manager)
-        .build();
-    let router = build_router(&mut app_state, onwards_router).await?;
-
-    Ok((router, onwards_config_sync, drop_guard))
-}
-
 #[instrument(skip_all)]
 pub async fn build_router(state: &mut AppState, onwards_router: Router) -> anyhow::Result<Router> {
     // Setup request logging if enabled
-    let outlet_layer = if state.config.enable_request_logging {
-        // Setup request logging with PostgreSQL handler using schema separation
-
-        // Get the database URL from the existing pool
-        let database_url = state.db.connect_options().to_url_lossy().to_string();
-
-        let outlet_pool = sqlx::postgres::PgPoolOptions::new()
-            .max_connections(5) // Smaller pool for logging
-            .after_connect(|conn, _meta| {
-                Box::pin(async move {
-                    // Set search path to outlet schema for all connections in this pool
-                    conn.execute("SET search_path = 'outlet'").await?;
-                    Ok(())
-                })
-            })
-            .connect(&database_url)
-            .await
-            .expect("Failed to create outlet database pool");
-
-        outlet_pool
-            .execute("CREATE SCHEMA IF NOT EXISTS outlet")
-            .await
-            .expect("Failed to create outlet schema");
-
-        outlet_postgres::migrator()
-            .run(&outlet_pool)
-            .await
-            .expect("Failed to run outlet migrations");
-
+    let outlet_layer = if let Some(outlet_pool) = state.outlet_db.as_ref() {
         // Initialize GenAI metrics BEFORE creating analytics serializer if metrics enabled
         if state.config.enable_metrics {
             let gen_ai_registry = prometheus::Registry::new();
@@ -464,8 +318,6 @@ pub async fn build_router(state: &mut AppState, onwards_router: Router) -> anyho
             .expect("Failed to create PostgresHandler for request logging")
             .with_request_serializer(parse_ai_request)
             .with_response_serializer(analytics_serializer.create_serializer());
-
-        state.outlet_db = Some(outlet_pool.clone());
 
         let outlet_config = RequestLoggerConfig {
             capture_request_body: true,
@@ -695,121 +547,348 @@ pub async fn build_router(state: &mut AppState, onwards_router: Router) -> anyho
     Ok(router)
 }
 
-pub async fn run<F>(config: Config, shutdown: F) -> anyhow::Result<()>
-where
-    F: std::future::Future<Output = ()> + Send + 'static,
-{
-    debug!("Starting control layer with configuration: {:#?}", config);
+/// Result from setting up background services
+pub struct BackgroundServices {
+    request_manager: Arc<fusillade::PostgresRequestManager<fusillade::ReqwestHttpClient>>,
+    is_leader: bool,
+    onwards_targets: onwards::target::Targets,
+    background_tasks: Vec<tokio::task::JoinHandle<()>>,
+    shutdown_token: tokio_util::sync::CancellationToken,
+}
 
-    // Database connection - handle both embedded and external
-    let (_embedded_db, database_url) = match &config.database {
-        config::DatabaseConfig::Embedded { .. } => {
-            let persistent = config.database.embedded_persistent();
-            info!("Starting with embedded database (persistent: {})", persistent);
-            if !persistent {
-                info!("persistent=false: database will be ephemeral and data will be lost on shutdown");
-            }
-            #[cfg(feature = "embedded-db")]
-            {
-                let data_dir = config.database.embedded_data_dir();
-                let embedded_db = db::embedded::EmbeddedDatabase::start(data_dir, persistent).await?;
-                let url = embedded_db.connection_string().to_string();
-                (Some(embedded_db), url)
-            }
-            #[cfg(not(feature = "embedded-db"))]
-            {
-                anyhow::bail!(
-                    "Embedded database is configured but the feature is not enabled. \
-                     Rebuild with --features embedded-db to use embedded database."
-                );
-            }
+impl BackgroundServices {
+    /// Gracefully shutdown all background tasks
+    pub async fn shutdown(self) {
+        // Signal all background tasks to shutdown
+        self.shutdown_token.cancel();
+
+        // Wait for all background tasks to complete
+        for handle in self.background_tasks {
+            let _ = handle.await;
         }
-        config::DatabaseConfig::External { url } => {
-            info!("Using external database");
-            (None::<db::embedded::EmbeddedDatabase>, url.clone())
-        }
-    };
+    }
+}
 
-    let pool = PgPool::connect(&database_url).await?;
+/// Setup background services (probe scheduler, batch daemon, leader election, onwards integration)
+async fn setup_background_services(
+    pool: PgPool,
+    fusillade_pool: PgPool,
+    config: Config,
+    shutdown_token: tokio_util::sync::CancellationToken,
+) -> anyhow::Result<BackgroundServices> {
+    // Track all background task handles for graceful shutdown
+    let mut background_tasks = Vec::new();
 
-    // Run migrations
-    migrator().run(&pool).await?;
+    // Start onwards integration for proxying AI requests
+    let (onwards_config_sync, initial_targets, onwards_stream) = sync::onwards_config::OnwardsConfigSync::new(pool.clone()).await?;
 
-    // Setup fusillade schema and run migrations
-    // Run fusillade migrations in separate schema
-    let fusillade_pool = sqlx::postgres::PgPoolOptions::new()
-        .max_connections(20)
-        .after_connect(|conn, _meta| {
-            Box::pin(async move {
-                // Set search path to fusillade schema for all connections in this pool
-                conn.execute("SET search_path = 'fusillade'").await?;
-                Ok(())
-            })
-        })
-        .connect(&database_url)
-        .await?;
+    // Clone targets for the update task
+    let targets_for_updates = initial_targets.clone();
 
-    fusillade_pool.execute("CREATE SCHEMA IF NOT EXISTS fusillade").await?;
+    // Start target updates (infallible task, handle internally)
+    let handle = tokio::spawn(async move {
+        let _ = targets_for_updates.receive_updates(onwards_stream).await;
+    });
+    background_tasks.push(handle);
 
-    fusillade::migrator().run(&fusillade_pool).await?;
-
-    // create admin user if it doesn't exist
-    create_initial_admin_user(&config.admin_email, config.admin_password.as_deref(), &pool)
-        .await
-        .map_err(|e| anyhow::anyhow!("Failed to create initial admin user: {}", e))?;
-
-    // Setup the complete application
-    let (router, onwards_config_sync, _drop_guard) = setup_app(pool.clone(), fusillade_pool.clone(), config.clone(), false).await?;
-
-    // Apply middleware at root level BEFORE routing decisions are made
-    let request_manager = Arc::new(
-        fusillade::PostgresRequestManager::new(fusillade_pool.clone())
-            .with_config(config.batches.daemon.to_fusillade_config())
-            .with_download_buffer_size(config.batches.files.download_buffer_size),
-    );
-    let middleware = from_fn_with_state(
-        AppState::builder()
-            .db(pool.clone())
-            .config(config.clone())
-            .request_manager(request_manager)
-            .build(),
-        admin_ai_proxy_middleware,
-    );
-
-    // Apply the layer around the whole Router so middleware runs before Router receives the request
-    let app_with_middleware = middleware.layer(router);
-
-    // Start the onwards integration task
-    tokio::spawn(async move {
+    // Start the onwards configuration listener
+    let onwards_shutdown = shutdown_token.clone();
+    let handle = tokio::spawn(async move {
         info!("Starting onwards configuration listener");
-        if let Err(e) = onwards_config_sync.start(Default::default()).await {
+        if let Err(e) = onwards_config_sync.start(Default::default(), onwards_shutdown).await {
             tracing::error!("Onwards configuration listener error: {}", e);
         }
     });
+    background_tasks.push(handle);
+    // Leader election lock ID: 0x44574354_50524F42 (DWCT_PROB in hex for "dwctl probes")
+    const LEADER_LOCK_ID: i64 = 0x4457_4354_5052_4F42_i64;
 
-    let bind_addr = config.bind_address();
-    let listener = TcpListener::bind(&bind_addr).await?;
-    info!(
-        "Control layer listening on http://{}, available at http://localhost:{}",
-        bind_addr, config.port
+    let probe_scheduler = probes::ProbeScheduler::new(pool.clone(), config.clone());
+
+    // Initialize the fusillade request manager (for batch processing)
+    let request_manager = Arc::new(
+        fusillade::PostgresRequestManager::new(fusillade_pool)
+            .with_config(config.batches.daemon.to_fusillade_config())
+            .with_download_buffer_size(config.batches.files.download_buffer_size),
     );
 
-    // Run the server with graceful shutdown
-    axum::serve(listener, app_with_middleware.into_make_service())
-        .with_graceful_shutdown(shutdown)
-        .await?;
+    let is_leader: bool;
 
-    // Shutdown telemetry
-    info!("Shutting down telemetry...");
-    telemetry::shutdown_telemetry();
+    if !config.leader_election.enabled {
+        info!("Launching without leader election: running as leader");
+        // Skip leader election - just become leader immediately
+        is_leader = true;
+        probe_scheduler.initialize(shutdown_token.clone()).await?;
 
-    // Clean up embedded database if it exists
-    if let Some(embedded_db) = _embedded_db {
-        info!("Shutting down embedded database...");
-        embedded_db.stop().await?;
+        // Start the scheduler daemon in the background
+        let daemon_scheduler = probe_scheduler.clone();
+        let daemon_shutdown = shutdown_token.clone();
+        let handle = tokio::spawn(async move {
+            // Use LISTEN/NOTIFY in production, but disable in tests to avoid hangs
+            let use_listen_notify = !cfg!(test);
+            daemon_scheduler.run_daemon(daemon_shutdown, use_listen_notify, 300).await;
+            // Fallback sync every 5 minutes
+        });
+        background_tasks.push(handle);
+
+        // Start the fusillade batch processing daemon based on config
+        use crate::config::DaemonEnabled;
+        use fusillade::DaemonExecutor;
+        match config.batches.daemon.enabled {
+            DaemonEnabled::Always | DaemonEnabled::Leader => {
+                let daemon_handle = request_manager.clone().run(shutdown_token.clone())?;
+                // Wrap the handle to convert Result<()> to ()
+                let handle = tokio::spawn(async move {
+                    let _ = daemon_handle.await;
+                });
+                background_tasks.push(handle);
+                info!("Skipping leader election - running as leader with probe scheduler and fusillade daemon");
+            }
+            DaemonEnabled::Never => {
+                info!("Skipping leader election - running as leader with probe scheduler (fusillade daemon disabled)");
+            }
+        }
+    } else {
+        // Normal leader election
+        is_leader = false;
+        info!("Starting leader election - will attempt to acquire leadership");
+
+        // If daemon is set to "Always", start it immediately regardless of leader election
+        use crate::config::DaemonEnabled;
+        if config.batches.daemon.enabled == DaemonEnabled::Always {
+            use fusillade::DaemonExecutor;
+            let daemon_handle = request_manager.clone().run(shutdown_token.clone())?;
+            // Wrap the handle to convert Result<()> to ()
+            let handle = tokio::spawn(async move {
+                let _ = daemon_handle.await;
+            });
+            background_tasks.push(handle);
+            info!("Fusillade batch daemon started (configured to always run)");
+        }
+
+        let is_leader_flag = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+
+        // Spawn leader election background task
+        let leader_election_pool = pool.clone();
+        let leader_election_scheduler_gain = probe_scheduler.clone();
+        let leader_election_scheduler_lose = probe_scheduler.clone();
+        let leader_election_request_manager_gain = request_manager.clone();
+        let leader_election_config = config.clone();
+        let leader_election_flag = is_leader_flag.clone();
+
+        // Store daemon handle for cleanup on leadership loss
+        let daemon_handle: Arc<tokio::sync::Mutex<Option<tokio::task::JoinHandle<fusillade::Result<()>>>>> =
+            Arc::new(tokio::sync::Mutex::new(None));
+        let daemon_handle_gain = daemon_handle.clone();
+        let daemon_handle_lose = daemon_handle.clone();
+
+        // Store leadership session shutdown token for cleanup on leadership loss
+        let leadership_shutdown: Arc<tokio::sync::Mutex<Option<tokio_util::sync::CancellationToken>>> =
+            Arc::new(tokio::sync::Mutex::new(None));
+        let leadership_shutdown_gain = leadership_shutdown.clone();
+        let leadership_shutdown_lose = leadership_shutdown.clone();
+
+        let leader_election_shutdown = shutdown_token.clone();
+        let handle = tokio::spawn(async move {
+            leader_election::leader_election_task(
+                leader_election_pool,
+                leader_election_config,
+                leader_election_flag,
+                LEADER_LOCK_ID,
+                leader_election_shutdown,
+                move |_pool, config| {
+                    // This closure is run when a replica becomes the leader
+                    let scheduler = leader_election_scheduler_gain.clone();
+                    let request_manager = leader_election_request_manager_gain.clone();
+                    let daemon_handle = daemon_handle_gain.clone();
+                    let leadership_shutdown = leadership_shutdown_gain.clone();
+                    async move {
+                        // Wait for the server to be fully up before starting probes
+                        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+
+                        // Create a new cancellation token for this leadership session
+                        let session_token = tokio_util::sync::CancellationToken::new();
+                        *leadership_shutdown.lock().await = Some(session_token.clone());
+
+                        scheduler
+                            .initialize(session_token.clone())
+                            .await
+                            .map_err(|e| anyhow::anyhow!("Failed to initialize probe scheduler: {}", e))?;
+
+                        // Start the probe scheduler daemon in the background
+                        let daemon_scheduler = scheduler.clone();
+                        let daemon_session_token = session_token.clone();
+                        tokio::spawn(async move {
+                            let use_listen_notify = !cfg!(test);
+                            daemon_scheduler.run_daemon(daemon_session_token, use_listen_notify, 300).await;
+                        });
+
+                        // Start the fusillade batch processing daemon based on config
+                        use crate::config::DaemonEnabled;
+                        use fusillade::DaemonExecutor;
+                        match config.batches.daemon.enabled {
+                            DaemonEnabled::Always | DaemonEnabled::Leader => {
+                                let handle = request_manager
+                                    .run(session_token.clone())
+                                    .map_err(|e| anyhow::anyhow!("Failed to start fusillade daemon: {}", e))?;
+
+                                // Store the handle so we can abort it when losing leadership
+                                *daemon_handle.lock().await = Some(handle);
+
+                                tracing::info!("Fusillade batch daemon started on elected leader");
+                            }
+                            DaemonEnabled::Never => {
+                                tracing::info!("Fusillade batch daemon disabled by configuration");
+                            }
+                        }
+
+                        Ok(())
+                    }
+                },
+                move |_pool, _config| {
+                    // This closure is run when a replica stops being the leader
+                    let scheduler = leader_election_scheduler_lose.clone();
+                    let daemon_handle = daemon_handle_lose.clone();
+                    let leadership_shutdown = leadership_shutdown_lose.clone();
+                    async move {
+                        // Cancel the leadership session token first, which will stop all background tasks gracefully
+                        if let Some(token) = leadership_shutdown.lock().await.take() {
+                            token.cancel();
+                        }
+
+                        // Now stop all schedulers (this will be faster since they're already shutting down)
+                        scheduler
+                            .stop_all()
+                            .await
+                            .map_err(|e| anyhow::anyhow!("Failed to stop probe scheduler: {}", e))?;
+
+                        // Stop the fusillade daemon
+                        if let Some(handle) = daemon_handle.lock().await.take() {
+                            handle.abort();
+                            tracing::info!("Fusillade batch daemon stopped (lost leadership)");
+                        }
+
+                        Ok(())
+                    }
+                },
+            )
+            .await;
+        });
+        background_tasks.push(handle);
     }
 
-    Ok(())
+    Ok(BackgroundServices {
+        request_manager,
+        is_leader,
+        onwards_targets: initial_targets,
+        background_tasks,
+        shutdown_token,
+    })
+}
+
+/// Main application struct that owns all resources
+pub struct Application {
+    router: Router,
+    app_state: AppState,
+    config: Config,
+    pool: PgPool,
+    _fusillade_pool: PgPool,
+    _outlet_pool: Option<PgPool>,
+    _embedded_db: Option<db::embedded::EmbeddedDatabase>,
+    bg_services: BackgroundServices,
+}
+
+impl Application {
+    /// Create a new application instance with all resources initialized
+    pub async fn new(config: Config) -> anyhow::Result<Self> {
+        debug!("Starting control layer with configuration: {:#?}", config);
+
+        // Setup database connections, run migrations, and initialize data
+        let (_embedded_db, pool, fusillade_pool, outlet_pool) = setup_database(&config).await?;
+
+        // Create a shutdown token for coordinating graceful shutdown of background tasks
+        let shutdown_token = tokio_util::sync::CancellationToken::new();
+
+        // Setup background services (onwards integration, probe scheduler, batch daemon, leader election)
+        let bg_services = setup_background_services(pool.clone(), fusillade_pool.clone(), config.clone(), shutdown_token.clone()).await?;
+
+        // Build onwards router from targets
+        let onwards_app_state = onwards::AppState::new(bg_services.onwards_targets.clone());
+        let onwards_router = onwards::build_router(onwards_app_state);
+
+        // Build app state and router
+        let mut app_state = AppState::builder()
+            .db(pool.clone())
+            .config(config.clone())
+            .is_leader(bg_services.is_leader)
+            .request_manager(bg_services.request_manager.clone())
+            .maybe_outlet_db(outlet_pool.clone())
+            .build();
+
+        let router = build_router(&mut app_state, onwards_router).await?;
+
+        Ok(Self {
+            router,
+            app_state,
+            config,
+            pool,
+            _fusillade_pool: fusillade_pool,
+            _outlet_pool: outlet_pool,
+            _embedded_db,
+            bg_services,
+        })
+    }
+
+    /// Convert application into a test server (for tests)
+    #[cfg(test)]
+    pub fn into_test_server(self) -> (axum_test::TestServer, BackgroundServices) {
+        // Apply middleware before path matching for tests
+        let middleware = from_fn_with_state(self.app_state, admin_ai_proxy_middleware);
+        let service = middleware.layer(self.router).into_make_service();
+        let server = axum_test::TestServer::new(service).expect("Failed to create test server");
+        (server, self.bg_services)
+    }
+
+    /// Start serving the application
+    pub async fn serve<F>(self, shutdown: F) -> anyhow::Result<()>
+    where
+        F: std::future::Future<Output = ()> + Send + 'static,
+    {
+        let bind_addr = self.config.bind_address();
+        let listener = TcpListener::bind(&bind_addr).await?;
+        info!(
+            "Control layer listening on http://{}, available at http://localhost:{}",
+            bind_addr, self.config.port
+        );
+
+        // Apply middleware before path matching
+        let middleware = from_fn_with_state(self.app_state, admin_ai_proxy_middleware);
+        let service = middleware.layer(self.router);
+
+        // Run the server with graceful shutdown
+        axum::serve(listener, service.into_make_service())
+            .with_graceful_shutdown(shutdown)
+            .await?;
+
+        // Shutdown background services and wait for tasks to complete
+        self.bg_services.shutdown().await;
+
+        // Close database connections
+        info!("Closing database connections...");
+        self.pool.close().await;
+
+        // Shutdown telemetry
+        info!("Shutting down telemetry...");
+        telemetry::shutdown_telemetry();
+
+        // Clean up embedded database if it exists
+        if let Some(embedded_db) = self._embedded_db {
+            info!("Shutting down embedded database...");
+            embedded_db.stop().await?;
+        }
+
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -817,52 +896,20 @@ mod test {
     use super::{create_initial_admin_user, AppState};
     use crate::{
         api::models::users::Role,
-        auth::middleware::admin_ai_proxy_middleware,
         db::handlers::Users,
         request_logging::{AiRequest, AiResponse},
         test_utils::*,
     };
-    use axum::ServiceExt as _;
     use outlet_postgres::RequestFilter;
-    use sqlx::PgPool;
-    use tower::Layer as _;
+    use sqlx::{ConnectOptions, PgPool};
 
     /// Integration test: setup the whole stack, including syncing the onwards config from
     /// LISTEN/NOTIFY, and then test user access via headers to /admin/api/v1/ai
     #[sqlx::test]
     #[test_log::test]
     async fn test_admin_ai_proxy_middleware_with_user_access(pool: PgPool) {
-        // Create fusillade pool for test
-        let fusillade_pool = crate::test_utils::setup_fusillade_for_tests(&pool).await;
-
-        // Create test app with sync enabled
-        let (router, onwards_config_sync, _drop_guard) =
-            crate::setup_app(pool.clone(), fusillade_pool, crate::test_utils::create_test_config(), true)
-                .await
-                .expect("Failed to setup test app");
-
-        // Apply middleware for this test
-        let middleware = admin_ai_proxy_middleware;
-        let request_manager = std::sync::Arc::new(fusillade::PostgresRequestManager::new(pool.clone()));
-        let app_state = crate::AppState::builder()
-            .db(pool.clone())
-            .config(crate::test_utils::create_test_config())
-            .request_manager(request_manager)
-            .build();
-        // TODO: put the middleware application into some function that's shared w/ main.rs. The
-        // reason it isn't now is that `Router` is a nice concrete type for setup_app to return,
-        // but impl IntoMakeService is a bit tougher
-        let middleware_layer = axum::middleware::from_fn_with_state(app_state, middleware);
-        let router_with_middleware = middleware_layer.layer(router);
-
-        let server = axum_test::TestServer::new(router_with_middleware.into_make_service()).expect("Failed to create test server");
-
-        // Start the config sync in background for test
-        tokio::spawn(async move {
-            if let Err(e) = onwards_config_sync.start(Default::default()).await {
-                eprintln!("Config sync error in test: {e}");
-            }
-        });
+        // Create test app (handles all setup including database seeding)
+        let (server, bg_services) = crate::test_utils::create_test_app(pool.clone(), true).await;
 
         // Create test users
         let admin_user = create_test_admin_user(&pool, Role::PlatformManager).await;
@@ -960,6 +1007,9 @@ mod test {
             403,
             "Admin proxy should reject non-existent model"
         );
+
+        // Manually trigger shutdown to clean up background tasks
+        bg_services.shutdown().await;
     }
 
     #[sqlx::test]
@@ -1078,23 +1128,19 @@ mod test {
         // Create test config with request logging enabled
         let mut config = crate::test_utils::create_test_config();
         config.enable_request_logging = true;
+        config.database = crate::config::DatabaseConfig::External {
+            url: pool.connect_options().to_url_lossy().to_string(),
+        };
+        config.leader_election.enabled = false;
 
-        // Build router with request logging enabled
-        let request_manager = std::sync::Arc::new(fusillade::PostgresRequestManager::new(pool.clone()));
-        let mut app_state = AppState::builder()
-            .db(pool.clone())
-            .config(config)
-            .request_manager(request_manager)
-            .build();
-        let onwards_router = axum::Router::new().route("/v1/models", axum::routing::get(|| async { "AI Models" })); // Simple
-                                                                                                                    // onwards router for testing
-        let router = super::build_router(&mut app_state, onwards_router)
-            .await
-            .expect("Failed to build router");
-        let outlet_pool = app_state.outlet_db.clone().expect("outlet_db should exist");
+        // Create application using proper setup (which will create outlet_db)
+        let app = crate::Application::new(config).await.expect("Failed to create application");
+
+        // Get outlet_db from app_state to query logs
+        let outlet_pool = app.app_state.outlet_db.clone().expect("outlet_db should exist");
         let repository: outlet_postgres::RequestRepository<AiRequest, AiResponse> = outlet_postgres::RequestRepository::new(outlet_pool);
 
-        let server = axum_test::TestServer::new(router).expect("Failed to create test server");
+        let (server, _drop_guard) = app.into_test_server();
 
         // Make a test request to /ai/ endpoint which should be logged
         let _ = server.get("/ai/v1/models").await;
@@ -1243,18 +1289,18 @@ mod test {
     }
 
     #[sqlx::test]
-    async fn test_setup_app_integration(pool: PgPool) {
-        let config = create_test_config();
+    async fn test_application_integration(pool: PgPool) {
+        let mut config = create_test_config();
+        config.database = crate::config::DatabaseConfig::External {
+            url: pool.connect_options().to_url_lossy().to_string(),
+        };
+        config.leader_election.enabled = false;
 
-        // Create fusillade pool for test
-        let fusillade_pool = crate::test_utils::setup_fusillade_for_tests(&pool).await;
+        // Create application
+        let app = crate::Application::new(config).await;
+        assert!(app.is_ok(), "Application::new should succeed");
 
-        // Call setup_app
-        let result = super::setup_app(pool.clone(), fusillade_pool, config, true).await;
-        assert!(result.is_ok(), "setup_app should succeed");
-
-        let (router, _onwards_sync, _drop_guard) = result.unwrap();
-        let server = axum_test::TestServer::new(router).expect("Failed to create test server");
+        let (server, _drop_guard) = app.unwrap().into_test_server();
 
         // Test that basic routes work
         let health_response = server.get("/healthz").await;

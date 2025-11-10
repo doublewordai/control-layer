@@ -2,6 +2,7 @@ use crate::config;
 use sqlx::PgPool;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, instrument};
 
 /// Background task for leader election
@@ -12,12 +13,13 @@ use tracing::{debug, info, instrument};
 ///
 /// PostgreSQL advisory locks are session-based, so we need to maintain a dedicated connection
 /// for the entire duration we want to hold the lock.
-#[instrument(skip(pool, config, lock_id, on_gain_leadership, on_lose_leadership))]
+#[instrument(skip(pool, config, lock_id, shutdown_token, on_gain_leadership, on_lose_leadership))]
 pub async fn leader_election_task<F1, F2, Fut1, Fut2>(
     pool: PgPool,
     config: config::Config,
     is_leader: Arc<AtomicBool>,
     lock_id: i64,
+    shutdown_token: CancellationToken,
     on_gain_leadership: F1,
     on_lose_leadership: F2,
 ) where
@@ -30,7 +32,20 @@ pub async fn leader_election_task<F1, F2, Fut1, Fut2>(
     let mut leader_conn: Option<sqlx::pool::PoolConnection<sqlx::Postgres>> = None;
 
     loop {
-        interval.tick().await;
+        tokio::select! {
+            _ = interval.tick() => {}
+            _ = shutdown_token.cancelled() => {
+                info!("Shutdown signal received, stopping leader election");
+                // If we're currently the leader, call the lose leadership callback
+                if is_leader.load(Ordering::Relaxed) {
+                    is_leader.store(false, Ordering::Relaxed);
+                    if let Err(e) = on_lose_leadership(pool.clone(), config.clone()).await {
+                        tracing::error!("Failed to execute on_lose_leadership callback during shutdown: {}", e);
+                    }
+                }
+                break;
+            }
+        }
 
         let current_status = is_leader.load(Ordering::Relaxed);
 

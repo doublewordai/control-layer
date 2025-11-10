@@ -769,7 +769,7 @@ mod tests {
     #[sqlx::test]
     #[test_log::test]
     async fn test_upload_and_download_file_content(pool: PgPool) {
-        let (app, _) = create_test_app(pool.clone(), false).await;
+        let (app, _bg_services) = create_test_app(pool.clone(), false).await;
         // User needs BatchAPIUser role to create/read files
         let user = create_test_user_with_roles(&pool, vec![Role::StandardUser, Role::BatchAPIUser]).await;
         let group = create_test_group(&pool).await;
@@ -827,7 +827,7 @@ mod tests {
     #[sqlx::test]
     #[test_log::test]
     async fn test_upload_missing_model_field(pool: PgPool) {
-        let (app, _) = create_test_app(pool.clone(), false).await;
+        let (app, _bg_services) = create_test_app(pool.clone(), false).await;
         let user = create_test_user_with_roles(&pool, vec![Role::StandardUser, Role::BatchAPIUser]).await;
 
         // Missing model field in body
@@ -854,7 +854,7 @@ mod tests {
     #[sqlx::test]
     #[test_log::test]
     async fn test_upload_missing_custom_id(pool: PgPool) {
-        let (app, _) = create_test_app(pool.clone(), false).await;
+        let (app, _bg_services) = create_test_app(pool.clone(), false).await;
         let user = create_test_user_with_roles(&pool, vec![Role::StandardUser, Role::BatchAPIUser]).await;
 
         // Missing custom_id field
@@ -882,7 +882,7 @@ mod tests {
     #[sqlx::test]
     #[test_log::test]
     async fn test_upload_invalid_json_body(pool: PgPool) {
-        let (app, _) = create_test_app(pool.clone(), false).await;
+        let (app, _bg_services) = create_test_app(pool.clone(), false).await;
         let user = create_test_user_with_roles(&pool, vec![Role::StandardUser, Role::BatchAPIUser]).await;
 
         // Invalid JSON in body field (not an object)
@@ -909,7 +909,7 @@ mod tests {
     #[sqlx::test]
     #[test_log::test]
     async fn test_upload_malformed_jsonl(pool: PgPool) {
-        let (app, _) = create_test_app(pool.clone(), false).await;
+        let (app, _bg_services) = create_test_app(pool.clone(), false).await;
         let user = create_test_user_with_roles(&pool, vec![Role::StandardUser, Role::BatchAPIUser]).await;
 
         // Malformed JSONL - not valid JSON
@@ -934,7 +934,7 @@ mod tests {
     #[sqlx::test]
     #[test_log::test]
     async fn test_upload_empty_file(pool: PgPool) {
-        let (app, _) = create_test_app(pool.clone(), false).await;
+        let (app, _bg_services) = create_test_app(pool.clone(), false).await;
         let user = create_test_user_with_roles(&pool, vec![Role::StandardUser, Role::BatchAPIUser]).await;
 
         // Empty file
@@ -959,7 +959,7 @@ mod tests {
     #[sqlx::test]
     #[test_log::test]
     async fn test_upload_with_metadata_after_file_field(pool: PgPool) {
-        let (app, _) = create_test_app(pool.clone(), false).await;
+        let (app, _bg_services) = create_test_app(pool.clone(), false).await;
         let user = create_test_user_with_roles(&pool, vec![Role::StandardUser, Role::BatchAPIUser]).await;
 
         // Create test JSONL content
@@ -1001,7 +1001,7 @@ mod tests {
     #[sqlx::test]
     #[test_log::test]
     async fn test_upload_duplicate_filename(pool: PgPool) {
-        let (app, _) = create_test_app(pool.clone(), false).await;
+        let (app, _bg_services) = create_test_app(pool.clone(), false).await;
         let user = create_test_user_with_roles(&pool, vec![Role::StandardUser, Role::BatchAPIUser]).await;
 
         // Create test JSONL content

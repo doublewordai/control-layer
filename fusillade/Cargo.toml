@@ -15,6 +15,7 @@ postgres = ["sqlx"]
 
 [dependencies]
 tokio-stream = { version = "0.1", features = ["sync"] }
+tokio-util = "0.7"
 tracing = "0.1"
 tokio = { version = "1", features = ["full"] }
 serde = { version = "1", features = ["derive"] }

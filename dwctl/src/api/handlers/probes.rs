@@ -399,7 +399,7 @@ mod tests {
     #[sqlx::test]
     #[test_log::test]
     async fn test_create_probe(pool: PgPool) {
-        let (app, _) = create_test_app(pool.clone(), false).await;
+        let (app, _bg_services) = create_test_app(pool.clone(), false).await;
         let user = create_test_admin_user(&pool, Role::PlatformManager).await;
         let deployment_id = setup_test_deployment(&pool, user.id).await;
 
@@ -426,7 +426,7 @@ mod tests {
     #[sqlx::test]
     #[test_log::test]
     async fn test_create_probe_unauthorized(pool: PgPool) {
-        let (app, _) = create_test_app(pool.clone(), false).await;
+        let (app, _bg_services) = create_test_app(pool.clone(), false).await;
         let user = create_test_user(&pool, Role::StandardUser).await;
         let deployment_id = setup_test_deployment(&pool, user.id).await;
 
@@ -448,7 +448,7 @@ mod tests {
     #[sqlx::test]
     #[test_log::test]
     async fn test_list_probes(pool: PgPool) {
-        let (app, _) = create_test_app(pool.clone(), false).await;
+        let (app, _bg_services) = create_test_app(pool.clone(), false).await;
         let user = create_test_admin_user(&pool, Role::PlatformManager).await;
 
         // Create test probes
@@ -496,7 +496,7 @@ mod tests {
     #[sqlx::test]
     #[test_log::test]
     async fn test_get_probe(pool: PgPool) {
-        let (app, _) = create_test_app(pool.clone(), false).await;
+        let (app, _bg_services) = create_test_app(pool.clone(), false).await;
         let user = create_test_admin_user(&pool, Role::PlatformManager).await;
         let deployment_id = setup_test_deployment(&pool, user.id).await;
 
@@ -528,7 +528,7 @@ mod tests {
     #[sqlx::test]
     #[test_log::test]
     async fn test_get_probe_not_found(pool: PgPool) {
-        let (app, _) = create_test_app(pool.clone(), false).await;
+        let (app, _bg_services) = create_test_app(pool.clone(), false).await;
         let user = create_test_admin_user(&pool, Role::PlatformManager).await;
         let non_existent_id = Uuid::new_v4();
 
@@ -543,7 +543,7 @@ mod tests {
     #[sqlx::test]
     #[test_log::test]
     async fn test_update_probe(pool: PgPool) {
-        let (app, _) = create_test_app(pool.clone(), false).await;
+        let (app, _bg_services) = create_test_app(pool.clone(), false).await;
         let user = create_test_admin_user(&pool, Role::PlatformManager).await;
         let deployment_id = setup_test_deployment(&pool, user.id).await;
 
@@ -580,7 +580,7 @@ mod tests {
     #[sqlx::test]
     #[test_log::test]
     async fn test_activate_probe(pool: PgPool) {
-        let (app, _) = create_test_app(pool.clone(), false).await;
+        let (app, _bg_services) = create_test_app(pool.clone(), false).await;
         let user = create_test_admin_user(&pool, Role::PlatformManager).await;
         let deployment_id = setup_test_deployment(&pool, user.id).await;
 
@@ -614,7 +614,7 @@ mod tests {
     #[sqlx::test]
     #[test_log::test]
     async fn test_deactivate_probe(pool: PgPool) {
-        let (app, _) = create_test_app(pool.clone(), false).await;
+        let (app, _bg_services) = create_test_app(pool.clone(), false).await;
         let user = create_test_admin_user(&pool, Role::PlatformManager).await;
         let deployment_id = setup_test_deployment(&pool, user.id).await;
 
@@ -645,7 +645,7 @@ mod tests {
     #[sqlx::test]
     #[test_log::test]
     async fn test_delete_probe(pool: PgPool) {
-        let (app, _) = create_test_app(pool.clone(), false).await;
+        let (app, _bg_services) = create_test_app(pool.clone(), false).await;
         let user = create_test_admin_user(&pool, Role::PlatformManager).await;
         let deployment_id = setup_test_deployment(&pool, user.id).await;
 
@@ -682,7 +682,7 @@ mod tests {
     #[sqlx::test]
     #[test_log::test]
     async fn test_get_probe_results(pool: PgPool) {
-        let (app, _) = create_test_app(pool.clone(), false).await;
+        let (app, _bg_services) = create_test_app(pool.clone(), false).await;
         let user = create_test_admin_user(&pool, Role::PlatformManager).await;
         let deployment_id = setup_test_deployment(&pool, user.id).await;
 
@@ -713,7 +713,7 @@ mod tests {
     #[sqlx::test]
     #[test_log::test]
     async fn test_get_statistics(pool: PgPool) {
-        let (app, _) = create_test_app(pool.clone(), false).await;
+        let (app, _bg_services) = create_test_app(pool.clone(), false).await;
         let user = create_test_admin_user(&pool, Role::PlatformManager).await;
         let deployment_id = setup_test_deployment(&pool, user.id).await;
 

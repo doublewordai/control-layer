@@ -547,7 +547,7 @@ mod tests {
     #[sqlx::test]
     #[test_log::test]
     async fn test_list_deployments(pool: PgPool) {
-        let (app, _) = create_test_app(pool.clone(), false).await;
+        let (app, _bg_services) = create_test_app(pool.clone(), false).await;
         let user = create_test_user(&pool, Role::StandardUser).await;
         let test_endpoint_id = get_test_endpoint_id(&pool).await;
 
@@ -565,7 +565,7 @@ mod tests {
     #[sqlx::test]
     #[test_log::test]
     async fn test_deployments_with_nonexistent_endpoint(pool: PgPool) {
-        let (app, _) = create_test_app(pool.clone(), false).await;
+        let (app, _bg_services) = create_test_app(pool.clone(), false).await;
         let user = create_test_user(&pool, Role::StandardUser).await;
         let non_existent_id = uuid::Uuid::new_v4();
 
@@ -580,7 +580,7 @@ mod tests {
     #[sqlx::test]
     #[test_log::test]
     async fn test_model_operations(pool: PgPool) {
-        let (app, _) = create_test_app(pool.clone(), false).await;
+        let (app, _bg_services) = create_test_app(pool.clone(), false).await;
         let user = create_test_admin_user(&pool, Role::PlatformManager).await;
 
         // Create a deployment on the test endpoint
@@ -652,7 +652,7 @@ mod tests {
     #[sqlx::test]
     #[test_log::test]
     async fn test_list_deployments_with_groups_include(pool: PgPool) {
-        let (app, _) = create_test_app(pool.clone(), false).await;
+        let (app, _bg_services) = create_test_app(pool.clone(), false).await;
         let admin_user = create_test_admin_user(&pool, Role::PlatformManager).await;
 
         // Create a deployment
@@ -713,7 +713,7 @@ mod tests {
     #[sqlx::test]
     #[test_log::test]
     async fn test_role_based_visibility_for_deleted_models(pool: PgPool) {
-        let (app, _) = create_test_app(pool.clone(), false).await;
+        let (app, _bg_services) = create_test_app(pool.clone(), false).await;
         let admin_user = create_test_admin_user(&pool, Role::PlatformManager).await;
         let regular_user = create_test_user(&pool, Role::StandardUser).await;
 
@@ -763,7 +763,7 @@ mod tests {
     #[sqlx::test]
     #[test_log::test]
     async fn test_role_based_list_filtering(pool: PgPool) {
-        let (app, _) = create_test_app(pool.clone(), false).await;
+        let (app, _bg_services) = create_test_app(pool.clone(), false).await;
         let admin_user = create_test_admin_user(&pool, Role::PlatformManager).await;
         let regular_user = create_test_user(&pool, Role::StandardUser).await;
 
@@ -830,7 +830,7 @@ mod tests {
     #[sqlx::test]
     #[test_log::test]
     async fn test_role_based_update_access_for_deleted_models(pool: PgPool) {
-        let (app, _) = create_test_app(pool.clone(), false).await;
+        let (app, _bg_services) = create_test_app(pool.clone(), false).await;
         let admin_user = create_test_admin_user(&pool, Role::PlatformManager).await;
         let regular_user = create_test_user(&pool, Role::StandardUser).await;
 
@@ -873,7 +873,7 @@ mod tests {
     #[sqlx::test]
     #[test_log::test]
     async fn test_soft_delete_preserves_model_accessibility_for_admin(pool: PgPool) {
-        let (app, _) = create_test_app(pool.clone(), false).await;
+        let (app, _bg_services) = create_test_app(pool.clone(), false).await;
         let admin_user = create_test_admin_user(&pool, Role::PlatformManager).await;
         let regular_user = create_test_user(&pool, Role::StandardUser).await;
 
@@ -935,7 +935,7 @@ mod tests {
     #[sqlx::test]
     #[test_log::test]
     async fn test_create_deployed_model(pool: PgPool) {
-        let (app, _) = create_test_app(pool.clone(), false).await;
+        let (app, _bg_services) = create_test_app(pool.clone(), false).await;
         let admin_user = create_test_admin_user(&pool, Role::PlatformManager).await;
         let test_endpoint_id = get_test_endpoint_id(&pool).await;
 
@@ -968,7 +968,7 @@ mod tests {
     #[sqlx::test]
     #[test_log::test]
     async fn test_create_deployed_model_with_defaults(pool: PgPool) {
-        let (app, _) = create_test_app(pool.clone(), false).await;
+        let (app, _bg_services) = create_test_app(pool.clone(), false).await;
         let admin_user = create_test_admin_user(&pool, Role::PlatformManager).await;
         let test_endpoint_id = get_test_endpoint_id(&pool).await;
 
@@ -997,7 +997,7 @@ mod tests {
     #[sqlx::test]
     #[test_log::test]
     async fn test_create_deployed_model_non_admin_forbidden(pool: PgPool) {
-        let (app, _) = create_test_app(pool.clone(), false).await;
+        let (app, _bg_services) = create_test_app(pool.clone(), false).await;
         let regular_user = create_test_user(&pool, Role::StandardUser).await;
         let test_endpoint_id = get_test_endpoint_id(&pool).await;
 
@@ -1018,7 +1018,7 @@ mod tests {
     #[sqlx::test]
     #[test_log::test]
     async fn test_create_deployed_model_nonexistent_endpoint(pool: PgPool) {
-        let (app, _) = create_test_app(pool.clone(), false).await;
+        let (app, _bg_services) = create_test_app(pool.clone(), false).await;
         let admin_user = create_test_admin_user(&pool, Role::PlatformManager).await;
 
         let create_request = json!({
@@ -1038,7 +1038,7 @@ mod tests {
     #[sqlx::test]
     #[test_log::test]
     async fn test_include_groups_admin_only(pool: PgPool) {
-        let (app, _) = create_test_app(pool.clone(), false).await;
+        let (app, _bg_services) = create_test_app(pool.clone(), false).await;
         let admin_user = create_test_admin_user(&pool, Role::PlatformManager).await;
         let regular_user = create_test_user(&pool, Role::StandardUser).await;
 
@@ -1107,7 +1107,7 @@ mod tests {
     #[sqlx::test]
     #[test_log::test]
     async fn test_accessible_parameter_filtering(pool: PgPool) {
-        let (app, _) = create_test_app(pool.clone(), false).await;
+        let (app, _bg_services) = create_test_app(pool.clone(), false).await;
         let admin_user = create_test_admin_user(&pool, Role::PlatformManager).await;
         let regular_user = create_test_user(&pool, Role::StandardUser).await;
 
@@ -1195,7 +1195,7 @@ mod tests {
     #[sqlx::test]
     #[test_log::test]
     async fn test_include_metrics_parameter(pool: PgPool) {
-        let (app, _) = create_test_app(pool.clone(), false).await;
+        let (app, _bg_services) = create_test_app(pool.clone(), false).await;
         let admin_user = create_test_admin_user(&pool, Role::PlatformManager).await;
         let regular_user = create_test_user(&pool, Role::StandardUser).await;
 
@@ -1273,7 +1273,7 @@ mod tests {
     #[sqlx::test]
     #[test_log::test]
     async fn test_platform_manager_sees_all_models_by_default(pool: PgPool) {
-        let (app, _) = create_test_app(pool.clone(), false).await;
+        let (app, _bg_services) = create_test_app(pool.clone(), false).await;
         let platform_manager = create_test_admin_user(&pool, Role::PlatformManager).await;
         let standard_user = create_test_user(&pool, Role::StandardUser).await;
 
@@ -1336,7 +1336,7 @@ mod tests {
     #[sqlx::test]
     #[test_log::test]
     async fn test_platform_manager_can_request_accessible_filtering(pool: PgPool) {
-        let (app, _) = create_test_app(pool.clone(), false).await;
+        let (app, _bg_services) = create_test_app(pool.clone(), false).await;
         let platform_manager = create_test_admin_user(&pool, Role::PlatformManager).await;
 
         // Create deployments
@@ -1397,7 +1397,7 @@ mod tests {
     #[sqlx::test]
     #[test_log::test]
     async fn test_request_viewer_role_gets_filtered(pool: PgPool) {
-        let (app, _) = create_test_app(pool.clone(), false).await;
+        let (app, _bg_services) = create_test_app(pool.clone(), false).await;
         let platform_manager = create_test_admin_user(&pool, Role::PlatformManager).await;
         let request_viewer = create_test_user(&pool, Role::RequestViewer).await;
 
@@ -1456,7 +1456,7 @@ mod tests {
     #[sqlx::test]
     #[test_log::test]
     async fn test_platform_manager_can_see_newly_created_models(pool: PgPool) {
-        let (app, _) = create_test_app(pool.clone(), false).await;
+        let (app, _bg_services) = create_test_app(pool.clone(), false).await;
         let platform_manager = create_test_admin_user(&pool, Role::PlatformManager).await;
         let test_endpoint_id = get_test_endpoint_id(&pool).await;
 
@@ -1500,7 +1500,7 @@ mod tests {
     #[sqlx::test]
     #[test_log::test]
     async fn test_standard_user_cannot_see_ungrouped_models(pool: PgPool) {
-        let (app, _) = create_test_app(pool.clone(), false).await;
+        let (app, _bg_services) = create_test_app(pool.clone(), false).await;
         let platform_manager = create_test_admin_user(&pool, Role::PlatformManager).await;
         let standard_user = create_test_user(&pool, Role::StandardUser).await;
 
@@ -1539,7 +1539,7 @@ mod tests {
     #[sqlx::test]
     #[test_log::test]
     async fn test_request_viewer_cannot_modify_models(pool: PgPool) {
-        let (app, _) = create_test_app(pool.clone(), false).await;
+        let (app, _bg_services) = create_test_app(pool.clone(), false).await;
         let platform_manager = create_test_admin_user(&pool, Role::PlatformManager).await;
         let request_viewer = create_test_user(&pool, Role::RequestViewer).await;
         let test_endpoint_id = get_test_endpoint_id(&pool).await;
@@ -1583,7 +1583,7 @@ mod tests {
     #[sqlx::test]
     #[test_log::test]
     async fn test_standard_user_cannot_modify_models(pool: PgPool) {
-        let (app, _) = create_test_app(pool.clone(), false).await;
+        let (app, _bg_services) = create_test_app(pool.clone(), false).await;
         let platform_manager = create_test_admin_user(&pool, Role::PlatformManager).await;
         let standard_user = create_test_user(&pool, Role::StandardUser).await;
         let test_endpoint_id = get_test_endpoint_id(&pool).await;
@@ -1627,7 +1627,7 @@ mod tests {
     #[sqlx::test]
     #[test_log::test]
     async fn test_multi_role_user_cannot_modify_models_without_platform_manager(pool: PgPool) {
-        let (app, _) = create_test_app(pool.clone(), false).await;
+        let (app, _bg_services) = create_test_app(pool.clone(), false).await;
         let platform_manager = create_test_admin_user(&pool, Role::PlatformManager).await;
         // Create user with StandardUser + RequestViewer (but not PlatformManager)
         let multi_role_user = create_test_user_with_roles(&pool, vec![Role::StandardUser, Role::RequestViewer]).await;
@@ -1672,7 +1672,7 @@ mod tests {
     #[sqlx::test]
     #[test_log::test]
     async fn test_platform_manager_plus_standard_user_can_modify_models(pool: PgPool) {
-        let (app, _) = create_test_app(pool.clone(), false).await;
+        let (app, _bg_services) = create_test_app(pool.clone(), false).await;
         // Create user with both PlatformManager and StandardUser roles
         let platform_user = create_test_user_with_roles(&pool, vec![Role::PlatformManager, Role::StandardUser]).await;
         let test_endpoint_id = get_test_endpoint_id(&pool).await;
@@ -1717,7 +1717,7 @@ mod tests {
     #[sqlx::test]
     #[test_log::test]
     async fn test_accessibility_filtering_permissions(pool: PgPool) {
-        let (app, _) = create_test_app(pool.clone(), false).await;
+        let (app, _bg_services) = create_test_app(pool.clone(), false).await;
         let platform_manager = create_test_admin_user(&pool, Role::PlatformManager).await;
         let standard_user = create_test_user(&pool, Role::StandardUser).await;
         let request_viewer = create_test_user(&pool, Role::RequestViewer).await;
@@ -1781,7 +1781,7 @@ mod tests {
     #[sqlx::test]
     #[test_log::test]
     async fn test_groups_include_permission_enforcement(pool: PgPool) {
-        let (app, _) = create_test_app(pool.clone(), false).await;
+        let (app, _bg_services) = create_test_app(pool.clone(), false).await;
         let platform_manager = create_test_admin_user(&pool, Role::PlatformManager).await;
         let standard_user = create_test_user(&pool, Role::StandardUser).await;
         let request_viewer = create_test_user(&pool, Role::RequestViewer).await;
@@ -1841,7 +1841,7 @@ mod tests {
     #[sqlx::test]
     #[test_log::test]
     async fn test_rate_limits_permission_gating(pool: PgPool) {
-        let (app, _) = create_test_app(pool.clone(), false).await;
+        let (app, _bg_services) = create_test_app(pool.clone(), false).await;
         let platform_manager = create_test_admin_user(&pool, Role::PlatformManager).await;
         let standard_user = create_test_user(&pool, Role::StandardUser).await;
         let request_viewer = create_test_user(&pool, Role::RequestViewer).await;
@@ -1911,7 +1911,7 @@ mod tests {
     #[sqlx::test]
     #[test_log::test]
     async fn test_metrics_permission_gating(pool: PgPool) {
-        let (app, _) = create_test_app(pool.clone(), false).await;
+        let (app, _bg_services) = create_test_app(pool.clone(), false).await;
         let platform_manager = create_test_admin_user(&pool, Role::PlatformManager).await;
         let standard_user = create_test_user(&pool, Role::StandardUser).await;
         let request_viewer = create_test_user(&pool, Role::RequestViewer).await;
