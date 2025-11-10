@@ -474,8 +474,13 @@ pub async fn store_analytics_record(pool: &PgPool, metrics: &UsageMetrics, auth:
             // Check if at least one price is set
             if row.input_price_per_token.is_some() || row.output_price_per_token.is_some() {
                 // Calculate total cost - use zero for missing prices
-                let total_cost = Decimal::from(row.prompt_tokens) * row.input_price_per_token.unwrap_or(rust_decimal::Decimal::ZERO)
-                    + (Decimal::from(row.completion_tokens) * row.output_price_per_token.unwrap_or(rust_decimal::Decimal::ZERO));
+                let input_cost = Decimal::from(row.prompt_tokens) * row.input_price_per_token.unwrap_or(rust_decimal::Decimal::ZERO);
+                let output_cost = Decimal::from(row.completion_tokens) * row.output_price_per_token.unwrap_or(rust_decimal::Decimal::ZERO);
+                let total_cost = input_cost + output_cost;
+
+                // Round to 2 decimal places to match database schema (DECIMAL(12, 2))
+                // This prevents precision issues when storing fractional cent amounts
+                let total_cost = total_cost.round_dp(2);
 
                 if total_cost > rust_decimal::Decimal::ZERO {
                     let mut conn = pool.acquire().await?;
@@ -1613,7 +1618,8 @@ mod tests {
             let output_price = Decimal::from_str("0.00003").unwrap();
 
             // Usage: 1000 input tokens, 500 output tokens
-            // Expected cost: (1000 * 0.00001) + (500 * 0.00003) = 0.01 + 0.015 = 0.025
+            // Calculated cost: (1000 * 0.00001) + (500 * 0.00003) = 0.01 + 0.015 = 0.025
+            // Rounded cost: 0.025 rounds to 0.02 (banker's rounding to 2 decimal places)
             let metrics = create_test_usage_metrics(Some(input_price), Some(output_price), 1000, 500);
 
             // Execute
@@ -1625,7 +1631,8 @@ mod tests {
             let mut credits = Credits::new(&mut conn);
             let final_balance = credits.get_user_balance(user_id).await.unwrap();
 
-            let expected_cost = Decimal::from_str("0.025").unwrap();
+            // Expected cost is rounded to 2 decimal places (0.025 -> 0.02)
+            let expected_cost = Decimal::from_str("0.02").unwrap();
             let expected_balance = initial_balance - expected_cost;
             assert_eq!(final_balance, expected_balance, "Balance should be deducted correctly");
 
@@ -1637,7 +1644,7 @@ mod tests {
             let usage_tx = usage_tx.unwrap();
             assert_eq!(
                 usage_tx.amount, expected_cost,
-                "Transaction amount should be positive (subtracted by handler)"
+                "Transaction amount should be rounded to 2 decimal places"
             );
             assert_eq!(usage_tx.balance_after, expected_balance, "Balance after should match");
         }
@@ -1698,7 +1705,7 @@ mod tests {
             let user_id = setup_user_with_balance(&pool, initial_balance).await;
             let auth = create_test_auth_for_user(&pool, user_id).await;
 
-            // Usage that costs more than balance (0.025)
+            // Usage that costs more than balance (0.025 calculated, rounds to 0.02)
             let input_price = Decimal::from_str("0.00001").unwrap();
             let output_price = Decimal::from_str("0.00003").unwrap();
             let metrics = create_test_usage_metrics(Some(input_price), Some(output_price), 1000, 500);
@@ -1713,7 +1720,8 @@ mod tests {
             let mut credits = Credits::new(&mut conn);
             let final_balance = credits.get_user_balance(user_id).await.unwrap();
 
-            let expected_cost = Decimal::from_str("0.025").unwrap();
+            // Expected cost is rounded to 2 decimal places (0.025 -> 0.02)
+            let expected_cost = Decimal::from_str("0.02").unwrap();
             let expected_balance = initial_balance - expected_cost;
             assert_eq!(final_balance, expected_balance, "Balance should reflect overdraft");
             // Verify: Usage transaction was created
@@ -1733,12 +1741,12 @@ mod tests {
             let auth = create_test_auth_for_user(&pool, user_id).await;
 
             // Test various token counts and pricing scenarios
-            // Note: Expected costs account for f64 -> Decimal conversion precision
+            // Note: Expected costs are rounded to 2 decimal places (banker's rounding)
             let test_cases = vec![
-                // (input_tokens, output_tokens, input_price_per_token, output_price_per_token, expected_cost)
-                (1500, 750, "0.00001", "0.00003", "0.0375"), // (1500*0.00001) + (750*0.00003) = 0.015 + 0.0225
-                (100, 50, "0.000005", "0.000015", "0.00125"), // (100*0.000005) + (50*0.000015) = 0.0005 + 0.00075 = 0.00125
-                (1, 1, "0.01", "0.02", "0.03"),              // (1*0.01) + (1*0.02) = 0.01 + 0.02
+                // (input_tokens, output_tokens, input_price_per_token, output_price_per_token, expected_cost_rounded)
+                (1500, 750, "0.00001", "0.00003", "0.04"), // (1500*0.00001) + (750*0.00003) = 0.0375 -> rounds to 0.04
+                (100, 50, "0.000005", "0.000015", "0.00"), // (100*0.000005) + (50*0.000015) = 0.00125 -> rounds to 0.00
+                (1, 1, "0.01", "0.02", "0.03"),            // (1*0.01) + (1*0.02) = 0.03 (exact)
             ];
 
             for (input_tokens, output_tokens, input_price_str, output_price_str, expected_cost_str) in test_cases {
@@ -1879,13 +1887,15 @@ mod tests {
                 let pool_clone = pool.clone();
                 let auth_clone = auth.clone();
 
-                // Each request has slightly different pricing (simulating database changes)
-                // Use small prices that vary: 0.00001, 0.000011, 0.000012, etc.
-                let input_price = Decimal::from_str(&format!("0.{:05}", 10 + i)).unwrap(); // 0.00010, 0.00011, ..., 0.00019
-                let output_price = Decimal::from_str(&format!("0.{:05}", 20 + i)).unwrap(); // 0.00020, 0.00021, ..., 0.00029
+                // Each request has different pricing that results in distinct costs after rounding to 2 decimals
+                // Use prices that yield costs like: 0.01, 0.02, 0.03, ..., 0.10 (all different after rounding)
+                // For 100 input tokens, we want total costs of 0.01, 0.02, etc.
+                let target_cost = (i + 1) as i64; // 1, 2, 3, ..., 10
+                let input_price = Decimal::new(target_cost, 4); // 0.0001, 0.0002, ..., 0.0010
+                let output_price = Decimal::ZERO; // Only charge for input to keep it simple
 
                 let handle = tokio::task::spawn(async move {
-                    let metrics = create_test_usage_metrics(Some(input_price), Some(output_price), 100, 50);
+                    let metrics = create_test_usage_metrics(Some(input_price), Some(output_price), 100, 0);
                     store_analytics_record(&pool_clone, &metrics, &auth_clone).await
                 });
 
@@ -1992,9 +2002,9 @@ mod tests {
             let mut credits = Credits::new(&mut conn);
             let final_balance = credits.get_user_balance(user_id).await.unwrap();
 
-            // Expected cost: only output tokens counted: 500 * 0.00003 = 0.015
+            // Expected cost: only output tokens counted: 500 * 0.00003 = 0.015, rounds to 0.02
             // Input tokens (1000) should be ignored since no input price
-            let expected_cost = Decimal::from_str("0.015").unwrap();
+            let expected_cost = Decimal::from_str("0.02").unwrap();
             let expected_balance = Decimal::from_str("10.00").unwrap() - expected_cost;
             assert_eq!(final_balance, expected_balance, "Balance should only deduct for output tokens");
 

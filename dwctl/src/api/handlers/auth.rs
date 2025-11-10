@@ -610,7 +610,12 @@ mod tests {
         // Set initial credits for standard users
         config.credits.initial_credits_for_standard_users = rust_decimal::Decimal::new(10000, 2); // 100.00 credits
 
-        let state = AppState::builder().db(pool.clone()).config(config).build();
+        let request_manager = std::sync::Arc::new(fusillade::PostgresRequestManager::new(pool.clone()));
+        let state = AppState::builder()
+            .db(pool.clone())
+            .config(config)
+            .request_manager(request_manager)
+            .build();
 
         let app = axum::Router::new()
             .route("/auth/register", axum::routing::post(register))
@@ -669,7 +674,12 @@ mod tests {
         // Set initial credits to zero (default)
         config.credits.initial_credits_for_standard_users = rust_decimal::Decimal::ZERO;
 
-        let state = AppState::builder().db(pool.clone()).config(config).build();
+        let request_manager = std::sync::Arc::new(fusillade::PostgresRequestManager::new(pool.clone()));
+        let state = AppState::builder()
+            .db(pool.clone())
+            .config(config)
+            .request_manager(request_manager)
+            .build();
 
         let app = axum::Router::new()
             .route("/auth/register", axum::routing::post(register))
