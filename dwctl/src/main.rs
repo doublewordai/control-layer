@@ -1,6 +1,35 @@
 use clap::Parser;
 use dwctl::{telemetry, Config};
 
+/// Wait for shutdown signal (SIGTERM or Ctrl+C)
+async fn shutdown_signal() {
+    use tokio::signal;
+
+    let ctrl_c = async {
+        signal::ctrl_c().await.expect("Failed to install Ctrl+C handler");
+    };
+
+    #[cfg(unix)]
+    let terminate = async {
+        signal::unix::signal(signal::unix::SignalKind::terminate())
+            .expect("Failed to install SIGTERM handler")
+            .recv()
+            .await;
+    };
+
+    #[cfg(not(unix))]
+    let terminate = std::future::pending::<()>();
+
+    tokio::select! {
+        _ = ctrl_c => {
+            tracing::info!("Received Ctrl+C, shutting down gracefully...");
+        },
+        _ = terminate => {
+            tracing::info!("Received SIGTERM, shutting down gracefully...");
+        },
+    }
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     // Parse CLI args
@@ -14,6 +43,6 @@ async fn main() -> anyhow::Result<()> {
 
     tracing::debug!("{:?}", args);
 
-    // Run the application
-    dwctl::run(config).await
+    // Run the application with graceful shutdown on SIGTERM/Ctrl+C
+    dwctl::run(config, shutdown_signal()).await
 }

@@ -1,7 +1,4 @@
 // TODO: This file has gotten way too big. We need to refactor it into smaller modules.
-// The router should be a builder pattern. CTRL-C logic should be in main.
-// Embedded asset handlers should be in api/handlers/
-// Leader election should be in its own module.
 // The constructors in test_utils should be unified with the actual constructors: right now they're
 // actually the best lib way to construct things, which is bad.
 pub mod api;
@@ -11,6 +8,7 @@ mod crypto;
 pub mod db;
 mod email;
 mod errors;
+mod leader_election;
 mod metrics;
 mod openapi;
 mod probes;
@@ -37,10 +35,7 @@ use auth::middleware::admin_ai_proxy_middleware;
 use axum::extract::DefaultBodyLimit;
 use axum::http::HeaderValue;
 use axum::{
-    body::Body,
-    http::{Response, StatusCode, Uri},
     middleware::from_fn_with_state,
-    response::{Html, IntoResponse},
     routing::{delete, get, patch, post},
     Router, ServiceExt,
 };
@@ -51,7 +46,6 @@ use outlet::{PathFilter, RequestLoggerConfig, RequestLoggerLayer};
 use outlet_postgres::PostgresHandler;
 use request_logging::{AiRequest, AiResponse};
 use sqlx::{ConnectOptions, Executor, PgPool};
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use tokio::net::TcpListener;
 use tower::Layer;
@@ -135,99 +129,6 @@ pub async fn create_initial_admin_user(email: &str, password: Option<&str>, db: 
     Ok(created_user.id)
 }
 
-/// Background task for leader election
-/// Runs periodically to maintain leadership or attempt to acquire it
-///
-/// We use leadership election for figuring out who runs background tasks like sending probes to
-/// the endpoints. At some point, we may want to expand this to other tasks as well.
-///
-/// PostgreSQL advisory locks are session-based, so we need to maintain a dedicated connection
-/// for the entire duration we want to hold the lock.
-#[instrument(skip(pool, config, lock_id, on_gain_leadership, on_lose_leadership))]
-async fn leader_election_task<F1, F2, Fut1, Fut2>(
-    pool: PgPool,
-    config: config::Config,
-    is_leader: Arc<AtomicBool>,
-    lock_id: i64,
-    on_gain_leadership: F1,
-    on_lose_leadership: F2,
-) where
-    F1: Fn(PgPool, config::Config) -> Fut1 + Send + 'static,
-    F2: Fn(PgPool, config::Config) -> Fut2 + Send + 'static,
-    Fut1: std::future::Future<Output = Result<(), anyhow::Error>> + Send + 'static,
-    Fut2: std::future::Future<Output = Result<(), anyhow::Error>> + Send + 'static,
-{
-    let mut interval = tokio::time::interval(std::time::Duration::from_secs(30));
-    let mut leader_conn: Option<sqlx::pool::PoolConnection<sqlx::Postgres>> = None;
-
-    loop {
-        interval.tick().await;
-
-        let current_status = is_leader.load(Ordering::Relaxed);
-
-        // If we're not leader, try to acquire the lock
-        if !current_status {
-            // Try to acquire a connection and the lock
-            match pool.acquire().await {
-                Ok(mut conn) => {
-                    match sqlx::query_scalar::<_, bool>("SELECT pg_try_advisory_lock($1)")
-                        .bind(lock_id)
-                        .fetch_one(&mut *conn)
-                        .await
-                    {
-                        Ok(true) => {
-                            // Successfully acquired lock!
-                            info!("Gained leadership");
-                            is_leader.store(true, Ordering::Relaxed);
-                            leader_conn = Some(conn); // Keep connection alive
-
-                            if let Err(e) = on_gain_leadership(pool.clone(), config.clone()).await {
-                                tracing::error!("Failed to execute on_gain_leadership callback: {}", e);
-                            }
-                        }
-                        Ok(false) => {
-                            // Someone else has the lock
-                            debug!("Following - will retry");
-                        }
-                        Err(e) => {
-                            tracing::error!("Failed to check leader lock: {}", e);
-                        }
-                    }
-                }
-                Err(e) => {
-                    tracing::error!("Failed to acquire connection for leader election: {}", e);
-                }
-            }
-        } else {
-            // We think we're leader - verify we still hold the lock
-            // by checking if our connection is still valid
-            if let Some(ref mut conn) = leader_conn {
-                // Ping the connection to keep it alive
-                match sqlx::query("SELECT 1").execute(&mut **conn).await {
-                    Ok(_) => {
-                        debug!(" Leadership renewed (connection alive)");
-                    }
-                    Err(e) => {
-                        // Connection died, which will drop the advisory lock, we lost leadership
-                        tracing::warn!("Lost leadership (connection died): {}", e);
-                        info!("Lost leadership");
-                        is_leader.store(false, Ordering::Relaxed);
-                        leader_conn = None;
-
-                        if let Err(e) = on_lose_leadership(pool.clone(), config.clone()).await {
-                            tracing::error!("Failed to execute on_lose_leadership callback: {}", e);
-                        }
-                    }
-                }
-            } else {
-                // We think we're leader but have no connection, this can't happen
-                tracing::error!("Inconsistent state: is_leader=true but no connection");
-                is_leader.store(false, Ordering::Relaxed);
-            }
-        }
-    }
-}
-
 /// Seed the database with initial configuration (run only once)
 #[instrument(skip_all)]
 pub async fn seed_database(sources: &[config::ModelSource], db: &PgPool) -> Result<(), anyhow::Error> {
@@ -307,51 +208,6 @@ fn create_cors_layer(config: &Config) -> anyhow::Result<CorsLayer> {
     }
 
     Ok(cors)
-}
-
-/// Serve embedded static assets with SPA fallback
-#[instrument]
-async fn serve_embedded_asset(uri: Uri) -> impl IntoResponse {
-    let mut path = uri.path().trim_start_matches('/');
-
-    // If path is empty or ends with /, serve index.html
-    if path.is_empty() || path.ends_with('/') {
-        path = "index.html";
-    }
-
-    // Try to serve the requested file
-    if let Some(content) = static_assets::Assets::get(path) {
-        let mime = mime_guess::from_path(path).first_or_octet_stream();
-        return Response::builder()
-            .header(axum::http::header::CONTENT_TYPE, mime.as_ref())
-            .body(Body::from(content.data.into_owned()))
-            .unwrap();
-    }
-
-    // If not found, serve index.html for SPA client-side routing
-    if let Some(index) = static_assets::Assets::get("index.html") {
-        return Response::builder()
-            .header(axum::http::header::CONTENT_TYPE, "text/html")
-            .body(Body::from(index.data.into_owned()))
-            .unwrap();
-    }
-
-    // If even index.html is missing, return 404
-    Response::builder().status(StatusCode::NOT_FOUND).body(Body::empty()).unwrap()
-}
-
-/// SPA fallback handler - serves index.html for client-side routes
-#[instrument(err)]
-async fn spa_fallback(uri: Uri) -> Result<Html<String>, StatusCode> {
-    debug!("Hitting SPA fallback for: {}", uri.path());
-
-    // Serve embedded index.html
-    if let Some(index) = static_assets::Assets::get("index.html") {
-        let content = String::from_utf8_lossy(&index.data).to_string();
-        Ok(Html(content))
-    } else {
-        Err(StatusCode::INTERNAL_SERVER_ERROR)
-    }
 }
 
 /// Setup the complete application with onwards integration
@@ -471,7 +327,7 @@ pub async fn setup_app(
         let daemon_handle_lose = daemon_handle.clone();
 
         tokio::spawn(async move {
-            leader_election_task(
+            leader_election::leader_election_task(
                 leader_election_pool,
                 leader_election_config,
                 leader_election_flag,
@@ -763,7 +619,7 @@ pub async fn build_router(state: &mut AppState, onwards_router: Router) -> anyho
     let api_routes_with_state = api_routes.with_state(state.clone());
 
     // Serve embedded static assets, falling back to SPA for unmatched routes
-    let fallback = get(serve_embedded_asset).fallback(get(spa_fallback));
+    let fallback = get(api::handlers::static_assets::serve_embedded_asset).fallback(get(api::handlers::static_assets::spa_fallback));
 
     // Build the app with admin API and onwards proxy nested. serve the (restricted) openai spec.
     let router = Router::new()
@@ -839,7 +695,10 @@ pub async fn build_router(state: &mut AppState, onwards_router: Router) -> anyho
     Ok(router)
 }
 
-pub async fn run(config: Config) -> anyhow::Result<()> {
+pub async fn run<F>(config: Config, shutdown: F) -> anyhow::Result<()>
+where
+    F: std::future::Future<Output = ()> + Send + 'static,
+{
     debug!("Starting control layer with configuration: {:#?}", config);
 
     // Database connection - handle both embedded and external
@@ -937,7 +796,7 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
 
     // Run the server with graceful shutdown
     axum::serve(listener, app_with_middleware.into_make_service())
-        .with_graceful_shutdown(shutdown_signal())
+        .with_graceful_shutdown(shutdown)
         .await?;
 
     // Shutdown telemetry
@@ -951,36 +810,6 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
     }
 
     Ok(())
-}
-
-/// Wait for shutdown signal (SIGTERM or Ctrl+C)
-#[instrument(skip_all)]
-async fn shutdown_signal() {
-    use tokio::signal;
-
-    let ctrl_c = async {
-        signal::ctrl_c().await.expect("Failed to install Ctrl+C handler");
-    };
-
-    #[cfg(unix)]
-    let terminate = async {
-        signal::unix::signal(signal::unix::SignalKind::terminate())
-            .expect("Failed to install SIGTERM handler")
-            .recv()
-            .await;
-    };
-
-    #[cfg(not(unix))]
-    let terminate = std::future::pending::<()>();
-
-    tokio::select! {
-        _ = ctrl_c => {
-            info!("Received Ctrl+C, shutting down gracefully...");
-        },
-        _ = terminate => {
-            info!("Received SIGTERM, shutting down gracefully...");
-        },
-    }
 }
 
 #[cfg(test)]
