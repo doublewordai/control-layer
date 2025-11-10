@@ -1,5 +1,5 @@
 // TODO: This file has gotten way too big. We need to refactor it into smaller modules.
-// The router should be a builder pattern. CTRL-C logic should be in main.
+// The router should be a builder pattern.
 // The constructors in test_utils should be unified with the actual constructors: right now they're
 // actually the best lib way to construct things, which is bad.
 pub mod api;
@@ -696,7 +696,10 @@ pub async fn build_router(state: &mut AppState, onwards_router: Router) -> anyho
     Ok(router)
 }
 
-pub async fn run(config: Config) -> anyhow::Result<()> {
+pub async fn run<F>(config: Config, shutdown: F) -> anyhow::Result<()>
+where
+    F: std::future::Future<Output = ()> + Send + 'static,
+{
     debug!("Starting control layer with configuration: {:#?}", config);
 
     // Database connection - handle both embedded and external
@@ -794,7 +797,7 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
 
     // Run the server with graceful shutdown
     axum::serve(listener, app_with_middleware.into_make_service())
-        .with_graceful_shutdown(shutdown_signal())
+        .with_graceful_shutdown(shutdown)
         .await?;
 
     // Shutdown telemetry
@@ -808,36 +811,6 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
     }
 
     Ok(())
-}
-
-/// Wait for shutdown signal (SIGTERM or Ctrl+C)
-#[instrument(skip_all)]
-async fn shutdown_signal() {
-    use tokio::signal;
-
-    let ctrl_c = async {
-        signal::ctrl_c().await.expect("Failed to install Ctrl+C handler");
-    };
-
-    #[cfg(unix)]
-    let terminate = async {
-        signal::unix::signal(signal::unix::SignalKind::terminate())
-            .expect("Failed to install SIGTERM handler")
-            .recv()
-            .await;
-    };
-
-    #[cfg(not(unix))]
-    let terminate = std::future::pending::<()>();
-
-    tokio::select! {
-        _ = ctrl_c => {
-            info!("Received Ctrl+C, shutting down gracefully...");
-        },
-        _ = terminate => {
-            info!("Received SIGTERM, shutting down gracefully...");
-        },
-    }
 }
 
 #[cfg(test)]
