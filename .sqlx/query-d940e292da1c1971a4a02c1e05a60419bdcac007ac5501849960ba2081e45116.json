@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "SELECT id, name, description, secret, purpose, user_id, created_at, last_used, requests_per_second, burst_size FROM api_keys WHERE id = ANY($1)",
+  "query": "SELECT id, name, description, secret, purpose, user_id, created_at, last_used, requests_per_second, burst_size, hidden FROM api_keys WHERE id = $1",
   "describe": {
     "columns": [
       {
@@ -52,11 +52,16 @@
         "ordinal": 9,
         "name": "burst_size",
         "type_info": "Int4"
+      },
+      {
+        "ordinal": 10,
+        "name": "hidden",
+        "type_info": "Bool"
       }
     ],
     "parameters": {
       "Left": [
-        "UuidArray"
+        "Uuid"
       ]
     },
     "nullable": [
@@ -69,8 +74,9 @@
       false,
       true,
       true,
-      true
+      true,
+      false
     ]
   },
-  "hash": "96c660f7b550aeae6e1027c6655be68c22a755874876613179bea84723ab420c"
+  "hash": "d940e292da1c1971a4a02c1e05a60419bdcac007ac5501849960ba2081e45116"
 }

@@ -52,6 +52,11 @@
         "ordinal": 9,
         "name": "purpose",
         "type_info": "Varchar"
+      },
+      {
+        "ordinal": 10,
+        "name": "hidden",
+        "type_info": "Bool"
       }
     ],
     "parameters": {
@@ -73,6 +78,7 @@
       true,
       true,
       true,
+      false,
       false
     ]
   },

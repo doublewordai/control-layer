@@ -42,6 +42,7 @@ struct ApiKey {
     pub last_used: Option<DateTime<Utc>>,
     pub requests_per_second: Option<f32>,
     pub burst_size: Option<i32>,
+    pub hidden: bool,
 }
 
 impl From<(Vec<DeploymentId>, ApiKey)> for ApiKeyDBResponse {
@@ -101,8 +102,8 @@ impl<'c> Repository for ApiKeys<'c> {
         let api_key = sqlx::query_as!(
             ApiKey,
             r#"
-            INSERT INTO api_keys (name, description, secret, purpose, user_id, requests_per_second, burst_size)
-            VALUES ($1, $2, $3, $4, $5, $6, $7)
+            INSERT INTO api_keys (name, description, secret, purpose, user_id, requests_per_second, burst_size, hidden)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, false)
             RETURNING *
             "#,
             request.name,
@@ -123,7 +124,7 @@ impl<'c> Repository for ApiKeys<'c> {
     async fn get_by_id(&mut self, id: Self::Id) -> Result<Option<Self::Response>> {
         let api_key = sqlx::query_as!(
             ApiKey,
-            "SELECT id, name, description, secret, purpose, user_id, created_at, last_used, requests_per_second, burst_size FROM api_keys WHERE id = $1",
+            "SELECT id, name, description, secret, purpose, user_id, created_at, last_used, requests_per_second, burst_size, hidden FROM api_keys WHERE id = $1",
             id
         )
             .fetch_optional(&mut *self.db)
@@ -139,7 +140,7 @@ impl<'c> Repository for ApiKeys<'c> {
     async fn get_bulk(&mut self, ids: Vec<Self::Id>) -> Result<HashMap<Self::Id, Self::Response>> {
         let api_keys = sqlx::query_as!(
             ApiKey,
-            "SELECT id, name, description, secret, purpose, user_id, created_at, last_used, requests_per_second, burst_size FROM api_keys WHERE id = ANY($1)",
+            "SELECT id, name, description, secret, purpose, user_id, created_at, last_used, requests_per_second, burst_size, hidden FROM api_keys WHERE id = ANY($1)",
             &ids
         )
             .fetch_all(&mut *self.db)
@@ -158,7 +159,7 @@ impl<'c> Repository for ApiKeys<'c> {
         let api_keys = if let Some(user_id) = filter.user_id {
             sqlx::query_as!(
                 ApiKey,
-                "SELECT id, name, description, secret, purpose, user_id, created_at, last_used, requests_per_second, burst_size FROM api_keys WHERE user_id = $1 ORDER BY created_at DESC LIMIT $2 OFFSET $3",
+                "SELECT id, name, description, secret, purpose, user_id, created_at, last_used, requests_per_second, burst_size, hidden FROM api_keys WHERE user_id = $1 AND hidden = false ORDER BY created_at DESC LIMIT $2 OFFSET $3",
                 user_id,
                 filter.limit,
                 filter.skip
@@ -168,7 +169,7 @@ impl<'c> Repository for ApiKeys<'c> {
         } else {
             sqlx::query_as!(
                 ApiKey,
-                "SELECT id, name, description, secret, purpose, user_id, created_at, last_used, requests_per_second, burst_size FROM api_keys ORDER BY created_at DESC LIMIT $1 OFFSET $2",
+                "SELECT id, name, description, secret, purpose, user_id, created_at, last_used, requests_per_second, burst_size, hidden FROM api_keys WHERE hidden = false ORDER BY created_at DESC LIMIT $1 OFFSET $2",
                 filter.limit,
                 filter.skip,
             )
@@ -237,6 +238,71 @@ impl<'c> ApiKeys<'c> {
         Self { db }
     }
 
+    /// Get or create a user-specific hidden API key for internal use
+    ///
+    /// Hidden API keys are automatically managed by the system and are not visible to users.
+    /// They are used for proxying requests through admin_api and batch processing.
+    ///
+    /// # Arguments
+    /// * `user_id` - The user ID to get or create a hidden key for
+    /// * `purpose` - The purpose of the key (should be ApiKeyPurpose::Inference for proxy use)
+    ///
+    /// # Returns
+    /// Returns the secret of the hidden API key
+    #[instrument(skip(self), fields(user_id = %abbrev_uuid(&user_id)), err)]
+    pub async fn get_or_create_hidden_key(&mut self, user_id: UserId, purpose: ApiKeyPurpose) -> Result<String> {
+        // Convert purpose enum to string for database
+        let purpose_str = match purpose {
+            ApiKeyPurpose::Platform => "platform",
+            ApiKeyPurpose::Inference => "inference",
+        };
+
+        // Try to get existing hidden key for this user and purpose
+        let existing_key = sqlx::query_scalar!(
+            r#"
+            SELECT secret
+            FROM api_keys
+            WHERE user_id = $1 AND purpose = $2 AND hidden = true
+            LIMIT 1
+            "#,
+            user_id,
+            purpose_str
+        )
+        .fetch_optional(&mut *self.db)
+        .await?;
+
+        if let Some(secret) = existing_key {
+            tracing::debug!("Using existing hidden API key for user");
+            return Ok(secret);
+        }
+
+        // No existing key found, create a new one
+        let secret = generate_api_key();
+        let name = format!("Internal {} Key", purpose_str);
+        let description = Some(format!(
+            "Automatically managed internal API key for {} operations. Not visible to users.",
+            purpose_str
+        ));
+
+        tracing::info!("Creating new hidden API key for user");
+
+        sqlx::query!(
+            r#"
+            INSERT INTO api_keys (name, description, secret, purpose, user_id, hidden)
+            VALUES ($1, $2, $3, $4, $5, true)
+            "#,
+            name,
+            description,
+            secret,
+            purpose_str,
+            user_id
+        )
+        .execute(&mut *self.db)
+        .await?;
+
+        Ok(secret)
+    }
+
     /// Get specific deployment IDs that an API key has access to
     #[instrument(skip(self), fields(api_key_id = %abbrev_uuid(&api_key_id)), err)]
     async fn get_api_key_deployments(&mut self, api_key_id: ApiKeyId) -> Result<Vec<DeploymentId>> {
@@ -280,7 +346,8 @@ impl<'c> ApiKeys<'c> {
                 ak.created_at as "created_at!",
                 ak.last_used,
                 ak.requests_per_second,
-                ak.burst_size
+                ak.burst_size,
+                ak.hidden as "hidden!"
             FROM api_keys ak
             WHERE ak.user_id = $2  -- System user has access to all deployments
 
@@ -296,7 +363,8 @@ impl<'c> ApiKeys<'c> {
                 ak.created_at as "created_at!",
                 ak.last_used,
                 ak.requests_per_second,
-                ak.burst_size
+                ak.burst_size,
+                ak.hidden as "hidden!"
             FROM api_keys ak
             INNER JOIN user_groups ug ON ak.user_id = ug.user_id
             INNER JOIN deployment_groups dg ON ug.group_id = dg.group_id
@@ -314,7 +382,8 @@ impl<'c> ApiKeys<'c> {
                 ak.created_at as "created_at!",
                 ak.last_used,
                 ak.requests_per_second,
-                ak.burst_size
+                ak.burst_size,
+                ak.hidden as "hidden!"
             FROM api_keys ak
             INNER JOIN deployment_groups dg ON dg.group_id = '00000000-0000-0000-0000-000000000000'
             WHERE dg.deployment_id = $1

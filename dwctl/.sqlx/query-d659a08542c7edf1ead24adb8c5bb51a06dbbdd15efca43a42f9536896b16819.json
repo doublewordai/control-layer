@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "SELECT id, name, description, secret, purpose, user_id, created_at, last_used, requests_per_second, burst_size FROM api_keys ORDER BY created_at DESC LIMIT $1 OFFSET $2",
+  "query": "\n            INSERT INTO api_keys (name, description, secret, purpose, user_id, requests_per_second, burst_size, hidden)\n            VALUES ($1, $2, $3, $4, $5, $6, $7, false)\n            RETURNING *\n            ",
   "describe": {
     "columns": [
       {
@@ -25,39 +25,49 @@
       },
       {
         "ordinal": 4,
-        "name": "purpose",
-        "type_info": "Varchar"
-      },
-      {
-        "ordinal": 5,
         "name": "user_id",
         "type_info": "Uuid"
       },
       {
-        "ordinal": 6,
+        "ordinal": 5,
         "name": "created_at",
         "type_info": "Timestamptz"
       },
       {
-        "ordinal": 7,
+        "ordinal": 6,
         "name": "last_used",
         "type_info": "Timestamptz"
       },
       {
-        "ordinal": 8,
+        "ordinal": 7,
         "name": "requests_per_second",
         "type_info": "Float4"
       },
       {
-        "ordinal": 9,
+        "ordinal": 8,
         "name": "burst_size",
         "type_info": "Int4"
+      },
+      {
+        "ordinal": 9,
+        "name": "purpose",
+        "type_info": "Varchar"
+      },
+      {
+        "ordinal": 10,
+        "name": "hidden",
+        "type_info": "Bool"
       }
     ],
     "parameters": {
       "Left": [
-        "Int8",
-        "Int8"
+        "Varchar",
+        "Text",
+        "Varchar",
+        "Varchar",
+        "Uuid",
+        "Float4",
+        "Int4"
       ]
     },
     "nullable": [
@@ -67,11 +77,12 @@
       false,
       false,
       false,
+      true,
+      true,
+      true,
       false,
-      true,
-      true,
-      true
+      false
     ]
   },
-  "hash": "87831f52e47ec29b67a71c7eb09b47954dd10124e301e63fe72abfae58538b0c"
+  "hash": "d659a08542c7edf1ead24adb8c5bb51a06dbbdd15efca43a42f9536896b16819"
 }

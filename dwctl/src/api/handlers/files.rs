@@ -8,7 +8,10 @@
 use crate::api::models::files::{FileDeleteResponse, FileListResponse, FileResponse, ListFilesQuery, ListObject, ObjectType, Purpose};
 use crate::auth::permissions::{can_read_all_resources, has_permission, operation, resource, RequiresPermission};
 
-use crate::db::handlers::{api_keys::ApiKeys, repository::Repository};
+use crate::db::{
+    handlers::api_keys::ApiKeys,
+    models::api_keys::ApiKeyPurpose,
+};
 use crate::errors::{Error, Result};
 use crate::types::{Operation, Resource};
 use crate::AppState;
@@ -344,16 +347,13 @@ pub async fn upload_file(
     let max_file_size = state.config.batches.files.max_file_size;
     let uploaded_by = Some(current_user.id.to_string());
 
-    // Fetch system API key for batch request execution
+    // Get or create user-specific hidden API key for batch request execution
     let mut conn = state.db.acquire().await.map_err(|e| Error::Database(e.into()))?;
     let mut api_keys_repo = ApiKeys::new(&mut conn);
-    let system_key = api_keys_repo
-        .get_by_id(Uuid::nil())
+    let user_api_key = api_keys_repo
+        .get_or_create_hidden_key(current_user.id, ApiKeyPurpose::Inference)
         .await
-        .map_err(Error::Database)?
-        .ok_or_else(|| Error::Internal {
-            operation: "System API key not found".to_string(),
-        })?;
+        .map_err(Error::Database)?;
 
     // Construct batch execution endpoint (where fusillade will send requests)
     let endpoint = format!("http://{}:{}/ai", state.config.host, state.config.port);
@@ -364,7 +364,7 @@ pub async fn upload_file(
         max_file_size,
         uploaded_by,
         endpoint,
-        system_key.secret,
+        user_api_key,
         state.config.batches.files.upload_buffer_size,
     );
 
