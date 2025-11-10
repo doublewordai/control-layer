@@ -1,3 +1,112 @@
+//! # dwctl - Control Layer for AI Model Management
+//!
+//! `dwctl` is a comprehensive control plane for managing AI model deployments, access control,
+//! and request routing. It provides a RESTful API for managing users, groups, deployments,
+//! and access policies, along with an OpenAI-compatible proxy for routing AI requests.
+//!
+//! ## Key Features
+//!
+//! - **User Management**: Authentication, authorization, and role-based access control
+//! - **Model Deployment Management**: Register and manage AI model endpoints
+//! - **Group-Based Access Control**: Fine-grained permissions through user groups
+//! - **Request Routing**: OpenAI-compatible proxy with intelligent routing
+//! - **Request Logging**: Optional PostgreSQL-backed request/response logging
+//! - **Batch Processing**: Asynchronous batch request processing via fusillade
+//! - **Health Probes**: Active monitoring of model endpoint availability
+//! - **Metrics**: Prometheus-compatible metrics for observability
+//! - **Leader Election**: Distributed coordination for multi-replica deployments
+//!
+//! ## Architecture
+//!
+//! The application is built on [Axum](https://github.com/tokio-rs/axum) and uses PostgreSQL
+//! for persistence. It can run with either an embedded or external PostgreSQL database.
+//!
+//! ### Main Components
+//!
+//! - **API Layer** ([`api`]): REST endpoints for management and AI request proxying
+//! - **Auth Layer** ([`auth`]): Authentication, sessions, and permission enforcement
+//! - **Database Layer** ([`db`]): Repository pattern for data access
+//! - **Config** ([`config`]): Application configuration and settings
+//! - **Telemetry** ([`telemetry`]): Distributed tracing and logging
+//!
+//! ## Quick Start
+//!
+//! ```no_run
+//! use dwctl::{Application, Config};
+//! use tokio::signal;
+//!
+//! #[tokio::main]
+//! async fn main() -> anyhow::Result<()> {
+//!     // Load configuration
+//!     let config = Config::from_env()?;
+//!
+//!     // Initialize telemetry
+//!     dwctl::telemetry::init_telemetry(&config.telemetry)?;
+//!
+//!     // Create and start the application
+//!     let app = Application::new(config).await?;
+//!
+//!     // Run with graceful shutdown on SIGTERM
+//!     app.serve(async {
+//!         signal::ctrl_c().await.expect("Failed to listen for Ctrl+C");
+//!     }).await?;
+//!
+//!     Ok(())
+//! }
+//! ```
+//!
+//! ## Database Setup
+//!
+//! The application requires a PostgreSQL database and automatically runs migrations on startup:
+//!
+//! ```no_run
+//! # use sqlx::PgPool;
+//! # async fn example(pool: PgPool) -> Result<(), sqlx::Error> {
+//! // Run migrations
+//! dwctl::migrator().run(&pool).await?;
+//! # Ok(())
+//! # }
+//! ```
+//!
+//! ## API Endpoints
+//!
+//! The application exposes several endpoint groups:
+//!
+//! - **Admin API** (`/admin/api/v1/*`): Management endpoints for users, groups, deployments
+//! - **AI Proxy** (`/ai/v1/*`): OpenAI-compatible endpoints for model requests
+//! - **Authentication** (`/authentication/*`): Login, registration, password management
+//! - **Health** (`/healthz`): Health check endpoint
+//! - **Metrics** (`/internal/metrics`): Prometheus metrics (when enabled)
+//!
+//! ## Configuration
+//!
+//! Configuration is loaded from environment variables and TOML files. See [`Config`] for details.
+//!
+//! Key environment variables:
+//! - `DWCTL_PORT`: Server port (default: 8080)
+//! - `DWCTL_DATABASE_URL`: PostgreSQL connection string
+//! - `DWCTL_ADMIN_EMAIL`: Initial admin user email
+//! - `DWCTL_ADMIN_PASSWORD`: Initial admin user password
+//!
+//! ## Testing
+//!
+//! Test utilities are available when the `test-utils` feature is enabled:
+//!
+//! ```ignore
+//! use dwctl::test_utils::*;
+//!
+//! #[sqlx::test]
+//! async fn test_example(pool: sqlx::PgPool) {
+//!     let (server, bg_services) = create_test_app(pool, true).await;
+//!     // Test your endpoints...
+//! }
+//! ```
+//!
+//! ## Features
+//!
+//! - `embedded-db`: Enable embedded PostgreSQL database support
+//! - `test-utils`: Expose test utilities for integration testing
+//!
 // TODO: This file has gotten way too big. We need to refactor it into smaller modules.
 // The constructors in test_utils should be unified with the actual constructors: right now they're
 // actually the best lib way to construct things, which is bad.
@@ -61,6 +170,29 @@ use uuid::Uuid;
 
 pub use types::{ApiKeyId, DeploymentId, GroupId, InferenceEndpointId, UserId};
 
+/// Application state shared across all request handlers.
+///
+/// This struct contains all the shared resources needed by the API handlers,
+/// including database connections, configuration, and background service managers.
+///
+/// # Fields
+///
+/// - `db`: Main PostgreSQL connection pool for application data
+/// - `config`: Application configuration loaded from environment/files
+/// - `outlet_db`: Optional connection pool for request logging (when enabled)
+/// - `metrics_recorder`: Optional Prometheus metrics recorder (when enabled)
+/// - `is_leader`: Whether this instance is the elected leader (for distributed deployments)
+/// - `request_manager`: Fusillade batch request manager for async processing
+///
+/// # Example
+///
+/// ```ignore
+/// let state = AppState::builder()
+///     .db(pool)
+///     .config(config)
+///     .request_manager(request_manager)
+///     .build();
+/// ```
 #[derive(Clone, Builder)]
 pub struct AppState {
     pub db: PgPool,
@@ -77,7 +209,40 @@ pub fn migrator() -> sqlx::migrate::Migrator {
     sqlx::migrate!("./migrations")
 }
 
-/// Create the initial admin user if it doesn't exist
+/// Create the initial admin user if it doesn't exist.
+///
+/// This function is idempotent - it will create a new admin user if one doesn't exist,
+/// or update the password if the user already exists. This is typically called during
+/// application startup to ensure there's always an admin user available.
+///
+/// # Arguments
+///
+/// - `email`: Email address for the admin user (also used as username)
+/// - `password`: Optional password. If `None`, the user will have no password set
+/// - `db`: PostgreSQL connection pool
+///
+/// # Returns
+///
+/// Returns the user ID of the created or existing admin user.
+///
+/// # Errors
+///
+/// Returns an error if database operations fail.
+///
+/// # Example
+///
+/// ```no_run
+/// # use dwctl::create_initial_admin_user;
+/// # use sqlx::PgPool;
+/// # async fn example(pool: PgPool) -> Result<(), sqlx::Error> {
+/// let user_id = create_initial_admin_user(
+///     "admin@example.com",
+///     Some("secure_password"),
+///     &pool
+/// ).await?;
+/// # Ok(())
+/// # }
+/// ```
 #[instrument(skip_all)]
 pub async fn create_initial_admin_user(email: &str, password: Option<&str>, db: &PgPool) -> Result<UserId, sqlx::Error> {
     // Hash password if provided
@@ -129,7 +294,27 @@ pub async fn create_initial_admin_user(email: &str, password: Option<&str>, db: 
     Ok(created_user.id)
 }
 
-/// Seed the database with initial configuration (run only once)
+/// Seed the database with initial configuration (run only once).
+///
+/// This function initializes the database with inference endpoints from model sources
+/// and generates a new system API key. It's idempotent - subsequent calls will skip
+/// seeding to preserve manual changes.
+///
+/// The function checks the `endpoints_seeded` flag in `system_config` to determine
+/// if seeding has already occurred. This prevents overwriting user modifications.
+///
+/// # Arguments
+///
+/// - `sources`: Slice of model source configurations to seed as inference endpoints
+/// - `db`: PostgreSQL connection pool
+///
+/// # Returns
+///
+/// Returns `Ok(())` if seeding succeeds or was already completed.
+///
+/// # Errors
+///
+/// Returns an error if database operations fail.
 #[instrument(skip_all)]
 pub async fn seed_database(sources: &[config::ModelSource], db: &PgPool) -> Result<(), anyhow::Error> {
     // Use a transaction to ensure atomicity
@@ -294,6 +479,30 @@ fn create_cors_layer(config: &Config) -> anyhow::Result<CorsLayer> {
     Ok(cors)
 }
 
+/// Build the main application router with all endpoints and middleware.
+///
+/// This function constructs the complete Axum router with:
+/// - Authentication routes (login, registration, password reset)
+/// - Admin API routes (user/group/deployment management)
+/// - AI proxy routes (OpenAI-compatible endpoints)
+/// - Static asset serving and SPA fallback
+/// - Optional request logging via outlet
+/// - Optional Prometheus metrics
+/// - CORS configuration
+/// - Tracing middleware
+///
+/// # Arguments
+///
+/// - `state`: Mutable application state (metrics recorder may be initialized here)
+/// - `onwards_router`: Pre-configured router for AI request proxying
+///
+/// # Returns
+///
+/// Returns the fully configured router ready to be served.
+///
+/// # Errors
+///
+/// Returns an error if CORS configuration is invalid or metrics initialization fails.
 #[instrument(skip_all)]
 pub async fn build_router(state: &mut AppState, onwards_router: Router) -> anyhow::Result<Router> {
     // Setup request logging if enabled
@@ -547,7 +756,20 @@ pub async fn build_router(state: &mut AppState, onwards_router: Router) -> anyho
     Ok(router)
 }
 
-/// Result from setting up background services
+/// Container for background services and their lifecycle management.
+///
+/// This struct encapsulates all background tasks that run alongside the HTTP server,
+/// including:
+/// - Fusillade batch request processing daemon
+/// - Probe scheduler for health monitoring
+/// - Onwards configuration synchronization
+/// - Leader election coordination (in distributed mode)
+///
+/// # Graceful Shutdown
+///
+/// The struct provides a [`shutdown`](BackgroundServices::shutdown) method to gracefully
+/// stop all background tasks. When dropped, the `drop_guard` will automatically cancel
+/// the shutdown token, signaling all tasks to stop.
 pub struct BackgroundServices {
     request_manager: Arc<fusillade::PostgresRequestManager<fusillade::ReqwestHttpClient>>,
     is_leader: bool,
@@ -790,7 +1012,36 @@ async fn setup_background_services(
     })
 }
 
-/// Main application struct that owns all resources
+/// Main application struct that owns all resources and lifecycle.
+///
+/// This is the top-level container for the entire application, managing:
+/// - HTTP server and routing
+/// - Database connections (main, fusillade, outlet, embedded)
+/// - Application configuration
+/// - Background services (probes, batches, leader election)
+///
+/// # Lifecycle
+///
+/// 1. **Create**: [`Application::new`] initializes all resources, runs migrations,
+///    seeds the database, and starts background services
+/// 2. **Serve**: [`Application::serve`] binds to a TCP port and starts handling requests
+/// 3. **Shutdown**: When the shutdown signal is received, gracefully stops all services
+///
+/// # Example
+///
+/// ```no_run
+/// use dwctl::{Application, Config};
+///
+/// # async fn example() -> anyhow::Result<()> {
+/// let config = Config::from_env()?;
+/// let app = Application::new(config).await?;
+///
+/// app.serve(async {
+///     tokio::signal::ctrl_c().await.expect("Failed to listen for ctrl+c");
+/// }).await?;
+/// # Ok(())
+/// # }
+/// ```
 pub struct Application {
     router: Router,
     app_state: AppState,

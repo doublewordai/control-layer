@@ -1,3 +1,58 @@
+//! Application configuration management.
+//!
+//! This module handles loading and validating configuration from multiple sources:
+//! - YAML configuration files
+//! - Environment variables (prefixed with `DWCTL_`)
+//! - Command-line arguments
+//!
+//! Configuration is loaded using [figment](https://docs.rs/figment), which provides
+//! a layered approach where environment variables override file settings.
+//!
+//! # Configuration Sources
+//!
+//! Priority (highest to lowest):
+//! 1. Environment variables (e.g., `DWCTL_PORT=8080`)
+//! 2. YAML config file (specified via `-f` or `DWCTL_CONFIG`)
+//! 3. Default values
+//!
+//! # Example Config File
+//!
+//! ```yaml
+//! host: "0.0.0.0"
+//! port: 8080
+//! database:
+//!   type: external
+//!   url: "postgres://localhost/dwctl"
+//! admin_email: "admin@example.com"
+//! model_sources:
+//!   - name: "openai"
+//!     url: "https://api.openai.com/v1"
+//! ```
+//!
+//! # Environment Variables
+//!
+//! Key environment variables:
+//! - `DWCTL_PORT`: Server port (default: 8080)
+//! - `DWCTL_DATABASE__TYPE`: Database type ("embedded" or "external")
+//! - `DWCTL_DATABASE__URL`: PostgreSQL connection string (for external DB)
+//! - `DWCTL_ADMIN_EMAIL`: Initial admin user email
+//! - `DWCTL_ADMIN_PASSWORD`: Initial admin user password
+//! - `DWCTL_SECRET_KEY`: Encryption/signing secret key
+//!
+//! # Usage
+//!
+//! ```no_run
+//! use dwctl::Config;
+//!
+//! # fn main() -> Result<(), Box<dyn std::error::Error>> {
+//! // Load from environment and default config file
+//! let config = Config::from_env()?;
+//!
+//! println!("Server will bind to {}:{}", config.host, config.port);
+//! # Ok(())
+//! # }
+//! ```
+
 use clap::Parser;
 use figment::{
     providers::{Env, Format, Yaml},

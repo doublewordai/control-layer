@@ -1,3 +1,57 @@
+//! User management API handlers.
+//!
+//! This module implements RESTful endpoints for user CRUD operations,
+//! including user creation, retrieval, updates, and deletion.
+//!
+//! # Endpoints
+//!
+//! - `GET /users` - List all users (admin only)
+//! - `POST /users` - Create a new user (admin only)
+//! - `GET /users/{id}` - Get user by ID (admin or own profile)
+//! - `PATCH /users/{id}` - Update user (admin or own profile)
+//! - `DELETE /users/{id}` - Delete user (admin only, protected users cannot be deleted)
+//!
+//! # Authorization
+//!
+//! User endpoints enforce role-based permissions:
+//! - **List/Create/Delete**: Requires admin role
+//! - **Get/Update**: Requires admin role OR user accessing their own profile
+//!
+//! Protected system users (e.g., initial admin) cannot be deleted to maintain
+//! system integrity.
+//!
+//! # Query Parameters
+//!
+//! - `skip`, `limit`: Pagination controls
+//! - `include`: Related entities (e.g., `include=groups` to embed group memberships)
+//!
+//! # Examples
+//!
+//! ## List Users (Admin)
+//!
+//! ```text
+//! GET /admin/api/v1/users?limit=10&include=groups
+//! ```
+//!
+//! ## Get Own Profile
+//!
+//! ```text
+//! GET /admin/api/v1/users/current
+//! ```
+//!
+//! ## Create User (Admin)
+//!
+//! ```text
+//! POST /admin/api/v1/users
+//! Content-Type: application/json
+//!
+//! {
+//!   "username": "alice",
+//!   "email": "alice@example.com",
+//!   "roles": ["StandardUser"]
+//! }
+//! ```
+
 use crate::{
     api::models::{
         groups::GroupResponse,
