@@ -1,7 +1,10 @@
 use crate::db::{
     errors::{DbError, Result},
     handlers::repository::Repository,
-    models::groups::{GroupCreateDBRequest, GroupDBResponse, GroupUpdateDBRequest},
+    models::{
+        api_keys::ApiKeyPurpose,
+        groups::{GroupCreateDBRequest, GroupDBResponse, GroupUpdateDBRequest},
+    },
 };
 use crate::types::{abbrev_uuid, DeploymentId, GroupId, Operation, UserId};
 use chrono::{DateTime, Utc};
@@ -1079,6 +1082,7 @@ mod tests {
             user_id: test_user_id,
             name: "CASCADE Test Key".to_string(),
             description: Some("API key for CASCADE delete test".to_string()),
+            purpose: ApiKeyPurpose::Inference,
             requests_per_second: None,
             burst_size: None,
         };

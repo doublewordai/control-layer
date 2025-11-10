@@ -1043,11 +1043,12 @@ mod test {
         let system_api_key_id = Uuid::nil();
         let original_secret = "original_test_secret";
         sqlx::query!(
-            "INSERT INTO api_keys (id, name, secret, user_id) VALUES ($1, $2, $3, $4)
+            "INSERT INTO api_keys (id, name, secret, purpose, user_id) VALUES ($1, $2, $3, $4, $5)
              ON CONFLICT (id) DO UPDATE SET secret = $3",
             system_api_key_id,
             "System API Key",
             original_secret,
+            "inference",
             system_api_key_id,
         )
         .execute(&pool)

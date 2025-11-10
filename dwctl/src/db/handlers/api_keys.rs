@@ -4,7 +4,7 @@ use crate::crypto::generate_api_key;
 use crate::db::errors::DbError;
 use crate::db::errors::Result;
 use crate::db::handlers::repository::Repository;
-use crate::db::models::api_keys::{ApiKeyCreateDBRequest, ApiKeyDBResponse, ApiKeyUpdateDBRequest};
+use crate::db::models::api_keys::{ApiKeyCreateDBRequest, ApiKeyDBResponse, ApiKeyPurpose, ApiKeyUpdateDBRequest};
 use crate::types::{abbrev_uuid, ApiKeyId, DeploymentId, UserId};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
@@ -36,6 +36,7 @@ struct ApiKey {
     pub name: String,
     pub description: Option<String>,
     pub secret: String,
+    pub purpose: String,
     pub user_id: UserId,
     pub created_at: DateTime<Utc>,
     pub last_used: Option<DateTime<Utc>>,
@@ -45,11 +46,25 @@ struct ApiKey {
 
 impl From<(Vec<DeploymentId>, ApiKey)> for ApiKeyDBResponse {
     fn from((model_access, api_key): (Vec<DeploymentId>, ApiKey)) -> Self {
+        // Parse purpose string to enum - default to Inference for backwards compatibility
+        let purpose = api_key.purpose.parse::<serde_json::Value>()
+            .ok()
+            .and_then(|v| serde_json::from_value::<ApiKeyPurpose>(v).ok())
+            .or_else(|| {
+                match api_key.purpose.as_str() {
+                    "platform" => Some(ApiKeyPurpose::Platform),
+                    "inference" => Some(ApiKeyPurpose::Inference),
+                    _ => None
+                }
+            })
+            .unwrap_or(ApiKeyPurpose::Inference);
+
         Self {
             id: api_key.id,
             name: api_key.name,
             description: api_key.description,
             secret: api_key.secret,
+            purpose,
             user_id: api_key.user_id,
             created_at: api_key.created_at,
             last_used: api_key.last_used,
@@ -77,16 +92,23 @@ impl<'c> Repository for ApiKeys<'c> {
         // Generate a secure API key
         let secret = generate_api_key();
 
+        // Convert purpose enum to string for database
+        let purpose_str = match request.purpose {
+            ApiKeyPurpose::Platform => "platform",
+            ApiKeyPurpose::Inference => "inference",
+        };
+
         let api_key = sqlx::query_as!(
             ApiKey,
             r#"
-            INSERT INTO api_keys (name, description, secret, user_id, requests_per_second, burst_size)
-            VALUES ($1, $2, $3, $4, $5, $6)
+            INSERT INTO api_keys (name, description, secret, purpose, user_id, requests_per_second, burst_size)
+            VALUES ($1, $2, $3, $4, $5, $6, $7)
             RETURNING *
             "#,
             request.name,
             request.description,
             secret,
+            purpose_str,
             request.user_id,
             request.requests_per_second,
             request.burst_size
@@ -101,7 +123,7 @@ impl<'c> Repository for ApiKeys<'c> {
     async fn get_by_id(&mut self, id: Self::Id) -> Result<Option<Self::Response>> {
         let api_key = sqlx::query_as!(
             ApiKey,
-            "SELECT id, name, description, secret, user_id, created_at, last_used, requests_per_second, burst_size FROM api_keys WHERE id = $1",
+            "SELECT id, name, description, secret, purpose, user_id, created_at, last_used, requests_per_second, burst_size FROM api_keys WHERE id = $1",
             id
         )
             .fetch_optional(&mut *self.db)
@@ -117,7 +139,7 @@ impl<'c> Repository for ApiKeys<'c> {
     async fn get_bulk(&mut self, ids: Vec<Self::Id>) -> Result<HashMap<Self::Id, Self::Response>> {
         let api_keys = sqlx::query_as!(
             ApiKey,
-            "SELECT id, name, description, secret, user_id, created_at, last_used, requests_per_second, burst_size FROM api_keys WHERE id = ANY($1)",
+            "SELECT id, name, description, secret, purpose, user_id, created_at, last_used, requests_per_second, burst_size FROM api_keys WHERE id = ANY($1)",
             &ids
         )
             .fetch_all(&mut *self.db)
@@ -136,7 +158,7 @@ impl<'c> Repository for ApiKeys<'c> {
         let api_keys = if let Some(user_id) = filter.user_id {
             sqlx::query_as!(
                 ApiKey,
-                "SELECT id, name, description, secret, user_id, created_at, last_used, requests_per_second, burst_size FROM api_keys WHERE user_id = $1 ORDER BY created_at DESC LIMIT $2 OFFSET $3",
+                "SELECT id, name, description, secret, purpose, user_id, created_at, last_used, requests_per_second, burst_size FROM api_keys WHERE user_id = $1 ORDER BY created_at DESC LIMIT $2 OFFSET $3",
                 user_id,
                 filter.limit,
                 filter.skip
@@ -146,7 +168,7 @@ impl<'c> Repository for ApiKeys<'c> {
         } else {
             sqlx::query_as!(
                 ApiKey,
-                "SELECT id, name, description, secret, user_id, created_at, last_used, requests_per_second, burst_size FROM api_keys ORDER BY created_at DESC LIMIT $1 OFFSET $2",
+                "SELECT id, name, description, secret, purpose, user_id, created_at, last_used, requests_per_second, burst_size FROM api_keys ORDER BY created_at DESC LIMIT $1 OFFSET $2",
                 filter.limit,
                 filter.skip,
             )
@@ -253,6 +275,7 @@ impl<'c> ApiKeys<'c> {
                 ak.name as "name!",
                 ak.description,
                 ak.secret as "secret!",
+                ak.purpose as "purpose!",
                 ak.user_id as "user_id!",
                 ak.created_at as "created_at!",
                 ak.last_used,
@@ -268,6 +291,7 @@ impl<'c> ApiKeys<'c> {
                 ak.name as "name!",
                 ak.description,
                 ak.secret as "secret!",
+                ak.purpose as "purpose!",
                 ak.user_id as "user_id!",
                 ak.created_at as "created_at!",
                 ak.last_used,
@@ -285,6 +309,7 @@ impl<'c> ApiKeys<'c> {
                 ak.name as "name!",
                 ak.description,
                 ak.secret as "secret!",
+                ak.purpose as "purpose!",
                 ak.user_id as "user_id!",
                 ak.created_at as "created_at!",
                 ak.last_used,
@@ -389,6 +414,7 @@ mod tests {
                     user_id: userid,
                     name: "Test API Key".to_string(),
                     description: Some("Test description".to_string()),
+                    purpose: ApiKeyPurpose::Inference,
                     requests_per_second: None,
                     burst_size: None,
                 };
@@ -428,6 +454,7 @@ mod tests {
                 user_id: user.id,
                 name: "Key 1".to_string(),
                 description: None,
+                purpose: ApiKeyPurpose::Inference,
                 requests_per_second: None,
                 burst_size: None,
             };
@@ -435,6 +462,7 @@ mod tests {
                 user_id: user.id,
                 name: "Key 2".to_string(),
                 description: Some("Key 2 description".to_string()),
+                purpose: ApiKeyPurpose::Inference,
                 requests_per_second: None,
                 burst_size: None,
             };
@@ -488,6 +516,7 @@ mod tests {
                 user_id: user.id,
                 name: "Delete Me".to_string(),
                 description: None,
+                purpose: ApiKeyPurpose::Inference,
                 requests_per_second: None,
                 burst_size: None,
             };
@@ -530,6 +559,7 @@ mod tests {
                 user_id: user.id,
                 name: "Trait Test Key".to_string(),
                 description: Some("Test trait description".to_string()),
+                purpose: ApiKeyPurpose::Inference,
                 requests_per_second: None,
                 burst_size: None,
             };
@@ -653,6 +683,7 @@ mod tests {
                 user_id: user.id,
                 name: "Test API Key".to_string(),
                 description: Some("API key for testing group access".to_string()),
+                purpose: ApiKeyPurpose::Inference,
                 requests_per_second: None,
                 burst_size: None,
             };
@@ -761,6 +792,7 @@ mod tests {
                 user_id: user.id,
                 name: "Test API Key".to_string(),
                 description: Some("API key for testing access removal".to_string()),
+                purpose: ApiKeyPurpose::Inference,
                 requests_per_second: None,
                 burst_size: None,
             };
@@ -879,6 +911,7 @@ mod tests {
                 user_id: user.id,
                 name: "Test API Key".to_string(),
                 description: Some("API key for testing deployment removal".to_string()),
+                purpose: ApiKeyPurpose::Inference,
                 requests_per_second: None,
                 burst_size: None,
             };
@@ -1023,6 +1056,7 @@ mod tests {
                 user_id: user1.id,
                 name: "User 1 Key".to_string(),
                 description: Some("API key for user 1".to_string()),
+                purpose: ApiKeyPurpose::Inference,
                 requests_per_second: None,
                 burst_size: None,
             };
@@ -1032,6 +1066,7 @@ mod tests {
                 user_id: user2.id,
                 name: "User 2 Key".to_string(),
                 description: Some("API key for user 2".to_string()),
+                purpose: ApiKeyPurpose::Inference,
                 requests_per_second: None,
                 burst_size: None,
             };
@@ -1164,6 +1199,7 @@ mod tests {
                 user_id: user.id,
                 name: "Multi Access Key".to_string(),
                 description: Some("API key for multiple deployments".to_string()),
+                purpose: ApiKeyPurpose::Inference,
                 requests_per_second: None,
                 burst_size: None,
             };
@@ -1274,6 +1310,7 @@ mod tests {
                 user_id: user.id,
                 name: "Dynamic Access Key".to_string(),
                 description: Some("API key for testing dynamic access".to_string()),
+                purpose: ApiKeyPurpose::Inference,
                 requests_per_second: None,
                 burst_size: None,
             };
@@ -1433,6 +1470,7 @@ mod tests {
                 user_id: user.id,
                 name: "Test API Key".to_string(),
                 description: Some("API key for testing Everyone group access".to_string()),
+                purpose: ApiKeyPurpose::Inference,
                 requests_per_second: None,
                 burst_size: None,
             };
@@ -1491,6 +1529,7 @@ mod tests {
                     user_id: user.id,
                     name: format!("Pagination Key {i}"),
                     description: Some(format!("Key {i} for pagination testing")),
+                    purpose: ApiKeyPurpose::Inference,
                     requests_per_second: None,
                     burst_size: None,
                 };
@@ -1617,6 +1656,7 @@ mod tests {
                 user_id: user1.id,
                 name: "User1 Key".to_string(),
                 description: None,
+                purpose: ApiKeyPurpose::Inference,
                 requests_per_second: None,
                 burst_size: None,
             };
@@ -1624,6 +1664,7 @@ mod tests {
                 user_id: user2.id,
                 name: "User2 Key".to_string(),
                 description: None,
+                purpose: ApiKeyPurpose::Inference,
                 requests_per_second: None,
                 burst_size: None,
             };
@@ -1686,6 +1727,7 @@ mod tests {
             user_id: user.id,
             name: "Bulk Key 1".to_string(),
             description: Some("First bulk key".to_string()),
+            purpose: ApiKeyPurpose::Inference,
             requests_per_second: None,
             burst_size: None,
         };
@@ -1693,6 +1735,7 @@ mod tests {
             user_id: user.id,
             name: "Bulk Key 2".to_string(),
             description: Some("Second bulk key".to_string()),
+            purpose: ApiKeyPurpose::Inference,
             requests_per_second: None,
             burst_size: None,
         };
@@ -1700,6 +1743,7 @@ mod tests {
             user_id: user.id,
             name: "Bulk Key 3".to_string(),
             description: None,
+            purpose: ApiKeyPurpose::Inference,
             requests_per_second: None,
             burst_size: None,
         };
@@ -1756,6 +1800,7 @@ mod tests {
             user_id: user.id,
             name: "Valid Key".to_string(),
             description: Some("Only valid key".to_string()),
+            purpose: ApiKeyPurpose::Inference,
             requests_per_second: None,
             burst_size: None,
         };
@@ -1834,6 +1879,7 @@ mod tests {
             user_id: user.id,
             name: "Duplicate Test Key".to_string(),
             description: Some("Key for testing duplicates".to_string()),
+            purpose: ApiKeyPurpose::Inference,
             requests_per_second: None,
             burst_size: None,
         };
@@ -1921,6 +1967,7 @@ mod tests {
             user_id: user.id,
             name: "Bulk Access Key 1".to_string(),
             description: Some("First key with model access".to_string()),
+            purpose: ApiKeyPurpose::Inference,
             requests_per_second: None,
             burst_size: None,
         };
@@ -1928,6 +1975,7 @@ mod tests {
             user_id: user.id,
             name: "Bulk Access Key 2".to_string(),
             description: Some("Second key with model access".to_string()),
+            purpose: ApiKeyPurpose::Inference,
             requests_per_second: None,
             burst_size: None,
         };
@@ -1987,6 +2035,7 @@ mod tests {
             user_id: user1.id,
             name: "User1 Bulk Key".to_string(),
             description: Some("Key for user 1".to_string()),
+            purpose: ApiKeyPurpose::Inference,
             requests_per_second: None,
             burst_size: None,
         };
@@ -1994,6 +2043,7 @@ mod tests {
             user_id: user2.id,
             name: "User2 Bulk Key".to_string(),
             description: Some("Key for user 2".to_string()),
+            purpose: ApiKeyPurpose::Inference,
             requests_per_second: None,
             burst_size: None,
         };
