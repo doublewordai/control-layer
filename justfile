@@ -111,19 +111,27 @@ check-db:
 # - Writes DATABASE_URL to .env files for sqlx compile-time verification
 # - Runs migrations to set up the schema
 #
-# Assumes postgres is running on localhost:5432 with user 'postgres' and password 'password'
-# (use 'just db-start' to start Docker postgres with these defaults)
+# Connection settings can be overridden with environment variables:
+# - DB_HOST (default: localhost)
+# - DB_PORT (default: 5432)
+# - DB_USER (default: postgres)
+# - DB_PASS (default: password)
+#
+# Examples:
+#   just db-setup                          # Use defaults (localhost:5432, postgres/password)
+#   DB_PASS=postgres just db-setup         # Override password (for CI)
+#   just db-start && just db-setup         # Start local Docker postgres and setup
 db-setup:
     #!/usr/bin/env bash
     set -euo pipefail
 
     echo "Setting up development databases..."
 
-    # Database connection settings
-    DB_HOST="localhost"
-    DB_PORT="5432"
-    DB_USER="postgres"
-    DB_PASS="password"
+    # Database connection settings (can be overridden with environment variables)
+    DB_HOST="${DB_HOST:-localhost}"
+    DB_PORT="${DB_PORT:-5432}"
+    DB_USER="${DB_USER:-postgres}"
+    DB_PASS="${DB_PASS:-password}"
 
     # Check if postgres is running
     if ! pg_isready -h "$DB_HOST" -p "$DB_PORT" >/dev/null 2>&1; then
@@ -146,11 +154,21 @@ db-setup:
 
     # Run migrations
     echo "Running migrations..."
-    cd dwctl && sqlx migrate run && cd ..
-    echo "  ✅ dwctl migrations complete"
+    echo "Running dwctl migrations..."
+    if (cd dwctl && sqlx migrate run); then
+        echo "  ✅ dwctl migrations complete"
+    else
+        echo "  ❌ dwctl migrations failed"
+        exit 1
+    fi
 
-    cd fusillade && sqlx migrate run && cd ..
-    echo "  ✅ fusillade migrations complete"
+    echo "Running fusillade migrations..."
+    if (cd fusillade && sqlx migrate run); then
+        echo "  ✅ fusillade migrations complete"
+    else
+        echo "  ❌ fusillade migrations failed"
+        exit 1
+    fi
 
     echo ""
     echo "✅ Database setup complete!"
