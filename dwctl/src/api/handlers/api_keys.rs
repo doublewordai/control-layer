@@ -42,6 +42,8 @@ use sqlx::Acquire;
         (status = 500, description = "Internal server error"),
     ),
     security(
+        ("BearerAuth" = []),
+        ("CookieAuth" = []),
         ("X-Doubleword-User" = [])
     )
 )]
@@ -117,6 +119,8 @@ pub async fn create_user_api_key(
         (status = 500, description = "Internal server error"),
     ),
     security(
+        ("BearerAuth" = []),
+        ("CookieAuth" = []),
         ("X-Doubleword-User" = [])
     )
 )]
@@ -195,6 +199,8 @@ pub async fn list_user_api_keys(
         (status = 500, description = "Internal server error"),
     ),
     security(
+        ("BearerAuth" = []),
+        ("CookieAuth" = []),
         ("X-Doubleword-User" = [])
     )
 )]
@@ -271,6 +277,8 @@ pub async fn get_user_api_key(
         (status = 500, description = "Internal server error"),
     ),
     security(
+        ("BearerAuth" = []),
+        ("CookieAuth" = []),
         ("X-Doubleword-User" = [])
     )
 )]

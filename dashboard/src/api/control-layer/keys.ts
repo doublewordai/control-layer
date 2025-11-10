@@ -5,7 +5,8 @@ export const queryKeys = {
     all: ["users"] as const,
     query: (options?: { include?: string }) =>
       ["users", "query", options] as const,
-    byId: (id: string, include?: string) => ["users", "byId", id, include] as const,
+    byId: (id: string, include?: string) =>
+      ["users", "byId", id, include] as const,
   },
 
   // Models

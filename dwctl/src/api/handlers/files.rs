@@ -785,7 +785,7 @@ mod tests {
         let file_part = axum_test::multipart::Part::bytes(jsonl_content.as_bytes()).file_name("test-batch.jsonl");
 
         let upload_response = app
-            .post("/admin/api/v1/files")
+            .post("/ai/v1/files")
             .add_header(add_auth_headers(&user).0, add_auth_headers(&user).1)
             .multipart(
                 axum_test::multipart::MultipartForm::new()
@@ -800,7 +800,7 @@ mod tests {
 
         // Download the file content
         let download_response = app
-            .get(&format!("/admin/api/v1/files/{}/content", file_id))
+            .get(&format!("/ai/v1/files/{}/content", file_id))
             .add_header(add_auth_headers(&user).0, add_auth_headers(&user).1)
             .await;
 
@@ -836,7 +836,7 @@ mod tests {
         let file_part = axum_test::multipart::Part::bytes(jsonl_content.as_bytes()).file_name("test-batch.jsonl");
 
         let upload_response = app
-            .post("/admin/api/v1/files")
+            .post("/ai/v1/files")
             .add_header(add_auth_headers(&user).0, add_auth_headers(&user).1)
             .multipart(
                 axum_test::multipart::MultipartForm::new()
@@ -864,7 +864,7 @@ mod tests {
         let file_part = axum_test::multipart::Part::bytes(jsonl_content.as_bytes()).file_name("test-batch.jsonl");
 
         let upload_response = app
-            .post("/admin/api/v1/files")
+            .post("/ai/v1/files")
             .add_header(add_auth_headers(&user).0, add_auth_headers(&user).1)
             .multipart(
                 axum_test::multipart::MultipartForm::new()
@@ -891,7 +891,7 @@ mod tests {
         let file_part = axum_test::multipart::Part::bytes(jsonl_content.as_bytes()).file_name("test-batch.jsonl");
 
         let upload_response = app
-            .post("/admin/api/v1/files")
+            .post("/ai/v1/files")
             .add_header(add_auth_headers(&user).0, add_auth_headers(&user).1)
             .multipart(
                 axum_test::multipart::MultipartForm::new()
@@ -918,7 +918,7 @@ mod tests {
         let file_part = axum_test::multipart::Part::bytes(jsonl_content.as_bytes()).file_name("test-batch.jsonl");
 
         let upload_response = app
-            .post("/admin/api/v1/files")
+            .post("/ai/v1/files")
             .add_header(add_auth_headers(&user).0, add_auth_headers(&user).1)
             .multipart(
                 axum_test::multipart::MultipartForm::new()
@@ -943,7 +943,7 @@ mod tests {
         let file_part = axum_test::multipart::Part::bytes(jsonl_content.as_bytes()).file_name("test-batch.jsonl");
 
         let upload_response = app
-            .post("/admin/api/v1/files")
+            .post("/ai/v1/files")
             .add_header(add_auth_headers(&user).0, add_auth_headers(&user).1)
             .multipart(
                 axum_test::multipart::MultipartForm::new()
@@ -970,7 +970,7 @@ mod tests {
         // NOTE: The file field is added BEFORE the metadata fields (purpose, expires_after)
         // This tests whether the handler correctly processes metadata regardless of field order
         let upload_response = app
-            .post("/admin/api/v1/files")
+            .post("/ai/v1/files")
             .add_header(add_auth_headers(&user).0, add_auth_headers(&user).1)
             .multipart(
                 axum_test::multipart::MultipartForm::new()
@@ -989,7 +989,7 @@ mod tests {
         // We need to query the database or fusillade to verify the metadata was stored
         // For now, we verify the upload succeeded and the file exists
         let get_response = app
-            .get(&format!("/admin/api/v1/files/{}", file.id))
+            .get(&format!("/ai/v1/files/{}", file.id))
             .add_header(add_auth_headers(&user).0, add_auth_headers(&user).1)
             .await;
 
@@ -1011,7 +1011,7 @@ mod tests {
         let file_part1 = axum_test::multipart::Part::bytes(jsonl_content.as_bytes()).file_name("duplicate-test.jsonl");
 
         let upload_response1 = app
-            .post("/admin/api/v1/files")
+            .post("/ai/v1/files")
             .add_header(add_auth_headers(&user).0, add_auth_headers(&user).1)
             .multipart(
                 axum_test::multipart::MultipartForm::new()
@@ -1027,7 +1027,7 @@ mod tests {
         let file_part2 = axum_test::multipart::Part::bytes(jsonl_content.as_bytes()).file_name("duplicate-test.jsonl");
 
         let upload_response2 = app
-            .post("/admin/api/v1/files")
+            .post("/ai/v1/files")
             .add_header(add_auth_headers(&user).0, add_auth_headers(&user).1)
             .multipart(
                 axum_test::multipart::MultipartForm::new()

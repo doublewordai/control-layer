@@ -352,7 +352,7 @@ pub async fn build_router(state: &mut AppState, onwards_router: Router) -> anyho
         .with_state(state.clone());
 
     // API routes
-    let mut api_routes = Router::new()
+    let api_routes = Router::new()
         .route("/config", get(api::handlers::config::get_config))
         // User management (admin only for collection operations)
         .route("/users", get(api::handlers::users::list_users))
@@ -445,8 +445,10 @@ pub async fn build_router(state: &mut AppState, onwards_router: Router) -> anyho
         .route("/probes/{id}/results", get(api::handlers::probes::get_probe_results))
         .route("/probes/{id}/statistics", get(api::handlers::probes::get_statistics));
 
-    // Batches API routes (files + batches) - conditionally enabled
-    if state.config.batches.enabled {
+    let api_routes_with_state = api_routes.with_state(state.clone());
+
+    // Batches API routes (files + batches) - conditionally enabled under /ai/v1
+    let batches_routes = if state.config.batches.enabled {
         // File upload route with custom body limit (other routes use default)
         let file_upload_limit = state.config.batches.files.max_file_size;
         let file_router = Router::new().route(
@@ -454,26 +456,36 @@ pub async fn build_router(state: &mut AppState, onwards_router: Router) -> anyho
             post(api::handlers::files::upload_file).layer(DefaultBodyLimit::max(file_upload_limit as usize)),
         );
 
-        api_routes = api_routes
-            // Files management - merge file upload route with custom body limit
-            .merge(file_router)
-            .route("/files", get(api::handlers::files::list_files))
-            .route("/files/{file_id}", get(api::handlers::files::get_file))
-            .route("/files/{file_id}/content", get(api::handlers::files::get_file_content))
-            .route("/files/{file_id}", delete(api::handlers::files::delete_file))
-            // Batches management
-            .route("/batches", post(api::handlers::batches::create_batch))
-            .route("/batches", get(api::handlers::batches::list_batches))
-            .route("/batches/{batch_id}", get(api::handlers::batches::get_batch))
-            .route("/batches/{batch_id}/cancel", post(api::handlers::batches::cancel_batch));
-    }
-
-    let api_routes_with_state = api_routes.with_state(state.clone());
+        Some(
+            Router::new()
+                // Files management - merge file upload route with custom body limit
+                .merge(file_router)
+                .route("/files", get(api::handlers::files::list_files))
+                .route("/files/{file_id}", get(api::handlers::files::get_file))
+                .route("/files/{file_id}/content", get(api::handlers::files::get_file_content))
+                .route("/files/{file_id}", delete(api::handlers::files::delete_file))
+                // Batches management
+                .route("/batches", post(api::handlers::batches::create_batch))
+                .route("/batches", get(api::handlers::batches::list_batches))
+                .route("/batches/{batch_id}", get(api::handlers::batches::get_batch))
+                .route("/batches/{batch_id}/cancel", post(api::handlers::batches::cancel_batch))
+                .with_state(state.clone()),
+        )
+    } else {
+        None
+    };
 
     // Serve embedded static assets, falling back to SPA for unmatched routes
     let fallback = get(api::handlers::static_assets::serve_embedded_asset).fallback(get(api::handlers::static_assets::spa_fallback));
 
     // Build the app with admin API and onwards proxy nested. serve the (restricted) openai spec.
+    // Batches routes are merged with onwards router under /ai/v1 (batches match first)
+    let ai_router = if let Some(batches) = batches_routes {
+        onwards_router.merge(batches)
+    } else {
+        onwards_router
+    };
+
     let router = Router::new()
         .route("/healthz", get(|| async { "OK" }))
         .route(
@@ -484,7 +496,7 @@ pub async fn build_router(state: &mut AppState, onwards_router: Router) -> anyho
             }),
         )
         .merge(auth_routes)
-        .nest("/ai/v1", onwards_router)
+        .nest("/ai/v1", ai_router)
         .nest("/admin/api/v1", api_routes_with_state)
         .merge(RapiDoc::with_openapi("/api-docs/openapi.json", ApiDoc::openapi()).path("/admin/docs"))
         .merge(RapiDoc::new("/openai-openapi.yaml").path("/ai/docs"))

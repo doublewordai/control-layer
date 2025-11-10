@@ -660,9 +660,7 @@ describe("dwctlApi.cost", () => {
       });
 
       expect(transactions).toBeInstanceOf(Array);
-      expect(
-        transactions.every((t) => t.user_id === userId),
-      ).toBe(true);
+      expect(transactions.every((t) => t.user_id === userId)).toBe(true);
     });
 
     it("should fetch transactions with pagination", async () => {

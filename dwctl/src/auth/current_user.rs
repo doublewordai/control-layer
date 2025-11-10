@@ -149,10 +149,7 @@ async fn try_proxy_header_auth(
 }
 
 /// Extract user from API key in Authorization header if present and valid
-async fn try_api_key_auth(
-    parts: &axum::http::request::Parts,
-    db: &PgPool,
-) -> Result<Option<CurrentUser>> {
+async fn try_api_key_auth(parts: &axum::http::request::Parts, db: &PgPool) -> Result<Option<CurrentUser>> {
     // Extract Authorization header
     let auth_header = match parts.headers.get(axum::http::header::AUTHORIZATION) {
         Some(header) => header,
@@ -186,9 +183,11 @@ async fn try_api_key_auth(
 
     let api_key_data = match api_key_result {
         Some(data) => data,
-        None => return Err(Error::Unauthenticated {
-            message: Some("Invalid API key".to_string()),
-        }),
+        None => {
+            return Err(Error::Unauthenticated {
+                message: Some("Invalid API key".to_string()),
+            })
+        }
     };
 
     // Check purpose matches the endpoint path

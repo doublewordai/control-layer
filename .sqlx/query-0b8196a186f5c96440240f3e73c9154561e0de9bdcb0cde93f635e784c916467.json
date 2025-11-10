@@ -1,0 +1,77 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n            SELECT DISTINCT\n                ak.id as \"id!\",\n                ak.name as \"name!\",\n                ak.description,\n                ak.secret as \"secret!\",\n                ak.purpose as \"purpose!\",\n                ak.user_id as \"user_id!\",\n                ak.created_at as \"created_at!\",\n                ak.last_used,\n                ak.requests_per_second,\n                ak.burst_size\n            FROM api_keys ak\n            WHERE ak.user_id = $2  -- System user has access to all deployments\n\n            UNION\n\n            SELECT DISTINCT\n                ak.id as \"id!\",\n                ak.name as \"name!\",\n                ak.description,\n                ak.secret as \"secret!\",\n                ak.purpose as \"purpose!\",\n                ak.user_id as \"user_id!\",\n                ak.created_at as \"created_at!\",\n                ak.last_used,\n                ak.requests_per_second,\n                ak.burst_size\n            FROM api_keys ak\n            INNER JOIN user_groups ug ON ak.user_id = ug.user_id\n            INNER JOIN deployment_groups dg ON ug.group_id = dg.group_id\n            WHERE dg.deployment_id = $1\n\n            UNION\n\n            SELECT DISTINCT\n                ak.id as \"id!\",\n                ak.name as \"name!\",\n                ak.description,\n                ak.secret as \"secret!\",\n                ak.purpose as \"purpose!\",\n                ak.user_id as \"user_id!\",\n                ak.created_at as \"created_at!\",\n                ak.last_used,\n                ak.requests_per_second,\n                ak.burst_size\n            FROM api_keys ak\n            INNER JOIN deployment_groups dg ON dg.group_id = '00000000-0000-0000-0000-000000000000'\n            WHERE dg.deployment_id = $1\n            AND ak.user_id != '00000000-0000-0000-0000-000000000000'  -- Exclude system user (already covered above)\n            ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "id!",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 1,
+        "name": "name!",
+        "type_info": "Varchar"
+      },
+      {
+        "ordinal": 2,
+        "name": "description",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 3,
+        "name": "secret!",
+        "type_info": "Varchar"
+      },
+      {
+        "ordinal": 4,
+        "name": "purpose!",
+        "type_info": "Varchar"
+      },
+      {
+        "ordinal": 5,
+        "name": "user_id!",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 6,
+        "name": "created_at!",
+        "type_info": "Timestamptz"
+      },
+      {
+        "ordinal": 7,
+        "name": "last_used",
+        "type_info": "Timestamptz"
+      },
+      {
+        "ordinal": 8,
+        "name": "requests_per_second",
+        "type_info": "Float4"
+      },
+      {
+        "ordinal": 9,
+        "name": "burst_size",
+        "type_info": "Int4"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Uuid"
+      ]
+    },
+    "nullable": [
+      null,
+      null,
+      null,
+      null,
+      null,
+      null,
+      null,
+      null,
+      null,
+      null
+    ]
+  },
+  "hash": "0b8196a186f5c96440240f3e73c9154561e0de9bdcb0cde93f635e784c916467"
+}

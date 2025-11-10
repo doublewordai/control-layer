@@ -488,12 +488,9 @@ describe("Billing Hooks", () => {
 
     it("should fetch transactions with userId filter", async () => {
       const userId = "550e8400-e29b-41d4-a716-446655440001";
-      const { result } = renderHook(
-        () => useTransactions({ userId }),
-        {
-          wrapper: createWrapper(),
-        },
-      );
+      const { result } = renderHook(() => useTransactions({ userId }), {
+        wrapper: createWrapper(),
+      });
 
       await waitFor(() => {
         expect(result.current.isSuccess).toBe(true);
@@ -502,9 +499,9 @@ describe("Billing Hooks", () => {
       expect(result.current.data).toBeDefined();
       expect(Array.isArray(result.current.data)).toBe(true);
       // All transactions should belong to the specified user
-      expect(
-        result.current.data!.every((t) => t.user_id === userId),
-      ).toBe(true);
+      expect(result.current.data!.every((t) => t.user_id === userId)).toBe(
+        true,
+      );
     });
 
     it("should fetch transactions with pagination", async () => {
@@ -593,7 +590,10 @@ describe("Billing Hooks", () => {
       // Mock an error response for non-existent user
       server.use(
         http.post("/admin/api/v1/transactions", () => {
-          return HttpResponse.json({ error: "User not found" }, { status: 404 });
+          return HttpResponse.json(
+            { error: "User not found" },
+            { status: 404 },
+          );
         }),
       );
 

@@ -14,7 +14,7 @@ database:
   # To have data not persists across restarts, set persistent=false.
   # We strongly recommend setting up external postgres in production!
   type: external
-  url: postgres://postgres:postgres@localhost:5432/dwctl
+  url: postgres://postgres:password@localhost:5432/dwctl
 
 # Admin user email - will be created on first startup
 admin_email: "test@doubleword.ai"

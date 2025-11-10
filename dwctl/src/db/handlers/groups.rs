@@ -1,10 +1,7 @@
 use crate::db::{
     errors::{DbError, Result},
     handlers::repository::Repository,
-    models::{
-        api_keys::ApiKeyPurpose,
-        groups::{GroupCreateDBRequest, GroupDBResponse, GroupUpdateDBRequest},
-    },
+    models::groups::{GroupCreateDBRequest, GroupDBResponse, GroupUpdateDBRequest},
 };
 use crate::types::{abbrev_uuid, DeploymentId, GroupId, Operation, UserId};
 use chrono::{DateTime, Utc};
@@ -536,6 +533,7 @@ impl<'c> Groups<'c> {
 mod tests {
     use super::*;
     use crate::db::handlers::api_keys::ApiKeys;
+    use crate::db::models::api_keys::ApiKeyPurpose;
     use crate::test_utils::get_test_endpoint_id;
     use crate::{
         db::{

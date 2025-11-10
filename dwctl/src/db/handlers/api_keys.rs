@@ -47,15 +47,15 @@ struct ApiKey {
 impl From<(Vec<DeploymentId>, ApiKey)> for ApiKeyDBResponse {
     fn from((model_access, api_key): (Vec<DeploymentId>, ApiKey)) -> Self {
         // Parse purpose string to enum - default to Inference for backwards compatibility
-        let purpose = api_key.purpose.parse::<serde_json::Value>()
+        let purpose = api_key
+            .purpose
+            .parse::<serde_json::Value>()
             .ok()
             .and_then(|v| serde_json::from_value::<ApiKeyPurpose>(v).ok())
-            .or_else(|| {
-                match api_key.purpose.as_str() {
-                    "platform" => Some(ApiKeyPurpose::Platform),
-                    "inference" => Some(ApiKeyPurpose::Inference),
-                    _ => None
-                }
+            .or(match api_key.purpose.as_str() {
+                "platform" => Some(ApiKeyPurpose::Platform),
+                "inference" => Some(ApiKeyPurpose::Inference),
+                _ => None,
             })
             .unwrap_or(ApiKeyPurpose::Inference);
 

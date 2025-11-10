@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "SELECT id, name, description, secret, user_id, created_at, last_used, requests_per_second, burst_size FROM api_keys ORDER BY created_at DESC LIMIT $1 OFFSET $2",
+  "query": "\n            INSERT INTO api_keys (name, description, secret, purpose, user_id, requests_per_second, burst_size)\n            VALUES ($1, $2, $3, $4, $5, $6, $7)\n            RETURNING *\n            ",
   "describe": {
     "columns": [
       {
@@ -47,12 +47,22 @@
         "ordinal": 8,
         "name": "burst_size",
         "type_info": "Int4"
+      },
+      {
+        "ordinal": 9,
+        "name": "purpose",
+        "type_info": "Varchar"
       }
     ],
     "parameters": {
       "Left": [
-        "Int8",
-        "Int8"
+        "Varchar",
+        "Text",
+        "Varchar",
+        "Varchar",
+        "Uuid",
+        "Float4",
+        "Int4"
       ]
     },
     "nullable": [
@@ -64,8 +74,9 @@
       false,
       true,
       true,
-      true
+      true,
+      false
     ]
   },
-  "hash": "8439f20a5fb8d6e7f7d6c95e07cfb91629e099b1773a8177bf794c3aeb991f83"
+  "hash": "3850eb9768c08df2c691c93e72a58f1add24e507f178b8e5044af0bcfcb199a7"
 }
