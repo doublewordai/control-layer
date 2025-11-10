@@ -18,10 +18,10 @@ use crate::{
         },
     },
 };
+use sqlx::ConnectOptions;
 
 use axum_test::TestServer;
 use sqlx::{Executor, PgConnection, PgPool};
-use tokio_util::sync::DropGuard;
 use uuid::Uuid;
 
 /// Set up fusillade schema and run migrations for tests
@@ -58,29 +58,20 @@ pub async fn setup_fusillade_for_tests(pool: &PgPool) -> PgPool {
     fusillade_pool
 }
 
-pub async fn create_test_app(pool: PgPool, enable_sync: bool) -> (TestServer, Option<DropGuard>) {
-    // Create a default fusillade pool for tests that don't explicitly set it up
-    let fusillade_pool = setup_fusillade_for_tests(&pool).await;
+pub async fn create_test_app(pool: PgPool, _enable_sync: bool) -> (TestServer, crate::BackgroundServices) {
+    let mut config = create_test_config();
+    // Override database config to use the test pool
+    config.database = crate::config::DatabaseConfig::External {
+        url: pool.connect_options().to_url_lossy().to_string(),
+    };
+    // Disable leader election for tests
+    config.leader_election.enabled = false;
 
-    let config = create_test_config();
-    let (router, onwards_config_sync, drop_guard) = crate::setup_app(pool, fusillade_pool, config, true)
-        .await
-        .expect("Failed to setup test app");
+    // Create application using the same infrastructure as production
+    let app = crate::Application::new(config).await.expect("Failed to create application");
 
-    if enable_sync {
-        // Start the config sync in background for tests
-        tokio::spawn(async move {
-            if let Err(e) = onwards_config_sync.start(Default::default()).await {
-                eprintln!("Config sync error in test: {e}");
-            }
-        });
-
-        let server = TestServer::new(router).expect("Failed to create test server");
-        (server, Some(drop_guard))
-    } else {
-        let server = TestServer::new(router).expect("Failed to create test server");
-        (server, None)
-    }
+    // Convert to test server (sync is always enabled in new())
+    app.into_test_server()
 }
 
 pub fn create_test_config() -> crate::config::Config {
@@ -124,6 +115,7 @@ pub fn create_test_config() -> crate::config::Config {
             },
             ..Default::default()
         },
+        leader_election: crate::config::LeaderElectionConfig::default(),
     }
 }
 
@@ -274,6 +266,7 @@ pub async fn create_test_api_key_for_user(pool: &PgPool, user_id: UserId) -> Api
         ApiKeyCreate {
             name: "Test API Key".to_string(),
             description: Some("Test description".to_string()),
+            purpose: crate::db::models::api_keys::ApiKeyPurpose::Inference,
             requests_per_second: None,
             burst_size: None,
         },

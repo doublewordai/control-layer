@@ -533,6 +533,7 @@ impl<'c> Groups<'c> {
 mod tests {
     use super::*;
     use crate::db::handlers::api_keys::ApiKeys;
+    use crate::db::models::api_keys::ApiKeyPurpose;
     use crate::test_utils::get_test_endpoint_id;
     use crate::{
         db::{
@@ -1100,6 +1101,7 @@ mod tests {
             user_id: test_user_id,
             name: "CASCADE Test Key".to_string(),
             description: Some("API key for CASCADE delete test".to_string()),
+            purpose: ApiKeyPurpose::Inference,
             requests_per_second: None,
             burst_size: None,
         };

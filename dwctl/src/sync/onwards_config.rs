@@ -3,7 +3,7 @@ use std::{collections::HashMap, num::NonZeroU32};
 use onwards::target::{Auth, ConfigFile, KeyDefinition, RateLimitParameters, TargetSpec, Targets, WatchTargetsStream};
 use sqlx::{postgres::PgListener, PgPool};
 use tokio::sync::{mpsc, watch};
-use tokio_util::sync::{CancellationToken, DropGuard};
+use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, instrument, warn};
 use url::Url;
 
@@ -29,7 +29,6 @@ use crate::{
 pub struct OnwardsConfigSync {
     db: PgPool,
     sender: watch::Sender<Targets>,
-    shutdown_token: CancellationToken,
 }
 
 #[derive(Default)]
@@ -38,32 +37,24 @@ pub struct SyncConfig {
 }
 
 impl OnwardsConfigSync {
-    /// Creates a new OnwardsConfigSync and returns it along with initial targets, a WatchTargetsStream, and a drop guard for shutdown
+    /// Creates a new OnwardsConfigSync and returns it along with initial targets and a WatchTargetsStream
     #[instrument(skip(db))]
-    pub async fn new(db: PgPool) -> Result<(Self, Targets, WatchTargetsStream, DropGuard), anyhow::Error> {
+    pub async fn new(db: PgPool) -> Result<(Self, Targets, WatchTargetsStream), anyhow::Error> {
         // Load initial configuration
         let initial_targets = load_targets_from_db(&db).await?;
 
         // Create watch channel with initial state
         let (sender, receiver) = watch::channel(initial_targets.clone());
 
-        // Create shutdown token and drop guard
-        let shutdown_token = CancellationToken::new();
-        let drop_guard = shutdown_token.clone().drop_guard();
-
-        let integration = Self {
-            db,
-            sender,
-            shutdown_token,
-        };
+        let integration = Self { db, sender };
         let stream = WatchTargetsStream::new(receiver);
 
-        Ok((integration, initial_targets, stream, drop_guard))
+        Ok((integration, initial_targets, stream))
     }
 
     /// Starts the background task that listens for database changes and updates the configuration
-    #[instrument(skip(self, config), err)]
-    pub async fn start(self, config: SyncConfig) -> Result<(), anyhow::Error> {
+    #[instrument(skip(self, config, shutdown_token), err)]
+    pub async fn start(self, config: SyncConfig, shutdown_token: CancellationToken) -> Result<(), anyhow::Error> {
         // Debouncing: prevent rapid-fire reloads
         let mut last_reload_time = std::time::Instant::now();
         const MIN_RELOAD_INTERVAL: std::time::Duration = std::time::Duration::from_millis(100);
@@ -84,7 +75,7 @@ impl OnwardsConfigSync {
             loop {
                 tokio::select! {
                     // Handle shutdown signal
-                    _ = self.shutdown_token.cancelled() => {
+                    _ = shutdown_token.cancelled() => {
                         info!("Received shutdown signal, stopping onwards configuration listener");
                         break 'outer;
                     }
@@ -414,6 +405,8 @@ mod tests {
         db::models::deployments::{DeploymentDBResponse, ModelStatus},
         sync::onwards_config::{convert_to_config_file, SyncConfig},
     };
+    use tokio::sync::mpsc;
+    use tokio_util::sync::CancellationToken;
 
     // Helper function to create a test deployed model
     fn create_test_model(name: &str, alias: &str, endpoint_id: Uuid) -> DeploymentDBResponse {
@@ -730,7 +723,7 @@ mod tests {
     #[test_log::test]
     async fn test_onwards_config_reconnects_after_connection_loss(pool: sqlx::PgPool) {
         // Start the onwards config sync with status channel
-        let (sync, _initial_targets, _stream, _drop_guard) = super::OnwardsConfigSync::new(pool.clone())
+        let (sync, _initial_targets, _stream) = super::OnwardsConfigSync::new(pool.clone())
             .await
             .expect("Failed to create OnwardsConfigSync");
 
@@ -738,7 +731,11 @@ mod tests {
         let config = SyncConfig {
             status_tx: Some(status_tx),
         };
-        let mut sync_handle = tokio::spawn(async move { sync.start(config).await });
+        let shutdown_token = CancellationToken::new();
+        let mut sync_handle = tokio::spawn({
+            let shutdown = shutdown_token.clone();
+            async move { sync.start(config, shutdown).await }
+        });
 
         // Wait for initial connection
         println!("Waiting for Connecting status...");
@@ -770,9 +767,6 @@ mod tests {
                 .expect("Failed to terminate backend");
         }
         println!("Killed LISTEN connections");
-
-        // Give the connection time to detect it's been terminated
-        tokio::time::sleep(Duration::from_millis(500)).await;
 
         // Wait for reconnection status events
         println!("Waiting for Disconnected status...");

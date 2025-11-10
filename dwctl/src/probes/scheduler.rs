@@ -10,6 +10,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::RwLock;
 use tokio::task::JoinHandle;
+use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
 /// Background scheduler daemon for managing probe execution.
@@ -36,20 +37,31 @@ impl ProbeScheduler {
     /// Initialize schedulers for all active probes in the database.
     ///
     /// This should be called when the replica becomes the leader to start monitoring.
-    pub async fn initialize(&self) -> Result<(), anyhow::Error> {
+    pub async fn initialize(&self, shutdown_token: CancellationToken) -> Result<(), anyhow::Error> {
+        // Check if we're already shutting down
+        if shutdown_token.is_cancelled() {
+            tracing::info!("Shutdown signal received, skipping scheduler initialization");
+            return Ok(());
+        }
+
         let probes = ProbeManager::list_active_probes(&self.pool).await?;
 
         tracing::info!("Initializing schedulers for {} active probes", probes.len());
 
         for probe in probes {
-            self.start_scheduler(probe.id).await?;
+            // Check for shutdown between spawning tasks
+            if shutdown_token.is_cancelled() {
+                tracing::info!("Shutdown signal received during initialization, stopping");
+                break;
+            }
+            self.start_scheduler(probe.id, shutdown_token.clone()).await?;
         }
 
         Ok(())
     }
 
     /// Start a scheduler for a specific probe
-    async fn start_scheduler(&self, probe_id: Uuid) -> Result<(), anyhow::Error> {
+    async fn start_scheduler(&self, probe_id: Uuid, shutdown_token: CancellationToken) -> Result<(), anyhow::Error> {
         // Check if scheduler already exists
         {
             let schedulers = self.schedulers.read().await;
@@ -117,6 +129,12 @@ impl ProbeScheduler {
             };
 
             loop {
+                // Check for shutdown signal
+                if shutdown_token.is_cancelled() {
+                    tracing::info!("Shutdown signal received, stopping scheduler for probe {}", probe_id);
+                    break;
+                }
+
                 // Get the probe to check if it's still active and get the interval
                 let probe = match ProbeManager::get_probe(&pool, probe_id).await {
                     Ok(p) => p,
@@ -150,8 +168,14 @@ impl ProbeScheduler {
                     }
                 }
 
-                // Sleep for the configured interval
-                tokio::time::sleep(tokio::time::Duration::from_secs(probe.interval_seconds as u64)).await;
+                // Sleep for the configured interval or until shutdown
+                tokio::select! {
+                    _ = tokio::time::sleep(tokio::time::Duration::from_secs(probe.interval_seconds as u64)) => {}
+                    _ = shutdown_token.cancelled() => {
+                        tracing::info!("Shutdown signal received during sleep, stopping scheduler for probe {}", probe_id);
+                        break;
+                    }
+                }
             }
 
             tracing::info!("Scheduler for probe {} has stopped", probe_id);
@@ -200,7 +224,7 @@ impl ProbeScheduler {
     /// This should be called periodically to ensure the scheduler state matches the database:
     /// - Start schedulers for newly activated probes
     /// - Stop schedulers for deactivated/deleted probes
-    pub async fn sync_with_database(&self) -> Result<(), anyhow::Error> {
+    pub async fn sync_with_database(&self, shutdown_token: CancellationToken) -> Result<(), anyhow::Error> {
         let active_probes = ProbeManager::list_active_probes(&self.pool).await?;
         let active_probe_ids: std::collections::HashSet<Uuid> = active_probes.iter().map(|p| p.id).collect();
 
@@ -211,7 +235,7 @@ impl ProbeScheduler {
         // Start schedulers for probes that are active but not running
         for probe_id in active_probe_ids.difference(&running_probe_ids) {
             tracing::info!("Starting scheduler for newly activated probe {}", probe_id);
-            if let Err(e) = self.start_scheduler(*probe_id).await {
+            if let Err(e) = self.start_scheduler(*probe_id, shutdown_token.clone()).await {
                 tracing::error!("Failed to start scheduler for probe {}: {}", probe_id, e);
             }
         }
@@ -228,12 +252,12 @@ impl ProbeScheduler {
     }
 
     /// Handle a probe change notification
-    async fn handle_probe_change(&self, probe_id: Uuid, active: bool) -> Result<(), anyhow::Error> {
+    async fn handle_probe_change(&self, probe_id: Uuid, active: bool, shutdown_token: CancellationToken) -> Result<(), anyhow::Error> {
         if active {
             // Probe is now active - start its scheduler if not already running
             if !self.is_scheduler_running(probe_id).await {
                 tracing::info!("Probe {} activated, starting scheduler", probe_id);
-                self.start_scheduler(probe_id).await?;
+                self.start_scheduler(probe_id, shutdown_token).await?;
             }
         } else {
             // Probe is now inactive - stop its scheduler if running
@@ -255,7 +279,7 @@ impl ProbeScheduler {
     ///
     /// This mode periodically syncs with the database using simple queries.
     /// Useful for testing or environments where LISTEN/NOTIFY is not available.
-    async fn run_daemon_polling(self, sync_interval_seconds: u64) {
+    async fn run_daemon_polling(self, shutdown_token: CancellationToken, sync_interval_seconds: u64) {
         tracing::info!(
             "Starting probe scheduler daemon in polling mode (sync every {}s)",
             sync_interval_seconds
@@ -265,10 +289,16 @@ impl ProbeScheduler {
         interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
         loop {
-            interval.tick().await;
-
-            if let Err(e) = self.sync_with_database().await {
-                tracing::error!("Error syncing probe schedulers with database: {}", e);
+            tokio::select! {
+                _ = interval.tick() => {
+                    if let Err(e) = self.sync_with_database(shutdown_token.clone()).await {
+                        tracing::error!("Error syncing probe schedulers with database: {}", e);
+                    }
+                }
+                _ = shutdown_token.cancelled() => {
+                    tracing::info!("Shutdown signal received, stopping probe scheduler daemon");
+                    break;
+                }
             }
         }
     }
@@ -279,9 +309,9 @@ impl ProbeScheduler {
     /// allowing immediate reaction to changes. A periodic full sync runs as a fallback.
     ///
     /// Set `use_listen_notify` to false to use simple polling instead (useful for tests).
-    pub async fn run_daemon(self, use_listen_notify: bool, fallback_sync_interval_seconds: u64) {
+    pub async fn run_daemon(self, shutdown_token: CancellationToken, use_listen_notify: bool, fallback_sync_interval_seconds: u64) {
         if !use_listen_notify {
-            return self.run_daemon_polling(fallback_sync_interval_seconds).await;
+            return self.run_daemon_polling(shutdown_token, fallback_sync_interval_seconds).await;
         }
         tracing::info!(
             "Starting probe scheduler daemon with LISTEN/NOTIFY (fallback sync every {}s)",
@@ -289,12 +319,24 @@ impl ProbeScheduler {
         );
 
         loop {
+            // Check for shutdown before reconnecting
+            if shutdown_token.is_cancelled() {
+                tracing::info!("Shutdown signal received, stopping probe scheduler daemon");
+                break;
+            }
+
             // Establish a dedicated connection for LISTEN
             let mut listener = match sqlx::postgres::PgListener::connect_with(&self.pool).await {
                 Ok(l) => l,
                 Err(e) => {
                     tracing::error!("Failed to create LISTEN connection: {}", e);
-                    tokio::time::sleep(tokio::time::Duration::from_secs(5)).await;
+                    tokio::select! {
+                        _ = tokio::time::sleep(tokio::time::Duration::from_secs(5)) => {}
+                        _ = shutdown_token.cancelled() => {
+                            tracing::info!("Shutdown signal received during reconnect delay");
+                            break;
+                        }
+                    }
                     continue;
                 }
             };
@@ -302,7 +344,13 @@ impl ProbeScheduler {
             // LISTEN on the probe_changes channel
             if let Err(e) = listener.listen("probe_changes").await {
                 tracing::error!("Failed to LISTEN on probe_changes: {}", e);
-                tokio::time::sleep(tokio::time::Duration::from_secs(5)).await;
+                tokio::select! {
+                    _ = tokio::time::sleep(tokio::time::Duration::from_secs(5)) => {}
+                    _ = shutdown_token.cancelled() => {
+                        tracing::info!("Shutdown signal received during reconnect delay");
+                        break;
+                    }
+                }
                 continue;
             }
 
@@ -314,6 +362,12 @@ impl ProbeScheduler {
 
             loop {
                 tokio::select! {
+                    // Handle shutdown signal
+                    _ = shutdown_token.cancelled() => {
+                        tracing::info!("Shutdown signal received, stopping probe scheduler daemon");
+                        return;
+                    }
+
                     // Handle incoming notifications
                     notification = listener.recv() => {
                         match notification {
@@ -326,7 +380,7 @@ impl ProbeScheduler {
                                             payload.get("active").and_then(|v| v.as_bool())
                                         ) {
                                             tracing::debug!("Received probe change notification: probe_id={}, active={}", probe_id, active);
-                                            if let Err(e) = self.handle_probe_change(probe_id, active).await {
+                                            if let Err(e) = self.handle_probe_change(probe_id, active, shutdown_token.clone()).await {
                                                 tracing::error!("Failed to handle probe change for {}: {}", probe_id, e);
                                             }
                                         }
@@ -346,7 +400,7 @@ impl ProbeScheduler {
                     // Periodic fallback sync
                     _ = fallback_interval.tick() => {
                         tracing::debug!("Running fallback sync");
-                        if let Err(e) = self.sync_with_database().await {
+                        if let Err(e) = self.sync_with_database(shutdown_token.clone()).await {
                             tracing::error!("Error during fallback sync: {}", e);
                         }
                     }
@@ -355,7 +409,13 @@ impl ProbeScheduler {
 
             // If we broke out of the inner loop, the connection died
             tracing::warn!("LISTEN connection lost, reconnecting in 5s...");
-            tokio::time::sleep(tokio::time::Duration::from_secs(5)).await;
+            tokio::select! {
+                _ = tokio::time::sleep(tokio::time::Duration::from_secs(5)) => {}
+                _ = shutdown_token.cancelled() => {
+                    tracing::info!("Shutdown signal received during reconnect delay");
+                    break;
+                }
+            }
         }
     }
 }
@@ -440,7 +500,7 @@ mod tests {
         let config = create_test_config();
         let scheduler = ProbeScheduler::new(pool, config);
 
-        scheduler.initialize().await.unwrap();
+        scheduler.initialize(CancellationToken::new()).await.unwrap();
 
         // Check that schedulers are running
         let schedulers = scheduler.schedulers.read().await;
@@ -455,7 +515,7 @@ mod tests {
         let scheduler = ProbeScheduler::new(pool.clone(), config);
 
         // Initially no schedulers
-        scheduler.initialize().await.unwrap();
+        scheduler.initialize(CancellationToken::new()).await.unwrap();
         let initial_count = scheduler.schedulers.read().await.len();
         assert_eq!(initial_count, 0);
 
@@ -475,7 +535,7 @@ mod tests {
         .unwrap();
 
         // Sync should start the scheduler
-        scheduler.sync_with_database().await.unwrap();
+        scheduler.sync_with_database(CancellationToken::new()).await.unwrap();
 
         let new_count = scheduler.schedulers.read().await.len();
         assert_eq!(new_count, 1);
@@ -502,14 +562,14 @@ mod tests {
         let config = create_test_config();
         let scheduler = ProbeScheduler::new(pool.clone(), config);
 
-        scheduler.initialize().await.unwrap();
+        scheduler.initialize(CancellationToken::new()).await.unwrap();
         assert_eq!(scheduler.schedulers.read().await.len(), 1);
 
         // Deactivate the probe
         ProbeManager::deactivate_probe(&pool, probe.id).await.unwrap();
 
         // Sync should stop the scheduler
-        scheduler.sync_with_database().await.unwrap();
+        scheduler.sync_with_database(CancellationToken::new()).await.unwrap();
         assert_eq!(scheduler.schedulers.read().await.len(), 0);
     }
 
@@ -536,7 +596,7 @@ mod tests {
         let config = create_test_config();
         let scheduler = ProbeScheduler::new(pool, config);
 
-        scheduler.initialize().await.unwrap();
+        scheduler.initialize(CancellationToken::new()).await.unwrap();
         assert_eq!(scheduler.schedulers.read().await.len(), 3);
 
         // Stop all
@@ -568,7 +628,7 @@ mod tests {
         let config = create_test_config();
         let scheduler = ProbeScheduler::new(pool, config);
 
-        scheduler.initialize().await.unwrap();
+        scheduler.initialize(CancellationToken::new()).await.unwrap();
 
         // Should not have any schedulers
         assert_eq!(scheduler.schedulers.read().await.len(), 0);

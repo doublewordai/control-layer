@@ -8,7 +8,7 @@
 use crate::api::models::files::{FileDeleteResponse, FileListResponse, FileResponse, ListFilesQuery, ListObject, ObjectType, Purpose};
 use crate::auth::permissions::{can_read_all_resources, has_permission, operation, resource, RequiresPermission};
 
-use crate::db::handlers::{api_keys::ApiKeys, repository::Repository};
+use crate::db::{handlers::api_keys::ApiKeys, models::api_keys::ApiKeyPurpose};
 use crate::errors::{Error, Result};
 use crate::types::{Operation, Resource};
 use crate::AppState;
@@ -344,16 +344,13 @@ pub async fn upload_file(
     let max_file_size = state.config.batches.files.max_file_size;
     let uploaded_by = Some(current_user.id.to_string());
 
-    // Fetch system API key for batch request execution
+    // Get or create user-specific hidden API key for batch request execution
     let mut conn = state.db.acquire().await.map_err(|e| Error::Database(e.into()))?;
     let mut api_keys_repo = ApiKeys::new(&mut conn);
-    let system_key = api_keys_repo
-        .get_by_id(Uuid::nil())
+    let user_api_key = api_keys_repo
+        .get_or_create_hidden_key(current_user.id, ApiKeyPurpose::Inference)
         .await
-        .map_err(Error::Database)?
-        .ok_or_else(|| Error::Internal {
-            operation: "System API key not found".to_string(),
-        })?;
+        .map_err(Error::Database)?;
 
     // Construct batch execution endpoint (where fusillade will send requests)
     let endpoint = format!("http://{}:{}/ai", state.config.host, state.config.port);
@@ -364,7 +361,7 @@ pub async fn upload_file(
         max_file_size,
         uploaded_by,
         endpoint,
-        system_key.secret,
+        user_api_key,
         state.config.batches.files.upload_buffer_size,
     );
 
@@ -769,7 +766,7 @@ mod tests {
     #[sqlx::test]
     #[test_log::test]
     async fn test_upload_and_download_file_content(pool: PgPool) {
-        let (app, _) = create_test_app(pool.clone(), false).await;
+        let (app, _bg_services) = create_test_app(pool.clone(), false).await;
         // User needs BatchAPIUser role to create/read files
         let user = create_test_user_with_roles(&pool, vec![Role::StandardUser, Role::BatchAPIUser]).await;
         let group = create_test_group(&pool).await;
@@ -785,7 +782,7 @@ mod tests {
         let file_part = axum_test::multipart::Part::bytes(jsonl_content.as_bytes()).file_name("test-batch.jsonl");
 
         let upload_response = app
-            .post("/admin/api/v1/files")
+            .post("/ai/v1/files")
             .add_header(add_auth_headers(&user).0, add_auth_headers(&user).1)
             .multipart(
                 axum_test::multipart::MultipartForm::new()
@@ -800,7 +797,7 @@ mod tests {
 
         // Download the file content
         let download_response = app
-            .get(&format!("/admin/api/v1/files/{}/content", file_id))
+            .get(&format!("/ai/v1/files/{}/content", file_id))
             .add_header(add_auth_headers(&user).0, add_auth_headers(&user).1)
             .await;
 
@@ -827,7 +824,7 @@ mod tests {
     #[sqlx::test]
     #[test_log::test]
     async fn test_upload_missing_model_field(pool: PgPool) {
-        let (app, _) = create_test_app(pool.clone(), false).await;
+        let (app, _bg_services) = create_test_app(pool.clone(), false).await;
         let user = create_test_user_with_roles(&pool, vec![Role::StandardUser, Role::BatchAPIUser]).await;
 
         // Missing model field in body
@@ -836,7 +833,7 @@ mod tests {
         let file_part = axum_test::multipart::Part::bytes(jsonl_content.as_bytes()).file_name("test-batch.jsonl");
 
         let upload_response = app
-            .post("/admin/api/v1/files")
+            .post("/ai/v1/files")
             .add_header(add_auth_headers(&user).0, add_auth_headers(&user).1)
             .multipart(
                 axum_test::multipart::MultipartForm::new()
@@ -854,7 +851,7 @@ mod tests {
     #[sqlx::test]
     #[test_log::test]
     async fn test_upload_missing_custom_id(pool: PgPool) {
-        let (app, _) = create_test_app(pool.clone(), false).await;
+        let (app, _bg_services) = create_test_app(pool.clone(), false).await;
         let user = create_test_user_with_roles(&pool, vec![Role::StandardUser, Role::BatchAPIUser]).await;
 
         // Missing custom_id field
@@ -864,7 +861,7 @@ mod tests {
         let file_part = axum_test::multipart::Part::bytes(jsonl_content.as_bytes()).file_name("test-batch.jsonl");
 
         let upload_response = app
-            .post("/admin/api/v1/files")
+            .post("/ai/v1/files")
             .add_header(add_auth_headers(&user).0, add_auth_headers(&user).1)
             .multipart(
                 axum_test::multipart::MultipartForm::new()
@@ -882,7 +879,7 @@ mod tests {
     #[sqlx::test]
     #[test_log::test]
     async fn test_upload_invalid_json_body(pool: PgPool) {
-        let (app, _) = create_test_app(pool.clone(), false).await;
+        let (app, _bg_services) = create_test_app(pool.clone(), false).await;
         let user = create_test_user_with_roles(&pool, vec![Role::StandardUser, Role::BatchAPIUser]).await;
 
         // Invalid JSON in body field (not an object)
@@ -891,7 +888,7 @@ mod tests {
         let file_part = axum_test::multipart::Part::bytes(jsonl_content.as_bytes()).file_name("test-batch.jsonl");
 
         let upload_response = app
-            .post("/admin/api/v1/files")
+            .post("/ai/v1/files")
             .add_header(add_auth_headers(&user).0, add_auth_headers(&user).1)
             .multipart(
                 axum_test::multipart::MultipartForm::new()
@@ -909,7 +906,7 @@ mod tests {
     #[sqlx::test]
     #[test_log::test]
     async fn test_upload_malformed_jsonl(pool: PgPool) {
-        let (app, _) = create_test_app(pool.clone(), false).await;
+        let (app, _bg_services) = create_test_app(pool.clone(), false).await;
         let user = create_test_user_with_roles(&pool, vec![Role::StandardUser, Role::BatchAPIUser]).await;
 
         // Malformed JSONL - not valid JSON
@@ -918,7 +915,7 @@ mod tests {
         let file_part = axum_test::multipart::Part::bytes(jsonl_content.as_bytes()).file_name("test-batch.jsonl");
 
         let upload_response = app
-            .post("/admin/api/v1/files")
+            .post("/ai/v1/files")
             .add_header(add_auth_headers(&user).0, add_auth_headers(&user).1)
             .multipart(
                 axum_test::multipart::MultipartForm::new()
@@ -934,7 +931,7 @@ mod tests {
     #[sqlx::test]
     #[test_log::test]
     async fn test_upload_empty_file(pool: PgPool) {
-        let (app, _) = create_test_app(pool.clone(), false).await;
+        let (app, _bg_services) = create_test_app(pool.clone(), false).await;
         let user = create_test_user_with_roles(&pool, vec![Role::StandardUser, Role::BatchAPIUser]).await;
 
         // Empty file
@@ -943,7 +940,7 @@ mod tests {
         let file_part = axum_test::multipart::Part::bytes(jsonl_content.as_bytes()).file_name("test-batch.jsonl");
 
         let upload_response = app
-            .post("/admin/api/v1/files")
+            .post("/ai/v1/files")
             .add_header(add_auth_headers(&user).0, add_auth_headers(&user).1)
             .multipart(
                 axum_test::multipart::MultipartForm::new()
@@ -959,7 +956,7 @@ mod tests {
     #[sqlx::test]
     #[test_log::test]
     async fn test_upload_with_metadata_after_file_field(pool: PgPool) {
-        let (app, _) = create_test_app(pool.clone(), false).await;
+        let (app, _bg_services) = create_test_app(pool.clone(), false).await;
         let user = create_test_user_with_roles(&pool, vec![Role::StandardUser, Role::BatchAPIUser]).await;
 
         // Create test JSONL content
@@ -970,7 +967,7 @@ mod tests {
         // NOTE: The file field is added BEFORE the metadata fields (purpose, expires_after)
         // This tests whether the handler correctly processes metadata regardless of field order
         let upload_response = app
-            .post("/admin/api/v1/files")
+            .post("/ai/v1/files")
             .add_header(add_auth_headers(&user).0, add_auth_headers(&user).1)
             .multipart(
                 axum_test::multipart::MultipartForm::new()
@@ -989,7 +986,7 @@ mod tests {
         // We need to query the database or fusillade to verify the metadata was stored
         // For now, we verify the upload succeeded and the file exists
         let get_response = app
-            .get(&format!("/admin/api/v1/files/{}", file.id))
+            .get(&format!("/ai/v1/files/{}", file.id))
             .add_header(add_auth_headers(&user).0, add_auth_headers(&user).1)
             .await;
 
@@ -1001,7 +998,7 @@ mod tests {
     #[sqlx::test]
     #[test_log::test]
     async fn test_upload_duplicate_filename(pool: PgPool) {
-        let (app, _) = create_test_app(pool.clone(), false).await;
+        let (app, _bg_services) = create_test_app(pool.clone(), false).await;
         let user = create_test_user_with_roles(&pool, vec![Role::StandardUser, Role::BatchAPIUser]).await;
 
         // Create test JSONL content
@@ -1011,7 +1008,7 @@ mod tests {
         let file_part1 = axum_test::multipart::Part::bytes(jsonl_content.as_bytes()).file_name("duplicate-test.jsonl");
 
         let upload_response1 = app
-            .post("/admin/api/v1/files")
+            .post("/ai/v1/files")
             .add_header(add_auth_headers(&user).0, add_auth_headers(&user).1)
             .multipart(
                 axum_test::multipart::MultipartForm::new()
@@ -1027,7 +1024,7 @@ mod tests {
         let file_part2 = axum_test::multipart::Part::bytes(jsonl_content.as_bytes()).file_name("duplicate-test.jsonl");
 
         let upload_response2 = app
-            .post("/admin/api/v1/files")
+            .post("/ai/v1/files")
             .add_header(add_auth_headers(&user).0, add_auth_headers(&user).1)
             .multipart(
                 axum_test::multipart::MultipartForm::new()

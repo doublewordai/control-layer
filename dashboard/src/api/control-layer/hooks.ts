@@ -16,7 +16,8 @@ import type {
   GroupsQuery,
   ListRequestsQuery,
   TransactionsQuery,
-  CreateProbeRequest, AddFundsRequest,
+  CreateProbeRequest,
+  AddFundsRequest,
 } from "./types";
 
 // Config hooks
@@ -639,7 +640,9 @@ export function useAddFunds() {
     onSuccess: async (_, variables) => {
       // Refetch user balance and transactions from server
       await Promise.all([
-        queryClient.refetchQueries({ queryKey: queryKeys.users.byId(variables.user_id, "billing") }),
+        queryClient.refetchQueries({
+          queryKey: queryKeys.users.byId(variables.user_id, "billing"),
+        }),
         queryClient.refetchQueries({ queryKey: ["cost", "transactions"] }),
       ]);
     },

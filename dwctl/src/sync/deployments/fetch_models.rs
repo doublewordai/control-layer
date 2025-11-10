@@ -191,10 +191,12 @@ impl FetchModels for FetchModelsReqwest {
 
 /// A static implementation of FetchModels that returns a predefined list of models
 /// Used for endpoints where we have a known list of models (e.g., Snowflake Cortex AI)
+#[allow(dead_code)]
 pub struct StaticModelsFetcher {
     models: OpenAIModelsResponse,
 }
 
+#[allow(dead_code)]
 impl StaticModelsFetcher {
     pub fn new(model_names: Vec<String>) -> Self {
         let models = model_names

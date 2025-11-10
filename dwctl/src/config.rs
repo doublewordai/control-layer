@@ -47,6 +47,8 @@ pub struct Config {
     pub auth: AuthConfig,
     // Batches API configuration
     pub batches: BatchConfig,
+    // Leader election configuration
+    pub leader_election: LeaderElectionConfig,
     // Metrics configuration
     pub enable_metrics: bool,
     // Request logging configuration
@@ -371,6 +373,20 @@ pub enum DaemonEnabled {
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(default)]
+pub struct LeaderElectionConfig {
+    /// Enable leader election (default: true)
+    /// When false, this instance always runs as leader (useful for single-instance deployments and testing)
+    pub enabled: bool,
+}
+
+impl Default for LeaderElectionConfig {
+    fn default() -> Self {
+        Self { enabled: true }
+    }
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(untagged)]
 pub enum CorsOrigin {
     #[serde(deserialize_with = "parse_wildcard")]
@@ -429,6 +445,7 @@ impl Default for Config {
             metadata: Metadata::default(),
             auth: AuthConfig::default(),
             batches: BatchConfig::default(),
+            leader_election: LeaderElectionConfig::default(),
             enable_metrics: true,
             enable_request_logging: true,
             enable_otel_export: false,

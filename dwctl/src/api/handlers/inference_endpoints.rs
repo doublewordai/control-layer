@@ -71,6 +71,8 @@ impl FetchModels for MockFetchModels {
         (status = 500, description = "Internal server error"),
     ),
     security(
+        ("BearerAuth" = []),
+        ("CookieAuth" = []),
         ("X-Doubleword-User" = [])
     )
 )]
@@ -106,6 +108,8 @@ pub async fn list_inference_endpoints(
         (status = 500, description = "Internal server error"),
     ),
     security(
+        ("BearerAuth" = []),
+        ("CookieAuth" = []),
         ("X-Doubleword-User" = [])
     )
 )]
@@ -145,6 +149,8 @@ pub async fn get_inference_endpoint(
         (status = 500, description = "Internal server error"),
     ),
     security(
+        ("BearerAuth" = []),
+        ("CookieAuth" = []),
         ("X-Doubleword-User" = [])
     )
 )]
@@ -259,6 +265,8 @@ pub async fn update_inference_endpoint(
         (status = 500, description = "Internal server error"),
     ),
     security(
+        ("BearerAuth" = []),
+        ("CookieAuth" = []),
         ("X-Doubleword-User" = [])
     )
 )]
@@ -329,6 +337,8 @@ pub async fn validate_inference_endpoint(
         (status = 500, description = "Internal server error"),
     ),
     security(
+        ("BearerAuth" = []),
+        ("CookieAuth" = []),
         ("X-Doubleword-User" = [])
     )
 )]
@@ -435,6 +445,8 @@ pub async fn create_inference_endpoint(
         (status = 500, description = "Internal server error"),
     ),
     security(
+        ("BearerAuth" = []),
+        ("CookieAuth" = []),
         ("X-Doubleword-User" = [])
     )
 )]
@@ -532,6 +544,8 @@ async fn validate_endpoint_connection(
         (status = 500, description = "Internal server error"),
     ),
     security(
+        ("BearerAuth" = []),
+        ("CookieAuth" = []),
         ("X-Doubleword-User" = [])
     )
 )]
@@ -560,7 +574,7 @@ mod tests {
     #[sqlx::test]
     #[test_log::test]
     async fn test_list_inference_endpoints(pool: PgPool) {
-        let (app, _) = create_test_app(pool.clone(), false).await;
+        let (app, _bg_services) = create_test_app(pool.clone(), false).await;
         let user = create_test_user(&pool, Role::StandardUser).await;
 
         let response = app
@@ -593,7 +607,7 @@ mod tests {
     #[sqlx::test]
     #[test_log::test]
     async fn test_get_inference_endpoint(pool: PgPool) {
-        let (app, _) = create_test_app(pool.clone(), false).await;
+        let (app, _bg_services) = create_test_app(pool.clone(), false).await;
         let user = create_test_user(&pool, Role::StandardUser).await;
         let test_endpoint_id = get_test_endpoint_id(&app, &user).await;
 
@@ -611,7 +625,7 @@ mod tests {
     #[sqlx::test]
     #[test_log::test]
     async fn test_get_nonexistent_inference_endpoint(pool: PgPool) {
-        let (app, _) = create_test_app(pool.clone(), false).await;
+        let (app, _bg_services) = create_test_app(pool.clone(), false).await;
         let user = create_test_user(&pool, Role::StandardUser).await;
         let non_existent_id = uuid::Uuid::new_v4();
 
@@ -626,7 +640,7 @@ mod tests {
     #[sqlx::test]
     #[test_log::test]
     async fn test_update_inference_endpoint_as_admin(pool: PgPool) {
-        let (app, _) = create_test_app(pool.clone(), false).await;
+        let (app, _bg_services) = create_test_app(pool.clone(), false).await;
         let admin_user = create_test_admin_user(&pool, Role::PlatformManager).await;
         let test_endpoint_id = get_test_endpoint_id(&app, &admin_user).await;
 
@@ -649,7 +663,7 @@ mod tests {
     #[sqlx::test]
     #[test_log::test]
     async fn test_update_inference_endpoint_as_non_admin_forbidden(pool: PgPool) {
-        let (app, _) = create_test_app(pool.clone(), false).await;
+        let (app, _bg_services) = create_test_app(pool.clone(), false).await;
         let user = create_test_user(&pool, Role::StandardUser).await;
         let test_endpoint_id = get_test_endpoint_id(&app, &user).await;
 
@@ -669,7 +683,7 @@ mod tests {
     #[sqlx::test]
     #[test_log::test]
     async fn test_update_nonexistent_endpoint(pool: PgPool) {
-        let (app, _) = create_test_app(pool.clone(), false).await;
+        let (app, _bg_services) = create_test_app(pool.clone(), false).await;
         let admin_user = create_test_admin_user(&pool, Role::PlatformManager).await;
         let non_existent_id = uuid::Uuid::new_v4();
 
@@ -689,7 +703,7 @@ mod tests {
     #[sqlx::test]
     #[test_log::test]
     async fn test_update_endpoint_with_empty_payload(pool: PgPool) {
-        let (app, _) = create_test_app(pool.clone(), false).await;
+        let (app, _bg_services) = create_test_app(pool.clone(), false).await;
         let admin_user = create_test_admin_user(&pool, Role::PlatformManager).await;
         let test_endpoint_id = get_test_endpoint_id(&app, &admin_user).await;
 
@@ -709,7 +723,7 @@ mod tests {
     #[sqlx::test]
     #[test_log::test]
     async fn test_update_endpoint_with_null_name(pool: PgPool) {
-        let (app, _) = create_test_app(pool.clone(), false).await;
+        let (app, _bg_services) = create_test_app(pool.clone(), false).await;
         let admin_user = create_test_admin_user(&pool, Role::PlatformManager).await;
         let test_endpoint_id = get_test_endpoint_id(&app, &admin_user).await;
 
@@ -731,7 +745,7 @@ mod tests {
     #[sqlx::test]
     #[test_log::test]
     async fn test_default_endpoint_exists(pool: PgPool) {
-        let (app, _) = create_test_app(pool.clone(), false).await;
+        let (app, _bg_services) = create_test_app(pool.clone(), false).await;
         let user = create_test_user(&pool, Role::StandardUser).await;
 
         // First get the list to find the test endpoint
@@ -762,7 +776,7 @@ mod tests {
     #[sqlx::test]
     #[test_log::test]
     async fn test_list_endpoints_with_pagination(pool: PgPool) {
-        let (app, _) = create_test_app(pool.clone(), false).await;
+        let (app, _bg_services) = create_test_app(pool.clone(), false).await;
         let user = create_test_user(&pool, Role::StandardUser).await;
 
         // Test with limit
@@ -799,7 +813,7 @@ mod tests {
     #[sqlx::test]
     #[test_log::test]
     async fn test_validate_inference_endpoint_new_valid_url(pool: PgPool) {
-        let (app, _) = create_test_app(pool.clone(), false).await;
+        let (app, _bg_services) = create_test_app(pool.clone(), false).await;
         let admin_user = create_test_admin_user(&pool, Role::PlatformManager).await;
 
         let validate_request = json!({
@@ -822,7 +836,7 @@ mod tests {
     #[sqlx::test]
     #[test_log::test]
     async fn test_validate_inference_endpoint_new_invalid_url(pool: PgPool) {
-        let (app, _) = create_test_app(pool.clone(), false).await;
+        let (app, _bg_services) = create_test_app(pool.clone(), false).await;
         let admin_user = create_test_admin_user(&pool, Role::PlatformManager).await;
 
         let validate_request = json!({
@@ -843,7 +857,7 @@ mod tests {
     #[sqlx::test]
     #[test_log::test]
     async fn test_validate_inference_endpoint_existing_endpoint(pool: PgPool) {
-        let (app, _) = create_test_app(pool.clone(), false).await;
+        let (app, _bg_services) = create_test_app(pool.clone(), false).await;
         let admin_user = create_test_admin_user(&pool, Role::PlatformManager).await;
         let test_endpoint_id = get_test_endpoint_id(&app, &admin_user).await;
 
@@ -866,7 +880,7 @@ mod tests {
     #[sqlx::test]
     #[test_log::test]
     async fn test_validate_inference_endpoint_nonexistent_endpoint(pool: PgPool) {
-        let (app, _) = create_test_app(pool.clone(), false).await;
+        let (app, _bg_services) = create_test_app(pool.clone(), false).await;
         let admin_user = create_test_admin_user(&pool, Role::PlatformManager).await;
         let fake_endpoint_id = uuid::Uuid::new_v4();
 
@@ -887,7 +901,7 @@ mod tests {
     #[sqlx::test]
     #[test_log::test]
     async fn test_validate_inference_endpoint_as_non_admin_forbidden(pool: PgPool) {
-        let (app, _) = create_test_app(pool.clone(), false).await;
+        let (app, _bg_services) = create_test_app(pool.clone(), false).await;
         let user = create_test_user(&pool, Role::StandardUser).await;
 
         let validate_request = json!({
@@ -908,7 +922,7 @@ mod tests {
     #[sqlx::test]
     #[test_log::test]
     async fn test_create_inference_endpoint_as_admin(pool: PgPool) {
-        let (app, _) = create_test_app(pool.clone(), false).await;
+        let (app, _bg_services) = create_test_app(pool.clone(), false).await;
         let admin_user = create_test_admin_user(&pool, Role::PlatformManager).await;
 
         let create_request = json!({
@@ -938,7 +952,7 @@ mod tests {
     #[sqlx::test]
     #[test_log::test]
     async fn test_create_inference_endpoint_minimal_fields(pool: PgPool) {
-        let (app, _) = create_test_app(pool.clone(), false).await;
+        let (app, _bg_services) = create_test_app(pool.clone(), false).await;
         let admin_user = create_test_admin_user(&pool, Role::PlatformManager).await;
 
         let create_request = json!({
@@ -965,7 +979,7 @@ mod tests {
     #[sqlx::test]
     #[test_log::test]
     async fn test_create_inference_endpoint_invalid_url(pool: PgPool) {
-        let (app, _) = create_test_app(pool.clone(), false).await;
+        let (app, _bg_services) = create_test_app(pool.clone(), false).await;
         let admin_user = create_test_admin_user(&pool, Role::PlatformManager).await;
 
         let create_request = json!({
@@ -985,7 +999,7 @@ mod tests {
     #[sqlx::test]
     #[test_log::test]
     async fn test_create_inference_endpoint_as_non_admin_forbidden(pool: PgPool) {
-        let (app, _) = create_test_app(pool.clone(), false).await;
+        let (app, _bg_services) = create_test_app(pool.clone(), false).await;
         let user = create_test_user(&pool, Role::StandardUser).await;
 
         let create_request = json!({
@@ -1005,7 +1019,7 @@ mod tests {
     #[sqlx::test]
     #[test_log::test]
     async fn test_delete_inference_endpoint_as_admin(pool: PgPool) {
-        let (app, _) = create_test_app(pool.clone(), false).await;
+        let (app, _bg_services) = create_test_app(pool.clone(), false).await;
         let admin_user = create_test_admin_user(&pool, Role::PlatformManager).await;
 
         // First create an endpoint to delete
@@ -1043,7 +1057,7 @@ mod tests {
     #[sqlx::test]
     #[test_log::test]
     async fn test_delete_nonexistent_inference_endpoint(pool: PgPool) {
-        let (app, _) = create_test_app(pool.clone(), false).await;
+        let (app, _bg_services) = create_test_app(pool.clone(), false).await;
         let admin_user = create_test_admin_user(&pool, Role::PlatformManager).await;
         let fake_endpoint_id = uuid::Uuid::new_v4();
 
@@ -1058,7 +1072,7 @@ mod tests {
     #[sqlx::test]
     #[test_log::test]
     async fn test_delete_inference_endpoint_as_non_admin_forbidden(pool: PgPool) {
-        let (app, _) = create_test_app(pool.clone(), false).await;
+        let (app, _bg_services) = create_test_app(pool.clone(), false).await;
         let user = create_test_user(&pool, Role::StandardUser).await;
         let admin_user = create_test_admin_user(&pool, Role::PlatformManager).await;
 
@@ -1097,7 +1111,7 @@ mod tests {
     #[sqlx::test]
     #[test_log::test]
     async fn test_synchronize_endpoint_as_admin(pool: PgPool) {
-        let (app, _) = create_test_app(pool.clone(), false).await;
+        let (app, _bg_services) = create_test_app(pool.clone(), false).await;
         let admin_user = create_test_admin_user(&pool, Role::PlatformManager).await;
         let test_endpoint_id = get_test_endpoint_id(&app, &admin_user).await;
 
@@ -1116,7 +1130,7 @@ mod tests {
     #[sqlx::test]
     #[test_log::test]
     async fn test_synchronize_nonexistent_endpoint(pool: PgPool) {
-        let (app, _) = create_test_app(pool.clone(), false).await;
+        let (app, _bg_services) = create_test_app(pool.clone(), false).await;
         let admin_user = create_test_admin_user(&pool, Role::PlatformManager).await;
         let fake_endpoint_id = uuid::Uuid::new_v4();
 
@@ -1132,7 +1146,7 @@ mod tests {
     #[sqlx::test]
     #[test_log::test]
     async fn test_synchronize_endpoint_as_non_admin_forbidden(pool: PgPool) {
-        let (app, _) = create_test_app(pool.clone(), false).await;
+        let (app, _bg_services) = create_test_app(pool.clone(), false).await;
         let user = create_test_user(&pool, Role::StandardUser).await;
         let test_endpoint_id = get_test_endpoint_id(&app, &user).await;
 
@@ -1147,7 +1161,7 @@ mod tests {
     #[sqlx::test]
     #[test_log::test]
     async fn test_standard_user_can_read_endpoints_only(pool: PgPool) {
-        let (app, _) = create_test_app(pool.clone(), false).await;
+        let (app, _bg_services) = create_test_app(pool.clone(), false).await;
         let standard_user = create_test_user(&pool, Role::StandardUser).await;
 
         // StandardUser should be able to list endpoints (has ReadAll for Endpoints)
@@ -1225,7 +1239,7 @@ mod tests {
     #[sqlx::test]
     #[test_log::test]
     async fn test_request_viewer_can_read_endpoints_only(pool: PgPool) {
-        let (app, _) = create_test_app(pool.clone(), false).await;
+        let (app, _bg_services) = create_test_app(pool.clone(), false).await;
         let request_viewer = create_test_user(&pool, Role::RequestViewer).await;
 
         // RequestViewer should NOT be able to list endpoints (no Endpoints permissions)
@@ -1279,7 +1293,7 @@ mod tests {
     #[sqlx::test]
     #[test_log::test]
     async fn test_multi_role_user_endpoint_permissions(pool: PgPool) {
-        let (app, _) = create_test_app(pool.clone(), false).await;
+        let (app, _bg_services) = create_test_app(pool.clone(), false).await;
 
         // User with StandardUser + RequestViewer should be able to read endpoints (from StandardUser)
         let multi_role_user = create_test_user_with_roles(&pool, vec![Role::StandardUser, Role::RequestViewer]).await;
@@ -1363,7 +1377,7 @@ mod tests {
     #[sqlx::test]
     #[test_log::test]
     async fn test_endpoint_crud_permission_isolation(pool: PgPool) {
-        let (app, _) = create_test_app(pool.clone(), false).await;
+        let (app, _bg_services) = create_test_app(pool.clone(), false).await;
         let platform_manager1 = create_test_admin_user(&pool, Role::PlatformManager).await;
         let platform_manager2 = create_test_admin_user(&pool, Role::PlatformManager).await;
         let standard_user = create_test_user(&pool, Role::StandardUser).await;
@@ -1425,7 +1439,7 @@ mod tests {
     #[sqlx::test]
     #[test_log::test]
     async fn test_validation_permission_requirements(pool: PgPool) {
-        let (app, _) = create_test_app(pool.clone(), false).await;
+        let (app, _bg_services) = create_test_app(pool.clone(), false).await;
         let platform_manager = create_test_admin_user(&pool, Role::PlatformManager).await;
         let standard_user = create_test_user(&pool, Role::StandardUser).await;
         let request_viewer = create_test_user(&pool, Role::RequestViewer).await;
@@ -1508,7 +1522,7 @@ mod tests {
     #[sqlx::test]
     #[test_log::test]
     async fn test_synchronization_permission_requirements(pool: PgPool) {
-        let (app, _) = create_test_app(pool.clone(), false).await;
+        let (app, _bg_services) = create_test_app(pool.clone(), false).await;
         let platform_manager = create_test_admin_user(&pool, Role::PlatformManager).await;
         let standard_user = create_test_user(&pool, Role::StandardUser).await;
         let request_viewer = create_test_user(&pool, Role::RequestViewer).await;
@@ -1552,7 +1566,7 @@ mod tests {
     #[sqlx::test]
     #[test_log::test]
     async fn test_standard_user_endpoint_access(pool: PgPool) {
-        let (app, _) = create_test_app(pool.clone(), false).await;
+        let (app, _bg_services) = create_test_app(pool.clone(), false).await;
         let standard_user = create_test_user(&pool, Role::StandardUser).await;
 
         // Standard user should be able to read endpoints
@@ -1578,7 +1592,7 @@ mod tests {
     #[sqlx::test]
     #[test_log::test]
     async fn test_request_viewer_endpoint_access(pool: PgPool) {
-        let (app, _) = create_test_app(pool.clone(), false).await;
+        let (app, _bg_services) = create_test_app(pool.clone(), false).await;
         let request_viewer = create_test_user(&pool, Role::RequestViewer).await;
 
         // Request viewer should NOT be able to read endpoints
@@ -1604,7 +1618,7 @@ mod tests {
     #[sqlx::test]
     #[test_log::test]
     async fn test_multi_role_user_endpoint_access(pool: PgPool) {
-        let (app, _) = create_test_app(pool.clone(), false).await;
+        let (app, _bg_services) = create_test_app(pool.clone(), false).await;
         let multi_role_user = create_test_user_with_roles(&pool, vec![Role::StandardUser, Role::RequestViewer]).await;
 
         // Multi-role user should be able to read (StandardUser permission)
@@ -1630,7 +1644,7 @@ mod tests {
     #[sqlx::test]
     #[test_log::test]
     async fn test_platform_manager_endpoint_access(pool: PgPool) {
-        let (app, _) = create_test_app(pool.clone(), false).await;
+        let (app, _bg_services) = create_test_app(pool.clone(), false).await;
         let platform_user = create_test_user_with_roles(&pool, vec![Role::PlatformManager, Role::StandardUser]).await;
 
         // Platform user should be able to read
@@ -1666,7 +1680,7 @@ mod tests {
     #[sqlx::test]
     #[test_log::test]
     async fn test_create_endpoint_with_unique_aliases(pool: PgPool) {
-        let (app, _) = create_test_app(pool.clone(), false).await;
+        let (app, _bg_services) = create_test_app(pool.clone(), false).await;
         let admin_user = create_test_admin_user(&pool, Role::PlatformManager).await;
 
         let create_request = json!({
@@ -1693,7 +1707,7 @@ mod tests {
     #[sqlx::test]
     #[test_log::test]
     async fn test_create_endpoint_with_duplicate_alias_conflict(pool: PgPool) {
-        let (app, _) = create_test_app(pool.clone(), false).await;
+        let (app, _bg_services) = create_test_app(pool.clone(), false).await;
         let admin_user = create_test_admin_user(&pool, Role::PlatformManager).await;
 
         // First endpoint with alias "shared-alias"
@@ -1734,7 +1748,7 @@ mod tests {
     #[sqlx::test]
     #[test_log::test]
     async fn test_update_endpoint_with_alias_conflict(pool: PgPool) {
-        let (app, _) = create_test_app(pool.clone(), false).await;
+        let (app, _bg_services) = create_test_app(pool.clone(), false).await;
         let admin_user = create_test_admin_user(&pool, Role::PlatformManager).await;
 
         // Create two endpoints with unique aliases
@@ -1783,7 +1797,7 @@ mod tests {
     #[sqlx::test]
     #[test_log::test]
     async fn test_update_endpoint_with_unique_aliases(pool: PgPool) {
-        let (app, _) = create_test_app(pool.clone(), false).await;
+        let (app, _bg_services) = create_test_app(pool.clone(), false).await;
         let admin_user = create_test_admin_user(&pool, Role::PlatformManager).await;
 
         // Create endpoint with one alias
@@ -1818,7 +1832,7 @@ mod tests {
     #[sqlx::test]
     #[test_log::test]
     async fn test_alias_uniqueness_is_global(pool: PgPool) {
-        let (app, _) = create_test_app(pool.clone(), false).await;
+        let (app, _bg_services) = create_test_app(pool.clone(), false).await;
         let admin_user = create_test_admin_user(&pool, Role::PlatformManager).await;
 
         // Create endpoint with alias "global-alias"
@@ -1853,7 +1867,7 @@ mod tests {
     #[sqlx::test]
     #[test_log::test]
     async fn test_alias_can_match_model_name_if_unique(pool: PgPool) {
-        let (app, _) = create_test_app(pool.clone(), false).await;
+        let (app, _bg_services) = create_test_app(pool.clone(), false).await;
         let admin_user = create_test_admin_user(&pool, Role::PlatformManager).await;
 
         // Alias matches model name, but is unique
@@ -1874,7 +1888,7 @@ mod tests {
     #[sqlx::test]
     #[test_log::test]
     async fn test_alias_update_noop_is_ok(pool: PgPool) {
-        let (app, _) = create_test_app(pool.clone(), false).await;
+        let (app, _bg_services) = create_test_app(pool.clone(), false).await;
         let admin_user = create_test_admin_user(&pool, Role::PlatformManager).await;
 
         // Create endpoint with alias
@@ -1907,7 +1921,7 @@ mod tests {
     #[sqlx::test]
     #[test_log::test]
     async fn test_multiple_same_model_different_endpoints_unique_aliases(pool: PgPool) {
-        let (app, _) = create_test_app(pool.clone(), false).await;
+        let (app, _bg_services) = create_test_app(pool.clone(), false).await;
         let admin_user = create_test_admin_user(&pool, Role::PlatformManager).await;
 
         // Endpoint 1 with gemma model, alias "alias-1"
@@ -1948,7 +1962,7 @@ mod tests {
     #[sqlx::test]
     #[test_log::test]
     async fn test_default_alias_conflict_when_no_alias_mapping(pool: PgPool) {
-        let (app, _) = create_test_app(pool.clone(), false).await;
+        let (app, _bg_services) = create_test_app(pool.clone(), false).await;
         let admin_user = create_test_admin_user(&pool, Role::PlatformManager).await;
 
         // First endpoint with gemma model, default alias (model name)
@@ -1985,7 +1999,7 @@ mod tests {
     #[sqlx::test]
     #[test_log::test]
     async fn test_endpoint_name_conflict_bounces_before_alias_conflict(pool: PgPool) {
-        let (app, _) = create_test_app(pool.clone(), false).await;
+        let (app, _bg_services) = create_test_app(pool.clone(), false).await;
         let admin_user = create_test_admin_user(&pool, Role::PlatformManager).await;
 
         // First endpoint with name "Endpoint X"
@@ -2026,7 +2040,7 @@ mod tests {
     #[sqlx::test]
     #[test_log::test]
     async fn test_create_endpoint_no_alias_mapping_defaults_to_model_name(pool: PgPool) {
-        let (app, _) = create_test_app(pool.clone(), false).await;
+        let (app, _bg_services) = create_test_app(pool.clone(), false).await;
         let admin_user = create_test_admin_user(&pool, Role::PlatformManager).await;
 
         let create_request = json!({

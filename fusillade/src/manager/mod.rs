@@ -228,7 +228,10 @@ pub trait DaemonExecutor<H: HttpClient>: Storage + Send + Sync {
     /// // Shutdown gracefully (implementation-specific)
     /// handle.abort();
     /// ```
-    fn run(self: Arc<Self>) -> Result<JoinHandle<Result<()>>>;
+    fn run(
+        self: Arc<Self>,
+        shutdown_token: tokio_util::sync::CancellationToken,
+    ) -> Result<JoinHandle<Result<()>>>;
 
     // File and Batch Management methods are inherited from the Storage trait
 }
