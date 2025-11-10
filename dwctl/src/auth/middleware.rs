@@ -103,8 +103,7 @@ pub(crate) async fn admin_ai_proxy(state: AppState, mut request: Request) -> Res
     let headers = request.headers_mut();
     headers.insert(
         "authorization",
-        HeaderValue::from_str(&format!("Bearer {}", user_api_key))
-            .with_context(|| "Failed to create authorization header value")?,
+        HeaderValue::from_str(&format!("Bearer {}", user_api_key)).with_context(|| "Failed to create authorization header value")?,
     );
 
     // Restore the body to the request

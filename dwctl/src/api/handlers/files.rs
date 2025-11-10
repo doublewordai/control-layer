@@ -8,10 +8,7 @@
 use crate::api::models::files::{FileDeleteResponse, FileListResponse, FileResponse, ListFilesQuery, ListObject, ObjectType, Purpose};
 use crate::auth::permissions::{can_read_all_resources, has_permission, operation, resource, RequiresPermission};
 
-use crate::db::{
-    handlers::api_keys::ApiKeys,
-    models::api_keys::ApiKeyPurpose,
-};
+use crate::db::{handlers::api_keys::ApiKeys, models::api_keys::ApiKeyPurpose};
 use crate::errors::{Error, Result};
 use crate::types::{Operation, Resource};
 use crate::AppState;
