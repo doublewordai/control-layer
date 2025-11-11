@@ -967,10 +967,10 @@ mod test {
             }))
             .await;
 
-        // Should be forbidden since user has no group membership
+        // Should be not found since onwards returns 404 for no access
         assert_eq!(
             no_access_response.status_code().as_u16(),
-            403,
+            404,
             "Admin proxy should reject user with no model access"
         );
 
@@ -1000,10 +1000,10 @@ mod test {
             }))
             .await;
 
-        // Should be forbidden since user doesn't exist
+        // With auto_create_users, user is created but has no access, onwards returns 404
         assert_eq!(
             nonexistent_user_response.status_code().as_u16(),
-            403,
+            404,
             "Admin proxy should reject non-existent user"
         );
 
@@ -1017,10 +1017,10 @@ mod test {
             }))
             .await;
 
-        // Should be not found since model doesn't exist
+        // Should be not found since onwards returns 404 for nonexistent models
         assert_eq!(
             nonexistent_model_response.status_code().as_u16(),
-            403,
+            404,
             "Admin proxy should reject non-existent model"
         );
 
