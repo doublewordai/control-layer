@@ -90,8 +90,12 @@ const Playground: React.FC = () => {
 
   const openai = new OpenAI({
     baseURL,
-    apiKey: "placeholder", // This should be handled by your auth system
+    apiKey: "", // SDK requires this but we override the header below
     dangerouslyAllowBrowser: true,
+    defaultHeaders: {
+      // Remove Authorization header so proxy can transform session cookies
+      Authorization: null as any,
+    },
   });
 
   // Convert models data to array and handle URL model selection
