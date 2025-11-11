@@ -190,9 +190,6 @@ enable_request_logging: true # Enable request/response logging to database
 # Batches can be sent containing requests to any model configured in the
 # control layer, and they'll be executed asynchronously over the course of 24
 # hours.
-# NOTE: this is in an alpha state. Users with the BatchAPIUser role can create
-# batches that send to any model source configured in the control layer -
-# regardless of their configured access.
 batches:
   # Enable batches API endpoints (/files, /batches)
   # These are mounted with the /admin endpoints - so can only be accessed via

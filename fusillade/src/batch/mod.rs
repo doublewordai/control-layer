@@ -303,6 +303,12 @@ pub struct FileFilter {
     pub status: Option<String>,
     /// Filter by purpose
     pub purpose: Option<String>,
+    /// Cursor for pagination (file ID to start after)
+    pub after: Option<FileId>,
+    /// Maximum number of results to return
+    pub limit: Option<usize>,
+    /// Sort order (true = ascending, false = descending)
+    pub ascending: bool,
 }
 
 /// Items that can be yielded from a file upload stream

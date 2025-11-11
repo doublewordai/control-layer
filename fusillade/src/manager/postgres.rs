@@ -907,56 +907,95 @@ impl<H: HttpClient + 'static> Storage for PostgresRequestManager<H> {
         Ok(file)
     }
 
-    #[tracing::instrument(skip(self, filter), fields(uploaded_by = ?filter.uploaded_by, status = ?filter.status, purpose = ?filter.purpose))]
+    #[tracing::instrument(skip(self, filter), fields(uploaded_by = ?filter.uploaded_by, status = ?filter.status, purpose = ?filter.purpose, after = ?filter.after, limit = ?filter.limit))]
     async fn list_files(&self, filter: crate::batch::FileFilter) -> Result<Vec<File>> {
-        // Build WHERE clause based on filter
-        let mut where_clauses = Vec::new();
-        let mut params: Vec<Option<&str>> = Vec::new();
+        use sqlx::QueryBuilder;
 
-        if filter.uploaded_by.is_some() {
-            where_clauses.push(format!("uploaded_by = ${}", params.len() + 1));
-            params.push(filter.uploaded_by.as_deref());
-        }
-
-        if filter.status.is_some() {
-            where_clauses.push(format!("status = ${}", params.len() + 1));
-            params.push(filter.status.as_deref());
-        }
-
-        if filter.purpose.is_some() {
-            where_clauses.push(format!("purpose = ${}", params.len() + 1));
-            params.push(filter.purpose.as_deref());
-        }
-
-        let where_clause = if where_clauses.is_empty() {
-            String::new()
+        // Get cursor timestamp if needed
+        let after_created_at = if let Some(after_id) = &filter.after {
+            sqlx::query!(
+                r#"SELECT created_at FROM files WHERE id = $1"#,
+                **after_id as Uuid
+            )
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(|e| FusilladeError::Other(anyhow!("Failed to fetch after cursor: {}", e)))?
+            .map(|row| row.created_at)
         } else {
-            format!("WHERE {}", where_clauses.join(" AND "))
+            None
         };
 
-        let query = format!(
-            r#"
-            SELECT id, name, description, size_bytes, status, error_message, purpose, expires_at, deleted_at, uploaded_by, created_at, updated_at
-            FROM files
-            {}
-            ORDER BY created_at DESC
-            "#,
-            where_clause
+        let mut query_builder = QueryBuilder::new(
+            "SELECT id, name, description, size_bytes, status, error_message, purpose, expires_at, deleted_at, uploaded_by, created_at, updated_at FROM files"
         );
 
-        let mut query_builder = sqlx::query(&query);
+        // Build WHERE clause
+        let mut has_where = false;
 
-        if let Some(uploaded_by) = filter.uploaded_by {
-            query_builder = query_builder.bind(uploaded_by);
+        if let Some(uploaded_by) = &filter.uploaded_by {
+            query_builder.push(" WHERE uploaded_by = ");
+            query_builder.push_bind(uploaded_by);
+            has_where = true;
         }
-        if let Some(status) = filter.status {
-            query_builder = query_builder.bind(status);
+
+        if let Some(status) = &filter.status {
+            if has_where {
+                query_builder.push(" AND status = ");
+            } else {
+                query_builder.push(" WHERE status = ");
+                has_where = true;
+            }
+            query_builder.push_bind(status);
         }
-        if let Some(purpose) = filter.purpose {
-            query_builder = query_builder.bind(purpose);
+
+        if let Some(purpose) = &filter.purpose {
+            if has_where {
+                query_builder.push(" AND purpose = ");
+            } else {
+                query_builder.push(" WHERE purpose = ");
+                has_where = true;
+            }
+            query_builder.push_bind(purpose);
+        }
+
+        // Add cursor-based pagination
+        if let (Some(after_id), Some(after_ts)) = (&filter.after, after_created_at) {
+            let comparison = if filter.ascending { ">" } else { "<" };
+
+            if has_where {
+                query_builder.push(" AND ");
+            } else {
+                query_builder.push(" WHERE ");
+            }
+
+            query_builder.push("(created_at ");
+            query_builder.push(comparison);
+            query_builder.push(" ");
+            query_builder.push_bind(after_ts);
+            query_builder.push(" OR (created_at = ");
+            query_builder.push_bind(after_ts);
+            query_builder.push(" AND id ");
+            query_builder.push(comparison);
+            query_builder.push(" ");
+            query_builder.push_bind(**after_id as Uuid);
+            query_builder.push("))");
+        }
+
+        // Add ORDER BY
+        let order_direction = if filter.ascending { "ASC" } else { "DESC" };
+        query_builder.push(" ORDER BY created_at ");
+        query_builder.push(order_direction);
+        query_builder.push(", id ");
+        query_builder.push(order_direction);
+
+        // Add LIMIT
+        if let Some(limit) = filter.limit {
+            query_builder.push(" LIMIT ");
+            query_builder.push_bind(limit as i64);
         }
 
         let rows = query_builder
+            .build()
             .fetch_all(&self.pool)
             .await
             .map_err(|e| FusilladeError::Other(anyhow!("Failed to list files: {}", e)))?;
@@ -1070,9 +1109,11 @@ impl<H: HttpClient + 'static> Storage for PostgresRequestManager<H> {
     fn get_file_content_stream(
         &self,
         file_id: FileId,
+        offset: usize,
     ) -> Pin<Box<dyn Stream<Item = Result<FileContentItem>> + Send>> {
         let pool = self.pool.clone();
         let (tx, rx) = mpsc::channel(self.download_buffer_size);
+        let offset = offset as i64;
 
         tokio::spawn(async move {
             // First, get the file to determine its purpose
@@ -1103,14 +1144,14 @@ impl<H: HttpClient + 'static> Storage for PostgresRequestManager<H> {
             // Route to appropriate streaming logic based on purpose
             match purpose.as_deref() {
                 Some("batch_output") => {
-                    Self::stream_batch_output(pool, file_id, tx).await;
+                    Self::stream_batch_output(pool, file_id, offset, tx).await;
                 }
                 Some("batch_error") => {
-                    Self::stream_batch_error(pool, file_id, tx).await;
+                    Self::stream_batch_error(pool, file_id, offset, tx).await;
                 }
                 _ => {
                     // Regular file or purpose='batch': stream request templates
-                    Self::stream_request_templates(pool, file_id, tx).await;
+                    Self::stream_request_templates(pool, file_id, offset, tx).await;
                 }
             }
         });
@@ -1929,22 +1970,34 @@ impl<H: HttpClient + 'static> PostgresRequestManager<H> {
     async fn stream_request_templates(
         pool: sqlx::PgPool,
         file_id: FileId,
+        offset: i64,
         tx: mpsc::Sender<Result<FileContentItem>>,
     ) {
         const BATCH_SIZE: i64 = 1000;
         let mut last_line_number: i32 = -1;
+        let mut is_first_batch = true;
 
         loop {
+            // Use OFFSET only on first batch, then use cursor pagination
+            let (line_filter, offset_val) = if is_first_batch {
+                (-1i32, offset)
+            } else {
+                (last_line_number, 0i64)
+            };
+            is_first_batch = false;
+
             let template_batch = sqlx::query!(
                 r#"
                 SELECT custom_id, endpoint, method, path, body, model, api_key, line_number
                 FROM request_templates
-                WHERE file_id = $1 AND line_number > $2
+                WHERE file_id = $1 AND ($2 = -1 OR line_number > $2)
                 ORDER BY line_number ASC
-                LIMIT $3
+                OFFSET $3
+                LIMIT $4
                 "#,
                 *file_id as Uuid,
-                last_line_number,
+                line_filter,
+                offset_val,
                 BATCH_SIZE,
             )
             .fetch_all(&pool)
@@ -2001,6 +2054,7 @@ impl<H: HttpClient + 'static> PostgresRequestManager<H> {
     async fn stream_batch_output(
         pool: sqlx::PgPool,
         file_id: FileId,
+        offset: i64,
         tx: mpsc::Sender<Result<FileContentItem>>,
     ) {
         // First, find the batch that owns this output file
@@ -2033,8 +2087,17 @@ impl<H: HttpClient + 'static> PostgresRequestManager<H> {
         const BATCH_SIZE: i64 = 1000;
         let mut last_completed_at: Option<chrono::DateTime<chrono::Utc>> = None;
         let mut last_id: Uuid = Uuid::nil();
+        let mut is_first_batch = true;
 
         loop {
+            // Use OFFSET only on first batch, then use cursor pagination
+            let (cursor_time, cursor_id, offset_val) = if is_first_batch {
+                (None, Uuid::nil(), offset)
+            } else {
+                (last_completed_at, last_id, 0i64)
+            };
+            is_first_batch = false;
+
             let request_batch = sqlx::query!(
                 r#"
                 SELECT id, custom_id, response_status, response_body, completed_at
@@ -2043,11 +2106,13 @@ impl<H: HttpClient + 'static> PostgresRequestManager<H> {
                   AND state = 'completed'
                   AND ($2::TIMESTAMPTZ IS NULL OR completed_at > $2 OR (completed_at = $2 AND id > $3))
                 ORDER BY completed_at ASC, id ASC
-                LIMIT $4
+                OFFSET $4
+                LIMIT $5
                 "#,
                 batch_id,
-                last_completed_at,
-                last_id,
+                cursor_time,
+                cursor_id,
+                offset_val,
                 BATCH_SIZE,
             )
             .fetch_all(&pool)
@@ -2113,6 +2178,7 @@ impl<H: HttpClient + 'static> PostgresRequestManager<H> {
     async fn stream_batch_error(
         pool: sqlx::PgPool,
         file_id: FileId,
+        offset: i64,
         tx: mpsc::Sender<Result<FileContentItem>>,
     ) {
         // First, find the batch that owns this error file
@@ -2145,8 +2211,17 @@ impl<H: HttpClient + 'static> PostgresRequestManager<H> {
         const BATCH_SIZE: i64 = 1000;
         let mut last_failed_at: Option<chrono::DateTime<chrono::Utc>> = None;
         let mut last_id: Uuid = Uuid::nil();
+        let mut is_first_batch = true;
 
         loop {
+            // Use OFFSET only on first batch, then use cursor pagination
+            let (cursor_time, cursor_id, offset_val) = if is_first_batch {
+                (None, Uuid::nil(), offset)
+            } else {
+                (last_failed_at, last_id, 0i64)
+            };
+            is_first_batch = false;
+
             let request_batch = sqlx::query!(
                 r#"
                 SELECT id, custom_id, error, failed_at
@@ -2155,11 +2230,13 @@ impl<H: HttpClient + 'static> PostgresRequestManager<H> {
                   AND state = 'failed'
                   AND ($2::TIMESTAMPTZ IS NULL OR failed_at > $2 OR (failed_at = $2 AND id > $3))
                 ORDER BY failed_at ASC, id ASC
-                LIMIT $4
+                OFFSET $4
+                LIMIT $5
                 "#,
                 batch_id,
-                last_failed_at,
-                last_id,
+                cursor_time,
+                cursor_id,
+                offset_val,
                 BATCH_SIZE,
             )
             .fetch_all(&pool)
@@ -3237,7 +3314,7 @@ mod tests {
         .expect("Failed to mark request as failed");
 
         // Stream the output file - should contain 2 completed requests
-        let output_stream = manager.get_file_content_stream(output_file_id);
+        let output_stream = manager.get_file_content_stream(output_file_id, 0);
         let output_items: Vec<_> = output_stream.collect().await;
 
         assert_eq!(output_items.len(), 2, "Should have 2 output items");
@@ -3271,7 +3348,7 @@ mod tests {
         );
 
         // Stream the error file - should contain 1 failed request
-        let error_stream = manager.get_file_content_stream(error_file_id);
+        let error_stream = manager.get_file_content_stream(error_file_id, 0);
         let error_items: Vec<_> = error_stream.collect().await;
 
         assert_eq!(error_items.len(), 1, "Should have 1 error item");
@@ -3291,7 +3368,7 @@ mod tests {
         }
 
         // Verify that streaming a regular input file still works
-        let input_stream = manager.get_file_content_stream(file_id);
+        let input_stream = manager.get_file_content_stream(file_id, 0);
         let input_items: Vec<_> = input_stream.collect().await;
 
         assert_eq!(input_items.len(), 3, "Input file should have 3 templates");

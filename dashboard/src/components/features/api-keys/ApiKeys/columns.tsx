@@ -186,7 +186,9 @@ export const createColumns = (actions: ColumnActions): ColumnDef<ApiKey>[] => {
 
   // Filter out the purpose column if user is not a platform manager
   if (!actions.isPlatformManager) {
-    return allColumns.filter((col) => !("accessorKey" in col) || col.accessorKey !== "purpose");
+    return allColumns.filter(
+      (col) => !("accessorKey" in col) || col.accessorKey !== "purpose",
+    );
   }
 
   return allColumns;

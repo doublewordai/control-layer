@@ -94,7 +94,7 @@ enable_request_logging: true # Enable request/response logging to database
 batches:
   # Enable batches API endpoints (/files, /batches)
   # When disabled, these endpoints will not be available (default: false)
-  enabled: false
+  enabled: true
 
   # Daemon configuration for processing batch requests
   daemon:

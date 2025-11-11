@@ -328,6 +328,7 @@ export function Requests() {
                 showPagination={requests.length > 10}
                 showColumnToggle={true}
                 pageSize={10}
+                rowHeight="40px"
                 initialColumnVisibility={{ timestamp: false }}
                 headerActions={
                   <Select

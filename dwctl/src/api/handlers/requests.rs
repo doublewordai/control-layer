@@ -100,8 +100,7 @@ fn convert_outlet_pairs_to_api(outlet_pairs: Vec<outlet_postgres::RequestRespons
 /// List HTTP requests with filtering and pagination
 ///
 /// Returns a paginated list of HTTP requests logged by the system, with optional filtering
-/// by user, endpoint type, time range, and other criteria. Only requests to AI endpoints
-/// (/ai/* paths) are included.
+/// by user, endpoint type, time range, and other criteria.
 #[utoipa::path(
     get,
     path = "/admin/api/v1/requests",
@@ -135,9 +134,9 @@ pub async fn list_requests(
 
     let repository: RequestRepository<AiRequest, AiResponse> = RequestRepository::new(outlet_pool.clone());
 
-    // Build filter for outlet-postgres - always filter to /ai/ paths only
+    // Build filter for outlet-postgres
     let mut filter = RequestFilter {
-        uri_pattern: Some("/ai/%".to_string()), // Only AI endpoint requests
+        uri_pattern: None,
         limit: Some(limit),
         offset: Some(offset),
         order_by_timestamp_desc: query.order_desc.unwrap_or(true),
@@ -179,8 +178,7 @@ pub async fn list_requests(
 
     // Additional URI pattern filtering if requested
     if let Some(uri_pattern) = &query.uri_pattern {
-        // Combine with /ai/ filter - must match both patterns
-        filter.uri_pattern = Some(format!("/ai/{uri_pattern}"));
+        filter.uri_pattern = Some(uri_pattern.clone());
     }
 
     // Query the outlet-postgres repository
