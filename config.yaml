@@ -83,7 +83,7 @@ credits:
   # Initial credits given to standard users when they are created
   # Set to 0 to disable initial credits (users start with no credits)
   # Example: 100.00 gives users 100 credits on registration
-  # initial_credits_for_standard_users: 0
+  initial_credits_for_standard_users: 0
 
 # Optional feature toggles
 enable_metrics: true # Enable Prometheus metrics endpoint
