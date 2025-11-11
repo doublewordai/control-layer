@@ -231,6 +231,15 @@ batches:
     download_buffer_size: 100 # Buffer size for file download streams
 ```
 
+### Initial Credit Grant
+
+The Control Layer has a credit system which allows you to assign budgets to users and prices to models. You can set the initial grant given to standard users in `config.yaml`:
+
+```yaml
+credits:
+  initial_credits_for_standard_users: 50
+```
+
 ## Production Checklist
 
 1. Setup a production-grade Postgres database, and point Control Layer to it via the

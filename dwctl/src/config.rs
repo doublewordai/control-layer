@@ -10,6 +10,12 @@ use url::Url;
 
 use crate::errors::Error;
 
+// DB sync channel name
+pub static ONWARDS_CONFIG_CHANGED_CHANNEL: &str = "auth_config_changed";
+// Header names for onwards pricing information
+pub static ONWARDS_INPUT_TOKEN_PRICE_HEADER: &str = "onwards-input-price-per-token";
+pub static ONWARDS_OUTPUT_TOKEN_PRICE_HEADER: &str = "onwards-output-price-per-token";
+
 /// Simple CLI args - just for specifying config file
 #[derive(Parser, Debug)]
 #[command(author, version, about, long_about = None)]
@@ -49,6 +55,8 @@ pub struct Config {
     pub enable_request_logging: bool,
     // OpenTelemetry OTLP export configuration
     pub enable_otel_export: bool,
+    // Initial credits configuration
+    pub credits: CreditsConfig,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -407,6 +415,22 @@ where
     Url::parse(&s).map_err(serde::de::Error::custom)
 }
 
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(default)]
+pub struct CreditsConfig {
+    /// Initial credits given to standard users when they are created
+    pub initial_credits_for_standard_users: rust_decimal::Decimal,
+}
+
+impl Default for CreditsConfig {
+    fn default() -> Self {
+        Self {
+            // Default to 0 credits (no credits given on creation)
+            initial_credits_for_standard_users: rust_decimal::Decimal::ZERO,
+        }
+    }
+}
+
 impl Default for Config {
     fn default() -> Self {
         Self {
@@ -425,6 +449,7 @@ impl Default for Config {
             enable_metrics: true,
             enable_request_logging: true,
             enable_otel_export: false,
+            credits: CreditsConfig::default(),
         }
     }
 }
