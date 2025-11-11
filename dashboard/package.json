@@ -91,5 +91,10 @@
     "workerDirectory": [
       "public"
     ]
+  },
+  "overrides": {
+    "vite": {
+      "rollup": "npm:@rollup/wasm-node"
+    }
   }
 }

@@ -2892,9 +2892,9 @@ dependencies = [
 
 [[package]]
 name = "outlet"
-version = "0.4.1"
+version = "0.4.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "980a1e9adbbfe60d8cc3bab0947b10c6710281a240a1c3d0d17a153be1b0d3f8"
+checksum = "b71c5ba1c445cf62752a81ac699c113109bbb4bfae9f7d01c30e664537ec59d9"
 dependencies = [
  "anyhow",
  "async-stream",
@@ -2917,9 +2917,9 @@ dependencies = [
 
 [[package]]
 name = "outlet-postgres"
-version = "0.4.2"
+version = "0.4.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a458117cad28e4cf9922e48ed8e9cd1ba7ce2635500c8b3bed1eb98351810839"
+checksum = "a3e8d6f18710fac9fb7ff38a6fa8f9b4c977841feafcfa6ab44bd49ce5e9aefc"
 dependencies = [
  "base64",
  "bytes",
