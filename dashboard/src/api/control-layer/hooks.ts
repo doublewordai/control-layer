@@ -17,6 +17,11 @@ import type {
   ListRequestsQuery,
   TransactionsQuery,
   CreateProbeRequest,
+  FilesListQuery,
+  BatchCreateRequest,
+  BatchesListQuery,
+  Batch,
+  FileUploadRequest,
   AddFundsRequest,
 } from "./types";
 
@@ -617,6 +622,206 @@ export function useUpdateProbe() {
       queryClient.invalidateQueries({ queryKey: ["probes"] });
       queryClient.invalidateQueries({ queryKey: ["probes", variables.id] });
       queryClient.invalidateQueries({ queryKey: queryKeys.models.all });
+    },
+  });
+}
+
+// ===== FILES HOOKS =====
+
+export function useFiles(options?: FilesListQuery) {
+  return useQuery({
+    queryKey: queryKeys.files.list(options || {}),
+    queryFn: () => dwctlApi.files.list(options),
+  });
+}
+
+export function useFile(id: string) {
+  return useQuery({
+    queryKey: queryKeys.files.detail(id),
+    queryFn: () => dwctlApi.files.get(id),
+    enabled: !!id,
+  });
+}
+
+// Deprecated: Use dwctlApi.files.getContent() with useQuery directly instead
+// export function useFileRequests(id: string, options?: FileRequestsListQuery) {
+//   return useQuery({
+//     queryKey: queryKeys.files.requestsList(id, options || {}),
+//     queryFn: () => dwctlApi.files.getContent(id, {limit: options?.limit, offset: options?.skip}),
+//     enabled: !!id,
+//   });
+// }
+
+export function useUploadFile() {
+  const queryClient = useQueryClient();
+
+  return useMutation({
+    mutationFn: (data: FileUploadRequest) => dwctlApi.files.upload(data),
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: queryKeys.files.lists() });
+    },
+  });
+}
+
+export function useDeleteFile() {
+  const queryClient = useQueryClient();
+
+  return useMutation({
+    mutationFn: (id: string) => dwctlApi.files.delete(id),
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: queryKeys.files.lists() });
+    },
+  });
+}
+
+// ===== BATCHES HOOKS =====
+
+export function useBatches(options?: BatchesListQuery) {
+  const queryClient = useQueryClient();
+
+  return useQuery({
+    queryKey: queryKeys.batches.list(options || {}),
+    queryFn: async () => {
+      const response = await dwctlApi.batches.list(options);
+
+      // Check if any batches just completed by comparing with cached data
+      const previousData = queryClient.getQueryData<{ data: Batch[] }>(
+        queryKeys.batches.list(options || {}),
+      );
+
+      if (previousData && response.data) {
+        const hasNewlyCompletedBatch = response.data.some((newBatch) => {
+          const oldBatch = previousData.data.find((b) => b.id === newBatch.id);
+          return (
+            oldBatch &&
+            ["validating", "in_progress", "finalizing"].includes(
+              oldBatch.status,
+            ) &&
+            ["completed", "failed", "expired", "cancelled"].includes(
+              newBatch.status,
+            )
+          );
+        });
+
+        // If a batch just completed, invalidate files to fetch new output/error files
+        if (hasNewlyCompletedBatch) {
+          queryClient.invalidateQueries({ queryKey: queryKeys.files.lists() });
+        }
+      }
+
+      return response;
+    },
+    refetchOnMount: "always",
+    refetchInterval: (query) => {
+      const batches = query.state.data?.data;
+      // Refetch every 2 seconds if any batch is in progress or cancelling
+      if (
+        batches &&
+        batches.some((batch: Batch) =>
+          ["validating", "in_progress", "finalizing", "cancelling"].includes(
+            batch.status,
+          ),
+        )
+      ) {
+        return 2000;
+      }
+      return false;
+    },
+  });
+}
+
+export function useBatch(id: string) {
+  return useQuery({
+    queryKey: queryKeys.batches.detail(id),
+    queryFn: () => dwctlApi.batches.get(id),
+    enabled: !!id,
+    refetchInterval: (query) => {
+      const batch = query.state.data as Batch | undefined;
+      // Refetch every 2 seconds if batch is in progress
+      if (
+        batch &&
+        ["validating", "in_progress", "finalizing", "cancelling"].includes(
+          batch.status,
+        )
+      ) {
+        return 2000;
+      }
+      return false;
+    },
+  });
+}
+
+// Deprecated: Batch request viewing disabled - would need to fetch/merge output and error files
+// export function useBatchRequests(
+//   id: string,
+//   options?: BatchRequestsListQuery,
+// ) {
+//   return useQuery({
+//     queryKey: queryKeys.batches.requestsList(id, options || {}),
+//     queryFn: () => dwctlApi.batches.getRequests(id, options),
+//     enabled: !!id,
+//     refetchInterval: (query) => {
+//       // Refetch requests periodically while batch is processing
+//       const parent = query.state.data as BatchRequestsListResponse | undefined;
+//       if (parent) {
+//         const hasInProgress = parent.data.some(
+//           (r) => r.status === "pending" || r.status === "in_progress",
+//         );
+//         if (hasInProgress) {
+//           return 3000; // Refetch every 3 seconds
+//         }
+//       }
+//       return false;
+//     },
+//   });
+// }
+
+export function useCreateBatch() {
+  const queryClient = useQueryClient();
+
+  return useMutation({
+    mutationFn: (data: BatchCreateRequest) => dwctlApi.batches.create(data),
+    onSuccess: async () => {
+      // Invalidate and refetch batches queries
+      await queryClient.invalidateQueries({
+        queryKey: queryKeys.batches.lists(),
+        refetchType: "all",
+      });
+      // Also refetch immediately
+      await queryClient.refetchQueries({
+        queryKey: queryKeys.batches.lists(),
+      });
+    },
+  });
+}
+
+export function useCancelBatch() {
+  const queryClient = useQueryClient();
+
+  return useMutation({
+    mutationFn: (id: string) => dwctlApi.batches.cancel(id),
+    onSuccess: (data) => {
+      queryClient.invalidateQueries({
+        queryKey: queryKeys.batches.detail(data.id),
+      });
+      queryClient.invalidateQueries({ queryKey: queryKeys.batches.lists() });
+    },
+  });
+}
+
+export function useDownloadBatchResults() {
+  return useMutation({
+    mutationFn: async (id: string) => {
+      const blob = await dwctlApi.batches.downloadResults(id);
+      // Create download link
+      const url = window.URL.createObjectURL(blob);
+      const a = document.createElement("a");
+      a.href = url;
+      a.download = `batch-${id}-results.jsonl`;
+      document.body.appendChild(a);
+      a.click();
+      window.URL.revokeObjectURL(url);
+      document.body.removeChild(a);
     },
   });
 }

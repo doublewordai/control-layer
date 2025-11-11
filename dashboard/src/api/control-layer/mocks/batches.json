@@ -1,0 +1,351 @@
+[
+  {
+    "id": "batch-demo-1",
+    "object": "batch",
+    "endpoint": "/v1/chat/completions",
+    "errors": null,
+    "input_file_id": "file-demo-1",
+    "completion_window": "24h",
+    "status": "completed",
+    "output_file_id": "file-output-1",
+    "error_file_id": null,
+    "created_at": 1730822400,
+    "in_progress_at": 1730824200,
+    "expires_at": 1731427200,
+    "finalizing_at": 1730865600,
+    "completed_at": 1730869200,
+    "failed_at": null,
+    "expired_at": null,
+    "cancelling_at": null,
+    "cancelled_at": null,
+    "request_counts": {
+      "total": 250,
+      "completed": 248,
+      "failed": 2
+    },
+    "metadata": {
+      "customer_id": "user_123",
+      "batch_description": "Daily evaluation batch"
+    },
+    "usage": {
+      "input_tokens": 125000,
+      "output_tokens": 89000,
+      "total_tokens": 214000
+    }
+  },
+  {
+    "id": "batch-demo-2",
+    "object": "batch",
+    "endpoint": "/v1/chat/completions",
+    "errors": null,
+    "input_file_id": "file-demo-2",
+    "completion_window": "24h",
+    "status": "in_progress",
+    "output_file_id": null,
+    "error_file_id": null,
+    "created_at": 1730901600,
+    "in_progress_at": 1730903400,
+    "expires_at": 1730980800,
+    "finalizing_at": null,
+    "completed_at": null,
+    "failed_at": null,
+    "expired_at": null,
+    "cancelling_at": null,
+    "cancelled_at": null,
+    "request_counts": {
+      "total": 150,
+      "completed": 87,
+      "failed": 1
+    },
+    "metadata": {
+      "batch_description": "Current processing batch"
+    }
+  },
+  {
+    "id": "batch-demo-3",
+    "object": "batch",
+    "endpoint": "/v1/chat/completions",
+    "errors": {
+      "object": "list",
+      "data": [
+        {
+          "code": "invalid_request",
+          "line": 42,
+          "message": "Invalid JSON format on line 42",
+          "param": "body"
+        }
+      ]
+    },
+    "input_file_id": "file-demo-3",
+    "completion_window": "24h",
+    "status": "failed",
+    "output_file_id": null,
+    "error_file_id": "file-error-3",
+    "created_at": 1730649600,
+    "in_progress_at": 1730651400,
+    "expires_at": null,
+    "finalizing_at": null,
+    "completed_at": null,
+    "failed_at": 1730653200,
+    "expired_at": null,
+    "cancelling_at": null,
+    "cancelled_at": null,
+    "request_counts": {
+      "total": 400,
+      "completed": 0,
+      "failed": 1
+    }
+  },
+  {
+    "id": "batch-demo-4",
+    "object": "batch",
+    "endpoint": "/v1/chat/completions",
+    "errors": null,
+    "input_file_id": "file-demo-4",
+    "completion_window": "24h",
+    "status": "completed",
+    "output_file_id": "file-output-4",
+    "error_file_id": null,
+    "created_at": 1730736000,
+    "in_progress_at": 1730737800,
+    "expires_at": 1731340800,
+    "finalizing_at": 1730779200,
+    "completed_at": 1730782800,
+    "failed_at": null,
+    "expired_at": null,
+    "cancelling_at": null,
+    "cancelled_at": null,
+    "request_counts": {
+      "total": 180,
+      "completed": 180,
+      "failed": 0
+    },
+    "metadata": {
+      "batch_description": "Training data processing"
+    }
+  },
+  {
+    "id": "batch-demo-5",
+    "object": "batch",
+    "endpoint": "/v1/chat/completions",
+    "errors": null,
+    "input_file_id": "file-demo-5",
+    "completion_window": "24h",
+    "status": "validating",
+    "output_file_id": null,
+    "error_file_id": null,
+    "created_at": 1730995200,
+    "in_progress_at": null,
+    "expires_at": 1731600000,
+    "finalizing_at": null,
+    "completed_at": null,
+    "failed_at": null,
+    "expired_at": null,
+    "cancelling_at": null,
+    "cancelled_at": null,
+    "request_counts": {
+      "total": 200,
+      "completed": 0,
+      "failed": 0
+    },
+    "metadata": {
+      "batch_description": "Sentiment analysis batch"
+    }
+  },
+  {
+    "id": "batch-demo-6",
+    "object": "batch",
+    "endpoint": "/v1/chat/completions",
+    "errors": null,
+    "input_file_id": "file-demo-6",
+    "completion_window": "24h",
+    "status": "in_progress",
+    "output_file_id": null,
+    "error_file_id": null,
+    "created_at": 1730908800,
+    "in_progress_at": 1730910600,
+    "expires_at": 1731513600,
+    "finalizing_at": null,
+    "completed_at": null,
+    "failed_at": null,
+    "expired_at": null,
+    "cancelling_at": null,
+    "cancelled_at": null,
+    "request_counts": {
+      "total": 500,
+      "completed": 234,
+      "failed": 3
+    },
+    "metadata": {
+      "batch_description": "Translation requests"
+    }
+  },
+  {
+    "id": "batch-demo-7",
+    "object": "batch",
+    "endpoint": "/v1/chat/completions",
+    "errors": null,
+    "input_file_id": "file-demo-7",
+    "completion_window": "24h",
+    "status": "completed",
+    "output_file_id": "file-output-7",
+    "error_file_id": null,
+    "created_at": 1730822400,
+    "in_progress_at": 1730824200,
+    "expires_at": 1731427200,
+    "finalizing_at": 1730865600,
+    "completed_at": 1730869200,
+    "failed_at": null,
+    "expired_at": null,
+    "cancelling_at": null,
+    "cancelled_at": null,
+    "request_counts": {
+      "total": 320,
+      "completed": 318,
+      "failed": 2
+    },
+    "metadata": {
+      "batch_description": "Summarization tasks"
+    }
+  },
+  {
+    "id": "batch-demo-8",
+    "object": "batch",
+    "endpoint": "/v1/chat/completions",
+    "errors": null,
+    "input_file_id": "file-demo-8",
+    "completion_window": "24h",
+    "status": "cancelled",
+    "output_file_id": null,
+    "error_file_id": null,
+    "created_at": 1730736000,
+    "in_progress_at": 1730737800,
+    "expires_at": null,
+    "finalizing_at": null,
+    "completed_at": null,
+    "failed_at": null,
+    "expired_at": null,
+    "cancelling_at": 1730740000,
+    "cancelled_at": 1730741800,
+    "request_counts": {
+      "total": 100,
+      "completed": 23,
+      "failed": 0
+    },
+    "metadata": {
+      "batch_description": "QA evaluation (cancelled)"
+    }
+  },
+  {
+    "id": "batch-demo-9",
+    "object": "batch",
+    "endpoint": "/v1/chat/completions",
+    "errors": null,
+    "input_file_id": "file-demo-9",
+    "completion_window": "24h",
+    "status": "finalizing",
+    "output_file_id": null,
+    "error_file_id": null,
+    "created_at": 1730995200,
+    "in_progress_at": 1730997000,
+    "expires_at": 1731600000,
+    "finalizing_at": 1731038400,
+    "completed_at": null,
+    "failed_at": null,
+    "expired_at": null,
+    "cancelling_at": null,
+    "cancelled_at": null,
+    "request_counts": {
+      "total": 275,
+      "completed": 275,
+      "failed": 0
+    },
+    "metadata": {
+      "batch_description": "Code generation tasks"
+    }
+  },
+  {
+    "id": "batch-demo-10",
+    "object": "batch",
+    "endpoint": "/v1/chat/completions",
+    "errors": null,
+    "input_file_id": "file-demo-10",
+    "completion_window": "24h",
+    "status": "completed",
+    "output_file_id": "file-output-10",
+    "error_file_id": null,
+    "created_at": 1730908800,
+    "in_progress_at": 1730910600,
+    "expires_at": 1731513600,
+    "finalizing_at": 1730952000,
+    "completed_at": 1730955600,
+    "failed_at": null,
+    "expired_at": null,
+    "cancelling_at": null,
+    "cancelled_at": null,
+    "request_counts": {
+      "total": 450,
+      "completed": 445,
+      "failed": 5
+    },
+    "metadata": {
+      "batch_description": "Content moderation"
+    }
+  },
+  {
+    "id": "batch-demo-11",
+    "object": "batch",
+    "endpoint": "/v1/chat/completions",
+    "errors": null,
+    "input_file_id": "file-demo-11",
+    "completion_window": "24h",
+    "status": "in_progress",
+    "output_file_id": null,
+    "error_file_id": null,
+    "created_at": 1730822400,
+    "in_progress_at": 1730824200,
+    "expires_at": 1731427200,
+    "finalizing_at": null,
+    "completed_at": null,
+    "failed_at": null,
+    "expired_at": null,
+    "cancelling_at": null,
+    "cancelled_at": null,
+    "request_counts": {
+      "total": 600,
+      "completed": 432,
+      "failed": 8
+    },
+    "metadata": {
+      "batch_description": "Classification tasks"
+    }
+  },
+  {
+    "id": "batch-demo-12",
+    "object": "batch",
+    "endpoint": "/v1/chat/completions",
+    "errors": null,
+    "input_file_id": "file-demo-12",
+    "completion_window": "24h",
+    "status": "completed",
+    "output_file_id": "file-output-12",
+    "error_file_id": null,
+    "created_at": 1730736000,
+    "in_progress_at": 1730737800,
+    "expires_at": 1731340800,
+    "finalizing_at": 1730779200,
+    "completed_at": 1730782800,
+    "failed_at": null,
+    "expired_at": null,
+    "cancelling_at": null,
+    "cancelled_at": null,
+    "request_counts": {
+      "total": 350,
+      "completed": 350,
+      "failed": 0
+    },
+    "metadata": {
+      "batch_description": "Entity extraction"
+    }
+  }
+]

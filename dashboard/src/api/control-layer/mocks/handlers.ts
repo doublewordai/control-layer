@@ -14,6 +14,11 @@ import type {
   ApiKey,
   Endpoint,
   Group,
+  FileObject,
+  Batch,
+  BatchRequest,
+  FileRequest,
+  BatchCreateRequest,
   Transaction,
   AddFundsRequest,
 } from "../types";
@@ -28,6 +33,10 @@ import transactionsDataRaw from "./transactions.json";
 import userGroups from "./user-groups.json";
 import modelsGroups from "./models-groups.json";
 import requestsDataRaw from "../../demo/data/requests.json";
+import filesDataRaw from "./files.json";
+import batchesDataRaw from "./batches.json";
+import batchRequestsDataRaw from "./batch-requests.json";
+import fileRequestsDataRaw from "./file-requests.json";
 import {
   loadDemoState,
   addModelToGroup as addModelToGroupState,
@@ -65,6 +74,13 @@ const transactionsData = transactionsDataRaw as Transaction[];
 const userGroupsInitial = userGroups as Record<string, string[]>;
 const modelsGroupsInitial = modelsGroups as Record<string, string[]>;
 const requestsData = requestsDataRaw as DemoRequest[];
+const filesData = filesDataRaw as FileObject[];
+const batchesData = batchesDataRaw as Batch[];
+const batchRequestsData = batchRequestsDataRaw as Record<
+  string,
+  BatchRequest[]
+>;
+const fileRequestsData = fileRequestsDataRaw as Record<string, FileRequest[]>;
 
 // Initialize demo state (loads from localStorage or uses initial data)
 let demoState = loadDemoState(modelsGroupsInitial, userGroupsInitial);
@@ -1189,5 +1205,262 @@ export const handlers = [
   // Probes API
   http.get("/admin/api/v1/probes", () => {
     return HttpResponse.json([]);
+  }),
+
+  // ===== FILES API =====
+
+  http.get("/ai/v1/files", ({ request }) => {
+    const url = new URL(request.url);
+    const after = url.searchParams.get("after");
+    const limit = parseInt(url.searchParams.get("limit") || "10000");
+    const order = url.searchParams.get("order") || "desc";
+    const purpose = url.searchParams.get("purpose");
+
+    let files = [...filesData];
+
+    // Filter by purpose
+    if (purpose) {
+      files = files.filter((f) => f.purpose === purpose);
+    }
+
+    // Sort by created_at
+    files.sort((a, b) => {
+      const diff = b.created_at - a.created_at;
+      return order === "asc" ? -diff : diff;
+    });
+
+    // Pagination with 'after' cursor
+    if (after) {
+      const afterIndex = files.findIndex((f) => f.id === after);
+      if (afterIndex !== -1) {
+        files = files.slice(afterIndex + 1);
+      }
+    }
+
+    const hasMore = files.length > limit;
+    const returnFiles = files.slice(0, limit);
+
+    return HttpResponse.json({
+      object: "list",
+      data: returnFiles,
+      first_id: returnFiles[0]?.id,
+      last_id: returnFiles[returnFiles.length - 1]?.id,
+      has_more: hasMore,
+    });
+  }),
+
+  http.get("/ai/v1/files/:id", ({ params }) => {
+    const file = filesData.find((f) => f.id === params.id);
+    if (!file) {
+      return HttpResponse.json({ error: "File not found" }, { status: 404 });
+    }
+    return HttpResponse.json(file);
+  }),
+
+  http.post("/ai/v1/files", async ({ request }) => {
+    const formData = await request.formData();
+    const file = formData.get("file") as File;
+    const purpose = formData.get("purpose") as string;
+    const expiresAfterSeconds = formData.get("expires_after[seconds]");
+
+    if (!file || !purpose) {
+      return HttpResponse.json(
+        { error: "Missing required fields: file and purpose" },
+        { status: 400 },
+      );
+    }
+
+    const now = Math.floor(Date.now() / 1000);
+    let expiresAt: number | undefined;
+
+    if (expiresAfterSeconds) {
+      const seconds = parseInt(expiresAfterSeconds as string);
+      expiresAt = now + seconds;
+    }
+
+    const newFile: FileObject = {
+      id: `file-${Date.now()}`,
+      object: "file",
+      bytes: file.size,
+      created_at: now,
+      expires_at: expiresAt,
+      filename: file.name,
+      purpose: purpose as any,
+    };
+
+    return HttpResponse.json(newFile, { status: 201 });
+  }),
+
+  http.delete("/ai/v1/files/:id", ({ params }) => {
+    const file = filesData.find((f) => f.id === params.id);
+    if (!file) {
+      return HttpResponse.json({ error: "File not found" }, { status: 404 });
+    }
+
+    return HttpResponse.json({
+      id: file.id,
+      object: "file",
+      deleted: true,
+    });
+  }),
+
+  // Get file content (supports pagination via limit/offset)
+  http.get("/ai/v1/files/:id/content", ({ request, params }) => {
+    const fileId = params.id as string;
+    const url = new URL(request.url);
+    const limit = url.searchParams.get("limit")
+      ? parseInt(url.searchParams.get("limit")!)
+      : undefined;
+    const offset = parseInt(url.searchParams.get("offset") || "0");
+
+    // Check if it's a batch output file
+    const batch = batchesData.find(
+      (b) => b.output_file_id === fileId || b.error_file_id === fileId,
+    );
+
+    if (batch) {
+      // Batch output or error file
+      const isErrorFile = batch.error_file_id === fileId;
+      const requests = batchRequestsData[batch.id] || [];
+
+      // Filter by type and apply pagination
+      const filtered = isErrorFile
+        ? requests.filter((r) => r.status === "failed")
+        : requests.filter((r) => r.status === "completed");
+
+      const paginated = limit
+        ? filtered.slice(offset, offset + limit)
+        : filtered.slice(offset);
+
+      // Generate JSONL output
+      const jsonl = paginated
+        .map((r) =>
+          JSON.stringify({
+            id: r.id,
+            custom_id: r.custom_id,
+            response: isErrorFile ? null : r.response,
+            error: isErrorFile ? r.error : null,
+          }),
+        )
+        .join("\n");
+
+      return HttpResponse.text(jsonl, {
+        headers: {
+          "Content-Type": "application/jsonl",
+        },
+      });
+    }
+
+    // Regular input file - return templates
+    const templates = fileRequestsData[fileId] || [];
+    const paginated = limit
+      ? templates.slice(offset, offset + limit)
+      : templates.slice(offset);
+
+    const jsonl = paginated
+      .map((t) =>
+        JSON.stringify({
+          custom_id: t.custom_id,
+          method: t.method,
+          url: t.url,
+          body: t.body,
+        }),
+      )
+      .join("\n");
+
+    return HttpResponse.text(jsonl, {
+      headers: {
+        "Content-Type": "application/jsonl",
+      },
+    });
+  }),
+
+  // ===== BATCHES API =====
+
+  http.get("/ai/v1/batches", ({ request }) => {
+    const url = new URL(request.url);
+    const after = url.searchParams.get("after");
+    const limit = parseInt(url.searchParams.get("limit") || "20");
+
+    let batches = [...batchesData];
+
+    // Sort by created_at desc
+    batches.sort((a, b) => b.created_at - a.created_at);
+
+    // Pagination with 'after' cursor
+    if (after) {
+      const afterIndex = batches.findIndex((b) => b.id === after);
+      if (afterIndex !== -1) {
+        batches = batches.slice(afterIndex + 1);
+      }
+    }
+
+    const hasMore = batches.length > limit;
+    const returnBatches = batches.slice(0, limit);
+
+    return HttpResponse.json({
+      object: "list",
+      data: returnBatches,
+      first_id: returnBatches[0]?.id,
+      last_id: returnBatches[returnBatches.length - 1]?.id,
+      has_more: hasMore,
+    });
+  }),
+
+  http.get("/ai/v1/batches/:id", ({ params }) => {
+    const batch = batchesData.find((b) => b.id === params.id);
+    if (!batch) {
+      return HttpResponse.json({ error: "Batch not found" }, { status: 404 });
+    }
+    return HttpResponse.json(batch);
+  }),
+
+  http.post("/ai/v1/batches", async ({ request }) => {
+    const body = (await request.json()) as BatchCreateRequest;
+
+    const now = Math.floor(Date.now() / 1000);
+    const newBatch: Batch = {
+      id: `batch-${Date.now()}`,
+      object: "batch",
+      endpoint: body.endpoint,
+      errors: null,
+      input_file_id: body.input_file_id,
+      completion_window: body.completion_window,
+      status: "validating",
+      output_file_id: null,
+      error_file_id: null,
+      created_at: now,
+      in_progress_at: null,
+      expires_at: now + 86400, // 24 hours
+      finalizing_at: null,
+      completed_at: null,
+      failed_at: null,
+      expired_at: null,
+      cancelling_at: null,
+      cancelled_at: null,
+      request_counts: {
+        total: 0,
+        completed: 0,
+        failed: 0,
+      },
+      metadata: body.metadata,
+    };
+
+    return HttpResponse.json(newBatch, { status: 201 });
+  }),
+
+  http.post("/ai/v1/batches/:id/cancel", ({ params }) => {
+    const batch = batchesData.find((b) => b.id === params.id);
+    if (!batch) {
+      return HttpResponse.json({ error: "Batch not found" }, { status: 404 });
+    }
+
+    const cancelledBatch: Batch = {
+      ...batch,
+      status: "cancelling",
+      cancelling_at: Math.floor(Date.now() / 1000),
+    };
+
+    return HttpResponse.json(cancelledBatch);
   }),
 ];

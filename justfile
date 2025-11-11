@@ -832,6 +832,7 @@ release:
 # - Runs on port 5432
 # - Credentials: postgres/password
 # - Container name: test-postgres
+# - Uses a named volume for persistent storage
 #
 # Examples:
 #   just db-start
@@ -849,9 +850,12 @@ db-start:
         fi
     else
         echo "Creating new test-postgres container with fsync disabled..."
+        # Create volume if it doesn't exist
+        docker volume create test-postgres-data >/dev/null 2>&1 || true
         docker run --name test-postgres \
           -e POSTGRES_PASSWORD=password \
           -p 5432:5432 \
+          -v test-postgres-data:/var/lib/postgresql/data \
           -d postgres:latest \
           postgres -c fsync=off
     fi

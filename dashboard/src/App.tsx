@@ -66,6 +66,16 @@ const UsersGroups = lazy(() =>
     default: m.UsersGroups,
   })),
 );
+const Batches = lazy(() =>
+  import("./components/features/batches").then((m) => ({
+    default: m.Batches,
+  })),
+);
+const FileRequests = lazy(() =>
+  import("./components/features/batches/FileRequests").then((m) => ({
+    default: m.FileRequests,
+  })),
+);
 
 // Loading component for lazy-loaded routes
 function RouteLoader() {
@@ -233,6 +243,26 @@ function AppRoutes() {
                 <Suspense fallback={<RouteLoader />}>
                   <Requests />
                 </Suspense>
+              </ProtectedRoute>
+            </AppLayout>
+          }
+        />
+        <Route
+          path="/batches"
+          element={
+            <AppLayout>
+              <ProtectedRoute path="/batches">
+                <Batches />
+              </ProtectedRoute>
+            </AppLayout>
+          }
+        />
+        <Route
+          path="/batches/files/:fileId/content"
+          element={
+            <AppLayout>
+              <ProtectedRoute path="/batches/files/:fileId/content">
+                <FileRequests />
               </ProtectedRoute>
             </AppLayout>
           }

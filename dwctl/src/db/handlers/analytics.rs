@@ -78,7 +78,7 @@ async fn get_total_requests(
     let total_requests = if let Some(model) = model_filter {
         sqlx::query_as!(
             TotalRequestsRow,
-            "SELECT COUNT(*) as total_requests FROM http_analytics WHERE uri LIKE '/ai/%' AND timestamp >= $1 AND timestamp <= $2 AND model = $3",
+            "SELECT COUNT(*) as total_requests FROM http_analytics WHERE timestamp >= $1 AND timestamp <= $2 AND model = $3",
             time_range_start,
             time_range_end,
             model
@@ -90,7 +90,7 @@ async fn get_total_requests(
     } else {
         sqlx::query_as!(
             TotalRequestsRow,
-            "SELECT COUNT(*) as total_requests FROM http_analytics WHERE uri LIKE '/ai/%' AND timestamp >= $1 AND timestamp <= $2",
+            "SELECT COUNT(*) as total_requests FROM http_analytics WHERE timestamp >= $1 AND timestamp <= $2",
             time_range_start,
             time_range_end
         )
@@ -138,7 +138,7 @@ async fn get_time_series_hourly(
                 PERCENTILE_CONT(0.95) WITHIN GROUP (ORDER BY duration_ms)::float8 as p95_latency_ms,
                 PERCENTILE_CONT(0.99) WITHIN GROUP (ORDER BY duration_ms)::float8 as p99_latency_ms
             FROM http_analytics
-            WHERE uri LIKE '/ai/%' AND timestamp >= $1 AND timestamp <= $2 AND model = $3
+            WHERE timestamp >= $1 AND timestamp <= $2 AND model = $3
             GROUP BY date_trunc('hour', timestamp)
             ORDER BY timestamp
             "#,
@@ -161,7 +161,7 @@ async fn get_time_series_hourly(
                 PERCENTILE_CONT(0.95) WITHIN GROUP (ORDER BY duration_ms)::float8 as p95_latency_ms,
                 PERCENTILE_CONT(0.99) WITHIN GROUP (ORDER BY duration_ms)::float8 as p99_latency_ms
             FROM http_analytics
-            WHERE uri LIKE '/ai/%' AND timestamp >= $1 AND timestamp <= $2
+            WHERE timestamp >= $1 AND timestamp <= $2
             GROUP BY date_trunc('hour', timestamp)
             ORDER BY timestamp
             "#,
@@ -215,7 +215,7 @@ async fn get_time_series_ten_minutes(
                 PERCENTILE_CONT(0.95) WITHIN GROUP (ORDER BY duration_ms)::float8 as p95_latency_ms,
                 PERCENTILE_CONT(0.99) WITHIN GROUP (ORDER BY duration_ms)::float8 as p99_latency_ms
             FROM http_analytics
-            WHERE uri LIKE '/ai/%' AND timestamp >= $1 AND timestamp <= $2 AND model = $3
+            WHERE timestamp >= $1 AND timestamp <= $2 AND model = $3
             GROUP BY date_trunc('hour', timestamp) + INTERVAL '10 minute' * FLOOR(EXTRACT(minute FROM timestamp) / 10)
             ORDER BY timestamp
             "#,
@@ -238,7 +238,7 @@ async fn get_time_series_ten_minutes(
                 PERCENTILE_CONT(0.95) WITHIN GROUP (ORDER BY duration_ms)::float8 as p95_latency_ms,
                 PERCENTILE_CONT(0.99) WITHIN GROUP (ORDER BY duration_ms)::float8 as p99_latency_ms
             FROM http_analytics
-            WHERE uri LIKE '/ai/%' AND timestamp >= $1 AND timestamp <= $2
+            WHERE timestamp >= $1 AND timestamp <= $2
             GROUP BY date_trunc('hour', timestamp) + INTERVAL '10 minute' * FLOOR(EXTRACT(minute FROM timestamp) / 10)
             ORDER BY timestamp
             "#,
@@ -374,7 +374,7 @@ async fn get_status_codes(
     let rows = if let Some(model) = model_filter {
         sqlx::query_as!(
             StatusCodeRow,
-            "SELECT status_code, COUNT(*) as status_count FROM http_analytics WHERE uri LIKE '/ai/%' AND timestamp >= $1 AND timestamp <= $2 AND model = $3 AND status_code IS NOT NULL GROUP BY status_code ORDER BY status_count DESC",
+            "SELECT status_code, COUNT(*) as status_count FROM http_analytics WHERE timestamp >= $1 AND timestamp <= $2 AND model = $3 AND status_code IS NOT NULL GROUP BY status_code ORDER BY status_count DESC",
             time_range_start,
             time_range_end,
             model
@@ -384,7 +384,7 @@ async fn get_status_codes(
     } else {
         sqlx::query_as!(
             StatusCodeRow,
-            "SELECT status_code, COUNT(*) as status_count FROM http_analytics WHERE uri LIKE '/ai/%' AND timestamp >= $1 AND timestamp <= $2 AND status_code IS NOT NULL GROUP BY status_code ORDER BY status_count DESC",
+            "SELECT status_code, COUNT(*) as status_count FROM http_analytics WHERE timestamp >= $1 AND timestamp <= $2 AND status_code IS NOT NULL GROUP BY status_code ORDER BY status_count DESC",
             time_range_start,
             time_range_end
         )
@@ -400,7 +400,7 @@ async fn get_status_codes(
 async fn get_model_usage(db: &PgPool, time_range_start: DateTime<Utc>, time_range_end: DateTime<Utc>) -> Result<Vec<ModelUsageRow>> {
     let rows = sqlx::query_as!(
         ModelUsageRow,
-        "SELECT model as model_name, COUNT(*) as model_count, COALESCE(AVG(duration_ms), 0)::float8 as model_avg_latency_ms FROM http_analytics WHERE uri LIKE '/ai/%' AND timestamp >= $1 AND timestamp <= $2 AND model IS NOT NULL GROUP BY model ORDER BY model_count DESC",
+        "SELECT model as model_name, COUNT(*) as model_count, COALESCE(AVG(duration_ms), 0)::float8 as model_avg_latency_ms FROM http_analytics WHERE timestamp >= $1 AND timestamp <= $2 AND model IS NOT NULL GROUP BY model ORDER BY model_count DESC",
         time_range_start,
         time_range_end
     )
@@ -501,7 +501,7 @@ pub async fn get_model_metrics(db: &PgPool, model_alias: &str) -> Result<ModelMe
             COALESCE(SUM(completion_tokens), 0)::bigint as total_output_tokens,
             MAX(timestamp) as last_active_at
         FROM http_analytics
-        WHERE uri LIKE '/ai/%' AND model = $1
+        WHERE model = $1
         "#,
         model_alias
     )
@@ -574,8 +574,7 @@ pub async fn get_model_user_usage(
             SUM(total_cost)::float8 as total_cost,
             MAX(timestamp) as last_active_at
         FROM http_analytics
-        WHERE uri LIKE '/ai/%'
-            AND model = $1
+        WHERE model = $1
             AND timestamp >= $2
             AND timestamp <= $3
             AND user_id IS NOT NULL
@@ -598,8 +597,7 @@ pub async fn get_model_user_usage(
             COALESCE(SUM(total_tokens), 0)::bigint as total_tokens,
             SUM(total_cost)::float8 as total_cost
         FROM http_analytics
-        WHERE uri LIKE '/ai/%'
-            AND model = $1
+        WHERE model = $1
             AND timestamp >= $2
             AND timestamp <= $3
             AND user_id IS NOT NULL
