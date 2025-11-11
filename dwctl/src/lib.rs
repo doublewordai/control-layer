@@ -42,14 +42,13 @@ use axum::{
 use axum_prometheus::PrometheusMetricLayer;
 use bon::Builder;
 pub use config::Config;
-use outlet::{PathFilter, RequestLoggerConfig, RequestLoggerLayer};
+use outlet::{RequestLoggerConfig, RequestLoggerLayer};
 use outlet_postgres::PostgresHandler;
 use request_logging::{AiRequest, AiResponse};
 use sqlx::{Executor, PgPool};
 use std::sync::Arc;
 use tokio::net::TcpListener;
 use tower::Layer;
-use tower::ServiceBuilder;
 use tower_http::{
     cors::CorsLayer,
     trace::{DefaultMakeSpan, DefaultOnRequest, DefaultOnResponse, TraceLayer},
@@ -322,10 +321,7 @@ pub async fn build_router(state: &mut AppState, onwards_router: Router) -> anyho
         let outlet_config = RequestLoggerConfig {
             capture_request_body: true,
             capture_response_body: true,
-            path_filter: Some(PathFilter {
-                allowed_prefixes: vec!["/ai/".to_string()],
-                blocked_prefixes: vec![],
-            }),
+            path_filter: None, // No path filter needed - applied directly to ai_router
         };
 
         Some(RequestLoggerLayer::new(outlet_config, postgres_handler))
@@ -478,6 +474,13 @@ pub async fn build_router(state: &mut AppState, onwards_router: Router) -> anyho
     // Serve embedded static assets, falling back to SPA for unmatched routes
     let fallback = get(api::handlers::static_assets::serve_embedded_asset).fallback(get(api::handlers::static_assets::spa_fallback));
 
+    // Apply request logging layer only to onwards router
+    let onwards_router = if let Some(outlet_layer) = outlet_layer.clone() {
+        onwards_router.layer(outlet_layer)
+    } else {
+        onwards_router
+    };
+
     // Build the app with admin API and onwards proxy nested. serve the (restricted) openai spec.
     // Batches routes are merged with onwards router under /ai/v1 (batches match first)
     let ai_router = if let Some(batches) = batches_routes {
@@ -505,12 +508,8 @@ pub async fn build_router(state: &mut AppState, onwards_router: Router) -> anyho
     // Create CORS layer from config
     let cors_layer = create_cors_layer(&state.config)?;
 
-    // Apply layers conditionally
-    let mut router = if let Some(outlet_layer) = outlet_layer {
-        router.layer(ServiceBuilder::new().layer(outlet_layer).layer(cors_layer))
-    } else {
-        router.layer(cors_layer)
-    };
+    // Apply CORS to main router (request logging already applied to onwards_router above)
+    let mut router = router.layer(cors_layer);
 
     // Add Prometheus metrics if enabled
     if state.config.enable_metrics {
