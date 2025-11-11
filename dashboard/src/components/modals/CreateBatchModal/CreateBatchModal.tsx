@@ -27,12 +27,6 @@ interface CreateBatchModalProps {
   preselectedFileId?: string;
 }
 
-const ENDPOINTS = [
-  { value: "/v1/chat/completions", label: "Chat Completions" },
-  { value: "/v1/completions", label: "Completions" },
-  { value: "/v1/embeddings", label: "Embeddings" },
-];
-
 export function CreateBatchModal({
   isOpen,
   onClose,

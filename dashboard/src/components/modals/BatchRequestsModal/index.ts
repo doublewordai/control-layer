@@ -1,1 +1,0 @@
-export { ViewBatchRequestsModal } from "./ViewBatchRequestsModal";

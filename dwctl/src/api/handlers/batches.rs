@@ -33,7 +33,7 @@ fn to_batch_response(batch: fusillade::Batch, status: fusillade::BatchStatus) ->
 
     // Determine OpenAI status - override if cancelling
     let base_status = status.openai_status();
-    let openai_status = if let Some(_) = batch.cancelling_at {
+    let openai_status = if batch.cancelling_at.is_some() {
         // If cancelling_at is set, check if batch is finished
         if status.is_finished() {
             // All requests are in terminal state, batch is now cancelled

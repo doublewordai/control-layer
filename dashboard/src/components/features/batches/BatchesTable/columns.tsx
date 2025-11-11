@@ -137,9 +137,10 @@ export const createBatchColumns = (
       const batch = row.original as Batch;
       const { total, completed, failed } = batch.request_counts;
       // Only infer canceled count if the batch status is cancelled
-      const canceled = batch.status === "cancelled"
-        ? Math.max(0, total - completed - failed)
-        : 0;
+      const canceled =
+        batch.status === "cancelled"
+          ? Math.max(0, total - completed - failed)
+          : 0;
       const completedPercent = total > 0 ? (completed / total) * 100 : 0;
       const failedPercent = total > 0 ? (failed / total) * 100 : 0;
       const canceledPercent = total > 0 ? (canceled / total) * 100 : 0;
@@ -150,7 +151,9 @@ export const createBatchColumns = (
             <span>
               {completed + failed + canceled} / {total}
             </span>
-            <span>{Math.round(completedPercent + failedPercent + canceledPercent)}%</span>
+            <span>
+              {Math.round(completedPercent + failedPercent + canceledPercent)}%
+            </span>
           </div>
           <div className="relative h-2 w-full bg-gray-200 rounded-full overflow-hidden">
             <div

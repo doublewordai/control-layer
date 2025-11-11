@@ -867,7 +867,10 @@ export function Batches() {
       </Dialog>
 
       {/* Cancel Batch Confirmation */}
-      <Dialog open={!!batchToCancel} onOpenChange={() => setBatchToCancel(null)}>
+      <Dialog
+        open={!!batchToCancel}
+        onOpenChange={() => setBatchToCancel(null)}
+      >
         <DialogContent className="sm:max-w-md">
           <DialogHeader>
             <div className="flex items-center gap-3">

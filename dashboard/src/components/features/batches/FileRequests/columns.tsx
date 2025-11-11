@@ -1,12 +1,9 @@
-"use client";
-
+/* eslint-disable react-refresh/only-export-components */
 import { type ColumnDef } from "@tanstack/react-table";
-import { ArrowUpDown, Eye } from "lucide-react";
+import { ArrowUpDown } from "lucide-react";
 import { useState } from "react";
 import { Prism as SyntaxHighlighter } from "react-syntax-highlighter";
 import { oneDark } from "react-syntax-highlighter/dist/esm/styles/prism";
-import { Button } from "../../../ui/button";
-import { Tooltip, TooltipContent, TooltipTrigger } from "../../../ui/tooltip";
 import {
   Dialog,
   DialogContent,

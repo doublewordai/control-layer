@@ -18,13 +18,10 @@ import type {
   TransactionsQuery,
   CreateProbeRequest,
   FilesListQuery,
-  FileRequestsListQuery,
   BatchCreateRequest,
   BatchesListQuery,
-  BatchRequestsListQuery,
   Batch,
   FileUploadRequest,
-  BatchRequestsListResponse,
   AddFundsRequest,
 } from "./types";
 

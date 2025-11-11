@@ -6,7 +6,6 @@ import { Toaster } from "./components/ui/sonner";
 import { AppLayout } from "./components/layout";
 import {
   ProtectedRoute,
-  DemoOnlyRoute,
   LoginForm,
   RegisterForm,
   AuthGuard,
