@@ -4,7 +4,7 @@ use onwards::target::{Auth, ConfigFile, KeyDefinition, RateLimitParameters, Targ
 use sqlx::{postgres::PgListener, PgPool};
 use tokio::sync::{mpsc, watch};
 use tokio_util::sync::CancellationToken;
-use tracing::{debug, error, info, instrument};
+use tracing::{debug, error, info, instrument, warn};
 use url::Url;
 
 /// Status events for testing/observability
@@ -17,6 +17,7 @@ pub enum SyncStatus {
 }
 
 use crate::{
+    config::{ONWARDS_CONFIG_CHANGED_CHANNEL, ONWARDS_INPUT_TOKEN_PRICE_HEADER, ONWARDS_OUTPUT_TOKEN_PRICE_HEADER},
     db::{
         handlers::{api_keys::ApiKeys, deployments::DeploymentFilter, Deployments, InferenceEndpoints, Repository as _},
         models::{api_keys::ApiKeyDBResponse, deployments::DeploymentDBResponse},
@@ -64,7 +65,7 @@ impl OnwardsConfigSync {
             }
             let mut listener = PgListener::connect_with(&self.db).await?;
             // Listen to auth config changes
-            listener.listen("auth_config_changed").await?;
+            listener.listen(ONWARDS_CONFIG_CHANGED_CHANNEL).await?;
 
             if let Some(tx) = &config.status_tx {
                 tx.send(SyncStatus::Connected).await?;
@@ -200,7 +201,7 @@ async fn load_targets_from_db(db: &PgPool) -> Result<Targets, anyhow::Error> {
 
         // Fetch API keys for each deployment
         for model in &models {
-            match api_keys_repo.get_api_keys_for_deployment(model.id).await {
+            match api_keys_repo.get_api_keys_for_deployment_with_sufficient_credit(model.id).await {
                 Ok(keys) => {
                     debug!("Found {} API keys for deployment '{}' ({})", keys.len(), model.alias, model.id);
                     deployment_api_keys.insert(model.id, keys);
@@ -356,6 +357,20 @@ fn convert_to_config_file(
             let upstream_auth_header_name = auth_header_name.and_then(|name| if name != "Authorization" { Some(name) } else { None });
             let upstream_auth_header_prefix = auth_header_prefix.and_then(|prefix| if prefix != "Bearer " { Some(prefix) } else { None });
 
+            // Convert pricing from database format to hashmap of response headers
+            let response_headers = model.pricing.as_ref().and_then(|p| {
+                p.upstream.as_ref().map(|upstream| {
+                    let mut headers = HashMap::new();
+                    upstream
+                        .input_price_per_token
+                        .map(|d| headers.insert(ONWARDS_INPUT_TOKEN_PRICE_HEADER.to_string(), d.to_string()));
+                    upstream
+                        .output_price_per_token
+                        .map(|d| headers.insert(ONWARDS_OUTPUT_TOKEN_PRICE_HEADER.to_string(), d.to_string()));
+                    headers
+                })
+            });
+
             let target_spec = TargetSpec {
                 url,
                 keys,
@@ -364,6 +379,7 @@ fn convert_to_config_file(
                 rate_limit,
                 upstream_auth_header_name,
                 upstream_auth_header_prefix,
+                response_headers,
             };
 
             Some((model.alias, target_spec))
@@ -375,19 +391,20 @@ fn convert_to_config_file(
 
 #[cfg(test)]
 mod tests {
-    use std::collections::HashMap;
-    use std::time::Duration;
+    use std::{collections::HashMap, str::FromStr, time::Duration};
 
     use chrono::Utc;
-    use tokio::time::timeout;
+    use tokio::{
+        sync::{mpsc, watch},
+        time::timeout,
+    };
+    use tokio_util::sync::CancellationToken;
     use uuid::Uuid;
 
     use crate::{
         db::models::deployments::{DeploymentDBResponse, ModelStatus},
         sync::onwards_config::{convert_to_config_file, SyncConfig},
     };
-    use tokio::sync::mpsc;
-    use tokio_util::sync::CancellationToken;
 
     // Helper function to create a test deployed model
     fn create_test_model(name: &str, alias: &str, endpoint_id: Uuid) -> DeploymentDBResponse {
@@ -542,6 +559,156 @@ mod tests {
         assert_eq!(config.targets.len(), 1);
         assert!(config.targets.contains_key("valid-alias"));
         assert!(!config.targets.contains_key("invalid-alias"));
+    }
+
+    #[sqlx::test]
+    #[test_log::test]
+    async fn test_pricing_update_triggers_notification_and_config_reload(pool: sqlx::PgPool) {
+        // Setup: Create user and endpoint
+        let user = crate::test_utils::create_test_user(&pool, crate::api::models::users::Role::StandardUser).await;
+
+        let endpoint_result = sqlx::query!(
+            r#"
+            INSERT INTO inference_endpoints (name, description, url, created_by)
+            VALUES ($1, $2, $3, $4)
+            RETURNING id
+            "#,
+            "test-endpoint",
+            "Test endpoint",
+            "http://localhost:8000",
+            user.id
+        )
+        .fetch_one(&pool)
+        .await
+        .expect("Failed to create endpoint");
+
+        // Create deployed_model with initial pricing
+        let original_input_price = rust_decimal::Decimal::from_str("0.00001").unwrap();
+        let original_output_price = rust_decimal::Decimal::from_str("0.00003").unwrap();
+
+        let model_result = sqlx::query!(
+            r#"
+            INSERT INTO deployed_models (
+                alias, model_name, created_by, hosted_on, status,
+                upstream_input_price_per_token, upstream_output_price_per_token
+            )
+            VALUES ($1, $2, $3, $4, 'active', $5, $6)
+            RETURNING id
+            "#,
+            "test-gpt-4",
+            "gpt-4",
+            user.id,
+            endpoint_result.id,
+            original_input_price,
+            original_output_price
+        )
+        .fetch_one(&pool)
+        .await
+        .expect("Failed to create deployed model");
+
+        // Create the OnwardsConfigSync with a custom watch channel to monitor changes
+        let initial_targets = super::load_targets_from_db(&pool).await.expect("Failed to load initial targets");
+        let (sender, mut receiver) = watch::channel(initial_targets.clone());
+
+        let shutdown_token = CancellationToken::new();
+        let _drop_guard = shutdown_token.clone().drop_guard();
+
+        let sync = super::OnwardsConfigSync { db: pool.clone(), sender };
+
+        // Verify initial pricing
+        let initial_target = initial_targets
+            .targets
+            .get("test-gpt-4")
+            .expect("Model should be in initial targets");
+        let initial_headers = initial_target
+            .response_headers
+            .as_ref()
+            .expect("Response headers should be present");
+        let initial_input_price = initial_headers
+            .get(crate::config::ONWARDS_INPUT_TOKEN_PRICE_HEADER)
+            .expect("Initial input price should be present");
+        assert!(
+            initial_input_price.starts_with("0.00001"),
+            "Initial config should have original input price, got: {}",
+            initial_input_price
+        );
+
+        // Start the sync task in the background
+        let (status_tx, _status_rx) = mpsc::channel(10);
+        let config = SyncConfig {
+            status_tx: Some(status_tx),
+        };
+        tokio::spawn(async move {
+            if let Err(e) = sync.start(config, shutdown_token).await {
+                eprintln!("Sync task failed: {}", e);
+            }
+        });
+
+        // Give the listener time to connect and start listening
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+        // Update the model's pricing
+        let new_input_price = rust_decimal::Decimal::from_str("0.00002").unwrap();
+        let new_output_price = rust_decimal::Decimal::from_str("0.00006").unwrap();
+
+        sqlx::query!(
+            r#"
+            UPDATE deployed_models
+            SET upstream_input_price_per_token = $1,
+                upstream_output_price_per_token = $2
+            WHERE id = $3
+            "#,
+            new_input_price,
+            new_output_price,
+            model_result.id
+        )
+        .execute(&pool)
+        .await
+        .expect("Failed to update model pricing");
+
+        // Wait for the receiver to detect a change
+        // The receiver will be notified when the notification triggers a config reload
+        let update_result = tokio::time::timeout(std::time::Duration::from_secs(5), receiver.changed()).await;
+
+        assert!(
+            update_result.is_ok(),
+            "Timeout waiting for config update - notification may not have triggered"
+        );
+        update_result
+            .expect("Failed to receive update notification")
+            .expect("Receiver error");
+
+        // Get the updated targets from the receiver
+        let updated_targets = receiver.borrow().clone();
+
+        // Verify the updated pricing in the new config
+        let updated_target = updated_targets
+            .targets
+            .get("test-gpt-4")
+            .expect("Model should be in updated targets");
+        let updated_headers = updated_target
+            .response_headers
+            .as_ref()
+            .expect("Response headers should be present");
+
+        let input_price_header = updated_headers
+            .get(crate::config::ONWARDS_INPUT_TOKEN_PRICE_HEADER)
+            .expect("Input price header should be present");
+        let output_price_header = updated_headers
+            .get(crate::config::ONWARDS_OUTPUT_TOKEN_PRICE_HEADER)
+            .expect("Output price header should be present");
+
+        // Verify the pricing was updated
+        assert!(
+            input_price_header.starts_with("0.00002"),
+            "Config should have updated input price, got: {}",
+            input_price_header
+        );
+        assert!(
+            output_price_header.starts_with("0.00006"),
+            "Config should have updated output price, got: {}",
+            output_price_header
+        );
     }
 
     /// Regression test: onwards_config should reconnect after connection loss

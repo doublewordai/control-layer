@@ -1,12 +1,15 @@
-use crate::config::Config;
+use crate::config::{Config, ONWARDS_INPUT_TOKEN_PRICE_HEADER, ONWARDS_OUTPUT_TOKEN_PRICE_HEADER};
+use crate::db::handlers::Credits;
+use crate::db::models::credits::{CreditTransactionCreateDBRequest, CreditTransactionType};
 use crate::request_logging::models::{AiRequest, AiResponse, ChatCompletionChunk};
 use outlet::{RequestData, ResponseData};
 use outlet_postgres::SerializationError;
+use rust_decimal::{prelude::ToPrimitive, Decimal};
 use serde_json::Value;
 use sqlx::PgPool;
 use std::fmt;
 use std::str;
-use tracing::{error, instrument, warn};
+use tracing::{debug, error, instrument, warn};
 use uuid::Uuid;
 
 use super::utils;
@@ -98,6 +101,8 @@ pub struct UsageMetrics {
     pub response_type: String,
     pub server_address: String,
     pub server_port: u16,
+    pub input_price_per_token: Option<rust_decimal::Decimal>,
+    pub output_price_per_token: Option<rust_decimal::Decimal>,
 }
 
 /// Parses HTTP request body data into structured AI request types.
@@ -232,6 +237,16 @@ impl UsageMetrics {
             response_type: response_metrics.response_type,
             server_address: config.host.clone(),
             server_port: config.port,
+            input_price_per_token: response_data.headers.get(ONWARDS_INPUT_TOKEN_PRICE_HEADER).and_then(|vals| {
+                vals.first()
+                    .and_then(|bytes| str::from_utf8(bytes).ok())
+                    .and_then(|s| s.parse::<rust_decimal::Decimal>().ok())
+            }),
+            output_price_per_token: response_data.headers.get(ONWARDS_OUTPUT_TOKEN_PRICE_HEADER).and_then(|vals| {
+                vals.first()
+                    .and_then(|bytes| str::from_utf8(bytes).ok())
+                    .and_then(|s| s.parse::<rust_decimal::Decimal>().ok())
+            }),
         }
     }
 }
@@ -347,8 +362,8 @@ pub async fn store_analytics_record(pool: &PgPool, metrics: &UsageMetrics, auth:
 
     // Get model pricing and provider name if we have a model
     // Use request_model for lookup since that's what the user specified
-    let (input_price_per_token, output_price_per_token, provider_name) = if let Some(ref model_name) = metrics.request_model {
-        match sqlx::query!(
+    let provider_name = if let Some(model_name) = &metrics.request_model {
+        sqlx::query!(
             r#"
             SELECT
                 dm.upstream_input_price_per_token,
@@ -364,27 +379,17 @@ pub async fn store_analytics_record(pool: &PgPool, metrics: &UsageMetrics, auth:
         )
         .fetch_optional(pool)
         .await?
-        {
-            Some(row) => {
-                // Map URL to OTel-compliant provider name, falling back to configured name
-                let otel_provider = row
-                    .provider_url
-                    .as_ref()
-                    .and_then(|url| map_url_to_otel_provider(url))
-                    .map(|s| s.to_string())
-                    .or(row.provider_name);
-
-                (
-                    row.upstream_input_price_per_token,
-                    row.upstream_output_price_per_token,
-                    otel_provider,
-                )
-            }
-            None => (None, None, None),
-        }
+        .map(|row| {
+            row.provider_url
+                .as_ref()
+                .and_then(|url| map_url_to_otel_provider(url))
+                .map(|s| s.to_string())
+                .or(row.provider_name)
+        })
     } else {
-        (None, None, None)
-    };
+        None
+    }
+    .flatten();
 
     // Construct the complete row
     let row = HttpAnalyticsRow {
@@ -405,8 +410,8 @@ pub async fn store_analytics_record(pool: &PgPool, metrics: &UsageMetrics, auth:
         user_id,
         user_email: user_email.clone(),
         access_source: access_source.to_string(),
-        input_price_per_token,
-        output_price_per_token,
+        input_price_per_token: metrics.input_price_per_token,
+        output_price_per_token: metrics.output_price_per_token,
         server_address: metrics.server_address.clone(),
         server_port: metrics.server_port,
         provider_name,
@@ -458,6 +463,96 @@ pub async fn store_analytics_record(pool: &PgPool, metrics: &UsageMetrics, auth:
     )
     .execute(pool)
     .await?;
+
+    // =======================================================================
+    // Deduct credits for API usage if applicable
+    // =======================================================================
+    // Skip credit deduction for Playground access, Auth::None will also be implicitly skipped as they'll have no user id
+    if !matches!(auth, Auth::Playground { .. }) {
+        // Deduct credits if applicable (user_id present and at least one price is set)
+        if let (Some(user_id), Some(model)) = (row.user_id, &row.request_model) {
+            // Check if at least one price is set
+            if row.input_price_per_token.is_some() || row.output_price_per_token.is_some() {
+                // Calculate total cost - use zero for missing prices
+                let input_cost = Decimal::from(row.prompt_tokens) * row.input_price_per_token.unwrap_or(rust_decimal::Decimal::ZERO);
+                let output_cost = Decimal::from(row.completion_tokens) * row.output_price_per_token.unwrap_or(rust_decimal::Decimal::ZERO);
+                let total_cost = input_cost + output_cost;
+
+                // Round to 2 decimal places to match database schema (DECIMAL(12, 2))
+                // This prevents precision issues when storing fractional cent amounts
+                let total_cost = total_cost.round_dp(2);
+
+                if total_cost > rust_decimal::Decimal::ZERO {
+                    let mut conn = pool.acquire().await?;
+                    let mut credits = Credits::new(&mut conn);
+
+                    // Get user balance to check for negative balance warning
+                    match credits.get_user_balance(user_id).await {
+                        Ok(balance) => {
+                            // Warn if this will result in negative balance
+                            if balance < total_cost {
+                                warn!(
+                                    user_id = %user_id,
+                                    current_balance = %balance,
+                                    cost = %total_cost,
+                                    "API usage will result in negative balance"
+                                );
+                            }
+
+                            // Create usage transaction
+                            match credits
+                                .create_transaction(&CreditTransactionCreateDBRequest {
+                                    user_id,
+                                    transaction_type: CreditTransactionType::Usage,
+                                    amount: total_cost,
+                                    source_id: user_id.to_string(),
+                                    description: Some(format!(
+                                        "API usage: {} ({} input + {} output tokens)",
+                                        model, row.prompt_tokens, row.completion_tokens
+                                    )),
+                                })
+                                .await
+                            {
+                                Ok(result) => {
+                                    debug!(
+                                        user_id = %user_id,
+                                        transaction_id = %result.id,
+                                        amount = %total_cost,
+                                        balance_after = %result.balance_after,
+                                        model = %model,
+                                        "Credits deducted for API usage"
+                                    );
+                                    crate::metrics::record_credit_deduction(
+                                        &user_id.to_string(),
+                                        model,
+                                        total_cost.to_f64().unwrap_or(0.0),
+                                    );
+                                }
+                                Err(e) => {
+                                    tracing::error!(
+                                        error = %e,
+                                        correlation_id = %row.correlation_id,
+                                        user_id = %user_id,
+                                        "Failed to create credit transaction for API usage"
+                                    );
+                                    crate::metrics::record_credit_deduction_error();
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            tracing::error!(
+                                error = %e,
+                                correlation_id = %row.correlation_id,
+                                user_id = %user_id,
+                                "Failed to get user balance for credit deduction"
+                            );
+                            crate::metrics::record_credit_deduction_error();
+                        }
+                    }
+                }
+            }
+        }
+    }
 
     Ok(row)
 }
@@ -1422,5 +1517,545 @@ mod tests {
     fn test_map_url_to_otel_provider_case_insensitive() {
         assert_eq!(super::map_url_to_otel_provider("https://API.OPENAI.COM/v1/chat"), Some("openai"));
         assert_eq!(super::map_url_to_otel_provider("HTTPS://API.ANTHROPIC.COM/"), Some("anthropic"));
+    }
+
+    // ===== Credit Deduction Tests =====
+    // Tests for the credit deduction functionality in store_analytics_record
+
+    mod credit_deduction_tests {
+        use super::super::*;
+        use crate::api::models::users::Role;
+        use crate::db::handlers::api_keys::ApiKeys;
+        use crate::db::handlers::credits::Credits;
+        use crate::db::handlers::Repository;
+        use crate::db::models::api_keys::{ApiKeyCreateDBRequest, ApiKeyPurpose};
+        use crate::db::models::credits::{CreditTransactionCreateDBRequest, CreditTransactionType};
+        use crate::test_utils::create_test_user;
+        use rust_decimal::Decimal;
+        use std::str::FromStr;
+        use uuid::Uuid;
+
+        /// Helper: Create a test user with an initial credit balance
+        async fn setup_user_with_balance(pool: &sqlx::PgPool, balance: Decimal) -> Uuid {
+            let user = create_test_user(pool, Role::StandardUser).await;
+            let user_id = user.id;
+
+            if balance > Decimal::ZERO {
+                // Create an initial AdminGrant transaction to set balance
+                let mut conn = pool.acquire().await.expect("Failed to acquire connection");
+                let mut credits = Credits::new(&mut conn);
+
+                credits
+                    .create_transaction(&CreditTransactionCreateDBRequest {
+                        user_id,
+                        transaction_type: CreditTransactionType::AdminGrant,
+                        amount: balance,
+                        source_id: "test_setup".to_string(),
+                        description: Some("Initial test balance".to_string()),
+                    })
+                    .await
+                    .expect("Failed to create initial balance");
+            }
+
+            user_id
+        }
+
+        /// Helper: Create test UsageMetrics for testing
+        fn create_test_usage_metrics(
+            input_price: Option<Decimal>,
+            output_price: Option<Decimal>,
+            prompt_tokens: i64,
+            completion_tokens: i64,
+        ) -> UsageMetrics {
+            UsageMetrics {
+                instance_id: Uuid::new_v4(),
+                correlation_id: 12345,
+                timestamp: chrono::Utc::now(),
+                method: "POST".to_string(),
+                uri: "/v1/chat/completions".to_string(),
+                request_model: Some("gpt-4".to_string()),
+                response_model: Some("gpt-4".to_string()),
+                status_code: 200,
+                duration_ms: 100,
+                duration_to_first_byte_ms: Some(50),
+                prompt_tokens,
+                completion_tokens,
+                total_tokens: prompt_tokens + completion_tokens,
+                response_type: "chat_completion".to_string(),
+                server_address: "api.openai.com".to_string(),
+                server_port: 443,
+                input_price_per_token: input_price,
+                output_price_per_token: output_price,
+            }
+        }
+
+        /// Helper: Create test Auth for API key with valid user
+        async fn create_test_auth_for_user(pool: &sqlx::PgPool, user_id: Uuid) -> Auth {
+            // Create an API key for this user
+            let mut conn = pool.acquire().await.expect("Failed to acquire connection");
+            let mut api_key_repo = ApiKeys::new(&mut conn);
+            let key = api_key_repo
+                .create(&ApiKeyCreateDBRequest {
+                    user_id,
+                    name: "Test API key".to_string(),
+                    description: None,
+                    purpose: ApiKeyPurpose::Inference,
+                    requests_per_second: None,
+                    burst_size: None,
+                })
+                .await
+                .unwrap();
+
+            Auth::ApiKey { bearer_token: key.secret }
+        }
+
+        #[sqlx::test]
+        #[test_log::test]
+        async fn test_credit_deduction_successful(pool: sqlx::PgPool) {
+            // Setup: User with $10.00 balance
+            let initial_balance = Decimal::from_str("10.00").unwrap();
+            let user_id = setup_user_with_balance(&pool, initial_balance).await;
+            let auth = create_test_auth_for_user(&pool, user_id).await;
+
+            // Pricing: 0.0001 per 1K input tokens, 0.0003 per 1K output tokens
+            let input_price = Decimal::from_str("0.00001").unwrap();
+            let output_price = Decimal::from_str("0.00003").unwrap();
+
+            // Usage: 1000 input tokens, 500 output tokens
+            // Calculated cost: (1000 * 0.00001) + (500 * 0.00003) = 0.01 + 0.015 = 0.025
+            // Rounded cost: 0.025 rounds to 0.02 (banker's rounding to 2 decimal places)
+            let metrics = create_test_usage_metrics(Some(input_price), Some(output_price), 1000, 500);
+
+            // Execute
+            let result = store_analytics_record(&pool, &metrics, &auth).await;
+            assert!(result.is_ok(), "store_analytics_record should succeed");
+
+            // Verify: Balance should be deducted
+            let mut conn = pool.acquire().await.unwrap();
+            let mut credits = Credits::new(&mut conn);
+            let final_balance = credits.get_user_balance(user_id).await.unwrap();
+
+            // Expected cost is rounded to 2 decimal places (0.025 -> 0.02)
+            let expected_cost = Decimal::from_str("0.02").unwrap();
+            let expected_balance = initial_balance - expected_cost;
+            assert_eq!(final_balance, expected_balance, "Balance should be deducted correctly");
+
+            // Verify: Transaction was created
+            let transactions = credits.list_user_transactions(user_id, 0, 10).await.unwrap();
+            let usage_tx = transactions.iter().find(|tx| tx.transaction_type == CreditTransactionType::Usage);
+            assert!(usage_tx.is_some(), "Usage transaction should be created");
+
+            let usage_tx = usage_tx.unwrap();
+            assert_eq!(
+                usage_tx.amount, expected_cost,
+                "Transaction amount should be rounded to 2 decimal places"
+            );
+            assert_eq!(usage_tx.balance_after, expected_balance, "Balance after should match");
+        }
+
+        #[sqlx::test]
+        #[test_log::test]
+        async fn test_skip_deduction_when_user_id_none(pool: sqlx::PgPool) {
+            // Setup: Auth::None (no user)
+            let auth = Auth::None;
+            let metrics = create_test_usage_metrics(
+                Some(Decimal::from_str("0.00001").unwrap()),
+                Some(Decimal::from_str("0.00003").unwrap()),
+                1000,
+                500,
+            );
+
+            // Execute
+            let result = store_analytics_record(&pool, &metrics, &auth).await;
+            assert!(result.is_ok(), "Should succeed even without user_id");
+
+            // Verify: No transactions should be created
+            // (We can't check this directly without querying all transactions, but the test passing means no error occurred)
+        }
+
+        #[sqlx::test]
+        #[test_log::test]
+        async fn test_skip_deduction_when_cost_zero(pool: sqlx::PgPool) {
+            // Setup: User with balance, but zero tokens
+            let user_id = setup_user_with_balance(&pool, Decimal::from_str("10.00").unwrap()).await;
+            let auth = create_test_auth_for_user(&pool, user_id).await;
+            let metrics = create_test_usage_metrics(
+                Some(Decimal::from_str("0.00001").unwrap()),
+                Some(Decimal::from_str("0.00003").unwrap()),
+                0, // Zero tokens
+                0,
+            );
+
+            // Execute
+            let result = store_analytics_record(&pool, &metrics, &auth).await;
+            assert!(result.is_ok(), "Should succeed with zero cost");
+
+            // Verify: Balance should not change (no Usage transaction)
+            let mut conn = pool.acquire().await.unwrap();
+            let mut credits = Credits::new(&mut conn);
+            let balance = credits.get_user_balance(user_id).await.unwrap();
+            assert_eq!(balance, Decimal::from_str("10.00").unwrap(), "Balance should not change");
+
+            let transactions = credits.list_user_transactions(user_id, 0, 10).await.unwrap();
+            let usage_tx = transactions.iter().find(|tx| tx.transaction_type == CreditTransactionType::Usage);
+            assert!(usage_tx.is_none(), "No Usage transaction should be created for zero cost");
+        }
+
+        #[sqlx::test]
+        #[test_log::test]
+        async fn test_insufficient_balance_still_accrues_usage_transaction(pool: sqlx::PgPool) {
+            // Setup: User with insufficient balance (0.01)
+            let initial_balance = Decimal::from_str("0.01").unwrap();
+            let user_id = setup_user_with_balance(&pool, initial_balance).await;
+            let auth = create_test_auth_for_user(&pool, user_id).await;
+
+            // Usage that costs more than balance (0.025 calculated, rounds to 0.02)
+            let input_price = Decimal::from_str("0.00001").unwrap();
+            let output_price = Decimal::from_str("0.00003").unwrap();
+            let metrics = create_test_usage_metrics(Some(input_price), Some(output_price), 1000, 500);
+
+            // Execute
+            let result = store_analytics_record(&pool, &metrics, &auth).await;
+            // Analytics record should still be created successfully
+            assert!(result.is_ok(), "Analytics record should be created even if credit deduction fails");
+
+            // Verify: Balance should go negative as used more than available
+            let mut conn = pool.acquire().await.unwrap();
+            let mut credits = Credits::new(&mut conn);
+            let final_balance = credits.get_user_balance(user_id).await.unwrap();
+
+            // Expected cost is rounded to 2 decimal places (0.025 -> 0.02)
+            let expected_cost = Decimal::from_str("0.02").unwrap();
+            let expected_balance = initial_balance - expected_cost;
+            assert_eq!(final_balance, expected_balance, "Balance should reflect overdraft");
+            // Verify: Usage transaction was created
+            let transactions = credits.list_user_transactions(user_id, 0, 10).await.unwrap();
+            let usage_tx = transactions.iter().find(|tx| tx.transaction_type == CreditTransactionType::Usage);
+            assert!(
+                usage_tx.is_some(),
+                "Usage transaction should be created even with insufficient balance"
+            );
+        }
+
+        #[sqlx::test]
+        #[test_log::test]
+        async fn test_cost_calculation_precision(pool: sqlx::PgPool) {
+            // Setup: User with balance
+            let user_id = setup_user_with_balance(&pool, Decimal::from_str("10.00").unwrap()).await;
+            let auth = create_test_auth_for_user(&pool, user_id).await;
+
+            // Test various token counts and pricing scenarios
+            // Note: Expected costs are rounded to 2 decimal places (banker's rounding)
+            let test_cases = vec![
+                // (input_tokens, output_tokens, input_price_per_token, output_price_per_token, expected_cost_rounded)
+                (1500, 750, "0.00001", "0.00003", "0.04"), // (1500*0.00001) + (750*0.00003) = 0.0375 -> rounds to 0.04
+                (100, 50, "0.000005", "0.000015", "0.00"), // (100*0.000005) + (50*0.000015) = 0.00125 -> rounds to 0.00
+                (1, 1, "0.01", "0.02", "0.03"),            // (1*0.01) + (1*0.02) = 0.03 (exact)
+            ];
+
+            for (input_tokens, output_tokens, input_price_str, output_price_str, expected_cost_str) in test_cases {
+                let input_price = Decimal::from_str(input_price_str).unwrap();
+                let output_price = Decimal::from_str(output_price_str).unwrap();
+                let expected_cost = Decimal::from_str(expected_cost_str).unwrap();
+
+                let metrics = create_test_usage_metrics(Some(input_price), Some(output_price), input_tokens, output_tokens);
+
+                let balance_before = {
+                    let mut conn = pool.acquire().await.unwrap();
+                    let mut credits = Credits::new(&mut conn);
+                    credits.get_user_balance(user_id).await.unwrap()
+                };
+
+                let result = store_analytics_record(&pool, &metrics, &auth).await;
+                assert!(result.is_ok(), "store_analytics_record should succeed");
+
+                let balance_after = {
+                    let mut conn = pool.acquire().await.unwrap();
+                    let mut credits = Credits::new(&mut conn);
+                    credits.get_user_balance(user_id).await.unwrap()
+                };
+
+                let actual_cost = balance_before - balance_after;
+                assert_eq!(
+                    actual_cost, expected_cost,
+                    "Cost calculation should be precise for tokens={}/{}, prices={}/{}",
+                    input_tokens, output_tokens, input_price_str, output_price_str
+                );
+            }
+        }
+
+        #[sqlx::test]
+        #[test_log::test]
+        async fn test_skip_deduction_when_model_missing(pool: sqlx::PgPool) {
+            // Setup: User with balance
+            let user_id = setup_user_with_balance(&pool, Decimal::from_str("10.00").unwrap()).await;
+            let auth = create_test_auth_for_user(&pool, user_id).await;
+
+            // Create metrics with pricing but no model
+            let mut metrics = create_test_usage_metrics(
+                Some(Decimal::from_str("0.00001").unwrap()),
+                Some(Decimal::from_str("0.00003").unwrap()),
+                1000,
+                500,
+            );
+            metrics.request_model = None; // Remove model
+
+            // Execute
+            let result = store_analytics_record(&pool, &metrics, &auth).await;
+            assert!(result.is_ok(), "Should succeed even without model");
+
+            // Verify: Balance should not change
+            let mut conn = pool.acquire().await.unwrap();
+            let mut credits = Credits::new(&mut conn);
+            let balance = credits.get_user_balance(user_id).await.unwrap();
+            assert_eq!(
+                balance,
+                Decimal::from_str("10.00").unwrap(),
+                "Balance should not change without model"
+            );
+        }
+
+        #[sqlx::test]
+        #[test_log::test]
+        async fn test_playground_users_not_charged(pool: sqlx::PgPool) {
+            // Setup: User with balance (accessed via Playground/SSO)
+            let initial_balance = Decimal::from_str("10.00").unwrap();
+            let user = create_test_user(&pool, Role::StandardUser).await;
+            let user_id = user.id;
+
+            // Grant initial balance
+            let mut conn = pool.acquire().await.expect("Failed to acquire connection");
+            let mut credits = Credits::new(&mut conn);
+            credits
+                .create_transaction(&CreditTransactionCreateDBRequest {
+                    user_id,
+                    transaction_type: CreditTransactionType::AdminGrant,
+                    amount: initial_balance,
+                    source_id: "test_setup".to_string(),
+                    description: Some("Initial test balance".to_string()),
+                })
+                .await
+                .expect("Failed to create initial balance");
+
+            // Create Playground auth (SSO via X-Doubleword-User header)
+            let auth = Auth::Playground {
+                user_email: user.email.clone(),
+            };
+
+            // Create metrics with pricing and tokens (would normally cost money)
+            let input_price = Decimal::from_str("0.00001").unwrap();
+            let output_price = Decimal::from_str("0.00003").unwrap();
+            let metrics = create_test_usage_metrics(Some(input_price), Some(output_price), 1000, 500);
+
+            // Execute
+            let result = store_analytics_record(&pool, &metrics, &auth).await;
+            assert!(result.is_ok(), "Analytics record should be created");
+
+            // Verify: Balance should NOT change (Playground users aren't charged)
+            let mut conn = pool.acquire().await.unwrap();
+            let mut credits = Credits::new(&mut conn);
+            let final_balance = credits.get_user_balance(user_id).await.unwrap();
+            assert_eq!(
+                final_balance, initial_balance,
+                "Playground users should not be charged for API usage"
+            );
+
+            // Verify: No Usage transaction created
+            let transactions = credits.list_user_transactions(user_id, 0, 10).await.unwrap();
+            let usage_tx = transactions.iter().find(|tx| tx.transaction_type == CreditTransactionType::Usage);
+            assert!(usage_tx.is_none(), "No Usage transaction should be created for Playground users");
+
+            // Verify: Analytics record WAS created (tracking, just not billing)
+            let analytics_count = sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM http_analytics WHERE user_id = $1")
+                .bind(user_id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+            assert_eq!(analytics_count, 1, "Analytics record should be created for tracking");
+        }
+
+        #[sqlx::test]
+        #[test_log::test]
+        async fn test_concurrent_requests_with_consistent_pricing(pool: sqlx::PgPool) {
+            // Test that multiple concurrent requests are each charged according to their
+            // own captured pricing, even if pricing changes between requests
+
+            let user_id = setup_user_with_balance(&pool, Decimal::from_str("100.00").unwrap()).await;
+            let auth = create_test_auth_for_user(&pool, user_id).await;
+
+            // Spawn 10 concurrent requests with DIFFERENT pricing
+            // (simulating pricing changes between requests being processed)
+            let mut handles = vec![];
+
+            for i in 0..10 {
+                let pool_clone = pool.clone();
+                let auth_clone = auth.clone();
+
+                // Each request has different pricing that results in distinct costs after rounding to 2 decimals
+                // Use prices that yield costs like: 0.01, 0.02, 0.03, ..., 0.10 (all different after rounding)
+                // For 100 input tokens, we want total costs of 0.01, 0.02, etc.
+                let target_cost = (i + 1) as i64; // 1, 2, 3, ..., 10
+                let input_price = Decimal::new(target_cost, 4); // 0.0001, 0.0002, ..., 0.0010
+                let output_price = Decimal::ZERO; // Only charge for input to keep it simple
+
+                let handle = tokio::task::spawn(async move {
+                    let metrics = create_test_usage_metrics(Some(input_price), Some(output_price), 100, 0);
+                    store_analytics_record(&pool_clone, &metrics, &auth_clone).await
+                });
+
+                handles.push(handle);
+            }
+
+            // Wait for all requests to complete
+            for handle in handles {
+                handle.await.expect("Task panicked").expect("store_analytics_record failed");
+            }
+
+            // Verify: All transactions were created successfully
+            let mut conn = pool.acquire().await.unwrap();
+            let mut credits = Credits::new(&mut conn);
+            let transactions = credits.list_user_transactions(user_id, 0, 20).await.unwrap();
+
+            let usage_transactions: Vec<_> = transactions
+                .iter()
+                .filter(|tx| tx.transaction_type == CreditTransactionType::Usage)
+                .collect();
+
+            assert_eq!(usage_transactions.len(), 10, "Should have 10 usage transactions, one per request");
+
+            // Verify: Each transaction has different amount (because pricing was different)
+            let mut amounts: Vec<_> = usage_transactions.iter().map(|tx| tx.amount).collect();
+            amounts.sort();
+            amounts.dedup();
+
+            assert_eq!(amounts.len(), 10, "Each request should have been charged at its own pricing");
+
+            // Verify: Final balance is correct (sum of all deductions)
+            let final_balance = credits.get_user_balance(user_id).await.unwrap();
+            let total_deducted = Decimal::from_str("100.00").unwrap() - final_balance;
+
+            assert!(
+                final_balance < Decimal::from_str("100.00").unwrap(),
+                "Balance should have decreased"
+            );
+            assert!(total_deducted > Decimal::ZERO, "Some credits should have been deducted");
+
+            // With 10 requests at ~0.00010-0.00029 per token, 100 input + 50 output tokens each
+            // Rough calculation: avg price ~0.00015 input, ~0.00025 output
+            // Per request: (100 * 0.00015) + (50 * 0.00025) = 0.015 + 0.0125 = 0.0275
+            // Total for 10: ~0.275
+            // Allow reasonable range
+            assert!(
+                total_deducted < Decimal::from_str("1.0").unwrap(),
+                "Total deducted ({}) should be less than $1.00",
+                total_deducted
+            );
+        }
+
+        #[sqlx::test]
+        #[test_log::test]
+        async fn test_credit_deduction_with_only_input_price(pool: sqlx::PgPool) {
+            // Test that cost is calculated correctly when only input price is set
+            let user_id = setup_user_with_balance(&pool, Decimal::from_str("10.00").unwrap()).await;
+            let auth = create_test_auth_for_user(&pool, user_id).await;
+
+            // Set only input price, output price is None
+            let input_price = Decimal::from_str("0.00001").unwrap();
+            let metrics = create_test_usage_metrics(Some(input_price), None, 1000, 500);
+
+            let result = store_analytics_record(&pool, &metrics, &auth).await;
+            assert!(result.is_ok(), "store_analytics_record should succeed");
+
+            // Verify credit deduction
+            let mut conn = pool.acquire().await.unwrap();
+            let mut credits = Credits::new(&mut conn);
+            let final_balance = credits.get_user_balance(user_id).await.unwrap();
+
+            // Expected cost: only input tokens counted: 1000 * 0.00001 = 0.01
+            // Output tokens (500) should be ignored since no output price
+            let expected_cost = Decimal::from_str("0.01").unwrap();
+            let expected_balance = Decimal::from_str("10.00").unwrap() - expected_cost;
+            assert_eq!(final_balance, expected_balance, "Balance should only deduct for input tokens");
+
+            // Verify transaction amount
+            let transactions = credits.list_user_transactions(user_id, 0, 10).await.unwrap();
+            let usage_tx = transactions
+                .iter()
+                .find(|tx| tx.transaction_type == CreditTransactionType::Usage)
+                .expect("Usage transaction should exist");
+
+            assert_eq!(usage_tx.amount, expected_cost, "Transaction should only charge for input tokens");
+        }
+
+        #[sqlx::test]
+        #[test_log::test]
+        async fn test_credit_deduction_with_only_output_price(pool: sqlx::PgPool) {
+            // Test that cost is calculated correctly when only output price is set
+            let user_id = setup_user_with_balance(&pool, Decimal::from_str("10.00").unwrap()).await;
+            let auth = create_test_auth_for_user(&pool, user_id).await;
+
+            // Set only output price, input price is None
+            let output_price = Decimal::from_str("0.00003").unwrap();
+            let metrics = create_test_usage_metrics(None, Some(output_price), 1000, 500);
+
+            let result = store_analytics_record(&pool, &metrics, &auth).await;
+            assert!(result.is_ok(), "store_analytics_record should succeed");
+
+            // Verify credit deduction
+            let mut conn = pool.acquire().await.unwrap();
+            let mut credits = Credits::new(&mut conn);
+            let final_balance = credits.get_user_balance(user_id).await.unwrap();
+
+            // Expected cost: only output tokens counted: 500 * 0.00003 = 0.015, rounds to 0.02
+            // Input tokens (1000) should be ignored since no input price
+            let expected_cost = Decimal::from_str("0.02").unwrap();
+            let expected_balance = Decimal::from_str("10.00").unwrap() - expected_cost;
+            assert_eq!(final_balance, expected_balance, "Balance should only deduct for output tokens");
+
+            // Verify transaction amount
+            let transactions = credits.list_user_transactions(user_id, 0, 10).await.unwrap();
+            let usage_tx = transactions
+                .iter()
+                .find(|tx| tx.transaction_type == CreditTransactionType::Usage)
+                .expect("Usage transaction should exist");
+
+            assert_eq!(usage_tx.amount, expected_cost, "Transaction should only charge for output tokens");
+        }
+
+        #[sqlx::test]
+        #[test_log::test]
+        async fn test_credit_deduction_with_no_pricing(pool: sqlx::PgPool) {
+            // Test that no deduction occurs when neither price is set
+            let initial_balance = Decimal::from_str("10.00").unwrap();
+            let user_id = setup_user_with_balance(&pool, initial_balance).await;
+            let auth = create_test_auth_for_user(&pool, user_id).await;
+
+            // Both prices are None
+            let metrics = create_test_usage_metrics(None, None, 1000, 500);
+
+            let result = store_analytics_record(&pool, &metrics, &auth).await;
+            assert!(result.is_ok(), "store_analytics_record should succeed");
+
+            // Verify NO credit deduction occurred
+            let mut conn = pool.acquire().await.unwrap();
+            let mut credits = Credits::new(&mut conn);
+            let final_balance = credits.get_user_balance(user_id).await.unwrap();
+
+            assert_eq!(final_balance, initial_balance, "Balance should remain unchanged with no pricing");
+
+            // Verify NO Usage transaction was created
+            let transactions = credits.list_user_transactions(user_id, 0, 10).await.unwrap();
+            let usage_tx = transactions.iter().find(|tx| tx.transaction_type == CreditTransactionType::Usage);
+
+            assert!(usage_tx.is_none(), "No Usage transaction should be created when pricing is None");
+
+            // Verify analytics record WAS still created (for tracking)
+            let analytics_count = sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM http_analytics WHERE user_id = $1")
+                .bind(user_id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+            assert_eq!(analytics_count, 1, "Analytics record should still be created");
+        }
     }
 }
