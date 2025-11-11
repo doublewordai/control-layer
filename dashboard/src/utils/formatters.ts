@@ -78,9 +78,13 @@ export function formatBytes(bytes: number): string {
   const k = 1024;
   const sizes = ["Bytes", "KB", "MB", "GB", "TB"];
   const i = Math.floor(Math.log(bytes) / Math.log(k));
-  
+
   // Guard against index out of bounds
   const sizeIndex = Math.min(i, sizes.length - 1);
-  
-  return Math.round(bytes / Math.pow(k, sizeIndex) * 100) / 100 + " " + sizes[sizeIndex];
+
+  return (
+    Math.round((bytes / Math.pow(k, sizeIndex)) * 100) / 100 +
+    " " +
+    sizes[sizeIndex]
+  );
 }

@@ -441,12 +441,17 @@ export const ApiKeys: React.FC = () => {
                                 tabIndex={-1}
                               >
                                 <Info className="h-4 w-4" />
-                                <span className="sr-only">Purpose information</span>
+                                <span className="sr-only">
+                                  Purpose information
+                                </span>
                               </button>
                             </HoverCardTrigger>
                             <HoverCardContent className="w-80" sideOffset={5}>
                               <p className="text-sm text-muted-foreground">
-                                Choose the API access level for this key. Inference keys can access AI endpoints (/ai/*), while Platform keys can access management APIs (/admin/api/*).
+                                Choose the API access level for this key.
+                                Inference keys can access AI endpoints (/ai/*),
+                                while Platform keys can access management APIs
+                                (/admin/api/*).
                               </p>
                             </HoverCardContent>
                           </HoverCard>
@@ -501,12 +506,15 @@ export const ApiKeys: React.FC = () => {
                                   tabIndex={-1}
                                 >
                                   <Info className="h-4 w-4" />
-                                  <span className="sr-only">Requests per second information</span>
+                                  <span className="sr-only">
+                                    Requests per second information
+                                  </span>
                                 </button>
                               </HoverCardTrigger>
                               <HoverCardContent className="w-80" sideOffset={5}>
                                 <p className="text-sm text-muted-foreground">
-                                  Maximum number of requests allowed per second for this API key. Leave blank for no limit.
+                                  Maximum number of requests allowed per second
+                                  for this API key. Leave blank for no limit.
                                 </p>
                               </HoverCardContent>
                             </HoverCard>
@@ -541,12 +549,16 @@ export const ApiKeys: React.FC = () => {
                                   tabIndex={-1}
                                 >
                                   <Info className="h-4 w-4" />
-                                  <span className="sr-only">Burst size information</span>
+                                  <span className="sr-only">
+                                    Burst size information
+                                  </span>
                                 </button>
                               </HoverCardTrigger>
                               <HoverCardContent className="w-80" sideOffset={5}>
                                 <p className="text-sm text-muted-foreground">
-                                  Maximum burst capacity for rate limiting. This allows temporary spikes above the per-second rate. Leave blank for no limit.
+                                  Maximum burst capacity for rate limiting. This
+                                  allows temporary spikes above the per-second
+                                  rate. Leave blank for no limit.
                                 </p>
                               </HoverCardContent>
                             </HoverCard>

@@ -8,9 +8,12 @@ interface DemoOnlyRouteProps {
   featureName?: string;
 }
 
-export function DemoOnlyRoute({ children, featureName = "This feature" }: DemoOnlyRouteProps) {
+export function DemoOnlyRoute({
+  children,
+  featureName = "This feature",
+}: DemoOnlyRouteProps) {
   const { isFeatureEnabled } = useSettings();
-  
+
   if (!isFeatureEnabled("demo")) {
     return (
       <div className="flex items-center justify-center min-h-[400px]">
@@ -20,10 +23,10 @@ export function DemoOnlyRoute({ children, featureName = "This feature" }: DemoOn
             Demo Mode Required
           </h2>
           <p className="text-gray-600 mb-6">
-            {featureName} is currently only available in demo mode. 
-            Enable demo mode in Settings to explore this feature.
+            {featureName} is currently only available in demo mode. Enable demo
+            mode in Settings to explore this feature.
           </p>
-          <Button onClick={() => window.location.href = '/settings'}>
+          <Button onClick={() => (window.location.href = "/settings")}>
             <Settings className="w-4 h-4 mr-2" />
             Go to Settings
           </Button>
@@ -31,6 +34,6 @@ export function DemoOnlyRoute({ children, featureName = "This feature" }: DemoOn
       </div>
     );
   }
-  
+
   return <>{children}</>;
 }

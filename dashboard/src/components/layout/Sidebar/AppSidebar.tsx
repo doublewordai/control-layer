@@ -62,7 +62,7 @@ export function AppSidebar() {
     { path: "/models", icon: Layers, label: "Models" },
     { path: "/endpoints", icon: Server, label: "Endpoints" },
     { path: "/playground", icon: Play, label: "Playground" },
-    { path: "/batches", icon: Box, label: "Batches", demoOnly: true },
+    { path: "/batches", icon: Box, label: "Batches", demoOnly: false },
     { path: "/analytics", icon: Activity, label: "Traffic" },
     {
       path: "/cost-management",

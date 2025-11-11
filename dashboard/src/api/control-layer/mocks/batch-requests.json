@@ -91,7 +91,10 @@
         "body": {
           "model": "gpt-4o-mini",
           "messages": [
-            { "role": "user", "content": "Invalid request without system message" }
+            {
+              "role": "user",
+              "content": "Invalid request without system message"
+            }
           ]
         }
       },

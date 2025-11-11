@@ -72,6 +72,11 @@ const Batches = lazy(() =>
     default: m.Batches,
   })),
 );
+const FileRequests = lazy(() =>
+  import("./components/features/batches/FileRequests").then((m) => ({
+    default: m.FileRequests,
+  })),
+);
 
 // Loading component for lazy-loaded routes
 function RouteLoader() {
@@ -248,9 +253,17 @@ function AppRoutes() {
           element={
             <AppLayout>
               <ProtectedRoute path="/batches">
-                <DemoOnlyRoute featureName="Batch processing">
-                  <Batches />
-                </DemoOnlyRoute>
+                <Batches />
+              </ProtectedRoute>
+            </AppLayout>
+          }
+        />
+        <Route
+          path="/batches/files/:fileId/content"
+          element={
+            <AppLayout>
+              <ProtectedRoute path="/batches/files/:fileId/content">
+                <FileRequests />
               </ProtectedRoute>
             </AppLayout>
           }

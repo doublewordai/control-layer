@@ -9,6 +9,7 @@ import {
   Loader2,
   AlertCircle,
 } from "lucide-react";
+import { useQuery } from "@tanstack/react-query";
 import {
   Dialog,
   DialogContent,
@@ -24,13 +25,16 @@ import {
   SelectTrigger,
   SelectValue,
 } from "../../ui/select";
-import { useBatchRequests } from "../../../api/control-layer/hooks";
-import { formatTimestamp, formatDuration } from "../../../utils";
-import type {
-  Batch,
-  BatchRequest,
-  RequestStatus,
-} from "../../../api/control-layer/types";
+import { dwctlApi } from "../../../api/control-layer/client";
+import type { Batch, RequestStatus } from "../../../api/control-layer/types";
+
+// Simplified request from output/error files
+interface BatchRequestResult {
+  id?: string;
+  custom_id: string;
+  response?: { status_code: number; body: any } | null;
+  error?: { code: string; message: string } | null;
+}
 
 interface ViewBatchRequestsModalProps {
   isOpen: boolean;
@@ -128,14 +132,18 @@ function RequestCard({ request }: { request: BatchRequest }) {
             <div>
               <span className="text-gray-600">Created:</span>{" "}
               <span className="text-gray-900">
-                {formatTimestamp(new Date(request.created_at * 1000).toISOString())}
+                {formatTimestamp(
+                  new Date(request.created_at * 1000).toISOString(),
+                )}
               </span>
             </div>
             {request.started_at && (
               <div>
                 <span className="text-gray-600">Started:</span>{" "}
                 <span className="text-gray-900">
-                  {formatTimestamp(new Date(request.started_at * 1000).toISOString())}
+                  {formatTimestamp(
+                    new Date(request.started_at * 1000).toISOString(),
+                  )}
                 </span>
               </div>
             )}
@@ -143,7 +151,9 @@ function RequestCard({ request }: { request: BatchRequest }) {
               <div>
                 <span className="text-gray-600">Completed:</span>{" "}
                 <span className="text-gray-900">
-                  {formatTimestamp(new Date(request.completed_at * 1000).toISOString())}
+                  {formatTimestamp(
+                    new Date(request.completed_at * 1000).toISOString(),
+                  )}
                 </span>
               </div>
             )}
@@ -151,7 +161,9 @@ function RequestCard({ request }: { request: BatchRequest }) {
               <>
                 <div>
                   <span className="text-gray-600">Prompt Tokens:</span>{" "}
-                  <span className="text-gray-900">{request.usage.prompt_tokens}</span>
+                  <span className="text-gray-900">
+                    {request.usage.prompt_tokens}
+                  </span>
                 </div>
                 <div>
                   <span className="text-gray-600">Completion Tokens:</span>{" "}
@@ -193,7 +205,9 @@ function RequestCard({ request }: { request: BatchRequest }) {
                   <p className="text-sm font-medium text-red-900">
                     {request.error.code}
                   </p>
-                  <p className="text-sm text-red-700">{request.error.message}</p>
+                  <p className="text-sm text-red-700">
+                    {request.error.message}
+                  </p>
                 </div>
               </div>
             </div>
@@ -210,21 +224,39 @@ export function ViewBatchRequestsModal({
   batch,
 }: ViewBatchRequestsModalProps) {
   const [page, setPage] = useState(0);
-  const [statusFilter, setStatusFilter] = useState<RequestStatus | "all">("all");
+  const [statusFilter, setStatusFilter] = useState<RequestStatus | "all">(
+    "all",
+  );
   const pageSize = 50;
 
-  const { data, isLoading } = useBatchRequests(
-    batch?.id || "",
-    {
-      limit: pageSize,
-      skip: page * pageSize,
-      status: statusFilter !== "all" ? statusFilter : undefined,
-    },
-  );
+  const { data, isLoading } = useBatchRequests(batch?.id || "", {
+    limit: pageSize,
+    skip: page * pageSize,
+    status: statusFilter !== "all" ? statusFilter : undefined,
+  });
 
   const requests = data?.data || [];
   const hasMore = data?.has_more || false;
   const total = data?.total || 0;
+
+  // Only infer canceled count if the batch status is cancelled
+  const canceledCount =
+    batch && batch.status === "cancelled"
+      ? Math.max(
+          0,
+          batch.request_counts.total -
+            batch.request_counts.completed -
+            batch.request_counts.failed,
+        )
+      : 0;
+  const finishedCount = batch
+    ? batch.request_counts.completed +
+      batch.request_counts.failed +
+      canceledCount
+    : 0;
+  const finishedPercent = batch
+    ? Math.round((finishedCount / batch.request_counts.total) * 100)
+    : 0;
 
   return (
     <Dialog open={isOpen} onOpenChange={onClose}>
@@ -240,7 +272,9 @@ export function ViewBatchRequestsModal({
               <div className="flex gap-6 text-sm">
                 <span className="text-gray-600">
                   <span className="font-medium text-gray-900">File:</span>{" "}
-                  <span className="font-mono text-xs">{batch.input_file_id}</span>
+                  <span className="font-mono text-xs">
+                    {batch.input_file_id}
+                  </span>
                 </span>
                 <span className="text-gray-600">
                   <span className="font-medium text-gray-900">Endpoint:</span>{" "}
@@ -253,23 +287,15 @@ export function ViewBatchRequestsModal({
             <div className="space-y-1">
               <div className="flex justify-between text-sm">
                 <span className="text-gray-600">
-                  Progress: {batch.request_counts.completed + batch.request_counts.failed} /{" "}
-                  {batch.request_counts.total}
+                  Progress: {finishedCount} / {batch.request_counts.total}
                 </span>
-                <span className="text-gray-600">
-                  {Math.round(
-                    ((batch.request_counts.completed + batch.request_counts.failed) /
-                      batch.request_counts.total) *
-                      100,
-                  )}
-                  %
-                </span>
+                <span className="text-gray-600">{finishedPercent}%</span>
               </div>
               <div className="w-full bg-gray-200 rounded-full h-2">
                 <div
                   className="bg-blue-600 h-2 rounded-full transition-all"
                   style={{
-                    width: `${((batch.request_counts.completed + batch.request_counts.failed) / batch.request_counts.total) * 100}%`,
+                    width: `${finishedPercent}%`,
                   }}
                 />
               </div>
@@ -280,6 +306,11 @@ export function ViewBatchRequestsModal({
                 {batch.request_counts.failed > 0 && (
                   <span className="text-red-600">
                     ✗ {batch.request_counts.failed} failed
+                  </span>
+                )}
+                {canceledCount > 0 && (
+                  <span className="text-gray-600">
+                    ⊘ {canceledCount} canceled
                   </span>
                 )}
               </div>

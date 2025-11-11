@@ -58,9 +58,12 @@ pub trait Storage: Send + Sync {
     /// - Regular files (purpose='batch'): RequestTemplateInput
     /// - Batch output files (purpose='batch_output'): BatchOutputItem
     /// - Batch error files (purpose='batch_error'): BatchErrorItem
+    ///
+    /// The offset parameter allows skipping the first N lines (0-indexed).
     fn get_file_content_stream(
         &self,
         file_id: FileId,
+        offset: usize,
     ) -> Pin<Box<dyn Stream<Item = Result<FileContentItem>> + Send>>;
 
     /// Delete a file (cascades to batches and executions).

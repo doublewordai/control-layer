@@ -5,15 +5,15 @@
 //! Repository methods are delegated to the fusillade/ crate - which (as of 04/11/2025) stores
 //! files disaggregated in postgres.
 
-use crate::api::models::files::{FileDeleteResponse, FileListResponse, FileResponse, ListFilesQuery, ListObject, ObjectType, Purpose};
-use crate::auth::permissions::{can_read_all_resources, has_permission, operation, resource, RequiresPermission};
+use crate::api::models::files::{
+    FileContentQuery, FileDeleteResponse, FileListResponse, FileResponse, ListFilesQuery, ListObject, ObjectType, Purpose,
+};
+use crate::auth::permissions::{can_read_all_resources, operation, resource, RequiresPermission};
 
 use crate::db::{handlers::api_keys::ApiKeys, models::api_keys::ApiKeyPurpose};
 use crate::errors::{Error, Result};
-use crate::types::{Operation, Resource};
+use crate::types::Resource;
 use crate::AppState;
-use axum::body::Body;
-use axum::response::IntoResponse;
 use axum::{
     extract::{Multipart, Path, Query, State},
     http::StatusCode,
@@ -389,6 +389,14 @@ pub async fn upload_file(
         }
     }
 
+    // Convert fusillade Purpose to API Purpose
+    let api_purpose = match file.purpose {
+        Some(fusillade::batch::Purpose::Batch) => Purpose::Batch,
+        Some(fusillade::batch::Purpose::BatchOutput) => Purpose::BatchOutput,
+        Some(fusillade::batch::Purpose::BatchError) => Purpose::BatchError,
+        None => Purpose::Batch, // Default to Batch for backwards compatibility
+    };
+
     Ok((
         StatusCode::CREATED,
         Json(FileResponse {
@@ -397,7 +405,8 @@ pub async fn upload_file(
             bytes: file.size_bytes,
             created_at: file.created_at.timestamp(),
             filename: file.name,
-            purpose: Purpose::Batch,
+            purpose: api_purpose,
+            expires_at: file.expires_at.map(|dt| dt.timestamp()),
         }),
     ))
 }
@@ -422,7 +431,6 @@ pub async fn list_files(
     Query(query): Query<ListFilesQuery>,
     current_user: RequiresPermission<resource::Files, operation::ReadOwn>,
 ) -> Result<Json<FileListResponse>> {
-    let has_system_access = has_permission(&current_user, Resource::Files, Operation::SystemAccess);
     let can_read_all_files = can_read_all_resources(&current_user, Resource::Files);
 
     if query.order != "asc" && query.order != "desc" {
@@ -431,7 +439,13 @@ pub async fn list_files(
         });
     }
 
-    let limit = query.limit.unwrap_or(20).clamp(1, 10000);
+    let limit = query.limit.unwrap_or(10000).clamp(1, 10000);
+
+    // Parse the 'after' cursor if provided
+    let after = query
+        .after
+        .as_ref()
+        .and_then(|id_str| uuid::Uuid::parse_str(id_str).ok().map(fusillade::FileId::from));
 
     // Build filter based on permissions
     let filter = fusillade::FileFilter {
@@ -441,10 +455,12 @@ pub async fn list_files(
         } else {
             None
         },
-        // Filter by status if user doesn't have system access
-        // TODO: What is the point of this 'status' field?
-        status: if !has_system_access { Some("processed".to_string()) } else { None },
-        purpose: None,
+        // No status filtering
+        status: None,
+        purpose: query.purpose.clone(),
+        after,
+        limit: Some((limit + 1) as usize), // Fetch one extra to check has_more
+        ascending: query.order == "asc",
     };
 
     use fusillade::Storage;
@@ -452,7 +468,7 @@ pub async fn list_files(
         operation: format!("list files: {}", e),
     })?;
 
-    // Apply limit and pagination (simple version)
+    // Check if there are more results
     let has_more = files.len() > limit as usize;
     if has_more {
         files.truncate(limit as usize);
@@ -463,13 +479,24 @@ pub async fn list_files(
 
     let data: Vec<FileResponse> = files
         .iter()
-        .map(|f| FileResponse {
-            id: f.id.0.to_string(), // Use full UUID, not Display truncation
-            object_type: ObjectType::File,
-            bytes: f.size_bytes,
-            created_at: f.created_at.timestamp(),
-            filename: f.name.clone(),
-            purpose: Purpose::Batch,
+        .map(|f| {
+            // Convert fusillade Purpose to API Purpose
+            let api_purpose = match f.purpose {
+                Some(fusillade::batch::Purpose::Batch) => Purpose::Batch,
+                Some(fusillade::batch::Purpose::BatchOutput) => Purpose::BatchOutput,
+                Some(fusillade::batch::Purpose::BatchError) => Purpose::BatchError,
+                None => Purpose::Batch, // Default to Batch for backwards compatibility
+            };
+
+            FileResponse {
+                id: f.id.0.to_string(), // Use full UUID, not Display truncation
+                object_type: ObjectType::File,
+                bytes: f.size_bytes,
+                created_at: f.created_at.timestamp(),
+                filename: f.name.clone(),
+                purpose: api_purpose,
+                expires_at: f.expires_at.map(|dt| dt.timestamp()),
+            }
         })
         .collect();
 
@@ -503,7 +530,6 @@ pub async fn get_file(
     Path(file_id_str): Path<String>,
     current_user: RequiresPermission<resource::Files, operation::ReadOwn>,
 ) -> Result<Json<FileResponse>> {
-    let has_system_access = has_permission(&current_user, Resource::Files, Operation::SystemAccess);
     let can_read_all_files = can_read_all_resources(&current_user, Resource::Files);
 
     let file_id = Uuid::parse_str(&file_id_str).map_err(|_| Error::BadRequest {
@@ -530,13 +556,13 @@ pub async fn get_file(
         }
     }
 
-    // Check status: users without SystemAccess can only see processed files
-    if !has_system_access && file.status != fusillade::FileStatus::Processed {
-        return Err(Error::NotFound {
-            resource: "File".to_string(),
-            id: file_id_str,
-        });
-    }
+    // Convert fusillade Purpose to API Purpose
+    let api_purpose = match file.purpose {
+        Some(fusillade::batch::Purpose::Batch) => Purpose::Batch,
+        Some(fusillade::batch::Purpose::BatchOutput) => Purpose::BatchOutput,
+        Some(fusillade::batch::Purpose::BatchError) => Purpose::BatchError,
+        None => Purpose::Batch, // Default to Batch for backwards compatibility
+    };
 
     Ok(Json(FileResponse {
         id: file.id.0.to_string(), // Use full UUID, not Display truncation
@@ -544,7 +570,8 @@ pub async fn get_file(
         bytes: file.size_bytes,
         created_at: file.created_at.timestamp(),
         filename: file.name,
-        purpose: Purpose::Batch,
+        purpose: api_purpose,
+        expires_at: file.expires_at.map(|dt| dt.timestamp()),
     }))
 }
 
@@ -553,23 +580,24 @@ pub async fn get_file(
     path = "/files/{file_id}/content",
     tag = "files",
     summary = "Retrieve file content",
-    description = "Download the content of a file as JSONL. Returns the file metadata and request templates.",
+    description = "Download the content of a file as JSONL. Returns the file metadata and request templates. Supports pagination via limit and offset parameters.",
     responses(
         (status = 200, description = "File content", content_type = "application/x-ndjson"),
         (status = 404, description = "File not found"),
         (status = 500, description = "Internal server error")
     ),
     params(
-        ("file_id" = String, Path, description = "The ID of the file to retrieve content from")
+        ("file_id" = String, Path, description = "The ID of the file to retrieve content from"),
+        FileContentQuery
     )
 )]
-#[tracing::instrument(skip(state, current_user), fields(user_id = %current_user.id, file_id = %file_id_str))]
+#[tracing::instrument(skip(state, current_user), fields(user_id = %current_user.id, file_id = %file_id_str, limit = ?query.limit, offset = ?query.offset))]
 pub async fn get_file_content(
     State(state): State<AppState>,
     Path(file_id_str): Path<String>,
+    Query(query): Query<FileContentQuery>,
     current_user: RequiresPermission<resource::Files, operation::ReadOwn>,
 ) -> Result<axum::response::Response> {
-    let has_system_access = has_permission(&current_user, Resource::Files, Operation::SystemAccess);
     let can_read_all_files = can_read_all_resources(&current_user, Resource::Files);
 
     let file_id = Uuid::parse_str(&file_id_str).map_err(|_| Error::BadRequest {
@@ -578,7 +606,7 @@ pub async fn get_file_content(
 
     use fusillade::Storage;
 
-    // First, get the file to check ownership and status
+    // First, get the file to check ownership
     let file = state
         .request_manager
         .get_file(fusillade::FileId(file_id))
@@ -599,64 +627,44 @@ pub async fn get_file_content(
         }
     }
 
-    // Check status: users without SystemAccess can only see processed files
-    if !has_system_access && file.status != fusillade::FileStatus::Processed {
-        return Err(Error::NotFound {
-            resource: "File".to_string(),
-            id: file_id_str,
-        });
-    }
+    // Stream the file content as JSONL, starting from offset
+    let offset = query.offset.unwrap_or(0) as usize;
+    let content_stream = state.request_manager.get_file_content_stream(fusillade::FileId(file_id), offset);
 
-    // For batch output/error files, verify the batch is complete before allowing download
-    if matches!(
-        file.purpose,
-        Some(fusillade::Purpose::BatchOutput) | Some(fusillade::Purpose::BatchError)
-    ) {
-        // Find the batch that owns this file using indexed lookup
-        let file_type = if file.purpose == Some(fusillade::Purpose::BatchOutput) {
-            fusillade::OutputFileType::Output
-        } else {
-            fusillade::OutputFileType::Error
-        };
+    // Apply limit if specified, fetching one extra to detect if there are more results
+    let requested_limit = query.limit.map(|l| l as usize);
+    let fetch_limit = requested_limit.map(|l| l + 1); // Fetch one extra to check for more results
 
-        let batch = state
-            .request_manager
-            .get_batch_by_output_file_id(fusillade::FileId(file_id), file_type)
-            .await
-            .map_err(|e| Error::Internal {
-                operation: format!("get batch by output file: {}", e),
-            })?;
+    let content_stream: Pin<Box<dyn Stream<Item = fusillade::Result<fusillade::FileContentItem>> + Send>> = if let Some(limit) = fetch_limit
+    {
+        Box::pin(content_stream.take(limit))
+    } else {
+        Box::pin(content_stream)
+    };
 
-        if let Some(batch) = batch {
-            // Get batch status to check if it's complete
-            let status = state
-                .request_manager
-                .get_batch_status(batch.id)
-                .await
-                .map_err(|e| Error::Internal {
-                    operation: format!("get batch status: {}", e),
-                })?;
+    // Collect items to determine if we need to truncate and set headers
+    let items: Vec<_> = content_stream.collect().await;
 
-            let openai_status = status.openai_status();
+    let has_more = if let Some(req_limit) = requested_limit {
+        items.len() > req_limit
+    } else {
+        false // No limit means we fetched everything available
+    };
 
-            // Only allow download if batch is in a terminal state
-            if openai_status != "completed" && openai_status != "failed" && openai_status != "cancelled" && openai_status != "expired" {
-                return Err(Error::BadRequest {
-                    message: format!(
-                        "Batch is still processing (status: {}). Wait for completion before downloading results.",
-                        openai_status
-                    ),
-                });
-            }
-        }
-    }
+    // Truncate to requested limit if we fetched extra
+    let items_to_return = if let Some(req_limit) = requested_limit {
+        items.into_iter().take(req_limit).collect::<Vec<_>>()
+    } else {
+        items
+    };
 
-    // Stream the file content as JSONL
-    let content_stream = state.request_manager.get_file_content_stream(fusillade::FileId(file_id));
+    let line_count = items_to_return.len();
+    let last_line = offset + line_count;
 
     // Convert FileContentItem to JSONL (one per line)
-    let jsonl_stream = content_stream.map(|content_result| {
-        content_result
+    let mut jsonl_lines = Vec::new();
+    for content_result in items_to_return {
+        let json_line = content_result
             .and_then(|content_item| {
                 // Handle different content types
                 match content_item {
@@ -684,12 +692,23 @@ pub async fn get_file_content(
                     }
                 }
             })
-            .map_err(|e| std::io::Error::other(e.to_string()))
-    });
+            .map_err(|e| Error::Internal {
+                operation: format!("serialize content: {}", e),
+            })?;
+        jsonl_lines.push(json_line);
+    }
 
-    let body = Body::from_stream(jsonl_stream);
+    let jsonl_content = jsonl_lines.join("");
 
-    Ok((StatusCode::OK, [("content-type", "application/x-ndjson")], body).into_response())
+    let mut response = axum::response::Response::new(axum::body::Body::from(jsonl_content));
+    response
+        .headers_mut()
+        .insert("content-type", "application/x-ndjson".parse().unwrap());
+    response.headers_mut().insert("X-Incomplete", has_more.to_string().parse().unwrap());
+    response.headers_mut().insert("X-Last-Line", last_line.to_string().parse().unwrap());
+    *response.status_mut() = StatusCode::OK;
+
+    Ok(response)
 }
 
 #[utoipa::path(

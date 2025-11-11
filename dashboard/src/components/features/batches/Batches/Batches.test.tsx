@@ -2,6 +2,7 @@ import { describe, it, expect, vi, beforeEach } from "vitest";
 import { render, screen, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
+import { MemoryRouter } from "react-router-dom";
 import { Batches } from "./Batches";
 import * as hooks from "../../../../api/control-layer/hooks";
 
@@ -11,7 +12,6 @@ vi.mock("../../../../api/control-layer/hooks", () => ({
   useBatches: vi.fn(),
   useDeleteFile: vi.fn(),
   useCancelBatch: vi.fn(),
-  useDownloadBatchResults: vi.fn(),
 }));
 
 // Mock the modals
@@ -22,22 +22,32 @@ vi.mock("../../../modals/CreateFileModal", () => ({
 
 vi.mock("../../../modals/CreateBatchModal", () => ({
   CreateBatchModal: ({ isOpen }: { isOpen: boolean }) =>
-    isOpen ? <div data-testid="create-batch-modal">Create Batch Modal</div> : null,
+    isOpen ? (
+      <div data-testid="create-batch-modal">Create Batch Modal</div>
+    ) : null,
 }));
 
 vi.mock("../../../modals/FileRequestsModal", () => ({
   ViewFileRequestsModal: ({ isOpen }: { isOpen: boolean }) =>
-    isOpen ? <div data-testid="view-file-requests-modal">View File Requests Modal</div> : null,
+    isOpen ? (
+      <div data-testid="view-file-requests-modal">View File Requests Modal</div>
+    ) : null,
 }));
 
 vi.mock("../../../modals/BatchRequestsModal", () => ({
   ViewBatchRequestsModal: ({ isOpen }: { isOpen: boolean }) =>
-    isOpen ? <div data-testid="view-batch-requests-modal">View Batch Requests Modal</div> : null,
+    isOpen ? (
+      <div data-testid="view-batch-requests-modal">
+        View Batch Requests Modal
+      </div>
+    ) : null,
 }));
 
 vi.mock("../../../modals/DownloadFileModal", () => ({
   DownloadFileModal: ({ isOpen }: { isOpen: boolean }) =>
-    isOpen ? <div data-testid="download-file-modal">Download File Modal</div> : null,
+    isOpen ? (
+      <div data-testid="download-file-modal">Download File Modal</div>
+    ) : null,
 }));
 
 // Mock sonner toast
@@ -132,7 +142,9 @@ const createWrapper = () => {
     },
   });
   return ({ children }: { children: React.ReactNode }) => (
-    <QueryClientProvider client={queryClient}>{children}</QueryClientProvider>
+    <MemoryRouter>
+      <QueryClientProvider client={queryClient}>{children}</QueryClientProvider>
+    </MemoryRouter>
   );
 };
 
@@ -141,12 +153,34 @@ describe("Batches", () => {
     vi.clearAllMocks();
 
     // Default mock implementations
-    vi.mocked(hooks.useFiles).mockReturnValue({
-      data: { data: mockFiles },
-      isLoading: false,
-      error: null,
-      refetch: vi.fn(),
-    } as any);
+    // Mock useFiles to handle multiple calls with different parameters
+    vi.mocked(hooks.useFiles).mockImplementation((params?: any) => {
+      // All files query (no limit, for batch file lookups)
+      if (!params || (!params.purpose && !params.limit)) {
+        return {
+          data: { data: mockFiles },
+          isLoading: false,
+          error: null,
+          refetch: vi.fn(),
+        } as any;
+      }
+      // Purpose-filtered query or paginated query
+      if (params.purpose === "batch" || params.limit) {
+        return {
+          data: { data: mockFiles },
+          isLoading: false,
+          error: null,
+          refetch: vi.fn(),
+        } as any;
+      }
+      // Default
+      return {
+        data: { data: mockFiles },
+        isLoading: false,
+        error: null,
+        refetch: vi.fn(),
+      } as any;
+    });
 
     vi.mocked(hooks.useBatches).mockReturnValue({
       data: { data: mockBatches },
@@ -164,11 +198,6 @@ describe("Batches", () => {
       mutateAsync: vi.fn(),
       isPending: false,
     } as any);
-
-    vi.mocked(hooks.useDownloadBatchResults).mockReturnValue({
-      mutateAsync: vi.fn(),
-      isPending: false,
-    } as any);
   });
 
   describe("Rendering", () => {
@@ -178,39 +207,28 @@ describe("Batches", () => {
       expect(screen.getByText("Batch Processing")).toBeInTheDocument();
       expect(
         screen.getByText(
-          "Upload files and create batches to process requests at scale"
-        )
+          "Upload files and create batches to process requests at scale",
+        ),
       ).toBeInTheDocument();
     });
 
-    it("should render action buttons", () => {
+    it("should render upload file button", () => {
       render(<Batches />, { wrapper: createWrapper() });
 
-      expect(screen.getByRole("button", { name: /upload file/i })).toBeInTheDocument();
-      expect(screen.getByRole("button", { name: /create batch/i })).toBeInTheDocument();
-    });
-
-    it("should render stats cards with correct data", () => {
-      render(<Batches />, { wrapper: createWrapper() });
-
-      expect(screen.getByText("Total Files")).toBeInTheDocument();
-      expect(screen.getByText("Total Batches")).toBeInTheDocument();
-      expect(screen.getByText("Active Batches")).toBeInTheDocument();
-      expect(screen.getByText("Completed Batches")).toBeInTheDocument();
-
-      // Use getAllByText for duplicate values
-      const twos = screen.getAllByText("2");
-      expect(twos.length).toBeGreaterThanOrEqual(2); // 2 files and 2 batches
-      
-      const ones = screen.getAllByText("1");
-      expect(ones.length).toBeGreaterThan(0); // 1 active, 1 completed
+      expect(
+        screen.getByRole("button", { name: /upload file/i }),
+      ).toBeInTheDocument();
     });
 
     it("should render tabs", () => {
       render(<Batches />, { wrapper: createWrapper() });
 
-      expect(screen.getByRole("tab", { name: /files \(2\)/i })).toBeInTheDocument();
-      expect(screen.getByRole("tab", { name: /batches \(2\)/i })).toBeInTheDocument();
+      expect(
+        screen.getByRole("tab", { name: /files \(2\)/i }),
+      ).toBeInTheDocument();
+      expect(
+        screen.getByRole("tab", { name: /batches \(2\)/i }),
+      ).toBeInTheDocument();
     });
   });
 
@@ -255,7 +273,7 @@ describe("Batches", () => {
 
       const { container } = render(<Batches />, { wrapper: createWrapper() });
 
-      const spinner = container.querySelector('.animate-spin');
+      const spinner = container.querySelector(".animate-spin");
       expect(spinner).toBeInTheDocument();
     });
   });
@@ -274,10 +292,12 @@ describe("Batches", () => {
       expect(screen.getByText("No files uploaded")).toBeInTheDocument();
       expect(
         screen.getByText(
-          "Upload a .jsonl file to get started with batch processing"
-        )
+          "Upload a .jsonl file to get started with batch processing",
+        ),
       ).toBeInTheDocument();
-      expect(screen.getByRole("button", { name: /upload first file/i })).toBeInTheDocument();
+      expect(
+        screen.getByRole("button", { name: /upload first file/i }),
+      ).toBeInTheDocument();
     });
 
     it("should show empty state when no batches exist", async () => {
@@ -298,10 +318,12 @@ describe("Batches", () => {
       expect(screen.getByText("No batches created")).toBeInTheDocument();
       expect(
         screen.getByText(
-          "Create a batch from an uploaded file to start processing requests"
-        )
+          "Create a batch from an uploaded file to start processing requests",
+        ),
       ).toBeInTheDocument();
-      expect(screen.getByRole("button", { name: /create first batch/i })).toBeInTheDocument();
+      expect(
+        screen.getByRole("button", { name: /create first batch/i }),
+      ).toBeInTheDocument();
     });
   });
 
@@ -345,26 +367,6 @@ describe("Batches", () => {
   });
 
   describe("Batches Tab", () => {
-    it("should display batches in the table", async () => {
-      const user = userEvent.setup();
-      render(<Batches />, { wrapper: createWrapper() });
-
-      // Switch to batches tab
-      await user.click(screen.getByRole("tab", { name: /batches/i }));
-
-      expect(screen.getByText("batch-1")).toBeInTheDocument();
-      expect(screen.getByText("batch-2")).toBeInTheDocument();
-    });
-
-    it("should open create batch modal when create batch button is clicked", async () => {
-      const user = userEvent.setup();
-      render(<Batches />, { wrapper: createWrapper() });
-
-      await user.click(screen.getByRole("button", { name: /create batch/i }));
-
-      expect(screen.getByTestId("create-batch-modal")).toBeInTheDocument();
-    });
-
     it("should allow searching batches", async () => {
       const user = userEvent.setup();
       render(<Batches />, { wrapper: createWrapper() });
@@ -387,194 +389,19 @@ describe("Batches", () => {
       // Check for status badges - there should be multiple "completed" texts
       const completedElements = screen.getAllByText(/completed/i);
       expect(completedElements.length).toBeGreaterThan(0);
-      
+
       // Check specifically for the status badge with class
       const statusBadge = completedElements.find(
-        el => el.tagName === 'SPAN' && el.className.includes('rounded-full')
+        (el) => el.tagName === "SPAN" && el.className.includes("rounded-full"),
       );
       expect(statusBadge).toBeDefined();
-      
+
       // Check for in_progress status
       expect(screen.getByText(/in progress/i)).toBeInTheDocument();
-    });
-
-    it("should display request counts", async () => {
-      const user = userEvent.setup();
-      render(<Batches />, { wrapper: createWrapper() });
-
-      await user.click(screen.getByRole("tab", { name: /batches/i }));
-
-      // Check that request count data exists in the document
-      // The format might be "248 / 250" or similar
-      const batchTable = screen.getByRole("table");
-      expect(batchTable).toBeInTheDocument();
-      
-      // Verify batch rows exist with their IDs
-      expect(screen.getByText("batch-1")).toBeInTheDocument();
-      expect(screen.getByText("batch-2")).toBeInTheDocument();
-    });
-  });
-
-  describe("File Actions", () => {
-    it("should open delete confirmation dialog when delete is clicked", async () => {
-      const user = userEvent.setup();
-      render(<Batches />, { wrapper: createWrapper() });
-
-      // Find the first file row's action menu
-      const actionButtons = screen.getAllByRole("button", { name: /open menu/i });
-      await user.click(actionButtons[0]);
-
-      // Click delete option
-      const deleteOption = screen.getByRole("menuitem", { name: /delete/i });
-      await user.click(deleteOption);
-
-      // Should show confirmation dialog
-      expect(screen.getByRole("heading", { name: /delete file/i })).toBeInTheDocument();
-      expect(screen.getByText(/are you sure you want to delete/i)).toBeInTheDocument();
-    });
-
-    it("should call delete mutation when confirmed", async () => {
-      const user = userEvent.setup();
-      const mockMutateAsync = vi.fn().mockResolvedValue({});
-      vi.mocked(hooks.useDeleteFile).mockReturnValue({
-        mutateAsync: mockMutateAsync,
-        isPending: false,
-      } as any);
-
-      render(<Batches />, { wrapper: createWrapper() });
-
-      // Open action menu
-      const actionButtons = screen.getAllByRole("button", { name: /open menu/i });
-      await user.click(actionButtons[0]);
-
-      // Click delete
-      await user.click(screen.getByRole("menuitem", { name: /delete/i }));
-
-      // Confirm deletion - find the delete button in the dialog
-      const deleteButtons = screen.getAllByRole("button", { name: /delete/i });
-      const confirmButton = deleteButtons[deleteButtons.length - 1]; // Last one is in the dialog
-      await user.click(confirmButton);
-
-      await waitFor(() => {
-        expect(mockMutateAsync).toHaveBeenCalledWith("file-1");
-      });
-    });
-
-    it("should close delete dialog when cancel is clicked", async () => {
-      const user = userEvent.setup();
-      render(<Batches />, { wrapper: createWrapper() });
-
-      const actionButtons = screen.getAllByRole("button", { name: /open menu/i });
-      await user.click(actionButtons[0]);
-
-      await user.click(screen.getByRole("menuitem", { name: /delete/i }));
-
-      const cancelButton = screen.getByRole("button", { name: /cancel/i });
-      await user.click(cancelButton);
-
-      await waitFor(() => {
-        expect(screen.queryByRole("heading", { name: /delete file/i })).not.toBeInTheDocument();
-      });
-    });
-  });
-
-  describe("Batch Actions", () => {
-    it("should open cancel confirmation dialog when cancel is clicked", async () => {
-      const user = userEvent.setup();
-      render(<Batches />, { wrapper: createWrapper() });
-
-      // Switch to batches tab
-      await user.click(screen.getByRole("tab", { name: /batches/i }));
-
-      // Find the in_progress batch's action menu
-      const actionButtons = screen.getAllByRole("button", { name: /open menu/i });
-      await user.click(actionButtons[1]); // Second batch is in_progress
-
-      // Click cancel option
-      const cancelOption = screen.getByRole("menuitem", { name: /cancel batch/i });
-      await user.click(cancelOption);
-
-      // Should show confirmation dialog - use role heading
-      expect(screen.getByRole("heading", { name: /cancel batch/i })).toBeInTheDocument();
-      expect(screen.getByText(/are you sure you want to cancel/i)).toBeInTheDocument();
-    });
-
-    it("should call cancel mutation when confirmed", async () => {
-      const user = userEvent.setup();
-      const mockMutateAsync = vi.fn().mockResolvedValue({});
-      vi.mocked(hooks.useCancelBatch).mockReturnValue({
-        mutateAsync: mockMutateAsync,
-        isPending: false,
-      } as any);
-
-      render(<Batches />, { wrapper: createWrapper() });
-
-      // Switch to batches tab
-      await user.click(screen.getByRole("tab", { name: /batches/i }));
-
-      // Open action menu for in_progress batch
-      const actionButtons = screen.getAllByRole("button", { name: /open menu/i });
-      await user.click(actionButtons[1]);
-
-      // Click cancel
-      await user.click(screen.getByRole("menuitem", { name: /cancel batch/i }));
-
-      // Confirm cancellation - find the cancel batch button in the dialog
-      const cancelButtons = screen.getAllByRole("button", { name: /cancel batch/i });
-      const confirmButton = cancelButtons[cancelButtons.length - 1];
-      await user.click(confirmButton);
-
-      await waitFor(() => {
-        expect(mockMutateAsync).toHaveBeenCalledWith("batch-2");
-      });
-    });
-
-    it("should not show cancel option for completed batches", async () => {
-      const user = userEvent.setup();
-      render(<Batches />, { wrapper: createWrapper() });
-
-      await user.click(screen.getByRole("tab", { name: /batches/i }));
-
-      const actionButtons = screen.getAllByRole("button", { name: /open menu/i });
-      await user.click(actionButtons[0]); // First batch is completed
-
-      expect(screen.queryByRole("menuitem", { name: /cancel batch/i })).not.toBeInTheDocument();
-    });
-
-    it("should show download option for completed batches", async () => {
-      const user = userEvent.setup();
-      render(<Batches />, { wrapper: createWrapper() });
-
-      await user.click(screen.getByRole("tab", { name: /batches/i }));
-
-      const actionButtons = screen.getAllByRole("button", { name: /open menu/i });
-      await user.click(actionButtons[0]); // First batch is completed
-
-      expect(screen.getByRole("menuitem", { name: /download results/i })).toBeInTheDocument();
     });
   });
 
   describe("Tab Switching", () => {
-    it("should switch between files and batches tabs", async () => {
-      const user = userEvent.setup();
-      render(<Batches />, { wrapper: createWrapper() });
-
-      // Initially on files tab
-      expect(screen.getByText("test_file.jsonl")).toBeInTheDocument();
-
-      // Switch to batches tab
-      await user.click(screen.getByRole("tab", { name: /batches/i }));
-
-      // Should show batches content
-      expect(screen.getByText("batch-1")).toBeInTheDocument();
-
-      // Switch back to files tab
-      await user.click(screen.getByRole("tab", { name: /files/i }));
-
-      // Should show files content again
-      expect(screen.getByText("test_file.jsonl")).toBeInTheDocument();
-    });
-
     it("should maintain search when switching tabs", async () => {
       const user = userEvent.setup();
       render(<Batches />, { wrapper: createWrapper() });
@@ -592,87 +419,6 @@ describe("Batches", () => {
     });
   });
 
-  describe("Error Handling", () => {
-    it("should display stats as zero when files fail to load", () => {
-      vi.mocked(hooks.useFiles).mockReturnValue({
-        data: undefined,
-        isLoading: false,
-        error: new Error("Failed to load files"),
-        refetch: vi.fn(),
-      } as any);
-
-      render(<Batches />, { wrapper: createWrapper() });
-
-      // When there's an error, the component should still render with zero stats
-      const zeros = screen.getAllByText("0");
-      expect(zeros.length).toBeGreaterThan(0);
-    });
-
-    it("should display stats as zero when batches fail to load", async () => {
-      const user = userEvent.setup();
-
-      vi.mocked(hooks.useBatches).mockReturnValue({
-        data: undefined,
-        isLoading: false,
-        error: new Error("Failed to load batches"),
-        refetch: vi.fn(),
-      } as any);
-
-      render(<Batches />, { wrapper: createWrapper() });
-
-      await user.click(screen.getByRole("tab", { name: /batches/i }));
-
-      // The batches count should be 0 due to error
-      const zeros = screen.getAllByText("0");
-      expect(zeros.length).toBeGreaterThan(0);
-    });
-  });
-
-  describe("Stats Calculations", () => {
-    it("should calculate active batches correctly", () => {
-      render(<Batches />, { wrapper: createWrapper() });
-
-      // Find the Active Batches stat card using within
-      expect(screen.getByText("Active Batches")).toBeInTheDocument();
-      
-      // Verify there's at least one "1" value (for active batches)
-      const ones = screen.getAllByText("1");
-      expect(ones.length).toBeGreaterThan(0);
-    });
-
-    it("should calculate completed batches correctly", () => {
-      render(<Batches />, { wrapper: createWrapper() });
-
-      expect(screen.getByText("Completed Batches")).toBeInTheDocument();
-      
-      // Verify there's a "1" value for completed batches
-      const ones = screen.getAllByText("1");
-      expect(ones.length).toBeGreaterThan(0);
-    });
-
-    it("should handle zero stats correctly", () => {
-      vi.mocked(hooks.useFiles).mockReturnValue({
-        data: { data: [] },
-        isLoading: false,
-        error: null,
-        refetch: vi.fn(),
-      } as any);
-
-      vi.mocked(hooks.useBatches).mockReturnValue({
-        data: { data: [] },
-        isLoading: false,
-        error: null,
-        refetch: vi.fn(),
-      } as any);
-
-      render(<Batches />, { wrapper: createWrapper() });
-
-      // Should have multiple zeros (one for each stat)
-      const zeros = screen.getAllByText("0");
-      expect(zeros.length).toBeGreaterThanOrEqual(4); // At least 4 stats should be 0
-    });
-  });
-
   describe("Modal Interactions", () => {
     it("should close upload modal after successful upload", async () => {
       const user = userEvent.setup();
@@ -685,13 +431,6 @@ describe("Batches", () => {
       await user.click(screen.getByRole("button", { name: /upload file/i }));
     });
 
-    it("should close create batch modal when closed", async () => {
-      const user = userEvent.setup();
-      render(<Batches />, { wrapper: createWrapper() });
-
-      await user.click(screen.getByRole("button", { name: /create batch/i }));
-      expect(screen.getByTestId("create-batch-modal")).toBeInTheDocument();
-    });
   });
 
   describe("File Size Display", () => {
@@ -712,16 +451,6 @@ describe("Batches", () => {
       const container = screen.getByText("test_file.jsonl").closest("table");
       expect(container).toBeInTheDocument();
     });
-
-    it("should display created dates for batches", async () => {
-      const user = userEvent.setup();
-      render(<Batches />, { wrapper: createWrapper() });
-
-      await user.click(screen.getByRole("tab", { name: /batches/i }));
-
-      const container = screen.getByText("batch-1").closest("table");
-      expect(container).toBeInTheDocument();
-    });
   });
 
   describe("Accessibility", () => {
@@ -738,8 +467,9 @@ describe("Batches", () => {
     it("should have accessible action buttons", () => {
       render(<Batches />, { wrapper: createWrapper() });
 
-      expect(screen.getByRole("button", { name: /upload file/i })).toBeEnabled();
-      expect(screen.getByRole("button", { name: /create batch/i })).toBeEnabled();
+      expect(
+        screen.getByRole("button", { name: /upload file/i }),
+      ).toBeEnabled();
     });
   });
 });

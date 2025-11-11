@@ -1,5 +1,5 @@
 import { useState, useEffect } from "react";
-import { Rocket, AlertCircle } from "lucide-react";
+import { Play, AlertCircle } from "lucide-react";
 import {
   Dialog,
   DialogContent,
@@ -82,7 +82,7 @@ export function CreateBatchModal({
       toast.success(
         `Batch created successfully from "${selectedFile?.filename || "file"}"`,
       );
-      
+
       setSelectedFileId("");
       setEndpoint("/v1/chat/completions");
       setDescription("");
@@ -115,74 +115,74 @@ export function CreateBatchModal({
         </DialogHeader>
 
         <div className="space-y-6">
-          {/* File Selection */}
-          <div className="space-y-2">
-            <Label htmlFor="file">Select File</Label>
-            <Select
-              value={selectedFileId}
-              onValueChange={setSelectedFileId}
-              disabled={filesLoading || !!preselectedFileId}
-            >
-              <SelectTrigger>
-                <SelectValue placeholder="Choose a file..." />
-              </SelectTrigger>
-              <SelectContent>
-                {filesLoading ? (
-                  <SelectItem value="loading" disabled>
-                    Loading files...
-                  </SelectItem>
-                ) : files.length === 0 ? (
-                  <SelectItem value="none" disabled>
-                    No files available
-                  </SelectItem>
-                ) : (
-                  files.map((file) => (
-                    <SelectItem key={file.id} value={file.id}>
-                      {file.filename} ({(file.bytes / 1024).toFixed(1)} KB)
-                    </SelectItem>
-                  ))
-                )}
-              </SelectContent>
-            </Select>
-            {preselectedFileId && (
-              <p className="text-xs text-gray-500">
-                File is pre-selected from the files table
-              </p>
-            )}
-          </div>
-
-          {/* File Info */}
-          {selectedFile && (
-            <div className="bg-gray-50 rounded-lg p-3 space-y-1">
-              <p className="text-sm font-medium text-gray-900">
-                {selectedFile.filename}
-              </p>
-              <div className="flex gap-4 text-xs text-gray-600">
-                <span>Size: {(selectedFile.bytes / 1024).toFixed(1)} KB</span>
-                <span>ID: {selectedFile.id}</span>
+          {/* File Selection or File Info */}
+          {preselectedFileId ? (
+            /* Show only file info when preselected */
+            selectedFile && (
+              <div className="space-y-2">
+                <Label>Selected File</Label>
+                <div className="bg-gray-50 rounded-lg p-3 space-y-1">
+                  <p className="text-sm font-medium text-gray-900">
+                    {selectedFile.filename}
+                  </p>
+                  <div className="flex gap-4 text-xs text-gray-600">
+                    <span>
+                      Size: {(selectedFile.bytes / 1024).toFixed(1)} KB
+                    </span>
+                    <span>ID: {selectedFile.id}</span>
+                  </div>
+                </div>
               </div>
-            </div>
-          )}
+            )
+          ) : (
+            /* Show file selection dropdown when not preselected */
+            <>
+              <div className="space-y-2">
+                <Label htmlFor="file">Select File</Label>
+                <Select
+                  value={selectedFileId}
+                  onValueChange={setSelectedFileId}
+                  disabled={filesLoading}
+                >
+                  <SelectTrigger>
+                    <SelectValue placeholder="Choose a file..." />
+                  </SelectTrigger>
+                  <SelectContent>
+                    {filesLoading ? (
+                      <SelectItem value="loading" disabled>
+                        Loading files...
+                      </SelectItem>
+                    ) : files.length === 0 ? (
+                      <SelectItem value="none" disabled>
+                        No files available
+                      </SelectItem>
+                    ) : (
+                      files.map((file) => (
+                        <SelectItem key={file.id} value={file.id}>
+                          {file.filename} ({(file.bytes / 1024).toFixed(1)} KB)
+                        </SelectItem>
+                      ))
+                    )}
+                  </SelectContent>
+                </Select>
+              </div>
 
-          {/* Endpoint Selection */}
-          <div className="space-y-2">
-            <Label htmlFor="endpoint">Endpoint</Label>
-            <Select value={endpoint} onValueChange={setEndpoint}>
-              <SelectTrigger>
-                <SelectValue />
-              </SelectTrigger>
-              <SelectContent>
-                {ENDPOINTS.map((ep) => (
-                  <SelectItem key={ep.value} value={ep.value}>
-                    {ep.label}
-                  </SelectItem>
-                ))}
-              </SelectContent>
-            </Select>
-            <p className="text-xs text-gray-500">
-              All requests in the file will use this endpoint
-            </p>
-          </div>
+              {/* File Info shown below dropdown when selected */}
+              {selectedFile && (
+                <div className="bg-gray-50 rounded-lg p-3 space-y-1">
+                  <p className="text-sm font-medium text-gray-900">
+                    {selectedFile.filename}
+                  </p>
+                  <div className="flex gap-4 text-xs text-gray-600">
+                    <span>
+                      Size: {(selectedFile.bytes / 1024).toFixed(1)} KB
+                    </span>
+                    <span>ID: {selectedFile.id}</span>
+                  </div>
+                </div>
+              )}
+            </>
+          )}
 
           {/* Description (Optional) */}
           <div className="space-y-2">
@@ -227,8 +227,10 @@ export function CreateBatchModal({
           </Button>
           <Button
             type="button"
+            variant="outline"
             onClick={handleSubmit}
             disabled={!selectedFileId || createBatchMutation.isPending}
+            className="group"
           >
             {createBatchMutation.isPending ? (
               <>
@@ -237,7 +239,7 @@ export function CreateBatchModal({
               </>
             ) : (
               <>
-                <Rocket className="w-4 h-4 mr-2" />
+                <Play className="w-4 h-4 mr-2 transition-transform group-hover:translate-x-[1px]" />
                 Create Batch
               </>
             )}

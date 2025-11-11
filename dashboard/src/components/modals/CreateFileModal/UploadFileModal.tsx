@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useState, useEffect } from "react";
 import { Upload, X, FileText, AlertCircle } from "lucide-react";
 import {
   Dialog,
@@ -23,6 +23,7 @@ interface UploadFileModalProps {
   isOpen: boolean;
   onClose: () => void;
   onSuccess?: () => void;
+  preselectedFile?: File;
 }
 
 const EXPIRATION_PRESETS = [
@@ -38,12 +39,20 @@ export function UploadFileModal({
   isOpen,
   onClose,
   onSuccess,
+  preselectedFile,
 }: UploadFileModalProps) {
-  const [file, setFile] = useState<File | null>(null);
+  const [file, setFile] = useState<File | null>(preselectedFile || null);
   const [expirationSeconds, setExpirationSeconds] = useState<number>(2592000); // 30 days default
   const [dragActive, setDragActive] = useState(false);
 
   const uploadMutation = useUploadFile();
+
+  // Update file when preselected file changes
+  useEffect(() => {
+    if (preselectedFile) {
+      setFile(preselectedFile);
+    }
+  }, [preselectedFile]);
 
   const handleDrag = (e: React.DragEvent) => {
     e.preventDefault();
@@ -178,9 +187,7 @@ export function UploadFileModal({
                   <p className="font-medium text-gray-700">
                     Drop your .jsonl file here
                   </p>
-                  <p className="text-sm text-gray-500">
-                    or click to browse
-                  </p>
+                  <p className="text-sm text-gray-500">or click to browse</p>
                 </div>
               </div>
             )}

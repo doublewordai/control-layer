@@ -3,22 +3,20 @@
 import { type ColumnDef } from "@tanstack/react-table";
 import {
   ArrowUpDown,
-  MoreHorizontal,
   Trash2,
-  Eye,
+  List,
   Clock,
   FileText,
-  Code,
+  Download,
+  Play,
+  FileCheck,
+  AlertCircle,
+  Eye,
+  Layers,
+  Loader2,
 } from "lucide-react";
 import { Button } from "../../../ui/button";
-import {
-  DropdownMenu,
-  DropdownMenuContent,
-  DropdownMenuItem,
-  DropdownMenuLabel,
-  DropdownMenuSeparator,
-  DropdownMenuTrigger,
-} from "../../../ui/dropdown-menu";
+import { Tooltip, TooltipContent, TooltipTrigger } from "../../../ui/tooltip";
 import { formatBytes, formatTimestamp } from "../../../../utils";
 import type { FileObject } from "../types";
 
@@ -26,89 +24,14 @@ interface ColumnActions {
   onView: (file: FileObject) => void;
   onDelete: (file: FileObject) => void;
   onDownloadCode: (file: FileObject) => void;
+  onTriggerBatch: (file: FileObject) => void;
+  onViewBatches: (file: FileObject) => void;
+  isFileInProgress: (file: FileObject) => boolean;
 }
 
 export const createFileColumns = (
   actions: ColumnActions,
 ): ColumnDef<FileObject>[] => [
-  {
-    accessorKey: "filename",
-    header: ({ column }) => {
-      return (
-        <button
-          onClick={() => column.toggleSorting(column.getIsSorted() === "asc")}
-          className="flex items-center text-left font-medium group"
-        >
-          Filename
-          <ArrowUpDown className="ml-2 h-4 w-4 text-gray-400 group-hover:text-gray-700 transition-colors" />
-        </button>
-      );
-    },
-    cell: ({ row }) => {
-      const file = row.original;
-      return (
-        <div className="flex items-center gap-2">
-          <FileText className="w-4 h-4 text-gray-500" />
-          <span className="font-medium">{file.filename}</span>
-        </div>
-      );
-    },
-  },
-  {
-    accessorKey: "id",
-    header: "File ID",
-    cell: ({ row }) => {
-      const id = row.getValue("id") as string;
-      return <span className="font-mono text-xs text-gray-600">{id}</span>;
-    },
-  },
-  {
-    accessorKey: "bytes",
-    header: ({ column }) => {
-      return (
-        <button
-          onClick={() => column.toggleSorting(column.getIsSorted() === "asc")}
-          className="flex items-center text-left font-medium group"
-        >
-          Size
-          <ArrowUpDown className="ml-2 h-4 w-4 text-gray-400 group-hover:text-gray-700 transition-colors" />
-        </button>
-      );
-    },
-    cell: ({ row }) => {
-      const bytes = row.getValue("bytes") as number;
-      return <span className="text-gray-700">{formatBytes(bytes)}</span>;
-    },
-  },
-  {
-    id: "request_count",
-    header: "Requests",
-    cell: ({ row }) => {
-      const file = row.original;
-      // In a real app, this would come from the API
-      // For demo, we'll use mock data based on file ID
-      const requestCounts: Record<string, number> = {
-        "file-demo-1": 3,
-        "file-demo-2": 2,
-        "file-demo-3": 5,
-        "file-demo-4": 2,
-        "file-demo-5": 1,
-        "file-demo-6": 3,
-        "file-demo-7": 1,
-        "file-demo-8": 2,
-        "file-demo-9": 3,
-        "file-demo-10": 1,
-        "file-demo-11": 2,
-        "file-demo-12": 3,
-      };
-      const count = requestCounts[file.id] || 0;
-      return (
-        <span className="inline-flex items-center px-2.5 py-0.5 rounded-full text-xs font-medium bg-gray-100 text-gray-800">
-          {count} {count === 1 ? "request" : "requests"}
-        </span>
-      );
-    },
-  },
   {
     accessorKey: "created_at",
     header: ({ column }) => {
@@ -132,6 +55,76 @@ export const createFileColumns = (
     },
   },
   {
+    accessorKey: "filename",
+    header: ({ column }) => {
+      return (
+        <button
+          onClick={() => column.toggleSorting(column.getIsSorted() === "asc")}
+          className="flex items-center text-left font-medium group"
+        >
+          Filename
+          <ArrowUpDown className="ml-2 h-4 w-4 text-gray-400 group-hover:text-gray-700 transition-colors" />
+        </button>
+      );
+    },
+    cell: ({ row }) => {
+      const file = row.original;
+
+      // Check if file is in progress
+      const isInProgress = actions.isFileInProgress(file);
+
+      // Choose icon based on purpose and progress
+      let icon = <FileText className="w-4 h-4 text-gray-500" />;
+      if (isInProgress) {
+        icon = <Loader2 className="w-4 h-4 text-blue-600 animate-spin" />;
+      } else if (file.purpose === "batch_output") {
+        icon = <FileCheck className="w-4 h-4 text-green-600" />;
+      } else if (file.purpose === "batch_error") {
+        icon = <AlertCircle className="w-4 h-4 text-red-500" />;
+      }
+
+      return (
+        <div
+          className="flex items-center gap-2 cursor-pointer hover:text-blue-600 transition-colors py-0"
+          onClick={() => actions.onView(file)}
+        >
+          {icon}
+          <span className="font-medium">{file.filename}</span>
+        </div>
+      );
+    },
+  },
+  {
+    accessorKey: "id",
+    header: "File ID",
+    cell: ({ row }) => {
+      const id = row.getValue("id") as string;
+      return <span className="font-mono text-xs text-gray-600">{id}</span>;
+    },
+    enableHiding: true,
+    meta: {
+      defaultHidden: true,
+    },
+  },
+  {
+    accessorKey: "bytes",
+    header: ({ column }) => {
+      return (
+        <button
+          onClick={() => column.toggleSorting(column.getIsSorted() === "asc")}
+          className="flex items-center text-left font-medium group"
+        >
+          Size
+          <ArrowUpDown className="ml-2 h-4 w-4 text-gray-400 group-hover:text-gray-700 transition-colors" />
+        </button>
+      );
+    },
+    cell: ({ row }) => {
+      const bytes = row.getValue("bytes") as number;
+      return <span className="text-gray-700">{formatBytes(bytes)}</span>;
+    },
+  },
+  {
     accessorKey: "expires_at",
     header: "Expires",
     cell: ({ row }) => {
@@ -144,22 +137,16 @@ export const createFileColumns = (
 
       if (isExpired) {
         return (
-          <div className="flex items-center gap-1">
-            <Clock className="w-3 h-3 text-red-500" />
-            <span className="text-red-600 font-medium">
-              Expired {formatTimestamp(expiresDate.toISOString())}
-            </span>
-          </div>
+          <span className="text-red-600 font-medium">
+            Expired {formatTimestamp(expiresDate.toISOString())}
+          </span>
         );
       }
 
       return (
-        <div className="flex items-center gap-1">
-          <Clock className="w-3 h-3 text-blue-500" />
-          <span className="text-gray-700">
-            {formatTimestamp(expiresDate.toISOString())}
-          </span>
-        </div>
+        <span className="text-gray-700">
+          {formatTimestamp(expiresDate.toISOString())}
+        </span>
       );
     },
   },
@@ -171,35 +158,94 @@ export const createFileColumns = (
         file.expires_at && new Date(file.expires_at * 1000) < new Date();
 
       return (
-        <DropdownMenu>
-          <DropdownMenuTrigger asChild>
-            <Button variant="ghost" className="h-8 w-8 p-0">
-              <span className="sr-only">Open menu</span>
-              <MoreHorizontal className="h-4 w-4" />
-            </Button>
-          </DropdownMenuTrigger>
-          <DropdownMenuContent align="end">
-            <DropdownMenuLabel>Actions</DropdownMenuLabel>
-            <DropdownMenuItem onClick={() => actions.onView(file)}>
-              <Eye className="mr-2 h-4 w-4" />
-              View Requests
-            </DropdownMenuItem>
-            {!isExpired && (
-              <DropdownMenuItem onClick={() => actions.onDownloadCode(file)}>
-                <Code className="mr-2 h-4 w-4" />
-                Download File
-              </DropdownMenuItem>
-            )}
-            <DropdownMenuSeparator />
-            <DropdownMenuItem
-              onClick={() => actions.onDelete(file)}
-              className="text-red-600"
-            >
-              <Trash2 className="mr-2 h-4 w-4" />
-              Delete
-            </DropdownMenuItem>
-          </DropdownMenuContent>
-        </DropdownMenu>
+        <div className="flex items-center justify-end gap-1">
+          {!isExpired && file.purpose === "batch" && (
+            <Tooltip delayDuration={500}>
+              <TooltipTrigger asChild>
+                <Button
+                  variant="ghost"
+                  size="sm"
+                  className="h-7 w-7 p-0 text-gray-700 hover:bg-gray-100 hover:text-gray-900"
+                  onClick={(e) => {
+                    e.stopPropagation();
+                    actions.onTriggerBatch(file);
+                  }}
+                >
+                  <Play className="h-4 w-4" />
+                </Button>
+              </TooltipTrigger>
+              <TooltipContent>Trigger Batch</TooltipContent>
+            </Tooltip>
+          )}
+          <Tooltip delayDuration={500}>
+            <TooltipTrigger asChild>
+              <Button
+                variant="ghost"
+                size="sm"
+                className="h-7 w-7 p-0 text-gray-700 hover:bg-gray-100 hover:text-gray-900"
+                onClick={(e) => {
+                  e.stopPropagation();
+                  actions.onView(file);
+                }}
+              >
+                <List className="h-4 w-4" />
+              </Button>
+            </TooltipTrigger>
+            <TooltipContent>View Requests</TooltipContent>
+          </Tooltip>
+          {file.purpose === "batch" && (
+            <Tooltip delayDuration={500}>
+              <TooltipTrigger asChild>
+                <Button
+                  variant="ghost"
+                  size="sm"
+                  className="h-7 w-7 p-0 text-gray-700 hover:bg-gray-100 hover:text-gray-900"
+                  onClick={(e) => {
+                    e.stopPropagation();
+                    actions.onViewBatches(file);
+                  }}
+                >
+                  <Layers className="h-4 w-4" />
+                </Button>
+              </TooltipTrigger>
+              <TooltipContent>View Batches</TooltipContent>
+            </Tooltip>
+          )}
+          {!isExpired && (
+            <Tooltip delayDuration={500}>
+              <TooltipTrigger asChild>
+                <Button
+                  variant="ghost"
+                  size="sm"
+                  className="h-7 w-7 p-0 text-gray-700 hover:bg-gray-100 hover:text-gray-900"
+                  onClick={(e) => {
+                    e.stopPropagation();
+                    actions.onDownloadCode(file);
+                  }}
+                >
+                  <Download className="h-4 w-4" />
+                </Button>
+              </TooltipTrigger>
+              <TooltipContent>Download File</TooltipContent>
+            </Tooltip>
+          )}
+          <Tooltip delayDuration={500}>
+            <TooltipTrigger asChild>
+              <Button
+                variant="ghost"
+                size="sm"
+                className="h-8 w-8 p-0 text-gray-700 hover:bg-red-50 hover:text-red-600"
+                onClick={(e) => {
+                  e.stopPropagation();
+                  actions.onDelete(file);
+                }}
+              >
+                <Trash2 className="h-4 w-4" />
+              </Button>
+            </TooltipTrigger>
+            <TooltipContent>Delete</TooltipContent>
+          </Tooltip>
+        </div>
       );
     },
   },

@@ -1,5 +1,6 @@
 import { useState } from "react";
 import { X, FileText, ChevronDown, ChevronRight } from "lucide-react";
+import { useQuery } from "@tanstack/react-query";
 import {
   Dialog,
   DialogContent,
@@ -8,7 +9,7 @@ import {
 } from "../../ui/dialog";
 import { Button } from "../../ui/button";
 import { ScrollArea } from "../../ui/scroll-area";
-import { useFileRequests } from "../../../api/control-layer/hooks";
+import { dwctlApi } from "../../../api/control-layer/client";
 import type { FileObject, FileRequest } from "../../../api/control-layer/types";
 
 interface ViewFileRequestsModalProps {
@@ -71,17 +72,26 @@ export function ViewFileRequestsModal({
   const [page, setPage] = useState(0);
   const pageSize = 50;
 
-  const { data, isLoading } = useFileRequests(
-    file?.id || "",
-    {
-      limit: pageSize,
-      skip: page * pageSize,
-    },
-  );
+  const { data, isLoading } = useQuery({
+    queryKey: ["file-content", file?.id, page],
+    queryFn: () =>
+      dwctlApi.files.getContent(file?.id || "", {
+        limit: pageSize,
+        offset: page * pageSize,
+      }),
+    enabled: !!file?.id && isOpen,
+  });
 
-  const requests = data?.data || [];
-  const hasMore = data?.has_more || false;
-  const total = data?.total || 0;
+  // Parse JSONL into requests
+  const requests: FileRequest[] = data?.content
+    ? data.content
+        .split("\n")
+        .filter((line) => line.trim())
+        .map((line) => JSON.parse(line))
+    : [];
+
+  const hasMore = data?.incomplete ?? false;
+  const total = page * pageSize + requests.length + (hasMore ? 1 : 0);
 
   return (
     <Dialog open={isOpen} onOpenChange={onClose}>
@@ -105,7 +115,9 @@ export function ViewFileRequestsModal({
                 {(file.bytes / 1024).toFixed(1)} KB
               </span>
               <span className="text-gray-600">
-                <span className="font-medium text-gray-900">Total Requests:</span>{" "}
+                <span className="font-medium text-gray-900">
+                  Total Requests:
+                </span>{" "}
                 {total}
               </span>
             </div>

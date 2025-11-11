@@ -6,7 +6,7 @@
       "url": "/v1/chat/completions",
       "body": {
         "model": "gpt-4",
-        "messages": [{"role": "user", "content": "What is 2+2?"}],
+        "messages": [{ "role": "user", "content": "What is 2+2?" }],
         "max_tokens": 100
       }
     },
@@ -16,7 +16,9 @@
       "url": "/v1/chat/completions",
       "body": {
         "model": "gpt-4",
-        "messages": [{"role": "user", "content": "Explain quantum computing"}],
+        "messages": [
+          { "role": "user", "content": "Explain quantum computing" }
+        ],
         "max_tokens": 200
       }
     },
@@ -26,7 +28,7 @@
       "url": "/v1/chat/completions",
       "body": {
         "model": "gpt-4",
-        "messages": [{"role": "user", "content": "Write a haiku"}],
+        "messages": [{ "role": "user", "content": "Write a haiku" }],
         "max_tokens": 50
       }
     }
@@ -38,7 +40,9 @@
       "url": "/v1/chat/completions",
       "body": {
         "model": "gpt-3.5-turbo",
-        "messages": [{"role": "user", "content": "Translate to Spanish: Hello"}],
+        "messages": [
+          { "role": "user", "content": "Translate to Spanish: Hello" }
+        ],
         "max_tokens": 50
       }
     },
@@ -48,7 +52,9 @@
       "url": "/v1/chat/completions",
       "body": {
         "model": "gpt-3.5-turbo",
-        "messages": [{"role": "user", "content": "Summarize: AI is transforming"}],
+        "messages": [
+          { "role": "user", "content": "Summarize: AI is transforming" }
+        ],
         "max_tokens": 100
       }
     }
@@ -60,7 +66,7 @@
       "url": "/v1/chat/completions",
       "body": {
         "model": "gpt-4",
-        "messages": [{"role": "user", "content": "Question 1"}],
+        "messages": [{ "role": "user", "content": "Question 1" }],
         "max_tokens": 150
       }
     },
@@ -70,7 +76,7 @@
       "url": "/v1/chat/completions",
       "body": {
         "model": "gpt-4",
-        "messages": [{"role": "user", "content": "Question 2"}],
+        "messages": [{ "role": "user", "content": "Question 2" }],
         "max_tokens": 150
       }
     },
@@ -80,7 +86,7 @@
       "url": "/v1/chat/completions",
       "body": {
         "model": "gpt-4",
-        "messages": [{"role": "user", "content": "Question 3"}],
+        "messages": [{ "role": "user", "content": "Question 3" }],
         "max_tokens": 150
       }
     },
@@ -90,7 +96,7 @@
       "url": "/v1/chat/completions",
       "body": {
         "model": "gpt-4",
-        "messages": [{"role": "user", "content": "Question 4"}],
+        "messages": [{ "role": "user", "content": "Question 4" }],
         "max_tokens": 150
       }
     },
@@ -100,7 +106,7 @@
       "url": "/v1/chat/completions",
       "body": {
         "model": "gpt-4",
-        "messages": [{"role": "user", "content": "Question 5"}],
+        "messages": [{ "role": "user", "content": "Question 5" }],
         "max_tokens": 150
       }
     }
@@ -112,7 +118,7 @@
       "url": "/v1/chat/completions",
       "body": {
         "model": "gpt-4",
-        "messages": [{"role": "user", "content": "Training example 1"}],
+        "messages": [{ "role": "user", "content": "Training example 1" }],
         "max_tokens": 100
       }
     },
@@ -122,7 +128,7 @@
       "url": "/v1/chat/completions",
       "body": {
         "model": "gpt-4",
-        "messages": [{"role": "user", "content": "Training example 2"}],
+        "messages": [{ "role": "user", "content": "Training example 2" }],
         "max_tokens": 100
       }
     }
@@ -134,7 +140,9 @@
       "url": "/v1/chat/completions",
       "body": {
         "model": "gpt-3.5-turbo",
-        "messages": [{"role": "user", "content": "Analyze sentiment: I love this!"}],
+        "messages": [
+          { "role": "user", "content": "Analyze sentiment: I love this!" }
+        ],
         "max_tokens": 50
       }
     }
@@ -146,7 +154,9 @@
       "url": "/v1/chat/completions",
       "body": {
         "model": "gpt-4",
-        "messages": [{"role": "user", "content": "Translate to French: Good morning"}],
+        "messages": [
+          { "role": "user", "content": "Translate to French: Good morning" }
+        ],
         "max_tokens": 50
       }
     },
@@ -156,7 +166,9 @@
       "url": "/v1/chat/completions",
       "body": {
         "model": "gpt-4",
-        "messages": [{"role": "user", "content": "Translate to German: Thank you"}],
+        "messages": [
+          { "role": "user", "content": "Translate to German: Thank you" }
+        ],
         "max_tokens": 50
       }
     },
@@ -166,7 +178,9 @@
       "url": "/v1/chat/completions",
       "body": {
         "model": "gpt-4",
-        "messages": [{"role": "user", "content": "Translate to Italian: Hello"}],
+        "messages": [
+          { "role": "user", "content": "Translate to Italian: Hello" }
+        ],
         "max_tokens": 50
       }
     }
@@ -178,7 +192,9 @@
       "url": "/v1/chat/completions",
       "body": {
         "model": "gpt-4",
-        "messages": [{"role": "user", "content": "Summarize this article..."}],
+        "messages": [
+          { "role": "user", "content": "Summarize this article..." }
+        ],
         "max_tokens": 200
       }
     }
@@ -190,7 +206,7 @@
       "url": "/v1/chat/completions",
       "body": {
         "model": "gpt-4",
-        "messages": [{"role": "user", "content": "What is AI?"}],
+        "messages": [{ "role": "user", "content": "What is AI?" }],
         "max_tokens": 150
       }
     },
@@ -200,7 +216,7 @@
       "url": "/v1/chat/completions",
       "body": {
         "model": "gpt-4",
-        "messages": [{"role": "user", "content": "Explain machine learning"}],
+        "messages": [{ "role": "user", "content": "Explain machine learning" }],
         "max_tokens": 150
       }
     }
@@ -212,7 +228,9 @@
       "url": "/v1/chat/completions",
       "body": {
         "model": "gpt-4",
-        "messages": [{"role": "user", "content": "Write Python function to sort array"}],
+        "messages": [
+          { "role": "user", "content": "Write Python function to sort array" }
+        ],
         "max_tokens": 300
       }
     },
@@ -222,7 +240,7 @@
       "url": "/v1/chat/completions",
       "body": {
         "model": "gpt-4",
-        "messages": [{"role": "user", "content": "Create React component"}],
+        "messages": [{ "role": "user", "content": "Create React component" }],
         "max_tokens": 300
       }
     },
@@ -232,7 +250,7 @@
       "url": "/v1/chat/completions",
       "body": {
         "model": "gpt-4",
-        "messages": [{"role": "user", "content": "SQL query to join tables"}],
+        "messages": [{ "role": "user", "content": "SQL query to join tables" }],
         "max_tokens": 200
       }
     }
@@ -244,7 +262,9 @@
       "url": "/v1/chat/completions",
       "body": {
         "model": "gpt-3.5-turbo",
-        "messages": [{"role": "user", "content": "Check if this is appropriate..."}],
+        "messages": [
+          { "role": "user", "content": "Check if this is appropriate..." }
+        ],
         "max_tokens": 100
       }
     }
@@ -256,7 +276,9 @@
       "url": "/v1/chat/completions",
       "body": {
         "model": "gpt-4",
-        "messages": [{"role": "user", "content": "Classify: This is a positive review"}],
+        "messages": [
+          { "role": "user", "content": "Classify: This is a positive review" }
+        ],
         "max_tokens": 50
       }
     },
@@ -266,7 +288,9 @@
       "url": "/v1/chat/completions",
       "body": {
         "model": "gpt-4",
-        "messages": [{"role": "user", "content": "Classify: Neutral statement"}],
+        "messages": [
+          { "role": "user", "content": "Classify: Neutral statement" }
+        ],
         "max_tokens": 50
       }
     }
@@ -278,7 +302,12 @@
       "url": "/v1/chat/completions",
       "body": {
         "model": "gpt-4",
-        "messages": [{"role": "user", "content": "Extract entities from: John works at Apple"}],
+        "messages": [
+          {
+            "role": "user",
+            "content": "Extract entities from: John works at Apple"
+          }
+        ],
         "max_tokens": 100
       }
     },
@@ -288,7 +317,12 @@
       "url": "/v1/chat/completions",
       "body": {
         "model": "gpt-4",
-        "messages": [{"role": "user", "content": "Extract entities from: Meeting in Paris"}],
+        "messages": [
+          {
+            "role": "user",
+            "content": "Extract entities from: Meeting in Paris"
+          }
+        ],
         "max_tokens": 100
       }
     },
@@ -298,7 +332,12 @@
       "url": "/v1/chat/completions",
       "body": {
         "model": "gpt-4",
-        "messages": [{"role": "user", "content": "Extract entities from: Tesla announced..."}],
+        "messages": [
+          {
+            "role": "user",
+            "content": "Extract entities from: Tesla announced..."
+          }
+        ],
         "max_tokens": 100
       }
     }

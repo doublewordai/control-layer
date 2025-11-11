@@ -66,7 +66,8 @@ export const queryKeys = {
     list: (filters: any) => [...queryKeys.files.lists(), filters] as const,
     details: () => [...queryKeys.files.all, "detail"] as const,
     detail: (id: string) => [...queryKeys.files.details(), id] as const,
-    requests: (id: string) => [...queryKeys.files.detail(id), "requests"] as const,
+    requests: (id: string) =>
+      [...queryKeys.files.detail(id), "requests"] as const,
     requestsList: (id: string, filters: any) =>
       [...queryKeys.files.requests(id), filters] as const,
   },
@@ -78,9 +79,9 @@ export const queryKeys = {
     list: (filters: any) => [...queryKeys.batches.lists(), filters] as const,
     details: () => [...queryKeys.batches.all, "detail"] as const,
     detail: (id: string) => [...queryKeys.batches.details(), id] as const,
-    requests: (id: string) => [...queryKeys.batches.detail(id), "requests"] as const,
+    requests: (id: string) =>
+      [...queryKeys.batches.detail(id), "requests"] as const,
     requestsList: (id: string, filters: any) =>
       [...queryKeys.batches.requests(id), filters] as const,
   },
 } as const;
-

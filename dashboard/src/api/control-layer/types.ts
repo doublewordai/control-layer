@@ -669,7 +669,15 @@ export interface FileObject {
   created_at: number; // Unix timestamp
   expires_at?: number; // Unix timestamp
   filename: string;
-  purpose: "batch" | "fine-tune" | "assistants" | "vision" | "user_data" | "evals";
+  purpose:
+    | "batch"
+    | "batch_output"
+    | "batch_error"
+    | "fine-tune"
+    | "assistants"
+    | "vision"
+    | "user_data"
+    | "evals";
 }
 
 export interface FileListResponse {

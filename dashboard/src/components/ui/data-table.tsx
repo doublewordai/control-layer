@@ -215,33 +215,60 @@ export function DataTable<TData, TValue>({
           <TableBody>
             {table.getRowModel().rows?.length ? (
               <>
-                {table.getRowModel().rows.map((row) => (
-                  <TableRow
-                    key={row.id}
-                    data-state={row.getIsSelected() && "selected"}
-                    className="group"
-                  >
-                    {row.getVisibleCells().map((cell) => (
-                      <TableCell
-                        key={cell.id}
-                        className={
-                          cell.column.id === "select"
-                            ? "pl-6 w-[50px]"
-                            : cell.column.getIndex() === 0
-                              ? "pl-6"
-                              : cell.column.id === "actions"
-                                ? "pr-6"
-                                : ""
-                        }
-                      >
-                        {flexRender(
-                          cell.column.columnDef.cell,
-                          cell.getContext(),
-                        )}
-                      </TableCell>
-                    ))}
-                  </TableRow>
-                ))}
+                {table.getRowModel().rows.map((row) => {
+                  // Check if this is an expansion row
+                  const isExpandedRow = (row.original as any)?._isExpandedRow;
+
+                  if (isExpandedRow) {
+                    // Render expansion row with colspan
+                    const visibleColumns = row.getVisibleCells();
+                    const firstCell = visibleColumns[0];
+
+                    return (
+                      <TableRow key={row.id} className="hover:bg-transparent">
+                        <TableCell
+                          colSpan={visibleColumns.length}
+                          className="p-0 whitespace-normal"
+                        >
+                          {flexRender(
+                            firstCell.column.columnDef.cell,
+                            firstCell.getContext(),
+                          )}
+                        </TableCell>
+                      </TableRow>
+                    );
+                  }
+
+                  // Regular row
+                  return (
+                    <TableRow
+                      key={row.id}
+                      data-state={row.getIsSelected() && "selected"}
+                      className="group"
+                      style={{ height: rowHeight }}
+                    >
+                      {row.getVisibleCells().map((cell) => (
+                        <TableCell
+                          key={cell.id}
+                          className={
+                            cell.column.id === "select"
+                              ? "pl-6 w-[50px]"
+                              : cell.column.getIndex() === 0
+                                ? "pl-6"
+                                : cell.column.id === "actions"
+                                  ? "pr-6"
+                                  : ""
+                          }
+                        >
+                          {flexRender(
+                            cell.column.columnDef.cell,
+                            cell.getContext(),
+                          )}
+                        </TableCell>
+                      ))}
+                    </TableRow>
+                  );
+                })}
                 {/* Render empty padding rows if minRows is set */}
                 {emptyRowsCount > 0 &&
                   Array.from({ length: emptyRowsCount }).map((_, index) => (
