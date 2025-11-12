@@ -72,7 +72,7 @@ export function AppSidebar() {
     },
     { path: "/users-groups", icon: Users, label: "Users & Groups" },
     { path: "/api-keys", icon: Key, label: "API Keys" },
-    { path: "/settings", icon: Settings, label: "Settings" },
+    { path: "/system", icon: Settings, label: "System" },
   ];
 
   const navItems = allNavItems.filter((item) => {

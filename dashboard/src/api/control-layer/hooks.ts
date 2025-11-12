@@ -23,6 +23,7 @@ import type {
   Batch,
   FileUploadRequest,
   AddFundsRequest,
+  DaemonsQuery,
 } from "./types";
 
 // Config hooks
@@ -851,5 +852,15 @@ export function useAddFunds() {
         queryClient.refetchQueries({ queryKey: ["cost", "transactions"] }),
       ]);
     },
+  });
+}
+
+// ===== DAEMONS HOOKS =====
+
+export function useDaemons(options?: DaemonsQuery) {
+  return useQuery({
+    queryKey: ["daemons", "list", options],
+    queryFn: () => dwctlApi.daemons.list(options),
+    refetchInterval: 5000, // Refetch every 5 seconds to show live daemon status
   });
 }
