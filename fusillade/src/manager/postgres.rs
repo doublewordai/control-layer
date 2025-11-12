@@ -241,23 +241,41 @@ impl<H: HttpClient + 'static> Storage for PostgresRequestManager<H> {
         let now = Utc::now();
 
         // Atomically claim pending executions using SELECT FOR UPDATE
+        // Interleave requests from different models using ROW_NUMBER partitioning
+        // This ensures we claim requests round-robin across models rather than
+        // draining one model before moving to the next (important for per-model concurrency)
         let rows = sqlx::query!(
             r#"
+            WITH locked_requests AS (
+                SELECT id, model, created_at
+                FROM requests
+                WHERE state = 'pending'
+                    AND (not_before IS NULL OR not_before <= $2)
+                FOR UPDATE SKIP LOCKED
+            ),
+            ranked AS (
+                SELECT
+                    id,
+                    ROW_NUMBER() OVER (PARTITION BY model ORDER BY created_at) as model_rn,
+                    created_at
+                FROM locked_requests
+            ),
+            to_claim AS (
+                SELECT id
+                FROM ranked
+                ORDER BY model_rn, created_at ASC
+                LIMIT $3
+            )
             UPDATE requests
             SET
                 state = 'claimed',
                 daemon_id = $1,
                 claimed_at = $2
-            WHERE id IN (
-                SELECT id
-                FROM requests
-                WHERE state = 'pending'
-                    AND (not_before IS NULL OR not_before <= $2)
-                ORDER BY created_at ASC
-                LIMIT $3
-                FOR UPDATE SKIP LOCKED
-            )
-            RETURNING id, batch_id, template_id, endpoint, method, path, body, model, api_key, retry_attempt
+            FROM to_claim
+            WHERE requests.id = to_claim.id
+            RETURNING requests.id, requests.batch_id, requests.template_id, requests.endpoint,
+                      requests.method, requests.path, requests.body, requests.model,
+                      requests.api_key, requests.retry_attempt
             "#,
             *daemon_id as Uuid,
             now,
@@ -3877,6 +3895,190 @@ mod tests {
                 assert_eq!(d.state.stats.requests_in_flight, 3);
             }
             _ => panic!("Expected Running state"),
+        }
+    }
+
+    #[sqlx::test]
+    async fn test_claim_requests_interleaves_by_model(pool: sqlx::PgPool) {
+        let http_client = Arc::new(MockHttpClient::new());
+        let manager = PostgresRequestManager::with_client(pool.clone(), http_client);
+
+        // Create a file with 9 templates: 3 for each of 3 different models
+        // We create them in order: all model-a, then all model-b, then all model-c
+        let file_id = manager
+            .create_file(
+                "interleave-test".to_string(),
+                None,
+                vec![
+                    // model-a requests
+                    RequestTemplateInput {
+                        custom_id: None,
+                        endpoint: "https://api.example.com".to_string(),
+                        method: "POST".to_string(),
+                        path: "/test".to_string(),
+                        body: r#"{"model":"a","n":1}"#.to_string(),
+                        model: "model-a".to_string(),
+                        api_key: "key".to_string(),
+                    },
+                    RequestTemplateInput {
+                        custom_id: None,
+                        endpoint: "https://api.example.com".to_string(),
+                        method: "POST".to_string(),
+                        path: "/test".to_string(),
+                        body: r#"{"model":"a","n":2}"#.to_string(),
+                        model: "model-a".to_string(),
+                        api_key: "key".to_string(),
+                    },
+                    RequestTemplateInput {
+                        custom_id: None,
+                        endpoint: "https://api.example.com".to_string(),
+                        method: "POST".to_string(),
+                        path: "/test".to_string(),
+                        body: r#"{"model":"a","n":3}"#.to_string(),
+                        model: "model-a".to_string(),
+                        api_key: "key".to_string(),
+                    },
+                    // model-b requests
+                    RequestTemplateInput {
+                        custom_id: None,
+                        endpoint: "https://api.example.com".to_string(),
+                        method: "POST".to_string(),
+                        path: "/test".to_string(),
+                        body: r#"{"model":"b","n":1}"#.to_string(),
+                        model: "model-b".to_string(),
+                        api_key: "key".to_string(),
+                    },
+                    RequestTemplateInput {
+                        custom_id: None,
+                        endpoint: "https://api.example.com".to_string(),
+                        method: "POST".to_string(),
+                        path: "/test".to_string(),
+                        body: r#"{"model":"b","n":2}"#.to_string(),
+                        model: "model-b".to_string(),
+                        api_key: "key".to_string(),
+                    },
+                    RequestTemplateInput {
+                        custom_id: None,
+                        endpoint: "https://api.example.com".to_string(),
+                        method: "POST".to_string(),
+                        path: "/test".to_string(),
+                        body: r#"{"model":"b","n":3}"#.to_string(),
+                        model: "model-b".to_string(),
+                        api_key: "key".to_string(),
+                    },
+                    // model-c requests
+                    RequestTemplateInput {
+                        custom_id: None,
+                        endpoint: "https://api.example.com".to_string(),
+                        method: "POST".to_string(),
+                        path: "/test".to_string(),
+                        body: r#"{"model":"c","n":1}"#.to_string(),
+                        model: "model-c".to_string(),
+                        api_key: "key".to_string(),
+                    },
+                    RequestTemplateInput {
+                        custom_id: None,
+                        endpoint: "https://api.example.com".to_string(),
+                        method: "POST".to_string(),
+                        path: "/test".to_string(),
+                        body: r#"{"model":"c","n":2}"#.to_string(),
+                        model: "model-c".to_string(),
+                        api_key: "key".to_string(),
+                    },
+                    RequestTemplateInput {
+                        custom_id: None,
+                        endpoint: "https://api.example.com".to_string(),
+                        method: "POST".to_string(),
+                        path: "/test".to_string(),
+                        body: r#"{"model":"c","n":3}"#.to_string(),
+                        model: "model-c".to_string(),
+                        api_key: "key".to_string(),
+                    },
+                ],
+            )
+            .await
+            .unwrap();
+
+        let _batch = manager
+            .create_batch(crate::batch::BatchInput {
+                file_id,
+                endpoint: "/v1/chat/completions".to_string(),
+                completion_window: "24h".to_string(),
+                metadata: None,
+                created_by: None,
+            })
+            .await
+            .unwrap();
+
+        let daemon_id = DaemonId::from(Uuid::new_v4());
+
+        // Claim 6 requests - should get 2 from each model in round-robin order
+        let claimed = manager
+            .claim_requests(6, daemon_id)
+            .await
+            .expect("Failed to claim requests");
+
+        assert_eq!(claimed.len(), 6);
+
+        // Extract the models in order
+        let models: Vec<&str> = claimed.iter().map(|r| r.data.model.as_str()).collect();
+
+        // With interleaving, we should see a round-robin pattern:
+        // First 3 requests should be from 3 different models
+        // Next 3 requests should also be from the same 3 different models
+        // The order of models isn't guaranteed, but the pattern should repeat
+        let first_three: Vec<&str> = models[0..3].to_vec();
+        let second_three: Vec<&str> = models[3..6].to_vec();
+
+        // Verify all unique (first batch has one from each model)
+        let mut first_sorted = first_three.clone();
+        first_sorted.sort();
+        first_sorted.dedup();
+        assert_eq!(
+            first_sorted.len(),
+            3,
+            "First 3 requests should be from 3 different models"
+        );
+        assert_eq!(
+            first_sorted,
+            vec!["model-a", "model-b", "model-c"],
+            "First 3 requests should cover all 3 models"
+        );
+
+        // Verify the pattern repeats (same order)
+        assert_eq!(
+            first_three, second_three,
+            "The round-robin pattern should repeat: got {:?} then {:?}",
+            first_three, second_three
+        );
+
+        // Verify each model's requests are in chronological order (n=1 before n=2)
+        for model in &["model-a", "model-b", "model-c"] {
+            let model_requests: Vec<&str> = claimed
+                .iter()
+                .filter(|r| r.data.model == *model)
+                .map(|r| r.data.body.as_str())
+                .collect();
+
+            // Should have 2 requests per model
+            assert_eq!(
+                model_requests.len(),
+                2,
+                "Should have 2 requests for {}",
+                model
+            );
+
+            // First should be n=1, second should be n=2
+            assert!(
+                model_requests[0].contains(r#""n":1"#),
+                "First request for {} should be n=1",
+                model
+            );
+            assert!(
+                model_requests[1].contains(r#""n":2"#),
+                "Second request for {} should be n=2",
+                model
+            );
         }
     }
 }
