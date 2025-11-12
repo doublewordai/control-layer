@@ -297,28 +297,41 @@ where
                                     }
                                     Err(failed) => {
                                         let retry_attempt = failed.state.retry_attempt;
-                                        tracing::warn!(
-                                            request_id = %request_id,
-                                            retry_attempt,
-                                            "Request failed, attempting retry"
-                                        );
 
-                                        // Attempt to retry
-                                        match failed.retry(retry_attempt, retry_config, storage.as_ref()).await? {
-                                            Some(_pending) => {
-                                                tracing::info!(
-                                                    request_id = %request_id,
-                                                    retry_attempt = retry_attempt + 1,
-                                                    "Request queued for retry"
-                                                );
+                                        // Check if this is a retriable error
+                                        // Non-retriable errors have format "HTTP request returned error status code: XXX"
+                                        let is_retriable = failed.state.error.starts_with("HTTP request returned retriable status code:");
+
+                                        if is_retriable {
+                                            tracing::warn!(
+                                                request_id = %request_id,
+                                                retry_attempt,
+                                                "Request failed with retriable error, attempting retry"
+                                            );
+
+                                            // Attempt to retry
+                                            match failed.retry(retry_attempt, retry_config, storage.as_ref()).await? {
+                                                Some(_pending) => {
+                                                    tracing::info!(
+                                                        request_id = %request_id,
+                                                        retry_attempt = retry_attempt + 1,
+                                                        "Request queued for retry"
+                                                    );
+                                                }
+                                                None => {
+                                                    tracing::warn!(
+                                                        request_id = %request_id,
+                                                        retry_attempt,
+                                                        "Request failed permanently (no retries remaining)"
+                                                    );
+                                                }
                                             }
-                                            None => {
-                                                tracing::warn!(
-                                                    request_id = %request_id,
-                                                    retry_attempt,
-                                                    "Request failed permanently (no retries remaining)"
-                                                );
-                                            }
+                                        } else {
+                                            tracing::warn!(
+                                                request_id = %request_id,
+                                                error = %failed.state.error,
+                                                "Request failed with non-retriable error, not retrying"
+                                            );
                                         }
                                     }
                                 }

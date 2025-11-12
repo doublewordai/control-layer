@@ -190,9 +190,6 @@ enable_request_logging: true # Enable request/response logging to database
 # Batches can be sent containing requests to any model configured in the
 # control layer, and they'll be executed asynchronously over the course of 24
 # hours.
-# NOTE: this is in an alpha state. Users with the BatchAPIUser role can create
-# batches that send to any model source configured in the control layer -
-# regardless of their configured access.
 batches:
   # Enable batches API endpoints (/files, /batches)
   # These are mounted with the /admin endpoints - so can only be accessed via
@@ -232,6 +229,15 @@ batches:
     max_file_size: 2147483648 # 2 GB - maximum size for file uploads
     upload_buffer_size: 100 # Buffer size for file upload streams
     download_buffer_size: 100 # Buffer size for file download streams
+```
+
+### Initial Credit Grant
+
+The Control Layer has a credit system which allows you to assign budgets to users and prices to models. You can set the initial grant given to standard users in `config.yaml`:
+
+```yaml
+credits:
+  initial_credits_for_standard_users: 50
 ```
 
 ## Production Checklist

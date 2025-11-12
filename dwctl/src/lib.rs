@@ -151,14 +151,13 @@ use axum::{
 use axum_prometheus::PrometheusMetricLayer;
 use bon::Builder;
 pub use config::Config;
-use outlet::{PathFilter, RequestLoggerConfig, RequestLoggerLayer};
+use outlet::{RequestLoggerConfig, RequestLoggerLayer};
 use outlet_postgres::PostgresHandler;
 use request_logging::{AiRequest, AiResponse};
 use sqlx::{Executor, PgPool};
 use std::sync::Arc;
 use tokio::net::TcpListener;
 use tower::Layer;
-use tower::ServiceBuilder;
 use tower_http::{
     cors::CorsLayer,
     trace::{DefaultMakeSpan, DefaultOnRequest, DefaultOnResponse, TraceLayer},
@@ -531,10 +530,7 @@ pub async fn build_router(state: &mut AppState, onwards_router: Router) -> anyho
         let outlet_config = RequestLoggerConfig {
             capture_request_body: true,
             capture_response_body: true,
-            path_filter: Some(PathFilter {
-                allowed_prefixes: vec!["/ai/".to_string()],
-                blocked_prefixes: vec![],
-            }),
+            path_filter: None, // No path filter needed - applied directly to ai_router
         };
 
         Some(RequestLoggerLayer::new(outlet_config, postgres_handler))
@@ -561,7 +557,7 @@ pub async fn build_router(state: &mut AppState, onwards_router: Router) -> anyho
         .with_state(state.clone());
 
     // API routes
-    let mut api_routes = Router::new()
+    let api_routes = Router::new()
         .route("/config", get(api::handlers::config::get_config))
         // User management (admin only for collection operations)
         .route("/users", get(api::handlers::users::list_users))
@@ -654,8 +650,10 @@ pub async fn build_router(state: &mut AppState, onwards_router: Router) -> anyho
         .route("/probes/{id}/results", get(api::handlers::probes::get_probe_results))
         .route("/probes/{id}/statistics", get(api::handlers::probes::get_statistics));
 
-    // Batches API routes (files + batches) - conditionally enabled
-    if state.config.batches.enabled {
+    let api_routes_with_state = api_routes.with_state(state.clone());
+
+    // Batches API routes (files + batches) - conditionally enabled under /ai/v1
+    let batches_routes = if state.config.batches.enabled {
         // File upload route with custom body limit (other routes use default)
         let file_upload_limit = state.config.batches.files.max_file_size;
         let file_router = Router::new().route(
@@ -663,26 +661,43 @@ pub async fn build_router(state: &mut AppState, onwards_router: Router) -> anyho
             post(api::handlers::files::upload_file).layer(DefaultBodyLimit::max(file_upload_limit as usize)),
         );
 
-        api_routes = api_routes
-            // Files management - merge file upload route with custom body limit
-            .merge(file_router)
-            .route("/files", get(api::handlers::files::list_files))
-            .route("/files/{file_id}", get(api::handlers::files::get_file))
-            .route("/files/{file_id}/content", get(api::handlers::files::get_file_content))
-            .route("/files/{file_id}", delete(api::handlers::files::delete_file))
-            // Batches management
-            .route("/batches", post(api::handlers::batches::create_batch))
-            .route("/batches", get(api::handlers::batches::list_batches))
-            .route("/batches/{batch_id}", get(api::handlers::batches::get_batch))
-            .route("/batches/{batch_id}/cancel", post(api::handlers::batches::cancel_batch));
-    }
-
-    let api_routes_with_state = api_routes.with_state(state.clone());
+        Some(
+            Router::new()
+                // Files management - merge file upload route with custom body limit
+                .merge(file_router)
+                .route("/files", get(api::handlers::files::list_files))
+                .route("/files/{file_id}", get(api::handlers::files::get_file))
+                .route("/files/{file_id}/content", get(api::handlers::files::get_file_content))
+                .route("/files/{file_id}", delete(api::handlers::files::delete_file))
+                // Batches management
+                .route("/batches", post(api::handlers::batches::create_batch))
+                .route("/batches", get(api::handlers::batches::list_batches))
+                .route("/batches/{batch_id}", get(api::handlers::batches::get_batch))
+                .route("/batches/{batch_id}/cancel", post(api::handlers::batches::cancel_batch))
+                .with_state(state.clone()),
+        )
+    } else {
+        None
+    };
 
     // Serve embedded static assets, falling back to SPA for unmatched routes
     let fallback = get(api::handlers::static_assets::serve_embedded_asset).fallback(get(api::handlers::static_assets::spa_fallback));
 
+    // Apply request logging layer only to onwards router
+    let onwards_router = if let Some(outlet_layer) = outlet_layer.clone() {
+        onwards_router.layer(outlet_layer)
+    } else {
+        onwards_router
+    };
+
     // Build the app with admin API and onwards proxy nested. serve the (restricted) openai spec.
+    // Batches routes are merged with onwards router under /ai/v1 (batches match first)
+    let ai_router = if let Some(batches) = batches_routes {
+        batches.merge(onwards_router)
+    } else {
+        onwards_router
+    };
+
     let router = Router::new()
         .route("/healthz", get(|| async { "OK" }))
         .route(
@@ -693,7 +708,7 @@ pub async fn build_router(state: &mut AppState, onwards_router: Router) -> anyho
             }),
         )
         .merge(auth_routes)
-        .nest("/ai/v1", onwards_router)
+        .nest("/ai/v1", ai_router)
         .nest("/admin/api/v1", api_routes_with_state)
         .merge(RapiDoc::with_openapi("/api-docs/openapi.json", ApiDoc::openapi()).path("/admin/docs"))
         .merge(RapiDoc::new("/openai-openapi.yaml").path("/ai/docs"))
@@ -702,12 +717,8 @@ pub async fn build_router(state: &mut AppState, onwards_router: Router) -> anyho
     // Create CORS layer from config
     let cors_layer = create_cors_layer(&state.config)?;
 
-    // Apply layers conditionally
-    let mut router = if let Some(outlet_layer) = outlet_layer {
-        router.layer(ServiceBuilder::new().layer(outlet_layer).layer(cors_layer))
-    } else {
-        router.layer(cors_layer)
-    };
+    // Apply CORS to main router (request logging already applied to onwards_router above)
+    let mut router = router.layer(cors_layer);
 
     // Add Prometheus metrics if enabled
     if state.config.enable_metrics {
@@ -1206,10 +1217,10 @@ mod test {
             }))
             .await;
 
-        // Should be forbidden since user has no group membership
+        // Should be not found since onwards returns 404 for no access
         assert_eq!(
             no_access_response.status_code().as_u16(),
-            403,
+            404,
             "Admin proxy should reject user with no model access"
         );
 
@@ -1239,10 +1250,10 @@ mod test {
             }))
             .await;
 
-        // Should be forbidden since user doesn't exist
+        // With auto_create_users, user is created but has no access, onwards returns 404
         assert_eq!(
             nonexistent_user_response.status_code().as_u16(),
-            403,
+            404,
             "Admin proxy should reject non-existent user"
         );
 
@@ -1256,10 +1267,10 @@ mod test {
             }))
             .await;
 
-        // Should be not found since model doesn't exist
+        // Should be not found since onwards returns 404 for nonexistent models
         assert_eq!(
             nonexistent_model_response.status_code().as_u16(),
-            403,
+            404,
             "Admin proxy should reject non-existent model"
         );
 
@@ -1294,11 +1305,12 @@ mod test {
         let system_api_key_id = Uuid::nil();
         let original_secret = "original_test_secret";
         sqlx::query!(
-            "INSERT INTO api_keys (id, name, secret, user_id) VALUES ($1, $2, $3, $4)
+            "INSERT INTO api_keys (id, name, secret, purpose, user_id) VALUES ($1, $2, $3, $4, $5)
              ON CONFLICT (id) DO UPDATE SET secret = $3",
             system_api_key_id,
             "System API Key",
             original_secret,
+            "inference",
             system_api_key_id,
         )
         .execute(&pool)

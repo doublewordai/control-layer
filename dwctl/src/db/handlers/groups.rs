@@ -533,14 +533,20 @@ impl<'c> Groups<'c> {
 mod tests {
     use super::*;
     use crate::db::handlers::api_keys::ApiKeys;
+    use crate::db::models::api_keys::ApiKeyPurpose;
     use crate::test_utils::get_test_endpoint_id;
     use crate::{
         db::{
-            handlers::{users::UserFilter, Deployments, Users},
-            models::{api_keys::ApiKeyCreateDBRequest, deployments::DeploymentCreateDBRequest},
+            handlers::{users::UserFilter, Credits, Deployments, Users},
+            models::{
+                api_keys::ApiKeyCreateDBRequest,
+                credits::{CreditTransactionCreateDBRequest, CreditTransactionType},
+                deployments::DeploymentCreateDBRequest,
+            },
         },
         seed_database,
     };
+    use rust_decimal::Decimal;
     use sqlx::{Acquire, PgPool};
 
     // Mock coalesce function to simulate SQL COALESCE behavior for tests
@@ -1071,6 +1077,22 @@ mod tests {
             .await
             .expect("Failed to add deployment to group");
 
+        // Add credits to user
+        {
+            let mut pool_conn = pool.acquire().await.unwrap();
+            let mut credits_repo = Credits::new(&mut pool_conn);
+            credits_repo
+                .create_transaction(&CreditTransactionCreateDBRequest {
+                    user_id: test_user_id,
+                    transaction_type: CreditTransactionType::Purchase,
+                    amount: Decimal::new(1000, 2),
+                    source_id: "test".to_string(),
+                    description: Some("Added credits".to_string()),
+                })
+                .await
+                .unwrap();
+        }
+
         // NOW create an API key - this will automatically create api_key_deployments entries
         let mut conn = pool.acquire().await.unwrap();
 
@@ -1079,6 +1101,7 @@ mod tests {
             user_id: test_user_id,
             name: "CASCADE Test Key".to_string(),
             description: Some("API key for CASCADE delete test".to_string()),
+            purpose: ApiKeyPurpose::Inference,
             requests_per_second: None,
             burst_size: None,
         };
@@ -1089,7 +1112,7 @@ mod tests {
 
         // Verify API key has access to deployment through group membership
         let keys_for_deployment = api_key_repo
-            .get_api_keys_for_deployment(deployment.id)
+            .get_api_keys_for_deployment_with_sufficient_credit(deployment.id)
             .await
             .expect("Failed to get keys for deployment");
         assert!(keys_for_deployment.iter().any(|k| k.secret == api_key.secret));
@@ -1121,7 +1144,7 @@ mod tests {
 
         // Verify API key no longer has access to deployment
         let keys_for_deployment = api_key_repo
-            .get_api_keys_for_deployment(deployment.id)
+            .get_api_keys_for_deployment_with_sufficient_credit(deployment.id)
             .await
             .expect("Failed to get keys for deployment");
         assert!(!keys_for_deployment.iter().any(|k| k.secret == api_key.secret));

@@ -4,13 +4,13 @@ use crate::crypto::generate_api_key;
 use crate::db::errors::DbError;
 use crate::db::errors::Result;
 use crate::db::handlers::repository::Repository;
-use crate::db::models::api_keys::{ApiKeyCreateDBRequest, ApiKeyDBResponse, ApiKeyUpdateDBRequest};
+use crate::db::models::api_keys::{ApiKeyCreateDBRequest, ApiKeyDBResponse, ApiKeyPurpose, ApiKeyUpdateDBRequest};
 use crate::types::{abbrev_uuid, ApiKeyId, DeploymentId, UserId};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use sqlx::FromRow;
 use sqlx::PgConnection;
-use tracing::instrument;
+use tracing::{debug, instrument};
 use uuid::Uuid;
 
 /// Filter for listing API keys
@@ -36,20 +36,36 @@ struct ApiKey {
     pub name: String,
     pub description: Option<String>,
     pub secret: String,
+    pub purpose: String,
     pub user_id: UserId,
     pub created_at: DateTime<Utc>,
     pub last_used: Option<DateTime<Utc>>,
     pub requests_per_second: Option<f32>,
     pub burst_size: Option<i32>,
+    pub hidden: bool,
 }
 
 impl From<(Vec<DeploymentId>, ApiKey)> for ApiKeyDBResponse {
     fn from((model_access, api_key): (Vec<DeploymentId>, ApiKey)) -> Self {
+        // Parse purpose string to enum - default to Inference for backwards compatibility
+        let purpose = api_key
+            .purpose
+            .parse::<serde_json::Value>()
+            .ok()
+            .and_then(|v| serde_json::from_value::<ApiKeyPurpose>(v).ok())
+            .or(match api_key.purpose.as_str() {
+                "platform" => Some(ApiKeyPurpose::Platform),
+                "inference" => Some(ApiKeyPurpose::Inference),
+                _ => None,
+            })
+            .unwrap_or(ApiKeyPurpose::Inference);
+
         Self {
             id: api_key.id,
             name: api_key.name,
             description: api_key.description,
             secret: api_key.secret,
+            purpose,
             user_id: api_key.user_id,
             created_at: api_key.created_at,
             last_used: api_key.last_used,
@@ -77,16 +93,23 @@ impl<'c> Repository for ApiKeys<'c> {
         // Generate a secure API key
         let secret = generate_api_key();
 
+        // Convert purpose enum to string for database
+        let purpose_str = match request.purpose {
+            ApiKeyPurpose::Platform => "platform",
+            ApiKeyPurpose::Inference => "inference",
+        };
+
         let api_key = sqlx::query_as!(
             ApiKey,
             r#"
-            INSERT INTO api_keys (name, description, secret, user_id, requests_per_second, burst_size)
-            VALUES ($1, $2, $3, $4, $5, $6)
+            INSERT INTO api_keys (name, description, secret, purpose, user_id, requests_per_second, burst_size, hidden)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, false)
             RETURNING *
             "#,
             request.name,
             request.description,
             secret,
+            purpose_str,
             request.user_id,
             request.requests_per_second,
             request.burst_size
@@ -101,7 +124,7 @@ impl<'c> Repository for ApiKeys<'c> {
     async fn get_by_id(&mut self, id: Self::Id) -> Result<Option<Self::Response>> {
         let api_key = sqlx::query_as!(
             ApiKey,
-            "SELECT id, name, description, secret, user_id, created_at, last_used, requests_per_second, burst_size FROM api_keys WHERE id = $1",
+            "SELECT id, name, description, secret, purpose, user_id, created_at, last_used, requests_per_second, burst_size, hidden FROM api_keys WHERE id = $1",
             id
         )
             .fetch_optional(&mut *self.db)
@@ -117,7 +140,7 @@ impl<'c> Repository for ApiKeys<'c> {
     async fn get_bulk(&mut self, ids: Vec<Self::Id>) -> Result<HashMap<Self::Id, Self::Response>> {
         let api_keys = sqlx::query_as!(
             ApiKey,
-            "SELECT id, name, description, secret, user_id, created_at, last_used, requests_per_second, burst_size FROM api_keys WHERE id = ANY($1)",
+            "SELECT id, name, description, secret, purpose, user_id, created_at, last_used, requests_per_second, burst_size, hidden FROM api_keys WHERE id = ANY($1)",
             &ids
         )
             .fetch_all(&mut *self.db)
@@ -136,7 +159,7 @@ impl<'c> Repository for ApiKeys<'c> {
         let api_keys = if let Some(user_id) = filter.user_id {
             sqlx::query_as!(
                 ApiKey,
-                "SELECT id, name, description, secret, user_id, created_at, last_used, requests_per_second, burst_size FROM api_keys WHERE user_id = $1 ORDER BY created_at DESC LIMIT $2 OFFSET $3",
+                "SELECT id, name, description, secret, purpose, user_id, created_at, last_used, requests_per_second, burst_size, hidden FROM api_keys WHERE user_id = $1 AND hidden = false ORDER BY created_at DESC LIMIT $2 OFFSET $3",
                 user_id,
                 filter.limit,
                 filter.skip
@@ -146,7 +169,7 @@ impl<'c> Repository for ApiKeys<'c> {
         } else {
             sqlx::query_as!(
                 ApiKey,
-                "SELECT id, name, description, secret, user_id, created_at, last_used, requests_per_second, burst_size FROM api_keys ORDER BY created_at DESC LIMIT $1 OFFSET $2",
+                "SELECT id, name, description, secret, purpose, user_id, created_at, last_used, requests_per_second, burst_size, hidden FROM api_keys WHERE hidden = false ORDER BY created_at DESC LIMIT $1 OFFSET $2",
                 filter.limit,
                 filter.skip,
             )
@@ -215,6 +238,71 @@ impl<'c> ApiKeys<'c> {
         Self { db }
     }
 
+    /// Get or create a user-specific hidden API key for internal use
+    ///
+    /// Hidden API keys are automatically managed by the system and are not visible to users.
+    /// They are used for proxying requests through admin_api and batch processing.
+    ///
+    /// # Arguments
+    /// * `user_id` - The user ID to get or create a hidden key for
+    /// * `purpose` - The purpose of the key (should be ApiKeyPurpose::Inference for proxy use)
+    ///
+    /// # Returns
+    /// Returns the secret of the hidden API key
+    #[instrument(skip(self), fields(user_id = %abbrev_uuid(&user_id)), err)]
+    pub async fn get_or_create_hidden_key(&mut self, user_id: UserId, purpose: ApiKeyPurpose) -> Result<String> {
+        // Convert purpose enum to string for database
+        let purpose_str = match purpose {
+            ApiKeyPurpose::Platform => "platform",
+            ApiKeyPurpose::Inference => "inference",
+        };
+
+        // Try to get existing hidden key for this user and purpose
+        let existing_key = sqlx::query_scalar!(
+            r#"
+            SELECT secret
+            FROM api_keys
+            WHERE user_id = $1 AND purpose = $2 AND hidden = true
+            LIMIT 1
+            "#,
+            user_id,
+            purpose_str
+        )
+        .fetch_optional(&mut *self.db)
+        .await?;
+
+        if let Some(secret) = existing_key {
+            tracing::debug!("Using existing hidden API key for user");
+            return Ok(secret);
+        }
+
+        // No existing key found, create a new one
+        let secret = generate_api_key();
+        let name = format!("Internal {} Key", purpose_str);
+        let description = Some(format!(
+            "Automatically managed internal API key for {} operations. Not visible to users.",
+            purpose_str
+        ));
+
+        tracing::info!("Creating new hidden API key for user");
+
+        sqlx::query!(
+            r#"
+            INSERT INTO api_keys (name, description, secret, purpose, user_id, hidden)
+            VALUES ($1, $2, $3, $4, $5, true)
+            "#,
+            name,
+            description,
+            secret,
+            purpose_str,
+            user_id
+        )
+        .execute(&mut *self.db)
+        .await?;
+
+        Ok(secret)
+    }
+
     /// Get specific deployment IDs that an API key has access to
     #[instrument(skip(self), fields(api_key_id = %abbrev_uuid(&api_key_id)), err)]
     async fn get_api_key_deployments(&mut self, api_key_id: ApiKeyId) -> Result<Vec<DeploymentId>> {
@@ -243,8 +331,12 @@ impl<'c> ApiKeys<'c> {
     }
 
     /// Get all API keys that can access the specified deployment with full response data
+    /// Excludes API keys from users with insufficient credits (balance <= 0)
     #[instrument(skip(self), fields(deployment_id = %abbrev_uuid(&deployment_id)), err)]
-    pub async fn get_api_keys_for_deployment(&mut self, deployment_id: DeploymentId) -> Result<Vec<ApiKeyDBResponse>> {
+    pub async fn get_api_keys_for_deployment_with_sufficient_credit(
+        &mut self,
+        deployment_id: DeploymentId,
+    ) -> Result<Vec<ApiKeyDBResponse>> {
         let api_keys = sqlx::query_as!(
             ApiKey,
             r#"
@@ -253,11 +345,13 @@ impl<'c> ApiKeys<'c> {
                 ak.name as "name!",
                 ak.description,
                 ak.secret as "secret!",
+                ak.purpose as "purpose!",
                 ak.user_id as "user_id!",
                 ak.created_at as "created_at!",
                 ak.last_used,
                 ak.requests_per_second,
-                ak.burst_size
+                ak.burst_size,
+                ak.hidden as "hidden!"
             FROM api_keys ak
             WHERE ak.user_id = $2  -- System user has access to all deployments
 
@@ -268,15 +362,45 @@ impl<'c> ApiKeys<'c> {
                 ak.name as "name!",
                 ak.description,
                 ak.secret as "secret!",
+                ak.purpose as "purpose!",
                 ak.user_id as "user_id!",
                 ak.created_at as "created_at!",
                 ak.last_used,
                 ak.requests_per_second,
-                ak.burst_size
+                ak.burst_size,
+                ak.hidden as "hidden!"
             FROM api_keys ak
             INNER JOIN user_groups ug ON ak.user_id = ug.user_id
             INNER JOIN deployment_groups dg ON ug.group_id = dg.group_id
+            INNER JOIN deployed_models dm ON dg.deployment_id = dm.id
             WHERE dg.deployment_id = $1
+            AND (
+                ak.user_id = $2  -- System user always has access
+                OR EXISTS (
+                    -- Platform Managers bypass credit checks
+                    SELECT 1 FROM user_roles ur
+                    WHERE ur.user_id = ak.user_id
+                    AND ur.role = 'PLATFORMMANAGER'
+                )
+                OR EXISTS (
+                    -- User's latest transaction has positive balance
+                    SELECT 1 FROM credits_transactions ct
+                    WHERE ct.user_id = ak.user_id
+                    AND ct.balance_after > 0
+                    AND NOT EXISTS (
+                        -- Make sure there's no newer transaction
+                        SELECT 1 FROM credits_transactions ct2
+                        WHERE ct2.user_id = ct.user_id
+                        AND (ct2.created_at > ct.created_at OR (ct2.created_at = ct.created_at AND ct2.id > ct.id))
+                    )
+                )
+                OR (
+                    -- Free models are accessible to all users (zero balance OK)
+                    -- A model is free if pricing is NULL OR both prices are 0
+                    (dm.upstream_input_price_per_token IS NULL OR dm.upstream_input_price_per_token = 0)
+                    AND (dm.upstream_output_price_per_token IS NULL OR dm.upstream_output_price_per_token = 0)
+                )
+            )
 
             UNION
 
@@ -285,21 +409,58 @@ impl<'c> ApiKeys<'c> {
                 ak.name as "name!",
                 ak.description,
                 ak.secret as "secret!",
+                ak.purpose as "purpose!",
                 ak.user_id as "user_id!",
                 ak.created_at as "created_at!",
                 ak.last_used,
                 ak.requests_per_second,
-                ak.burst_size
+                ak.burst_size,
+                ak.hidden as "hidden!"
             FROM api_keys ak
             INNER JOIN deployment_groups dg ON dg.group_id = '00000000-0000-0000-0000-000000000000'
+            INNER JOIN deployed_models dm ON dg.deployment_id = dm.id
             WHERE dg.deployment_id = $1
             AND ak.user_id != '00000000-0000-0000-0000-000000000000'  -- Exclude system user (already covered above)
+            AND (
+                ak.user_id = $2  -- System user always has access
+                OR EXISTS (
+                    -- Platform Managers bypass credit checks
+                    SELECT 1 FROM user_roles ur
+                    WHERE ur.user_id = ak.user_id
+                    AND ur.role = 'PLATFORMMANAGER'
+                )
+                OR EXISTS (
+                    -- User's latest transaction has positive balance
+                    SELECT 1 FROM credits_transactions ct
+                    WHERE ct.user_id = ak.user_id
+                    AND ct.balance_after > 0
+                    AND NOT EXISTS (
+                        -- Make sure there's no newer transaction
+                        SELECT 1 FROM credits_transactions ct2
+                        WHERE ct2.user_id = ct.user_id
+                        AND (ct2.created_at > ct.created_at OR (ct2.created_at = ct.created_at AND ct2.id > ct.id))
+                    )
+                )
+                OR (
+                    -- Free models are accessible to all users (zero balance OK)
+                    -- A model is free if pricing is NULL OR both prices are 0
+                    (dm.upstream_input_price_per_token IS NULL OR dm.upstream_input_price_per_token = 0)
+                    AND (dm.upstream_output_price_per_token IS NULL OR dm.upstream_output_price_per_token = 0)
+                )
+            )
             "#,
             deployment_id,
             Uuid::nil() // System user ID
         )
         .fetch_all(&mut *self.db)
         .await?;
+
+        // Log the number of API keys returned after credit filtering
+        debug!(
+            "Found {} API keys with access to deployment {} after credit filtering",
+            api_keys.len(),
+            abbrev_uuid(&deployment_id)
+        );
 
         // Get all deployment access for these API keys in bulk
         let api_key_ids: Vec<ApiKeyId> = api_keys.iter().map(|ak| ak.id).collect();
@@ -350,15 +511,22 @@ impl<'c> ApiKeys<'c> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::errors::Error;
     use crate::{
         api::models::users::{Role, UserCreate},
         db::{
-            handlers::{Deployments, Groups, Repository, Users},
-            models::{deployments::DeploymentCreateDBRequest, groups::GroupCreateDBRequest, users::UserCreateDBRequest},
+            handlers::{credits::Credits, deployments::Deployments, groups::Groups, users::Users},
+            models::{
+                credits::{CreditTransactionCreateDBRequest, CreditTransactionType},
+                deployments::{DeploymentCreateDBRequest, DeploymentDBResponse},
+                groups::{GroupCreateDBRequest, GroupDBResponse},
+                users::UserCreateDBRequest,
+            },
         },
+        errors::Error,
         test_utils::get_test_endpoint_id,
     };
+
+    use rust_decimal::Decimal;
     use sqlx::{Acquire, PgPool};
 
     #[sqlx::test]
@@ -389,6 +557,7 @@ mod tests {
                     user_id: userid,
                     name: "Test API Key".to_string(),
                     description: Some("Test description".to_string()),
+                    purpose: ApiKeyPurpose::Inference,
                     requests_per_second: None,
                     burst_size: None,
                 };
@@ -428,6 +597,7 @@ mod tests {
                 user_id: user.id,
                 name: "Key 1".to_string(),
                 description: None,
+                purpose: ApiKeyPurpose::Inference,
                 requests_per_second: None,
                 burst_size: None,
             };
@@ -435,6 +605,7 @@ mod tests {
                 user_id: user.id,
                 name: "Key 2".to_string(),
                 description: Some("Key 2 description".to_string()),
+                purpose: ApiKeyPurpose::Inference,
                 requests_per_second: None,
                 burst_size: None,
             };
@@ -488,6 +659,7 @@ mod tests {
                 user_id: user.id,
                 name: "Delete Me".to_string(),
                 description: None,
+                purpose: ApiKeyPurpose::Inference,
                 requests_per_second: None,
                 burst_size: None,
             };
@@ -530,6 +702,7 @@ mod tests {
                 user_id: user.id,
                 name: "Trait Test Key".to_string(),
                 description: Some("Test trait description".to_string()),
+                purpose: ApiKeyPurpose::Inference,
                 requests_per_second: None,
                 burst_size: None,
             };
@@ -653,6 +826,7 @@ mod tests {
                 user_id: user.id,
                 name: "Test API Key".to_string(),
                 description: Some("API key for testing group access".to_string()),
+                purpose: ApiKeyPurpose::Inference,
                 requests_per_second: None,
                 burst_size: None,
             };
@@ -661,12 +835,31 @@ mod tests {
         // Commit all of that to the db so we can read it out to run checks.
         tx.commit().await.unwrap();
 
+        // Credit standard users so they can access deployments
+        {
+            let mut credit_conn = pool.acquire().await.unwrap();
+            let mut credit_repo = Credits::new(&mut credit_conn);
+            credit_repo
+                .create_transaction(&CreditTransactionCreateDBRequest {
+                    user_id: user.id,
+                    amount: Decimal::from(1000),
+                    source_id: user.id.to_string(),
+                    transaction_type: CreditTransactionType::AdminGrant,
+                    description: Some("Initial credit for testing".to_string()),
+                })
+                .await
+                .unwrap();
+        }
+
         // Can't use our transaction now as its been commited, but can just make a new repo with a connection from the pool.
         let mut pool_conn = pool.acquire().await.unwrap();
         let mut api_key_repo = ApiKeys::new(&mut pool_conn);
 
         // API key should have access to the deployment
-        let keys_for_deployment = api_key_repo.get_api_keys_for_deployment(deployment.id).await.unwrap();
+        let keys_for_deployment = api_key_repo
+            .get_api_keys_for_deployment_with_sufficient_credit(deployment.id)
+            .await
+            .unwrap();
         assert!(keys_for_deployment.iter().any(|k| k.secret == api_key.secret));
 
         // API key should show the deployment in model_access
@@ -761,6 +954,7 @@ mod tests {
                 user_id: user.id,
                 name: "Test API Key".to_string(),
                 description: Some("API key for testing access removal".to_string()),
+                purpose: ApiKeyPurpose::Inference,
                 requests_per_second: None,
                 burst_size: None,
             };
@@ -769,11 +963,31 @@ mod tests {
 
         // Commit transaction and create new connection for assertions
         tx.commit().await.unwrap();
+
+        // Credit standard users so they can access deployments
+        {
+            let mut credit_conn = pool.acquire().await.unwrap();
+            let mut credit_repo = Credits::new(&mut credit_conn);
+            credit_repo
+                .create_transaction(&CreditTransactionCreateDBRequest {
+                    user_id: user.id,
+                    amount: Decimal::from(1000),
+                    source_id: user.id.to_string(),
+                    transaction_type: CreditTransactionType::AdminGrant,
+                    description: Some("Initial credit for testing".to_string()),
+                })
+                .await
+                .unwrap();
+        }
+
         let mut pool_conn = pool.acquire().await.unwrap();
         let mut api_key_repo = ApiKeys::new(&mut pool_conn);
 
         // Verify API key has access
-        let keys_for_deployment = api_key_repo.get_api_keys_for_deployment(deployment.id).await.unwrap();
+        let keys_for_deployment = api_key_repo
+            .get_api_keys_for_deployment_with_sufficient_credit(deployment.id)
+            .await
+            .unwrap();
         assert!(keys_for_deployment.iter().any(|k| k.secret == api_key.secret));
 
         // Remove user from group
@@ -782,7 +996,10 @@ mod tests {
         group_repo.remove_user_from_group(user.id, group.id).await.unwrap();
 
         // API key should lose access
-        let keys_for_deployment = api_key_repo.get_api_keys_for_deployment(deployment.id).await.unwrap();
+        let keys_for_deployment = api_key_repo
+            .get_api_keys_for_deployment_with_sufficient_credit(deployment.id)
+            .await
+            .unwrap();
         assert!(!keys_for_deployment.iter().any(|k| k.secret == api_key.secret));
 
         // API key should show no model access
@@ -879,6 +1096,7 @@ mod tests {
                 user_id: user.id,
                 name: "Test API Key".to_string(),
                 description: Some("API key for testing deployment removal".to_string()),
+                purpose: ApiKeyPurpose::Inference,
                 requests_per_second: None,
                 burst_size: None,
             };
@@ -887,11 +1105,31 @@ mod tests {
 
         // Commit transaction and create new connection for assertions
         tx.commit().await.unwrap();
+
+        // Credit standard users so they can access deployments
+        {
+            let mut credit_conn = pool.acquire().await.unwrap();
+            let mut credit_repo = Credits::new(&mut credit_conn);
+            credit_repo
+                .create_transaction(&CreditTransactionCreateDBRequest {
+                    user_id: user.id,
+                    amount: Decimal::from(1000),
+                    source_id: user.id.to_string(),
+                    transaction_type: CreditTransactionType::AdminGrant,
+                    description: Some("Initial credit for testing".to_string()),
+                })
+                .await
+                .unwrap();
+        }
+
         let mut pool_conn = pool.acquire().await.unwrap();
         let mut api_key_repo = ApiKeys::new(&mut pool_conn);
 
         // Verify API key has access
-        let keys_for_deployment = api_key_repo.get_api_keys_for_deployment(deployment.id).await.unwrap();
+        let keys_for_deployment = api_key_repo
+            .get_api_keys_for_deployment_with_sufficient_credit(deployment.id)
+            .await
+            .unwrap();
         assert!(keys_for_deployment.iter().any(|k| k.secret == api_key.secret));
 
         // Remove deployment from group
@@ -900,7 +1138,10 @@ mod tests {
         group_repo.remove_deployment_from_group(deployment.id, group.id).await.unwrap();
 
         // API key should lose access
-        let keys_for_deployment = api_key_repo.get_api_keys_for_deployment(deployment.id).await.unwrap();
+        let keys_for_deployment = api_key_repo
+            .get_api_keys_for_deployment_with_sufficient_credit(deployment.id)
+            .await
+            .unwrap();
         assert!(!keys_for_deployment.iter().any(|k| k.secret == api_key.secret));
 
         // API key should show no model access
@@ -1023,6 +1264,7 @@ mod tests {
                 user_id: user1.id,
                 name: "User 1 Key".to_string(),
                 description: Some("API key for user 1".to_string()),
+                purpose: ApiKeyPurpose::Inference,
                 requests_per_second: None,
                 burst_size: None,
             };
@@ -1032,6 +1274,7 @@ mod tests {
                 user_id: user2.id,
                 name: "User 2 Key".to_string(),
                 description: Some("API key for user 2".to_string()),
+                purpose: ApiKeyPurpose::Inference,
                 requests_per_second: None,
                 burst_size: None,
             };
@@ -1040,11 +1283,41 @@ mod tests {
 
         // Commit transaction and create new connection for assertions
         tx.commit().await.unwrap();
+
+        // Credit standard users so they can access deployments
+        {
+            let mut credit_conn = pool.acquire().await.unwrap();
+            let mut credit_repo = Credits::new(&mut credit_conn);
+            credit_repo
+                .create_transaction(&CreditTransactionCreateDBRequest {
+                    user_id: user1.id,
+                    amount: Decimal::from(1000),
+                    source_id: user1.id.to_string(),
+                    transaction_type: CreditTransactionType::AdminGrant,
+                    description: Some("Initial credit for testing".to_string()),
+                })
+                .await
+                .unwrap();
+            credit_repo
+                .create_transaction(&CreditTransactionCreateDBRequest {
+                    user_id: user2.id,
+                    amount: Decimal::from(1000),
+                    source_id: user2.id.to_string(),
+                    transaction_type: CreditTransactionType::AdminGrant,
+                    description: Some("Initial credit for testing".to_string()),
+                })
+                .await
+                .unwrap();
+        }
+
         let mut pool_conn = pool.acquire().await.unwrap();
         let mut api_key_repo = ApiKeys::new(&mut pool_conn);
 
         // Both API keys should have access to the deployment
-        let keys_for_deployment = api_key_repo.get_api_keys_for_deployment(deployment.id).await.unwrap();
+        let keys_for_deployment = api_key_repo
+            .get_api_keys_for_deployment_with_sufficient_credit(deployment.id)
+            .await
+            .unwrap();
         assert!(keys_for_deployment.iter().any(|k| k.secret == api_key1.secret));
         assert!(keys_for_deployment.iter().any(|k| k.secret == api_key2.secret));
         assert_eq!(keys_for_deployment.len(), 2 + 1); // + 1 for system user
@@ -1055,7 +1328,10 @@ mod tests {
         group_repo.remove_deployment_from_group(deployment.id, group1.id).await.unwrap();
 
         // Only user 2's API key should have access now
-        let keys_for_deployment = api_key_repo.get_api_keys_for_deployment(deployment.id).await.unwrap();
+        let keys_for_deployment = api_key_repo
+            .get_api_keys_for_deployment_with_sufficient_credit(deployment.id)
+            .await
+            .unwrap();
         assert!(!keys_for_deployment.iter().any(|k| k.secret == api_key1.secret));
         assert!(keys_for_deployment.iter().any(|k| k.secret == api_key2.secret));
         assert_eq!(keys_for_deployment.len(), 1 + 1); // + 1 for system user
@@ -1164,6 +1440,7 @@ mod tests {
                 user_id: user.id,
                 name: "Multi Access Key".to_string(),
                 description: Some("API key for multiple deployments".to_string()),
+                purpose: ApiKeyPurpose::Inference,
                 requests_per_second: None,
                 burst_size: None,
             };
@@ -1172,12 +1449,35 @@ mod tests {
 
         // Commit transaction and create new connection for assertions
         tx.commit().await.unwrap();
+
+        // Credit standard users so they can access deployments
+        {
+            let mut credit_conn = pool.acquire().await.unwrap();
+            let mut credit_repo = Credits::new(&mut credit_conn);
+            credit_repo
+                .create_transaction(&CreditTransactionCreateDBRequest {
+                    user_id: user.id,
+                    amount: Decimal::from(1000),
+                    source_id: user.id.to_string(),
+                    transaction_type: CreditTransactionType::AdminGrant,
+                    description: Some("Initial credit for testing".to_string()),
+                })
+                .await
+                .unwrap();
+        }
+
         let mut pool_conn = pool.acquire().await.unwrap();
         let mut api_key_repo = ApiKeys::new(&mut pool_conn);
 
         // API key should have access to both deployments
-        let keys_for_deployment1 = api_key_repo.get_api_keys_for_deployment(deployment1.id).await.unwrap();
-        let keys_for_deployment2 = api_key_repo.get_api_keys_for_deployment(deployment2.id).await.unwrap();
+        let keys_for_deployment1 = api_key_repo
+            .get_api_keys_for_deployment_with_sufficient_credit(deployment1.id)
+            .await
+            .unwrap();
+        let keys_for_deployment2 = api_key_repo
+            .get_api_keys_for_deployment_with_sufficient_credit(deployment2.id)
+            .await
+            .unwrap();
         assert!(keys_for_deployment1.iter().any(|k| k.secret == api_key.secret));
         assert!(keys_for_deployment2.iter().any(|k| k.secret == api_key.secret));
 
@@ -1192,8 +1492,14 @@ mod tests {
         group_repo.remove_deployment_from_group(deployment1.id, group.id).await.unwrap();
 
         // API key should only have access to deployment 2
-        let keys_for_deployment1 = api_key_repo.get_api_keys_for_deployment(deployment1.id).await.unwrap();
-        let keys_for_deployment2 = api_key_repo.get_api_keys_for_deployment(deployment2.id).await.unwrap();
+        let keys_for_deployment1 = api_key_repo
+            .get_api_keys_for_deployment_with_sufficient_credit(deployment1.id)
+            .await
+            .unwrap();
+        let keys_for_deployment2 = api_key_repo
+            .get_api_keys_for_deployment_with_sufficient_credit(deployment2.id)
+            .await
+            .unwrap();
         assert!(!keys_for_deployment1.iter().any(|k| k.secret == api_key.secret));
         assert!(keys_for_deployment2.iter().any(|k| k.secret == api_key.secret));
 
@@ -1274,6 +1580,7 @@ mod tests {
                 user_id: user.id,
                 name: "Dynamic Access Key".to_string(),
                 description: Some("API key for testing dynamic access".to_string()),
+                purpose: ApiKeyPurpose::Inference,
                 requests_per_second: None,
                 burst_size: None,
             };
@@ -1281,11 +1588,30 @@ mod tests {
         }
         tx.commit().await.unwrap();
 
+        // Credit standard users so they can access deployments
+        {
+            let mut credit_conn = pool.acquire().await.unwrap();
+            let mut credit_repo = Credits::new(&mut credit_conn);
+            credit_repo
+                .create_transaction(&CreditTransactionCreateDBRequest {
+                    user_id: user.id,
+                    amount: Decimal::from(1000),
+                    source_id: user.id.to_string(),
+                    transaction_type: CreditTransactionType::AdminGrant,
+                    description: Some("Initial credit for testing".to_string()),
+                })
+                .await
+                .unwrap();
+        }
+
         let mut pool_conn = pool.acquire().await.unwrap();
         let mut api_key_repo = ApiKeys::new(&mut pool_conn);
 
         // Initially, API key should have NO access (user not in group yet)
-        let keys_for_deployment = api_key_repo.get_api_keys_for_deployment(deployment.id).await.unwrap();
+        let keys_for_deployment = api_key_repo
+            .get_api_keys_for_deployment_with_sufficient_credit(deployment.id)
+            .await
+            .unwrap();
         assert!(
             !keys_for_deployment.iter().any(|k| k.secret == api_key.secret),
             "API key should not have access before user is added to group"
@@ -1305,7 +1631,10 @@ mod tests {
         group_repo.add_user_to_group(user.id, group.id).await.unwrap();
 
         // API key should now dynamically gain access
-        let keys_for_deployment = api_key_repo.get_api_keys_for_deployment(deployment.id).await.unwrap();
+        let keys_for_deployment = api_key_repo
+            .get_api_keys_for_deployment_with_sufficient_credit(deployment.id)
+            .await
+            .unwrap();
         assert!(
             keys_for_deployment.iter().any(|k| k.secret == api_key.secret),
             "API key should gain access after user is added to group"
@@ -1320,7 +1649,10 @@ mod tests {
         // Remove user from group - access should be revoked again
         group_repo.remove_user_from_group(user.id, group.id).await.unwrap();
 
-        let keys_for_deployment = api_key_repo.get_api_keys_for_deployment(deployment.id).await.unwrap();
+        let keys_for_deployment = api_key_repo
+            .get_api_keys_for_deployment_with_sufficient_credit(deployment.id)
+            .await
+            .unwrap();
         assert!(
             !keys_for_deployment.iter().any(|k| k.secret == api_key.secret),
             "API key should lose access after user is removed from group"
@@ -1392,6 +1724,7 @@ mod tests {
             enable_metrics: false,
             enable_request_logging: false,
             enable_otel_export: false,
+            credits: Default::default(),
             batches: Default::default(),
             leader_election: crate::config::LeaderElectionConfig::default(),
         };
@@ -1433,6 +1766,7 @@ mod tests {
                 user_id: user.id,
                 name: "Test API Key".to_string(),
                 description: Some("API key for testing Everyone group access".to_string()),
+                purpose: ApiKeyPurpose::Inference,
                 requests_per_second: None,
                 burst_size: None,
             };
@@ -1441,11 +1775,31 @@ mod tests {
 
         // Commit transaction and create new connection for assertions
         tx.commit().await.unwrap();
+
+        // Credit standard users so they can access deployments
+        {
+            let mut credit_conn = pool.acquire().await.unwrap();
+            let mut credit_repo = Credits::new(&mut credit_conn);
+            credit_repo
+                .create_transaction(&CreditTransactionCreateDBRequest {
+                    user_id: user.id,
+                    amount: Decimal::from(1000),
+                    source_id: user.id.to_string(),
+                    transaction_type: CreditTransactionType::AdminGrant,
+                    description: Some("Initial credit for testing".to_string()),
+                })
+                .await
+                .unwrap();
+        }
+
         let mut pool_conn = pool.acquire().await.unwrap();
         let mut api_key_repo = ApiKeys::new(&mut pool_conn);
 
         // API key should have access to the deployment through Everyone group
-        let keys_for_deployment = api_key_repo.get_api_keys_for_deployment(deployment.id).await.unwrap();
+        let keys_for_deployment = api_key_repo
+            .get_api_keys_for_deployment_with_sufficient_credit(deployment.id)
+            .await
+            .unwrap();
         assert!(
             keys_for_deployment.iter().any(|k| k.secret == api_key.secret),
             "API key should have access through Everyone group"
@@ -1458,7 +1812,10 @@ mod tests {
         );
 
         // Verify that everyone group access works for keys_for_deployment
-        let all_keys = api_key_repo.get_api_keys_for_deployment(deployment.id).await.unwrap();
+        let all_keys = api_key_repo
+            .get_api_keys_for_deployment_with_sufficient_credit(deployment.id)
+            .await
+            .unwrap();
         assert!(
             all_keys.iter().any(|k| k.secret == api_key.secret),
             "get_api_keys_for_deployment should include API keys with Everyone group access"
@@ -1491,6 +1848,7 @@ mod tests {
                     user_id: user.id,
                     name: format!("Pagination Key {i}"),
                     description: Some(format!("Key {i} for pagination testing")),
+                    purpose: ApiKeyPurpose::Inference,
                     requests_per_second: None,
                     burst_size: None,
                 };
@@ -1617,6 +1975,7 @@ mod tests {
                 user_id: user1.id,
                 name: "User1 Key".to_string(),
                 description: None,
+                purpose: ApiKeyPurpose::Inference,
                 requests_per_second: None,
                 burst_size: None,
             };
@@ -1624,6 +1983,7 @@ mod tests {
                 user_id: user2.id,
                 name: "User2 Key".to_string(),
                 description: None,
+                purpose: ApiKeyPurpose::Inference,
                 requests_per_second: None,
                 burst_size: None,
             };
@@ -1686,6 +2046,7 @@ mod tests {
             user_id: user.id,
             name: "Bulk Key 1".to_string(),
             description: Some("First bulk key".to_string()),
+            purpose: ApiKeyPurpose::Inference,
             requests_per_second: None,
             burst_size: None,
         };
@@ -1693,6 +2054,7 @@ mod tests {
             user_id: user.id,
             name: "Bulk Key 2".to_string(),
             description: Some("Second bulk key".to_string()),
+            purpose: ApiKeyPurpose::Inference,
             requests_per_second: None,
             burst_size: None,
         };
@@ -1700,6 +2062,7 @@ mod tests {
             user_id: user.id,
             name: "Bulk Key 3".to_string(),
             description: None,
+            purpose: ApiKeyPurpose::Inference,
             requests_per_second: None,
             burst_size: None,
         };
@@ -1756,6 +2119,7 @@ mod tests {
             user_id: user.id,
             name: "Valid Key".to_string(),
             description: Some("Only valid key".to_string()),
+            purpose: ApiKeyPurpose::Inference,
             requests_per_second: None,
             burst_size: None,
         };
@@ -1834,6 +2198,7 @@ mod tests {
             user_id: user.id,
             name: "Duplicate Test Key".to_string(),
             description: Some("Key for testing duplicates".to_string()),
+            purpose: ApiKeyPurpose::Inference,
             requests_per_second: None,
             burst_size: None,
         };
@@ -1921,6 +2286,7 @@ mod tests {
             user_id: user.id,
             name: "Bulk Access Key 1".to_string(),
             description: Some("First key with model access".to_string()),
+            purpose: ApiKeyPurpose::Inference,
             requests_per_second: None,
             burst_size: None,
         };
@@ -1928,6 +2294,7 @@ mod tests {
             user_id: user.id,
             name: "Bulk Access Key 2".to_string(),
             description: Some("Second key with model access".to_string()),
+            purpose: ApiKeyPurpose::Inference,
             requests_per_second: None,
             burst_size: None,
         };
@@ -1987,6 +2354,7 @@ mod tests {
             user_id: user1.id,
             name: "User1 Bulk Key".to_string(),
             description: Some("Key for user 1".to_string()),
+            purpose: ApiKeyPurpose::Inference,
             requests_per_second: None,
             burst_size: None,
         };
@@ -1994,6 +2362,7 @@ mod tests {
             user_id: user2.id,
             name: "User2 Bulk Key".to_string(),
             description: Some("Key for user 2".to_string()),
+            purpose: ApiKeyPurpose::Inference,
             requests_per_second: None,
             burst_size: None,
         };
@@ -2026,5 +2395,971 @@ mod tests {
         assert_ne!(retrieved_key1.secret, retrieved_key2.secret);
         assert!(retrieved_key1.secret.starts_with("sk-"));
         assert!(retrieved_key2.secret.starts_with("sk-"));
+    }
+
+    // Helper struct to hold test setup data for credit filtering tests
+    struct CreditFilteringTestSetup {
+        deployment: DeploymentDBResponse,
+        group: GroupDBResponse,
+    }
+
+    // Helper function to set up common test infrastructure for credit filtering tests
+    async fn setup_credit_filtering_test(pool: &PgPool) -> CreditFilteringTestSetup {
+        let mut tx = pool.begin().await.unwrap();
+
+        // Create admin user
+        let admin_user;
+        {
+            let mut user_repo = Users::new(tx.acquire().await.unwrap());
+            let admin_create = UserCreateDBRequest::from(UserCreate {
+                username: format!("admin_{}", uuid::Uuid::new_v4()),
+                email: format!("admin_{}@example.com", uuid::Uuid::new_v4()),
+                display_name: None,
+                avatar_url: None,
+                roles: vec![Role::PlatformManager],
+            });
+            admin_user = user_repo.create(&admin_create).await.unwrap();
+        }
+
+        // Create group
+        let group;
+        {
+            let mut group_tx = tx.begin().await.unwrap();
+            let mut group_repo = Groups::new(group_tx.acquire().await.unwrap());
+            let group_create = GroupCreateDBRequest {
+                name: format!("Test Group {}", uuid::Uuid::new_v4()),
+                description: Some("Test group for credit filtering".to_string()),
+                created_by: admin_user.id,
+            };
+            group = group_repo.create(&group_create).await.unwrap();
+            group_tx.commit().await.unwrap();
+        }
+
+        // Seed database and get endpoint ID
+        let config = crate::test_utils::create_test_config();
+        crate::seed_database(&config.model_sources, pool).await.unwrap();
+        let test_endpoint_id = get_test_endpoint_id(pool).await;
+
+        // Create deployment with pricing (paid model by default for credit tests)
+        let deployment;
+        {
+            use crate::db::models::deployments::{ModelPricing, TokenPricing};
+
+            let mut deployment_tx = tx.begin().await.unwrap();
+            let mut deployment_repo = Deployments::new(deployment_tx.acquire().await.unwrap());
+
+            // Default to a paid model for credit filtering tests
+            let pricing = ModelPricing {
+                upstream: Some(TokenPricing {
+                    input_price_per_token: Some(Decimal::new(1, 6)),  // $0.000001 per token
+                    output_price_per_token: Some(Decimal::new(2, 6)), // $0.000002 per token
+                }),
+                downstream: None,
+            };
+
+            let mut deployment_create = DeploymentCreateDBRequest::builder()
+                .created_by(admin_user.id)
+                .model_name(format!("test-model-{}", uuid::Uuid::new_v4()))
+                .alias(format!("test-alias-{}", uuid::Uuid::new_v4()))
+                .pricing(pricing)
+                .build();
+            deployment_create.hosted_on = test_endpoint_id;
+            deployment = deployment_repo.create(&deployment_create).await.unwrap();
+            deployment_tx.commit().await.unwrap();
+        }
+
+        // Add deployment to group
+        {
+            let mut group_tx = tx.begin().await.unwrap();
+            let mut group_repo = Groups::new(group_tx.acquire().await.unwrap());
+            group_repo
+                .add_deployment_to_group(deployment.id, group.id, admin_user.id)
+                .await
+                .unwrap();
+            group_tx.commit().await.unwrap();
+        }
+
+        tx.commit().await.unwrap();
+
+        CreditFilteringTestSetup { deployment, group }
+    }
+
+    #[sqlx::test]
+    #[test_log::test]
+    async fn test_api_keys_filtered_by_insufficient_credits(pool: PgPool) {
+        let mut tx = pool.begin().await.unwrap();
+
+        // Create admin and users
+        let admin_user;
+        let user_with_credits;
+        let user_without_credits;
+        {
+            let mut user_repo = Users::new(tx.acquire().await.unwrap());
+
+            // Create admin user
+            let admin_create = UserCreateDBRequest::from(UserCreate {
+                username: "admin".to_string(),
+                email: "admin@example.com".to_string(),
+                display_name: None,
+                avatar_url: None,
+                roles: vec![Role::PlatformManager],
+            });
+            admin_user = user_repo.create(&admin_create).await.unwrap();
+
+            // Create user with credits
+            let user_create1 = UserCreateDBRequest::from(UserCreate {
+                username: "user_with_credits".to_string(),
+                email: "user_with_credits@example.com".to_string(),
+                display_name: None,
+                avatar_url: None,
+                roles: vec![Role::StandardUser],
+            });
+            user_with_credits = user_repo.create(&user_create1).await.unwrap();
+
+            // Create user without credits
+            let user_create2 = UserCreateDBRequest::from(UserCreate {
+                username: "user_without_credits".to_string(),
+                email: "user_without_credits@example.com".to_string(),
+                display_name: None,
+                avatar_url: None,
+                roles: vec![Role::StandardUser],
+            });
+            user_without_credits = user_repo.create(&user_create2).await.unwrap();
+        }
+
+        // Create group
+        let group;
+        {
+            let mut group_tx = tx.begin().await.unwrap();
+            let mut group_repo = Groups::new(group_tx.acquire().await.unwrap());
+            let group_create = GroupCreateDBRequest {
+                name: "Test Group".to_string(),
+                description: Some("Test group for credit filtering".to_string()),
+                created_by: admin_user.id,
+            };
+            group = group_repo.create(&group_create).await.unwrap();
+            group_tx.commit().await.unwrap();
+        }
+
+        // Seed database and get endpoint ID
+        let config = crate::test_utils::create_test_config();
+        crate::seed_database(&config.model_sources, &pool).await.unwrap();
+        let test_endpoint_id = get_test_endpoint_id(&pool).await;
+
+        // Create deployment with pricing (paid model)
+        let deployment;
+        {
+            use crate::db::models::deployments::{ModelPricing, TokenPricing};
+
+            let mut deployment_tx = tx.begin().await.unwrap();
+            let mut deployment_repo = Deployments::new(deployment_tx.acquire().await.unwrap());
+
+            let pricing = ModelPricing {
+                upstream: Some(TokenPricing {
+                    input_price_per_token: Some(Decimal::new(1, 6)),  // $0.000001 per token
+                    output_price_per_token: Some(Decimal::new(2, 6)), // $0.000002 per token
+                }),
+                downstream: None,
+            };
+
+            let mut deployment_create = DeploymentCreateDBRequest::builder()
+                .created_by(admin_user.id)
+                .model_name("test-model".to_string())
+                .alias("test-alias".to_string())
+                .pricing(pricing)
+                .build();
+            deployment_create.hosted_on = test_endpoint_id;
+            deployment = deployment_repo.create(&deployment_create).await.unwrap();
+            deployment_tx.commit().await.unwrap();
+        }
+
+        // Add users to group and deployment to group
+        {
+            let mut group_tx = tx.begin().await.unwrap();
+            let mut group_repo = Groups::new(group_tx.acquire().await.unwrap());
+            group_repo.add_user_to_group(user_with_credits.id, group.id).await.unwrap();
+            group_repo.add_user_to_group(user_without_credits.id, group.id).await.unwrap();
+            group_repo
+                .add_deployment_to_group(deployment.id, group.id, admin_user.id)
+                .await
+                .unwrap();
+            group_tx.commit().await.unwrap();
+        }
+
+        // Create API keys for both users
+        let mut api_repo = ApiKeys::new(&mut tx);
+        let key_with_credits = api_repo
+            .create(&ApiKeyCreateDBRequest {
+                name: "Key with credits".to_string(),
+                description: Some("Has sufficient credits".to_string()),
+                user_id: user_with_credits.id,
+                requests_per_second: None,
+                burst_size: None,
+                purpose: ApiKeyPurpose::Inference,
+            })
+            .await
+            .unwrap();
+
+        let key_without_credits = api_repo
+            .create(&ApiKeyCreateDBRequest {
+                name: "Key without credits".to_string(),
+                description: Some("Has insufficient credits".to_string()),
+                user_id: user_without_credits.id,
+                requests_per_second: None,
+                burst_size: None,
+                purpose: ApiKeyPurpose::Inference,
+            })
+            .await
+            .unwrap();
+
+        tx.commit().await.unwrap();
+
+        // Add credits to user_with_credits
+        let mut pool_conn = pool.acquire().await.unwrap();
+        let mut credits_repo = Credits::new(&mut pool_conn);
+
+        credits_repo
+            .create_transaction(&CreditTransactionCreateDBRequest {
+                user_id: user_with_credits.id,
+                transaction_type: CreditTransactionType::Purchase,
+                amount: Decimal::new(1000, 0), // 1000 credits
+                source_id: "test".to_string(),
+                description: Some("Initial credits".to_string()),
+            })
+            .await
+            .unwrap();
+
+        // Add credits to user_without_credits but then deduct them all
+        credits_repo
+            .create_transaction(&CreditTransactionCreateDBRequest {
+                user_id: user_without_credits.id,
+                transaction_type: CreditTransactionType::Purchase,
+                amount: Decimal::new(100, 0),
+                source_id: "test".to_string(),
+                description: Some("Initial credits".to_string()),
+            })
+            .await
+            .unwrap();
+
+        credits_repo
+            .create_transaction(&CreditTransactionCreateDBRequest {
+                user_id: user_without_credits.id,
+                transaction_type: CreditTransactionType::Usage,
+                amount: Decimal::new(120, 0), // Deduct all credits
+                source_id: "test".to_string(),
+                description: Some("Used all credits".to_string()),
+            })
+            .await
+            .unwrap();
+
+        // Get new connection to query
+        let mut api_repo = ApiKeys::new(&mut pool_conn);
+
+        // Get API keys for deployment - should only include key_with_credits
+        let keys_for_deployment = api_repo
+            .get_api_keys_for_deployment_with_sufficient_credit(deployment.id)
+            .await
+            .unwrap();
+
+        // Debug: Check credits
+        let mut credits_repo = Credits::new(&mut pool_conn);
+        let balance_with = credits_repo.get_user_balance(user_with_credits.id).await.unwrap();
+        let balance_without = credits_repo.get_user_balance(user_without_credits.id).await.unwrap();
+        println!("Balance for user_with_credits: {}", balance_with);
+        println!("Balance for user_without_credits: {}", balance_without);
+
+        println!("Keys returned: {}", keys_for_deployment.len());
+        for key in &keys_for_deployment {
+            println!(
+                "  - {} (user: {}, secret: {}...)",
+                key.name,
+                abbrev_uuid(&key.user_id),
+                &key.secret[..10]
+            );
+        }
+        println!("Expected key_with_credits secret: {}...", &key_with_credits.secret[..10]);
+        println!("Expected key_without_credits secret: {}...", &key_without_credits.secret[..10]);
+
+        // Should include system user key + key_with_credits, but NOT key_without_credits
+        assert!(
+            keys_for_deployment.iter().any(|k| k.secret == key_with_credits.secret),
+            "User with sufficient credits should have access"
+        );
+
+        assert!(
+            !keys_for_deployment.iter().any(|k| k.secret == key_without_credits.secret),
+            "User with insufficient credits (balance = 0) should NOT have access"
+        );
+    }
+
+    #[sqlx::test]
+    #[test_log::test]
+    async fn test_platform_manager_api_keys_not_filtered_by_credits(pool: PgPool) {
+        let setup = setup_credit_filtering_test(&pool).await;
+        let mut pool_conn = pool.acquire().await.unwrap();
+
+        // Create a Platform Manager user with zero credits
+        let platform_manager;
+        {
+            let mut user_repo = Users::new(&mut pool_conn);
+            let user_create = UserCreateDBRequest::from(UserCreate {
+                username: "platform".to_string(),
+                email: "platform@example.com".to_string(),
+                display_name: None,
+                avatar_url: None,
+                roles: vec![Role::PlatformManager],
+            });
+            platform_manager = user_repo.create(&user_create).await.unwrap();
+        }
+
+        // Add the Platform Manager to the group
+        {
+            let mut group_repo = Groups::new(&mut pool_conn);
+            group_repo.add_user_to_group(platform_manager.id, setup.group.id).await.unwrap();
+        }
+
+        // Create API key for Platform Manager
+        let platform_key;
+        {
+            let mut api_key_repo = ApiKeys::new(&mut pool_conn);
+            platform_key = api_key_repo
+                .create(&ApiKeyCreateDBRequest {
+                    user_id: platform_manager.id,
+                    name: "Platform Manager Key".to_string(),
+                    description: None,
+                    requests_per_second: None,
+                    burst_size: None,
+                    purpose: ApiKeyPurpose::Inference,
+                })
+                .await
+                .unwrap();
+        }
+
+        // Retrieve API keys for the deployment
+        let keys_for_deployment;
+        {
+            let mut api_repo = ApiKeys::new(&mut pool_conn);
+            keys_for_deployment = api_repo
+                .get_api_keys_for_deployment_with_sufficient_credit(setup.deployment.id)
+                .await
+                .unwrap();
+        }
+
+        // Platform Manager should have access despite zero credits
+        assert!(
+            keys_for_deployment.iter().any(|k| k.secret == platform_key.secret),
+            "Platform Manager should have access regardless of credit balance"
+        );
+    }
+
+    #[sqlx::test]
+    #[test_log::test]
+    async fn test_users_without_credit_transactions_excluded(pool: PgPool) {
+        let setup = setup_credit_filtering_test(&pool).await;
+        let mut pool_conn = pool.acquire().await.unwrap();
+
+        // Create a StandardUser with NO credit transactions
+        let user_no_transactions;
+        {
+            let mut user_repo = Users::new(&mut pool_conn);
+            let user_create = UserCreateDBRequest::from(UserCreate {
+                username: "notransactions".to_string(),
+                email: "notransactions@example.com".to_string(),
+                display_name: None,
+                avatar_url: None,
+                roles: vec![Role::StandardUser],
+            });
+            user_no_transactions = user_repo.create(&user_create).await.unwrap();
+        }
+
+        // Add the user to the group
+        {
+            let mut group_repo = Groups::new(&mut pool_conn);
+            group_repo.add_user_to_group(user_no_transactions.id, setup.group.id).await.unwrap();
+        }
+
+        // Create API key for user
+        let key_no_transactions;
+        {
+            let mut api_key_repo = ApiKeys::new(&mut pool_conn);
+            key_no_transactions = api_key_repo
+                .create(&ApiKeyCreateDBRequest {
+                    user_id: user_no_transactions.id,
+                    name: "No Transactions Key".to_string(),
+                    description: None,
+                    requests_per_second: None,
+                    burst_size: None,
+                    purpose: ApiKeyPurpose::Inference,
+                })
+                .await
+                .unwrap();
+        }
+
+        // DO NOT create any credit transactions for this user
+
+        // Retrieve API keys for the deployment
+        let keys_for_deployment;
+        {
+            let mut api_repo = ApiKeys::new(&mut pool_conn);
+            keys_for_deployment = api_repo
+                .get_api_keys_for_deployment_with_sufficient_credit(setup.deployment.id)
+                .await
+                .unwrap();
+        }
+
+        // User without transactions should be excluded (balance considered 0)
+        assert!(
+            !keys_for_deployment.iter().any(|k| k.secret == key_no_transactions.secret),
+            "User without credit transactions should be excluded (balance considered 0)"
+        );
+    }
+
+    #[sqlx::test]
+    #[test_log::test]
+    async fn test_negative_balance_user_excluded(pool: PgPool) {
+        let setup = setup_credit_filtering_test(&pool).await;
+        let mut pool_conn = pool.acquire().await.unwrap();
+
+        // Create a StandardUser
+        let user_negative;
+        {
+            let mut user_repo = Users::new(&mut pool_conn);
+            let user_create = UserCreateDBRequest::from(UserCreate {
+                username: "negative".to_string(),
+                email: "negative@example.com".to_string(),
+                display_name: None,
+                avatar_url: None,
+                roles: vec![Role::StandardUser],
+            });
+            user_negative = user_repo.create(&user_create).await.unwrap();
+        }
+
+        // Add the user to the group
+        {
+            let mut group_repo = Groups::new(&mut pool_conn);
+            group_repo.add_user_to_group(user_negative.id, setup.group.id).await.unwrap();
+        }
+
+        // Create API key for user
+        let key_negative;
+        {
+            let mut api_key_repo = ApiKeys::new(&mut pool_conn);
+            key_negative = api_key_repo
+                .create(&ApiKeyCreateDBRequest {
+                    user_id: user_negative.id,
+                    name: "Negative Balance Key".to_string(),
+                    description: None,
+                    requests_per_second: None,
+                    burst_size: None,
+                    purpose: ApiKeyPurpose::Inference,
+                })
+                .await
+                .unwrap();
+        }
+
+        // Give user a negative balance by using more credits than they have
+        {
+            let mut credits_repo = Credits::new(&mut pool_conn);
+            // First add some credits
+            credits_repo
+                .create_transaction(&CreditTransactionCreateDBRequest {
+                    user_id: user_negative.id,
+                    transaction_type: CreditTransactionType::Purchase,
+                    amount: Decimal::new(100, 2), // +1.00
+                    source_id: "test".to_string(),
+                    description: Some("Initial credits".to_string()),
+                })
+                .await
+                .unwrap();
+            // Then deduct more than available to create negative balance
+            credits_repo
+                .create_transaction(&CreditTransactionCreateDBRequest {
+                    user_id: user_negative.id,
+                    transaction_type: CreditTransactionType::Usage,
+                    amount: Decimal::new(1100, 2), // -11.00
+                    source_id: "test".to_string(),
+                    description: Some("Negative balance".to_string()),
+                })
+                .await
+                .unwrap();
+        }
+
+        // Retrieve API keys for the deployment
+        let keys_for_deployment;
+        {
+            let mut api_repo = ApiKeys::new(&mut pool_conn);
+            keys_for_deployment = api_repo
+                .get_api_keys_for_deployment_with_sufficient_credit(setup.deployment.id)
+                .await
+                .unwrap();
+        }
+
+        // User with negative balance should be excluded
+        assert!(
+            !keys_for_deployment.iter().any(|k| k.secret == key_negative.secret),
+            "User with negative balance should be excluded"
+        );
+    }
+
+    #[sqlx::test]
+    #[test_log::test]
+    async fn test_user_regains_access_after_adding_credits(pool: PgPool) {
+        let setup = setup_credit_filtering_test(&pool).await;
+        let mut pool_conn = pool.acquire().await.unwrap();
+
+        // Create a StandardUser
+        let user;
+        {
+            let mut user_repo = Users::new(&mut pool_conn);
+            let user_create = UserCreateDBRequest::from(UserCreate {
+                username: "regains".to_string(),
+                email: "regains@example.com".to_string(),
+                display_name: None,
+                avatar_url: None,
+                roles: vec![Role::StandardUser],
+            });
+            user = user_repo.create(&user_create).await.unwrap();
+        }
+
+        // Add the user to the group
+        {
+            let mut group_repo = Groups::new(&mut pool_conn);
+            group_repo.add_user_to_group(user.id, setup.group.id).await.unwrap();
+        }
+
+        // Create API key for user
+        let key;
+        {
+            let mut api_key_repo = ApiKeys::new(&mut pool_conn);
+            key = api_key_repo
+                .create(&ApiKeyCreateDBRequest {
+                    user_id: user.id,
+                    name: "Regains Access Key".to_string(),
+                    description: None,
+                    requests_per_second: None,
+                    burst_size: None,
+                    purpose: ApiKeyPurpose::Inference,
+                })
+                .await
+                .unwrap();
+        }
+
+        // Verify user does NOT have access with zero balance
+        let keys_no_access;
+        {
+            let mut api_repo = ApiKeys::new(&mut pool_conn);
+            keys_no_access = api_repo
+                .get_api_keys_for_deployment_with_sufficient_credit(setup.deployment.id)
+                .await
+                .unwrap();
+        }
+
+        assert!(
+            !keys_no_access.iter().any(|k| k.secret == key.secret),
+            "User with zero balance should NOT have access"
+        );
+
+        // Add credits to user
+        {
+            let mut credits_repo = Credits::new(&mut pool_conn);
+            credits_repo
+                .create_transaction(&CreditTransactionCreateDBRequest {
+                    user_id: user.id,
+                    transaction_type: CreditTransactionType::Purchase,
+                    amount: Decimal::new(10000, 2), // +100.00
+                    source_id: "test".to_string(),
+                    description: Some("Added credits".to_string()),
+                })
+                .await
+                .unwrap();
+        }
+
+        // Verify user NOW has access with positive balance
+        let keys_with_access;
+        {
+            let mut api_repo = ApiKeys::new(&mut pool_conn);
+            keys_with_access = api_repo
+                .get_api_keys_for_deployment_with_sufficient_credit(setup.deployment.id)
+                .await
+                .unwrap();
+        }
+
+        assert!(
+            keys_with_access.iter().any(|k| k.secret == key.secret),
+            "User should regain access after adding credits"
+        );
+    }
+
+    #[sqlx::test]
+    #[test_log::test]
+    async fn test_zero_credit_user_can_access_free_model(pool: PgPool) {
+        // This test will FAIL initially - demonstrating that zero-credit users
+        // currently cannot access free models (but they should be able to)
+        let mut tx = pool.begin().await.unwrap();
+
+        // Create users
+        let admin_user;
+        let user_no_credits;
+        {
+            let mut user_repo = Users::new(tx.acquire().await.unwrap());
+
+            let admin_create = UserCreateDBRequest::from(UserCreate {
+                username: "admin".to_string(),
+                email: "admin@example.com".to_string(),
+                display_name: None,
+                avatar_url: None,
+                roles: vec![Role::PlatformManager],
+            });
+            admin_user = user_repo.create(&admin_create).await.unwrap();
+
+            let user_create = UserCreateDBRequest::from(UserCreate {
+                username: "zerocredits".to_string(),
+                email: "zerocredits@example.com".to_string(),
+                display_name: None,
+                avatar_url: None,
+                roles: vec![Role::StandardUser],
+            });
+            user_no_credits = user_repo.create(&user_create).await.unwrap();
+        }
+
+        // Create group
+        let group;
+        {
+            let mut group_tx = tx.begin().await.unwrap();
+            let mut group_repo = Groups::new(group_tx.acquire().await.unwrap());
+            let group_create = GroupCreateDBRequest {
+                name: "Free Model Test Group".to_string(),
+                description: Some("Testing free model access".to_string()),
+                created_by: admin_user.id,
+            };
+            group = group_repo.create(&group_create).await.unwrap();
+            group_tx.commit().await.unwrap();
+        }
+
+        // Seed database and get endpoint ID
+        let config = crate::test_utils::create_test_config();
+        crate::seed_database(&config.model_sources, &pool).await.unwrap();
+        let test_endpoint_id = get_test_endpoint_id(&pool).await;
+
+        // Create deployment with NO pricing (free model)
+        let deployment;
+        {
+            let mut deployment_tx = tx.begin().await.unwrap();
+            let mut deployment_repo = Deployments::new(deployment_tx.acquire().await.unwrap());
+            let mut deployment_create = DeploymentCreateDBRequest::builder()
+                .created_by(admin_user.id)
+                .model_name("free-model".to_string())
+                .alias("free-alias".to_string())
+                .build();
+            deployment_create.hosted_on = test_endpoint_id;
+            deployment = deployment_repo.create(&deployment_create).await.unwrap();
+            deployment_tx.commit().await.unwrap();
+        }
+
+        // Add user to group and deployment to group
+        {
+            let mut group_tx = tx.begin().await.unwrap();
+            let mut group_repo = Groups::new(group_tx.acquire().await.unwrap());
+            group_repo.add_user_to_group(user_no_credits.id, group.id).await.unwrap();
+            group_repo
+                .add_deployment_to_group(deployment.id, group.id, admin_user.id)
+                .await
+                .unwrap();
+            group_tx.commit().await.unwrap();
+        }
+
+        // Create API key for zero-credit user
+        let mut api_repo = ApiKeys::new(&mut tx);
+        let key_no_credits = api_repo
+            .create(&ApiKeyCreateDBRequest {
+                name: "Zero Credits Key".to_string(),
+                description: Some("User with no credits".to_string()),
+                user_id: user_no_credits.id,
+                requests_per_second: None,
+                burst_size: None,
+                purpose: ApiKeyPurpose::Inference,
+            })
+            .await
+            .unwrap();
+
+        tx.commit().await.unwrap();
+
+        // User has NO credit transactions - balance is 0
+
+        // Get API keys for the free deployment
+        let mut pool_conn = pool.acquire().await.unwrap();
+        let mut api_repo = ApiKeys::new(&mut pool_conn);
+        let keys_for_deployment = api_repo
+            .get_api_keys_for_deployment_with_sufficient_credit(deployment.id)
+            .await
+            .unwrap();
+
+        // Debug output
+        println!("Keys returned for free model: {}", keys_for_deployment.len());
+        for key in &keys_for_deployment {
+            println!("  - {} (user: {})", key.name, key.user_id);
+        }
+
+        // Zero-credit user SHOULD have access to free models
+        assert!(
+            keys_for_deployment.iter().any(|k| k.secret == key_no_credits.secret),
+            "User with zero credits SHOULD have access to FREE models"
+        );
+    }
+
+    #[sqlx::test]
+    #[test_log::test]
+    async fn test_zero_credit_user_cannot_access_paid_model(pool: PgPool) {
+        // This test should PASS - demonstrating that zero-credit users
+        // correctly cannot access paid models
+        let mut tx = pool.begin().await.unwrap();
+
+        // Create users
+        let admin_user;
+        let user_no_credits;
+        {
+            let mut user_repo = Users::new(tx.acquire().await.unwrap());
+
+            let admin_create = UserCreateDBRequest::from(UserCreate {
+                username: "admin".to_string(),
+                email: "admin@example.com".to_string(),
+                display_name: None,
+                avatar_url: None,
+                roles: vec![Role::PlatformManager],
+            });
+            admin_user = user_repo.create(&admin_create).await.unwrap();
+
+            let user_create = UserCreateDBRequest::from(UserCreate {
+                username: "zerocredits".to_string(),
+                email: "zerocredits@example.com".to_string(),
+                display_name: None,
+                avatar_url: None,
+                roles: vec![Role::StandardUser],
+            });
+            user_no_credits = user_repo.create(&user_create).await.unwrap();
+        }
+
+        // Create group
+        let group;
+        {
+            let mut group_tx = tx.begin().await.unwrap();
+            let mut group_repo = Groups::new(group_tx.acquire().await.unwrap());
+            let group_create = GroupCreateDBRequest {
+                name: "Paid Model Test Group".to_string(),
+                description: Some("Testing paid model access".to_string()),
+                created_by: admin_user.id,
+            };
+            group = group_repo.create(&group_create).await.unwrap();
+            group_tx.commit().await.unwrap();
+        }
+
+        // Seed database and get endpoint ID
+        let config = crate::test_utils::create_test_config();
+        crate::seed_database(&config.model_sources, &pool).await.unwrap();
+        let test_endpoint_id = get_test_endpoint_id(&pool).await;
+
+        // Create deployment WITH pricing (paid model)
+        let deployment;
+        {
+            let mut deployment_tx = tx.begin().await.unwrap();
+            let mut deployment_repo = Deployments::new(deployment_tx.acquire().await.unwrap());
+
+            use crate::db::models::deployments::{ModelPricing, TokenPricing};
+            let pricing = ModelPricing {
+                upstream: Some(TokenPricing {
+                    input_price_per_token: Some(Decimal::new(1, 6)),  // $0.000001 per token
+                    output_price_per_token: Some(Decimal::new(2, 6)), // $0.000002 per token
+                }),
+                downstream: None,
+            };
+
+            let mut deployment_create = DeploymentCreateDBRequest::builder()
+                .created_by(admin_user.id)
+                .model_name("paid-model".to_string())
+                .alias("paid-alias".to_string())
+                .pricing(pricing) // Paid model - has pricing
+                .build();
+            deployment_create.hosted_on = test_endpoint_id;
+            deployment = deployment_repo.create(&deployment_create).await.unwrap();
+            deployment_tx.commit().await.unwrap();
+        }
+
+        // Add user to group and deployment to group
+        {
+            let mut group_tx = tx.begin().await.unwrap();
+            let mut group_repo = Groups::new(group_tx.acquire().await.unwrap());
+            group_repo.add_user_to_group(user_no_credits.id, group.id).await.unwrap();
+            group_repo
+                .add_deployment_to_group(deployment.id, group.id, admin_user.id)
+                .await
+                .unwrap();
+            group_tx.commit().await.unwrap();
+        }
+
+        // Create API key for zero-credit user
+        let mut api_repo = ApiKeys::new(&mut tx);
+        let key_no_credits = api_repo
+            .create(&ApiKeyCreateDBRequest {
+                name: "Zero Credits Key".to_string(),
+                description: Some("User with no credits".to_string()),
+                user_id: user_no_credits.id,
+                requests_per_second: None,
+                burst_size: None,
+                purpose: ApiKeyPurpose::Inference,
+            })
+            .await
+            .unwrap();
+
+        tx.commit().await.unwrap();
+
+        // User has NO credit transactions - balance is 0
+
+        // Get API keys for the paid deployment
+        let mut pool_conn = pool.acquire().await.unwrap();
+        let mut api_repo = ApiKeys::new(&mut pool_conn);
+        let keys_for_deployment = api_repo
+            .get_api_keys_for_deployment_with_sufficient_credit(deployment.id)
+            .await
+            .unwrap();
+
+        // Debug output
+        println!("Keys returned for paid model: {}", keys_for_deployment.len());
+        for key in &keys_for_deployment {
+            println!("  - {} (user: {})", key.name, key.user_id);
+        }
+
+        // Zero-credit user should NOT have access to paid models
+        assert!(
+            !keys_for_deployment.iter().any(|k| k.secret == key_no_credits.secret),
+            "User with zero credits should NOT have access to PAID models"
+        );
+    }
+
+    #[sqlx::test]
+    #[test_log::test]
+    async fn test_zero_credit_user_can_access_zero_price_model(pool: PgPool) {
+        // This test verifies that models with explicit $0.00 pricing (not NULL)
+        // are also accessible to zero-credit users
+        let mut tx = pool.begin().await.unwrap();
+
+        // Create users
+        let admin_user;
+        let user_no_credits;
+        {
+            let mut user_repo = Users::new(tx.acquire().await.unwrap());
+
+            let admin_create = UserCreateDBRequest::from(UserCreate {
+                username: "admin".to_string(),
+                email: "admin@example.com".to_string(),
+                display_name: None,
+                avatar_url: None,
+                roles: vec![Role::PlatformManager],
+            });
+            admin_user = user_repo.create(&admin_create).await.unwrap();
+
+            let user_create = UserCreateDBRequest::from(UserCreate {
+                username: "zerocredits".to_string(),
+                email: "zerocredits@example.com".to_string(),
+                display_name: None,
+                avatar_url: None,
+                roles: vec![Role::StandardUser],
+            });
+            user_no_credits = user_repo.create(&user_create).await.unwrap();
+        }
+
+        // Create group
+        let group;
+        {
+            let mut group_tx = tx.begin().await.unwrap();
+            let mut group_repo = Groups::new(group_tx.acquire().await.unwrap());
+            let group_create = GroupCreateDBRequest {
+                name: "Zero Price Model Test Group".to_string(),
+                description: Some("Testing zero-price model access".to_string()),
+                created_by: admin_user.id,
+            };
+            group = group_repo.create(&group_create).await.unwrap();
+            group_tx.commit().await.unwrap();
+        }
+
+        // Seed database and get endpoint ID
+        let config = crate::test_utils::create_test_config();
+        crate::seed_database(&config.model_sources, &pool).await.unwrap();
+        let test_endpoint_id = get_test_endpoint_id(&pool).await;
+
+        // Create deployment with explicit zero pricing (free model)
+        let deployment;
+        {
+            let mut deployment_tx = tx.begin().await.unwrap();
+            let mut deployment_repo = Deployments::new(deployment_tx.acquire().await.unwrap());
+
+            use crate::db::models::deployments::{ModelPricing, TokenPricing};
+            let pricing = ModelPricing {
+                upstream: Some(TokenPricing {
+                    input_price_per_token: Some(Decimal::ZERO),  // Explicit $0.00
+                    output_price_per_token: Some(Decimal::ZERO), // Explicit $0.00
+                }),
+                downstream: None,
+            };
+
+            let mut deployment_create = DeploymentCreateDBRequest::builder()
+                .created_by(admin_user.id)
+                .model_name("zero-price-model".to_string())
+                .alias("zero-price-alias".to_string())
+                .pricing(pricing) // Free model with explicit zero pricing
+                .build();
+            deployment_create.hosted_on = test_endpoint_id;
+            deployment = deployment_repo.create(&deployment_create).await.unwrap();
+            deployment_tx.commit().await.unwrap();
+        }
+
+        // Add user to group and deployment to group
+        {
+            let mut group_tx = tx.begin().await.unwrap();
+            let mut group_repo = Groups::new(group_tx.acquire().await.unwrap());
+            group_repo.add_user_to_group(user_no_credits.id, group.id).await.unwrap();
+            group_repo
+                .add_deployment_to_group(deployment.id, group.id, admin_user.id)
+                .await
+                .unwrap();
+            group_tx.commit().await.unwrap();
+        }
+
+        // Create API key for zero-credit user
+        let mut api_repo = ApiKeys::new(&mut tx);
+        let key_no_credits = api_repo
+            .create(&ApiKeyCreateDBRequest {
+                name: "Zero Credits Key".to_string(),
+                description: Some("User with no credits".to_string()),
+                user_id: user_no_credits.id,
+                requests_per_second: None,
+                burst_size: None,
+                purpose: ApiKeyPurpose::Inference,
+            })
+            .await
+            .unwrap();
+
+        tx.commit().await.unwrap();
+
+        // User has NO credit transactions - balance is 0
+
+        // Get API keys for the zero-price deployment
+        let mut pool_conn = pool.acquire().await.unwrap();
+        let mut api_repo = ApiKeys::new(&mut pool_conn);
+        let keys_for_deployment = api_repo
+            .get_api_keys_for_deployment_with_sufficient_credit(deployment.id)
+            .await
+            .unwrap();
+
+        // Debug output
+        println!("Keys returned for zero-price model: {}", keys_for_deployment.len());
+        for key in &keys_for_deployment {
+            println!("  - {} (user: {})", key.name, key.user_id);
+        }
+
+        // Zero-credit user SHOULD have access to models with explicit $0.00 pricing
+        assert!(
+            keys_for_deployment.iter().any(|k| k.secret == key_no_credits.secret),
+            "User with zero credits SHOULD have access to models with explicit $0.00 pricing"
+        );
     }
 }

@@ -1,8 +1,7 @@
 use crate::{
     api::models::users::CurrentUser,
-    db::handlers::Deployments,
+    db::{handlers::api_keys::ApiKeys, models::api_keys::ApiKeyPurpose},
     errors::Error,
-    types::{Operation, Permission},
     AppState,
 };
 use anyhow::Context;
@@ -30,11 +29,9 @@ pub(crate) async fn admin_ai_proxy(state: AppState, mut request: Request) -> Res
     // Extract user using the same auth methods as other endpoints
     let (mut parts, body) = request.into_parts();
     let current_user = CurrentUser::from_request_parts(&mut parts, &state).await?;
-    let user_email = current_user.email.clone();
 
     // Reconstruct request for further processing
     request = Request::from_parts(parts, body);
-    trace!("Authenticated user: {}", user_email);
 
     // Extract the request body to parse the model
     let body_bytes = match axum::body::to_bytes(std::mem::take(request.body_mut()), usize::MAX).await {
@@ -53,22 +50,13 @@ pub(crate) async fn admin_ai_proxy(state: AppState, mut request: Request) -> Res
 
     debug!("Model name extracted from request: {}", model_name);
 
-    let mut deployment_conn = state.db.acquire().await.unwrap();
-    let mut deployment_repo = Deployments::new(&mut deployment_conn);
-    let access_info = deployment_repo
-        .check_user_access(&model_name, &user_email)
+    // Get or create user-specific hidden API key for this request
+    let mut api_key_conn = state.db.acquire().await.unwrap();
+    let mut api_keys_repo = ApiKeys::new(&mut api_key_conn);
+    let user_api_key = api_keys_repo
+        .get_or_create_hidden_key(current_user.id, ApiKeyPurpose::Inference)
         .await
-        .map_err(anyhow::Error::from)
-        .with_context(|| format!("Failed to check user access for model '{model_name}' and user '{user_email}'"))?
-        .ok_or_else(|| Error::InsufficientPermissions {
-            required: Permission::Granted,
-            action: Operation::ReadAll,
-            resource: format!("model '{model_name}'"),
-        });
-
-    trace!("Access info for user {}: {:?}", user_email, access_info);
-
-    let access_info = access_info?;
+        .with_context(|| format!("Failed to get or create hidden API key for user {}", current_user.id))?;
 
     // Rewrite the path from /admin/api/v1/ai/* to /ai/*
     debug!("User has access to model: {}", model_name);
@@ -88,12 +76,11 @@ pub(crate) async fn admin_ai_proxy(state: AppState, mut request: Request) -> Res
     // Update the request URI
     *request.uri_mut() = new_uri;
 
-    // Add system API key as Authorization header for the AI proxy (from optimized query)
+    // Add user-specific hidden API key as Authorization header for the AI proxy
     let headers = request.headers_mut();
     headers.insert(
         "authorization",
-        HeaderValue::from_str(&format!("Bearer {}", access_info.system_api_key))
-            .with_context(|| "Failed to create authorization header value")?,
+        HeaderValue::from_str(&format!("Bearer {}", user_api_key)).with_context(|| "Failed to create authorization header value")?,
     );
 
     // Restore the body to the request
@@ -187,8 +174,10 @@ mod tests {
                 .into(),
             )
             .unwrap();
-        let request = admin_ai_proxy(state, request).await;
-        assert_eq!(request.unwrap_err().status_code().as_u16(), 403);
+        // Middleware should succeed - access control is handled by onwards later
+        let request = admin_ai_proxy(state, request).await.unwrap();
+        assert_eq!(request.uri().path(), "/ai/v1/chat/completions");
+        assert!(request.headers().get("authorization").is_some());
     }
 
     #[sqlx::test]
@@ -322,9 +311,10 @@ mod tests {
                 .into(),
             )
             .unwrap();
-        // No error on making request - user has access
-        let err = admin_ai_proxy(state, request).await.unwrap_err();
-        assert_eq!(err.status_code().as_u16(), 403);
+        // With auto_create_users enabled, user is created and middleware succeeds
+        let request = admin_ai_proxy(state, request).await.unwrap();
+        assert_eq!(request.uri().path(), "/ai/v1/chat/completions");
+        assert!(request.headers().get("authorization").is_some());
     }
 
     #[sqlx::test]
@@ -351,9 +341,10 @@ mod tests {
                 .into(),
             )
             .unwrap();
-        // No error on making request - user has access
-        let err = admin_ai_proxy(state, request).await.unwrap_err();
-        assert_eq!(err.status_code().as_u16(), 403);
+        // Middleware succeeds - model existence check is done by onwards later
+        let request = admin_ai_proxy(state, request).await.unwrap();
+        assert_eq!(request.uri().path(), "/ai/v1/chat/completions");
+        assert!(request.headers().get("authorization").is_some());
     }
 
     #[sqlx::test]
@@ -935,6 +926,107 @@ mod tests {
             .unwrap();
 
         // Should succeed via proxy header fallback
+        let request = admin_ai_proxy(state, request).await.unwrap();
+        assert_eq!(request.uri().path(), "/ai/v1/chat/completions");
+        assert!(request.headers().get("authorization").is_some());
+    }
+
+    #[sqlx::test]
+    async fn test_invalid_api_key_with_valid_jwt(pool: PgPool) {
+        let mut config = create_test_config();
+        // Enable native auth for JWT tests
+        config.auth.native.enabled = true;
+        let user = create_test_user(&pool, Role::StandardUser).await;
+        let mut inference_conn = pool.acquire().await.unwrap();
+        let mut endpoints = InferenceEndpoints::new(&mut inference_conn);
+        let endpoint = endpoints
+            .create(&InferenceEndpointCreateDBRequest {
+                name: "Test Endpoint".to_string(),
+                description: Some("Test endpoint".to_string()),
+                url: "http://localhost:8000".parse().unwrap(),
+                api_key: None,
+                model_filter: None,
+                auth_header_name: None,
+                auth_header_prefix: None,
+                created_by: user.id,
+            })
+            .await
+            .expect("Failed to create test inference endpoint");
+
+        let mut deployment_conn = pool.acquire().await.unwrap();
+        let mut deployments = Deployments::new(&mut deployment_conn);
+        let model = deployments
+            .create(
+                &DeploymentCreateDBRequest::builder()
+                    .created_by(user.id)
+                    .model_name("test_model".to_string())
+                    .alias("gpt-4-playground".to_string())
+                    .maybe_description(Some("Test deployment for playground scenario".to_string()))
+                    .hosted_on(endpoint.id)
+                    .build(),
+            )
+            .await
+            .expect("Failed to create test deployment");
+
+        let mut group_conn = pool.acquire().await.unwrap();
+        let mut groups = Groups::new(&mut group_conn);
+        let group = groups
+            .create(&GroupCreateDBRequest::new(
+                Uuid::nil(),
+                GroupCreate {
+                    name: "playground group".to_string(),
+                    description: Some("A test group for playground".to_string()),
+                },
+            ))
+            .await
+            .expect("Failed to create test group");
+
+        groups
+            .add_user_to_group(user.id, group.id)
+            .await
+            .expect("Failed to add user to group");
+        groups
+            .add_deployment_to_group(model.id, group.id, Uuid::nil())
+            .await
+            .expect("Failed to add deployment to group");
+
+        // Create JWT session token
+        let current_user = CurrentUser {
+            id: user.id,
+            username: user.username,
+            email: user.email.clone(),
+            is_admin: user.is_admin,
+            roles: user.roles,
+            display_name: user.display_name,
+            avatar_url: user.avatar_url,
+        };
+        let jwt_token = session::create_session_token(&current_user, &config).unwrap();
+
+        let request_manager = std::sync::Arc::new(fusillade::PostgresRequestManager::new(pool.clone()));
+        let state = crate::AppState {
+            db: pool.clone(),
+            config: config.clone(),
+            outlet_db: None,
+            metrics_recorder: None,
+            is_leader: false,
+            request_manager,
+        };
+
+        let request = axum::http::Request::builder()
+            .uri("/admin/api/v1/ai/v1/chat/completions")
+            .header("cookie", format!("{}={}", config.auth.native.session.cookie_name, jwt_token))
+            // Invalid API key (like the playground sends "placeholder")
+            .header("authorization", "Bearer invalid-api-key-placeholder")
+            .body(
+                json!({
+                    "model": model.alias
+                })
+                .to_string()
+                .into(),
+            )
+            .unwrap();
+
+        // Should succeed via JWT session despite invalid API key
         let request = admin_ai_proxy(state, request).await.unwrap();
         assert_eq!(request.uri().path(), "/ai/v1/chat/completions");
         assert!(request.headers().get("authorization").is_some());

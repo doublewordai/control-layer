@@ -1,0 +1,149 @@
+{
+  "batch-demo-1": [
+    {
+      "id": "req-1",
+      "batch_id": "batch-demo-1",
+      "custom_id": "request-001",
+      "status": "completed",
+      "request": {
+        "method": "POST",
+        "url": "/v1/chat/completions",
+        "body": {
+          "model": "gpt-4o-mini",
+          "messages": [
+            { "role": "system", "content": "You are a helpful assistant." },
+            { "role": "user", "content": "What is 2+2?" }
+          ]
+        }
+      },
+      "response": {
+        "status_code": 200,
+        "body": {
+          "id": "chatcmpl-123",
+          "choices": [
+            {
+              "message": {
+                "role": "assistant",
+                "content": "2+2 equals 4."
+              },
+              "finish_reason": "stop"
+            }
+          ]
+        }
+      },
+      "created_at": 1730824200,
+      "started_at": 1730826000,
+      "completed_at": 1730827800,
+      "usage": {
+        "prompt_tokens": 25,
+        "completion_tokens": 10,
+        "total_tokens": 35
+      }
+    },
+    {
+      "id": "req-2",
+      "batch_id": "batch-demo-1",
+      "custom_id": "request-002",
+      "status": "completed",
+      "request": {
+        "method": "POST",
+        "url": "/v1/chat/completions",
+        "body": {
+          "model": "gpt-4o-mini",
+          "messages": [
+            { "role": "system", "content": "You are a helpful assistant." },
+            { "role": "user", "content": "What is the capital of France?" }
+          ]
+        }
+      },
+      "response": {
+        "status_code": 200,
+        "body": {
+          "id": "chatcmpl-124",
+          "choices": [
+            {
+              "message": {
+                "role": "assistant",
+                "content": "The capital of France is Paris."
+              },
+              "finish_reason": "stop"
+            }
+          ]
+        }
+      },
+      "created_at": 1730824200,
+      "started_at": 1730827800,
+      "completed_at": 1730829600,
+      "usage": {
+        "prompt_tokens": 28,
+        "completion_tokens": 12,
+        "total_tokens": 40
+      }
+    },
+    {
+      "id": "req-3",
+      "batch_id": "batch-demo-1",
+      "custom_id": "request-003",
+      "status": "failed",
+      "request": {
+        "method": "POST",
+        "url": "/v1/chat/completions",
+        "body": {
+          "model": "gpt-4o-mini",
+          "messages": [
+            {
+              "role": "user",
+              "content": "Invalid request without system message"
+            }
+          ]
+        }
+      },
+      "error": {
+        "code": "invalid_request_error",
+        "message": "Missing required system message"
+      },
+      "created_at": 1730824200,
+      "started_at": 1730829600,
+      "completed_at": 1730831400
+    }
+  ],
+  "batch-demo-2": [
+    {
+      "id": "req-4",
+      "batch_id": "batch-demo-2",
+      "custom_id": "request-004",
+      "status": "in_progress",
+      "request": {
+        "method": "POST",
+        "url": "/v1/chat/completions",
+        "body": {
+          "model": "gpt-4o-mini",
+          "messages": [
+            { "role": "system", "content": "You are a helpful assistant." },
+            { "role": "user", "content": "Explain quantum computing." }
+          ]
+        }
+      },
+      "created_at": 1730903400,
+      "started_at": 1730908500
+    },
+    {
+      "id": "req-5",
+      "batch_id": "batch-demo-2",
+      "custom_id": "request-005",
+      "status": "pending",
+      "request": {
+        "method": "POST",
+        "url": "/v1/chat/completions",
+        "body": {
+          "model": "gpt-4o-mini",
+          "messages": [
+            { "role": "system", "content": "You are a helpful assistant." },
+            { "role": "user", "content": "What is machine learning?" }
+          ]
+        }
+      },
+      "created_at": 1730903400
+    }
+  ]
+}

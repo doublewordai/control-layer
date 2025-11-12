@@ -2,6 +2,7 @@ import { NavLink, Link, useNavigate } from "react-router-dom";
 import {
   Settings,
   Activity,
+  Box,
   Layers,
   Users,
   Key,
@@ -47,6 +48,7 @@ interface NavItem {
   icon: React.ComponentType<{ className?: string }>;
   label: string;
   featureFlag?: keyof FeatureFlags;
+  demoOnly?: boolean;
 }
 
 export function AppSidebar() {
@@ -60,8 +62,14 @@ export function AppSidebar() {
     { path: "/models", icon: Layers, label: "Models" },
     { path: "/endpoints", icon: Server, label: "Endpoints" },
     { path: "/playground", icon: Play, label: "Playground" },
+    { path: "/batches", icon: Box, label: "Batches", demoOnly: false },
     { path: "/analytics", icon: Activity, label: "Traffic" },
-    { path: "/cost-management", icon: DollarSign, label: "Cost Management", featureFlag: "use_billing" },
+    {
+      path: "/cost-management",
+      icon: DollarSign,
+      label: "Cost Management",
+      featureFlag: "use_billing",
+    },
     { path: "/users-groups", icon: Users, label: "Users & Groups" },
     { path: "/api-keys", icon: Key, label: "API Keys" },
     { path: "/settings", icon: Settings, label: "Settings" },
@@ -70,6 +78,10 @@ export function AppSidebar() {
   const navItems = allNavItems.filter((item) => {
     // Check feature flag if specified
     if (item.featureFlag && !isFeatureEnabled(item.featureFlag)) {
+      return false;
+    }
+    // Filter demo-only items when not in demo mode
+    if (item.demoOnly && !isFeatureEnabled("demo")) {
       return false;
     }
     // Check route access permissions

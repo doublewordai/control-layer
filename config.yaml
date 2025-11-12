@@ -14,7 +14,7 @@ database:
   # To have data not persists across restarts, set persistent=false.
   # We strongly recommend setting up external postgres in production!
   type: external
-  url: postgres://postgres:postgres@localhost:5432/dwctl
+  url: postgres://postgres:password@localhost:5432/dwctl
 
 # Admin user email - will be created on first startup
 admin_email: "test@doubleword.ai"
@@ -78,6 +78,13 @@ auth:
       allow_credentials: true
       max_age: 3600 # Cache preflight requests for 1 hour
 
+# Credits configuration
+credits:
+  # Initial credits given to standard users when they are created
+  # Set to 0 to disable initial credits (users start with no credits)
+  # Example: 100.00 gives users 100 credits on registration
+  initial_credits_for_standard_users: 0
+
 # Optional feature toggles
 enable_metrics: true # Enable Prometheus metrics endpoint
 enable_request_logging: true # Enable request/response logging to database
@@ -94,7 +101,7 @@ enable_request_logging: true # Enable request/response logging to database
 batches:
   # Enable batches API endpoints (/files, /batches)
   # When disabled, these endpoints will not be available (default: false)
-  enabled: false
+  enabled: true
 
   # Daemon configuration for processing batch requests
   daemon:

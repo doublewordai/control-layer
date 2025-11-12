@@ -1212,6 +1212,7 @@ dependencies = [
  "jsonwebtoken",
  "lettre",
  "mime_guess",
+ "once_cell",
  "onwards",
  "opentelemetry",
  "opentelemetry-otlp",
@@ -2726,9 +2727,9 @@ checksum = "384b8ab6d37215f3c5301a95a4accb5d64aa607f1fcb26a11b5303878451b4fe"
 
 [[package]]
 name = "onwards"
-version = "0.9.0"
+version = "0.9.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e1f7a0fe568c6824b724258b2b2aa50623309b353c584a11a136ffdf6e838773"
+checksum = "463df0b3915b44556c9355839bf3892cb8c5ff1a370e7c6b9b9592544d39354f"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -2892,9 +2893,9 @@ dependencies = [
 
 [[package]]
 name = "outlet"
-version = "0.4.1"
+version = "0.4.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "980a1e9adbbfe60d8cc3bab0947b10c6710281a240a1c3d0d17a153be1b0d3f8"
+checksum = "b71c5ba1c445cf62752a81ac699c113109bbb4bfae9f7d01c30e664537ec59d9"
 dependencies = [
  "anyhow",
  "async-stream",
@@ -2917,9 +2918,9 @@ dependencies = [
 
 [[package]]
 name = "outlet-postgres"
-version = "0.4.2"
+version = "0.4.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a458117cad28e4cf9922e48ed8e9cd1ba7ce2635500c8b3bed1eb98351810839"
+checksum = "a3e8d6f18710fac9fb7ff38a6fa8f9b4c977841feafcfa6ab44bd49ce5e9aefc"
 dependencies = [
  "base64",
  "bytes",

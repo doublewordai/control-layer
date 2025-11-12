@@ -106,6 +106,7 @@ pub fn create_test_config() -> crate::config::Config {
         enable_metrics: false,
         enable_request_logging: false,
         enable_otel_export: false,
+        credits: crate::config::CreditsConfig::default(),
         batches: BatchConfig {
             enabled: true,
             files: FilesConfig {
@@ -265,6 +266,7 @@ pub async fn create_test_api_key_for_user(pool: &PgPool, user_id: UserId) -> Api
         ApiKeyCreate {
             name: "Test API Key".to_string(),
             description: Some("Test description".to_string()),
+            purpose: crate::db::models::api_keys::ApiKeyPurpose::Inference,
             requests_per_second: None,
             burst_size: None,
         },

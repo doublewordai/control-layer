@@ -313,6 +313,9 @@ impl Request<Processing> {
 
         match result {
             Some(Ok(http_response)) => {
+                // Check if this is an error response (4xx or 5xx)
+                let is_error = http_response.status >= 400;
+
                 // Check if this response should be retried
                 if should_retry(&http_response) {
                     // Treat as failure for retry purposes
@@ -320,6 +323,23 @@ impl Request<Processing> {
                         error: format!(
                             "HTTP request returned retriable status code: {}",
                             http_response.status
+                        ),
+                        failed_at: chrono::Utc::now(),
+                        retry_attempt: self.state.retry_attempt,
+                    };
+                    let request = Request {
+                        data: self.data,
+                        state: failed_state,
+                    };
+                    storage.persist(&request).await?;
+                    Ok(Err(request))
+                } else if is_error {
+                    // Non-retriable error (e.g., 4xx client errors)
+                    // Mark as failed but don't retry
+                    let failed_state = Failed {
+                        error: format!(
+                            "HTTP request returned error status code: {} - {}",
+                            http_response.status, http_response.body
                         ),
                         failed_at: chrono::Utc::now(),
                         retry_attempt: self.state.retry_attempt,
