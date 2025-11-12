@@ -9,8 +9,16 @@ use tokio::task::JoinSet;
 
 use crate::error::Result;
 use crate::http::{HttpClient, HttpResponse};
-use crate::manager::Storage;
+use crate::manager::{DaemonStorage, Storage};
 use crate::request::DaemonId;
+
+pub mod transitions;
+pub mod types;
+
+pub use types::{
+    AnyDaemonRecord, DaemonData, DaemonRecord, DaemonState, DaemonStats, DaemonStatus, Dead,
+    Initializing, Running,
+};
 
 /// Predicate function to determine if a response should be retried.
 ///
@@ -23,7 +31,7 @@ pub fn default_should_retry(response: &HttpResponse) -> bool {
 }
 
 /// Configuration for the daemon.
-#[derive(Clone)]
+#[derive(Clone, serde::Serialize)]
 pub struct DaemonConfig {
     /// Maximum number of requests to claim in each iteration
     pub claim_batch_size: usize,
@@ -58,6 +66,7 @@ pub struct DaemonConfig {
 
     /// Predicate function to determine if a response should be retried.
     /// Defaults to retrying 5xx, 429, and 408 status codes.
+    #[serde(skip)]
     pub should_retry: ShouldRetryFn,
 
     /// Maximum time a request can stay in "claimed" state before being unclaimed
@@ -95,7 +104,7 @@ impl Default for DaemonConfig {
 /// per-model concurrency limits, and dispatches requests for execution.
 pub struct Daemon<S, H>
 where
-    S: Storage,
+    S: Storage + DaemonStorage,
     H: HttpClient,
 {
     daemon_id: DaemonId,
@@ -109,7 +118,7 @@ where
 
 impl<S, H> Daemon<S, H>
 where
-    S: Storage + 'static,
+    S: Storage + DaemonStorage + 'static,
     H: HttpClient + 'static,
 {
     /// Create a new daemon.
@@ -162,6 +171,81 @@ where
     pub async fn run(self: Arc<Self>) -> Result<()> {
         tracing::info!("Daemon starting main processing loop");
 
+        // Register daemon in database
+        let daemon_record = DaemonRecord {
+            data: DaemonData {
+                id: self.daemon_id,
+                hostname: types::get_hostname(),
+                pid: types::get_pid(),
+                version: types::get_version(),
+                config_snapshot: serde_json::to_value(&self.config)
+                    .expect("Failed to serialize daemon config"),
+            },
+            state: Initializing {
+                started_at: chrono::Utc::now(),
+            },
+        };
+
+        let running_record = daemon_record.start(self.storage.as_ref()).await?;
+        tracing::info!("Daemon registered in database");
+
+        // Spawn periodic heartbeat task
+        let storage = self.storage.clone();
+        let requests_in_flight = self.requests_in_flight.clone();
+        let daemon_id = self.daemon_id;
+        let shutdown_signal = self.shutdown_token.clone();
+
+        let heartbeat_handle = tokio::spawn(async move {
+            let mut interval = tokio::time::interval(Duration::from_secs(10)); // Heartbeat every 10s
+            let mut daemon_record = running_record;
+            let total_processed: u64 = 0;
+            let total_failed: u64 = 0;
+
+            loop {
+                tokio::select! {
+                    _ = interval.tick() => {
+                        let stats = DaemonStats {
+                            requests_processed: total_processed,
+                            requests_failed: total_failed,
+                            requests_in_flight: requests_in_flight.load(Ordering::Relaxed),
+                        };
+
+                        // Clone the record so we preserve it if heartbeat fails
+                        let current = daemon_record.clone();
+                        match current.heartbeat(stats, storage.as_ref()).await {
+                            Ok(updated) => {
+                                daemon_record = updated;
+                                tracing::trace!(
+                                    daemon_id = %daemon_id,
+                                    "Heartbeat sent"
+                                );
+                            }
+                            Err(e) => {
+                                tracing::error!(
+                                    daemon_id = %daemon_id,
+                                    error = %e,
+                                    "Failed to send heartbeat"
+                                );
+                                // daemon_record stays unchanged on error
+                            }
+                        }
+                    }
+                    _ = shutdown_signal.cancelled() => {
+                        // Mark daemon as dead on shutdown
+                        tracing::info!("Shutting down heartbeat task");
+                        if let Err(e) = daemon_record.shutdown(storage.as_ref()).await {
+                            tracing::error!(
+                                daemon_id = %daemon_id,
+                                error = %e,
+                                "Failed to mark daemon as dead during shutdown"
+                            );
+                        }
+                        break;
+                    }
+                }
+            }
+        });
+
         // Spawn periodic status logging task if configured
         if let Some(interval_ms) = self.config.status_log_interval_ms {
             let requests_in_flight = self.requests_in_flight.clone();
@@ -182,11 +266,11 @@ where
 
         let mut join_set: JoinSet<Result<()>> = JoinSet::new();
 
-        loop {
+        let run_result = loop {
             // Check for shutdown signal
             if self.shutdown_token.is_cancelled() {
                 tracing::info!("Shutdown signal received, stopping daemon");
-                return Ok(());
+                break Ok(());
             }
 
             // Poll for completed tasks (non-blocking)
@@ -217,7 +301,7 @@ where
                     _ = tokio::time::sleep(Duration::from_millis(self.config.claim_interval_ms)) => {},
                     _ = self.shutdown_token.cancelled() => {
                         tracing::info!("Shutdown signal received, stopping daemon");
-                        return Ok(());
+                        break Ok(());
                     }
                 }
                 continue;
@@ -359,7 +443,15 @@ where
                     }
                 }
             }
+        };
+
+        // Wait for heartbeat task to complete (it will mark daemon as dead)
+        tracing::info!("Waiting for heartbeat task to complete");
+        if let Err(e) = heartbeat_handle.await {
+            tracing::error!(error = %e, "Heartbeat task panicked");
         }
+
+        run_result
     }
 }
 

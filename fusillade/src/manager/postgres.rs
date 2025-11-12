@@ -18,13 +18,16 @@ use tokio::task::JoinHandle;
 use tokio_stream::wrappers::ReceiverStream;
 use uuid::Uuid;
 
-use super::Storage;
+use super::{DaemonStorage, Storage};
 use crate::batch::{
     Batch, BatchErrorDetails, BatchErrorItem, BatchId, BatchInput, BatchOutputItem,
     BatchResponseDetails, BatchStatus, File, FileContentItem, FileId, FileMetadata, FileStreamItem,
     OutputFileType, RequestTemplate, RequestTemplateInput, TemplateId,
 };
-use crate::daemon::{Daemon, DaemonConfig};
+use crate::daemon::{
+    AnyDaemonRecord, Daemon, DaemonConfig, DaemonData, DaemonRecord, DaemonState, DaemonStatus,
+    Dead, Initializing, Running,
+};
 use crate::error::{FusilladeError, Result};
 use crate::http::HttpClient;
 use crate::request::{
@@ -2341,6 +2344,271 @@ impl<H: HttpClient + 'static> PostgresRequestManager<H> {
     }
 }
 
+// Implement DaemonStorage trait
+#[async_trait]
+impl<H: HttpClient> DaemonStorage for PostgresRequestManager<H> {
+    async fn persist_daemon<T: DaemonState + Clone>(&self, record: &DaemonRecord<T>) -> Result<()>
+    where
+        AnyDaemonRecord: From<DaemonRecord<T>>,
+    {
+        let any_daemon = AnyDaemonRecord::from(record.clone());
+
+        match any_daemon {
+            AnyDaemonRecord::Initializing(daemon) => {
+                sqlx::query!(
+                    r#"
+                    INSERT INTO daemons (
+                        id, status, hostname, pid, version, config_snapshot,
+                        started_at, last_heartbeat, stopped_at,
+                        requests_processed, requests_failed, requests_in_flight
+                    ) VALUES ($1, 'initializing', $2, $3, $4, $5, $6, NULL, NULL, 0, 0, 0)
+                    ON CONFLICT (id) DO UPDATE SET
+                        status = 'initializing',
+                        started_at = $6,
+                        updated_at = NOW()
+                    "#,
+                    *daemon.data.id as Uuid,
+                    daemon.data.hostname,
+                    daemon.data.pid,
+                    daemon.data.version,
+                    daemon.data.config_snapshot,
+                    daemon.state.started_at,
+                )
+                .execute(&self.pool)
+                .await
+                .map_err(|e| FusilladeError::Other(anyhow!("Failed to persist daemon: {}", e)))?;
+            }
+            AnyDaemonRecord::Running(daemon) => {
+                sqlx::query!(
+                    r#"
+                    INSERT INTO daemons (
+                        id, status, hostname, pid, version, config_snapshot,
+                        started_at, last_heartbeat, stopped_at,
+                        requests_processed, requests_failed, requests_in_flight
+                    ) VALUES ($1, 'running', $2, $3, $4, $5, $6, $7, NULL, $8, $9, $10)
+                    ON CONFLICT (id) DO UPDATE SET
+                        status = 'running',
+                        last_heartbeat = $7,
+                        requests_processed = $8,
+                        requests_failed = $9,
+                        requests_in_flight = $10,
+                        updated_at = NOW()
+                    "#,
+                    *daemon.data.id as Uuid,
+                    daemon.data.hostname,
+                    daemon.data.pid,
+                    daemon.data.version,
+                    daemon.data.config_snapshot,
+                    daemon.state.started_at,
+                    daemon.state.last_heartbeat,
+                    daemon.state.stats.requests_processed as i64,
+                    daemon.state.stats.requests_failed as i64,
+                    daemon.state.stats.requests_in_flight as i32,
+                )
+                .execute(&self.pool)
+                .await
+                .map_err(|e| FusilladeError::Other(anyhow!("Failed to persist daemon: {}", e)))?;
+            }
+            AnyDaemonRecord::Dead(daemon) => {
+                sqlx::query!(
+                    r#"
+                    INSERT INTO daemons (
+                        id, status, hostname, pid, version, config_snapshot,
+                        started_at, last_heartbeat, stopped_at,
+                        requests_processed, requests_failed, requests_in_flight
+                    ) VALUES ($1, 'dead', $2, $3, $4, $5, $6, NULL, $7, $8, $9, $10)
+                    ON CONFLICT (id) DO UPDATE SET
+                        status = 'dead',
+                        stopped_at = $7,
+                        requests_processed = $8,
+                        requests_failed = $9,
+                        requests_in_flight = $10,
+                        updated_at = NOW()
+                    "#,
+                    *daemon.data.id as Uuid,
+                    daemon.data.hostname,
+                    daemon.data.pid,
+                    daemon.data.version,
+                    daemon.data.config_snapshot,
+                    daemon.state.started_at,
+                    daemon.state.stopped_at,
+                    daemon.state.final_stats.requests_processed as i64,
+                    daemon.state.final_stats.requests_failed as i64,
+                    daemon.state.final_stats.requests_in_flight as i32,
+                )
+                .execute(&self.pool)
+                .await
+                .map_err(|e| FusilladeError::Other(anyhow!("Failed to persist daemon: {}", e)))?;
+            }
+        }
+
+        Ok(())
+    }
+
+    async fn get_daemon(&self, daemon_id: DaemonId) -> Result<AnyDaemonRecord> {
+        let row = sqlx::query!(
+            r#"
+            SELECT
+                id, status, hostname, pid, version, config_snapshot,
+                started_at, last_heartbeat, stopped_at,
+                requests_processed, requests_failed, requests_in_flight
+            FROM daemons
+            WHERE id = $1
+            "#,
+            *daemon_id as Uuid,
+        )
+        .fetch_one(&self.pool)
+        .await
+        .map_err(|e| match e {
+            sqlx::Error::RowNotFound => FusilladeError::Other(anyhow!("Daemon not found")),
+            _ => FusilladeError::Other(anyhow!("Failed to fetch daemon: {}", e)),
+        })?;
+
+        let data = DaemonData {
+            id: DaemonId(row.id),
+            hostname: row.hostname,
+            pid: row.pid,
+            version: row.version,
+            config_snapshot: row.config_snapshot,
+        };
+
+        let any_daemon = match row.status.as_str() {
+            "initializing" => AnyDaemonRecord::Initializing(DaemonRecord {
+                data,
+                state: Initializing {
+                    started_at: row.started_at,
+                },
+            }),
+            "running" => AnyDaemonRecord::Running(DaemonRecord {
+                data,
+                state: Running {
+                    started_at: row.started_at,
+                    last_heartbeat: row.last_heartbeat.ok_or_else(|| {
+                        FusilladeError::Other(anyhow!("Running daemon missing last_heartbeat"))
+                    })?,
+                    stats: crate::daemon::DaemonStats {
+                        requests_processed: row.requests_processed as u64,
+                        requests_failed: row.requests_failed as u64,
+                        requests_in_flight: row.requests_in_flight as usize,
+                    },
+                },
+            }),
+            "dead" => AnyDaemonRecord::Dead(DaemonRecord {
+                data,
+                state: Dead {
+                    started_at: row.started_at,
+                    stopped_at: row.stopped_at.ok_or_else(|| {
+                        FusilladeError::Other(anyhow!("Dead daemon missing stopped_at"))
+                    })?,
+                    final_stats: crate::daemon::DaemonStats {
+                        requests_processed: row.requests_processed as u64,
+                        requests_failed: row.requests_failed as u64,
+                        requests_in_flight: row.requests_in_flight as usize,
+                    },
+                },
+            }),
+            _ => {
+                return Err(FusilladeError::Other(anyhow!(
+                    "Unknown daemon status: {}",
+                    row.status
+                )))
+            }
+        };
+
+        Ok(any_daemon)
+    }
+
+    async fn list_daemons(
+        &self,
+        status_filter: Option<DaemonStatus>,
+    ) -> Result<Vec<AnyDaemonRecord>> {
+        let status_str = status_filter.as_ref().map(|s| s.as_str());
+
+        let rows = sqlx::query!(
+            r#"
+            SELECT
+                id, status, hostname, pid, version, config_snapshot,
+                started_at, last_heartbeat, stopped_at,
+                requests_processed, requests_failed, requests_in_flight
+            FROM daemons
+            WHERE ($1::text IS NULL OR status = $1)
+            ORDER BY created_at DESC
+            "#,
+            status_str,
+        )
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|e| FusilladeError::Other(anyhow!("Failed to list daemons: {}", e)))?;
+
+        let mut daemons = Vec::new();
+
+        for row in rows {
+            let data = DaemonData {
+                id: DaemonId(row.id),
+                hostname: row.hostname,
+                pid: row.pid,
+                version: row.version,
+                config_snapshot: row.config_snapshot,
+            };
+
+            let any_daemon = match row.status.as_str() {
+                "initializing" => AnyDaemonRecord::Initializing(DaemonRecord {
+                    data,
+                    state: Initializing {
+                        started_at: row.started_at,
+                    },
+                }),
+                "running" => {
+                    if let Some(last_heartbeat) = row.last_heartbeat {
+                        AnyDaemonRecord::Running(DaemonRecord {
+                            data,
+                            state: Running {
+                                started_at: row.started_at,
+                                last_heartbeat,
+                                stats: crate::daemon::DaemonStats {
+                                    requests_processed: row.requests_processed as u64,
+                                    requests_failed: row.requests_failed as u64,
+                                    requests_in_flight: row.requests_in_flight as usize,
+                                },
+                            },
+                        })
+                    } else {
+                        // Skip invalid running daemons
+                        continue;
+                    }
+                }
+                "dead" => {
+                    if let Some(stopped_at) = row.stopped_at {
+                        AnyDaemonRecord::Dead(DaemonRecord {
+                            data,
+                            state: Dead {
+                                started_at: row.started_at,
+                                stopped_at,
+                                final_stats: crate::daemon::DaemonStats {
+                                    requests_processed: row.requests_processed as u64,
+                                    requests_failed: row.requests_failed as u64,
+                                    requests_in_flight: row.requests_in_flight as usize,
+                                },
+                            },
+                        })
+                    } else {
+                        // Skip invalid dead daemons
+                        continue;
+                    }
+                }
+                _ => {
+                    // Skip unknown statuses
+                    continue;
+                }
+            };
+
+            daemons.push(any_daemon);
+        }
+
+        Ok(daemons)
+    }
+}
+
 // Implement DaemonExecutor trait
 #[async_trait]
 impl<H: HttpClient + 'static> DaemonExecutor<H> for PostgresRequestManager<H> {
@@ -2376,6 +2644,10 @@ impl<H: HttpClient + 'static> DaemonExecutor<H> for PostgresRequestManager<H> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::daemon::{
+        AnyDaemonRecord, DaemonData, DaemonRecord, DaemonStats, DaemonStatus, Dead, Initializing,
+        Running,
+    };
     use crate::http::MockHttpClient;
 
     #[sqlx::test]
@@ -3381,6 +3653,230 @@ mod tests {
                 }
                 _ => panic!("Expected FileContentItem::Template for input file"),
             }
+        }
+    }
+
+    // ========================================================================
+    // Daemon storage tests
+    // ========================================================================
+
+    #[sqlx::test]
+    async fn test_daemon_persist_and_get(pool: sqlx::PgPool) {
+        let http_client = Arc::new(MockHttpClient::new());
+        let manager = PostgresRequestManager::with_client(pool.clone(), http_client);
+
+        let daemon_id = DaemonId(Uuid::new_v4());
+        let daemon_data = DaemonData {
+            id: daemon_id,
+            hostname: "test-host".to_string(),
+            pid: 12345,
+            version: "1.0.0".to_string(),
+            config_snapshot: serde_json::json!({"test": "config"}),
+        };
+
+        // Test Initializing state
+        let initializing = DaemonRecord {
+            data: daemon_data.clone(),
+            state: Initializing {
+                started_at: Utc::now(),
+            },
+        };
+
+        manager.persist_daemon(&initializing).await.unwrap();
+
+        let retrieved = manager.get_daemon(daemon_id).await.unwrap();
+        match retrieved {
+            AnyDaemonRecord::Initializing(d) => {
+                assert_eq!(d.data.id, daemon_id);
+                assert_eq!(d.data.hostname, "test-host");
+            }
+            _ => panic!("Expected Initializing state"),
+        }
+
+        // Test Running state
+        let running = DaemonRecord {
+            data: daemon_data.clone(),
+            state: Running {
+                started_at: Utc::now(),
+                last_heartbeat: Utc::now(),
+                stats: DaemonStats {
+                    requests_processed: 10,
+                    requests_failed: 2,
+                    requests_in_flight: 3,
+                },
+            },
+        };
+
+        manager.persist_daemon(&running).await.unwrap();
+
+        let retrieved = manager.get_daemon(daemon_id).await.unwrap();
+        match retrieved {
+            AnyDaemonRecord::Running(d) => {
+                assert_eq!(d.data.id, daemon_id);
+                assert_eq!(d.state.stats.requests_processed, 10);
+                assert_eq!(d.state.stats.requests_failed, 2);
+                assert_eq!(d.state.stats.requests_in_flight, 3);
+            }
+            _ => panic!("Expected Running state"),
+        }
+
+        // Test Dead state
+        let dead = DaemonRecord {
+            data: daemon_data,
+            state: Dead {
+                started_at: Utc::now() - chrono::Duration::hours(1),
+                stopped_at: Utc::now(),
+                final_stats: DaemonStats {
+                    requests_processed: 100,
+                    requests_failed: 5,
+                    requests_in_flight: 0,
+                },
+            },
+        };
+
+        manager.persist_daemon(&dead).await.unwrap();
+
+        let retrieved = manager.get_daemon(daemon_id).await.unwrap();
+        match retrieved {
+            AnyDaemonRecord::Dead(d) => {
+                assert_eq!(d.data.id, daemon_id);
+                assert_eq!(d.state.final_stats.requests_processed, 100);
+                assert_eq!(d.state.final_stats.requests_failed, 5);
+            }
+            _ => panic!("Expected Dead state"),
+        }
+    }
+
+    #[sqlx::test]
+    async fn test_daemon_list_all(pool: sqlx::PgPool) {
+        let http_client = Arc::new(MockHttpClient::new());
+        let manager = PostgresRequestManager::with_client(pool.clone(), http_client);
+
+        // Create multiple daemons in different states
+        let daemon1 = DaemonRecord {
+            data: DaemonData {
+                id: DaemonId(Uuid::new_v4()),
+                hostname: "host1".to_string(),
+                pid: 1001,
+                version: "1.0.0".to_string(),
+                config_snapshot: serde_json::json!({}),
+            },
+            state: Running {
+                started_at: Utc::now(),
+                last_heartbeat: Utc::now(),
+                stats: DaemonStats::default(),
+            },
+        };
+
+        let daemon2 = DaemonRecord {
+            data: DaemonData {
+                id: DaemonId(Uuid::new_v4()),
+                hostname: "host2".to_string(),
+                pid: 1002,
+                version: "1.0.0".to_string(),
+                config_snapshot: serde_json::json!({}),
+            },
+            state: Running {
+                started_at: Utc::now(),
+                last_heartbeat: Utc::now(),
+                stats: DaemonStats::default(),
+            },
+        };
+
+        let daemon3 = DaemonRecord {
+            data: DaemonData {
+                id: DaemonId(Uuid::new_v4()),
+                hostname: "host3".to_string(),
+                pid: 1003,
+                version: "1.0.0".to_string(),
+                config_snapshot: serde_json::json!({}),
+            },
+            state: Dead {
+                started_at: Utc::now() - chrono::Duration::hours(1),
+                stopped_at: Utc::now(),
+                final_stats: DaemonStats::default(),
+            },
+        };
+
+        manager.persist_daemon(&daemon1).await.unwrap();
+        manager.persist_daemon(&daemon2).await.unwrap();
+        manager.persist_daemon(&daemon3).await.unwrap();
+
+        // List all daemons
+        let all = manager.list_daemons(None).await.unwrap();
+        assert_eq!(all.len(), 3);
+
+        // List only running daemons
+        let running = manager
+            .list_daemons(Some(DaemonStatus::Running))
+            .await
+            .unwrap();
+        assert_eq!(running.len(), 2);
+
+        // List only dead daemons
+        let dead = manager
+            .list_daemons(Some(DaemonStatus::Dead))
+            .await
+            .unwrap();
+        assert_eq!(dead.len(), 1);
+    }
+
+    #[sqlx::test]
+    async fn test_daemon_heartbeat_updates(pool: sqlx::PgPool) {
+        let http_client = Arc::new(MockHttpClient::new());
+        let manager = PostgresRequestManager::with_client(pool.clone(), http_client);
+
+        let daemon_id = DaemonId(Uuid::new_v4());
+        let daemon_data = DaemonData {
+            id: daemon_id,
+            hostname: "test-host".to_string(),
+            pid: 12345,
+            version: "1.0.0".to_string(),
+            config_snapshot: serde_json::json!({}),
+        };
+
+        // Start with Running state
+        let running = DaemonRecord {
+            data: daemon_data,
+            state: Running {
+                started_at: Utc::now(),
+                last_heartbeat: Utc::now(),
+                stats: DaemonStats {
+                    requests_processed: 0,
+                    requests_failed: 0,
+                    requests_in_flight: 0,
+                },
+            },
+        };
+
+        manager.persist_daemon(&running).await.unwrap();
+
+        // Simulate heartbeat updates
+        for i in 1..=3 {
+            let updated = DaemonRecord {
+                data: running.data.clone(),
+                state: Running {
+                    started_at: running.state.started_at,
+                    last_heartbeat: Utc::now(),
+                    stats: DaemonStats {
+                        requests_processed: i * 10,
+                        requests_failed: i,
+                        requests_in_flight: i as usize,
+                    },
+                },
+            };
+            manager.persist_daemon(&updated).await.unwrap();
+        }
+
+        // Verify final state
+        let retrieved = manager.get_daemon(daemon_id).await.unwrap();
+        match retrieved {
+            AnyDaemonRecord::Running(d) => {
+                assert_eq!(d.state.stats.requests_processed, 30);
+                assert_eq!(d.state.stats.requests_failed, 3);
+                assert_eq!(d.state.stats.requests_in_flight, 3);
+            }
+            _ => panic!("Expected Running state"),
         }
     }
 }
