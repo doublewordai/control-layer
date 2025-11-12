@@ -51,6 +51,8 @@ import type {
   Transaction,
   AddFundsRequest,
   AddFundsResponse,
+  DaemonsListResponse,
+  DaemonsQuery,
 } from "./types";
 import { ApiError } from "./errors";
 
@@ -1070,6 +1072,20 @@ const batchesApi = {
   },
 };
 
+const daemonsApi = {
+  async list(options?: DaemonsQuery): Promise<DaemonsListResponse> {
+    const params = new URLSearchParams();
+    if (options?.status) params.set("status", options.status);
+
+    const url = `/ai/v1/daemons${params.toString() ? "?" + params.toString() : ""}`;
+    const response = await fetch(url);
+    if (!response.ok) {
+      throw new Error(`Failed to fetch daemons: ${response.status}`);
+    }
+    return response.json();
+  },
+};
+
 // Main nested API object
 export const dwctlApi = {
   users: userApi,
@@ -1083,4 +1099,5 @@ export const dwctlApi = {
   probes: probesApi,
   files: filesApi,
   batches: batchesApi,
+  daemons: daemonsApi,
 };

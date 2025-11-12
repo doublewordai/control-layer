@@ -7,6 +7,7 @@ use crate::batch::{
     Batch, BatchId, BatchInput, BatchStatus, File, FileContentItem, FileFilter, FileId,
     FileStreamItem, OutputFileType, RequestTemplate, RequestTemplateInput,
 };
+use crate::daemon::{AnyDaemonRecord, DaemonRecord, DaemonState, DaemonStatus};
 use crate::error::Result;
 use crate::http::HttpClient;
 use crate::request::{AnyRequest, Claimed, DaemonId, Request, RequestId, RequestState};
@@ -192,6 +193,35 @@ pub trait Storage: Send + Sync {
     async fn persist<T: RequestState + Clone>(&self, request: &Request<T>) -> Result<()>
     where
         AnyRequest: From<Request<T>>;
+}
+
+/// Daemon lifecycle persistence.
+///
+/// This trait provides storage operations for tracking daemon state,
+/// including registration, heartbeat updates, and graceful shutdown.
+#[async_trait]
+pub trait DaemonStorage: Send + Sync {
+    /// Persist daemon state update.
+    ///
+    /// This is a low-level method used by state transition methods.
+    /// The type parameter `T` ensures type-safe state transitions.
+    async fn persist_daemon<T: DaemonState + Clone>(&self, record: &DaemonRecord<T>) -> Result<()>
+    where
+        AnyDaemonRecord: From<DaemonRecord<T>>;
+
+    /// Get daemon by ID.
+    ///
+    /// Returns an `AnyDaemonRecord` which can hold the daemon in any state.
+    async fn get_daemon(&self, daemon_id: DaemonId) -> Result<AnyDaemonRecord>;
+
+    /// List all daemons with optional status filter.
+    ///
+    /// If `status_filter` is `None`, returns all daemons regardless of status.
+    /// Otherwise, returns only daemons matching the specified status.
+    async fn list_daemons(
+        &self,
+        status_filter: Option<DaemonStatus>,
+    ) -> Result<Vec<AnyDaemonRecord>>;
 }
 
 /// Daemon executor trait for runtime orchestration.

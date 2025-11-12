@@ -465,6 +465,8 @@ pub async fn build_router(state: &mut AppState, onwards_router: Router) -> anyho
                 .route("/batches", get(api::handlers::batches::list_batches))
                 .route("/batches/{batch_id}", get(api::handlers::batches::get_batch))
                 .route("/batches/{batch_id}/cancel", post(api::handlers::batches::cancel_batch))
+                // Daemon monitoring
+                .route("/daemons", get(api::handlers::daemons::list_daemons))
                 .with_state(state.clone()),
         )
     } else {

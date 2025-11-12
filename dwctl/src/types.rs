@@ -70,6 +70,7 @@ pub enum Resource {
     Probes,
     Files,
     Batches,
+    System,
 }
 
 // Permission types for authorization

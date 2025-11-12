@@ -50,6 +50,9 @@ pub mod resource {
     #[derive(Default)]
     pub struct Batches;
 
+    #[derive(Default)]
+    pub struct System;
+
     // Convert type-level markers to enum values using Into
     impl From<Users> for Resource {
         fn from(_: Users) -> Resource {
@@ -114,6 +117,11 @@ pub mod resource {
     impl From<Batches> for Resource {
         fn from(_: Batches) -> Resource {
             Resource::Batches
+        }
+    }
+    impl From<System> for Resource {
+        fn from(_: System) -> Resource {
+            Resource::System
         }
     }
 }
@@ -270,7 +278,7 @@ pub fn role_has_permission(role: &Role, resource: Resource, operation: Operation
         Role::PlatformManager => {
             // Platform Manager has full access to platform data except Requests (sensitive request logs)
             // But they can access Analytics (aggregated data without sensitive details)
-            // They also have access to ModelRateLimits, Files, and Batches
+            // They also have access to ModelRateLimits, Files, Batches, and System monitoring
             !matches!(resource, Resource::Requests)
         }
         Role::StandardUser => {
@@ -561,5 +569,26 @@ mod tests {
 
         // Regular user should not have SystemAccess
         assert!(!has_permission(&regular_user, Resource::Files, Operation::SystemAccess));
+    }
+
+    #[test]
+    fn test_system_resource_permissions() {
+        let admin = create_user_with_roles(vec![Role::StandardUser], true);
+        let pm = create_user_with_roles(vec![Role::PlatformManager], false);
+        let request_viewer = create_user_with_roles(vec![Role::RequestViewer], false);
+        let standard_user = create_user_with_roles(vec![Role::StandardUser], false);
+
+        // Admin should have full access to System resource
+        assert!(has_permission(&admin, Resource::System, Operation::ReadAll));
+
+        // PlatformManager should have access to System resource
+        assert!(has_permission(&pm, Resource::System, Operation::ReadAll));
+
+        // RequestViewer should NOT have access to System resource (only request/analytics monitoring)
+        assert!(!has_permission(&request_viewer, Resource::System, Operation::ReadAll));
+
+        // StandardUser should NOT have access to System resource
+        assert!(!has_permission(&standard_user, Resource::System, Operation::ReadAll));
+        assert!(!has_permission(&standard_user, Resource::System, Operation::ReadOwn));
     }
 }
