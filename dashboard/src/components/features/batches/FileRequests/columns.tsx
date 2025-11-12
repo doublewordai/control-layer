@@ -1,18 +1,9 @@
 /* eslint-disable react-refresh/only-export-components */
 import { type ColumnDef } from "@tanstack/react-table";
 import { ArrowUpDown } from "lucide-react";
-import { useState } from "react";
-import { Prism as SyntaxHighlighter } from "react-syntax-highlighter";
-import { oneDark } from "react-syntax-highlighter/dist/esm/styles/prism";
-import {
-  Dialog,
-  DialogContent,
-  DialogHeader,
-  DialogTitle,
-} from "../../../ui/dialog";
 import type { FileRequest } from "../../../../api/control-layer/types";
 
-type FileRequestOrResponse =
+export type FileRequestOrResponse =
   | FileRequest
   | {
       id?: string;
@@ -21,18 +12,21 @@ type FileRequestOrResponse =
       error?: { code: string; message: string } | null;
     };
 
-function RequestBodyModal({
+/**
+ * Button component to trigger viewing request body
+ * Modal state is managed at parent level to prevent loss during re-renders
+ */
+function RequestBodyButton({
   request,
   isOutput,
+  onView,
 }: {
   request: FileRequestOrResponse;
   isOutput: boolean;
+  onView: (request: FileRequestOrResponse) => void;
 }) {
-  const [open, setOpen] = useState(false);
-
   // Determine what to show based on whether it's an output file or input file
   let content: any;
-  let title: string;
 
   if (isOutput) {
     // Output/Error file - show response or error
@@ -43,19 +37,15 @@ function RequestBodyModal({
     };
     if (outputRequest.error) {
       content = outputRequest.error;
-      title = `Error: ${request.custom_id}`;
     } else if (outputRequest.response) {
       content = outputRequest.response.body || outputRequest.response;
-      title = `Response: ${request.custom_id}`;
     } else {
       content = null;
-      title = request.custom_id;
     }
   } else {
     // Input file - show request body
     const inputRequest = request as FileRequest;
     content = inputRequest.body;
-    title = `Request Body: ${request.custom_id}`;
   }
 
   // Generate preview text
@@ -70,45 +60,19 @@ function RequestBodyModal({
       : previewText;
 
   return (
-    <>
-      <button
-        onClick={() => setOpen(true)}
-        className="text-left text-sm text-gray-700 hover:text-blue-600 transition-colors cursor-pointer font-mono"
-        title="Click to view full content"
-      >
-        {truncatedPreview}
-      </button>
-      <Dialog open={open} onOpenChange={setOpen}>
-        <DialogContent className="sm:max-w-4xl max-h-[80vh] flex flex-col">
-          <DialogHeader>
-            <DialogTitle>{title}</DialogTitle>
-          </DialogHeader>
-          <div className="overflow-auto flex-1 min-h-0">
-            {content ? (
-              <SyntaxHighlighter
-                language="json"
-                style={oneDark}
-                customStyle={{
-                  margin: 0,
-                  borderRadius: "0.375rem",
-                  fontSize: "0.75rem",
-                  maxHeight: "none",
-                }}
-              >
-                {JSON.stringify(content, null, 2)}
-              </SyntaxHighlighter>
-            ) : (
-              <p className="text-gray-500 text-sm p-4">No content available</p>
-            )}
-          </div>
-        </DialogContent>
-      </Dialog>
-    </>
+    <button
+      onClick={() => onView(request)}
+      className="text-left text-sm text-gray-700 hover:text-blue-600 transition-colors cursor-pointer font-mono"
+      title="Click to view full content"
+    >
+      {truncatedPreview}
+    </button>
   );
 }
 
 export const createFileRequestsColumns = (
   isOutput: boolean,
+  onViewRequestBody: (request: FileRequestOrResponse) => void,
 ): ColumnDef<FileRequestOrResponse>[] => [
   {
     accessorKey: "custom_id",
@@ -192,7 +156,13 @@ export const createFileRequestsColumns = (
     header: isOutput ? "Content" : "Request Body",
     cell: ({ row }) => {
       const request = row.original;
-      return <RequestBodyModal request={request} isOutput={isOutput} />;
+      return (
+        <RequestBodyButton
+          request={request}
+          isOutput={isOutput}
+          onView={onViewRequestBody}
+        />
+      );
     },
   },
 ];

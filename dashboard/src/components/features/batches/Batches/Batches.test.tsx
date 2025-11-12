@@ -134,6 +134,16 @@ const mockBatches = [
   },
 ];
 
+// Default props for the Batches component
+const defaultProps = {
+  onOpenUploadModal: vi.fn(),
+  onOpenCreateBatchModal: vi.fn(),
+  onOpenDownloadModal: vi.fn(),
+  onOpenDeleteDialog: vi.fn(),
+  onOpenCancelDialog: vi.fn(),
+  onBatchCreatedCallback: vi.fn(),
+};
+
 const createWrapper = () => {
   const queryClient = new QueryClient({
     defaultOptions: {
@@ -202,7 +212,7 @@ describe("Batches", () => {
 
   describe("Rendering", () => {
     it("should render the page title and description", () => {
-      render(<Batches />, { wrapper: createWrapper() });
+      render(<Batches {...defaultProps} />, { wrapper: createWrapper() });
 
       expect(screen.getByText("Batch Processing")).toBeInTheDocument();
       expect(
@@ -213,7 +223,7 @@ describe("Batches", () => {
     });
 
     it("should render upload file button", () => {
-      render(<Batches />, { wrapper: createWrapper() });
+      render(<Batches {...defaultProps} />, { wrapper: createWrapper() });
 
       expect(
         screen.getByRole("button", { name: /upload file/i }),
@@ -221,7 +231,7 @@ describe("Batches", () => {
     });
 
     it("should render tabs", () => {
-      render(<Batches />, { wrapper: createWrapper() });
+      render(<Batches {...defaultProps} />, { wrapper: createWrapper() });
 
       expect(
         screen.getByRole("tab", { name: /files \(2\)/i }),
@@ -241,7 +251,7 @@ describe("Batches", () => {
         refetch: vi.fn(),
       } as any);
 
-      render(<Batches />, { wrapper: createWrapper() });
+      render(<Batches {...defaultProps} />, { wrapper: createWrapper() });
 
       // Use getAllByText since there are multiple "Loading..." texts
       const loadingTexts = screen.getAllByText("Loading...");
@@ -256,7 +266,7 @@ describe("Batches", () => {
         refetch: vi.fn(),
       } as any);
 
-      render(<Batches />, { wrapper: createWrapper() });
+      render(<Batches {...defaultProps} />, { wrapper: createWrapper() });
 
       // Use getAllByText since there are multiple "Loading..." texts
       const loadingTexts = screen.getAllByText("Loading...");
@@ -271,7 +281,9 @@ describe("Batches", () => {
         refetch: vi.fn(),
       } as any);
 
-      const { container } = render(<Batches />, { wrapper: createWrapper() });
+      const { container } = render(<Batches {...defaultProps} />, {
+        wrapper: createWrapper(),
+      });
 
       const spinner = container.querySelector(".animate-spin");
       expect(spinner).toBeInTheDocument();
@@ -287,7 +299,7 @@ describe("Batches", () => {
         refetch: vi.fn(),
       } as any);
 
-      render(<Batches />, { wrapper: createWrapper() });
+      render(<Batches {...defaultProps} />, { wrapper: createWrapper() });
 
       expect(screen.getByText("No files uploaded")).toBeInTheDocument();
       expect(
@@ -310,7 +322,7 @@ describe("Batches", () => {
         refetch: vi.fn(),
       } as any);
 
-      render(<Batches />, { wrapper: createWrapper() });
+      render(<Batches {...defaultProps} />, { wrapper: createWrapper() });
 
       // Switch to batches tab
       await user.click(screen.getByRole("tab", { name: /batches/i }));
@@ -329,7 +341,7 @@ describe("Batches", () => {
 
   describe("Files Tab", () => {
     it("should display files in the table", () => {
-      render(<Batches />, { wrapper: createWrapper() });
+      render(<Batches {...defaultProps} />, { wrapper: createWrapper() });
 
       expect(screen.getByText("test_file.jsonl")).toBeInTheDocument();
       expect(screen.getByText("another_file.jsonl")).toBeInTheDocument();
@@ -337,16 +349,20 @@ describe("Batches", () => {
 
     it("should open upload modal when upload button is clicked", async () => {
       const user = userEvent.setup();
-      render(<Batches />, { wrapper: createWrapper() });
+      const onOpenUploadModal = vi.fn();
+      render(
+        <Batches {...defaultProps} onOpenUploadModal={onOpenUploadModal} />,
+        { wrapper: createWrapper() },
+      );
 
       await user.click(screen.getByRole("button", { name: /upload file/i }));
 
-      expect(screen.getByTestId("upload-modal")).toBeInTheDocument();
+      expect(onOpenUploadModal).toHaveBeenCalledTimes(1);
     });
 
     it("should allow searching files", async () => {
       const user = userEvent.setup();
-      render(<Batches />, { wrapper: createWrapper() });
+      render(<Batches {...defaultProps} />, { wrapper: createWrapper() });
 
       const searchInput = screen.getByPlaceholderText(/search files/i);
       await user.type(searchInput, "test");
@@ -356,7 +372,7 @@ describe("Batches", () => {
 
     it("should filter files based on search query", async () => {
       const user = userEvent.setup();
-      render(<Batches />, { wrapper: createWrapper() });
+      render(<Batches {...defaultProps} />, { wrapper: createWrapper() });
 
       const searchInput = screen.getByPlaceholderText(/search files/i);
       await user.type(searchInput, "test_file");
@@ -369,7 +385,7 @@ describe("Batches", () => {
   describe("Batches Tab", () => {
     it("should allow searching batches", async () => {
       const user = userEvent.setup();
-      render(<Batches />, { wrapper: createWrapper() });
+      render(<Batches {...defaultProps} />, { wrapper: createWrapper() });
 
       // Switch to batches tab
       await user.click(screen.getByRole("tab", { name: /batches/i }));
@@ -382,7 +398,7 @@ describe("Batches", () => {
 
     it("should display batch status correctly", async () => {
       const user = userEvent.setup();
-      render(<Batches />, { wrapper: createWrapper() });
+      render(<Batches {...defaultProps} />, { wrapper: createWrapper() });
 
       await user.click(screen.getByRole("tab", { name: /batches/i }));
 
@@ -404,7 +420,7 @@ describe("Batches", () => {
   describe("Tab Switching", () => {
     it("should maintain search when switching tabs", async () => {
       const user = userEvent.setup();
-      render(<Batches />, { wrapper: createWrapper() });
+      render(<Batches {...defaultProps} />, { wrapper: createWrapper() });
 
       // Search in files tab
       const fileSearch = screen.getByPlaceholderText(/search files/i);
@@ -420,21 +436,26 @@ describe("Batches", () => {
   });
 
   describe("Modal Interactions", () => {
-    it("should close upload modal after successful upload", async () => {
+    it("should call onOpenUploadModal when upload button is clicked", async () => {
       const user = userEvent.setup();
-      render(<Batches />, { wrapper: createWrapper() });
+      const onOpenUploadModal = vi.fn();
+      render(
+        <Batches {...defaultProps} onOpenUploadModal={onOpenUploadModal} />,
+        { wrapper: createWrapper() },
+      );
 
       await user.click(screen.getByRole("button", { name: /upload file/i }));
-      expect(screen.getByTestId("upload-modal")).toBeInTheDocument();
+      expect(onOpenUploadModal).toHaveBeenCalledTimes(1);
 
-      // Close modal (this would normally be done through modal's internal logic)
+      // Clicking again should call it again
       await user.click(screen.getByRole("button", { name: /upload file/i }));
+      expect(onOpenUploadModal).toHaveBeenCalledTimes(2);
     });
   });
 
   describe("File Size Display", () => {
     it("should display file sizes correctly", () => {
-      render(<Batches />, { wrapper: createWrapper() });
+      render(<Batches {...defaultProps} />, { wrapper: createWrapper() });
 
       // File sizes should be formatted (e.g., "142.19 KB", "87.11 KB")
       const container = screen.getByText("test_file.jsonl").closest("table");
@@ -444,7 +465,7 @@ describe("Batches", () => {
 
   describe("Date Formatting", () => {
     it("should display created dates for files", () => {
-      render(<Batches />, { wrapper: createWrapper() });
+      render(<Batches {...defaultProps} />, { wrapper: createWrapper() });
 
       // Dates should be formatted and displayed
       const container = screen.getByText("test_file.jsonl").closest("table");
@@ -454,7 +475,7 @@ describe("Batches", () => {
 
   describe("Accessibility", () => {
     it("should have accessible tab controls", () => {
-      render(<Batches />, { wrapper: createWrapper() });
+      render(<Batches {...defaultProps} />, { wrapper: createWrapper() });
 
       const filesTab = screen.getByRole("tab", { name: /files/i });
       const batchesTab = screen.getByRole("tab", { name: /batches/i });
@@ -464,7 +485,7 @@ describe("Batches", () => {
     });
 
     it("should have accessible action buttons", () => {
-      render(<Batches />, { wrapper: createWrapper() });
+      render(<Batches {...defaultProps} />, { wrapper: createWrapper() });
 
       expect(
         screen.getByRole("button", { name: /upload file/i }),

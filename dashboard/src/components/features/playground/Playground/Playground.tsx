@@ -86,7 +86,6 @@ const Playground: React.FC = () => {
 
   // Initialize OpenAI client pointing to our API
   const baseURL = `${window.location.origin}/admin/api/v1/ai/v1`;
-  console.log("OpenAI Base URL:", baseURL);
 
   const openai = new OpenAI({
     baseURL,
@@ -529,9 +528,6 @@ const Playground: React.FC = () => {
     }
 
     try {
-      console.log("Sending request to model:", selectedModel.alias);
-      console.log("Full request URL will be:", `${baseURL}/chat/completions`);
-
       // Build messages array with optional system prompt
       const apiMessages: ChatCompletionMessageParam[] = [];
 
@@ -588,10 +584,6 @@ const Playground: React.FC = () => {
             firstTokenTime = performance.now() - startTime;
           }
 
-          console.log(
-            `Chunk ${chunkCount}: "${content}" (length: ${content.length})`,
-          );
-
           // Update immediately without requestAnimationFrame to avoid batching
           setStreamingContent(fullContent);
         }
@@ -607,8 +599,6 @@ const Playground: React.FC = () => {
 
       const endTime = performance.now();
       const totalTime = endTime - startTime;
-
-      console.log(`Total chunks received: ${chunkCount}`);
 
       // Calculate metrics
       const metrics: MessageMetrics = {
@@ -665,8 +655,6 @@ const Playground: React.FC = () => {
     setAbortControllerModelB(controller);
 
     try {
-      console.log("Sending request to model B:", comparisonModel.alias);
-
       const startTime = performance.now();
       let firstTokenTime: number | undefined;
       let totalTokens = 0;

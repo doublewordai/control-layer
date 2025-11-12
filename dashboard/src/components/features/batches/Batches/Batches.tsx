@@ -2,7 +2,14 @@ import { useState, useEffect } from "react";
 import * as React from "react";
 import { useNavigate, useSearchParams } from "react-router-dom";
 import { useQueryClient } from "@tanstack/react-query";
-import { Upload, Play, FileText, Box, Trash2, Loader2 } from "lucide-react";
+import {
+  Upload,
+  Play,
+  Box,
+  FileInput,
+  FileCheck,
+  AlertCircle,
+} from "lucide-react";
 import { Button } from "../../../ui/button";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "../../../ui/tabs";
 import {
@@ -12,64 +19,85 @@ import {
   SelectTrigger,
   SelectValue,
 } from "../../../ui/select";
-import {
-  Dialog,
-  DialogContent,
-  DialogHeader,
-  DialogTitle,
-  DialogFooter,
-} from "../../../ui/dialog";
 import { DataTable } from "../../../ui/data-table";
-import { UploadFileModal } from "../../../modals/CreateFileModal";
-import { CreateBatchModal } from "../../../modals/CreateBatchModal";
-// ViewFileRequestsModal removed - now uses dedicated page with routing
-// ViewBatchRequestsModal removed - batch request viewing disabled for now
-import { DownloadFileModal } from "../../../modals/DownloadFileModal";
 import { createFileColumns } from "../FilesTable/columns";
 import { createBatchColumns } from "../BatchesTable/columns";
-import {
-  useFiles,
-  useBatches,
-  useDeleteFile,
-  useCancelBatch,
-} from "../../../../api/control-layer/hooks";
+import { useFiles, useBatches } from "../../../../api/control-layer/hooks";
 import { dwctlApi } from "../../../../api/control-layer/client";
-import { toast } from "sonner";
 import type { FileObject, Batch } from "../types";
 
-export function Batches() {
-  const navigate = useNavigate();
-  const [searchParams, setSearchParams] = useSearchParams();
-  const queryClient = useQueryClient();
-
-  // Modal states
-  const [uploadModalOpen, setUploadModalOpen] = useState(false);
-  const [createBatchModalOpen, setCreateBatchModalOpen] = useState(false);
-  const [downloadFileModalOpen, setDownloadFileModalOpen] = useState(false);
-
-  // Selected items
-  const [downloadResource, setDownloadResource] = useState<{
+/**
+ * Props for the Batches component.
+ * All modal operations are handled by parent container to prevent
+ * modal state from being lost during auto-refresh re-renders.
+ */
+interface BatchesProps {
+  onOpenUploadModal: (file?: File) => void;
+  onOpenCreateBatchModal: (fileId?: string) => void;
+  onOpenDownloadModal: (resource: {
     type: "file" | "batch-results";
     id: string;
     filename?: string;
     isPartial?: boolean;
-  } | null>(null);
-  const [preselectedFileId, setPreselectedFileId] = useState<
-    string | undefined
-  >();
+  }) => void;
+  onOpenDeleteDialog: (file: FileObject) => void;
+  onOpenCancelDialog: (batch: Batch) => void;
+  onBatchCreatedCallback?: (callback: () => void) => void;
+}
 
-  // Delete confirmation
-  const [fileToDelete, setFileToDelete] = useState<FileObject | null>(null);
-  const [batchToCancel, setBatchToCancel] = useState<Batch | null>(null);
+export function Batches({
+  onOpenUploadModal,
+  onOpenCreateBatchModal,
+  onOpenDownloadModal,
+  onOpenDeleteDialog,
+  onOpenCancelDialog,
+  onBatchCreatedCallback,
+}: BatchesProps) {
+  const navigate = useNavigate();
+  const [searchParams, setSearchParams] = useSearchParams();
+  const queryClient = useQueryClient();
 
-  // Drag and drop state
+  // Drag and drop state (kept locally as it's UI-only)
   const [dragActive, setDragActive] = useState(false);
-  const [droppedFile, setDroppedFile] = useState<File | undefined>();
+
+  // Sync URL with state changes
+  const updateURL = (
+    tab: "files" | "batches",
+    fileFilter: string | null,
+    fileType?: "input" | "output" | "error",
+  ) => {
+    const params = new URLSearchParams(searchParams);
+    params.set("tab", tab);
+    if (fileFilter) {
+      params.set("fileFilter", fileFilter);
+    } else {
+      params.delete("fileFilter");
+    }
+    if (fileType && fileType !== "input") {
+      params.set("fileType", fileType);
+    } else {
+      params.delete("fileType");
+    }
+    setSearchParams(params, { replace: false });
+  };
+
+  // Register callback for when batch is successfully created
+  const handleBatchCreated = () => {
+    updateURL("batches", null);
+  };
+
+  useEffect(() => {
+    if (onBatchCreatedCallback) {
+      onBatchCreatedCallback(handleBatchCreated);
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [onBatchCreatedCallback]);
 
   // Read state from URL
   const activeTab = (searchParams.get("tab") as "files" | "batches") || "files";
   const batchFileFilter = searchParams.get("fileFilter");
-  const filePurposeFilter = searchParams.get("purpose") || "batch";
+  const fileTypeFilter =
+    (searchParams.get("fileType") as "input" | "output" | "error") || "input";
 
   // Pagination state from URL
   const filesPage = parseInt(searchParams.get("filesPage") || "0", 10);
@@ -86,27 +114,6 @@ export function Batches() {
   const [batchesAfterCursor, setBatchesAfterCursor] = useState<
     string | undefined
   >(undefined);
-
-  // Sync URL with state changes
-  const updateURL = (
-    tab: "files" | "batches",
-    fileFilter: string | null,
-    purposeFilter?: string | null,
-  ) => {
-    const params = new URLSearchParams(searchParams);
-    params.set("tab", tab);
-    if (fileFilter) {
-      params.set("fileFilter", fileFilter);
-    } else {
-      params.delete("fileFilter");
-    }
-    if (purposeFilter && purposeFilter !== "batch") {
-      params.set("purpose", purposeFilter);
-    } else {
-      params.delete("purpose");
-    }
-    setSearchParams(params, { replace: false });
-  };
 
   // Update files pagination in URL
   const updateFilesPagination = (newPage: number, newPageSize: number) => {
@@ -126,25 +133,19 @@ export function Batches() {
 
   // API queries
   // Paginated files query for display in Files tab
-  const { data: inputFilesResponse, isLoading: inputFilesLoading } = useFiles(
-    filePurposeFilter === "batch"
-      ? {
-          purpose: "batch",
-          limit: filesPageSize + 1, // Fetch one extra to detect if there are more
-          after: filesAfterCursor,
-        }
-      : undefined,
-  );
+  // Map fileType to purpose filter
+  const filePurpose =
+    fileTypeFilter === "input"
+      ? "batch"
+      : fileTypeFilter === "output"
+        ? "batch_output"
+        : "batch_error"; // error
 
-  const { data: displayFilesResponse, isLoading: displayFilesLoading } =
-    useFiles(
-      filePurposeFilter !== "batch"
-        ? {
-            limit: filesPageSize + 1, // Fetch one extra to detect if there are more
-            after: filesAfterCursor,
-          }
-        : undefined,
-    );
+  const { data: filesResponse, isLoading: filesLoading } = useFiles({
+    purpose: filePurpose,
+    limit: filesPageSize + 1, // Fetch one extra to detect if there are more
+    after: filesAfterCursor,
+  });
 
   // Separate unpaginated query for all files (needed for batch file lookups in batches table)
   const { data: allFilesResponse, isLoading: allFilesLoading } = useFiles({});
@@ -154,10 +155,6 @@ export function Batches() {
     limit: batchesPageSize + 1, // Fetch one extra to detect if there are more
     after: batchesAfterCursor,
   });
-
-  // Mutations
-  const deleteMutation = useDeleteFile();
-  const cancelMutation = useCancelBatch();
 
   // Process batches response - remove extra item used for hasMore detection
   const batchesData = batchesResponse?.data || [];
@@ -170,29 +167,16 @@ export function Batches() {
   const allFiles = allFilesResponse?.data || [];
 
   // Process files response - remove extra item used for hasMore detection
-  const filesData =
-    filePurposeFilter === "batch"
-      ? inputFilesResponse?.data || []
-      : displayFilesResponse?.data || [];
+  const filesData = filesResponse?.data || [];
   const filesHasMore = filesData.length > filesPageSize;
   const filesForDisplay = filesHasMore
     ? filesData.slice(0, filesPageSize)
     : filesData;
 
-  // Files to display in the table (based on purpose filter)
-  const files = React.useMemo(() => {
-    if (filePurposeFilter === "batch") {
-      return filesForDisplay.filter((f) => f.purpose === "batch");
-    } else {
-      // Show output and error files
-      return filesForDisplay.filter(
-        (f) => f.purpose === "batch_output" || f.purpose === "batch_error",
-      );
-    }
-  }, [filesForDisplay, filePurposeFilter]);
+  // Display files as returned by API (server-side filtered by purpose)
+  const files = filesForDisplay;
 
-  const filesLoading =
-    inputFilesLoading || displayFilesLoading || allFilesLoading;
+  const isFilesLoading = filesLoading || allFilesLoading;
 
   // Filter batches by input file if filter is set
   const filteredBatches = React.useMemo(() => {
@@ -206,17 +190,18 @@ export function Batches() {
       const lastFile = files[files.length - 1];
       const nextCursor = lastFile.id;
 
-      const prefetchOptions =
-        filePurposeFilter === "batch"
-          ? { purpose: "batch", limit: filesPageSize + 1, after: nextCursor }
-          : { limit: filesPageSize + 1, after: nextCursor };
+      const prefetchOptions = {
+        purpose: filePurpose,
+        limit: filesPageSize + 1,
+        after: nextCursor,
+      };
 
       queryClient.prefetchQuery({
         queryKey: ["files", "list", prefetchOptions],
         queryFn: () => dwctlApi.files.list(prefetchOptions),
       });
     }
-  }, [files, filesHasMore, filesPageSize, filePurposeFilter, queryClient]);
+  }, [files, filesHasMore, filesPageSize, filePurpose, queryClient]);
 
   // Prefetch next page for batches
   useEffect(() => {
@@ -261,7 +246,7 @@ export function Batches() {
 
   const handleDeleteFile = (file: FileObject) => {
     if ((file as any)._isEmpty) return;
-    setFileToDelete(file);
+    onOpenDeleteDialog(file);
   };
 
   const handleDownloadFileCode = (file: FileObject) => {
@@ -276,19 +261,17 @@ export function Batches() {
           ["validating", "in_progress", "finalizing"].includes(b.status),
       );
 
-    setDownloadResource({
+    onOpenDownloadModal({
       type: "file",
       id: file.id,
       filename: file.filename,
       isPartial,
     });
-    setDownloadFileModalOpen(true);
   };
 
   const handleTriggerBatch = (file: FileObject) => {
     if ((file as any)._isEmpty) return;
-    setPreselectedFileId(file.id);
-    setCreateBatchModalOpen(true);
+    onOpenCreateBatchModal(file.id);
   };
 
   const handleFileClick = (file: FileObject) => {
@@ -297,44 +280,10 @@ export function Batches() {
     updateURL("batches", file.id);
   };
 
-  const confirmDeleteFile = async () => {
-    if (!fileToDelete) return;
-
-    try {
-      await deleteMutation.mutateAsync(fileToDelete.id);
-      toast.success(`File "${fileToDelete.filename}" deleted successfully`);
-      setFileToDelete(null);
-    } catch (error) {
-      console.error("Failed to delete file:", error);
-      toast.error(
-        error instanceof Error
-          ? error.message
-          : "Failed to delete file. Please try again.",
-      );
-    }
-  };
-
   // Batch actions
   const handleCancelBatch = (batch: Batch) => {
     if ((batch as any)._isEmpty) return;
-    setBatchToCancel(batch);
-  };
-
-  const confirmCancelBatch = async () => {
-    if (!batchToCancel) return;
-
-    try {
-      await cancelMutation.mutateAsync(batchToCancel.id);
-      toast.success(`Batch "${batchToCancel.id}" is being cancelled`);
-      setBatchToCancel(null);
-    } catch (error) {
-      console.error("Failed to cancel batch:", error);
-      toast.error(
-        error instanceof Error
-          ? error.message
-          : "Failed to cancel batch. Please try again.",
-      );
-    }
+    onOpenCancelDialog(batch);
   };
 
   // Drag and drop handlers
@@ -356,10 +305,7 @@ export function Batches() {
     if (e.dataTransfer.files && e.dataTransfer.files[0]) {
       const file = e.dataTransfer.files[0];
       if (file.name.endsWith(".jsonl")) {
-        setDroppedFile(file);
-        setUploadModalOpen(true);
-      } else {
-        toast.error("Please upload a .jsonl file");
+        onOpenUploadModal(file);
       }
     }
   };
@@ -457,7 +403,7 @@ export function Batches() {
   });
 
   // Loading state
-  if (filesLoading || batchesLoading) {
+  if (isFilesLoading || batchesLoading) {
     return (
       <div className="py-4 px-6">
         <div className="mb-4">
@@ -503,7 +449,7 @@ export function Batches() {
         <div className="flex flex-col sm:flex-row items-stretch sm:items-center gap-3 lg:flex-shrink-0">
           {/* Action Button */}
           <Button
-            onClick={() => setUploadModalOpen(true)}
+            onClick={() => onOpenUploadModal()}
             variant="outline"
             className={`flex-1 sm:flex-none transition-all duration-200 ${
               dragActive ? "border-blue-500 bg-blue-50 text-blue-700" : ""
@@ -524,7 +470,7 @@ export function Batches() {
                 value="files"
                 className="flex items-center gap-2 flex-1 sm:flex-none"
               >
-                <FileText className="w-4 h-4" />
+                <FileInput className="w-4 h-4" />
                 Files ({files.length})
               </TabsTrigger>
               <TabsTrigger
@@ -549,7 +495,7 @@ export function Batches() {
           {files.length === 0 ? (
             <div className="text-center py-12">
               <div className="p-4 bg-doubleword-neutral-100 rounded-full w-16 h-16 mx-auto mb-4 flex items-center justify-center">
-                <FileText className="w-8 h-8 text-doubleword-neutral-600" />
+                <FileInput className="w-8 h-8 text-doubleword-neutral-600" />
               </div>
               <h3 className="text-lg font-medium text-doubleword-neutral-900 mb-2">
                 No files uploaded
@@ -557,7 +503,7 @@ export function Batches() {
               <p className="text-doubleword-neutral-600 mb-4">
                 Upload a .jsonl file to get started with batch processing
               </p>
-              <Button onClick={() => setUploadModalOpen(true)}>
+              <Button onClick={() => onOpenUploadModal()}>
                 <Upload className="w-4 h-4 mr-2" />
                 Upload First File
               </Button>
@@ -576,25 +522,59 @@ export function Batches() {
                 initialColumnVisibility={{ id: false }}
                 headerActions={
                   <div className="flex items-center gap-2">
-                    <Select
-                      value={filePurposeFilter === "batch" ? "input" : "output"}
-                      onValueChange={(value) => {
-                        const purpose =
-                          value === "input" ? "batch" : "batch_output";
-                        updateURL(activeTab, batchFileFilter, purpose);
-                        // Reset pagination when changing filter
-                        setFilesAfterCursor(undefined);
-                        updateFilesPagination(0, filesPageSize);
-                      }}
-                    >
-                      <SelectTrigger className="w-[120px]">
-                        <SelectValue />
-                      </SelectTrigger>
-                      <SelectContent>
-                        <SelectItem value="input">Input</SelectItem>
-                        <SelectItem value="output">Output</SelectItem>
-                      </SelectContent>
-                    </Select>
+                    <div className="inline-flex h-9 items-center justify-center rounded-md bg-muted p-1 text-muted-foreground">
+                      {(["input", "output", "error"] as const).map((type) => {
+                        const Icon =
+                          type === "input"
+                            ? FileInput
+                            : type === "output"
+                              ? FileCheck
+                              : AlertCircle;
+                        const label =
+                          type.charAt(0).toUpperCase() + type.slice(1);
+
+                        return (
+                          <button
+                            key={type}
+                            type="button"
+                            title={`${label} files`}
+                            onClick={(e) => {
+                              e.preventDefault();
+                              e.stopPropagation();
+                              // Combine URL updates into single setSearchParams call
+                              const params = new URLSearchParams(searchParams);
+                              params.set("tab", activeTab);
+                              if (batchFileFilter) {
+                                params.set("fileFilter", batchFileFilter);
+                              } else {
+                                params.delete("fileFilter");
+                              }
+                              if (type !== "input") {
+                                params.set("fileType", type);
+                              } else {
+                                params.delete("fileType");
+                              }
+                              // Reset pagination
+                              params.set("filesPage", "0");
+                              params.set(
+                                "filesPageSize",
+                                filesPageSize.toString(),
+                              );
+                              setSearchParams(params, { replace: false });
+                              // Reset cursor
+                              setFilesAfterCursor(undefined);
+                            }}
+                            className={`inline-flex items-center justify-center whitespace-nowrap rounded-sm px-3 py-1 text-sm font-medium ring-offset-background transition-all focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 ${
+                              fileTypeFilter === type
+                                ? "bg-background text-foreground shadow-sm"
+                                : "hover:bg-background/50"
+                            }`}
+                          >
+                            <Icon className="w-4 h-4" />
+                          </button>
+                        );
+                      })}
+                    </div>
                     <span className="text-sm text-gray-600">Rows:</span>
                     <Select
                       value={filesPageSize.toString()}
@@ -625,6 +605,18 @@ export function Batches() {
                   {filesHasMore && " of many"}
                 </div>
                 <div className="flex items-center gap-2">
+                  {filesPage > 1 && (
+                    <Button
+                      variant="outline"
+                      size="sm"
+                      onClick={() => {
+                        setFilesAfterCursor(undefined);
+                        updateFilesPagination(0, filesPageSize);
+                      }}
+                    >
+                      First
+                    </Button>
+                  )}
                   <Button
                     variant="outline"
                     size="sm"
@@ -654,7 +646,7 @@ export function Batches() {
           {/* Show filter indicator if active */}
           {batchFileFilter && (
             <div className="flex items-center gap-2 bg-blue-50 border border-blue-200 rounded-lg p-3">
-              <FileText className="w-4 h-4 text-blue-600" />
+              <FileInput className="w-4 h-4 text-blue-600" />
               <span className="text-sm text-blue-900">
                 Showing batches for file:{" "}
                 <span className="font-mono">
@@ -686,10 +678,7 @@ export function Batches() {
               </p>
               <Button
                 onClick={() => {
-                  if (batchFileFilter) {
-                    setPreselectedFileId(batchFileFilter);
-                  }
-                  setCreateBatchModalOpen(true);
+                  onOpenCreateBatchModal(batchFileFilter || undefined);
                 }}
               >
                 <Play className="w-4 h-4 mr-2" />
@@ -740,6 +729,18 @@ export function Batches() {
                   {batchesHasMore && " of many"}
                 </div>
                 <div className="flex items-center gap-2">
+                  {batchesPage > 1 && (
+                    <Button
+                      variant="outline"
+                      size="sm"
+                      onClick={() => {
+                        setBatchesAfterCursor(undefined);
+                        updateBatchesPagination(0, batchesPageSize);
+                      }}
+                    >
+                      First
+                    </Button>
+                  )}
                   <Button
                     variant="outline"
                     size="sm"
@@ -765,156 +766,6 @@ export function Batches() {
           )}
         </TabsContent>
       </Tabs>
-
-      {/* Modals - keeping existing modal code */}
-      <UploadFileModal
-        isOpen={uploadModalOpen}
-        onClose={() => {
-          setUploadModalOpen(false);
-          setDroppedFile(undefined);
-        }}
-        onSuccess={() => {
-          setUploadModalOpen(false);
-          setDroppedFile(undefined);
-        }}
-        preselectedFile={droppedFile}
-      />
-
-      <CreateBatchModal
-        isOpen={createBatchModalOpen}
-        onClose={() => {
-          setCreateBatchModalOpen(false);
-          setPreselectedFileId(undefined);
-        }}
-        onSuccess={() => {
-          setCreateBatchModalOpen(false);
-          setPreselectedFileId(undefined);
-          updateURL("batches", null);
-        }}
-        preselectedFileId={preselectedFileId}
-      />
-
-      {/* ViewFileRequestsModal removed - now uses dedicated page at /batches/files/:id/content */}
-      {/* ViewBatchRequestsModal removed - batch request viewing disabled for now */}
-
-      <DownloadFileModal
-        isOpen={downloadFileModalOpen}
-        onClose={() => {
-          setDownloadFileModalOpen(false);
-          setDownloadResource(null);
-        }}
-        title={
-          downloadResource?.type === "file"
-            ? "Download File"
-            : "Download Batch Results"
-        }
-        description={
-          downloadResource?.type === "file"
-            ? "Use the code below to download this file via the API"
-            : "Use the code below to download batch results via the API"
-        }
-        resourceType={downloadResource?.type || "file"}
-        resourceId={downloadResource?.id || ""}
-        filename={downloadResource?.filename}
-        isPartial={downloadResource?.isPartial}
-      />
-
-      {/* Delete File Confirmation */}
-      <Dialog open={!!fileToDelete} onOpenChange={() => setFileToDelete(null)}>
-        <DialogContent className="sm:max-w-md">
-          <DialogHeader>
-            <div className="flex items-center gap-3">
-              <div className="w-10 h-10 bg-red-100 rounded-full flex items-center justify-center">
-                <Trash2 className="w-5 h-5 text-red-600" />
-              </div>
-              <div>
-                <DialogTitle>Delete File</DialogTitle>
-                <p className="text-sm text-gray-600">
-                  This action cannot be undone
-                </p>
-              </div>
-            </div>
-          </DialogHeader>
-
-          <div className="py-4">
-            <p className="text-sm text-gray-700">
-              Are you sure you want to delete the file{" "}
-              <strong>"{fileToDelete?.filename}"</strong>? This action cannot be
-              undone.
-            </p>
-          </div>
-
-          <DialogFooter>
-            <Button
-              type="button"
-              variant="outline"
-              onClick={() => setFileToDelete(null)}
-            >
-              Cancel
-            </Button>
-            <Button
-              onClick={confirmDeleteFile}
-              disabled={deleteMutation.isPending}
-              variant="destructive"
-            >
-              {deleteMutation.isPending && (
-                <Loader2 className="w-4 h-4 mr-2 animate-spin" />
-              )}
-              Delete File
-            </Button>
-          </DialogFooter>
-        </DialogContent>
-      </Dialog>
-
-      {/* Cancel Batch Confirmation */}
-      <Dialog
-        open={!!batchToCancel}
-        onOpenChange={() => setBatchToCancel(null)}
-      >
-        <DialogContent className="sm:max-w-md">
-          <DialogHeader>
-            <div className="flex items-center gap-3">
-              <div className="w-10 h-10 bg-red-100 rounded-full flex items-center justify-center">
-                <Trash2 className="w-5 h-5 text-red-600" />
-              </div>
-              <div>
-                <DialogTitle>Cancel Batch</DialogTitle>
-                <p className="text-sm text-gray-600">
-                  This will stop processing
-                </p>
-              </div>
-            </div>
-          </DialogHeader>
-
-          <div className="py-4">
-            <p className="text-sm text-gray-700">
-              Are you sure you want to cancel batch{" "}
-              <strong className="font-mono">"{batchToCancel?.id}"</strong>? This
-              will stop processing and may result in partial results.
-            </p>
-          </div>
-
-          <DialogFooter>
-            <Button
-              type="button"
-              variant="outline"
-              onClick={() => setBatchToCancel(null)}
-            >
-              Keep Running
-            </Button>
-            <Button
-              onClick={confirmCancelBatch}
-              disabled={cancelMutation.isPending}
-              variant="destructive"
-            >
-              {cancelMutation.isPending && (
-                <Loader2 className="w-4 h-4 mr-2 animate-spin" />
-              )}
-              Cancel Batch
-            </Button>
-          </DialogFooter>
-        </DialogContent>
-      </Dialog>
     </div>
   );
 }
