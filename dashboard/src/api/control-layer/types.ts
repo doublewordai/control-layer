@@ -2,7 +2,12 @@ import { z } from "zod";
 
 export type ModelType = "CHAT" | "EMBEDDINGS" | "RERANKER";
 export type AuthSource = "vouch" | "native" | "system" | "proxy-header";
-export type Role = "PlatformManager" | "RequestViewer" | "StandardUser";
+export type Role =
+  | "PlatformManager"
+  | "RequestViewer"
+  | "StandardUser"
+  | "BillingManager"
+  | "BatchAPIUser";
 export type ApiKeyPurpose = "platform" | "inference";
 
 // Config/Metadata types

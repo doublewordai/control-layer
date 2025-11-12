@@ -5,7 +5,7 @@ import {
   ArrowUpDown,
   Trash2,
   List,
-  FileText,
+  FileInput,
   Download,
   Play,
   FileCheck,
@@ -72,7 +72,7 @@ export const createFileColumns = (
       const isInProgress = actions.isFileInProgress(file);
 
       // Choose icon based on purpose and progress
-      let icon = <FileText className="w-4 h-4 text-gray-500" />;
+      let icon = <FileInput className="w-4 h-4 text-gray-500" />;
       if (isInProgress) {
         icon = <Loader2 className="w-4 h-4 text-blue-600 animate-spin" />;
       } else if (file.purpose === "batch_output") {

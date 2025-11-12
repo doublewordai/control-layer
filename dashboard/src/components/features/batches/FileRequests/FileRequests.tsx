@@ -1,6 +1,13 @@
 import { useState, useEffect } from "react";
 import { useParams, useNavigate, useSearchParams } from "react-router-dom";
-import { ArrowLeft, FileText, Download, Loader2 } from "lucide-react";
+import {
+  ArrowLeft,
+  FileInput,
+  FileCheck,
+  AlertCircle,
+  Download,
+  Loader2,
+} from "lucide-react";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { Button } from "../../../ui/button";
 import { DataTable } from "../../../ui/data-table";
@@ -13,19 +20,21 @@ import {
 } from "../../../ui/select";
 import { dwctlApi } from "../../../../api/control-layer/client";
 import { useFile, useBatches } from "../../../../api/control-layer/hooks";
-import { createFileRequestsColumns } from "./columns";
+import {
+  createFileRequestsColumns,
+  type FileRequestOrResponse,
+} from "./columns";
 import { DownloadFileModal } from "../../../modals/DownloadFileModal/DownloadFileModal";
+import {
+  Dialog,
+  DialogContent,
+  DialogHeader,
+  DialogTitle,
+  DialogDescription,
+} from "../../../ui/dialog";
+import { Prism as SyntaxHighlighter } from "react-syntax-highlighter";
+import { oneDark } from "react-syntax-highlighter/dist/esm/styles/prism";
 import type { FileRequest } from "../../../../api/control-layer/types";
-
-// Extended type to handle both templates and responses
-type FileRequestOrResponse =
-  | FileRequest
-  | {
-      id?: string;
-      custom_id: string;
-      response?: { status_code: number; body: any } | null;
-      error?: { code: string; message: string } | null;
-    };
 
 export function FileRequests() {
   const { fileId } = useParams<{ fileId: string }>();
@@ -33,6 +42,11 @@ export function FileRequests() {
   const queryClient = useQueryClient();
   const [searchParams, setSearchParams] = useSearchParams();
   const [downloadModalOpen, setDownloadModalOpen] = useState(false);
+
+  // Modal state for viewing request bodies - lifted to component level
+  const [selectedRequest, setSelectedRequest] =
+    useState<FileRequestOrResponse | null>(null);
+  const [requestBodyModalOpen, setRequestBodyModalOpen] = useState(false);
 
   // Get pagination from URL or use defaults
   const page = parseInt(searchParams.get("page") || "0", 10);
@@ -103,7 +117,16 @@ export function FileRequests() {
 
   const hasMore = data?.incomplete ?? false;
 
-  const columns = createFileRequestsColumns(isOutputFile);
+  // Handler to open request body modal
+  const handleViewRequestBody = (request: FileRequestOrResponse) => {
+    setSelectedRequest(request);
+    setRequestBodyModalOpen(true);
+  };
+
+  const columns = createFileRequestsColumns(
+    isOutputFile,
+    handleViewRequestBody,
+  );
 
   return (
     <div className="py-4 px-6">
@@ -123,8 +146,18 @@ export function FileRequests() {
           </h1>
           {file && (
             <div className="mt-1 flex items-center gap-4 text-sm text-gray-600">
-              <span className="truncate">
-                <span className="font-medium">File:</span> {file.filename}
+              <span className="truncate flex items-center gap-2">
+                <span className="font-medium">File:</span>
+                {file.purpose === "batch" && (
+                  <FileInput className="w-4 h-4 text-gray-500 flex-shrink-0" />
+                )}
+                {file.purpose === "batch_output" && (
+                  <FileCheck className="w-4 h-4 text-green-600 flex-shrink-0" />
+                )}
+                {file.purpose === "batch_error" && (
+                  <AlertCircle className="w-4 h-4 text-red-500 flex-shrink-0" />
+                )}
+                {file.filename}
               </span>
               <span className="flex-shrink-0">
                 <span className="font-medium">Showing:</span>{" "}
@@ -162,7 +195,7 @@ export function FileRequests() {
       ) : requests.length === 0 ? (
         <div className="text-center py-12">
           <div className="p-4 bg-doubleword-neutral-100 rounded-full w-16 h-16 mx-auto mb-4 flex items-center justify-center">
-            <FileText className="w-8 h-8 text-doubleword-neutral-600" />
+            <FileInput className="w-8 h-8 text-doubleword-neutral-600" />
           </div>
           <h3 className="text-lg font-medium text-doubleword-neutral-900 mb-2">
             File is empty
@@ -214,6 +247,15 @@ export function FileRequests() {
               {hasMore && " of many"}
             </div>
             <div className="flex items-center gap-2">
+              {page > 1 && (
+                <Button
+                  variant="outline"
+                  size="sm"
+                  onClick={() => updatePagination(0, pageSize)}
+                >
+                  First
+                </Button>
+              )}
               <Button
                 variant="outline"
                 size="sm"
@@ -251,6 +293,83 @@ export function FileRequests() {
           isPartial={isPartial}
         />
       )}
+
+      {/* Request Body Modal */}
+      <Dialog
+        open={requestBodyModalOpen}
+        onOpenChange={setRequestBodyModalOpen}
+      >
+        <DialogContent className="sm:max-w-4xl max-h-[80vh] flex flex-col">
+          <DialogHeader>
+            <DialogTitle>
+              {selectedRequest &&
+                (() => {
+                  if (isOutputFile) {
+                    const outputRequest = selectedRequest as {
+                      response?: any;
+                      error?: any;
+                      custom_id: string;
+                    };
+                    if (outputRequest.error) {
+                      return `Error: ${selectedRequest.custom_id}`;
+                    } else if (outputRequest.response) {
+                      return `Response: ${selectedRequest.custom_id}`;
+                    }
+                    return selectedRequest.custom_id;
+                  } else {
+                    return `Request Body: ${selectedRequest.custom_id}`;
+                  }
+                })()}
+            </DialogTitle>
+            <DialogDescription>
+              View the full{" "}
+              {isOutputFile ? "response or error" : "request body"} content
+            </DialogDescription>
+          </DialogHeader>
+          <div className="overflow-auto flex-1 min-h-0">
+            {selectedRequest &&
+              (() => {
+                let content: any;
+                if (isOutputFile) {
+                  const outputRequest = selectedRequest as {
+                    response?: any;
+                    error?: any;
+                  };
+                  if (outputRequest.error) {
+                    content = outputRequest.error;
+                  } else if (outputRequest.response) {
+                    content =
+                      outputRequest.response.body || outputRequest.response;
+                  } else {
+                    content = null;
+                  }
+                } else {
+                  const inputRequest = selectedRequest as FileRequest;
+                  content = inputRequest.body;
+                }
+
+                return content ? (
+                  <SyntaxHighlighter
+                    language="json"
+                    style={oneDark}
+                    customStyle={{
+                      margin: 0,
+                      borderRadius: "0.375rem",
+                      fontSize: "0.75rem",
+                      maxHeight: "none",
+                    }}
+                  >
+                    {JSON.stringify(content, null, 2)}
+                  </SyntaxHighlighter>
+                ) : (
+                  <p className="text-gray-500 text-sm p-4">
+                    No content available
+                  </p>
+                );
+              })()}
+          </div>
+        </DialogContent>
+      </Dialog>
     </div>
   );
 }

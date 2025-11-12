@@ -35,18 +35,58 @@ export default defineConfig(({ mode }) => {
         "/admin": {
           target: process.env.BACKEND_URL || "http://localhost:3001",
           changeOrigin: true,
+          configure: (proxy) => {
+            proxy.on("proxyReq", (proxyReq) => {
+              if (process.env.AUTHORIZATION) {
+                proxyReq.setHeader(
+                  "authorization",
+                  `Bearer ${process.env.AUTHORIZATION}`,
+                );
+              }
+            });
+          },
         },
         "/authentication": {
           target: process.env.BACKEND_URL || "http://localhost:3001",
           changeOrigin: true,
+          configure: (proxy) => {
+            proxy.on("proxyReq", (proxyReq) => {
+              if (process.env.AUTHORIZATION) {
+                proxyReq.setHeader(
+                  "authorization",
+                  `Bearer ${process.env.AUTHORIZATION}`,
+                );
+              }
+            });
+          },
         },
         "/ai": {
           target: process.env.BACKEND_URL || "http://localhost:3001",
           changeOrigin: true,
+          configure: (proxy) => {
+            proxy.on("proxyReq", (proxyReq) => {
+              if (process.env.AUTHORIZATION) {
+                proxyReq.setHeader(
+                  "authorization",
+                  `Bearer ${process.env.AUTHORIZATION}`,
+                );
+              }
+            });
+          },
         },
         "/openai-openapi.yaml": {
           target: process.env.BACKEND_URL || "http://localhost:3001",
           changeOrigin: true,
+          configure: (proxy) => {
+            proxy.on("proxyReq", (proxyReq) => {
+              if (process.env.AUTHORIZATION) {
+                proxyReq.setHeader(
+                  "authorization",
+                  `Bearer ${process.env.AUTHORIZATION}`,
+                );
+              }
+            });
+          },
         },
       },
     },

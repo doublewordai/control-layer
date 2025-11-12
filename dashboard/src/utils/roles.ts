@@ -5,10 +5,17 @@ export const AVAILABLE_ROLES: Role[] = [
   "PlatformManager",
   "RequestViewer",
   "StandardUser",
+  "BillingManager",
+  "BatchAPIUser",
 ];
 
 // Roles available for editing in user management forms (excludes StandardUser)
-export const EDITABLE_ROLES: Role[] = ["PlatformManager", "RequestViewer"];
+export const EDITABLE_ROLES: Role[] = [
+  "PlatformManager",
+  "RequestViewer",
+  "BillingManager",
+  "BatchAPIUser",
+];
 
 /**
  * Format role for display (PLATFORMMANAGER -> Platform Manager, etc.)
@@ -18,6 +25,8 @@ export const formatRoleForDisplay = (role: Role): string => {
     PlatformManager: "Platform Manager",
     RequestViewer: "Request Viewer",
     StandardUser: "Standard User",
+    BillingManager: "Billing Manager",
+    BatchAPIUser: "Batch API User",
   };
   return displayNames[role] || role;
 };
