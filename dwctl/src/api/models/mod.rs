@@ -1,6 +1,7 @@
 pub mod api_keys;
 pub mod auth;
 pub mod batches;
+pub mod daemons;
 pub mod deployments;
 pub mod files;
 pub mod groups;

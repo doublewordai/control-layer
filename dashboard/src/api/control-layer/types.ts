@@ -876,3 +876,50 @@ export interface FileRequestsListQuery {
   limit?: number;
   skip?: number;
 }
+
+// ===== DAEMON MONITORING TYPES =====
+
+export type DaemonStatus = "initializing" | "running" | "dead";
+
+export interface DaemonStats {
+  requests_processed: number;
+  requests_failed: number;
+  requests_in_flight: number;
+}
+
+export interface DaemonConfig {
+  claim_batch_size: number;
+  default_model_concurrency: number;
+  model_concurrency_limits: Record<string, number>;
+  claim_interval_ms: number;
+  max_retries: number;
+  backoff_ms: number;
+  backoff_factor: number;
+  max_backoff_ms: number;
+  timeout_ms: number;
+  status_log_interval_ms?: number | null;
+  heartbeat_interval_ms: number;
+  claim_timeout_ms: number;
+  processing_timeout_ms: number;
+}
+
+export interface Daemon {
+  id: string;
+  status: DaemonStatus;
+  hostname: string;
+  pid: number;
+  version: string;
+  started_at: number; // Unix timestamp
+  last_heartbeat?: number | null; // Unix timestamp
+  stopped_at?: number | null; // Unix timestamp
+  stats: DaemonStats;
+  config: DaemonConfig;
+}
+
+export interface DaemonsListResponse {
+  daemons: Daemon[];
+}
+
+export interface DaemonsQuery {
+  status?: DaemonStatus;
+}

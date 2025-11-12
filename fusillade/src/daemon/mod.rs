@@ -1,6 +1,6 @@
 //! Daemon for processing batched requests with per-model concurrency control.
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -64,6 +64,9 @@ pub struct DaemonConfig {
     /// Set to None to disable periodic status logging
     pub status_log_interval_ms: Option<u64>,
 
+    /// Interval for sending heartbeats to update daemon status in database (milliseconds)
+    pub heartbeat_interval_ms: u64,
+
     /// Predicate function to determine if a response should be retried.
     /// Defaults to retrying 5xx, 429, and 408 status codes.
     #[serde(skip)]
@@ -90,7 +93,8 @@ impl Default for DaemonConfig {
             backoff_factor: 2,
             max_backoff_ms: 10000,
             timeout_ms: 600000,
-            status_log_interval_ms: Some(2000), // Log every 5 seconds by default
+            status_log_interval_ms: Some(2000), // Log every 2 seconds by default
+            heartbeat_interval_ms: 10000,       // Heartbeat every 10 seconds by default
             should_retry: Arc::new(default_should_retry),
             claim_timeout_ms: 60000,       // 1 minute
             processing_timeout_ms: 600000, // 10 minutes
@@ -113,6 +117,8 @@ where
     config: DaemonConfig,
     semaphores: Arc<RwLock<HashMap<String, Arc<Semaphore>>>>,
     requests_in_flight: Arc<AtomicUsize>,
+    requests_processed: Arc<AtomicU64>,
+    requests_failed: Arc<AtomicU64>,
     shutdown_token: tokio_util::sync::CancellationToken,
 }
 
@@ -135,6 +141,8 @@ where
             config,
             semaphores: Arc::new(RwLock::new(HashMap::new())),
             requests_in_flight: Arc::new(AtomicUsize::new(0)),
+            requests_processed: Arc::new(AtomicU64::new(0)),
+            requests_failed: Arc::new(AtomicU64::new(0)),
             shutdown_token,
         }
     }
@@ -192,21 +200,22 @@ where
         // Spawn periodic heartbeat task
         let storage = self.storage.clone();
         let requests_in_flight = self.requests_in_flight.clone();
+        let requests_processed = self.requests_processed.clone();
+        let requests_failed = self.requests_failed.clone();
         let daemon_id = self.daemon_id;
+        let heartbeat_interval_ms = self.config.heartbeat_interval_ms;
         let shutdown_signal = self.shutdown_token.clone();
 
         let heartbeat_handle = tokio::spawn(async move {
-            let mut interval = tokio::time::interval(Duration::from_secs(10)); // Heartbeat every 10s
+            let mut interval = tokio::time::interval(Duration::from_millis(heartbeat_interval_ms));
             let mut daemon_record = running_record;
-            let total_processed: u64 = 0;
-            let total_failed: u64 = 0;
 
             loop {
                 tokio::select! {
                     _ = interval.tick() => {
                         let stats = DaemonStats {
-                            requests_processed: total_processed,
-                            requests_failed: total_failed,
+                            requests_processed: requests_processed.load(Ordering::Relaxed),
+                            requests_failed: requests_failed.load(Ordering::Relaxed),
                             requests_in_flight: requests_in_flight.load(Ordering::Relaxed),
                         };
 
@@ -349,6 +358,8 @@ where
                             let timeout_ms = self.config.timeout_ms;
                             let retry_config = (&self.config).into();
                             let requests_in_flight = self.requests_in_flight.clone();
+                            let requests_processed = self.requests_processed.clone();
+                            let requests_failed = self.requests_failed.clone();
                             let should_retry = self.config.should_retry.clone();
 
                             // Increment in-flight counter
@@ -377,6 +388,7 @@ where
                                     (should_retry)(response)
                                 }).await? {
                                     Ok(_completed) => {
+                                        requests_processed.fetch_add(1, Ordering::Relaxed);
                                         tracing::info!(request_id = %request_id, "Request completed successfully");
                                     }
                                     Err(failed) => {
@@ -403,6 +415,7 @@ where
                                                     );
                                                 }
                                                 None => {
+                                                    requests_failed.fetch_add(1, Ordering::Relaxed);
                                                     tracing::warn!(
                                                         request_id = %request_id,
                                                         retry_attempt,
@@ -411,6 +424,7 @@ where
                                                 }
                                             }
                                         } else {
+                                            requests_failed.fetch_add(1, Ordering::Relaxed);
                                             tracing::warn!(
                                                 request_id = %request_id,
                                                 error = %failed.state.error,
@@ -486,6 +500,7 @@ mod tests {
             max_backoff_ms: 1000,
             timeout_ms: 5000,
             status_log_interval_ms: None, // Disable status logging in tests
+            heartbeat_interval_ms: 10000, // 10 seconds
             should_retry: Arc::new(default_should_retry),
             claim_timeout_ms: 60000,
             processing_timeout_ms: 600000,
@@ -645,6 +660,7 @@ mod tests {
             max_backoff_ms: 1000,
             timeout_ms: 5000,
             status_log_interval_ms: None,
+            heartbeat_interval_ms: 10000,
             should_retry: Arc::new(default_should_retry),
             claim_timeout_ms: 60000,
             processing_timeout_ms: 600000,
@@ -862,6 +878,7 @@ mod tests {
             max_backoff_ms: 100,
             timeout_ms: 5000,
             status_log_interval_ms: None,
+            heartbeat_interval_ms: 10000,
             should_retry: Arc::new(default_should_retry),
             claim_timeout_ms: 60000,
             processing_timeout_ms: 600000,

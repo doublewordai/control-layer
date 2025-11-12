@@ -56,11 +56,6 @@ const Requests = lazy(() =>
     default: m.Requests,
   })),
 );
-const Settings = lazy(() =>
-  import("./components/features/settings").then((m) => ({
-    default: m.Settings,
-  })),
-);
 const UsersGroups = lazy(() =>
   import("./components/features/users-groups").then((m) => ({
     default: m.UsersGroups,
@@ -74,6 +69,11 @@ const Batches = lazy(() =>
 const FileRequests = lazy(() =>
   import("./components/features/batches/FileRequests").then((m) => ({
     default: m.FileRequests,
+  })),
+);
+const System = lazy(() =>
+  import("./components/features/system").then((m) => ({
+    default: m.System,
   })),
 );
 
@@ -327,18 +327,7 @@ function AppRoutes() {
             </AppLayout>
           }
         />
-        <Route
-          path="/settings"
-          element={
-            <AppLayout>
-              <ProtectedRoute path="/settings">
-                <Suspense fallback={<RouteLoader />}>
-                  <Settings />
-                </Suspense>
-              </ProtectedRoute>
-            </AppLayout>
-          }
-        />
+        <Route path="/settings" element={<Navigate to="/system" replace />} />
         <Route
           path="/profile"
           element={
@@ -373,6 +362,18 @@ function AppRoutes() {
               >
                 <Suspense fallback={<RouteLoader />}>
                   <CostManagement />
+                </Suspense>
+              </ProtectedRoute>
+            </AppLayout>
+          }
+        />
+        <Route
+          path="/system"
+          element={
+            <AppLayout>
+              <ProtectedRoute path="/system">
+                <Suspense fallback={<RouteLoader />}>
+                  <System />
                 </Suspense>
               </ProtectedRoute>
             </AppLayout>
