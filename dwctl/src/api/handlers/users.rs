@@ -1,3 +1,5 @@
+//! HTTP handlers for user management endpoints.
+
 use crate::{
     api::models::{
         groups::GroupResponse,

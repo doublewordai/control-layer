@@ -1,3 +1,5 @@
+//! Cryptographic utilities for API key generation.
+
 use base64::{engine::general_purpose, Engine as _};
 use rand::{thread_rng, Rng};
 

@@ -1,3 +1,5 @@
+//! Base repository trait for database operations.
+
 use std::collections::HashMap;
 
 /// Contains the Repository trait.

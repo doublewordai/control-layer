@@ -1,3 +1,5 @@
+//! Database models for users.
+
 use crate::api::models::users::{Role, UserCreate, UserUpdate};
 use crate::types::UserId;
 use chrono::{DateTime, Utc};
@@ -25,7 +27,7 @@ impl From<UserCreate> for UserCreateDBRequest {
             is_admin: false, // API users cannot create admins
             roles: api.roles,
             auth_source: "proxy-header".to_string(), // Default auth source
-            password_hash: None,                     // No password for vouch users
+            password_hash: None,                     // No password for SSO proxy users
         }
     }
 }

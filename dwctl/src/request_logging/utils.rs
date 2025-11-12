@@ -1,3 +1,5 @@
+//! Request logging utility functions.
+
 use crate::request_logging::models::AiResponse;
 use outlet_postgres::SerializationError;
 use std::io::Read as _;

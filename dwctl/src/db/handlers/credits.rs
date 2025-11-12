@@ -1,3 +1,5 @@
+//! Database repository for credit transactions.
+
 use crate::{
     db::{
         errors::Result,

@@ -1,3 +1,5 @@
+//! HTTP handlers for inference endpoint management.
+
 use crate::{
     api::models::inference_endpoints::{
         InferenceEndpointCreate, InferenceEndpointResponse, InferenceEndpointUpdate, InferenceEndpointValidate,

@@ -1,3 +1,5 @@
+//! API request/response models for API keys.
+
 use crate::db::models::api_keys::{ApiKeyDBResponse, ApiKeyPurpose};
 use crate::types::{ApiKeyId, DeploymentId, UserId};
 use chrono::{DateTime, Utc};

@@ -1,3 +1,5 @@
+//! Model fetching from external sources.
+
 use crate::api::models::inference_endpoints::{AnthropicModelsResponse, OpenAIModelsResponse};
 use crate::db::models::inference_endpoints::InferenceEndpointDBResponse;
 use anyhow::anyhow;

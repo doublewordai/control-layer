@@ -1,3 +1,5 @@
+//! API request/response models for user groups.
+
 use crate::api::models::deployments::DeployedModelResponse;
 use crate::api::models::users::UserResponse;
 use crate::db::models::groups::GroupDBResponse;

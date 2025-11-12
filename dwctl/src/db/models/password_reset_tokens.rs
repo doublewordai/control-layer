@@ -1,3 +1,5 @@
+//! Database models for password reset tokens.
+
 use chrono::{DateTime, Utc};
 use sqlx::FromRow;
 use uuid::Uuid;

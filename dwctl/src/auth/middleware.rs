@@ -1,3 +1,5 @@
+//! Authentication middleware for HTTP requests.
+
 use crate::{
     api::models::users::CurrentUser,
     db::{handlers::api_keys::ApiKeys, models::api_keys::ApiKeyPurpose},

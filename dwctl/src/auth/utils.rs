@@ -1,1 +1,1 @@
-
+//! Authentication utility functions.

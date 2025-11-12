@@ -1,3 +1,5 @@
+//! Database repository for password reset tokens.
+
 use std::collections::HashMap;
 
 use chrono::Utc;

@@ -1,3 +1,5 @@
+//! HTTP handlers for group management endpoints.
+
 use crate::api::models::deployments::DeployedModelResponse;
 use crate::api::models::groups::{GroupCreate, GroupResponse, GroupUpdate, ListGroupsQuery};
 use crate::api::models::users::{CurrentUser, UserResponse};

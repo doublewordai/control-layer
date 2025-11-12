@@ -1,3 +1,5 @@
+//! API request/response models for inference endpoints.
+
 use crate::db::models::inference_endpoints::InferenceEndpointDBResponse;
 use crate::types::{InferenceEndpointId, UserId};
 use chrono::{DateTime, Utc};

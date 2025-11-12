@@ -1,4 +1,4 @@
-//! Metrics recorder that extracts attributes and records GenAI metrics
+//! Prometheus metrics recorder.
 
 use crate::request_logging::serializers::HttpAnalyticsRow;
 

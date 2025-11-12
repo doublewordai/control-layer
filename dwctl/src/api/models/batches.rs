@@ -1,3 +1,5 @@
+//! API request/response models for batch processing.
+
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use utoipa::{IntoParams, ToSchema};

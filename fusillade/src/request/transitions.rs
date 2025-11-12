@@ -1,3 +1,106 @@
+//! State transitions for batch requests using the typestate pattern.
+//!
+//! This module implements state transitions for HTTP batch requests using Rust's
+//! type system to enforce valid state transitions at compile time. Each request
+//! state is represented as a distinct type parameter on `Request<State>`.
+//!
+//! # Typestate Pattern
+//!
+//! The typestate pattern leverages Rust's type system to make invalid states
+//! unrepresentable. A `Request<Pending>` can only call methods available for
+//! pending requests, and transitions return different types:
+//!
+//! ```text
+//! Request<Pending> ──claim()──> Request<Claimed> ──process()──> Request<Processing>
+//!       │                             │                               │
+//!       │                             │                               └──complete()──> Request<Completed>
+//!       │                             │                               └──complete()──> Request<Failed>
+//!       └──cancel()──> Request<Canceled>                              └──cancel()────> Request<Canceled>
+//!                              │
+//!                              └──unclaim()─> Request<Pending>
+//!
+//! Request<Failed> ──retry()──> Request<Pending>  (if retries remain)
+//!                 ──retry()──> None              (if max retries reached)
+//! ```
+//!
+//! # State Lifecycle
+//!
+//! ## 1. Pending → Claimed
+//!
+//! A daemon claims a pending request for processing:
+//! - Records which daemon claimed it
+//! - Sets claimed_at timestamp
+//! - Preserves retry attempt count
+//!
+//! ## 2. Claimed → Processing
+//!
+//! The daemon starts executing the HTTP request:
+//! - Spawns an async task to make the HTTP call
+//! - Creates a channel to receive the result
+//! - Provides an abort handle for cancellation
+//!
+//! ## 3. Processing → Completed or Failed
+//!
+//! The HTTP request completes:
+//! - **Success**: Transitions to `Completed` with response body
+//! - **Failure**: Transitions to `Failed` with error message
+//! - **Retriable**: HTTP succeeded but status code indicates retry (e.g., 429, 500)
+//!
+//! ## 4. Failed → Pending (Retry)
+//!
+//! Failed requests can be retried with exponential backoff:
+//! - Increments retry_attempt counter
+//! - Calculates backoff delay: `backoff_ms * (factor ^ attempt)`
+//! - Sets not_before timestamp to delay retry
+//! - Returns `None` if max retries exceeded
+//!
+//! ## 5. Any State → Canceled
+//!
+//! Requests can be canceled from most states:
+//! - `Pending`: Simply marks as canceled
+//! - `Claimed`: Releases claim and cancels
+//! - `Processing`: Aborts the in-flight HTTP request
+//!
+//! # Retry Configuration
+//!
+//! Exponential backoff is configured via [`RetryConfig`]:
+//!
+//! ```rust
+//! # use fusillade::request::transitions::RetryConfig;
+//! let config = RetryConfig {
+//!     max_retries: 3,           // Retry up to 3 times
+//!     backoff_ms: 1000,         // Start with 1 second
+//!     backoff_factor: 2,        // Double each time (1s, 2s, 4s)
+//!     max_backoff_ms: 60000,    // Cap at 60 seconds
+//! };
+//! ```
+//!
+//! # Example Workflow
+//!
+//! ```ignore
+//! // Daemon claims a pending request
+//! let pending: Request<Pending> = storage.next_pending().await?;
+//! let claimed = pending.claim(daemon_id, &storage).await?;
+//!
+//! // Start processing
+//! let processing = claimed.process(http_client, timeout_ms, &storage).await?;
+//!
+//! // Wait for completion
+//! let result = processing.complete(&storage, |resp| resp.status >= 500).await?;
+//!
+//! match result {
+//!     Ok(completed) => println!("Success: {}", completed.state.response_status),
+//!     Err(failed) => {
+//!         // Attempt retry with backoff
+//!         if let Some(retrying) = failed.retry(retry_attempt, config, &storage).await? {
+//!             println!("Retrying request...");
+//!         } else {
+//!             println!("Max retries exceeded");
+//!         }
+//!     }
+//! }
+//! ```
+
 use std::sync::Arc;
 
 use tokio::sync::Mutex;

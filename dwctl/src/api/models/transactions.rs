@@ -1,3 +1,5 @@
+//! API request/response models for credit transactions.
+
 use crate::{
     db::models::credits::{CreditTransactionDBResponse, CreditTransactionType},
     types::UserId,
