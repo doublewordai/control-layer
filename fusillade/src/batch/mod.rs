@@ -361,6 +361,16 @@ pub struct Batch {
     pub cancelling_at: Option<DateTime<Utc>>,
     /// Batch-level errors (validation errors, system errors, etc.)
     pub errors: Option<serde_json::Value>,
+
+    /// Status fields
+    pub total_requests: i64,
+    pub pending_requests: i64,
+    pub in_progress_requests: i64,
+    pub completed_requests: i64,
+    pub failed_requests: i64,
+    pub canceled_requests: i64,
+    pub requests_started_at: Option<DateTime<Utc>>,
+    pub requests_last_updated_at: Option<DateTime<Utc>>,
 }
 
 /// Status information for a batch, computed from its executions.
