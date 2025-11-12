@@ -13,7 +13,11 @@ import {
 } from "lucide-react";
 import { Button } from "../../../ui/button";
 import { Tooltip, TooltipContent, TooltipTrigger } from "../../../ui/tooltip";
-import { formatTimestamp, formatLongDuration } from "../../../../utils";
+import {
+  formatTimestamp,
+  formatLongDuration,
+  formatNumber,
+} from "../../../../utils";
 import type { Batch, BatchStatus } from "../types";
 
 interface ColumnActions {
@@ -260,12 +264,12 @@ export const createBatchColumns = (
                 >
                   <FileCheck className="h-5 w-5" />
                   <span className="absolute top-[5%] left-[55%] text-gray-600 group-hover/output:text-gray-900 text-[8px] font-bold leading-none border border-gray-400 group-hover/output:border-gray-900 rounded-full min-w-[12px] h-3 flex items-center justify-center bg-white px-0.5 transition-colors">
-                    {outputCount}
+                    {formatNumber(outputCount)}
                   </span>
                 </Button>
               </TooltipTrigger>
               <TooltipContent>
-                View output file ({outputCount} requests)
+                View output file ({formatNumber(outputCount)} requests)
               </TooltipContent>
             </Tooltip>
           ) : (
@@ -285,12 +289,12 @@ export const createBatchColumns = (
                 >
                   <AlertCircle className="h-5 w-5" />
                   <span className="absolute top-[5%] left-[55%] text-gray-600 group-hover/error:text-red-600 text-[8px] font-bold leading-none border border-gray-400 group-hover/error:border-red-600 rounded-full min-w-[12px] h-3 flex items-center justify-center bg-white px-0.5 transition-colors">
-                    {errorCount}
+                    {formatNumber(errorCount)}
                   </span>
                 </Button>
               </TooltipTrigger>
               <TooltipContent>
-                View error file ({errorCount} requests)
+                View error file ({formatNumber(errorCount)} requests)
               </TooltipContent>
             </Tooltip>
           ) : (

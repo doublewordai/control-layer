@@ -12,7 +12,8 @@ export type PagePermission =
   | "api-keys"
   | "settings"
   | "profile"
-  | "manage-groups";
+  | "manage-groups"
+  | "batches";
 
 // Define which roles can access which pages
 const ROLE_PERMISSIONS: Record<Role, PagePermission[]> = {
@@ -27,6 +28,7 @@ const ROLE_PERMISSIONS: Record<Role, PagePermission[]> = {
     "settings",
     "profile",
     "manage-groups",
+    "batches",
   ],
   StandardUser: [
     "models",
@@ -43,6 +45,15 @@ const ROLE_PERMISSIONS: Record<Role, PagePermission[]> = {
     "profile",
     "settings",
   ],
+  BillingManager: ["models", "cost-management", "profile"],
+  BatchAPIUser: [
+    "models",
+    "api-keys",
+    "playground",
+    "cost-management",
+    "profile",
+    "batches",
+  ],
 };
 
 // Map route paths to permissions
@@ -56,6 +67,7 @@ export const ROUTE_PERMISSIONS: Record<string, PagePermission> = {
   "/api-keys": "api-keys",
   "/settings": "settings",
   "/profile": "profile",
+  "/batches": "batches",
 };
 
 /**

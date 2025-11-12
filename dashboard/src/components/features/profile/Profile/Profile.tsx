@@ -62,6 +62,10 @@ export const Profile: React.FC = () => {
         "Platform Managers can control access to models, create new users, change permissions for existing users, manage inference endpoints, and configure system settings.",
       RequestViewer:
         "Request Viewers can view a full log of all requests that have transited the gateway.",
+      BillingManager:
+        "Billing Managers can view and manage cost information and user credit balances.",
+      BatchAPIUser:
+        "Batch API Users can upload, view, and delete their own files for use with the Batch API.",
     };
     return descriptions[role];
   };
@@ -521,48 +525,64 @@ export const Profile: React.FC = () => {
                       </HoverCard>
                     </div>
                     <div className="space-y-2 border border-gray-300 rounded-lg p-3">
-                      {AVAILABLE_ROLES.map((role) => (
-                        <label key={role} className="flex items-center">
-                          <input
-                            type="checkbox"
-                            value={role}
-                            checked={
-                              role === "StandardUser" || roles.includes(role)
-                            }
-                            onChange={() =>
-                              role !== "StandardUser" && handleRoleChange(role)
-                            }
-                            disabled={role === "StandardUser"}
-                            className={`border-gray-300 text-doubleword-primary focus:ring-doubleword-primary rounded ${
-                              role === "StandardUser"
-                                ? "opacity-50 cursor-not-allowed"
-                                : ""
-                            }`}
-                          />
-                          <div className="ml-2 text-sm flex-1 flex items-center gap-1">
-                            <span
-                              className={
-                                role === "StandardUser"
-                                  ? "text-gray-500"
-                                  : "text-gray-700"
+                      {AVAILABLE_ROLES.map((role) => {
+                        const isPlatformManagerSelected =
+                          roles.includes("PlatformManager");
+                        const isSubsetRole =
+                          role === "BatchAPIUser" || role === "BillingManager";
+                        const isDisabled =
+                          role === "StandardUser" ||
+                          (isPlatformManagerSelected && isSubsetRole);
+
+                        return (
+                          <label key={role} className="flex items-center">
+                            <input
+                              type="checkbox"
+                              value={role}
+                              checked={
+                                role === "StandardUser" ||
+                                roles.includes(role) ||
+                                (isPlatformManagerSelected && isSubsetRole)
                               }
-                            >
-                              {getRoleDisplayName(role)}
-                              {role === "StandardUser" && " (always enabled)"}
-                            </span>
-                            <HoverCard openDelay={150} closeDelay={200}>
-                              <HoverCardTrigger asChild>
-                                <Info className="w-3 h-3 text-gray-400 cursor-pointer" />
-                              </HoverCardTrigger>
-                              <HoverCardContent side="top" align="end">
-                                <p className="text-sm">
-                                  {getRoleDescription(role)}
-                                </p>
-                              </HoverCardContent>
-                            </HoverCard>
-                          </div>
-                        </label>
-                      ))}
+                              onChange={() =>
+                                role !== "StandardUser" &&
+                                handleRoleChange(role)
+                              }
+                              disabled={isDisabled}
+                              className={`border-gray-300 text-doubleword-primary focus:ring-doubleword-primary rounded ${
+                                isDisabled
+                                  ? "opacity-50 cursor-not-allowed"
+                                  : ""
+                              }`}
+                            />
+                            <div className="ml-2 text-sm flex-1 flex items-center gap-1">
+                              <span
+                                className={
+                                  isDisabled ? "text-gray-500" : "text-gray-700"
+                                }
+                              >
+                                {getRoleDisplayName(role)}
+                                {role === "StandardUser" && " (always enabled)"}
+                                {isPlatformManagerSelected && isSubsetRole && (
+                                  <span className="text-gray-400 text-xs ml-1">
+                                    (included in Platform Manager)
+                                  </span>
+                                )}
+                              </span>
+                              <HoverCard openDelay={150} closeDelay={200}>
+                                <HoverCardTrigger asChild>
+                                  <Info className="w-3 h-3 text-gray-400 cursor-pointer" />
+                                </HoverCardTrigger>
+                                <HoverCardContent side="top" align="end">
+                                  <p className="text-sm">
+                                    {getRoleDescription(role)}
+                                  </p>
+                                </HoverCardContent>
+                              </HoverCard>
+                            </div>
+                          </label>
+                        );
+                      })}
                     </div>
                     <p className="text-xs text-gray-500 mt-1"></p>
                   </div>
