@@ -4061,7 +4061,12 @@ mod tests {
                 .collect();
 
             // Should have 2 requests per model
-            assert_eq!(model_requests.len(), 2, "Should have 2 requests for {}", model);
+            assert_eq!(
+                model_requests.len(),
+                2,
+                "Should have 2 requests for {}",
+                model
+            );
 
             // First should be n=1, second should be n=2
             assert!(
