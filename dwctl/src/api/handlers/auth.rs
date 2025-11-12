@@ -1,3 +1,5 @@
+//! HTTP handlers for authentication endpoints.
+
 use axum::{
     extract::{Path, State},
     Json,

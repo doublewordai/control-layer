@@ -1,3 +1,5 @@
+//! Database repository for users.
+
 use crate::types::{abbrev_uuid, UserId};
 use crate::{
     api::models::users::Role,

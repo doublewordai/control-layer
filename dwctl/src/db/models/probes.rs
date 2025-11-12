@@ -1,3 +1,5 @@
+//! Database models for health probes.
+
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use sqlx::FromRow;

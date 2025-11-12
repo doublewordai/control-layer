@@ -1,3 +1,5 @@
+//! API request/response models for file management.
+
 use serde::{Deserialize, Serialize};
 use utoipa::{IntoParams, ToSchema};
 

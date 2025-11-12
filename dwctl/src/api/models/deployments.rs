@@ -1,3 +1,5 @@
+//! API request/response models for model deployments.
+
 use crate::api::models::groups::GroupResponse;
 use crate::db::models::deployments::{
     DeploymentDBResponse, ModelType, ProviderPricing, ProviderPricingUpdate, TokenPricing, TokenPricingUpdate,

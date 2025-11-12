@@ -1,3 +1,5 @@
+//! HTTP handlers for health probe endpoints.
+
 use crate::api::models::probes::{
     CreateProbe, ProbeStatistics, ProbesQuery, ResultsQuery, StatsQuery, TestProbeRequest, UpdateProbeRequest,
 };

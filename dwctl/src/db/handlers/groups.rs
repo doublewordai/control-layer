@@ -1,3 +1,5 @@
+//! Database repository for groups and memberships.
+
 use crate::db::{
     errors::{DbError, Result},
     handlers::repository::Repository,

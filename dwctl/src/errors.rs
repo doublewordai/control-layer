@@ -1,3 +1,66 @@
+//! Error types and HTTP response conversion.
+//!
+//! This module defines the application's error hierarchy and implements conversion
+//! to HTTP responses with appropriate status codes and JSON payloads.
+//!
+//! # Error Hierarchy
+//!
+//! The main [`Error`] enum covers all application error cases:
+//!
+//! - **Authentication Errors**: `Unauthenticated` (401)
+//! - **Authorization Errors**: `InsufficientPermissions` (403)
+//! - **Validation Errors**: `BadRequest` (400)
+//! - **Not Found Errors**: `NotFound` (404)
+//! - **Conflict Errors**: `Conflict` (409) for unique constraint violations
+//! - **Database Errors**: Wraps [`DbError`] with appropriate status codes
+//! - **Internal Errors**: Generic server errors (500)
+//!
+//! # HTTP Response Conversion
+//!
+//! All errors implement [`IntoResponse`] for automatic conversion to HTTP responses
+//! with JSON bodies:
+//!
+//! ```json
+//! {
+//!   "error": "Not Found",
+//!   "message": "User with ID abc123 not found"
+//! }
+//! ```
+//!
+//! # Usage in Handlers
+//!
+//! Handlers can return `Result<T, Error>` and errors will automatically convert
+//! to appropriate HTTP responses:
+//!
+//! ```ignore
+//! use dwctl::errors::Error;
+//!
+//! async fn handler() -> Result<String, Error> {
+//!     Err(Error::BadRequest {
+//!         message: "Invalid input".to_string()
+//!     })
+//! }
+//! ```
+//!
+//! # Error Construction Helpers
+//!
+//! The module provides convenience methods for common error types:
+//!
+//! ```ignore
+//! // Not found error
+//! return Err(Error::NotFound {
+//!     resource: "User".to_string(),
+//!     id: user_id.to_string(),
+//! });
+//!
+//! // Permission error
+//! return Err(Error::InsufficientPermissions {
+//!     required: Permission::Admin,
+//!     action: Operation::Delete,
+//!     resource: "deployment".to_string(),
+//! });
+//! ```
+
 use crate::db::errors::DbError;
 use crate::types::{Operation, Permission};
 use axum::{

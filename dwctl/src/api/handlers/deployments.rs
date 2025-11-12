@@ -1,3 +1,5 @@
+//! HTTP handlers for model deployment endpoints.
+
 use crate::{
     api::models::{
         deployments::{DeployedModelCreate, DeployedModelResponse, DeployedModelUpdate, GetModelQuery, ListModelsQuery, ModelProbeStatus},

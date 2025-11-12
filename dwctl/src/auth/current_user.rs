@@ -1,3 +1,5 @@
+//! User extraction from request authentication.
+
 use crate::db::errors::DbError;
 use crate::db::handlers::Groups;
 use crate::{

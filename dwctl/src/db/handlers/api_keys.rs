@@ -1,3 +1,5 @@
+//! Database repository for API keys.
+
 use std::collections::HashMap;
 
 use crate::crypto::generate_api_key;

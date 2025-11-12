@@ -1,3 +1,5 @@
+//! Credit balance metrics for Prometheus.
+
 use once_cell::sync::Lazy;
 use prometheus::{register_int_counter, register_int_counter_vec, IntCounter, IntCounterVec};
 

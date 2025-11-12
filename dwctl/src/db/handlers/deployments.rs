@@ -1,3 +1,5 @@
+//! Database repository for model deployments.
+
 use crate::db::{
     errors::{DbError, Result},
     handlers::repository::Repository,

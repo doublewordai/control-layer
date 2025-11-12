@@ -1,6 +1,4 @@
-//! Analytics data aggregation for HTTP requests
-//!
-//! Provides functions for generating analytics reports from logged HTTP requests.
+//! Database queries for request analytics and aggregation.
 
 use chrono::{DateTime, Duration, Timelike, Utc};
 use sqlx::{FromRow, PgPool};

@@ -1,3 +1,5 @@
+//! Email service for sending password reset emails and notifications.
+
 use lettre::{
     message::{header::ContentType, Mailbox},
     transport::smtp::authentication::Credentials,

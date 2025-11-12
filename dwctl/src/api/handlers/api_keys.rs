@@ -1,3 +1,5 @@
+//! HTTP handlers for API key management endpoints.
+
 use crate::api::models::api_keys::ListApiKeysQuery;
 use crate::{
     api::models::{

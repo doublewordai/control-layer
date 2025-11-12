@@ -1,3 +1,69 @@
+//! Application configuration management.
+//!
+//! Configuration is loaded from a YAML file with environment variable overrides. The configuration
+//! file path defaults to `config.yaml` but can be specified via `-f` flag or `DWCTL_CONFIG`
+//! environment variable.
+//!
+//! ## Loading Priority
+//!
+//! Configuration sources are merged in the following order (later sources override earlier ones):
+//!
+//! 1. **YAML config file** - Base configuration (default: `config.yaml`)
+//! 2. **Environment variables** - Variables prefixed with `DWCTL_` override YAML values
+//! 3. **DATABASE_URL** - Special case: overrides `database.url` if set
+//!
+//! For nested config values, use double underscores in environment variables. For example,
+//! `DWCTL_DATABASE__TYPE=external` sets the `database.type` field.
+//!
+//! ## Usage
+//!
+//! ```no_run
+//! use clap::Parser;
+//! use dwctl::config::{Args, Config};
+//!
+//! # fn main() -> Result<(), Box<dyn std::error::Error>> {
+//! // Parse CLI arguments
+//! let args = Args::parse();
+//!
+//! // Load configuration from file and environment
+//! let config = Config::load(&args)?;
+//!
+//! println!("Server will bind to {}:{}", config.host, config.port);
+//! # Ok(())
+//! # }
+//! ```
+//!
+//! ## Configuration Structure
+//!
+//! The configuration file is structured in YAML format. See the repository's `config.yaml` for a
+//! complete example with all available options. Key sections include:
+//!
+//! - **Server**: `host`, `port` - HTTP server binding configuration
+//! - **Database**: `database.type`, `database.url` - PostgreSQL connection settings
+//! - **Admin User**: `admin_email`, `admin_password` - Initial admin user created on first startup
+//! - **Authentication**: `auth.native`, `auth.proxy_header` - Authentication method configuration
+//! - **Security**: `secret_key`, `auth.security.cors` - Security and CORS settings
+//! - **Credits**: `credits.initial_credits_for_standard_users` - Credit system configuration
+//! - **Features**: `enable_metrics`, `enable_request_logging` - Optional feature toggles
+//! - **Batches**: `batches.enabled`, `batches.daemon` - Batch API configuration
+//!
+//! ## Environment Variable Examples
+//!
+//! ```bash
+//! # Override server port
+//! DWCTL_PORT=8080
+//!
+//! # Set database connection (preferred method)
+//! DATABASE_URL="postgresql://user:pass@localhost/dwctl"
+//!
+//! # Or use DWCTL_DATABASE__URL
+//! DWCTL_DATABASE__URL="postgresql://user:pass@localhost/dwctl"
+//!
+//! # Override nested values
+//! DWCTL_AUTH__NATIVE__ENABLED=false
+//! DWCTL_ENABLE_METRICS=true
+//! ```
+
 use clap::Parser;
 use figment::{
     providers::{Env, Format, Yaml},
@@ -25,40 +91,52 @@ pub struct Args {
     pub config: String,
 }
 
+/// Main application configuration.
+///
+/// This is the root configuration structure loaded from YAML and environment variables.
+/// All fields have sensible defaults defined in the `Default` implementation.
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(default)]
 pub struct Config {
+    /// HTTP server host to bind to (e.g., "0.0.0.0" for all interfaces)
     pub host: String,
+    /// HTTP server port to bind to
     pub port: u16,
     /// Deprecated: Use `database` field instead. Kept for backward compatibility.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub database_url: Option<String>,
-    /// Database configuration - either embedded or external
+    /// Database configuration - either embedded or external PostgreSQL
     pub database: DatabaseConfig,
+    /// Email address for the initial admin user (created on first startup)
     pub admin_email: String,
+    /// Password for the initial admin user (optional, can be set via environment)
     pub admin_password: Option<String>,
-    // Global secret key for encryption/signing
+    /// Secret key for JWT signing and encryption (required for production)
     pub secret_key: Option<String>,
-    // Model sources are now properly plural
+    /// Model sources for syncing available models
     pub model_sources: Vec<ModelSource>,
-    // Frontend metadata
+    /// Frontend metadata displayed in the UI
     pub metadata: Metadata,
-    // Authentication configuration
+    /// Authentication configuration for various auth methods
     pub auth: AuthConfig,
-    // Batches API configuration
+    /// Batch API configuration
     pub batches: BatchConfig,
-    // Leader election configuration
+    /// Leader election configuration for multi-instance deployments
     pub leader_election: LeaderElectionConfig,
-    // Metrics configuration
+    /// Enable Prometheus metrics endpoint at `/internal/metrics`
     pub enable_metrics: bool,
-    // Request logging configuration
+    /// Enable request/response logging to PostgreSQL
     pub enable_request_logging: bool,
-    // OpenTelemetry OTLP export configuration
+    /// Enable OpenTelemetry OTLP export for distributed tracing
     pub enable_otel_export: bool,
-    // Initial credits configuration
+    /// Credit system configuration
     pub credits: CreditsConfig,
 }
 
+/// Database configuration.
+///
+/// Supports either an embedded PostgreSQL instance (for development) or an external
+/// PostgreSQL database (recommended for production).
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(tag = "type", rename_all = "lowercase")]
 pub enum DatabaseConfig {
@@ -129,114 +207,175 @@ impl DatabaseConfig {
     }
 }
 
+/// Frontend metadata displayed in the UI.
+///
+/// These values are exposed to the frontend and shown in the user interface.
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(default)]
 pub struct Metadata {
+    /// Region name displayed in the UI (e.g., "UK South", "US East")
     pub region: String,
+    /// Organization name displayed in the UI
     pub organization: String,
+    /// Whether user registration is enabled (shown in frontend)
     pub registration_enabled: bool,
 }
 
+/// External model source configuration.
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct ModelSource {
+    /// Name identifier for this model source
     pub name: String,
+    /// Base URL of the model source API
     pub url: Url,
+    /// Optional API key for authenticating with the model source
     pub api_key: Option<String>,
     #[serde(default = "ModelSource::default_sync_interval")]
     #[serde(with = "humantime_serde")]
     pub sync_interval: Duration,
 }
 
+/// Authentication configuration for all supported auth methods.
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(default)]
 #[derive(Default)]
 pub struct AuthConfig {
+    /// Native username/password authentication
     pub native: NativeAuthConfig,
+    /// Proxy header-based authentication (for SSO integration)
     pub proxy_header: ProxyHeaderAuthConfig,
+    /// Security settings (JWT, CORS, etc.)
     pub security: SecurityConfig,
 }
 
+/// Native username/password authentication configuration.
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(default)]
 pub struct NativeAuthConfig {
+    /// Enable native authentication (login/registration)
     pub enabled: bool,
+    /// Allow new users to self-register
     pub allow_registration: bool,
+    /// Password validation rules
     pub password: PasswordConfig,
+    /// Session cookie configuration
     pub session: SessionConfig,
+    /// Email configuration for password resets
     pub email: EmailConfig,
 }
 
+/// Proxy header-based authentication configuration.
+///
+/// This authentication method reads user identity from HTTP headers set by an upstream
+/// proxy (e.g., SSO proxy). Enables integration with external authentication systems.
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(default)]
 pub struct ProxyHeaderAuthConfig {
+    /// Enable proxy header authentication
     pub enabled: bool,
+    /// HTTP header name containing user email/identity
     pub header_name: String,
+    /// HTTP header name containing user groups (comma-separated)
     pub groups_field_name: String,
+    /// Automatically create users if they don't exist
     pub auto_create_users: bool,
+    /// SSO groups to exclude from import
     pub blacklisted_sso_groups: Vec<String>,
+    /// HTTP header name containing SSO provider name
     pub provider_field_name: String,
+    /// Import and sync user groups from SSO provider
     pub import_idp_groups: bool,
 }
 
+/// Session cookie configuration.
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(default)]
 pub struct SessionConfig {
+    /// Session timeout duration
     #[serde(with = "humantime_serde")]
     pub timeout: Duration,
+    /// Cookie name for session token
     pub cookie_name: String,
+    /// Set Secure flag on cookies (HTTPS only)
     pub cookie_secure: bool,
+    /// SameSite cookie attribute ("strict", "lax", or "none")
     pub cookie_same_site: String,
 }
 
+/// Password validation rules.
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(default)]
 pub struct PasswordConfig {
+    /// Minimum password length
     pub min_length: usize,
+    /// Maximum password length
     pub max_length: usize,
 }
 
+/// Security configuration for JWT and CORS.
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(default)]
 pub struct SecurityConfig {
+    /// JWT token expiry duration
     #[serde(with = "humantime_serde")]
     pub jwt_expiry: Duration,
+    /// CORS configuration for browser clients
     pub cors: CorsConfig,
 }
 
+/// CORS (Cross-Origin Resource Sharing) configuration.
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(default)]
 pub struct CorsConfig {
+    /// Allowed origins for CORS requests
     pub allowed_origins: Vec<CorsOrigin>,
+    /// Allow credentials (cookies) in CORS requests
     pub allow_credentials: bool,
-    pub max_age: Option<u64>, // Cache preflight requests (seconds)
+    /// Cache preflight requests for this many seconds
+    pub max_age: Option<u64>,
 }
 
+/// Email configuration for password resets and notifications.
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(default)]
 pub struct EmailConfig {
+    /// SMTP server configuration (required for email functionality)
     pub smtp: Option<SmtpConfig>,
+    /// Sender email address
     pub from_email: String,
+    /// Sender display name
     pub from_name: String,
+    /// Password reset email configuration
     pub password_reset: PasswordResetEmailConfig,
 }
 
+/// SMTP server configuration for sending emails.
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct SmtpConfig {
+    /// SMTP server hostname
     pub host: String,
+    /// SMTP server port
     pub port: u16,
+    /// SMTP authentication username
     pub username: String,
+    /// SMTP authentication password
     pub password: String,
+    /// Use TLS encryption
     pub use_tls: bool,
 }
 
+/// Password reset email configuration.
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(default)]
 pub struct PasswordResetEmailConfig {
+    /// How long reset tokens are valid
     #[serde(with = "humantime_serde")]
     pub token_expiry: Duration,
+    /// Base URL for reset links (e.g., <https://app.example.com>)
     pub base_url: String,
 }
 
+/// File upload/download configuration for batch processing.
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(default)]
 pub struct FilesConfig {
@@ -267,6 +406,10 @@ impl Default for FilesConfig {
     }
 }
 
+/// Batch API configuration.
+///
+/// The batch API provides OpenAI-compatible batch processing endpoints for asynchronous
+/// request processing.
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(default)]
 #[derive(Default)]
@@ -279,6 +422,9 @@ pub struct BatchConfig {
     pub files: FilesConfig,
 }
 
+/// Batch processing daemon configuration.
+///
+/// The daemon processes batch requests asynchronously in the background.
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(default)]
 pub struct DaemonConfig {
@@ -364,14 +510,22 @@ impl DaemonConfig {
     }
 }
 
+/// Controls when the batch processing daemon runs.
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
 pub enum DaemonEnabled {
+    /// Always run the daemon on this instance
     Always,
+    /// Never run the daemon on this instance
     Never,
+    /// Only run the daemon if this instance is elected leader
     Leader,
 }
 
+/// Leader election configuration for multi-instance deployments.
+///
+/// Leader election uses PostgreSQL advisory locks to elect a single leader instance that
+/// runs background services like health probes and batch processing.
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(default)]
 pub struct LeaderElectionConfig {
@@ -386,11 +540,16 @@ impl Default for LeaderElectionConfig {
     }
 }
 
+/// CORS origin specification.
+///
+/// Can be either a wildcard (`*`) to allow all origins, or a specific URL.
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(untagged)]
 pub enum CorsOrigin {
+    /// Allow all origins (`*`)
     #[serde(deserialize_with = "parse_wildcard")]
     Wildcard,
+    /// Specific origin URL (e.g., `https://app.example.com`)
     #[serde(deserialize_with = "parse_url")]
     Url(Url),
 }
@@ -417,8 +576,11 @@ where
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(default)]
+/// Credit system configuration.
+///
+/// Controls how credits are allocated to users for tracking AI usage.
 pub struct CreditsConfig {
-    /// Initial credits given to standard users when they are created
+    /// Initial credits given to standard users when they are created (default: 0)
     pub initial_credits_for_standard_users: rust_decimal::Decimal,
 }
 

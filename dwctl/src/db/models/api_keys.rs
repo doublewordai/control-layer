@@ -1,3 +1,5 @@
+//! Database models for API keys.
+
 use crate::api::models::api_keys::ApiKeyCreate;
 use crate::types::{ApiKeyId, DeploymentId, UserId};
 use chrono::{DateTime, Utc};

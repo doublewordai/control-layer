@@ -1,3 +1,5 @@
+//! HTTP handlers for static asset serving.
+
 use axum::{
     body::Body,
     http::{Response, StatusCode, Uri},

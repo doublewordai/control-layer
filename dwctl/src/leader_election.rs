@@ -1,3 +1,5 @@
+//! Leader election using PostgreSQL advisory locks for multi-instance deployments.
+
 use crate::config;
 use sqlx::PgPool;
 use std::sync::atomic::{AtomicBool, Ordering};

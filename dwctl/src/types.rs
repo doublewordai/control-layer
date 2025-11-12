@@ -1,3 +1,47 @@
+//! Common type definitions and permission system types.
+//!
+//! This module defines:
+//! - Type aliases for entity IDs (UserId, GroupId, etc.)
+//! - Permission and authorization types
+//! - Resource and operation enums for access control
+//!
+//! # ID Types
+//!
+//! All entity IDs are UUIDs wrapped in type aliases for better type safety:
+//!
+//! - [`UserId`]: User account identifier
+//! - [`ApiKeyId`]: API key identifier
+//! - [`DeploymentId`]: Model deployment identifier
+//! - [`GroupId`]: Group identifier
+//! - [`InferenceEndpointId`]: Backend endpoint identifier
+//!
+//! # Permission System
+//!
+//! The permission system is based on three core types:
+//!
+//! - [`Resource`]: What entity type is being accessed (Users, Groups, Models, etc.)
+//! - [`Operation`]: What action is being performed (Read, Create, Update, Delete)
+//! - [`Permission`]: Authorization requirement combining resource and operation
+//!
+//! ## Operations
+//!
+//! Operations come in two flavors:
+//! - **All**: Unrestricted access to all entities (e.g., `ReadAll`, `DeleteAll`)
+//! - **Own**: Restricted to user's own entities (e.g., `ReadOwn`, `UpdateOwn`)
+//!
+//! ## Example Permission Check
+//!
+//! ```ignore
+//! use dwctl::types::{Permission, Resource, Operation};
+//!
+//! let required = Permission::Allow(Resource::Users, Operation::ReadAll);
+//! // Check if user has this permission...
+//! ```
+//!
+//! # Utility Functions
+//!
+//! - [`abbrev_uuid`]: Abbreviate UUIDs to first 8 chars for logging
+
 use serde::Deserialize;
 use std::fmt;
 use uuid::Uuid;

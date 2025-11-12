@@ -1,3 +1,7 @@
+//! API request and response data models.
+//!
+//! This module contains the data structures used for HTTP request deserialization
+//! and response serialization. These models define the public API contract.
 pub mod api_keys;
 pub mod auth;
 pub mod batches;

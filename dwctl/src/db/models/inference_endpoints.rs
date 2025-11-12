@@ -1,3 +1,5 @@
+//! Database models for inference endpoints.
+
 use crate::types::{InferenceEndpointId, UserId};
 use chrono::{DateTime, Utc};
 use url::Url;
