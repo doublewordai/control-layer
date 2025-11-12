@@ -40,7 +40,7 @@ export default defineConfig(({ mode }) => {
               if (process.env.AUTHORIZATION) {
                 proxyReq.setHeader(
                   "authorization",
-                  `Bearer ${process.env.AUTHORIZATION}`
+                  `Bearer ${process.env.AUTHORIZATION}`,
                 );
               }
             });
@@ -54,7 +54,7 @@ export default defineConfig(({ mode }) => {
               if (process.env.AUTHORIZATION) {
                 proxyReq.setHeader(
                   "authorization",
-                  `Bearer ${process.env.AUTHORIZATION}`
+                  `Bearer ${process.env.AUTHORIZATION}`,
                 );
               }
             });
@@ -68,7 +68,7 @@ export default defineConfig(({ mode }) => {
               if (process.env.AUTHORIZATION) {
                 proxyReq.setHeader(
                   "authorization",
-                  `Bearer ${process.env.AUTHORIZATION}`
+                  `Bearer ${process.env.AUTHORIZATION}`,
                 );
               }
             });
@@ -82,7 +82,7 @@ export default defineConfig(({ mode }) => {
               if (process.env.AUTHORIZATION) {
                 proxyReq.setHeader(
                   "authorization",
-                  `Bearer ${process.env.AUTHORIZATION}`
+                  `Bearer ${process.env.AUTHORIZATION}`,
                 );
               }
             });

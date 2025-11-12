@@ -113,18 +113,6 @@ export const Sparkline: React.FC<SparklineProps> = ({
     ? `M 0 ${pathPoints[0]?.y || height - marginBottom} L ${width} ${pathPoints[0]?.y || height - marginBottom}`
     : createSteppedPath(pathPoints, false);
 
-  // Debug logging for zero case
-  if (allZero) {
-    console.log("All zero sparkline:", {
-      values,
-      pathPoints: pathPoints.map((p) => ({ x: p.x, y: p.y })),
-      linePath,
-      width,
-      height,
-      marginBottom,
-    });
-  }
-
   // Get start time
   const startTime = new Date(data[0].timestamp);
   const formatTime = (date: Date) =>
