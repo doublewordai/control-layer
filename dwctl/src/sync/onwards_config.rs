@@ -1,3 +1,5 @@
+//! Configuration synchronization to onwards routing layer.
+
 use std::{collections::HashMap, num::NonZeroU32};
 
 use onwards::target::{Auth, ConfigFile, KeyDefinition, RateLimitParameters, TargetSpec, Targets, WatchTargetsStream};

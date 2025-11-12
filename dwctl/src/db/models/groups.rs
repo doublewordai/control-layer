@@ -1,3 +1,5 @@
+//! Database models for groups.
+
 use crate::api::models::groups::{GroupCreate, GroupUpdate};
 use crate::types::{GroupId, UserId};
 use chrono::{DateTime, Utc};

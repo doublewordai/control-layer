@@ -1,3 +1,5 @@
+//! API request/response models for users.
+
 use crate::api::models::groups::GroupResponse;
 use crate::db::models::users::UserDBResponse;
 use crate::types::UserId;

@@ -1,3 +1,5 @@
+//! Authorization and permission checking.
+
 use crate::{
     api::models::users::{CurrentUser, Role},
     errors::Error,

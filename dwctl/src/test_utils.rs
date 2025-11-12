@@ -1,3 +1,5 @@
+//! Test utilities for integration testing (available with `test-utils` feature).
+
 use crate::config::{BatchConfig, FilesConfig, NativeAuthConfig, ProxyHeaderAuthConfig, SecurityConfig};
 use crate::db::handlers::inference_endpoints::{InferenceEndpointFilter, InferenceEndpoints};
 use crate::db::handlers::repository::Repository;

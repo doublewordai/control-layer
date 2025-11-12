@@ -1,3 +1,5 @@
+//! Inference endpoint health synchronization.
+
 use crate::api::models::inference_endpoints::OpenAIModel;
 use crate::db::handlers::deployments::DeploymentFilter;
 use crate::db::handlers::repository::Repository;

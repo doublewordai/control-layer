@@ -1,3 +1,5 @@
+//! API request/response models for authentication.
+
 use serde::{Deserialize, Serialize};
 use utoipa::ToSchema;
 

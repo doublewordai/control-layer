@@ -1,11 +1,6 @@
 //! HTTP request handlers for all API endpoints.
 //!
 //! This module contains Axum route handlers organized by resource type.
-//! Each handler is responsible for:
-//! - Request validation and deserialization
-//! - Authentication and authorization checks
-//! - Business logic execution via database repositories
-//! - Response serialization
 //!
 //! # Handler Modules
 //!
@@ -25,14 +20,15 @@
 //!
 //! # Authentication
 //!
-//! Most handlers require authentication via session cookies or API keys.
-//! The [`crate::auth::middleware`] module provides authentication extractors
-//! that handlers can use to access the current user.
+//! Most handlers require authentication via session cookies, API keys or trusted headers. The
+//! [`crate::auth`] module provides authentication utilities that handlers can use to access the
+//! current user.
 //!
 //! # Error Handling
 //!
-//! Handlers return [`crate::errors::AppError`] which automatically converts to
-//! appropriate HTTP status codes and JSON error responses.
+//! Handlers return [`crate::errors::Error`] which automatically converts to
+//! appropriate HTTP status codes and JSON error responses. See [`crate::errors`]
+//! for details on error types and HTTP status mappings.
 
 pub mod api_keys;
 pub mod auth;

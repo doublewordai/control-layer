@@ -1,3 +1,5 @@
+//! Database models for credit transactions.
+
 use crate::types::UserId;
 use chrono::{DateTime, Utc};
 use rust_decimal::Decimal;

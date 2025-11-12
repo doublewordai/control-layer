@@ -1,3 +1,5 @@
+//! Database repository for inference endpoints.
+
 use crate::db::errors::{DbError, Result};
 use crate::db::handlers::repository::Repository;
 use crate::db::models::inference_endpoints::{

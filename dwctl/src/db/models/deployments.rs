@@ -1,3 +1,5 @@
+//! Database models for deployments.
+
 use crate::api::models::deployments::{DeployedModelCreate, DeployedModelUpdate};
 use crate::db::handlers::inference_endpoints::InferenceEndpoints;
 use crate::types::{DeploymentId, InferenceEndpointId, UserId};

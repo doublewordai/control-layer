@@ -1,54 +1,112 @@
-//! # dwctl - Control Layer for AI Model Management
+//! # dwctl: Control Layer for AI Model Management
 //!
 //! `dwctl` is a comprehensive control plane for managing AI model deployments, access control,
 //! and request routing. It provides a RESTful API for managing users, groups, deployments,
 //! and access policies, along with an OpenAI-compatible proxy for routing AI requests.
 //!
-//! ## Key Features
+//! ## Overview
 //!
-//! - **User Management**: Authentication, authorization, and role-based access control
-//! - **Model Deployment Management**: Register and manage AI model endpoints
-//! - **Group-Based Access Control**: Fine-grained permissions through user groups
-//! - **Request Routing**: OpenAI-compatible proxy with intelligent routing
-//! - **Request Logging**: Optional PostgreSQL-backed request/response logging
-//! - **Batch Processing**: Asynchronous batch request processing via fusillade
-//! - **Health Probes**: Active monitoring of model endpoint availability
-//! - **Metrics**: Prometheus-compatible metrics for observability
-//! - **Leader Election**: Distributed coordination for multi-replica deployments
+//! `dwctl` acts as a centralized control plane sitting between AI model consumers and multiple
+//! AI inference endpoints. Organizations deploying AI models face challenges around multi-tenancy,
+//! cost tracking, and managing access to diverse model deployments. This crate addresses these
+//! challenges by providing a unified control layer that handles authentication, authorization,
+//! request routing, and observability.
+//!
+//! The system is designed for platforms that need to expose AI capabilities to multiple users or
+//! teams while maintaining isolation, tracking usage, and ensuring high availability. It's
+//! particularly suited for organizations running their own inference infrastructure or aggregating
+//! multiple AI providers behind a single interface.
+//!
+//! ### What It Does
+//!
+//! At its core, `dwctl` receives requests from clients using the OpenAI-compatible API format,
+//! authenticates the user, checks their permissions against the requested model, routes the
+//! request to the appropriate inference endpoint, and optionally logs the request/response for
+//! audit and analytics. It manages a credit system for usage tracking and rate limiting, monitors
+//! endpoint health to remove failing backends from rotation, and supports batch processing for
+//! asynchronous workloads.
 //!
 //! ## Architecture
 //!
-//! The application is built on [Axum](https://github.com/tokio-rs/axum) and uses PostgreSQL
-//! for persistence. It can run with either an embedded or external PostgreSQL database.
+//! The application is built on [Axum](https://github.com/tokio-rs/axum) for the HTTP layer and
+//! uses PostgreSQL for all persistence needs. It can operate with either an embedded PostgreSQL
+//! instance (useful for development) or an external PostgreSQL database (recommended for production).
 //!
-//! ### Main Components
+//! ### Request Flow
 //!
-//! - **API Layer** ([`api`]): REST endpoints for management and AI request proxying
-//! - **Auth Layer** ([`auth`]): Authentication, sessions, and permission enforcement
-//! - **Database Layer** ([`db`]): Repository pattern for data access
-//! - **Config** ([`config`]): Application configuration and settings
-//! - **Telemetry** ([`telemetry`]): Distributed tracing and logging
+//! The application handles two distinct request flows depending on the endpoint accessed.
+//!
+//! #### AI Proxy Requests (`/ai/v1/*`)
+//!
+//! When a client makes a request to `/ai/v1/chat/completions`, the request is handled by the
+//! [onwards] routing layer. The system maintains a synchronized cache of valid API keys for each
+//! model deployment—only keys with sufficient credits and appropriate group access are included.
+//! This cache is continuously updated via PostgreSQL LISTEN/NOTIFY whenever database state changes.
+//! onwards validates the incoming API key against this cache, maps the model alias to an inference
+//! endpoint, and forwards the request. Optional middleware powered by [outlet] and [outlet-postgres]
+//! can log request and response data to PostgreSQL for auditing, and credits are deducted based on
+//! token usage.
+//!
+//! #### Management API Requests (`/admin/api/v1/*`)
+//!
+//! Requests to the management API follow a traditional web application flow. The request first
+//! passes through authentication middleware that validates credentials through multiple methods:
+//! session cookies (for browser clients), trusted proxy headers (for SSO integration), or API keys
+//! with "platform" purpose. The authentication system tries these methods in priority order, falling
+//! back to the next if one is unavailable or invalid. Once authenticated, the request reaches the
+//! appropriate handler which performs authorization checks based on the user's roles and permissions.
+//! Handlers interact with the database through repository interfaces to perform CRUD operations on
+//! resources like users, groups, deployments, and endpoints. Changes to deployments or API keys
+//! trigger PostgreSQL NOTIFY events that update the [onwards] routing cache in real-time.
+//!
+//! [onwards]: https://github.com/doublewordai/onwards
+//! [outlet]: https://github.com/doublewordai/outlet
+//! [outlet-postgres]: https://github.com/doublewordai/outlet-postgres
+//!
+//! ### Core Components
+//!
+//! The **API layer** ([`api`]) exposes two main surfaces: a management API for administrators at
+//! `/admin/api/v1/*` and an OpenAI-compatible proxy at `/ai/v1/*`. The management API uses RESTful
+//! conventions for CRUD operations on users, groups, deployments, and other resources, while the
+//! proxy API mimics OpenAI's interface to maximize compatibility with existing clients.
+//!
+//! The **authentication layer** ([`auth`]) handles session-based authentication for the management
+//! API and can integrate with SSO proxy implementations for federated authentication. It includes
+//! permission checking logic and role-based access control for administrative operations. The AI
+//! proxy endpoints use a separate authentication mechanism where valid API keys are synced to
+//! [onwards].
+//!
+//! The **database layer** ([`db`]) uses the repository pattern to abstract data access. Each entity
+//! (users, groups, deployments, etc.) has a corresponding repository that handles queries and
+//! mutations. The schema uses PostgreSQL features like advisory locks for leader election and
+//! LISTEN/NOTIFY for real-time configuration updates.
+//!
+//! **Background services** run alongside the HTTP server and include a health probe scheduler that
+//! periodically checks inference endpoint availability, a batch processing daemon powered by
+//! fusillade for async job execution, and an [onwards] configuration sync process that watches for
+//! database changes and updates the routing layer in real-time.
 //!
 //! ## Quick Start
 //!
 //! ```no_run
+//! use clap::Parser;
 //! use dwctl::{Application, Config};
-//! use tokio::signal;
 //!
 //! #[tokio::main]
 //! async fn main() -> anyhow::Result<()> {
-//!     // Load configuration
-//!     let config = Config::from_env()?;
+//!     // Parse CLI arguments and load configuration
+//!     let args = dwctl::config::Args::parse();
+//!     let config = Config::load(&args)?;
 //!
-//!     // Initialize telemetry
-//!     dwctl::telemetry::init_telemetry(&config.telemetry)?;
+//!     // Initialize telemetry (structured logging and optional OpenTelemetry)
+//!     dwctl::telemetry::init_telemetry(config.enable_otel_export)?;
 //!
 //!     // Create and start the application
 //!     let app = Application::new(config).await?;
 //!
-//!     // Run with graceful shutdown on SIGTERM
+//!     // Run with graceful shutdown on Ctrl+C
 //!     app.serve(async {
-//!         signal::ctrl_c().await.expect("Failed to listen for Ctrl+C");
+//!         tokio::signal::ctrl_c().await.expect("Failed to listen for Ctrl+C");
 //!     }).await?;
 //!
 //!     Ok(())
@@ -68,55 +126,20 @@
 //! # }
 //! ```
 //!
-//! ## API Endpoints
-//!
-//! The application exposes several endpoint groups:
-//!
-//! - **Admin API** (`/admin/api/v1/*`): Management endpoints for users, groups, deployments
-//! - **AI Proxy** (`/ai/v1/*`): OpenAI-compatible endpoints for model requests
-//! - **Authentication** (`/authentication/*`): Login, registration, password management
-//! - **Health** (`/healthz`): Health check endpoint
-//! - **Metrics** (`/internal/metrics`): Prometheus metrics (when enabled)
-//!
 //! ## Configuration
 //!
-//! Configuration is loaded from environment variables and TOML files. See [`Config`] for details.
-//!
-//! Key environment variables:
-//! - `DWCTL_PORT`: Server port (default: 8080)
-//! - `DWCTL_DATABASE_URL`: PostgreSQL connection string
-//! - `DWCTL_ADMIN_EMAIL`: Initial admin user email
-//! - `DWCTL_ADMIN_PASSWORD`: Initial admin user password
-//!
-//! ## Testing
-//!
-//! Test utilities are available when the `test-utils` feature is enabled:
-//!
-//! ```ignore
-//! use dwctl::test_utils::*;
-//!
-//! #[sqlx::test]
-//! async fn test_example(pool: sqlx::PgPool) {
-//!     let (server, bg_services) = create_test_app(pool, true).await;
-//!     // Test your endpoints...
-//! }
-//! ```
-//!
-//! ## Features
-//!
-//! - `embedded-db`: Enable embedded PostgreSQL database support
-//! - `test-utils`: Expose test utilities for integration testing
+//! See the [`config`] module for configuration options.
 //!
 // TODO: This file has gotten way too big. We need to refactor it into smaller modules.
 // The constructors in test_utils should be unified with the actual constructors: right now they're
 // actually the best lib way to construct things, which is bad.
 pub mod api;
-mod auth;
+pub mod auth;
 pub mod config;
 mod crypto;
 pub mod db;
 mod email;
-mod errors;
+pub mod errors;
 mod leader_election;
 mod metrics;
 mod openapi;
@@ -537,7 +560,7 @@ pub async fn build_router(state: &mut AppState, onwards_router: Router) -> anyho
     } else {
         None
     };
-    // Authentication routes (at root level, masked by proxy when deployed behind vouch)
+    // Authentication routes (at root level, can be masked when deployed behind SSO proxy)
     let auth_routes = Router::new()
         .route(
             "/authentication/register",

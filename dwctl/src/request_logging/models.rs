@@ -1,3 +1,5 @@
+//! Request logging data models.
+
 use async_openai::types::{
     CreateBase64EmbeddingResponse, CreateChatCompletionRequest, CreateChatCompletionResponse, CreateChatCompletionStreamResponse,
     CreateCompletionRequest, CreateCompletionResponse, CreateEmbeddingRequest, CreateEmbeddingResponse,

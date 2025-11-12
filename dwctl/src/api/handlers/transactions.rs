@@ -1,3 +1,5 @@
+//! HTTP handlers for credit transaction endpoints.
+
 use crate::{
     api::models::{
         transactions::{CreditTransactionCreate, CreditTransactionResponse, ListTransactionsQuery},
