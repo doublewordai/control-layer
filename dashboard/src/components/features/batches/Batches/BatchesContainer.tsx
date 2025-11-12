@@ -12,7 +12,10 @@ import {
 } from "../../../ui/dialog";
 import { Button } from "../../../ui/button";
 import { Trash2, Loader2 } from "lucide-react";
-import { useDeleteFile, useCancelBatch } from "../../../../api/control-layer/hooks";
+import {
+  useDeleteFile,
+  useCancelBatch,
+} from "../../../../api/control-layer/hooks";
 import { toast } from "sonner";
 import type { FileObject, Batch } from "../types";
 
