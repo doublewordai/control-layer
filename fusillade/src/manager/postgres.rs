@@ -1290,26 +1290,16 @@ impl<H: HttpClient + 'static> Storage for PostgresRequestManager<H> {
             .await
             .map_err(|e| FusilladeError::Other(anyhow!("Failed to commit transaction: {}", e)))?;
 
-        Ok(Batch {
-            id: BatchId(batch_id),
-            file_id: FileId(row.file_id),
-            created_at: row.created_at,
-            metadata: row.metadata,
-            completion_window: row.completion_window,
-            endpoint: row.endpoint,
-            output_file_id: Some(FileId(output_file_id)),
-            error_file_id: Some(FileId(error_file_id)),
-            created_by: row.created_by,
-            expires_at: row.expires_at,
-            cancelling_at: row.cancelling_at,
-            errors: row.errors,
-        })
+        // Fetch the final batch with status fields populated by triggers
+        self.get_batch(BatchId(batch_id)).await
     }
 
     async fn get_batch(&self, batch_id: BatchId) -> Result<Batch> {
         let row = sqlx::query!(
             r#"
-            SELECT id, file_id, endpoint, completion_window, metadata, output_file_id, error_file_id, created_by, created_at, expires_at, cancelling_at, errors
+            SELECT id, file_id, endpoint, completion_window, metadata, output_file_id, error_file_id, created_by, created_at, expires_at, cancelling_at, errors,
+                   total_requests, pending_requests, in_progress_requests, completed_requests, failed_requests, canceled_requests,
+                   requests_started_at, requests_last_updated_at
             FROM batches
             WHERE id = $1
             "#,
@@ -1333,14 +1323,36 @@ impl<H: HttpClient + 'static> Storage for PostgresRequestManager<H> {
             expires_at: row.expires_at,
             cancelling_at: row.cancelling_at,
             errors: row.errors,
+            total_requests: row.total_requests,
+            pending_requests: row.pending_requests,
+            in_progress_requests: row.in_progress_requests,
+            completed_requests: row.completed_requests,
+            failed_requests: row.failed_requests,
+            canceled_requests: row.canceled_requests,
+            requests_started_at: row.requests_started_at,
+            requests_last_updated_at: row.requests_last_updated_at,
         })
     }
 
     async fn get_batch_status(&self, batch_id: BatchId) -> Result<BatchStatus> {
         let row = sqlx::query!(
             r#"
-            SELECT * FROM batch_status
-            WHERE batch_id = $1
+            SELECT
+                b.id as batch_id,
+                b.file_id,
+                f.name as file_name,
+                b.total_requests,
+                b.pending_requests,
+                b.in_progress_requests,
+                b.completed_requests,
+                b.failed_requests,
+                b.canceled_requests,
+                b.requests_started_at as started_at,
+                b.requests_last_updated_at as last_updated_at,
+                b.created_at
+            FROM batches b
+            JOIN files f ON f.id = b.file_id
+            WHERE b.id = $1
             "#,
             *batch_id as Uuid,
         )
@@ -1350,35 +1362,41 @@ impl<H: HttpClient + 'static> Storage for PostgresRequestManager<H> {
         .ok_or_else(|| FusilladeError::Other(anyhow!("Batch not found")))?;
 
         Ok(BatchStatus {
-            batch_id: BatchId(row.batch_id.ok_or_else(|| {
-                FusilladeError::Other(anyhow!("Batch status view missing batch_id"))
-            })?),
-            file_id: FileId(row.file_id.ok_or_else(|| {
-                FusilladeError::Other(anyhow!("Batch status view missing file_id"))
-            })?),
-            file_name: row.file_name.ok_or_else(|| {
-                FusilladeError::Other(anyhow!("Batch status view missing file_name"))
-            })?,
-            total_requests: row.total_requests.unwrap_or(0),
-            pending_requests: row.pending_requests.unwrap_or(0),
-            in_progress_requests: row.in_progress_requests.unwrap_or(0),
-            completed_requests: row.completed_requests.unwrap_or(0),
-            failed_requests: row.failed_requests.unwrap_or(0),
-            canceled_requests: row.canceled_requests.unwrap_or(0),
+            batch_id: BatchId(row.batch_id),
+            file_id: FileId(row.file_id),
+            file_name: row.file_name,
+            total_requests: row.total_requests,
+            pending_requests: row.pending_requests,
+            in_progress_requests: row.in_progress_requests,
+            completed_requests: row.completed_requests,
+            failed_requests: row.failed_requests,
+            canceled_requests: row.canceled_requests,
             started_at: row.started_at,
             last_updated_at: row.last_updated_at,
-            created_at: row.created_at.ok_or_else(|| {
-                FusilladeError::Other(anyhow!("Batch status view missing created_at"))
-            })?,
+            created_at: row.created_at,
         })
     }
 
     async fn list_file_batches(&self, file_id: FileId) -> Result<Vec<BatchStatus>> {
         let rows = sqlx::query!(
             r#"
-            SELECT * FROM batch_status
-            WHERE file_id = $1
-            ORDER BY created_at DESC
+            SELECT
+                b.id as batch_id,
+                b.file_id,
+                f.name as file_name,
+                b.total_requests,
+                b.pending_requests,
+                b.in_progress_requests,
+                b.completed_requests,
+                b.failed_requests,
+                b.canceled_requests,
+                b.requests_started_at as started_at,
+                b.requests_last_updated_at as last_updated_at,
+                b.created_at
+            FROM batches b
+            JOIN files f ON f.id = b.file_id
+            WHERE b.file_id = $1
+            ORDER BY b.created_at DESC
             "#,
             *file_id as Uuid,
         )
@@ -1388,21 +1406,19 @@ impl<H: HttpClient + 'static> Storage for PostgresRequestManager<H> {
 
         Ok(rows
             .into_iter()
-            .filter_map(|row| {
-                Some(BatchStatus {
-                    batch_id: BatchId(row.batch_id?),
-                    file_id: FileId(row.file_id?),
-                    file_name: row.file_name?,
-                    total_requests: row.total_requests.unwrap_or(0),
-                    pending_requests: row.pending_requests.unwrap_or(0),
-                    in_progress_requests: row.in_progress_requests.unwrap_or(0),
-                    completed_requests: row.completed_requests.unwrap_or(0),
-                    failed_requests: row.failed_requests.unwrap_or(0),
-                    canceled_requests: row.canceled_requests.unwrap_or(0),
-                    started_at: row.started_at,
-                    last_updated_at: row.last_updated_at,
-                    created_at: row.created_at?,
-                })
+            .map(|row| BatchStatus {
+                batch_id: BatchId(row.batch_id),
+                file_id: FileId(row.file_id),
+                file_name: row.file_name,
+                total_requests: row.total_requests,
+                pending_requests: row.pending_requests,
+                in_progress_requests: row.in_progress_requests,
+                completed_requests: row.completed_requests,
+                failed_requests: row.failed_requests,
+                canceled_requests: row.canceled_requests,
+                started_at: row.started_at,
+                last_updated_at: row.last_updated_at,
+                created_at: row.created_at,
             })
             .collect())
     }
@@ -1416,7 +1432,9 @@ impl<H: HttpClient + 'static> Storage for PostgresRequestManager<H> {
             OutputFileType::Output => {
                 let row = sqlx::query!(
                     r#"
-                    SELECT id, file_id, endpoint, completion_window, metadata, output_file_id, error_file_id, created_by, created_at, expires_at, cancelling_at, errors
+                    SELECT id, file_id, endpoint, completion_window, metadata, output_file_id, error_file_id, created_by, created_at, expires_at, cancelling_at, errors,
+                           total_requests, pending_requests, in_progress_requests, completed_requests, failed_requests, canceled_requests,
+                           requests_started_at, requests_last_updated_at
                     FROM batches
                     WHERE output_file_id = $1
                     "#,
@@ -1439,12 +1457,22 @@ impl<H: HttpClient + 'static> Storage for PostgresRequestManager<H> {
                     expires_at: row.expires_at,
                     cancelling_at: row.cancelling_at,
                     errors: row.errors,
+                    total_requests: row.total_requests,
+                    pending_requests: row.pending_requests,
+                    in_progress_requests: row.in_progress_requests,
+                    completed_requests: row.completed_requests,
+                    failed_requests: row.failed_requests,
+                    canceled_requests: row.canceled_requests,
+                    requests_started_at: row.requests_started_at,
+                    requests_last_updated_at: row.requests_last_updated_at,
                 }))
             }
             OutputFileType::Error => {
                 let row = sqlx::query!(
                     r#"
-                    SELECT id, file_id, endpoint, completion_window, metadata, output_file_id, error_file_id, created_by, created_at, expires_at, cancelling_at, errors
+                    SELECT id, file_id, endpoint, completion_window, metadata, output_file_id, error_file_id, created_by, created_at, expires_at, cancelling_at, errors,
+                           total_requests, pending_requests, in_progress_requests, completed_requests, failed_requests, canceled_requests,
+                           requests_started_at, requests_last_updated_at
                     FROM batches
                     WHERE error_file_id = $1
                     "#,
@@ -1467,6 +1495,14 @@ impl<H: HttpClient + 'static> Storage for PostgresRequestManager<H> {
                     expires_at: row.expires_at,
                     cancelling_at: row.cancelling_at,
                     errors: row.errors,
+                    total_requests: row.total_requests,
+                    pending_requests: row.pending_requests,
+                    in_progress_requests: row.in_progress_requests,
+                    completed_requests: row.completed_requests,
+                    failed_requests: row.failed_requests,
+                    canceled_requests: row.canceled_requests,
+                    requests_started_at: row.requests_started_at,
+                    requests_last_updated_at: row.requests_last_updated_at,
                 }))
             }
         }
@@ -1500,7 +1536,9 @@ impl<H: HttpClient + 'static> Storage for PostgresRequestManager<H> {
         // Use a single query with optional cursor filtering
         let rows = sqlx::query!(
             r#"
-            SELECT id, file_id, endpoint, completion_window, metadata, output_file_id, error_file_id, created_by, created_at, expires_at, cancelling_at, errors
+            SELECT id, file_id, endpoint, completion_window, metadata, output_file_id, error_file_id, created_by, created_at, expires_at, cancelling_at, errors,
+                   total_requests, pending_requests, in_progress_requests, completed_requests, failed_requests, canceled_requests,
+                   requests_started_at, requests_last_updated_at
             FROM batches
             WHERE ($1::TEXT IS NULL OR created_by = $1)
               AND ($3::TIMESTAMPTZ IS NULL OR created_at < $3 OR (created_at = $3 AND id < $4))
@@ -1531,6 +1569,14 @@ impl<H: HttpClient + 'static> Storage for PostgresRequestManager<H> {
                 expires_at: row.expires_at,
                 cancelling_at: row.cancelling_at,
                 errors: row.errors,
+                total_requests: row.total_requests,
+                pending_requests: row.pending_requests,
+                in_progress_requests: row.in_progress_requests,
+                completed_requests: row.completed_requests,
+                failed_requests: row.failed_requests,
+                canceled_requests: row.canceled_requests,
+                requests_started_at: row.requests_started_at,
+                requests_last_updated_at: row.requests_last_updated_at,
             })
             .collect())
     }

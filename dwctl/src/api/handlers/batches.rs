@@ -20,8 +20,8 @@ use fusillade::Storage;
 use std::collections::HashMap;
 use uuid::Uuid;
 
-/// Helper function to convert fusillade Batch + BatchStatus to OpenAI BatchResponse
-fn to_batch_response(batch: fusillade::Batch, status: fusillade::BatchStatus) -> BatchResponse {
+/// Helper function to convert fusillade Batch to OpenAI BatchResponse
+fn to_batch_response(batch: fusillade::Batch) -> BatchResponse {
     // Convert metadata from serde_json::Value to HashMap<String, String>
     let metadata: Option<HashMap<String, String>> = batch.metadata.and_then(|m| {
         m.as_object().map(|obj| {
@@ -31,48 +31,56 @@ fn to_batch_response(batch: fusillade::Batch, status: fusillade::BatchStatus) ->
         })
     });
 
-    // Determine OpenAI status - override if cancelling
-    let base_status = status.openai_status();
+    // Determine OpenAI status from request counts
+    let is_finished = batch.pending_requests == 0 && batch.in_progress_requests == 0;
     let openai_status = if batch.cancelling_at.is_some() {
         // If cancelling_at is set, check if batch is finished
-        if status.is_finished() {
+        if is_finished {
             // All requests are in terminal state, batch is now cancelled
             "cancelled"
         } else {
             // Still cancelling
             "cancelling"
         }
+    } else if batch.total_requests == 0 {
+        "validating"
+    } else if is_finished && batch.failed_requests == batch.total_requests {
+        "failed"
+    } else if is_finished {
+        "completed"
+    } else if batch.in_progress_requests > 0 || batch.completed_requests > 0 {
+        "in_progress"
     } else {
-        base_status
+        "validating"
     };
 
     // Compute timestamps based on status
     let in_progress_at = if openai_status != "validating" {
-        status.started_at.map(|dt| dt.timestamp())
+        batch.requests_started_at.map(|dt| dt.timestamp())
     } else {
         None
     };
 
     let finalizing_at = if openai_status == "finalizing" || openai_status == "completed" {
-        status.last_updated_at.map(|dt| dt.timestamp())
+        batch.requests_last_updated_at.map(|dt| dt.timestamp())
     } else {
         None
     };
 
     let completed_at = if openai_status == "completed" {
-        status.last_updated_at.map(|dt| dt.timestamp())
+        batch.requests_last_updated_at.map(|dt| dt.timestamp())
     } else {
         None
     };
 
     let failed_at = if openai_status == "failed" {
-        status.last_updated_at.map(|dt| dt.timestamp())
+        batch.requests_last_updated_at.map(|dt| dt.timestamp())
     } else {
         None
     };
 
     let cancelled_at = if openai_status == "cancelled" {
-        status.last_updated_at.map(|dt| dt.timestamp())
+        batch.requests_last_updated_at.map(|dt| dt.timestamp())
     } else {
         None
     };
@@ -109,9 +117,9 @@ fn to_batch_response(batch: fusillade::Batch, status: fusillade::BatchStatus) ->
         cancelling_at: batch.cancelling_at.map(|dt| dt.timestamp()),
         cancelled_at,
         request_counts: RequestCounts {
-            total: status.total_requests,
-            completed: status.completed_requests,
-            failed: status.failed_requests,
+            total: batch.total_requests,
+            completed: batch.completed_requests,
+            failed: batch.failed_requests,
         },
         metadata,
     }
@@ -204,18 +212,9 @@ pub async fn create_batch(
         operation: format!("create batch: {}", e),
     })?;
 
-    // Get batch status
-    let status = state
-        .request_manager
-        .get_batch_status(batch.id)
-        .await
-        .map_err(|e| Error::Internal {
-            operation: format!("get batch status: {}", e),
-        })?;
-
     tracing::info!("Batch {} created successfully", batch.id);
 
-    Ok((StatusCode::CREATED, Json(to_batch_response(batch, status))))
+    Ok((StatusCode::CREATED, Json(to_batch_response(batch))))
 }
 
 #[utoipa::path(
@@ -265,16 +264,7 @@ pub async fn get_batch(
         }
     }
 
-    // Get batch status
-    let status = state
-        .request_manager
-        .get_batch_status(fusillade::BatchId(batch_id))
-        .await
-        .map_err(|e| Error::Internal {
-            operation: format!("get batch status: {}", e),
-        })?;
-
-    Ok(Json(to_batch_response(batch, status)))
+    Ok(Json(to_batch_response(batch)))
 }
 
 #[utoipa::path(
@@ -333,18 +323,19 @@ pub async fn cancel_batch(
             operation: format!("cancel batch: {}", e),
         })?;
 
-    // Get updated status
-    let status = state
+    // Fetch updated batch to get latest status
+    let batch = state
         .request_manager
-        .get_batch_status(fusillade::BatchId(batch_id))
+        .get_batch(fusillade::BatchId(batch_id))
         .await
-        .map_err(|e| Error::Internal {
-            operation: format!("get batch status: {}", e),
+        .map_err(|_| Error::NotFound {
+            resource: "Batch".to_string(),
+            id: batch_id_str.clone(),
         })?;
 
     tracing::info!("Batch {} cancelled", batch_id);
 
-    Ok(Json(to_batch_response(batch, status)))
+    Ok(Json(to_batch_response(batch)))
 }
 
 #[utoipa::path(
@@ -396,19 +387,8 @@ pub async fn list_batches(
     let first_id = batches.first().map(|b| b.id.0.to_string());
     let last_id = batches.last().map(|b| b.id.0.to_string());
 
-    // Convert batches to responses (need to get status for each)
-    let mut data = Vec::new();
-    for batch in batches {
-        let status = state
-            .request_manager
-            .get_batch_status(batch.id)
-            .await
-            .map_err(|e| Error::Internal {
-                operation: format!("get batch status: {}", e),
-            })?;
-
-        data.push(to_batch_response(batch, status));
-    }
+    // Convert batches to responses (status is embedded in batch)
+    let data: Vec<_> = batches.into_iter().map(to_batch_response).collect();
 
     Ok(Json(BatchListResponse {
         object_type: ListObjectType::List,
