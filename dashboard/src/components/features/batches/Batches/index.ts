@@ -1,1 +1,1 @@
-export { Batches } from "./Batches";
+export { BatchesContainer as Batches } from "./BatchesContainer";
