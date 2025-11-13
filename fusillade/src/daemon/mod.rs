@@ -282,26 +282,34 @@ where
         let storage = self.storage.clone();
         let flush_interval_ms = self.config.flush_batch_events_interval_ms;
         let daemon_id = self.daemon_id;
+        let shutdown_signal = self.shutdown_token.clone();
         tokio::spawn(async move {
             let mut interval = tokio::time::interval(Duration::from_millis(flush_interval_ms));
             loop {
-                interval.tick().await;
-                match storage.flush_batch_events(None).await {
-                    Ok(count) => {
-                        if count > 0 {
-                            tracing::trace!(
-                                daemon_id = %daemon_id,
-                                batches_flushed = count,
-                                "Flushed batch WAL events"
-                            );
+                tokio::select! {
+                    _ = interval.tick() => {
+                        match storage.flush_batch_events(None).await {
+                            Ok(count) => {
+                                if count > 0 {
+                                    tracing::trace!(
+                                        daemon_id = %daemon_id,
+                                        batches_flushed = count,
+                                        "Flushed batch WAL events"
+                                    );
+                                }
+                            }
+                            Err(e) => {
+                                tracing::warn!(
+                                    daemon_id = %daemon_id,
+                                    error = %e,
+                                    "Failed to flush batch events"
+                                );
+                            }
                         }
                     }
-                    Err(e) => {
-                        tracing::warn!(
-                            daemon_id = %daemon_id,
-                            error = %e,
-                            "Failed to flush batch events"
-                        );
+                    _ = shutdown_signal.cancelled() => {
+                        tracing::info!("Shutting down batch events flush task");
+                        break;
                     }
                 }
             }

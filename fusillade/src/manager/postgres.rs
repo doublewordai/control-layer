@@ -1445,6 +1445,7 @@ impl<H: HttpClient + 'static> Storage for PostgresRequestManager<H> {
                             SUM(failed_delta) as failed_delta,
                             SUM(canceled_delta) as canceled_delta
                         FROM batch_state_events
+                        WHERE batch_id = (SELECT id FROM batches WHERE output_file_id = $1)
                         GROUP BY batch_id
                     ) wal ON b.id = wal.batch_id
                     WHERE b.output_file_id = $1
@@ -1503,6 +1504,7 @@ impl<H: HttpClient + 'static> Storage for PostgresRequestManager<H> {
                             SUM(failed_delta) as failed_delta,
                             SUM(canceled_delta) as canceled_delta
                         FROM batch_state_events
+                        WHERE batch_id = (SELECT id FROM batches WHERE error_file_id = $1)
                         GROUP BY batch_id
                     ) wal ON b.id = wal.batch_id
                     WHERE b.error_file_id = $1
@@ -1580,17 +1582,16 @@ impl<H: HttpClient + 'static> Storage for PostgresRequestManager<H> {
                 b.requests_started_at,
                 b.requests_last_updated_at
             FROM batches b
-            LEFT JOIN (
+            LEFT JOIN LATERAL (
                 SELECT
-                    batch_id,
                     SUM(pending_delta) as pending_delta,
                     SUM(in_progress_delta) as in_progress_delta,
                     SUM(completed_delta) as completed_delta,
                     SUM(failed_delta) as failed_delta,
                     SUM(canceled_delta) as canceled_delta
                 FROM batch_state_events
-                GROUP BY batch_id
-            ) wal ON b.id = wal.batch_id
+                WHERE batch_id = b.id
+            ) wal ON TRUE
             WHERE ($1::TEXT IS NULL OR b.created_by = $1)
               AND ($3::TIMESTAMPTZ IS NULL OR b.created_at < $3 OR (b.created_at = $3 AND b.id < $4))
             ORDER BY b.created_at DESC, b.id DESC
@@ -1659,6 +1660,7 @@ impl<H: HttpClient + 'static> Storage for PostgresRequestManager<H> {
                     SUM(failed_delta) as failed_delta,
                     SUM(canceled_delta) as canceled_delta
                 FROM batch_state_events
+                WHERE batch_id IN (SELECT id FROM batches WHERE file_id = $1)
                 GROUP BY batch_id
             ) wal ON b.id = wal.batch_id
             WHERE b.file_id = $1

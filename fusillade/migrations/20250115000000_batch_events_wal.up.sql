@@ -50,7 +50,9 @@ BEGIN
         CASE OLD.state
             WHEN 'pending' THEN
                 old_pending := 1; old_in_progress := 0; old_completed := 0; old_failed := 0; old_canceled := 0;
-            WHEN 'claimed', 'processing' THEN
+            WHEN 'claimed' THEN
+                old_pending := 0; old_in_progress := 1; old_completed := 0; old_failed := 0; old_canceled := 0;
+            WHEN 'processing' THEN
                 old_pending := 0; old_in_progress := 1; old_completed := 0; old_failed := 0; old_canceled := 0;
             WHEN 'completed' THEN
                 old_pending := 0; old_in_progress := 0; old_completed := 1; old_failed := 0; old_canceled := 0;
@@ -66,7 +68,9 @@ BEGIN
         CASE NEW.state
             WHEN 'pending' THEN
                 new_pending := 1; new_in_progress := 0; new_completed := 0; new_failed := 0; new_canceled := 0;
-            WHEN 'claimed', 'processing' THEN
+            WHEN 'claimed' THEN
+                new_pending := 0; new_in_progress := 1; new_completed := 0; new_failed := 0; new_canceled := 0;
+            WHEN 'processing' THEN
                 new_pending := 0; new_in_progress := 1; new_completed := 0; new_failed := 0; new_canceled := 0;
             WHEN 'completed' THEN
                 new_pending := 0; new_in_progress := 0; new_completed := 1; new_failed := 0; new_canceled := 0;
