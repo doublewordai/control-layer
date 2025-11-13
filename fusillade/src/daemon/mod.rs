@@ -297,24 +297,19 @@ where
                 }
             }
 
+            tracing::trace!("Sleeping before claiming");
+            tokio::select! {
+                _ = tokio::time::sleep(Duration::from_millis(self.config.claim_interval_ms)) => {},
+                _ = self.shutdown_token.cancelled() => {
+                    tracing::info!("Shutdown signal received, stopping daemon");
+                    break Ok(());
+                }
+            }
             // Claim a batch of pending requests
             let claimed = self
                 .storage
                 .claim_requests(self.config.claim_batch_size, self.daemon_id)
                 .await?;
-
-            if claimed.is_empty() {
-                tracing::trace!("No pending requests, sleeping");
-                // No pending requests, sleep and retry with cancellation check
-                tokio::select! {
-                    _ = tokio::time::sleep(Duration::from_millis(self.config.claim_interval_ms)) => {},
-                    _ = self.shutdown_token.cancelled() => {
-                        tracing::info!("Shutdown signal received, stopping daemon");
-                        break Ok(());
-                    }
-                }
-                continue;
-            }
 
             tracing::debug!(
                 claimed_count = claimed.len(),
