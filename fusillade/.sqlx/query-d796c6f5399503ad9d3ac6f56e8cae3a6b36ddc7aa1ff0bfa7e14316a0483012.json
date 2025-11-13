@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "\n            SELECT * FROM batch_status\n            WHERE batch_id = $1\n            ",
+  "query": "\n            SELECT\n                b.id as batch_id,\n                b.file_id,\n                f.name as file_name,\n                b.total_requests,\n                b.pending_requests,\n                b.in_progress_requests,\n                b.completed_requests,\n                b.failed_requests,\n                b.canceled_requests,\n                b.requests_started_at as started_at,\n                b.requests_last_updated_at as last_updated_at,\n                b.created_at\n            FROM batches b\n            JOIN files f ON f.id = b.file_id\n            WHERE b.file_id = $1\n            ORDER BY b.created_at DESC\n            ",
   "describe": {
     "columns": [
       {
@@ -70,19 +70,19 @@
       ]
     },
     "nullable": [
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
       true,
       true,
-      true,
-      true,
-      true,
-      true,
-      true,
-      true,
-      true,
-      true,
-      true,
-      true
+      false
     ]
   },
-  "hash": "964e1c2d033ed575e336c1687cfad329e1713d15c8caee88d74877a18caa15e3"
+  "hash": "d796c6f5399503ad9d3ac6f56e8cae3a6b36ddc7aa1ff0bfa7e14316a0483012"
 }

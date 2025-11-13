@@ -57,6 +57,9 @@ pub struct RequestData {
     /// The template this execution was created from
     pub template_id: TemplateId,
 
+    /// Optional custom ID provided by the user for tracking
+    pub custom_id: Option<String>,
+
     /// The base URL of the target endpoint (e.g., <https://api.openai.com>)
     pub endpoint: String,
 
