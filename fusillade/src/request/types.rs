@@ -145,10 +145,68 @@ pub struct Completed {
 
 impl RequestState for Completed {}
 
+/// Reason why a request failed.
+///
+/// This enum distinguishes between different types of failures to determine
+/// whether a request should be retried.
+#[derive(Debug, Clone, Serialize, serde::Deserialize, PartialEq, Eq)]
+#[serde(tag = "type", content = "details")]
+pub enum FailureReason {
+    /// HTTP request returned a status code that should be retried (e.g., 429, 500, 503).
+    /// These are transient errors that may succeed on retry.
+    RetriableHttpStatus { status: u16, body: String },
+
+    /// HTTP request returned a client error status code that should not be retried (e.g., 400, 404).
+    /// These indicate problems with the request itself that won't be fixed by retrying.
+    NonRetriableHttpStatus { status: u16, body: String },
+
+    /// Network error, timeout, or other transport-level failure.
+    /// These are transient infrastructure issues that should be retried.
+    NetworkError { error: String },
+
+    /// The HTTP task terminated unexpectedly (panic or crash).
+    /// This should be retried as it may be a transient issue.
+    TaskTerminated,
+}
+
+impl FailureReason {
+    /// Returns true if this failure reason indicates the request should be retried.
+    pub fn is_retriable(&self) -> bool {
+        match self {
+            FailureReason::RetriableHttpStatus { .. } => true,
+            FailureReason::NonRetriableHttpStatus { .. } => false,
+            FailureReason::NetworkError { .. } => true,
+            FailureReason::TaskTerminated => true,
+        }
+    }
+
+    /// Returns a human-readable error message for this failure reason.
+    pub fn to_error_message(&self) -> String {
+        match self {
+            FailureReason::RetriableHttpStatus { status, body } => {
+                format!(
+                    "HTTP request returned retriable status code: {} - {}",
+                    status, body
+                )
+            }
+            FailureReason::NonRetriableHttpStatus { status, body } => {
+                format!(
+                    "HTTP request returned error status code: {} - {}",
+                    status, body
+                )
+            }
+            FailureReason::NetworkError { error } => {
+                format!("Network error: {}", error)
+            }
+            FailureReason::TaskTerminated => "HTTP task terminated unexpectedly".to_string(),
+        }
+    }
+}
+
 /// Request failed after exhausting retries.
 #[derive(Debug, Clone, Serialize)]
 pub struct Failed {
-    pub error: String,
+    pub reason: FailureReason,
     pub failed_at: DateTime<Utc>,
     /// Number of times this request has been attempted when it failed
     pub retry_attempt: u32,

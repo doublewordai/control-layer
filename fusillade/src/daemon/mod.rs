@@ -394,14 +394,12 @@ where
                                     Err(failed) => {
                                         let retry_attempt = failed.state.retry_attempt;
 
-                                        // Check if this is a retriable error
-                                        // Non-retriable errors have format "HTTP request returned error status code: XXX"
-                                        let is_retriable = failed.state.error.starts_with("HTTP request returned retriable status code:");
-
-                                        if is_retriable {
+                                        // Check if this is a retriable error using the FailureReason
+                                        if failed.state.reason.is_retriable() {
                                             tracing::warn!(
                                                 request_id = %request_id,
                                                 retry_attempt,
+                                                error = %failed.state.reason.to_error_message(),
                                                 "Request failed with retriable error, attempting retry"
                                             );
 
@@ -427,7 +425,7 @@ where
                                             requests_failed.fetch_add(1, Ordering::Relaxed);
                                             tracing::warn!(
                                                 request_id = %request_id,
-                                                error = %failed.state.error,
+                                                error = %failed.state.reason.to_error_message(),
                                                 "Request failed with non-retriable error, not retrying"
                                             );
                                         }
