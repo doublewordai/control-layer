@@ -4,6 +4,7 @@
 //! a production-ready batching system with persistent storage and real-time updates.
 
 use crate::request::AnyRequest;
+use futures::StreamExt;
 use std::pin::Pin;
 use std::sync::Arc;
 
@@ -22,7 +23,7 @@ use super::{DaemonStorage, Storage};
 use crate::batch::{
     Batch, BatchErrorDetails, BatchErrorItem, BatchId, BatchInput, BatchOutputItem,
     BatchResponseDetails, BatchStatus, File, FileContentItem, FileId, FileMetadata, FileStreamItem,
-    OutputFileType, RequestTemplate, RequestTemplateInput, TemplateId,
+    OutputFileType, RequestTemplateInput, TemplateId,
 };
 use crate::daemon::{
     AnyDaemonRecord, Daemon, DaemonConfig, DaemonData, DaemonRecord, DaemonState, DaemonStatus,
@@ -247,35 +248,37 @@ impl<H: HttpClient + 'static> Storage for PostgresRequestManager<H> {
         let rows = sqlx::query!(
             r#"
             WITH locked_requests AS (
-                SELECT id, model, created_at
-                FROM requests
-                WHERE state = 'pending'
-                    AND (not_before IS NULL OR not_before <= $2)
-                FOR UPDATE SKIP LOCKED
+                SELECT r.id, r.template_id, t.model, r.created_at
+                FROM requests r
+                JOIN request_templates t ON r.template_id = t.id
+                WHERE r.state = 'pending'
+                    AND (r.not_before IS NULL OR r.not_before <= $2)
+                FOR UPDATE OF r SKIP LOCKED
             ),
             ranked AS (
                 SELECT
                     id,
+                    template_id,
                     ROW_NUMBER() OVER (PARTITION BY model ORDER BY created_at) as model_rn,
                     created_at
                 FROM locked_requests
             ),
             to_claim AS (
-                SELECT id
+                SELECT id, template_id
                 FROM ranked
                 ORDER BY model_rn, created_at ASC
                 LIMIT $3
             )
-            UPDATE requests
+            UPDATE requests r
             SET
                 state = 'claimed',
                 daemon_id = $1,
                 claimed_at = $2
-            FROM to_claim
-            WHERE requests.id = to_claim.id
-            RETURNING requests.id, requests.batch_id, requests.template_id, requests.endpoint,
-                      requests.method, requests.path, requests.body, requests.model,
-                      requests.api_key, requests.retry_attempt
+            FROM to_claim tc
+            JOIN request_templates t ON tc.template_id = t.id
+            WHERE r.id = tc.id
+            RETURNING r.id, r.batch_id, r.template_id, r.retry_attempt,
+                      t.custom_id, t.endpoint, t.method, t.path, t.body, t.model, t.api_key
             "#,
             *daemon_id as Uuid,
             now,
@@ -297,6 +300,7 @@ impl<H: HttpClient + 'static> Storage for PostgresRequestManager<H> {
                     id: RequestId(row.id),
                     batch_id: BatchId(row.batch_id),
                     template_id: TemplateId(row.template_id),
+                    custom_id: row.custom_id,
                     endpoint: row.endpoint,
                     method: row.method,
                     path: row.path,
@@ -475,11 +479,13 @@ impl<H: HttpClient + 'static> Storage for PostgresRequestManager<H> {
         let rows = sqlx::query!(
             r#"
             SELECT
-                id, batch_id, template_id, state, endpoint, method, path, body, model, api_key,
-                retry_attempt, not_before, daemon_id, claimed_at, started_at,
-                response_status, response_body, completed_at, error, failed_at, canceled_at
-            FROM requests
-            WHERE id = ANY($1)
+                r.id, r.batch_id, r.template_id, r.state,
+                t.custom_id, t.endpoint, t.method, t.path, t.body, t.model, t.api_key,
+                r.retry_attempt, r.not_before, r.daemon_id, r.claimed_at, r.started_at,
+                r.response_status, r.response_body, r.completed_at, r.error, r.failed_at, r.canceled_at
+            FROM requests r
+            JOIN request_templates t ON r.template_id = t.id
+            WHERE r.id = ANY($1)
             "#,
             &uuid_ids,
         )
@@ -497,6 +503,7 @@ impl<H: HttpClient + 'static> Storage for PostgresRequestManager<H> {
                 id: request_id,
                 batch_id: BatchId(row.batch_id),
                 template_id: TemplateId(row.template_id),
+                custom_id: row.custom_id,
                 endpoint: row.endpoint,
                 method: row.method,
                 path: row.path,
@@ -638,51 +645,21 @@ impl<H: HttpClient + 'static> Storage for PostgresRequestManager<H> {
         description: Option<String>,
         templates: Vec<RequestTemplateInput>,
     ) -> Result<FileId> {
-        let mut tx =
-            self.pool.begin().await.map_err(|e| {
-                FusilladeError::Other(anyhow!("Failed to begin transaction: {}", e))
-            })?;
+        use futures::stream;
 
-        // Insert file
-        let file_id = sqlx::query_scalar!(
-            r#"
-            INSERT INTO files (name, description)
-            VALUES ($1, $2)
-            RETURNING id
-            "#,
-            name,
+        // Convert the Vec into a stream of FileStreamItems
+        let mut items = vec![FileStreamItem::Metadata(FileMetadata {
+            filename: Some(name),
             description,
-        )
-        .fetch_one(&mut *tx)
-        .await
-        .map_err(|e| FusilladeError::Other(anyhow!("Failed to create file: {}", e)))?;
+            ..Default::default()
+        })];
 
-        // Insert templates
         for template in templates {
-            sqlx::query!(
-                r#"
-                INSERT INTO request_templates (file_id, custom_id, endpoint, method, path, body, model, api_key)
-                VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
-                "#,
-                file_id,
-                template.custom_id,
-                template.endpoint,
-                template.method,
-                template.path,
-                template.body,
-                template.model,
-                template.api_key,
-            )
-            .execute(&mut *tx)
-            .await
-            .map_err(|e| FusilladeError::Other(anyhow!("Failed to create template: {}", e)))?;
+            items.push(FileStreamItem::Template(template));
         }
 
-        tx.commit()
-            .await
-            .map_err(|e| FusilladeError::Other(anyhow!("Failed to commit transaction: {}", e)))?;
-
-        Ok(FileId(file_id))
+        let stream = stream::iter(items);
+        self.create_file_stream(stream).await
     }
 
     #[tracing::instrument(skip(self, stream))]
@@ -709,6 +686,9 @@ impl<H: HttpClient + 'static> Storage for PostgresRequestManager<H> {
                     // Accumulate metadata (later values override earlier ones)
                     if meta.filename.is_some() {
                         metadata.filename = meta.filename;
+                    }
+                    if meta.description.is_some() {
+                        metadata.description = meta.description;
                     }
                     if meta.purpose.is_some() {
                         metadata.purpose = meta.purpose;
@@ -801,6 +781,7 @@ impl<H: HttpClient + 'static> Storage for PostgresRequestManager<H> {
         } else {
             let name = metadata
                 .filename
+                .clone()
                 .unwrap_or_else(|| format!("file_{}", uuid::Uuid::new_v4()));
 
             sqlx::query_scalar!(
@@ -847,15 +828,19 @@ impl<H: HttpClient + 'static> Storage for PostgresRequestManager<H> {
             None
         };
 
+        let description = metadata.description.clone();
         let uploaded_by = metadata.uploaded_by.clone();
+        let name = metadata.filename.clone();
 
         sqlx::query!(
             r#"
             UPDATE files
-            SET size_bytes = $2, status = $3, purpose = $4, expires_at = $5, uploaded_by = $6
+            SET name = COALESCE($2, name), description = $3, size_bytes = $4, status = $5, purpose = $6, expires_at = $7, uploaded_by = $8
             WHERE id = $1
             "#,
             fid,
+            name,
+            description,
             size_bytes,
             status,
             purpose,
@@ -926,6 +911,71 @@ impl<H: HttpClient + 'static> Storage for PostgresRequestManager<H> {
         self.check_and_mark_expired(&mut file).await?;
 
         Ok(file)
+    }
+
+    async fn get_file_content(&self, file_id: FileId) -> Result<Vec<FileContentItem>> {
+        let mut stream = self.get_file_content_stream(file_id, 0);
+        let mut items = Vec::new();
+
+        while let Some(result) = stream.next().await {
+            items.push(result?);
+        }
+
+        Ok(items)
+    }
+
+    #[tracing::instrument(skip(self), fields(file_id = %file_id))]
+    fn get_file_content_stream(
+        &self,
+        file_id: FileId,
+        offset: usize,
+    ) -> Pin<Box<dyn Stream<Item = Result<FileContentItem>> + Send>> {
+        let pool = self.pool.clone();
+        let (tx, rx) = mpsc::channel(self.download_buffer_size);
+        let offset = offset as i64;
+
+        tokio::spawn(async move {
+            // First, get the file to determine its purpose
+            let file_result = sqlx::query!(
+                r#"
+                SELECT purpose
+                FROM files
+                WHERE id = $1
+                "#,
+                *file_id as Uuid,
+            )
+            .fetch_one(&pool)
+            .await;
+
+            let purpose = match file_result {
+                Ok(row) => row.purpose,
+                Err(e) => {
+                    let _ = tx
+                        .send(Err(FusilladeError::Other(anyhow!(
+                            "Failed to fetch file: {}",
+                            e
+                        ))))
+                        .await;
+                    return;
+                }
+            };
+
+            // Route to appropriate streaming logic based on purpose
+            match purpose.as_deref() {
+                Some("batch_output") => {
+                    Self::stream_batch_output(pool, file_id, offset, tx).await;
+                }
+                Some("batch_error") => {
+                    Self::stream_batch_error(pool, file_id, offset, tx).await;
+                }
+                _ => {
+                    // Regular file or purpose='batch': stream request templates
+                    Self::stream_request_templates(pool, file_id, offset, tx).await;
+                }
+            }
+        });
+
+        Box::pin(ReceiverStream::new(rx))
     }
 
     #[tracing::instrument(skip(self, filter), fields(uploaded_by = ?filter.uploaded_by, status = ?filter.status, purpose = ?filter.purpose, after = ?filter.after, limit = ?filter.limit))]
@@ -1094,92 +1144,6 @@ impl<H: HttpClient + 'static> Storage for PostgresRequestManager<H> {
         Ok(files)
     }
 
-    async fn get_file_templates(&self, file_id: FileId) -> Result<Vec<RequestTemplate>> {
-        let rows = sqlx::query!(
-            r#"
-            SELECT id, file_id, custom_id, endpoint, method, path, body, model, api_key, created_at, updated_at
-            FROM request_templates
-            WHERE file_id = $1
-            ORDER BY line_number ASC
-            "#,
-            *file_id as Uuid,
-        )
-        .fetch_all(&self.pool)
-        .await
-        .map_err(|e| FusilladeError::Other(anyhow!("Failed to fetch templates: {}", e)))?;
-
-        Ok(rows
-            .into_iter()
-            .map(|row| RequestTemplate {
-                id: TemplateId(row.id),
-                file_id: FileId(row.file_id),
-                custom_id: row.custom_id,
-                endpoint: row.endpoint,
-                method: row.method,
-                path: row.path,
-                body: row.body,
-                model: row.model,
-                api_key: row.api_key,
-                created_at: row.created_at,
-                updated_at: row.updated_at,
-            })
-            .collect())
-    }
-
-    #[tracing::instrument(skip(self), fields(file_id = %file_id))]
-    fn get_file_content_stream(
-        &self,
-        file_id: FileId,
-        offset: usize,
-    ) -> Pin<Box<dyn Stream<Item = Result<FileContentItem>> + Send>> {
-        let pool = self.pool.clone();
-        let (tx, rx) = mpsc::channel(self.download_buffer_size);
-        let offset = offset as i64;
-
-        tokio::spawn(async move {
-            // First, get the file to determine its purpose
-            let file_result = sqlx::query!(
-                r#"
-                SELECT purpose
-                FROM files
-                WHERE id = $1
-                "#,
-                *file_id as Uuid,
-            )
-            .fetch_one(&pool)
-            .await;
-
-            let purpose = match file_result {
-                Ok(row) => row.purpose,
-                Err(e) => {
-                    let _ = tx
-                        .send(Err(FusilladeError::Other(anyhow!(
-                            "Failed to fetch file: {}",
-                            e
-                        ))))
-                        .await;
-                    return;
-                }
-            };
-
-            // Route to appropriate streaming logic based on purpose
-            match purpose.as_deref() {
-                Some("batch_output") => {
-                    Self::stream_batch_output(pool, file_id, offset, tx).await;
-                }
-                Some("batch_error") => {
-                    Self::stream_batch_error(pool, file_id, offset, tx).await;
-                }
-                _ => {
-                    // Regular file or purpose='batch': stream request templates
-                    Self::stream_request_templates(pool, file_id, offset, tx).await;
-                }
-            }
-        });
-
-        Box::pin(ReceiverStream::new(rx))
-    }
-
     #[tracing::instrument(skip(self), fields(file_id = %file_id))]
     async fn delete_file(&self, file_id: FileId) -> Result<()> {
         let rows_affected = sqlx::query!(
@@ -1206,25 +1170,6 @@ impl<H: HttpClient + 'static> Storage for PostgresRequestManager<H> {
             self.pool.begin().await.map_err(|e| {
                 FusilladeError::Other(anyhow!("Failed to begin transaction: {}", e))
             })?;
-
-        // Get templates
-        let templates = sqlx::query!(
-            r#"
-            SELECT id, custom_id, endpoint, method, path, body, model, api_key
-            FROM request_templates
-            WHERE file_id = $1
-            "#,
-            *input.file_id as Uuid,
-        )
-        .fetch_all(&mut *tx)
-        .await
-        .map_err(|e| FusilladeError::Other(anyhow!("Failed to fetch templates: {}", e)))?;
-
-        if templates.is_empty() {
-            return Err(FusilladeError::Other(anyhow!(
-                "Cannot create batch from file with no templates"
-            )));
-        }
 
         // Calculate expires_at from completion_window
         let now = Utc::now();
@@ -1278,30 +1223,32 @@ impl<H: HttpClient + 'static> Storage for PostgresRequestManager<H> {
             FusilladeError::Other(anyhow!("Failed to update batch with file IDs: {}", e))
         })?;
 
-        // Create executions from templates
-        for template in templates {
-            sqlx::query!(
-                r#"
-                INSERT INTO requests (
-                    batch_id, template_id, state,
-                    custom_id, endpoint, method, path, body, model, api_key,
-                    retry_attempt
-                )
-                VALUES ($1, $2, 'pending', $3, $4, $5, $6, $7, $8, $9, 0)
-                "#,
-                batch_id,
-                template.id,
-                template.custom_id,
-                template.endpoint,
-                template.method,
-                template.path,
-                template.body,
-                template.model,
-                template.api_key,
-            )
-            .execute(&mut *tx)
-            .await
-            .map_err(|e| FusilladeError::Other(anyhow!("Failed to create execution: {}", e)))?;
+        // bulk insert requests from templates
+        let rows_affected = sqlx::query!(
+            r#"
+            INSERT INTO requests (batch_id, template_id, state, custom_id, retry_attempt)
+            SELECT $1, id, 'pending', custom_id, 0
+            FROM request_templates
+            WHERE file_id = $2
+            "#,
+            batch_id,
+            *input.file_id as Uuid,
+        )
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| FusilladeError::Other(anyhow!("Failed to create requests: {}", e)))?
+        .rows_affected();
+
+        if rows_affected == 0 {
+            tx.rollback().await.map_err(|e| {
+                FusilladeError::Other(anyhow!(
+                    "Failed to rollback transaction after zero templates: {}",
+                    e
+                ))
+            })?;
+            return Err(FusilladeError::Other(anyhow!(
+                "Cannot create batch from file with no templates"
+            )));
         }
 
         tx.commit()
@@ -1393,52 +1340,6 @@ impl<H: HttpClient + 'static> Storage for PostgresRequestManager<H> {
             last_updated_at: row.last_updated_at,
             created_at: row.created_at,
         })
-    }
-
-    async fn list_file_batches(&self, file_id: FileId) -> Result<Vec<BatchStatus>> {
-        let rows = sqlx::query!(
-            r#"
-            SELECT
-                b.id as batch_id,
-                b.file_id,
-                f.name as file_name,
-                b.total_requests,
-                b.pending_requests,
-                b.in_progress_requests,
-                b.completed_requests,
-                b.failed_requests,
-                b.canceled_requests,
-                b.requests_started_at as started_at,
-                b.requests_last_updated_at as last_updated_at,
-                b.created_at
-            FROM batches b
-            JOIN files f ON f.id = b.file_id
-            WHERE b.file_id = $1
-            ORDER BY b.created_at DESC
-            "#,
-            *file_id as Uuid,
-        )
-        .fetch_all(&self.pool)
-        .await
-        .map_err(|e| FusilladeError::Other(anyhow!("Failed to list batches: {}", e)))?;
-
-        Ok(rows
-            .into_iter()
-            .map(|row| BatchStatus {
-                batch_id: BatchId(row.batch_id),
-                file_id: FileId(row.file_id),
-                file_name: row.file_name,
-                total_requests: row.total_requests,
-                pending_requests: row.pending_requests,
-                in_progress_requests: row.in_progress_requests,
-                completed_requests: row.completed_requests,
-                failed_requests: row.failed_requests,
-                canceled_requests: row.canceled_requests,
-                started_at: row.started_at,
-                last_updated_at: row.last_updated_at,
-                created_at: row.created_at,
-            })
-            .collect())
     }
 
     async fn get_batch_by_output_file_id(
@@ -1599,6 +1500,52 @@ impl<H: HttpClient + 'static> Storage for PostgresRequestManager<H> {
             .collect())
     }
 
+    async fn list_file_batches(&self, file_id: FileId) -> Result<Vec<BatchStatus>> {
+        let rows = sqlx::query!(
+            r#"
+            SELECT
+                b.id as batch_id,
+                b.file_id,
+                f.name as file_name,
+                b.total_requests,
+                b.pending_requests,
+                b.in_progress_requests,
+                b.completed_requests,
+                b.failed_requests,
+                b.canceled_requests,
+                b.requests_started_at as started_at,
+                b.requests_last_updated_at as last_updated_at,
+                b.created_at
+            FROM batches b
+            JOIN files f ON f.id = b.file_id
+            WHERE b.file_id = $1
+            ORDER BY b.created_at DESC
+            "#,
+            *file_id as Uuid,
+        )
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|e| FusilladeError::Other(anyhow!("Failed to list batches: {}", e)))?;
+
+        Ok(rows
+            .into_iter()
+            .map(|row| BatchStatus {
+                batch_id: BatchId(row.batch_id),
+                file_id: FileId(row.file_id),
+                file_name: row.file_name,
+                total_requests: row.total_requests,
+                pending_requests: row.pending_requests,
+                in_progress_requests: row.in_progress_requests,
+                completed_requests: row.completed_requests,
+                failed_requests: row.failed_requests,
+                canceled_requests: row.canceled_requests,
+                started_at: row.started_at,
+                last_updated_at: row.last_updated_at,
+                created_at: row.created_at,
+            })
+            .collect())
+    }
+
     async fn cancel_batch(&self, batch_id: BatchId) -> Result<()> {
         let now = Utc::now();
 
@@ -1638,12 +1585,14 @@ impl<H: HttpClient + 'static> Storage for PostgresRequestManager<H> {
         let rows = sqlx::query!(
             r#"
             SELECT
-                id, batch_id, template_id, state, endpoint, method, path, body, model, api_key,
-                retry_attempt, not_before, daemon_id, claimed_at, started_at,
-                response_status, response_body, completed_at, error, failed_at, canceled_at
-            FROM requests
-            WHERE batch_id = $1
-            ORDER BY created_at ASC
+                r.id, r.batch_id, r.template_id, r.state,
+                t.custom_id, t.endpoint, t.method, t.path, t.body, t.model, t.api_key,
+                r.retry_attempt, r.not_before, r.daemon_id, r.claimed_at, r.started_at,
+                r.response_status, r.response_body, r.completed_at, r.error, r.failed_at, r.canceled_at
+            FROM requests r
+            JOIN request_templates t ON r.template_id = t.id
+            WHERE r.batch_id = $1
+            ORDER BY r.created_at ASC
             "#,
             *batch_id as Uuid,
         )
@@ -1658,6 +1607,7 @@ impl<H: HttpClient + 'static> Storage for PostgresRequestManager<H> {
                 id: RequestId(row.id),
                 batch_id: BatchId(row.batch_id),
                 template_id: TemplateId(row.template_id),
+                custom_id: row.custom_id,
                 endpoint: row.endpoint,
                 method: row.method,
                 path: row.path,
@@ -1780,254 +1730,6 @@ impl<H: HttpClient + 'static> Storage for PostgresRequestManager<H> {
         }
 
         Ok(results)
-    }
-
-    fn get_request_updates(
-        &self,
-        id_filter: Option<Vec<RequestId>>,
-    ) -> std::pin::Pin<Box<dyn Stream<Item = Result<Result<AnyRequest>>> + Send>> {
-        let pool = self.pool.clone();
-        let (tx, rx) = mpsc::channel(100);
-
-        tokio::spawn(async move {
-            // Create a listener for Postgres NOTIFY events
-            let mut listener = match PgListener::connect_with(&pool)
-                .await
-                .map_err(|e| FusilladeError::Other(anyhow!("Failed to create listener: {}", e)))
-            {
-                Ok(l) => l,
-                Err(e) => {
-                    tracing::error!(error = %e, "Failed to create listener");
-                    let _ = tx.send(Err(e)).await;
-                    return;
-                }
-            };
-
-            // Listen on the request_updates channel
-            if let Err(e) = listener.listen("request_updates").await {
-                tracing::error!(error = %e, "Failed to listen on request_updates channel");
-                let _ = tx
-                    .send(Err(FusilladeError::Other(anyhow::anyhow!(
-                        "Failed to listen: {}",
-                        e
-                    ))))
-                    .await;
-                return;
-            }
-
-            tracing::info!("Listening for request updates");
-
-            loop {
-                match listener.recv().await {
-                    Ok(notification) => {
-                        // Parse the JSON payload
-                        let payload = notification.payload();
-
-                        // The payload contains: { "id": "...", "state": "...", "updated_at": "..." }
-                        // We need to parse the ID and fetch the full request from storage
-                        let parsed: serde_json::Result<serde_json::Value> =
-                            serde_json::from_str(payload);
-
-                        match parsed {
-                            Ok(json) => {
-                                if let Some(id_str) = json.get("id").and_then(|v| v.as_str()) {
-                                    // Parse the UUID
-                                    if let Ok(uuid) = uuid::Uuid::parse_str(id_str) {
-                                        let request_id = RequestId(uuid);
-
-                                        // Apply filter if specified
-                                        if let Some(ref filter) = id_filter {
-                                            if !filter.contains(&request_id) {
-                                                // Skip this update - not in filter
-                                                continue;
-                                            }
-                                        }
-
-                                        // Fetch the full request from storage by querying directly
-                                        let fetch_result: Result<Vec<Result<AnyRequest>>> =
-                                            async {
-                                                let uuid_ids = [*request_id];
-                                                let rows = sqlx::query!(
-                                                    r#"
-                                                SELECT
-                                                    id, batch_id, template_id, state, endpoint, method, path, body, model, api_key,
-                                                    retry_attempt, not_before, daemon_id, claimed_at, started_at,
-                                                    response_status, response_body, completed_at, error, failed_at, canceled_at
-                                                FROM requests
-                                                WHERE id = ANY($1)
-                                                "#,
-                                                    &uuid_ids[..],
-                                                )
-                                                .fetch_all(&pool)
-                                                .await
-                                                .map_err(|e| FusilladeError::Other(anyhow!("Failed to fetch requests: {}", e)))?;
-
-                                                let mut results = Vec::new();
-                                                for row in rows {
-                                                    let data = RequestData {
-                                                        id: RequestId(row.id),
-                                                        batch_id: BatchId(row.batch_id),
-                                                        template_id: TemplateId(row.template_id),
-                                                        endpoint: row.endpoint,
-                                                        method: row.method,
-                                                        path: row.path,
-                                                        body: row.body,
-                                                        model: row.model,
-                                                        api_key: row.api_key,
-                                                    };
-
-                                                    let state = &row.state;
-                                                    let any_request =
-                                                        match state.as_str() {
-                                                            "pending" => Ok(AnyRequest::Pending(Request {
-                                                                state: Pending {
-                                                                    retry_attempt: row.retry_attempt as u32,
-                                                                    not_before: row.not_before,
-                                                                },
-                                                                data,
-                                                            })),
-                                                            "claimed" => Ok(AnyRequest::Claimed(Request {
-                                                                state: Claimed {
-                                                                    daemon_id: DaemonId(row.daemon_id.ok_or_else(|| {
-                                                                        FusilladeError::Other(anyhow!("Missing daemon_id"))
-                                                                    })?),
-                                                                    claimed_at: row.claimed_at.ok_or_else(|| {
-                                                                        FusilladeError::Other(anyhow!("Missing claimed_at"))
-                                                                    })?,
-                                                                    retry_attempt: row.retry_attempt as u32,
-                                                                },
-                                                                data,
-                                                            })),
-                                                            "processing" => {
-                                                                let (_tx, rx) = mpsc::channel(1);
-                                                                let abort_handle = tokio::spawn(async {}).abort_handle();
-                                                                Ok(AnyRequest::Processing(Request {
-                                                                    state: Processing {
-                                                                        daemon_id: DaemonId(row.daemon_id.ok_or_else(|| {
-                                                                            FusilladeError::Other(anyhow!("Missing daemon_id"))
-                                                                        })?),
-                                                                        claimed_at: row.claimed_at.ok_or_else(|| {
-                                                                            FusilladeError::Other(anyhow!("Missing claimed_at"))
-                                                                        })?,
-                                                                        started_at: row.started_at.ok_or_else(|| {
-                                                                            FusilladeError::Other(anyhow!("Missing started_at"))
-                                                                        })?,
-                                                                        retry_attempt: row.retry_attempt as u32,
-                                                                        result_rx: Arc::new(Mutex::new(rx)),
-                                                                        abort_handle,
-                                                                    },
-                                                                    data,
-                                                                }))
-                                                            }
-                                                            "completed" => Ok(AnyRequest::Completed(Request {
-                                                                state: Completed {
-                                                                    response_status: row.response_status.ok_or_else(|| {
-                                                                        FusilladeError::Other(anyhow!("Missing response_status"))
-                                                                    })?
-                                                                        as u16,
-                                                                    response_body: row.response_body.ok_or_else(|| {
-                                                                        FusilladeError::Other(anyhow!("Missing response_body"))
-                                                                    })?,
-                                                                    claimed_at: row.claimed_at.ok_or_else(|| {
-                                                                        FusilladeError::Other(anyhow!("Missing claimed_at"))
-                                                                    })?,
-                                                                    started_at: row.started_at.ok_or_else(|| {
-                                                                        FusilladeError::Other(anyhow!("Missing started_at"))
-                                                                    })?,
-                                                                    completed_at: row.completed_at.ok_or_else(|| {
-                                                                        FusilladeError::Other(anyhow!("Missing completed_at"))
-                                                                    })?,
-                                                                },
-                                                                data,
-                                                            })),
-                                                            "failed" => Ok(AnyRequest::Failed(Request {
-                                                                state: Failed {
-                                                                    error: row
-                                                                        .error
-                                                                        .ok_or_else(|| FusilladeError::Other(anyhow!("Missing error")))?,
-                                                                    failed_at: row.failed_at.ok_or_else(|| {
-                                                                        FusilladeError::Other(anyhow!("Missing failed_at"))
-                                                                    })?,
-                                                                    retry_attempt: row.retry_attempt as u32,
-                                                                },
-                                                                data,
-                                                            })),
-                                                            "canceled" => Ok(AnyRequest::Canceled(Request {
-                                                                state: Canceled {
-                                                                    canceled_at: row.canceled_at.ok_or_else(|| {
-                                                                        FusilladeError::Other(anyhow!("Missing canceled_at"))
-                                                                    })?,
-                                                                },
-                                                                data,
-                                                            })),
-                                                            _ => Err(FusilladeError::Other(anyhow!("Unknown state: {}", state))),
-                                                        };
-                                                    results.push(any_request);
-                                                }
-                                                Ok(results)
-                                            }
-                                            .await;
-
-                                        match fetch_result {
-                                            Ok(results) => {
-                                                if let Some(result) = results.into_iter().next() {
-                                                    if tx.send(Ok(result)).await.is_err() {
-                                                        return;
-                                                    }
-                                                }
-                                            }
-                                            Err(e) => {
-                                                tracing::warn!(
-                                                    error = %e,
-                                                    request_id = %request_id,
-                                                    "Failed to fetch request after notification"
-                                                );
-                                                if tx.send(Err(e)).await.is_err() {
-                                                    return;
-                                                }
-                                            }
-                                        }
-                                    } else {
-                                        tracing::warn!(
-                                            id_str = id_str,
-                                            "Failed to parse UUID from notification"
-                                        );
-                                    }
-                                } else {
-                                    tracing::warn!(
-                                        payload = payload,
-                                        "Notification payload missing 'id' field"
-                                    );
-                                }
-                            }
-                            Err(e) => {
-                                tracing::warn!(
-                                    error = %e,
-                                    payload = payload,
-                                    "Failed to parse notification payload"
-                                );
-                            }
-                        }
-                    }
-                    Err(e) => {
-                        tracing::error!(error = %e, "Error receiving notification");
-                        if tx
-                            .send(Err(FusilladeError::Other(anyhow::anyhow!(
-                                "Notification error: {}",
-                                e
-                            ))))
-                            .await
-                            .is_err()
-                        {
-                            return;
-                        }
-                        // Don't return - keep trying to receive notifications
-                    }
-                }
-            }
-        });
-
-        Box::pin(ReceiverStream::new(rx))
     }
 }
 
@@ -2755,15 +2457,21 @@ mod tests {
         assert_eq!(file.name, "test-file");
         assert_eq!(file.description, Some("A test file".to_string()));
 
-        // Get templates for the file
-        let templates = manager
-            .get_file_templates(file_id)
+        // Get content for the file
+        let content = manager
+            .get_file_content(file_id)
             .await
-            .expect("Failed to get templates");
+            .expect("Failed to get content");
 
-        assert_eq!(templates.len(), 2);
-        assert_eq!(templates[0].model, "gpt-4");
-        assert_eq!(templates[1].model, "gpt-3.5");
+        assert_eq!(content.len(), 2);
+        match &content[0] {
+            FileContentItem::Template(t) => assert_eq!(t.model, "gpt-4"),
+            _ => panic!("Expected template"),
+        }
+        match &content[1] {
+            FileContentItem::Template(t) => assert_eq!(t.model, "gpt-3.5"),
+            _ => panic!("Expected template"),
+        }
     }
 
     #[sqlx::test]
@@ -3942,6 +3650,552 @@ mod tests {
             }
             _ => panic!("Expected Running state"),
         }
+    }
+
+    #[sqlx::test]
+    async fn test_create_file_stream_with_metadata_and_templates(pool: sqlx::PgPool) {
+        use crate::batch::{FileMetadata, FileStreamItem};
+        use futures::stream;
+
+        let http_client = Arc::new(MockHttpClient::new());
+        let manager = PostgresRequestManager::with_client(pool.clone(), http_client);
+
+        // Create a stream with metadata first, then templates
+        let items = vec![
+            FileStreamItem::Metadata(FileMetadata {
+                filename: Some("streamed-file".to_string()),
+                description: Some("A file created via streaming".to_string()),
+                purpose: None,
+                expires_after_anchor: None,
+                expires_after_seconds: None,
+                size_bytes: None,
+                uploaded_by: Some("test-user".to_string()),
+            }),
+            FileStreamItem::Template(RequestTemplateInput {
+                custom_id: Some("stream-1".to_string()),
+                endpoint: "https://api.example.com".to_string(),
+                method: "POST".to_string(),
+                path: "/v1/completions".to_string(),
+                body: r#"{"prompt":"first"}"#.to_string(),
+                model: "gpt-4".to_string(),
+                api_key: "key1".to_string(),
+            }),
+            FileStreamItem::Template(RequestTemplateInput {
+                custom_id: Some("stream-2".to_string()),
+                endpoint: "https://api.example.com".to_string(),
+                method: "POST".to_string(),
+                path: "/v1/completions".to_string(),
+                body: r#"{"prompt":"second"}"#.to_string(),
+                model: "gpt-3.5".to_string(),
+                api_key: "key2".to_string(),
+            }),
+        ];
+
+        let stream = stream::iter(items);
+
+        // Create file from stream
+        let file_id = manager
+            .create_file_stream(stream)
+            .await
+            .expect("Failed to create file from stream");
+
+        // Verify the file was created with correct metadata
+        let file = manager.get_file(file_id).await.expect("Failed to get file");
+        assert_eq!(file.name, "streamed-file");
+        assert_eq!(
+            file.description,
+            Some("A file created via streaming".to_string())
+        );
+
+        // Verify templates were created
+        let content = manager
+            .get_file_content(file_id)
+            .await
+            .expect("Failed to get content");
+        assert_eq!(content.len(), 2);
+
+        match &content[0] {
+            FileContentItem::Template(t) => {
+                assert_eq!(t.custom_id, Some("stream-1".to_string()));
+                assert_eq!(t.model, "gpt-4");
+            }
+            _ => panic!("Expected template"),
+        }
+        match &content[1] {
+            FileContentItem::Template(t) => {
+                assert_eq!(t.custom_id, Some("stream-2".to_string()));
+                assert_eq!(t.model, "gpt-3.5");
+            }
+            _ => panic!("Expected template"),
+        }
+    }
+
+    #[sqlx::test]
+    async fn test_create_file_stream_templates_before_metadata(pool: sqlx::PgPool) {
+        use crate::batch::{FileMetadata, FileStreamItem};
+        use futures::stream;
+
+        let http_client = Arc::new(MockHttpClient::new());
+        let manager = PostgresRequestManager::with_client(pool.clone(), http_client);
+
+        // Create a stream with templates first, then metadata
+        // This tests that metadata (including filename) can come after templates
+        // and will properly update the file
+        let items = vec![
+            FileStreamItem::Template(RequestTemplateInput {
+                custom_id: None,
+                endpoint: "https://api.example.com".to_string(),
+                method: "POST".to_string(),
+                path: "/test".to_string(),
+                body: r#"{"n":1}"#.to_string(),
+                model: "test".to_string(),
+                api_key: "key".to_string(),
+            }),
+            FileStreamItem::Metadata(FileMetadata {
+                filename: Some("late-metadata".to_string()),
+                description: Some("Metadata came late".to_string()),
+                purpose: None,
+                expires_after_anchor: None,
+                expires_after_seconds: None,
+                size_bytes: None,
+                uploaded_by: Some("test-user".to_string()),
+            }),
+            FileStreamItem::Template(RequestTemplateInput {
+                custom_id: None,
+                endpoint: "https://api.example.com".to_string(),
+                method: "POST".to_string(),
+                path: "/test".to_string(),
+                body: r#"{"n":2}"#.to_string(),
+                model: "test".to_string(),
+                api_key: "key".to_string(),
+            }),
+        ];
+
+        let stream = stream::iter(items);
+        let file_id = manager
+            .create_file_stream(stream)
+            .await
+            .expect("Failed to create file from stream");
+
+        // File should have the metadata even though it came after first template
+        let file = manager.get_file(file_id).await.unwrap();
+        assert_eq!(file.name, "late-metadata");
+        assert_eq!(file.description, Some("Metadata came late".to_string()));
+
+        // Should have 2 templates
+        let content = manager.get_file_content(file_id).await.unwrap();
+        assert_eq!(content.len(), 2);
+    }
+
+    #[sqlx::test]
+    async fn test_create_file_stream_error_handling(pool: sqlx::PgPool) {
+        use crate::batch::FileStreamItem;
+        use futures::stream;
+
+        let http_client = Arc::new(MockHttpClient::new());
+        let manager = PostgresRequestManager::with_client(pool.clone(), http_client);
+
+        // Create a stream with an error in the middle
+        let items = vec![
+            FileStreamItem::Template(RequestTemplateInput {
+                custom_id: None,
+                endpoint: "https://api.example.com".to_string(),
+                method: "POST".to_string(),
+                path: "/test".to_string(),
+                body: r#"{"n":1}"#.to_string(),
+                model: "test".to_string(),
+                api_key: "key".to_string(),
+            }),
+            FileStreamItem::Error("Invalid JSON on line 2".to_string()),
+            FileStreamItem::Template(RequestTemplateInput {
+                custom_id: None,
+                endpoint: "https://api.example.com".to_string(),
+                method: "POST".to_string(),
+                path: "/test".to_string(),
+                body: r#"{"n":2}"#.to_string(),
+                model: "test".to_string(),
+                api_key: "key".to_string(),
+            }),
+        ];
+
+        let stream = stream::iter(items);
+        let result = manager.create_file_stream(stream).await;
+
+        // Should fail with validation error
+        assert!(result.is_err());
+        match result {
+            Err(FusilladeError::ValidationError(msg)) => {
+                assert_eq!(msg, "Invalid JSON on line 2");
+            }
+            _ => panic!("Expected ValidationError"),
+        }
+    }
+
+    #[sqlx::test]
+    async fn test_get_batch(pool: sqlx::PgPool) {
+        let http_client = Arc::new(MockHttpClient::new());
+        let manager = PostgresRequestManager::with_client(pool.clone(), http_client);
+
+        // Create a file and batch
+        let file_id = manager
+            .create_file(
+                "batch-retrieval-test".to_string(),
+                Some("Test file for batch retrieval".to_string()),
+                vec![RequestTemplateInput {
+                    custom_id: Some("req-1".to_string()),
+                    endpoint: "https://api.example.com".to_string(),
+                    method: "POST".to_string(),
+                    path: "/v1/completions".to_string(),
+                    body: r#"{"prompt":"test"}"#.to_string(),
+                    model: "gpt-4".to_string(),
+                    api_key: "key".to_string(),
+                }],
+            )
+            .await
+            .unwrap();
+
+        let batch_input = crate::batch::BatchInput {
+            file_id,
+            endpoint: "/v1/chat/completions".to_string(),
+            completion_window: "24h".to_string(),
+            metadata: Some(serde_json::json!({"project": "test"})),
+            created_by: Some("test-user".to_string()),
+        };
+
+        let created_batch = manager.create_batch(batch_input).await.unwrap();
+
+        // Retrieve the batch
+        let retrieved_batch = manager
+            .get_batch(created_batch.id)
+            .await
+            .expect("Failed to get batch");
+
+        // Verify all fields match
+        assert_eq!(retrieved_batch.id, created_batch.id);
+        assert_eq!(retrieved_batch.file_id, file_id);
+        assert_eq!(retrieved_batch.endpoint, "/v1/chat/completions");
+        assert_eq!(retrieved_batch.completion_window, "24h");
+        assert_eq!(
+            retrieved_batch.metadata,
+            Some(serde_json::json!({"project": "test"}))
+        );
+        assert_eq!(retrieved_batch.created_by, Some("test-user".to_string()));
+        assert!(retrieved_batch.output_file_id.is_some());
+        assert!(retrieved_batch.error_file_id.is_some());
+        assert_eq!(retrieved_batch.total_requests, 1);
+        assert_eq!(retrieved_batch.pending_requests, 1);
+        assert_eq!(retrieved_batch.completed_requests, 0);
+    }
+
+    #[sqlx::test]
+    async fn test_get_batch_not_found(pool: sqlx::PgPool) {
+        let http_client = Arc::new(MockHttpClient::new());
+        let manager = PostgresRequestManager::with_client(pool.clone(), http_client);
+
+        // Try to get a batch that doesn't exist
+        let fake_batch_id = BatchId(Uuid::new_v4());
+        let result = manager.get_batch(fake_batch_id).await;
+
+        // Should return an error
+        assert!(result.is_err());
+        match result {
+            Err(FusilladeError::Other(e)) => {
+                assert!(e.to_string().contains("Batch not found"));
+            }
+            _ => panic!("Expected Other error with 'Batch not found' message"),
+        }
+    }
+
+    #[sqlx::test]
+    async fn test_get_batch_with_progress(pool: sqlx::PgPool) {
+        let http_client = Arc::new(MockHttpClient::new());
+        let manager = PostgresRequestManager::with_client(pool.clone(), http_client);
+
+        // Create a batch with multiple requests
+        let file_id = manager
+            .create_file(
+                "progress-test".to_string(),
+                None,
+                (0..5)
+                    .map(|i| RequestTemplateInput {
+                        custom_id: None,
+                        endpoint: "https://api.example.com".to_string(),
+                        method: "POST".to_string(),
+                        path: "/test".to_string(),
+                        body: format!(r#"{{"n":{}}}"#, i),
+                        model: "test".to_string(),
+                        api_key: "key".to_string(),
+                    })
+                    .collect(),
+            )
+            .await
+            .unwrap();
+
+        let batch = manager
+            .create_batch(crate::batch::BatchInput {
+                file_id,
+                endpoint: "/v1/chat/completions".to_string(),
+                completion_window: "24h".to_string(),
+                metadata: None,
+                created_by: None,
+            })
+            .await
+            .unwrap();
+
+        // Claim and complete some requests
+        let daemon_id = DaemonId::from(Uuid::new_v4());
+        let claimed = manager.claim_requests(2, daemon_id).await.unwrap();
+
+        // Mark one as completed
+        sqlx::query!(
+            r#"
+            UPDATE requests
+            SET state = 'completed',
+                response_status = 200,
+                response_body = '{"result":"ok"}',
+                completed_at = NOW()
+            WHERE id = $1
+            "#,
+            *claimed[0].data.id as Uuid,
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        // Get the batch and verify progress
+        let retrieved = manager.get_batch(batch.id).await.unwrap();
+        assert_eq!(retrieved.total_requests, 5);
+        assert_eq!(retrieved.pending_requests, 3);
+        assert_eq!(retrieved.in_progress_requests, 1); // Still claimed
+        assert_eq!(retrieved.completed_requests, 1);
+        assert_eq!(retrieved.failed_requests, 0);
+        assert_eq!(retrieved.canceled_requests, 0);
+    }
+
+    #[sqlx::test]
+    async fn test_get_requests_various_states(pool: sqlx::PgPool) {
+        let http_client = Arc::new(MockHttpClient::new());
+        let manager = PostgresRequestManager::with_client(pool.clone(), http_client);
+
+        // Create a batch with 5 requests
+        let file_id = manager
+            .create_file(
+                "get-requests-test".to_string(),
+                None,
+                (0..5)
+                    .map(|i| RequestTemplateInput {
+                        custom_id: Some(format!("req-{}", i)),
+                        endpoint: "https://api.example.com".to_string(),
+                        method: "POST".to_string(),
+                        path: "/test".to_string(),
+                        body: format!(r#"{{"n":{}}}"#, i),
+                        model: "test".to_string(),
+                        api_key: "key".to_string(),
+                    })
+                    .collect(),
+            )
+            .await
+            .unwrap();
+
+        let batch = manager
+            .create_batch(crate::batch::BatchInput {
+                file_id,
+                endpoint: "/v1/chat/completions".to_string(),
+                completion_window: "24h".to_string(),
+                metadata: None,
+                created_by: None,
+            })
+            .await
+            .unwrap();
+
+        let all_requests = manager.get_batch_requests(batch.id).await.unwrap();
+        let request_ids: Vec<_> = all_requests.iter().map(|r| r.id()).collect();
+
+        // Put requests in different states
+        let daemon_id = DaemonId::from(Uuid::new_v4());
+        let claimed = manager.claim_requests(2, daemon_id).await.unwrap();
+        let claimed_ids: Vec<_> = claimed.iter().map(|r| r.data.id).collect();
+
+        // Mark first claimed as completed (needs started_at for Processing->Completed transition)
+        sqlx::query!(
+            r#"
+            UPDATE requests
+            SET state = 'completed',
+                started_at = NOW() - INTERVAL '1 minute',
+                response_status = 200,
+                response_body = '{"done":true}',
+                completed_at = NOW()
+            WHERE id = $1
+            "#,
+            *claimed_ids[0] as Uuid,
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        // Mark one pending request as failed
+        let pending_id = request_ids
+            .iter()
+            .find(|id| !claimed_ids.contains(id))
+            .unwrap();
+        sqlx::query!(
+            r#"
+            UPDATE requests
+            SET state = 'failed',
+                error = 'Rate limit exceeded',
+                failed_at = NOW()
+            WHERE id = $1
+            "#,
+            **pending_id as Uuid,
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        // Retrieve all requests
+        let results = manager.get_requests(request_ids.clone()).await.unwrap();
+        assert_eq!(results.len(), 5);
+
+        // Verify states
+        let states: Vec<_> = results
+            .iter()
+            .map(|r| match r {
+                Ok(AnyRequest::Pending(_)) => "pending",
+                Ok(AnyRequest::Claimed(_)) => "claimed",
+                Ok(AnyRequest::Processing(_)) => "processing",
+                Ok(AnyRequest::Completed(_)) => "completed",
+                Ok(AnyRequest::Failed(_)) => "failed",
+                Ok(AnyRequest::Canceled(_)) => "canceled",
+                Err(_) => "error",
+            })
+            .collect();
+
+        // Should have: 1 completed, 1 failed, 1 claimed, 2 pending
+        assert_eq!(states.iter().filter(|&&s| s == "completed").count(), 1);
+        assert_eq!(states.iter().filter(|&&s| s == "failed").count(), 1);
+        assert_eq!(states.iter().filter(|&&s| s == "claimed").count(), 1);
+        assert_eq!(states.iter().filter(|&&s| s == "pending").count(), 2);
+    }
+
+    #[sqlx::test]
+    async fn test_get_requests_preserves_custom_ids(pool: sqlx::PgPool) {
+        let http_client = Arc::new(MockHttpClient::new());
+        let manager = PostgresRequestManager::with_client(pool.clone(), http_client);
+
+        // Create requests with custom IDs
+        let file_id = manager
+            .create_file(
+                "custom-id-test".to_string(),
+                None,
+                vec![
+                    RequestTemplateInput {
+                        custom_id: Some("my-custom-id-1".to_string()),
+                        endpoint: "https://api.example.com".to_string(),
+                        method: "POST".to_string(),
+                        path: "/test".to_string(),
+                        body: r#"{"test":1}"#.to_string(),
+                        model: "test".to_string(),
+                        api_key: "key".to_string(),
+                    },
+                    RequestTemplateInput {
+                        custom_id: Some("my-custom-id-2".to_string()),
+                        endpoint: "https://api.example.com".to_string(),
+                        method: "POST".to_string(),
+                        path: "/test".to_string(),
+                        body: r#"{"test":2}"#.to_string(),
+                        model: "test".to_string(),
+                        api_key: "key".to_string(),
+                    },
+                ],
+            )
+            .await
+            .unwrap();
+
+        let batch = manager
+            .create_batch(crate::batch::BatchInput {
+                file_id,
+                endpoint: "/v1/chat/completions".to_string(),
+                completion_window: "24h".to_string(),
+                metadata: None,
+                created_by: None,
+            })
+            .await
+            .unwrap();
+
+        let all_requests = manager.get_batch_requests(batch.id).await.unwrap();
+        let request_ids: Vec<_> = all_requests.iter().map(|r| r.id()).collect();
+
+        // Get requests
+        let results = manager.get_requests(request_ids).await.unwrap();
+        assert_eq!(results.len(), 2);
+
+        // Verify custom IDs are preserved
+        for result in results {
+            let request = result.expect("Request should be Ok");
+            let custom_id = match &request {
+                AnyRequest::Pending(r) => &r.data.custom_id,
+                _ => panic!("Expected Pending"),
+            };
+
+            assert!(
+                custom_id == &Some("my-custom-id-1".to_string())
+                    || custom_id == &Some("my-custom-id-2".to_string())
+            );
+        }
+    }
+
+    #[sqlx::test]
+    async fn test_get_requests_with_nonexistent_ids(pool: sqlx::PgPool) {
+        let http_client = Arc::new(MockHttpClient::new());
+        let manager = PostgresRequestManager::with_client(pool.clone(), http_client);
+
+        // Create one real request
+        let file_id = manager
+            .create_file(
+                "mixed-ids-test".to_string(),
+                None,
+                vec![RequestTemplateInput {
+                    custom_id: None,
+                    endpoint: "https://api.example.com".to_string(),
+                    method: "POST".to_string(),
+                    path: "/test".to_string(),
+                    body: r#"{}"#.to_string(),
+                    model: "test".to_string(),
+                    api_key: "key".to_string(),
+                }],
+            )
+            .await
+            .unwrap();
+
+        let batch = manager
+            .create_batch(crate::batch::BatchInput {
+                file_id,
+                endpoint: "/v1/chat/completions".to_string(),
+                completion_window: "24h".to_string(),
+                metadata: None,
+                created_by: None,
+            })
+            .await
+            .unwrap();
+
+        let all_requests = manager.get_batch_requests(batch.id).await.unwrap();
+        let real_id = all_requests[0].id();
+
+        // Mix real and fake IDs
+        let mixed_ids = vec![
+            real_id,
+            RequestId(Uuid::new_v4()),
+            RequestId(Uuid::new_v4()),
+        ];
+
+        let results = manager.get_requests(mixed_ids).await.unwrap();
+
+        // Should get results for all IDs requested
+        // Real ID should be Ok, fake IDs should be Err
+        assert_eq!(results.len(), 3);
+        assert!(results[0].is_ok()); // Real request
+        assert!(results[1].is_err()); // Fake ID
+        assert!(results[2].is_err()); // Fake ID
     }
 
     #[sqlx::test]

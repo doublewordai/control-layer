@@ -285,6 +285,7 @@ pub enum FileContentItem {
 #[derive(Debug, Clone, Default, Serialize)]
 pub struct FileMetadata {
     pub filename: Option<String>,
+    pub description: Option<String>,
     pub purpose: Option<String>,
     pub expires_after_anchor: Option<String>,
     pub expires_after_seconds: Option<i64>,

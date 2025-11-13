@@ -1062,21 +1062,6 @@ async fn setup_background_services(
 ///    seeds the database, and starts background services
 /// 2. **Serve**: [`Application::serve`] binds to a TCP port and starts handling requests
 /// 3. **Shutdown**: When the shutdown signal is received, gracefully stops all services
-///
-/// # Example
-///
-/// ```no_run
-/// use dwctl::{Application, Config};
-///
-/// # async fn example() -> anyhow::Result<()> {
-/// let config = Config::from_env()?;
-/// let app = Application::new(config).await?;
-///
-/// app.serve(async {
-///     tokio::signal::ctrl_c().await.expect("Failed to listen for ctrl+c");
-/// }).await?;
-/// # Ok(())
-/// # }
 /// ```
 pub struct Application {
     router: Router,
