@@ -32,8 +32,8 @@ use crate::daemon::{
 use crate::error::{FusilladeError, Result};
 use crate::http::HttpClient;
 use crate::request::{
-    Canceled, Claimed, Completed, DaemonId, Failed, Pending, Processing, Request, RequestData,
-    RequestId, RequestState,
+    Canceled, Claimed, Completed, DaemonId, Failed, FailureReason, Pending, Processing, Request,
+    RequestData, RequestId, RequestState,
 };
 
 use super::DaemonExecutor;
@@ -425,6 +425,11 @@ impl<H: HttpClient + 'static> Storage for PostgresRequestManager<H> {
                 }
             }
             AnyRequest::Failed(req) => {
+                // Serialize FailureReason as JSON
+                let error_json = serde_json::to_string(&req.state.reason).map_err(|e| {
+                    FusilladeError::Other(anyhow!("Failed to serialize failure reason: {}", e))
+                })?;
+
                 let rows_affected = sqlx::query!(
                     r#"
                     UPDATE requests SET
@@ -436,7 +441,7 @@ impl<H: HttpClient + 'static> Storage for PostgresRequestManager<H> {
                     "#,
                     *req.data.id as Uuid,
                     req.state.retry_attempt as i32,
-                    req.state.error,
+                    error_json,
                     req.state.failed_at,
                 )
                 .execute(&self.pool)
@@ -595,18 +600,34 @@ impl<H: HttpClient + 'static> Storage for PostgresRequestManager<H> {
                     },
                     data,
                 })),
-                "failed" => Ok(AnyRequest::Failed(Request {
-                    state: Failed {
-                        error: row.error.ok_or_else(|| {
-                            FusilladeError::Other(anyhow!("Missing error for failed request"))
-                        })?,
-                        failed_at: row.failed_at.ok_or_else(|| {
-                            FusilladeError::Other(anyhow!("Missing failed_at for failed request"))
-                        })?,
-                        retry_attempt: row.retry_attempt as u32,
-                    },
-                    data,
-                })),
+                "failed" => {
+                    let error_json = row.error.ok_or_else(|| {
+                        FusilladeError::Other(anyhow!("Missing error for failed request"))
+                    })?;
+
+                    // Try to deserialize as FailureReason, fall back to NetworkError for old data
+                    let reason: FailureReason =
+                        serde_json::from_str(&error_json).unwrap_or_else(|_| {
+                            // If deserialization fails, treat it as a legacy error string
+                            // and wrap it as a NetworkError for backwards compatibility
+                            FailureReason::NetworkError {
+                                error: error_json.clone(),
+                            }
+                        });
+
+                    Ok(AnyRequest::Failed(Request {
+                        state: Failed {
+                            reason,
+                            failed_at: row.failed_at.ok_or_else(|| {
+                                FusilladeError::Other(anyhow!(
+                                    "Missing failed_at for failed request"
+                                ))
+                            })?,
+                            retry_attempt: row.retry_attempt as u32,
+                        },
+                        data,
+                    }))
+                }
                 "canceled" => Ok(AnyRequest::Canceled(Request {
                     state: Canceled {
                         canceled_at: row.canceled_at.ok_or_else(|| {
@@ -1699,18 +1720,34 @@ impl<H: HttpClient + 'static> Storage for PostgresRequestManager<H> {
                     },
                     data,
                 }),
-                "failed" => AnyRequest::Failed(Request {
-                    state: Failed {
-                        error: row.error.ok_or_else(|| {
-                            FusilladeError::Other(anyhow!("Missing error for failed execution"))
-                        })?,
-                        failed_at: row.failed_at.ok_or_else(|| {
-                            FusilladeError::Other(anyhow!("Missing failed_at for failed execution"))
-                        })?,
-                        retry_attempt: row.retry_attempt as u32,
-                    },
-                    data,
-                }),
+                "failed" => {
+                    let error_json = row.error.ok_or_else(|| {
+                        FusilladeError::Other(anyhow!("Missing error for failed execution"))
+                    })?;
+
+                    // Try to deserialize as FailureReason, fall back to NetworkError for old data
+                    let reason: FailureReason =
+                        serde_json::from_str(&error_json).unwrap_or_else(|_| {
+                            // If deserialization fails, treat it as a legacy error string
+                            // and wrap it as a NetworkError for backwards compatibility
+                            FailureReason::NetworkError {
+                                error: error_json.clone(),
+                            }
+                        });
+
+                    AnyRequest::Failed(Request {
+                        state: Failed {
+                            reason,
+                            failed_at: row.failed_at.ok_or_else(|| {
+                                FusilladeError::Other(anyhow!(
+                                    "Missing failed_at for failed execution"
+                                ))
+                            })?,
+                            retry_attempt: row.retry_attempt as u32,
+                        },
+                        data,
+                    })
+                }
                 "canceled" => AnyRequest::Canceled(Request {
                     state: Canceled {
                         canceled_at: row.canceled_at.ok_or_else(|| {

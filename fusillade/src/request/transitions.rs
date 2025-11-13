@@ -107,7 +107,9 @@ use tokio::sync::Mutex;
 
 use crate::{error::Result, http::HttpClient, manager::Storage};
 
-use super::types::{Canceled, Claimed, Completed, DaemonId, Failed, Pending, Processing, Request};
+use super::types::{
+    Canceled, Claimed, Completed, DaemonId, Failed, FailureReason, Pending, Processing, Request,
+};
 
 impl Request<Pending> {
     pub async fn claim<S: Storage + ?Sized>(
@@ -320,10 +322,10 @@ impl Request<Processing> {
                 if should_retry(&http_response) {
                     // Treat as failure for retry purposes
                     let failed_state = Failed {
-                        error: format!(
-                            "HTTP request returned retriable status code: {}",
-                            http_response.status
-                        ),
+                        reason: FailureReason::RetriableHttpStatus {
+                            status: http_response.status,
+                            body: http_response.body.clone(),
+                        },
                         failed_at: chrono::Utc::now(),
                         retry_attempt: self.state.retry_attempt,
                     };
@@ -337,10 +339,10 @@ impl Request<Processing> {
                     // Non-retriable error (e.g., 4xx client errors)
                     // Mark as failed but don't retry
                     let failed_state = Failed {
-                        error: format!(
-                            "HTTP request returned error status code: {} - {}",
-                            http_response.status, http_response.body
-                        ),
+                        reason: FailureReason::NonRetriableHttpStatus {
+                            status: http_response.status,
+                            body: http_response.body.clone(),
+                        },
                         failed_at: chrono::Utc::now(),
                         retry_attempt: self.state.retry_attempt,
                     };
@@ -368,9 +370,11 @@ impl Request<Processing> {
                 }
             }
             Some(Err(e)) => {
-                // HTTP request failed
+                // HTTP request failed (network error, timeout, etc.)
                 let failed_state = Failed {
-                    error: crate::error::error_serialization::serialize_error(&e.into()),
+                    reason: FailureReason::NetworkError {
+                        error: crate::error::error_serialization::serialize_error(&e.into()),
+                    },
                     failed_at: chrono::Utc::now(),
                     retry_attempt: self.state.retry_attempt,
                 };
@@ -384,7 +388,7 @@ impl Request<Processing> {
             None => {
                 // Channel closed - task died without sending a result
                 let failed_state = Failed {
-                    error: "HTTP task terminated unexpectedly".to_string(),
+                    reason: FailureReason::TaskTerminated,
                     failed_at: chrono::Utc::now(),
                     retry_attempt: self.state.retry_attempt,
                 };
