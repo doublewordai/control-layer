@@ -1218,6 +1218,7 @@ mod test {
 
         // Test 2: Admin AI proxy with user who has no access to model
         let restricted_user = create_test_user(&pool, Role::StandardUser).await;
+
         let no_access_response = server
             .post("/admin/api/v1/ai/v1/chat/completions")
             .add_header("x-doubleword-user", &restricted_user.email)
@@ -1227,11 +1228,14 @@ mod test {
             }))
             .await;
 
-        // Should be not found since onwards returns 404 for no access
-        assert_eq!(
-            no_access_response.status_code().as_u16(),
-            404,
-            "Admin proxy should reject user with no model access"
+        // Should reject access - either 403 (Forbidden - API key not yet synced to onwards)
+        // or 404 (Not Found - onwards knows about key but user has no model access)
+        // The difference depends on timing of onwards config sync after hidden API key creation
+        let status = no_access_response.status_code().as_u16();
+        assert!(
+            status == 403 || status == 404,
+            "Admin proxy should reject user with no model access (got {})",
+            status
         );
 
         // Test 3: Admin AI proxy with missing header
