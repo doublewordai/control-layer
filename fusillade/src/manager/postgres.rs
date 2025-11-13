@@ -1251,6 +1251,24 @@ impl<H: HttpClient + 'static> Storage for PostgresRequestManager<H> {
             )));
         }
 
+        // Manually update batch counters since trigger no longer fires on INSERT
+        // All requests start in 'pending' state, so only total_requests and pending_requests need updating
+        sqlx::query!(
+            r#"
+            UPDATE batches
+            SET total_requests = $2,
+                pending_requests = $2,
+                requests_started_at = NOW(),
+                requests_last_updated_at = NOW()
+            WHERE id = $1
+            "#,
+            batch_id,
+            rows_affected as i64
+        )
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| FusilladeError::Other(anyhow!("Failed to update batch counters: {}", e)))?;
+
         tx.commit()
             .await
             .map_err(|e| FusilladeError::Other(anyhow!("Failed to commit transaction: {}", e)))?;
