@@ -1301,11 +1301,32 @@ impl<H: HttpClient + 'static> Storage for PostgresRequestManager<H> {
     async fn get_batch(&self, batch_id: BatchId) -> Result<Batch> {
         let row = sqlx::query!(
             r#"
-            SELECT id, file_id, endpoint, completion_window, metadata, output_file_id, error_file_id, created_by, created_at, expires_at, cancelling_at, errors,
-                   total_requests, pending_requests, in_progress_requests, completed_requests, failed_requests, canceled_requests,
-                   requests_started_at, requests_last_updated_at
-            FROM batches
-            WHERE id = $1
+            SELECT
+                b.id, b.file_id, b.endpoint, b.completion_window, b.metadata,
+                b.output_file_id, b.error_file_id, b.created_by, b.created_at,
+                b.expires_at, b.cancelling_at, b.errors,
+                b.total_requests,
+                (b.pending_requests + COALESCE(wal.pending_delta, 0))::BIGINT as "pending_requests!",
+                (b.in_progress_requests + COALESCE(wal.in_progress_delta, 0))::BIGINT as "in_progress_requests!",
+                (b.completed_requests + COALESCE(wal.completed_delta, 0))::BIGINT as "completed_requests!",
+                (b.failed_requests + COALESCE(wal.failed_delta, 0))::BIGINT as "failed_requests!",
+                (b.canceled_requests + COALESCE(wal.canceled_delta, 0))::BIGINT as "canceled_requests!",
+                b.requests_started_at,
+                b.requests_last_updated_at
+            FROM batches b
+            LEFT JOIN (
+                SELECT
+                    batch_id,
+                    SUM(pending_delta) as pending_delta,
+                    SUM(in_progress_delta) as in_progress_delta,
+                    SUM(completed_delta) as completed_delta,
+                    SUM(failed_delta) as failed_delta,
+                    SUM(canceled_delta) as canceled_delta
+                FROM batch_state_events
+                WHERE batch_id = $1
+                GROUP BY batch_id
+            ) wal ON b.id = wal.batch_id
+            WHERE b.id = $1
             "#,
             *batch_id as Uuid,
         )
@@ -1346,16 +1367,28 @@ impl<H: HttpClient + 'static> Storage for PostgresRequestManager<H> {
                 b.file_id,
                 f.name as file_name,
                 b.total_requests,
-                b.pending_requests,
-                b.in_progress_requests,
-                b.completed_requests,
-                b.failed_requests,
-                b.canceled_requests,
+                (b.pending_requests + COALESCE(wal.pending_delta, 0))::BIGINT as "pending_requests!",
+                (b.in_progress_requests + COALESCE(wal.in_progress_delta, 0))::BIGINT as "in_progress_requests!",
+                (b.completed_requests + COALESCE(wal.completed_delta, 0))::BIGINT as "completed_requests!",
+                (b.failed_requests + COALESCE(wal.failed_delta, 0))::BIGINT as "failed_requests!",
+                (b.canceled_requests + COALESCE(wal.canceled_delta, 0))::BIGINT as "canceled_requests!",
                 b.requests_started_at as started_at,
                 b.requests_last_updated_at as last_updated_at,
                 b.created_at
             FROM batches b
             JOIN files f ON f.id = b.file_id
+            LEFT JOIN (
+                SELECT
+                    batch_id,
+                    SUM(pending_delta) as pending_delta,
+                    SUM(in_progress_delta) as in_progress_delta,
+                    SUM(completed_delta) as completed_delta,
+                    SUM(failed_delta) as failed_delta,
+                    SUM(canceled_delta) as canceled_delta
+                FROM batch_state_events
+                WHERE batch_id = $1
+                GROUP BY batch_id
+            ) wal ON b.id = wal.batch_id
             WHERE b.id = $1
             "#,
             *batch_id as Uuid,
@@ -1390,11 +1423,31 @@ impl<H: HttpClient + 'static> Storage for PostgresRequestManager<H> {
             OutputFileType::Output => {
                 let row = sqlx::query!(
                     r#"
-                    SELECT id, file_id, endpoint, completion_window, metadata, output_file_id, error_file_id, created_by, created_at, expires_at, cancelling_at, errors,
-                           total_requests, pending_requests, in_progress_requests, completed_requests, failed_requests, canceled_requests,
-                           requests_started_at, requests_last_updated_at
-                    FROM batches
-                    WHERE output_file_id = $1
+                    SELECT
+                        b.id, b.file_id, b.endpoint, b.completion_window, b.metadata,
+                        b.output_file_id, b.error_file_id, b.created_by, b.created_at,
+                        b.expires_at, b.cancelling_at, b.errors,
+                        b.total_requests,
+                        (b.pending_requests + COALESCE(wal.pending_delta, 0))::BIGINT as "pending_requests!",
+                        (b.in_progress_requests + COALESCE(wal.in_progress_delta, 0))::BIGINT as "in_progress_requests!",
+                        (b.completed_requests + COALESCE(wal.completed_delta, 0))::BIGINT as "completed_requests!",
+                        (b.failed_requests + COALESCE(wal.failed_delta, 0))::BIGINT as "failed_requests!",
+                        (b.canceled_requests + COALESCE(wal.canceled_delta, 0))::BIGINT as "canceled_requests!",
+                        b.requests_started_at,
+                        b.requests_last_updated_at
+                    FROM batches b
+                    LEFT JOIN (
+                        SELECT
+                            batch_id,
+                            SUM(pending_delta) as pending_delta,
+                            SUM(in_progress_delta) as in_progress_delta,
+                            SUM(completed_delta) as completed_delta,
+                            SUM(failed_delta) as failed_delta,
+                            SUM(canceled_delta) as canceled_delta
+                        FROM batch_state_events
+                        GROUP BY batch_id
+                    ) wal ON b.id = wal.batch_id
+                    WHERE b.output_file_id = $1
                     "#,
                     *file_id as Uuid,
                 )
@@ -1428,11 +1481,31 @@ impl<H: HttpClient + 'static> Storage for PostgresRequestManager<H> {
             OutputFileType::Error => {
                 let row = sqlx::query!(
                     r#"
-                    SELECT id, file_id, endpoint, completion_window, metadata, output_file_id, error_file_id, created_by, created_at, expires_at, cancelling_at, errors,
-                           total_requests, pending_requests, in_progress_requests, completed_requests, failed_requests, canceled_requests,
-                           requests_started_at, requests_last_updated_at
-                    FROM batches
-                    WHERE error_file_id = $1
+                    SELECT
+                        b.id, b.file_id, b.endpoint, b.completion_window, b.metadata,
+                        b.output_file_id, b.error_file_id, b.created_by, b.created_at,
+                        b.expires_at, b.cancelling_at, b.errors,
+                        b.total_requests,
+                        (b.pending_requests + COALESCE(wal.pending_delta, 0))::BIGINT as "pending_requests!",
+                        (b.in_progress_requests + COALESCE(wal.in_progress_delta, 0))::BIGINT as "in_progress_requests!",
+                        (b.completed_requests + COALESCE(wal.completed_delta, 0))::BIGINT as "completed_requests!",
+                        (b.failed_requests + COALESCE(wal.failed_delta, 0))::BIGINT as "failed_requests!",
+                        (b.canceled_requests + COALESCE(wal.canceled_delta, 0))::BIGINT as "canceled_requests!",
+                        b.requests_started_at,
+                        b.requests_last_updated_at
+                    FROM batches b
+                    LEFT JOIN (
+                        SELECT
+                            batch_id,
+                            SUM(pending_delta) as pending_delta,
+                            SUM(in_progress_delta) as in_progress_delta,
+                            SUM(completed_delta) as completed_delta,
+                            SUM(failed_delta) as failed_delta,
+                            SUM(canceled_delta) as canceled_delta
+                        FROM batch_state_events
+                        GROUP BY batch_id
+                    ) wal ON b.id = wal.batch_id
+                    WHERE b.error_file_id = $1
                     "#,
                     *file_id as Uuid,
                 )
@@ -1491,16 +1564,36 @@ impl<H: HttpClient + 'static> Storage for PostgresRequestManager<H> {
             (None, None)
         };
 
-        // Use a single query with optional cursor filtering
+        // Use a single query with optional cursor filtering and WAL delta aggregation
         let rows = sqlx::query!(
             r#"
-            SELECT id, file_id, endpoint, completion_window, metadata, output_file_id, error_file_id, created_by, created_at, expires_at, cancelling_at, errors,
-                   total_requests, pending_requests, in_progress_requests, completed_requests, failed_requests, canceled_requests,
-                   requests_started_at, requests_last_updated_at
-            FROM batches
-            WHERE ($1::TEXT IS NULL OR created_by = $1)
-              AND ($3::TIMESTAMPTZ IS NULL OR created_at < $3 OR (created_at = $3 AND id < $4))
-            ORDER BY created_at DESC, id DESC
+            SELECT
+                b.id, b.file_id, b.endpoint, b.completion_window, b.metadata,
+                b.output_file_id, b.error_file_id, b.created_by, b.created_at,
+                b.expires_at, b.cancelling_at, b.errors,
+                b.total_requests,
+                (b.pending_requests + COALESCE(wal.pending_delta, 0))::BIGINT as "pending_requests!",
+                (b.in_progress_requests + COALESCE(wal.in_progress_delta, 0))::BIGINT as "in_progress_requests!",
+                (b.completed_requests + COALESCE(wal.completed_delta, 0))::BIGINT as "completed_requests!",
+                (b.failed_requests + COALESCE(wal.failed_delta, 0))::BIGINT as "failed_requests!",
+                (b.canceled_requests + COALESCE(wal.canceled_delta, 0))::BIGINT as "canceled_requests!",
+                b.requests_started_at,
+                b.requests_last_updated_at
+            FROM batches b
+            LEFT JOIN (
+                SELECT
+                    batch_id,
+                    SUM(pending_delta) as pending_delta,
+                    SUM(in_progress_delta) as in_progress_delta,
+                    SUM(completed_delta) as completed_delta,
+                    SUM(failed_delta) as failed_delta,
+                    SUM(canceled_delta) as canceled_delta
+                FROM batch_state_events
+                GROUP BY batch_id
+            ) wal ON b.id = wal.batch_id
+            WHERE ($1::TEXT IS NULL OR b.created_by = $1)
+              AND ($3::TIMESTAMPTZ IS NULL OR b.created_at < $3 OR (b.created_at = $3 AND b.id < $4))
+            ORDER BY b.created_at DESC, b.id DESC
             LIMIT $2
             "#,
             created_by,
@@ -1547,16 +1640,27 @@ impl<H: HttpClient + 'static> Storage for PostgresRequestManager<H> {
                 b.file_id,
                 f.name as file_name,
                 b.total_requests,
-                b.pending_requests,
-                b.in_progress_requests,
-                b.completed_requests,
-                b.failed_requests,
-                b.canceled_requests,
+                (b.pending_requests + COALESCE(wal.pending_delta, 0))::BIGINT as "pending_requests!",
+                (b.in_progress_requests + COALESCE(wal.in_progress_delta, 0))::BIGINT as "in_progress_requests!",
+                (b.completed_requests + COALESCE(wal.completed_delta, 0))::BIGINT as "completed_requests!",
+                (b.failed_requests + COALESCE(wal.failed_delta, 0))::BIGINT as "failed_requests!",
+                (b.canceled_requests + COALESCE(wal.canceled_delta, 0))::BIGINT as "canceled_requests!",
                 b.requests_started_at as started_at,
                 b.requests_last_updated_at as last_updated_at,
                 b.created_at
             FROM batches b
             JOIN files f ON f.id = b.file_id
+            LEFT JOIN (
+                SELECT
+                    batch_id,
+                    SUM(pending_delta) as pending_delta,
+                    SUM(in_progress_delta) as in_progress_delta,
+                    SUM(completed_delta) as completed_delta,
+                    SUM(failed_delta) as failed_delta,
+                    SUM(canceled_delta) as canceled_delta
+                FROM batch_state_events
+                GROUP BY batch_id
+            ) wal ON b.id = wal.batch_id
             WHERE b.file_id = $1
             ORDER BY b.created_at DESC
             "#,
@@ -1618,6 +1722,40 @@ impl<H: HttpClient + 'static> Storage for PostgresRequestManager<H> {
         .map_err(|e| FusilladeError::Other(anyhow!("Failed to cancel batch: {}", e)))?;
 
         Ok(())
+    }
+
+    async fn flush_batch_events(&self, batch_ids: Option<Vec<BatchId>>) -> Result<usize> {
+        let result = if let Some(ids) = batch_ids {
+            // Flush specific batches
+            let uuids: Vec<Uuid> = ids.iter().map(|id| **id).collect();
+            sqlx::query!(
+                r#"
+                SELECT compact_batch_state_events(id)
+                FROM UNNEST($1::uuid[]) AS id
+                "#,
+                &uuids
+            )
+            .fetch_all(&self.pool)
+            .await
+            .map_err(|e| FusilladeError::Other(anyhow!("Failed to flush batch events: {}", e)))?
+        } else {
+            // Flush all batches with pending WAL events
+            sqlx::query!(
+                r#"
+                WITH batch_ids AS (
+                    SELECT DISTINCT batch_id FROM batch_state_events
+                )
+                SELECT compact_batch_state_events(batch_id) FROM batch_ids
+                "#
+            )
+            .fetch_all(&self.pool)
+            .await
+            .map_err(|e| {
+                FusilladeError::Other(anyhow!("Failed to flush all batch events: {}", e))
+            })?
+        };
+
+        Ok(result.len())
     }
 
     async fn get_batch_requests(&self, batch_id: BatchId) -> Result<Vec<AnyRequest>> {

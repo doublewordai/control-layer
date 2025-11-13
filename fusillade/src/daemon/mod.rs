@@ -67,6 +67,10 @@ pub struct DaemonConfig {
     /// Interval for sending heartbeats to update daemon status in database (milliseconds)
     pub heartbeat_interval_ms: u64,
 
+    /// Interval for flushing batch WAL events into batch counters (milliseconds)
+    /// This keeps batch status counters up-to-date by periodically compacting the WAL
+    pub flush_batch_events_interval_ms: u64,
+
     /// Predicate function to determine if a response should be retried.
     /// Defaults to retrying 5xx, 429, and 408 status codes.
     #[serde(skip)]
@@ -95,6 +99,7 @@ impl Default for DaemonConfig {
             timeout_ms: 600000,
             status_log_interval_ms: Some(2000), // Log every 2 seconds by default
             heartbeat_interval_ms: 10000,       // Heartbeat every 10 seconds by default
+            flush_batch_events_interval_ms: 2000, // Flush batch events every 2 seconds by default
             should_retry: Arc::new(default_should_retry),
             claim_timeout_ms: 60000,       // 1 minute
             processing_timeout_ms: 600000, // 10 minutes
@@ -272,6 +277,35 @@ where
                 }
             });
         }
+
+        // Spawn periodic batch events flush task
+        let storage = self.storage.clone();
+        let flush_interval_ms = self.config.flush_batch_events_interval_ms;
+        let daemon_id = self.daemon_id;
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(Duration::from_millis(flush_interval_ms));
+            loop {
+                interval.tick().await;
+                match storage.flush_batch_events(None).await {
+                    Ok(count) => {
+                        if count > 0 {
+                            tracing::trace!(
+                                daemon_id = %daemon_id,
+                                batches_flushed = count,
+                                "Flushed batch WAL events"
+                            );
+                        }
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            daemon_id = %daemon_id,
+                            error = %e,
+                            "Failed to flush batch events"
+                        );
+                    }
+                }
+            }
+        });
 
         let mut join_set: JoinSet<Result<()>> = JoinSet::new();
 
@@ -499,6 +533,7 @@ mod tests {
             timeout_ms: 5000,
             status_log_interval_ms: None, // Disable status logging in tests
             heartbeat_interval_ms: 10000, // 10 seconds
+            flush_batch_events_interval_ms: 2000,
             should_retry: Arc::new(default_should_retry),
             claim_timeout_ms: 60000,
             processing_timeout_ms: 600000,
@@ -659,6 +694,7 @@ mod tests {
             timeout_ms: 5000,
             status_log_interval_ms: None,
             heartbeat_interval_ms: 10000,
+            flush_batch_events_interval_ms: 2000,
             should_retry: Arc::new(default_should_retry),
             claim_timeout_ms: 60000,
             processing_timeout_ms: 600000,
@@ -877,6 +913,7 @@ mod tests {
             timeout_ms: 5000,
             status_log_interval_ms: None,
             heartbeat_interval_ms: 10000,
+            flush_batch_events_interval_ms: 2000,
             should_retry: Arc::new(default_should_retry),
             claim_timeout_ms: 60000,
             processing_timeout_ms: 600000,
