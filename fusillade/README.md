@@ -102,27 +102,6 @@ for req in requests {
 }
 ```
 
-#### Streaming Updates
-
-To follow the status of an arbitrary set of requests over time.
-
-```rust
-use futures::StreamExt;
-
-let mut updates = manager.get_request_updates(Some(vec![request_id]));
-
-while let Some(result) = updates.next().await {
-    match result? {
-        Ok(AnyRequest::Processing(_)) => println!("Request processing..."),
-        Ok(AnyRequest::Completed(r)) => {
-            println!("Done: {}", r.state.response_body);
-            break;
-        }
-        _ => {}
-    }
-}
-```
-
 ## Database Setup
 
 Run migrations before first use, by importing the migrator and executing it against your database pool:

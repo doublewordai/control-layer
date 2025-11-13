@@ -5,7 +5,7 @@
 
 use crate::batch::{
     Batch, BatchId, BatchInput, BatchStatus, File, FileContentItem, FileFilter, FileId,
-    FileStreamItem, OutputFileType, RequestTemplate, RequestTemplateInput,
+    FileStreamItem, OutputFileType, RequestTemplateInput,
 };
 use crate::daemon::{AnyDaemonRecord, DaemonRecord, DaemonState, DaemonStatus};
 use crate::error::Result;
@@ -51,8 +51,8 @@ pub trait Storage: Send + Sync {
     /// List files with optional filtering.
     async fn list_files(&self, filter: FileFilter) -> Result<Vec<File>>;
 
-    /// Get all templates for a file.
-    async fn get_file_templates(&self, file_id: FileId) -> Result<Vec<RequestTemplate>>;
+    /// Get all content for a file.
+    async fn get_file_content(&self, file_id: FileId) -> Result<Vec<FileContentItem>>;
 
     /// Stream file content.
     /// Returns different content types based on the file's purpose:
@@ -165,19 +165,6 @@ pub trait Storage: Send + Sync {
 
     /// Get in progress requests by IDs.
     async fn get_requests(&self, ids: Vec<RequestId>) -> Result<Vec<Result<AnyRequest>>>;
-
-    /// Get a stream of updates for requests.
-    ///
-    /// Returns requests as they change status, if possible.
-    /// `None` for `id_filter` implies getting all request updates.
-    ///
-    /// The stream continues indefinitely, emitting updates as they occur.
-    /// The outer Result represents stream-level errors (e.g., connection loss),
-    /// while the inner Result represents per-update errors.
-    fn get_request_updates(
-        &self,
-        id_filter: Option<Vec<RequestId>>,
-    ) -> Pin<Box<dyn Stream<Item = Result<Result<AnyRequest>>> + Send>>;
 
     // These methods are used by the DaemonExecutor for pulling requests, and then persisting their
     // states as they iterate through them

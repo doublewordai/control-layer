@@ -191,16 +191,14 @@ enable_request_logging: true # Enable request/response logging to database
 # control layer, and they'll be executed asynchronously over the course of 24
 # hours.
 batches:
-  # Enable batches API endpoints (/files, /batches)
-  # These are mounted with the /admin endpoints - so can only be accessed via
-  # session or header auth, for now
+  # Enable batches API endpoints (/ai/v1/files, /ai/v1/batches)
   # When disabled, these endpoints will not be available (default: false).
   enabled: false
 
   # Daemon configuration for processing batch requests
   daemon:
     # Controls when the batch processing daemon runs
-    # - "leader": Only run on the elected leader instance (default, recommended for multi-instance deployments)
+    # - "leader": Only run on the elected leader instance (default)
     # - "always": Run on all instances (use for single-instance deployments)
     # - "never": Never run the daemon (useful for testing or when using external processors)
     enabled: leader

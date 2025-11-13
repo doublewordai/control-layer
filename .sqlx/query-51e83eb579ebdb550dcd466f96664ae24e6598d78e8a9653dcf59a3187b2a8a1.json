@@ -1,0 +1,84 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n            WITH locked_requests AS (\n                SELECT r.id, r.template_id, t.model, r.created_at\n                FROM requests r\n                JOIN request_templates t ON r.template_id = t.id\n                WHERE r.state = 'pending'\n                    AND (r.not_before IS NULL OR r.not_before <= $2)\n                FOR UPDATE OF r SKIP LOCKED\n            ),\n            ranked AS (\n                SELECT\n                    id,\n                    template_id,\n                    ROW_NUMBER() OVER (PARTITION BY model ORDER BY created_at) as model_rn,\n                    created_at\n                FROM locked_requests\n            ),\n            to_claim AS (\n                SELECT id, template_id\n                FROM ranked\n                ORDER BY model_rn, created_at ASC\n                LIMIT $3\n            )\n            UPDATE requests r\n            SET\n                state = 'claimed',\n                daemon_id = $1,\n                claimed_at = $2\n            FROM to_claim tc\n            JOIN request_templates t ON tc.template_id = t.id\n            WHERE r.id = tc.id\n            RETURNING r.id, r.batch_id, r.template_id, r.retry_attempt,\n                      t.custom_id, t.endpoint, t.method, t.path, t.body, t.model, t.api_key\n            ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "id",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 1,
+        "name": "batch_id",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 2,
+        "name": "template_id",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 3,
+        "name": "retry_attempt",
+        "type_info": "Int4"
+      },
+      {
+        "ordinal": 4,
+        "name": "custom_id",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 5,
+        "name": "endpoint",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 6,
+        "name": "method",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 7,
+        "name": "path",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 8,
+        "name": "body",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 9,
+        "name": "model",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 10,
+        "name": "api_key",
+        "type_info": "Text"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Timestamptz",
+        "Int8"
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      false,
+      false,
+      true,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false
+    ]
+  },
+  "hash": "51e83eb579ebdb550dcd466f96664ae24e6598d78e8a9653dcf59a3187b2a8a1"
+}
