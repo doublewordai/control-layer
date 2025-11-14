@@ -18,7 +18,11 @@ import {
   useUpdateModel,
 } from "../../../../api/control-layer";
 import { useAuthorization } from "../../../../utils";
-import { ApiExamples, AccessManagementModal } from "../../../modals";
+import {
+  ApiExamples,
+  AccessManagementModal,
+  UpdateModelPricingModal,
+} from "../../../modals";
 import UserUsageTable from "./UserUsageTable";
 import ModelProbes from "./ModelProbes";
 import {
@@ -112,6 +116,7 @@ const ModelInfo: React.FC = () => {
   const [isEditingAlias, setIsEditingAlias] = useState(false);
   const [showAccessModal, setShowAccessModal] = useState(false);
   const [isEditingModelDetails, setIsEditingModelDetails] = useState(false);
+  const [showPricingModal, setShowPricingModal] = useState(false);
 
   // Alias form
   const aliasForm = useForm<z.infer<typeof aliasFormSchema>>({
@@ -125,10 +130,12 @@ const ModelInfo: React.FC = () => {
 
   // Build include parameter based on permissions
   const includeParam = (() => {
-    if (canManageGroups && canViewAnalytics) return "groups,metrics" as const;
-    if (canManageGroups) return "groups" as const;
-    if (canViewAnalytics) return "metrics" as const;
-    return undefined;
+    const parts: string[] = [];
+    if (canManageGroups) parts.push("groups");
+    if (canViewAnalytics) parts.push("metrics");
+    // Always include pricing for all users
+    parts.push("pricing");
+    return parts.length > 0 ? (parts.join(",") as any) : undefined;
   })();
 
   const {
@@ -155,6 +162,15 @@ const ModelInfo: React.FC = () => {
   // Find the specific model and endpoint
   const model = rawModelsData?.find((m) => m.id === modelId);
   const endpoint = endpointsData?.find((e) => e.id === model?.hosted_on);
+
+  // Debug logging
+  useEffect(() => {
+    if (model) {
+      console.log("ModelInfo - Model data:", model);
+      console.log("ModelInfo - Pricing data:", model.pricing);
+      console.log("ModelInfo - Include param:", includeParam);
+    }
+  }, [model, includeParam]);
 
   // Initialize form data when model is loaded
   useEffect(() => {
@@ -251,6 +267,32 @@ const ModelInfo: React.FC = () => {
     });
     setIsEditingAlias(false);
     setSettingsError(null);
+  };
+
+  // Pricing modal handler
+  const handlePricingSubmit = async (pricing: {
+    input_price_per_token?: number;
+    output_price_per_token?: number;
+  }) => {
+    if (!model) return;
+    setSettingsError(null);
+
+    try {
+      await updateModelMutation.mutateAsync({
+        id: model.id,
+        data: {
+          pricing: {
+            input_price_per_token: pricing.input_price_per_token ?? null,
+            output_price_per_token: pricing.output_price_per_token ?? null,
+          },
+        },
+      });
+      setShowPricingModal(false);
+    } catch (error) {
+      setSettingsError(
+        error instanceof Error ? error.message : "Failed to update pricing",
+      );
+    }
   };
 
   if (loading) {
@@ -874,6 +916,68 @@ const ModelInfo: React.FC = () => {
                           </div>
                         )}
 
+                      {/* Pricing Display - visible to all users */}
+                      <div className="border-t pt-6">
+                        <div className="flex items-center justify-between mb-1">
+                          <div className="flex items-center gap-1">
+                            <p className="text-sm text-gray-600">Pricing</p>
+                            <HoverCard openDelay={100} closeDelay={50}>
+                              <HoverCardTrigger asChild>
+                                <Info className="h-3 w-3 text-gray-400 hover:text-gray-600" />
+                              </HoverCardTrigger>
+                              <HoverCardContent
+                                className="w-80"
+                                sideOffset={5}
+                              >
+                                <p className="text-sm text-muted-foreground">
+                                  Customer-facing pricing rates per token.
+                                  {canManageGroups && ` Click ${model.pricing ? "Edit" : "Set Pricing"} to update pricing.`}
+                                </p>
+                              </HoverCardContent>
+                            </HoverCard>
+                          </div>
+                          {canManageGroups && (
+                            <Button
+                              variant="outline"
+                              size="sm"
+                              onClick={() => setShowPricingModal(true)}
+                              className="h-8"
+                            >
+                              <Edit className="h-3 w-3 mr-1" />
+                              {model.pricing ? "Edit" : "Set Pricing"}
+                            </Button>
+                          )}
+                        </div>
+                        {model.pricing ? (
+                          <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
+                            <div>
+                              <p className="text-xs text-gray-500 mb-1">
+                                Input Price per Token
+                              </p>
+                              <p className="font-medium">
+                                {model.pricing.input_price_per_token
+                                  ? `$${model.pricing.input_price_per_token}`
+                                  : "Not set"}
+                              </p>
+                            </div>
+                            <div>
+                              <p className="text-xs text-gray-500 mb-1">
+                                Output Price per Token
+                              </p>
+                              <p className="font-medium">
+                                {model.pricing.output_price_per_token
+                                  ? `$${model.pricing.output_price_per_token}`
+                                  : "Not set"}
+                              </p>
+                            </div>
+                          </div>
+                        ) : (
+                          <p className="text-sm text-gray-500 mt-2">
+                            No pricing configured.{canManageGroups && ' Click "Set Pricing" to add pricing information.'}
+                          </p>
+                        )}
+                      </div>
+
                       {/* Rate Limiting Display - only show for Platform Managers */}
                       {canManageGroups &&
                         (model.requests_per_second !== undefined ||
@@ -1183,6 +1287,16 @@ const ModelInfo: React.FC = () => {
         isOpen={showAccessModal}
         onClose={() => setShowAccessModal(false)}
         model={model}
+      />
+
+      {/* Update Model Pricing Modal */}
+      <UpdateModelPricingModal
+        isOpen={showPricingModal}
+        modelName={model.alias}
+        currentPricing={model.pricing}
+        onSubmit={handlePricingSubmit}
+        onClose={() => setShowPricingModal(false)}
+        isLoading={updateModelMutation.isPending}
       />
     </div>
   );
