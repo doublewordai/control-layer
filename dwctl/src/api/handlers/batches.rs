@@ -61,29 +61,11 @@ fn to_batch_response(batch: fusillade::Batch) -> BatchResponse {
         None
     };
 
-    let finalizing_at = if openai_status == "finalizing" || openai_status == "completed" {
-        batch.requests_last_updated_at.map(|dt| dt.timestamp())
-    } else {
-        None
-    };
-
-    let completed_at = if openai_status == "completed" {
-        batch.requests_last_updated_at.map(|dt| dt.timestamp())
-    } else {
-        None
-    };
-
-    let failed_at = if openai_status == "failed" {
-        batch.requests_last_updated_at.map(|dt| dt.timestamp())
-    } else {
-        None
-    };
-
-    let cancelled_at = if openai_status == "cancelled" {
-        batch.requests_last_updated_at.map(|dt| dt.timestamp())
-    } else {
-        None
-    };
+    // Terminal state timestamps from batch table
+    let finalizing_at = batch.finalizing_at.map(|dt| dt.timestamp());
+    let completed_at = batch.completed_at.map(|dt| dt.timestamp());
+    let failed_at = batch.failed_at.map(|dt| dt.timestamp());
+    let cancelled_at = batch.cancelled_at.map(|dt| dt.timestamp());
 
     // Parse errors from JSON if present
     let errors = batch.errors.and_then(|e| serde_json::from_value::<BatchErrors>(e).ok());
