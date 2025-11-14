@@ -140,6 +140,18 @@ impl ProbeManager {
         .await
         .map_err(|e| anyhow::anyhow!("Failed to fetch deployment statuses: {}", e))?;
 
+        // Collect all active probe IDs for bulk uptime calculation
+        let active_probe_ids: Vec<Uuid> = rows.iter().filter(|row| row.active).map(|row| row.probe_id).collect();
+
+        // Calculate uptime for all active probes in one query
+        let uptime_map = if !active_probe_ids.is_empty() {
+            Self::calculate_uptime_percentages_bulk(pool, &active_probe_ids, chrono::Duration::hours(24))
+                .await
+                .unwrap_or_else(|_| std::collections::HashMap::new())
+        } else {
+            std::collections::HashMap::new()
+        };
+
         let mut result = std::collections::HashMap::new();
 
         for row in rows {
@@ -150,14 +162,8 @@ impl ProbeManager {
             let last_check = row.last_check;
             let last_success = row.last_success;
 
-            // Calculate 24h uptime for this probe
-            let uptime_24h = if active {
-                Self::calculate_uptime_percentage(pool, probe_id, chrono::Duration::hours(24))
-                    .await
-                    .ok()
-            } else {
-                None
-            };
+            // Get uptime from the bulk-calculated map (only for active probes)
+            let uptime_24h = if active { uptime_map.get(&probe_id).copied() } else { None };
 
             result.insert(
                 deployment_id,
@@ -168,33 +174,56 @@ impl ProbeManager {
         Ok(result)
     }
 
-    /// Calculate uptime percentage for a probe over a time period
-    async fn calculate_uptime_percentage(pool: &PgPool, probe_id: Uuid, duration: chrono::Duration) -> Result<f64, AppError> {
+    /// Calculate uptime percentages for multiple probes in bulk
+    async fn calculate_uptime_percentages_bulk(
+        pool: &PgPool,
+        probe_ids: &[Uuid],
+        duration: chrono::Duration,
+    ) -> Result<std::collections::HashMap<Uuid, f64>, AppError> {
+        if probe_ids.is_empty() {
+            return Ok(std::collections::HashMap::new());
+        }
+
         let since = chrono::Utc::now() - duration;
 
-        let row = sqlx::query!(
+        let rows = sqlx::query!(
             r#"
             SELECT
+                probe_id,
                 COUNT(*) as total,
                 COUNT(*) FILTER (WHERE success = true) as successful
             FROM probe_results
-            WHERE probe_id = $1 AND executed_at >= $2
+            WHERE probe_id = ANY($1) AND executed_at >= $2
+            GROUP BY probe_id
             "#,
-            probe_id,
+            probe_ids,
             since
         )
-        .fetch_one(pool)
+        .fetch_all(pool)
         .await
-        .map_err(|e| anyhow::anyhow!("Failed to calculate uptime: {}", e))?;
+        .map_err(|e| anyhow::anyhow!("Failed to calculate bulk uptime: {}", e))?;
 
-        let total = row.total.unwrap_or(0);
-        let successful = row.successful.unwrap_or(0);
+        let mut uptime_map = std::collections::HashMap::new();
 
-        if total == 0 {
-            return Ok(100.0); // No data = assume operational
+        for row in rows {
+            let total = row.total.unwrap_or(0);
+            let successful = row.successful.unwrap_or(0);
+
+            let uptime = if total == 0 {
+                100.0 // No data = assume operational
+            } else {
+                (successful as f64 / total as f64) * 100.0
+            };
+
+            uptime_map.insert(row.probe_id, uptime);
         }
 
-        Ok((successful as f64 / total as f64) * 100.0)
+        // For probes with no results, assume 100% uptime
+        for probe_id in probe_ids {
+            uptime_map.entry(*probe_id).or_insert(100.0);
+        }
+
+        Ok(uptime_map)
     }
 
     /// Activate a probe

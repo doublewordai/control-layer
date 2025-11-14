@@ -42,8 +42,12 @@ export function AuthProvider({ children }: AuthProviderProps) {
     try {
       setAuthState((prev) => ({ ...prev, isLoading: true }));
 
-      // Try to get current user (works for both proxy and native auth)
-      const user = await dwctlApi.users.get("current");
+      // Use queryClient.fetchQuery to leverage React Query caching
+      // This deduplicates simultaneous requests and caches the result
+      const user = await queryClient.fetchQuery({
+        queryKey: queryKeys.users.byId("current", undefined),
+        queryFn: () => dwctlApi.users.get("current"),
+      });
 
       // Determine auth method based on response headers or user data
       const authMethod = user.auth_source === "native" ? "native" : "proxy";

@@ -125,12 +125,12 @@ const ModelInfo: React.FC = () => {
 
   const updateModelMutation = useUpdateModel();
 
-  // Build include parameter based on permissions
+  // Build include parameter based on permissions - always include status to match Models page cache
   const includeParam = (() => {
-    if (canManageGroups && canViewAnalytics) return "groups,metrics" as const;
-    if (canManageGroups) return "groups" as const;
-    if (canViewAnalytics) return "metrics" as const;
-    return undefined;
+    const parts: string[] = ["status"]; // Always include status to reuse cache from Models page
+    if (canManageGroups) parts.push("groups");
+    if (canViewAnalytics) parts.push("metrics");
+    return parts.join(",") as const;
   })();
 
   const {
@@ -139,6 +139,7 @@ const ModelInfo: React.FC = () => {
     error: modelsError,
   } = useModels({
     include: includeParam,
+    accessible: !canManageGroups, // Match Models page: admins see all (false), non-admins see accessible only (true)
   });
 
   const {
