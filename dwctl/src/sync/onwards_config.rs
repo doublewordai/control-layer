@@ -1,8 +1,10 @@
 //! Configuration synchronization to onwards routing layer.
 
-use std::{collections::HashMap, num::NonZeroU32};
+use std::{collections::HashMap, num::NonZeroU32, sync::Arc};
 
-use onwards::target::{Auth, ConfigFile, KeyDefinition, RateLimitParameters, TargetSpec, Targets, WatchTargetsStream};
+use onwards::target::{
+    Auth, ConcurrencyLimitParameters, ConfigFile, KeyDefinition, RateLimitParameters, TargetSpec, Targets, WatchTargetsStream,
+};
 use sqlx::{postgres::PgListener, PgPool};
 use tokio::sync::{mpsc, watch};
 use tokio_util::sync::CancellationToken;
@@ -31,6 +33,8 @@ use crate::{
 pub struct OnwardsConfigSync {
     db: PgPool,
     sender: watch::Sender<Targets>,
+    /// Shared map of model batch capacity limits for the daemon
+    daemon_capacity_limits: Option<Arc<dashmap::DashMap<String, usize>>>,
 }
 
 #[derive(Default)]
@@ -42,13 +46,31 @@ impl OnwardsConfigSync {
     /// Creates a new OnwardsConfigSync and returns it along with initial targets and a WatchTargetsStream
     #[instrument(skip(db))]
     pub async fn new(db: PgPool) -> Result<(Self, Targets, WatchTargetsStream), anyhow::Error> {
+        Self::new_with_daemon_limits(db, None).await
+    }
+
+    /// Creates a new OnwardsConfigSync with optional daemon capacity limits map
+    #[instrument(skip(db, daemon_capacity_limits))]
+    pub async fn new_with_daemon_limits(
+        db: PgPool,
+        daemon_capacity_limits: Option<Arc<dashmap::DashMap<String, usize>>>,
+    ) -> Result<(Self, Targets, WatchTargetsStream), anyhow::Error> {
         // Load initial configuration
         let initial_targets = load_targets_from_db(&db).await?;
+
+        // If daemon limits are provided, populate them
+        if let Some(ref limits) = daemon_capacity_limits {
+            update_daemon_capacity_limits(&db, limits).await?;
+        }
 
         // Create watch channel with initial state
         let (sender, receiver) = watch::channel(initial_targets.clone());
 
-        let integration = Self { db, sender };
+        let integration = Self {
+            db,
+            sender,
+            daemon_capacity_limits,
+        };
         let stream = WatchTargetsStream::new(receiver);
 
         Ok((integration, initial_targets, stream))
@@ -121,6 +143,13 @@ impl OnwardsConfigSync {
                                             let target = entry.value();
                                             debug!("Target '{}': {} keys configured", alias,
                                                   target.keys.as_ref().map(|k| k.len()).unwrap_or(0));
+                                        }
+
+                                        // Update daemon capacity limits if configured
+                                        if let Some(ref limits) = self.daemon_capacity_limits {
+                                            if let Err(e) = update_daemon_capacity_limits(&self.db, limits).await {
+                                                error!("Failed to update daemon capacity limits: {}", e);
+                                            }
                                         }
 
                                         // Send update through watch channel
@@ -278,6 +307,7 @@ fn convert_to_config_file(
                         KeyDefinition {
                             key: api_key.secret.clone(),
                             rate_limit,
+                            concurrency_limit: None, // Per-key concurrency limits not yet supported
                         },
                     );
                 }
@@ -359,6 +389,15 @@ fn convert_to_config_file(
             let upstream_auth_header_name = auth_header_name.and_then(|name| if name != "Authorization" { Some(name) } else { None });
             let upstream_auth_header_prefix = auth_header_prefix.and_then(|prefix| if prefix != "Bearer " { Some(prefix) } else { None });
 
+            // Build concurrency limiting parameters if configured
+            let concurrency_limit = model.capacity.map(|capacity| {
+                debug!("Model '{}' configured with {} max concurrent requests", model.alias, capacity);
+
+                ConcurrencyLimitParameters {
+                    max_concurrent_requests: capacity as usize,
+                }
+            });
+
             // Convert pricing from database format to hashmap of response headers
             let response_headers = model.pricing.as_ref().and_then(|p| {
                 p.upstream.as_ref().map(|upstream| {
@@ -379,6 +418,7 @@ fn convert_to_config_file(
                 onwards_key: endpoint_api_key.cloned(),
                 onwards_model: Some(model.model_name.clone()),
                 rate_limit,
+                concurrency_limit,
                 upstream_auth_header_name,
                 upstream_auth_header_prefix,
                 response_headers,
@@ -617,7 +657,11 @@ mod tests {
         let shutdown_token = CancellationToken::new();
         let _drop_guard = shutdown_token.clone().drop_guard();
 
-        let sync = super::OnwardsConfigSync { db: pool.clone(), sender };
+        let sync = super::OnwardsConfigSync {
+            db: pool.clone(),
+            sender,
+            daemon_capacity_limits: None,
+        };
 
         // Verify initial pricing
         let initial_target = initial_targets
@@ -804,4 +848,37 @@ mod tests {
         assert!(result.is_err(), "Task should still be running after reconnection");
         sync_handle.abort();
     }
+}
+
+/// Updates the daemon capacity limits DashMap with batch_capacity values from deployed_models
+/// Atomically updates the map without clearing it to avoid a window with no limits
+async fn update_daemon_capacity_limits(db: &PgPool, limits: &Arc<dashmap::DashMap<String, usize>>) -> Result<(), anyhow::Error> {
+    // Query all models with their batch_capacity (including nulls to know what to remove)
+    let models = sqlx::query!(
+        r#"
+        SELECT alias, batch_capacity
+        FROM deployed_models
+        WHERE deleted = FALSE
+        "#
+    )
+    .fetch_all(db)
+    .await?;
+
+    // Build a set of models that should have limits
+    let mut models_with_limits = std::collections::HashSet::new();
+
+    // Insert/update limits for models with batch_capacity
+    for model in &models {
+        if let Some(batch_capacity) = model.batch_capacity {
+            models_with_limits.insert(model.alias.clone());
+            limits.insert(model.alias.clone(), batch_capacity as usize);
+            debug!("Updated daemon capacity limit for model '{}': {}", model.alias, batch_capacity);
+        }
+    }
+
+    // Remove limits for models that no longer have batch_capacity or were deleted
+    limits.retain(|model_alias, _| models_with_limits.contains(model_alias));
+
+    info!("Updated {} model capacity limits for daemon", limits.len());
+    Ok(())
 }

@@ -30,8 +30,13 @@ pub fn default_should_retry(response: &HttpResponse) -> bool {
     response.status >= 500 || response.status == 429 || response.status == 408
 }
 
+/// Default function for creating the should_retry Arc
+fn default_should_retry_fn() -> ShouldRetryFn {
+    Arc::new(default_should_retry)
+}
+
 /// Configuration for the daemon.
-#[derive(Clone, serde::Serialize)]
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
 pub struct DaemonConfig {
     /// Maximum number of requests to claim in each iteration
     pub claim_batch_size: usize,
@@ -39,8 +44,8 @@ pub struct DaemonConfig {
     /// Default concurrency limit per model
     pub default_model_concurrency: usize,
 
-    /// Per-model concurrency overrides
-    pub model_concurrency_limits: HashMap<String, usize>,
+    /// Per-model concurrency overrides (shared, can be updated dynamically)
+    pub model_concurrency_limits: Arc<dashmap::DashMap<String, usize>>,
 
     /// How long to sleep between claim iterations
     pub claim_interval_ms: u64,
@@ -73,7 +78,7 @@ pub struct DaemonConfig {
 
     /// Predicate function to determine if a response should be retried.
     /// Defaults to retrying 5xx, 429, and 408 status codes.
-    #[serde(skip)]
+    #[serde(skip, default = "default_should_retry_fn")]
     pub should_retry: ShouldRetryFn,
 
     /// Maximum time a request can stay in "claimed" state before being unclaimed
@@ -90,7 +95,7 @@ impl Default for DaemonConfig {
         Self {
             claim_batch_size: 100,
             default_model_concurrency: 10,
-            model_concurrency_limits: HashMap::new(),
+            model_concurrency_limits: Arc::new(dashmap::DashMap::new()),
             claim_interval_ms: 1000,
             max_retries: 5,
             backoff_ms: 1000,
@@ -163,7 +168,7 @@ where
                     .config
                     .model_concurrency_limits
                     .get(model)
-                    .copied()
+                    .map(|entry| *entry.value())
                     .unwrap_or(self.config.default_model_concurrency);
                 Arc::new(Semaphore::new(limit))
             })
@@ -528,7 +533,7 @@ mod tests {
             claim_batch_size: 10,
             claim_interval_ms: 10, // Very fast for testing
             default_model_concurrency: 10,
-            model_concurrency_limits: HashMap::new(),
+            model_concurrency_limits: Arc::new(dashmap::DashMap::new()),
             max_retries: 3,
             backoff_ms: 100,
             backoff_factor: 2,
@@ -682,7 +687,7 @@ mod tests {
         );
 
         // Setup: Create manager with concurrency limit of 2 for "gpt-4"
-        let mut model_concurrency_limits = HashMap::new();
+        let model_concurrency_limits = Arc::new(dashmap::DashMap::new());
         model_concurrency_limits.insert("gpt-4".to_string(), 2);
 
         let config = DaemonConfig {
@@ -908,7 +913,7 @@ mod tests {
             claim_batch_size: 10,
             claim_interval_ms: 10,
             default_model_concurrency: 10,
-            model_concurrency_limits: HashMap::new(),
+            model_concurrency_limits: Arc::new(dashmap::DashMap::new()),
             max_retries: 5,
             backoff_ms: 10, // Very fast backoff for testing
             backoff_factor: 2,

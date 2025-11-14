@@ -493,9 +493,17 @@ impl Default for DaemonConfig {
 impl DaemonConfig {
     /// Convert to fusillade daemon config
     pub fn to_fusillade_config(&self) -> fusillade::daemon::DaemonConfig {
+        self.to_fusillade_config_with_limits(None)
+    }
+
+    pub fn to_fusillade_config_with_limits(
+        &self,
+        model_capacity_limits: Option<std::sync::Arc<dashmap::DashMap<String, usize>>>,
+    ) -> fusillade::daemon::DaemonConfig {
         fusillade::daemon::DaemonConfig {
             claim_batch_size: self.claim_batch_size,
             default_model_concurrency: self.default_model_concurrency,
+            model_concurrency_limits: model_capacity_limits.unwrap_or_else(|| std::sync::Arc::new(dashmap::DashMap::new())),
             claim_interval_ms: self.claim_interval_ms,
             max_retries: self.max_retries,
             backoff_ms: self.backoff_ms,
