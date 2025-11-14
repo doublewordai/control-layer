@@ -94,7 +94,7 @@ const queryClient = new QueryClient({
       gcTime: 10 * 60 * 1000, // 10 minutes (was cacheTime in v4)
       refetchOnWindowFocus: false,
       retry: (failureCount, error) => {
-        // Don't retry on 401/403/404 (auth/not found errors) - fail fast
+        // Don't retry on 401/403/404 (auth/permission/not found errors) - fail fast
         if (error instanceof Error) {
           // Check if it's our ApiError with status property
           if (
@@ -118,8 +118,28 @@ const queryClient = new QueryClient({
         return failureCount < 3;
       },
     },
+    mutations: {
+      onError: (error) => {
+        // Handle 401s globally for mutations
+        if (error instanceof Error && "status" in error && error.status === 401) {
+          // Clear all queries and redirect to login
+          queryClient.clear();
+          window.location.href = "/login";
+        }
+      },
+    },
   },
 });
+
+// Global error boundary for query errors
+queryClient.getQueryCache().config.onError = (error) => {
+  // Handle 401s globally - session expired
+  if (error instanceof Error && "status" in error && error.status === 401) {
+    // Clear all queries and redirect to login
+    queryClient.clear();
+    window.location.href = "/login";
+  }
+};
 
 function RootRedirect() {
   const { isAuthenticated, isLoading } = useAuth();

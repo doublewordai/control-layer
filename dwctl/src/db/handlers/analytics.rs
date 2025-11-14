@@ -1,6 +1,8 @@
 //! Database queries for request analytics and aggregation.
 
 use chrono::{DateTime, Duration, Timelike, Utc};
+use moka::future::Cache;
+use once_cell::sync::Lazy;
 use sqlx::{FromRow, PgPool};
 use std::collections::HashMap;
 use tracing::instrument;
@@ -12,6 +14,14 @@ use crate::{
     },
     db::errors::Result,
 };
+
+/// Global cache for model metrics (60 second TTL)
+static METRICS_CACHE: Lazy<Cache<String, HashMap<String, ModelMetrics>>> = Lazy::new(|| {
+    Cache::builder()
+        .max_capacity(100)
+        .time_to_live(std::time::Duration::from_secs(60))
+        .build()
+});
 
 /// Time granularity for analytics queries
 #[derive(Debug, Clone, Copy)]
@@ -58,11 +68,20 @@ struct TotalRequestsRow {
 /// Model metrics aggregation from analytics query
 #[derive(FromRow)]
 struct ModelMetricsRow {
+    pub model: Option<String>,
     pub total_requests: Option<i64>,
     pub avg_latency_ms: Option<f64>,
     pub total_input_tokens: Option<i64>,
     pub total_output_tokens: Option<i64>,
     pub last_active_at: Option<DateTime<Utc>>,
+}
+
+/// Time series data for bulk queries (includes model name)
+#[derive(FromRow)]
+struct BulkTimeSeriesRow {
+    pub model: Option<String>,
+    pub timestamp: Option<DateTime<Utc>>,
+    pub requests_count: Option<i64>,
 }
 
 /// Get total request count
@@ -361,6 +380,46 @@ fn fill_missing_intervals_ten_minutes(
     filled_series
 }
 
+/// Fill missing 10-minute intervals for sparklines (simplified version for ModelTimeSeriesPoint)
+fn fill_missing_intervals_for_sparklines(
+    mut time_series: Vec<ModelTimeSeriesPoint>,
+    time_range_start: DateTime<Utc>,
+    time_range_end: DateTime<Utc>,
+) -> Vec<ModelTimeSeriesPoint> {
+    // Sort by timestamp to ensure order
+    time_series.sort_by_key(|point| point.timestamp);
+
+    // Create a HashMap for quick lookup of existing data points
+    let existing_points: HashMap<DateTime<Utc>, &ModelTimeSeriesPoint> = time_series.iter().map(|point| (point.timestamp, point)).collect();
+
+    // Generate all 10-minute intervals from start time to end time
+    // Round start time down to the nearest 10-minute interval
+    let start_ten_minutes = time_range_start
+        .date_naive()
+        .and_hms_opt(time_range_start.hour(), (time_range_start.minute() / 10) * 10, 0)
+        .map(|naive| naive.and_utc())
+        .unwrap_or(time_range_start);
+
+    let mut filled_series = Vec::new();
+    let mut current = start_ten_minutes;
+
+    while current <= time_range_end {
+        if let Some(existing_point) = existing_points.get(&current) {
+            // Use existing data
+            filled_series.push((*existing_point).clone());
+        } else {
+            // Fill with zero values
+            filled_series.push(ModelTimeSeriesPoint {
+                timestamp: current,
+                requests: 0,
+            });
+        }
+        current += Duration::minutes(10);
+    }
+
+    filled_series
+}
+
 /// Get status code breakdown (raw counts, percentages calculated later)
 #[instrument(skip(db), err)]
 async fn get_status_codes(
@@ -485,56 +544,136 @@ pub async fn get_requests_aggregate(
     })
 }
 
-/// Get aggregated metrics for a specific model
+/// Get aggregated metrics for one or more models (with 60s cache)
 #[instrument(skip(db), err)]
-pub async fn get_model_metrics(db: &PgPool, model_alias: &str) -> Result<ModelMetrics> {
-    // Get basic metrics
-    let row = sqlx::query_as!(
+pub async fn get_model_metrics(db: &PgPool, mut model_aliases: Vec<String>) -> Result<HashMap<String, ModelMetrics>> {
+    if model_aliases.is_empty() {
+        return Ok(HashMap::new());
+    }
+
+    // Create cache key by sorting aliases to ensure consistent key regardless of order
+    model_aliases.sort();
+    let cache_key = model_aliases.join(",");
+
+    // Check cache first
+    if let Some(cached) = METRICS_CACHE.get(&cache_key).await {
+        tracing::debug!("Cache hit for model metrics");
+        return Ok(cached);
+    }
+
+    // Cache miss - execute query
+    tracing::debug!("Cache miss for model metrics, executing query");
+    let result = get_model_metrics_impl(db, model_aliases.clone()).await?;
+
+    // Store in cache
+    METRICS_CACHE.insert(cache_key, result.clone()).await;
+
+    Ok(result)
+}
+
+/// Internal implementation of get_model_metrics (not cached)
+async fn get_model_metrics_impl(db: &PgPool, model_aliases: Vec<String>) -> Result<HashMap<String, ModelMetrics>> {
+    // Initialize all models with zero metrics (for models with no activity)
+    let mut metrics_map: HashMap<String, ModelMetrics> = HashMap::new();
+    for alias in &model_aliases {
+        metrics_map.insert(
+            alias.clone(),
+            ModelMetrics {
+                avg_latency_ms: None,
+                total_requests: 0,
+                total_input_tokens: 0,
+                total_output_tokens: 0,
+                last_active_at: None,
+                time_series: None, // Will be filled in later
+            },
+        );
+    }
+
+    // Get basic metrics for models that have activity
+    let metrics_rows = sqlx::query_as!(
         ModelMetricsRow,
         r#"
         SELECT
+            model,
             COUNT(*) as total_requests,
             AVG(duration_ms)::float8 as avg_latency_ms,
             COALESCE(SUM(prompt_tokens), 0)::bigint as total_input_tokens,
             COALESCE(SUM(completion_tokens), 0)::bigint as total_output_tokens,
             MAX(timestamp) as last_active_at
         FROM http_analytics
-        WHERE model = $1
+        WHERE model = ANY($1)
+        GROUP BY model
         "#,
-        model_alias
+        &model_aliases
     )
-    .fetch_one(db)
+    .fetch_all(db)
     .await?;
 
-    // Get time series data for sparklines (last 2 hours in 10-minute intervals)
+    // Update metrics for models that have actual data
+    for row in metrics_rows {
+        if let Some(model) = row.model {
+            if let Some(metrics) = metrics_map.get_mut(&model) {
+                metrics.avg_latency_ms = row.avg_latency_ms;
+                metrics.total_requests = row.total_requests.unwrap_or(0);
+                metrics.total_input_tokens = row.total_input_tokens.unwrap_or(0);
+                metrics.total_output_tokens = row.total_output_tokens.unwrap_or(0);
+                metrics.last_active_at = row.last_active_at;
+            }
+        }
+    }
+
+    // Get time series data for sparklines (last 2 hours in 10-minute intervals) for all models in one query
     let now = Utc::now();
     let two_hours_ago = now - Duration::hours(2);
-    let sparkline_data = match get_time_series(db, two_hours_ago, now, Some(model_alias), TimeGranularity::TenMinutes).await {
-        Ok(time_series_data) => {
-            let sparkline_points: Vec<ModelTimeSeriesPoint> = time_series_data
-                .into_iter()
-                .map(|point| ModelTimeSeriesPoint {
-                    timestamp: point.timestamp,
-                    requests: point.requests,
-                })
-                .collect();
-            Some(sparkline_points)
-        }
-        Err(_) => {
-            // If time series fails, still return metrics without sparkline
-            tracing::warn!("Failed to fetch time series data for model {}", model_alias);
-            None
-        }
-    };
 
-    Ok(ModelMetrics {
-        avg_latency_ms: row.avg_latency_ms,
-        total_requests: row.total_requests.unwrap_or(0),
-        total_input_tokens: row.total_input_tokens.unwrap_or(0),
-        total_output_tokens: row.total_output_tokens.unwrap_or(0),
-        last_active_at: row.last_active_at,
-        time_series: sparkline_data,
-    })
+    let time_series_rows = sqlx::query_as!(
+        BulkTimeSeriesRow,
+        r#"
+        SELECT
+            model,
+            date_trunc('hour', timestamp) + INTERVAL '10 minute' * FLOOR(EXTRACT(minute FROM timestamp) / 10) as timestamp,
+            COUNT(*) as requests_count
+        FROM http_analytics
+        WHERE model = ANY($1)
+            AND timestamp >= $2
+            AND timestamp <= $3
+        GROUP BY model, date_trunc('hour', timestamp) + INTERVAL '10 minute' * FLOOR(EXTRACT(minute FROM timestamp) / 10)
+        ORDER BY model, timestamp
+        "#,
+        &model_aliases,
+        two_hours_ago,
+        now
+    )
+    .fetch_all(db)
+    .await;
+
+    // Process time series data if successful
+    if let Ok(rows) = time_series_rows {
+        // Group time series points by model
+        let mut model_time_series: HashMap<String, Vec<ModelTimeSeriesPoint>> = HashMap::new();
+        for row in rows {
+            if let (Some(model), Some(timestamp)) = (row.model, row.timestamp) {
+                model_time_series.entry(model).or_default().push(ModelTimeSeriesPoint {
+                    timestamp,
+                    requests: row.requests_count.unwrap_or(0),
+                });
+            }
+        }
+
+        // Fill in missing intervals for all models (including those with no activity)
+        for model in &model_aliases {
+            if let Some(metrics) = metrics_map.get_mut(model) {
+                let time_series = model_time_series.get(model).cloned().unwrap_or_default();
+                // Fill gaps with zero values for consistent sparklines
+                let filled_time_series = fill_missing_intervals_for_sparklines(time_series, two_hours_ago, now);
+                metrics.time_series = Some(filled_time_series);
+            }
+        }
+    } else {
+        tracing::warn!("Failed to fetch bulk time series data for models");
+    }
+
+    Ok(metrics_map)
 }
 
 /// User usage data from analytics query
