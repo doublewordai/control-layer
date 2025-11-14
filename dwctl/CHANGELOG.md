@@ -1,5 +1,33 @@
 # Changelog
 
+## [0.7.0](https://github.com/doublewordai/control-layer/compare/v0.6.0...v0.7.0) (2025-11-14)
+
+
+### Features
+
+* add capacity & batch capacity ([#106](https://github.com/doublewordai/control-layer/issues/106)) ([d7f3f6d](https://github.com/doublewordai/control-layer/commit/d7f3f6d5435717dd10e2fda304bf4022a3179dc8))
+* Add support for billing to frontend ([#53](https://github.com/doublewordai/control-layer/issues/53)) ([c4f81da](https://github.com/doublewordai/control-layer/commit/c4f81dac1aec18a2288a0f6678e18c7f8c830d22))
+* batches endpoints ([#72](https://github.com/doublewordai/control-layer/issues/72)) ([f2143c6](https://github.com/doublewordai/control-layer/commit/f2143c6be2ed1cdc1cba60e630259feb1166ab7e))
+* daemon status tracking ([#96](https://github.com/doublewordai/control-layer/issues/96)) ([9222649](https://github.com/doublewordai/control-layer/commit/9222649f6706756fc5166c4747893e356f196914))
+* deduct credits when users use api ([#66](https://github.com/doublewordai/control-layer/issues/66)) ([e40ff24](https://github.com/doublewordai/control-layer/commit/e40ff24add8dc3c570e151aed9652126ac833b9e))
+* openAI compatible files endpoints ([#60](https://github.com/doublewordai/control-layer/issues/60)) ([5c2eccd](https://github.com/doublewordai/control-layer/commit/5c2eccd3aafc8b2fabe6baadad4d26552a80da41))
+* track batch status via triggers, and query in bulk rather than doing N+1 queries ([#100](https://github.com/doublewordai/control-layer/issues/100)) ([68d005d](https://github.com/doublewordai/control-layer/commit/68d005dadb00c2a4afc066b8a62c2afb528d57ef))
+
+
+### Bug Fixes
+
+* add just release target, setup idempotent publishing ([3084ce1](https://github.com/doublewordai/control-layer/commit/3084ce18c95ddabc23a9716e9918dcb244e51141))
+* bug where providing an invalid API key (like we do in the playground) would foreclose other auth methods ([#91](https://github.com/doublewordai/control-layer/issues/91)) ([1627a76](https://github.com/doublewordai/control-layer/commit/1627a7670b1bbd94090fe514c2836c585baf3ee5))
+* matching order ([de42c08](https://github.com/doublewordai/control-layer/commit/de42c08aa6578e5b73f582f3229786140b7815dd))
+* revert to aggregating batch status on demand ([#112](https://github.com/doublewordai/control-layer/issues/112)) ([04e9498](https://github.com/doublewordai/control-layer/commit/04e9498fc92e2461482f8df016c6b0e4974f0a78))
+
+
+### Dependencies
+
+* The following workspace dependencies were updated
+  * dependencies
+    * fusillade bumped from 0.1 to 0.2.0
+
 ## [0.6.0](https://github.com/doublewordai/control-layer/compare/v0.5.1...v0.6.0) (2025-11-06)
 
 
