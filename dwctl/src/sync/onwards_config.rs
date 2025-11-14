@@ -44,6 +44,7 @@ pub struct SyncConfig {
 
 impl OnwardsConfigSync {
     /// Creates a new OnwardsConfigSync and returns it along with initial targets and a WatchTargetsStream
+    #[allow(dead_code)]
     #[instrument(skip(db))]
     pub async fn new(db: PgPool) -> Result<(Self, Targets, WatchTargetsStream), anyhow::Error> {
         Self::new_with_daemon_limits(db, None).await
