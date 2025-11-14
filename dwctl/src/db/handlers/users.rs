@@ -114,25 +114,47 @@ impl<'c> Repository for Users<'c> {
 
     #[instrument(skip(self), fields(user_id = %abbrev_uuid(&id)), err)]
     async fn get_by_id(&mut self, id: Self::Id) -> Result<Option<Self::Response>> {
-        let mut tx = self.db.begin().await?;
-        let user = sqlx::query_as!(
-            User,
-            "SELECT * FROM users WHERE id = $1 AND id != '00000000-0000-0000-0000-000000000000'",
+        let result = sqlx::query!(
+            r#"
+            SELECT
+                u.id,
+                u.username,
+                u.email,
+                u.display_name,
+                u.avatar_url,
+                u.auth_source,
+                u.created_at,
+                u.updated_at,
+                u.last_login,
+                u.is_admin,
+                u.password_hash,
+                ARRAY_AGG(ur.role) FILTER (WHERE ur.role IS NOT NULL) as "roles: Vec<Role>"
+            FROM users u
+            LEFT JOIN user_roles ur ON ur.user_id = u.id
+            WHERE u.id = $1 AND u.id != '00000000-0000-0000-0000-000000000000'
+            GROUP BY u.id, u.username, u.email, u.display_name, u.avatar_url, u.auth_source, u.created_at, u.updated_at, u.last_login, u.is_admin, u.password_hash
+            "#,
             id
         )
-        .fetch_optional(&mut *tx)
+        .fetch_optional(&mut *self.db)
         .await?;
 
-        if let Some(user) = user {
-            // Get roles for this user
-            let roles = sqlx::query!("SELECT role as \"role: Role\" FROM user_roles WHERE user_id = $1", id)
-                .fetch_all(&mut *tx)
-                .await?;
+        if let Some(row) = result {
+            let user = User {
+                id: row.id,
+                username: row.username,
+                email: row.email,
+                display_name: row.display_name,
+                avatar_url: row.avatar_url,
+                auth_source: row.auth_source,
+                created_at: row.created_at,
+                updated_at: row.updated_at,
+                last_login: row.last_login,
+                is_admin: row.is_admin,
+                password_hash: row.password_hash,
+            };
 
-            let roles: Vec<Role> = roles.into_iter().map(|r| r.role).collect();
-
-            // This is a read operation, but we still need to commit the transaction to properly release database resources and close the transaction cleanly.
-            tx.commit().await?;
+            let roles = row.roles.unwrap_or_default();
 
             Ok(Some(UserDBResponse::from((roles, user))))
         } else {
@@ -146,29 +168,53 @@ impl<'c> Repository for Users<'c> {
             return Ok(std::collections::HashMap::new());
         }
 
-        let mut tx = self.db.begin().await?;
-
-        let users = sqlx::query_as!(
-            User,
-            "SELECT * FROM users WHERE id = ANY($1) AND id != '00000000-0000-0000-0000-000000000000'",
+        // Use a single JOIN query to avoid N+1 queries
+        let rows = sqlx::query!(
+            r#"
+            SELECT
+                u.id,
+                u.username,
+                u.email,
+                u.display_name,
+                u.avatar_url,
+                u.auth_source,
+                u.created_at,
+                u.updated_at,
+                u.last_login,
+                u.is_admin,
+                u.password_hash,
+                ARRAY_AGG(ur.role) FILTER (WHERE ur.role IS NOT NULL) as "roles: Vec<Role>"
+            FROM users u
+            LEFT JOIN user_roles ur ON ur.user_id = u.id
+            WHERE u.id = ANY($1) AND u.id != '00000000-0000-0000-0000-000000000000'
+            GROUP BY u.id, u.username, u.email, u.display_name, u.avatar_url, u.auth_source, u.created_at, u.updated_at, u.last_login, u.is_admin, u.password_hash
+            "#,
             ids.as_slice()
         )
-        .fetch_all(&mut *tx)
+        .fetch_all(&mut *self.db)
         .await?;
 
         let mut result = std::collections::HashMap::new();
 
-        for user in users {
-            // Get roles for each user
-            let roles = sqlx::query!("SELECT role as \"role: Role\" FROM user_roles WHERE user_id = $1", user.id)
-                .fetch_all(&mut *tx)
-                .await?;
+        for row in rows {
+            let user = User {
+                id: row.id,
+                username: row.username,
+                email: row.email,
+                display_name: row.display_name,
+                avatar_url: row.avatar_url,
+                auth_source: row.auth_source,
+                created_at: row.created_at,
+                updated_at: row.updated_at,
+                last_login: row.last_login,
+                is_admin: row.is_admin,
+                password_hash: row.password_hash,
+            };
 
-            let roles: Vec<Role> = roles.into_iter().map(|r| r.role).collect();
+            let roles = row.roles.unwrap_or_default();
 
             result.insert(user.id, UserDBResponse::from((roles, user)));
         }
-        tx.commit().await?;
 
         Ok(result)
     }

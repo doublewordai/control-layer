@@ -101,6 +101,7 @@ futures = "0.3.31"
 # axum-test is optional and only used for tests and benchmarks
 axum-test = { version = "17.3", optional = true }
 dashmap = { version = "6.1.0", features = ["serde"] }
+moka = { version = "0.12", features = ["future"] }
 
 [dev-dependencies]
 axum-test = { version = "17.3" }

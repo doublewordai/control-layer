@@ -1,4 +1,4 @@
-import { useEffect, useState, type ReactNode } from "react";
+import { useCallback, useEffect, useState, type ReactNode } from "react";
 import { useQueryClient } from "@tanstack/react-query";
 import { dwctlApi } from "../../api/control-layer/client";
 import { queryKeys } from "../../api/control-layer/keys";
@@ -28,22 +28,16 @@ export function AuthProvider({ children }: AuthProviderProps) {
 
   const queryClient = useQueryClient();
 
-  // Check authentication status on mount, but wait for MSW in demo mode
-  useEffect(() => {
-    // If in demo mode, wait for MSW to be ready before checking auth
-    if (isDemoMode && !isMswReady) {
-      return;
-    }
-
-    checkAuthStatus();
-  }, [isDemoMode, isMswReady]);
-
-  const checkAuthStatus = async () => {
+  const checkAuthStatus = useCallback(async () => {
     try {
       setAuthState((prev) => ({ ...prev, isLoading: true }));
 
-      // Try to get current user (works for both proxy and native auth)
-      const user = await dwctlApi.users.get("current");
+      // Use queryClient.fetchQuery to leverage React Query caching
+      // This deduplicates simultaneous requests and caches the result
+      const user = await queryClient.fetchQuery({
+        queryKey: queryKeys.users.byId("current", undefined),
+        queryFn: () => dwctlApi.users.get("current"),
+      });
 
       // Determine auth method based on response headers or user data
       const authMethod = user.auth_source === "native" ? "native" : "proxy";
@@ -63,7 +57,17 @@ export function AuthProvider({ children }: AuthProviderProps) {
         authMethod: null,
       });
     }
-  };
+  }, [queryClient]);
+
+  // Check authentication status on mount, but wait for MSW in demo mode
+  useEffect(() => {
+    // If in demo mode, wait for MSW to be ready before checking auth
+    if (isDemoMode && !isMswReady) {
+      return;
+    }
+
+    checkAuthStatus();
+  }, [isDemoMode, isMswReady, checkAuthStatus]);
 
   const login = async (credentials: LoginCredentials) => {
     const response = await dwctlApi.auth.login(credentials);
