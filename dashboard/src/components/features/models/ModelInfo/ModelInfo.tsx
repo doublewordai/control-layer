@@ -163,15 +163,6 @@ const ModelInfo: React.FC = () => {
   const model = rawModelsData?.find((m) => m.id === modelId);
   const endpoint = endpointsData?.find((e) => e.id === model?.hosted_on);
 
-  // Debug logging
-  useEffect(() => {
-    if (model) {
-      console.log("ModelInfo - Model data:", model);
-      console.log("ModelInfo - Pricing data:", model.pricing);
-      console.log("ModelInfo - Include param:", includeParam);
-    }
-  }, [model, includeParam]);
-
   // Initialize form data when model is loaded
   useEffect(() => {
     if (model) {
@@ -956,7 +947,7 @@ const ModelInfo: React.FC = () => {
                               </p>
                               <p className="font-medium">
                                 {model.pricing.input_price_per_token
-                                  ? `$${model.pricing.input_price_per_token}`
+                                  ? `$${Number(model.pricing.input_price_per_token).toFixed(4)}`
                                   : "Not set"}
                               </p>
                             </div>
@@ -966,7 +957,7 @@ const ModelInfo: React.FC = () => {
                               </p>
                               <p className="font-medium">
                                 {model.pricing.output_price_per_token
-                                  ? `$${model.pricing.output_price_per_token}`
+                                  ? `$${Number(model.pricing.output_price_per_token).toFixed(4)}`
                                   : "Not set"}
                               </p>
                             </div>

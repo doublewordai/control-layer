@@ -14,6 +14,7 @@ import {
   Info,
   ChevronRight,
   LayoutGrid,
+  DollarSign,
 } from "lucide-react";
 import {
   useModels,
@@ -102,6 +103,15 @@ const formatRelativeTime = (dateString?: string): string => {
   if (diffDays < 7) return `${diffDays}d ago`;
 
   return date.toLocaleDateString();
+};
+
+const formatPricing = (pricing?: { input_price_per_token?: number | null; output_price_per_token?: number | null }): string => {
+  if (!pricing || (!pricing.input_price_per_token && !pricing.output_price_per_token)) {
+    return "N/A";
+  }
+  const input = pricing.input_price_per_token ? `$${Number(pricing.input_price_per_token).toFixed(4)}` : "N/A";
+  const output = pricing.output_price_per_token ? `$${Number(pricing.output_price_per_token).toFixed(4)}` : "N/A";
+  return `${input} / ${output}`;
 };
 
 // StatusRow component for status page layout
@@ -215,6 +225,7 @@ const Models: React.FC = () => {
 
     if (canManageGroups) parts.push("groups");
     if (canViewAnalytics) parts.push("metrics");
+    parts.push("pricing"); // Always fetch pricing for display
 
     return parts.join(",");
   }, [canManageGroups, canViewAnalytics]);
@@ -885,6 +896,28 @@ const Models: React.FC = () => {
                                         )}
                                       </span>
                                     </div>
+
+                                    <div className="flex items-center gap-1.5 col-span-2">
+                                      <HoverCard
+                                        openDelay={200}
+                                        closeDelay={100}
+                                      >
+                                        <HoverCardTrigger asChild>
+                                          <DollarSign className="h-3.5 w-3.5 text-gray-500 " />
+                                        </HoverCardTrigger>
+                                        <HoverCardContent
+                                          className="w-48"
+                                          sideOffset={5}
+                                        >
+                                          <p className="text-xs text-muted-foreground">
+                                            Pricing per token (input / output)
+                                          </p>
+                                        </HoverCardContent>
+                                      </HoverCard>
+                                      <span className="text-gray-600">
+                                        {formatPricing(model.pricing)}
+                                      </span>
+                                    </div>
                                   </div>
                                 </div>
 
@@ -901,15 +934,36 @@ const Models: React.FC = () => {
                                 </div>
                               </div>
                             ) : (
-                              // Fallback when metrics not available - show description
+                              // Fallback when metrics not available - show description and pricing
                               <div
-                                className="flex items-center px-6 pb-4"
+                                className="px-6 pb-4 space-y-3"
                                 style={{ minHeight: "90px" }}
                               >
-                                <p className="text-sm text-gray-700 line-clamp-3">
+                                <p className="text-sm text-gray-700 line-clamp-2">
                                   {model.description ||
                                     "No description provided"}
                                 </p>
+                                <div className="flex items-center gap-1.5 text-xs">
+                                  <HoverCard
+                                    openDelay={200}
+                                    closeDelay={100}
+                                  >
+                                    <HoverCardTrigger asChild>
+                                      <DollarSign className="h-3.5 w-3.5 text-gray-500 " />
+                                    </HoverCardTrigger>
+                                    <HoverCardContent
+                                      className="w-48"
+                                      sideOffset={5}
+                                    >
+                                      <p className="text-xs text-muted-foreground">
+                                        Pricing per token (input / output)
+                                      </p>
+                                    </HoverCardContent>
+                                  </HoverCard>
+                                  <span className="text-gray-600">
+                                    {formatPricing(model.pricing)}
+                                  </span>
+                                </div>
                               </div>
                             )}
                           </CardContent>
