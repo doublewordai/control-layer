@@ -1,4 +1,4 @@
-import { useEffect, useState, type ReactNode } from "react";
+import { useCallback, useEffect, useState, type ReactNode } from "react";
 import { useQueryClient } from "@tanstack/react-query";
 import { dwctlApi } from "../../api/control-layer/client";
 import { queryKeys } from "../../api/control-layer/keys";
@@ -28,17 +28,7 @@ export function AuthProvider({ children }: AuthProviderProps) {
 
   const queryClient = useQueryClient();
 
-  // Check authentication status on mount, but wait for MSW in demo mode
-  useEffect(() => {
-    // If in demo mode, wait for MSW to be ready before checking auth
-    if (isDemoMode && !isMswReady) {
-      return;
-    }
-
-    checkAuthStatus();
-  }, [isDemoMode, isMswReady]);
-
-  const checkAuthStatus = async () => {
+  const checkAuthStatus = useCallback(async () => {
     try {
       setAuthState((prev) => ({ ...prev, isLoading: true }));
 
@@ -67,7 +57,17 @@ export function AuthProvider({ children }: AuthProviderProps) {
         authMethod: null,
       });
     }
-  };
+  }, [queryClient]);
+
+  // Check authentication status on mount, but wait for MSW in demo mode
+  useEffect(() => {
+    // If in demo mode, wait for MSW to be ready before checking auth
+    if (isDemoMode && !isMswReady) {
+      return;
+    }
+
+    checkAuthStatus();
+  }, [isDemoMode, isMswReady, checkAuthStatus]);
 
   const login = async (credentials: LoginCredentials) => {
     const response = await dwctlApi.auth.login(credentials);

@@ -16,6 +16,7 @@ import {
   useModels,
   useEndpoints,
   useUpdateModel,
+  type ModelsInclude,
 } from "../../../../api/control-layer";
 import { useAuthorization } from "../../../../utils";
 import { ApiExamples, AccessManagementModal } from "../../../modals";
@@ -130,7 +131,7 @@ const ModelInfo: React.FC = () => {
     const parts: string[] = ["status"]; // Always include status to reuse cache from Models page
     if (canManageGroups) parts.push("groups");
     if (canViewAnalytics) parts.push("metrics");
-    return parts.join(",") as const;
+    return parts.join(",");
   })();
 
   const {
@@ -138,7 +139,7 @@ const ModelInfo: React.FC = () => {
     isLoading: modelsLoading,
     error: modelsError,
   } = useModels({
-    include: includeParam,
+    include: includeParam as ModelsInclude,
     accessible: !canManageGroups, // Match Models page: admins see all (false), non-admins see accessible only (true)
   });
 
