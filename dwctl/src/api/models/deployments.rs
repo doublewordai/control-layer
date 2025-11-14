@@ -82,6 +82,10 @@ pub struct DeployedModelCreate {
     pub requests_per_second: Option<f32>,
     /// Global per-model rate limit: maximum burst size (null = no limit)
     pub burst_size: Option<i32>,
+    /// Maximum number of concurrent requests allowed for this model (null = no limit)
+    pub capacity: Option<i32>,
+    /// Maximum number of concurrent batch requests allowed for this model (null = defaults to capacity or no limit)
+    pub batch_capacity: Option<i32>,
     /// Customer-facing pricing rates
     pub pricing: Option<TokenPricing>,
     /// Provider/downstream pricing details (admin only)
@@ -101,6 +105,12 @@ pub struct DeployedModelUpdate {
     /// Global per-model rate limit: maximum burst size (null = no change, Some(None) = remove limit)
     #[serde(default, skip_serializing_if = "Option::is_none", with = "double_option")]
     pub burst_size: Option<Option<i32>>,
+    /// Maximum concurrent requests (null = no change, Some(None) = remove limit, Some(Some(n)) = set limit)
+    #[serde(default, skip_serializing_if = "Option::is_none", with = "double_option")]
+    pub capacity: Option<Option<i32>>,
+    /// Maximum concurrent batch requests (null = no change, Some(None) = remove limit, Some(Some(n)) = set limit)
+    #[serde(default, skip_serializing_if = "Option::is_none", with = "double_option")]
+    pub batch_capacity: Option<Option<i32>>,
     /// Customer-facing pricing rates partial updates (null = no change, Some(pricing_update) = partial update)
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pricing: Option<TokenPricingUpdate>,
@@ -151,6 +161,12 @@ pub struct DeployedModelResponse {
     /// Global per-model rate limit: maximum burst size (null = no limit)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub burst_size: Option<i32>,
+    /// Maximum number of concurrent requests allowed for this model (null = no limit)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub capacity: Option<i32>,
+    /// Maximum number of concurrent batch requests allowed for this model (null = defaults to capacity or no limit)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub batch_capacity: Option<i32>,
     /// Groups that have access to this model (only included if requested)
     /// Note: no_recursion is important! utoipa will panic at runtime, because it overflows the
     /// stack trying to follow the relationship.
@@ -186,6 +202,8 @@ impl From<DeploymentDBResponse> for DeployedModelResponse {
             updated_at: db.updated_at,
             requests_per_second: db.requests_per_second,
             burst_size: db.burst_size,
+            capacity: db.capacity,
+            batch_capacity: db.batch_capacity,
             groups: None,             // By default, relationships are not included
             metrics: None,            // By default, metrics are not included
             status: None,             // By default, probe status is not included

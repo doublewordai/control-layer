@@ -840,8 +840,13 @@ async fn setup_background_services(
     // Track all background task handles for graceful shutdown
     let mut background_tasks = Vec::new();
 
+    // Create shared model capacity limits map for daemon coordination
+    // This is populated by onwards config sync and read by fusillade daemon
+    let model_capacity_limits = Arc::new(dashmap::DashMap::new());
+
     // Start onwards integration for proxying AI requests
-    let (onwards_config_sync, initial_targets, onwards_stream) = sync::onwards_config::OnwardsConfigSync::new(pool.clone()).await?;
+    let (onwards_config_sync, initial_targets, onwards_stream) =
+        sync::onwards_config::OnwardsConfigSync::new_with_daemon_limits(pool.clone(), Some(model_capacity_limits.clone())).await?;
 
     // Clone targets for the update task
     let targets_for_updates = initial_targets.clone();
@@ -869,7 +874,12 @@ async fn setup_background_services(
     // Initialize the fusillade request manager (for batch processing)
     let request_manager = Arc::new(
         fusillade::PostgresRequestManager::new(fusillade_pool)
-            .with_config(config.batches.daemon.to_fusillade_config())
+            .with_config(
+                config
+                    .batches
+                    .daemon
+                    .to_fusillade_config_with_limits(Some(model_capacity_limits.clone())),
+            )
             .with_download_buffer_size(config.batches.files.download_buffer_size),
     );
 

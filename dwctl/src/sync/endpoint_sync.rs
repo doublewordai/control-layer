@@ -734,6 +734,8 @@ mod tests {
                 deleted: false,
                 requests_per_second: None,
                 burst_size: None,
+                capacity: None,
+                batch_capacity: None,
                 pricing: None,
             }
         }
