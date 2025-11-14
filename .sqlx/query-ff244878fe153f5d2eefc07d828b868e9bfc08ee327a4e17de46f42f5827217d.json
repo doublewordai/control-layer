@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "SELECT id, model_name, alias, description, type, capabilities, created_by, hosted_on, status, last_sync, deleted, created_at, updated_at, requests_per_second, burst_size, upstream_input_price_per_token, upstream_output_price_per_token, downstream_pricing_mode, downstream_input_price_per_token, downstream_output_price_per_token, downstream_hourly_rate, downstream_input_token_cost_ratio FROM deployed_models WHERE id = $1",
+  "query": "SELECT id, model_name, alias, description, type, capabilities, created_by, hosted_on, status, last_sync, deleted, created_at, updated_at, requests_per_second, burst_size, capacity, batch_capacity, upstream_input_price_per_token, upstream_output_price_per_token, downstream_pricing_mode, downstream_input_price_per_token, downstream_output_price_per_token, downstream_hourly_rate, downstream_input_token_cost_ratio FROM deployed_models WHERE id = ANY($1)",
   "describe": {
     "columns": [
       {
@@ -80,43 +80,53 @@
       },
       {
         "ordinal": 15,
+        "name": "capacity",
+        "type_info": "Int4"
+      },
+      {
+        "ordinal": 16,
+        "name": "batch_capacity",
+        "type_info": "Int4"
+      },
+      {
+        "ordinal": 17,
         "name": "upstream_input_price_per_token",
         "type_info": "Numeric"
       },
       {
-        "ordinal": 16,
+        "ordinal": 18,
         "name": "upstream_output_price_per_token",
         "type_info": "Numeric"
       },
       {
-        "ordinal": 17,
+        "ordinal": 19,
         "name": "downstream_pricing_mode",
         "type_info": "Varchar"
       },
       {
-        "ordinal": 18,
+        "ordinal": 20,
         "name": "downstream_input_price_per_token",
         "type_info": "Numeric"
       },
       {
-        "ordinal": 19,
+        "ordinal": 21,
         "name": "downstream_output_price_per_token",
         "type_info": "Numeric"
       },
       {
-        "ordinal": 20,
+        "ordinal": 22,
         "name": "downstream_hourly_rate",
         "type_info": "Numeric"
       },
       {
-        "ordinal": 21,
+        "ordinal": 23,
         "name": "downstream_input_token_cost_ratio",
         "type_info": "Numeric"
       }
     ],
     "parameters": {
       "Left": [
-        "Uuid"
+        "UuidArray"
       ]
     },
     "nullable": [
@@ -141,8 +151,10 @@
       true,
       true,
       true,
+      true,
+      true,
       true
     ]
   },
-  "hash": "bf00d3e42820bfa8facae8c34004bd2fd8b47f5c739caeb0cfd74cca15c6f3f6"
+  "hash": "ff244878fe153f5d2eefc07d828b868e9bfc08ee327a4e17de46f42f5827217d"
 }

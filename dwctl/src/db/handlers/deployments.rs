@@ -93,6 +93,8 @@ struct DeployedModel {
     pub updated_at: DateTime<Utc>,
     pub requests_per_second: Option<f32>,
     pub burst_size: Option<i32>,
+    pub capacity: Option<i32>,
+    pub batch_capacity: Option<i32>,
     // User-facing pricing (always per-token)
     pub upstream_input_price_per_token: Option<Decimal>,
     pub upstream_output_price_per_token: Option<Decimal>,
@@ -137,6 +139,8 @@ impl From<(Option<ModelType>, DeployedModel)> for DeploymentDBResponse {
             updated_at: m.updated_at,
             requests_per_second: m.requests_per_second,
             burst_size: m.burst_size,
+            capacity: m.capacity,
+            batch_capacity: m.batch_capacity,
             pricing,
         }
     }
@@ -178,11 +182,11 @@ impl<'c> Repository for Deployments<'c> {
             r#"
             INSERT INTO deployed_models (
                 model_name, alias, description, type, capabilities, created_by, hosted_on, created_at, updated_at,
-                requests_per_second, burst_size, upstream_input_price_per_token, upstream_output_price_per_token,
+                requests_per_second, burst_size, capacity, batch_capacity, upstream_input_price_per_token, upstream_output_price_per_token,
                 downstream_pricing_mode, downstream_input_price_per_token, downstream_output_price_per_token,
                 downstream_hourly_rate, downstream_input_token_cost_ratio
             )
-            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20)
             RETURNING *
             "#,
             request.model_name.trim(),
@@ -196,6 +200,8 @@ impl<'c> Repository for Deployments<'c> {
             updated_at,
             request.requests_per_second,
             request.burst_size,
+            request.capacity,
+            request.batch_capacity,
             flat_pricing.upstream_input_price_per_token,
             flat_pricing.upstream_output_price_per_token,
             flat_pricing.downstream_pricing_mode,
@@ -221,7 +227,7 @@ impl<'c> Repository for Deployments<'c> {
     async fn get_by_id(&mut self, id: Self::Id) -> Result<Option<Self::Response>> {
         let model = sqlx::query_as!(
             DeployedModel,
-            "SELECT id, model_name, alias, description, type, capabilities, created_by, hosted_on, status, last_sync, deleted, created_at, updated_at, requests_per_second, burst_size, upstream_input_price_per_token, upstream_output_price_per_token, downstream_pricing_mode, downstream_input_price_per_token, downstream_output_price_per_token, downstream_hourly_rate, downstream_input_token_cost_ratio FROM deployed_models WHERE id = $1",
+            "SELECT id, model_name, alias, description, type, capabilities, created_by, hosted_on, status, last_sync, deleted, created_at, updated_at, requests_per_second, burst_size, capacity, batch_capacity, upstream_input_price_per_token, upstream_output_price_per_token, downstream_pricing_mode, downstream_input_price_per_token, downstream_output_price_per_token, downstream_hourly_rate, downstream_input_token_cost_ratio FROM deployed_models WHERE id = $1",
             id
         )
             .fetch_optional(&mut *self.db)
@@ -246,7 +252,7 @@ impl<'c> Repository for Deployments<'c> {
 
         let deployments = sqlx::query_as!(
             DeployedModel,
-            "SELECT id, model_name, alias, description, type, capabilities, created_by, hosted_on, status, last_sync, deleted, created_at, updated_at, requests_per_second, burst_size, upstream_input_price_per_token, upstream_output_price_per_token, downstream_pricing_mode, downstream_input_price_per_token, downstream_output_price_per_token, downstream_hourly_rate, downstream_input_token_cost_ratio FROM deployed_models WHERE id = ANY($1)",
+            "SELECT id, model_name, alias, description, type, capabilities, created_by, hosted_on, status, last_sync, deleted, created_at, updated_at, requests_per_second, burst_size, capacity, batch_capacity, upstream_input_price_per_token, upstream_output_price_per_token, downstream_pricing_mode, downstream_input_price_per_token, downstream_output_price_per_token, downstream_hourly_rate, downstream_input_token_cost_ratio FROM deployed_models WHERE id = ANY($1)",
             ids.as_slice()
         )
             .fetch_all(&mut *self.db)
@@ -358,35 +364,45 @@ impl<'c> Repository for Deployments<'c> {
                 ELSE burst_size
             END,
 
+            -- Three-state update for capacity
+            capacity = CASE
+                WHEN $18 THEN $19
+                ELSE capacity
+            END,
+            batch_capacity = CASE
+                WHEN $20 THEN $21
+                ELSE batch_capacity
+            END,
+
             -- Individual field updates for customer/upstream pricing
             upstream_input_price_per_token = CASE
-                WHEN $18 THEN $19
+                WHEN $22 THEN $23
                 ELSE upstream_input_price_per_token
             END,
             upstream_output_price_per_token = CASE
-                WHEN $20 THEN $21
+                WHEN $24 THEN $25
                 ELSE upstream_output_price_per_token
             END,
 
             -- Individual field updates for downstream pricing
             downstream_pricing_mode = CASE
-                WHEN $22 THEN $23
+                WHEN $26 THEN $27
                 ELSE downstream_pricing_mode
             END,
             downstream_input_price_per_token = CASE
-                WHEN $24 THEN $25
+                WHEN $28 THEN $29
                 ELSE downstream_input_price_per_token
             END,
             downstream_output_price_per_token = CASE
-                WHEN $26 THEN $27
+                WHEN $30 THEN $31
                 ELSE downstream_output_price_per_token
             END,
             downstream_hourly_rate = CASE
-                WHEN $28 THEN $29
+                WHEN $32 THEN $33
                 ELSE downstream_hourly_rate
             END,
             downstream_input_token_cost_ratio = CASE
-                WHEN $30 THEN $31
+                WHEN $34 THEN $35
                 ELSE downstream_input_token_cost_ratio
             END,
 
@@ -416,22 +432,27 @@ impl<'c> Repository for Deployments<'c> {
             request.requests_per_second.as_ref().and_then(|inner| inner.as_ref()), // $15
             request.burst_size.is_some() as bool,                                  // $16
             request.burst_size.as_ref().and_then(|inner| inner.as_ref()),          // $17
+            // For capacity
+            request.capacity.is_some() as bool,                               // $18
+            request.capacity.as_ref().and_then(|inner| inner.as_ref()),       // $19
+            request.batch_capacity.is_some() as bool,                         // $20
+            request.batch_capacity.as_ref().and_then(|inner| inner.as_ref()), // $21
             // For individual customer/upstream pricing fields
-            pricing_params.should_update_customer_input,  // $18
-            pricing_params.customer_input,                // $19
-            pricing_params.should_update_customer_output, // $20
-            pricing_params.customer_output,               // $21
+            pricing_params.should_update_customer_input,  // $22
+            pricing_params.customer_input,                // $23
+            pricing_params.should_update_customer_output, // $24
+            pricing_params.customer_output,               // $25
             // For individual downstream pricing fields
-            pricing_params.should_update_downstream_mode,   // $22
-            pricing_params.downstream_mode,                 // $23
-            pricing_params.should_update_downstream_input,  // $24
-            pricing_params.downstream_input,                // $25
-            pricing_params.should_update_downstream_output, // $26
-            pricing_params.downstream_output,               // $27
-            pricing_params.should_update_downstream_hourly, // $28
-            pricing_params.downstream_hourly,               // $29
-            pricing_params.should_update_downstream_ratio,  // $30
-            pricing_params.downstream_ratio                 // $31
+            pricing_params.should_update_downstream_mode,   // $26
+            pricing_params.downstream_mode,                 // $27
+            pricing_params.should_update_downstream_input,  // $28
+            pricing_params.downstream_input,                // $29
+            pricing_params.should_update_downstream_output, // $30
+            pricing_params.downstream_output,               // $31
+            pricing_params.should_update_downstream_hourly, // $32
+            pricing_params.downstream_hourly,               // $33
+            pricing_params.should_update_downstream_ratio,  // $34
+            pricing_params.downstream_ratio                 // $35
         )
         .fetch_one(&mut *self.db)
         .await?;
@@ -616,6 +637,8 @@ mod tests {
                     .hosted_on(test_endpoint_id)
                     .model_type(ModelType::Chat)
                     .capabilities(vec!["text-generation".to_string(), "streaming".to_string()])
+                    .capacity(100)
+                    .batch_capacity(50)
                     .build();
 
                 model = repo.create(&model_create).await.unwrap();
@@ -630,6 +653,8 @@ mod tests {
             model.capabilities,
             Some(vec!["text-generation".to_string(), "streaming".to_string()])
         );
+        assert_eq!(model.capacity, Some(100));
+        assert_eq!(model.batch_capacity, Some(50));
     }
 
     #[sqlx::test]
@@ -709,6 +734,8 @@ mod tests {
                     .description(Some("Updated description".to_string()))
                     .model_type(Some(ModelType::Embeddings))
                     .capabilities(Some(vec!["embeddings".to_string(), "similarity".to_string()]))
+                    .capacity(Some(200))
+                    .batch_capacity(Some(75))
                     .build();
 
                 updated_model = repo.update(created_model.id, &update).await.unwrap();
@@ -722,6 +749,8 @@ mod tests {
             updated_model.capabilities,
             Some(vec!["embeddings".to_string(), "similarity".to_string()])
         );
+        assert_eq!(updated_model.capacity, Some(200));
+        assert_eq!(updated_model.batch_capacity, Some(75));
     }
 
     #[sqlx::test]
@@ -761,6 +790,8 @@ mod tests {
         assert_eq!(model.created_by, user.id);
         assert_eq!(model.model_type, None);
         assert_eq!(model.capabilities, None);
+        assert_eq!(model.capacity, None);
+        assert_eq!(model.batch_capacity, None);
     }
 
     #[sqlx::test]
@@ -785,7 +816,7 @@ mod tests {
             let mut tx = pool.begin().await.unwrap();
             {
                 let mut repo = Deployments::new(tx.acquire().await.unwrap());
-                // Create a model with type and capabilities
+                // Create a model with type, capabilities, and capacity
                 let mut model_create = DeploymentCreateDBRequest::builder()
                     .created_by(user.id)
                     .model_name("to-null-model".to_string())
@@ -794,6 +825,8 @@ mod tests {
                 model_create.hosted_on = test_endpoint_id;
                 model_create.model_type = Some(ModelType::Chat);
                 model_create.capabilities = Some(vec!["test-capability".to_string()]);
+                model_create.capacity = Some(150);
+                model_create.batch_capacity = Some(60);
 
                 created_model = repo.create(&model_create).await.unwrap();
 
@@ -801,6 +834,8 @@ mod tests {
                 let update = DeploymentUpdateDBRequest::builder()
                     .maybe_model_type(Some(None))
                     .maybe_capabilities(Some(None))
+                    .maybe_capacity(Some(None))
+                    .maybe_batch_capacity(Some(None))
                     .build();
 
                 updated_model = repo.update(created_model.id, &update).await.unwrap();
@@ -809,8 +844,12 @@ mod tests {
         }
         assert_eq!(created_model.model_type, Some(ModelType::Chat));
         assert_eq!(created_model.capabilities, Some(vec!["test-capability".to_string()]));
+        assert_eq!(created_model.capacity, Some(150));
+        assert_eq!(created_model.batch_capacity, Some(60));
         assert_eq!(updated_model.model_type, None);
         assert_eq!(updated_model.capabilities, None);
+        assert_eq!(updated_model.capacity, None);
+        assert_eq!(updated_model.batch_capacity, None);
     }
 
     #[sqlx::test]

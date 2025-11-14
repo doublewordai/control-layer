@@ -366,6 +366,8 @@ pub struct DeploymentCreateDBRequest {
     pub hosted_on: InferenceEndpointId,
     pub requests_per_second: Option<f32>,
     pub burst_size: Option<i32>,
+    pub capacity: Option<i32>,
+    pub batch_capacity: Option<i32>,
     // Clean structured pricing
     pub pricing: Option<ModelPricing>,
 }
@@ -385,6 +387,8 @@ impl DeploymentCreateDBRequest {
             .hosted_on(create.hosted_on)
             .maybe_requests_per_second(create.requests_per_second)
             .maybe_burst_size(create.burst_size)
+            .maybe_capacity(create.capacity)
+            .maybe_batch_capacity(create.batch_capacity)
             .maybe_pricing(combined_pricing)
             .build()
     }
@@ -403,6 +407,8 @@ pub struct DeploymentUpdateDBRequest {
     pub deleted: Option<bool>,
     pub requests_per_second: Option<Option<f32>>,
     pub burst_size: Option<Option<i32>>,
+    pub capacity: Option<Option<i32>>,
+    pub batch_capacity: Option<Option<i32>>,
     // Pricing updates using double-option pattern
     pub pricing: Option<ModelPricingUpdate>,
 }
@@ -425,6 +431,8 @@ impl From<DeployedModelUpdate> for DeploymentUpdateDBRequest {
             .maybe_capabilities(update.capabilities)
             .maybe_requests_per_second(update.requests_per_second)
             .maybe_burst_size(update.burst_size)
+            .maybe_capacity(update.capacity)
+            .maybe_batch_capacity(update.batch_capacity)
             .maybe_pricing(pricing_update)
             .build()
     }
@@ -466,6 +474,8 @@ pub struct DeploymentDBResponse {
     pub updated_at: DateTime<Utc>,
     pub requests_per_second: Option<f32>,
     pub burst_size: Option<i32>,
+    pub capacity: Option<i32>,
+    pub batch_capacity: Option<i32>,
     // Clean structured pricing
     pub pricing: Option<ModelPricing>,
 }

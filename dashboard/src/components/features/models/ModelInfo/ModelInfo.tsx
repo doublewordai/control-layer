@@ -106,6 +106,8 @@ const ModelInfo: React.FC = () => {
     capabilities: [] as string[],
     requests_per_second: null as number | null,
     burst_size: null as number | null,
+    capacity: null as number | null,
+    batch_capacity: null as number | null,
   });
   const [settingsError, setSettingsError] = useState<string | null>(null);
   const [showApiExamples, setShowApiExamples] = useState(false);
@@ -168,6 +170,8 @@ const ModelInfo: React.FC = () => {
         capabilities: model.capabilities || [],
         requests_per_second: model.requests_per_second || null,
         burst_size: model.burst_size || null,
+        capacity: model.capacity || null,
+        batch_capacity: model.batch_capacity || null,
       });
       aliasForm.reset({
         alias: model.alias,
@@ -194,10 +198,12 @@ const ModelInfo: React.FC = () => {
               ? null
               : (updateData.model_type as "CHAT" | "EMBEDDINGS"),
           capabilities: updateData.capabilities,
-          // Always include rate limiting fields to handle clearing properly
+          // Always include rate limiting and capacity fields to handle clearing properly
           // Send null as the actual value when clearing (not undefined)
           requests_per_second: updateData.requests_per_second,
           burst_size: updateData.burst_size,
+          capacity: updateData.capacity,
+          batch_capacity: updateData.batch_capacity,
         },
       });
       setIsEditingModelDetails(false);
@@ -221,6 +227,8 @@ const ModelInfo: React.FC = () => {
         capabilities: model.capabilities || [],
         requests_per_second: model.requests_per_second || null,
         burst_size: model.burst_size || null,
+        capacity: model.capacity || null,
+        batch_capacity: model.batch_capacity || null,
       });
     }
     setIsEditingModelDetails(false);
@@ -609,8 +617,18 @@ const ModelInfo: React.FC = () => {
                         </div>
                         <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
                           <div>
-                            <label className="text-sm text-gray-600 mb-2 block">
+                            <label className="text-sm text-gray-600 mb-2 flex items-center gap-1">
                               Requests per Second
+                              <HoverCard openDelay={100} closeDelay={50}>
+                                <HoverCardTrigger asChild>
+                                  <Info className="h-3 w-3 text-gray-400 hover:text-gray-600" />
+                                </HoverCardTrigger>
+                                <HoverCardContent className="w-80" sideOffset={5}>
+                                  <p className="text-sm text-muted-foreground">
+                                    Sustained request rate limit. Temporary bursts can exceed this up to the burst size. Exceeding this limit returns 429 errors.
+                                  </p>
+                                </HoverCardContent>
+                              </HoverCard>
                             </label>
                             <Input
                               type="number"
@@ -636,8 +654,18 @@ const ModelInfo: React.FC = () => {
                             />
                           </div>
                           <div>
-                            <label className="text-sm text-gray-600 mb-2 block">
+                            <label className="text-sm text-gray-600 mb-2 flex items-center gap-1">
                               Burst Size
+                              <HoverCard openDelay={100} closeDelay={50}>
+                                <HoverCardTrigger asChild>
+                                  <Info className="h-3 w-3 text-gray-400 hover:text-gray-600" />
+                                </HoverCardTrigger>
+                                <HoverCardContent className="w-80" sideOffset={5}>
+                                  <p className="text-sm text-muted-foreground">
+                                    Maximum number of requests allowed in a temporary burst above the sustained rate.
+                                  </p>
+                                </HoverCardContent>
+                              </HoverCard>
                             </label>
                             <Input
                               type="number"
@@ -661,9 +689,83 @@ const ModelInfo: React.FC = () => {
                               }
                             />
                           </div>
+                          <div>
+                            <label className="text-sm text-gray-600 mb-2 flex items-center gap-1">
+                              Maximum Concurrent Requests
+                              <HoverCard openDelay={100} closeDelay={50}>
+                                <HoverCardTrigger asChild>
+                                  <Info className="h-3 w-3 text-gray-400 hover:text-gray-600" />
+                                </HoverCardTrigger>
+                                <HoverCardContent className="w-80" sideOffset={5}>
+                                  <p className="text-sm text-muted-foreground">
+                                    Maximum number of requests that can be processed concurrently. Exceeding this limit returns 429 errors.
+                                  </p>
+                                </HoverCardContent>
+                              </HoverCard>
+                            </label>
+                            <Input
+                              type="number"
+                              min="1"
+                              max="10000"
+                              step="1"
+                              value={updateData.capacity || ""}
+                              onChange={(e) =>
+                                setUpdateData((prev) => ({
+                                  ...prev,
+                                  capacity:
+                                    e.target.value === ""
+                                      ? null
+                                      : Number(e.target.value),
+                                }))
+                              }
+                              placeholder={
+                                updateData.capacity !== null
+                                  ? updateData.capacity?.toString() || "None"
+                                  : "None"
+                              }
+                            />
+                          </div>
+                          <div>
+                            <label className="text-sm text-gray-600 mb-2 flex items-center gap-1">
+                              Maximum Batch Concurrent Requests
+                              <HoverCard openDelay={100} closeDelay={50}>
+                                <HoverCardTrigger asChild>
+                                  <Info className="h-3 w-3 text-gray-400 hover:text-gray-600" />
+                                </HoverCardTrigger>
+                                <HoverCardContent className="w-80" sideOffset={5}>
+                                  <p className="text-sm text-muted-foreground">
+                                    Maximum number of concurrent requests the batching system can send to this model.
+                                  </p>
+                                </HoverCardContent>
+                              </HoverCard>
+                            </label>
+                            <Input
+                              type="number"
+                              min="1"
+                              max="10000"
+                              step="1"
+                              value={updateData.batch_capacity || ""}
+                              onChange={(e) =>
+                                setUpdateData((prev) => ({
+                                  ...prev,
+                                  batch_capacity:
+                                    e.target.value === ""
+                                      ? null
+                                      : Number(e.target.value),
+                                }))
+                              }
+                              placeholder={
+                                updateData.batch_capacity !== null
+                                  ? updateData.batch_capacity?.toString() || "None"
+                                  : "None"
+                              }
+                            />
+                          </div>
                         </div>
                         {(updateData.requests_per_second ||
-                          updateData.burst_size) && (
+                          updateData.burst_size ||
+                          updateData.capacity ||
+                          updateData.batch_capacity) && (
                           <div className="mt-3">
                             <Button
                               type="button"
@@ -674,18 +776,18 @@ const ModelInfo: React.FC = () => {
                                   ...prev,
                                   requests_per_second: null,
                                   burst_size: null,
+                                  capacity: null,
+                                  batch_capacity: null,
                                 }))
                               }
                               className="text-xs"
                             >
-                              Clear Rate Limits
+                              Clear Rate Limits & Capacity
                             </Button>
                           </div>
                         )}
                         <p className="text-xs text-gray-500 mt-2">
-                          Leave blank for no global rate limits. These limits
-                          apply system-wide and take precedence over individual
-                          API key limits.
+                          Leave fields blank for no limits.
                         </p>
                         {updateData.burst_size &&
                           !updateData.requests_per_second && (
@@ -694,6 +796,15 @@ const ModelInfo: React.FC = () => {
                                 ⚠️ Burst size will be ignored without requests
                                 per second. Set requests per second to enable
                                 rate limiting.
+                              </p>
+                            </div>
+                          )}
+                        {updateData.batch_capacity &&
+                          updateData.capacity &&
+                          updateData.batch_capacity > updateData.capacity && (
+                            <div className="mt-2 p-2 bg-yellow-50 border border-yellow-200 rounded-md">
+                              <p className="text-xs text-yellow-700">
+                                ⚠️ Maximum Batch Concurrent Requests is higher than Maximum Concurrent Requests. Batch requests may be rate limited.
                               </p>
                             </div>
                           )}
@@ -874,14 +985,16 @@ const ModelInfo: React.FC = () => {
                           </div>
                         )}
 
-                      {/* Rate Limiting Display - only show for Platform Managers */}
+                      {/* Rate Limiting & Capacity Display - only show for Platform Managers */}
                       {canManageGroups &&
                         (model.requests_per_second !== undefined ||
-                          model.burst_size !== undefined) && (
+                          model.burst_size !== undefined ||
+                          model.capacity !== undefined ||
+                          model.batch_capacity !== undefined) && (
                           <div className="border-t pt-6">
                             <div className="flex items-center gap-1 mb-1">
                               <p className="text-sm text-gray-600">
-                                Global Rate Limiting
+                                Rate Limiting & Capacity
                               </p>
                               <HoverCard openDelay={100} closeDelay={50}>
                                 <HoverCardTrigger asChild>
@@ -892,17 +1005,25 @@ const ModelInfo: React.FC = () => {
                                   sideOffset={5}
                                 >
                                   <p className="text-sm text-muted-foreground">
-                                    System-wide rate limits that apply to all
-                                    users and override individual API key
-                                    limits.
+                                    Rate limits control request throughput. Capacity limits control concurrent requests.
                                   </p>
                                 </HoverCardContent>
                               </HoverCard>
                             </div>
                             <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
                               <div>
-                                <p className="text-xs text-gray-500 mb-1">
+                                <p className="text-xs text-gray-500 mb-1 flex items-center gap-1">
                                   Requests per Second
+                                  <HoverCard openDelay={100} closeDelay={50}>
+                                    <HoverCardTrigger asChild>
+                                      <Info className="h-3 w-3 text-gray-400 hover:text-gray-600" />
+                                    </HoverCardTrigger>
+                                    <HoverCardContent className="w-80" sideOffset={5}>
+                                      <p className="text-sm text-muted-foreground">
+                                        Sustained request rate limit. Temporary bursts can exceed this up to the burst size. Exceeding this limit returns 429 errors.
+                                      </p>
+                                    </HoverCardContent>
+                                  </HoverCard>
                                 </p>
                                 <p className="font-medium">
                                   {model.requests_per_second
@@ -911,8 +1032,18 @@ const ModelInfo: React.FC = () => {
                                 </p>
                               </div>
                               <div>
-                                <p className="text-xs text-gray-500 mb-1">
+                                <p className="text-xs text-gray-500 mb-1 flex items-center gap-1">
                                   Burst Size
+                                  <HoverCard openDelay={100} closeDelay={50}>
+                                    <HoverCardTrigger asChild>
+                                      <Info className="h-3 w-3 text-gray-400 hover:text-gray-600" />
+                                    </HoverCardTrigger>
+                                    <HoverCardContent className="w-80" sideOffset={5}>
+                                      <p className="text-sm text-muted-foreground">
+                                        Maximum number of requests allowed in a temporary burst above the sustained rate.
+                                      </p>
+                                    </HoverCardContent>
+                                  </HoverCard>
                                 </p>
                                 <p className="font-medium">
                                   {model.burst_size
@@ -920,7 +1051,61 @@ const ModelInfo: React.FC = () => {
                                     : "No limit"}
                                 </p>
                               </div>
+                              <div>
+                                <p className="text-xs text-gray-500 mb-1 flex items-center gap-1">
+                                  Maximum Concurrent Requests
+                                  <HoverCard openDelay={100} closeDelay={50}>
+                                    <HoverCardTrigger asChild>
+                                      <Info className="h-3 w-3 text-gray-400 hover:text-gray-600" />
+                                    </HoverCardTrigger>
+                                    <HoverCardContent className="w-80" sideOffset={5}>
+                                      <p className="text-sm text-muted-foreground">
+                                        Maximum number of requests that can be processed concurrently. Exceeding this limit returns 429 errors.
+                                      </p>
+                                    </HoverCardContent>
+                                  </HoverCard>
+                                </p>
+                                <p className="font-medium">
+                                  {model.capacity
+                                    ? `${model.capacity.toLocaleString()} concurrent`
+                                    : "No limit"}
+                                </p>
+                              </div>
+                              <div>
+                                <p className="text-xs text-gray-500 mb-1 flex items-center gap-1">
+                                  Maximum Batch Concurrent Requests
+                                  <HoverCard openDelay={100} closeDelay={50}>
+                                    <HoverCardTrigger asChild>
+                                      <Info className="h-3 w-3 text-gray-400 hover:text-gray-600" />
+                                    </HoverCardTrigger>
+                                    <HoverCardContent className="w-80" sideOffset={5}>
+                                      <p className="text-sm text-muted-foreground">
+                                        Maximum number of concurrent requests the batching system can send to this model.
+                                      </p>
+                                    </HoverCardContent>
+                                  </HoverCard>
+                                </p>
+                                <p className="font-medium">
+                                  {model.batch_capacity
+                                    ? `${model.batch_capacity.toLocaleString()} concurrent`
+                                    : "No limit"}
+                                </p>
+                              </div>
                             </div>
+                            {model.burst_size && !model.requests_per_second && (
+                              <div className="mt-4 p-2 bg-yellow-50 border border-yellow-200 rounded-md">
+                                <p className="text-xs text-yellow-700">
+                                  ⚠️ Burst size will be ignored without requests per second. Set requests per second to enable rate limiting.
+                                </p>
+                              </div>
+                            )}
+                            {model.batch_capacity && model.capacity && model.batch_capacity > model.capacity && (
+                              <div className="mt-4 p-2 bg-yellow-50 border border-yellow-200 rounded-md">
+                                <p className="text-xs text-yellow-700">
+                                  ⚠️ Maximum Batch Concurrent Requests is higher than Maximum Concurrent Requests. Batch requests may be rate limited.
+                                </p>
+                              </div>
+                            )}
                           </div>
                         )}
                     </div>
