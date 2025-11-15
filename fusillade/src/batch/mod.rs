@@ -371,7 +371,12 @@ pub struct Batch {
     pub failed_requests: i64,
     pub canceled_requests: i64,
     pub requests_started_at: Option<DateTime<Utc>>,
-    pub requests_last_updated_at: Option<DateTime<Utc>>,
+
+    /// Terminal state timestamps (set once when batch enters that state)
+    pub finalizing_at: Option<DateTime<Utc>>,
+    pub completed_at: Option<DateTime<Utc>>,
+    pub failed_at: Option<DateTime<Utc>>,
+    pub cancelled_at: Option<DateTime<Utc>>,
 }
 
 /// Status information for a batch, computed from its executions.
@@ -387,7 +392,6 @@ pub struct BatchStatus {
     pub failed_requests: i64,
     pub canceled_requests: i64,
     pub started_at: Option<DateTime<Utc>>,
-    pub last_updated_at: Option<DateTime<Utc>>,
     pub created_at: DateTime<Utc>,
 }
 

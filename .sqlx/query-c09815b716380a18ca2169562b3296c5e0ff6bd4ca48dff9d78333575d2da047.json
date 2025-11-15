@@ -1,0 +1,108 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n            SELECT\n                u.id,\n                u.username,\n                u.email,\n                u.display_name,\n                u.avatar_url,\n                u.auth_source,\n                u.created_at,\n                u.updated_at,\n                u.last_login,\n                u.is_admin,\n                u.password_hash,\n                ARRAY_AGG(ur.role) FILTER (WHERE ur.role IS NOT NULL) as \"roles: Vec<Role>\"\n            FROM users u\n            LEFT JOIN user_roles ur ON ur.user_id = u.id\n            WHERE u.id = $1 AND u.id != '00000000-0000-0000-0000-000000000000'\n            GROUP BY u.id, u.username, u.email, u.display_name, u.avatar_url, u.auth_source, u.created_at, u.updated_at, u.last_login, u.is_admin, u.password_hash\n            ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "id",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 1,
+        "name": "username",
+        "type_info": "Varchar"
+      },
+      {
+        "ordinal": 2,
+        "name": "email",
+        "type_info": "Varchar"
+      },
+      {
+        "ordinal": 3,
+        "name": "display_name",
+        "type_info": "Varchar"
+      },
+      {
+        "ordinal": 4,
+        "name": "avatar_url",
+        "type_info": "Varchar"
+      },
+      {
+        "ordinal": 5,
+        "name": "auth_source",
+        "type_info": "Varchar"
+      },
+      {
+        "ordinal": 6,
+        "name": "created_at",
+        "type_info": "Timestamptz"
+      },
+      {
+        "ordinal": 7,
+        "name": "updated_at",
+        "type_info": "Timestamptz"
+      },
+      {
+        "ordinal": 8,
+        "name": "last_login",
+        "type_info": "Timestamptz"
+      },
+      {
+        "ordinal": 9,
+        "name": "is_admin",
+        "type_info": "Bool"
+      },
+      {
+        "ordinal": 10,
+        "name": "password_hash",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 11,
+        "name": "roles: Vec<Role>",
+        "type_info": {
+          "Custom": {
+            "name": "user_role[]",
+            "kind": {
+              "Array": {
+                "Custom": {
+                  "name": "user_role",
+                  "kind": {
+                    "Enum": [
+                      "PLATFORMMANAGER",
+                      "REQUESTVIEWER",
+                      "STANDARDUSER",
+                      "BILLINGMANAGER",
+                      "BATCHAPIUSER"
+                    ]
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid"
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      false,
+      true,
+      true,
+      false,
+      false,
+      false,
+      true,
+      false,
+      true,
+      null
+    ]
+  },
+  "hash": "c09815b716380a18ca2169562b3296c5e0ff6bd4ca48dff9d78333575d2da047"
+}

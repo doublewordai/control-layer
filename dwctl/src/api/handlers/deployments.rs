@@ -179,35 +179,62 @@ pub async fn list_deployed_models(
     let include_status = includes.contains(&"status");
     let include_pricing = includes.contains(&"pricing");
 
-    // Fetch groups data if requested
-    let (model_groups_map, groups_map) = if include_groups {
-        let groups_conn = tx.acquire().await.map_err(|e| Error::Database(e.into()))?;
-        let mut groups_repo = Groups::new(&mut *groups_conn);
+    // Fetch all includes in parallel for maximum performance
+    let model_aliases: Vec<String> = filtered_models.iter().map(|m| m.alias.clone()).collect();
 
-        let model_groups_map = groups_repo.get_deployments_groups_bulk(&model_ids).await?;
+    let (groups_result, status_map, metrics_map) = tokio::join!(
+        // Groups query
+        async {
+            if include_groups {
+                let groups_conn = tx.acquire().await.map_err(|e| Error::Database(e.into())).ok()?;
+                let mut groups_repo = Groups::new(&mut *groups_conn);
 
-        // Collect all unique group IDs that we need to fetch
-        let all_group_ids: Vec<GroupId> = model_groups_map
-            .values()
-            .flatten()
-            .copied()
-            .collect::<std::collections::HashSet<_>>()
-            .into_iter()
-            .collect();
+                let model_groups_map = groups_repo.get_deployments_groups_bulk(&model_ids).await.ok()?;
 
-        let groups_map = groups_repo.get_bulk(all_group_ids).await?;
+                // Collect all unique group IDs that we need to fetch
+                let all_group_ids: Vec<GroupId> = model_groups_map
+                    .values()
+                    .flatten()
+                    .copied()
+                    .collect::<std::collections::HashSet<_>>()
+                    .into_iter()
+                    .collect();
 
-        (Some(model_groups_map), Some(groups_map))
-    } else {
-        (None, None)
-    };
+                let groups_map = groups_repo.get_bulk(all_group_ids).await.ok()?;
 
-    // Fetch probe status data if requested
-    let status_map = if include_status {
-        use crate::probes::db::ProbeManager;
-        ProbeManager::get_deployment_statuses(&state.db, &model_ids).await.ok()
-    } else {
-        None
+                Some((model_groups_map, groups_map))
+            } else {
+                None
+            }
+        },
+        // Probe status query
+        async {
+            if include_status {
+                use crate::probes::db::ProbeManager;
+                ProbeManager::get_deployment_statuses(&state.db, &model_ids).await.ok()
+            } else {
+                None
+            }
+        },
+        // Metrics query
+        async {
+            if include_metrics {
+                match get_model_metrics(&state.db, model_aliases).await {
+                    Ok(map) => Some(map),
+                    Err(e) => {
+                        tracing::warn!("Failed to fetch bulk metrics: {:?}", e);
+                        None
+                    }
+                }
+            } else {
+                None
+            }
+        }
+    );
+
+    let (model_groups_map, groups_map) = match groups_result {
+        Some((model_groups_map, groups_map)) => (Some(model_groups_map), Some(groups_map)),
+        None => (None, None),
     };
 
     // Build response with requested includes
@@ -241,14 +268,11 @@ pub async fn list_deployed_models(
 
         // Add metrics if requested
         if include_metrics {
-            match get_model_metrics(&state.db, &model_response.alias).await {
-                Ok(metrics) => {
-                    model_response = model_response.with_metrics(metrics);
+            if let Some(ref metrics_map) = metrics_map {
+                if let Some(metrics) = metrics_map.get(&model_response.alias) {
+                    model_response = model_response.with_metrics(metrics.clone());
                 }
-                Err(e) => {
-                    // Log the error but don't fail the request - just skip metrics for this model
-                    tracing::warn!("Failed to fetch metrics for model {}: {:?}", model_response.alias, e);
-                }
+                // If no metrics found for this model, just skip it (no warning needed - model might be new)
             }
         }
 

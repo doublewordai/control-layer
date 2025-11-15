@@ -25,13 +25,21 @@ pub use types::{
 /// Takes an HTTP response and returns true if the request should be retried.
 pub type ShouldRetryFn = Arc<dyn Fn(&HttpResponse) -> bool + Send + Sync>;
 
+/// Semaphore entry tracking both the semaphore and its configured limit.
+type SemaphoreEntry = (Arc<Semaphore>, usize);
+
 /// Default retry predicate: retry on server errors (5xx), rate limits (429), and timeouts (408).
 pub fn default_should_retry(response: &HttpResponse) -> bool {
     response.status >= 500 || response.status == 429 || response.status == 408
 }
 
+/// Default function for creating the should_retry Arc
+fn default_should_retry_fn() -> ShouldRetryFn {
+    Arc::new(default_should_retry)
+}
+
 /// Configuration for the daemon.
-#[derive(Clone, serde::Serialize)]
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
 pub struct DaemonConfig {
     /// Maximum number of requests to claim in each iteration
     pub claim_batch_size: usize,
@@ -39,8 +47,8 @@ pub struct DaemonConfig {
     /// Default concurrency limit per model
     pub default_model_concurrency: usize,
 
-    /// Per-model concurrency overrides
-    pub model_concurrency_limits: HashMap<String, usize>,
+    /// Per-model concurrency overrides (shared, can be updated dynamically)
+    pub model_concurrency_limits: Arc<dashmap::DashMap<String, usize>>,
 
     /// How long to sleep between claim iterations
     pub claim_interval_ms: u64,
@@ -67,13 +75,9 @@ pub struct DaemonConfig {
     /// Interval for sending heartbeats to update daemon status in database (milliseconds)
     pub heartbeat_interval_ms: u64,
 
-    /// Interval for flushing batch WAL events into batch counters (milliseconds)
-    /// This keeps batch status counters up-to-date by periodically compacting the WAL
-    pub flush_batch_events_interval_ms: u64,
-
     /// Predicate function to determine if a response should be retried.
     /// Defaults to retrying 5xx, 429, and 408 status codes.
-    #[serde(skip)]
+    #[serde(skip, default = "default_should_retry_fn")]
     pub should_retry: ShouldRetryFn,
 
     /// Maximum time a request can stay in "claimed" state before being unclaimed
@@ -90,7 +94,7 @@ impl Default for DaemonConfig {
         Self {
             claim_batch_size: 100,
             default_model_concurrency: 10,
-            model_concurrency_limits: HashMap::new(),
+            model_concurrency_limits: Arc::new(dashmap::DashMap::new()),
             claim_interval_ms: 1000,
             max_retries: 5,
             backoff_ms: 1000,
@@ -99,7 +103,6 @@ impl Default for DaemonConfig {
             timeout_ms: 600000,
             status_log_interval_ms: Some(2000), // Log every 2 seconds by default
             heartbeat_interval_ms: 10000,       // Heartbeat every 10 seconds by default
-            flush_batch_events_interval_ms: 2000, // Flush batch events every 2 seconds by default
             should_retry: Arc::new(default_should_retry),
             claim_timeout_ms: 60000,       // 1 minute
             processing_timeout_ms: 600000, // 10 minutes
@@ -120,7 +123,7 @@ where
     storage: Arc<S>,
     http_client: Arc<H>,
     config: DaemonConfig,
-    semaphores: Arc<RwLock<HashMap<String, Arc<Semaphore>>>>,
+    semaphores: Arc<RwLock<HashMap<String, SemaphoreEntry>>>,
     requests_in_flight: Arc<AtomicUsize>,
     requests_processed: Arc<AtomicU64>,
     requests_failed: Arc<AtomicU64>,
@@ -153,21 +156,72 @@ where
     }
 
     /// Get or create a semaphore for a model.
+    ///
+    /// Automatically adjusts the semaphore's permit count if the configured limit has changed.
+    /// For limit increases, adds permits. For decreases, forgets permits (as many as possible).
+    /// Note: When decreasing, we can only forget permits that aren't currently held, so the
+    /// effective limit may temporarily remain higher until requests complete.
     async fn get_semaphore(&self, model: &str) -> Arc<Semaphore> {
+        let current_limit = self
+            .config
+            .model_concurrency_limits
+            .get(model)
+            .map(|entry| *entry.value())
+            .unwrap_or(self.config.default_model_concurrency);
+
         let mut semaphores = self.semaphores.write().await;
 
-        semaphores
+        let entry = semaphores
             .entry(model.to_string())
-            .or_insert_with(|| {
-                let limit = self
-                    .config
-                    .model_concurrency_limits
-                    .get(model)
-                    .copied()
-                    .unwrap_or(self.config.default_model_concurrency);
-                Arc::new(Semaphore::new(limit))
-            })
-            .clone()
+            .or_insert_with(|| (Arc::new(Semaphore::new(current_limit)), current_limit));
+
+        let (semaphore, stored_limit) = entry;
+
+        // Check if the limit has changed
+        if *stored_limit != current_limit {
+            if current_limit > *stored_limit {
+                // Limit increased - add permits
+                let delta = current_limit - *stored_limit;
+                semaphore.add_permits(delta);
+                tracing::info!(
+                    model = %model,
+                    old_limit = *stored_limit,
+                    new_limit = current_limit,
+                    added_permits = delta,
+                    "Increased model concurrency limit"
+                );
+                *stored_limit = current_limit;
+            } else {
+                // Limit decreased - forget permits (as many as we can)
+                let desired_delta = *stored_limit - current_limit;
+                let actual_forgotten = semaphore.forget_permits(desired_delta);
+
+                if actual_forgotten < desired_delta {
+                    tracing::warn!(
+                        model = %model,
+                        old_limit = *stored_limit,
+                        target_limit = current_limit,
+                        desired_to_forget = desired_delta,
+                        actually_forgot = actual_forgotten,
+                        held_permits = desired_delta - actual_forgotten,
+                        "Decreased model concurrency limit (some permits still held by in-flight requests)"
+                    );
+                } else {
+                    tracing::info!(
+                        model = %model,
+                        old_limit = *stored_limit,
+                        new_limit = current_limit,
+                        forgot_permits = actual_forgotten,
+                        "Decreased model concurrency limit"
+                    );
+                }
+
+                // Update to the new effective limit (accounting for unforgettable permits)
+                *stored_limit = current_limit + (desired_delta - actual_forgotten);
+            }
+        }
+
+        semaphore.clone()
     }
 
     /// Try to acquire a permit for a model (non-blocking).
@@ -277,43 +331,6 @@ where
                 }
             });
         }
-
-        // Spawn periodic batch events flush task
-        let storage = self.storage.clone();
-        let flush_interval_ms = self.config.flush_batch_events_interval_ms;
-        let daemon_id = self.daemon_id;
-        let shutdown_signal = self.shutdown_token.clone();
-        tokio::spawn(async move {
-            let mut interval = tokio::time::interval(Duration::from_millis(flush_interval_ms));
-            loop {
-                tokio::select! {
-                    _ = interval.tick() => {
-                        match storage.flush_batch_events(None).await {
-                            Ok(count) => {
-                                if count > 0 {
-                                    tracing::trace!(
-                                        daemon_id = %daemon_id,
-                                        batches_flushed = count,
-                                        "Flushed batch WAL events"
-                                    );
-                                }
-                            }
-                            Err(e) => {
-                                tracing::warn!(
-                                    daemon_id = %daemon_id,
-                                    error = %e,
-                                    "Failed to flush batch events"
-                                );
-                            }
-                        }
-                    }
-                    _ = shutdown_signal.cancelled() => {
-                        tracing::info!("Shutting down batch events flush task");
-                        break;
-                    }
-                }
-            }
-        });
 
         let mut join_set: JoinSet<Result<()>> = JoinSet::new();
 
@@ -528,7 +545,7 @@ mod tests {
             claim_batch_size: 10,
             claim_interval_ms: 10, // Very fast for testing
             default_model_concurrency: 10,
-            model_concurrency_limits: HashMap::new(),
+            model_concurrency_limits: Arc::new(dashmap::DashMap::new()),
             max_retries: 3,
             backoff_ms: 100,
             backoff_factor: 2,
@@ -536,7 +553,6 @@ mod tests {
             timeout_ms: 5000,
             status_log_interval_ms: None, // Disable status logging in tests
             heartbeat_interval_ms: 10000, // 10 seconds
-            flush_batch_events_interval_ms: 2000,
             should_retry: Arc::new(default_should_retry),
             claim_timeout_ms: 60000,
             processing_timeout_ms: 600000,
@@ -682,7 +698,7 @@ mod tests {
         );
 
         // Setup: Create manager with concurrency limit of 2 for "gpt-4"
-        let mut model_concurrency_limits = HashMap::new();
+        let model_concurrency_limits = Arc::new(dashmap::DashMap::new());
         model_concurrency_limits.insert("gpt-4".to_string(), 2);
 
         let config = DaemonConfig {
@@ -697,7 +713,6 @@ mod tests {
             timeout_ms: 5000,
             status_log_interval_ms: None,
             heartbeat_interval_ms: 10000,
-            flush_batch_events_interval_ms: 2000,
             should_retry: Arc::new(default_should_retry),
             claim_timeout_ms: 60000,
             processing_timeout_ms: 600000,
@@ -908,7 +923,7 @@ mod tests {
             claim_batch_size: 10,
             claim_interval_ms: 10,
             default_model_concurrency: 10,
-            model_concurrency_limits: HashMap::new(),
+            model_concurrency_limits: Arc::new(dashmap::DashMap::new()),
             max_retries: 5,
             backoff_ms: 10, // Very fast backoff for testing
             backoff_factor: 2,
@@ -916,7 +931,6 @@ mod tests {
             timeout_ms: 5000,
             status_log_interval_ms: None,
             heartbeat_interval_ms: 10000,
-            flush_batch_events_interval_ms: 2000,
             should_retry: Arc::new(default_should_retry),
             claim_timeout_ms: 60000,
             processing_timeout_ms: 600000,
@@ -1008,5 +1022,172 @@ mod tests {
             3,
             "Expected 3 HTTP calls (2 failed attempts + 1 success)"
         );
+    }
+
+    #[sqlx::test]
+    async fn test_daemon_dynamically_updates_concurrency_limits(pool: sqlx::PgPool) {
+        // Setup: Create HTTP client with triggered responses
+        let http_client = Arc::new(MockHttpClient::new());
+
+        // Add 10 triggered responses
+        let mut triggers = vec![];
+        for i in 1..=10 {
+            let trigger = http_client.add_response_with_trigger(
+                "POST /v1/test",
+                Ok(HttpResponse {
+                    status: 200,
+                    body: format!(r#"{{"result":"{}"}}"#, i),
+                }),
+            );
+            triggers.push(trigger);
+        }
+
+        // Setup: Start with concurrency limit of 2 for "gpt-4"
+        let model_concurrency_limits = Arc::new(dashmap::DashMap::new());
+        model_concurrency_limits.insert("gpt-4".to_string(), 2);
+
+        let config = DaemonConfig {
+            claim_batch_size: 10,
+            claim_interval_ms: 10,
+            default_model_concurrency: 10,
+            model_concurrency_limits: model_concurrency_limits.clone(),
+            max_retries: 3,
+            backoff_ms: 100,
+            backoff_factor: 2,
+            max_backoff_ms: 1000,
+            timeout_ms: 5000,
+            status_log_interval_ms: None,
+            heartbeat_interval_ms: 10000,
+            should_retry: Arc::new(default_should_retry),
+            claim_timeout_ms: 60000,
+            processing_timeout_ms: 600000,
+        };
+
+        let manager = Arc::new(
+            PostgresRequestManager::with_client(pool.clone(), http_client.clone())
+                .with_config(config),
+        );
+
+        // Setup: Create a file with 10 requests, all using "gpt-4"
+        let templates: Vec<_> = (1..=10)
+            .map(|i| crate::RequestTemplateInput {
+                custom_id: None,
+                endpoint: "https://api.example.com".to_string(),
+                method: "POST".to_string(),
+                path: "/v1/test".to_string(),
+                body: format!(r#"{{"prompt":"test{}"}}"#, i),
+                model: "gpt-4".to_string(),
+                api_key: "test-key".to_string(),
+            })
+            .collect();
+
+        let file_id = manager
+            .create_file(
+                "test-file".to_string(),
+                Some("Test dynamic limits".to_string()),
+                templates,
+            )
+            .await
+            .expect("Failed to create file");
+
+        let batch = manager
+            .create_batch(crate::batch::BatchInput {
+                file_id,
+                endpoint: "/v1/chat/completions".to_string(),
+                completion_window: "24h".to_string(),
+                metadata: None,
+                created_by: None,
+            })
+            .await
+            .expect("Failed to create batch");
+
+        // Start the daemon
+        let shutdown_token = tokio_util::sync::CancellationToken::new();
+        let daemon_handle = manager
+            .clone()
+            .run(shutdown_token.clone())
+            .expect("Failed to start daemon");
+
+        // Wait for exactly 2 requests to be in-flight (initial limit)
+        let start = tokio::time::Instant::now();
+        let timeout = Duration::from_secs(2);
+        let mut reached_initial_limit = false;
+
+        while start.elapsed() < timeout {
+            let in_flight = http_client.in_flight_count();
+            if in_flight == 2 {
+                reached_initial_limit = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+
+        assert!(
+            reached_initial_limit,
+            "Expected exactly 2 requests in-flight with initial limit"
+        );
+
+        // Increase the limit to 5
+        model_concurrency_limits.insert("gpt-4".to_string(), 5);
+
+        // Wait a bit for the daemon to pick up the new limit
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        // Complete one request to free up a permit and trigger daemon to check limits
+        triggers.remove(0).send(()).unwrap();
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        // Now we should see up to 5 requests in flight
+        let start = tokio::time::Instant::now();
+        let timeout = Duration::from_secs(2);
+        let mut reached_new_limit = false;
+
+        while start.elapsed() < timeout {
+            let in_flight = http_client.in_flight_count();
+            if in_flight >= 4 {
+                // Should see at least 4-5 in flight with new limit
+                reached_new_limit = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+
+        assert!(
+            reached_new_limit,
+            "Expected more requests in-flight after limit increase, got {}",
+            http_client.in_flight_count()
+        );
+
+        // Now decrease the limit to 3
+        model_concurrency_limits.insert("gpt-4".to_string(), 3);
+
+        // Complete remaining requests
+        for trigger in triggers {
+            trigger.send(()).unwrap();
+        }
+
+        // Wait for all requests to complete
+        let start = tokio::time::Instant::now();
+        let timeout = Duration::from_secs(5);
+        let mut all_completed = false;
+
+        while start.elapsed() < timeout {
+            let status = manager
+                .get_batch_status(batch.id)
+                .await
+                .expect("Failed to get batch status");
+
+            if status.completed_requests == 10 {
+                all_completed = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+
+        // Stop the daemon
+        daemon_handle.abort();
+
+        assert!(all_completed, "All 10 requests should have completed");
+        assert_eq!(http_client.call_count(), 10);
     }
 }

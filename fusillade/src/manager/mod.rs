@@ -107,15 +107,6 @@ pub trait Storage: Send + Sync {
     /// Cancel all pending/in-progress requests for a batch.
     async fn cancel_batch(&self, batch_id: BatchId) -> Result<()>;
 
-    /// Flush WAL events for batches into their base counters.
-    ///
-    /// If `batch_ids` is None, flushes all batches that have pending WAL events.
-    /// If `batch_ids` is Some, only flushes the specified batches.
-    ///
-    /// This should be called periodically to keep batch counters up-to-date.
-    /// Returns the number of batches that were flushed.
-    async fn flush_batch_events(&self, batch_ids: Option<Vec<BatchId>>) -> Result<usize>;
-
     /// The following methods are defined specifically for requests - i.e. independent of the
     /// files/batches they belong to.
     ///

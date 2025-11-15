@@ -61,6 +61,8 @@ export interface Model {
   hosted_on: string; // endpoint ID (UUID)
   requests_per_second?: number | null; // Global rate limiting: requests per second
   burst_size?: number | null; // Global rate limiting: burst capacity
+  capacity?: number | null; // Maximum concurrent requests allowed
+  batch_capacity?: number | null; // Maximum concurrent batch requests allowed
   groups?: Group[]; // array of group IDs - only present when include=groups
   metrics?: ModelMetrics; // only present when include=metrics
   status?: ModelProbeStatus; // only present when include=status
@@ -225,6 +227,8 @@ export interface ModelUpdateRequest {
   capabilities?: string[] | null;
   requests_per_second?: number | null;
   burst_size?: number | null;
+  capacity?: number | null;
+  batch_capacity?: number | null;
   pricing?: TokenPricingUpdate;
 }
 
