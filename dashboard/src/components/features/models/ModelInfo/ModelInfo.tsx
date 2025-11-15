@@ -1,4 +1,4 @@
-import React, { useState, useEffect } from "react";
+import React, { useState, useEffect, useMemo } from "react";
 import { useParams, useNavigate, useSearchParams } from "react-router-dom";
 import {
   ArrowLeft,
@@ -19,6 +19,7 @@ import {
   type ModelsInclude,
 } from "../../../../api/control-layer";
 import { useAuthorization } from "../../../../utils";
+import { useSettings } from "../../../../contexts";
 import {
   ApiExamples,
   AccessManagementModal,
@@ -69,8 +70,10 @@ const ModelInfo: React.FC = () => {
   const navigate = useNavigate();
   const [searchParams] = useSearchParams();
   const { hasPermission } = useAuthorization();
+  const { isFeatureEnabled } = useSettings();
   const canManageGroups = hasPermission("manage-groups");
   const canViewAnalytics = hasPermission("analytics");
+  const showPricing = isFeatureEnabled("use_billing");
 
   const fromUrl = searchParams.get("from");
 
@@ -132,12 +135,13 @@ const ModelInfo: React.FC = () => {
   const updateModelMutation = useUpdateModel();
 
   // Build include parameter based on permissions - always include status to match Models page cache
-  const includeParam = (() => {
-    const parts: string[] = ["status", "pricing"]; // Always include status to reuse cache from Models page
+  const includeParam = useMemo(() => {
+    const parts: string[] = ["status"]; // Always include status to reuse cache from Models page
+    if (showPricing) parts.push("pricing");
     if (canManageGroups) parts.push("groups");
     if (canViewAnalytics) parts.push("metrics");
     return parts.join(",");
-  })();
+  }, [showPricing, canManageGroups, canViewAnalytics]);
 
   const {
     data: rawModelsData,
@@ -1018,67 +1022,69 @@ const ModelInfo: React.FC = () => {
                           </div>
                         )}
 
-                      {/* Pricing Display - visible to all users */}
-                      <div className="border-t pt-6">
-                        <div className="flex items-center justify-between mb-1">
-                          <div className="flex items-center gap-1">
-                            <p className="text-sm text-gray-600">Pricing</p>
-                            <HoverCard openDelay={100} closeDelay={50}>
-                              <HoverCardTrigger asChild>
-                                <Info className="h-3 w-3 text-gray-400 hover:text-gray-600" />
-                              </HoverCardTrigger>
-                              <HoverCardContent
-                                className="w-80"
-                                sideOffset={5}
+                      {/* Pricing Display - visible to all users when billing is enabled */}
+                      {showPricing && (
+                        <div className="border-t pt-6">
+                          <div className="flex items-center justify-between mb-1">
+                            <div className="flex items-center gap-1">
+                              <p className="text-sm text-gray-600">Pricing</p>
+                              <HoverCard openDelay={100} closeDelay={50}>
+                                <HoverCardTrigger asChild>
+                                  <Info className="h-3 w-3 text-gray-400 hover:text-gray-600" />
+                                </HoverCardTrigger>
+                                <HoverCardContent
+                                  className="w-80"
+                                  sideOffset={5}
+                                >
+                                  <p className="text-sm text-muted-foreground">
+                                    Customer-facing pricing rates per token.
+                                    {canManageGroups && ` Click ${model.pricing ? "Edit" : "Set Pricing"} to update pricing.`}
+                                  </p>
+                                </HoverCardContent>
+                              </HoverCard>
+                            </div>
+                            {canManageGroups && (
+                              <Button
+                                variant="outline"
+                                size="sm"
+                                onClick={() => setShowPricingModal(true)}
+                                className="h-8"
                               >
-                                <p className="text-sm text-muted-foreground">
-                                  Customer-facing pricing rates per token.
-                                  {canManageGroups && ` Click ${model.pricing ? "Edit" : "Set Pricing"} to update pricing.`}
-                                </p>
-                              </HoverCardContent>
-                            </HoverCard>
+                                <Edit className="h-3 w-3 mr-1" />
+                                {model.pricing ? "Edit" : "Set Pricing"}
+                              </Button>
+                            )}
                           </div>
-                          {canManageGroups && (
-                            <Button
-                              variant="outline"
-                              size="sm"
-                              onClick={() => setShowPricingModal(true)}
-                              className="h-8"
-                            >
-                              <Edit className="h-3 w-3 mr-1" />
-                              {model.pricing ? "Edit" : "Set Pricing"}
-                            </Button>
+                          {model.pricing ? (
+                            <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
+                              <div>
+                                <p className="text-xs text-gray-500 mb-1">
+                                  Input Price per Token
+                                </p>
+                                <p className="font-medium">
+                                  {model.pricing.input_price_per_token
+                                    ? `$${Number(model.pricing.input_price_per_token).toFixed(4)}`
+                                    : "Not set"}
+                                </p>
+                              </div>
+                              <div>
+                                <p className="text-xs text-gray-500 mb-1">
+                                  Output Price per Token
+                                </p>
+                                <p className="font-medium">
+                                  {model.pricing.output_price_per_token
+                                    ? `$${Number(model.pricing.output_price_per_token).toFixed(4)}`
+                                    : "Not set"}
+                                </p>
+                              </div>
+                            </div>
+                          ) : (
+                            <p className="text-sm text-gray-500 mt-2">
+                              No pricing configured.{canManageGroups && ' Click "Set Pricing" to add pricing information.'}
+                            </p>
                           )}
                         </div>
-                        {model.pricing ? (
-                          <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
-                            <div>
-                              <p className="text-xs text-gray-500 mb-1">
-                                Input Price per Token
-                              </p>
-                              <p className="font-medium">
-                                {model.pricing.input_price_per_token
-                                  ? `$${Number(model.pricing.input_price_per_token).toFixed(4)}`
-                                  : "Not set"}
-                              </p>
-                            </div>
-                            <div>
-                              <p className="text-xs text-gray-500 mb-1">
-                                Output Price per Token
-                              </p>
-                              <p className="font-medium">
-                                {model.pricing.output_price_per_token
-                                  ? `$${Number(model.pricing.output_price_per_token).toFixed(4)}`
-                                  : "Not set"}
-                              </p>
-                            </div>
-                          </div>
-                        ) : (
-                          <p className="text-sm text-gray-500 mt-2">
-                            No pricing configured.{canManageGroups && ' Click "Set Pricing" to add pricing information.'}
-                          </p>
-                        )}
-                      </div>
+                      )}
 
                       {/* Rate Limiting & Capacity Display - only show for Platform Managers */}
                       {canManageGroups &&
@@ -1440,7 +1446,7 @@ const ModelInfo: React.FC = () => {
 
         {canManageGroups && (
           <TabsContent value="usage">
-            <UserUsageTable modelAlias={model.alias} />
+            <UserUsageTable modelAlias={model.alias} showPricing={showPricing} />
           </TabsContent>
         )}
 

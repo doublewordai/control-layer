@@ -14,9 +14,10 @@ import { ArrowUpDown, Users, Download } from "lucide-react";
 
 interface UserUsageTableProps {
   modelAlias: string;
+  showPricing?: boolean;
 }
 
-const UserUsageTable: React.FC<UserUsageTableProps> = ({ modelAlias }) => {
+const UserUsageTable: React.FC<UserUsageTableProps> = ({ modelAlias, showPricing = true }) => {
   const [dateRange, setDateRange] = useState<{ from: Date; to: Date }>({
     from: new Date(new Date().getTime() - 24 * 60 * 60 * 1000), // 24 hours ago
     to: new Date(), // now
@@ -72,7 +73,7 @@ const UserUsageTable: React.FC<UserUsageTableProps> = ({ modelAlias }) => {
       "Input Tokens",
       "Output Tokens",
       "Total Tokens",
-      "Total Cost",
+      ...(showPricing ? ["Total Cost"] : []),
       "Last Active",
     ];
 
@@ -84,7 +85,7 @@ const UserUsageTable: React.FC<UserUsageTableProps> = ({ modelAlias }) => {
       user.input_tokens.toString(),
       user.output_tokens.toString(),
       user.total_tokens.toString(),
-      user.total_cost?.toString() || "0",
+      ...(showPricing ? [user.total_cost?.toString() || "0"] : []),
       user.last_active_at || "",
     ]);
 
@@ -161,7 +162,7 @@ const UserUsageTable: React.FC<UserUsageTableProps> = ({ modelAlias }) => {
           );
         },
       },
-      {
+      ...(showPricing ? [{
         accessorKey: "total_cost",
         header: ({ column }) => {
           return (
@@ -183,14 +184,14 @@ const UserUsageTable: React.FC<UserUsageTableProps> = ({ modelAlias }) => {
             {formatCost(row.getValue("total_cost"))}
           </span>
         ),
-      },
+      }] : []),
       {
         accessorKey: "last_active_at",
         header: "Last Active",
         cell: ({ row }) => formatDate(row.getValue("last_active_at")),
       },
     ],
-    [],
+    [showPricing],
   );
 
   if (isLoading) {
@@ -287,7 +288,7 @@ const UserUsageTable: React.FC<UserUsageTableProps> = ({ modelAlias }) => {
                 </HoverCardContent>
               </HoverCard>
 
-              {data.total_cost !== undefined && (
+              {showPricing && data.total_cost !== undefined && (
                 <HoverCard openDelay={100} closeDelay={50}>
                   <HoverCardTrigger asChild>
                     <div className="flex items-center gap-1.5 px-3 py-1.5 bg-green-50 rounded-md select-none cursor-default border border-green-200">
