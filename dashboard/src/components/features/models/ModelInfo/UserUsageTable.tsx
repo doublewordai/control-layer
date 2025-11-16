@@ -163,8 +163,8 @@ const UserUsageTable: React.FC<UserUsageTableProps> = ({ modelAlias, showPricing
         },
       },
       ...(showPricing ? [{
-        accessorKey: "total_cost",
-        header: ({ column }) => {
+        accessorKey: "total_cost" as const,
+        header: ({ column }: { column: any }) => {
           return (
             <Button
               variant="ghost"
@@ -179,12 +179,12 @@ const UserUsageTable: React.FC<UserUsageTableProps> = ({ modelAlias, showPricing
             </Button>
           );
         },
-        cell: ({ row }) => (
+        cell: ({ row }: { row: any }) => (
           <span className="font-medium text-green-700">
             {formatCost(row.getValue("total_cost"))}
           </span>
         ),
-      }] : []),
+      }] as ColumnDef<UserUsage>[] : []),
       {
         accessorKey: "last_active_at",
         header: "Last Active",
