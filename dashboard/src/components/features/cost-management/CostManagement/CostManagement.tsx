@@ -1,12 +1,13 @@
 import { useEffect } from "react";
-import { useUser, useAddFunds } from "@/api/control-layer";
+import { useUser, useAddFunds, useConfig } from "@/api/control-layer";
 import { toast } from "sonner";
 import { useSettings } from "@/contexts";
 import { TransactionHistory } from "@/components/features/cost-management/CostManagement/TransactionHistory.tsx";
 
 export function CostManagement() {
-  const { isFeatureEnabled, settings } = useSettings();
+  const { isFeatureEnabled } = useSettings();
   const isDemoMode = isFeatureEnabled("demo");
+  const { data: config } = useConfig();
 
   // Fetch current user
   const { data: user, refetch: refetchUser } = useUser("current");
@@ -46,21 +47,34 @@ export function CostManagement() {
         toast.error("Failed to add funds");
         console.error("Error adding funds:", error);
       }
+    } else if (config?.payment_enabled) {
+      // Payment processing enabled: Call checkout endpoint and follow redirect
+      try {
+        const response = await fetch("/admin/api/v1/create_checkout", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          redirect: "manual",
+        });
+
+        // Backend returns 303 redirect with Location header
+        const location = response.headers.get("Location");
+        if (location) {
+          window.location.href = location;
+        } else if (!response.ok) {
+          const errorData = await response.json().catch(() => ({}));
+          toast.error(errorData.message || "Failed to initiate checkout");
+        }
+      } catch (error) {
+        toast.error("Failed to add funds");
+        console.error("Error creating checkout:", error);
+      }
     } else {
-      // API mode: Redirect to payment provider
-      const paymentProviderUrl = settings.paymentProviderUrl;
-
-      // Build callback URL to return to this page
-      const callbackUrl = `${window.location.origin}${window.location.pathname}?payment_complete=true`;
-
-      // Redirect to payment provider with callback URL
-      const redirectUrl = `${paymentProviderUrl}?callback=${encodeURIComponent(callbackUrl)}`;
-      window.location.href = redirectUrl;
+      toast.error("Payment processing is not configured");
     }
   };
 
-  // Only show Add Funds button if in demo mode or payment provider is configured
-  const canAddFunds = isDemoMode || !!settings.paymentProviderUrl;
+  // Only show Add Funds button if in demo mode or payment processing is enabled
+  const canAddFunds = isDemoMode || !!config?.payment_enabled;
 
   return (
     <div className="p-6">

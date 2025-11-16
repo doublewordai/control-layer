@@ -14,6 +14,8 @@ export type ApiKeyPurpose = "platform" | "inference";
 export interface ConfigResponse {
   region: string;
   organization: string;
+  registration_enabled: boolean;
+  payment_enabled: boolean;
 }
 
 // Model metrics time series point

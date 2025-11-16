@@ -12,7 +12,6 @@ const DEFAULT_SETTINGS: AppSettings = {
     demo: false,
     use_billing: false,
   },
-  paymentProviderUrl: undefined,
 };
 
 /**
@@ -70,10 +69,6 @@ function loadSettings(): AppSettings {
         DEFAULT_SETTINGS.features.use_billing,
     },
     demoConfig: localSettings.demoConfig,
-    paymentProviderUrl:
-      import.meta.env.VITE_PAYMENT_PROVIDER_URL ||
-      localSettings.paymentProviderUrl ||
-      DEFAULT_SETTINGS.paymentProviderUrl,
   };
 }
 

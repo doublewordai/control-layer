@@ -219,6 +219,9 @@ pub struct Metadata {
     pub organization: String,
     /// Whether user registration is enabled (shown in frontend)
     pub registration_enabled: bool,
+    /// Payment processor to use (e.g., "stripe", "paypal", or None for no payments)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub payment_processor: Option<String>,
 }
 
 /// External model source configuration.
@@ -630,6 +633,7 @@ impl Default for Metadata {
             region: "UK South".to_string(),
             organization: "ACME Corp".to_string(),
             registration_enabled: true,
+            payment_processor: None,
         }
     }
 }

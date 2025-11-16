@@ -607,6 +607,8 @@ pub async fn build_router(state: &mut AppState, onwards_router: Router) -> anyho
         .route("/transactions", post(api::handlers::transactions::create_transaction))
         .route("/transactions/{transaction_id}", get(api::handlers::transactions::get_transaction))
         .route("/transactions", get(api::handlers::transactions::list_transactions))
+        // Payment processing
+        .route("/create_checkout", post(api::handlers::payments::create_checkout))
         // Inference endpoints management (admin only for write operations)
         .route("/endpoints", get(api::handlers::inference_endpoints::list_inference_endpoints))
         .route("/endpoints", post(api::handlers::inference_endpoints::create_inference_endpoint))
