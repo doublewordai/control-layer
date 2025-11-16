@@ -1,0 +1,1 @@
+export { UpdateModelPricingModal } from "./UpdateModelPricingModal";

@@ -8,7 +8,7 @@ import {
 } from "../../ui/dialog";
 import { Button } from "../../ui/button";
 import type { DisplayUser } from "../../../types/display";
-import { TransactionHistory } from "@/components";
+import { TransactionHistory } from "../../features/cost-management/CostManagement/TransactionHistory";
 import { AddFundsModal } from "../AddCreditsModal";
 
 interface UserTransactionsModalProps {

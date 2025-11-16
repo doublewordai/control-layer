@@ -15,6 +15,7 @@ import {
 } from "vitest";
 import Models from "./Models";
 import { handlers } from "../../../../api/control-layer/mocks/handlers";
+import { SettingsProvider } from "../../../../contexts/settings/SettingsContext";
 
 // Mock the authorization hook
 vi.mock("../../../../utils/authorization", () => ({
@@ -32,7 +33,7 @@ beforeAll(() => server.listen({ onUnhandledRequest: "error" }));
 afterEach(() => server.resetHandlers());
 afterAll(() => server.close());
 
-// Test wrapper with QueryClient and Router
+// Test wrapper with QueryClient, Router, and Context Providers
 function createWrapper() {
   const queryClient = new QueryClient({
     defaultOptions: {
@@ -43,9 +44,11 @@ function createWrapper() {
   });
 
   return ({ children }: { children: ReactNode }) => (
-    <QueryClientProvider client={queryClient}>
-      <BrowserRouter>{children}</BrowserRouter>
-    </QueryClientProvider>
+    <SettingsProvider>
+      <QueryClientProvider client={queryClient}>
+        <BrowserRouter>{children}</BrowserRouter>
+      </QueryClientProvider>
+    </SettingsProvider>
   );
 }
 
