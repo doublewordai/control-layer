@@ -25,6 +25,8 @@ admin_password: "hunter2"
 # TODO: Change this in production
 secret_key: insecure-change-in-production
 
+payment_processor: stripe
+
 # Model sources - inference endpoints to connect to
 # Uncomment and configure as needed
 model_sources: []

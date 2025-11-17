@@ -117,6 +117,9 @@ pub struct Config {
     pub model_sources: Vec<ModelSource>,
     /// Frontend metadata displayed in the UI
     pub metadata: Metadata,
+    /// Payment processor to use (e.g., "stripe", "paypal", or None for no payments)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub payment_processor: Option<String>,
     /// Authentication configuration for various auth methods
     pub auth: AuthConfig,
     /// Batch API configuration
@@ -219,9 +222,6 @@ pub struct Metadata {
     pub organization: String,
     /// Whether user registration is enabled (shown in frontend)
     pub registration_enabled: bool,
-    /// Payment processor to use (e.g., "stripe", "paypal", or None for no payments)
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub payment_processor: Option<String>,
 }
 
 /// External model source configuration.
@@ -616,6 +616,7 @@ impl Default for Config {
             secret_key: None,
             model_sources: vec![],
             metadata: Metadata::default(),
+            payment_processor: None,
             auth: AuthConfig::default(),
             batches: BatchConfig::default(),
             leader_election: LeaderElectionConfig::default(),
@@ -633,7 +634,6 @@ impl Default for Metadata {
             region: "UK South".to_string(),
             organization: "ACME Corp".to_string(),
             registration_enabled: true,
-            payment_processor: None,
         }
     }
 }

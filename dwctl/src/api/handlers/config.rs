@@ -39,7 +39,7 @@ pub async fn get_config(State(state): State<AppState>, _user: CurrentUser) -> im
         // Compute registration_enabled based on native auth configuration
         registration_enabled: state.config.auth.native.enabled && state.config.auth.native.allow_registration,
         // Compute payment_enabled based on whether payment_processor is configured
-        payment_enabled: metadata.payment_processor.is_some(),
+        payment_enabled: state.config.payment_processor.is_some(),
     };
 
     Json(response)
