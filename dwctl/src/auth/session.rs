@@ -119,6 +119,7 @@ mod tests {
             is_admin: false,
             display_name: Some("Test User".to_string()),
             avatar_url: None,
+            payment_provider_id: None,
         }
     }
 

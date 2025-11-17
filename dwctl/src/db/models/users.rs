@@ -66,4 +66,5 @@ pub struct UserDBResponse {
     pub is_admin: bool,
     pub roles: Vec<Role>,
     pub password_hash: Option<String>,
+    pub payment_provider_id: Option<String>,
 }
