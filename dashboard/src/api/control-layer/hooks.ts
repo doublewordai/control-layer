@@ -629,10 +629,12 @@ export function useUpdateProbe() {
 
 // ===== FILES HOOKS =====
 
-export function useFiles(options?: FilesListQuery) {
+export function useFiles(options?: FilesListQuery & { enabled?: boolean }) {
+  const { enabled, ...queryOptions } = options || {};
   return useQuery({
-    queryKey: queryKeys.files.list(options || {}),
-    queryFn: () => dwctlApi.files.list(options),
+    queryKey: queryKeys.files.list(queryOptions),
+    queryFn: () => dwctlApi.files.list(queryOptions),
+    enabled,
   });
 }
 
@@ -677,17 +679,18 @@ export function useDeleteFile() {
 
 // ===== BATCHES HOOKS =====
 
-export function useBatches(options?: BatchesListQuery) {
+export function useBatches(options?: BatchesListQuery & { enabled?: boolean }) {
   const queryClient = useQueryClient();
+  const { enabled, ...queryOptions } = options || {};
 
   return useQuery({
-    queryKey: queryKeys.batches.list(options || {}),
+    queryKey: queryKeys.batches.list(queryOptions),
     queryFn: async () => {
-      const response = await dwctlApi.batches.list(options);
+      const response = await dwctlApi.batches.list(queryOptions);
 
       // Check if any batches just completed by comparing with cached data
       const previousData = queryClient.getQueryData<{ data: Batch[] }>(
-        queryKeys.batches.list(options || {}),
+        queryKeys.batches.list(queryOptions),
       );
 
       if (previousData && response.data) {
@@ -712,6 +715,7 @@ export function useBatches(options?: BatchesListQuery) {
 
       return response;
     },
+    enabled,
     refetchOnMount: "always",
     refetchInterval: (query) => {
       const batches = query.state.data?.data;

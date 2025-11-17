@@ -33,7 +33,7 @@ import type { FileObject, Batch } from "../types";
  */
 interface BatchesProps {
   onOpenUploadModal: (file?: File) => void;
-  onOpenCreateBatchModal: (fileId?: string) => void;
+  onOpenCreateBatchModal: (file?: FileObject) => void;
   onOpenDownloadModal: (resource: {
     type: "file" | "batch-results";
     id: string;
@@ -145,15 +145,14 @@ export function Batches({
     purpose: filePurpose,
     limit: filesPageSize + 1, // Fetch one extra to detect if there are more
     after: filesAfterCursor,
+    enabled: activeTab === "files", // Only fetch when on files tab
   });
-
-  // Separate unpaginated query for all files (needed for batch file lookups in batches table)
-  const { data: allFilesResponse, isLoading: allFilesLoading } = useFiles({});
 
   // Paginated batches query
   const { data: batchesResponse, isLoading: batchesLoading } = useBatches({
     limit: batchesPageSize + 1, // Fetch one extra to detect if there are more
     after: batchesAfterCursor,
+    enabled: activeTab === "batches", // Only fetch when on batches tab
   });
 
   // Process batches response - remove extra item used for hasMore detection
@@ -162,9 +161,6 @@ export function Batches({
   const batches = batchesHasMore
     ? batchesData.slice(0, batchesPageSize)
     : batchesData;
-
-  // All files for batch lookup (unpaginated)
-  const allFiles = allFilesResponse?.data || [];
 
   // Process files response - remove extra item used for hasMore detection
   const filesData = filesResponse?.data || [];
@@ -176,7 +172,7 @@ export function Batches({
   // Display files as returned by API (server-side filtered by purpose)
   const files = filesForDisplay;
 
-  const isFilesLoading = filesLoading || allFilesLoading;
+  const isFilesLoading = filesLoading;
 
   // Filter batches by input file if filter is set
   const filteredBatches = React.useMemo(() => {
@@ -184,9 +180,9 @@ export function Batches({
     return batches.filter((b) => b.input_file_id === batchFileFilter);
   }, [batches, batchFileFilter]);
 
-  // Prefetch next page for files
+  // Prefetch next page for files - only if user has already started paginating
   useEffect(() => {
-    if (filesHasMore && files.length > 0) {
+    if (filesHasMore && files.length > 0 && filesPage > 0) {
       const lastFile = files[files.length - 1];
       const nextCursor = lastFile.id;
 
@@ -201,11 +197,11 @@ export function Batches({
         queryFn: () => dwctlApi.files.list(prefetchOptions),
       });
     }
-  }, [files, filesHasMore, filesPageSize, filePurpose, queryClient]);
+  }, [files, filesHasMore, filesPage, filesPageSize, filePurpose, queryClient]);
 
-  // Prefetch next page for batches
+  // Prefetch next page for batches - only if user has already started paginating
   useEffect(() => {
-    if (batchesHasMore && batches.length > 0) {
+    if (batchesHasMore && batches.length > 0 && batchesPage > 0) {
       const lastBatch = batches[batches.length - 1];
       const nextCursor = lastBatch.id;
 
@@ -222,18 +218,16 @@ export function Batches({
           }),
       });
     }
-  }, [batches, batchesHasMore, batchesPageSize, queryClient]);
+  }, [batches, batchesHasMore, batchesPage, batchesPageSize, queryClient]);
 
-  // Get output/error files for a batch using the file IDs from the batch object
+  // Get output/error file IDs for a batch
   const getBatchFiles = (batch: Batch) => {
-    const files: FileObject[] = [];
+    const files: Array<{ id: string; purpose: string }> = [];
     if (batch.output_file_id) {
-      const outputFile = allFiles.find((f) => f.id === batch.output_file_id);
-      if (outputFile) files.push(outputFile);
+      files.push({ id: batch.output_file_id, purpose: "batch_output" });
     }
     if (batch.error_file_id) {
-      const errorFile = allFiles.find((f) => f.id === batch.error_file_id);
-      if (errorFile) files.push(errorFile);
+      files.push({ id: batch.error_file_id, purpose: "batch_error" });
     }
     return files;
   };
@@ -271,7 +265,7 @@ export function Batches({
 
   const handleTriggerBatch = (file: FileObject) => {
     if ((file as any)._isEmpty) return;
-    onOpenCreateBatchModal(file.id);
+    onOpenCreateBatchModal(file);
   };
 
   const handleFileClick = (file: FileObject) => {
@@ -310,9 +304,9 @@ export function Batches({
     }
   };
 
-  // Get input file for a batch
+  // Get input file ID for a batch
   const getInputFile = (batch: Batch) => {
-    return allFiles.find((f) => f.id === batch.input_file_id);
+    return { id: batch.input_file_id, purpose: "batch" };
   };
 
   // Pagination handlers
@@ -678,7 +672,11 @@ export function Batches({
               </p>
               <Button
                 onClick={() => {
-                  onOpenCreateBatchModal(batchFileFilter || undefined);
+                  // Find the file object if we have a filter
+                  const file = batchFileFilter
+                    ? files.find((f) => f.id === batchFileFilter)
+                    : undefined;
+                  onOpenCreateBatchModal(file);
                 }}
               >
                 <Play className="w-4 h-4 mr-2" />
