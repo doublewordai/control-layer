@@ -347,16 +347,16 @@ const Models: React.FC = () => {
   const hasNoFilteredResults = !hasNoModels && filteredModels.length === 0;
 
   return (
-    <div className="p-6">
+    <div className="p-4 md:p-6">
       <Tabs value={viewMode} onValueChange={handleTabChange}>
         {/* Header */}
         <div className="mb-6">
           <div className="flex flex-col lg:flex-row lg:items-center lg:justify-between gap-4">
             <div>
-              <h1 className="text-3xl font-bold text-doubleword-neutral-900">
+              <h1 className="text-2xl md:text-3xl font-bold text-doubleword-neutral-900">
                 Models
               </h1>
-              <p className="text-doubleword-neutral-600 mt-1">
+              <p className="text-sm md:text-base text-doubleword-neutral-600 mt-1">
                 View and monitor your deployed models
               </p>
             </div>
