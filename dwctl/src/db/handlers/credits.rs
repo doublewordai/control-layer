@@ -836,8 +836,7 @@ mod tests {
 
         assert_eq!(notification.channel(), "auth_config_changed");
 
-        let payload: serde_json::Value =
-            serde_json::from_str(notification.payload()).expect("Failed to parse notification payload");
+        let payload: serde_json::Value = serde_json::from_str(notification.payload()).expect("Failed to parse notification payload");
 
         assert_eq!(payload["user_id"], user_id.to_string());
         assert_eq!(payload["threshold_crossed"], "zero");
@@ -868,8 +867,7 @@ mod tests {
         assert_eq!(notification.channel(), "auth_config_changed");
 
         // Parse the JSON payload
-        let payload: serde_json::Value =
-            serde_json::from_str(notification.payload()).expect("Failed to parse notification payload");
+        let payload: serde_json::Value = serde_json::from_str(notification.payload()).expect("Failed to parse notification payload");
 
         assert_eq!(payload["user_id"], user_id.to_string());
         assert_eq!(payload["threshold_crossed"], "zero");
@@ -899,8 +897,7 @@ mod tests {
 
         assert_eq!(notification.channel(), "auth_config_changed");
 
-        let payload: serde_json::Value =
-            serde_json::from_str(notification.payload()).expect("Failed to parse notification payload");
+        let payload: serde_json::Value = serde_json::from_str(notification.payload()).expect("Failed to parse notification payload");
 
         assert_eq!(payload["user_id"], user_id.to_string());
         assert_eq!(payload["threshold_crossed"], "zero");
@@ -924,10 +921,7 @@ mod tests {
 
         // Try to receive notification with short timeout - should NOT receive one
         let result = timeout(Duration::from_millis(500), listener.recv()).await;
-        assert!(
-            result.is_err(),
-            "Should NOT receive notification when staying in positive range"
-        );
+        assert!(result.is_err(), "Should NOT receive notification when staying in positive range");
     }
 
     #[sqlx::test]
