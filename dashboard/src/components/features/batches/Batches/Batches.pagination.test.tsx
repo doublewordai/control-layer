@@ -513,6 +513,8 @@ describe("Batches - Pagination", () => {
       const smallPageFiles = createMockFiles(1, 11);
       const largePageFiles = createMockFiles(1, 26); // 25 per page + 1
 
+      let pageSizeChanged = false;
+
       vi.mocked(hooks.useFiles).mockImplementation((params?: any) => {
         if (!params || (!params.purpose && !params.limit)) {
           return {
@@ -534,6 +536,7 @@ describe("Batches - Pagination", () => {
         }
 
         if (params.limit === 26) {
+          pageSizeChanged = true;
           return {
             data: { data: largePageFiles },
             isLoading: false,
@@ -581,11 +584,18 @@ describe("Batches - Pagination", () => {
         expect(screen.getByText(/Page 2/i)).toBeInTheDocument();
       });
 
-      // Change page size
-      const pageSizeSelect = screen.getByRole("combobox", { name: "" });
+      // Change page size by clicking the combobox trigger
+      const pageSizeSelect = screen.getByRole("combobox");
       await user.click(pageSizeSelect);
 
-      const option25 = await screen.findByRole("option", { name: "25" });
+      // Wait for the dropdown to open and find the option by text
+      // Radix UI Select uses data-radix-collection-item for options
+      await waitFor(() => {
+        expect(screen.getByText("25")).toBeInTheDocument();
+      });
+
+      // Click the option
+      const option25 = screen.getByText("25");
       await user.click(option25);
 
       // Should reset to page 1 after changing page size

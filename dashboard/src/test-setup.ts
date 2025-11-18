@@ -9,6 +9,36 @@ if (typeof window !== "undefined" && !window.ResizeObserver) {
   };
 }
 
+// Polyfill PointerEvent and hasPointerCapture for Radix UI Select
+if (typeof window !== "undefined") {
+  // @ts-ignore - Polyfill for testing
+  if (!window.PointerEvent) {
+    window.PointerEvent = class PointerEvent extends MouseEvent {} as any;
+  }
+
+  // @ts-ignore - Polyfill for testing
+  if (!Element.prototype.hasPointerCapture) {
+    Element.prototype.hasPointerCapture = function() {
+      return false;
+    };
+  }
+
+  // @ts-ignore - Polyfill for testing
+  if (!Element.prototype.setPointerCapture) {
+    Element.prototype.setPointerCapture = function() {};
+  }
+
+  // @ts-ignore - Polyfill for testing
+  if (!Element.prototype.releasePointerCapture) {
+    Element.prototype.releasePointerCapture = function() {};
+  }
+
+  // @ts-ignore - Polyfill for testing
+  if (!Element.prototype.scrollIntoView) {
+    Element.prototype.scrollIntoView = function() {};
+  }
+}
+
 // Mock environment variables
 Object.defineProperty(import.meta, "env", {
   value: {
