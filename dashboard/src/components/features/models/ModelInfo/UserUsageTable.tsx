@@ -14,9 +14,10 @@ import { ArrowUpDown, Users, Download } from "lucide-react";
 
 interface UserUsageTableProps {
   modelAlias: string;
+  showPricing?: boolean;
 }
 
-const UserUsageTable: React.FC<UserUsageTableProps> = ({ modelAlias }) => {
+const UserUsageTable: React.FC<UserUsageTableProps> = ({ modelAlias, showPricing = true }) => {
   const [dateRange, setDateRange] = useState<{ from: Date; to: Date }>({
     from: new Date(new Date().getTime() - 24 * 60 * 60 * 1000), // 24 hours ago
     to: new Date(), // now
@@ -39,6 +40,11 @@ const UserUsageTable: React.FC<UserUsageTableProps> = ({ modelAlias }) => {
   // Formatting helpers
   const formatNumber = (num: number) => {
     return new Intl.NumberFormat().format(num);
+  };
+
+  const formatCost = (cost?: number) => {
+    if (cost === undefined || cost === null) return "-";
+    return `$${cost.toFixed(4)}`;
   };
 
   const formatDate = (dateStr?: string) => {
@@ -67,6 +73,7 @@ const UserUsageTable: React.FC<UserUsageTableProps> = ({ modelAlias }) => {
       "Input Tokens",
       "Output Tokens",
       "Total Tokens",
+      ...(showPricing ? ["Total Cost"] : []),
       "Last Active",
     ];
 
@@ -78,6 +85,7 @@ const UserUsageTable: React.FC<UserUsageTableProps> = ({ modelAlias }) => {
       user.input_tokens.toString(),
       user.output_tokens.toString(),
       user.total_tokens.toString(),
+      ...(showPricing ? [user.total_cost?.toString() || "0"] : []),
       user.last_active_at || "",
     ]);
 
@@ -154,13 +162,36 @@ const UserUsageTable: React.FC<UserUsageTableProps> = ({ modelAlias }) => {
           );
         },
       },
+      ...(showPricing ? [{
+        accessorKey: "total_cost" as const,
+        header: ({ column }: { column: any }) => {
+          return (
+            <Button
+              variant="ghost"
+              size="sm"
+              className="-ml-3 h-8"
+              onClick={() =>
+                column.toggleSorting(column.getIsSorted() === "asc")
+              }
+            >
+              Cost
+              <ArrowUpDown className="ml-2 h-4 w-4" />
+            </Button>
+          );
+        },
+        cell: ({ row }: { row: any }) => (
+          <span className="font-medium text-green-700">
+            {formatCost(row.getValue("total_cost"))}
+          </span>
+        ),
+      }] as ColumnDef<UserUsage>[] : []),
       {
         accessorKey: "last_active_at",
         header: "Last Active",
         cell: ({ row }) => formatDate(row.getValue("last_active_at")),
       },
     ],
-    [],
+    [showPricing],
   );
 
   if (isLoading) {
@@ -256,6 +287,27 @@ const UserUsageTable: React.FC<UserUsageTableProps> = ({ modelAlias }) => {
                   </p>
                 </HoverCardContent>
               </HoverCard>
+
+              {showPricing && data.total_cost !== undefined && (
+                <HoverCard openDelay={100} closeDelay={50}>
+                  <HoverCardTrigger asChild>
+                    <div className="flex items-center gap-1.5 px-3 py-1.5 bg-green-50 rounded-md select-none cursor-default border border-green-200">
+                      <span className="text-xs text-green-700 font-medium">
+                        Total Cost:
+                      </span>
+                      <span className="text-sm font-bold text-green-800">
+                        {formatCost(data.total_cost)}
+                      </span>
+                    </div>
+                  </HoverCardTrigger>
+                  <HoverCardContent className="w-64" sideOffset={5}>
+                    <p className="text-sm text-muted-foreground">
+                      Total cost for all requests in the selected time period,
+                      calculated based on token usage and model pricing.
+                    </p>
+                  </HoverCardContent>
+                </HoverCard>
+              )}
             </div>
           )}
 

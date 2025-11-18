@@ -15,6 +15,7 @@ import {
 } from "vitest";
 import Models from "./Models";
 import { handlers } from "../../../../api/control-layer/mocks/handlers";
+import { SettingsProvider } from "../../../../contexts/settings/SettingsContext";
 
 // Setup MSW server with existing handlers
 const server = setupServer(...handlers);
@@ -33,7 +34,16 @@ vi.mock("react-router-dom", async () => {
   };
 });
 
-// Test wrapper with QueryClient and Router
+// Mock the authorization hook
+vi.mock("../../../../utils/authorization", () => ({
+  useAuthorization: vi.fn(() => ({
+    userRoles: ["PlatformManager"],
+    hasPermission: vi.fn(() => true),
+    canAccessRoute: vi.fn(() => true),
+  })),
+}));
+
+// Test wrapper with QueryClient, Router, and Context Providers
 function createWrapper() {
   const queryClient = new QueryClient({
     defaultOptions: {
@@ -45,9 +55,11 @@ function createWrapper() {
   });
 
   return ({ children }: { children: ReactNode }) => (
-    <QueryClientProvider client={queryClient}>
-      <BrowserRouter>{children}</BrowserRouter>
-    </QueryClientProvider>
+    <SettingsProvider>
+      <QueryClientProvider client={queryClient}>
+        <BrowserRouter>{children}</BrowserRouter>
+      </QueryClientProvider>
+    </SettingsProvider>
   );
 }
 
