@@ -166,11 +166,7 @@ use crate::{
 use auth::middleware::admin_ai_proxy_middleware;
 use axum::extract::DefaultBodyLimit;
 use axum::http::HeaderValue;
-use axum::{
-    middleware::from_fn_with_state,
-    routing::{delete, get, patch, post},
-    Router, ServiceExt,
-};
+use axum::{http, middleware::from_fn_with_state, routing::{delete, get, patch, post}, Router, ServiceExt};
 use axum_prometheus::PrometheusMetricLayer;
 use bon::Builder;
 pub use config::Config;
@@ -492,7 +488,8 @@ fn create_cors_layer(config: &Config) -> anyhow::Result<CorsLayer> {
 
     let mut cors = CorsLayer::new()
         .allow_origin(origins)
-        .allow_credentials(config.auth.security.cors.allow_credentials);
+        .allow_credentials(config.auth.security.cors.allow_credentials)
+        .expose_headers(vec![http::header::LOCATION]);
 
     if let Some(max_age) = config.auth.security.cors.max_age {
         cors = cors.max_age(std::time::Duration::from_secs(max_age));

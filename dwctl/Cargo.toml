@@ -102,6 +102,8 @@ futures = "0.3.31"
 axum-test = { version = "17.3", optional = true }
 dashmap = { version = "6.1.0", features = ["serde"] }
 moka = { version = "0.12", features = ["future"] }
+# Stripe payment processing
+async-stripe = { version = "0.41.0", default-features = false, features = ["runtime-tokio-hyper", "checkout"] }
 
 [dev-dependencies]
 axum-test = { version = "17.3" }

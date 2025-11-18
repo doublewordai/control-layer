@@ -51,6 +51,7 @@ impl From<SessionClaims> for CurrentUser {
             is_admin: claims.is_admin,
             display_name: None, // Not stored in JWT
             avatar_url: None,   // Not stored in JWT
+            payment_provider_id: None,
         }
     }
 }

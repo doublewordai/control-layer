@@ -48,19 +48,22 @@ export function CostManagement() {
         console.error("Error adding funds:", error);
       }
     } else if (config?.payment_enabled) {
-      // Payment processing enabled: Call checkout endpoint and follow redirect
+      // Payment processing enabled: Get checkout URL and redirect
       try {
         const response = await fetch("/admin/api/v1/create_checkout", {
           method: "POST",
           headers: { "Content-Type": "application/json" },
-          redirect: "manual",
         });
 
-        // Backend returns 303 redirect with Location header
-        const location = response.headers.get("Location");
-        if (location) {
-          window.location.href = location;
-        } else if (!response.ok) {
+        if (response.ok) {
+          const data = await response.json();
+          if (data.url) {
+            // Navigate to Stripe checkout page
+            window.location.href = data.url;
+          } else {
+            toast.error("Failed to get checkout URL");
+          }
+        } else {
           const errorData = await response.json().catch(() => ({}));
           toast.error(errorData.message || "Failed to initiate checkout");
         }
