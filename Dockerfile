@@ -29,10 +29,9 @@ RUN npm ci && npm run build
 WORKDIR /app
 RUN rm -rf dwctl/static && cp -r dashboard/dist dwctl/static
 
-# Build from workspace root (target dir will be at /app/target)
-# Use --no-default-features to disable embedded-db for Docker (uses external postgres)
+# Build from workspace root with embedded database (target dir will be at /app/target)
 ENV SQLX_OFFLINE=true
-RUN cargo build --release -p dwctl --no-default-features
+RUN cargo build --release -p dwctl
 
 # Development stage
 FROM backend-builder AS dev
@@ -41,7 +40,7 @@ FROM backend-builder AS dev
 EXPOSE 3001
 
 # Default command for development: doesn't rebuild the frontend on changes
-CMD ["cargo", "watch", "-w", "dwctl/src", "-x", "run -p dwctl --no-default-features"]
+CMD ["cargo", "watch", "-w", "dwctl/src", "-x", "run -p dwctl"]
 
 # Runtime stage
 FROM ubuntu:24.04
