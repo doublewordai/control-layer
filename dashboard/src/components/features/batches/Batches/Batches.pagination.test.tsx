@@ -206,8 +206,6 @@ describe("Batches - Pagination", () => {
       const page1Files = createMockFiles(1, 11);
       const page2Files = createMockFiles(2, 5);
 
-      let currentPage = 1;
-
       vi.mocked(hooks.useFiles).mockImplementation((params?: any) => {
         // Unpaginated query
         if (!params || (!params.purpose && !params.limit)) {
@@ -221,7 +219,6 @@ describe("Batches - Pagination", () => {
 
         // Page 1: no cursor
         if (!params.after) {
-          currentPage = 1;
           return {
             data: { data: page1Files },
             isLoading: false,
@@ -232,7 +229,6 @@ describe("Batches - Pagination", () => {
 
         // Page 2: with cursor
         if (params.after === page1Files[9].id) {
-          currentPage = 2;
           return {
             data: { data: page2Files },
             isLoading: false,
@@ -513,8 +509,6 @@ describe("Batches - Pagination", () => {
       const smallPageFiles = createMockFiles(1, 11);
       const largePageFiles = createMockFiles(1, 26); // 25 per page + 1
 
-      let pageSizeChanged = false;
-
       vi.mocked(hooks.useFiles).mockImplementation((params?: any) => {
         if (!params || (!params.purpose && !params.limit)) {
           return {
@@ -536,7 +530,6 @@ describe("Batches - Pagination", () => {
         }
 
         if (params.limit === 26) {
-          pageSizeChanged = true;
           return {
             data: { data: largePageFiles },
             isLoading: false,
