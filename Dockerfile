@@ -50,6 +50,7 @@ RUN apt-get update && apt-get install -y \
   ca-certificates \
   curl \
   libxml2 \
+  tzdata \
   && rm -rf /var/lib/apt/lists/*
 
 # Set working directory
