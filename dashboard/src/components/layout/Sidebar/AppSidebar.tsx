@@ -198,19 +198,19 @@ export function AppLayout({ children }: { children: React.ReactNode }) {
       <div className="flex min-h-screen w-full">
         <AppSidebar />
         <SidebarInset className="flex flex-col flex-1">
-          <header className="flex h-16 items-center justify-between border-b px-6">
+          <header className="flex h-16 items-center justify-between border-b px-4 md:px-6">
             <SidebarTrigger />
-            <div className="flex items-center gap-6 text-sm text-muted-foreground">
+            <div className="flex items-center gap-3 md:gap-6 text-sm text-muted-foreground">
               {!configLoading && config && (
                 <>
-                  <div className="flex items-center gap-2">
+                  <div className="hidden lg:flex items-center gap-2">
                     <span className="text-muted-foreground/70">Region:</span>
                     <span className="font-medium text-foreground">
                       {config.region}
                     </span>
                   </div>
-                  <div className="w-px h-4 bg-border"></div>
-                  <div className="flex items-center gap-2">
+                  <div className="hidden lg:block w-px h-4 bg-border"></div>
+                  <div className="hidden md:flex items-center gap-2">
                     <span className="text-muted-foreground/70">
                       Organization:
                     </span>
@@ -218,7 +218,7 @@ export function AppLayout({ children }: { children: React.ReactNode }) {
                       {config.organization}
                     </span>
                   </div>
-                  <div className="w-px h-4 bg-border"></div>
+                  <div className="hidden md:block w-px h-4 bg-border"></div>
                 </>
               )}
               <a
@@ -227,7 +227,8 @@ export function AppLayout({ children }: { children: React.ReactNode }) {
                 rel="noopener noreferrer"
                 className="flex items-center gap-2 text-muted-foreground hover:text-primary transition-colors font-medium"
               >
-                <span>Documentation</span>
+                <span className="hidden sm:inline">Documentation</span>
+                <span className="sm:hidden">Docs</span>
                 <ExternalLink className="w-3 h-3" />
               </a>
             </div>

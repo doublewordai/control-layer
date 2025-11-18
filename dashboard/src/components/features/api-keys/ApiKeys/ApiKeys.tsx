@@ -175,21 +175,21 @@ export const ApiKeys: React.FC = () => {
   }
 
   return (
-    <div className="p-6">
+    <div className="p-4 md:p-6">
       <div className="mb-8">
-        <div className="flex items-center justify-between">
+        <div className="flex flex-col sm:flex-row items-start sm:items-center justify-between gap-4">
           <div>
-            <h1 className="text-3xl font-bold text-doubleword-neutral-900 mb-2">
+            <h1 className="text-2xl md:text-3xl font-bold text-doubleword-neutral-900 mb-2">
               API Keys
             </h1>
-            <p className="text-doubleword-neutral-600">
+            <p className="text-sm md:text-base text-doubleword-neutral-600">
               Manage your API keys for programmatic access
             </p>
           </div>
           {apiKeys.length > 0 && (
             <Button
               onClick={() => setShowCreateForm(true)}
-              className="bg-doubleword-background-dark hover:bg-doubleword-neutral-900"
+              className="bg-doubleword-background-dark hover:bg-doubleword-neutral-900 w-full sm:w-auto"
               aria-label="Create new API key"
             >
               <Plus className="w-4 h-4 mr-2" />
@@ -491,7 +491,7 @@ export const ApiKeys: React.FC = () => {
                       </div>
 
                       {/* Rate Limiting */}
-                      <div className="grid grid-cols-2 gap-3">
+                      <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
                         <div className="space-y-2">
                           <div className="flex items-center gap-1">
                             <Label htmlFor="requestsPerSecond">
