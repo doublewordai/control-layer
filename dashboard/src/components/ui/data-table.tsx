@@ -32,6 +32,13 @@ import {
   DropdownMenuTrigger,
 } from "./dropdown-menu";
 
+interface ServerSidePaginationConfig {
+  currentPage: number;
+  totalPages: number;
+  totalCount: number;
+  onPageChange: (page: number) => void;
+}
+
 interface DataTableProps<TData, TValue> {
   columns: ColumnDef<TData, TValue>[];
   data: TData[];
@@ -46,6 +53,7 @@ interface DataTableProps<TData, TValue> {
   actionBar?: React.ReactNode;
   headerActions?: React.ReactNode;
   initialColumnVisibility?: VisibilityState;
+  serverSidePagination?: ServerSidePaginationConfig; // Optional: Enable server-side pagination
 }
 
 export function DataTable<TData, TValue>({
@@ -62,6 +70,7 @@ export function DataTable<TData, TValue>({
   actionBar,
   headerActions,
   initialColumnVisibility = {},
+  serverSidePagination,
 }: DataTableProps<TData, TValue>) {
   const [sorting, setSorting] = React.useState<SortingState>([]);
   const [columnFilters, setColumnFilters] = React.useState<ColumnFiltersState>(
@@ -79,7 +88,10 @@ export function DataTable<TData, TValue>({
     onColumnFiltersChange: setColumnFilters,
     onGlobalFilterChange: setGlobalFilter,
     getCoreRowModel: getCoreRowModel(),
-    getPaginationRowModel: getPaginationRowModel(),
+    // Only use client-side pagination if not using server-side
+    getPaginationRowModel: serverSidePagination
+      ? undefined
+      : getPaginationRowModel(),
     getSortedRowModel: getSortedRowModel(),
     getFilteredRowModel: getFilteredRowModel(),
     onColumnVisibilityChange: setColumnVisibility,
@@ -96,6 +108,9 @@ export function DataTable<TData, TValue>({
         pageSize,
       },
     },
+    // For server-side pagination, disable page count calculation
+    manualPagination: !!serverSidePagination,
+    pageCount: serverSidePagination?.totalPages ?? -1,
   });
 
   const selectedRows = table.getFilteredSelectedRowModel().rows;
@@ -305,37 +320,94 @@ export function DataTable<TData, TValue>({
       {showPagination && (
         <div className="flex items-center justify-between">
           <div className="text-sm text-muted-foreground">
-            Showing{" "}
-            {table.getState().pagination.pageIndex *
-              table.getState().pagination.pageSize +
-              1}{" "}
-            to{" "}
-            {Math.min(
-              (table.getState().pagination.pageIndex + 1) *
-                table.getState().pagination.pageSize,
-              table.getFilteredRowModel().rows.length,
+            {serverSidePagination ? (
+              <>
+                Showing{" "}
+                {serverSidePagination.totalCount > 0
+                  ? serverSidePagination.currentPage * pageSize + 1
+                  : 0}{" "}
+                to{" "}
+                {Math.min(
+                  (serverSidePagination.currentPage + 1) * pageSize,
+                  serverSidePagination.totalCount,
+                )}{" "}
+                of {serverSidePagination.totalCount} results
+              </>
+            ) : (
+              <>
+                Showing{" "}
+                {table.getState().pagination.pageIndex *
+                  table.getState().pagination.pageSize +
+                  1}{" "}
+                to{" "}
+                {Math.min(
+                  (table.getState().pagination.pageIndex + 1) *
+                    table.getState().pagination.pageSize,
+                  table.getFilteredRowModel().rows.length,
+                )}
+                of {table.getFilteredRowModel().rows.length} results
+              </>
             )}
-            of {table.getFilteredRowModel().rows.length} results
           </div>
           <div className="flex items-center space-x-2">
-            <Button
-              variant="outline"
-              size="sm"
-              onClick={() => table.previousPage()}
-              disabled={!table.getCanPreviousPage()}
-            >
-              <ChevronLeft className="h-4 w-4" />
-              Previous
-            </Button>
-            <Button
-              variant="outline"
-              size="sm"
-              onClick={() => table.nextPage()}
-              disabled={!table.getCanNextPage()}
-            >
-              Next
-              <ChevronRight className="h-4 w-4" />
-            </Button>
+            {serverSidePagination ? (
+              <>
+                <Button
+                  variant="outline"
+                  size="sm"
+                  onClick={() =>
+                    serverSidePagination.onPageChange(
+                      serverSidePagination.currentPage - 1,
+                    )
+                  }
+                  disabled={serverSidePagination.currentPage === 0}
+                >
+                  <ChevronLeft className="h-4 w-4" />
+                  Previous
+                </Button>
+                <div className="text-sm text-muted-foreground">
+                  Page {serverSidePagination.currentPage + 1} of{" "}
+                  {serverSidePagination.totalPages}
+                </div>
+                <Button
+                  variant="outline"
+                  size="sm"
+                  onClick={() =>
+                    serverSidePagination.onPageChange(
+                      serverSidePagination.currentPage + 1,
+                    )
+                  }
+                  disabled={
+                    serverSidePagination.currentPage >=
+                    serverSidePagination.totalPages - 1
+                  }
+                >
+                  Next
+                  <ChevronRight className="h-4 w-4" />
+                </Button>
+              </>
+            ) : (
+              <>
+                <Button
+                  variant="outline"
+                  size="sm"
+                  onClick={() => table.previousPage()}
+                  disabled={!table.getCanPreviousPage()}
+                >
+                  <ChevronLeft className="h-4 w-4" />
+                  Previous
+                </Button>
+                <Button
+                  variant="outline"
+                  size="sm"
+                  onClick={() => table.nextPage()}
+                  disabled={!table.getCanNextPage()}
+                >
+                  Next
+                  <ChevronRight className="h-4 w-4" />
+                </Button>
+              </>
+            )}
           </div>
         </div>
       )}

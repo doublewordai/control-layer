@@ -166,6 +166,7 @@ export function getMockRequestResponsePairs(): RequestResponsePair[] {
 export function useMockRequests(
   query?: {
     limit?: number;
+    offset?: number;
     order_desc?: boolean;
   },
   options?: { enabled?: boolean },
@@ -200,13 +201,16 @@ export function useMockRequests(
     );
   }
 
-  // Apply limit if requested
-  if (query?.limit) {
-    sortedPairs = sortedPairs.slice(0, query.limit);
-  }
+  // Get total count before pagination
+  const totalCount = sortedPairs.length;
+
+  // Apply offset and limit for pagination
+  const offset = query?.offset || 0;
+  const limit = query?.limit || 50;
+  const paginatedPairs = sortedPairs.slice(offset, offset + limit);
 
   return {
-    data: { requests: sortedPairs },
+    data: { requests: paginatedPairs, total_count: totalCount },
     isLoading: false,
     error: null,
   };

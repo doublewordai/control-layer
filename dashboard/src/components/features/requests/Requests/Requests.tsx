@@ -1,5 +1,6 @@
 import { Activity, X, BarChart3, List, ArrowLeft } from "lucide-react";
 import { useState, useEffect } from "react";
+import * as React from "react";
 import { useSearchParams, useNavigate } from "react-router-dom";
 import {
   useRequests,
@@ -44,7 +45,16 @@ export function Requests() {
   const [dateRange, setDateRange] = useState<
     { from: Date; to: Date } | undefined
   >(getDefaultDateRange());
-  const [recordLimit, setRecordLimit] = useState<number>(50);
+
+  // Initialize pagination state from URL parameters
+  const pageFromUrl = searchParams.get("page");
+  const pageSizeFromUrl = searchParams.get("pageSize");
+  const [currentPage, setCurrentPage] = useState<number>(
+    pageFromUrl ? parseInt(pageFromUrl, 10) : 0,
+  );
+  const [pageSize, setPageSize] = useState<number>(
+    pageSizeFromUrl ? parseInt(pageSizeFromUrl, 10) : 10,
+  );
 
   // Check user permissions
   const hasAnalyticsPermission = userRoles.some(
@@ -95,14 +105,17 @@ export function Requests() {
   // Get from parameter for back navigation
   const fromUrl = searchParams.get("from");
 
+  // Calculate offset for server-side pagination
+  const offset = currentPage * pageSize;
+
   // Fetch requests data only if user has requests permission
   const realRequestsQuery = useRequests(
-    { limit: recordLimit, order_desc: true },
+    { limit: pageSize, offset, order_desc: true },
     { enabled: hasRequestsPermission },
     dateRange,
   );
   const mockRequestsQuery = useMockRequests(
-    { limit: recordLimit, order_desc: true },
+    { limit: pageSize, offset, order_desc: true },
     { enabled: hasRequestsPermission },
     dateRange,
   );
@@ -126,14 +139,26 @@ export function Requests() {
   const error = requestsError;
 
   // Transform backend data to frontend format
-  const allRequests = requestsResponse
+  const requests = requestsResponse
     ? transformRequestResponsePairs(requestsResponse.requests)
     : [];
 
-  // Filter requests by selected model
-  const requests = selectedModel
-    ? allRequests.filter((request) => request.model === selectedModel)
-    : allRequests;
+  // Get total count for pagination
+  const totalCount = requestsResponse?.total_count || 0;
+  const totalPages = Math.ceil(totalCount / pageSize);
+
+  // Sync pagination state with URL
+  React.useEffect(() => {
+    const newParams = new URLSearchParams(searchParams);
+    newParams.set("page", currentPage.toString());
+    newParams.set("pageSize", pageSize.toString());
+    navigate(`/analytics?${newParams.toString()}`, { replace: true });
+  }, [currentPage, pageSize, navigate, searchParams]);
+
+  // Reset to first page when filters change
+  React.useEffect(() => {
+    setCurrentPage(0);
+  }, [selectedModel, dateRange]);
 
   const columns = createRequestColumns();
 
@@ -325,28 +350,33 @@ export function Requests() {
                 columns={columns}
                 data={requests}
                 searchPlaceholder="Search requests and responses..."
-                showPagination={requests.length > 10}
+                showPagination={true}
                 showColumnToggle={true}
-                pageSize={10}
+                pageSize={pageSize}
                 rowHeight="40px"
                 initialColumnVisibility={{ timestamp: false }}
+                serverSidePagination={{
+                  currentPage,
+                  totalPages,
+                  totalCount,
+                  onPageChange: setCurrentPage,
+                }}
                 headerActions={
                   <Select
-                    value={recordLimit.toString()}
-                    onValueChange={(value) =>
-                      setRecordLimit(parseInt(value, 10))
-                    }
+                    value={pageSize.toString()}
+                    onValueChange={(value) => {
+                      setPageSize(parseInt(value, 10));
+                      setCurrentPage(0); // Reset to first page when changing page size
+                    }}
                   >
                     <SelectTrigger className="w-[130px] h-9">
-                      <SelectValue placeholder="Records" />
+                      <SelectValue placeholder="Page size" />
                     </SelectTrigger>
                     <SelectContent>
-                      <SelectItem value="10">10 records</SelectItem>
-                      <SelectItem value="25">25 records</SelectItem>
-                      <SelectItem value="50">50 records</SelectItem>
-                      <SelectItem value="100">100 records</SelectItem>
-                      <SelectItem value="200">200 records</SelectItem>
-                      <SelectItem value="500">500 records</SelectItem>
+                      <SelectItem value="10">10 per page</SelectItem>
+                      <SelectItem value="25">25 per page</SelectItem>
+                      <SelectItem value="50">50 per page</SelectItem>
+                      <SelectItem value="100">100 per page</SelectItem>
                     </SelectContent>
                   </Select>
                 }

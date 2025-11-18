@@ -300,6 +300,7 @@ export interface RequestResponsePair {
 
 export interface ListRequestsResponse {
   requests: RequestResponsePair[];
+  total_count: number;
 }
 
 // AI request/response types (matching Control Layer's tagged ApiAiRequest/ApiAiResponse enums)

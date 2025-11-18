@@ -25,6 +25,117 @@ use chrono::{DateTime, Duration, Utc};
 use serde::Deserialize;
 use utoipa::IntoParams;
 
+/// Count total requests matching the filter
+///
+/// This queries the outlet database directly to get the total count of requests
+/// matching the filter criteria, which is needed for proper pagination.
+async fn count_filtered_requests(
+    pool: &sqlx::PgPool,
+    filter: &RequestFilter,
+) -> Result<i64, Error> {
+    // Build the WHERE clause dynamically based on filters
+    let mut where_clauses = vec![];
+    let mut params: Vec<Box<dyn sqlx::Encode<'_, sqlx::Postgres> + Send>> = vec![];
+    let mut param_idx = 1;
+
+    if let Some(_method) = &filter.method {
+        where_clauses.push(format!("method = ${}", param_idx));
+        param_idx += 1;
+    }
+
+    if let Some(_status_code) = filter.status_code {
+        where_clauses.push(format!("EXISTS (SELECT 1 FROM outlet.http_responses r WHERE r.correlation_id = req.correlation_id AND r.status_code = ${})", param_idx));
+        param_idx += 1;
+    }
+
+    if let Some(_min_status) = filter.status_code_min {
+        where_clauses.push(format!("EXISTS (SELECT 1 FROM outlet.http_responses r WHERE r.correlation_id = req.correlation_id AND r.status_code >= ${})", param_idx));
+        param_idx += 1;
+    }
+
+    if let Some(_max_status) = filter.status_code_max {
+        where_clauses.push(format!("EXISTS (SELECT 1 FROM outlet.http_responses r WHERE r.correlation_id = req.correlation_id AND r.status_code <= ${})", param_idx));
+        param_idx += 1;
+    }
+
+    if let Some(_timestamp_after) = filter.timestamp_after {
+        where_clauses.push(format!("timestamp >= ${}", param_idx));
+        param_idx += 1;
+    }
+
+    if let Some(_timestamp_before) = filter.timestamp_before {
+        where_clauses.push(format!("timestamp <= ${}", param_idx));
+        param_idx += 1;
+    }
+
+    if let Some(_uri_pattern) = &filter.uri_pattern {
+        where_clauses.push(format!("uri LIKE ${}", param_idx));
+        param_idx += 1;
+    }
+
+    if let Some(_min_duration) = filter.min_duration_ms {
+        where_clauses.push(format!("EXISTS (SELECT 1 FROM outlet.http_responses r WHERE r.correlation_id = req.correlation_id AND r.duration_ms >= ${})", param_idx));
+        param_idx += 1;
+    }
+
+    if let Some(_max_duration) = filter.max_duration_ms {
+        where_clauses.push(format!("EXISTS (SELECT 1 FROM outlet.http_responses r WHERE r.correlation_id = req.correlation_id AND r.duration_ms <= ${})", param_idx));
+        //param_idx += 1;
+    }
+
+    let where_clause = if where_clauses.is_empty() {
+        String::new()
+    } else {
+        format!("WHERE {}", where_clauses.join(" AND "))
+    };
+
+    // Build the query
+    let query_str = format!(
+        "SELECT COUNT(*) as count FROM outlet.http_requests req {}",
+        where_clause
+    );
+
+    // Execute query with parameters
+    let mut query = sqlx::query_scalar::<_, i64>(&query_str);
+
+    if let Some(method) = &filter.method {
+        query = query.bind(method);
+    }
+    if let Some(status_code) = filter.status_code {
+        query = query.bind(status_code);
+    }
+    if let Some(min_status) = filter.status_code_min {
+        query = query.bind(min_status);
+    }
+    if let Some(max_status) = filter.status_code_max {
+        query = query.bind(max_status);
+    }
+    if let Some(timestamp_after) = filter.timestamp_after {
+        query = query.bind(timestamp_after);
+    }
+    if let Some(timestamp_before) = filter.timestamp_before {
+        query = query.bind(timestamp_before);
+    }
+    if let Some(uri_pattern) = &filter.uri_pattern {
+        query = query.bind(format!("%{}%", uri_pattern));
+    }
+    if let Some(min_duration) = filter.min_duration_ms {
+        query = query.bind(min_duration);
+    }
+    if let Some(max_duration) = filter.max_duration_ms {
+        query = query.bind(max_duration);
+    }
+
+    let count = query.fetch_one(pool).await.map_err(|e| {
+        error!("Failed to count requests: {}", e);
+        Error::Internal {
+            operation: "Failed to count requests".to_string(),
+        }
+    })?;
+
+    Ok(count)
+}
+
 /// Convert outlet-postgres request/response pairs to API types
 ///
 /// This function handles the conversion from the outlet-postgres database types
@@ -181,18 +292,24 @@ pub async fn list_requests(
         filter.uri_pattern = Some(uri_pattern.clone());
     }
 
-    // Query the outlet-postgres repository
-    let outlet_pairs = repository.query(filter).await.map_err(|e| {
+    // Query the outlet-postgres repository for the actual data
+    let outlet_pairs = repository.query(filter.clone()).await.map_err(|e| {
         error!("Failed to query requests: {}", e);
         Error::Internal {
             operation: "Failed to query requests".to_string(),
         }
     })?;
 
+    // Query the total count for pagination
+    let total_count = count_filtered_requests(outlet_pool, &filter).await?;
+
     // Convert outlet-postgres types to API types
     let api_pairs = convert_outlet_pairs_to_api(outlet_pairs);
 
-    Ok(Json(ListRequestsResponse { requests: api_pairs }))
+    Ok(Json(ListRequestsResponse {
+        requests: api_pairs,
+        total_count,
+    }))
 }
 
 /// Get aggregated request metrics and analytics

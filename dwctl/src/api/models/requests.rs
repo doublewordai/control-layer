@@ -146,6 +146,8 @@ pub struct RequestResponsePair {
 pub struct ListRequestsResponse {
     /// List of HTTP requests
     pub requests: Vec<RequestResponsePair>,
+    /// Total count of requests matching the filter (for pagination)
+    pub total_count: i64,
 }
 
 impl Default for ListRequestsQuery {
