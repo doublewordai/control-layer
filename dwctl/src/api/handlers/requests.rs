@@ -35,7 +35,6 @@ async fn count_filtered_requests(
 ) -> Result<i64, Error> {
     // Build the WHERE clause dynamically based on filters
     let mut where_clauses = vec![];
-    let mut params: Vec<Box<dyn sqlx::Encode<'_, sqlx::Postgres> + Send>> = vec![];
     let mut param_idx = 1;
 
     if let Some(_method) = &filter.method {
@@ -292,16 +291,16 @@ pub async fn list_requests(
         filter.uri_pattern = Some(uri_pattern.clone());
     }
 
+    // Query the total count for pagination first (before moving filter)
+    let total_count = count_filtered_requests(outlet_pool, &filter).await?;
+
     // Query the outlet-postgres repository for the actual data
-    let outlet_pairs = repository.query(filter.clone()).await.map_err(|e| {
+    let outlet_pairs = repository.query(filter).await.map_err(|e| {
         error!("Failed to query requests: {}", e);
         Error::Internal {
             operation: "Failed to query requests".to_string(),
         }
     })?;
-
-    // Query the total count for pagination
-    let total_count = count_filtered_requests(outlet_pool, &filter).await?;
 
     // Convert outlet-postgres types to API types
     let api_pairs = convert_outlet_pairs_to_api(outlet_pairs);
