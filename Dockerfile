@@ -52,20 +52,17 @@ RUN apt-get update && apt-get install -y \
   libxml2 \
   && rm -rf /var/lib/apt/lists/*
 
-# Create a non-root user and group
-RUN groupadd -r appuser && useradd -r -g appuser -u 1000 appuser
-
 # Set working directory
 WORKDIR /app
 
 # Copy the binary from backend builder stage (frontend is already embedded in the binary)
 COPY --from=backend-builder /app/target/release/dwctl /app/dwctl
 
-# Change ownership of the app directory to the non-root user
-RUN chown -R appuser:appuser /app
+# Change ownership of the app directory to the ubuntu user
+RUN chown -R ubuntu:ubuntu /app
 
 # Switch to non-root user
-USER appuser
+USER ubuntu
 
 # Expose port (app uses 3001 by default)
 EXPOSE 3001
