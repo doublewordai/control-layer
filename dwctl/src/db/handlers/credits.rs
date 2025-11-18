@@ -798,6 +798,140 @@ mod tests {
     /// is committed wins and the second calculated its balance based on stale data.
     #[sqlx::test]
     #[test_log::test]
+    async fn test_balance_threshold_notification_triggers(pool: PgPool) {
+        use sqlx::postgres::PgListener;
+        use std::time::Duration;
+        use tokio::time::timeout;
+
+        let user_id = create_test_user(&pool).await;
+
+        // Setup a listener for auth_config_changed notifications
+        let mut listener = PgListener::connect_with(&pool).await.expect("Failed to create listener");
+        listener
+            .listen("auth_config_changed")
+            .await
+            .expect("Failed to listen to auth_config_changed");
+
+        // Test 1: Going from 0 to positive (SHOULD trigger - crossing zero threshold)
+        // This enables API keys when user gets their first credits
+        {
+            let mut conn = pool.acquire().await.expect("Failed to acquire connection");
+            let mut credits = Credits::new(&mut conn);
+
+            let request = CreditTransactionCreateDBRequest {
+                user_id,
+                transaction_type: CreditTransactionType::AdminGrant,
+                amount: Decimal::from_str("100.0").unwrap(),
+                source_id: user_id.to_string(),
+                description: Some("Initial grant".to_string()),
+            };
+            credits.create_transaction(&request).await.expect("Failed to create transaction");
+        }
+
+        // Should receive notification
+        let notification = timeout(Duration::from_secs(2), listener.recv())
+            .await
+            .expect("Timeout waiting for notification")
+            .expect("Failed to receive notification");
+
+        assert_eq!(notification.channel(), "auth_config_changed");
+
+        let payload: serde_json::Value =
+            serde_json::from_str(notification.payload()).expect("Failed to parse notification payload");
+
+        assert_eq!(payload["user_id"], user_id.to_string());
+        assert_eq!(payload["threshold_crossed"], "zero");
+        assert_eq!(payload["old_balance"].as_f64().unwrap(), 0.0);
+        assert_eq!(payload["new_balance"].as_f64().unwrap(), 100.0);
+
+        // Test 2: Going from positive to negative (crossing zero threshold downward - SHOULD trigger)
+        {
+            let mut conn = pool.acquire().await.expect("Failed to acquire connection");
+            let mut credits = Credits::new(&mut conn);
+
+            let request = CreditTransactionCreateDBRequest {
+                user_id,
+                transaction_type: CreditTransactionType::Usage,
+                amount: Decimal::from_str("150.0").unwrap(),
+                source_id: user_id.to_string(),
+                description: Some("Usage that crosses zero".to_string()),
+            };
+            credits.create_transaction(&request).await.expect("Failed to create transaction");
+        }
+
+        // Should receive notification
+        let notification = timeout(Duration::from_secs(2), listener.recv())
+            .await
+            .expect("Timeout waiting for notification")
+            .expect("Failed to receive notification");
+
+        assert_eq!(notification.channel(), "auth_config_changed");
+
+        // Parse the JSON payload
+        let payload: serde_json::Value =
+            serde_json::from_str(notification.payload()).expect("Failed to parse notification payload");
+
+        assert_eq!(payload["user_id"], user_id.to_string());
+        assert_eq!(payload["threshold_crossed"], "zero");
+        assert_eq!(payload["old_balance"].as_f64().unwrap(), 100.0);
+        assert_eq!(payload["new_balance"].as_f64().unwrap(), -50.0);
+
+        // Test 3: Going from negative to positive (crossing zero threshold upward - SHOULD trigger)
+        {
+            let mut conn = pool.acquire().await.expect("Failed to acquire connection");
+            let mut credits = Credits::new(&mut conn);
+
+            let request = CreditTransactionCreateDBRequest {
+                user_id,
+                transaction_type: CreditTransactionType::AdminGrant,
+                amount: Decimal::from_str("100.0").unwrap(),
+                source_id: user_id.to_string(),
+                description: Some("Grant that crosses zero".to_string()),
+            };
+            credits.create_transaction(&request).await.expect("Failed to create transaction");
+        }
+
+        // Should receive notification
+        let notification = timeout(Duration::from_secs(2), listener.recv())
+            .await
+            .expect("Timeout waiting for notification")
+            .expect("Failed to receive notification");
+
+        assert_eq!(notification.channel(), "auth_config_changed");
+
+        let payload: serde_json::Value =
+            serde_json::from_str(notification.payload()).expect("Failed to parse notification payload");
+
+        assert_eq!(payload["user_id"], user_id.to_string());
+        assert_eq!(payload["threshold_crossed"], "zero");
+        assert_eq!(payload["old_balance"].as_f64().unwrap(), -50.0);
+        assert_eq!(payload["new_balance"].as_f64().unwrap(), 50.0);
+
+        // Test 4: Staying in positive range (should NOT trigger)
+        {
+            let mut conn = pool.acquire().await.expect("Failed to acquire connection");
+            let mut credits = Credits::new(&mut conn);
+
+            let request = CreditTransactionCreateDBRequest {
+                user_id,
+                transaction_type: CreditTransactionType::AdminGrant,
+                amount: Decimal::from_str("50.0").unwrap(),
+                source_id: user_id.to_string(),
+                description: Some("Another grant".to_string()),
+            };
+            credits.create_transaction(&request).await.expect("Failed to create transaction");
+        }
+
+        // Try to receive notification with short timeout - should NOT receive one
+        let result = timeout(Duration::from_millis(500), listener.recv()).await;
+        assert!(
+            result.is_err(),
+            "Should NOT receive notification when staying in positive range"
+        );
+    }
+
+    #[sqlx::test]
+    #[test_log::test]
     async fn test_concurrent_transactions_no_race_condition(pool: PgPool) {
         use std::sync::Arc;
         use tokio::task;
