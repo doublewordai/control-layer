@@ -7,7 +7,7 @@ default:
 get-admin-email:
     @grep 'admin_email:' config.yaml | sed 's/.*admin_email:[ ]*"\(.*\)"/\1/'
 
-# Setup development environment for local development
+# Check that you've got all the dependencies for development installed
 #
 # Prerequisites:
 # - macOS or Linux
@@ -16,7 +16,7 @@ get-admin-email:
 # First-time setup:
 #   brew install docker hurl postgresql
 #   just setup
-setup:
+check:
     #!/usr/bin/env bash
     set -euo pipefail
     echo "Setting up development environment..."
@@ -26,7 +26,7 @@ setup:
     missing_tools=()
 
     # Required tools
-    required_tools=("docker" "hurl" "psql" "createdb")
+    required_tools=("docker" "hurl" "psql" "createdb", "cargo", "npm")
     for tool in "${required_tools[@]}"; do
         if ! command -v "$tool" >/dev/null 2>&1; then
             missing_tools+=("$tool")
@@ -44,57 +44,13 @@ setup:
         for tool in "${missing_tools[@]}"; do
             echo "  - $tool"
         done
-        echo ""
-        echo "Install with:"
-        echo "  brew install docker hurl postgresql"
-        echo ""
-        echo "Note: docker compose-plugin is included with Docker Desktop"
-        echo ""
-        echo "Individual installation guides:"
-        echo "  hurl: https://hurl.dev/docs/installation.html"
         exit 1
     fi
 
     echo "✅ All required tools found!"
 
     echo "✅ Development setup complete!"
-    echo ""
-    echo "Checking database setup..."
-    just check-db || echo "Run 'Database not setup properly! just db-setup' to setup database for rust development"
 
-check-db:
-    #!/usr/bin/env bash
-    set -euo pipefail
-    echo "Setting up development environment..."
-    # Check if postgres user exists
-    postgres_user_exists=false
-    if psql -U postgres -d postgres -c '\q' 2>/dev/null; then
-        postgres_user_exists=true
-    fi
-
-    # Check if test database exists and is accessible
-    test_db_exists=false
-    if psql -U postgres -d test -c '\q' 2>/dev/null; then
-        test_db_exists=true
-    fi
-
-    echo "Database setup status:"
-    if [ "$postgres_user_exists" = true ]; then
-        echo "  ✅ postgres user exists"
-    else
-        echo "  ❌ postgres user missing"
-    fi
-
-    if [ "$test_db_exists" = true ]; then
-        echo "  ✅ test database accessible"
-        echo ""
-        echo "🎉 Database setup is ready for Rust tests!"
-    else
-        echo "  ❌ test database missing or inaccessible"
-        echo ""
-        echo "💡 Run 'just db-setup' to fix database configuration"
-        exit 1
-    fi
 
 # Setup PostgreSQL databases for Rust development
 #
