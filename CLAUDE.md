@@ -164,6 +164,42 @@ DWCTL_SECRET_KEY="your-secret-key"
 - `batches.enabled`: Enable OpenAI-compatible batch processing API
 - `batches.daemon.enabled`: When batch daemon runs (`leader`, `always`, `never`)
 
+## Demo Mode
+
+The dashboard supports a demo mode for showcasing features without a live backend. Demo mode uses Mock Service Worker (MSW) to intercept API requests and return mock data.
+
+### Enabling Demo Mode
+
+Demo mode can be enabled in three ways:
+
+1. **URL parameter**: Add `?flags=demo` to the URL (e.g., `https://control-layer.pages.dev?flags=demo`)
+2. **Settings page**: Toggle demo mode in the Settings UI (persisted to localStorage)
+3. **localStorage**: Set `app-settings` key with `features.demo: true`
+
+### How Demo Mode Works
+
+- **MSW Service Worker**: When demo mode is enabled, the app initializes a service worker that intercepts fetch requests
+- **Mock handlers**: Located in `dashboard/src/api/control-layer/mocks/handlers.ts`, these handlers return static JSON data
+- **Demo data**: Mock data includes users, groups, models, endpoints, API keys, requests, batches, and transactions
+- **State persistence**: Demo state (like user-group associations) is stored in localStorage and survives page refreshes
+- **DemoOnlyRoute**: Some features may be wrapped in `DemoOnlyRoute` component to only show in demo mode
+
+### Demo Data Files
+
+Mock data is stored in `dashboard/src/api/control-layer/mocks/`:
+- `users.json`, `groups.json`, `endpoints.json`, `models.json`
+- `api-keys.json`, `transactions.json`
+- `files.json`, `batches.json`, `batch-requests.json`, `file-requests.json`
+- `demoState.ts`: Manages stateful operations (adding/removing users from groups, etc.)
+
+### Feature Flags
+
+Demo mode is part of the broader feature flag system. Available flags:
+- `demo`: Enable demo mode with mock data
+- `use_billing`: Enable billing and cost management features
+
+Flags can be combined: `?flags=demo,use_billing`
+
 ## Code Architecture
 
 ### dwctl Structure
@@ -279,14 +315,23 @@ TAGS=v1.0.0 PLATFORMS=linux/amd64,linux/arm64 docker buildx bake --push
 - Test files colocated with source: `Component.tsx` → `Component.test.tsx`
 - Focus on testing utility functions, context behavior, and complex component logic
 - Prefer testing user-facing behavior over implementation details
-- To select components, always use aria labels or roles rather than class names
-or tag names, to both improve accessibility and reduce brittleness.
+- To select components, always use aria labels or roles rather than class names or tag names, to both improve accessibility and reduce brittleness
 
 **Component Structure:**
 
 - Use functional components with TypeScript
 - Keep components focused and composable
 - Extract complex logic to custom hooks or utility functions
+
+**Design Principles:**
+
+- **Consistency over flashiness**: Use existing components from `components/ui/` where possible (based on Radix UI primitives)
+- **Avoid bright colors for emphasis**: Rely on clear UX and layout instead of vibrant colors
+- **Subtle animations only**: Never animate without user behavior (no autoplay); when animating, keep it subtle (e.g., `transition-colors`, `transition-transform`)
+- **Pragmatic DRY**: A little copying is better than slavish dedication to DRY - prefer clarity over abstraction for smaller chunks
+- **Color palette**: Use the `doubleword-*` color scheme (neutrals, muted tones) defined in `tailwind.config.js`
+- **Spacing & typography**: Consistent use of Tailwind utilities; Space Grotesk font family
+- **Loading states**: Use subtle spinners (`animate-spin`) only when needed, prefer skeleton states for content loading
 
 ### General
 
