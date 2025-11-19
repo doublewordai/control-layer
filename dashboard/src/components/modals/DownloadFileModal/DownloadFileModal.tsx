@@ -76,10 +76,18 @@ export function DownloadFileModal({
     }
   };
 
-  const copyToClipboard = (text: string, codeType: string) => {
-    navigator.clipboard.writeText(text);
-    setCopiedCode(codeType);
-    setTimeout(() => setCopiedCode(null), 2000);
+  const copyToClipboard = async (text: string, codeType: string) => {
+    try {
+      await navigator.clipboard.writeText(text);
+      setCopiedCode(codeType);
+      const message =
+        codeType === "api-key" ? "API key copied to clipboard" : "Code copied to clipboard";
+      toast.success(message);
+      setTimeout(() => setCopiedCode(null), 2000);
+    } catch (err) {
+      console.error("Failed to copy to clipboard:", err);
+      toast.error("Failed to copy to clipboard");
+    }
   };
 
   const getBaseUrl = () => `${window.location.origin}/ai/v1`;
