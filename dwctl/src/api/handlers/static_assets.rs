@@ -22,8 +22,19 @@ pub async fn serve_embedded_asset(uri: Uri) -> impl IntoResponse {
     // Try to serve the requested file
     if let Some(content) = static_assets::Assets::get(path) {
         let mime = mime_guess::from_path(path).first_or_octet_stream();
+
+        // Set cache headers based on file path
+        // Vite hashed assets can be cached indefinitely
+        let cache_control = if path.starts_with("assets/") {
+            "public, max-age=31536000, immutable"
+        } else {
+            // HTML and other files should not be cached
+            "no-cache"
+        };
+
         return Response::builder()
             .header(axum::http::header::CONTENT_TYPE, mime.as_ref())
+            .header(axum::http::header::CACHE_CONTROL, cache_control)
             .body(Body::from(content.data.into_owned()))
             .unwrap();
     }
@@ -32,6 +43,7 @@ pub async fn serve_embedded_asset(uri: Uri) -> impl IntoResponse {
     if let Some(index) = static_assets::Assets::get("index.html") {
         return Response::builder()
             .header(axum::http::header::CONTENT_TYPE, "text/html")
+            .header(axum::http::header::CACHE_CONTROL, "no-cache")
             .body(Body::from(index.data.into_owned()))
             .unwrap();
     }
