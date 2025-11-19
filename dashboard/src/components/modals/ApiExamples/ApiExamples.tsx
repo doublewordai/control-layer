@@ -1,7 +1,6 @@
 import React, { useState } from "react";
 import { Copy, Code, Plus, Loader2, Info } from "lucide-react";
-import { Prism as SyntaxHighlighter } from "react-syntax-highlighter";
-import { oneDark } from "react-syntax-highlighter/dist/esm/styles/prism";
+import { CodeBlock } from "../../ui/code-block";
 import { toast } from "sonner";
 import { useCreateApiKey } from "../../../api/control-layer";
 import { type ModelType } from "../../../utils/modelType";
@@ -510,22 +509,10 @@ chatCompletion();`;
                   </button>
                 </div>
               </div>
-              <div className="p-0">
-                <SyntaxHighlighter
-                  language={getLanguageForHighlighting(selectedLanguage)}
-                  style={oneDark}
-                  customStyle={{
-                    margin: 0,
-                    borderRadius: 0,
-                    fontSize: "14px",
-                    padding: "16px",
-                  }}
-                  showLineNumbers={false}
-                  wrapLines={true}
-                  wrapLongLines={true}
-                >
+              <div className="p-4">
+                <CodeBlock language={getLanguageForHighlighting(selectedLanguage) as "python" | "javascript" | "bash"}>
                   {getCurrentCode()}
-                </SyntaxHighlighter>
+                </CodeBlock>
               </div>
             </div>
           </div>
