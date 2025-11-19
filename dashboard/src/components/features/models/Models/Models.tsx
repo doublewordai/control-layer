@@ -223,6 +223,7 @@ const Models: React.FC = () => {
   };
 
   // Build include parameter based on permissions - always include status
+  // IMPORTANT: Order must match ModelInfo.tsx to ensure cache reuse
   const includeParam = useMemo(() => {
     const parts: string[] = ["status"]; // Always fetch status for badges
 

@@ -12,7 +12,7 @@ export const queryKeys = {
   // Models
   models: {
     all: ["models"] as const,
-    query: (options?: { endpoint?: string }) =>
+    query: (options?: { endpoint?: string; include?: string; accessible?: boolean }) =>
       ["models", "query", options] as const,
     byId: (id: string) => ["models", "byId", id] as const,
   },
