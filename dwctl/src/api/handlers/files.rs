@@ -33,7 +33,6 @@ use std::collections::HashSet;
 use std::pin::Pin;
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
-use tracing::{debug, error};
 use uuid::Uuid;
 
 /// OpenAI Batch API request format
