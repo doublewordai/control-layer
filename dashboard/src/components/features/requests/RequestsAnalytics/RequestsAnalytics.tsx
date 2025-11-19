@@ -13,8 +13,6 @@ import {
   Sector,
 } from "recharts";
 import { useRequestsAggregate, useModels } from "../../../../api/control-layer";
-import { useMockAggregateData } from "../../../../api/demo/mockRequests";
-import { useSettings } from "../../../../contexts";
 import { Card, CardContent, CardHeader, CardTitle } from "../../../ui/card";
 import {
   HoverCard,
@@ -37,17 +35,9 @@ export function RequestsAnalytics({
   selectedModel,
   dateRange,
 }: RequestsAnalyticsProps) {
-  const { isFeatureEnabled } = useSettings();
-  const isDemoMode = isFeatureEnabled("demo");
-  const realDataQuery = useRequestsAggregate(selectedModel, dateRange);
-  const mockDataQuery = useMockAggregateData(selectedModel, dateRange);
-  const { data, isLoading, error } = isDemoMode ? mockDataQuery : realDataQuery;
-
-  const realAllModelsQuery = useRequestsAggregate(undefined, dateRange);
-  const mockAllModelsQuery = useMockAggregateData(undefined, dateRange);
-  const { data: allModelsData } = isDemoMode
-    ? mockAllModelsQuery
-    : realAllModelsQuery;
+  // MSW will intercept these calls in demo mode
+  const { data, isLoading, error } = useRequestsAggregate(selectedModel, dateRange);
+  const { data: allModelsData } = useRequestsAggregate(undefined, dateRange);
   const { data: modelsData } = useModels();
 
   // Initialize all React hooks at the top
