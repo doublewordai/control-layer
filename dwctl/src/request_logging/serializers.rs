@@ -1859,7 +1859,10 @@ mod tests {
             // Expected cost is rounded to 2 decimal places (0.025 -> 0.02)
             let expected_cost = Decimal::from_str("0.02").unwrap();
             let expected_balance = initial_balance - expected_cost;
-            assert_eq!(final_balance, expected_balance, "Balance should be deducted correctly for Playground users");
+            assert_eq!(
+                final_balance, expected_balance,
+                "Balance should be deducted correctly for Playground users"
+            );
 
             // Verify: Transaction was created
             let transactions = credits.list_user_transactions(user_id, 0, 10).await.unwrap();
