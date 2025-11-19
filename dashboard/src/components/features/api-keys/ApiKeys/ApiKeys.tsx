@@ -9,6 +9,7 @@ import {
   ChevronDown,
   Info,
 } from "lucide-react";
+import { toast } from "sonner";
 import {
   useApiKeys,
   useCreateApiKey,
@@ -142,6 +143,7 @@ export const ApiKeys: React.FC = () => {
     try {
       await navigator.clipboard.writeText(text);
       setCopiedKey(text);
+      toast.success("API key copied to clipboard");
 
       // Reset the copied state after 2 seconds
       setTimeout(() => {
@@ -149,6 +151,7 @@ export const ApiKeys: React.FC = () => {
       }, 2000);
     } catch (err) {
       console.error("Failed to copy to clipboard:", err);
+      toast.error("Failed to copy API key");
     }
   };
 
