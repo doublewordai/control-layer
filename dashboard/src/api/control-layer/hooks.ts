@@ -49,6 +49,7 @@ export function useUser(id: string, options?: { include?: string }) {
   return useQuery({
     queryKey: queryKeys.users.byId(id, options?.include),
     queryFn: () => dwctlApi.users.get(id, options),
+    staleTime: 30 * 1000, // 30 seconds - matches useTransactions to keep balance in sync
   });
 }
 
@@ -849,7 +850,10 @@ export function useAddFunds() {
         queryClient.refetchQueries({
           queryKey: queryKeys.users.byId(variables.user_id, "billing"),
         }),
-        queryClient.refetchQueries({ queryKey: ["cost", "transactions"] }),
+        queryClient.invalidateQueries({
+          queryKey: ["cost", "transactions"],
+          exact: false,
+        }),
       ]);
     },
   });
