@@ -115,6 +115,10 @@ export function Batches({
     string | undefined
   >(undefined);
 
+  // Cursor history for backwards pagination
+  const filesCursorHistory = React.useRef<(string | undefined)[]>([]);
+  const batchesCursorHistory = React.useRef<(string | undefined)[]>([]);
+
   // Update files pagination in URL
   const updateFilesPagination = (newPage: number, newPageSize: number) => {
     const params = new URLSearchParams(searchParams);
@@ -313,6 +317,8 @@ export function Batches({
   const handleFilesNextPage = () => {
     const lastFile = files[files.length - 1];
     if (lastFile && filesHasMore) {
+      // Save current cursor to history before moving forward
+      filesCursorHistory.current[filesPage] = filesAfterCursor;
       setFilesAfterCursor(lastFile.id);
       updateFilesPagination(filesPage + 1, filesPageSize);
     }
@@ -320,21 +326,24 @@ export function Batches({
 
   const handleFilesPrevPage = () => {
     if (filesPage > 0) {
-      // For cursor pagination, going backwards is complex
-      // Reset to page 0 for now (a full implementation would need cursor history)
-      setFilesAfterCursor(undefined);
-      updateFilesPagination(0, filesPageSize);
+      // Use cursor history to go back one page
+      const previousCursor = filesCursorHistory.current[filesPage - 1];
+      setFilesAfterCursor(previousCursor);
+      updateFilesPagination(filesPage - 1, filesPageSize);
     }
   };
 
   const handleFilesPageSizeChange = (newSize: number) => {
     setFilesAfterCursor(undefined);
+    filesCursorHistory.current = []; // Clear history when changing page size
     updateFilesPagination(0, newSize);
   };
 
   const handleBatchesNextPage = () => {
     const lastBatch = batches[batches.length - 1];
     if (lastBatch && batchesHasMore) {
+      // Save current cursor to history before moving forward
+      batchesCursorHistory.current[batchesPage] = batchesAfterCursor;
       setBatchesAfterCursor(lastBatch.id);
       updateBatchesPagination(batchesPage + 1, batchesPageSize);
     }
@@ -342,14 +351,16 @@ export function Batches({
 
   const handleBatchesPrevPage = () => {
     if (batchesPage > 0) {
-      // Reset to page 0 for simplicity
-      setBatchesAfterCursor(undefined);
-      updateBatchesPagination(0, batchesPageSize);
+      // Use cursor history to go back one page
+      const previousCursor = batchesCursorHistory.current[batchesPage - 1];
+      setBatchesAfterCursor(previousCursor);
+      updateBatchesPagination(batchesPage - 1, batchesPageSize);
     }
   };
 
   const handleBatchesPageSizeChange = (newSize: number) => {
     setBatchesAfterCursor(undefined);
+    batchesCursorHistory.current = []; // Clear history when changing page size
     updateBatchesPagination(0, newSize);
   };
 
@@ -555,8 +566,9 @@ export function Batches({
                                 filesPageSize.toString(),
                               );
                               setSearchParams(params, { replace: false });
-                              // Reset cursor
+                              // Reset cursor and history
                               setFilesAfterCursor(undefined);
+                              filesCursorHistory.current = [];
                             }}
                             className={`inline-flex items-center justify-center whitespace-nowrap rounded-sm px-3 py-1 text-sm font-medium ring-offset-background transition-all focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 ${
                               fileTypeFilter === type
@@ -605,6 +617,7 @@ export function Batches({
                       size="sm"
                       onClick={() => {
                         setFilesAfterCursor(undefined);
+                        filesCursorHistory.current = []; // Clear history when jumping to first page
                         updateFilesPagination(0, filesPageSize);
                       }}
                     >
@@ -733,6 +746,7 @@ export function Batches({
                       size="sm"
                       onClick={() => {
                         setBatchesAfterCursor(undefined);
+                        batchesCursorHistory.current = []; // Clear history when jumping to first page
                         updateBatchesPagination(0, batchesPageSize);
                       }}
                     >

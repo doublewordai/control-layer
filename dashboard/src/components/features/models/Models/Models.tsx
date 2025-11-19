@@ -14,6 +14,7 @@ import {
   Info,
   ChevronRight,
   LayoutGrid,
+  DollarSign,
 } from "lucide-react";
 import {
   useModels,
@@ -28,6 +29,7 @@ import {
 import { AccessManagementModal } from "../../../modals";
 import { ApiExamples } from "../../../modals";
 import { useAuthorization } from "../../../../utils";
+import { useSettings } from "../../../../contexts";
 import { ProbeTimeline } from "../ModelInfo/ProbeTimeline";
 import {
   Pagination,
@@ -102,6 +104,15 @@ const formatRelativeTime = (dateString?: string): string => {
   if (diffDays < 7) return `${diffDays}d ago`;
 
   return date.toLocaleDateString();
+};
+
+const formatPricing = (pricing?: { input_price_per_token?: number | null; output_price_per_token?: number | null }): string => {
+  if (!pricing || (!pricing.input_price_per_token && !pricing.output_price_per_token)) {
+    return "N/A";
+  }
+  const input = pricing.input_price_per_token ? `$${Number(pricing.input_price_per_token).toFixed(4)}` : "N/A";
+  const output = pricing.output_price_per_token ? `$${Number(pricing.output_price_per_token).toFixed(4)}` : "N/A";
+  return `${input} / ${output}`;
 };
 
 // StatusRow component for status page layout
@@ -188,8 +199,10 @@ const Models: React.FC = () => {
   const navigate = useNavigate();
   const [searchParams, setSearchParams] = useSearchParams();
   const { hasPermission } = useAuthorization();
+  const { isFeatureEnabled } = useSettings();
   const canManageGroups = hasPermission("manage-groups");
   const canViewAnalytics = hasPermission("analytics");
+  const showPricing = isFeatureEnabled("use_billing");
   const [filterProvider, setFilterProvider] = useState("all");
   const [showAccessModal, setShowAccessModal] = useState(false);
   const [accessModelId, setAccessModelId] = useState<string | null>(null);
@@ -215,9 +228,10 @@ const Models: React.FC = () => {
 
     if (canManageGroups) parts.push("groups");
     if (canViewAnalytics) parts.push("metrics");
+    if (showPricing) parts.push("pricing"); // Only fetch pricing if billing is enabled
 
     return parts.join(",");
-  }, [canManageGroups, canViewAnalytics]);
+  }, [canManageGroups, canViewAnalytics, showPricing]);
 
   const {
     data: rawModelsData,
@@ -347,16 +361,16 @@ const Models: React.FC = () => {
   const hasNoFilteredResults = !hasNoModels && filteredModels.length === 0;
 
   return (
-    <div className="p-6">
+    <div className="p-4 md:p-6">
       <Tabs value={viewMode} onValueChange={handleTabChange}>
         {/* Header */}
         <div className="mb-6">
           <div className="flex flex-col lg:flex-row lg:items-center lg:justify-between gap-4">
             <div>
-              <h1 className="text-3xl font-bold text-doubleword-neutral-900">
+              <h1 className="text-2xl md:text-3xl font-bold text-doubleword-neutral-900">
                 Models
               </h1>
-              <p className="text-doubleword-neutral-600 mt-1">
+              <p className="text-sm md:text-base text-doubleword-neutral-600 mt-1">
                 View and monitor your deployed models
               </p>
             </div>
@@ -885,6 +899,30 @@ const Models: React.FC = () => {
                                         )}
                                       </span>
                                     </div>
+
+                                    {showPricing && (
+                                      <div className="flex items-center gap-1.5 col-span-2">
+                                        <HoverCard
+                                          openDelay={200}
+                                          closeDelay={100}
+                                        >
+                                          <HoverCardTrigger asChild>
+                                            <DollarSign className="h-3.5 w-3.5 text-gray-500 " />
+                                          </HoverCardTrigger>
+                                          <HoverCardContent
+                                            className="w-48"
+                                            sideOffset={5}
+                                          >
+                                            <p className="text-xs text-muted-foreground">
+                                              Pricing per token (input / output)
+                                            </p>
+                                          </HoverCardContent>
+                                        </HoverCard>
+                                        <span className="text-gray-600">
+                                          {formatPricing(model.pricing)}
+                                        </span>
+                                      </div>
+                                    )}
                                   </div>
                                 </div>
 
@@ -901,15 +939,38 @@ const Models: React.FC = () => {
                                 </div>
                               </div>
                             ) : (
-                              // Fallback when metrics not available - show description
+                              // Fallback when metrics not available - show description and pricing
                               <div
-                                className="flex items-center px-6 pb-4"
+                                className="px-6 pb-4 space-y-3"
                                 style={{ minHeight: "90px" }}
                               >
-                                <p className="text-sm text-gray-700 line-clamp-3">
+                                <p className="text-sm text-gray-700 line-clamp-2">
                                   {model.description ||
                                     "No description provided"}
                                 </p>
+                                {showPricing && (
+                                  <div className="flex items-center gap-1.5 text-xs">
+                                    <HoverCard
+                                      openDelay={200}
+                                      closeDelay={100}
+                                    >
+                                      <HoverCardTrigger asChild>
+                                        <DollarSign className="h-3.5 w-3.5 text-gray-500 " />
+                                      </HoverCardTrigger>
+                                      <HoverCardContent
+                                        className="w-48"
+                                        sideOffset={5}
+                                      >
+                                        <p className="text-xs text-muted-foreground">
+                                          Pricing per token (input / output)
+                                        </p>
+                                      </HoverCardContent>
+                                    </HoverCard>
+                                    <span className="text-gray-600">
+                                      {formatPricing(model.pricing)}
+                                    </span>
+                                  </div>
+                                )}
                               </div>
                             )}
                           </CardContent>
