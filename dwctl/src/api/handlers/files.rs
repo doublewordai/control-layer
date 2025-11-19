@@ -67,7 +67,7 @@ impl OpenAIBatchRequest {
         // Validate model access
         if !accessible_models.contains(&model) {
             return Err(Error::BadRequest {
-                message: format!("Access denied to model '{}'", model),
+                message: format!("Model '{}' has not been configured or is not available to user.", model),
             });
         }
 
@@ -372,14 +372,16 @@ pub async fn upload_file(
     let endpoint = format!("http://{}:{}/ai", state.config.host, state.config.port);
 
     // Query models accessible to the user for validation during file parsing
-    let mut deployments_conn = state.db.acquire().await.map_err(|e| Error::Database(e.into()))?;
-    let mut deployments_repo = Deployments::new(&mut deployments_conn);
+    let mut deployments_repo = Deployments::new(&mut conn);
     let filter = DeploymentFilter::new(0, i64::MAX)
         .with_accessible_to(current_user.id)
         .with_statuses(vec![ModelStatus::Active])
         .with_deleted(false);
     let accessible_deployments = deployments_repo.list(&filter).await.map_err(Error::Database)?;
     let accessible_models: HashSet<String> = accessible_deployments.into_iter().map(|d| d.alias).collect();
+
+    // drop conn so it isn't persisted for entire upload process
+    drop(conn);
 
     // Create a stream that parses the multipart upload and yields FileStreamItems
     let file_stream = create_file_stream(
@@ -928,8 +930,8 @@ mod tests {
         // Should reject with 400 Bad Request due to model access denied
         upload_response.assert_status(axum::http::StatusCode::BAD_REQUEST);
         let error_body = upload_response.text();
-        assert!(error_body.contains("Access denied"));
-        assert!(error_body.contains("unauthorized-model"));
+        assert!(error_body.contains("Model"));
+        assert!(error_body.contains("has not been configured or is not available to user."));
     }
 
     #[sqlx::test]
