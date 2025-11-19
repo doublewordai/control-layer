@@ -315,9 +315,9 @@ impl<'c> ApiKeys<'c> {
             INNER JOIN deployment_groups dg ON ug.group_id = dg.group_id
             INNER JOIN api_keys ak ON ug.user_id = ak.user_id
             WHERE ak.id = $1
-            
+
             UNION
-            
+
             SELECT DISTINCT dg.deployment_id
             FROM deployment_groups dg
             INNER JOIN api_keys ak ON dg.group_id = '00000000-0000-0000-0000-000000000000'
@@ -378,12 +378,6 @@ impl<'c> ApiKeys<'c> {
             WHERE dg.deployment_id = $1
             AND (
                 ak.user_id = $2  -- System user always has access
-                OR EXISTS (
-                    -- Platform Managers bypass credit checks
-                    SELECT 1 FROM user_roles ur
-                    WHERE ur.user_id = ak.user_id
-                    AND ur.role = 'PLATFORMMANAGER'
-                )
                 OR EXISTS (
                     -- User's latest transaction has positive balance
                     SELECT 1 FROM credits_transactions ct
