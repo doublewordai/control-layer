@@ -37,8 +37,8 @@ export function BatchesContainer() {
     filename?: string;
     isPartial?: boolean;
   } | null>(null);
-  const [preselectedFileId, setPreselectedFileId] = useState<
-    string | undefined
+  const [preselectedFile, setPreselectedFile] = useState<
+    FileObject | undefined
   >();
 
   // Delete/cancel confirmation
@@ -66,8 +66,8 @@ export function BatchesContainer() {
     setUploadModalOpen(true);
   };
 
-  const handleOpenCreateBatchModal = (fileId?: string) => {
-    setPreselectedFileId(fileId);
+  const handleOpenCreateBatchModal = (file?: FileObject) => {
+    setPreselectedFile(file);
     setCreateBatchModalOpen(true);
   };
 
@@ -154,17 +154,17 @@ export function BatchesContainer() {
         isOpen={createBatchModalOpen}
         onClose={() => {
           setCreateBatchModalOpen(false);
-          setPreselectedFileId(undefined);
+          setPreselectedFile(undefined);
         }}
         onSuccess={() => {
           setCreateBatchModalOpen(false);
-          setPreselectedFileId(undefined);
+          setPreselectedFile(undefined);
           // Call the registered callback from Batches component
           if (batchCreatedCallbackRef.current) {
             batchCreatedCallbackRef.current();
           }
         }}
-        preselectedFileId={preselectedFileId}
+        preselectedFile={preselectedFile}
       />
 
       <DownloadFileModal

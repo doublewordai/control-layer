@@ -138,14 +138,14 @@ pub async fn get_transaction(
     path = "/transactions",
     tag = "transactions",
     summary = "List credit transactions",
-    description = "Get a list of credit transactions. Non-BillingManager users can only see their own transactions. Use user_id parameter to filter by user (BillingManager only).",
+    description = "Get a list of credit transactions. By default, returns only the current user's transactions. Use 'all=true' to get all transactions (BillingManager/PlatformManager only). Use 'user_id' parameter to filter by a specific user (BillingManager/PlatformManager only for other users).",
     params(
         ListTransactionsQuery
     ),
     responses(
         (status = 200, description = "List of transactions", body = [CreditTransactionResponse]),
         (status = 401, description = "Unauthorized"),
-        (status = 403, description = "Forbidden - cannot access other users' transactions"),
+        (status = 403, description = "Forbidden - cannot access other users' transactions or all transactions without proper permissions"),
         (status = 500, description = "Internal server error"),
     ),
     security(
@@ -166,9 +166,21 @@ pub async fn list_transactions(
     // Check if user has ReadAll permission
     let has_read_all = permissions::has_permission(&current_user, Resource::Credits, Operation::ReadAll);
 
+    // Check if requesting all transactions
+    if query.all == Some(true) && !has_read_all {
+        return Err(Error::InsufficientPermissions {
+            required: Permission::Allow(Resource::Credits, Operation::ReadAll),
+            action: Operation::ReadAll,
+            resource: "all transactions".to_string(),
+        });
+    }
+
     // Determine which user_id to filter by
-    let filter_user_id = match query.user_id {
-        Some(requested_user_id) => {
+    let filter_user_id = match (query.all, query.user_id) {
+        // all=true takes precedence - return all transactions
+        (Some(true), _) => None,
+        // user_id specified - filter to that user
+        (_, Some(requested_user_id)) => {
             // If requesting specific user's transactions
             if !has_read_all && requested_user_id != current_user.id {
                 return Err(Error::InsufficientPermissions {
@@ -179,14 +191,8 @@ pub async fn list_transactions(
             }
             Some(requested_user_id)
         }
-        None => {
-            // If no user_id specified
-            if has_read_all {
-                None // BillingManager can see all
-            } else {
-                Some(current_user.id) // Others see only their own
-            }
-        }
+        // No parameters - default to current user
+        (_, None) => Some(current_user.id),
     };
 
     let mut pool_conn = state.db.acquire().await.map_err(|e| Error::Database(e.into()))?;
@@ -460,7 +466,7 @@ mod tests {
         response.assert_status_forbidden();
     }
 
-    // Test: BillingManager can list all transactions without filter
+    // Test: BillingManager without params returns only own transactions (changed behavior)
     #[sqlx::test]
     #[test_log::test]
     async fn test_billing_manager_can_list_all_transactions(pool: PgPool) {
@@ -469,10 +475,12 @@ mod tests {
         let user1 = create_test_user(&pool, Role::StandardUser).await;
         let user2 = create_test_user(&pool, Role::StandardUser).await;
 
-        // Create transactions for both users
+        // Create transactions for all users
+        create_initial_credit_transaction(&pool, billing_manager.id, "50.0").await;
         create_initial_credit_transaction(&pool, user1.id, "100.0").await;
         create_initial_credit_transaction(&pool, user2.id, "200.0").await;
 
+        // Without all=true, should only see own transactions
         let response = app
             .get("/admin/api/v1/transactions")
             .add_header(add_auth_headers(&billing_manager).0, add_auth_headers(&billing_manager).1)
@@ -481,9 +489,8 @@ mod tests {
         response.assert_status_ok();
         let transactions: Vec<CreditTransactionResponse> = response.json();
 
-        // Should see transactions from both users
-        assert!(transactions.iter().any(|t| t.user_id == user1.id));
-        assert!(transactions.iter().any(|t| t.user_id == user2.id));
+        // Should only see billing_manager's own transactions
+        assert!(transactions.iter().all(|t| t.user_id == billing_manager.id));
     }
 
     // Test: BillingManager can filter transactions by user_id
@@ -736,7 +743,7 @@ mod tests {
         assert!(transactions.iter().all(|t| t.user_id == user1.id));
     }
 
-    // Test: PlatformManager can list all transactions (has ReadAll permission)
+    // Test: PlatformManager without params returns only own transactions (changed behavior)
     #[sqlx::test]
     #[test_log::test]
     async fn test_platform_manager_can_list_all_transactions(pool: PgPool) {
@@ -745,10 +752,12 @@ mod tests {
         let user1 = create_test_user(&pool, Role::StandardUser).await;
         let user2 = create_test_user(&pool, Role::StandardUser).await;
 
-        // Create transactions for both users
+        // Create transactions for all users
+        create_initial_credit_transaction(&pool, platform_manager.id, "50.0").await;
         create_initial_credit_transaction(&pool, user1.id, "100.0").await;
         create_initial_credit_transaction(&pool, user2.id, "200.0").await;
 
+        // Without all=true, should only see own transactions
         let response = app
             .get("/admin/api/v1/transactions")
             .add_header(add_auth_headers(&platform_manager).0, add_auth_headers(&platform_manager).1)
@@ -757,9 +766,8 @@ mod tests {
         response.assert_status_ok();
         let transactions: Vec<CreditTransactionResponse> = response.json();
 
-        // Should see transactions from both users
-        assert!(transactions.iter().any(|t| t.user_id == user1.id));
-        assert!(transactions.iter().any(|t| t.user_id == user2.id));
+        // Should only see platform_manager's own transactions
+        assert!(transactions.iter().all(|t| t.user_id == platform_manager.id));
     }
 
     // Test: GET /transactions?user_id=X returns 403 for RequestViewer querying another user
@@ -835,5 +843,145 @@ mod tests {
         response.assert_status_ok();
         let transactions: Vec<CreditTransactionResponse> = response.json();
         assert_eq!(transactions.len(), 2);
+    }
+
+    // Test: BillingManager without params returns own transactions (not all)
+    #[sqlx::test]
+    #[test_log::test]
+    async fn test_billing_manager_without_params_returns_own(pool: PgPool) {
+        let (app, _bg_services) = create_test_app(pool.clone(), false).await;
+        let billing_manager = create_test_user(&pool, Role::BillingManager).await;
+        let user1 = create_test_user(&pool, Role::StandardUser).await;
+        let user2 = create_test_user(&pool, Role::StandardUser).await;
+
+        // Create transactions for all users
+        create_initial_credit_transaction(&pool, billing_manager.id, "50.0").await;
+        create_initial_credit_transaction(&pool, user1.id, "100.0").await;
+        create_initial_credit_transaction(&pool, user2.id, "200.0").await;
+
+        let response = app
+            .get("/admin/api/v1/transactions")
+            .add_header(add_auth_headers(&billing_manager).0, add_auth_headers(&billing_manager).1)
+            .await;
+
+        response.assert_status_ok();
+        let transactions: Vec<CreditTransactionResponse> = response.json();
+
+        // Should only see their own transactions
+        assert!(transactions.iter().all(|t| t.user_id == billing_manager.id));
+        assert!(!transactions.is_empty());
+    }
+
+    // Test: BillingManager with all=true returns all transactions
+    #[sqlx::test]
+    #[test_log::test]
+    async fn test_billing_manager_with_all_returns_all_transactions(pool: PgPool) {
+        let (app, _bg_services) = create_test_app(pool.clone(), false).await;
+        let billing_manager = create_test_user(&pool, Role::BillingManager).await;
+        let user1 = create_test_user(&pool, Role::StandardUser).await;
+        let user2 = create_test_user(&pool, Role::StandardUser).await;
+
+        // Create transactions for all users
+        create_initial_credit_transaction(&pool, billing_manager.id, "50.0").await;
+        create_initial_credit_transaction(&pool, user1.id, "100.0").await;
+        create_initial_credit_transaction(&pool, user2.id, "200.0").await;
+
+        let response = app
+            .get("/admin/api/v1/transactions?all=true")
+            .add_header(add_auth_headers(&billing_manager).0, add_auth_headers(&billing_manager).1)
+            .await;
+
+        response.assert_status_ok();
+        let transactions: Vec<CreditTransactionResponse> = response.json();
+
+        // Should see transactions from all users
+        assert!(transactions.iter().any(|t| t.user_id == billing_manager.id));
+        assert!(transactions.iter().any(|t| t.user_id == user1.id));
+        assert!(transactions.iter().any(|t| t.user_id == user2.id));
+    }
+
+    // Test: Standard user with all=true returns 403
+    #[sqlx::test]
+    #[test_log::test]
+    async fn test_standard_user_with_all_forbidden(pool: PgPool) {
+        let (app, _bg_services) = create_test_app(pool.clone(), false).await;
+        let user = create_test_user(&pool, Role::StandardUser).await;
+
+        let response = app
+            .get("/admin/api/v1/transactions?all=true")
+            .add_header(add_auth_headers(&user).0, add_auth_headers(&user).1)
+            .await;
+
+        response.assert_status_forbidden();
+    }
+
+    // Test: all=true takes precedence over user_id parameter
+    #[sqlx::test]
+    #[test_log::test]
+    async fn test_all_takes_precedence_over_user_id(pool: PgPool) {
+        let (app, _bg_services) = create_test_app(pool.clone(), false).await;
+        let billing_manager = create_test_user(&pool, Role::BillingManager).await;
+        let user1 = create_test_user(&pool, Role::StandardUser).await;
+        let user2 = create_test_user(&pool, Role::StandardUser).await;
+
+        // Create transactions for both users
+        create_initial_credit_transaction(&pool, user1.id, "100.0").await;
+        create_initial_credit_transaction(&pool, user2.id, "200.0").await;
+
+        // Request with both all=true and user_id - all should take precedence
+        let response = app
+            .get(&format!("/admin/api/v1/transactions?all=true&user_id={}", user1.id))
+            .add_header(add_auth_headers(&billing_manager).0, add_auth_headers(&billing_manager).1)
+            .await;
+
+        response.assert_status_ok();
+        let transactions: Vec<CreditTransactionResponse> = response.json();
+
+        // Should see all transactions, not just user1's
+        assert!(transactions.iter().any(|t| t.user_id == user1.id));
+        assert!(transactions.iter().any(|t| t.user_id == user2.id));
+    }
+
+    // Test: PlatformManager with all=true returns all transactions
+    #[sqlx::test]
+    #[test_log::test]
+    async fn test_platform_manager_with_all_returns_all_transactions(pool: PgPool) {
+        let (app, _bg_services) = create_test_app(pool.clone(), false).await;
+        let platform_manager = create_test_user(&pool, Role::PlatformManager).await;
+        let user1 = create_test_user(&pool, Role::StandardUser).await;
+        let user2 = create_test_user(&pool, Role::StandardUser).await;
+
+        // Create transactions for all users
+        create_initial_credit_transaction(&pool, platform_manager.id, "50.0").await;
+        create_initial_credit_transaction(&pool, user1.id, "100.0").await;
+        create_initial_credit_transaction(&pool, user2.id, "200.0").await;
+
+        let response = app
+            .get("/admin/api/v1/transactions?all=true")
+            .add_header(add_auth_headers(&platform_manager).0, add_auth_headers(&platform_manager).1)
+            .await;
+
+        response.assert_status_ok();
+        let transactions: Vec<CreditTransactionResponse> = response.json();
+
+        // Should see transactions from all users
+        assert!(transactions.iter().any(|t| t.user_id == platform_manager.id));
+        assert!(transactions.iter().any(|t| t.user_id == user1.id));
+        assert!(transactions.iter().any(|t| t.user_id == user2.id));
+    }
+
+    // Test: RequestViewer with all=true returns 403
+    #[sqlx::test]
+    #[test_log::test]
+    async fn test_request_viewer_with_all_forbidden(pool: PgPool) {
+        let (app, _bg_services) = create_test_app(pool.clone(), false).await;
+        let user = create_test_user(&pool, Role::RequestViewer).await;
+
+        let response = app
+            .get("/admin/api/v1/transactions?all=true")
+            .add_header(add_auth_headers(&user).0, add_auth_headers(&user).1)
+            .await;
+
+        response.assert_status_forbidden();
     }
 }

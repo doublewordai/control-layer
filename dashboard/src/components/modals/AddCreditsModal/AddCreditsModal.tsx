@@ -32,6 +32,12 @@ export function AddFundsModal({
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
 
+    // Guard: Ensure currentUser is loaded
+    if (!currentUser?.id) {
+      toast.error("Unable to add funds. Please try refreshing the page.");
+      return;
+    }
+
     const amountNum = parseFloat(amount);
     if (isNaN(amountNum) || amountNum <= 0) {
       toast.error("Please enter a valid amount");
@@ -41,10 +47,11 @@ export function AddFundsModal({
     try {
       const result = await addFundsMutation.mutateAsync({
         user_id: targetUser.id,
+        source_id: currentUser.id,
         amount: amountNum,
         description:
           description ||
-          `Funds gift from ${currentUser?.display_name || currentUser?.username || "admin"}`,
+          `Funds gift from ${currentUser.display_name || currentUser.username || "admin"}`,
       });
 
       const sentAmount = Number(result.amount).toFixed(2);

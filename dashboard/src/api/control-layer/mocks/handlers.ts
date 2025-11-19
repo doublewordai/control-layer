@@ -1122,6 +1122,105 @@ export const handlers = [
     });
   }),
 
+  // List requests
+  http.get("/admin/api/v1/requests", ({ request }) => {
+    const url = new URL(request.url);
+    const limitParam = url.searchParams.get("limit");
+    const orderDesc = url.searchParams.get("order_desc") === "true";
+    const timestampAfter = url.searchParams.get("timestamp_after");
+    const timestampBefore = url.searchParams.get("timestamp_before");
+
+    let filtered = [...requestsData];
+
+    // Filter by timestamp range
+    if (timestampAfter) {
+      const afterDate = new Date(timestampAfter);
+      filtered = filtered.filter((req) => new Date(req.timestamp) >= afterDate);
+    }
+    if (timestampBefore) {
+      const beforeDate = new Date(timestampBefore);
+      filtered = filtered.filter((req) => new Date(req.timestamp) <= beforeDate);
+    }
+
+    // Sort by timestamp
+    filtered.sort((a, b) => {
+      const aTime = new Date(a.timestamp).getTime();
+      const bTime = new Date(b.timestamp).getTime();
+      return orderDesc ? bTime - aTime : aTime - bTime;
+    });
+
+    // Apply limit
+    const limit = limitParam ? parseInt(limitParam, 10) : 50;
+    const limited = filtered.slice(0, limit);
+
+    return HttpResponse.json({
+      requests: limited,
+      total: filtered.length,
+    });
+  }),
+
+  // Requests aggregate
+  http.get("/admin/api/v1/requests/aggregate", ({ request }) => {
+    const url = new URL(request.url);
+    const model = url.searchParams.get("model") || undefined;
+    const timestampAfter = url.searchParams.get("timestamp_after");
+    const timestampBefore = url.searchParams.get("timestamp_before");
+
+    let filtered = [...requestsData];
+
+    // Filter by model
+    if (model) {
+      filtered = filtered.filter((req) => req.model === model);
+    }
+
+    // Filter by timestamp range
+    if (timestampAfter) {
+      const afterDate = new Date(timestampAfter);
+      filtered = filtered.filter((req) => new Date(req.timestamp) >= afterDate);
+    }
+    if (timestampBefore) {
+      const beforeDate = new Date(timestampBefore);
+      filtered = filtered.filter((req) => new Date(req.timestamp) <= beforeDate);
+    }
+
+    // Aggregate by model
+    const modelCounts: Record<string, { model: string; count: number }> = {};
+    filtered.forEach((req) => {
+      if (!modelCounts[req.model]) {
+        modelCounts[req.model] = { model: req.model, count: 0 };
+      }
+      modelCounts[req.model].count++;
+    });
+
+    // Aggregate by status code (extract from metadata if available)
+    const statusCounts: Record<number, number> = { 200: filtered.length };
+
+    // Time series data (group by hour)
+    const timeSeriesMap: Record<string, { timestamp: string; count: number; tokens: number }> = {};
+    filtered.forEach((req) => {
+      const date = new Date(req.timestamp);
+      const hourKey = new Date(date.getFullYear(), date.getMonth(), date.getDate(), date.getHours()).toISOString();
+
+      if (!timeSeriesMap[hourKey]) {
+        timeSeriesMap[hourKey] = { timestamp: hourKey, count: 0, tokens: 0 };
+      }
+      timeSeriesMap[hourKey].count++;
+      timeSeriesMap[hourKey].tokens += req.response?.usage?.total_tokens || 0;
+    });
+
+    const timeSeries = Object.values(timeSeriesMap).sort((a, b) =>
+      new Date(a.timestamp).getTime() - new Date(b.timestamp).getTime()
+    );
+
+    return HttpResponse.json({
+      models: Object.values(modelCounts),
+      status_codes: statusCounts,
+      time_series: timeSeries,
+      total_requests: filtered.length,
+      total_tokens: filtered.reduce((sum, req) => sum + (req.response?.usage?.total_tokens || 0), 0),
+    });
+  }),
+
   // Requests aggregate by user
   http.get("/admin/api/v1/requests/aggregate-by-user", ({ request }) => {
     const url = new URL(request.url);

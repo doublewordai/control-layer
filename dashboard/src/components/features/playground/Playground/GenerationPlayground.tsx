@@ -20,8 +20,7 @@ import {
 import { toast } from "sonner";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
-import { Prism as SyntaxHighlighter } from "react-syntax-highlighter";
-import { oneDark } from "react-syntax-highlighter/dist/esm/styles/prism";
+import { CodeBlock } from "../../../ui/code-block";
 import type { Model } from "../../../../api/control-layer/types";
 import { Textarea } from "../../../ui/textarea";
 import { Button } from "../../../ui/button";
@@ -326,15 +325,10 @@ const GenerationPlayground: React.FC<GenerationPlaygroundProps> = ({
                             }
 
                             return className ? (
-                              <div className="relative group">
-                                <SyntaxHighlighter
-                                  style={oneDark}
-                                  language={language}
-                                  PreTag="div"
-                                  className="my-4 text-sm rounded-lg"
-                                >
+                              <div className="relative group my-4">
+                                <CodeBlock language={language as "python" | "javascript" | "bash" | "json"}>
                                   {codeString}
-                                </SyntaxHighlighter>
+                                </CodeBlock>
                                 <button
                                   onClick={() => copyCode(codeString)}
                                   className="absolute top-2 right-2 p-2 bg-gray-700 hover:bg-gray-600 rounded transition-all duration-200 active:scale-95"
@@ -582,15 +576,10 @@ const GenerationPlayground: React.FC<GenerationPlaygroundProps> = ({
                         }
 
                         return className ? (
-                          <div className="relative group">
-                            <SyntaxHighlighter
-                              style={oneDark}
-                              language={language}
-                              PreTag="div"
-                              className="my-4 text-sm rounded-lg"
-                            >
+                          <div className="relative group my-4">
+                            <CodeBlock language={language as "python" | "javascript" | "bash" | "json"}>
                               {codeString}
-                            </SyntaxHighlighter>
+                            </CodeBlock>
                             <button
                               onClick={() => copyCode(codeString)}
                               className="absolute top-2 right-2 p-2 bg-gray-700 hover:bg-gray-600 rounded transition-all duration-200 active:scale-95"

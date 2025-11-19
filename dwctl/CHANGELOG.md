@@ -1,5 +1,38 @@
 # Changelog
 
+## [0.7.0](https://github.com/doublewordai/control-layer/compare/v0.6.0...v0.7.0) (2025-11-19)
+
+
+### Features
+
+* add capacity & batch capacity ([#106](https://github.com/doublewordai/control-layer/issues/106)) ([d7f3f6d](https://github.com/doublewordai/control-layer/commit/d7f3f6d5435717dd10e2fda304bf4022a3179dc8))
+* Add support for billing to frontend ([#53](https://github.com/doublewordai/control-layer/issues/53)) ([c4f81da](https://github.com/doublewordai/control-layer/commit/c4f81dac1aec18a2288a0f6678e18c7f8c830d22))
+* allow pricing to be updated from frontend ([#111](https://github.com/doublewordai/control-layer/issues/111)) ([a7ab173](https://github.com/doublewordai/control-layer/commit/a7ab1733bd9c7d58c6a93a89de588da519ecbcff))
+* batches endpoints ([#72](https://github.com/doublewordai/control-layer/issues/72)) ([f2143c6](https://github.com/doublewordai/control-layer/commit/f2143c6be2ed1cdc1cba60e630259feb1166ab7e))
+* caching configuration for static files ([#149](https://github.com/doublewordai/control-layer/issues/149)) ([77818c0](https://github.com/doublewordai/control-layer/commit/77818c064ec43bc75aba9a89420c673e9d6060bd))
+* daemon status tracking ([#96](https://github.com/doublewordai/control-layer/issues/96)) ([9222649](https://github.com/doublewordai/control-layer/commit/9222649f6706756fc5166c4747893e356f196914))
+* deduct credits when users use api ([#66](https://github.com/doublewordai/control-layer/issues/66)) ([e40ff24](https://github.com/doublewordai/control-layer/commit/e40ff24add8dc3c570e151aed9652126ac833b9e))
+* **dwctl:** Validate model access in batch file uploads ([#151](https://github.com/doublewordai/control-layer/issues/151)) ([089aa1a](https://github.com/doublewordai/control-layer/commit/089aa1a3a2583b090275fbe8a7270362dd55a3d5))
+* openAI compatible files endpoints ([#60](https://github.com/doublewordai/control-layer/issues/60)) ([5c2eccd](https://github.com/doublewordai/control-layer/commit/5c2eccd3aafc8b2fabe6baadad4d26552a80da41))
+* track batch status via triggers, and query in bulk rather than doing N+1 queries ([#100](https://github.com/doublewordai/control-layer/issues/100)) ([68d005d](https://github.com/doublewordai/control-layer/commit/68d005dadb00c2a4afc066b8a62c2afb528d57ef))
+
+
+### Bug Fixes
+
+* add just release target, setup idempotent publishing ([3084ce1](https://github.com/doublewordai/control-layer/commit/3084ce18c95ddabc23a9716e9918dcb244e51141))
+* bug where providing an invalid API key (like we do in the playground) would foreclose other auth methods ([#91](https://github.com/doublewordai/control-layer/issues/91)) ([1627a76](https://github.com/doublewordai/control-layer/commit/1627a7670b1bbd94090fe514c2836c585baf3ee5))
+* don't charge system users ([#150](https://github.com/doublewordai/control-layer/issues/150)) ([aaa0196](https://github.com/doublewordai/control-layer/commit/aaa019628f97455d880bfcf98ee3d9914a7759be))
+* matching order ([de42c08](https://github.com/doublewordai/control-layer/commit/de42c08aa6578e5b73f582f3229786140b7815dd))
+* revert to aggregating batch status on demand ([#112](https://github.com/doublewordai/control-layer/issues/112)) ([04e9498](https://github.com/doublewordai/control-layer/commit/04e9498fc92e2461482f8df016c6b0e4974f0a78))
+* Various billing fixes ([#147](https://github.com/doublewordai/control-layer/issues/147)) ([a30a29a](https://github.com/doublewordai/control-layer/commit/a30a29aaec8fed9799da57606b152a7818c81da2))
+
+
+### Dependencies
+
+* The following workspace dependencies were updated
+  * dependencies
+    * fusillade bumped from 0.1 to 0.2.0
+
 ## [0.6.0](https://github.com/doublewordai/control-layer/compare/v0.5.1...v0.6.0) (2025-11-06)
 
 
