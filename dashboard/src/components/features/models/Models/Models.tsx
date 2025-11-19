@@ -113,9 +113,9 @@ const StatusRow: React.FC<StatusRowProps> = ({
                     : "bg-gray-400"
               }`}
             />
-            <div>
-              <div className="font-medium text-sm">{model.alias}</div>
-              <div className="text-xs text-gray-500">
+            <div className="min-w-0">
+              <div className="font-medium text-sm truncate break-all">{model.alias}</div>
+              <div className="text-xs text-gray-500 truncate">
                 {endpointsRecord[model.hosted_on]?.name || "Unknown"}
               </div>
             </div>
@@ -536,7 +536,7 @@ const Models: React.FC = () => {
                             <div className="flex items-start justify-between gap-4">
                               <div className="flex-1 min-w-0">
                                 <div className="flex items-center gap-2">
-                                  <CardTitle className="text-lg">
+                                  <CardTitle className="text-lg truncate break-all">
                                     {model.alias}
                                   </CardTitle>
 
@@ -622,8 +622,8 @@ const Models: React.FC = () => {
                                     </HoverCardContent>
                                   </HoverCard>
                                 </div>
-                                <CardDescription className="mt-1">
-                                  {model.model_name} •{" "}
+                                <CardDescription className="mt-1 truncate">
+                                  <span className="break-all">{model.model_name}</span> •{" "}
                                   {endpointsRecord[model.hosted_on]?.name ||
                                     "Unknown endpoint"}
                                 </CardDescription>
@@ -663,7 +663,7 @@ const Models: React.FC = () => {
                                                 title={`Group: ${group.name}`}
                                               >
                                                 <Users className="h-3 w-3" />
-                                                <span className="max-w-[60px] truncate">
+                                                <span className="max-w-[60px] truncate break-all">
                                                   {group.name}
                                                 </span>
                                               </Badge>
@@ -696,10 +696,10 @@ const Models: React.FC = () => {
                                                     <Badge
                                                       key={group.id}
                                                       variant="secondary"
-                                                      className="text-xs"
+                                                      className="text-xs max-w-[200px]"
                                                     >
-                                                      <Users className="h-3 w-3" />
-                                                      {group.name}
+                                                      <Users className="h-3 w-3 flex-shrink-0" />
+                                                      <span className="truncate break-all">{group.name}</span>
                                                     </Badge>
                                                   ))}
                                                 </div>
