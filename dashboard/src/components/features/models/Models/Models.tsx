@@ -64,56 +64,12 @@ import {
   HoverCardTrigger,
 } from "../../../ui/hover-card";
 import { Sparkline } from "../../../ui/sparkline";
-
-// Utility functions for formatting
-const formatNumber = (num: number): string => {
-  if (num >= 1_000_000_000) {
-    return `${(num / 1_000_000_000).toFixed(1)}B`;
-  }
-  if (num >= 1_000_000) {
-    return `${(num / 1_000_000).toFixed(1)}M`;
-  }
-  if (num >= 1_000) {
-    return `${(num / 1_000).toFixed(1)}K`;
-  }
-  return num.toString();
-};
-
-const formatLatency = (ms?: number): string => {
-  if (!ms) return "N/A";
-  if (ms >= 1000) {
-    return `${(ms / 1000).toFixed(1)}s`;
-  }
-  return `${Math.round(ms)}ms`;
-};
-
-const formatRelativeTime = (dateString?: string): string => {
-  if (!dateString) return "Never";
-
-  const date = new Date(dateString);
-  const now = new Date();
-  const diffMs = now.getTime() - date.getTime();
-
-  const diffMinutes = Math.floor(diffMs / (1000 * 60));
-  const diffHours = Math.floor(diffMs / (1000 * 60 * 60));
-  const diffDays = Math.floor(diffMs / (1000 * 60 * 60 * 24));
-
-  if (diffMinutes < 1) return "Just now";
-  if (diffMinutes < 60) return `${diffMinutes}m ago`;
-  if (diffHours < 24) return `${diffHours}h ago`;
-  if (diffDays < 7) return `${diffDays}d ago`;
-
-  return date.toLocaleDateString();
-};
-
-const formatPricing = (pricing?: { input_price_per_token?: number | null; output_price_per_token?: number | null }): string => {
-  if (!pricing || (!pricing.input_price_per_token && !pricing.output_price_per_token)) {
-    return "N/A";
-  }
-  const input = pricing.input_price_per_token ? `$${Number(pricing.input_price_per_token).toFixed(4)}` : "N/A";
-  const output = pricing.output_price_per_token ? `$${Number(pricing.output_price_per_token).toFixed(4)}` : "N/A";
-  return `${input} / ${output}`;
-};
+import {
+  formatNumber,
+  formatLatency,
+  formatRelativeTime,
+  formatPricing,
+} from "../../../../utils/formatters";
 
 // StatusRow component for status page layout
 interface StatusRowProps {
