@@ -64,27 +64,12 @@ import {
   HoverCardTrigger,
 } from "../../../ui/hover-card";
 import { Sparkline } from "../../../ui/sparkline";
+import { formatNumber, formatDuration } from "../../../../utils/formatters";
 
 // Utility functions for formatting
-const formatNumber = (num: number): string => {
-  if (num >= 1_000_000_000) {
-    return `${(num / 1_000_000_000).toFixed(1)}B`;
-  }
-  if (num >= 1_000_000) {
-    return `${(num / 1_000_000).toFixed(1)}M`;
-  }
-  if (num >= 1_000) {
-    return `${(num / 1_000).toFixed(1)}K`;
-  }
-  return num.toString();
-};
-
 const formatLatency = (ms?: number): string => {
   if (!ms) return "N/A";
-  if (ms >= 1000) {
-    return `${(ms / 1000).toFixed(1)}s`;
-  }
-  return `${Math.round(ms)}ms`;
+  return formatDuration(ms);
 };
 
 const formatRelativeTime = (dateString?: string): string => {
