@@ -121,3 +121,58 @@ export function formatBytes(bytes: number): string {
     sizes[sizeIndex]
   );
 }
+
+/**
+ * Format latency in milliseconds to human-readable string
+ */
+export function formatLatency(ms?: number): string {
+  if (!ms) return "N/A";
+  if (ms >= 1000) {
+    return `${(ms / 1000).toFixed(1)}s`;
+  }
+  return `${Math.round(ms)}ms`;
+}
+
+/**
+ * Format a date string to relative time (e.g., "5m ago", "2h ago")
+ */
+export function formatRelativeTime(dateString?: string): string {
+  if (!dateString) return "Never";
+
+  const date = new Date(dateString);
+  const now = new Date();
+  const diffMs = now.getTime() - date.getTime();
+
+  const diffMinutes = Math.floor(diffMs / (1000 * 60));
+  const diffHours = Math.floor(diffMs / (1000 * 60 * 60));
+  const diffDays = Math.floor(diffMs / (1000 * 60 * 60 * 24));
+
+  if (diffMinutes < 1) return "Just now";
+  if (diffMinutes < 60) return `${diffMinutes}m ago`;
+  if (diffHours < 24) return `${diffHours}h ago`;
+  if (diffDays < 7) return `${diffDays}d ago`;
+
+  return date.toLocaleDateString();
+}
+
+/**
+ * Format pricing information (input and output prices per token)
+ */
+export function formatPricing(pricing?: {
+  input_price_per_token?: number | null;
+  output_price_per_token?: number | null;
+}): string {
+  if (
+    !pricing ||
+    (!pricing.input_price_per_token && !pricing.output_price_per_token)
+  ) {
+    return "N/A";
+  }
+  const input = pricing.input_price_per_token
+    ? `$${Number(pricing.input_price_per_token).toFixed(4)}`
+    : "N/A";
+  const output = pricing.output_price_per_token
+    ? `$${Number(pricing.output_price_per_token).toFixed(4)}`
+    : "N/A";
+  return `${input} / ${output}`;
+}
