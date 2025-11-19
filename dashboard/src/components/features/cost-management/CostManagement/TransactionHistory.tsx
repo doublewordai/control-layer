@@ -29,7 +29,7 @@ import {
   TableRow,
 } from "../../../ui/table.tsx";
 import type { Transaction } from "@/api/control-layer";
-import { useUser, useUserBalance, useTransactions } from "@/api/control-layer";
+import { useUserBalance, useTransactions } from "@/api/control-layer";
 import { useSettings } from "@/contexts";
 
 export interface TransactionHistoryProps {
@@ -48,9 +48,6 @@ export function TransactionHistory({
   const { isFeatureEnabled } = useSettings();
   const isDemoMode = isFeatureEnabled("demo");
 
-  // Fetch current user to check if we're viewing the current user's transactions
-  const { data: currentUser } = useUser("current");
-
   // Fetch balance and transactions
   const {
     data: balance = 0,
@@ -58,13 +55,13 @@ export function TransactionHistory({
     refetch: refetchBalance,
   } = useUserBalance(userId);
 
-  // Only pass userId if it's not the current user (omit param for current user)
-  const transactionsQuery = userId === currentUser?.id ? undefined : { userId };
+  // Always pass userId to filter transactions by the specific user
+  // Backend enforces permissions: non-admins can only see their own transactions
   const {
     data: transactionsData,
     isLoading: isLoadingTransactions,
     refetch: refetchTransactions,
-  } = useTransactions(transactionsQuery);
+  } = useTransactions({ userId });
 
   // Get transactions - use fetched data in both demo and API mode
   // In demo mode, MSW returns data from transactions.json

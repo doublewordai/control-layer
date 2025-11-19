@@ -37,9 +37,10 @@ export function CostManagement() {
       const fundAmount = 100.0;
       try {
         await addFundsMutation.mutateAsync({
+          source_id: user?.id || "",
           user_id: user?.id || "",
           amount: fundAmount,
-          description: "Funds purchase - Demo top up",
+          description: "Funds purchase - Demo top up"
         });
         toast.success(`Added $${fundAmount.toFixed(2)}`);
       } catch (error) {
