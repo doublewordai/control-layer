@@ -7,6 +7,9 @@ import {
   formatLongDuration,
   formatTimestamp,
   formatBytes,
+  formatLatency,
+  formatRelativeTime,
+  formatPricing,
 } from "./formatters";
 
 describe("formatters", () => {
@@ -174,6 +177,88 @@ describe("formatters", () => {
       expect(formatBytes(NaN)).toBe("N/A");
       expect(formatBytes(Infinity)).toBe("N/A");
       expect(formatBytes(-100)).toBe("0 Bytes");
+    });
+  });
+
+  describe("formatLatency", () => {
+    it("should return N/A for undefined or null", () => {
+      expect(formatLatency(undefined)).toBe("N/A");
+      expect(formatLatency(0)).toBe("N/A");
+    });
+
+    it("should format milliseconds", () => {
+      expect(formatLatency(50)).toBe("50ms");
+      expect(formatLatency(999)).toBe("999ms");
+    });
+
+    it("should format seconds", () => {
+      expect(formatLatency(1000)).toBe("1.0s");
+      expect(formatLatency(1500)).toBe("1.5s");
+      expect(formatLatency(2345)).toBe("2.3s");
+    });
+  });
+
+  describe("formatRelativeTime", () => {
+    it("should return Never for undefined", () => {
+      expect(formatRelativeTime(undefined)).toBe("Never");
+    });
+
+    it("should format just now", () => {
+      const now = new Date().toISOString();
+      expect(formatRelativeTime(now)).toBe("Just now");
+    });
+
+    it("should format minutes ago", () => {
+      const minutesAgo = new Date(Date.now() - 5 * 60 * 1000).toISOString();
+      expect(formatRelativeTime(minutesAgo)).toBe("5m ago");
+    });
+
+    it("should format hours ago", () => {
+      const hoursAgo = new Date(Date.now() - 3 * 60 * 60 * 1000).toISOString();
+      expect(formatRelativeTime(hoursAgo)).toBe("3h ago");
+    });
+
+    it("should format days ago", () => {
+      const daysAgo = new Date(Date.now() - 2 * 24 * 60 * 60 * 1000).toISOString();
+      expect(formatRelativeTime(daysAgo)).toBe("2d ago");
+    });
+
+    it("should format older dates as locale string", () => {
+      const longAgo = new Date(Date.now() - 10 * 24 * 60 * 60 * 1000).toISOString();
+      const result = formatRelativeTime(longAgo);
+      expect(result).toBeTruthy();
+      expect(result).not.toContain("ago");
+    });
+  });
+
+  describe("formatPricing", () => {
+    it("should return N/A for undefined pricing", () => {
+      expect(formatPricing(undefined)).toBe("N/A");
+    });
+
+    it("should return N/A when both prices are null", () => {
+      expect(formatPricing({ input_price_per_token: null, output_price_per_token: null })).toBe("N/A");
+    });
+
+    it("should format both input and output prices", () => {
+      expect(formatPricing({
+        input_price_per_token: 0.0001,
+        output_price_per_token: 0.0002
+      })).toBe("$0.0001 / $0.0002");
+    });
+
+    it("should handle missing input price", () => {
+      expect(formatPricing({
+        input_price_per_token: null,
+        output_price_per_token: 0.0002
+      })).toBe("N/A / $0.0002");
+    });
+
+    it("should handle missing output price", () => {
+      expect(formatPricing({
+        input_price_per_token: 0.0001,
+        output_price_per_token: null
+      })).toBe("$0.0001 / N/A");
     });
   });
 });
