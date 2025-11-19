@@ -303,7 +303,10 @@ version = "0.41.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "cecbddf002ad7a13d2041eadf1b234cb3f57653ffdd901a01bc3f1c65aa77440"
 dependencies = [
+ "chrono",
  "futures-util",
+ "hex",
+ "hmac",
  "http-types",
  "hyper 0.14.32",
  "hyper-tls 0.5.0",
@@ -311,6 +314,7 @@ dependencies = [
  "serde_json",
  "serde_path_to_error",
  "serde_qs 0.10.1",
+ "sha2",
  "smart-default",
  "smol_str",
  "thiserror 1.0.69",

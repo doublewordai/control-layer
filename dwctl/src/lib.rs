@@ -605,7 +605,7 @@ pub async fn build_router(state: &mut AppState, onwards_router: Router) -> anyho
         .route("/transactions/{transaction_id}", get(api::handlers::transactions::get_transaction))
         .route("/transactions", get(api::handlers::transactions::list_transactions))
         // Payment processing
-        .route("/create_checkout", post(api::handlers::payments::create_checkout))
+        .route("/payments/create_checkout", post(api::handlers::payments::create_checkout))
         // Inference endpoints management (admin only for write operations)
         .route("/endpoints", get(api::handlers::inference_endpoints::list_inference_endpoints))
         .route("/endpoints", post(api::handlers::inference_endpoints::create_inference_endpoint))
@@ -731,6 +731,9 @@ pub async fn build_router(state: &mut AppState, onwards_router: Router) -> anyho
                 (axum::http::StatusCode::OK, [("content-type", "application/yaml")], OPENAPI_SPEC)
             }),
         )
+        // Webhook routes (external services, not part of client API docs)
+        .route("/webhooks/stripe", post(api::handlers::payments::stripe_webhook))
+        .with_state(state.clone())
         .merge(auth_routes)
         .nest("/ai/v1", ai_router)
         .nest("/admin/api/v1", api_routes_with_state)
