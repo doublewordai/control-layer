@@ -17,6 +17,7 @@ import {
   ChevronDown,
   Settings,
 } from "lucide-react";
+import { toast } from "sonner";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
 import { Prism as SyntaxHighlighter } from "react-syntax-highlighter";
@@ -149,10 +150,16 @@ const GenerationPlayground: React.FC<GenerationPlaygroundProps> = ({
     }
   }, [isComparisonMode]);
 
-  const copyCode = (code: string) => {
-    navigator.clipboard.writeText(code);
-    setCopiedCode(code);
-    setTimeout(() => setCopiedCode(null), 2000);
+  const copyCode = async (code: string) => {
+    try {
+      await navigator.clipboard.writeText(code);
+      setCopiedCode(code);
+      toast.success("Code copied to clipboard");
+      setTimeout(() => setCopiedCode(null), 2000);
+    } catch (err) {
+      console.error("Failed to copy to clipboard:", err);
+      toast.error("Failed to copy code");
+    }
   };
 
   const getTextContent = (content: MessageContent): string => {

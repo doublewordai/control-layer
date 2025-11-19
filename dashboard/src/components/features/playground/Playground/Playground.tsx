@@ -1,6 +1,7 @@
 import React, { useState, useEffect } from "react";
 import { useNavigate, useSearchParams } from "react-router-dom";
 import { Play, ArrowLeft, GitCompare, X as XIcon } from "lucide-react";
+import { toast } from "sonner";
 import OpenAI from "openai";
 import type { ChatCompletionMessageParam } from "openai/resources/chat/completions";
 import { useModels } from "../../../../api/control-layer";
@@ -855,10 +856,16 @@ const Playground: React.FC = () => {
   const [isSplitInput, setIsSplitInput] = useState(false);
   const [currentMessageModelB, setCurrentMessageModelB] = useState("");
 
-  const copyMessage = (content: string, messageIndex: number) => {
-    navigator.clipboard.writeText(content);
-    setCopiedMessageIndex(messageIndex);
-    setTimeout(() => setCopiedMessageIndex(null), 2000);
+  const copyMessage = async (content: string, messageIndex: number) => {
+    try {
+      await navigator.clipboard.writeText(content);
+      setCopiedMessageIndex(messageIndex);
+      toast.success("Message copied to clipboard");
+      setTimeout(() => setCopiedMessageIndex(null), 2000);
+    } catch (err) {
+      console.error("Failed to copy to clipboard:", err);
+      toast.error("Failed to copy message");
+    }
   };
 
   return (
