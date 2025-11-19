@@ -13,8 +13,21 @@ import {
   afterAll,
   vi,
 } from "vitest";
+
+// Mock sonner module - use factory function to avoid hoisting issues
+vi.mock("sonner", () => {
+  return {
+    toast: {
+      success: vi.fn(),
+      error: vi.fn(),
+    },
+    Toaster: () => null,
+  };
+});
+
 import { ApiKeys } from "./ApiKeys";
 import { handlers } from "../../../../api/control-layer/mocks/handlers";
+import { toast } from "sonner";
 
 // Setup MSW server with existing handlers
 const server = setupServer(...handlers);
@@ -27,23 +40,12 @@ afterEach(() => {
 afterAll(() => server.close());
 
 // Mock clipboard API for copy functionality
-const mockWriteText = vi.fn().mockImplementation(() => Promise.resolve());
+const mockWriteText = vi.fn().mockResolvedValue(undefined);
 Object.assign(navigator, {
   clipboard: {
     writeText: mockWriteText,
   },
 });
-
-// Mock toast from sonner
-const mockToastSuccess = vi.fn();
-const mockToastError = vi.fn();
-vi.mock("sonner", () => ({
-  toast: {
-    success: mockToastSuccess,
-    error: mockToastError,
-  },
-  Toaster: () => null,
-}));
 
 // Test wrapper with QueryClient and Router
 function createWrapper() {
@@ -267,7 +269,7 @@ describe("API Keys Component - Functional Tests", () => {
 
       // Should show success toast
       await waitFor(() => {
-        expect(mockToastSuccess).toHaveBeenCalledWith(
+        expect(toast.success).toHaveBeenCalledWith(
           "API key copied to clipboard",
         );
       });
@@ -275,11 +277,6 @@ describe("API Keys Component - Functional Tests", () => {
 
     it("shows error toast notification when copying fails", async () => {
       const user = userEvent.setup();
-
-      // Mock clipboard to fail
-      mockWriteText.mockImplementationOnce(() =>
-        Promise.reject(new Error("Clipboard access denied")),
-      );
 
       render(<ApiKeys />, { wrapper: createWrapper() });
 
@@ -314,6 +311,11 @@ describe("API Keys Component - Functional Tests", () => {
         ).toBeInTheDocument();
       });
 
+      // Mock clipboard to fail right before clicking
+      mockWriteText.mockRejectedValueOnce(
+        new Error("Clipboard access denied"),
+      );
+
       // Click copy button
       const copyButton = screen.getByRole("button", { name: /copy api key/i });
       await user.click(copyButton);
@@ -325,7 +327,7 @@ describe("API Keys Component - Functional Tests", () => {
 
       // Should show error toast
       await waitFor(() => {
-        expect(mockToastError).toHaveBeenCalledWith("Failed to copy API key");
+        expect(toast.error).toHaveBeenCalledWith("Failed to copy API key");
       });
     });
 
