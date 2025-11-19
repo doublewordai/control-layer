@@ -456,8 +456,8 @@ const UsersGroups: React.FC = () => {
                       >
                         <Users className="w-5 h-5 text-white" />
                       </div>
-                      <div>
-                        <h3 className="font-semibold text-doubleword-neutral-900">
+                      <div className="min-w-0 flex-1">
+                        <h3 className="font-semibold text-doubleword-neutral-900 truncate break-all">
                           {group.name}
                         </h3>
                         <p className="text-sm text-doubleword-neutral-500">
@@ -483,7 +483,7 @@ const UsersGroups: React.FC = () => {
                       />
                     </div>
                   </div>
-                  <p className="text-sm text-doubleword-neutral-600 mb-4">
+                  <p className="text-sm text-doubleword-neutral-600 mb-4 break-words">
                     {group.description}
                   </p>
                   <div className="flex items-center justify-start pt-4 border-t border-doubleword-neutral-100">

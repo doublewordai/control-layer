@@ -846,7 +846,8 @@ impl<H: HttpClient + 'static> Storage for PostgresRequestManager<H> {
                 None
             }
         } else {
-            None
+            // Default to 30 days if no expiry is specified
+            Some(Utc::now() + chrono::Duration::days(30))
         };
 
         let description = metadata.description.clone();
