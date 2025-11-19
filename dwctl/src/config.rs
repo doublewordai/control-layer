@@ -412,14 +412,23 @@ impl Default for FilesConfig {
 /// request processing.
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(default)]
-#[derive(Default)]
 pub struct BatchConfig {
-    /// Enable batches API endpoints (default: false)
+    /// Enable batches API endpoints (default: true)
     pub enabled: bool,
     /// Daemon configuration for processing batch requests
     pub daemon: DaemonConfig,
     /// Files configuration for batch file uploads/downloads
     pub files: FilesConfig,
+}
+
+impl Default for BatchConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            daemon: DaemonConfig::default(),
+            files: FilesConfig::default(),
+        }
+    }
 }
 
 /// Batch processing daemon configuration.
