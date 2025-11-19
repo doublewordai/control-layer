@@ -272,7 +272,9 @@ function AppRoutes() {
           element={
             <AppLayout>
               <ProtectedRoute path="/batches">
-                <Batches />
+                <Suspense fallback={<RouteLoader />}>
+                  <Batches />
+                </Suspense>
               </ProtectedRoute>
             </AppLayout>
           }
@@ -282,7 +284,9 @@ function AppRoutes() {
           element={
             <AppLayout>
               <ProtectedRoute path="/batches/files/:fileId/content">
-                <FileRequests />
+                <Suspense fallback={<RouteLoader />}>
+                  <FileRequests />
+                </Suspense>
               </ProtectedRoute>
             </AppLayout>
           }
