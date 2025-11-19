@@ -32,8 +32,7 @@ import {
   DialogTitle,
   DialogDescription,
 } from "../../../ui/dialog";
-import { Prism as SyntaxHighlighter } from "react-syntax-highlighter";
-import { oneDark } from "react-syntax-highlighter/dist/esm/styles/prism";
+import { CodeBlock } from "../../../ui/code-block";
 import type { FileRequest } from "../../../../api/control-layer/types";
 
 export function FileRequests() {
@@ -349,18 +348,9 @@ export function FileRequests() {
                 }
 
                 return content ? (
-                  <SyntaxHighlighter
-                    language="json"
-                    style={oneDark}
-                    customStyle={{
-                      margin: 0,
-                      borderRadius: "0.375rem",
-                      fontSize: "0.75rem",
-                      maxHeight: "none",
-                    }}
-                  >
+                  <CodeBlock language="json">
                     {JSON.stringify(content, null, 2)}
-                  </SyntaxHighlighter>
+                  </CodeBlock>
                 ) : (
                   <p className="text-gray-500 text-sm p-4">
                     No content available
