@@ -95,15 +95,15 @@ export function Requests() {
   // Get from parameter for back navigation
   const fromUrl = searchParams.get("from");
 
-  // Fetch requests data only if user has requests permission
+  // Fetch requests data only if user has requests permission AND requests tab is active
   const realRequestsQuery = useRequests(
     { limit: recordLimit, order_desc: true },
-    { enabled: hasRequestsPermission },
+    { enabled: hasRequestsPermission && activeTab === "requests" },
     dateRange,
   );
   const mockRequestsQuery = useMockRequests(
     { limit: recordLimit, order_desc: true },
-    { enabled: hasRequestsPermission },
+    { enabled: hasRequestsPermission && activeTab === "requests" },
     dateRange,
   );
 

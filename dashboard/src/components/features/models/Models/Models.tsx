@@ -64,56 +64,12 @@ import {
   HoverCardTrigger,
 } from "../../../ui/hover-card";
 import { Sparkline } from "../../../ui/sparkline";
-
-// Utility functions for formatting
-const formatNumber = (num: number): string => {
-  if (num >= 1_000_000_000) {
-    return `${(num / 1_000_000_000).toFixed(1)}B`;
-  }
-  if (num >= 1_000_000) {
-    return `${(num / 1_000_000).toFixed(1)}M`;
-  }
-  if (num >= 1_000) {
-    return `${(num / 1_000).toFixed(1)}K`;
-  }
-  return num.toString();
-};
-
-const formatLatency = (ms?: number): string => {
-  if (!ms) return "N/A";
-  if (ms >= 1000) {
-    return `${(ms / 1000).toFixed(1)}s`;
-  }
-  return `${Math.round(ms)}ms`;
-};
-
-const formatRelativeTime = (dateString?: string): string => {
-  if (!dateString) return "Never";
-
-  const date = new Date(dateString);
-  const now = new Date();
-  const diffMs = now.getTime() - date.getTime();
-
-  const diffMinutes = Math.floor(diffMs / (1000 * 60));
-  const diffHours = Math.floor(diffMs / (1000 * 60 * 60));
-  const diffDays = Math.floor(diffMs / (1000 * 60 * 60 * 24));
-
-  if (diffMinutes < 1) return "Just now";
-  if (diffMinutes < 60) return `${diffMinutes}m ago`;
-  if (diffHours < 24) return `${diffHours}h ago`;
-  if (diffDays < 7) return `${diffDays}d ago`;
-
-  return date.toLocaleDateString();
-};
-
-const formatPricing = (pricing?: { input_price_per_token?: number | null; output_price_per_token?: number | null }): string => {
-  if (!pricing || (!pricing.input_price_per_token && !pricing.output_price_per_token)) {
-    return "N/A";
-  }
-  const input = pricing.input_price_per_token ? `$${Number(pricing.input_price_per_token).toFixed(4)}` : "N/A";
-  const output = pricing.output_price_per_token ? `$${Number(pricing.output_price_per_token).toFixed(4)}` : "N/A";
-  return `${input} / ${output}`;
-};
+import {
+  formatNumber,
+  formatLatency,
+  formatRelativeTime,
+  formatPricing,
+} from "../../../../utils/formatters";
 
 // StatusRow component for status page layout
 interface StatusRowProps {
@@ -157,9 +113,9 @@ const StatusRow: React.FC<StatusRowProps> = ({
                     : "bg-gray-400"
               }`}
             />
-            <div>
-              <div className="font-medium text-sm">{model.alias}</div>
-              <div className="text-xs text-gray-500">
+            <div className="min-w-0">
+              <div className="font-medium text-sm truncate break-all">{model.alias}</div>
+              <div className="text-xs text-gray-500 truncate">
                 {endpointsRecord[model.hosted_on]?.name || "Unknown"}
               </div>
             </div>
@@ -223,6 +179,7 @@ const Models: React.FC = () => {
   };
 
   // Build include parameter based on permissions - always include status
+  // IMPORTANT: Order must match ModelInfo.tsx to ensure cache reuse
   const includeParam = useMemo(() => {
     const parts: string[] = ["status"]; // Always fetch status for badges
 
@@ -580,7 +537,7 @@ const Models: React.FC = () => {
                             <div className="flex items-start justify-between gap-4">
                               <div className="flex-1 min-w-0">
                                 <div className="flex items-center gap-2">
-                                  <CardTitle className="text-lg">
+                                  <CardTitle className="text-lg truncate break-all">
                                     {model.alias}
                                   </CardTitle>
 
@@ -666,8 +623,8 @@ const Models: React.FC = () => {
                                     </HoverCardContent>
                                   </HoverCard>
                                 </div>
-                                <CardDescription className="mt-1">
-                                  {model.model_name} •{" "}
+                                <CardDescription className="mt-1 truncate">
+                                  <span className="break-all">{model.model_name}</span> •{" "}
                                   {endpointsRecord[model.hosted_on]?.name ||
                                     "Unknown endpoint"}
                                 </CardDescription>
@@ -707,7 +664,7 @@ const Models: React.FC = () => {
                                                 title={`Group: ${group.name}`}
                                               >
                                                 <Users className="h-3 w-3" />
-                                                <span className="max-w-[60px] truncate">
+                                                <span className="max-w-[60px] truncate break-all">
                                                   {group.name}
                                                 </span>
                                               </Badge>
@@ -740,10 +697,10 @@ const Models: React.FC = () => {
                                                     <Badge
                                                       key={group.id}
                                                       variant="secondary"
-                                                      className="text-xs"
+                                                      className="text-xs max-w-[200px]"
                                                     >
-                                                      <Users className="h-3 w-3" />
-                                                      {group.name}
+                                                      <Users className="h-3 w-3 flex-shrink-0" />
+                                                      <span className="truncate break-all">{group.name}</span>
                                                     </Badge>
                                                   ))}
                                                 </div>

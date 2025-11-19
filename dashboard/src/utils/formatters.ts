@@ -1,4 +1,8 @@
 export function formatMemory(memoryGb: number): string {
+  // Guard against invalid numbers
+  if (!isFinite(memoryGb) || isNaN(memoryGb)) return "N/A";
+  if (memoryGb < 0) return "0GB";
+
   if (memoryGb >= 1000) {
     return `${(memoryGb / 1000).toFixed(1)}TB`;
   }
@@ -6,14 +10,29 @@ export function formatMemory(memoryGb: number): string {
 }
 
 export function formatNumber(num: number): string {
-  if (num >= 1000000) return `${(num / 1000000).toFixed(1)}M`;
-  if (num >= 1000) return `${(num / 1000).toFixed(0)}k`;
+  // Guard against invalid numbers
+  if (!isFinite(num) || isNaN(num)) return "N/A";
+  if (num < 0) return "0";
+
+  if (num >= 1_000_000_000) {
+    return `${(num / 1_000_000_000).toFixed(1)}B`;
+  }
+  if (num >= 1_000_000) {
+    return `${(num / 1_000_000).toFixed(1)}M`;
+  }
+  if (num >= 1_000) {
+    return `${(num / 1_000).toFixed(1)}K`;
+  }
   return num.toString();
 }
 
 export function formatTokens(tokens: number): string {
-  if (tokens >= 1000000) return `${(tokens / 1000000).toFixed(0)}M`;
-  if (tokens >= 1000) return `${(tokens / 1000).toFixed(0)}k`;
+  // Guard against invalid numbers
+  if (!isFinite(tokens) || isNaN(tokens)) return "N/A";
+  if (tokens < 0) return "0";
+
+  if (tokens >= 1_000_000) return `${(tokens / 1_000_000).toFixed(1)}M`;
+  if (tokens >= 1_000) return `${(tokens / 1_000).toFixed(1)}K`;
   return tokens.toString();
 }
 
@@ -22,7 +41,11 @@ export function formatTokens(tokens: number): string {
  * Good for short durations (< 1 minute)
  */
 export function formatDuration(ms: number): string {
-  if (ms < 1000) return `${ms}ms`;
+  // Guard against invalid numbers
+  if (!isFinite(ms) || isNaN(ms)) return "N/A";
+  if (ms < 0) return "0ms";
+
+  if (ms < 1000) return `${Math.round(ms)}ms`;
   if (ms < 60000) return `${(ms / 1000).toFixed(1)}s`;
   return `${Math.floor(ms / 60000)}m ${Math.floor((ms % 60000) / 1000)}s`;
 }
@@ -32,6 +55,9 @@ export function formatDuration(ms: number): string {
  * Optimized for longer durations (minutes, hours, days)
  */
 export function formatLongDuration(ms: number): string {
+  // Guard against invalid numbers
+  if (!isFinite(ms) || isNaN(ms)) return "N/A";
+  if (ms < 0) return "0s";
   if (ms < 1000) return "< 1s";
 
   const seconds = Math.floor(ms / 1000);
@@ -70,11 +96,18 @@ export function formatLongDuration(ms: number): string {
  * Format timestamp to human-readable string
  */
 export function formatTimestamp(timestamp: string): string {
-  return new Date(timestamp).toLocaleString();
+  const date = new Date(timestamp);
+  // Guard against invalid dates
+  if (isNaN(date.getTime())) return "Invalid date";
+  return date.toLocaleString();
 }
 
 export function formatBytes(bytes: number): string {
+  // Guard against invalid numbers
+  if (!isFinite(bytes) || isNaN(bytes)) return "N/A";
+  if (bytes < 0) return "0 Bytes";
   if (bytes === 0) return "0 Bytes";
+
   const k = 1024;
   const sizes = ["Bytes", "KB", "MB", "GB", "TB"];
   const i = Math.floor(Math.log(bytes) / Math.log(k));
@@ -87,4 +120,59 @@ export function formatBytes(bytes: number): string {
     " " +
     sizes[sizeIndex]
   );
+}
+
+/**
+ * Format latency in milliseconds to human-readable string
+ */
+export function formatLatency(ms?: number): string {
+  if (!ms) return "N/A";
+  if (ms >= 1000) {
+    return `${(ms / 1000).toFixed(1)}s`;
+  }
+  return `${Math.round(ms)}ms`;
+}
+
+/**
+ * Format a date string to relative time (e.g., "5m ago", "2h ago")
+ */
+export function formatRelativeTime(dateString?: string): string {
+  if (!dateString) return "Never";
+
+  const date = new Date(dateString);
+  const now = new Date();
+  const diffMs = now.getTime() - date.getTime();
+
+  const diffMinutes = Math.floor(diffMs / (1000 * 60));
+  const diffHours = Math.floor(diffMs / (1000 * 60 * 60));
+  const diffDays = Math.floor(diffMs / (1000 * 60 * 60 * 24));
+
+  if (diffMinutes < 1) return "Just now";
+  if (diffMinutes < 60) return `${diffMinutes}m ago`;
+  if (diffHours < 24) return `${diffHours}h ago`;
+  if (diffDays < 7) return `${diffDays}d ago`;
+
+  return date.toLocaleDateString();
+}
+
+/**
+ * Format pricing information (input and output prices per token)
+ */
+export function formatPricing(pricing?: {
+  input_price_per_token?: number | null;
+  output_price_per_token?: number | null;
+}): string {
+  if (
+    !pricing ||
+    (!pricing.input_price_per_token && !pricing.output_price_per_token)
+  ) {
+    return "N/A";
+  }
+  const input = pricing.input_price_per_token
+    ? `$${Number(pricing.input_price_per_token).toFixed(4)}`
+    : "N/A";
+  const output = pricing.output_price_per_token
+    ? `$${Number(pricing.output_price_per_token).toFixed(4)}`
+    : "N/A";
+  return `${input} / ${output}`;
 }
