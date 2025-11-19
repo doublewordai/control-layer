@@ -420,12 +420,6 @@ impl<'c> ApiKeys<'c> {
             AND (
                 ak.user_id = $2  -- System user always has access
                 OR EXISTS (
-                    -- Platform Managers bypass credit checks
-                    SELECT 1 FROM user_roles ur
-                    WHERE ur.user_id = ak.user_id
-                    AND ur.role = 'PLATFORMMANAGER'
-                )
-                OR EXISTS (
                     -- User's latest transaction has positive balance
                     SELECT 1 FROM credits_transactions ct
                     WHERE ct.user_id = ak.user_id
@@ -2690,7 +2684,7 @@ mod tests {
 
     #[sqlx::test]
     #[test_log::test]
-    async fn test_platform_manager_api_keys_not_filtered_by_credits(pool: PgPool) {
+    async fn test_platform_manager_api_keys_filtered_by_credits(pool: PgPool) {
         let setup = setup_credit_filtering_test(&pool).await;
         let mut pool_conn = pool.acquire().await.unwrap();
 
@@ -2731,7 +2725,7 @@ mod tests {
                 .unwrap();
         }
 
-        // Retrieve API keys for the deployment
+        // Retrieve API keys for the deployment - Platform Manager has no credits
         let keys_for_deployment;
         {
             let mut api_repo = ApiKeys::new(&mut pool_conn);
@@ -2741,10 +2735,41 @@ mod tests {
                 .unwrap();
         }
 
-        // Platform Manager should have access despite zero credits
+        // Platform Manager should NOT have access with zero credits
+        assert!(
+            !keys_for_deployment.iter().any(|k| k.secret == platform_key.secret),
+            "Platform Manager should be filtered when they have zero credits"
+        );
+
+        // Now give Platform Manager some credits
+        {
+            let mut credits_repo = Credits::new(&mut pool_conn);
+            credits_repo
+                .create_transaction(&CreditTransactionCreateDBRequest {
+                    user_id: platform_manager.id,
+                    transaction_type: CreditTransactionType::AdminGrant,
+                    amount: Decimal::new(10000, 2), // 100.00 credits
+                    source_id: "test".to_string(),
+                    description: Some("Platform Manager credits".to_string()),
+                })
+                .await
+                .unwrap();
+        }
+
+        // Retrieve API keys again - Platform Manager now has credits
+        let keys_for_deployment;
+        {
+            let mut api_repo = ApiKeys::new(&mut pool_conn);
+            keys_for_deployment = api_repo
+                .get_api_keys_for_deployment_with_sufficient_credit(setup.deployment.id)
+                .await
+                .unwrap();
+        }
+
+        // Platform Manager should now have access with positive credits
         assert!(
             keys_for_deployment.iter().any(|k| k.secret == platform_key.secret),
-            "Platform Manager should have access regardless of credit balance"
+            "Platform Manager should have access when they have positive credits"
         );
     }
 
