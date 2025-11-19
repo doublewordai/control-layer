@@ -52,8 +52,9 @@ impl OpenAIBatchRequest {
     /// # Arguments
     /// * `endpoint` - The target endpoint (e.g., "http://localhost:8080/ai")
     /// * `api_key` - The API key to inject for request execution
-    #[tracing::instrument(skip(self, api_key), fields(custom_id = %self.custom_id, method = %self.method, url = %self.url))]
-    fn to_internal(&self, endpoint: &str, api_key: String) -> Result<fusillade::RequestTemplateInput> {
+    /// * `accessible_models` - Set of model aliases the user can access
+    #[tracing::instrument(skip(self, api_key, accessible_models), fields(custom_id = %self.custom_id, method = %self.method, url = %self.url))]
+    fn to_internal(&self, endpoint: &str, api_key: String, accessible_models: &HashSet<String>) -> Result<fusillade::RequestTemplateInput> {
         // Extract model from body if present
         let model = self
             .body
@@ -63,6 +64,13 @@ impl OpenAIBatchRequest {
                 message: "Missing 'model' field in request body".to_string(),
             })?
             .to_string();
+
+        // Validate model access
+        if !accessible_models.contains(&model) {
+            return Err(Error::BadRequest {
+                message: format!("Access denied to model '{}'", model),
+            });
+        }
 
         // Serialize body back to string
         let body = serde_json::to_string(&self.body).map_err(|e| Error::BadRequest {
@@ -224,22 +232,8 @@ fn create_file_stream(
                             // Parse JSON line as OpenAI Batch format, then transform to internal
                             match serde_json::from_str::<OpenAIBatchRequest>(trimmed) {
                                 Ok(openai_req) => {
-                                    // Validate model access before transforming
-                                    if let Some(model) = openai_req.body.get("model").and_then(|v| v.as_str()) {
-                                        if !accessible_models.contains(model) {
-                                            let _ = tx
-                                                .send(fusillade::FileStreamItem::Error(format!(
-                                                    "Access denied to model '{}' on line {}",
-                                                    model,
-                                                    line_count + 1
-                                                )))
-                                                .await;
-                                            return;
-                                        }
-                                    }
-
-                                    // Transform to internal format
-                                    match openai_req.to_internal(&endpoint, api_key.clone()) {
+                                    // Transform to internal format (includes model access validation)
+                                    match openai_req.to_internal(&endpoint, api_key.clone(), &accessible_models) {
                                         Ok(template) => {
                                             line_count += 1;
                                             incomplete_line.clear();
@@ -250,7 +244,7 @@ fn create_file_stream(
                                         Err(e) => {
                                             let _ = tx
                                                 .send(fusillade::FileStreamItem::Error(format!(
-                                                    "Failed to transform request on line {}: {:?}",
+                                                    "Failed to transform request on line {}: {}",
                                                     line_count + 1,
                                                     e
                                                 )))
@@ -278,35 +272,20 @@ fn create_file_stream(
                         let trimmed = incomplete_line.trim();
                         if !trimmed.is_empty() {
                             match serde_json::from_str::<OpenAIBatchRequest>(trimmed) {
-                                Ok(openai_req) => {
-                                    // Validate model access before transforming
-                                    if let Some(model) = openai_req.body.get("model").and_then(|v| v.as_str()) {
-                                        if !accessible_models.contains(model) {
-                                            let _ = tx
-                                                .send(fusillade::FileStreamItem::Error(format!(
-                                                    "Access denied to model '{}' on final line",
-                                                    model
-                                                )))
-                                                .await;
+                                Ok(openai_req) => match openai_req.to_internal(&endpoint, api_key.clone(), &accessible_models) {
+                                    Ok(template) => {
+                                        line_count += 1;
+                                        if tx.send(fusillade::FileStreamItem::Template(template)).await.is_err() {
                                             return;
                                         }
                                     }
-
-                                    match openai_req.to_internal(&endpoint, api_key.clone()) {
-                                        Ok(template) => {
-                                            line_count += 1;
-                                            if tx.send(fusillade::FileStreamItem::Template(template)).await.is_err() {
-                                                return;
-                                            }
-                                        }
-                                        Err(e) => {
-                                            let _ = tx
-                                                .send(fusillade::FileStreamItem::Error(format!("Failed to transform final line: {:?}", e)))
-                                                .await;
-                                            return;
-                                        }
+                                    Err(e) => {
+                                        let _ = tx
+                                            .send(fusillade::FileStreamItem::Error(format!("Failed to transform final line: {:?}", e)))
+                                            .await;
+                                        return;
                                     }
-                                }
+                                },
                                 Err(e) => {
                                     let _ = tx
                                         .send(fusillade::FileStreamItem::Error(format!("Invalid JSON on final line: {}", e)))
