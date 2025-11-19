@@ -382,8 +382,6 @@ pub async fn upload_file(
     let accessible_deployments = deployments_repo.list(&filter).await.map_err(Error::Database)?;
     let accessible_models: HashSet<String> = accessible_deployments.into_iter().map(|d| d.alias).collect();
 
-    error!("Accessible models, {:?}", accessible_models);
-
     // Create a stream that parses the multipart upload and yields FileStreamItems
     let file_stream = create_file_stream(
         multipart,
