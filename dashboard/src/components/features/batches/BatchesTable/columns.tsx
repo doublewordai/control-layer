@@ -37,7 +37,7 @@ const getStatusIcon = (status: BatchStatus) => {
       return <XCircle className="w-4 h-4 text-gray-600" />;
     case "in_progress":
     case "finalizing":
-      return <Loader2 className="w-4 h-4 text-gray-600 animate-spin" />;
+      return <Loader2 className="w-4 h-4 text-blue-600 animate-spin" />;
     case "validating":
     case "cancelling":
       return <Clock className="w-4 h-4 text-yellow-600" />;
