@@ -7,6 +7,7 @@ import {
   ChevronLeft,
   ChevronRight,
   Search,
+  RefreshCw,
 } from "lucide-react";
 import { Card } from "../../../ui/card.tsx";
 import { Button } from "@/components";
@@ -28,7 +29,7 @@ import {
   TableRow,
 } from "../../../ui/table.tsx";
 import type { Transaction } from "@/api/control-layer";
-import { useUser, useUserBalance, useTransactions } from "@/api/control-layer";
+import { useUserBalance, useTransactions } from "@/api/control-layer";
 import { useSettings } from "@/contexts";
 
 export interface TransactionHistoryProps {
@@ -47,17 +48,20 @@ export function TransactionHistory({
   const { isFeatureEnabled } = useSettings();
   const isDemoMode = isFeatureEnabled("demo");
 
-  // Fetch current user to check if we're viewing the current user's transactions
-  const { data: currentUser } = useUser("current");
-
   // Fetch balance and transactions
-  const { data: balance = 0, isLoading: isLoadingBalance } =
-    useUserBalance(userId);
+  const {
+    data: balance = 0,
+    isLoading: isLoadingBalance,
+    refetch: refetchBalance,
+  } = useUserBalance(userId);
 
-  // Only pass userId if it's not the current user (omit param for current user)
-  const transactionsQuery = userId === currentUser?.id ? undefined : { userId };
-  const { data: transactionsData, isLoading: isLoadingTransactions } =
-    useTransactions(transactionsQuery);
+  // Always pass userId to filter transactions by the specific user
+  // Backend enforces permissions: non-admins can only see their own transactions
+  const {
+    data: transactionsData,
+    isLoading: isLoadingTransactions,
+    refetch: refetchTransactions,
+  } = useTransactions({ userId });
 
   // Get transactions - use fetched data in both demo and API mode
   // In demo mode, MSW returns data from transactions.json
@@ -188,14 +192,39 @@ export function TransactionHistory({
     setCurrentPage(1);
   };
 
+  // Refresh handler
+  const [isRefreshing, setIsRefreshing] = useState(false);
+  const handleRefresh = async () => {
+    setIsRefreshing(true);
+    try {
+      await Promise.all([refetchBalance(), refetchTransactions()]);
+    } finally {
+      setIsRefreshing(false);
+    }
+  };
+
   const content = (
     <>
       {/* Transaction History Card */}
       <Card className="p-4">
         <div className="flex items-center justify-between mb-2">
-          <h2 className="text-2xl font-semibold text-doubleword-neutral-900">
-            Transaction History
-          </h2>
+          <div className="flex items-center gap-3">
+            <h2 className="text-2xl font-semibold text-doubleword-neutral-900">
+              Transaction History
+            </h2>
+            <Button
+              variant="ghost"
+              size="sm"
+              onClick={handleRefresh}
+              disabled={isRefreshing || isLoading}
+              className="h-8 w-8 p-0"
+              title="Refresh balance and transactions"
+            >
+              <RefreshCw
+                className={`h-4 w-4 ${isRefreshing ? "animate-spin" : ""}`}
+              />
+            </Button>
+          </div>
           <div className="flex items-stretch border border-blue-200 rounded-lg overflow-hidden bg-gradient-to-br from-blue-50 to-indigo-50">
             <div className="flex items-center gap-3 px-4 py-2">
               <span className="text-sm font-medium text-blue-700">Balance</span>
@@ -324,7 +353,7 @@ export function TransactionHistory({
                           isCredit ? "text-green-600" : "text-red-600"
                         }`}
                       >
-                        {isCredit ? "+" : ""}
+                        {isCredit ? "+" : "-"}
                         {formatDollars(transaction.amount)}
                       </p>
                     </TableCell>

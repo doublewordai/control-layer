@@ -1,7 +1,7 @@
 import React, { useState } from "react";
 import { Copy, Code, Plus, Loader2, Info } from "lucide-react";
-import { Prism as SyntaxHighlighter } from "react-syntax-highlighter";
-import { oneDark } from "react-syntax-highlighter/dist/esm/styles/prism";
+import { CodeBlock } from "../../ui/code-block";
+import { toast } from "sonner";
 import { useCreateApiKey } from "../../../api/control-layer";
 import { type ModelType } from "../../../utils/modelType";
 import type { Model } from "../../../api/control-layer";
@@ -67,10 +67,18 @@ const ApiExamplesModal: React.FC<ApiExamplesModalProps> = ({
     }
   };
 
-  const copyToClipboard = (text: string, codeType: string) => {
-    navigator.clipboard.writeText(text);
-    setCopiedCode(codeType);
-    setTimeout(() => setCopiedCode(null), 2000);
+  const copyToClipboard = async (text: string, codeType: string) => {
+    try {
+      await navigator.clipboard.writeText(text);
+      setCopiedCode(codeType);
+      const message =
+        codeType === "api-key" ? "API key copied to clipboard" : "Code copied to clipboard";
+      toast.success(message);
+      setTimeout(() => setCopiedCode(null), 2000);
+    } catch (err) {
+      console.error("Failed to copy to clipboard:", err);
+      toast.error("Failed to copy to clipboard");
+    }
   };
 
   const getBaseUrl = () => `${window.location.origin}/ai/v1`;
@@ -501,22 +509,10 @@ chatCompletion();`;
                   </button>
                 </div>
               </div>
-              <div className="p-0">
-                <SyntaxHighlighter
-                  language={getLanguageForHighlighting(selectedLanguage)}
-                  style={oneDark}
-                  customStyle={{
-                    margin: 0,
-                    borderRadius: 0,
-                    fontSize: "14px",
-                    padding: "16px",
-                  }}
-                  showLineNumbers={false}
-                  wrapLines={true}
-                  wrapLongLines={true}
-                >
+              <div className="p-4">
+                <CodeBlock language={getLanguageForHighlighting(selectedLanguage) as "python" | "javascript" | "bash"}>
                   {getCurrentCode()}
-                </SyntaxHighlighter>
+                </CodeBlock>
               </div>
             </div>
           </div>

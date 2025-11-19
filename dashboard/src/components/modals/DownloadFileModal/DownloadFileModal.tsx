@@ -1,7 +1,6 @@
 import { useState } from "react";
 import { Copy, Code, Download, Plus, Loader2 } from "lucide-react";
-import { Prism as SyntaxHighlighter } from "react-syntax-highlighter";
-import { oneDark } from "react-syntax-highlighter/dist/esm/styles/prism";
+import { CodeBlock } from "../../ui/code-block";
 import {
   Dialog,
   DialogContent,
@@ -76,10 +75,18 @@ export function DownloadFileModal({
     }
   };
 
-  const copyToClipboard = (text: string, codeType: string) => {
-    navigator.clipboard.writeText(text);
-    setCopiedCode(codeType);
-    setTimeout(() => setCopiedCode(null), 2000);
+  const copyToClipboard = async (text: string, codeType: string) => {
+    try {
+      await navigator.clipboard.writeText(text);
+      setCopiedCode(codeType);
+      const message =
+        codeType === "api-key" ? "API key copied to clipboard" : "Code copied to clipboard";
+      toast.success(message);
+      setTimeout(() => setCopiedCode(null), 2000);
+    } catch (err) {
+      console.error("Failed to copy to clipboard:", err);
+      toast.error("Failed to copy to clipboard");
+    }
   };
 
   const getBaseUrl = () => `${window.location.origin}/ai/v1`;
@@ -522,20 +529,10 @@ curl -i -X GET "${getBaseUrl()}/files/${resourceId}/content" \\
                   </button>
                 </div>
               </div>
-              <div className="overflow-x-auto">
-                <SyntaxHighlighter
-                  language={getLanguageForHighlighting(selectedLanguage)}
-                  style={oneDark}
-                  customStyle={{
-                    margin: 0,
-                    borderRadius: 0,
-                    fontSize: "14px",
-                    padding: "16px",
-                  }}
-                  showLineNumbers={false}
-                >
+              <div className="overflow-x-auto p-4">
+                <CodeBlock language={getLanguageForHighlighting(selectedLanguage) as "python" | "javascript" | "bash"}>
                   {getCurrentCode()}
-                </SyntaxHighlighter>
+                </CodeBlock>
               </div>
             </div>
           </div>

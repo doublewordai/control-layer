@@ -9,12 +9,15 @@ port: 3001
 
 # Database configuration
 database:
-  # By default, we bundle postgres with the application. It's launched on a
-  # random port, and data is stored in $HOME/.dwctl_data/
-  # To have data not persists across restarts, set persistent=false.
-  # We strongly recommend setting up external postgres in production!
+  # Configure connectivity to an external postgres database here
   type: external
   url: postgres://postgres:password@localhost:5432/dwctl
+  # We also bundle a copy of postgres with dwctl. It's launched on a random
+  # port, and data is stored in $HOME/.dwctl_data/ To have data persist
+  # across restarts, set persistent=true.
+  # We strongly recommend setting up external postgres in production!
+  # type: embedded
+  # persistent: true
 
 # Admin user email - will be created on first startup
 admin_email: "test@doubleword.ai"
@@ -100,7 +103,7 @@ enable_request_logging: true # Enable request/response logging to database
 # Batches API configuration
 batches:
   # Enable batches API endpoints (/files, /batches)
-  # When disabled, these endpoints will not be available (default: false)
+  # When disabled, these endpoints will not be available (default: true)
   enabled: true
 
   # Daemon configuration for processing batch requests

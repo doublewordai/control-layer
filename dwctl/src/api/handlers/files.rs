@@ -68,7 +68,7 @@ impl OpenAIBatchRequest {
         // Validate model access
         if !accessible_models.contains(&model) {
             return Err(Error::BadRequest {
-                message: format!("Access denied to model '{}'", model),
+                message: format!("Model '{}' has not been configured or is not available to user.", model),
             });
         }
 
@@ -373,14 +373,16 @@ pub async fn upload_file(
     let endpoint = format!("http://{}:{}/ai", state.config.host, state.config.port);
 
     // Query models accessible to the user for validation during file parsing
-    let mut deployments_conn = state.db.acquire().await.map_err(|e| Error::Database(e.into()))?;
-    let mut deployments_repo = Deployments::new(&mut deployments_conn);
+    let mut deployments_repo = Deployments::new(&mut conn);
     let filter = DeploymentFilter::new(0, i64::MAX)
         .with_accessible_to(current_user.id)
         .with_statuses(vec![ModelStatus::Active])
         .with_deleted(false);
     let accessible_deployments = deployments_repo.list(&filter).await.map_err(Error::Database)?;
     let accessible_models: HashSet<String> = accessible_deployments.into_iter().map(|d| d.alias).collect();
+
+    // drop conn so it isn't persisted for entire upload process
+    drop(conn);
 
     // Create a stream that parses the multipart upload and yields FileStreamItems
     let file_stream = create_file_stream(
@@ -819,6 +821,10 @@ mod tests {
         let group = create_test_group(&pool).await;
         add_user_to_group(&pool, user.id, group.id).await;
 
+        // Create a deployment and add to group so user has access to the model
+        let deployment = create_test_deployment(&pool, user.id, "gpt-4-model", "gpt-4").await;
+        add_deployment_to_group(&pool, deployment.id, group.id, user.id).await;
+
         // Create test JSONL content with 3 request templates in OpenAI Batch API format
         let jsonl_content = r#"{"custom_id":"request-1","method":"POST","url":"/v1/chat/completions","body":{"model":"gpt-4","messages":[{"role":"user","content":"Hello 1"}]}}
 {"custom_id":"request-2","method":"POST","url":"/v1/chat/completions","body":{"model":"gpt-4","messages":[{"role":"user","content":"Hello 2"}]}}
@@ -893,6 +899,40 @@ mod tests {
         upload_response.assert_status(axum::http::StatusCode::BAD_REQUEST);
         let error_body = upload_response.text();
         assert!(error_body.contains("model"));
+    }
+
+    #[sqlx::test]
+    #[test_log::test]
+    async fn test_upload_model_access_denied(pool: PgPool) {
+        let (app, _bg_services) = create_test_app(pool.clone(), false).await;
+        let user = create_test_user_with_roles(&pool, vec![Role::StandardUser, Role::BatchAPIUser]).await;
+        let group = create_test_group(&pool).await;
+        add_user_to_group(&pool, user.id, group.id).await;
+
+        // Create a deployment for a different model than what's in the batch file
+        let deployment = create_test_deployment(&pool, user.id, "allowed-model", "allowed-model").await;
+        add_deployment_to_group(&pool, deployment.id, group.id, user.id).await;
+
+        // Batch file requests a model the user doesn't have access to
+        let jsonl_content = r#"{"custom_id":"request-1","method":"POST","url":"/v1/chat/completions","body":{"model":"unauthorized-model","messages":[{"role":"user","content":"Hello"}]}}"#;
+
+        let file_part = axum_test::multipart::Part::bytes(jsonl_content.as_bytes()).file_name("test-batch.jsonl");
+
+        let upload_response = app
+            .post("/ai/v1/files")
+            .add_header(add_auth_headers(&user).0, add_auth_headers(&user).1)
+            .multipart(
+                axum_test::multipart::MultipartForm::new()
+                    .add_text("purpose", "batch")
+                    .add_part("file", file_part),
+            )
+            .await;
+
+        // Should reject with 400 Bad Request due to model access denied
+        upload_response.assert_status(axum::http::StatusCode::BAD_REQUEST);
+        let error_body = upload_response.text();
+        assert!(error_body.contains("Model"));
+        assert!(error_body.contains("has not been configured or is not available to user."));
     }
 
     #[sqlx::test]
@@ -1005,6 +1045,12 @@ mod tests {
     async fn test_upload_with_metadata_after_file_field(pool: PgPool) {
         let (app, _bg_services) = create_test_app(pool.clone(), false).await;
         let user = create_test_user_with_roles(&pool, vec![Role::StandardUser, Role::BatchAPIUser]).await;
+        let group = create_test_group(&pool).await;
+        add_user_to_group(&pool, user.id, group.id).await;
+
+        // Create a deployment and add to group so user has access to the model
+        let deployment = create_test_deployment(&pool, user.id, "gpt-4-model", "gpt-4").await;
+        add_deployment_to_group(&pool, deployment.id, group.id, user.id).await;
 
         // Create test JSONL content
         let jsonl_content = r#"{"custom_id":"request-1","method":"POST","url":"/v1/chat/completions","body":{"model":"gpt-4","messages":[{"role":"user","content":"Hello"}]}}"#;
@@ -1047,6 +1093,12 @@ mod tests {
     async fn test_upload_duplicate_filename(pool: PgPool) {
         let (app, _bg_services) = create_test_app(pool.clone(), false).await;
         let user = create_test_user_with_roles(&pool, vec![Role::StandardUser, Role::BatchAPIUser]).await;
+        let group = create_test_group(&pool).await;
+        add_user_to_group(&pool, user.id, group.id).await;
+
+        // Create a deployment and add to group so user has access to the model
+        let deployment = create_test_deployment(&pool, user.id, "gpt-4-model", "gpt-4").await;
+        add_deployment_to_group(&pool, deployment.id, group.id, user.id).await;
 
         // Create test JSONL content
         let jsonl_content = r#"{"custom_id":"request-1","method":"POST","url":"/v1/chat/completions","body":{"model":"gpt-4","messages":[{"role":"user","content":"Hello"}]}}"#;

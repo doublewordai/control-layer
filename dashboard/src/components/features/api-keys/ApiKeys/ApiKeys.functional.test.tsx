@@ -12,19 +12,36 @@ import {
   afterEach,
   afterAll,
   vi,
+  type Mock,
 } from "vitest";
+
+// Mock sonner module - use factory function to avoid hoisting issues
+vi.mock("sonner", () => {
+  return {
+    toast: {
+      success: vi.fn(),
+      error: vi.fn(),
+    },
+    Toaster: () => null,
+  };
+});
+
 import { ApiKeys } from "./ApiKeys";
 import { handlers } from "../../../../api/control-layer/mocks/handlers";
+import { toast } from "sonner";
 
 // Setup MSW server with existing handlers
 const server = setupServer(...handlers);
 
 beforeAll(() => server.listen({ onUnhandledRequest: "error" }));
-afterEach(() => server.resetHandlers());
+afterEach(() => {
+  server.resetHandlers();
+  vi.clearAllMocks();
+});
 afterAll(() => server.close());
 
 // Mock clipboard API for copy functionality
-const mockWriteText = vi.fn().mockImplementation(() => Promise.resolve());
+const mockWriteText = vi.fn().mockResolvedValue(undefined);
 Object.assign(navigator, {
   clipboard: {
     writeText: mockWriteText,
@@ -205,6 +222,126 @@ describe("API Keys Component - Functional Tests", () => {
 
       // Should show API key in code block
       expect(screen.getByRole("code")).toBeInTheDocument();
+    });
+
+    it("shows success toast notification when copying API key", async () => {
+      const user = userEvent.setup();
+
+      // Setup fresh clipboard mock for this test
+      const testMockWrite = vi.fn().mockResolvedValue(undefined);
+      Object.defineProperty(navigator, 'clipboard', {
+        value: { writeText: testMockWrite },
+        writable: true,
+        configurable: true
+      });
+
+      render(<ApiKeys />, { wrapper: createWrapper() });
+
+      // Create an API key first
+      await waitFor(() => {
+        expect(
+          screen.getByRole("heading", { name: /api keys/i }),
+        ).toBeInTheDocument();
+      });
+
+      const createButton = screen.getByRole("button", {
+        name: /create new api key/i,
+      });
+      await user.click(createButton);
+
+      await waitFor(() => {
+        expect(screen.getByRole("dialog")).toBeInTheDocument();
+      });
+
+      const nameInput = screen.getByLabelText(/name/i);
+      await user.type(nameInput, "Test Key");
+
+      const submitButton = screen.getByRole("button", { name: /create key/i });
+      await user.click(submitButton);
+
+      // Wait for success state
+      await waitFor(() => {
+        expect(
+          screen.getByRole("heading", {
+            name: /api key created successfully/i,
+          }),
+        ).toBeInTheDocument();
+      });
+
+      // Find and click the copy button
+      const copyButton = await screen.findByRole("button", {
+        name: /copy api key/i
+      });
+
+      expect(copyButton).toBeInTheDocument();
+      await user.click(copyButton);
+
+      // Should call clipboard API and show success toast
+      await waitFor(() => {
+        expect(testMockWrite).toHaveBeenCalled();
+        expect(toast.success as unknown as Mock).toHaveBeenCalledWith(
+          "API key copied to clipboard",
+        );
+      });
+    });
+
+    it("shows error toast notification when copying fails", async () => {
+      const user = userEvent.setup();
+
+      // Setup fresh clipboard mock that rejects
+      const testMockWrite = vi.fn().mockRejectedValue(new Error("Clipboard access denied"));
+      Object.defineProperty(navigator, 'clipboard', {
+        value: { writeText: testMockWrite },
+        writable: true,
+        configurable: true
+      });
+
+      render(<ApiKeys />, { wrapper: createWrapper() });
+
+      // Create an API key first
+      await waitFor(() => {
+        expect(
+          screen.getByRole("heading", { name: /api keys/i }),
+        ).toBeInTheDocument();
+      });
+
+      const createButton = screen.getByRole("button", {
+        name: /create new api key/i,
+      });
+      await user.click(createButton);
+
+      await waitFor(() => {
+        expect(screen.getByRole("dialog")).toBeInTheDocument();
+      });
+
+      const nameInput = screen.getByLabelText(/name/i);
+      await user.type(nameInput, "Test Key");
+
+      const submitButton = screen.getByRole("button", { name: /create key/i });
+      await user.click(submitButton);
+
+      // Wait for success state
+      await waitFor(() => {
+        expect(
+          screen.getByRole("heading", {
+            name: /api key created successfully/i,
+          }),
+        ).toBeInTheDocument();
+      });
+
+      // Find the copy button
+      const copyButton = await screen.findByRole("button", {
+        name: /copy api key/i
+      });
+
+      expect(copyButton).toBeInTheDocument();
+      await user.click(copyButton);
+
+      // Should call clipboard API, fail, and show error toast
+      await waitFor(() => {
+        expect(testMockWrite).toHaveBeenCalled();
+        expect(toast.error as unknown as Mock).toHaveBeenCalledWith("Failed to copy API key");
+      });
     });
 
     it("closes create dialog with cancel or done buttons", async () => {

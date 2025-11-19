@@ -316,4 +316,18 @@
   body {
     @apply bg-background text-foreground;
   }
+
+  /* Mobile-specific improvements */
+  @media (max-width: 767px) {
+    /* Prevent horizontal scroll on the body */
+    html, body {
+      overflow-x: hidden;
+      max-width: 100vw;
+    }
+
+    /* Ensure tables are scrollable on mobile */
+    table {
+      min-width: 600px;
+    }
+  }
 }

@@ -81,6 +81,9 @@ pub struct ListTransactionsQuery {
     #[param(value_type = Option<String>, format = "uuid")]
     pub user_id: Option<UserId>,
 
+    /// Return all transactions across all users (BillingManager only)
+    pub all: Option<bool>,
+
     /// Number of items to skip
     pub skip: Option<i64>,
 

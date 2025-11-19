@@ -42,6 +42,14 @@ export interface ModelProbeStatus {
   uptime_percentage?: number; // Last 24h uptime
 }
 
+// Pricing types
+export type TokenPricing = {
+  input_price_per_token?: number | null;
+  output_price_per_token?: number | null;
+};
+
+export type TokenPricingUpdate = TokenPricing;
+
 // Base model types
 export interface Model {
   id: string;
@@ -58,6 +66,7 @@ export interface Model {
   groups?: Group[]; // array of group IDs - only present when include=groups
   metrics?: ModelMetrics; // only present when include=metrics
   status?: ModelProbeStatus; // only present when include=status
+  pricing?: TokenPricing; // only present when include=pricing
 }
 
 export interface Endpoint {
@@ -137,10 +146,18 @@ export type ModelsInclude =
   | "groups"
   | "metrics"
   | "status"
+  | "pricing"
   | "groups,metrics"
   | "groups,status"
+  | "groups,pricing"
   | "metrics,status"
-  | "groups,metrics,status";
+  | "metrics,pricing"
+  | "status,pricing"
+  | "groups,metrics,status"
+  | "groups,metrics,pricing"
+  | "groups,status,pricing"
+  | "metrics,status,pricing"
+  | "groups,metrics,status,pricing";
 export type GroupsInclude = "users" | "models" | "users,models";
 export type UsersInclude = "groups";
 
@@ -212,6 +229,7 @@ export interface ModelUpdateRequest {
   burst_size?: number | null;
   capacity?: number | null;
   batch_capacity?: number | null;
+  pricing?: TokenPricingUpdate;
 }
 
 // Endpoint-specific types
@@ -614,6 +632,7 @@ export interface TransactionsQuery {
 
 export interface AddFundsRequest {
   user_id: string; // UUID of the user to add funds to
+  source_id: string; // UUID of the user providing the funds
   amount: number; // Amount in dollars
   description?: string;
 }

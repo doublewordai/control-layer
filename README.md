@@ -9,6 +9,8 @@ The Doubleword Control Layer (dwctl) is the world’s fastest AI model gateway (
 - Turn any model (self-hosted or hosted) into a production-ready API with full auth and user controls
 - Centrally govern, monitor, and audit all inference activity
 
+To get a sense of how the control layer works, visit our interactive [demo](https://control-layer.pages.dev?flags=demo).
+
 ## Getting started
 
 The Doubleword Control Layer requries Docker to be installed. For information on how to get started with Docker see the docs [here](https://docs.docker.com/get-started/).

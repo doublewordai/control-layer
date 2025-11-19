@@ -5,11 +5,6 @@ import {
   useRequests,
   useRequestsAggregate,
 } from "../../../../api/control-layer";
-import {
-  useMockRequests,
-  useMockAggregateData,
-} from "../../../../api/demo/mockRequests";
-import { useSettings } from "../../../../contexts";
 import { transformRequestResponsePairs } from "../../../../utils";
 import { useAuthorization } from "../../../../utils/authorization";
 import { DataTable } from "../../../ui/data-table";
@@ -27,8 +22,6 @@ import { RequestsAnalytics } from "../RequestsAnalytics";
 import { createRequestColumns } from "./columns";
 
 export function Requests() {
-  const { isFeatureEnabled } = useSettings();
-  const isDemoMode = isFeatureEnabled("demo");
   const { userRoles } = useAuthorization();
   const [searchParams] = useSearchParams();
   const navigate = useNavigate();
@@ -95,31 +88,21 @@ export function Requests() {
   // Get from parameter for back navigation
   const fromUrl = searchParams.get("from");
 
-  // Fetch requests data only if user has requests permission
-  const realRequestsQuery = useRequests(
-    { limit: recordLimit, order_desc: true },
-    { enabled: hasRequestsPermission },
-    dateRange,
-  );
-  const mockRequestsQuery = useMockRequests(
-    { limit: recordLimit, order_desc: true },
-    { enabled: hasRequestsPermission },
-    dateRange,
-  );
-
-  // Choose data source based on demo mode
+  // Fetch requests data only if user has requests permission AND requests tab is active
+  // MSW will intercept these calls in demo mode
   const {
     data: requestsResponse,
     isLoading: requestsLoading,
     error: requestsError,
-  } = isDemoMode ? mockRequestsQuery : realRequestsQuery;
+  } = useRequests(
+    { limit: recordLimit, order_desc: true },
+    { enabled: hasRequestsPermission && activeTab === "requests" },
+    dateRange,
+  );
 
   // Fetch models that have received requests from analytics
-  const realAnalyticsQuery = useRequestsAggregate(undefined, dateRange);
-  const mockAnalyticsQuery = useMockAggregateData(undefined, dateRange);
-  const { data: analyticsData } = isDemoMode
-    ? mockAnalyticsQuery
-    : realAnalyticsQuery;
+  // MSW will intercept this call in demo mode
+  const { data: analyticsData } = useRequestsAggregate(undefined, dateRange);
   const modelsWithRequests = analyticsData?.models || [];
 
   const loading = requestsLoading;
