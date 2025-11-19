@@ -187,6 +187,7 @@ Demo mode can be enabled in three ways:
 ### Demo Data Files
 
 Mock data is stored in `dashboard/src/api/control-layer/mocks/`:
+
 - `users.json`, `groups.json`, `endpoints.json`, `models.json`
 - `api-keys.json`, `transactions.json`
 - `files.json`, `batches.json`, `batch-requests.json`, `file-requests.json`
@@ -195,6 +196,7 @@ Mock data is stored in `dashboard/src/api/control-layer/mocks/`:
 ### Feature Flags
 
 Demo mode is part of the broader feature flag system. Available flags:
+
 - `demo`: Enable demo mode with mock data
 - `use_billing`: Enable billing and cost management features
 
@@ -332,6 +334,7 @@ TAGS=v1.0.0 PLATFORMS=linux/amd64,linux/arm64 docker buildx bake --push
 - **Color palette**: Use the `doubleword-*` color scheme (neutrals, muted tones) defined in `tailwind.config.js`
 - **Spacing & typography**: Consistent use of Tailwind utilities; Space Grotesk font family
 - **Loading states**: Use subtle spinners (`animate-spin`) only when needed, prefer skeleton states for content loading
+- **Mobile responsiveness**: When working on the frontend, always keep mobile responsiveness in mind
 
 ### General
 
@@ -352,3 +355,4 @@ TAGS=v1.0.0 PLATFORMS=linux/amd64,linux/arm64 docker buildx bake --push
 - Database queries should use appropriate indexes (check migrations)
 - Use PostgreSQL LISTEN/NOTIFY for real-time cache invalidation (see `sync/` module)
 - Avoid N+1 queries - batch fetch related data when possible
+
