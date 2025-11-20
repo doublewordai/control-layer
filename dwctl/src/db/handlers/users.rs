@@ -5,7 +5,7 @@ use crate::{
     api::models::users::Role,
     db::{
         errors::{DbError, Result},
-        handlers::repository::Repository,
+        handlers::{repository::Repository, Groups},
         models::users::{UserCreateDBRequest, UserDBResponse, UserUpdateDBRequest},
     },
 };
@@ -351,6 +351,133 @@ impl<'c> Users<'c> {
         } else {
             Ok(None)
         }
+    }
+
+    #[instrument(skip(self, external_user_id), err)]
+    pub async fn get_user_by_external_user_id(&mut self, external_user_id: &str) -> Result<Option<UserDBResponse>> {
+        let user = sqlx::query_as!(
+            User,
+            "SELECT * FROM users WHERE external_user_id = $1 AND id != '00000000-0000-0000-0000-000000000000'",
+            external_user_id
+        )
+        .fetch_optional(&mut *self.db)
+        .await?;
+
+        if let Some(user) = user {
+            // Get roles for this user
+            let roles = sqlx::query!("SELECT role as \"role: Role\" FROM user_roles WHERE user_id = $1", user.id)
+                .fetch_all(&mut *self.db)
+                .await?;
+
+            let roles: Vec<Role> = roles.into_iter().map(|r| r.role).collect();
+
+            Ok(Some(UserDBResponse::from((roles, user))))
+        } else {
+            Ok(None)
+        }
+    }
+
+    /// Get or create a user for proxy header authentication.
+    ///
+    /// This method handles the complete proxy header auth flow:
+    /// 1. Look up by external_user_id → if found, update email and groups
+    /// 2. Fall back to email lookup (TEMPORARY migration support) → update external_user_id and groups
+    /// 3. If not found, create new user
+    ///
+    /// Email is required for user creation. Groups are synced if provided (along with provider).
+    #[instrument(skip(self, external_user_id, email, groups_and_provider), err)]
+    pub async fn get_or_create_proxy_header_user(
+        &mut self,
+        external_user_id: &str,
+        email: &str,
+        groups_and_provider: Option<(Vec<String>, &str)>,
+    ) -> Result<UserDBResponse> {
+        // Look up by external_user_id (preferred)
+        if let Some(mut user) = self.get_user_by_external_user_id(external_user_id).await? {
+            // Found by external_user_id - update email and sync groups
+            if user.email != email {
+                sqlx::query!("UPDATE users SET email = $1 WHERE id = $2", email, user.id)
+                    .execute(&mut *self.db)
+                    .await?;
+                user.email = email.to_string();
+            }
+
+            // no need to update in memory user, since groups are in a join table
+            if let Some((groups, provider)) = groups_and_provider {
+                let mut group_repo = Groups::new(&mut *self.db);
+                group_repo
+                    .sync_groups_with_sso(
+                        user.id,
+                        groups,
+                        provider,
+                        &format!("A group provisioned by the {provider} SSO source."),
+                    )
+                    .await?;
+            }
+
+            return Ok(user);
+        }
+
+        // TEMPORARY: Fall back to email lookup for migration
+        // TODO: Remove this after all users have external_user_id populated
+        if let Some(mut user) = self.get_user_by_email(email).await? {
+            // Found by email - backfill external_user_id and sync groups
+            if let Some(existing_external_id) = &user.external_user_id {
+                if existing_external_id != external_user_id {
+                    return Err(DbError::Other(anyhow::anyhow!("External user ID mismatch")));
+                }
+            } else {
+                sqlx::query!("UPDATE users SET external_user_id = $1 WHERE id = $2", external_user_id, user.id)
+                    .execute(&mut *self.db)
+                    .await?;
+                user.external_user_id = Some(external_user_id.to_string());
+            }
+
+            // no need to update in memory user, since groups are in a join table
+            if let Some((groups, provider)) = groups_and_provider {
+                let mut group_repo = Groups::new(&mut *self.db);
+                group_repo
+                    .sync_groups_with_sso(
+                        user.id,
+                        groups,
+                        provider,
+                        &format!("A group provisioned by the {provider} SSO source."),
+                    )
+                    .await?;
+            }
+
+            return Ok(user);
+        }
+
+        // User not found, by either email or id, create new user
+        let create_request = UserCreateDBRequest {
+            username: external_user_id.to_string(),
+            email: email.to_string(),
+            display_name: None,
+            avatar_url: None,
+            is_admin: false,
+            roles: vec![Role::StandardUser],
+            auth_source: "proxy-header".to_string(),
+            password_hash: None,
+            external_user_id: Some(external_user_id.to_string()),
+        };
+
+        let user = self.create(&create_request).await?;
+
+        // Sync groups for new user
+        if let Some((groups, provider)) = groups_and_provider {
+            let mut group_repo = Groups::new(&mut *self.db);
+            group_repo
+                .sync_groups_with_sso(
+                    user.id,
+                    groups,
+                    provider,
+                    &format!("A group provisioned by the {provider} SSO source."),
+                )
+                .await?;
+        }
+
+        Ok(user)
     }
 }
 

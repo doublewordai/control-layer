@@ -4,6 +4,9 @@
 
 ALTER TABLE users ADD COLUMN external_user_id TEXT;
 
+-- No backfill - external_user_id will be populated on first login
+-- This allows the value to match whatever the upstream proxy actually sends
+
 -- Create unique index on external_user_id for fast lookups
 -- Use partial index to allow multiple NULL values (for native auth users)
 CREATE UNIQUE INDEX IF NOT EXISTS idx_users_external_user_id

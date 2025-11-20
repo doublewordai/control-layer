@@ -63,11 +63,12 @@ auth:
       cookie_secure: true
       cookie_same_site: "strict"
 
-  # Proxy header authentication. Will accept & autocreate users based on emails
-  # supplied in a header. Lets you use an upstream proxy to authenticate users.
+  # Proxy header authentication. Will accept & autocreate users based on
+  # unique user IDs supplied in headers. Lets you use an upstream proxy to authenticate users.
   proxy_header:
-    enabled: true # X-Doubleword-User header auth
-    header_name: "x-doubleword-user"
+    enabled: true
+    header_name: "x-doubleword-user"           # Unique user ID from IdP
+    email_header_name: "x-doubleword-email"    # User's email address
     auto_create_users: true
 
   # Security settings

@@ -1,14 +1,10 @@
 //! User extraction from request authentication.
 
 use crate::db::errors::DbError;
-use crate::db::handlers::Groups;
 use crate::{
     api::models::users::{CurrentUser, Role},
     auth::session,
-    db::{
-        handlers::{Repository, Users},
-        models::users::UserCreateDBRequest,
-    },
+    db::handlers::Users,
     errors::{Error, Result},
     AppState,
 };
@@ -65,13 +61,48 @@ async fn try_proxy_header_auth(
     config: &crate::config::Config,
     db: &PgPool,
 ) -> Option<Result<CurrentUser>> {
-    let user_email = match parts
+    // Extract external_user_id from header_name (required)
+    let external_user_id = parts
         .headers
         .get(&config.auth.proxy_header.header_name)
+        .and_then(|h| h.to_str().ok())?;
+
+    // Extract email from email_header_name (required)
+    let user_email = match parts
+        .headers
+        .get(&config.auth.proxy_header.email_header_name)
         .and_then(|h| h.to_str().ok())
     {
         Some(email) => email,
-        None => return None,
+        None => return Some(Err(Error::Unauthenticated { message: None })),
+    };
+
+    // Extract groups and provider if import_idp_groups is enabled
+    let groups_and_provider = if config.auth.proxy_header.import_idp_groups {
+        parts
+            .headers
+            .get(&config.auth.proxy_header.groups_field_name)
+            .and_then(|h| h.to_str().ok())
+            .and_then(|group_string| {
+                let groups: Vec<String> = group_string
+                    .split(',')
+                    .map(|g| g.trim().to_string())
+                    .filter(|g| !config.auth.proxy_header.blacklisted_sso_groups.contains(g))
+                    .collect();
+
+                if groups.is_empty() {
+                    None
+                } else {
+                    let provider = parts
+                        .headers
+                        .get(&config.auth.proxy_header.provider_field_name)
+                        .and_then(|h| h.to_str().ok())
+                        .unwrap_or("unknown");
+                    Some((groups, provider))
+                }
+            })
+    } else {
+        None
     };
 
     let mut tx = match db.begin().await {
@@ -80,95 +111,41 @@ async fn try_proxy_header_auth(
     };
     let mut user_repo = Users::new(&mut tx);
 
-    let user_result = match user_repo.get_user_by_email(user_email).await {
-        Ok(Some(user)) => Some(CurrentUser {
-            id: user.id,
-            username: user.username,
-            email: user.email,
-            is_admin: user.is_admin,
-            roles: user.roles,
-            display_name: user.display_name,
-            avatar_url: user.avatar_url,
-        }),
-        Ok(None) => {
-            if config.auth.proxy_header.auto_create_users {
-                let create_request = UserCreateDBRequest {
-                    username: user_email.to_string(),
-                    email: user_email.to_string(),
-                    display_name: None,
-                    avatar_url: None,
-                    is_admin: false,
-                    roles: vec![Role::StandardUser],
-                    auth_source: "proxy-header".to_string(),
-                    password_hash: None,
-                    external_user_id: None,
-                };
-
-                match user_repo.create(&create_request).await {
-                    Ok(new_user) => Some(CurrentUser {
-                        id: new_user.id,
-                        username: new_user.username,
-                        email: new_user.email,
-                        is_admin: new_user.is_admin,
-                        roles: new_user.roles,
-                        display_name: new_user.display_name,
-                        avatar_url: new_user.avatar_url,
-                    }),
-                    Err(e) => return Some(Err(Error::Database(e))),
-                }
-            } else {
-                None
-            }
+    // Get or create user with group sync (only if auto_create is enabled)
+    let user_result = if config.auth.proxy_header.auto_create_users {
+        match user_repo
+            .get_or_create_proxy_header_user(external_user_id, user_email, groups_and_provider)
+            .await
+        {
+            Ok(user) => Some(CurrentUser {
+                id: user.id,
+                username: user.username,
+                email: user.email,
+                is_admin: user.is_admin,
+                roles: user.roles,
+                display_name: user.display_name,
+                avatar_url: user.avatar_url,
+            }),
+            Err(e) => return Some(Err(Error::Database(e))),
         }
-        Err(e) => return Some(Err(Error::Database(e))),
+    } else {
+        // auto_create disabled - just lookup by external_user_id
+        match user_repo.get_user_by_external_user_id(external_user_id).await {
+            Ok(Some(user)) => Some(CurrentUser {
+                id: user.id,
+                username: user.username,
+                email: user.email,
+                is_admin: user.is_admin,
+                roles: user.roles,
+                display_name: user.display_name,
+                avatar_url: user.avatar_url,
+            }),
+            Ok(None) => None,
+            Err(e) => return Some(Err(Error::Database(e))),
+        }
     };
 
-    // If we found a user, check their oauth groups match their db ones.
-    if let Some(user) = &user_result {
-        if config.auth.proxy_header.import_idp_groups {
-            let user_groups: Option<Vec<&str>> = match parts
-                .headers
-                .get(&config.auth.proxy_header.groups_field_name)
-                .and_then(|h| h.to_str().ok())
-            {
-                Some(group_string) => {
-                    let groups: Vec<&str> = group_string
-                        .split(",")
-                        .map(|g| g.trim())
-                        .filter(|g| !config.auth.proxy_header.blacklisted_sso_groups.contains(&g.to_string()))
-                        .collect();
-                    if groups.is_empty() {
-                        None
-                    } else {
-                        Some(groups)
-                    }
-                }
-                None => None,
-            };
-
-            let source = parts
-                .headers
-                .get(&config.auth.proxy_header.provider_field_name) // &String works as &str
-                .and_then(|h| h.to_str().ok()) // convert HeaderValue → &str
-                .unwrap_or("unknown"); // default if header missing or invalid UTF-8
-            if let Some(groups) = user_groups {
-                let mut group_repo = Groups::new(&mut tx);
-                if let Err(e) = group_repo
-                    .sync_groups_with_sso(
-                        user.id,
-                        groups.into_iter().map(|s| s.to_string()).collect(),
-                        source,
-                        &format!("A group provisioned by the {source} SSO source."),
-                    )
-                    .await
-                {
-                    return Some(Err(Error::Database(e)));
-                }
-            }
-        }
-    }
-
-    // Only commit if both user and group operations succeeded
+    // Commit transaction
     match tx.commit().await {
         Ok(_) => {}
         Err(e) => return Some(Err(DbError::from(e).into())),
