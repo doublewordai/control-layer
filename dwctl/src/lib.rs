@@ -606,6 +606,7 @@ pub async fn build_router(state: &mut AppState, onwards_router: Router) -> anyho
         .route("/transactions", get(api::handlers::transactions::list_transactions))
         // Payment processing
         .route("/payments/create_checkout", post(api::handlers::payments::create_checkout))
+        .route("/payments/process/{session_id}", post(api::handlers::payments::process_payment))
         // Inference endpoints management (admin only for write operations)
         .route("/endpoints", get(api::handlers::inference_endpoints::list_inference_endpoints))
         .route("/endpoints", post(api::handlers::inference_endpoints::create_inference_endpoint))
@@ -732,7 +733,7 @@ pub async fn build_router(state: &mut AppState, onwards_router: Router) -> anyho
             }),
         )
         // Webhook routes (external services, not part of client API docs)
-        .route("/webhooks/stripe", post(api::handlers::payments::stripe_webhook))
+        .route("/webhooks/stripe", post(api::handlers::payments::stripe::webhook))
         .with_state(state.clone())
         .merge(auth_routes)
         .nest("/ai/v1", ai_router)
