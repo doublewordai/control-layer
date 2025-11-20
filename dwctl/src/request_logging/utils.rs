@@ -8,33 +8,42 @@ use super::models::{ChatCompletionChunk, SseParseError};
 
 /// Parse a Server-Sent Events string into a vector of data chunks
 ///
+/// Per the SSE specification, empty data fields (e.g., "data: \n\n") should
+/// dispatch events with empty string data, not be ignored.
+///
 /// # Errors
-/// - `SseParseError::InvalidFormat` if no valid SSE data found
+/// - `SseParseError::InvalidFormat` if no valid SSE data fields found
 fn parse_sse_chunks(body_str: &str) -> Result<Vec<String>, SseParseError> {
     let mut chunks = Vec::new();
     let mut current_event_data = String::new();
     let mut found_sse_data = false;
+    let mut has_pending_data = false;
 
     for line in body_str.lines() {
-        let line = line.trim();
+        let trimmed = line.trim();
 
-        if let Some(data_part) = line.strip_prefix("data: ") {
-            // Skip "data: "
+        // Handle both "data: value" and "data:value" formats
+        if let Some(data_part) = trimmed.strip_prefix("data:") {
+            // Found a data field - even if empty, it's valid per SSE spec
+            // Strip leading space if present (e.g., "data: " vs "data:")
+            let data_part = data_part.strip_prefix(' ').unwrap_or(data_part);
             current_event_data = data_part.to_string();
             found_sse_data = true;
-        } else if line.is_empty() && !current_event_data.is_empty() {
-            // End of event, add the accumulated data
+            has_pending_data = true;
+        } else if trimmed.is_empty() && has_pending_data {
+            // End of event, add the accumulated data (even if empty)
             chunks.push(current_event_data.clone());
             current_event_data.clear();
+            has_pending_data = false;
         }
     }
 
     // Process any remaining data (in case the stream doesn't end with empty line)
-    if !current_event_data.is_empty() {
+    if has_pending_data {
         chunks.push(current_event_data);
     }
 
-    if !found_sse_data || chunks.is_empty() {
+    if !found_sse_data {
         return Err(SseParseError::InvalidFormat);
     }
 
@@ -162,13 +171,13 @@ mod tests {
     #[test]
     fn test_parse_sse_chunks_empty_data() {
         // Test case with valid SSE prefix but empty/whitespace-only data
+        // Per SSE spec, this should dispatch an event with empty string data
         let sse_data = "data: \n\n";
 
-        let result = parse_sse_chunks(sse_data);
+        let result = parse_sse_chunks(sse_data).unwrap();
 
-        // With empty data after "data: ", this should return InvalidFormat
-        // TODO: This is the current behaviour: its not ideal
-        assert_eq!(result.unwrap_err(), SseParseError::InvalidFormat);
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0], "");
     }
 
     #[test]
