@@ -7,6 +7,9 @@ import {
   formatLongDuration,
   formatTimestamp,
   formatBytes,
+  formatLatency,
+  formatRelativeTime,
+  formatPricing,
 } from "./formatters";
 
 describe("formatters", () => {
@@ -20,6 +23,12 @@ describe("formatters", () => {
       expect(formatMemory(1000)).toBe("1.0TB");
       expect(formatMemory(2500)).toBe("2.5TB");
     });
+
+    it("should handle invalid numbers", () => {
+      expect(formatMemory(NaN)).toBe("N/A");
+      expect(formatMemory(Infinity)).toBe("N/A");
+      expect(formatMemory(-100)).toBe("0GB");
+    });
   });
 
   describe("formatNumber", () => {
@@ -28,14 +37,26 @@ describe("formatters", () => {
       expect(formatNumber(999)).toBe("999");
     });
 
-    it("should format thousands with k suffix", () => {
-      expect(formatNumber(1000)).toBe("1k");
-      expect(formatNumber(5500)).toBe("6k");
+    it("should format thousands with K suffix", () => {
+      expect(formatNumber(1000)).toBe("1.0K");
+      expect(formatNumber(5500)).toBe("5.5K");
     });
 
     it("should format millions with M suffix", () => {
       expect(formatNumber(1000000)).toBe("1.0M");
       expect(formatNumber(2500000)).toBe("2.5M");
+    });
+
+    it("should format billions with B suffix", () => {
+      expect(formatNumber(1000000000)).toBe("1.0B");
+      expect(formatNumber(2500000000)).toBe("2.5B");
+    });
+
+    it("should handle invalid numbers", () => {
+      expect(formatNumber(NaN)).toBe("N/A");
+      expect(formatNumber(Infinity)).toBe("N/A");
+      expect(formatNumber(-Infinity)).toBe("N/A");
+      expect(formatNumber(-100)).toBe("0");
     });
   });
 
@@ -45,14 +66,20 @@ describe("formatters", () => {
       expect(formatTokens(999)).toBe("999");
     });
 
-    it("should format thousands with k suffix", () => {
-      expect(formatTokens(1000)).toBe("1k");
-      expect(formatTokens(5000)).toBe("5k");
+    it("should format thousands with K suffix", () => {
+      expect(formatTokens(1000)).toBe("1.0K");
+      expect(formatTokens(5000)).toBe("5.0K");
     });
 
     it("should format millions with M suffix", () => {
-      expect(formatTokens(1000000)).toBe("1M");
-      expect(formatTokens(2500000)).toBe("3M");
+      expect(formatTokens(1000000)).toBe("1.0M");
+      expect(formatTokens(2500000)).toBe("2.5M");
+    });
+
+    it("should handle invalid numbers", () => {
+      expect(formatTokens(NaN)).toBe("N/A");
+      expect(formatTokens(Infinity)).toBe("N/A");
+      expect(formatTokens(-100)).toBe("0");
     });
   });
 
@@ -69,6 +96,12 @@ describe("formatters", () => {
     it("should format minutes and seconds", () => {
       expect(formatDuration(90000)).toBe("1m 30s");
       expect(formatDuration(125000)).toBe("2m 5s");
+    });
+
+    it("should handle invalid numbers", () => {
+      expect(formatDuration(NaN)).toBe("N/A");
+      expect(formatDuration(Infinity)).toBe("N/A");
+      expect(formatDuration(-100)).toBe("0ms");
     });
   });
 
@@ -96,6 +129,12 @@ describe("formatters", () => {
     it("should format exact days", () => {
       expect(formatLongDuration(86400000)).toBe("1d");
     });
+
+    it("should handle invalid numbers", () => {
+      expect(formatLongDuration(NaN)).toBe("N/A");
+      expect(formatLongDuration(Infinity)).toBe("N/A");
+      expect(formatLongDuration(-100)).toBe("0s");
+    });
   });
 
   describe("formatTimestamp", () => {
@@ -104,6 +143,11 @@ describe("formatters", () => {
       const result = formatTimestamp(timestamp);
       expect(result).toBeTruthy();
       expect(typeof result).toBe("string");
+    });
+
+    it("should handle invalid dates", () => {
+      expect(formatTimestamp("garbage")).toBe("Invalid date");
+      expect(formatTimestamp("not-a-date")).toBe("Invalid date");
     });
   });
 
@@ -127,6 +171,94 @@ describe("formatters", () => {
 
     it("should format gigabytes", () => {
       expect(formatBytes(1073741824)).toBe("1 GB");
+    });
+
+    it("should handle invalid numbers", () => {
+      expect(formatBytes(NaN)).toBe("N/A");
+      expect(formatBytes(Infinity)).toBe("N/A");
+      expect(formatBytes(-100)).toBe("0 Bytes");
+    });
+  });
+
+  describe("formatLatency", () => {
+    it("should return N/A for undefined or null", () => {
+      expect(formatLatency(undefined)).toBe("N/A");
+      expect(formatLatency(0)).toBe("N/A");
+    });
+
+    it("should format milliseconds", () => {
+      expect(formatLatency(50)).toBe("50ms");
+      expect(formatLatency(999)).toBe("999ms");
+    });
+
+    it("should format seconds", () => {
+      expect(formatLatency(1000)).toBe("1.0s");
+      expect(formatLatency(1500)).toBe("1.5s");
+      expect(formatLatency(2345)).toBe("2.3s");
+    });
+  });
+
+  describe("formatRelativeTime", () => {
+    it("should return Never for undefined", () => {
+      expect(formatRelativeTime(undefined)).toBe("Never");
+    });
+
+    it("should format just now", () => {
+      const now = new Date().toISOString();
+      expect(formatRelativeTime(now)).toBe("Just now");
+    });
+
+    it("should format minutes ago", () => {
+      const minutesAgo = new Date(Date.now() - 5 * 60 * 1000).toISOString();
+      expect(formatRelativeTime(minutesAgo)).toBe("5m ago");
+    });
+
+    it("should format hours ago", () => {
+      const hoursAgo = new Date(Date.now() - 3 * 60 * 60 * 1000).toISOString();
+      expect(formatRelativeTime(hoursAgo)).toBe("3h ago");
+    });
+
+    it("should format days ago", () => {
+      const daysAgo = new Date(Date.now() - 2 * 24 * 60 * 60 * 1000).toISOString();
+      expect(formatRelativeTime(daysAgo)).toBe("2d ago");
+    });
+
+    it("should format older dates as locale string", () => {
+      const longAgo = new Date(Date.now() - 10 * 24 * 60 * 60 * 1000).toISOString();
+      const result = formatRelativeTime(longAgo);
+      expect(result).toBeTruthy();
+      expect(result).not.toContain("ago");
+    });
+  });
+
+  describe("formatPricing", () => {
+    it("should return N/A for undefined pricing", () => {
+      expect(formatPricing(undefined)).toBe("N/A");
+    });
+
+    it("should return N/A when both prices are null", () => {
+      expect(formatPricing({ input_price_per_token: null, output_price_per_token: null })).toBe("N/A");
+    });
+
+    it("should format both input and output prices", () => {
+      expect(formatPricing({
+        input_price_per_token: 0.0001,
+        output_price_per_token: 0.0002
+      })).toBe("$0.0001 / $0.0002");
+    });
+
+    it("should handle missing input price", () => {
+      expect(formatPricing({
+        input_price_per_token: null,
+        output_price_per_token: 0.0002
+      })).toBe("N/A / $0.0002");
+    });
+
+    it("should handle missing output price", () => {
+      expect(formatPricing({
+        input_price_per_token: 0.0001,
+        output_price_per_token: null
+      })).toBe("$0.0001 / N/A");
     });
   });
 });

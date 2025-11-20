@@ -798,6 +798,134 @@ mod tests {
     /// is committed wins and the second calculated its balance based on stale data.
     #[sqlx::test]
     #[test_log::test]
+    async fn test_balance_threshold_notification_triggers(pool: PgPool) {
+        use sqlx::postgres::PgListener;
+        use std::time::Duration;
+        use tokio::time::timeout;
+
+        let user_id = create_test_user(&pool).await;
+
+        // Setup a listener for auth_config_changed notifications
+        let mut listener = PgListener::connect_with(&pool).await.expect("Failed to create listener");
+        listener
+            .listen("auth_config_changed")
+            .await
+            .expect("Failed to listen to auth_config_changed");
+
+        // Test 1: Going from 0 to positive (SHOULD trigger - crossing zero threshold)
+        // This enables API keys when user gets their first credits
+        {
+            let mut conn = pool.acquire().await.expect("Failed to acquire connection");
+            let mut credits = Credits::new(&mut conn);
+
+            let request = CreditTransactionCreateDBRequest {
+                user_id,
+                transaction_type: CreditTransactionType::AdminGrant,
+                amount: Decimal::from_str("100.0").unwrap(),
+                source_id: user_id.to_string(),
+                description: Some("Initial grant".to_string()),
+            };
+            credits.create_transaction(&request).await.expect("Failed to create transaction");
+        }
+
+        // Should receive notification
+        let notification = timeout(Duration::from_secs(2), listener.recv())
+            .await
+            .expect("Timeout waiting for notification")
+            .expect("Failed to receive notification");
+
+        assert_eq!(notification.channel(), "auth_config_changed");
+
+        let payload: serde_json::Value = serde_json::from_str(notification.payload()).expect("Failed to parse notification payload");
+
+        assert_eq!(payload["user_id"], user_id.to_string());
+        assert_eq!(payload["threshold_crossed"], "zero");
+        assert_eq!(payload["old_balance"].as_f64().unwrap(), 0.0);
+        assert_eq!(payload["new_balance"].as_f64().unwrap(), 100.0);
+
+        // Test 2: Going from positive to negative (crossing zero threshold downward - SHOULD trigger)
+        {
+            let mut conn = pool.acquire().await.expect("Failed to acquire connection");
+            let mut credits = Credits::new(&mut conn);
+
+            let request = CreditTransactionCreateDBRequest {
+                user_id,
+                transaction_type: CreditTransactionType::Usage,
+                amount: Decimal::from_str("150.0").unwrap(),
+                source_id: user_id.to_string(),
+                description: Some("Usage that crosses zero".to_string()),
+            };
+            credits.create_transaction(&request).await.expect("Failed to create transaction");
+        }
+
+        // Should receive notification
+        let notification = timeout(Duration::from_secs(2), listener.recv())
+            .await
+            .expect("Timeout waiting for notification")
+            .expect("Failed to receive notification");
+
+        assert_eq!(notification.channel(), "auth_config_changed");
+
+        // Parse the JSON payload
+        let payload: serde_json::Value = serde_json::from_str(notification.payload()).expect("Failed to parse notification payload");
+
+        assert_eq!(payload["user_id"], user_id.to_string());
+        assert_eq!(payload["threshold_crossed"], "zero");
+        assert_eq!(payload["old_balance"].as_f64().unwrap(), 100.0);
+        assert_eq!(payload["new_balance"].as_f64().unwrap(), -50.0);
+
+        // Test 3: Going from negative to positive (crossing zero threshold upward - SHOULD trigger)
+        {
+            let mut conn = pool.acquire().await.expect("Failed to acquire connection");
+            let mut credits = Credits::new(&mut conn);
+
+            let request = CreditTransactionCreateDBRequest {
+                user_id,
+                transaction_type: CreditTransactionType::AdminGrant,
+                amount: Decimal::from_str("100.0").unwrap(),
+                source_id: user_id.to_string(),
+                description: Some("Grant that crosses zero".to_string()),
+            };
+            credits.create_transaction(&request).await.expect("Failed to create transaction");
+        }
+
+        // Should receive notification
+        let notification = timeout(Duration::from_secs(2), listener.recv())
+            .await
+            .expect("Timeout waiting for notification")
+            .expect("Failed to receive notification");
+
+        assert_eq!(notification.channel(), "auth_config_changed");
+
+        let payload: serde_json::Value = serde_json::from_str(notification.payload()).expect("Failed to parse notification payload");
+
+        assert_eq!(payload["user_id"], user_id.to_string());
+        assert_eq!(payload["threshold_crossed"], "zero");
+        assert_eq!(payload["old_balance"].as_f64().unwrap(), -50.0);
+        assert_eq!(payload["new_balance"].as_f64().unwrap(), 50.0);
+
+        // Test 4: Staying in positive range (should NOT trigger)
+        {
+            let mut conn = pool.acquire().await.expect("Failed to acquire connection");
+            let mut credits = Credits::new(&mut conn);
+
+            let request = CreditTransactionCreateDBRequest {
+                user_id,
+                transaction_type: CreditTransactionType::AdminGrant,
+                amount: Decimal::from_str("50.0").unwrap(),
+                source_id: user_id.to_string(),
+                description: Some("Another grant".to_string()),
+            };
+            credits.create_transaction(&request).await.expect("Failed to create transaction");
+        }
+
+        // Try to receive notification with short timeout - should NOT receive one
+        let result = timeout(Duration::from_millis(500), listener.recv()).await;
+        assert!(result.is_err(), "Should NOT receive notification when staying in positive range");
+    }
+
+    #[sqlx::test]
+    #[test_log::test]
     async fn test_concurrent_transactions_no_race_condition(pool: PgPool) {
         use std::sync::Arc;
         use tokio::task;
@@ -945,5 +1073,95 @@ mod tests {
             "Expected {} but got {}",
             transactions[0].balance_after, final_balance
         );
+    }
+
+    #[sqlx::test]
+    #[test_log::test]
+    async fn test_create_transaction_large_amounts(pool: PgPool) {
+        let user_id = create_test_user(&pool).await;
+        let mut conn = pool.acquire().await.expect("Failed to acquire connection");
+        let mut credits = Credits::new(&mut conn);
+
+        // Test with large credit amount that fits in DECIMAL(12, 2)
+        // Maximum is 9,999,999,999.99
+        let large_amount = Decimal::from_str("1000000000.00").unwrap(); // 1 billion
+        let request = CreditTransactionCreateDBRequest {
+            user_id,
+            transaction_type: CreditTransactionType::AdminGrant,
+            amount: large_amount,
+            source_id: user_id.to_string(),
+            description: Some("Large credit grant".to_string()),
+        };
+
+        let transaction = credits
+            .create_transaction(&request)
+            .await
+            .expect("Failed to create large transaction");
+
+        assert_eq!(transaction.user_id, user_id);
+        assert_eq!(transaction.amount, large_amount);
+        assert_eq!(transaction.balance_after, large_amount);
+
+        // Add another large amount
+        let request2 = CreditTransactionCreateDBRequest {
+            user_id,
+            transaction_type: CreditTransactionType::AdminGrant,
+            amount: large_amount,
+            source_id: user_id.to_string(),
+            description: Some("Second large grant".to_string()),
+        };
+
+        let transaction2 = credits
+            .create_transaction(&request2)
+            .await
+            .expect("Failed to create second large transaction");
+
+        assert_eq!(transaction2.balance_after, Decimal::from_str("2000000000.00").unwrap());
+
+        // Verify balance
+        let balance = credits.get_user_balance(user_id).await.expect("Failed to get balance");
+        assert_eq!(balance, Decimal::from_str("2000000000.00").unwrap());
+    }
+
+    #[sqlx::test]
+    #[test_log::test]
+    async fn test_create_transaction_preserves_high_precision(pool: PgPool) {
+        let user_id = create_test_user(&pool).await;
+        let mut conn = pool.acquire().await.expect("Failed to acquire connection");
+        let mut credits = Credits::new(&mut conn);
+
+        // Test with high precision amount (e.g., per-token micro-transaction)
+        let request = CreditTransactionCreateDBRequest {
+            user_id,
+            transaction_type: CreditTransactionType::AdminGrant,
+            amount: Decimal::from_str("100.12345678").unwrap(),
+            source_id: user_id.to_string(),
+            description: Some("High precision grant".to_string()),
+        };
+
+        let transaction = credits.create_transaction(&request).await.expect("Failed to create transaction");
+
+        // Amount should preserve all decimal places (no rounding)
+        assert_eq!(transaction.amount, Decimal::from_str("100.12345678").unwrap());
+        assert_eq!(transaction.balance_after, Decimal::from_str("100.12345678").unwrap());
+
+        // Test micro-transaction precision (like per-token costs)
+        let micro_request = CreditTransactionCreateDBRequest {
+            user_id,
+            transaction_type: CreditTransactionType::Usage,
+            amount: Decimal::from_str("0.000000405").unwrap(), // ~1 input + 1 output token cost
+            source_id: "micro-txn".to_string(),
+            description: Some("Micro-transaction".to_string()),
+        };
+
+        let micro_transaction = credits
+            .create_transaction(&micro_request)
+            .await
+            .expect("Failed to create micro-transaction");
+
+        // Micro-transaction should preserve full precision
+        assert_eq!(micro_transaction.amount, Decimal::from_str("0.000000405").unwrap());
+        assert_eq!(micro_transaction.balance_after, Decimal::from_str("100.123456375").unwrap());
+        // 100.12345678 - 0.000000405
     }
 }

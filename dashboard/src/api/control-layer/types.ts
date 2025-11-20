@@ -634,6 +634,7 @@ export interface TransactionsQuery {
 
 export interface AddFundsRequest {
   user_id: string; // UUID of the user to add funds to
+  source_id: string; // UUID of the user providing the funds
   amount: number; // Amount in dollars
   description?: string;
 }

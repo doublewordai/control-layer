@@ -468,10 +468,10 @@ pub async fn store_analytics_record(pool: &PgPool, metrics: &UsageMetrics, auth:
     // =======================================================================
     // Deduct credits for API usage if applicable
     // =======================================================================
-    // Skip credit deduction for Playground access, Auth::None will also be implicitly skipped as they'll have no user id
-    if !matches!(auth, Auth::Playground { .. }) {
-        // Deduct credits if applicable (user_id present and at least one price is set)
-        if let (Some(user_id), Some(model)) = (row.user_id, &row.request_model) {
+    // Deduct credits if applicable (user_id present and at least one price is set)
+    if let (Some(user_id), Some(model)) = (row.user_id, &row.request_model) {
+        // skip deduction if originated from system user
+        if user_id != Uuid::nil() {
             // Check if at least one price is set
             if row.input_price_per_token.is_some() || row.output_price_per_token.is_some() {
                 // Calculate total cost - use zero for missing prices
@@ -1818,7 +1818,7 @@ mod tests {
 
         #[sqlx::test]
         #[test_log::test]
-        async fn test_playground_users_not_charged(pool: sqlx::PgPool) {
+        async fn test_playground_users_are_charged(pool: sqlx::PgPool) {
             // Setup: User with balance (accessed via Playground/SSO)
             let initial_balance = Decimal::from_str("10.00").unwrap();
             let user = create_test_user(&pool, Role::StandardUser).await;
@@ -1842,6 +1842,73 @@ mod tests {
             let auth = Auth::Playground {
                 user_email: user.email.clone(),
             };
+
+            // Create metrics with pricing and tokens (would normally cost money)
+            let input_price = Decimal::from_str("0.00001").unwrap();
+            let output_price = Decimal::from_str("0.00003").unwrap();
+            let metrics = create_test_usage_metrics(Some(input_price), Some(output_price), 1000, 500);
+
+            // Execute
+            let result = store_analytics_record(&pool, &metrics, &auth).await;
+            assert!(result.is_ok(), "Analytics record should be created");
+
+            // Verify: Balance SHOULD change (Playground users ARE charged)
+            let mut conn = pool.acquire().await.unwrap();
+            let mut credits = Credits::new(&mut conn);
+            let final_balance = credits.get_user_balance(user_id).await.unwrap();
+
+            // Expected cost is rounded to 2 decimal places (0.025 -> 0.02)
+            let expected_cost = Decimal::from_str("0.02").unwrap();
+            let expected_balance = initial_balance - expected_cost;
+            assert_eq!(
+                final_balance, expected_balance,
+                "Balance should be deducted correctly for Playground users"
+            );
+
+            // Verify: Transaction was created
+            let transactions = credits.list_user_transactions(user_id, 0, 10).await.unwrap();
+            let usage_tx = transactions.iter().find(|tx| tx.transaction_type == CreditTransactionType::Usage);
+            assert!(usage_tx.is_some(), "Usage transaction should be created");
+
+            let usage_tx = usage_tx.unwrap();
+            assert_eq!(
+                usage_tx.amount, expected_cost,
+                "Transaction amount should be rounded to 2 decimal places"
+            );
+            assert_eq!(usage_tx.balance_after, expected_balance, "Balance after should match");
+
+            // Verify: Analytics record WAS created (tracking, just not billing)
+            let analytics_count = sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM http_analytics WHERE user_id = $1")
+                .bind(user_id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+            assert_eq!(analytics_count, 1, "Analytics record should be created for tracking");
+        }
+
+        #[sqlx::test]
+        #[test_log::test]
+        async fn test_system_user_are_not_charged(pool: sqlx::PgPool) {
+            // Setup: User with balance (accessed via Playground/SSO)
+            let initial_balance = Decimal::from_str("10.00").unwrap();
+            let user_id = Uuid::nil();
+
+            // Grant initial balance
+            let mut conn = pool.acquire().await.expect("Failed to acquire connection");
+            let mut credits = Credits::new(&mut conn);
+            credits
+                .create_transaction(&CreditTransactionCreateDBRequest {
+                    user_id,
+                    transaction_type: CreditTransactionType::AdminGrant,
+                    amount: initial_balance,
+                    source_id: "test_setup".to_string(),
+                    description: Some("Initial test balance".to_string()),
+                })
+                .await
+                .expect("Failed to create initial balance");
+
+            // Create Playground auth (SSO via X-Doubleword-User header)
+            let auth = create_test_auth_for_user(&pool, user_id).await;
 
             // Create metrics with pricing and tokens (would normally cost money)
             let input_price = Decimal::from_str("0.00001").unwrap();

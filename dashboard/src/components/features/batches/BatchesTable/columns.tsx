@@ -103,6 +103,9 @@ export const createBatchColumns = (
         return <span className="text-gray-400">-</span>;
       }
 
+      // Truncate file ID to show first 8 characters
+      const truncatedId = inputFile.id.slice(0, 8) + "...";
+
       return (
         <div
           className="flex items-center gap-2 cursor-pointer hover:text-blue-600 transition-colors"
@@ -112,7 +115,7 @@ export const createBatchColumns = (
           }}
         >
           <FileText className="w-4 h-4 text-gray-500" />
-          <span className="font-medium">{inputFile.filename}</span>
+          <span className="font-mono text-sm">{truncatedId}</span>
         </div>
       );
     },

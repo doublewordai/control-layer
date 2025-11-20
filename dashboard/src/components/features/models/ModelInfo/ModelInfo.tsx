@@ -135,13 +135,15 @@ const ModelInfo: React.FC = () => {
   const updateModelMutation = useUpdateModel();
 
   // Build include parameter based on permissions - always include status to match Models page cache
+  // IMPORTANT: Order must match Models.tsx to ensure cache reuse
   const includeParam = useMemo(() => {
     const parts: string[] = ["status"]; // Always include status to reuse cache from Models page
     if (showPricing) parts.push("pricing");
     if (canManageGroups) parts.push("groups");
     if (canViewAnalytics) parts.push("metrics");
+    if (showPricing) parts.push("pricing");
     return parts.join(",");
-  }, [showPricing, canManageGroups, canViewAnalytics]);
+  }, [canManageGroups, canViewAnalytics, showPricing]);
 
   const {
     data: rawModelsData,

@@ -1,4 +1,4 @@
-import { useState, useEffect } from "react";
+import { useState } from "react";
 import { Play, AlertCircle } from "lucide-react";
 import {
   Dialog,
@@ -9,53 +9,32 @@ import {
 } from "../../ui/dialog";
 import { Button } from "../../ui/button";
 import { Label } from "../../ui/label";
-import {
-  Select,
-  SelectContent,
-  SelectItem,
-  SelectTrigger,
-  SelectValue,
-} from "../../ui/select";
 import { Input } from "../../ui/input";
-import { useCreateBatch, useFiles } from "../../../api/control-layer/hooks";
+import { useCreateBatch } from "../../../api/control-layer/hooks";
 import { toast } from "sonner";
+import type { FileObject } from "../../features/batches/types";
 
 interface CreateBatchModalProps {
   isOpen: boolean;
   onClose: () => void;
   onSuccess?: () => void;
-  preselectedFileId?: string;
+  preselectedFile?: FileObject;
 }
 
 export function CreateBatchModal({
   isOpen,
   onClose,
   onSuccess,
-  preselectedFileId,
+  preselectedFile,
 }: CreateBatchModalProps) {
-  const [selectedFileId, setSelectedFileId] = useState<string>(
-    preselectedFileId || "",
-  );
   const [endpoint, setEndpoint] = useState<string>("/v1/chat/completions");
   const [description, setDescription] = useState<string>("");
 
-  const { data: filesResponse, isLoading: filesLoading } = useFiles({
-    purpose: "batch",
-  });
   const createBatchMutation = useCreateBatch();
 
-  const files = filesResponse?.data || [];
-
-  // Update selected file when preselected changes
-  useEffect(() => {
-    if (preselectedFileId) {
-      setSelectedFileId(preselectedFileId);
-    }
-  }, [preselectedFileId]);
-
   const handleSubmit = async () => {
-    if (!selectedFileId) {
-      toast.error("Please select a file");
+    if (!preselectedFile) {
+      toast.error("No file selected");
       return;
     }
 
@@ -66,18 +45,16 @@ export function CreateBatchModal({
       }
 
       await createBatchMutation.mutateAsync({
-        input_file_id: selectedFileId,
+        input_file_id: preselectedFile.id,
         endpoint,
         completion_window: "24h",
         metadata: Object.keys(metadata).length > 0 ? metadata : undefined,
       });
 
-      const selectedFile = files.find((f) => f.id === selectedFileId);
       toast.success(
-        `Batch created successfully from "${selectedFile?.filename || "file"}"`,
+        `Batch created successfully from "${preselectedFile.filename}"`,
       );
 
-      setSelectedFileId("");
       setEndpoint("/v1/chat/completions");
       setDescription("");
       onSuccess?.();
@@ -93,13 +70,10 @@ export function CreateBatchModal({
   };
 
   const handleClose = () => {
-    setSelectedFileId(preselectedFileId || "");
     setEndpoint("/v1/chat/completions");
     setDescription("");
     onClose();
   };
-
-  const selectedFile = files.find((f) => f.id === selectedFileId);
 
   return (
     <Dialog open={isOpen} onOpenChange={handleClose}>
@@ -109,73 +83,22 @@ export function CreateBatchModal({
         </DialogHeader>
 
         <div className="space-y-6">
-          {/* File Selection or File Info */}
-          {preselectedFileId ? (
-            /* Show only file info when preselected */
-            selectedFile && (
-              <div className="space-y-2">
-                <Label>Selected File</Label>
-                <div className="bg-gray-50 rounded-lg p-3 space-y-1">
-                  <p className="text-sm font-medium text-gray-900">
-                    {selectedFile.filename}
-                  </p>
-                  <div className="flex gap-4 text-xs text-gray-600">
-                    <span>
-                      Size: {(selectedFile.bytes / 1024).toFixed(1)} KB
-                    </span>
-                    <span>ID: {selectedFile.id}</span>
-                  </div>
+          {/* File Info */}
+          {preselectedFile && (
+            <div className="space-y-2">
+              <Label>Selected File</Label>
+              <div className="bg-gray-50 rounded-lg p-3 space-y-1">
+                <p className="text-sm font-medium text-gray-900">
+                  {preselectedFile.filename}
+                </p>
+                <div className="flex gap-4 text-xs text-gray-600">
+                  <span>
+                    Size: {(preselectedFile.bytes / 1024).toFixed(1)} KB
+                  </span>
+                  <span>ID: {preselectedFile.id}</span>
                 </div>
               </div>
-            )
-          ) : (
-            /* Show file selection dropdown when not preselected */
-            <>
-              <div className="space-y-2">
-                <Label htmlFor="file">Select File</Label>
-                <Select
-                  value={selectedFileId}
-                  onValueChange={setSelectedFileId}
-                  disabled={filesLoading}
-                >
-                  <SelectTrigger>
-                    <SelectValue placeholder="Choose a file..." />
-                  </SelectTrigger>
-                  <SelectContent>
-                    {filesLoading ? (
-                      <SelectItem value="loading" disabled>
-                        Loading files...
-                      </SelectItem>
-                    ) : files.length === 0 ? (
-                      <SelectItem value="none" disabled>
-                        No files available
-                      </SelectItem>
-                    ) : (
-                      files.map((file) => (
-                        <SelectItem key={file.id} value={file.id}>
-                          {file.filename} ({(file.bytes / 1024).toFixed(1)} KB)
-                        </SelectItem>
-                      ))
-                    )}
-                  </SelectContent>
-                </Select>
-              </div>
-
-              {/* File Info shown below dropdown when selected */}
-              {selectedFile && (
-                <div className="bg-gray-50 rounded-lg p-3 space-y-1">
-                  <p className="text-sm font-medium text-gray-900">
-                    {selectedFile.filename}
-                  </p>
-                  <div className="flex gap-4 text-xs text-gray-600">
-                    <span>
-                      Size: {(selectedFile.bytes / 1024).toFixed(1)} KB
-                    </span>
-                    <span>ID: {selectedFile.id}</span>
-                  </div>
-                </div>
-              )}
-            </>
+            </div>
           )}
 
           {/* Description (Optional) */}
@@ -223,7 +146,7 @@ export function CreateBatchModal({
             type="button"
             variant="outline"
             onClick={handleSubmit}
-            disabled={!selectedFileId || createBatchMutation.isPending}
+            disabled={!preselectedFile || createBatchMutation.isPending}
             className="group"
           >
             {createBatchMutation.isPending ? (
