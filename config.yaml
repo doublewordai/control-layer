@@ -109,10 +109,10 @@ batches:
   # Daemon configuration for processing batch requests
   daemon:
     # Controls when the batch processing daemon runs
-    # - "leader": Only run on the elected leader instance (default, recommended for multi-instance deployments)
-    # - "always": Run on all instances (use for single-instance deployments)
-    # - "never": Never run the daemon (useful for testing or when using external processors)
-    enabled: leader
+    # - "always": Run on all instances (default)
+    # - "leader": Only run on the elected leader instance
+    # - "never": Never run the daemon
+    enabled: always
 
     # Performance & Concurrency Settings
     claim_batch_size: 100 # Maximum number of requests to claim in each iteration

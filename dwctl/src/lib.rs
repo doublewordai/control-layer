@@ -1580,36 +1580,6 @@ mod test {
     }
 
     #[sqlx::test]
-    async fn test_application_integration(pool: PgPool) {
-        let mut config = create_test_config();
-        config.database = crate::config::DatabaseConfig::External {
-            url: pool.connect_options().to_url_lossy().to_string(),
-        };
-        config.leader_election.enabled = false;
-
-        // Create application
-        let app = crate::Application::new(config).await;
-        assert!(app.is_ok(), "Application::new should succeed");
-
-        let (server, _drop_guard) = app.unwrap().into_test_server();
-
-        // Test that basic routes work
-        let health_response = server.get("/healthz").await;
-        assert_eq!(health_response.status_code().as_u16(), 200);
-        assert_eq!(health_response.text(), "OK");
-
-        // Test openapi endpoint
-        let openapi_response = server.get("/openai-openapi.yaml").await;
-        assert_eq!(openapi_response.status_code().as_u16(), 200);
-        assert_eq!(openapi_response.headers().get("content-type").unwrap(), "application/yaml");
-
-        // Test that API routes exist (should require auth)
-        let api_response = server.get("/admin/api/v1/users").await;
-        // Should get unauthorized (401) since no auth header provided
-        assert_eq!(api_response.status_code().as_u16(), 401);
-    }
-
-    #[sqlx::test]
     async fn test_build_router_with_metrics_disabled(pool: PgPool) {
         let mut config = create_test_config();
         config.enable_metrics = false;

@@ -10,7 +10,10 @@ use tokio::task::JoinSet;
 use crate::error::Result;
 use crate::http::{HttpClient, HttpResponse};
 use crate::manager::{DaemonStorage, Storage};
-use crate::request::DaemonId;
+use crate::request::{DaemonId, RequestCompletionResult};
+use crate::types::RequestId;
+use crate::FusilladeError;
+use futures::StreamExt;
 
 pub mod transitions;
 pub mod types;
@@ -128,6 +131,8 @@ where
     requests_processed: Arc<AtomicU64>,
     requests_failed: Arc<AtomicU64>,
     shutdown_token: tokio_util::sync::CancellationToken,
+    /// Map of request_id -> cancellation token for user-initiated cancellation
+    cancellation_tokens: Arc<dashmap::DashMap<RequestId, tokio_util::sync::CancellationToken>>,
 }
 
 impl<S, H> Daemon<S, H>
@@ -152,6 +157,7 @@ where
             requests_processed: Arc::new(AtomicU64::new(0)),
             requests_failed: Arc::new(AtomicU64::new(0)),
             shutdown_token,
+            cancellation_tokens: Arc::new(dashmap::DashMap::new()),
         }
     }
 
@@ -234,8 +240,14 @@ where
     ///
     /// This continuously claims and processes requests until an error occurs
     /// or the task is cancelled.
-    #[tracing::instrument(skip(self), fields(daemon_id = %self.daemon_id))]
-    pub async fn run(self: Arc<Self>) -> Result<()> {
+    ///
+    /// The `cancellation_stream` parameter is an optional stream that yields
+    /// `RequestId`s that should be cancelled (e.g., from PostgreSQL LISTEN/NOTIFY).
+    #[tracing::instrument(skip(self, cancellation_stream), fields(daemon_id = %self.daemon_id))]
+    pub async fn run<CS>(self: Arc<Self>, cancellation_stream: Option<CS>) -> Result<()>
+    where
+        CS: futures::Stream<Item = RequestId> + Unpin + Send + 'static,
+    {
         tracing::info!("Daemon starting main processing loop");
 
         // Register daemon in database
@@ -332,6 +344,38 @@ where
             });
         }
 
+        // Spawn task to process cancellation stream if provided
+        if let Some(mut stream) = cancellation_stream {
+            let cancellation_tokens = self.cancellation_tokens.clone();
+            let shutdown_token = self.shutdown_token.clone();
+            tokio::spawn(async move {
+                tracing::info!("Cancellation stream listener started");
+
+                loop {
+                    tokio::select! {
+                        Some(request_id) = stream.next() => {
+                            tracing::info!(request_id = %request_id, "Received cancellation notification");
+
+                            // Look up the cancellation token and cancel it
+                            if let Some(entry) = cancellation_tokens.get(&request_id) {
+                                entry.value().cancel();
+                                tracing::debug!(request_id = %request_id, "Cancelled request token");
+                            } else {
+                                tracing::debug!(
+                                    request_id = %request_id,
+                                    "Request not found in active requests (may have already completed)"
+                                );
+                            }
+                        }
+                        _ = shutdown_token.cancelled() => {
+                            tracing::info!("Shutting down cancellation listener");
+                            break;
+                        }
+                    }
+                }
+            });
+        }
+
         let mut join_set: JoinSet<Result<()>> = JoinSet::new();
 
         let run_result = loop {
@@ -415,6 +459,15 @@ where
                             let requests_processed = self.requests_processed.clone();
                             let requests_failed = self.requests_failed.clone();
                             let should_retry = self.config.should_retry.clone();
+                            let shutdown_token = self.shutdown_token.clone();
+                            let cancellation_tokens = self.cancellation_tokens.clone();
+
+                            // Create a cancellation token for user-initiated cancellation
+                            let user_cancellation_token =
+                                tokio_util::sync::CancellationToken::new();
+
+                            // Register the token so the LISTEN task can cancel it
+                            cancellation_tokens.insert(request_id, user_cancellation_token.clone());
 
                             // Increment in-flight counter
                             requests_in_flight.fetch_add(1, Ordering::Relaxed);
@@ -437,15 +490,27 @@ where
                                     storage.as_ref()
                                 ).await?;
 
+                                // Create cancellation future that resolves to User or Shutdown
+                                let cancellation = async {
+                                    tokio::select! {
+                                        _ = user_cancellation_token.cancelled() => {
+                                            crate::request::transitions::CancellationReason::User
+                                        }
+                                        _ = shutdown_token.cancelled() => {
+                                            crate::request::transitions::CancellationReason::Shutdown
+                                        }
+                                    }
+                                };
+
                                 // Wait for completion
                                 match processing.complete(storage.as_ref(), |response| {
                                     (should_retry)(response)
-                                }).await? {
-                                    Ok(_completed) => {
+                                }, cancellation).await {
+                                    Ok(RequestCompletionResult::Completed(_completed)) => {
                                         requests_processed.fetch_add(1, Ordering::Relaxed);
                                         tracing::info!(request_id = %request_id, "Request completed successfully");
                                     }
-                                    Err(failed) => {
+                                    Ok(RequestCompletionResult::Failed(failed)) => {
                                         let retry_attempt = failed.state.retry_attempt;
 
                                         // Check if this is a retriable error using the FailureReason
@@ -484,7 +549,22 @@ where
                                             );
                                         }
                                     }
+                                    Ok(RequestCompletionResult::Canceled(_canceled)) => {
+                                        tracing::info!(request_id = %request_id, "Request canceled by user");
+                                    }
+                                    Err(FusilladeError::Shutdown) => {
+                                        tracing::info!(request_id = %request_id, "Request aborted due to shutdown");
+                                        // Don't count as failed - request will be reclaimed
+                                    }
+                                    Err(e) => {
+                                        // Unexpected error
+                                        tracing::error!(request_id = %request_id, error = %e, "Unexpected error processing request");
+                                        return Err(e);
+                                    }
                                 }
+
+                                // Remove the cancellation token from the map
+                                cancellation_tokens.remove(&request_id);
 
                                 Ok(())
                             });
