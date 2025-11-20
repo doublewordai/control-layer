@@ -1125,24 +1125,43 @@ mod tests {
 
     #[sqlx::test]
     #[test_log::test]
-    async fn test_create_transaction_rounds_to_two_decimal_places(pool: PgPool) {
+    async fn test_create_transaction_preserves_high_precision(pool: PgPool) {
         let user_id = create_test_user(&pool).await;
         let mut conn = pool.acquire().await.expect("Failed to acquire connection");
         let mut credits = Credits::new(&mut conn);
 
-        // Test with amount that has more than 2 decimal places
+        // Test with high precision amount (e.g., per-token micro-transaction)
         let request = CreditTransactionCreateDBRequest {
             user_id,
             transaction_type: CreditTransactionType::AdminGrant,
             amount: Decimal::from_str("100.12345678").unwrap(),
             source_id: user_id.to_string(),
-            description: Some("Rounded grant".to_string()),
+            description: Some("High precision grant".to_string()),
         };
 
         let transaction = credits.create_transaction(&request).await.expect("Failed to create transaction");
 
-        // Amount should be rounded to 2 decimal places
-        assert_eq!(transaction.amount, Decimal::from_str("100.12").unwrap());
-        assert_eq!(transaction.balance_after, Decimal::from_str("100.12").unwrap());
+        // Amount should preserve all decimal places (no rounding)
+        assert_eq!(transaction.amount, Decimal::from_str("100.12345678").unwrap());
+        assert_eq!(transaction.balance_after, Decimal::from_str("100.12345678").unwrap());
+
+        // Test micro-transaction precision (like per-token costs)
+        let micro_request = CreditTransactionCreateDBRequest {
+            user_id,
+            transaction_type: CreditTransactionType::Usage,
+            amount: Decimal::from_str("0.000000405").unwrap(), // ~1 input + 1 output token cost
+            source_id: "micro-txn".to_string(),
+            description: Some("Micro-transaction".to_string()),
+        };
+
+        let micro_transaction = credits
+            .create_transaction(&micro_request)
+            .await
+            .expect("Failed to create micro-transaction");
+
+        // Micro-transaction should preserve full precision
+        assert_eq!(micro_transaction.amount, Decimal::from_str("0.000000405").unwrap());
+        assert_eq!(micro_transaction.balance_after, Decimal::from_str("100.123456375").unwrap());
+        // 100.12345678 - 0.000000405
     }
 }
