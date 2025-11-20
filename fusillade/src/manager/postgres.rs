@@ -700,11 +700,11 @@ impl<H: HttpClient + 'static> Storage for PostgresRequestManager<H> {
         let mut metadata = FileMetadata::default();
         let mut file_id: Option<Uuid> = None;
         let mut template_count = 0;
-        
+
         // Track what we've seen and checked
         let mut stub_filename: Option<String> = None; // The filename used when creating stub
         let mut uniqueness_checked_for_final_filename = false; // Only true if we've checked the final filename from metadata
-    
+
         // uploaded_by is established at the start and won't change
         // (dwctl sends it immediately, so it's either Some(value) or None from the beginning)
         let mut uploaded_by_established = false;
@@ -734,7 +734,7 @@ impl<H: HttpClient + 'static> Storage for PostgresRequestManager<H> {
                     if meta.uploaded_by.is_some() {
                         metadata.uploaded_by = meta.uploaded_by;
                     }
-                    
+
                     // Establish uploaded_by on first metadata (won't change after this)
                     if !uploaded_by_established {
                         uploaded_by_established = true;
@@ -742,17 +742,17 @@ impl<H: HttpClient + 'static> Storage for PostgresRequestManager<H> {
 
                     // CASE 1: Filename arrives AFTER stub was created with auto-generated name
                     // We need to check uniqueness now before continuing to stream templates
-                    if file_id.is_some() 
-                        && metadata.filename.is_some() 
+                    if file_id.is_some()
+                        && metadata.filename.is_some()
                         && !uniqueness_checked_for_final_filename
                     {
                         let final_filename = metadata.filename.as_ref().unwrap();
-                        
+
                         // Only check if the filename differs from what we used for the stub
                         // (if stub used this exact filename, DB constraint already checked it)
                         if stub_filename.as_ref() != Some(final_filename) {
                             let uploaded_by = metadata.uploaded_by.as_deref();
-                            
+
                             // Check uniqueness outside transaction for speed
                             let exists = sqlx::query_scalar!(
                                 r#"
@@ -773,7 +773,7 @@ impl<H: HttpClient + 'static> Storage for PostgresRequestManager<H> {
                                     e
                                 ))
                             })?;
-                            
+
                             if exists {
                                 // Rollback and fail fast
                                 tx.rollback().await.ok();
@@ -782,14 +782,14 @@ impl<H: HttpClient + 'static> Storage for PostgresRequestManager<H> {
                                     final_filename
                                 )));
                             }
-                            
+
                             tracing::debug!(
                                 filename = %final_filename,
                                 uploaded_by = ?uploaded_by,
                                 "Late-arriving filename uniqueness check passed"
                             );
                         }
-                        
+
                         uniqueness_checked_for_final_filename = true;
                     }
                 }
@@ -805,16 +805,16 @@ impl<H: HttpClient + 'static> Storage for PostgresRequestManager<H> {
                             .filename
                             .clone()
                             .unwrap_or_else(|| format!("file_{}", uuid::Uuid::new_v4()));
-                        
+
                         // Remember what filename we used for the stub
                         stub_filename = Some(name.clone());
-                        
+
                         // CASE 2a: Creating stub with final filename from metadata
                         // The DB constraint will check uniqueness
                         // CASE 2b: Creating stub with auto-generated filename
                         // No uniqueness check needed (UUID is unique), but we don't mark as checked
                         // because the real filename might come later in metadata
-                        
+
                         let created_file_id = sqlx::query_scalar!(
                             r#"
                             INSERT INTO files (name, uploaded_by)
@@ -840,12 +840,12 @@ impl<H: HttpClient + 'static> Storage for PostgresRequestManager<H> {
                         })?;
 
                         file_id = Some(created_file_id);
-                        
+
                         // Only mark as checked if we used the actual filename from metadata
                         if metadata.filename.is_some() {
                             uniqueness_checked_for_final_filename = true;
                         }
-                        
+
                         tracing::debug!(
                             file_id = %created_file_id,
                             name = %name,
@@ -913,7 +913,7 @@ impl<H: HttpClient + 'static> Storage for PostgresRequestManager<H> {
                 }
                 FusilladeError::Other(anyhow!("Failed to create file: {}", e))
             })?;
-            
+
             created_file_id
         };
 
