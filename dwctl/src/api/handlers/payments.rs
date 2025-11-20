@@ -14,7 +14,7 @@ use crate::{
 };
 
 /// Stripe-specific payment processing implementation
-mod stripe {
+pub mod stripe {
     use axum::{
         body::Body,
         extract::{FromRequest, State},
@@ -23,7 +23,7 @@ mod stripe {
     };
     use rust_decimal::Decimal;
     use sqlx::PgPool;
-    use stripe::{CheckoutSession, CheckoutSessionMode, CheckoutSessionPaymentStatus, Client, CreateCheckoutSession, CreateCheckoutSessionAutomaticTax, CreateCheckoutSessionLineItems, CheckoutSessionUiMode, CustomerId, Event, EventObject, EventType, Webhook, CheckoutSessionCustomerCreation};
+    use stripe::{CheckoutSession, CheckoutSessionMode, CheckoutSessionPaymentStatus, Client, CreateCheckoutSession, CreateCheckoutSessionAutomaticTax, CreateCheckoutSessionLineItems, CheckoutSessionUiMode, CustomerId, Event, EventObject, Webhook, CheckoutSessionCustomerCreation};
     use stripe::EventType::{CheckoutSessionAsyncPaymentSucceeded, CheckoutSessionCompleted};
 
     use crate::{
@@ -157,7 +157,7 @@ mod stripe {
         let client = Client::new(api_key);
 
         // Retrieve full checkout session with line items
-        let checkout_session = CheckoutSession::retrieve(&client, session_id, &*["line_items"])
+        let checkout_session = CheckoutSession::retrieve(&client, session_id, &["line_items"])
             .await
             .map_err(|e| {
                 tracing::error!("Failed to retrieve Stripe checkout session: {:?}", e);
@@ -189,7 +189,9 @@ mod stripe {
             .ok_or_else(|| {
                 tracing::error!("Checkout session missing both line_items and amount_total");
                 StatusCode::INTERNAL_SERVER_ERROR
-            })?;
+            })? / 100; //Need to divide by 100 as we transact in USDs and so amounts come back in cents
+
+
 
         // Create the credit transaction
         let mut conn = db_pool.acquire()
@@ -212,7 +214,7 @@ mod stripe {
             transaction_type: CreditTransactionType::Purchase,
             amount: Decimal::from(price),
             source_id: session_id.to_string(),
-            description: Some(format!("Stripe payment ({})", session_id)),
+            description: Some("Stripe payment".to_string()),
         };
 
         credits.create_transaction(&request)
@@ -227,7 +229,7 @@ mod stripe {
     }
 
     /// StripeEvent extractor that validates webhook signatures
-    pub(super) struct StripeEvent(pub Event);
+    pub struct StripeEvent(pub Event);
 
     impl FromRequest<AppState> for StripeEvent
     where
@@ -385,8 +387,8 @@ pub async fn create_checkout(
             format!("{}://{}", proto, host)
         });
 
-    let success_url = format!("{}/cost-management?payment=success", origin);
-    let cancel_url = format!("{}/cost-management?payment=cancelled", origin);
+    let success_url = format!("{}/cost-management?payment=success&session_id={{CHECKOUT_SESSION_ID}}", origin);
+    let cancel_url = format!("{}/cost-management?payment=cancelled&session_id={{CHECKOUT_SESSION_ID}}", origin);
 
     tracing::info!("Building checkout URLs with origin: {}", origin);
 
