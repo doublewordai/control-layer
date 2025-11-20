@@ -1,10 +1,24 @@
--- Fix decimal precision in balance threshold trigger function
--- The function was using DECIMAL(12, 8) but should use DECIMAL(12, 2) to match
--- the column precision updated in migration 024
+-- Update credit decimal precision from DECIMAL(12, 2) to DECIMAL(64, 32)
+-- This allows for high precision tracking of micro-transactions (e.g., per-token costs)
+-- while still supporting large balances. Storage and performance scale with actual
+-- precision of values stored, not the declared maximum.
 
+-- Update amount column
+ALTER TABLE credits_transactions
+    ALTER COLUMN amount TYPE DECIMAL(64, 32);
+
+-- Update balance_after column
+ALTER TABLE credits_transactions
+    ALTER COLUMN balance_after TYPE DECIMAL(64, 32);
+
+-- Comments
+COMMENT ON COLUMN credits_transactions.amount IS 'Absolute value of transaction amount with high precision for micro-transactions';
+COMMENT ON COLUMN credits_transactions.balance_after IS 'Balance after this transaction with high precision for micro-transactions';
+
+-- Update the balance threshold trigger function to match the new precision
 CREATE OR REPLACE FUNCTION notify_on_balance_threshold_crossing() RETURNS trigger AS $$
 DECLARE
-    old_balance DECIMAL(12, 2);
+    old_balance DECIMAL(64, 32);
 BEGIN
     -- Get the previous balance for this user
     -- For the first transaction, old_balance will be NULL (treated as 0)
