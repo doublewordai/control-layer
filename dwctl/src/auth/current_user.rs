@@ -101,6 +101,7 @@ async fn try_proxy_header_auth(
                     roles: vec![Role::StandardUser],
                     auth_source: "proxy-header".to_string(),
                     password_hash: None,
+                    external_user_id: None,
                 };
 
                 match user_repo.create(&create_request).await {

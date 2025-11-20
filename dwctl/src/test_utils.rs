@@ -139,6 +139,7 @@ pub async fn create_test_user(pool: &PgPool, role: Role) -> UserResponse {
         roles,
         auth_source: "test".to_string(),
         password_hash: None,
+        external_user_id: None,
     };
 
     let user = users_repo.create(&user_create).await.expect("Failed to create test user");
@@ -163,6 +164,7 @@ pub async fn create_test_admin_user(pool: &PgPool, role: Role) -> UserResponse {
         roles,
         auth_source: "test".to_string(),
         password_hash: None,
+        external_user_id: None,
     };
 
     let user = users_repo.create(&user_create).await.expect("Failed to create test admin user");
@@ -185,6 +187,7 @@ pub async fn create_test_user_with_roles(pool: &PgPool, roles: Vec<Role>) -> Use
         roles,
         auth_source: "test".to_string(),
         password_hash: None,
+        external_user_id: None,
     };
 
     let user = users_repo

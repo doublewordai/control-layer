@@ -115,6 +115,7 @@ pub async fn register(State(state): State<AppState>, Json(request): Json<Registe
         roles: vec![Role::StandardUser],
         auth_source: "native".to_string(),
         password_hash: Some(password_hash),
+        external_user_id: None,
     };
 
     let created_user = user_repo.create(&create_request).await?;

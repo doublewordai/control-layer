@@ -305,6 +305,7 @@ pub async fn create_initial_admin_user(email: &str, password: Option<&str>, db: 
         roles: vec![Role::PlatformManager],
         auth_source: "system".to_string(),
         password_hash,
+        external_user_id: None,
     };
 
     let created_user = user_repo

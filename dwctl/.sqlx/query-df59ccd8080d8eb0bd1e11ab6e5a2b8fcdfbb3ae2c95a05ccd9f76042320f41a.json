@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "\n            INSERT INTO users (id, username, email, display_name, avatar_url, auth_source, is_admin, password_hash)\n            VALUES ($1, $2, $3, $4, $5, $6, $7, $8)\n            RETURNING *\n            ",
+  "query": "\n            INSERT INTO users (id, username, email, display_name, avatar_url, auth_source, is_admin, password_hash, external_user_id)\n            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)\n            RETURNING *\n            ",
   "describe": {
     "columns": [
       {
@@ -57,6 +57,11 @@
         "ordinal": 10,
         "name": "password_hash",
         "type_info": "Text"
+      },
+      {
+        "ordinal": 11,
+        "name": "external_user_id",
+        "type_info": "Text"
       }
     ],
     "parameters": {
@@ -68,6 +73,7 @@
         "Varchar",
         "Varchar",
         "Bool",
+        "Text",
         "Text"
       ]
     },
@@ -82,8 +88,9 @@
       false,
       true,
       false,
+      true,
       true
     ]
   },
-  "hash": "e353122a78e503023e8535de99f016c402a7bde3f69e6a5475735273c22f5655"
+  "hash": "df59ccd8080d8eb0bd1e11ab6e5a2b8fcdfbb3ae2c95a05ccd9f76042320f41a"
 }
