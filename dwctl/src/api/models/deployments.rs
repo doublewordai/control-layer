@@ -12,7 +12,6 @@ use utoipa::{IntoParams, ToSchema};
 use uuid::Uuid;
 
 /// Query parameters for listing deployed models
-/// TODO: Pagination
 #[derive(Debug, Deserialize, IntoParams, ToSchema)]
 pub struct ListModelsQuery {
     /// Filter by inference endpoint ID
@@ -27,6 +26,12 @@ pub struct ListModelsQuery {
     pub inactive: Option<bool>,
     /// Filter to only models the current user can access (defaults to false for admins, true for users)
     pub accessible: Option<bool>,
+    /// Maximum number of items to return (default: 100)
+    #[param(default = 100, minimum = 1)]
+    pub limit: Option<i64>,
+    /// Number of items to skip (default: 0)
+    #[param(default = 0, minimum = 0)]
+    pub offset: Option<i64>,
 }
 
 /// Query parameters for getting a single deployed model

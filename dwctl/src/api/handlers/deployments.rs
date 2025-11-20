@@ -52,6 +52,8 @@ fn apply_pricing_to_response(
         ("include" = Option<String>, Query, description = "Include additional data (comma-separated: 'groups', 'metrics', 'status', 'pricing'). Only platform managers can include groups. Status shows probe monitoring information. Pricing shows simple customer rates for regular users, full pricing structure for users with Pricing::ReadAll permission."),
         ("deleted" = Option<bool>, Query, description = "Show deleted models when true (admin only), non-deleted models when false, and all models when not specified"),
         ("inactive" = Option<bool>, Query, description = "Show inactive models when true (admin only)"),
+        ("limit" = Option<i64>, Query, description = "Maximum number of items to return (default: 100, max: 1000)"),
+        ("offset" = Option<i64>, Query, description = "Number of items to skip (default: 0)"),
     ),
     responses(
         (status = 200, description = "Map of deployed models", body = HashMap<String, DeployedModelResponse>),
@@ -95,8 +97,10 @@ pub async fn list_deployed_models(
     // Get deployments with the filter
     let mut repo = Deployments::new(tx.acquire().await.map_err(|e| Error::Database(e.into()))?);
 
-    // Build the filter with role-based deleted parameter handling
-    let mut filter = DeploymentFilter::new(0, i64::MAX);
+    // Build the filter with pagination parameters
+    let offset = query.offset.unwrap_or(0).max(0);
+    let limit = query.limit.unwrap_or(100).clamp(1, 1000); // Cap at 1000 for performance
+    let mut filter = DeploymentFilter::new(offset, limit);
 
     if let Some(endpoint_id) = query.endpoint {
         filter = filter.with_endpoint(endpoint_id);
@@ -2003,5 +2007,81 @@ mod tests {
         let models: Vec<DeployedModelResponse> = response.json();
         let rv_model = get_model_by_id(deployment.id, &models).unwrap();
         assert!(rv_model.metrics.is_some(), "RequestViewer should see metrics when requested");
+    }
+
+    #[sqlx::test]
+    #[test_log::test]
+    async fn test_models_pagination(pool: PgPool) {
+        let (app, _bg_services) = create_test_app(pool.clone(), false).await;
+        let admin_user = create_test_admin_user(&pool, Role::PlatformManager).await;
+
+        // Create 5 test deployments
+        let deployment1 = create_test_deployment(&pool, admin_user.id, "model-1", "alias-1").await;
+        let deployment2 = create_test_deployment(&pool, admin_user.id, "model-2", "alias-2").await;
+        let deployment3 = create_test_deployment(&pool, admin_user.id, "model-3", "alias-3").await;
+        let deployment4 = create_test_deployment(&pool, admin_user.id, "model-4", "alias-4").await;
+        let deployment5 = create_test_deployment(&pool, admin_user.id, "model-5", "alias-5").await;
+
+        // Test 1: Get first page with limit=2
+        let response = app
+            .get("/admin/api/v1/models?limit=2&offset=0")
+            .add_header(add_auth_headers(&admin_user).0, add_auth_headers(&admin_user).1)
+            .await;
+        response.assert_status_ok();
+        let page1: Vec<DeployedModelResponse> = response.json();
+        assert_eq!(page1.len(), 2, "First page should have 2 models");
+
+        // Test 2: Get second page with limit=2, offset=2
+        let response = app
+            .get("/admin/api/v1/models?limit=2&offset=2")
+            .add_header(add_auth_headers(&admin_user).0, add_auth_headers(&admin_user).1)
+            .await;
+        response.assert_status_ok();
+        let page2: Vec<DeployedModelResponse> = response.json();
+        assert_eq!(page2.len(), 2, "Second page should have 2 models");
+
+        // Test 3: Get third page with limit=2, offset=4 (should have 1 model)
+        let response = app
+            .get("/admin/api/v1/models?limit=2&offset=4")
+            .add_header(add_auth_headers(&admin_user).0, add_auth_headers(&admin_user).1)
+            .await;
+        response.assert_status_ok();
+        let page3: Vec<DeployedModelResponse> = response.json();
+        assert_eq!(page3.len(), 1, "Third page should have 1 model");
+
+        // Test 4: Verify no duplicate models across pages
+        let all_page_ids: Vec<DeploymentId> = page1.iter().chain(page2.iter()).chain(page3.iter()).map(|m| m.id).collect();
+
+        let unique_ids: std::collections::HashSet<DeploymentId> = all_page_ids.iter().copied().collect();
+        assert_eq!(all_page_ids.len(), unique_ids.len(), "Pages should not have duplicate models");
+        assert_eq!(unique_ids.len(), 5, "Should have all 5 models across pages");
+
+        // Test 5: Verify all created models are present
+        assert!(
+            unique_ids.contains(&deployment1.id)
+                && unique_ids.contains(&deployment2.id)
+                && unique_ids.contains(&deployment3.id)
+                && unique_ids.contains(&deployment4.id)
+                && unique_ids.contains(&deployment5.id),
+            "All created deployments should be present in paginated results"
+        );
+
+        // Test 6: Default limit (should get all 5 models)
+        let response = app
+            .get("/admin/api/v1/models")
+            .add_header(add_auth_headers(&admin_user).0, add_auth_headers(&admin_user).1)
+            .await;
+        response.assert_status_ok();
+        let all_models: Vec<DeployedModelResponse> = response.json();
+        assert_eq!(all_models.len(), 5, "Without pagination params, should get all models");
+
+        // Test 7: Offset beyond available models (should return empty)
+        let response = app
+            .get("/admin/api/v1/models?limit=10&offset=100")
+            .add_header(add_auth_headers(&admin_user).0, add_auth_headers(&admin_user).1)
+            .await;
+        response.assert_status_ok();
+        let empty_page: Vec<DeployedModelResponse> = response.json();
+        assert_eq!(empty_page.len(), 0, "Offset beyond available models should return empty array");
     }
 }

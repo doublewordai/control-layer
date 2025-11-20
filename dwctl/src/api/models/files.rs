@@ -3,7 +3,7 @@
 use serde::{Deserialize, Serialize};
 use utoipa::{IntoParams, ToSchema};
 
-/// Query parameters for listing files
+/// Query parameters for listing files (OpenAI-compatible cursor-based pagination)
 #[derive(Debug, Deserialize, IntoParams, ToSchema)]
 pub struct ListFilesQuery {
     /// A cursor for use in pagination. after is an object ID that defines your place in the list.

@@ -445,9 +445,9 @@ pub async fn upload_file(
     path = "/files",
     tag = "files",
     summary = "List files",
-    description = "Returns a list of files.",
+    description = "Returns a list of files with cursor-based pagination (OpenAI-compatible). Use the `last_id` from the response as the `after` parameter to get the next page.",
     responses(
-        (status = 200, description = "List of files", body = FileListResponse),
+        (status = 200, description = "List of files with pagination metadata (first_id, last_id, has_more)", body = FileListResponse),
         (status = 500, description = "Internal server error")
     ),
     params(
