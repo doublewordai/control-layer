@@ -1,7 +1,7 @@
 -- Update credit decimal precision from DECIMAL(12, 2) to DECIMAL(64, 32)
 -- This allows for high precision tracking of micro-transactions (e.g., per-token costs)
 -- while still supporting large balances. Storage and performance scale with actual
--- precision of values stored, not the declared maximum.
+-- precision of values stored, not the declared maximum, hence minimal impact on storage and performance.
 
 -- Update amount column
 ALTER TABLE credits_transactions
