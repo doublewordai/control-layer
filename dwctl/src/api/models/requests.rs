@@ -3,6 +3,7 @@
 //! These types provide a flexible interface for querying HTTP requests logged by the outlet-postgres
 //! middleware, with basic enrichment for AI-specific endpoints.
 
+use super::pagination::Pagination;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -73,11 +74,10 @@ pub struct AggregateRequestsQuery {
 /// Query parameters for listing requests
 #[derive(Debug, Deserialize, ToSchema, IntoParams)]
 pub struct ListRequestsQuery {
-    /// Maximum number of requests to return (default: 50, max: 1000)
-    pub limit: Option<i64>,
-
-    /// Number of requests to skip for pagination
-    pub offset: Option<i64>,
+    /// Pagination parameters
+    #[serde(flatten)]
+    #[param(inline)]
+    pub pagination: Pagination,
 
     /// Filter by HTTP method (GET, POST, etc.)
     pub method: Option<String>,
@@ -91,7 +91,7 @@ pub struct ListRequestsQuery {
     /// Filter by minimum status code (for ranges)
     pub status_code_min: Option<i32>,
 
-    /// Filter by maximum status code (for ranges)  
+    /// Filter by maximum status code (for ranges)
     pub status_code_max: Option<i32>,
 
     /// Filter by minimum request duration in milliseconds
@@ -122,7 +122,7 @@ pub struct HttpRequest {
     pub created_at: DateTime<Utc>,
 }
 
-/// API-compatible HTTP response representation  
+/// API-compatible HTTP response representation
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct HttpResponse {
     pub id: i64,
@@ -151,8 +151,7 @@ pub struct ListRequestsResponse {
 impl Default for ListRequestsQuery {
     fn default() -> Self {
         Self {
-            limit: Some(50),
-            offset: Some(0),
+            pagination: Pagination::default(),
             method: None,
             uri_pattern: None,
             status_code: None,

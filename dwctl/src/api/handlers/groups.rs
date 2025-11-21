@@ -50,8 +50,8 @@ pub async fn list_groups(
     let groups;
     {
         let mut repo = Groups::new(tx.acquire().await.map_err(|e| Error::Database(e.into()))?);
-        let skip = query.skip.unwrap_or(0);
-        let limit = query.limit.unwrap_or(100).min(1000);
+        let skip = query.pagination.skip();
+        let limit = query.pagination.limit();
 
         groups = repo.list(&GroupFilter::new(skip, limit)).await?;
     }

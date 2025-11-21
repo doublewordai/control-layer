@@ -160,8 +160,8 @@ pub async fn list_transactions(
     Query(query): Query<ListTransactionsQuery>,
     current_user: CurrentUser,
 ) -> Result<Json<Vec<CreditTransactionResponse>>> {
-    let skip = query.skip.unwrap_or(0);
-    let limit = query.limit.unwrap_or(100).min(1000);
+    let skip = query.pagination.skip();
+    let limit = query.pagination.limit();
 
     // Check if user has ReadAll permission
     let has_read_all = permissions::has_permission(&current_user, Resource::Credits, Operation::ReadAll);

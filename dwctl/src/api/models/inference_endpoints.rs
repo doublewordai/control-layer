@@ -1,5 +1,6 @@
 //! API request/response models for inference endpoints.
 
+use super::pagination::Pagination;
 use crate::db::models::inference_endpoints::InferenceEndpointDBResponse;
 use crate::types::{InferenceEndpointId, UserId};
 use chrono::{DateTime, Utc};
@@ -63,13 +64,10 @@ impl From<AnthropicModelsResponse> for OpenAIModelsResponse {
 /// Query parameters for listing inference endpoints
 #[derive(Debug, Deserialize, IntoParams, ToSchema)]
 pub struct ListEndpointsQuery {
-    /// Number of items to skip
-    #[param(default = 0, minimum = 0)]
-    pub skip: Option<i64>,
-
-    /// Maximum number of items to return
-    #[param(default = 100, minimum = 1, maximum = 1000)]
-    pub limit: Option<i64>,
+    /// Pagination parameters
+    #[serde(flatten)]
+    #[param(inline)]
+    pub pagination: Pagination,
 }
 
 // Request models

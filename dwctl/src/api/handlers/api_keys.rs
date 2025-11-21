@@ -169,8 +169,8 @@ pub async fn list_user_api_keys(
     let mut repo = ApiKeys::new(&mut pool_conn);
 
     // Extract pagination parameters with defaults & validation
-    let skip = query.skip.unwrap_or(0);
-    let limit = query.limit.unwrap_or(100).min(1000);
+    let skip = query.pagination.skip();
+    let limit = query.pagination.limit();
 
     let filter = ApiKeyFilter {
         skip,

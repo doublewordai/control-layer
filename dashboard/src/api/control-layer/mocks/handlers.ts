@@ -427,11 +427,24 @@ export const handlers = [
     const endpoint = url.searchParams.get("endpoint");
     const include = url.searchParams.get("include");
     const accessible = url.searchParams.get("accessible");
+    const skip = parseInt(url.searchParams.get("skip") || "0", 10);
+    const limit = parseInt(url.searchParams.get("limit") || "10", 10);
+    const search = url.searchParams.get("search");
 
     let models: Model[] = [...modelsData];
 
     if (endpoint) {
       models = models.filter((m) => m.hosted_on === endpoint);
+    }
+
+    // Apply search filter (case-insensitive substring match on alias or model_name)
+    if (search) {
+      const searchLower = search.toLowerCase();
+      models = models.filter(
+        (m) =>
+          m.alias.toLowerCase().includes(searchLower) ||
+          m.model_name.toLowerCase().includes(searchLower),
+      );
     }
 
     // Filter models by accessibility if requested
@@ -454,6 +467,12 @@ export const handlers = [
       }
     }
 
+    // Store total count before pagination
+    const total_count = models.length;
+
+    // Apply pagination
+    models = models.slice(skip, skip + limit);
+
     if (include?.includes("groups")) {
       const modelsGroupsData = getModelsGroupsData();
       models = models.map((model) => ({
@@ -472,7 +491,12 @@ export const handlers = [
       }));
     }
 
-    return HttpResponse.json(models);
+    return HttpResponse.json({
+      data: models,
+      total_count,
+      skip,
+      limit,
+    });
   }),
 
   http.get("/admin/api/v1/models/:id", ({ params }) => {
@@ -1139,7 +1163,9 @@ export const handlers = [
     }
     if (timestampBefore) {
       const beforeDate = new Date(timestampBefore);
-      filtered = filtered.filter((req) => new Date(req.timestamp) <= beforeDate);
+      filtered = filtered.filter(
+        (req) => new Date(req.timestamp) <= beforeDate,
+      );
     }
 
     // Sort by timestamp
@@ -1180,7 +1206,9 @@ export const handlers = [
     }
     if (timestampBefore) {
       const beforeDate = new Date(timestampBefore);
-      filtered = filtered.filter((req) => new Date(req.timestamp) <= beforeDate);
+      filtered = filtered.filter(
+        (req) => new Date(req.timestamp) <= beforeDate,
+      );
     }
 
     // Aggregate by model
@@ -1196,10 +1224,18 @@ export const handlers = [
     const statusCounts: Record<number, number> = { 200: filtered.length };
 
     // Time series data (group by hour)
-    const timeSeriesMap: Record<string, { timestamp: string; count: number; tokens: number }> = {};
+    const timeSeriesMap: Record<
+      string,
+      { timestamp: string; count: number; tokens: number }
+    > = {};
     filtered.forEach((req) => {
       const date = new Date(req.timestamp);
-      const hourKey = new Date(date.getFullYear(), date.getMonth(), date.getDate(), date.getHours()).toISOString();
+      const hourKey = new Date(
+        date.getFullYear(),
+        date.getMonth(),
+        date.getDate(),
+        date.getHours(),
+      ).toISOString();
 
       if (!timeSeriesMap[hourKey]) {
         timeSeriesMap[hourKey] = { timestamp: hourKey, count: 0, tokens: 0 };
@@ -1208,8 +1244,9 @@ export const handlers = [
       timeSeriesMap[hourKey].tokens += req.response?.usage?.total_tokens || 0;
     });
 
-    const timeSeries = Object.values(timeSeriesMap).sort((a, b) =>
-      new Date(a.timestamp).getTime() - new Date(b.timestamp).getTime()
+    const timeSeries = Object.values(timeSeriesMap).sort(
+      (a, b) =>
+        new Date(a.timestamp).getTime() - new Date(b.timestamp).getTime(),
     );
 
     return HttpResponse.json({
@@ -1217,7 +1254,10 @@ export const handlers = [
       status_codes: statusCounts,
       time_series: timeSeries,
       total_requests: filtered.length,
-      total_tokens: filtered.reduce((sum, req) => sum + (req.response?.usage?.total_tokens || 0), 0),
+      total_tokens: filtered.reduce(
+        (sum, req) => sum + (req.response?.usage?.total_tokens || 0),
+        0,
+      ),
     });
   }),
 

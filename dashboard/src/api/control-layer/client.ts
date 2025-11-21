@@ -6,6 +6,7 @@ import type {
   User,
   ApiKey,
   ApiKeyCreateResponse,
+  PaginatedResponse,
   ModelsQuery,
   GroupsQuery,
   UsersQuery,
@@ -168,12 +169,17 @@ const userApi = {
 };
 
 const modelApi = {
-  async list(options?: ModelsQuery): Promise<Model[]> {
+  async list(options?: ModelsQuery): Promise<PaginatedResponse<Model>> {
     const params = new URLSearchParams();
+    if (options?.skip !== undefined)
+      params.set("skip", options.skip.toString());
+    if (options?.limit !== undefined)
+      params.set("limit", options.limit.toString());
     if (options?.endpoint) params.set("endpoint", options.endpoint);
     if (options?.include) params.set("include", options.include);
     if (options?.accessible !== undefined)
       params.set("accessible", options.accessible.toString());
+    if (options?.search) params.set("search", options.search);
 
     const url = `/admin/api/v1/models${params.toString() ? "?" + params.toString() : ""}`;
     const response = await fetch(url);

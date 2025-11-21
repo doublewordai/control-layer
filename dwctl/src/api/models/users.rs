@@ -1,5 +1,6 @@
 //! API request/response models for users.
 
+use super::pagination::Pagination;
 use crate::api::models::groups::GroupResponse;
 use crate::db::models::users::UserDBResponse;
 use crate::types::UserId;
@@ -64,13 +65,10 @@ pub struct UserResponse {
 /// Query parameters for listing users
 #[derive(Debug, Deserialize, IntoParams, ToSchema)]
 pub struct ListUsersQuery {
-    /// Number of items to skip
-    #[param(default = 0, minimum = 0)]
-    pub skip: Option<i64>,
-
-    /// Maximum number of items to return
-    #[param(default = 100, minimum = 1, maximum = 1000)]
-    pub limit: Option<i64>,
+    /// Pagination parameters
+    #[serde(flatten)]
+    #[param(inline)]
+    pub pagination: Pagination,
 
     /// Include related data (comma-separated: "groups")
     pub include: Option<String>,

@@ -144,14 +144,13 @@ pub enum ListObjectType {
     List,
 }
 
+use super::pagination::CursorPagination;
+
 /// Query parameters for listing batches
 #[derive(Debug, Deserialize, IntoParams, ToSchema)]
 pub struct ListBatchesQuery {
-    /// A cursor for pagination (after this batch ID)
-    #[serde(rename = "after")]
-    pub after: Option<String>,
-
-    /// Maximum number of batches to return (1-100, default 20)
-    #[param(default = 20, minimum = 1, maximum = 100)]
-    pub limit: Option<i64>,
+    /// Pagination parameters
+    #[serde(flatten)]
+    #[param(inline)]
+    pub pagination: CursorPagination,
 }

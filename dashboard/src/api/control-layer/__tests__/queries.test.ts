@@ -250,12 +250,14 @@ describe("dwctlApi.users", () => {
 describe("dwctlApi.models", () => {
   describe("list", () => {
     it("should fetch all models", async () => {
-      const models = await dwctlApi.models.list();
+      const response = await dwctlApi.models.list();
 
-      expect(models).toBeInstanceOf(Object);
-      expect(Object.keys(models).length).toBeGreaterThan(0);
+      expect(response).toHaveProperty("data");
+      expect(response).toHaveProperty("total_count");
+      expect(response.data).toBeInstanceOf(Array);
+      expect(response.data.length).toBeGreaterThan(0);
 
-      const firstModel = Object.values(models)[0];
+      const firstModel = response.data[0];
       expect(firstModel).toHaveProperty("id");
       expect(firstModel).toHaveProperty("alias");
       expect(firstModel).toHaveProperty("model_name");
@@ -263,34 +265,32 @@ describe("dwctlApi.models", () => {
     });
 
     it("should filter models by endpoint", async () => {
-      const models = await dwctlApi.models.list({ endpoint: "2" });
+      const response = await dwctlApi.models.list({ endpoint: "2" });
 
-      expect(models).toBeInstanceOf(Object);
-      const modelValues = Object.values(models);
-      expect(modelValues.every((model) => model.hosted_on === 2)).toBe(true);
+      expect(response).toHaveProperty("data");
+      expect(response.data.every((model) => model.hosted_on === 2)).toBe(true);
     });
 
     it("should include groups when requested", async () => {
-      const models = await dwctlApi.models.list({ include: "groups" });
+      const response = await dwctlApi.models.list({ include: "groups" });
 
-      const firstModel = Object.values(models)[0];
+      const firstModel = response.data[0];
       expect(firstModel).toHaveProperty("groups");
       expect(firstModel.groups).toBeInstanceOf(Array);
     });
 
     it("should construct URL correctly with multiple parameters", async () => {
-      const models = await dwctlApi.models.list({
+      const response = await dwctlApi.models.list({
         endpoint: "c3d4e5f6-7890-1234-5678-90abcdef0123",
         include: "groups",
       });
 
-      const modelValues = Object.values(models);
       expect(
-        modelValues.every(
+        response.data.every(
           (model) => model.hosted_on === "c3d4e5f6-7890-1234-5678-90abcdef0123",
         ),
       ).toBe(true);
-      expect(modelValues[0]).toHaveProperty("groups");
+      expect(response.data[0]).toHaveProperty("groups");
     });
   });
 
@@ -556,11 +556,12 @@ describe("URL Construction", () => {
   it("should handle empty query parameters correctly", async () => {
     // Test that URLs are constructed correctly when no parameters are provided
     const users = await dwctlApi.users.list();
-    const models = await dwctlApi.models.list();
+    const modelsResponse = await dwctlApi.models.list();
     const groups = await dwctlApi.groups.list();
 
     expect(users).toBeInstanceOf(Array);
-    expect(models).toBeInstanceOf(Object);
+    expect(modelsResponse).toHaveProperty("data");
+    expect(modelsResponse.data).toBeInstanceOf(Array);
     expect(groups).toBeInstanceOf(Array);
   });
 
@@ -569,25 +570,24 @@ describe("URL Construction", () => {
     const modelsFiltered = await dwctlApi.models.list({ endpoint: "2" });
 
     expect(usersWithGroups[0]).toHaveProperty("groups");
-    expect(
-      Object.values(modelsFiltered).every((model) => model.hosted_on === 2),
-    ).toBe(true);
+    expect(modelsFiltered.data.every((model) => model.hosted_on === 2)).toBe(
+      true,
+    );
   });
 
   it("should handle multiple query parameters", async () => {
-    const models = await dwctlApi.models.list({
+    const modelsResponse = await dwctlApi.models.list({
       endpoint: "c3d4e5f6-7890-1234-5678-90abcdef0123",
       include: "groups",
     });
     const groups = await dwctlApi.groups.list({ include: "users,models" });
 
-    const modelValues = Object.values(models);
     expect(
-      modelValues.every(
+      modelsResponse.data.every(
         (model) => model.hosted_on === "c3d4e5f6-7890-1234-5678-90abcdef0123",
       ),
     ).toBe(true);
-    expect(modelValues[0]).toHaveProperty("groups");
+    expect(modelsResponse.data[0]).toHaveProperty("groups");
 
     expect(groups[0]).toHaveProperty("users");
     expect(groups[0]).toHaveProperty("models");
@@ -634,7 +634,7 @@ describe("Type Safety", () => {
 
     // Optional fields should be present when requested
     expect(usersWithGroups[0].groups).toBeDefined();
-    expect(Object.values(modelsWithGroups)[0].groups).toBeDefined();
+    expect(modelsWithGroups.data[0].groups).toBeDefined();
   });
 });
 

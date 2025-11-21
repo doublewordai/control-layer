@@ -1,5 +1,6 @@
 //! API request/response models for API keys.
 
+use super::pagination::Pagination;
 use crate::db::models::api_keys::{ApiKeyDBResponse, ApiKeyPurpose};
 use crate::types::{ApiKeyId, DeploymentId, UserId};
 use chrono::{DateTime, Utc};
@@ -72,13 +73,10 @@ pub struct ApiKeyInfoResponse {
 
 #[derive(Debug, Deserialize, IntoParams, ToSchema)]
 pub struct ListApiKeysQuery {
-    // Number of items to skip
-    #[param(default = 0, minimum = 0)]
-    pub skip: Option<i64>,
-
-    // Maximum number of items to return
-    #[param(default = 100, minimum = 1, maximum = 1000)]
-    pub limit: Option<i64>,
+    /// Pagination parameters
+    #[serde(flatten)]
+    #[param(inline)]
+    pub pagination: Pagination,
 }
 
 impl From<ApiKeyDBResponse> for ApiKeyResponse {

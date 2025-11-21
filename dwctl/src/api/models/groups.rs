@@ -1,5 +1,6 @@
 //! API request/response models for user groups.
 
+use super::pagination::Pagination;
 use crate::api::models::deployments::DeployedModelResponse;
 use crate::api::models::users::UserResponse;
 use crate::db::models::groups::GroupDBResponse;
@@ -11,13 +12,10 @@ use utoipa::{IntoParams, ToSchema};
 /// Query parameters for listing groups
 #[derive(Debug, Deserialize, IntoParams, ToSchema)]
 pub struct ListGroupsQuery {
-    /// Number of items to skip
-    #[param(default = 0, minimum = 0)]
-    pub skip: Option<i64>,
-
-    /// Maximum number of items to return
-    #[param(default = 100, minimum = 1, maximum = 1000)]
-    pub limit: Option<i64>,
+    /// Pagination parameters
+    #[serde(flatten)]
+    #[param(inline)]
+    pub pagination: Pagination,
 
     /// Include related data (comma-separated: "users", "models")
     pub include: Option<String>,
@@ -50,7 +48,7 @@ pub struct GroupResponse {
     /// Users in this group (only included if requested)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub users: Option<Vec<UserResponse>>,
-    /// Models accessible by this group (only included if requested)  
+    /// Models accessible by this group (only included if requested)
     #[serde(skip_serializing_if = "Option::is_none")]
     /// Note: no_recursion is important! utoipa will panic at runtime, because it overflows the
     /// stack trying to follow the relationship.
