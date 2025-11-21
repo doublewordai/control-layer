@@ -232,12 +232,12 @@ describe("formatters", () => {
   });
 
   describe("formatPricing", () => {
-    it("should return N/A for undefined pricing", () => {
-      expect(formatPricing(undefined)).toBe("N/A");
+    it("should return $0/$0 for undefined pricing", () => {
+      expect(formatPricing(undefined)).toBe("$0/$0");
     });
 
-    it("should return N/A when both prices are null", () => {
-      expect(formatPricing({ input_price_per_token: null, output_price_per_token: null })).toBe("N/A");
+    it("should return $0/$0 when both prices are null", () => {
+      expect(formatPricing({ input_price_per_token: null, output_price_per_token: null })).toBe("$0/$0");
     });
 
     it("should format both input and output prices", () => {
@@ -251,14 +251,14 @@ describe("formatters", () => {
       expect(formatPricing({
         input_price_per_token: null,
         output_price_per_token: 0.0002
-      })).toBe("N/A / $0.0002");
+      })).toBe("$0 / $0.0002");
     });
 
     it("should handle missing output price", () => {
       expect(formatPricing({
         input_price_per_token: 0.0001,
         output_price_per_token: null
-      })).toBe("$0.0001 / N/A");
+      })).toBe("$0.0001 / $0");
     });
   });
 });
