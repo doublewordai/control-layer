@@ -922,7 +922,8 @@ mod tests {
 
         let upload_response = app
             .post("/ai/v1/files")
-            .add_header(add_auth_headers(&user).0, add_auth_headers(&user).1)
+            .add_header(&add_auth_headers(&user)[0].0, &add_auth_headers(&user)[0].1)
+            .add_header(&add_auth_headers(&user)[1].0, &add_auth_headers(&user)[1].1)
             .multipart(
                 axum_test::multipart::MultipartForm::new()
                     .add_text("purpose", "batch")
