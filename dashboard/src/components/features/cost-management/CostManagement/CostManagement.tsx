@@ -1,5 +1,5 @@
 import { useEffect, useState } from "react";
-import { useUser, useAddFunds, useConfig } from "@/api/control-layer";
+import { useUser, useAddFunds, useConfig, dwctlApi } from "@/api/control-layer";
 import { toast } from "sonner";
 import { useSettings } from "@/contexts";
 import { TransactionHistory } from "@/components/features/cost-management/CostManagement/TransactionHistory.tsx";
@@ -36,38 +36,23 @@ export function CostManagement() {
     const sessionId = urlParams.get("session_id");
 
     if (paymentStatus === "success" && sessionId) {
-      // Process the payment immediately
+      // Process payment with simple async/await
       setShowSuccessModal(true);
       setIsProcessingPayment(true);
       setProcessingError(null);
 
-      // Call process_payment endpoint
-      fetch(`/admin/api/v1/payments/process/${sessionId}`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-      })
-        .then(async (response) => {
-          if (response.ok) {
-            // Payment processed successfully
-            await refetchUser();
-            setIsProcessingPayment(false);
-          } else if (response.status === 402) {
-            // Payment not completed yet
-            setProcessingError("Payment is still processing. Please check back in a moment.");
-            setIsProcessingPayment(false);
-          } else {
-            const errorData = await response.json().catch(() => ({}));
-            setProcessingError(errorData.message || "Failed to process payment");
-            setIsProcessingPayment(false);
-          }
+      dwctlApi.payments.processPayment(sessionId)
+        .then(() => {
+          setIsProcessingPayment(false);
+          refetchUser();
         })
         .catch((error) => {
           console.error("Error processing payment:", error);
-          setProcessingError("Failed to process payment");
           setIsProcessingPayment(false);
+          setProcessingError(error instanceof Error ? error.message : "Failed to process payment");
         });
 
-      // Clean up URL
+      // Clean up URL - this prevents re-processing on subsequent renders
       window.history.replaceState({}, "", window.location.pathname);
     } else if (paymentStatus === "cancelled" && sessionId) {
       setShowCancelledModal(true);
@@ -79,7 +64,8 @@ export function CostManagement() {
       refetchUser();
       window.history.replaceState({}, "", window.location.pathname);
     }
-  }, [isDemoMode, refetchUser]);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [isDemoMode]);
 
   const handleAddFunds = async () => {
     if (isDemoMode) {
@@ -100,25 +86,16 @@ export function CostManagement() {
     } else if (config?.payment_enabled) {
       // Payment processing enabled: Get checkout URL and redirect
       try {
-        const response = await fetch("/admin/api/v1/payments/create_checkout", {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-        });
-
-        if (response.ok) {
-          const data = await response.json();
-          if (data.url) {
-            // Navigate to Stripe checkout page
-            window.location.href = data.url;
-          } else {
-            toast.error("Failed to get checkout URL");
-          }
+        const data = await dwctlApi.payments.createCheckout();
+        if (data.url) {
+          // Navigate to Stripe checkout page
+          window.location.href = data.url;
         } else {
-          const errorData = await response.json().catch(() => ({}));
-          toast.error(errorData.message || "Failed to initiate checkout");
+          toast.error("Failed to get checkout URL");
         }
       } catch (error) {
-        toast.error("Failed to add funds");
+        const errorMessage = error instanceof Error ? error.message : "Failed to initiate checkout";
+        toast.error(errorMessage);
         console.error("Error creating checkout:", error);
       }
     } else {

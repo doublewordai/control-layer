@@ -758,6 +758,46 @@ const costApi = {
   },
 };
 
+// Payment processing API
+const paymentsApi = {
+  async createCheckout(): Promise<{ url: string }> {
+    const response = await fetch("/admin/api/v1/payments/create_checkout", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+    });
+
+    if (!response.ok) {
+      const errorData = await response.json().catch(() => ({}));
+      throw new Error(errorData.message || `Failed to create checkout: ${response.status}`);
+    }
+
+    return response.json();
+  },
+
+  async processPayment(sessionId: string): Promise<void> {
+    const response = await fetch(`/admin/api/v1/payments/process/${sessionId}`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+    });
+
+    if (!response.ok) {
+      if (response.status === 402) {
+        throw new ApiError(
+          402,
+          "Payment is still processing. Please check back in a moment.",
+          response,
+        );
+      }
+      const errorData = await response.json().catch(() => ({}));
+      throw new ApiError(
+        response.status,
+        errorData.message || "Failed to process payment",
+        response,
+      );
+    }
+  },
+};
+
 // Probes API
 const probesApi = {
   async list(status?: string): Promise<Probe[]> {
@@ -1096,6 +1136,7 @@ export const dwctlApi = {
   requests: requestsApi,
   auth: authApi,
   cost: costApi,
+  payments: paymentsApi,
   probes: probesApi,
   files: filesApi,
   batches: batchesApi,
