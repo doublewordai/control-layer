@@ -143,6 +143,7 @@ pub mod errors;
 mod leader_election;
 mod metrics;
 mod openapi;
+mod payment_providers;
 mod probes;
 mod request_logging;
 mod static_assets;
@@ -733,7 +734,7 @@ pub async fn build_router(state: &mut AppState, onwards_router: Router) -> anyho
             }),
         )
         // Webhook routes (external services, not part of client API docs)
-        .route("/webhooks/stripe", post(api::handlers::payments::stripe::webhook))
+        .route("/webhooks/payments", post(api::handlers::payments::webhook_handler))
         .with_state(state.clone())
         .merge(auth_routes)
         .nest("/ai/v1", ai_router)

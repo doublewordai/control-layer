@@ -223,6 +223,10 @@ pub enum PaymentConfig {
     /// - `DWCTL_PAYMENT__STRIPE__WEBHOOK_SECRET` - Webhook signing secret
     /// - `DWCTL_PAYMENT__STRIPE__PRICE_ID` - Price ID for the payment product
     Stripe(StripeConfig),
+    /// Dummy payment provider for testing
+    /// Set configuration via:
+    /// - `DWCTL_PAYMENT__DUMMY__AMOUNT` - Amount to add (defaults to $50)
+    Dummy(DummyConfig),
 }
 
 /// Stripe payment configuration.
@@ -234,6 +238,14 @@ pub struct StripeConfig {
     pub webhook_secret: String,
     /// Stripe price ID for the payment (starts with price_)
     pub price_id: String,
+}
+
+/// Dummy payment configuration for testing.
+#[derive(Debug, Clone, Deserialize, Serialize, Default)]
+pub struct DummyConfig {
+    /// Amount to add in dollars (defaults to $50)
+    #[serde(default)]
+    pub amount: Option<rust_decimal::Decimal>,
 }
 
 /// Frontend metadata displayed in the UI.
