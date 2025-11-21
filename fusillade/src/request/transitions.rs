@@ -105,11 +105,26 @@ use std::sync::Arc;
 
 use tokio::sync::Mutex;
 
-use crate::{error::Result, http::HttpClient, manager::Storage};
+use crate::{
+    error::Result,
+    http::{HttpClient, HttpResponse},
+    manager::Storage,
+    FusilladeError,
+};
 
 use super::types::{
     Canceled, Claimed, Completed, DaemonId, Failed, FailureReason, Pending, Processing, Request,
+    RequestCompletionResult,
 };
+
+/// Reason for cancelling a request.
+#[derive(Debug, Clone, Copy)]
+pub enum CancellationReason {
+    /// User-initiated cancellation (should persist Canceled state).
+    User,
+    /// Daemon shutdown (abort HTTP but don't persist state change).
+    Shutdown,
+}
 
 impl Request<Pending> {
     pub async fn claim<S: Storage + ?Sized>(
@@ -291,26 +306,66 @@ impl Request<Processing> {
     /// Wait for the HTTP request to complete.
     ///
     /// This method awaits the result from the spawned HTTP task and transitions
-    /// the request to either `Completed` or `Failed` state.
+    /// the request to one of three terminal states: `Completed`, `Failed`, or `Canceled`.
     ///
     /// The `should_retry` predicate determines whether a response should be considered
     /// a failure (and thus eligible for retry) or a success.
     ///
+    /// The `cancellation` future allows external cancellation of the request. It should
+    /// resolve to a `CancellationReason`:
+    /// - `CancellationReason::User`: User-initiated cancellation (persists Canceled state)
+    /// - `CancellationReason::Shutdown`: Daemon shutdown (aborts HTTP but doesn't persist)
+    ///
     /// Returns:
-    /// - `Ok(completed_request)` if the HTTP request succeeded
-    /// - `Err(failed_request)` if the HTTP request failed or should be retried
-    pub async fn complete<S: Storage + ?Sized, F>(
+    /// - `RequestCompletionResult::Completed` if the HTTP request succeeded
+    /// - `RequestCompletionResult::Failed` if the HTTP request failed or should be retried
+    /// - `RequestCompletionResult::Canceled` if the request was canceled by user
+    /// - `Err(FusilladeError::Shutdown)` if the daemon is shutting down
+    pub async fn complete<S, F, Fut>(
         self,
         storage: &S,
         should_retry: F,
-    ) -> Result<std::result::Result<Request<Completed>, Request<Failed>>>
+        cancellation: Fut,
+    ) -> Result<RequestCompletionResult>
     where
-        F: Fn(&crate::http::HttpResponse) -> bool,
+        S: Storage + ?Sized,
+        F: Fn(&HttpResponse) -> bool,
+        Fut: std::future::Future<Output = CancellationReason>,
     {
         // Await the result from the channel (lock the mutex to access the receiver)
-        let result = {
+        // We use an enum to track whether we got a result or cancellation so we can
+        // drop the mutex guard before calling self.cancel()
+        enum Outcome {
+            Result(Option<std::result::Result<HttpResponse, FusilladeError>>),
+            Canceled(CancellationReason),
+        }
+
+        let outcome = {
             let mut rx = self.state.result_rx.lock().await;
-            rx.recv().await
+
+            tokio::select! {
+                // Wait for the HTTP request to finish processing
+                result = rx.recv() => Outcome::Result(result),
+                // Handle cancellation
+                reason = cancellation => Outcome::Canceled(reason),
+            }
+        };
+
+        // Handle cancellation outside the mutex guard
+        let result = match outcome {
+            Outcome::Canceled(CancellationReason::User) => {
+                // User cancellation: persist Canceled state
+                // (self.cancel() will abort the HTTP task)
+                let canceled = self.cancel(storage).await?;
+                return Ok(RequestCompletionResult::Canceled(canceled));
+            }
+            Outcome::Canceled(CancellationReason::Shutdown) => {
+                // Shutdown: abort HTTP task but don't persist state change
+                // Request stays in Processing state and will be reclaimed later
+                self.state.abort_handle.abort();
+                return Err(FusilladeError::Shutdown);
+            }
+            Outcome::Result(result) => result,
         };
 
         match result {
@@ -334,7 +389,7 @@ impl Request<Processing> {
                         state: failed_state,
                     };
                     storage.persist(&request).await?;
-                    Ok(Err(request))
+                    Ok(RequestCompletionResult::Failed(request))
                 } else if is_error {
                     // Non-retriable error (e.g., 4xx client errors)
                     // Mark as failed but don't retry
@@ -351,7 +406,7 @@ impl Request<Processing> {
                         state: failed_state,
                     };
                     storage.persist(&request).await?;
-                    Ok(Err(request))
+                    Ok(RequestCompletionResult::Failed(request))
                 } else {
                     // HTTP request completed successfully
                     let completed_state = Completed {
@@ -366,7 +421,7 @@ impl Request<Processing> {
                         state: completed_state,
                     };
                     storage.persist(&request).await?;
-                    Ok(Ok(request))
+                    Ok(RequestCompletionResult::Completed(request))
                 }
             }
             Some(Err(e)) => {
@@ -383,7 +438,7 @@ impl Request<Processing> {
                     state: failed_state,
                 };
                 storage.persist(&request).await?;
-                Ok(Err(request))
+                Ok(RequestCompletionResult::Failed(request))
             }
             None => {
                 // Channel closed - task died without sending a result
@@ -397,7 +452,7 @@ impl Request<Processing> {
                     state: failed_state,
                 };
                 storage.persist(&request).await?;
-                Ok(Err(request))
+                Ok(RequestCompletionResult::Failed(request))
             }
         }
     }
