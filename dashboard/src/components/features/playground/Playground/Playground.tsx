@@ -99,7 +99,7 @@ const Playground: React.FC = () => {
     search: debouncedModelSearch || undefined,
     limit: 50,
   });
-  const models = modelsData?.data ?? [];
+  const models = useMemo(() => modelsData?.data ?? [], [modelsData]);
 
   const { data: compareModelsData } = useModels({
     search: debouncedCompareSearch || undefined,
