@@ -705,10 +705,6 @@ impl<H: HttpClient + 'static> Storage for PostgresRequestManager<H> {
         let mut stub_filename: Option<String> = None; // The filename used when creating stub
         let mut uniqueness_checked_for_final_filename = false; // Only true if we've checked the final filename from metadata
 
-        // uploaded_by is established at the start and won't change
-        // (dwctl sends it immediately, so it's either Some(value) or None from the beginning)
-        let mut uploaded_by_established = false;
-
         while let Some(item) = stream.next().await {
             match item {
                 FileStreamItem::Metadata(meta) => {
@@ -733,11 +729,6 @@ impl<H: HttpClient + 'static> Storage for PostgresRequestManager<H> {
                     }
                     if meta.uploaded_by.is_some() {
                         metadata.uploaded_by = meta.uploaded_by;
-                    }
-
-                    // Establish uploaded_by on first metadata (won't change after this)
-                    if !uploaded_by_established {
-                        uploaded_by_established = true;
                     }
 
                     // CASE 1: Filename arrives AFTER stub was created with auto-generated name
