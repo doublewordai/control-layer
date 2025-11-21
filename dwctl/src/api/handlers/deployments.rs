@@ -578,7 +578,10 @@ pub async fn delete_deployed_model(
 mod tests {
 
     use crate::{
-        api::{handlers::deployments::DeployedModelResponse, models::users::Role},
+        api::{
+            handlers::deployments::DeployedModelResponse,
+            models::{pagination::PaginatedResponse, users::Role},
+        },
         db::{
             handlers::{Groups, Repository},
             models::groups::GroupCreateDBRequest,
@@ -589,9 +592,9 @@ mod tests {
     use serde_json::json;
     use sqlx::PgPool;
 
-    /// Helper function to find a model by ID in a list of models
-    fn get_model_by_id(id: DeploymentId, models: &[DeployedModelResponse]) -> Option<&DeployedModelResponse> {
-        models.iter().find(|model| model.id == id)
+    /// Helper function to find a model by ID in a paginated response
+    fn get_model_by_id(id: DeploymentId, response: &PaginatedResponse<DeployedModelResponse>) -> Option<&DeployedModelResponse> {
+        response.data.iter().find(|model| model.id == id)
     }
 
     #[sqlx::test]
@@ -607,9 +610,9 @@ mod tests {
             .await;
 
         response.assert_status_ok();
-        let deployments: Vec<DeployedModelResponse> = response.json();
+        let response_body: PaginatedResponse<DeployedModelResponse> = response.json();
         // Should be empty initially, but test that it returns proper structure
-        assert!(deployments.is_empty() || !deployments.is_empty());
+        assert!(response_body.data.is_empty() || !response_body.data.is_empty());
     }
 
     #[sqlx::test]
@@ -671,8 +674,8 @@ mod tests {
             .await;
 
         response.assert_status_ok();
-        let models: Vec<DeployedModelResponse> = response.json();
-        assert!(models.iter().any(|it| it.id == deployment_id));
+        let response_body: PaginatedResponse<DeployedModelResponse> = response.json();
+        assert!(response_body.data.iter().any(|it| it.id == deployment_id));
 
         // Delete the deployment
         let response = app
@@ -730,8 +733,8 @@ mod tests {
             .await;
 
         response.assert_status_ok();
-        let models: Vec<DeployedModelResponse> = response.json();
-        assert!(models.iter().any(|it| it.id == deployment.id && it.groups.is_none()));
+        let models: PaginatedResponse<DeployedModelResponse> = response.json();
+        assert!(models.data.iter().any(|it| it.id == deployment.id && it.groups.is_none()));
 
         // Test with include=groups - should include groups
         let response = app
@@ -740,9 +743,10 @@ mod tests {
             .await;
 
         response.assert_status_ok();
-        let models: Vec<DeployedModelResponse> = response.json();
+        let models: PaginatedResponse<DeployedModelResponse> = response.json();
 
         assert!(models
+            .data
             .iter()
             .any(|it| { it.id == deployment.id && it.groups.as_deref().is_some_and(|gs| gs.len() == 1 && gs[0].id == group.id) }));
 
@@ -754,8 +758,9 @@ mod tests {
             .await;
 
         response.assert_status_ok();
-        let models: Vec<DeployedModelResponse> = response.json();
+        let models: PaginatedResponse<DeployedModelResponse> = response.json();
         assert!(models
+            .data
             .iter()
             .any(|it| { it.id == deployment.id && it.groups.as_deref().is_some_and(|gs| gs.iter().any(|g| g.id == group.id)) }));
     }
@@ -852,9 +857,9 @@ mod tests {
             .add_header(add_auth_headers(&admin_user).0, add_auth_headers(&admin_user).1)
             .await;
         response.assert_status_ok();
-        let admin_all_models: Vec<DeployedModelResponse> = response.json();
-        assert!(admin_all_models.iter().any(|it| it.id == deployment1.id));
-        assert!(admin_all_models.iter().any(|it| it.id == deployment2.id));
+        let admin_all_models: PaginatedResponse<DeployedModelResponse> = response.json();
+        assert!(admin_all_models.data.iter().any(|it| it.id == deployment1.id));
+        assert!(admin_all_models.data.iter().any(|it| it.id == deployment2.id));
 
         // Admin should see only non-deleted models by default
         let response = app
@@ -862,9 +867,9 @@ mod tests {
             .add_header(add_auth_headers(&admin_user).0, add_auth_headers(&admin_user).1)
             .await;
         response.assert_status_ok();
-        let admin_models: Vec<DeployedModelResponse> = response.json();
-        assert!(admin_models.iter().any(|it| it.id == deployment1.id));
-        assert!(!admin_models.iter().any(|it| it.id == deployment2.id));
+        let admin_models: PaginatedResponse<DeployedModelResponse> = response.json();
+        assert!(admin_models.data.iter().any(|it| it.id == deployment1.id));
+        assert!(!admin_models.data.iter().any(|it| it.id == deployment2.id));
 
         // Regular user should only see the active model
         let response = app
@@ -872,9 +877,9 @@ mod tests {
             .add_header(add_auth_headers(&regular_user).0, add_auth_headers(&regular_user).1)
             .await;
         response.assert_status_ok();
-        let user_models: Vec<DeployedModelResponse> = response.json();
-        assert!(user_models.iter().any(|it| it.id == deployment1.id));
-        assert!(!user_models.iter().any(|it| it.id == deployment2.id));
+        let user_models: PaginatedResponse<DeployedModelResponse> = response.json();
+        assert!(user_models.data.iter().any(|it| it.id == deployment1.id));
+        assert!(!user_models.data.iter().any(|it| it.id == deployment2.id));
     }
 
     #[sqlx::test]
@@ -1121,13 +1126,13 @@ mod tests {
             .add_header(add_auth_headers(&admin_user).0, add_auth_headers(&admin_user).1)
             .await;
         response.assert_status_ok();
-        let models: Vec<DeployedModelResponse> = response.json();
+        let models: PaginatedResponse<DeployedModelResponse> = response.json();
 
         // Find our test deployment by ID and verify it has groups included
         let test_model = get_model_by_id(deployment.id, &models).unwrap_or_else(|| {
             panic!(
                 "Test model not found. Available models: {:?}",
-                models.iter().map(|m| &m.id).collect::<Vec<_>>()
+                models.data.iter().map(|m| &m.id).collect::<Vec<_>>()
             )
         });
 
@@ -1142,13 +1147,13 @@ mod tests {
             .add_header(add_auth_headers(&regular_user).0, add_auth_headers(&regular_user).1)
             .await;
         response.assert_status_ok();
-        let models: Vec<DeployedModelResponse> = response.json();
+        let models: PaginatedResponse<DeployedModelResponse> = response.json();
 
         // Find our test deployment by ID and verify groups are NOT included
         let test_model = get_model_by_id(deployment.id, &models).unwrap_or_else(|| {
             panic!(
                 "Test model not found. Available models: {:?}",
-                models.iter().map(|m| &m.id).collect::<Vec<_>>()
+                models.data.iter().map(|m| &m.id).collect::<Vec<_>>()
             )
         });
         assert!(test_model.groups.is_none(), "Regular user should NOT see groups included");
@@ -1189,8 +1194,8 @@ mod tests {
             .add_header(add_auth_headers(&regular_user).0, add_auth_headers(&regular_user).1)
             .await;
         response.assert_status_ok();
-        let user_models: Vec<DeployedModelResponse> = response.json();
-        assert_eq!(user_models.len(), 1, "Regular user should only see 1 accessible model");
+        let user_models: PaginatedResponse<DeployedModelResponse> = response.json();
+        assert_eq!(user_models.data.len(), 1, "Regular user should only see 1 accessible model");
         assert!(get_model_by_id(deployment1.id, &user_models).is_some());
         assert!(get_model_by_id(deployment2.id, &user_models).is_none());
 
@@ -1200,8 +1205,8 @@ mod tests {
             .add_header(add_auth_headers(&regular_user).0, add_auth_headers(&regular_user).1)
             .await;
         response.assert_status_ok();
-        let user_models_explicit: Vec<DeployedModelResponse> = response.json();
-        assert_eq!(user_models_explicit.len(), 1);
+        let user_models_explicit: PaginatedResponse<DeployedModelResponse> = response.json();
+        assert_eq!(user_models_explicit.data.len(), 1);
         assert!(get_model_by_id(deployment1.id, &user_models_explicit).is_some());
 
         // Test 3: Admin user without accessible parameter should see all models (default)
@@ -1210,8 +1215,8 @@ mod tests {
             .add_header(add_auth_headers(&admin_user).0, add_auth_headers(&admin_user).1)
             .await;
         response.assert_status_ok();
-        let admin_models: Vec<DeployedModelResponse> = response.json();
-        assert_eq!(admin_models.len(), 2, "Admin should see all models by default");
+        let admin_models: PaginatedResponse<DeployedModelResponse> = response.json();
+        assert_eq!(admin_models.data.len(), 2, "Admin should see all models by default");
         assert!(get_model_by_id(deployment1.id, &admin_models).is_some());
         assert!(get_model_by_id(deployment2.id, &admin_models).is_some());
 
@@ -1221,8 +1226,8 @@ mod tests {
             .add_header(add_auth_headers(&admin_user).0, add_auth_headers(&admin_user).1)
             .await;
         response.assert_status_ok();
-        let admin_models_explicit: Vec<DeployedModelResponse> = response.json();
-        assert_eq!(admin_models_explicit.len(), 2);
+        let admin_models_explicit: PaginatedResponse<DeployedModelResponse> = response.json();
+        assert_eq!(admin_models_explicit.data.len(), 2);
 
         // Test 5: Admin user with accessible=true should get filtered results (only their accessible models)
         // First add admin to a group and that group to deployment1
@@ -1233,9 +1238,9 @@ mod tests {
             .add_header(add_auth_headers(&admin_user).0, add_auth_headers(&admin_user).1)
             .await;
         response.assert_status_ok();
-        let admin_accessible: Vec<DeployedModelResponse> = response.json();
+        let admin_accessible: PaginatedResponse<DeployedModelResponse> = response.json();
         assert_eq!(
-            admin_accessible.len(),
+            admin_accessible.data.len(),
             1,
             "Admin with accessible=true should only see their accessible models"
         );
@@ -1259,7 +1264,7 @@ mod tests {
             .await;
 
         response.assert_status_ok();
-        let models: Vec<DeployedModelResponse> = response.json();
+        let models: PaginatedResponse<DeployedModelResponse> = response.json();
         let test_model = get_model_by_id(deployment.id, &models).unwrap();
         assert!(test_model.metrics.is_none(), "Should not include metrics by default");
 
@@ -1270,7 +1275,7 @@ mod tests {
             .await;
 
         response.assert_status_ok();
-        let models: Vec<DeployedModelResponse> = response.json();
+        let models: PaginatedResponse<DeployedModelResponse> = response.json();
         let test_model = get_model_by_id(deployment.id, &models).unwrap();
         assert!(test_model.metrics.is_some(), "Admin should see metrics when requested");
         let metrics = test_model.metrics.as_ref().unwrap();
@@ -1283,7 +1288,7 @@ mod tests {
             .await;
 
         response.assert_status_ok();
-        let models: Vec<DeployedModelResponse> = response.json();
+        let models: PaginatedResponse<DeployedModelResponse> = response.json();
         if let Some(test_model) = get_model_by_id(deployment.id, &models) {
             assert!(
                 test_model.metrics.is_none(),
@@ -1298,7 +1303,7 @@ mod tests {
             .await;
 
         response.assert_status_ok();
-        let models: Vec<DeployedModelResponse> = response.json();
+        let models: PaginatedResponse<DeployedModelResponse> = response.json();
         let test_model = get_model_by_id(deployment.id, &models).unwrap();
         assert!(test_model.groups.is_some(), "Admin should see groups when requested");
         assert!(test_model.metrics.is_some(), "Admin should see metrics when requested");
@@ -1310,7 +1315,7 @@ mod tests {
             .await;
 
         response.assert_status_ok();
-        let models: Vec<DeployedModelResponse> = response.json();
+        let models: PaginatedResponse<DeployedModelResponse> = response.json();
         if let Some(test_model) = get_model_by_id(deployment.id, &models) {
             assert!(test_model.groups.is_none(), "Regular user should NOT see groups");
             assert!(
@@ -1355,11 +1360,11 @@ mod tests {
             .add_header(add_auth_headers(&platform_manager).0, add_auth_headers(&platform_manager).1)
             .await;
         response.assert_status_ok();
-        let pm_models: Vec<DeployedModelResponse> = response.json();
+        let pm_models: PaginatedResponse<DeployedModelResponse> = response.json();
 
-        assert!(pm_models.iter().any(|m| m.id == deployment1.id), "PM should see deployment1");
+        assert!(pm_models.data.iter().any(|m| m.id == deployment1.id), "PM should see deployment1");
         assert!(
-            pm_models.iter().any(|m| m.id == deployment2.id),
+            pm_models.data.iter().any(|m| m.id == deployment2.id),
             "PM should see deployment2 even without group access"
         );
 
@@ -1369,16 +1374,20 @@ mod tests {
             .add_header(add_auth_headers(&standard_user).0, add_auth_headers(&standard_user).1)
             .await;
         response.assert_status_ok();
-        let user_models: Vec<DeployedModelResponse> = response.json();
+        let user_models: PaginatedResponse<DeployedModelResponse> = response.json();
 
         let user_accessible_count = user_models
+            .data
             .iter()
             .filter(|m| m.id == deployment1.id || m.id == deployment2.id)
             .count();
         assert_eq!(user_accessible_count, 1, "Standard user should only see 1 accessible model");
-        assert!(user_models.iter().any(|m| m.id == deployment1.id), "User should see deployment1");
         assert!(
-            !user_models.iter().any(|m| m.id == deployment2.id),
+            user_models.data.iter().any(|m| m.id == deployment1.id),
+            "User should see deployment1"
+        );
+        assert!(
+            !user_models.data.iter().any(|m| m.id == deployment2.id),
             "User should NOT see deployment2"
         );
     }
@@ -1416,10 +1425,10 @@ mod tests {
             .add_header(add_auth_headers(&platform_manager).0, add_auth_headers(&platform_manager).1)
             .await;
         response.assert_status_ok();
-        let all_models: Vec<DeployedModelResponse> = response.json();
+        let all_models: PaginatedResponse<DeployedModelResponse> = response.json();
 
-        assert!(all_models.iter().any(|m| m.id == deployment1.id));
-        assert!(all_models.iter().any(|m| m.id == deployment2.id));
+        assert!(all_models.data.iter().any(|m| m.id == deployment1.id));
+        assert!(all_models.data.iter().any(|m| m.id == deployment2.id));
 
         // Platform manager with accessible=true should see only accessible models
         let response = app
@@ -1427,19 +1436,20 @@ mod tests {
             .add_header(add_auth_headers(&platform_manager).0, add_auth_headers(&platform_manager).1)
             .await;
         response.assert_status_ok();
-        let accessible_models: Vec<DeployedModelResponse> = response.json();
+        let accessible_models: PaginatedResponse<DeployedModelResponse> = response.json();
 
         let accessible_count = accessible_models
+            .data
             .iter()
             .filter(|m| m.id == deployment1.id || m.id == deployment2.id)
             .count();
         assert_eq!(accessible_count, 1, "PM with accessible=true should see only 1 accessible model");
         assert!(
-            accessible_models.iter().any(|m| m.id == deployment1.id),
+            accessible_models.data.iter().any(|m| m.id == deployment1.id),
             "Should see accessible deployment"
         );
         assert!(
-            !accessible_models.iter().any(|m| m.id == deployment2.id),
+            !accessible_models.data.iter().any(|m| m.id == deployment2.id),
             "Should NOT see non-accessible deployment"
         );
     }
@@ -1478,16 +1488,20 @@ mod tests {
             .add_header(add_auth_headers(&request_viewer).0, add_auth_headers(&request_viewer).1)
             .await;
         response.assert_status_ok();
-        let rv_models: Vec<DeployedModelResponse> = response.json();
+        let rv_models: PaginatedResponse<DeployedModelResponse> = response.json();
 
         let rv_accessible_count = rv_models
+            .data
             .iter()
             .filter(|m| m.id == deployment1.id || m.id == deployment2.id)
             .count();
         assert_eq!(rv_accessible_count, 1, "RequestViewer should only see 1 accessible model");
-        assert!(rv_models.iter().any(|m| m.id == deployment1.id), "Should see accessible deployment");
         assert!(
-            !rv_models.iter().any(|m| m.id == deployment2.id),
+            rv_models.data.iter().any(|m| m.id == deployment1.id),
+            "Should see accessible deployment"
+        );
+        assert!(
+            !rv_models.data.iter().any(|m| m.id == deployment2.id),
             "Should NOT see non-accessible deployment"
         );
 
@@ -1497,10 +1511,10 @@ mod tests {
             .add_header(add_auth_headers(&platform_manager).0, add_auth_headers(&platform_manager).1)
             .await;
         response.assert_status_ok();
-        let pm_models: Vec<DeployedModelResponse> = response.json();
+        let pm_models: PaginatedResponse<DeployedModelResponse> = response.json();
 
-        assert!(pm_models.iter().any(|m| m.id == deployment1.id));
-        assert!(pm_models.iter().any(|m| m.id == deployment2.id));
+        assert!(pm_models.data.iter().any(|m| m.id == deployment1.id));
+        assert!(pm_models.data.iter().any(|m| m.id == deployment2.id));
     }
 
     #[sqlx::test]
@@ -1535,14 +1549,14 @@ mod tests {
             .await;
         response.assert_status_ok();
 
-        let models: Vec<DeployedModelResponse> = response.json();
+        let models: PaginatedResponse<DeployedModelResponse> = response.json();
         assert!(
-            models.iter().any(|m| m.id == deployment_id),
+            models.data.iter().any(|m| m.id == deployment_id),
             "Platform manager should see newly created model immediately"
         );
 
         // Verify the model details
-        let found_model = models.iter().find(|m| m.id == deployment_id).unwrap();
+        let found_model = models.data.iter().find(|m| m.id == deployment_id).unwrap();
         assert_eq!(found_model.model_name, "pm-new-model");
         assert_eq!(found_model.alias, "Platform Manager New Model");
     }
@@ -1566,9 +1580,9 @@ mod tests {
             .await;
         response.assert_status_ok();
 
-        let pm_models: Vec<DeployedModelResponse> = response.json();
+        let pm_models: PaginatedResponse<DeployedModelResponse> = response.json();
         assert!(
-            pm_models.iter().any(|m| m.id == deployment.id),
+            pm_models.data.iter().any(|m| m.id == deployment.id),
             "Platform manager should see ungrouped model"
         );
 
@@ -1579,9 +1593,9 @@ mod tests {
             .await;
         response.assert_status_ok();
 
-        let user_models: Vec<DeployedModelResponse> = response.json();
+        let user_models: PaginatedResponse<DeployedModelResponse> = response.json();
         assert!(
-            !user_models.iter().any(|m| m.id == deployment.id),
+            !user_models.data.iter().any(|m| m.id == deployment.id),
             "Standard user should NOT see ungrouped model"
         );
     }
@@ -1801,9 +1815,9 @@ mod tests {
             .await;
         response.assert_status_ok();
 
-        let standard_models: Vec<DeployedModelResponse> = response.json();
-        assert!(standard_models.iter().any(|m| m.id == accessible_deployment.id));
-        assert!(!standard_models.iter().any(|m| m.id == inaccessible_deployment.id));
+        let standard_models: PaginatedResponse<DeployedModelResponse> = response.json();
+        assert!(standard_models.data.iter().any(|m| m.id == accessible_deployment.id));
+        assert!(!standard_models.data.iter().any(|m| m.id == inaccessible_deployment.id));
 
         // RequestViewer should have same accessibility filtering as StandardUser
         let response = app
@@ -1812,9 +1826,9 @@ mod tests {
             .await;
         response.assert_status_ok();
 
-        let rv_models: Vec<DeployedModelResponse> = response.json();
-        assert!(rv_models.iter().any(|m| m.id == accessible_deployment.id));
-        assert!(!rv_models.iter().any(|m| m.id == inaccessible_deployment.id));
+        let rv_models: PaginatedResponse<DeployedModelResponse> = response.json();
+        assert!(rv_models.data.iter().any(|m| m.id == accessible_deployment.id));
+        assert!(!rv_models.data.iter().any(|m| m.id == inaccessible_deployment.id));
 
         // PlatformManager should see all models by default
         let response = app
@@ -1823,9 +1837,9 @@ mod tests {
             .await;
         response.assert_status_ok();
 
-        let pm_models: Vec<DeployedModelResponse> = response.json();
-        assert!(pm_models.iter().any(|m| m.id == accessible_deployment.id));
-        assert!(pm_models.iter().any(|m| m.id == inaccessible_deployment.id));
+        let pm_models: PaginatedResponse<DeployedModelResponse> = response.json();
+        assert!(pm_models.data.iter().any(|m| m.id == accessible_deployment.id));
+        assert!(pm_models.data.iter().any(|m| m.id == inaccessible_deployment.id));
     }
 
     #[sqlx::test]
@@ -1862,8 +1876,8 @@ mod tests {
             .add_header(add_auth_headers(&platform_manager).0, add_auth_headers(&platform_manager).1)
             .await;
         response.assert_status_ok();
-        let pm_models: Vec<DeployedModelResponse> = response.json();
-        let pm_model = pm_models.iter().find(|m| m.id == deployment.id).unwrap();
+        let pm_models: PaginatedResponse<DeployedModelResponse> = response.json();
+        let pm_model = pm_models.data.iter().find(|m| m.id == deployment.id).unwrap();
         assert!(pm_model.groups.is_some(), "PlatformManager should see groups when included");
 
         // StandardUser should NOT be able to include groups (groups should be None)
@@ -1872,7 +1886,7 @@ mod tests {
             .add_header(add_auth_headers(&standard_user).0, add_auth_headers(&standard_user).1)
             .await;
         response.assert_status_ok();
-        let models: Vec<DeployedModelResponse> = response.json();
+        let models: PaginatedResponse<DeployedModelResponse> = response.json();
         let test_model = get_model_by_id(deployment.id, &models).unwrap();
         assert!(test_model.groups.is_none(), "Regular user should NOT see groups included");
 
@@ -1883,8 +1897,8 @@ mod tests {
             .await;
         response.assert_status_ok();
 
-        let rv_models: Vec<DeployedModelResponse> = response.json();
-        let rv_model = rv_models.iter().find(|m| m.id == deployment.id).unwrap();
+        let rv_models: PaginatedResponse<DeployedModelResponse> = response.json();
+        let rv_model = rv_models.data.iter().find(|m| m.id == deployment.id).unwrap();
         assert!(rv_model.groups.is_none(), "RequestViewer should NOT see groups even when requested");
     }
 
@@ -1991,7 +2005,7 @@ mod tests {
             .add_header(add_auth_headers(&platform_manager).0, add_auth_headers(&platform_manager).1)
             .await;
         response.assert_status_ok();
-        let models: Vec<DeployedModelResponse> = response.json();
+        let models: PaginatedResponse<DeployedModelResponse> = response.json();
         let pm_model = get_model_by_id(deployment.id, &models).unwrap();
         assert!(pm_model.metrics.is_some(), "PlatformManager should see metrics when requested");
 
@@ -2001,7 +2015,7 @@ mod tests {
             .add_header(add_auth_headers(&standard_user).0, add_auth_headers(&standard_user).1)
             .await;
         response.assert_status_ok();
-        let models: Vec<DeployedModelResponse> = response.json();
+        let models: PaginatedResponse<DeployedModelResponse> = response.json();
         let user_model = get_model_by_id(deployment.id, &models).unwrap();
         assert!(
             user_model.metrics.is_none(),
@@ -2014,7 +2028,7 @@ mod tests {
             .add_header(add_auth_headers(&request_viewer).0, add_auth_headers(&request_viewer).1)
             .await;
         response.assert_status_ok();
-        let models: Vec<DeployedModelResponse> = response.json();
+        let models: PaginatedResponse<DeployedModelResponse> = response.json();
         let rv_model = get_model_by_id(deployment.id, &models).unwrap();
         assert!(rv_model.metrics.is_some(), "RequestViewer should see metrics when requested");
     }
@@ -2038,8 +2052,8 @@ mod tests {
             .add_header(add_auth_headers(&admin_user).0, add_auth_headers(&admin_user).1)
             .await;
         response.assert_status_ok();
-        let page1: Vec<DeployedModelResponse> = response.json();
-        assert_eq!(page1.len(), 2, "First page should have 2 models");
+        let page1: PaginatedResponse<DeployedModelResponse> = response.json();
+        assert_eq!(page1.data.len(), 2, "First page should have 2 models");
 
         // Test 2: Get second page with limit=2, skip=2
         let response = app
@@ -2047,8 +2061,8 @@ mod tests {
             .add_header(add_auth_headers(&admin_user).0, add_auth_headers(&admin_user).1)
             .await;
         response.assert_status_ok();
-        let page2: Vec<DeployedModelResponse> = response.json();
-        assert_eq!(page2.len(), 2, "Second page should have 2 models");
+        let page2: PaginatedResponse<DeployedModelResponse> = response.json();
+        assert_eq!(page2.data.len(), 2, "Second page should have 2 models");
 
         // Test 3: Get third page with limit=2, skip=4 (should have 1 model)
         let response = app
@@ -2056,11 +2070,17 @@ mod tests {
             .add_header(add_auth_headers(&admin_user).0, add_auth_headers(&admin_user).1)
             .await;
         response.assert_status_ok();
-        let page3: Vec<DeployedModelResponse> = response.json();
-        assert_eq!(page3.len(), 1, "Third page should have 1 model");
+        let page3: PaginatedResponse<DeployedModelResponse> = response.json();
+        assert_eq!(page3.data.len(), 1, "Third page should have 1 model");
 
         // Test 4: Verify no duplicate models across pages
-        let all_page_ids: Vec<DeploymentId> = page1.iter().chain(page2.iter()).chain(page3.iter()).map(|m| m.id).collect();
+        let all_page_ids: Vec<DeploymentId> = page1
+            .data
+            .iter()
+            .chain(page2.data.iter())
+            .chain(page3.data.iter())
+            .map(|m| m.id)
+            .collect();
 
         let unique_ids: std::collections::HashSet<DeploymentId> = all_page_ids.iter().copied().collect();
         assert_eq!(all_page_ids.len(), unique_ids.len(), "Pages should not have duplicate models");
@@ -2082,8 +2102,8 @@ mod tests {
             .add_header(add_auth_headers(&admin_user).0, add_auth_headers(&admin_user).1)
             .await;
         response.assert_status_ok();
-        let all_models: Vec<DeployedModelResponse> = response.json();
-        assert_eq!(all_models.len(), 5, "Without pagination params, should get all models");
+        let all_models: PaginatedResponse<DeployedModelResponse> = response.json();
+        assert_eq!(all_models.data.len(), 5, "Without pagination params, should get all models");
 
         // Test 7: Offset (skip) beyond available models (should return empty)
         let response = app
@@ -2091,7 +2111,7 @@ mod tests {
             .add_header(add_auth_headers(&admin_user).0, add_auth_headers(&admin_user).1)
             .await;
         response.assert_status_ok();
-        let empty_page: Vec<DeployedModelResponse> = response.json();
-        assert_eq!(empty_page.len(), 0, "Offset beyond available models should return empty array");
+        let empty_page: PaginatedResponse<DeployedModelResponse> = response.json();
+        assert_eq!(empty_page.data.len(), 0, "Offset beyond available models should return empty array");
     }
 }

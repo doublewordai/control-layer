@@ -568,6 +568,7 @@ pub async fn synchronize_endpoint(
 mod tests {
     use crate::api::models::deployments::DeployedModelResponse;
     use crate::api::models::inference_endpoints::InferenceEndpointResponse;
+    use crate::api::models::pagination::PaginatedResponse;
     use crate::api::models::users::Role;
     use crate::test_utils::*;
     use serde_json::json;
@@ -2069,8 +2070,8 @@ mod tests {
             .await;
 
         response.assert_status_ok();
-        let deployments: Vec<DeployedModelResponse> = response.json();
-        assert!(deployments.iter().any(|d| d.alias == "google/gemma-3-12b-it"));
-        assert!(deployments.iter().any(|d| d.alias == "openai/gpt-4"));
+        let deployments: PaginatedResponse<DeployedModelResponse> = response.json();
+        assert!(deployments.data.iter().any(|d| d.alias == "google/gemma-3-12b-it"));
+        assert!(deployments.data.iter().any(|d| d.alias == "openai/gpt-4"));
     }
 }

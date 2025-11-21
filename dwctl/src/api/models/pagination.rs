@@ -60,7 +60,7 @@ impl Pagination {
 ///
 /// Wraps a list of items with pagination metadata including total count
 /// for client-side pagination calculations.
-#[derive(Debug, Clone, Serialize, ToSchema)]
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct PaginatedResponse<T: ToSchema> {
     /// The items for the current page
     pub data: Vec<T>,
