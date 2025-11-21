@@ -2599,82 +2599,97 @@ impl<H: HttpClient + 'static> PostgresRequestManager<H> {
         let pool = self.pool.clone();
 
         // Create a stream that handles reconnection internally
-        let stream = futures::stream::unfold(pool, |pool| async move {
+        // State: (pool, optional listener) - we keep the listener alive across iterations
+        type State = (PgPool, Option<sqlx::postgres::PgListener>);
+
+        let stream = futures::stream::unfold((pool, None), |(pool, listener_opt): State| async move {
             const RECONNECT_DELAY_SECS: u64 = 5;
 
-            'reconnect: loop {
-                // Try to create a new listener
-                let mut listener = match sqlx::postgres::PgListener::connect_with(&pool).await {
-                    Ok(l) => {
-                        tracing::debug!("Connected to PostgreSQL for cancellation stream");
-                        l
+            let mut listener = match listener_opt {
+                Some(l) => l,
+                None => {
+                    // Need to establish a connection
+                    'reconnect: loop {
+                        // Try to create a new listener
+                        let mut listener = match sqlx::postgres::PgListener::connect_with(&pool).await {
+                            Ok(l) => {
+                                tracing::debug!("Connected to PostgreSQL for cancellation stream");
+                                l
+                            }
+                            Err(e) => {
+                                tracing::error!(
+                                    error = %e,
+                                    "Failed to connect listener for cancellations, retrying in {}s",
+                                    RECONNECT_DELAY_SECS
+                                );
+                                tokio::time::sleep(std::time::Duration::from_secs(RECONNECT_DELAY_SECS)).await;
+                                continue 'reconnect;
+                            }
+                        };
+
+                        // Try to listen to the channel
+                        if let Err(e) = listener.listen("request_cancellations").await {
+                            tracing::error!(
+                                error = %e,
+                                "Failed to LISTEN on request_cancellations channel, retrying in {}s",
+                                RECONNECT_DELAY_SECS
+                            );
+                            tokio::time::sleep(std::time::Duration::from_secs(RECONNECT_DELAY_SECS)).await;
+                            continue 'reconnect;
+                        }
+
+                        tracing::info!("Listening for request cancellations via PostgreSQL NOTIFY");
+                        break listener;
+                    }
+                }
+            };
+
+            // Try to receive a notification from the active listener
+            loop {
+                match listener.try_recv().await {
+                    Ok(Some(notification)) => {
+                        // Parse the request ID from the payload (UUID string)
+                        match notification.payload().parse::<uuid::Uuid>() {
+                            Ok(uuid) => {
+                                // Valid cancellation - return it and keep the connection alive
+                                return Some((RequestId(uuid), (pool, Some(listener))));
+                            }
+                            Err(e) => {
+                                tracing::error!(
+                                    payload = notification.payload(),
+                                    error = %e,
+                                    "Failed to parse request ID from notification, skipping"
+                                );
+                                // Skip invalid messages, continue listening on same connection
+                            }
+                        }
+                    }
+                    Ok(None) => {
+                        tracing::error!(
+                            "Connection closed while listening for cancellations, reconnecting in {}s",
+                            RECONNECT_DELAY_SECS
+                        );
+                        tokio::time::sleep(std::time::Duration::from_secs(RECONNECT_DELAY_SECS)).await;
+                        // Drop the listener to trigger reconnect on next iteration
+                        return Some((RequestId(uuid::Uuid::nil()), (pool, None)));
                     }
                     Err(e) => {
                         tracing::error!(
                             error = %e,
-                            "Failed to connect listener for cancellations, retrying in {}s",
+                            "PostgreSQL error while listening for cancellations, reconnecting in {}s",
                             RECONNECT_DELAY_SECS
                         );
                         tokio::time::sleep(std::time::Duration::from_secs(RECONNECT_DELAY_SECS)).await;
-                        continue 'reconnect;
-                    }
-                };
-
-                // Try to listen to the channel
-                if let Err(e) = listener.listen("request_cancellations").await {
-                    tracing::error!(
-                        error = %e,
-                        "Failed to LISTEN on request_cancellations channel, retrying in {}s",
-                        RECONNECT_DELAY_SECS
-                    );
-                    tokio::time::sleep(std::time::Duration::from_secs(RECONNECT_DELAY_SECS)).await;
-                    continue 'reconnect;
-                }
-
-                tracing::info!("Listening for request cancellations via PostgreSQL NOTIFY");
-
-                // Process messages until connection fails
-                loop {
-                    match listener.try_recv().await {
-                        Ok(Some(notification)) => {
-                            // Parse the request ID from the payload (UUID string)
-                            match notification.payload().parse::<uuid::Uuid>() {
-                                Ok(uuid) => {
-                                    // Valid cancellation - return it
-                                    return Some((RequestId(uuid), pool));
-                                }
-                                Err(e) => {
-                                    tracing::error!(
-                                        payload = notification.payload(),
-                                        error = %e,
-                                        "Failed to parse request ID from notification, skipping"
-                                    );
-                                    // Skip invalid messages, continue listening on same connection
-                                }
-                            }
-                        }
-                        Ok(None) => {
-                            tracing::error!(
-                                "Connection closed while listening for cancellations, reconnecting in {}s",
-                                RECONNECT_DELAY_SECS
-                            );
-                            tokio::time::sleep(std::time::Duration::from_secs(RECONNECT_DELAY_SECS)).await;
-                            // Break inner loop to reconnect
-                            break;
-                        }
-                        Err(e) => {
-                            tracing::error!(
-                                error = %e,
-                                "PostgreSQL error while listening for cancellations, reconnecting in {}s",
-                                RECONNECT_DELAY_SECS
-                            );
-                            tokio::time::sleep(std::time::Duration::from_secs(RECONNECT_DELAY_SECS)).await;
-                            // Break inner loop to reconnect
-                            break;
-                        }
+                        // Drop the listener to trigger reconnect on next iteration
+                        return Some((RequestId(uuid::Uuid::nil()), (pool, None)));
                     }
                 }
             }
+        })
+        .filter(|request_id| {
+            // Filter out nil UUIDs (used for reconnection signaling)
+            let keep = !request_id.0.is_nil();
+            futures::future::ready(keep)
         })
         .boxed();
 
