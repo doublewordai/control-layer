@@ -5,7 +5,7 @@ use crate::{
     api::models::users::Role,
     db::{
         errors::{DbError, Result},
-        handlers::repository::Repository,
+        handlers::{repository::Repository, Groups},
         models::users::{UserCreateDBRequest, UserDBResponse, UserUpdateDBRequest},
     },
 };
@@ -42,6 +42,7 @@ struct User {
     pub last_login: Option<DateTime<Utc>>,
     pub is_admin: bool,
     pub password_hash: Option<String>,
+    pub external_user_id: Option<String>,
 }
 
 pub struct Users<'c> {
@@ -62,6 +63,7 @@ impl From<(Vec<Role>, User)> for UserDBResponse {
             is_admin: user.is_admin,
             roles,
             password_hash: user.password_hash,
+            external_user_id: user.external_user_id,
         }
     }
 }
@@ -84,8 +86,8 @@ impl<'c> Repository for Users<'c> {
         let user = sqlx::query_as!(
             User,
             r#"
-            INSERT INTO users (id, username, email, display_name, avatar_url, auth_source, is_admin, password_hash)
-            VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+            INSERT INTO users (id, username, email, display_name, avatar_url, auth_source, is_admin, password_hash, external_user_id)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
             RETURNING *
             "#,
             user_id,
@@ -95,7 +97,8 @@ impl<'c> Repository for Users<'c> {
             request.avatar_url,
             request.auth_source,
             request.is_admin,
-            request.password_hash
+            request.password_hash,
+            request.external_user_id
         )
         .fetch_one(&mut *tx)
         .await?;
@@ -128,11 +131,12 @@ impl<'c> Repository for Users<'c> {
                 u.last_login,
                 u.is_admin,
                 u.password_hash,
+                u.external_user_id,
                 ARRAY_AGG(ur.role) FILTER (WHERE ur.role IS NOT NULL) as "roles: Vec<Role>"
             FROM users u
             LEFT JOIN user_roles ur ON ur.user_id = u.id
             WHERE u.id = $1 AND u.id != '00000000-0000-0000-0000-000000000000'
-            GROUP BY u.id, u.username, u.email, u.display_name, u.avatar_url, u.auth_source, u.created_at, u.updated_at, u.last_login, u.is_admin, u.password_hash
+            GROUP BY u.id, u.username, u.email, u.display_name, u.avatar_url, u.auth_source, u.created_at, u.updated_at, u.last_login, u.is_admin, u.password_hash, u.external_user_id
             "#,
             id
         )
@@ -152,6 +156,7 @@ impl<'c> Repository for Users<'c> {
                 last_login: row.last_login,
                 is_admin: row.is_admin,
                 password_hash: row.password_hash,
+                external_user_id: row.external_user_id,
             };
 
             let roles = row.roles.unwrap_or_default();
@@ -183,11 +188,12 @@ impl<'c> Repository for Users<'c> {
                 u.last_login,
                 u.is_admin,
                 u.password_hash,
+                u.external_user_id,
                 ARRAY_AGG(ur.role) FILTER (WHERE ur.role IS NOT NULL) as "roles: Vec<Role>"
             FROM users u
             LEFT JOIN user_roles ur ON ur.user_id = u.id
             WHERE u.id = ANY($1) AND u.id != '00000000-0000-0000-0000-000000000000'
-            GROUP BY u.id, u.username, u.email, u.display_name, u.avatar_url, u.auth_source, u.created_at, u.updated_at, u.last_login, u.is_admin, u.password_hash
+            GROUP BY u.id, u.username, u.email, u.display_name, u.avatar_url, u.auth_source, u.created_at, u.updated_at, u.last_login, u.is_admin, u.password_hash, u.external_user_id
             "#,
             ids.as_slice()
         )
@@ -209,6 +215,7 @@ impl<'c> Repository for Users<'c> {
                 last_login: row.last_login,
                 is_admin: row.is_admin,
                 password_hash: row.password_hash,
+                external_user_id: row.external_user_id,
             };
 
             let roles = row.roles.unwrap_or_default();
@@ -344,6 +351,171 @@ impl<'c> Users<'c> {
         } else {
             Ok(None)
         }
+    }
+
+    #[instrument(skip(self, external_user_id), err)]
+    pub async fn get_user_by_external_user_id(&mut self, external_user_id: &str) -> Result<Option<UserDBResponse>> {
+        let user = sqlx::query_as!(
+            User,
+            "SELECT * FROM users WHERE external_user_id = $1 AND id != '00000000-0000-0000-0000-000000000000'",
+            external_user_id
+        )
+        .fetch_optional(&mut *self.db)
+        .await?;
+
+        if let Some(user) = user {
+            // Get roles for this user
+            let roles = sqlx::query!("SELECT role as \"role: Role\" FROM user_roles WHERE user_id = $1", user.id)
+                .fetch_all(&mut *self.db)
+                .await?;
+
+            let roles: Vec<Role> = roles.into_iter().map(|r| r.role).collect();
+
+            Ok(Some(UserDBResponse::from((roles, user))))
+        } else {
+            Ok(None)
+        }
+    }
+
+    /// Update a user's email address
+    #[instrument(skip(self, email), fields(user_id = %abbrev_uuid(&user_id)), err)]
+    async fn update_user_email(&mut self, user_id: UserId, email: &str) -> Result<()> {
+        sqlx::query!("UPDATE users SET email = $1 WHERE id = $2", email, user_id)
+            .execute(&mut *self.db)
+            .await?;
+        Ok(())
+    }
+
+    /// Update a user's external_user_id
+    #[instrument(skip(self, external_user_id), fields(user_id = %abbrev_uuid(&user_id)), err)]
+    async fn update_user_external_id(&mut self, user_id: UserId, external_user_id: &str) -> Result<()> {
+        sqlx::query!("UPDATE users SET external_user_id = $1 WHERE id = $2", external_user_id, user_id)
+            .execute(&mut *self.db)
+            .await?;
+        Ok(())
+    }
+
+    /// Get or create a user for proxy header authentication.
+    ///
+    /// This method handles the complete proxy header auth flow:
+    /// 1. Look up by external_user_id → if found, update email and groups
+    /// 2. Fall back to email lookup (TEMPORARY migration support) → update external_user_id and groups
+    /// 3. If not found, create new user
+    ///
+    /// Email is required for user creation. Groups are synced if provided (along with provider).
+    #[instrument(skip(self, external_user_id, email, groups_and_provider), err)]
+    pub async fn get_or_create_proxy_header_user(
+        &mut self,
+        external_user_id: &str,
+        email: &str,
+        groups_and_provider: Option<(Vec<String>, &str)>,
+    ) -> Result<UserDBResponse> {
+        tracing::trace!(
+            "Starting get_or_create_proxy_header_user for external_user_id: {}",
+            external_user_id
+        );
+
+        // Acquire advisory lock to prevent concurrent creation of same user
+        // Lock is automatically released when transaction commits/rolls back
+        // Use PostgreSQL's hashtext function for deterministic hashing across replicas
+        sqlx::query!("SELECT pg_advisory_xact_lock(hashtext($1))", external_user_id)
+            .execute(&mut *self.db)
+            .await?;
+        tracing::trace!("Acquired advisory lock for external_user_id");
+
+        let user = 'user_lookup: {
+            // Look up by external_user_id
+            if let Some(mut user) = self.get_user_by_external_user_id(external_user_id).await? {
+                tracing::debug!("Found existing user by external_user_id");
+                tracing::trace!("Found user by external_user_id: {}", external_user_id);
+                // Found by external_user_id - update email if needed
+                if user.email != email {
+                    tracing::debug!("Updating email for user {}", abbrev_uuid(&user.id));
+                    tracing::trace!("Updating email from {} to {}", user.email, email);
+                    self.update_user_email(user.id, email).await?;
+                    user.email = email.to_string();
+                }
+
+                break 'user_lookup user;
+            }
+
+            // external user id not found (might be NULL). Lookup by email for single header mode
+            if let Some(mut user) = self.get_user_by_email(email).await? {
+                tracing::debug!("Found existing user by email");
+                tracing::trace!("Found user by email: {}", email);
+                // Found by email - check if we should use this user or create a new one
+                if let Some(existing_external_id) = &user.external_user_id {
+                    tracing::debug!("User {} has existing external_user_id set", abbrev_uuid(&user.id));
+                    tracing::trace!("Existing external_user_id: {}", existing_external_id);
+                    if existing_external_id == external_user_id {
+                        tracing::debug!("External user ID matches for user {}, using existing user", abbrev_uuid(&user.id));
+                        // Exact match - use this user
+                        break 'user_lookup user;
+                    }
+                    tracing::debug!("External user ID mismatch for user {}, creating new user", abbrev_uuid(&user.id));
+                    // External user ID mismatch - this is a different federated identity with the same email
+                    // Skip this user and fall through to create a new one
+                } else {
+                    // No external_user_id set - check if we should backfill
+
+                    // Skip backfill if external_user_id == email (backwards compatibility mode)
+                    // This happens when proxy sends single header and new code falls back to using it for both
+                    // We want to wait until proxy sends separate headers before backfilling
+                    if external_user_id == email {
+                        tracing::debug!(
+                            "External user ID equals email for user {}, skipping backfill",
+                            abbrev_uuid(&user.id)
+                        );
+                        // Backwards compatibility mode - use this user but don't backfill yet
+                        break 'user_lookup user;
+                    }
+                    tracing::debug!("Backfilling external_user_id for user {}", abbrev_uuid(&user.id));
+                    tracing::trace!("Backfilling external_user_id to {}", external_user_id);
+
+                    // Backfill external_user_id for this existing user
+                    self.update_user_external_id(user.id, external_user_id).await?;
+                    user.external_user_id = Some(external_user_id.to_string());
+
+                    break 'user_lookup user;
+                }
+            }
+
+            // User not found by either email or id, create new user
+            tracing::debug!("Creating new user via proxy header auth");
+            tracing::trace!(
+                "No existing user found for external_user_id: {} and email: {}, creating new user",
+                external_user_id,
+                email
+            );
+            let create_request = UserCreateDBRequest {
+                username: external_user_id.to_string(),
+                email: email.to_string(),
+                display_name: None,
+                avatar_url: None,
+                is_admin: false,
+                roles: vec![Role::StandardUser],
+                auth_source: "proxy-header".to_string(),
+                password_hash: None,
+                external_user_id: Some(external_user_id.to_string()),
+            };
+
+            self.create(&create_request).await?
+        };
+
+        // Sync groups once at the end, regardless of which path we took
+        if let Some((groups, provider)) = groups_and_provider {
+            let mut group_repo = Groups::new(&mut *self.db);
+            group_repo
+                .sync_groups_with_sso(
+                    user.id,
+                    groups,
+                    provider,
+                    &format!("A group provisioned by the {provider} SSO source."),
+                )
+                .await?;
+        }
+
+        Ok(user)
     }
 }
 

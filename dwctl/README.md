@@ -70,6 +70,49 @@ The service uses `config.yaml` (or `DWCTL_*` environment variables):
 - `DWCTL_PORT`: Server port (default: 3001)
 - `DATABASE_URL`: PostgreSQL connection string
 
+## Authentication
+
+Control Layer supports two authentication methods:
+
+### Native Authentication
+Username/password authentication with session cookies. Users can register and log in directly through the Control Layer UI or API.
+
+### Proxy Header Authentication
+
+Accepts user identity from HTTP headers set by an upstream authentication proxy (e.g., oauth2-proxy, Vouch, Authentik, Auth0).
+
+#### Header Configuration
+
+You can configure authentication in two ways:
+
+**Single Header Mode (Simple)**
+- Send only `x-doubleword-user` header with the user's email
+- The email must be unique per user
+- Example: `x-doubleword-user: "user@example.com"`
+
+**Dual Header Mode (Federated Identity)**
+- Send both `x-doubleword-user` (unique identifier from IdP) and `x-doubleword-email` (email address)
+- Allows multiple accounts with the same email from different identity providers
+- The combination of (email, external_user_id) must be unique
+- Examples:
+  - GitHub user: `x-doubleword-user: "github|user123"`, `x-doubleword-email: "user@example.com"`
+  - Google user: `x-doubleword-user: "google-oauth2|456"`, `x-doubleword-email: "user@example.com"`
+
+In dual header mode, the same email can belong to different users as long as they have different external user IDs from their identity providers.
+
+#### Configuration
+
+See `config.yaml` for proxy header authentication settings:
+
+```yaml
+auth:
+  proxy_header:
+    enabled: true
+    header_name: "x-doubleword-user"           # User identifier or email (single mode)
+    email_header_name: "x-doubleword-email"    # User's email (dual mode, optional)
+    auto_create_users: true                     # Auto-create users on first login
+```
+
 ## User Roles and Permissions
 
 Control Layer uses an additive role-based access control system where users can have multiple roles that combine to provide different levels of access.

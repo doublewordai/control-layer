@@ -57,6 +57,11 @@
         "ordinal": 10,
         "name": "password_hash",
         "type_info": "Text"
+      },
+      {
+        "ordinal": 11,
+        "name": "external_user_id",
+        "type_info": "Text"
       }
     ],
     "parameters": {
@@ -78,6 +83,7 @@
       false,
       true,
       false,
+      true,
       true
     ]
   },

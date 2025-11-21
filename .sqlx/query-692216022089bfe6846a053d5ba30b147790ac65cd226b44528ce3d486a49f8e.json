@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "\n            SELECT\n                u.id,\n                u.username,\n                u.email,\n                u.display_name,\n                u.avatar_url,\n                u.auth_source,\n                u.created_at,\n                u.updated_at,\n                u.last_login,\n                u.is_admin,\n                u.password_hash,\n                ARRAY_AGG(ur.role) FILTER (WHERE ur.role IS NOT NULL) as \"roles: Vec<Role>\"\n            FROM users u\n            LEFT JOIN user_roles ur ON ur.user_id = u.id\n            WHERE u.id = $1 AND u.id != '00000000-0000-0000-0000-000000000000'\n            GROUP BY u.id, u.username, u.email, u.display_name, u.avatar_url, u.auth_source, u.created_at, u.updated_at, u.last_login, u.is_admin, u.password_hash\n            ",
+  "query": "\n            SELECT\n                u.id,\n                u.username,\n                u.email,\n                u.display_name,\n                u.avatar_url,\n                u.auth_source,\n                u.created_at,\n                u.updated_at,\n                u.last_login,\n                u.is_admin,\n                u.password_hash,\n                u.external_user_id,\n                ARRAY_AGG(ur.role) FILTER (WHERE ur.role IS NOT NULL) as \"roles: Vec<Role>\"\n            FROM users u\n            LEFT JOIN user_roles ur ON ur.user_id = u.id\n            WHERE u.id = ANY($1) AND u.id != '00000000-0000-0000-0000-000000000000'\n            GROUP BY u.id, u.username, u.email, u.display_name, u.avatar_url, u.auth_source, u.created_at, u.updated_at, u.last_login, u.is_admin, u.password_hash, u.external_user_id\n            ",
   "describe": {
     "columns": [
       {
@@ -60,6 +60,11 @@
       },
       {
         "ordinal": 11,
+        "name": "external_user_id",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 12,
         "name": "roles: Vec<Role>",
         "type_info": {
           "Custom": {
@@ -86,7 +91,7 @@
     ],
     "parameters": {
       "Left": [
-        "Uuid"
+        "UuidArray"
       ]
     },
     "nullable": [
@@ -101,8 +106,9 @@
       true,
       false,
       true,
+      true,
       null
     ]
   },
-  "hash": "c09815b716380a18ca2169562b3296c5e0ff6bd4ca48dff9d78333575d2da047"
+  "hash": "692216022089bfe6846a053d5ba30b147790ac65cd226b44528ce3d486a49f8e"
 }
