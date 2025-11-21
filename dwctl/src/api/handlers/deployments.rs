@@ -2129,7 +2129,8 @@ mod tests {
         // Test 1: Get first page with limit=2
         let response = app
             .get("/admin/api/v1/models?limit=2&skip=0")
-            .add_header(add_auth_headers(&admin_user).0, add_auth_headers(&admin_user).1)
+            .add_header(&add_auth_headers(&admin_user)[0].0, &add_auth_headers(&admin_user)[0].1)
+            .add_header(&add_auth_headers(&admin_user)[1].0, &add_auth_headers(&admin_user)[1].1)
             .await;
         response.assert_status_ok();
         let page1: PaginatedResponse<DeployedModelResponse> = response.json();
@@ -2138,7 +2139,8 @@ mod tests {
         // Test 2: Get second page with limit=2, skip=2
         let response = app
             .get("/admin/api/v1/models?limit=2&skip=2")
-            .add_header(add_auth_headers(&admin_user).0, add_auth_headers(&admin_user).1)
+            .add_header(&add_auth_headers(&admin_user)[0].0, &add_auth_headers(&admin_user)[0].1)
+            .add_header(&add_auth_headers(&admin_user)[1].0, &add_auth_headers(&admin_user)[1].1)
             .await;
         response.assert_status_ok();
         let page2: PaginatedResponse<DeployedModelResponse> = response.json();
@@ -2147,7 +2149,8 @@ mod tests {
         // Test 3: Get third page with limit=2, skip=4 (should have 1 model)
         let response = app
             .get("/admin/api/v1/models?limit=2&skip=4")
-            .add_header(add_auth_headers(&admin_user).0, add_auth_headers(&admin_user).1)
+            .add_header(&add_auth_headers(&admin_user)[0].0, &add_auth_headers(&admin_user)[0].1)
+            .add_header(&add_auth_headers(&admin_user)[1].0, &add_auth_headers(&admin_user)[1].1)
             .await;
         response.assert_status_ok();
         let page3: PaginatedResponse<DeployedModelResponse> = response.json();
@@ -2179,7 +2182,8 @@ mod tests {
         // Test 6: Default limit (should get all 5 models)
         let response = app
             .get("/admin/api/v1/models")
-            .add_header(add_auth_headers(&admin_user).0, add_auth_headers(&admin_user).1)
+            .add_header(&add_auth_headers(&admin_user)[0].0, &add_auth_headers(&admin_user)[0].1)
+            .add_header(&add_auth_headers(&admin_user)[1].0, &add_auth_headers(&admin_user)[1].1)
             .await;
         response.assert_status_ok();
         let all_models: PaginatedResponse<DeployedModelResponse> = response.json();
@@ -2188,7 +2192,8 @@ mod tests {
         // Test 7: Offset (skip) beyond available models (should return empty)
         let response = app
             .get("/admin/api/v1/models?limit=10&skip=100")
-            .add_header(add_auth_headers(&admin_user).0, add_auth_headers(&admin_user).1)
+            .add_header(&add_auth_headers(&admin_user)[0].0, &add_auth_headers(&admin_user)[0].1)
+            .add_header(&add_auth_headers(&admin_user)[1].0, &add_auth_headers(&admin_user)[1].1)
             .await;
         response.assert_status_ok();
         let empty_page: PaginatedResponse<DeployedModelResponse> = response.json();
