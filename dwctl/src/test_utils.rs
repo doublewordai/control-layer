@@ -118,6 +118,7 @@ pub fn create_test_config() -> crate::config::Config {
             ..Default::default()
         },
         leader_election: crate::config::LeaderElectionConfig::default(),
+        payment: None,
     }
 }
 
@@ -248,6 +249,7 @@ pub async fn get_system_user(pool: &mut PgConnection) -> UserResponse {
         auth_source: user.auth_source,
         groups: None, // Groups not included in test users by default
         credit_balance: None,
+        payment_provider_id: None,
     }
 }
 

@@ -1717,6 +1717,7 @@ mod tests {
             credits: Default::default(),
             batches: Default::default(),
             leader_election: crate::config::LeaderElectionConfig::default(),
+            payment: None,
         };
         crate::seed_database(&config.model_sources, &pool).await.unwrap();
 
