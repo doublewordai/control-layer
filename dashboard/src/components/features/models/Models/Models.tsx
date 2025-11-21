@@ -114,7 +114,9 @@ const StatusRow: React.FC<StatusRowProps> = ({
               }`}
             />
             <div className="min-w-0">
-              <div className="font-medium text-sm truncate break-all">{model.alias}</div>
+              <div className="font-medium text-sm truncate break-all">
+                {model.alias}
+              </div>
               <div className="text-xs text-gray-500 truncate">
                 {endpointsRecord[model.hosted_on]?.name || "Unknown"}
               </div>
@@ -195,8 +197,11 @@ const Models: React.FC = () => {
     isLoading: modelsLoading,
     error: modelsError,
   } = useModels({
+    skip: (currentPage - 1) * itemsPerPage,
+    limit: itemsPerPage,
     include: includeParam as ModelsInclude,
     accessible: isStatusMode ? true : !canManageGroups || showAccessibleOnly, // Status mode always filters to accessible, others use existing logic
+    search: searchQuery || undefined, // Server-side search
   });
 
   // TODO: resolve `hosted_on` references in the backend, so we don't need this query.
@@ -216,32 +221,39 @@ const Models: React.FC = () => {
       ? (endpointsError as Error).message
       : null;
 
-  const { modelsRecord, modelsArray, endpointsRecord } = useMemo(() => {
-    if (!rawModelsData || !endpointsData)
-      return { modelsRecord: {}, modelsArray: [], endpointsRecord: {} };
+  const { modelsRecord, modelsArray, endpointsRecord, totalCount } =
+    useMemo(() => {
+      if (!rawModelsData || !endpointsData)
+        return {
+          modelsRecord: {},
+          modelsArray: [],
+          endpointsRecord: {},
+          totalCount: 0,
+        };
 
-    // Create models record and sorted array
-    const modelsLookup: Record<string, Model> = Object.fromEntries(
-      rawModelsData.map((model) => [model.id, model]),
-    );
-    const sortedArray = rawModelsData.sort((a, b) =>
-      a.alias.localeCompare(b.alias),
-    );
+      // Create models record and sorted array from paginated response
+      const modelsLookup: Record<string, Model> = Object.fromEntries(
+        rawModelsData.data.map((model) => [model.id, model]),
+      );
+      const sortedArray = [...rawModelsData.data].sort((a, b) =>
+        a.alias.localeCompare(b.alias),
+      );
 
-    const endpointsRecord = endpointsData.reduce(
-      (acc, endpoint) => {
-        acc[endpoint.id] = endpoint;
-        return acc;
-      },
-      {} as Record<string, Endpoint>,
-    );
+      const endpointsRecord = endpointsData.reduce(
+        (acc, endpoint) => {
+          acc[endpoint.id] = endpoint;
+          return acc;
+        },
+        {} as Record<string, Endpoint>,
+      );
 
-    return {
-      modelsRecord: modelsLookup,
-      modelsArray: sortedArray,
-      endpointsRecord: endpointsRecord,
-    };
-  }, [rawModelsData, endpointsData]);
+      return {
+        modelsRecord: modelsLookup,
+        modelsArray: sortedArray,
+        endpointsRecord: endpointsRecord,
+        totalCount: rawModelsData.total_count,
+      };
+    }, [rawModelsData, endpointsData]);
 
   // Extract unique providers from the models data dynamically
   const uniqueProviders = [
@@ -259,16 +271,13 @@ const Models: React.FC = () => {
       return false;
     }
 
+    // Provider filtering is still client-side for now
     const matchesProvider =
       filterProvider === "all" ||
       endpointsRecord[model.hosted_on]?.name === filterProvider;
 
-    const matchesSearch =
-      searchQuery === "" ||
-      model.alias.toLowerCase().includes(searchQuery.toLowerCase()) ||
-      model.model_name.toLowerCase().includes(searchQuery.toLowerCase());
-
-    return matchesProvider && matchesSearch;
+    // Search is now handled server-side
+    return matchesProvider;
   });
 
   // Reset to page 1 when filter or search changes
@@ -276,12 +285,13 @@ const Models: React.FC = () => {
     setCurrentPage(1);
   }, [filterProvider, searchQuery]);
 
-  // Pagination calculations
-  const totalItems = filteredModels.length;
+  // Pagination calculations - use server-side total count
+  const totalItems = totalCount;
   const totalPages = Math.ceil(totalItems / itemsPerPage);
   const startIndex = (currentPage - 1) * itemsPerPage;
-  const endIndex = startIndex + itemsPerPage;
-  const paginatedModels = filteredModels.slice(startIndex, endIndex);
+  const endIndex = Math.min(startIndex + itemsPerPage, totalItems);
+  // Models are already paginated from server, use filteredModels directly
+  const paginatedModels = filteredModels;
 
   if (loading) {
     return (
@@ -313,7 +323,7 @@ const Models: React.FC = () => {
   }
 
   // Check if we have any models at all (true empty state)
-  const hasNoModels = modelsArray.length === 0;
+  const hasNoModels = totalCount === 0 && currentPage === 1;
   // Check if we have models but none match filters (filtered empty state)
   const hasNoFilteredResults = !hasNoModels && filteredModels.length === 0;
 
@@ -624,7 +634,10 @@ const Models: React.FC = () => {
                                   </HoverCard>
                                 </div>
                                 <CardDescription className="mt-1 truncate">
-                                  <span className="break-all">{model.model_name}</span> •{" "}
+                                  <span className="break-all">
+                                    {model.model_name}
+                                  </span>{" "}
+                                  •{" "}
                                   {endpointsRecord[model.hosted_on]?.name ||
                                     "Unknown endpoint"}
                                 </CardDescription>
@@ -700,7 +713,9 @@ const Models: React.FC = () => {
                                                       className="text-xs max-w-[200px]"
                                                     >
                                                       <Users className="h-3 w-3 flex-shrink-0" />
-                                                      <span className="truncate break-all">{group.name}</span>
+                                                      <span className="truncate break-all">
+                                                        {group.name}
+                                                      </span>
                                                     </Badge>
                                                   ))}
                                                 </div>
@@ -907,10 +922,7 @@ const Models: React.FC = () => {
                                 </p>
                                 {showPricing && (
                                   <div className="flex items-center gap-1.5 text-xs">
-                                    <HoverCard
-                                      openDelay={200}
-                                      closeDelay={100}
-                                    >
+                                    <HoverCard openDelay={200} closeDelay={100}>
                                       <HoverCardTrigger asChild>
                                         <DollarSign className="h-3.5 w-3.5 text-gray-500 " />
                                       </HoverCardTrigger>
