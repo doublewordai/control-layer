@@ -310,7 +310,7 @@ export const ModelsContent: React.FC<ModelsContentProps> = ({
                 className="hover:shadow-md transition-shadow rounded-lg p-0 gap-0 overflow-hidden flex flex-col"
               >
                 <div
-                  className="cursor-pointer hover:bg-gray-50 transition-colors group flex-grow flex flex-col"
+                  className="cursor-pointer hover:bg-gray-50 transition-colors group grow flex flex-col"
                   onClick={() => {
                     navigate(
                       `/models/${model.id}?from=${encodeURIComponent("/models")}`,
@@ -461,7 +461,7 @@ export const ModelsContent: React.FC<ModelsContentProps> = ({
                                             variant="secondary"
                                             className="text-xs max-w-[200px]"
                                           >
-                                            <Users className="h-3 w-3 flex-shrink-0" />
+                                            <Users className="h-3 w-3 shrink-0" />
                                             <span className="truncate break-all">
                                               {group.name}
                                             </span>
@@ -494,7 +494,7 @@ export const ModelsContent: React.FC<ModelsContentProps> = ({
                     </div>
                   </CardHeader>
 
-                  <CardContent className="flex-grow px-0 pt-0 pb-0 flex flex-col">
+                  <CardContent className="grow px-0 pt-0 pb-0 flex flex-col">
                     {model.metrics ? (
                       <div
                         className="flex gap-6 items-center px-6 pb-4"

@@ -1,4 +1,4 @@
-import React, { useState, useEffect } from "react";
+import React, { useState, useEffect, useMemo } from "react";
 import { useNavigate, useSearchParams } from "react-router-dom";
 import { Play, ArrowLeft, GitCompare, X as XIcon } from "lucide-react";
 import { toast } from "sonner";
@@ -13,14 +13,18 @@ import type {
 import EmbeddingPlayground from "./EmbeddingPlayground";
 import GenerationPlayground from "./GenerationPlayground";
 import RerankPlayground from "./RerankPlayground";
-import {
-  Select,
-  SelectContent,
-  SelectItem,
-  SelectTrigger,
-  SelectValue,
-} from "../../../ui/select";
 import { Button } from "../../../ui/button";
+import {
+  Command,
+  CommandEmpty,
+  CommandGroup,
+  CommandInput,
+  CommandItem,
+  CommandList,
+} from "../../../ui/command";
+import { Popover, PopoverContent, PopoverTrigger } from "../../../ui/popover";
+import { ChevronsUpDownIcon } from "lucide-react";
+import { useDebounce } from "@/hooks/useDebounce";
 
 interface ImageContent {
   type: "image_url";
@@ -83,7 +87,32 @@ const Playground: React.FC = () => {
   ]);
   const [rerankResult, setRerankResult] = useState<RerankResponse | null>(null);
 
-  const { data: models = [], error: modelsError } = useModels();
+  const [modelSearchQuery, setModelSearchQuery] = useState("");
+  const [modelSelectOpen, setModelSelectOpen] = useState(false);
+  const debouncedModelSearch = useDebounce(modelSearchQuery, 300);
+
+  const [compareSearchQuery, setCompareSearchQuery] = useState("");
+  const [compareSelectOpen, setCompareSelectOpen] = useState(false);
+  const debouncedCompareSearch = useDebounce(compareSearchQuery, 300);
+
+  const { data: modelsData, error: modelsError } = useModels({
+    search: debouncedModelSearch || undefined,
+    limit: 50,
+  });
+  const models = useMemo(() => modelsData?.data ?? [], [modelsData]);
+
+  const { data: compareModelsData } = useModels({
+    search: debouncedCompareSearch || undefined,
+    limit: 50,
+  });
+  const compareModels = useMemo(() => {
+    const data = compareModelsData?.data ?? [];
+    return data.filter(
+      (model) =>
+        model.alias !== selectedModel?.alias &&
+        (model.model_type?.toLowerCase() as ModelType) === "chat",
+    );
+  }, [compareModelsData, selectedModel?.alias]);
 
   // Initialize OpenAI client pointing to our API
   const baseURL = `${window.location.origin}/admin/api/v1/ai/v1`;
@@ -906,50 +935,102 @@ const Playground: React.FC = () => {
           </div>
           <div className="flex items-center gap-2 md:gap-3 w-full md:w-auto">
             {/* Model Selector */}
-            <Select
-              value={selectedModel?.alias || ""}
-              onValueChange={handleModelChange}
-              disabled={!models.length}
-            >
-              <SelectTrigger className="w-full md:w-[200px]" aria-label="Select model">
-                <SelectValue placeholder="Select a model..." />
-              </SelectTrigger>
-              <SelectContent>
-                {models.map((model) => (
-                  <SelectItem key={model.id} value={model.alias}>
-                    {model.alias}
-                  </SelectItem>
-                ))}
-              </SelectContent>
-            </Select>
+            <Popover open={modelSelectOpen} onOpenChange={setModelSelectOpen}>
+              <PopoverTrigger asChild>
+                <Button
+                  variant="outline"
+                  role="combobox"
+                  aria-expanded={modelSelectOpen}
+                  className="w-full md:w-[200px] justify-between text-left"
+                >
+                  <span className="truncate">
+                    {selectedModel?.alias || "Select a model..."}
+                  </span>
+                  <ChevronsUpDownIcon className="ml-2 h-4 w-4 shrink-0 opacity-50" />
+                </Button>
+              </PopoverTrigger>
+              <PopoverContent
+                className="p-0"
+                style={{ width: "var(--radix-popover-trigger-width)" }}
+              >
+                <Command shouldFilter={false}>
+                  <CommandInput
+                    placeholder="Search models..."
+                    value={modelSearchQuery}
+                    onValueChange={setModelSearchQuery}
+                  />
+                  <CommandList>
+                    <CommandEmpty>No models found.</CommandEmpty>
+                    <CommandGroup>
+                      {models.map((model) => (
+                        <CommandItem
+                          key={model.id}
+                          value={model.alias}
+                          onSelect={() => {
+                            handleModelChange(model.alias);
+                            setModelSelectOpen(false);
+                          }}
+                        >
+                          <span className="truncate">{model.alias}</span>
+                        </CommandItem>
+                      ))}
+                    </CommandGroup>
+                  </CommandList>
+                </Command>
+              </PopoverContent>
+            </Popover>
 
             {/* Comparison Mode Button - Only show for chat models */}
             {selectedModel && modelType === "chat" && (
               <>
                 {!isComparisonMode ? (
-                  <Select onValueChange={handleComparisonModelSelect}>
-                    <SelectTrigger
-                      className="w-full md:w-[160px]"
-                      aria-label="Compare with"
+                  <Popover
+                    open={compareSelectOpen}
+                    onOpenChange={setCompareSelectOpen}
+                  >
+                    <PopoverTrigger asChild>
+                      <Button
+                        variant="outline"
+                        role="combobox"
+                        aria-expanded={compareSelectOpen}
+                        className="w-full md:w-[180px] justify-between text-left"
+                      >
+                        <GitCompare className="w-4 h-4 mr-2" />
+                        <span className="truncate">Compare...</span>
+                        <ChevronsUpDownIcon className="ml-2 h-4 w-4 shrink-0 opacity-50" />
+                      </Button>
+                    </PopoverTrigger>
+                    <PopoverContent
+                      className="p-0"
+                      style={{ width: "var(--radix-popover-trigger-width)" }}
                     >
-                      <GitCompare className="w-4 h-4 mr-2" />
-                      <SelectValue placeholder="Compare..." />
-                    </SelectTrigger>
-                    <SelectContent>
-                      {models
-                        .filter(
-                          (model) =>
-                            model.alias !== selectedModel.alias &&
-                            (model.model_type?.toLowerCase() as ModelType) ===
-                              "chat",
-                        )
-                        .map((model) => (
-                          <SelectItem key={model.id} value={model.alias}>
-                            {model.alias}
-                          </SelectItem>
-                        ))}
-                    </SelectContent>
-                  </Select>
+                      <Command shouldFilter={false}>
+                        <CommandInput
+                          placeholder="Search models..."
+                          value={compareSearchQuery}
+                          onValueChange={setCompareSearchQuery}
+                        />
+                        <CommandList>
+                          <CommandEmpty>No models found.</CommandEmpty>
+                          <CommandGroup>
+                            {compareModels.map((model) => (
+                              <CommandItem
+                                key={model.id}
+                                value={model.alias}
+                                onSelect={() => {
+                                  handleComparisonModelSelect(model.alias);
+                                  setCompareSelectOpen(false);
+                                }}
+                                className="flex items-center"
+                              >
+                                <span className="truncate">{model.alias}</span>
+                              </CommandItem>
+                            ))}
+                          </CommandGroup>
+                        </CommandList>
+                      </Command>
+                    </PopoverContent>
+                  </Popover>
                 ) : (
                   <div className="flex items-center gap-2">
                     <div className="text-sm text-gray-600 flex items-center gap-2 bg-gray-100 rounded-lg px-3 py-2">
