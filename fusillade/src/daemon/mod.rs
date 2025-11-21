@@ -354,7 +354,7 @@ where
                 loop {
                     tokio::select! {
                         Some(request_id) = stream.next() => {
-                            tracing::info!(request_id = %request_id, "Received cancellation notification");
+                            tracing::debug!(request_id = %request_id, "Received cancellation notification");
 
                             // Look up the cancellation token and cancel it
                             if let Some(entry) = cancellation_tokens.get(&request_id) {
@@ -550,7 +550,7 @@ where
                                         }
                                     }
                                     Ok(RequestCompletionResult::Canceled(_canceled)) => {
-                                        tracing::info!(request_id = %request_id, "Request canceled by user");
+                                        tracing::debug!(request_id = %request_id, "Request canceled by user");
                                     }
                                     Err(FusilladeError::Shutdown) => {
                                         tracing::info!(request_id = %request_id, "Request aborted due to shutdown");

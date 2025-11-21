@@ -812,7 +812,7 @@ pub struct BackgroundServices {
     request_manager: Arc<fusillade::PostgresRequestManager<fusillade::ReqwestHttpClient>>,
     is_leader: bool,
     onwards_targets: onwards::target::Targets,
-    background_tasks: Vec<tokio::task::JoinHandle<anyhow::Result<()>>>,
+    background_tasks: Vec<(&'static str, tokio::task::JoinHandle<anyhow::Result<()>>)>,
     shutdown_token: tokio_util::sync::CancellationToken,
     // Pub so that we can disarm it if we want to
     pub drop_guard: Option<tokio_util::sync::DropGuard>,
@@ -831,23 +831,34 @@ impl BackgroundServices {
             unreachable!()
         }
 
-        let (result, index, remaining) = futures::future::select_all(tasks).await;
+        // Extract names and handles separately
+        let (names, handles): (Vec<_>, Vec<_>) = tasks.into_iter().unzip();
 
-        // Put remaining tasks back
-        self.background_tasks = remaining;
+        let (result, index, remaining) = futures::future::select_all(handles).await;
+
+        let task_name = names.get(index).copied().unwrap_or("unknown");
+
+        // Put remaining tasks back - zip names (minus the completed one) with remaining handles
+        let remaining_names: Vec<_> = names
+            .into_iter()
+            .enumerate()
+            .filter_map(|(i, name)| if i != index { Some(name) } else { None })
+            .collect();
+
+        self.background_tasks = remaining_names.into_iter().zip(remaining.into_iter()).collect();
 
         match result {
             Ok(Ok(())) => {
-                tracing::warn!("Background task {} completed unexpectedly", index);
-                anyhow::bail!("Background task {} completed early", index)
+                tracing::warn!(task = task_name, "Background task completed unexpectedly");
+                anyhow::bail!("Background task '{}' completed early", task_name)
             }
             Ok(Err(e)) => {
-                tracing::error!("Background task {} failed: {}", index, e);
-                anyhow::bail!("Background task {} failed: {}", index, e)
+                tracing::error!(task = task_name, error = %e, "Background task failed");
+                anyhow::bail!("Background task '{}' failed: {}", task_name, e)
             }
             Err(e) => {
-                tracing::error!("Background task {} panicked: {}", index, e);
-                anyhow::bail!("Background task {} panicked: {}", index, e)
+                tracing::error!(task = task_name, error = %e, "Background task panicked");
+                anyhow::bail!("Background task '{}' panicked: {}", task_name, e)
             }
         }
     }
@@ -858,16 +869,16 @@ impl BackgroundServices {
         self.shutdown_token.cancel();
 
         // Wait for all background tasks to complete and check for errors
-        for (i, handle) in self.background_tasks.into_iter().enumerate() {
+        for (name, handle) in self.background_tasks.into_iter() {
             match handle.await {
                 Ok(Ok(())) => {
-                    tracing::debug!("Background task {} completed successfully", i);
+                    tracing::debug!(task = name, "Background task completed successfully");
                 }
                 Ok(Err(e)) => {
-                    tracing::error!("Background task {} failed: {}", i, e);
+                    tracing::error!(task = name, error = %e, "Background task failed");
                 }
                 Err(e) => {
-                    tracing::error!("Background task {} panicked: {}", i, e);
+                    tracing::error!(task = name, error = %e, "Background task panicked");
                 }
             }
         }
@@ -893,18 +904,12 @@ async fn setup_background_services(
     let (onwards_config_sync, initial_targets, onwards_stream) =
         sync::onwards_config::OnwardsConfigSync::new_with_daemon_limits(pool.clone(), Some(model_capacity_limits.clone())).await?;
 
-    // Clone targets for the update task
-    let targets_for_updates = initial_targets.clone();
-
-    // Start target updates - propagate errors for fail-fast behavior
-    let handle = tokio::spawn(async move {
-        targets_for_updates
-            .receive_updates(onwards_stream)
-            .await
-            .map_err(anyhow::Error::from)
-            .context("Onwards target updates failed")
-    });
-    background_tasks.push(handle);
+    // Start target updates - this spawns a background task internally and returns immediately
+    initial_targets
+        .receive_updates(onwards_stream)
+        .await
+        .map_err(anyhow::Error::from)
+        .context("Onwards target updates failed")?;
 
     // Start the onwards configuration listener
     let onwards_shutdown = shutdown_token.clone();
@@ -915,7 +920,7 @@ async fn setup_background_services(
             .await
             .context("Onwards configuration listener failed")
     });
-    background_tasks.push(handle);
+    background_tasks.push(("onwards-config-sync", handle));
     // Leader election lock ID: 0x44574354_50524F42 (DWCT_PROB in hex for "dwctl probes")
     const LEADER_LOCK_ID: i64 = 0x4457_4354_5052_4F42_i64;
 
@@ -951,7 +956,7 @@ async fn setup_background_services(
             // Probe scheduler runs until cancelled, then exits normally
             Ok(())
         });
-        background_tasks.push(handle);
+        background_tasks.push(("probe-scheduler", handle));
 
         // Start the fusillade batch processing daemon based on config
         use crate::config::DaemonEnabled;
@@ -976,7 +981,7 @@ async fn setup_background_services(
                     }
                     Ok(())
                 });
-                background_tasks.push(handle);
+                background_tasks.push(("fusillade-daemon", handle));
                 info!("Skipping leader election - running as leader with probe scheduler and fusillade daemon");
             }
             DaemonEnabled::Never => {
@@ -1010,7 +1015,7 @@ async fn setup_background_services(
                 }
                 Ok(())
             });
-            background_tasks.push(handle);
+            background_tasks.push(("fusillade-daemon", handle));
             info!("Fusillade batch daemon started (configured to always run)");
         }
 
@@ -1124,7 +1129,7 @@ async fn setup_background_services(
             // Leader election runs until cancelled, then exits normally
             Ok(())
         });
-        background_tasks.push(handle);
+        background_tasks.push(("leader-election", handle));
     }
 
     Ok(BackgroundServices {
