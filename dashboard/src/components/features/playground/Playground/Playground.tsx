@@ -99,7 +99,7 @@ const Playground: React.FC = () => {
     search: debouncedModelSearch || undefined,
     limit: 50,
   });
-  const models = useMemo(() => modelsData?.data ?? [], [modelsData]);
+  const models = modelsData?.data ?? [];
 
   const { data: compareModelsData } = useModels({
     search: debouncedCompareSearch || undefined,
@@ -941,6 +941,7 @@ const Playground: React.FC = () => {
                   variant="outline"
                   role="combobox"
                   aria-expanded={modelSelectOpen}
+                  aria-label="Select model"
                   className="w-full md:w-[200px] justify-between text-left"
                 >
                   <span className="truncate">

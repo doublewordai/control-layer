@@ -160,6 +160,7 @@ export const ModelsContent: React.FC<ModelsContentProps> = ({
       };
     }, [rawModelsData, endpointsData]);
 
+  // TODO: filter providers on the server-side
   const filteredModels = modelsArray.filter((model) => {
     if (isStatusMode && !model.status?.probe_id) {
       return false;

@@ -13,6 +13,7 @@ import {
 import { Tabs, TabsList, TabsTrigger } from "../../../ui/tabs";
 import { Input } from "../../../ui/input";
 import { ModelsContent } from "./ModelsContent";
+import { useEndpoints } from "@/api/control-layer/hooks";
 
 const Models: React.FC = () => {
   const [searchParams, setSearchParams] = useSearchParams();
@@ -27,6 +28,11 @@ const Models: React.FC = () => {
   const [searchQuery, setSearchQuery] = useState("");
   const [debouncedSearchQuery, setDebouncedSearchQuery] = useState("");
   const [showAccessibleOnly, setShowAccessibleOnly] = useState(false);
+
+  const { data: endpointsData } = useEndpoints();
+  const providers = [
+    ...new Set(["all", ...(endpointsData || []).map((e) => e.name).sort()]),
+  ];
 
   // Debounce search query to avoid excessive API calls
   useEffect(() => {
@@ -104,6 +110,24 @@ const Models: React.FC = () => {
                   aria-label="Search models"
                 />
               </div>
+              <Select
+                value={filterProvider}
+                onValueChange={(value) => setFilterProvider(value)}
+              >
+                <SelectTrigger
+                  className="w-[180px]"
+                  aria-label="Filter by endpoint provider"
+                >
+                  <SelectValue />
+                </SelectTrigger>
+                <SelectContent>
+                  {providers.map((provider) => (
+                    <SelectItem key={provider} value={provider}>
+                      {provider === "all" ? "All Endpoints" : provider}
+                    </SelectItem>
+                  ))}
+                </SelectContent>
+              </Select>
 
               {/* View mode tabs */}
               <TabsList className="w-full sm:w-auto">
