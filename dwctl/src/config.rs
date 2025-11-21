@@ -288,9 +288,10 @@ pub struct ProxyHeaderAuthConfig {
     /// signup at a different provider and perform an account takeover.
     pub header_name: String,
     /// HTTP header name containing the user's email.
-    /// Must be supplied per-request if auto_create_users
-    /// is enabled and user doesn't already exist
-    /// with an email.
+    /// Optional per-request - if not provided, the value from header_name
+    /// will be used as the email (for backwards compatibility).
+    /// For federated authentication where users can log in via multiple
+    /// providers, send both headers to keep users separate.
     pub email_header_name: String,
     /// HTTP header name containing user groups (comma-separated)
     /// Not required, but will be respected if auto_create_users

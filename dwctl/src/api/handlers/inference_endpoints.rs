@@ -1444,8 +1444,14 @@ mod tests {
 
         let response = app
             .post("/admin/api/v1/endpoints")
-            .add_header(&add_auth_headers(&platform_manager1)[0].0, &add_auth_headers(&platform_manager1)[0].1)
-            .add_header(&add_auth_headers(&platform_manager1)[1].0, &add_auth_headers(&platform_manager1)[1].1)
+            .add_header(
+                &add_auth_headers(&platform_manager1)[0].0,
+                &add_auth_headers(&platform_manager1)[0].1,
+            )
+            .add_header(
+                &add_auth_headers(&platform_manager1)[1].0,
+                &add_auth_headers(&platform_manager1)[1].1,
+            )
             .json(&create_request)
             .await;
 
@@ -1457,8 +1463,14 @@ mod tests {
         let update = json!({"name": "Updated by PM2"});
         let response = app
             .patch(&format!("/admin/api/v1/endpoints/{}", endpoint.id))
-            .add_header(&add_auth_headers(&platform_manager2)[0].0, &add_auth_headers(&platform_manager2)[0].1)
-            .add_header(&add_auth_headers(&platform_manager2)[1].0, &add_auth_headers(&platform_manager2)[1].1)
+            .add_header(
+                &add_auth_headers(&platform_manager2)[0].0,
+                &add_auth_headers(&platform_manager2)[0].1,
+            )
+            .add_header(
+                &add_auth_headers(&platform_manager2)[1].0,
+                &add_auth_headers(&platform_manager2)[1].1,
+            )
             .json(&update)
             .await;
 
@@ -1487,8 +1499,14 @@ mod tests {
         // Platform Manager 2 should be able to delete it
         let response = app
             .delete(&format!("/admin/api/v1/endpoints/{}", endpoint.id))
-            .add_header(&add_auth_headers(&platform_manager2)[0].0, &add_auth_headers(&platform_manager2)[0].1)
-            .add_header(&add_auth_headers(&platform_manager2)[1].0, &add_auth_headers(&platform_manager2)[1].1)
+            .add_header(
+                &add_auth_headers(&platform_manager2)[0].0,
+                &add_auth_headers(&platform_manager2)[0].1,
+            )
+            .add_header(
+                &add_auth_headers(&platform_manager2)[1].0,
+                &add_auth_headers(&platform_manager2)[1].1,
+            )
             .await;
 
         response.assert_status(axum::http::StatusCode::NO_CONTENT);

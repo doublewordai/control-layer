@@ -468,7 +468,7 @@ mod tests {
 
             app.post("/admin/api/v1/users/current/api-keys")
                 .add_header(&add_auth_headers(&user)[0].0, &add_auth_headers(&user)[0].1)
-            .add_header(&add_auth_headers(&user)[1].0, &add_auth_headers(&user)[1].1)
+                .add_header(&add_auth_headers(&user)[1].0, &add_auth_headers(&user)[1].1)
                 .json(&api_key_data)
                 .await
                 .assert_status(axum::http::StatusCode::CREATED);

@@ -1134,7 +1134,7 @@ mod tests {
             let response = app
                 .get("/admin/api/v1/requests")
                 .add_header(&add_auth_headers(&user)[0].0, &add_auth_headers(&user)[0].1)
-            .add_header(&add_auth_headers(&user)[1].0, &add_auth_headers(&user)[1].1)
+                .add_header(&add_auth_headers(&user)[1].0, &add_auth_headers(&user)[1].1)
                 .await;
 
             if can_access_requests {
@@ -1147,7 +1147,7 @@ mod tests {
             let response = app
                 .get("/admin/api/v1/requests/aggregate")
                 .add_header(&add_auth_headers(&user)[0].0, &add_auth_headers(&user)[0].1)
-            .add_header(&add_auth_headers(&user)[1].0, &add_auth_headers(&user)[1].1)
+                .add_header(&add_auth_headers(&user)[1].0, &add_auth_headers(&user)[1].1)
                 .await;
 
             if can_access_analytics {
@@ -1189,7 +1189,7 @@ mod tests {
             let response = app
                 .get(&format!("/admin/api/v1/requests?{query_params}"))
                 .add_header(&add_auth_headers(&request_viewer)[0].0, &add_auth_headers(&request_viewer)[0].1)
-            .add_header(&add_auth_headers(&request_viewer)[1].0, &add_auth_headers(&request_viewer)[1].1)
+                .add_header(&add_auth_headers(&request_viewer)[1].0, &add_auth_headers(&request_viewer)[1].1)
                 .await;
 
             response.assert_status_ok();

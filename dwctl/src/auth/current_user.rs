@@ -67,15 +67,14 @@ async fn try_proxy_header_auth(
         .get(&config.auth.proxy_header.header_name)
         .and_then(|h| h.to_str().ok())?;
 
-    // Extract email from email_header_name (required)
-    let user_email = match parts
+    // Extract email from email_header_name, or fall back to external_user_id for backwards compatibility
+    // This allows old deployments (single header with email) to continue working
+    // while new deployments can send both headers to distinguish federated users
+    let user_email = parts
         .headers
         .get(&config.auth.proxy_header.email_header_name)
         .and_then(|h| h.to_str().ok())
-    {
-        Some(email) => email,
-        None => return Some(Err(Error::Unauthenticated { message: None })),
-    };
+        .unwrap_or(external_user_id);
 
     // Extract groups and provider if import_idp_groups is enabled
     let groups_and_provider = if config.auth.proxy_header.import_idp_groups {
@@ -344,7 +343,7 @@ impl FromRequestParts<AppState> for CurrentUser {
 mod tests {
     use crate::{
         api::models::users::{CurrentUser, Role},
-        db::handlers::Users,
+        db::handlers::{repository::Repository, Users},
         test_utils::create_test_config,
         test_utils::require_admin,
         AppState,
@@ -452,6 +451,482 @@ mod tests {
 
         let error = result.unwrap_err();
         assert_eq!(error.status_code(), axum::http::StatusCode::UNAUTHORIZED);
+    }
+
+    #[sqlx::test]
+    async fn test_backwards_compatibility_single_header(pool: PgPool) {
+        let config = create_test_config();
+        let state = {
+            let request_manager = std::sync::Arc::new(fusillade::PostgresRequestManager::new(pool.clone()));
+            AppState::builder()
+                .db(pool.clone())
+                .config(config)
+                .request_manager(request_manager)
+                .build()
+        };
+
+        // Old deployment behavior: single header with email value
+        // Should use it as both external_user_id and email
+        let email = "legacy-user@example.com";
+        let request = axum::http::Request::builder()
+            .uri("http://localhost/test")
+            .header("x-doubleword-user", email)
+            // Intentionally NOT sending x-doubleword-email header
+            .body(())
+            .unwrap();
+
+        let (mut parts, _body) = request.into_parts();
+
+        // Should succeed and auto-create user with email as external_user_id
+        let result = CurrentUser::from_request_parts(&mut parts, &state).await;
+        assert!(result.is_ok());
+
+        let current_user = result.unwrap();
+        assert_eq!(current_user.email, email);
+        assert_eq!(current_user.username, email); // Username set to external_user_id
+        assert!(current_user.roles.contains(&Role::StandardUser));
+
+        // Verify user was created in database with correct external_user_id
+        let mut pool_conn = pool.acquire().await.unwrap();
+        let mut users_repo = Users::new(&mut pool_conn);
+        let db_user = users_repo.get_user_by_email(email).await.unwrap().unwrap();
+
+        // external_user_id in database should match the email value sent in header_name
+        assert_eq!(db_user.external_user_id, Some(email.to_string()));
+    }
+
+    #[sqlx::test]
+    async fn test_multiple_federated_identities_same_email(pool: PgPool) {
+        let config = create_test_config();
+        let state = {
+            let request_manager = std::sync::Arc::new(fusillade::PostgresRequestManager::new(pool.clone()));
+            AppState::builder()
+                .db(pool.clone())
+                .config(config)
+                .request_manager(request_manager)
+                .build()
+        };
+
+        let shared_email = "user@example.com";
+
+        // First login via GitHub
+        let github_external_id = "github|user123";
+        let request1 = axum::http::Request::builder()
+            .uri("http://localhost/test")
+            .header("x-doubleword-user", github_external_id)
+            .header("x-doubleword-email", shared_email)
+            .body(())
+            .unwrap();
+
+        let (mut parts1, _) = request1.into_parts();
+        let result1 = CurrentUser::from_request_parts(&mut parts1, &state).await;
+        assert!(result1.is_ok(), "First identity should succeed");
+
+        let user1 = result1.unwrap();
+        assert_eq!(user1.email, shared_email);
+        assert_eq!(user1.username, github_external_id);
+
+        // Second login via Google (same email, different external_user_id)
+        let google_external_id = "google|user456";
+        let request2 = axum::http::Request::builder()
+            .uri("http://localhost/test")
+            .header("x-doubleword-user", google_external_id)
+            .header("x-doubleword-email", shared_email)
+            .body(())
+            .unwrap();
+
+        let (mut parts2, _) = request2.into_parts();
+        let result2 = CurrentUser::from_request_parts(&mut parts2, &state).await;
+
+        // EXPECTED: Should create a second user with different external_user_id but same email
+        // CURRENT: Fails due to email UNIQUE constraint in database
+        assert!(
+            result2.is_ok(),
+            "Second identity should create separate user. Error: {:?}",
+            result2.as_ref().err()
+        );
+
+        let user2 = result2.unwrap();
+        assert_eq!(user2.email, shared_email);
+        assert_eq!(user2.username, google_external_id);
+        assert_ne!(user1.id, user2.id, "Should be different users");
+    }
+
+    #[sqlx::test]
+    async fn test_migration_backfill_external_user_id(pool: PgPool) {
+        let config = create_test_config();
+        let state = {
+            let request_manager = std::sync::Arc::new(fusillade::PostgresRequestManager::new(pool.clone()));
+            AppState::builder()
+                .db(pool.clone())
+                .config(config)
+                .request_manager(request_manager)
+                .build()
+        };
+
+        let email = "legacy-user@example.com";
+
+        // Simulate a user created before external_user_id feature (external_user_id = NULL)
+        // This is what existing users will look like after upgrading
+        let mut pool_conn = pool.acquire().await.unwrap();
+        let mut users_repo = Users::new(&mut pool_conn);
+        let legacy_user = users_repo
+            .create(&crate::db::models::users::UserCreateDBRequest {
+                username: "legacyuser".to_string(),
+                email: email.to_string(),
+                display_name: None,
+                avatar_url: None,
+                is_admin: false,
+                roles: vec![Role::StandardUser],
+                auth_source: "proxy-header".to_string(),
+                password_hash: None,
+                external_user_id: None, // NULL - no external_user_id set
+            })
+            .await
+            .unwrap();
+
+        let legacy_user_id = legacy_user.id;
+        drop(pool_conn); // Release connection for state.db
+
+        // Now user logs in with federated auth for the first time
+        let federated_external_id = "auth0|github|user123";
+        let request = axum::http::Request::builder()
+            .uri("http://localhost/test")
+            .header("x-doubleword-user", federated_external_id)
+            .header("x-doubleword-email", email)
+            .body(())
+            .unwrap();
+
+        let (mut parts, _) = request.into_parts();
+        let result = CurrentUser::from_request_parts(&mut parts, &state).await;
+
+        // Should backfill the external_user_id on the existing user
+        assert!(result.is_ok(), "Should backfill external_user_id for existing user");
+        let user = result.unwrap();
+        assert_eq!(user.id, legacy_user_id, "Should use the same existing user");
+        assert_eq!(user.email, email);
+
+        // Verify external_user_id was backfilled in database
+        let mut pool_conn = pool.acquire().await.unwrap();
+        let mut users_repo = Users::new(&mut pool_conn);
+        let db_user = users_repo
+            .get_user_by_external_user_id(federated_external_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(db_user.id, legacy_user_id);
+        assert_eq!(db_user.external_user_id, Some(federated_external_id.to_string()));
+    }
+
+    #[sqlx::test]
+    async fn test_backwards_compat_no_backfill(pool: PgPool) {
+        let config = create_test_config();
+        let state = {
+            let request_manager = std::sync::Arc::new(fusillade::PostgresRequestManager::new(pool.clone()));
+            AppState::builder()
+                .db(pool.clone())
+                .config(config)
+                .request_manager(request_manager)
+                .build()
+        };
+
+        let email = "legacy-user@example.com";
+
+        // Create legacy user with NULL external_user_id (pre-migration state)
+        let mut pool_conn = pool.acquire().await.unwrap();
+        let mut users_repo = Users::new(&mut pool_conn);
+        let legacy_user = users_repo
+            .create(&crate::db::models::users::UserCreateDBRequest {
+                username: "legacyuser".to_string(),
+                email: email.to_string(),
+                display_name: None,
+                avatar_url: None,
+                is_admin: false,
+                roles: vec![Role::StandardUser],
+                auth_source: "proxy-header".to_string(),
+                password_hash: None,
+                external_user_id: None,
+            })
+            .await
+            .unwrap();
+
+        let legacy_user_id = legacy_user.id;
+        drop(pool_conn);
+
+        // Login with old proxy (single header) - backwards compatibility mode
+        // This simulates upgrading dwctl but NOT upgrading proxy yet
+        let request = axum::http::Request::builder()
+            .uri("http://localhost/test")
+            .header("x-doubleword-user", email) // Only one header sent
+            // x-doubleword-email is NOT sent (old proxy behavior)
+            .body(())
+            .unwrap();
+
+        let (mut parts, _) = request.into_parts();
+        let result = CurrentUser::from_request_parts(&mut parts, &state).await;
+
+        assert!(result.is_ok(), "Should work in backwards compat mode");
+        let user = result.unwrap();
+        assert_eq!(user.id, legacy_user_id, "Should use existing user");
+        assert_eq!(user.email, email);
+
+        // CRITICAL: external_user_id should remain NULL (not backfilled)
+        // Because external_user_id == email in this case (backwards compat mode)
+        let mut pool_conn = pool.acquire().await.unwrap();
+        let mut users_repo = Users::new(&mut pool_conn);
+        let db_user = users_repo.get_user_by_email(email).await.unwrap().unwrap();
+        assert_eq!(db_user.external_user_id, None, "Should NOT backfill in backwards compat mode");
+
+        // Now upgrade proxy to send both headers
+        drop(pool_conn);
+        let federated_external_id = "github|user123";
+        let request2 = axum::http::Request::builder()
+            .uri("http://localhost/test")
+            .header("x-doubleword-user", federated_external_id)
+            .header("x-doubleword-email", email)
+            .body(())
+            .unwrap();
+
+        let (mut parts2, _) = request2.into_parts();
+        let result2 = CurrentUser::from_request_parts(&mut parts2, &state).await;
+
+        assert!(result2.is_ok(), "Should work with both headers");
+        let user2 = result2.unwrap();
+        assert_eq!(user2.id, legacy_user_id, "Should still use same user");
+
+        // NOW it should backfill because external_user_id != email
+        let mut pool_conn = pool.acquire().await.unwrap();
+        let mut users_repo = Users::new(&mut pool_conn);
+        let db_user_after = users_repo.get_user_by_email(email).await.unwrap().unwrap();
+        assert_eq!(
+            db_user_after.external_user_id,
+            Some(federated_external_id.to_string()),
+            "Should backfill now that proxy sends both headers"
+        );
+    }
+
+    #[sqlx::test]
+    async fn test_only_email_header_sent_fails(pool: PgPool) {
+        let config = create_test_config();
+        let state = {
+            let request_manager = std::sync::Arc::new(fusillade::PostgresRequestManager::new(pool.clone()));
+            AppState::builder()
+                .db(pool.clone())
+                .config(config)
+                .request_manager(request_manager)
+                .build()
+        };
+
+        // Send only email header, not user header - this is invalid
+        let request = axum::http::Request::builder()
+            .uri("http://localhost/test")
+            .header("x-doubleword-email", "user@example.com")
+            // Missing x-doubleword-user header
+            .body(())
+            .unwrap();
+
+        let (mut parts, _) = request.into_parts();
+        let result = CurrentUser::from_request_parts(&mut parts, &state).await;
+
+        // Should fail - user header is required
+        assert!(result.is_err());
+        assert_eq!(result.unwrap_err().status_code(), axum::http::StatusCode::UNAUTHORIZED);
+    }
+
+    #[sqlx::test]
+    async fn test_auto_create_disabled_existing_user(pool: PgPool) {
+        let mut config = create_test_config();
+        config.auth.proxy_header.auto_create_users = false;
+
+        let state = {
+            let request_manager = std::sync::Arc::new(fusillade::PostgresRequestManager::new(pool.clone()));
+            AppState::builder()
+                .db(pool.clone())
+                .config(config)
+                .request_manager(request_manager)
+                .build()
+        };
+
+        // Create a user first
+        let test_user = crate::test_utils::create_test_user(&pool, Role::StandardUser).await;
+        let external_user_id = test_user.external_user_id.as_ref().unwrap();
+
+        // Try to login with auto_create disabled - should work because user exists
+        let request = axum::http::Request::builder()
+            .uri("http://localhost/test")
+            .header("x-doubleword-user", external_user_id)
+            .header("x-doubleword-email", &test_user.email)
+            .body(())
+            .unwrap();
+
+        let (mut parts, _) = request.into_parts();
+        let result = CurrentUser::from_request_parts(&mut parts, &state).await;
+
+        assert!(result.is_ok(), "Should succeed for existing user even with auto_create disabled");
+        let current_user = result.unwrap();
+        assert_eq!(current_user.email, test_user.email);
+    }
+
+    #[sqlx::test]
+    async fn test_auto_create_disabled_new_user_fails(pool: PgPool) {
+        let mut config = create_test_config();
+        config.auth.proxy_header.auto_create_users = false;
+
+        let state = {
+            let request_manager = std::sync::Arc::new(fusillade::PostgresRequestManager::new(pool.clone()));
+            AppState::builder()
+                .db(pool.clone())
+                .config(config)
+                .request_manager(request_manager)
+                .build()
+        };
+
+        // Try to login as new user with auto_create disabled
+        let request = axum::http::Request::builder()
+            .uri("http://localhost/test")
+            .header("x-doubleword-user", "github|newuser789")
+            .header("x-doubleword-email", "newuser@example.com")
+            .body(())
+            .unwrap();
+
+        let (mut parts, _) = request.into_parts();
+        let result = CurrentUser::from_request_parts(&mut parts, &state).await;
+
+        // Should fail - user doesn't exist and auto_create is disabled
+        assert!(result.is_err(), "Should fail for new user when auto_create disabled");
+        assert_eq!(result.unwrap_err().status_code(), axum::http::StatusCode::UNAUTHORIZED);
+    }
+
+    #[sqlx::test]
+    async fn test_existing_user_email_update(pool: PgPool) {
+        let config = create_test_config();
+        let state = {
+            let request_manager = std::sync::Arc::new(fusillade::PostgresRequestManager::new(pool.clone()));
+            AppState::builder()
+                .db(pool.clone())
+                .config(config)
+                .request_manager(request_manager)
+                .build()
+        };
+
+        let external_user_id = "github|user123";
+        let old_email = "old@example.com";
+        let new_email = "new@example.com";
+
+        // First login with original email
+        let request1 = axum::http::Request::builder()
+            .uri("http://localhost/test")
+            .header("x-doubleword-user", external_user_id)
+            .header("x-doubleword-email", old_email)
+            .body(())
+            .unwrap();
+
+        let (mut parts1, _) = request1.into_parts();
+        let result1 = CurrentUser::from_request_parts(&mut parts1, &state).await;
+        assert!(result1.is_ok());
+        let user1 = result1.unwrap();
+        let user_id = user1.id;
+        assert_eq!(user1.email, old_email);
+
+        // Second login with same external_user_id but different email
+        let request2 = axum::http::Request::builder()
+            .uri("http://localhost/test")
+            .header("x-doubleword-user", external_user_id)
+            .header("x-doubleword-email", new_email)
+            .body(())
+            .unwrap();
+
+        let (mut parts2, _) = request2.into_parts();
+        let result2 = CurrentUser::from_request_parts(&mut parts2, &state).await;
+        assert!(result2.is_ok(), "Should update email for existing user");
+
+        let user2 = result2.unwrap();
+        assert_eq!(user2.id, user_id, "Should be same user");
+        assert_eq!(user2.email, new_email, "Email should be updated");
+
+        // Verify in database
+        let mut pool_conn = pool.acquire().await.unwrap();
+        let mut users_repo = Users::new(&mut pool_conn);
+        let db_user = users_repo.get_user_by_external_user_id(external_user_id).await.unwrap().unwrap();
+        assert_eq!(db_user.email, new_email);
+    }
+
+    #[sqlx::test]
+    async fn test_idempotent_logins(pool: PgPool) {
+        let config = create_test_config();
+        let state = {
+            let request_manager = std::sync::Arc::new(fusillade::PostgresRequestManager::new(pool.clone()));
+            AppState::builder()
+                .db(pool.clone())
+                .config(config)
+                .request_manager(request_manager)
+                .build()
+        };
+
+        let external_user_id = "auth0|user456";
+        let email = "user@example.com";
+
+        // Login multiple times with identical credentials
+        for i in 0..3 {
+            let request = axum::http::Request::builder()
+                .uri("http://localhost/test")
+                .header("x-doubleword-user", external_user_id)
+                .header("x-doubleword-email", email)
+                .body(())
+                .unwrap();
+
+            let (mut parts, _) = request.into_parts();
+            let result = CurrentUser::from_request_parts(&mut parts, &state).await;
+
+            assert!(result.is_ok(), "Login attempt {} should succeed", i + 1);
+            let user = result.unwrap();
+            assert_eq!(user.email, email);
+        }
+
+        // Verify only one user was created
+        let mut pool_conn = pool.acquire().await.unwrap();
+        let mut users_repo = Users::new(&mut pool_conn);
+        let db_user = users_repo.get_user_by_external_user_id(external_user_id).await.unwrap().unwrap();
+        assert_eq!(db_user.email, email);
+    }
+
+    #[sqlx::test]
+    async fn test_special_characters_in_external_user_id(pool: PgPool) {
+        let config = create_test_config();
+        let state = {
+            let request_manager = std::sync::Arc::new(fusillade::PostgresRequestManager::new(pool.clone()));
+            AppState::builder()
+                .db(pool.clone())
+                .config(config)
+                .request_manager(request_manager)
+                .build()
+        };
+
+        // Test various special characters that might appear in IdP identifiers
+        let test_cases = vec![
+            "auth0|google-oauth2|123456789",
+            "okta|user@domain.com",
+            "azure-ad|user_with_underscores",
+            "github|user-with-dashes",
+        ];
+
+        for external_user_id in test_cases {
+            let email = format!("{}@example.com", external_user_id.replace('|', "_").replace('@', "_"));
+
+            let request = axum::http::Request::builder()
+                .uri("http://localhost/test")
+                .header("x-doubleword-user", external_user_id)
+                .header("x-doubleword-email", &email)
+                .body(())
+                .unwrap();
+
+            let (mut parts, _) = request.into_parts();
+            let result = CurrentUser::from_request_parts(&mut parts, &state).await;
+
+            assert!(result.is_ok(), "Should handle external_user_id: {}", external_user_id);
+            let user = result.unwrap();
+            assert_eq!(user.username, external_user_id);
+        }
     }
 
     #[test]

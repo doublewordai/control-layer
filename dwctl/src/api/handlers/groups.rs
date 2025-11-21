@@ -880,7 +880,7 @@ mod tests {
             // Add user to each group
             app.post(&format!("/admin/api/v1/groups/{}/users/{}", group.id, user.id))
                 .add_header(&add_auth_headers(&user)[0].0, &add_auth_headers(&user)[0].1)
-            .add_header(&add_auth_headers(&user)[1].0, &add_auth_headers(&user)[1].1)
+                .add_header(&add_auth_headers(&user)[1].0, &add_auth_headers(&user)[1].1)
                 .await
                 .assert_status(StatusCode::NO_CONTENT);
         }
@@ -1438,8 +1438,14 @@ mod tests {
         let request_viewer_only = create_test_user(&pool, Role::RequestViewer).await; // RequestViewer without PlatformManager role
         let response = app
             .get(&format!("/admin/api/v1/users/{}/groups", standard_user.id))
-            .add_header(&add_auth_headers(&request_viewer_only)[0].0, &add_auth_headers(&request_viewer_only)[0].1)
-            .add_header(&add_auth_headers(&request_viewer_only)[1].0, &add_auth_headers(&request_viewer_only)[1].1)
+            .add_header(
+                &add_auth_headers(&request_viewer_only)[0].0,
+                &add_auth_headers(&request_viewer_only)[0].1,
+            )
+            .add_header(
+                &add_auth_headers(&request_viewer_only)[1].0,
+                &add_auth_headers(&request_viewer_only)[1].1,
+            )
             .await;
 
         response.assert_status(StatusCode::FORBIDDEN); // This should still be forbidden

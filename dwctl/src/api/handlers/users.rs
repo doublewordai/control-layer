@@ -1300,7 +1300,7 @@ mod tests {
             let response = app
                 .get("/admin/api/v1/users")
                 .add_header(&add_auth_headers(&user)[0].0, &add_auth_headers(&user)[0].1)
-            .add_header(&add_auth_headers(&user)[1].0, &add_auth_headers(&user)[1].1)
+                .add_header(&add_auth_headers(&user)[1].0, &add_auth_headers(&user)[1].1)
                 .await;
 
             if can_list_users {
@@ -1313,7 +1313,7 @@ mod tests {
             let response = app
                 .get("/admin/api/v1/users/current")
                 .add_header(&add_auth_headers(&user)[0].0, &add_auth_headers(&user)[0].1)
-            .add_header(&add_auth_headers(&user)[1].0, &add_auth_headers(&user)[1].1)
+                .add_header(&add_auth_headers(&user)[1].0, &add_auth_headers(&user)[1].1)
                 .await;
 
             if can_read_own {
@@ -1332,7 +1332,7 @@ mod tests {
             let response = app
                 .post("/admin/api/v1/users")
                 .add_header(&add_auth_headers(&user)[0].0, &add_auth_headers(&user)[0].1)
-            .add_header(&add_auth_headers(&user)[1].0, &add_auth_headers(&user)[1].1)
+                .add_header(&add_auth_headers(&user)[1].0, &add_auth_headers(&user)[1].1)
                 .json(&new_user)
                 .await;
 
@@ -1342,7 +1342,7 @@ mod tests {
                 let created_user: UserResponse = response.json();
                 app.delete(&format!("/admin/api/v1/users/{}", created_user.id))
                     .add_header(&add_auth_headers(&user)[0].0, &add_auth_headers(&user)[0].1)
-            .add_header(&add_auth_headers(&user)[1].0, &add_auth_headers(&user)[1].1)
+                    .add_header(&add_auth_headers(&user)[1].0, &add_auth_headers(&user)[1].1)
                     .await
                     .assert_status(axum::http::StatusCode::NO_CONTENT);
             } else {

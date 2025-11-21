@@ -419,34 +419,73 @@ impl<'c> Users<'c> {
         }
 
         // TEMPORARY: Fall back to email lookup for migration
-        // TODO: Remove this after all users have external_user_id populated
+        // This allows backfilling external_user_id for users created before the federated auth feature
+        // Note: Since multiple users can now share the same email (with different external_user_ids),
+        // we only backfill if external_user_id is NULL. Otherwise, we skip and create a new user.
         if let Some(mut user) = self.get_user_by_email(email).await? {
-            // Found by email - backfill external_user_id and sync groups
+            // Found by email - check if we should use this user or create a new one
             if let Some(existing_external_id) = &user.external_user_id {
-                if existing_external_id != external_user_id {
-                    return Err(DbError::Other(anyhow::anyhow!("External user ID mismatch")));
+                if existing_external_id == external_user_id {
+                    // Exact match - use this user and update groups if needed
+                    if let Some((groups, provider)) = groups_and_provider {
+                        let mut group_repo = Groups::new(&mut *self.db);
+                        group_repo
+                            .sync_groups_with_sso(
+                                user.id,
+                                groups,
+                                provider,
+                                &format!("A group provisioned by the {provider} SSO source."),
+                            )
+                            .await?;
+                    }
+                    return Ok(user);
                 }
+                // External user ID mismatch - this is a different federated identity with the same email
+                // Skip this user and fall through to create a new one
             } else {
+                // No external_user_id set - check if we should backfill
+
+                // Skip backfill if external_user_id == email (backwards compatibility mode)
+                // This happens when proxy sends single header and new code falls back to using it for both
+                // We want to wait until proxy sends separate headers before backfilling
+                if external_user_id == email {
+                    // Backwards compatibility mode - use this user but don't backfill yet
+                    // Sync groups if needed
+                    if let Some((groups, provider)) = groups_and_provider {
+                        let mut group_repo = Groups::new(&mut *self.db);
+                        group_repo
+                            .sync_groups_with_sso(
+                                user.id,
+                                groups,
+                                provider,
+                                &format!("A group provisioned by the {provider} SSO source."),
+                            )
+                            .await?;
+                    }
+                    return Ok(user);
+                }
+
+                // Backfill external_user_id for this existing user
                 sqlx::query!("UPDATE users SET external_user_id = $1 WHERE id = $2", external_user_id, user.id)
                     .execute(&mut *self.db)
                     .await?;
                 user.external_user_id = Some(external_user_id.to_string());
-            }
 
-            // no need to update in memory user, since groups are in a join table
-            if let Some((groups, provider)) = groups_and_provider {
-                let mut group_repo = Groups::new(&mut *self.db);
-                group_repo
-                    .sync_groups_with_sso(
-                        user.id,
-                        groups,
-                        provider,
-                        &format!("A group provisioned by the {provider} SSO source."),
-                    )
-                    .await?;
-            }
+                // Sync groups if needed
+                if let Some((groups, provider)) = groups_and_provider {
+                    let mut group_repo = Groups::new(&mut *self.db);
+                    group_repo
+                        .sync_groups_with_sso(
+                            user.id,
+                            groups,
+                            provider,
+                            &format!("A group provisioned by the {provider} SSO source."),
+                        )
+                        .await?;
+                }
 
-            return Ok(user);
+                return Ok(user);
+            }
         }
 
         // User not found, by either email or id, create new user
