@@ -1,5 +1,14 @@
 # Changelog
 
+## [0.7.1](https://github.com/doublewordai/control-layer/compare/v0.7.0...v0.7.1) (2025-11-21)
+
+
+### Bug Fixes
+
+* **dwctl:** improve JWT error code mapping ([#173](https://github.com/doublewordai/control-layer/issues/173)) ([4b22293](https://github.com/doublewordai/control-layer/commit/4b222939f083f1e720d1ea0926a5c53977178470)), closes [#80](https://github.com/doublewordai/control-layer/issues/80)
+* SSE parser now correctly handles empty data fields per spec ([#171](https://github.com/doublewordai/control-layer/issues/171)) ([4b9d04c](https://github.com/doublewordai/control-layer/commit/4b9d04c1c7ff0b24d21f0d1af9d29914fd456cf3))
+* transaction credit precision + no admin negative access ([#176](https://github.com/doublewordai/control-layer/issues/176)) ([218596c](https://github.com/doublewordai/control-layer/commit/218596cc10637852bf783e259117787b2ea0c2f7))
+
 ## [0.7.0](https://github.com/doublewordai/control-layer/compare/v0.6.0...v0.7.0) (2025-11-19)
 
 
