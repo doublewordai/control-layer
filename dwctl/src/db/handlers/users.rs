@@ -12,8 +12,6 @@ use crate::{
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use sqlx::{Connection, FromRow, PgConnection};
-use std::collections::hash_map::DefaultHasher;
-use std::hash::{Hash, Hasher};
 use tracing::instrument;
 use uuid::Uuid;
 
@@ -379,6 +377,24 @@ impl<'c> Users<'c> {
         }
     }
 
+    /// Update a user's email address
+    #[instrument(skip(self, email), fields(user_id = %abbrev_uuid(&user_id)), err)]
+    async fn update_user_email(&mut self, user_id: UserId, email: &str) -> Result<()> {
+        sqlx::query!("UPDATE users SET email = $1 WHERE id = $2", email, user_id)
+            .execute(&mut *self.db)
+            .await?;
+        Ok(())
+    }
+
+    /// Update a user's external_user_id
+    #[instrument(skip(self, external_user_id), fields(user_id = %abbrev_uuid(&user_id)), err)]
+    async fn update_user_external_id(&mut self, user_id: UserId, external_user_id: &str) -> Result<()> {
+        sqlx::query!("UPDATE users SET external_user_id = $1 WHERE id = $2", external_user_id, user_id)
+            .execute(&mut *self.db)
+            .await?;
+        Ok(())
+    }
+
     /// Get or create a user for proxy header authentication.
     ///
     /// This method handles the complete proxy header auth flow:
@@ -401,148 +417,92 @@ impl<'c> Users<'c> {
 
         // Acquire advisory lock to prevent concurrent creation of same user
         // Lock is automatically released when transaction commits/rolls back
-        // Use a stable hash of external_user_id as the lock key
-        let lock_key = {
-            let mut hasher = DefaultHasher::new();
-            external_user_id.hash(&mut hasher);
-            hasher.finish() as i64
-        };
-        sqlx::query!("SELECT pg_advisory_xact_lock($1)", lock_key)
+        // Use PostgreSQL's hashtext function for deterministic hashing across replicas
+        sqlx::query!("SELECT pg_advisory_xact_lock(hashtext($1))", external_user_id)
             .execute(&mut *self.db)
             .await?;
         tracing::trace!("Acquired advisory lock for external_user_id");
 
-        // Look up by external_user_id
-        if let Some(mut user) = self.get_user_by_external_user_id(external_user_id).await? {
-            tracing::debug!("Found existing user by external_user_id");
-            tracing::trace!("Found user by external_user_id: {}", external_user_id);
-            // Found by external_user_id - update email and sync groups
-            if user.email != email {
-                tracing::debug!("Updating email for user {}", abbrev_uuid(&user.id));
-                tracing::trace!("Updating email from {} to {}", user.email, email);
-                sqlx::query!("UPDATE users SET email = $1 WHERE id = $2", email, user.id)
-                    .execute(&mut *self.db)
-                    .await?;
-                user.email = email.to_string();
+        let user = 'user_lookup: {
+            // Look up by external_user_id
+            if let Some(mut user) = self.get_user_by_external_user_id(external_user_id).await? {
+                tracing::debug!("Found existing user by external_user_id");
+                tracing::trace!("Found user by external_user_id: {}", external_user_id);
+                // Found by external_user_id - update email if needed
+                if user.email != email {
+                    tracing::debug!("Updating email for user {}", abbrev_uuid(&user.id));
+                    tracing::trace!("Updating email from {} to {}", user.email, email);
+                    self.update_user_email(user.id, email).await?;
+                    user.email = email.to_string();
+                }
+
+                break 'user_lookup user;
             }
 
-            // no need to update in memory user, since groups are in a join table
-            if let Some((groups, provider)) = groups_and_provider {
-                let mut group_repo = Groups::new(&mut *self.db);
-                group_repo
-                    .sync_groups_with_sso(
-                        user.id,
-                        groups,
-                        provider,
-                        &format!("A group provisioned by the {provider} SSO source."),
-                    )
-                    .await?;
-            }
-
-            return Ok(user);
-        }
-
-        // external user id not found (might be NULL). Lookup by email for single header mode
-        if let Some(mut user) = self.get_user_by_email(email).await? {
-            tracing::debug!("Found existing user by email");
-            tracing::trace!("Found user by email: {}", email);
-            // Found by email - check if we should use this user or create a new one
-            if let Some(existing_external_id) = &user.external_user_id {
-                tracing::debug!("User {} has existing external_user_id set", abbrev_uuid(&user.id));
-                tracing::trace!("Existing external_user_id: {}", existing_external_id);
-                if existing_external_id == external_user_id {
-                    tracing::debug!("External user ID matches for user {}, using existing user", abbrev_uuid(&user.id));
-                    // Exact match - use this user and update groups if needed
-                    if let Some((groups, provider)) = groups_and_provider {
-                        let mut group_repo = Groups::new(&mut *self.db);
-                        group_repo
-                            .sync_groups_with_sso(
-                                user.id,
-                                groups,
-                                provider,
-                                &format!("A group provisioned by the {provider} SSO source."),
-                            )
-                            .await?;
+            // external user id not found (might be NULL). Lookup by email for single header mode
+            if let Some(mut user) = self.get_user_by_email(email).await? {
+                tracing::debug!("Found existing user by email");
+                tracing::trace!("Found user by email: {}", email);
+                // Found by email - check if we should use this user or create a new one
+                if let Some(existing_external_id) = &user.external_user_id {
+                    tracing::debug!("User {} has existing external_user_id set", abbrev_uuid(&user.id));
+                    tracing::trace!("Existing external_user_id: {}", existing_external_id);
+                    if existing_external_id == external_user_id {
+                        tracing::debug!("External user ID matches for user {}, using existing user", abbrev_uuid(&user.id));
+                        // Exact match - use this user
+                        break 'user_lookup user;
                     }
-                    return Ok(user);
-                }
-                tracing::debug!("External user ID mismatch for user {}, creating new user", abbrev_uuid(&user.id));
-                // External user ID mismatch - this is a different federated identity with the same email
-                // Skip this user and fall through to create a new one
-            } else {
-                // No external_user_id set - check if we should backfill
+                    tracing::debug!("External user ID mismatch for user {}, creating new user", abbrev_uuid(&user.id));
+                    // External user ID mismatch - this is a different federated identity with the same email
+                    // Skip this user and fall through to create a new one
+                } else {
+                    // No external_user_id set - check if we should backfill
 
-                // Skip backfill if external_user_id == email (backwards compatibility mode)
-                // This happens when proxy sends single header and new code falls back to using it for both
-                // We want to wait until proxy sends separate headers before backfilling
-                if external_user_id == email {
-                    tracing::debug!(
-                        "External user ID equals email for user {}, skipping backfill",
-                        abbrev_uuid(&user.id)
-                    );
-                    // Backwards compatibility mode - use this user but don't backfill yet
-                    // Sync groups if needed
-                    if let Some((groups, provider)) = groups_and_provider {
-                        let mut group_repo = Groups::new(&mut *self.db);
-                        group_repo
-                            .sync_groups_with_sso(
-                                user.id,
-                                groups,
-                                provider,
-                                &format!("A group provisioned by the {provider} SSO source."),
-                            )
-                            .await?;
+                    // Skip backfill if external_user_id == email (backwards compatibility mode)
+                    // This happens when proxy sends single header and new code falls back to using it for both
+                    // We want to wait until proxy sends separate headers before backfilling
+                    if external_user_id == email {
+                        tracing::debug!(
+                            "External user ID equals email for user {}, skipping backfill",
+                            abbrev_uuid(&user.id)
+                        );
+                        // Backwards compatibility mode - use this user but don't backfill yet
+                        break 'user_lookup user;
                     }
-                    return Ok(user);
+                    tracing::debug!("Backfilling external_user_id for user {}", abbrev_uuid(&user.id));
+                    tracing::trace!("Backfilling external_user_id to {}", external_user_id);
+
+                    // Backfill external_user_id for this existing user
+                    self.update_user_external_id(user.id, external_user_id).await?;
+                    user.external_user_id = Some(external_user_id.to_string());
+
+                    break 'user_lookup user;
                 }
-                tracing::debug!("Backfilling external_user_id for user {}", abbrev_uuid(&user.id));
-                tracing::trace!("Backfilling external_user_id to {}", external_user_id);
-
-                // Backfill external_user_id for this existing user
-                sqlx::query!("UPDATE users SET external_user_id = $1 WHERE id = $2", external_user_id, user.id)
-                    .execute(&mut *self.db)
-                    .await?;
-                user.external_user_id = Some(external_user_id.to_string());
-
-                // Sync groups if needed
-                if let Some((groups, provider)) = groups_and_provider {
-                    let mut group_repo = Groups::new(&mut *self.db);
-                    group_repo
-                        .sync_groups_with_sso(
-                            user.id,
-                            groups,
-                            provider,
-                            &format!("A group provisioned by the {provider} SSO source."),
-                        )
-                        .await?;
-                }
-
-                return Ok(user);
             }
-        }
 
-        // User not found, by either email or id, create new user
-        tracing::debug!("Creating new user via proxy header auth");
-        tracing::trace!(
-            "No existing user found for external_user_id: {} and email: {}, creating new user",
-            external_user_id,
-            email
-        );
-        let create_request = UserCreateDBRequest {
-            username: external_user_id.to_string(),
-            email: email.to_string(),
-            display_name: None,
-            avatar_url: None,
-            is_admin: false,
-            roles: vec![Role::StandardUser],
-            auth_source: "proxy-header".to_string(),
-            password_hash: None,
-            external_user_id: Some(external_user_id.to_string()),
+            // User not found by either email or id, create new user
+            tracing::debug!("Creating new user via proxy header auth");
+            tracing::trace!(
+                "No existing user found for external_user_id: {} and email: {}, creating new user",
+                external_user_id,
+                email
+            );
+            let create_request = UserCreateDBRequest {
+                username: external_user_id.to_string(),
+                email: email.to_string(),
+                display_name: None,
+                avatar_url: None,
+                is_admin: false,
+                roles: vec![Role::StandardUser],
+                auth_source: "proxy-header".to_string(),
+                password_hash: None,
+                external_user_id: Some(external_user_id.to_string()),
+            };
+
+            self.create(&create_request).await?
         };
 
-        let user = self.create(&create_request).await?;
-
-        // Sync groups for new user
+        // Sync groups once at the end, regardless of which path we took
         if let Some((groups, provider)) = groups_and_provider {
             let mut group_repo = Groups::new(&mut *self.db);
             group_repo
