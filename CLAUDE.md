@@ -356,3 +356,4 @@ prevent name clashes.
 - Database queries should use appropriate indexes (check migrations)
 - Use PostgreSQL LISTEN/NOTIFY for real-time cache invalidation (see `sync/` module)
 - Avoid N+1 queries - batch fetch related data when possible
+- To run sqlx migrations, navigate to the appropriate directory (dwctl, or fusillade/) and run `cargo sqlx migrate run`. NEVER try to run sqlx migrate run --source ... --database-url from the root.

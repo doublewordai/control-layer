@@ -435,7 +435,8 @@ mod tests {
 
         let response = app
             .post("/admin/api/v1/probes")
-            .add_header(add_auth_headers(&user).0, add_auth_headers(&user).1)
+            .add_header(&add_auth_headers(&user)[0].0, &add_auth_headers(&user)[0].1)
+            .add_header(&add_auth_headers(&user)[1].0, &add_auth_headers(&user)[1].1)
             .json(&payload)
             .await;
 
@@ -462,7 +463,8 @@ mod tests {
 
         let response = app
             .post("/admin/api/v1/probes")
-            .add_header(add_auth_headers(&user).0, add_auth_headers(&user).1)
+            .add_header(&add_auth_headers(&user)[0].0, &add_auth_headers(&user)[0].1)
+            .add_header(&add_auth_headers(&user)[1].0, &add_auth_headers(&user)[1].1)
             .json(&payload)
             .await;
 
@@ -509,7 +511,8 @@ mod tests {
 
         let response = app
             .get("/admin/api/v1/probes")
-            .add_header(add_auth_headers(&user).0, add_auth_headers(&user).1)
+            .add_header(&add_auth_headers(&user)[0].0, &add_auth_headers(&user)[0].1)
+            .add_header(&add_auth_headers(&user)[1].0, &add_auth_headers(&user)[1].1)
             .await;
 
         response.assert_status_ok();
@@ -540,7 +543,8 @@ mod tests {
 
         let response = app
             .get(&format!("/admin/api/v1/probes/{}", created.id))
-            .add_header(add_auth_headers(&user).0, add_auth_headers(&user).1)
+            .add_header(&add_auth_headers(&user)[0].0, &add_auth_headers(&user)[0].1)
+            .add_header(&add_auth_headers(&user)[1].0, &add_auth_headers(&user)[1].1)
             .await;
 
         response.assert_status_ok();
@@ -558,7 +562,8 @@ mod tests {
 
         let response = app
             .get(&format!("/admin/api/v1/probes/{}", non_existent_id))
-            .add_header(add_auth_headers(&user).0, add_auth_headers(&user).1)
+            .add_header(&add_auth_headers(&user)[0].0, &add_auth_headers(&user)[0].1)
+            .add_header(&add_auth_headers(&user)[1].0, &add_auth_headers(&user)[1].1)
             .await;
 
         response.assert_status_not_found();
@@ -591,7 +596,8 @@ mod tests {
 
         let response = app
             .patch(&format!("/admin/api/v1/probes/{}", created.id))
-            .add_header(add_auth_headers(&user).0, add_auth_headers(&user).1)
+            .add_header(&add_auth_headers(&user)[0].0, &add_auth_headers(&user)[0].1)
+            .add_header(&add_auth_headers(&user)[1].0, &add_auth_headers(&user)[1].1)
             .json(&payload)
             .await;
 
@@ -627,7 +633,8 @@ mod tests {
 
         let response = app
             .patch(&format!("/admin/api/v1/probes/{}/activate", created.id))
-            .add_header(add_auth_headers(&user).0, add_auth_headers(&user).1)
+            .add_header(&add_auth_headers(&user)[0].0, &add_auth_headers(&user)[0].1)
+            .add_header(&add_auth_headers(&user)[1].0, &add_auth_headers(&user)[1].1)
             .await;
 
         response.assert_status_ok();
@@ -658,7 +665,8 @@ mod tests {
 
         let response = app
             .patch(&format!("/admin/api/v1/probes/{}/deactivate", created.id))
-            .add_header(add_auth_headers(&user).0, add_auth_headers(&user).1)
+            .add_header(&add_auth_headers(&user)[0].0, &add_auth_headers(&user)[0].1)
+            .add_header(&add_auth_headers(&user)[1].0, &add_auth_headers(&user)[1].1)
             .await;
 
         response.assert_status_ok();
@@ -689,7 +697,8 @@ mod tests {
 
         let response = app
             .delete(&format!("/admin/api/v1/probes/{}", created.id))
-            .add_header(add_auth_headers(&user).0, add_auth_headers(&user).1)
+            .add_header(&add_auth_headers(&user)[0].0, &add_auth_headers(&user)[0].1)
+            .add_header(&add_auth_headers(&user)[1].0, &add_auth_headers(&user)[1].1)
             .await;
 
         response.assert_status(axum::http::StatusCode::NO_CONTENT);
@@ -697,7 +706,8 @@ mod tests {
         // Verify probe is deleted
         let get_response = app
             .get(&format!("/admin/api/v1/probes/{}", created.id))
-            .add_header(add_auth_headers(&user).0, add_auth_headers(&user).1)
+            .add_header(&add_auth_headers(&user)[0].0, &add_auth_headers(&user)[0].1)
+            .add_header(&add_auth_headers(&user)[1].0, &add_auth_headers(&user)[1].1)
             .await;
 
         get_response.assert_status_not_found();
@@ -726,7 +736,8 @@ mod tests {
 
         let response = app
             .get(&format!("/admin/api/v1/probes/{}/results", created.id))
-            .add_header(add_auth_headers(&user).0, add_auth_headers(&user).1)
+            .add_header(&add_auth_headers(&user)[0].0, &add_auth_headers(&user)[0].1)
+            .add_header(&add_auth_headers(&user)[1].0, &add_auth_headers(&user)[1].1)
             .await;
 
         response.assert_status_ok();
@@ -757,7 +768,8 @@ mod tests {
 
         let response = app
             .get(&format!("/admin/api/v1/probes/{}/statistics", created.id))
-            .add_header(add_auth_headers(&user).0, add_auth_headers(&user).1)
+            .add_header(&add_auth_headers(&user)[0].0, &add_auth_headers(&user)[0].1)
+            .add_header(&add_auth_headers(&user)[1].0, &add_auth_headers(&user)[1].1)
             .await;
 
         response.assert_status_ok();

@@ -10,7 +10,13 @@ use crate::api::models::files::{
 };
 use crate::auth::permissions::{can_read_all_resources, operation, resource, RequiresPermission};
 
-use crate::db::{handlers::api_keys::ApiKeys, models::api_keys::ApiKeyPurpose};
+use crate::db::{
+    handlers::api_keys::ApiKeys,
+    handlers::deployments::{DeploymentFilter, Deployments},
+    handlers::repository::Repository,
+    models::api_keys::ApiKeyPurpose,
+    models::deployments::ModelStatus,
+};
 use crate::errors::{Error, Result};
 use crate::types::Resource;
 use crate::AppState;
@@ -23,6 +29,7 @@ use fusillade::Storage;
 use futures::stream::Stream;
 use futures::StreamExt;
 use serde::{Deserialize, Serialize};
+use std::collections::HashSet;
 use std::pin::Pin;
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
@@ -44,8 +51,9 @@ impl OpenAIBatchRequest {
     /// # Arguments
     /// * `endpoint` - The target endpoint (e.g., "http://localhost:8080/ai")
     /// * `api_key` - The API key to inject for request execution
-    #[tracing::instrument(skip(self, api_key), fields(custom_id = %self.custom_id, method = %self.method, url = %self.url))]
-    fn to_internal(&self, endpoint: &str, api_key: String) -> Result<fusillade::RequestTemplateInput> {
+    /// * `accessible_models` - Set of model aliases the user can access
+    #[tracing::instrument(skip(self, api_key, accessible_models), fields(custom_id = %self.custom_id, method = %self.method, url = %self.url))]
+    fn to_internal(&self, endpoint: &str, api_key: String, accessible_models: &HashSet<String>) -> Result<fusillade::RequestTemplateInput> {
         // Extract model from body if present
         let model = self
             .body
@@ -55,6 +63,13 @@ impl OpenAIBatchRequest {
                 message: "Missing 'model' field in request body".to_string(),
             })?
             .to_string();
+
+        // Validate model access
+        if !accessible_models.contains(&model) {
+            return Err(Error::BadRequest {
+                message: format!("Model '{}' has not been configured or is not available to user.", model),
+            });
+        }
 
         // Serialize body back to string
         let body = serde_json::to_string(&self.body).map_err(|e| Error::BadRequest {
@@ -98,7 +113,7 @@ impl OpenAIBatchRequest {
 /// # Arguments
 /// * `endpoint` - Target endpoint for batch requests (e.g., "http://localhost:8080/ai")
 /// * `api_key` - API key to inject for request execution
-#[tracing::instrument(skip(multipart, api_key), fields(max_file_size, uploaded_by = ?uploaded_by, endpoint = %endpoint, buffer_size))]
+#[tracing::instrument(skip(multipart, api_key, accessible_models), fields(max_file_size, uploaded_by = ?uploaded_by, endpoint = %endpoint, buffer_size))]
 fn create_file_stream(
     mut multipart: Multipart,
     max_file_size: u64,
@@ -106,6 +121,7 @@ fn create_file_stream(
     endpoint: String,
     api_key: String,
     buffer_size: usize,
+    accessible_models: HashSet<String>,
 ) -> Pin<Box<dyn Stream<Item = fusillade::FileStreamItem> + Send>> {
     let (tx, rx) = mpsc::channel(buffer_size);
 
@@ -215,8 +231,8 @@ fn create_file_stream(
                             // Parse JSON line as OpenAI Batch format, then transform to internal
                             match serde_json::from_str::<OpenAIBatchRequest>(trimmed) {
                                 Ok(openai_req) => {
-                                    // Transform to internal format
-                                    match openai_req.to_internal(&endpoint, api_key.clone()) {
+                                    // Transform to internal format (includes model access validation)
+                                    match openai_req.to_internal(&endpoint, api_key.clone(), &accessible_models) {
                                         Ok(template) => {
                                             line_count += 1;
                                             incomplete_line.clear();
@@ -227,7 +243,7 @@ fn create_file_stream(
                                         Err(e) => {
                                             let _ = tx
                                                 .send(fusillade::FileStreamItem::Error(format!(
-                                                    "Failed to transform request on line {}: {:?}",
+                                                    "Failed to transform request on line {}: {}",
                                                     line_count + 1,
                                                     e
                                                 )))
@@ -255,7 +271,7 @@ fn create_file_stream(
                         let trimmed = incomplete_line.trim();
                         if !trimmed.is_empty() {
                             match serde_json::from_str::<OpenAIBatchRequest>(trimmed) {
-                                Ok(openai_req) => match openai_req.to_internal(&endpoint, api_key.clone()) {
+                                Ok(openai_req) => match openai_req.to_internal(&endpoint, api_key.clone(), &accessible_models) {
                                     Ok(template) => {
                                         line_count += 1;
                                         if tx.send(fusillade::FileStreamItem::Template(template)).await.is_err() {
@@ -355,6 +371,18 @@ pub async fn upload_file(
     // Construct batch execution endpoint (where fusillade will send requests)
     let endpoint = format!("http://{}:{}/ai", state.config.host, state.config.port);
 
+    // Query models accessible to the user for validation during file parsing
+    let mut deployments_repo = Deployments::new(&mut conn);
+    let filter = DeploymentFilter::new(0, i64::MAX)
+        .with_accessible_to(current_user.id)
+        .with_statuses(vec![ModelStatus::Active])
+        .with_deleted(false);
+    let accessible_deployments = deployments_repo.list(&filter).await.map_err(Error::Database)?;
+    let accessible_models: HashSet<String> = accessible_deployments.into_iter().map(|d| d.alias).collect();
+
+    // drop conn so it isn't persisted for entire upload process
+    drop(conn);
+
     // Create a stream that parses the multipart upload and yields FileStreamItems
     let file_stream = create_file_stream(
         multipart,
@@ -363,6 +391,7 @@ pub async fn upload_file(
         endpoint,
         user_api_key,
         state.config.batches.files.upload_buffer_size,
+        accessible_models,
     );
 
     // Create file via request manager with streaming
@@ -791,6 +820,10 @@ mod tests {
         let group = create_test_group(&pool).await;
         add_user_to_group(&pool, user.id, group.id).await;
 
+        // Create a deployment and add to group so user has access to the model
+        let deployment = create_test_deployment(&pool, user.id, "gpt-4-model", "gpt-4").await;
+        add_deployment_to_group(&pool, deployment.id, group.id, user.id).await;
+
         // Create test JSONL content with 3 request templates in OpenAI Batch API format
         let jsonl_content = r#"{"custom_id":"request-1","method":"POST","url":"/v1/chat/completions","body":{"model":"gpt-4","messages":[{"role":"user","content":"Hello 1"}]}}
 {"custom_id":"request-2","method":"POST","url":"/v1/chat/completions","body":{"model":"gpt-4","messages":[{"role":"user","content":"Hello 2"}]}}
@@ -802,7 +835,8 @@ mod tests {
 
         let upload_response = app
             .post("/ai/v1/files")
-            .add_header(add_auth_headers(&user).0, add_auth_headers(&user).1)
+            .add_header(&add_auth_headers(&user)[0].0, &add_auth_headers(&user)[0].1)
+            .add_header(&add_auth_headers(&user)[1].0, &add_auth_headers(&user)[1].1)
             .multipart(
                 axum_test::multipart::MultipartForm::new()
                     .add_text("purpose", "batch")
@@ -817,7 +851,8 @@ mod tests {
         // Download the file content
         let download_response = app
             .get(&format!("/ai/v1/files/{}/content", file_id))
-            .add_header(add_auth_headers(&user).0, add_auth_headers(&user).1)
+            .add_header(&add_auth_headers(&user)[0].0, &add_auth_headers(&user)[0].1)
+            .add_header(&add_auth_headers(&user)[1].0, &add_auth_headers(&user)[1].1)
             .await;
 
         download_response.assert_status(axum::http::StatusCode::OK);
@@ -853,7 +888,8 @@ mod tests {
 
         let upload_response = app
             .post("/ai/v1/files")
-            .add_header(add_auth_headers(&user).0, add_auth_headers(&user).1)
+            .add_header(&add_auth_headers(&user)[0].0, &add_auth_headers(&user)[0].1)
+            .add_header(&add_auth_headers(&user)[1].0, &add_auth_headers(&user)[1].1)
             .multipart(
                 axum_test::multipart::MultipartForm::new()
                     .add_text("purpose", "batch")
@@ -865,6 +901,41 @@ mod tests {
         upload_response.assert_status(axum::http::StatusCode::BAD_REQUEST);
         let error_body = upload_response.text();
         assert!(error_body.contains("model"));
+    }
+
+    #[sqlx::test]
+    #[test_log::test]
+    async fn test_upload_model_access_denied(pool: PgPool) {
+        let (app, _bg_services) = create_test_app(pool.clone(), false).await;
+        let user = create_test_user_with_roles(&pool, vec![Role::StandardUser, Role::BatchAPIUser]).await;
+        let group = create_test_group(&pool).await;
+        add_user_to_group(&pool, user.id, group.id).await;
+
+        // Create a deployment for a different model than what's in the batch file
+        let deployment = create_test_deployment(&pool, user.id, "allowed-model", "allowed-model").await;
+        add_deployment_to_group(&pool, deployment.id, group.id, user.id).await;
+
+        // Batch file requests a model the user doesn't have access to
+        let jsonl_content = r#"{"custom_id":"request-1","method":"POST","url":"/v1/chat/completions","body":{"model":"unauthorized-model","messages":[{"role":"user","content":"Hello"}]}}"#;
+
+        let file_part = axum_test::multipart::Part::bytes(jsonl_content.as_bytes()).file_name("test-batch.jsonl");
+
+        let upload_response = app
+            .post("/ai/v1/files")
+            .add_header(&add_auth_headers(&user)[0].0, &add_auth_headers(&user)[0].1)
+            .add_header(&add_auth_headers(&user)[1].0, &add_auth_headers(&user)[1].1)
+            .multipart(
+                axum_test::multipart::MultipartForm::new()
+                    .add_text("purpose", "batch")
+                    .add_part("file", file_part),
+            )
+            .await;
+
+        // Should reject with 400 Bad Request due to model access denied
+        upload_response.assert_status(axum::http::StatusCode::BAD_REQUEST);
+        let error_body = upload_response.text();
+        assert!(error_body.contains("Model"));
+        assert!(error_body.contains("has not been configured or is not available to user."));
     }
 
     #[sqlx::test]
@@ -881,7 +952,8 @@ mod tests {
 
         let upload_response = app
             .post("/ai/v1/files")
-            .add_header(add_auth_headers(&user).0, add_auth_headers(&user).1)
+            .add_header(&add_auth_headers(&user)[0].0, &add_auth_headers(&user)[0].1)
+            .add_header(&add_auth_headers(&user)[1].0, &add_auth_headers(&user)[1].1)
             .multipart(
                 axum_test::multipart::MultipartForm::new()
                     .add_text("purpose", "batch")
@@ -908,7 +980,8 @@ mod tests {
 
         let upload_response = app
             .post("/ai/v1/files")
-            .add_header(add_auth_headers(&user).0, add_auth_headers(&user).1)
+            .add_header(&add_auth_headers(&user)[0].0, &add_auth_headers(&user)[0].1)
+            .add_header(&add_auth_headers(&user)[1].0, &add_auth_headers(&user)[1].1)
             .multipart(
                 axum_test::multipart::MultipartForm::new()
                     .add_text("purpose", "batch")
@@ -935,7 +1008,8 @@ mod tests {
 
         let upload_response = app
             .post("/ai/v1/files")
-            .add_header(add_auth_headers(&user).0, add_auth_headers(&user).1)
+            .add_header(&add_auth_headers(&user)[0].0, &add_auth_headers(&user)[0].1)
+            .add_header(&add_auth_headers(&user)[1].0, &add_auth_headers(&user)[1].1)
             .multipart(
                 axum_test::multipart::MultipartForm::new()
                     .add_text("purpose", "batch")
@@ -960,7 +1034,8 @@ mod tests {
 
         let upload_response = app
             .post("/ai/v1/files")
-            .add_header(add_auth_headers(&user).0, add_auth_headers(&user).1)
+            .add_header(&add_auth_headers(&user)[0].0, &add_auth_headers(&user)[0].1)
+            .add_header(&add_auth_headers(&user)[1].0, &add_auth_headers(&user)[1].1)
             .multipart(
                 axum_test::multipart::MultipartForm::new()
                     .add_text("purpose", "batch")
@@ -977,6 +1052,12 @@ mod tests {
     async fn test_upload_with_metadata_after_file_field(pool: PgPool) {
         let (app, _bg_services) = create_test_app(pool.clone(), false).await;
         let user = create_test_user_with_roles(&pool, vec![Role::StandardUser, Role::BatchAPIUser]).await;
+        let group = create_test_group(&pool).await;
+        add_user_to_group(&pool, user.id, group.id).await;
+
+        // Create a deployment and add to group so user has access to the model
+        let deployment = create_test_deployment(&pool, user.id, "gpt-4-model", "gpt-4").await;
+        add_deployment_to_group(&pool, deployment.id, group.id, user.id).await;
 
         // Create test JSONL content
         let jsonl_content = r#"{"custom_id":"request-1","method":"POST","url":"/v1/chat/completions","body":{"model":"gpt-4","messages":[{"role":"user","content":"Hello"}]}}"#;
@@ -987,7 +1068,8 @@ mod tests {
         // This tests whether the handler correctly processes metadata regardless of field order
         let upload_response = app
             .post("/ai/v1/files")
-            .add_header(add_auth_headers(&user).0, add_auth_headers(&user).1)
+            .add_header(&add_auth_headers(&user)[0].0, &add_auth_headers(&user)[0].1)
+            .add_header(&add_auth_headers(&user)[1].0, &add_auth_headers(&user)[1].1)
             .multipart(
                 axum_test::multipart::MultipartForm::new()
                     .add_part("file", file_part)
@@ -1006,7 +1088,8 @@ mod tests {
         // For now, we verify the upload succeeded and the file exists
         let get_response = app
             .get(&format!("/ai/v1/files/{}", file.id))
-            .add_header(add_auth_headers(&user).0, add_auth_headers(&user).1)
+            .add_header(&add_auth_headers(&user)[0].0, &add_auth_headers(&user)[0].1)
+            .add_header(&add_auth_headers(&user)[1].0, &add_auth_headers(&user)[1].1)
             .await;
 
         get_response.assert_status(axum::http::StatusCode::OK);
@@ -1019,6 +1102,12 @@ mod tests {
     async fn test_upload_duplicate_filename(pool: PgPool) {
         let (app, _bg_services) = create_test_app(pool.clone(), false).await;
         let user = create_test_user_with_roles(&pool, vec![Role::StandardUser, Role::BatchAPIUser]).await;
+        let group = create_test_group(&pool).await;
+        add_user_to_group(&pool, user.id, group.id).await;
+
+        // Create a deployment and add to group so user has access to the model
+        let deployment = create_test_deployment(&pool, user.id, "gpt-4-model", "gpt-4").await;
+        add_deployment_to_group(&pool, deployment.id, group.id, user.id).await;
 
         // Create test JSONL content
         let jsonl_content = r#"{"custom_id":"request-1","method":"POST","url":"/v1/chat/completions","body":{"model":"gpt-4","messages":[{"role":"user","content":"Hello"}]}}"#;
@@ -1028,7 +1117,8 @@ mod tests {
 
         let upload_response1 = app
             .post("/ai/v1/files")
-            .add_header(add_auth_headers(&user).0, add_auth_headers(&user).1)
+            .add_header(&add_auth_headers(&user)[0].0, &add_auth_headers(&user)[0].1)
+            .add_header(&add_auth_headers(&user)[1].0, &add_auth_headers(&user)[1].1)
             .multipart(
                 axum_test::multipart::MultipartForm::new()
                     .add_text("purpose", "batch")
@@ -1044,7 +1134,8 @@ mod tests {
 
         let upload_response2 = app
             .post("/ai/v1/files")
-            .add_header(add_auth_headers(&user).0, add_auth_headers(&user).1)
+            .add_header(&add_auth_headers(&user)[0].0, &add_auth_headers(&user)[0].1)
+            .add_header(&add_auth_headers(&user)[1].0, &add_auth_headers(&user)[1].1)
             .multipart(
                 axum_test::multipart::MultipartForm::new()
                     .add_text("purpose", "batch")

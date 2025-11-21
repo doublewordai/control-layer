@@ -66,6 +66,7 @@ export const ROUTE_PERMISSIONS: Record<string, PagePermission> = {
   "/users-groups": "users-groups",
   "/api-keys": "api-keys",
   "/settings": "settings",
+  "/system": "settings",
   "/profile": "profile",
   "/batches": "batches",
 };
