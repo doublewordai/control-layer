@@ -6,7 +6,7 @@ use crate::{
     api::models::users::{CurrentUser, Role},
     auth::session,
     db::{
-        handlers::{Repository, Users},
+        handlers::{Repository, Users}, // Add Repository here
         models::users::UserCreateDBRequest,
     },
     errors::{Error, Result},
@@ -19,10 +19,14 @@ use tracing::{debug, instrument, trace};
 /// Extract user from JWT session cookie if present and valid
 /// Returns:
 /// - None: No JWT cookie present
-/// - Some(Ok(user)): Valid JWT found and verified
-/// - Some(Err(error)): JWT cookie present but invalid/malformed
-#[instrument(skip(parts, config))]
-fn try_jwt_session_auth(parts: &axum::http::request::Parts, config: &crate::config::Config) -> Option<Result<CurrentUser>> {
+/// - Some(Ok(user)): Valid JWT found, user fetched from DB with current data
+/// - Some(Err(error)): JWT cookie present but invalid/malformed, or user not found/deleted
+#[instrument(skip(parts, config, db))]
+async fn try_jwt_session_auth(
+    parts: &axum::http::request::Parts,
+    config: &crate::config::Config,
+    db: &PgPool,
+) -> Option<Result<CurrentUser>> {
     let cookie_header = parts.headers.get(axum::http::header::COOKIE)?;
 
     let cookie_str = match cookie_header.to_str() {
@@ -39,15 +43,42 @@ fn try_jwt_session_auth(parts: &axum::http::request::Parts, config: &crate::conf
         let cookie = cookie.trim();
         if let Some((name, value)) = cookie.split_once('=') {
             if name == cookie_name {
-                // Try to verify the JWT session token
-                match session::verify_session_token(value, config) {
-                    Ok(user) => return Some(Ok(user)),
+                // Verify the JWT and extract user ID
+                let user_id = match session::verify_session_token(value, config) {
+                    Ok(id) => id,
                     Err(_) => {
-                        // Invalid/expired token, continue checking other cookies or return None
-                        // We don't propagate JWT verification errors as they're expected for expired tokens
+                        // Invalid/expired token, continue checking other cookies
                         continue;
                     }
-                }
+                };
+
+                // Fetch fresh user data from database
+                let mut conn = match db.acquire().await {
+                    Ok(conn) => conn,
+                    Err(e) => return Some(Err(DbError::from(e).into())),
+                };
+                let mut user_repo = Users::new(&mut conn);
+
+                let user = match user_repo.get_by_id(user_id).await {
+                    Ok(Some(user)) => user,
+                    Ok(None) => {
+                        // User was deleted - invalidate session
+                        return Some(Err(Error::Unauthenticated {
+                            message: Some("User no longer exists".to_string()),
+                        }));
+                    }
+                    Err(e) => return Some(Err(Error::Database(e))),
+                };
+
+                return Some(Ok(CurrentUser {
+                    id: user.id,
+                    username: user.username,
+                    email: user.email,
+                    is_admin: user.is_admin,
+                    roles: user.roles,
+                    display_name: user.display_name,
+                    avatar_url: user.avatar_url,
+                }));
             }
         }
     }
@@ -317,7 +348,7 @@ impl FromRequestParts<AppState> for CurrentUser {
 
         // Native authentication (JWT sessions)
         if state.config.auth.native.enabled {
-            match try_jwt_session_auth(parts, &state.config) {
+            match try_jwt_session_auth(parts, &state.config, &state.db).await {
                 Some(Ok(user)) => {
                     debug!("Found JWT session authenticated user: {}", user.id);
                     return Ok(user);
@@ -366,7 +397,8 @@ impl FromRequestParts<AppState> for CurrentUser {
 mod tests {
     use crate::{
         api::models::users::{CurrentUser, Role},
-        db::handlers::Users,
+        db::handlers::{Repository, Users}, // Add Repository here
+        errors::Error,                     // Add Error here
         test_utils::create_test_config,
         test_utils::require_admin,
         AppState,
@@ -522,5 +554,138 @@ mod tests {
         assert!(result.is_err());
         let error = result.unwrap_err();
         assert_eq!(error.status_code(), axum::http::StatusCode::FORBIDDEN);
+    }
+
+    #[sqlx::test]
+    async fn test_jwt_reflects_current_user_state(pool: PgPool) {
+        use crate::auth::session;
+
+        let mut config = create_test_config();
+        config.auth.native.enabled = true;
+
+        // Create a user with StandardUser role
+        let user = crate::test_utils::create_test_user(&pool, Role::StandardUser).await;
+
+        // Create a JWT token
+        let current_user = CurrentUser {
+            id: user.id,
+            username: user.username.clone(),
+            email: user.email.clone(),
+            is_admin: user.is_admin,
+            roles: user.roles.clone(),
+            display_name: user.display_name.clone(),
+            avatar_url: user.avatar_url.clone(),
+        };
+        let jwt_token = session::create_session_token(&current_user, &config).unwrap();
+
+        let state = {
+            let request_manager = std::sync::Arc::new(fusillade::PostgresRequestManager::new(pool.clone()));
+            AppState::builder()
+                .db(pool.clone())
+                .config(config.clone())
+                .request_manager(request_manager)
+                .build()
+        };
+
+        // Create request with JWT
+        let request = axum::http::Request::builder()
+            .uri("http://localhost/test")
+            .header("cookie", format!("{}={}", config.auth.native.session.cookie_name, jwt_token))
+            .body(())
+            .unwrap();
+        let (mut parts, _body) = request.into_parts();
+
+        // First extraction should succeed with StandardUser role
+        let extracted_user = CurrentUser::from_request_parts(&mut parts, &state).await.unwrap();
+        assert_eq!(extracted_user.id, user.id);
+        assert_eq!(extracted_user.roles, vec![Role::StandardUser]);
+        assert!(!extracted_user.is_admin);
+
+        // Now update the user's roles in the database
+        let mut conn = pool.acquire().await.unwrap();
+        let mut users_repo = Users::new(&mut conn);
+        let update = crate::db::models::users::UserUpdateDBRequest {
+            display_name: None,
+            avatar_url: None,
+            roles: Some(vec![Role::StandardUser, Role::PlatformManager]),
+            password_hash: None,
+        };
+        users_repo.update(user.id, &update).await.unwrap();
+
+        // Create a NEW request with the SAME JWT token
+        let request = axum::http::Request::builder()
+            .uri("http://localhost/test")
+            .header("cookie", format!("{}={}", config.auth.native.session.cookie_name, jwt_token))
+            .body(())
+            .unwrap();
+        let (mut parts, _body) = request.into_parts();
+
+        // Extraction should now show updated roles (fetched fresh from DB)
+        let extracted_user = CurrentUser::from_request_parts(&mut parts, &state).await.unwrap();
+        assert_eq!(extracted_user.id, user.id);
+        assert!(extracted_user.roles.contains(&Role::StandardUser));
+        assert!(extracted_user.roles.contains(&Role::PlatformManager));
+    }
+
+    #[sqlx::test]
+    async fn test_jwt_invalidated_when_user_deleted(pool: PgPool) {
+        use crate::auth::session;
+
+        let mut config = create_test_config();
+        config.auth.native.enabled = true;
+
+        let user = crate::test_utils::create_test_user(&pool, Role::StandardUser).await;
+
+        // Create a JWT token
+        let current_user = CurrentUser {
+            id: user.id,
+            username: user.username.clone(),
+            email: user.email.clone(),
+            is_admin: user.is_admin,
+            roles: user.roles.clone(),
+            display_name: user.display_name.clone(),
+            avatar_url: user.avatar_url.clone(),
+        };
+        let jwt_token = session::create_session_token(&current_user, &config).unwrap();
+
+        let state = {
+            let request_manager = std::sync::Arc::new(fusillade::PostgresRequestManager::new(pool.clone()));
+            AppState::builder()
+                .db(pool.clone())
+                .config(config.clone())
+                .request_manager(request_manager)
+                .build()
+        };
+
+        // First extraction should succeed
+        let request = axum::http::Request::builder()
+            .uri("http://localhost/test")
+            .header("cookie", format!("{}={}", config.auth.native.session.cookie_name, jwt_token))
+            .body(())
+            .unwrap();
+        let (mut parts, _body) = request.into_parts();
+        let result = CurrentUser::from_request_parts(&mut parts, &state).await;
+        assert!(result.is_ok());
+
+        // Delete the user
+        let mut conn = pool.acquire().await.unwrap();
+        let mut users_repo = Users::new(&mut conn);
+        users_repo.delete(user.id).await.unwrap();
+
+        // Try to use the same JWT token after user deletion
+        let request = axum::http::Request::builder()
+            .uri("http://localhost/test")
+            .header("cookie", format!("{}={}", config.auth.native.session.cookie_name, jwt_token))
+            .body(())
+            .unwrap();
+        let (mut parts, _body) = request.into_parts();
+        let result = CurrentUser::from_request_parts(&mut parts, &state).await;
+
+        // Should fail with Unauthenticated error - user no longer exists
+        // The important security property is that authentication fails,
+        // not the specific error message (which may be aggregated)
+        assert!(result.is_err());
+        let error = result.unwrap_err();
+        assert!(matches!(error, Error::Unauthenticated { .. }));
     }
 }
