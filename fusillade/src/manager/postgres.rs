@@ -2577,10 +2577,8 @@ impl<H: HttpClient + 'static> DaemonExecutor<H> for PostgresRequestManager<H> {
         let manager = self.clone();
         let handle = tokio::spawn(async move {
             // Create a cancellation stream from PostgreSQL LISTEN/NOTIFY
-            // Fail-fast if we can't create the stream - this is a fatal error
-            let cancellation_stream = manager.create_cancellation_stream().await.expect(
-                "Failed to create cancellation stream - cannot listen for request cancellations",
-            );
+            // If we can't create the stream, return error for fail-fast behavior
+            let cancellation_stream = manager.create_cancellation_stream().await?;
             daemon.run(Some(cancellation_stream)).await
         });
 
