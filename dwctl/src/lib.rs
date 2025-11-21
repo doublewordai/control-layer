@@ -999,7 +999,7 @@ async fn setup_background_services(
                         use crate::config::DaemonEnabled;
                         use fusillade::DaemonExecutor;
                         match config.batches.daemon.enabled {
-                            DaemonEnabled::Always | DaemonEnabled::Leader => {
+                            DaemonEnabled::Leader => {
                                 let handle = request_manager
                                     .run(session_token.clone())
                                     .map_err(|e| anyhow::anyhow!("Failed to start fusillade daemon: {}", e))?;
@@ -1008,6 +1008,9 @@ async fn setup_background_services(
                                 *daemon_handle.lock().await = Some(handle);
 
                                 tracing::info!("Fusillade batch daemon started on elected leader");
+                            }
+                            DaemonEnabled::Always => {
+                                // Daemon already started earlier, nothing to do here
                             }
                             DaemonEnabled::Never => {
                                 tracing::info!("Fusillade batch daemon disabled by configuration");
