@@ -342,7 +342,8 @@ mod tests {
 
         let response = app
             .get("/admin/api/v1/requests")
-            .add_header(add_auth_headers(&admin_user).0, add_auth_headers(&admin_user).1)
+            .add_header(&add_auth_headers(&admin_user)[0].0, &add_auth_headers(&admin_user)[0].1)
+            .add_header(&add_auth_headers(&admin_user)[1].0, &add_auth_headers(&admin_user)[1].1)
             .await;
 
         // Should return 404 since request logging is disabled
@@ -357,7 +358,8 @@ mod tests {
 
         let response = app
             .get("/admin/api/v1/requests")
-            .add_header(add_auth_headers(&user).0, add_auth_headers(&user).1)
+            .add_header(&add_auth_headers(&user)[0].0, &add_auth_headers(&user)[0].1)
+            .add_header(&add_auth_headers(&user)[1].0, &add_auth_headers(&user)[1].1)
             .await;
 
         // Should be forbidden since user doesn't have Requests:Read permission
@@ -372,7 +374,8 @@ mod tests {
 
         let response = app
             .get("/admin/api/v1/requests/aggregate")
-            .add_header(add_auth_headers(&admin_user).0, add_auth_headers(&admin_user).1)
+            .add_header(&add_auth_headers(&admin_user)[0].0, &add_auth_headers(&admin_user)[0].1)
+            .add_header(&add_auth_headers(&admin_user)[1].0, &add_auth_headers(&admin_user)[1].1)
             .await;
 
         // Should return 404 since request logging is disabled
@@ -401,7 +404,8 @@ mod tests {
 
         let response = server
             .get("/admin/api/v1/requests/aggregate")
-            .add_header(add_auth_headers(&admin_user).0, add_auth_headers(&admin_user).1)
+            .add_header(&add_auth_headers(&admin_user)[0].0, &add_auth_headers(&admin_user)[0].1)
+            .add_header(&add_auth_headers(&admin_user)[1].0, &add_auth_headers(&admin_user)[1].1)
             .await;
 
         response.assert_status_ok();
@@ -433,7 +437,8 @@ mod tests {
 
         let response = server
             .get("/admin/api/v1/requests/aggregate?model=gpt-4")
-            .add_header(add_auth_headers(&admin_user).0, add_auth_headers(&admin_user).1)
+            .add_header(&add_auth_headers(&admin_user)[0].0, &add_auth_headers(&admin_user)[0].1)
+            .add_header(&add_auth_headers(&admin_user)[1].0, &add_auth_headers(&admin_user)[1].1)
             .await;
 
         response.assert_status_ok();
@@ -450,7 +455,8 @@ mod tests {
 
         let response = app
             .get("/admin/api/v1/requests/aggregate")
-            .add_header(add_auth_headers(&user).0, add_auth_headers(&user).1)
+            .add_header(&add_auth_headers(&user)[0].0, &add_auth_headers(&user)[0].1)
+            .add_header(&add_auth_headers(&user)[1].0, &add_auth_headers(&user)[1].1)
             .await;
 
         // Should be forbidden since user doesn't have Analytics:Read permission
@@ -476,7 +482,8 @@ mod tests {
 
         let response = server
             .get("/admin/api/v1/requests")
-            .add_header(add_auth_headers(&admin_user).0, add_auth_headers(&admin_user).1)
+            .add_header(&add_auth_headers(&admin_user)[0].0, &add_auth_headers(&admin_user)[0].1)
+            .add_header(&add_auth_headers(&admin_user)[1].0, &add_auth_headers(&admin_user)[1].1)
             .await;
 
         response.assert_status_ok();
@@ -839,7 +846,8 @@ mod tests {
         // StandardUser should NOT be able to list requests (no Requests permissions)
         let response = app
             .get("/admin/api/v1/requests")
-            .add_header(add_auth_headers(&standard_user).0, add_auth_headers(&standard_user).1)
+            .add_header(&add_auth_headers(&standard_user)[0].0, &add_auth_headers(&standard_user)[0].1)
+            .add_header(&add_auth_headers(&standard_user)[1].0, &add_auth_headers(&standard_user)[1].1)
             .await;
 
         response.assert_status_forbidden();
@@ -847,7 +855,8 @@ mod tests {
         // StandardUser should NOT be able to access aggregated requests (no Analytics permissions)
         let response = app
             .get("/admin/api/v1/requests/aggregate")
-            .add_header(add_auth_headers(&standard_user).0, add_auth_headers(&standard_user).1)
+            .add_header(&add_auth_headers(&standard_user)[0].0, &add_auth_headers(&standard_user)[0].1)
+            .add_header(&add_auth_headers(&standard_user)[1].0, &add_auth_headers(&standard_user)[1].1)
             .await;
 
         response.assert_status_forbidden();
@@ -872,7 +881,8 @@ mod tests {
         // RequestViewer should be able to list requests (has ReadAll for Requests)
         let response = app
             .get("/admin/api/v1/requests")
-            .add_header(add_auth_headers(&request_viewer).0, add_auth_headers(&request_viewer).1)
+            .add_header(&add_auth_headers(&request_viewer)[0].0, &add_auth_headers(&request_viewer)[0].1)
+            .add_header(&add_auth_headers(&request_viewer)[1].0, &add_auth_headers(&request_viewer)[1].1)
             .await;
 
         response.assert_status_ok();
@@ -882,7 +892,8 @@ mod tests {
         // RequestViewer should be able to access aggregated requests (has ReadAll for Analytics)
         let response = app
             .get("/admin/api/v1/requests/aggregate")
-            .add_header(add_auth_headers(&request_viewer).0, add_auth_headers(&request_viewer).1)
+            .add_header(&add_auth_headers(&request_viewer)[0].0, &add_auth_headers(&request_viewer)[0].1)
+            .add_header(&add_auth_headers(&request_viewer)[1].0, &add_auth_headers(&request_viewer)[1].1)
             .await;
 
         response.assert_status_ok();
@@ -911,7 +922,8 @@ mod tests {
         // PlatformManager should NOT be able to list requests (no Requests permissions)
         let response = app
             .get("/admin/api/v1/requests")
-            .add_header(add_auth_headers(&platform_manager).0, add_auth_headers(&platform_manager).1)
+            .add_header(&add_auth_headers(&platform_manager)[0].0, &add_auth_headers(&platform_manager)[0].1)
+            .add_header(&add_auth_headers(&platform_manager)[1].0, &add_auth_headers(&platform_manager)[1].1)
             .await;
 
         response.assert_status_forbidden();
@@ -919,7 +931,8 @@ mod tests {
         // But PlatformManager should be able to access aggregated analytics (has Analytics permissions)
         let response = app
             .get("/admin/api/v1/requests/aggregate")
-            .add_header(add_auth_headers(&platform_manager).0, add_auth_headers(&platform_manager).1)
+            .add_header(&add_auth_headers(&platform_manager)[0].0, &add_auth_headers(&platform_manager)[0].1)
+            .add_header(&add_auth_headers(&platform_manager)[1].0, &add_auth_headers(&platform_manager)[1].1)
             .await;
 
         response.assert_status_ok();
@@ -946,7 +959,8 @@ mod tests {
         // Should be able to list requests (RequestViewer permission)
         let response = app
             .get("/admin/api/v1/requests")
-            .add_header(add_auth_headers(&monitoring_user).0, add_auth_headers(&monitoring_user).1)
+            .add_header(&add_auth_headers(&monitoring_user)[0].0, &add_auth_headers(&monitoring_user)[0].1)
+            .add_header(&add_auth_headers(&monitoring_user)[1].0, &add_auth_headers(&monitoring_user)[1].1)
             .await;
 
         response.assert_status_ok();
@@ -954,7 +968,8 @@ mod tests {
         // Should be able to access analytics (RequestViewer permission)
         let response = app
             .get("/admin/api/v1/requests/aggregate")
-            .add_header(add_auth_headers(&monitoring_user).0, add_auth_headers(&monitoring_user).1)
+            .add_header(&add_auth_headers(&monitoring_user)[0].0, &add_auth_headers(&monitoring_user)[0].1)
+            .add_header(&add_auth_headers(&monitoring_user)[1].0, &add_auth_headers(&monitoring_user)[1].1)
             .await;
 
         response.assert_status_ok();
@@ -965,7 +980,8 @@ mod tests {
         // Should be able to list requests (RequestViewer permission)
         let response = app
             .get("/admin/api/v1/requests")
-            .add_header(add_auth_headers(&full_admin).0, add_auth_headers(&full_admin).1)
+            .add_header(&add_auth_headers(&full_admin)[0].0, &add_auth_headers(&full_admin)[0].1)
+            .add_header(&add_auth_headers(&full_admin)[1].0, &add_auth_headers(&full_admin)[1].1)
             .await;
 
         response.assert_status_ok();
@@ -973,7 +989,8 @@ mod tests {
         // Should be able to access analytics (both roles have this)
         let response = app
             .get("/admin/api/v1/requests/aggregate")
-            .add_header(add_auth_headers(&full_admin).0, add_auth_headers(&full_admin).1)
+            .add_header(&add_auth_headers(&full_admin)[0].0, &add_auth_headers(&full_admin)[0].1)
+            .add_header(&add_auth_headers(&full_admin)[1].0, &add_auth_headers(&full_admin)[1].1)
             .await;
 
         response.assert_status_ok();
@@ -999,14 +1016,16 @@ mod tests {
         // RequestViewer should be able to use all query parameters
         let response = app
             .get("/admin/api/v1/requests?limit=10&offset=0&method=POST&status_code_min=200&status_code_max=299")
-            .add_header(add_auth_headers(&request_viewer).0, add_auth_headers(&request_viewer).1)
+            .add_header(&add_auth_headers(&request_viewer)[0].0, &add_auth_headers(&request_viewer)[0].1)
+            .add_header(&add_auth_headers(&request_viewer)[1].0, &add_auth_headers(&request_viewer)[1].1)
             .await;
 
         response.assert_status_ok();
 
         let response = app
             .get("/admin/api/v1/requests?uri_pattern=chat/completions&order_desc=false")
-            .add_header(add_auth_headers(&request_viewer).0, add_auth_headers(&request_viewer).1)
+            .add_header(&add_auth_headers(&request_viewer)[0].0, &add_auth_headers(&request_viewer)[0].1)
+            .add_header(&add_auth_headers(&request_viewer)[1].0, &add_auth_headers(&request_viewer)[1].1)
             .await;
 
         response.assert_status_ok();
@@ -1014,7 +1033,8 @@ mod tests {
         // StandardUser should be forbidden regardless of query parameters
         let response = app
             .get("/admin/api/v1/requests?limit=1")
-            .add_header(add_auth_headers(&standard_user).0, add_auth_headers(&standard_user).1)
+            .add_header(&add_auth_headers(&standard_user)[0].0, &add_auth_headers(&standard_user)[0].1)
+            .add_header(&add_auth_headers(&standard_user)[1].0, &add_auth_headers(&standard_user)[1].1)
             .await;
 
         response.assert_status_forbidden();
@@ -1046,7 +1066,8 @@ mod tests {
         // RequestViewer should be able to filter analytics by model
         let response = app
             .get("/admin/api/v1/requests/aggregate?model=gpt-4")
-            .add_header(add_auth_headers(&request_viewer).0, add_auth_headers(&request_viewer).1)
+            .add_header(&add_auth_headers(&request_viewer)[0].0, &add_auth_headers(&request_viewer)[0].1)
+            .add_header(&add_auth_headers(&request_viewer)[1].0, &add_auth_headers(&request_viewer)[1].1)
             .await;
 
         response.assert_status_ok();
@@ -1056,7 +1077,8 @@ mod tests {
         // PlatformManager should be able to access analytics (but not requests)
         let response = app
             .get("/admin/api/v1/requests/aggregate")
-            .add_header(add_auth_headers(&platform_manager).0, add_auth_headers(&platform_manager).1)
+            .add_header(&add_auth_headers(&platform_manager)[0].0, &add_auth_headers(&platform_manager)[0].1)
+            .add_header(&add_auth_headers(&platform_manager)[1].0, &add_auth_headers(&platform_manager)[1].1)
             .await;
 
         response.assert_status_ok();
@@ -1064,7 +1086,8 @@ mod tests {
         // StandardUser should be forbidden from analytics
         let response = app
             .get("/admin/api/v1/requests/aggregate?model=gpt-4")
-            .add_header(add_auth_headers(&standard_user).0, add_auth_headers(&standard_user).1)
+            .add_header(&add_auth_headers(&standard_user)[0].0, &add_auth_headers(&standard_user)[0].1)
+            .add_header(&add_auth_headers(&standard_user)[1].0, &add_auth_headers(&standard_user)[1].1)
             .await;
 
         response.assert_status_forbidden();
@@ -1110,7 +1133,8 @@ mod tests {
             // Test requests access
             let response = app
                 .get("/admin/api/v1/requests")
-                .add_header(add_auth_headers(&user).0, add_auth_headers(&user).1)
+                .add_header(&add_auth_headers(&user)[0].0, &add_auth_headers(&user)[0].1)
+                .add_header(&add_auth_headers(&user)[1].0, &add_auth_headers(&user)[1].1)
                 .await;
 
             if can_access_requests {
@@ -1122,7 +1146,8 @@ mod tests {
             // Test analytics access
             let response = app
                 .get("/admin/api/v1/requests/aggregate")
-                .add_header(add_auth_headers(&user).0, add_auth_headers(&user).1)
+                .add_header(&add_auth_headers(&user)[0].0, &add_auth_headers(&user)[0].1)
+                .add_header(&add_auth_headers(&user)[1].0, &add_auth_headers(&user)[1].1)
                 .await;
 
             if can_access_analytics {
@@ -1163,7 +1188,8 @@ mod tests {
         for (query_params, _description) in boundary_tests {
             let response = app
                 .get(&format!("/admin/api/v1/requests?{query_params}"))
-                .add_header(add_auth_headers(&request_viewer).0, add_auth_headers(&request_viewer).1)
+                .add_header(&add_auth_headers(&request_viewer)[0].0, &add_auth_headers(&request_viewer)[0].1)
+                .add_header(&add_auth_headers(&request_viewer)[1].0, &add_auth_headers(&request_viewer)[1].1)
                 .await;
 
             response.assert_status_ok();

@@ -63,11 +63,28 @@ auth:
       cookie_secure: true
       cookie_same_site: "strict"
 
-  # Proxy header authentication. Will accept & autocreate users based on emails
-  # supplied in a header. Lets you use an upstream proxy to authenticate users.
+  # Proxy header authentication
+  # Accepts user identity from HTTP headers set by an upstream authentication proxy
+  # (e.g., oauth2-proxy, Vouch, Authentik, Auth0)
+  #
+  # Two modes:
+  #   Single header: Send only header_name with user's email (must be unique)
+  #   Dual header: Send both header_name (IdP identifier) and email_header_name (email)
+  #                Allows multiple accounts per email from different identity providers
   proxy_header:
-    enabled: true # X-Doubleword-User header auth
+    enabled: true
+
+    # header_name: User identifier or email
+    # Single header mode: User's email (e.g., "user@example.com")
+    # Dual header mode: Unique identifier from IdP (e.g., "github|user123", "google-oauth2|456")
     header_name: "x-doubleword-user"
+
+    # email_header_name: User's email address (optional, enables dual header mode)
+    # If provided: Enables federated identity with (email, external_user_id) uniqueness
+    # If omitted: Uses header_name value as email (single header mode, email must be unique)
+    email_header_name: "x-doubleword-email"
+
+    # auto_create_users: Automatically create users on first login
     auto_create_users: true
 
   # Security settings
@@ -109,10 +126,10 @@ batches:
   # Daemon configuration for processing batch requests
   daemon:
     # Controls when the batch processing daemon runs
-    # - "leader": Only run on the elected leader instance (default, recommended for multi-instance deployments)
-    # - "always": Run on all instances (use for single-instance deployments)
-    # - "never": Never run the daemon (useful for testing or when using external processors)
-    enabled: leader
+    # - "always": Run on all instances (default)
+    # - "leader": Only run on the elected leader instance
+    # - "never": Never run the daemon
+    enabled: always
 
     # Performance & Concurrency Settings
     claim_batch_size: 100 # Maximum number of requests to claim in each iteration

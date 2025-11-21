@@ -271,7 +271,8 @@ TAGS=v1.0.0 PLATFORMS=linux/amd64,linux/arm64 docker buildx bake --push
 
 **Import Style:**
 
-- Use unqualified imports at the top of the file unless they would clash with other imports
+- Use unqualified names for imports, and put identifier imports at the top of the file. DON'T use fully qualified names unless absolutely necessary, to
+prevent name clashes.
 - Organize imports in groups: std → external crates → internal modules
 - Example: `use crate::errors::{Error, Result};` then use `Result` directly, not `errors::Result`
 
@@ -355,4 +356,4 @@ TAGS=v1.0.0 PLATFORMS=linux/amd64,linux/arm64 docker buildx bake --push
 - Database queries should use appropriate indexes (check migrations)
 - Use PostgreSQL LISTEN/NOTIFY for real-time cache invalidation (see `sync/` module)
 - Avoid N+1 queries - batch fetch related data when possible
-
+- To run sqlx migrations, navigate to the appropriate directory (dwctl, or fusillade/) and run `cargo sqlx migrate run`. NEVER try to run sqlx migrate run --source ... --database-url from the root.
