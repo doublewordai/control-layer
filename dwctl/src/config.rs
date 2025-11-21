@@ -117,6 +117,9 @@ pub struct Config {
     pub model_sources: Vec<ModelSource>,
     /// Frontend metadata displayed in the UI
     pub metadata: Metadata,
+    /// Payment provider configuration (Stripe, PayPal, etc.)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub payment: Option<PaymentConfig>,
     /// Authentication configuration for various auth methods
     pub auth: AuthConfig,
     /// Batch API configuration
@@ -205,6 +208,32 @@ impl DatabaseConfig {
             DatabaseConfig::External { .. } => false,
         }
     }
+}
+
+/// Payment provider configuration.
+///
+/// Supports different payment providers via an enum. Credentials should be
+/// set via environment variables for security.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum PaymentConfig {
+    /// Stripe payment processing
+    /// Set credentials via:
+    /// - `DWCTL_PAYMENT__STRIPE__API_KEY` - Stripe secret API key
+    /// - `DWCTL_PAYMENT__STRIPE__WEBHOOK_SECRET` - Webhook signing secret
+    /// - `DWCTL_PAYMENT__STRIPE__PRICE_ID` - Price ID for the payment product
+    Stripe(StripeConfig),
+}
+
+/// Stripe payment configuration.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct StripeConfig {
+    /// Stripe API key (secret key starting with sk_)
+    pub api_key: String,
+    /// Stripe webhook signing secret (starts with whsec_)
+    pub webhook_secret: String,
+    /// Stripe price ID for the payment (starts with price_)
+    pub price_id: String,
 }
 
 /// Frontend metadata displayed in the UI.
@@ -622,6 +651,7 @@ impl Default for Config {
             secret_key: None,
             model_sources: vec![],
             metadata: Metadata::default(),
+            payment: None,
             auth: AuthConfig::default(),
             batches: BatchConfig::default(),
             leader_election: LeaderElectionConfig::default(),

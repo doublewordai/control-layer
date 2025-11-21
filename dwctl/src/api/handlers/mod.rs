@@ -12,6 +12,7 @@
 //! - [`files`]: File upload, download, and management for batch processing
 //! - [`groups`]: Group management, user memberships, and model access
 //! - [`inference_endpoints`]: Inference endpoint CRUD and synchronization
+//! - [`payments`]: Payment processing and checkout session creation
 //! - [`probes`]: Health probe configuration, execution, and result retrieval
 //! - [`requests`]: Request logging, analytics, and aggregation
 //! - [`static_assets`]: Frontend asset serving and SPA routing
@@ -39,6 +40,7 @@ pub mod deployments;
 pub mod files;
 pub mod groups;
 pub mod inference_endpoints;
+pub mod payments;
 pub mod probes;
 pub mod requests;
 pub mod static_assets;

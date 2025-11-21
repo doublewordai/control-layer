@@ -57,6 +57,11 @@
         "ordinal": 10,
         "name": "password_hash",
         "type_info": "Text"
+      },
+      {
+        "ordinal": 11,
+        "name": "payment_provider_id",
+        "type_info": "Varchar"
       }
     ],
     "parameters": {
@@ -75,6 +80,7 @@
       false,
       true,
       false,
+      true,
       true
     ]
   },

@@ -28,6 +28,4 @@ export interface AppSettings {
   features: FeatureFlags;
   /** Demo mode configuration */
   demoConfig?: DemoConfig;
-  /** Payment provider URL for credit purchases */
-  paymentProviderUrl?: string;
 }

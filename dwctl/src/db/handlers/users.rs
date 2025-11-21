@@ -42,6 +42,7 @@ struct User {
     pub last_login: Option<DateTime<Utc>>,
     pub is_admin: bool,
     pub password_hash: Option<String>,
+    pub payment_provider_id: Option<String>,
 }
 
 pub struct Users<'c> {
@@ -62,6 +63,7 @@ impl From<(Vec<Role>, User)> for UserDBResponse {
             is_admin: user.is_admin,
             roles,
             password_hash: user.password_hash,
+            payment_provider_id: user.payment_provider_id,
         }
     }
 }
@@ -128,11 +130,12 @@ impl<'c> Repository for Users<'c> {
                 u.last_login,
                 u.is_admin,
                 u.password_hash,
+                u.payment_provider_id,
                 ARRAY_AGG(ur.role) FILTER (WHERE ur.role IS NOT NULL) as "roles: Vec<Role>"
             FROM users u
             LEFT JOIN user_roles ur ON ur.user_id = u.id
             WHERE u.id = $1 AND u.id != '00000000-0000-0000-0000-000000000000'
-            GROUP BY u.id, u.username, u.email, u.display_name, u.avatar_url, u.auth_source, u.created_at, u.updated_at, u.last_login, u.is_admin, u.password_hash
+            GROUP BY u.id, u.username, u.email, u.display_name, u.avatar_url, u.auth_source, u.created_at, u.updated_at, u.last_login, u.is_admin, u.password_hash, u.payment_provider_id
             "#,
             id
         )
@@ -152,6 +155,7 @@ impl<'c> Repository for Users<'c> {
                 last_login: row.last_login,
                 is_admin: row.is_admin,
                 password_hash: row.password_hash,
+                payment_provider_id: row.payment_provider_id,
             };
 
             let roles = row.roles.unwrap_or_default();
@@ -183,11 +187,12 @@ impl<'c> Repository for Users<'c> {
                 u.last_login,
                 u.is_admin,
                 u.password_hash,
+                u.payment_provider_id,
                 ARRAY_AGG(ur.role) FILTER (WHERE ur.role IS NOT NULL) as "roles: Vec<Role>"
             FROM users u
             LEFT JOIN user_roles ur ON ur.user_id = u.id
             WHERE u.id = ANY($1) AND u.id != '00000000-0000-0000-0000-000000000000'
-            GROUP BY u.id, u.username, u.email, u.display_name, u.avatar_url, u.auth_source, u.created_at, u.updated_at, u.last_login, u.is_admin, u.password_hash
+            GROUP BY u.id, u.username, u.email, u.display_name, u.avatar_url, u.auth_source, u.created_at, u.updated_at, u.last_login, u.is_admin, u.password_hash, u.payment_provider_id
             "#,
             ids.as_slice()
         )
@@ -209,6 +214,7 @@ impl<'c> Repository for Users<'c> {
                 last_login: row.last_login,
                 is_admin: row.is_admin,
                 password_hash: row.password_hash,
+                payment_provider_id: row.payment_provider_id,
             };
 
             let roles = row.roles.unwrap_or_default();
