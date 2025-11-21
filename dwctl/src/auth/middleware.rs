@@ -165,9 +165,11 @@ mod tests {
                 .request_manager(request_manager)
                 .build()
         };
+        let external_user_id = user.external_user_id.as_ref().unwrap_or(&user.username);
         let request = axum::http::Request::builder()
             .uri("/admin/api/v1/ai/v1/chat/completions")
-            .header("x-doubleword-user", user.email)
+            .header("x-doubleword-user", external_user_id)
+            .header("x-doubleword-email", &user.email)
             .body(
                 json!({
                     "model": model.alias
@@ -247,9 +249,11 @@ mod tests {
                 .request_manager(request_manager)
                 .build()
         };
+        let external_user_id = user.external_user_id.as_ref().unwrap_or(&user.username);
         let request = axum::http::Request::builder()
             .uri("/admin/api/v1/ai/v1/chat/completions")
-            .header("x-doubleword-user", user.email)
+            .header("x-doubleword-user", external_user_id)
+            .header("x-doubleword-email", &user.email)
             .body(
                 json!({
                     "model": model.alias
@@ -305,6 +309,7 @@ mod tests {
         let request = axum::http::Request::builder()
             .uri("/admin/api/v1/ai/v1/chat/completions")
             .header("x-doubleword-user", "test@example.org")
+            .header("x-doubleword-email", "test@example.org")
             .body(
                 json!({
                     "model": "irrelevant"
@@ -332,9 +337,11 @@ mod tests {
         };
         let user = create_test_user(&pool, Role::StandardUser).await;
 
+        let external_user_id = user.external_user_id.as_ref().unwrap_or(&user.username);
         let request = axum::http::Request::builder()
             .uri("/admin/api/v1/ai/v1/chat/completions")
-            .header("x-doubleword-user", user.email)
+            .header("x-doubleword-user", external_user_id)
+            .header("x-doubleword-email", &user.email)
             .body(
                 json!({
                     "model": "nonexistent"
@@ -364,7 +371,8 @@ mod tests {
 
         let request = axum::http::Request::builder()
             .uri("/nonsense/admin/api/v1/ai/v1/chat/completions")
-            .header("x-doubleword-user", user.email)
+            .header("x-doubleword-user", user.email.clone())
+            .header("x-doubleword-email", user.email.clone())
             .body(
                 json!({
                     "model": "nonexistent"
@@ -431,9 +439,11 @@ mod tests {
                 .request_manager(request_manager)
                 .build()
         };
+        let external_user_id = user.external_user_id.as_ref().unwrap_or(&user.username);
         let request = axum::http::Request::builder()
             .uri("/admin/api/v1/ai/v1/chat/completions")
-            .header("x-doubleword-user", user.email)
+            .header("x-doubleword-user", external_user_id)
+            .header("x-doubleword-email", &user.email)
             .body(
                 json!({
                     "model": model.alias
@@ -632,11 +642,13 @@ mod tests {
             request_manager,
         };
 
+        let header_external_user_id = header_user.external_user_id.as_ref().unwrap_or(&header_user.username);
         let request = axum::http::Request::builder()
             .uri("/admin/api/v1/ai/v1/chat/completions")
             // Both JWT cookie and proxy header present - JWT should take priority
             .header("cookie", format!("{}={}", config.auth.native.session.cookie_name, jwt_token))
-            .header("x-doubleword-user", header_user.email) // This user has no access
+            .header("x-doubleword-user", header_external_user_id)
+            .header("x-doubleword-email", &header_user.email) // This user has no access
             .body(
                 json!({
                     "model": model.alias
@@ -735,10 +747,12 @@ mod tests {
         };
 
         // Request with JWT cookie - should be ignored since native auth is disabled
+        let external_user_id = user.external_user_id.as_ref().unwrap_or(&user.username);
         let request = axum::http::Request::builder()
             .uri("/admin/api/v1/ai/v1/chat/completions")
             .header("cookie", format!("{}={}", config.auth.native.session.cookie_name, jwt_token))
-            .header("x-doubleword-user", user.email) // This should work since proxy header is enabled
+            .header("x-doubleword-user", external_user_id)
+            .header("x-doubleword-email", &user.email) // This should work since proxy header is enabled
             .body(
                 json!({
                     "model": model.alias
@@ -819,6 +833,7 @@ mod tests {
         let request = axum::http::Request::builder()
             .uri("/admin/api/v1/ai/v1/chat/completions")
             .header("x-doubleword-user", new_user_email)
+            .header("x-doubleword-email", new_user_email)
             .body(
                 json!({
                     "model": model.alias
@@ -912,12 +927,14 @@ mod tests {
             request_manager,
         };
 
+        let external_user_id = user.external_user_id.as_ref().unwrap_or(&user.username);
         let request = axum::http::Request::builder()
             .uri("/admin/api/v1/ai/v1/chat/completions")
             // Invalid JWT token
             .header("cookie", format!("{}=invalid-jwt-token", config.auth.native.session.cookie_name))
             // Valid proxy header - should fallback to this
-            .header("x-doubleword-user", user.email)
+            .header("x-doubleword-user", external_user_id)
+            .header("x-doubleword-email", &user.email)
             .body(
                 json!({
                     "model": model.alias

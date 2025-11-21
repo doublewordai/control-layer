@@ -589,7 +589,8 @@ mod tests {
 
         let response = app
             .get(&format!("/admin/api/v1/models?endpoint={test_endpoint_id}"))
-            .add_header(add_auth_headers(&user).0, add_auth_headers(&user).1)
+            .add_header(&add_auth_headers(&user)[0].0, &add_auth_headers(&user)[0].1)
+            .add_header(&add_auth_headers(&user)[1].0, &add_auth_headers(&user)[1].1)
             .await;
 
         response.assert_status_ok();
@@ -607,7 +608,8 @@ mod tests {
 
         let response = app
             .get(&format!("/admin/api/v1/models?endpoint={non_existent_id}"))
-            .add_header(add_auth_headers(&user).0, add_auth_headers(&user).1)
+            .add_header(&add_auth_headers(&user)[0].0, &add_auth_headers(&user)[0].1)
+            .add_header(&add_auth_headers(&user)[1].0, &add_auth_headers(&user)[1].1)
             .await;
 
         response.assert_status_not_found();
@@ -626,7 +628,8 @@ mod tests {
         // Get the deployment
         let response = app
             .get(&format!("/admin/api/v1/models/{deployment_id}"))
-            .add_header(add_auth_headers(&user).0, add_auth_headers(&user).1)
+            .add_header(&add_auth_headers(&user)[0].0, &add_auth_headers(&user)[0].1)
+            .add_header(&add_auth_headers(&user)[1].0, &add_auth_headers(&user)[1].1)
             .await;
 
         response.assert_status_ok();
@@ -641,7 +644,8 @@ mod tests {
         });
         let response = app
             .patch(&format!("/admin/api/v1/models/{deployment_id}"))
-            .add_header(add_auth_headers(&user).0, add_auth_headers(&user).1)
+            .add_header(&add_auth_headers(&user)[0].0, &add_auth_headers(&user)[0].1)
+            .add_header(&add_auth_headers(&user)[1].0, &add_auth_headers(&user)[1].1)
             .json(&update)
             .await;
 
@@ -653,7 +657,8 @@ mod tests {
         let test_endpoint_id = get_test_endpoint_id(&pool).await;
         let response = app
             .get(&format!("/admin/api/v1/models?endpoint={test_endpoint_id}"))
-            .add_header(add_auth_headers(&user).0, add_auth_headers(&user).1)
+            .add_header(&add_auth_headers(&user)[0].0, &add_auth_headers(&user)[0].1)
+            .add_header(&add_auth_headers(&user)[1].0, &add_auth_headers(&user)[1].1)
             .await;
 
         response.assert_status_ok();
@@ -663,7 +668,8 @@ mod tests {
         // Delete the deployment
         let response = app
             .delete(&format!("/admin/api/v1/models/{deployment_id}"))
-            .add_header(add_auth_headers(&user).0, add_auth_headers(&user).1)
+            .add_header(&add_auth_headers(&user)[0].0, &add_auth_headers(&user)[0].1)
+            .add_header(&add_auth_headers(&user)[1].0, &add_auth_headers(&user)[1].1)
             .await;
 
         response.assert_status_ok();
@@ -671,7 +677,8 @@ mod tests {
         // Verify it's deleted - should return 404 without deleted=true parameter
         let response = app
             .get(&format!("/admin/api/v1/models/{deployment_id}"))
-            .add_header(add_auth_headers(&user).0, add_auth_headers(&user).1)
+            .add_header(&add_auth_headers(&user)[0].0, &add_auth_headers(&user)[0].1)
+            .add_header(&add_auth_headers(&user)[1].0, &add_auth_headers(&user)[1].1)
             .await;
 
         response.assert_status_not_found(); // Returns 404 without deleted=true
@@ -679,7 +686,8 @@ mod tests {
         // But admin should be able to see it with deleted=true
         let response = app
             .get(&format!("/admin/api/v1/models/{deployment_id}?deleted=true"))
-            .add_header(add_auth_headers(&user).0, add_auth_headers(&user).1)
+            .add_header(&add_auth_headers(&user)[0].0, &add_auth_headers(&user)[0].1)
+            .add_header(&add_auth_headers(&user)[1].0, &add_auth_headers(&user)[1].1)
             .await;
 
         response.assert_status_ok(); // Admin can see deleted model with deleted=true
@@ -712,7 +720,8 @@ mod tests {
         // Test without include parameter - should not include groups
         let response = app
             .get("/admin/api/v1/models")
-            .add_header(add_auth_headers(&admin_user).0, add_auth_headers(&admin_user).1)
+            .add_header(&add_auth_headers(&admin_user)[0].0, &add_auth_headers(&admin_user)[0].1)
+            .add_header(&add_auth_headers(&admin_user)[1].0, &add_auth_headers(&admin_user)[1].1)
             .await;
 
         response.assert_status_ok();
@@ -722,7 +731,8 @@ mod tests {
         // Test with include=groups - should include groups
         let response = app
             .get("/admin/api/v1/models?include=groups")
-            .add_header(add_auth_headers(&admin_user).0, add_auth_headers(&admin_user).1)
+            .add_header(&add_auth_headers(&admin_user)[0].0, &add_auth_headers(&admin_user)[0].1)
+            .add_header(&add_auth_headers(&admin_user)[1].0, &add_auth_headers(&admin_user)[1].1)
             .await;
 
         response.assert_status_ok();
@@ -736,7 +746,8 @@ mod tests {
         let test_endpoint_id = get_test_endpoint_id(&pool).await;
         let response = app
             .get(&format!("/admin/api/v1/models?endpoint={test_endpoint_id}&include=groups"))
-            .add_header(add_auth_headers(&admin_user).0, add_auth_headers(&admin_user).1)
+            .add_header(&add_auth_headers(&admin_user)[0].0, &add_auth_headers(&admin_user)[0].1)
+            .add_header(&add_auth_headers(&admin_user)[1].0, &add_auth_headers(&admin_user)[1].1)
             .await;
 
         response.assert_status_ok();
@@ -760,27 +771,31 @@ mod tests {
         // Both users should initially see the model
         let response = app
             .get(&format!("/admin/api/v1/models/{deployment_id}"))
-            .add_header(add_auth_headers(&admin_user).0, add_auth_headers(&admin_user).1)
+            .add_header(&add_auth_headers(&admin_user)[0].0, &add_auth_headers(&admin_user)[0].1)
+            .add_header(&add_auth_headers(&admin_user)[1].0, &add_auth_headers(&admin_user)[1].1)
             .await;
         response.assert_status_ok();
 
         let response = app
             .get(&format!("/admin/api/v1/models/{deployment_id}"))
-            .add_header(add_auth_headers(&regular_user).0, add_auth_headers(&regular_user).1)
+            .add_header(&add_auth_headers(&regular_user)[0].0, &add_auth_headers(&regular_user)[0].1)
+            .add_header(&add_auth_headers(&regular_user)[1].0, &add_auth_headers(&regular_user)[1].1)
             .await;
         response.assert_status_ok();
 
         // Admin hides the model (soft delete)
         let response = app
             .delete(&format!("/admin/api/v1/models/{deployment_id}"))
-            .add_header(add_auth_headers(&admin_user).0, add_auth_headers(&admin_user).1)
+            .add_header(&add_auth_headers(&admin_user)[0].0, &add_auth_headers(&admin_user)[0].1)
+            .add_header(&add_auth_headers(&admin_user)[1].0, &add_auth_headers(&admin_user)[1].1)
             .await;
         response.assert_status_ok();
 
         // Admin should still be able to see the deleted model with deleted=true
         let response = app
             .get(&format!("/admin/api/v1/models/{deployment_id}?deleted=true"))
-            .add_header(add_auth_headers(&admin_user).0, add_auth_headers(&admin_user).1)
+            .add_header(&add_auth_headers(&admin_user)[0].0, &add_auth_headers(&admin_user)[0].1)
+            .add_header(&add_auth_headers(&admin_user)[1].0, &add_auth_headers(&admin_user)[1].1)
             .await;
         response.assert_status_ok();
         let model: DeployedModelResponse = response.json();
@@ -789,7 +804,8 @@ mod tests {
         // Regular user should NOT see the deleted model (404)
         let response = app
             .get(&format!("/admin/api/v1/models/{deployment_id}"))
-            .add_header(add_auth_headers(&regular_user).0, add_auth_headers(&regular_user).1)
+            .add_header(&add_auth_headers(&regular_user)[0].0, &add_auth_headers(&regular_user)[0].1)
+            .add_header(&add_auth_headers(&regular_user)[1].0, &add_auth_headers(&regular_user)[1].1)
             .await;
         response.assert_status_not_found();
 
@@ -828,14 +844,16 @@ mod tests {
         // Hide the second deployment
         let response = app
             .delete(&format!("/admin/api/v1/models/{}", deployment2.id))
-            .add_header(add_auth_headers(&admin_user).0, add_auth_headers(&admin_user).1)
+            .add_header(&add_auth_headers(&admin_user)[0].0, &add_auth_headers(&admin_user)[0].1)
+            .add_header(&add_auth_headers(&admin_user)[1].0, &add_auth_headers(&admin_user)[1].1)
             .await;
         response.assert_status_ok();
 
         // Admin should see both models in list when requesting deleted=true (include deleted)
         let response = app
             .get("/admin/api/v1/models?deleted=true")
-            .add_header(add_auth_headers(&admin_user).0, add_auth_headers(&admin_user).1)
+            .add_header(&add_auth_headers(&admin_user)[0].0, &add_auth_headers(&admin_user)[0].1)
+            .add_header(&add_auth_headers(&admin_user)[1].0, &add_auth_headers(&admin_user)[1].1)
             .await;
         response.assert_status_ok();
         let admin_all_models: Vec<DeployedModelResponse> = response.json();
@@ -845,7 +863,8 @@ mod tests {
         // Admin should see only non-deleted models by default
         let response = app
             .get("/admin/api/v1/models")
-            .add_header(add_auth_headers(&admin_user).0, add_auth_headers(&admin_user).1)
+            .add_header(&add_auth_headers(&admin_user)[0].0, &add_auth_headers(&admin_user)[0].1)
+            .add_header(&add_auth_headers(&admin_user)[1].0, &add_auth_headers(&admin_user)[1].1)
             .await;
         response.assert_status_ok();
         let admin_models: Vec<DeployedModelResponse> = response.json();
@@ -855,7 +874,8 @@ mod tests {
         // Regular user should only see the active model
         let response = app
             .get("/admin/api/v1/models")
-            .add_header(add_auth_headers(&regular_user).0, add_auth_headers(&regular_user).1)
+            .add_header(&add_auth_headers(&regular_user)[0].0, &add_auth_headers(&regular_user)[0].1)
+            .add_header(&add_auth_headers(&regular_user)[1].0, &add_auth_headers(&regular_user)[1].1)
             .await;
         response.assert_status_ok();
         let user_models: Vec<DeployedModelResponse> = response.json();
@@ -877,7 +897,8 @@ mod tests {
         // Hide the model
         let response = app
             .delete(&format!("/admin/api/v1/models/{deployment_id}"))
-            .add_header(add_auth_headers(&admin_user).0, add_auth_headers(&admin_user).1)
+            .add_header(&add_auth_headers(&admin_user)[0].0, &add_auth_headers(&admin_user)[0].1)
+            .add_header(&add_auth_headers(&admin_user)[1].0, &add_auth_headers(&admin_user)[1].1)
             .await;
         response.assert_status_ok();
 
@@ -887,7 +908,8 @@ mod tests {
         });
         let response = app
             .patch(&format!("/admin/api/v1/models/{deployment_id}"))
-            .add_header(add_auth_headers(&admin_user).0, add_auth_headers(&admin_user).1)
+            .add_header(&add_auth_headers(&admin_user)[0].0, &add_auth_headers(&admin_user)[0].1)
+            .add_header(&add_auth_headers(&admin_user)[1].0, &add_auth_headers(&admin_user)[1].1)
             .json(&update)
             .await;
         response.assert_status_ok();
@@ -900,7 +922,8 @@ mod tests {
         });
         let response = app
             .patch(&format!("/admin/api/v1/models/{deployment_id}"))
-            .add_header(add_auth_headers(&regular_user).0, add_auth_headers(&regular_user).1)
+            .add_header(&add_auth_headers(&regular_user)[0].0, &add_auth_headers(&regular_user)[0].1)
+            .add_header(&add_auth_headers(&regular_user)[1].0, &add_auth_headers(&regular_user)[1].1)
             .json(&update)
             .await;
         response.assert_status_forbidden();
@@ -920,27 +943,31 @@ mod tests {
         // Verify both users can initially access the model
         let response = app
             .get(&format!("/admin/api/v1/models/{deployment_id}"))
-            .add_header(add_auth_headers(&admin_user).0, add_auth_headers(&admin_user).1)
+            .add_header(&add_auth_headers(&admin_user)[0].0, &add_auth_headers(&admin_user)[0].1)
+            .add_header(&add_auth_headers(&admin_user)[1].0, &add_auth_headers(&admin_user)[1].1)
             .await;
         response.assert_status_ok();
 
         let response = app
             .get(&format!("/admin/api/v1/models/{deployment_id}"))
-            .add_header(add_auth_headers(&regular_user).0, add_auth_headers(&regular_user).1)
+            .add_header(&add_auth_headers(&regular_user)[0].0, &add_auth_headers(&regular_user)[0].1)
+            .add_header(&add_auth_headers(&regular_user)[1].0, &add_auth_headers(&regular_user)[1].1)
             .await;
         response.assert_status_ok();
 
         // Admin soft deletes the model
         let response = app
             .delete(&format!("/admin/api/v1/models/{deployment_id}"))
-            .add_header(add_auth_headers(&admin_user).0, add_auth_headers(&admin_user).1)
+            .add_header(&add_auth_headers(&admin_user)[0].0, &add_auth_headers(&admin_user)[0].1)
+            .add_header(&add_auth_headers(&admin_user)[1].0, &add_auth_headers(&admin_user)[1].1)
             .await;
         response.assert_status_ok();
 
         // Admin can still access the model after soft deletion with deleted=true
         let response = app
             .get(&format!("/admin/api/v1/models/{deployment_id}?deleted=true"))
-            .add_header(add_auth_headers(&admin_user).0, add_auth_headers(&admin_user).1)
+            .add_header(&add_auth_headers(&admin_user)[0].0, &add_auth_headers(&admin_user)[0].1)
+            .add_header(&add_auth_headers(&admin_user)[1].0, &add_auth_headers(&admin_user)[1].1)
             .await;
         response.assert_status_ok();
         let model: DeployedModelResponse = response.json();
@@ -950,7 +977,8 @@ mod tests {
         // Regular user can no longer access the model
         let response = app
             .get(&format!("/admin/api/v1/models/{deployment_id}"))
-            .add_header(add_auth_headers(&regular_user).0, add_auth_headers(&regular_user).1)
+            .add_header(&add_auth_headers(&regular_user)[0].0, &add_auth_headers(&regular_user)[0].1)
+            .add_header(&add_auth_headers(&regular_user)[1].0, &add_auth_headers(&regular_user)[1].1)
             .await;
         response.assert_status_not_found();
 
@@ -960,7 +988,8 @@ mod tests {
         });
         let response = app
             .patch(&format!("/admin/api/v1/models/{deployment_id}"))
-            .add_header(add_auth_headers(&admin_user).0, add_auth_headers(&admin_user).1)
+            .add_header(&add_auth_headers(&admin_user)[0].0, &add_auth_headers(&admin_user)[0].1)
+            .add_header(&add_auth_headers(&admin_user)[1].0, &add_auth_headers(&admin_user)[1].1)
             .json(&update)
             .await;
         response.assert_status_ok();
@@ -987,7 +1016,8 @@ mod tests {
 
         let response = app
             .post("/admin/api/v1/models")
-            .add_header(add_auth_headers(&admin_user).0, add_auth_headers(&admin_user).1)
+            .add_header(&add_auth_headers(&admin_user)[0].0, &add_auth_headers(&admin_user)[0].1)
+            .add_header(&add_auth_headers(&admin_user)[1].0, &add_auth_headers(&admin_user)[1].1)
             .json(&create_request)
             .await;
 
@@ -1016,7 +1046,8 @@ mod tests {
 
         let response = app
             .post("/admin/api/v1/models")
-            .add_header(add_auth_headers(&admin_user).0, add_auth_headers(&admin_user).1)
+            .add_header(&add_auth_headers(&admin_user)[0].0, &add_auth_headers(&admin_user)[0].1)
+            .add_header(&add_auth_headers(&admin_user)[1].0, &add_auth_headers(&admin_user)[1].1)
             .json(&create_request)
             .await;
 
@@ -1044,7 +1075,8 @@ mod tests {
 
         let response = app
             .post("/admin/api/v1/models")
-            .add_header(add_auth_headers(&regular_user).0, add_auth_headers(&regular_user).1)
+            .add_header(&add_auth_headers(&regular_user)[0].0, &add_auth_headers(&regular_user)[0].1)
+            .add_header(&add_auth_headers(&regular_user)[1].0, &add_auth_headers(&regular_user)[1].1)
             .json(&create_request)
             .await;
 
@@ -1064,7 +1096,8 @@ mod tests {
 
         let response = app
             .post("/admin/api/v1/models")
-            .add_header(add_auth_headers(&admin_user).0, add_auth_headers(&admin_user).1)
+            .add_header(&add_auth_headers(&admin_user)[0].0, &add_auth_headers(&admin_user)[0].1)
+            .add_header(&add_auth_headers(&admin_user)[1].0, &add_auth_headers(&admin_user)[1].1)
             .json(&create_request)
             .await;
 
@@ -1104,7 +1137,8 @@ mod tests {
         // Admin should be able to include groups and see them
         let response = app
             .get("/admin/api/v1/models?include=groups")
-            .add_header(add_auth_headers(&admin_user).0, add_auth_headers(&admin_user).1)
+            .add_header(&add_auth_headers(&admin_user)[0].0, &add_auth_headers(&admin_user)[0].1)
+            .add_header(&add_auth_headers(&admin_user)[1].0, &add_auth_headers(&admin_user)[1].1)
             .await;
         response.assert_status_ok();
         let models: Vec<DeployedModelResponse> = response.json();
@@ -1125,7 +1159,8 @@ mod tests {
         // Regular user should NOT be able to include groups (groups should be None)
         let response = app
             .get("/admin/api/v1/models?include=groups")
-            .add_header(add_auth_headers(&regular_user).0, add_auth_headers(&regular_user).1)
+            .add_header(&add_auth_headers(&regular_user)[0].0, &add_auth_headers(&regular_user)[0].1)
+            .add_header(&add_auth_headers(&regular_user)[1].0, &add_auth_headers(&regular_user)[1].1)
             .await;
         response.assert_status_ok();
         let models: Vec<DeployedModelResponse> = response.json();
@@ -1172,7 +1207,8 @@ mod tests {
         // Test 1: Regular user without accessible=true should still get filtered (default behavior)
         let response = app
             .get("/admin/api/v1/models")
-            .add_header(add_auth_headers(&regular_user).0, add_auth_headers(&regular_user).1)
+            .add_header(&add_auth_headers(&regular_user)[0].0, &add_auth_headers(&regular_user)[0].1)
+            .add_header(&add_auth_headers(&regular_user)[1].0, &add_auth_headers(&regular_user)[1].1)
             .await;
         response.assert_status_ok();
         let user_models: Vec<DeployedModelResponse> = response.json();
@@ -1183,7 +1219,8 @@ mod tests {
         // Test 2: Regular user with accessible=true should get same result (explicit filtering)
         let response = app
             .get("/admin/api/v1/models?accessible=true")
-            .add_header(add_auth_headers(&regular_user).0, add_auth_headers(&regular_user).1)
+            .add_header(&add_auth_headers(&regular_user)[0].0, &add_auth_headers(&regular_user)[0].1)
+            .add_header(&add_auth_headers(&regular_user)[1].0, &add_auth_headers(&regular_user)[1].1)
             .await;
         response.assert_status_ok();
         let user_models_explicit: Vec<DeployedModelResponse> = response.json();
@@ -1193,7 +1230,8 @@ mod tests {
         // Test 3: Admin user without accessible parameter should see all models (default)
         let response = app
             .get("/admin/api/v1/models")
-            .add_header(add_auth_headers(&admin_user).0, add_auth_headers(&admin_user).1)
+            .add_header(&add_auth_headers(&admin_user)[0].0, &add_auth_headers(&admin_user)[0].1)
+            .add_header(&add_auth_headers(&admin_user)[1].0, &add_auth_headers(&admin_user)[1].1)
             .await;
         response.assert_status_ok();
         let admin_models: Vec<DeployedModelResponse> = response.json();
@@ -1204,7 +1242,8 @@ mod tests {
         // Test 4: Admin user with accessible=false should see all models (explicit no filtering)
         let response = app
             .get("/admin/api/v1/models?accessible=false")
-            .add_header(add_auth_headers(&admin_user).0, add_auth_headers(&admin_user).1)
+            .add_header(&add_auth_headers(&admin_user)[0].0, &add_auth_headers(&admin_user)[0].1)
+            .add_header(&add_auth_headers(&admin_user)[1].0, &add_auth_headers(&admin_user)[1].1)
             .await;
         response.assert_status_ok();
         let admin_models_explicit: Vec<DeployedModelResponse> = response.json();
@@ -1216,7 +1255,8 @@ mod tests {
 
         let response = app
             .get("/admin/api/v1/models?accessible=true")
-            .add_header(add_auth_headers(&admin_user).0, add_auth_headers(&admin_user).1)
+            .add_header(&add_auth_headers(&admin_user)[0].0, &add_auth_headers(&admin_user)[0].1)
+            .add_header(&add_auth_headers(&admin_user)[1].0, &add_auth_headers(&admin_user)[1].1)
             .await;
         response.assert_status_ok();
         let admin_accessible: Vec<DeployedModelResponse> = response.json();
@@ -1241,7 +1281,8 @@ mod tests {
         // Test without include parameter - should not include metrics
         let response = app
             .get("/admin/api/v1/models")
-            .add_header(add_auth_headers(&admin_user).0, add_auth_headers(&admin_user).1)
+            .add_header(&add_auth_headers(&admin_user)[0].0, &add_auth_headers(&admin_user)[0].1)
+            .add_header(&add_auth_headers(&admin_user)[1].0, &add_auth_headers(&admin_user)[1].1)
             .await;
 
         response.assert_status_ok();
@@ -1252,7 +1293,8 @@ mod tests {
         // Test with include=metrics - should include metrics
         let response = app
             .get("/admin/api/v1/models?include=metrics")
-            .add_header(add_auth_headers(&admin_user).0, add_auth_headers(&admin_user).1)
+            .add_header(&add_auth_headers(&admin_user)[0].0, &add_auth_headers(&admin_user)[0].1)
+            .add_header(&add_auth_headers(&admin_user)[1].0, &add_auth_headers(&admin_user)[1].1)
             .await;
 
         response.assert_status_ok();
@@ -1265,7 +1307,8 @@ mod tests {
         // Test that regular users CANNOT include metrics (no Analytics::ReadAll permission)
         let response = app
             .get("/admin/api/v1/models?include=metrics")
-            .add_header(add_auth_headers(&regular_user).0, add_auth_headers(&regular_user).1)
+            .add_header(&add_auth_headers(&regular_user)[0].0, &add_auth_headers(&regular_user)[0].1)
+            .add_header(&add_auth_headers(&regular_user)[1].0, &add_auth_headers(&regular_user)[1].1)
             .await;
 
         response.assert_status_ok();
@@ -1280,7 +1323,8 @@ mod tests {
         // Test with include=groups,metrics - should include both for admin
         let response = app
             .get("/admin/api/v1/models?include=groups,metrics")
-            .add_header(add_auth_headers(&admin_user).0, add_auth_headers(&admin_user).1)
+            .add_header(&add_auth_headers(&admin_user)[0].0, &add_auth_headers(&admin_user)[0].1)
+            .add_header(&add_auth_headers(&admin_user)[1].0, &add_auth_headers(&admin_user)[1].1)
             .await;
 
         response.assert_status_ok();
@@ -1292,7 +1336,8 @@ mod tests {
         // Test that regular users cannot include groups or metrics (no permissions)
         let response = app
             .get("/admin/api/v1/models?include=groups,metrics")
-            .add_header(add_auth_headers(&regular_user).0, add_auth_headers(&regular_user).1)
+            .add_header(&add_auth_headers(&regular_user)[0].0, &add_auth_headers(&regular_user)[0].1)
+            .add_header(&add_auth_headers(&regular_user)[1].0, &add_auth_headers(&regular_user)[1].1)
             .await;
 
         response.assert_status_ok();
@@ -1338,7 +1383,8 @@ mod tests {
         // Platform manager should see ALL models (both deployment1 and deployment2)
         let response = app
             .get("/admin/api/v1/models")
-            .add_header(add_auth_headers(&platform_manager).0, add_auth_headers(&platform_manager).1)
+            .add_header(&add_auth_headers(&platform_manager)[0].0, &add_auth_headers(&platform_manager)[0].1)
+            .add_header(&add_auth_headers(&platform_manager)[1].0, &add_auth_headers(&platform_manager)[1].1)
             .await;
         response.assert_status_ok();
         let pm_models: Vec<DeployedModelResponse> = response.json();
@@ -1352,7 +1398,8 @@ mod tests {
         // Standard user should only see models they have access to (deployment1 only)
         let response = app
             .get("/admin/api/v1/models")
-            .add_header(add_auth_headers(&standard_user).0, add_auth_headers(&standard_user).1)
+            .add_header(&add_auth_headers(&standard_user)[0].0, &add_auth_headers(&standard_user)[0].1)
+            .add_header(&add_auth_headers(&standard_user)[1].0, &add_auth_headers(&standard_user)[1].1)
             .await;
         response.assert_status_ok();
         let user_models: Vec<DeployedModelResponse> = response.json();
@@ -1399,7 +1446,8 @@ mod tests {
         // Platform manager with accessible=false should see ALL models (default behavior)
         let response = app
             .get("/admin/api/v1/models?accessible=false")
-            .add_header(add_auth_headers(&platform_manager).0, add_auth_headers(&platform_manager).1)
+            .add_header(&add_auth_headers(&platform_manager)[0].0, &add_auth_headers(&platform_manager)[0].1)
+            .add_header(&add_auth_headers(&platform_manager)[1].0, &add_auth_headers(&platform_manager)[1].1)
             .await;
         response.assert_status_ok();
         let all_models: Vec<DeployedModelResponse> = response.json();
@@ -1410,7 +1458,8 @@ mod tests {
         // Platform manager with accessible=true should see only accessible models
         let response = app
             .get("/admin/api/v1/models?accessible=true")
-            .add_header(add_auth_headers(&platform_manager).0, add_auth_headers(&platform_manager).1)
+            .add_header(&add_auth_headers(&platform_manager)[0].0, &add_auth_headers(&platform_manager)[0].1)
+            .add_header(&add_auth_headers(&platform_manager)[1].0, &add_auth_headers(&platform_manager)[1].1)
             .await;
         response.assert_status_ok();
         let accessible_models: Vec<DeployedModelResponse> = response.json();
@@ -1461,7 +1510,8 @@ mod tests {
         // Request viewer should only see models they have access to (like standard user)
         let response = app
             .get("/admin/api/v1/models")
-            .add_header(add_auth_headers(&request_viewer).0, add_auth_headers(&request_viewer).1)
+            .add_header(&add_auth_headers(&request_viewer)[0].0, &add_auth_headers(&request_viewer)[0].1)
+            .add_header(&add_auth_headers(&request_viewer)[1].0, &add_auth_headers(&request_viewer)[1].1)
             .await;
         response.assert_status_ok();
         let rv_models: Vec<DeployedModelResponse> = response.json();
@@ -1480,7 +1530,8 @@ mod tests {
         // Compare with platform manager who should see both
         let response = app
             .get("/admin/api/v1/models")
-            .add_header(add_auth_headers(&platform_manager).0, add_auth_headers(&platform_manager).1)
+            .add_header(&add_auth_headers(&platform_manager)[0].0, &add_auth_headers(&platform_manager)[0].1)
+            .add_header(&add_auth_headers(&platform_manager)[1].0, &add_auth_headers(&platform_manager)[1].1)
             .await;
         response.assert_status_ok();
         let pm_models: Vec<DeployedModelResponse> = response.json();
@@ -1506,7 +1557,8 @@ mod tests {
 
         let response = app
             .post("/admin/api/v1/models")
-            .add_header(add_auth_headers(&platform_manager).0, add_auth_headers(&platform_manager).1)
+            .add_header(&add_auth_headers(&platform_manager)[0].0, &add_auth_headers(&platform_manager)[0].1)
+            .add_header(&add_auth_headers(&platform_manager)[1].0, &add_auth_headers(&platform_manager)[1].1)
             .json(&create_request)
             .await;
         response.assert_status_ok();
@@ -1517,7 +1569,8 @@ mod tests {
         // Platform manager should immediately see the newly created model in list
         let response = app
             .get("/admin/api/v1/models")
-            .add_header(add_auth_headers(&platform_manager).0, add_auth_headers(&platform_manager).1)
+            .add_header(&add_auth_headers(&platform_manager)[0].0, &add_auth_headers(&platform_manager)[0].1)
+            .add_header(&add_auth_headers(&platform_manager)[1].0, &add_auth_headers(&platform_manager)[1].1)
             .await;
         response.assert_status_ok();
 
@@ -1548,7 +1601,8 @@ mod tests {
         // Platform manager should see the ungrouped model
         let response = app
             .get("/admin/api/v1/models")
-            .add_header(add_auth_headers(&platform_manager).0, add_auth_headers(&platform_manager).1)
+            .add_header(&add_auth_headers(&platform_manager)[0].0, &add_auth_headers(&platform_manager)[0].1)
+            .add_header(&add_auth_headers(&platform_manager)[1].0, &add_auth_headers(&platform_manager)[1].1)
             .await;
         response.assert_status_ok();
 
@@ -1561,7 +1615,8 @@ mod tests {
         // Standard user should NOT see the ungrouped model
         let response = app
             .get("/admin/api/v1/models")
-            .add_header(add_auth_headers(&standard_user).0, add_auth_headers(&standard_user).1)
+            .add_header(&add_auth_headers(&standard_user)[0].0, &add_auth_headers(&standard_user)[0].1)
+            .add_header(&add_auth_headers(&standard_user)[1].0, &add_auth_headers(&standard_user)[1].1)
             .await;
         response.assert_status_ok();
 
@@ -1591,7 +1646,8 @@ mod tests {
 
         let response = app
             .post("/admin/api/v1/models")
-            .add_header(add_auth_headers(&request_viewer).0, add_auth_headers(&request_viewer).1)
+            .add_header(&add_auth_headers(&request_viewer)[0].0, &add_auth_headers(&request_viewer)[0].1)
+            .add_header(&add_auth_headers(&request_viewer)[1].0, &add_auth_headers(&request_viewer)[1].1)
             .json(&create_request)
             .await;
 
@@ -1601,7 +1657,8 @@ mod tests {
         let update = json!({"alias": "rv-forbidden-update"});
         let response = app
             .patch(&format!("/admin/api/v1/models/{}", deployment.id))
-            .add_header(add_auth_headers(&request_viewer).0, add_auth_headers(&request_viewer).1)
+            .add_header(&add_auth_headers(&request_viewer)[0].0, &add_auth_headers(&request_viewer)[0].1)
+            .add_header(&add_auth_headers(&request_viewer)[1].0, &add_auth_headers(&request_viewer)[1].1)
             .json(&update)
             .await;
 
@@ -1610,7 +1667,8 @@ mod tests {
         // RequestViewer should NOT be able to delete models
         let response = app
             .delete(&format!("/admin/api/v1/models/{}", deployment.id))
-            .add_header(add_auth_headers(&request_viewer).0, add_auth_headers(&request_viewer).1)
+            .add_header(&add_auth_headers(&request_viewer)[0].0, &add_auth_headers(&request_viewer)[0].1)
+            .add_header(&add_auth_headers(&request_viewer)[1].0, &add_auth_headers(&request_viewer)[1].1)
             .await;
 
         response.assert_status_forbidden();
@@ -1635,7 +1693,8 @@ mod tests {
 
         let response = app
             .post("/admin/api/v1/models")
-            .add_header(add_auth_headers(&standard_user).0, add_auth_headers(&standard_user).1)
+            .add_header(&add_auth_headers(&standard_user)[0].0, &add_auth_headers(&standard_user)[0].1)
+            .add_header(&add_auth_headers(&standard_user)[1].0, &add_auth_headers(&standard_user)[1].1)
             .json(&create_request)
             .await;
 
@@ -1645,7 +1704,8 @@ mod tests {
         let update = json!({"alias": "su-forbidden-update"});
         let response = app
             .patch(&format!("/admin/api/v1/models/{}", deployment.id))
-            .add_header(add_auth_headers(&standard_user).0, add_auth_headers(&standard_user).1)
+            .add_header(&add_auth_headers(&standard_user)[0].0, &add_auth_headers(&standard_user)[0].1)
+            .add_header(&add_auth_headers(&standard_user)[1].0, &add_auth_headers(&standard_user)[1].1)
             .json(&update)
             .await;
 
@@ -1654,7 +1714,8 @@ mod tests {
         // StandardUser should NOT be able to delete models
         let response = app
             .delete(&format!("/admin/api/v1/models/{}", deployment.id))
-            .add_header(add_auth_headers(&standard_user).0, add_auth_headers(&standard_user).1)
+            .add_header(&add_auth_headers(&standard_user)[0].0, &add_auth_headers(&standard_user)[0].1)
+            .add_header(&add_auth_headers(&standard_user)[1].0, &add_auth_headers(&standard_user)[1].1)
             .await;
 
         response.assert_status_forbidden();
@@ -1677,7 +1738,8 @@ mod tests {
 
         let response = app
             .post("/admin/api/v1/models")
-            .add_header(add_auth_headers(&multi_role_user).0, add_auth_headers(&multi_role_user).1)
+            .add_header(&add_auth_headers(&multi_role_user)[0].0, &add_auth_headers(&multi_role_user)[0].1)
+            .add_header(&add_auth_headers(&multi_role_user)[1].0, &add_auth_headers(&multi_role_user)[1].1)
             .json(&create_request)
             .await;
 
@@ -1690,7 +1752,8 @@ mod tests {
         let update = json!({"alias": "multi-forbidden-update"});
         let response = app
             .patch(&format!("/admin/api/v1/models/{}", deployment.id))
-            .add_header(add_auth_headers(&multi_role_user).0, add_auth_headers(&multi_role_user).1)
+            .add_header(&add_auth_headers(&multi_role_user)[0].0, &add_auth_headers(&multi_role_user)[0].1)
+            .add_header(&add_auth_headers(&multi_role_user)[1].0, &add_auth_headers(&multi_role_user)[1].1)
             .json(&update)
             .await;
 
@@ -1699,7 +1762,8 @@ mod tests {
         // Multi-role user should NOT be able to delete models
         let response = app
             .delete(&format!("/admin/api/v1/models/{}", deployment.id))
-            .add_header(add_auth_headers(&multi_role_user).0, add_auth_headers(&multi_role_user).1)
+            .add_header(&add_auth_headers(&multi_role_user)[0].0, &add_auth_headers(&multi_role_user)[0].1)
+            .add_header(&add_auth_headers(&multi_role_user)[1].0, &add_auth_headers(&multi_role_user)[1].1)
             .await;
 
         response.assert_status_forbidden();
@@ -1722,7 +1786,8 @@ mod tests {
 
         let response = app
             .post("/admin/api/v1/models")
-            .add_header(add_auth_headers(&platform_user).0, add_auth_headers(&platform_user).1)
+            .add_header(&add_auth_headers(&platform_user)[0].0, &add_auth_headers(&platform_user)[0].1)
+            .add_header(&add_auth_headers(&platform_user)[1].0, &add_auth_headers(&platform_user)[1].1)
             .json(&create_request)
             .await;
 
@@ -1733,7 +1798,8 @@ mod tests {
         let update = json!({"alias": "PM Updated Alias"});
         let response = app
             .patch(&format!("/admin/api/v1/models/{}", created_model.id))
-            .add_header(add_auth_headers(&platform_user).0, add_auth_headers(&platform_user).1)
+            .add_header(&add_auth_headers(&platform_user)[0].0, &add_auth_headers(&platform_user)[0].1)
+            .add_header(&add_auth_headers(&platform_user)[1].0, &add_auth_headers(&platform_user)[1].1)
             .json(&update)
             .await;
 
@@ -1744,7 +1810,8 @@ mod tests {
         // Should be able to delete models
         let response = app
             .delete(&format!("/admin/api/v1/models/{}", created_model.id))
-            .add_header(add_auth_headers(&platform_user).0, add_auth_headers(&platform_user).1)
+            .add_header(&add_auth_headers(&platform_user)[0].0, &add_auth_headers(&platform_user)[0].1)
+            .add_header(&add_auth_headers(&platform_user)[1].0, &add_auth_headers(&platform_user)[1].1)
             .await;
 
         response.assert_status_ok();
@@ -1783,7 +1850,8 @@ mod tests {
         // StandardUser should only see accessible models (default behavior)
         let response = app
             .get("/admin/api/v1/models")
-            .add_header(add_auth_headers(&standard_user).0, add_auth_headers(&standard_user).1)
+            .add_header(&add_auth_headers(&standard_user)[0].0, &add_auth_headers(&standard_user)[0].1)
+            .add_header(&add_auth_headers(&standard_user)[1].0, &add_auth_headers(&standard_user)[1].1)
             .await;
         response.assert_status_ok();
 
@@ -1794,7 +1862,8 @@ mod tests {
         // RequestViewer should have same accessibility filtering as StandardUser
         let response = app
             .get("/admin/api/v1/models")
-            .add_header(add_auth_headers(&request_viewer).0, add_auth_headers(&request_viewer).1)
+            .add_header(&add_auth_headers(&request_viewer)[0].0, &add_auth_headers(&request_viewer)[0].1)
+            .add_header(&add_auth_headers(&request_viewer)[1].0, &add_auth_headers(&request_viewer)[1].1)
             .await;
         response.assert_status_ok();
 
@@ -1805,7 +1874,8 @@ mod tests {
         // PlatformManager should see all models by default
         let response = app
             .get("/admin/api/v1/models")
-            .add_header(add_auth_headers(&platform_manager).0, add_auth_headers(&platform_manager).1)
+            .add_header(&add_auth_headers(&platform_manager)[0].0, &add_auth_headers(&platform_manager)[0].1)
+            .add_header(&add_auth_headers(&platform_manager)[1].0, &add_auth_headers(&platform_manager)[1].1)
             .await;
         response.assert_status_ok();
 
@@ -1845,7 +1915,8 @@ mod tests {
         // PlatformManager should be able to include groups
         let response = app
             .get("/admin/api/v1/models?include=groups")
-            .add_header(add_auth_headers(&platform_manager).0, add_auth_headers(&platform_manager).1)
+            .add_header(&add_auth_headers(&platform_manager)[0].0, &add_auth_headers(&platform_manager)[0].1)
+            .add_header(&add_auth_headers(&platform_manager)[1].0, &add_auth_headers(&platform_manager)[1].1)
             .await;
         response.assert_status_ok();
         let pm_models: Vec<DeployedModelResponse> = response.json();
@@ -1855,7 +1926,8 @@ mod tests {
         // StandardUser should NOT be able to include groups (groups should be None)
         let response = app
             .get("/admin/api/v1/models?include=groups")
-            .add_header(add_auth_headers(&standard_user).0, add_auth_headers(&standard_user).1)
+            .add_header(&add_auth_headers(&standard_user)[0].0, &add_auth_headers(&standard_user)[0].1)
+            .add_header(&add_auth_headers(&standard_user)[1].0, &add_auth_headers(&standard_user)[1].1)
             .await;
         response.assert_status_ok();
         let models: Vec<DeployedModelResponse> = response.json();
@@ -1865,7 +1937,8 @@ mod tests {
         // RequestViewer should NOT be able to include groups
         let response = app
             .get("/admin/api/v1/models?include=groups")
-            .add_header(add_auth_headers(&request_viewer).0, add_auth_headers(&request_viewer).1)
+            .add_header(&add_auth_headers(&request_viewer)[0].0, &add_auth_headers(&request_viewer)[0].1)
+            .add_header(&add_auth_headers(&request_viewer)[1].0, &add_auth_headers(&request_viewer)[1].1)
             .await;
         response.assert_status_ok();
 
@@ -1892,7 +1965,8 @@ mod tests {
         });
         let response = app
             .patch(&format!("/admin/api/v1/models/{}", deployment.id))
-            .add_header(add_auth_headers(&platform_manager).0, add_auth_headers(&platform_manager).1)
+            .add_header(&add_auth_headers(&platform_manager)[0].0, &add_auth_headers(&platform_manager)[0].1)
+            .add_header(&add_auth_headers(&platform_manager)[1].0, &add_auth_headers(&platform_manager)[1].1)
             .json(&update)
             .await;
         response.assert_status_ok();
@@ -1916,7 +1990,8 @@ mod tests {
         // PlatformManager should see rate limits (has ModelRateLimits::ReadAll)
         let response = app
             .get(&format!("/admin/api/v1/models/{}", deployment.id))
-            .add_header(add_auth_headers(&platform_manager).0, add_auth_headers(&platform_manager).1)
+            .add_header(&add_auth_headers(&platform_manager)[0].0, &add_auth_headers(&platform_manager)[0].1)
+            .add_header(&add_auth_headers(&platform_manager)[1].0, &add_auth_headers(&platform_manager)[1].1)
             .await;
         response.assert_status_ok();
         let pm_model: DeployedModelResponse = response.json();
@@ -1926,7 +2001,8 @@ mod tests {
         // StandardUser should NOT see rate limits (masked)
         let response = app
             .get(&format!("/admin/api/v1/models/{}", deployment.id))
-            .add_header(add_auth_headers(&standard_user).0, add_auth_headers(&standard_user).1)
+            .add_header(&add_auth_headers(&standard_user)[0].0, &add_auth_headers(&standard_user)[0].1)
+            .add_header(&add_auth_headers(&standard_user)[1].0, &add_auth_headers(&standard_user)[1].1)
             .await;
         response.assert_status_ok();
         let user_model: DeployedModelResponse = response.json();
@@ -1936,7 +2012,8 @@ mod tests {
         // RequestViewer should NOT see rate limits (masked)
         let response = app
             .get(&format!("/admin/api/v1/models/{}", deployment.id))
-            .add_header(add_auth_headers(&request_viewer).0, add_auth_headers(&request_viewer).1)
+            .add_header(&add_auth_headers(&request_viewer)[0].0, &add_auth_headers(&request_viewer)[0].1)
+            .add_header(&add_auth_headers(&request_viewer)[1].0, &add_auth_headers(&request_viewer)[1].1)
             .await;
         response.assert_status_ok();
         let rv_model: DeployedModelResponse = response.json();
@@ -1974,7 +2051,8 @@ mod tests {
         // PlatformManager should be able to include metrics (has Analytics::ReadAll)
         let response = app
             .get("/admin/api/v1/models?include=metrics")
-            .add_header(add_auth_headers(&platform_manager).0, add_auth_headers(&platform_manager).1)
+            .add_header(&add_auth_headers(&platform_manager)[0].0, &add_auth_headers(&platform_manager)[0].1)
+            .add_header(&add_auth_headers(&platform_manager)[1].0, &add_auth_headers(&platform_manager)[1].1)
             .await;
         response.assert_status_ok();
         let models: Vec<DeployedModelResponse> = response.json();
@@ -1984,7 +2062,8 @@ mod tests {
         // StandardUser should NOT be able to include metrics (no Analytics::ReadAll)
         let response = app
             .get("/admin/api/v1/models?include=metrics")
-            .add_header(add_auth_headers(&standard_user).0, add_auth_headers(&standard_user).1)
+            .add_header(&add_auth_headers(&standard_user)[0].0, &add_auth_headers(&standard_user)[0].1)
+            .add_header(&add_auth_headers(&standard_user)[1].0, &add_auth_headers(&standard_user)[1].1)
             .await;
         response.assert_status_ok();
         let models: Vec<DeployedModelResponse> = response.json();
@@ -1997,7 +2076,8 @@ mod tests {
         // RequestViewer should be able to include metrics (has Analytics::ReadAll)
         let response = app
             .get("/admin/api/v1/models?include=metrics")
-            .add_header(add_auth_headers(&request_viewer).0, add_auth_headers(&request_viewer).1)
+            .add_header(&add_auth_headers(&request_viewer)[0].0, &add_auth_headers(&request_viewer)[0].1)
+            .add_header(&add_auth_headers(&request_viewer)[1].0, &add_auth_headers(&request_viewer)[1].1)
             .await;
         response.assert_status_ok();
         let models: Vec<DeployedModelResponse> = response.json();

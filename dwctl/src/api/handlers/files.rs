@@ -835,7 +835,8 @@ mod tests {
 
         let upload_response = app
             .post("/ai/v1/files")
-            .add_header(add_auth_headers(&user).0, add_auth_headers(&user).1)
+            .add_header(&add_auth_headers(&user)[0].0, &add_auth_headers(&user)[0].1)
+            .add_header(&add_auth_headers(&user)[1].0, &add_auth_headers(&user)[1].1)
             .multipart(
                 axum_test::multipart::MultipartForm::new()
                     .add_text("purpose", "batch")
@@ -850,7 +851,8 @@ mod tests {
         // Download the file content
         let download_response = app
             .get(&format!("/ai/v1/files/{}/content", file_id))
-            .add_header(add_auth_headers(&user).0, add_auth_headers(&user).1)
+            .add_header(&add_auth_headers(&user)[0].0, &add_auth_headers(&user)[0].1)
+            .add_header(&add_auth_headers(&user)[1].0, &add_auth_headers(&user)[1].1)
             .await;
 
         download_response.assert_status(axum::http::StatusCode::OK);
@@ -886,7 +888,8 @@ mod tests {
 
         let upload_response = app
             .post("/ai/v1/files")
-            .add_header(add_auth_headers(&user).0, add_auth_headers(&user).1)
+            .add_header(&add_auth_headers(&user)[0].0, &add_auth_headers(&user)[0].1)
+            .add_header(&add_auth_headers(&user)[1].0, &add_auth_headers(&user)[1].1)
             .multipart(
                 axum_test::multipart::MultipartForm::new()
                     .add_text("purpose", "batch")
@@ -919,7 +922,8 @@ mod tests {
 
         let upload_response = app
             .post("/ai/v1/files")
-            .add_header(add_auth_headers(&user).0, add_auth_headers(&user).1)
+            .add_header(&add_auth_headers(&user)[0].0, &add_auth_headers(&user)[0].1)
+            .add_header(&add_auth_headers(&user)[1].0, &add_auth_headers(&user)[1].1)
             .multipart(
                 axum_test::multipart::MultipartForm::new()
                     .add_text("purpose", "batch")
@@ -948,7 +952,8 @@ mod tests {
 
         let upload_response = app
             .post("/ai/v1/files")
-            .add_header(add_auth_headers(&user).0, add_auth_headers(&user).1)
+            .add_header(&add_auth_headers(&user)[0].0, &add_auth_headers(&user)[0].1)
+            .add_header(&add_auth_headers(&user)[1].0, &add_auth_headers(&user)[1].1)
             .multipart(
                 axum_test::multipart::MultipartForm::new()
                     .add_text("purpose", "batch")
@@ -975,7 +980,8 @@ mod tests {
 
         let upload_response = app
             .post("/ai/v1/files")
-            .add_header(add_auth_headers(&user).0, add_auth_headers(&user).1)
+            .add_header(&add_auth_headers(&user)[0].0, &add_auth_headers(&user)[0].1)
+            .add_header(&add_auth_headers(&user)[1].0, &add_auth_headers(&user)[1].1)
             .multipart(
                 axum_test::multipart::MultipartForm::new()
                     .add_text("purpose", "batch")
@@ -1002,7 +1008,8 @@ mod tests {
 
         let upload_response = app
             .post("/ai/v1/files")
-            .add_header(add_auth_headers(&user).0, add_auth_headers(&user).1)
+            .add_header(&add_auth_headers(&user)[0].0, &add_auth_headers(&user)[0].1)
+            .add_header(&add_auth_headers(&user)[1].0, &add_auth_headers(&user)[1].1)
             .multipart(
                 axum_test::multipart::MultipartForm::new()
                     .add_text("purpose", "batch")
@@ -1027,7 +1034,8 @@ mod tests {
 
         let upload_response = app
             .post("/ai/v1/files")
-            .add_header(add_auth_headers(&user).0, add_auth_headers(&user).1)
+            .add_header(&add_auth_headers(&user)[0].0, &add_auth_headers(&user)[0].1)
+            .add_header(&add_auth_headers(&user)[1].0, &add_auth_headers(&user)[1].1)
             .multipart(
                 axum_test::multipart::MultipartForm::new()
                     .add_text("purpose", "batch")
@@ -1060,7 +1068,8 @@ mod tests {
         // This tests whether the handler correctly processes metadata regardless of field order
         let upload_response = app
             .post("/ai/v1/files")
-            .add_header(add_auth_headers(&user).0, add_auth_headers(&user).1)
+            .add_header(&add_auth_headers(&user)[0].0, &add_auth_headers(&user)[0].1)
+            .add_header(&add_auth_headers(&user)[1].0, &add_auth_headers(&user)[1].1)
             .multipart(
                 axum_test::multipart::MultipartForm::new()
                     .add_part("file", file_part)
@@ -1079,7 +1088,8 @@ mod tests {
         // For now, we verify the upload succeeded and the file exists
         let get_response = app
             .get(&format!("/ai/v1/files/{}", file.id))
-            .add_header(add_auth_headers(&user).0, add_auth_headers(&user).1)
+            .add_header(&add_auth_headers(&user)[0].0, &add_auth_headers(&user)[0].1)
+            .add_header(&add_auth_headers(&user)[1].0, &add_auth_headers(&user)[1].1)
             .await;
 
         get_response.assert_status(axum::http::StatusCode::OK);
@@ -1107,7 +1117,8 @@ mod tests {
 
         let upload_response1 = app
             .post("/ai/v1/files")
-            .add_header(add_auth_headers(&user).0, add_auth_headers(&user).1)
+            .add_header(&add_auth_headers(&user)[0].0, &add_auth_headers(&user)[0].1)
+            .add_header(&add_auth_headers(&user)[1].0, &add_auth_headers(&user)[1].1)
             .multipart(
                 axum_test::multipart::MultipartForm::new()
                     .add_text("purpose", "batch")
@@ -1123,7 +1134,8 @@ mod tests {
 
         let upload_response2 = app
             .post("/ai/v1/files")
-            .add_header(add_auth_headers(&user).0, add_auth_headers(&user).1)
+            .add_header(&add_auth_headers(&user)[0].0, &add_auth_headers(&user)[0].1)
+            .add_header(&add_auth_headers(&user)[1].0, &add_auth_headers(&user)[1].1)
             .multipart(
                 axum_test::multipart::MultipartForm::new()
                     .add_text("purpose", "batch")
