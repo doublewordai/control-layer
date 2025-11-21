@@ -71,15 +71,6 @@ import {
   formatPricing,
 } from "../../../../utils/formatters";
 
-const formatPricing = (pricing?: { input_price_per_token?: number | null; output_price_per_token?: number | null }): string => {
-  if (!pricing || (!pricing.input_price_per_token && !pricing.output_price_per_token)) {
-    return "N/A";
-  }
-  const input = pricing.input_price_per_token ? `$${Number(pricing.input_price_per_token).toFixed(4)}` : "N/A";
-  const output = pricing.output_price_per_token ? `$${Number(pricing.output_price_per_token).toFixed(4)}` : "N/A";
-  return `${input} / ${output}`;
-};
-
 // StatusRow component for status page layout
 interface StatusRowProps {
   model: Model;

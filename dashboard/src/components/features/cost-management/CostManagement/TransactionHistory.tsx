@@ -107,30 +107,6 @@ export function TransactionHistory({
     }).format(amount);
   };
 
-  const formatTokens = (tokens: number) => {
-    return new Intl.NumberFormat().format(tokens);
-  };
-
-  // Parse transaction description to extract token information
-  // Format: "API usage: model_name (X input + Y output tokens)"
-  const parseTokenInfo = (
-    description?: string,
-  ): { inputTokens: number; outputTokens: number; model?: string } | null => {
-    if (!description) return null;
-
-    const match = description.match(
-      /API usage: (.+?) \((\d+) input \+ (\d+) output tokens\)/,
-    );
-    if (match) {
-      return {
-        model: match[1],
-        inputTokens: parseInt(match[2], 10),
-        outputTokens: parseInt(match[3], 10),
-      };
-    }
-    return null;
-  };
-
   // Apply filters
   const filteredTransactions = useMemo(() => {
     let filtered = [...transactions];
@@ -335,7 +311,6 @@ export function TransactionHistory({
                 <TableHead className="w-[50px]"></TableHead>
                 <TableHead>Description</TableHead>
                 <TableHead>Date</TableHead>
-                <TableHead className="text-right">Tokens In/Out</TableHead>
                 <TableHead className="text-right">Amount</TableHead>
                 <TableHead className="text-right">Balance</TableHead>
               </TableRow>
@@ -346,9 +321,6 @@ export function TransactionHistory({
                 const isCredit =
                   transaction.transaction_type === "admin_grant" ||
                   transaction.transaction_type === "purchase";
-
-                // Parse token info for usage transactions
-                const tokenInfo = parseTokenInfo(transaction.description);
 
                 return (
                   <TableRow key={transaction.id}>
@@ -367,35 +339,13 @@ export function TransactionHistory({
                     </TableCell>
                     <TableCell>
                       <p className="font-medium text-doubleword-neutral-900">
-                        {tokenInfo
-                          ? `API usage: ${tokenInfo.model}`
-                          : transaction.description || "No description"}
+                        {transaction.description || "No description"}
                       </p>
-                      {tokenInfo && (
-                        <p className="text-xs text-doubleword-neutral-500">
-                          Total: {formatTokens(tokenInfo.inputTokens + tokenInfo.outputTokens)} tokens
-                        </p>
-                      )}
                     </TableCell>
                     <TableCell>
                       <p className="text-sm text-doubleword-neutral-600">
                         {formatDate(transaction.created_at)}
                       </p>
-                    </TableCell>
-                    <TableCell className="text-right">
-                      {tokenInfo ? (
-                        <div className="text-sm">
-                          <p className="text-doubleword-neutral-700">
-                            {formatTokens(tokenInfo.inputTokens)} /{" "}
-                            {formatTokens(tokenInfo.outputTokens)}
-                          </p>
-                          <p className="text-xs text-doubleword-neutral-500">
-                            in / out
-                          </p>
-                        </div>
-                      ) : (
-                        <p className="text-sm text-doubleword-neutral-500">-</p>
-                      )}
                     </TableCell>
                     <TableCell className="text-right">
                       <p
