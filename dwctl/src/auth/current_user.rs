@@ -352,10 +352,11 @@ mod tests {
     use axum::{extract::FromRequestParts as _, http::request::Parts};
     use sqlx::PgPool;
 
-    fn create_test_parts_with_header(header_name: &str, header_value: &str) -> Parts {
+    fn create_test_parts_with_auth(external_user_id: &str, email: &str) -> Parts {
         let request = axum::http::Request::builder()
             .uri("http://localhost/test")
-            .header(header_name, header_value)
+            .header("x-doubleword-user", external_user_id)
+            .header("x-doubleword-email", email)
             .body(())
             .unwrap();
 
@@ -379,7 +380,8 @@ mod tests {
         let test_user = crate::test_utils::create_test_user(&pool, Role::StandardUser).await;
 
         // Test extracting existing user
-        let mut parts = create_test_parts_with_header("x-doubleword-user", &test_user.email);
+        let external_user_id = test_user.external_user_id.as_ref().unwrap();
+        let mut parts = create_test_parts_with_auth(external_user_id, &test_user.email);
 
         let result = CurrentUser::from_request_parts(&mut parts, &state).await;
         assert!(result.is_ok());
@@ -403,7 +405,8 @@ mod tests {
         };
 
         let new_email = "newuser@example.com";
-        let mut parts = create_test_parts_with_header("x-doubleword-user", new_email);
+        let new_external_id = "auth0|newuser123";
+        let mut parts = create_test_parts_with_auth(new_external_id, new_email);
 
         // Verify user doesn't exist initially
         let mut pool_conn = pool.acquire().await.unwrap();
@@ -417,7 +420,7 @@ mod tests {
 
         let current_user = result.unwrap();
         assert_eq!(current_user.email, new_email);
-        assert_eq!(current_user.username, new_email); // Username should be the email for uniqueness
+        assert_eq!(current_user.username, new_external_id); // Username is set to external_user_id for uniqueness
         assert!(current_user.roles.contains(&Role::StandardUser));
 
         // Verify user was actually created in database

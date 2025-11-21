@@ -1211,9 +1211,11 @@ mod test {
         add_deployment_to_group(&pool, deployment.id, test_group.id, admin_user.id).await;
 
         // Test 1: Admin AI proxy with X-Doubleword-User header (new middleware)
+        let regular_user_external_id = regular_user.external_user_id.as_ref().unwrap_or(&regular_user.username);
         let admin_proxy_response = server
             .post("/admin/api/v1/ai/v1/chat/completions")
-            .add_header("x-doubleword-user", &regular_user.email)
+            .add_header("x-doubleword-user", regular_user_external_id)
+            .add_header("x-doubleword-email", &regular_user.email)
             .json(&serde_json::json!({
                 "model": deployment.alias,
                 "messages": [{"role": "user", "content": "Hello via admin proxy"}]
@@ -1230,9 +1232,11 @@ mod test {
         // Test 2: Admin AI proxy with user who has no access to model
         let restricted_user = create_test_user(&pool, Role::StandardUser).await;
 
+        let restricted_user_external_id = restricted_user.external_user_id.as_ref().unwrap_or(&restricted_user.username);
         let no_access_response = server
             .post("/admin/api/v1/ai/v1/chat/completions")
-            .add_header("x-doubleword-user", &restricted_user.email)
+            .add_header("x-doubleword-user", restricted_user_external_id)
+            .add_header("x-doubleword-email", &restricted_user.email)
             .json(&serde_json::json!({
                 "model": deployment.alias,
                 "messages": [{"role": "user", "content": "Hello"}]
@@ -1269,6 +1273,7 @@ mod test {
         let nonexistent_user_response = server
             .post("/admin/api/v1/ai/v1/chat/completions")
             .add_header("x-doubleword-user", "nonexistent@example.com")
+            .add_header("x-doubleword-email", "nonexistent@example.com")
             .json(&serde_json::json!({
                 "model": deployment.alias,
                 "messages": [{"role": "user", "content": "Hello"}]
@@ -1285,7 +1290,8 @@ mod test {
         // Test 5: Admin AI proxy with non-existent model
         let nonexistent_model_response = server
             .post("/admin/api/v1/ai/v1/chat/completions")
-            .add_header("x-doubleword-user", &regular_user.email)
+            .add_header("x-doubleword-user", regular_user_external_id)
+            .add_header("x-doubleword-email", &regular_user.email)
             .json(&serde_json::json!({
                 "model": "nonexistent-model",
                 "messages": [{"role": "user", "content": "Hello"}]
