@@ -2577,8 +2577,11 @@ impl<H: HttpClient + 'static> DaemonExecutor<H> for PostgresRequestManager<H> {
         let manager = self.clone();
         let handle = tokio::spawn(async move {
             // Create a cancellation stream from PostgreSQL LISTEN/NOTIFY
-            let cancellation_stream = manager.create_cancellation_stream().await.ok();
-            daemon.run(cancellation_stream).await
+            // Fail-fast if we can't create the stream - this is a fatal error
+            let cancellation_stream = manager.create_cancellation_stream().await.expect(
+                "Failed to create cancellation stream - cannot listen for request cancellations",
+            );
+            daemon.run(Some(cancellation_stream)).await
         });
 
         tracing::info!("Daemon spawned successfully");
@@ -2594,39 +2597,87 @@ impl<H: HttpClient + 'static> PostgresRequestManager<H> {
     ) -> Result<std::pin::Pin<Box<dyn futures::Stream<Item = RequestId> + Send>>> {
         use futures::StreamExt;
 
-        let mut listener = self.create_listener().await?;
+        // Clone the pool so the stream can create new listeners on reconnection
+        let pool = self.pool.clone();
 
-        // Listen to the request_cancellations channel
-        listener
-            .listen("request_cancellations")
-            .await
-            .map_err(|e| FusilladeError::Other(anyhow!("Failed to LISTEN: {}", e)))?;
+        // Create a stream that handles reconnection internally
+        let stream = futures::stream::unfold(pool, |pool| async move {
+            const RECONNECT_DELAY_SECS: u64 = 5;
 
-        // Transform PgListener into a stream of RequestIds
-        let stream = futures::stream::unfold(listener, |mut listener| async move {
-            match listener.recv().await {
-                Ok(notification) => {
-                    // Parse the request ID from the payload (UUID string)
-                    match notification.payload().parse::<uuid::Uuid>() {
-                        Ok(uuid) => Some((RequestId(uuid), listener)),
+            'reconnect: loop {
+                // Try to create a new listener
+                let mut listener = match sqlx::postgres::PgListener::connect_with(&pool).await {
+                    Ok(l) => {
+                        tracing::debug!("Connected to PostgreSQL for cancellation stream");
+                        l
+                    }
+                    Err(e) => {
+                        tracing::error!(
+                            error = %e,
+                            "Failed to connect listener for cancellations, retrying in {}s",
+                            RECONNECT_DELAY_SECS
+                        );
+                        tokio::time::sleep(std::time::Duration::from_secs(RECONNECT_DELAY_SECS)).await;
+                        continue 'reconnect;
+                    }
+                };
+
+                // Try to listen to the channel
+                if let Err(e) = listener.listen("request_cancellations").await {
+                    tracing::error!(
+                        error = %e,
+                        "Failed to LISTEN on request_cancellations channel, retrying in {}s",
+                        RECONNECT_DELAY_SECS
+                    );
+                    tokio::time::sleep(std::time::Duration::from_secs(RECONNECT_DELAY_SECS)).await;
+                    continue 'reconnect;
+                }
+
+                tracing::info!("Listening for request cancellations via PostgreSQL NOTIFY");
+
+                // Process messages until connection fails
+                loop {
+                    match listener.try_recv().await {
+                        Ok(Some(notification)) => {
+                            // Parse the request ID from the payload (UUID string)
+                            match notification.payload().parse::<uuid::Uuid>() {
+                                Ok(uuid) => {
+                                    // Valid cancellation - return it
+                                    return Some((RequestId(uuid), pool));
+                                }
+                                Err(e) => {
+                                    tracing::error!(
+                                        payload = notification.payload(),
+                                        error = %e,
+                                        "Failed to parse request ID from notification, skipping"
+                                    );
+                                    // Skip invalid messages, continue listening on same connection
+                                }
+                            }
+                        }
+                        Ok(None) => {
+                            tracing::error!(
+                                "Connection closed while listening for cancellations, reconnecting in {}s",
+                                RECONNECT_DELAY_SECS
+                            );
+                            tokio::time::sleep(std::time::Duration::from_secs(RECONNECT_DELAY_SECS)).await;
+                            // Break inner loop to reconnect
+                            break;
+                        }
                         Err(e) => {
                             tracing::error!(
-                                payload = notification.payload(),
                                 error = %e,
-                                "Failed to parse request ID from notification"
+                                "PostgreSQL error while listening for cancellations, reconnecting in {}s",
+                                RECONNECT_DELAY_SECS
                             );
-                            // Continue listening despite parse error
-                            Some((RequestId(uuid::Uuid::nil()), listener))
+                            tokio::time::sleep(std::time::Duration::from_secs(RECONNECT_DELAY_SECS)).await;
+                            // Break inner loop to reconnect
+                            break;
                         }
                     }
                 }
-                Err(e) => {
-                    tracing::error!(error = %e, "Error receiving notification, stream ending");
-                    None
-                }
             }
         })
-        .filter(|id| futures::future::ready(!id.0.is_nil()))
         .boxed();
 
         Ok(stream)

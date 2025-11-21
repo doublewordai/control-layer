@@ -163,6 +163,7 @@ use crate::{
     openapi::ApiDoc,
     request_logging::serializers::{parse_ai_request, AnalyticsResponseSerializer},
 };
+use anyhow::Context;
 use auth::middleware::admin_ai_proxy_middleware;
 use axum::extract::DefaultBodyLimit;
 use axum::http::HeaderValue;
@@ -811,21 +812,64 @@ pub struct BackgroundServices {
     request_manager: Arc<fusillade::PostgresRequestManager<fusillade::ReqwestHttpClient>>,
     is_leader: bool,
     onwards_targets: onwards::target::Targets,
-    background_tasks: Vec<tokio::task::JoinHandle<()>>,
+    background_tasks: Vec<tokio::task::JoinHandle<anyhow::Result<()>>>,
     shutdown_token: tokio_util::sync::CancellationToken,
     // Pub so that we can disarm it if we want to
     pub drop_guard: Option<tokio_util::sync::DropGuard>,
 }
 
 impl BackgroundServices {
+    /// Wait for any background task to complete (indicating a failure)
+    /// Mutates the task list to contain only the remaining pending tasks
+    /// Returns an error with details about which task failed
+    pub async fn wait_for_failure(&mut self) -> anyhow::Result<std::convert::Infallible> {
+        let tasks = std::mem::take(&mut self.background_tasks);
+
+        if tasks.is_empty() {
+            // No background tasks - wait forever
+            futures::future::pending::<()>().await;
+            unreachable!()
+        }
+
+        let (result, index, remaining) = futures::future::select_all(tasks).await;
+
+        // Put remaining tasks back
+        self.background_tasks = remaining;
+
+        match result {
+            Ok(Ok(())) => {
+                tracing::warn!("Background task {} completed unexpectedly", index);
+                anyhow::bail!("Background task {} completed early", index)
+            }
+            Ok(Err(e)) => {
+                tracing::error!("Background task {} failed: {}", index, e);
+                anyhow::bail!("Background task {} failed: {}", index, e)
+            }
+            Err(e) => {
+                tracing::error!("Background task {} panicked: {}", index, e);
+                anyhow::bail!("Background task {} panicked: {}", index, e)
+            }
+        }
+    }
+
     /// Gracefully shutdown all background tasks
     pub async fn shutdown(self) {
         // Signal all background tasks to shutdown
         self.shutdown_token.cancel();
 
-        // Wait for all background tasks to complete
-        for handle in self.background_tasks {
-            let _ = handle.await;
+        // Wait for all background tasks to complete and check for errors
+        for (i, handle) in self.background_tasks.into_iter().enumerate() {
+            match handle.await {
+                Ok(Ok(())) => {
+                    tracing::debug!("Background task {} completed successfully", i);
+                }
+                Ok(Err(e)) => {
+                    tracing::error!("Background task {} failed: {}", i, e);
+                }
+                Err(e) => {
+                    tracing::error!("Background task {} panicked: {}", i, e);
+                }
+            }
         }
     }
 }
@@ -852,9 +896,13 @@ async fn setup_background_services(
     // Clone targets for the update task
     let targets_for_updates = initial_targets.clone();
 
-    // Start target updates (infallible task, handle internally)
+    // Start target updates - propagate errors for fail-fast behavior
     let handle = tokio::spawn(async move {
-        let _ = targets_for_updates.receive_updates(onwards_stream).await;
+        targets_for_updates
+            .receive_updates(onwards_stream)
+            .await
+            .map_err(anyhow::Error::from)
+            .context("Onwards target updates failed")
     });
     background_tasks.push(handle);
 
@@ -862,9 +910,10 @@ async fn setup_background_services(
     let onwards_shutdown = shutdown_token.clone();
     let handle = tokio::spawn(async move {
         info!("Starting onwards configuration listener");
-        if let Err(e) = onwards_config_sync.start(Default::default(), onwards_shutdown).await {
-            tracing::error!("Onwards configuration listener error: {}", e);
-        }
+        onwards_config_sync
+            .start(Default::default(), onwards_shutdown)
+            .await
+            .context("Onwards configuration listener failed")
     });
     background_tasks.push(handle);
     // Leader election lock ID: 0x44574354_50524F42 (DWCT_PROB in hex for "dwctl probes")
@@ -899,7 +948,8 @@ async fn setup_background_services(
             // Use LISTEN/NOTIFY in production, but disable in tests to avoid hangs
             let use_listen_notify = !cfg!(test);
             daemon_scheduler.run_daemon(daemon_shutdown, use_listen_notify, 300).await;
-            // Fallback sync every 5 minutes
+            // Probe scheduler runs until cancelled, then exits normally
+            Ok(())
         });
         background_tasks.push(handle);
 
@@ -909,9 +959,22 @@ async fn setup_background_services(
         match config.batches.daemon.enabled {
             DaemonEnabled::Always | DaemonEnabled::Leader => {
                 let daemon_handle = request_manager.clone().run(shutdown_token.clone())?;
-                // Wrap the handle to convert Result<()> to ()
+                // Spawn task that propagates daemon errors
                 let handle = tokio::spawn(async move {
-                    let _ = daemon_handle.await;
+                    match daemon_handle.await {
+                        Ok(Ok(())) => {
+                            tracing::info!("Fusillade daemon exited normally");
+                        }
+                        Ok(Err(e)) => {
+                            tracing::error!(error = %e, "Fusillade daemon failed");
+                            anyhow::bail!("Fusillade daemon error: {}", e);
+                        }
+                        Err(e) => {
+                            tracing::error!(error = %e, "Fusillade daemon task panicked");
+                            anyhow::bail!("Fusillade daemon panic: {}", e);
+                        }
+                    }
+                    Ok(())
                 });
                 background_tasks.push(handle);
                 info!("Skipping leader election - running as leader with probe scheduler and fusillade daemon");
@@ -930,9 +993,22 @@ async fn setup_background_services(
         if config.batches.daemon.enabled == DaemonEnabled::Always {
             use fusillade::DaemonExecutor;
             let daemon_handle = request_manager.clone().run(shutdown_token.clone())?;
-            // Wrap the handle to convert Result<()> to ()
+            // Spawn task that propagates daemon errors
             let handle = tokio::spawn(async move {
-                let _ = daemon_handle.await;
+                match daemon_handle.await {
+                    Ok(Ok(())) => {
+                        tracing::info!("Fusillade daemon exited normally");
+                    }
+                    Ok(Err(e)) => {
+                        tracing::error!(error = %e, "Fusillade daemon failed");
+                        anyhow::bail!("Fusillade daemon error: {}", e);
+                    }
+                    Err(e) => {
+                        tracing::error!(error = %e, "Fusillade daemon task panicked");
+                        anyhow::bail!("Fusillade daemon panic: {}", e);
+                    }
+                }
+                Ok(())
             });
             background_tasks.push(handle);
             info!("Fusillade batch daemon started (configured to always run)");
@@ -1045,6 +1121,8 @@ async fn setup_background_services(
                 },
             )
             .await;
+            // Leader election runs until cancelled, then exits normally
+            Ok(())
         });
         background_tasks.push(handle);
     }
@@ -1137,7 +1215,7 @@ impl Application {
     }
 
     /// Start serving the application
-    pub async fn serve<F>(self, shutdown: F) -> anyhow::Result<()>
+    pub async fn serve<F>(mut self, shutdown: F) -> anyhow::Result<()>
     where
         F: std::future::Future<Output = ()> + Send + 'static,
     {
@@ -1152,12 +1230,22 @@ impl Application {
         let middleware = from_fn_with_state(self.app_state, admin_ai_proxy_middleware);
         let service = middleware.layer(self.router);
 
-        // Run the server with graceful shutdown
-        axum::serve(listener, service.into_make_service())
-            .with_graceful_shutdown(shutdown)
-            .await?;
+        // Race the server against background task failures (fail-fast)
+        let server_error: Option<anyhow::Error> = tokio::select! {
+            result = axum::serve(listener, service.into_make_service()).with_graceful_shutdown(shutdown) => {
+                result.err().map(Into::into) // None if server shut down cleanly
+            }
+            result = self.bg_services.wait_for_failure() => {
+                // Background task failed - save error for fail-fast restart after cleanup
+                match result {
+                    Ok(_infallible) => unreachable!("wait_for_failure never returns Ok"),
+                    Err(e) => Some(e),
+                }
+            }
+        };
 
-        // Shutdown background services and wait for tasks to complete
+        // Graceful shutdown - even if we're failing fast, clean up properly
+        info!("Shutting down background services...");
         self.bg_services.shutdown().await;
 
         // Close database connections
@@ -1172,6 +1260,11 @@ impl Application {
         if let Some(embedded_db) = self._embedded_db {
             info!("Shutting down embedded database...");
             embedded_db.stop().await?;
+        }
+
+        // If there was an error (either server or background task), propagate it after cleanup
+        if let Some(e) = server_error {
+            return Err(e);
         }
 
         Ok(())
