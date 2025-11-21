@@ -105,22 +105,30 @@ auth:
       cookie_secure: true
       cookie_same_site: "strict"
 
-  # Proxy header authentication. 
-  # Will accept & autocreate users based on email addresses
-  # supplied in a configurable header. Lets you use an upstream proxy to 
-  # authenticate users.
+  # Proxy header authentication
+  # Accepts user identity from HTTP headers set by an upstream authentication proxy
+  # (e.g., oauth2-proxy, Vouch, Authentik, Auth0)
+  #
+  # Two modes:
+  #   Single header: Send only header_name with user's email (must be unique)
+  #   Dual header: Send both header_name (IdP identifier) and email_header_name (email)
+  #                Allows multiple accounts per email from different identity providers
   proxy_header:
-    enabled: false # X-Doubleword-User header auth
+    enabled: false
+    # header_name: User identifier or email
+    # Single header mode: User's email (e.g., "user@example.com")
+    # Dual header mode: Unique identifier from IdP (e.g., "github|user123", "google-oauth2|456")
     header_name: "x-doubleword-user"
-    groups_field_name: "x-doubleword-user-groups" # Header from which to read out group claims
-    blacklisted_sso_groups:  # Which SSO groups to ignore from the iDP
-       - "t1"
-       - "t2"
-    provider_field_name: "x-doubleword-sso-provider" # Header from which to read the sso provider (for source column)
-    import_idp_groups: false # Whether to import iDP groups or not
-     # Whether users should be automatically created if their email is supplied
-    # in a header, or whether they must be pre-created by an admin in the UI.
-    # If false, users that aren't precreated will receive a 403 Forbidden error.
+    # email_header_name: User's email address (optional, enables dual header mode)
+    # If provided: Enables federated identity with (email, external_user_id) uniqueness
+    # If omitted: Uses header_name value as email (single header mode, email must be unique)
+    email_header_name: "x-doubleword-email"
+    # Groups and SSO provider headers (optional)
+    groups_field_name: "x-doubleword-user-groups"
+    provider_field_name: "x-doubleword-sso-provider"
+    import_idp_groups: false # Import IdP groups
+    blacklisted_sso_groups: []  # SSO groups to ignore
+    # auto_create_users: Automatically create users on first login
     auto_create_users: true
 
   # Security settings
