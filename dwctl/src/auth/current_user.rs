@@ -55,12 +55,13 @@ fn try_jwt_session_auth(parts: &axum::http::request::Parts, config: &crate::conf
 /// - None: No proxy header present
 /// - Some(Ok(user)): Valid proxy header found and user authenticated
 /// - Some(Err(error)): Proxy header present but user lookup/creation failed
-#[instrument(skip(parts, config, db))]
+#[instrument(skip(parts, config, db), level = "TRACE")]
 async fn try_proxy_header_auth(
     parts: &axum::http::request::Parts,
     config: &crate::config::Config,
     db: &PgPool,
 ) -> Option<Result<CurrentUser>> {
+    tracing::trace!("Trying proxy header auth, config: {:?}", config.auth.proxy_header);
     // Extract external_user_id from header_name (required)
     let external_user_id = parts
         .headers
@@ -103,6 +104,12 @@ async fn try_proxy_header_auth(
     } else {
         None
     };
+    tracing::trace!(
+        "Proxy header auth: external_user_id='{}', email='{}', groups_and_provider={:?}",
+        external_user_id,
+        user_email,
+        groups_and_provider
+    );
 
     let mut tx = match db.begin().await {
         Ok(tx) => tx,
@@ -129,17 +136,24 @@ async fn try_proxy_header_auth(
         }
     } else {
         // auto_create disabled - just lookup by external_user_id
+        debug!("Auto-create disabled, looking up existing user");
         match user_repo.get_user_by_external_user_id(external_user_id).await {
-            Ok(Some(user)) => Some(CurrentUser {
-                id: user.id,
-                username: user.username,
-                email: user.email,
-                is_admin: user.is_admin,
-                roles: user.roles,
-                display_name: user.display_name,
-                avatar_url: user.avatar_url,
-            }),
-            Ok(None) => None,
+            Ok(Some(user)) => {
+                debug!("Found existing user");
+                Some(CurrentUser {
+                    id: user.id,
+                    username: user.username,
+                    email: user.email,
+                    is_admin: user.is_admin,
+                    roles: user.roles,
+                    display_name: user.display_name,
+                    avatar_url: user.avatar_url,
+                })
+            }
+            Ok(None) => {
+                debug!("User not found and auto-create disabled");
+                None
+            }
             Err(e) => return Some(Err(Error::Database(e))),
         }
     };
@@ -279,7 +293,8 @@ impl FromRequestParts<AppState> for CurrentUser {
         // Try API key authentication first (most specific)
         match try_api_key_auth(parts, &state.db).await {
             Some(Ok(user)) => {
-                debug!("Found API key authenticated user: {}", user.id);
+                debug!("Authentication successful via API key");
+                trace!("Authenticated user: {}", user.id);
                 return Ok(user);
             }
             Some(Err(e)) => {
@@ -296,7 +311,8 @@ impl FromRequestParts<AppState> for CurrentUser {
         if state.config.auth.native.enabled {
             match try_jwt_session_auth(parts, &state.config) {
                 Some(Ok(user)) => {
-                    debug!("Found JWT session authenticated user: {}", user.id);
+                    debug!("Authentication successful via JWT session");
+                    trace!("Authenticated user: {}", user.id);
                     return Ok(user);
                 }
                 Some(Err(e)) => {
@@ -314,7 +330,8 @@ impl FromRequestParts<AppState> for CurrentUser {
         if state.config.auth.proxy_header.enabled {
             match try_proxy_header_auth(parts, &state.config, &state.db).await {
                 Some(Ok(user)) => {
-                    debug!("Found proxy header authenticated user: {}", user.id);
+                    debug!("Authentication successful via proxy header");
+                    trace!("Authenticated user: {}", user.id);
                     return Ok(user);
                 }
                 Some(Err(e)) => {
@@ -330,9 +347,11 @@ impl FromRequestParts<AppState> for CurrentUser {
 
         // If we get here, no auth method succeeded
         if !any_auth_attempted {
+            debug!("Authentication failed: no credentials provided");
             trace!("No authentication credentials found in request");
             Err(Error::Unauthenticated { message: None })
         } else {
+            debug!("Authentication failed: invalid credentials");
             trace!("All authentication attempts failed ({}): {:?}", auth_errors.len(), auth_errors);
             Err(Error::Unauthenticated { message: None })
         }
