@@ -1717,13 +1717,18 @@ impl<H: HttpClient + 'static> Storage for PostgresRequestManager<H> {
         .await
         .map_err(|e| FusilladeError::Other(anyhow!("Failed to set cancelling_at: {}", e)))?;
 
-        // Cancel all pending/in-progress requests
+        // Cancel all pending/in-progress requests and notify daemons
         sqlx::query!(
             r#"
-            UPDATE requests
-            SET state = 'canceled', canceled_at = $2
-            WHERE batch_id = $1
-                AND state IN ('pending', 'claimed', 'processing')
+            WITH canceled AS (
+                UPDATE requests
+                SET state = 'canceled', canceled_at = $2
+                WHERE batch_id = $1
+                    AND state IN ('pending', 'claimed', 'processing')
+                RETURNING id
+            )
+            SELECT pg_notify('request_cancellations', id::text)
+            FROM canceled
             "#,
             *batch_id as Uuid,
             now,
@@ -2569,11 +2574,126 @@ impl<H: HttpClient + 'static> DaemonExecutor<H> for PostgresRequestManager<H> {
             shutdown_token,
         ));
 
-        let handle = tokio::spawn(async move { daemon.run().await });
+        let manager = self.clone();
+        let handle = tokio::spawn(async move {
+            // Create a cancellation stream from PostgreSQL LISTEN/NOTIFY
+            // If we can't create the stream, return error for fail-fast behavior
+            let cancellation_stream = manager.create_cancellation_stream().await?;
+            daemon.run(Some(cancellation_stream)).await
+        });
 
         tracing::info!("Daemon spawned successfully");
 
         Ok(handle)
+    }
+}
+
+impl<H: HttpClient + 'static> PostgresRequestManager<H> {
+    /// Create a stream of request cancellations from PostgreSQL LISTEN/NOTIFY.
+    async fn create_cancellation_stream(
+        &self,
+    ) -> Result<std::pin::Pin<Box<dyn futures::Stream<Item = RequestId> + Send>>> {
+        use futures::StreamExt;
+
+        // Clone the pool so the stream can create new listeners on reconnection
+        let pool = self.pool.clone();
+
+        // Create a stream that handles reconnection internally
+        // State: (pool, optional listener) - we keep the listener alive across iterations
+        type State = (PgPool, Option<sqlx::postgres::PgListener>);
+
+        let stream = futures::stream::unfold((pool, None), |(pool, listener_opt): State| async move {
+            const RECONNECT_DELAY_SECS: u64 = 5;
+
+            let mut listener = match listener_opt {
+                Some(l) => l,
+                None => {
+                    // Need to establish a connection
+                    'reconnect: loop {
+                        // Try to create a new listener
+                        let mut listener = match sqlx::postgres::PgListener::connect_with(&pool).await {
+                            Ok(l) => {
+                                tracing::debug!("Connected to PostgreSQL for cancellation stream");
+                                l
+                            }
+                            Err(e) => {
+                                tracing::error!(
+                                    error = %e,
+                                    "Failed to connect listener for cancellations, retrying in {}s",
+                                    RECONNECT_DELAY_SECS
+                                );
+                                tokio::time::sleep(std::time::Duration::from_secs(RECONNECT_DELAY_SECS)).await;
+                                continue 'reconnect;
+                            }
+                        };
+
+                        // Try to listen to the channel
+                        if let Err(e) = listener.listen("request_cancellations").await {
+                            tracing::error!(
+                                error = %e,
+                                "Failed to LISTEN on request_cancellations channel, retrying in {}s",
+                                RECONNECT_DELAY_SECS
+                            );
+                            tokio::time::sleep(std::time::Duration::from_secs(RECONNECT_DELAY_SECS)).await;
+                            continue 'reconnect;
+                        }
+
+                        tracing::info!("Listening for request cancellations via PostgreSQL NOTIFY");
+                        break listener;
+                    }
+                }
+            };
+
+            // Try to receive a notification from the active listener
+            loop {
+                match listener.try_recv().await {
+                    Ok(Some(notification)) => {
+                        // Parse the request ID from the payload (UUID string)
+                        match notification.payload().parse::<uuid::Uuid>() {
+                            Ok(uuid) => {
+                                // Valid cancellation - return it and keep the connection alive
+                                return Some((RequestId(uuid), (pool, Some(listener))));
+                            }
+                            Err(e) => {
+                                tracing::error!(
+                                    payload = notification.payload(),
+                                    error = %e,
+                                    "Failed to parse request ID from notification, skipping"
+                                );
+                                // Skip invalid messages, continue listening on same connection
+                            }
+                        }
+                    }
+                    Ok(None) => {
+                        tracing::error!(
+                            "Connection closed while listening for cancellations, reconnecting in {}s",
+                            RECONNECT_DELAY_SECS
+                        );
+                        tokio::time::sleep(std::time::Duration::from_secs(RECONNECT_DELAY_SECS)).await;
+                        // Drop the listener to trigger reconnect on next iteration
+                        return Some((RequestId(uuid::Uuid::nil()), (pool, None)));
+                    }
+                    Err(e) => {
+                        tracing::error!(
+                            error = %e,
+                            "PostgreSQL error while listening for cancellations, reconnecting in {}s",
+                            RECONNECT_DELAY_SECS
+                        );
+                        tokio::time::sleep(std::time::Duration::from_secs(RECONNECT_DELAY_SECS)).await;
+                        // Drop the listener to trigger reconnect on next iteration
+                        return Some((RequestId(uuid::Uuid::nil()), (pool, None)));
+                    }
+                }
+            }
+        })
+        .filter(|request_id| {
+            // Filter out nil UUIDs (used for reconnection signaling)
+            let keep = !request_id.0.is_nil();
+            futures::future::ready(keep)
+        })
+        .boxed();
+
+        Ok(stream)
     }
 }
 
@@ -4550,5 +4670,199 @@ mod tests {
                 model
             );
         }
+    }
+
+    /// Helper to poll for a condition with timeout
+    async fn wait_for<F, Fut>(mut check: F, timeout: std::time::Duration) -> bool
+    where
+        F: FnMut() -> Fut,
+        Fut: std::future::Future<Output = bool>,
+    {
+        let start = std::time::Instant::now();
+        while start.elapsed() < timeout {
+            if check().await {
+                return true;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        false
+    }
+
+    #[sqlx::test]
+    async fn test_batch_cancellation_with_stream(pool: sqlx::PgPool) {
+        use crate::http::HttpResponse;
+        use std::time::Duration;
+        use tokio::sync::mpsc;
+
+        let http_client = Arc::new(MockHttpClient::new());
+        let manager = Arc::new(PostgresRequestManager::with_client(
+            pool.clone(),
+            http_client.clone(),
+        ));
+
+        // Create a file with templates
+        let file_id = manager
+            .create_file(
+                "test_cancellation".to_string(),
+                None,
+                vec![
+                    RequestTemplateInput {
+                        custom_id: Some("req1".to_string()),
+                        endpoint: "http://example.com".to_string(),
+                        method: "POST".to_string(),
+                        path: "/test".to_string(),
+                        body: r#"{"test": 1}"#.to_string(),
+                        model: "model-a".to_string(),
+                        api_key: "test-key".to_string(),
+                    },
+                    RequestTemplateInput {
+                        custom_id: Some("req2".to_string()),
+                        endpoint: "http://example.com".to_string(),
+                        method: "POST".to_string(),
+                        path: "/test".to_string(),
+                        body: r#"{"test": 2}"#.to_string(),
+                        model: "model-a".to_string(),
+                        api_key: "test-key".to_string(),
+                    },
+                ],
+            )
+            .await
+            .unwrap();
+
+        // Create a batch
+        let batch = manager
+            .create_batch(BatchInput {
+                file_id,
+                created_by: Some("test-user".to_string()),
+                completion_window: "24h".to_string(),
+                endpoint: "/v1/chat/completions".to_string(),
+                metadata: None,
+            })
+            .await
+            .unwrap();
+
+        // Create a mock cancellation stream using mpsc channel
+        let (cancel_tx, cancel_rx) = mpsc::unbounded_channel::<RequestId>();
+        let cancellation_stream = tokio_stream::wrappers::UnboundedReceiverStream::new(cancel_rx);
+
+        // Set up triggered responses that won't complete until we tell them to
+        http_client.clear_calls();
+        let trigger1 = http_client.add_response_with_trigger(
+            "POST /test",
+            Ok(HttpResponse {
+                status: 200,
+                body: "ok".to_string(),
+            }),
+        );
+        let trigger2 = http_client.add_response_with_trigger(
+            "POST /test",
+            Ok(HttpResponse {
+                status: 200,
+                body: "ok".to_string(),
+            }),
+        );
+
+        // Start a daemon with the mock cancellation stream
+        let shutdown_token = tokio_util::sync::CancellationToken::new();
+        let config = crate::daemon::DaemonConfig {
+            claim_batch_size: 10,
+            default_model_concurrency: 5,
+            model_concurrency_limits: Arc::new(dashmap::DashMap::new()),
+            claim_interval_ms: 10,
+            max_retries: 3,
+            backoff_ms: 100,
+            backoff_factor: 2,
+            max_backoff_ms: 1000,
+            timeout_ms: 30000,
+            status_log_interval_ms: None,
+            heartbeat_interval_ms: 1000,
+            should_retry: Arc::new(|_| false),
+            claim_timeout_ms: 5000,
+            processing_timeout_ms: 10000,
+        };
+
+        let daemon = Arc::new(crate::daemon::Daemon::new(
+            manager.clone(),
+            http_client.clone(),
+            config,
+            shutdown_token.clone(),
+        ));
+
+        // Run daemon with cancellation stream
+        let daemon_handle = tokio::spawn({
+            let daemon = daemon.clone();
+            async move { daemon.run(Some(cancellation_stream)).await }
+        });
+
+        // Get the request IDs from the batch
+        let requests = manager.get_batch_requests(batch.id).await.unwrap();
+        assert_eq!(requests.len(), 2);
+        let request_ids: Vec<RequestId> = requests.iter().map(|r| r.id()).collect();
+
+        // Wait for both requests to be processing (blocked on triggers)
+        let manager_clone = manager.clone();
+        let batch_id = batch.id;
+        let reached_processing = wait_for(
+            || async {
+                if let Ok(reqs) = manager_clone.get_batch_requests(batch_id).await {
+                    reqs.iter().all(|r| matches!(r, AnyRequest::Processing(_)))
+                } else {
+                    false
+                }
+            },
+            Duration::from_secs(3),
+        )
+        .await;
+        assert!(
+            reached_processing,
+            "Both requests should reach processing state"
+        );
+
+        // Send cancellation for first request via the stream
+        cancel_tx.send(request_ids[0]).unwrap();
+
+        // Wait for first request to be canceled
+        let manager_clone = manager.clone();
+        let req_id_0 = request_ids[0];
+        let reached_canceled = wait_for(
+            || async {
+                if let Ok(reqs) = manager_clone.get_batch_requests(batch_id).await {
+                    if let Some(req) = reqs.iter().find(|r| r.id() == req_id_0) {
+                        return matches!(req, AnyRequest::Canceled(_));
+                    }
+                }
+                false
+            },
+            Duration::from_secs(3),
+        )
+        .await;
+        assert!(reached_canceled, "First request should be canceled");
+
+        // Trigger the second request to complete normally
+        trigger2.send(()).ok();
+
+        // Wait for second request to complete
+        let manager_clone = manager.clone();
+        let req_id_1 = request_ids[1];
+        let reached_completed = wait_for(
+            || async {
+                if let Ok(reqs) = manager_clone.get_batch_requests(batch_id).await {
+                    if let Some(req) = reqs.iter().find(|r| r.id() == req_id_1) {
+                        return matches!(req, AnyRequest::Completed(_));
+                    }
+                }
+                false
+            },
+            Duration::from_secs(3),
+        )
+        .await;
+        assert!(reached_completed, "Second request should complete");
+
+        // Shutdown daemon
+        shutdown_token.cancel();
+        let _ = tokio::time::timeout(Duration::from_secs(5), daemon_handle).await;
+
+        // Drop trigger1 to unblock if still waiting
+        drop(trigger1);
     }
 }

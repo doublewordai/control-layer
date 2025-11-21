@@ -582,7 +582,8 @@ mod tests {
 
         let response = app
             .get("/admin/api/v1/endpoints")
-            .add_header(add_auth_headers(&user).0, add_auth_headers(&user).1)
+            .add_header(&add_auth_headers(&user)[0].0, &add_auth_headers(&user)[0].1)
+            .add_header(&add_auth_headers(&user)[1].0, &add_auth_headers(&user)[1].1)
             .await;
 
         response.assert_status_ok();
@@ -599,7 +600,8 @@ mod tests {
     ) -> crate::types::InferenceEndpointId {
         let response = app
             .get("/admin/api/v1/endpoints")
-            .add_header(add_auth_headers(user).0, add_auth_headers(user).1)
+            .add_header(&add_auth_headers(user)[0].0, &add_auth_headers(user)[0].1)
+            .add_header(&add_auth_headers(user)[1].0, &add_auth_headers(user)[1].1)
             .await;
 
         response.assert_status_ok();
@@ -616,7 +618,8 @@ mod tests {
 
         let response = app
             .get(&format!("/admin/api/v1/endpoints/{test_endpoint_id}"))
-            .add_header(add_auth_headers(&user).0, add_auth_headers(&user).1)
+            .add_header(&add_auth_headers(&user)[0].0, &add_auth_headers(&user)[0].1)
+            .add_header(&add_auth_headers(&user)[1].0, &add_auth_headers(&user)[1].1)
             .await;
 
         response.assert_status_ok();
@@ -634,7 +637,8 @@ mod tests {
 
         let response = app
             .get(&format!("/admin/api/v1/endpoints/{non_existent_id}"))
-            .add_header(add_auth_headers(&user).0, add_auth_headers(&user).1)
+            .add_header(&add_auth_headers(&user)[0].0, &add_auth_headers(&user)[0].1)
+            .add_header(&add_auth_headers(&user)[1].0, &add_auth_headers(&user)[1].1)
             .await;
 
         response.assert_status_not_found();
@@ -653,7 +657,8 @@ mod tests {
 
         let response = app
             .patch(&format!("/admin/api/v1/endpoints/{test_endpoint_id}"))
-            .add_header(add_auth_headers(&admin_user).0, add_auth_headers(&admin_user).1)
+            .add_header(&add_auth_headers(&admin_user)[0].0, &add_auth_headers(&admin_user)[0].1)
+            .add_header(&add_auth_headers(&admin_user)[1].0, &add_auth_headers(&admin_user)[1].1)
             .json(&update)
             .await;
 
@@ -676,7 +681,8 @@ mod tests {
 
         let response = app
             .patch(&format!("/admin/api/v1/endpoints/{test_endpoint_id}"))
-            .add_header(add_auth_headers(&user).0, add_auth_headers(&user).1)
+            .add_header(&add_auth_headers(&user)[0].0, &add_auth_headers(&user)[0].1)
+            .add_header(&add_auth_headers(&user)[1].0, &add_auth_headers(&user)[1].1)
             .json(&update)
             .await;
 
@@ -696,7 +702,8 @@ mod tests {
 
         let response = app
             .patch(&format!("/admin/api/v1/endpoints/{non_existent_id}"))
-            .add_header(add_auth_headers(&admin_user).0, add_auth_headers(&admin_user).1)
+            .add_header(&add_auth_headers(&admin_user)[0].0, &add_auth_headers(&admin_user)[0].1)
+            .add_header(&add_auth_headers(&admin_user)[1].0, &add_auth_headers(&admin_user)[1].1)
             .json(&update)
             .await;
 
@@ -714,7 +721,8 @@ mod tests {
 
         let response = app
             .patch(&format!("/admin/api/v1/endpoints/{test_endpoint_id}"))
-            .add_header(add_auth_headers(&admin_user).0, add_auth_headers(&admin_user).1)
+            .add_header(&add_auth_headers(&admin_user)[0].0, &add_auth_headers(&admin_user)[0].1)
+            .add_header(&add_auth_headers(&admin_user)[1].0, &add_auth_headers(&admin_user)[1].1)
             .json(&update)
             .await;
 
@@ -736,7 +744,8 @@ mod tests {
 
         let response = app
             .patch(&format!("/admin/api/v1/endpoints/{test_endpoint_id}"))
-            .add_header(add_auth_headers(&admin_user).0, add_auth_headers(&admin_user).1)
+            .add_header(&add_auth_headers(&admin_user)[0].0, &add_auth_headers(&admin_user)[0].1)
+            .add_header(&add_auth_headers(&admin_user)[1].0, &add_auth_headers(&admin_user)[1].1)
             .json(&update)
             .await;
 
@@ -754,7 +763,8 @@ mod tests {
         // First get the list to find the test endpoint
         let response = app
             .get("/admin/api/v1/endpoints")
-            .add_header(add_auth_headers(&user).0, add_auth_headers(&user).1)
+            .add_header(&add_auth_headers(&user)[0].0, &add_auth_headers(&user)[0].1)
+            .add_header(&add_auth_headers(&user)[1].0, &add_auth_headers(&user)[1].1)
             .await;
 
         response.assert_status_ok();
@@ -767,7 +777,8 @@ mod tests {
         // Get endpoint by ID directly
         let response = app
             .get(&format!("/admin/api/v1/endpoints/{test_endpoint_id}"))
-            .add_header(add_auth_headers(&user).0, add_auth_headers(&user).1)
+            .add_header(&add_auth_headers(&user)[0].0, &add_auth_headers(&user)[0].1)
+            .add_header(&add_auth_headers(&user)[1].0, &add_auth_headers(&user)[1].1)
             .await;
 
         response.assert_status_ok();
@@ -785,7 +796,8 @@ mod tests {
         // Test with limit
         let response = app
             .get("/admin/api/v1/endpoints?limit=10")
-            .add_header(add_auth_headers(&user).0, add_auth_headers(&user).1)
+            .add_header(&add_auth_headers(&user)[0].0, &add_auth_headers(&user)[0].1)
+            .add_header(&add_auth_headers(&user)[1].0, &add_auth_headers(&user)[1].1)
             .await;
 
         response.assert_status_ok();
@@ -795,7 +807,8 @@ mod tests {
         // Test with skip and limit
         let response = app
             .get("/admin/api/v1/endpoints?skip=0&limit=5")
-            .add_header(add_auth_headers(&user).0, add_auth_headers(&user).1)
+            .add_header(&add_auth_headers(&user)[0].0, &add_auth_headers(&user)[0].1)
+            .add_header(&add_auth_headers(&user)[1].0, &add_auth_headers(&user)[1].1)
             .await;
 
         response.assert_status_ok();
@@ -805,7 +818,8 @@ mod tests {
         // Test skip beyond available endpoints
         let response = app
             .get("/admin/api/v1/endpoints?skip=1000&limit=10")
-            .add_header(add_auth_headers(&user).0, add_auth_headers(&user).1)
+            .add_header(&add_auth_headers(&user)[0].0, &add_auth_headers(&user)[0].1)
+            .add_header(&add_auth_headers(&user)[1].0, &add_auth_headers(&user)[1].1)
             .await;
 
         response.assert_status_ok();
@@ -827,7 +841,8 @@ mod tests {
 
         let response = app
             .post("/admin/api/v1/endpoints/validate")
-            .add_header(add_auth_headers(&admin_user).0, add_auth_headers(&admin_user).1)
+            .add_header(&add_auth_headers(&admin_user)[0].0, &add_auth_headers(&admin_user)[0].1)
+            .add_header(&add_auth_headers(&admin_user)[1].0, &add_auth_headers(&admin_user)[1].1)
             .json(&validate_request)
             .await;
 
@@ -850,7 +865,8 @@ mod tests {
 
         let response = app
             .post("/admin/api/v1/endpoints/validate")
-            .add_header(add_auth_headers(&admin_user).0, add_auth_headers(&admin_user).1)
+            .add_header(&add_auth_headers(&admin_user)[0].0, &add_auth_headers(&admin_user)[0].1)
+            .add_header(&add_auth_headers(&admin_user)[1].0, &add_auth_headers(&admin_user)[1].1)
             .json(&validate_request)
             .await;
 
@@ -871,7 +887,8 @@ mod tests {
 
         let response = app
             .post("/admin/api/v1/endpoints/validate")
-            .add_header(add_auth_headers(&admin_user).0, add_auth_headers(&admin_user).1)
+            .add_header(&add_auth_headers(&admin_user)[0].0, &add_auth_headers(&admin_user)[0].1)
+            .add_header(&add_auth_headers(&admin_user)[1].0, &add_auth_headers(&admin_user)[1].1)
             .json(&validate_request)
             .await;
 
@@ -894,7 +911,8 @@ mod tests {
 
         let response = app
             .post("/admin/api/v1/endpoints/validate")
-            .add_header(add_auth_headers(&admin_user).0, add_auth_headers(&admin_user).1)
+            .add_header(&add_auth_headers(&admin_user)[0].0, &add_auth_headers(&admin_user)[0].1)
+            .add_header(&add_auth_headers(&admin_user)[1].0, &add_auth_headers(&admin_user)[1].1)
             .json(&validate_request)
             .await;
 
@@ -915,7 +933,8 @@ mod tests {
 
         let response = app
             .post("/admin/api/v1/endpoints/validate")
-            .add_header(add_auth_headers(&user).0, add_auth_headers(&user).1)
+            .add_header(&add_auth_headers(&user)[0].0, &add_auth_headers(&user)[0].1)
+            .add_header(&add_auth_headers(&user)[1].0, &add_auth_headers(&user)[1].1)
             .json(&validate_request)
             .await;
 
@@ -938,7 +957,8 @@ mod tests {
 
         let response = app
             .post("/admin/api/v1/endpoints")
-            .add_header(add_auth_headers(&admin_user).0, add_auth_headers(&admin_user).1)
+            .add_header(&add_auth_headers(&admin_user)[0].0, &add_auth_headers(&admin_user)[0].1)
+            .add_header(&add_auth_headers(&admin_user)[1].0, &add_auth_headers(&admin_user)[1].1)
             .json(&create_request)
             .await;
 
@@ -965,7 +985,8 @@ mod tests {
 
         let response = app
             .post("/admin/api/v1/endpoints")
-            .add_header(add_auth_headers(&admin_user).0, add_auth_headers(&admin_user).1)
+            .add_header(&add_auth_headers(&admin_user)[0].0, &add_auth_headers(&admin_user)[0].1)
+            .add_header(&add_auth_headers(&admin_user)[1].0, &add_auth_headers(&admin_user)[1].1)
             .json(&create_request)
             .await;
 
@@ -992,7 +1013,8 @@ mod tests {
 
         let response = app
             .post("/admin/api/v1/endpoints")
-            .add_header(add_auth_headers(&admin_user).0, add_auth_headers(&admin_user).1)
+            .add_header(&add_auth_headers(&admin_user)[0].0, &add_auth_headers(&admin_user)[0].1)
+            .add_header(&add_auth_headers(&admin_user)[1].0, &add_auth_headers(&admin_user)[1].1)
             .json(&create_request)
             .await;
 
@@ -1012,7 +1034,8 @@ mod tests {
 
         let response = app
             .post("/admin/api/v1/endpoints")
-            .add_header(add_auth_headers(&user).0, add_auth_headers(&user).1)
+            .add_header(&add_auth_headers(&user)[0].0, &add_auth_headers(&user)[0].1)
+            .add_header(&add_auth_headers(&user)[1].0, &add_auth_headers(&user)[1].1)
             .json(&create_request)
             .await;
 
@@ -1033,7 +1056,8 @@ mod tests {
 
         let create_response = app
             .post("/admin/api/v1/endpoints")
-            .add_header(add_auth_headers(&admin_user).0, add_auth_headers(&admin_user).1)
+            .add_header(&add_auth_headers(&admin_user)[0].0, &add_auth_headers(&admin_user)[0].1)
+            .add_header(&add_auth_headers(&admin_user)[1].0, &add_auth_headers(&admin_user)[1].1)
             .json(&create_request)
             .await;
 
@@ -1043,7 +1067,8 @@ mod tests {
         // Now delete it
         let delete_response = app
             .delete(&format!("/admin/api/v1/endpoints/{}", created_endpoint.id))
-            .add_header(add_auth_headers(&admin_user).0, add_auth_headers(&admin_user).1)
+            .add_header(&add_auth_headers(&admin_user)[0].0, &add_auth_headers(&admin_user)[0].1)
+            .add_header(&add_auth_headers(&admin_user)[1].0, &add_auth_headers(&admin_user)[1].1)
             .await;
 
         delete_response.assert_status(axum::http::StatusCode::NO_CONTENT);
@@ -1051,7 +1076,8 @@ mod tests {
         // Verify it's deleted by trying to get it
         let get_response = app
             .get(&format!("/admin/api/v1/endpoints/{}", created_endpoint.id))
-            .add_header(add_auth_headers(&admin_user).0, add_auth_headers(&admin_user).1)
+            .add_header(&add_auth_headers(&admin_user)[0].0, &add_auth_headers(&admin_user)[0].1)
+            .add_header(&add_auth_headers(&admin_user)[1].0, &add_auth_headers(&admin_user)[1].1)
             .await;
 
         get_response.assert_status_not_found();
@@ -1066,7 +1092,8 @@ mod tests {
 
         let response = app
             .delete(&format!("/admin/api/v1/endpoints/{fake_endpoint_id}"))
-            .add_header(add_auth_headers(&admin_user).0, add_auth_headers(&admin_user).1)
+            .add_header(&add_auth_headers(&admin_user)[0].0, &add_auth_headers(&admin_user)[0].1)
+            .add_header(&add_auth_headers(&admin_user)[1].0, &add_auth_headers(&admin_user)[1].1)
             .await;
 
         response.assert_status_not_found();
@@ -1087,7 +1114,8 @@ mod tests {
 
         let create_response = app
             .post("/admin/api/v1/endpoints")
-            .add_header(add_auth_headers(&admin_user).0, add_auth_headers(&admin_user).1)
+            .add_header(&add_auth_headers(&admin_user)[0].0, &add_auth_headers(&admin_user)[0].1)
+            .add_header(&add_auth_headers(&admin_user)[1].0, &add_auth_headers(&admin_user)[1].1)
             .json(&create_request)
             .await;
 
@@ -1097,7 +1125,8 @@ mod tests {
         // Try to delete as non-admin
         let delete_response = app
             .delete(&format!("/admin/api/v1/endpoints/{}", created_endpoint.id))
-            .add_header(add_auth_headers(&user).0, add_auth_headers(&user).1)
+            .add_header(&add_auth_headers(&user)[0].0, &add_auth_headers(&user)[0].1)
+            .add_header(&add_auth_headers(&user)[1].0, &add_auth_headers(&user)[1].1)
             .await;
 
         delete_response.assert_status_forbidden();
@@ -1105,7 +1134,8 @@ mod tests {
         // Verify it still exists
         let get_response = app
             .get(&format!("/admin/api/v1/endpoints/{}", created_endpoint.id))
-            .add_header(add_auth_headers(&admin_user).0, add_auth_headers(&admin_user).1)
+            .add_header(&add_auth_headers(&admin_user)[0].0, &add_auth_headers(&admin_user)[0].1)
+            .add_header(&add_auth_headers(&admin_user)[1].0, &add_auth_headers(&admin_user)[1].1)
             .await;
 
         get_response.assert_status_ok();
@@ -1120,7 +1150,8 @@ mod tests {
 
         let response = app
             .post(&format!("/admin/api/v1/endpoints/{test_endpoint_id}/synchronize"))
-            .add_header(add_auth_headers(&admin_user).0, add_auth_headers(&admin_user).1)
+            .add_header(&add_auth_headers(&admin_user)[0].0, &add_auth_headers(&admin_user)[0].1)
+            .add_header(&add_auth_headers(&admin_user)[1].0, &add_auth_headers(&admin_user)[1].1)
             .await;
 
         // The sync might fail due to network issues, but we test the handler structure
@@ -1139,7 +1170,8 @@ mod tests {
 
         let response = app
             .post(&format!("/admin/api/v1/endpoints/{fake_endpoint_id}/synchronize"))
-            .add_header(add_auth_headers(&admin_user).0, add_auth_headers(&admin_user).1)
+            .add_header(&add_auth_headers(&admin_user)[0].0, &add_auth_headers(&admin_user)[0].1)
+            .add_header(&add_auth_headers(&admin_user)[1].0, &add_auth_headers(&admin_user)[1].1)
             .await;
 
         // Should return an error status when trying to sync non-existent endpoint
@@ -1155,7 +1187,8 @@ mod tests {
 
         let response = app
             .post(&format!("/admin/api/v1/endpoints/{test_endpoint_id}/synchronize"))
-            .add_header(add_auth_headers(&user).0, add_auth_headers(&user).1)
+            .add_header(&add_auth_headers(&user)[0].0, &add_auth_headers(&user)[0].1)
+            .add_header(&add_auth_headers(&user)[1].0, &add_auth_headers(&user)[1].1)
             .await;
 
         response.assert_status_forbidden();
@@ -1170,7 +1203,8 @@ mod tests {
         // StandardUser should be able to list endpoints (has ReadAll for Endpoints)
         let response = app
             .get("/admin/api/v1/endpoints")
-            .add_header(add_auth_headers(&standard_user).0, add_auth_headers(&standard_user).1)
+            .add_header(&add_auth_headers(&standard_user)[0].0, &add_auth_headers(&standard_user)[0].1)
+            .add_header(&add_auth_headers(&standard_user)[1].0, &add_auth_headers(&standard_user)[1].1)
             .await;
 
         response.assert_status_ok();
@@ -1179,7 +1213,8 @@ mod tests {
         let test_endpoint_id = get_test_endpoint_id(&app, &standard_user).await;
         let response = app
             .get(&format!("/admin/api/v1/endpoints/{test_endpoint_id}"))
-            .add_header(add_auth_headers(&standard_user).0, add_auth_headers(&standard_user).1)
+            .add_header(&add_auth_headers(&standard_user)[0].0, &add_auth_headers(&standard_user)[0].1)
+            .add_header(&add_auth_headers(&standard_user)[1].0, &add_auth_headers(&standard_user)[1].1)
             .await;
 
         response.assert_status_ok();
@@ -1192,7 +1227,8 @@ mod tests {
 
         let response = app
             .post("/admin/api/v1/endpoints")
-            .add_header(add_auth_headers(&standard_user).0, add_auth_headers(&standard_user).1)
+            .add_header(&add_auth_headers(&standard_user)[0].0, &add_auth_headers(&standard_user)[0].1)
+            .add_header(&add_auth_headers(&standard_user)[1].0, &add_auth_headers(&standard_user)[1].1)
             .json(&create_request)
             .await;
 
@@ -1202,7 +1238,8 @@ mod tests {
         let update = json!({"name": "Updated by Standard User"});
         let response = app
             .patch(&format!("/admin/api/v1/endpoints/{test_endpoint_id}"))
-            .add_header(add_auth_headers(&standard_user).0, add_auth_headers(&standard_user).1)
+            .add_header(&add_auth_headers(&standard_user)[0].0, &add_auth_headers(&standard_user)[0].1)
+            .add_header(&add_auth_headers(&standard_user)[1].0, &add_auth_headers(&standard_user)[1].1)
             .json(&update)
             .await;
 
@@ -1211,7 +1248,8 @@ mod tests {
         // StandardUser should NOT be able to delete endpoints
         let response = app
             .delete(&format!("/admin/api/v1/endpoints/{test_endpoint_id}"))
-            .add_header(add_auth_headers(&standard_user).0, add_auth_headers(&standard_user).1)
+            .add_header(&add_auth_headers(&standard_user)[0].0, &add_auth_headers(&standard_user)[0].1)
+            .add_header(&add_auth_headers(&standard_user)[1].0, &add_auth_headers(&standard_user)[1].1)
             .await;
 
         response.assert_status_forbidden();
@@ -1224,7 +1262,8 @@ mod tests {
 
         let response = app
             .post("/admin/api/v1/endpoints/validate")
-            .add_header(add_auth_headers(&standard_user).0, add_auth_headers(&standard_user).1)
+            .add_header(&add_auth_headers(&standard_user)[0].0, &add_auth_headers(&standard_user)[0].1)
+            .add_header(&add_auth_headers(&standard_user)[1].0, &add_auth_headers(&standard_user)[1].1)
             .json(&validate_request)
             .await;
 
@@ -1233,7 +1272,8 @@ mod tests {
         // StandardUser should NOT be able to synchronize endpoints
         let response = app
             .post(&format!("/admin/api/v1/endpoints/{test_endpoint_id}/synchronize"))
-            .add_header(add_auth_headers(&standard_user).0, add_auth_headers(&standard_user).1)
+            .add_header(&add_auth_headers(&standard_user)[0].0, &add_auth_headers(&standard_user)[0].1)
+            .add_header(&add_auth_headers(&standard_user)[1].0, &add_auth_headers(&standard_user)[1].1)
             .await;
 
         response.assert_status_forbidden();
@@ -1248,7 +1288,8 @@ mod tests {
         // RequestViewer should NOT be able to list endpoints (no Endpoints permissions)
         let response = app
             .get("/admin/api/v1/endpoints")
-            .add_header(add_auth_headers(&request_viewer).0, add_auth_headers(&request_viewer).1)
+            .add_header(&add_auth_headers(&request_viewer)[0].0, &add_auth_headers(&request_viewer)[0].1)
+            .add_header(&add_auth_headers(&request_viewer)[1].0, &add_auth_headers(&request_viewer)[1].1)
             .await;
 
         response.assert_status_forbidden();
@@ -1259,7 +1300,8 @@ mod tests {
 
         let response = app
             .get(&format!("/admin/api/v1/endpoints/{test_endpoint_id}"))
-            .add_header(add_auth_headers(&request_viewer).0, add_auth_headers(&request_viewer).1)
+            .add_header(&add_auth_headers(&request_viewer)[0].0, &add_auth_headers(&request_viewer)[0].1)
+            .add_header(&add_auth_headers(&request_viewer)[1].0, &add_auth_headers(&request_viewer)[1].1)
             .await;
 
         response.assert_status_forbidden();
@@ -1272,7 +1314,8 @@ mod tests {
 
         let response = app
             .post("/admin/api/v1/endpoints")
-            .add_header(add_auth_headers(&request_viewer).0, add_auth_headers(&request_viewer).1)
+            .add_header(&add_auth_headers(&request_viewer)[0].0, &add_auth_headers(&request_viewer)[0].1)
+            .add_header(&add_auth_headers(&request_viewer)[1].0, &add_auth_headers(&request_viewer)[1].1)
             .json(&create_request)
             .await;
 
@@ -1286,7 +1329,8 @@ mod tests {
 
         let response = app
             .post("/admin/api/v1/endpoints/validate")
-            .add_header(add_auth_headers(&request_viewer).0, add_auth_headers(&request_viewer).1)
+            .add_header(&add_auth_headers(&request_viewer)[0].0, &add_auth_headers(&request_viewer)[0].1)
+            .add_header(&add_auth_headers(&request_viewer)[1].0, &add_auth_headers(&request_viewer)[1].1)
             .json(&validate_request)
             .await;
 
@@ -1303,7 +1347,8 @@ mod tests {
 
         let response = app
             .get("/admin/api/v1/endpoints")
-            .add_header(add_auth_headers(&multi_role_user).0, add_auth_headers(&multi_role_user).1)
+            .add_header(&add_auth_headers(&multi_role_user)[0].0, &add_auth_headers(&multi_role_user)[0].1)
+            .add_header(&add_auth_headers(&multi_role_user)[1].0, &add_auth_headers(&multi_role_user)[1].1)
             .await;
 
         response.assert_status_ok();
@@ -1316,7 +1361,8 @@ mod tests {
 
         let response = app
             .post("/admin/api/v1/endpoints")
-            .add_header(add_auth_headers(&multi_role_user).0, add_auth_headers(&multi_role_user).1)
+            .add_header(&add_auth_headers(&multi_role_user)[0].0, &add_auth_headers(&multi_role_user)[0].1)
+            .add_header(&add_auth_headers(&multi_role_user)[1].0, &add_auth_headers(&multi_role_user)[1].1)
             .json(&create_request)
             .await;
 
@@ -1327,7 +1373,8 @@ mod tests {
 
         let response = app
             .post("/admin/api/v1/endpoints")
-            .add_header(add_auth_headers(&platform_user).0, add_auth_headers(&platform_user).1)
+            .add_header(&add_auth_headers(&platform_user)[0].0, &add_auth_headers(&platform_user)[0].1)
+            .add_header(&add_auth_headers(&platform_user)[1].0, &add_auth_headers(&platform_user)[1].1)
             .json(&create_request)
             .await;
 
@@ -1338,7 +1385,8 @@ mod tests {
         let update = json!({"name": "Updated Platform Endpoint"});
         let response = app
             .patch(&format!("/admin/api/v1/endpoints/{}", created_endpoint.id))
-            .add_header(add_auth_headers(&platform_user).0, add_auth_headers(&platform_user).1)
+            .add_header(&add_auth_headers(&platform_user)[0].0, &add_auth_headers(&platform_user)[0].1)
+            .add_header(&add_auth_headers(&platform_user)[1].0, &add_auth_headers(&platform_user)[1].1)
             .json(&update)
             .await;
 
@@ -1352,7 +1400,8 @@ mod tests {
 
         let response = app
             .post("/admin/api/v1/endpoints/validate")
-            .add_header(add_auth_headers(&platform_user).0, add_auth_headers(&platform_user).1)
+            .add_header(&add_auth_headers(&platform_user)[0].0, &add_auth_headers(&platform_user)[0].1)
+            .add_header(&add_auth_headers(&platform_user)[1].0, &add_auth_headers(&platform_user)[1].1)
             .json(&validate_request)
             .await;
 
@@ -1362,7 +1411,8 @@ mod tests {
         // Should be able to synchronize
         let response = app
             .post(&format!("/admin/api/v1/endpoints/{}/synchronize", created_endpoint.id))
-            .add_header(add_auth_headers(&platform_user).0, add_auth_headers(&platform_user).1)
+            .add_header(&add_auth_headers(&platform_user)[0].0, &add_auth_headers(&platform_user)[0].1)
+            .add_header(&add_auth_headers(&platform_user)[1].0, &add_auth_headers(&platform_user)[1].1)
             .await;
 
         // Might fail due to network, but should not be forbidden
@@ -1371,7 +1421,8 @@ mod tests {
         // Should be able to delete
         let response = app
             .delete(&format!("/admin/api/v1/endpoints/{}", created_endpoint.id))
-            .add_header(add_auth_headers(&platform_user).0, add_auth_headers(&platform_user).1)
+            .add_header(&add_auth_headers(&platform_user)[0].0, &add_auth_headers(&platform_user)[0].1)
+            .add_header(&add_auth_headers(&platform_user)[1].0, &add_auth_headers(&platform_user)[1].1)
             .await;
 
         response.assert_status(axum::http::StatusCode::NO_CONTENT);
@@ -1394,7 +1445,14 @@ mod tests {
 
         let response = app
             .post("/admin/api/v1/endpoints")
-            .add_header(add_auth_headers(&platform_manager1).0, add_auth_headers(&platform_manager1).1)
+            .add_header(
+                &add_auth_headers(&platform_manager1)[0].0,
+                &add_auth_headers(&platform_manager1)[0].1,
+            )
+            .add_header(
+                &add_auth_headers(&platform_manager1)[1].0,
+                &add_auth_headers(&platform_manager1)[1].1,
+            )
             .json(&create_request)
             .await;
 
@@ -1406,7 +1464,14 @@ mod tests {
         let update = json!({"name": "Updated by PM2"});
         let response = app
             .patch(&format!("/admin/api/v1/endpoints/{}", endpoint.id))
-            .add_header(add_auth_headers(&platform_manager2).0, add_auth_headers(&platform_manager2).1)
+            .add_header(
+                &add_auth_headers(&platform_manager2)[0].0,
+                &add_auth_headers(&platform_manager2)[0].1,
+            )
+            .add_header(
+                &add_auth_headers(&platform_manager2)[1].0,
+                &add_auth_headers(&platform_manager2)[1].1,
+            )
             .json(&update)
             .await;
 
@@ -1415,7 +1480,8 @@ mod tests {
         // Standard User should only be able to read it
         let response = app
             .get(&format!("/admin/api/v1/endpoints/{}", endpoint.id))
-            .add_header(add_auth_headers(&standard_user).0, add_auth_headers(&standard_user).1)
+            .add_header(&add_auth_headers(&standard_user)[0].0, &add_auth_headers(&standard_user)[0].1)
+            .add_header(&add_auth_headers(&standard_user)[1].0, &add_auth_headers(&standard_user)[1].1)
             .await;
 
         response.assert_status_ok();
@@ -1425,7 +1491,8 @@ mod tests {
         // Standard User should NOT be able to delete it
         let response = app
             .delete(&format!("/admin/api/v1/endpoints/{}", endpoint.id))
-            .add_header(add_auth_headers(&standard_user).0, add_auth_headers(&standard_user).1)
+            .add_header(&add_auth_headers(&standard_user)[0].0, &add_auth_headers(&standard_user)[0].1)
+            .add_header(&add_auth_headers(&standard_user)[1].0, &add_auth_headers(&standard_user)[1].1)
             .await;
 
         response.assert_status_forbidden();
@@ -1433,7 +1500,14 @@ mod tests {
         // Platform Manager 2 should be able to delete it
         let response = app
             .delete(&format!("/admin/api/v1/endpoints/{}", endpoint.id))
-            .add_header(add_auth_headers(&platform_manager2).0, add_auth_headers(&platform_manager2).1)
+            .add_header(
+                &add_auth_headers(&platform_manager2)[0].0,
+                &add_auth_headers(&platform_manager2)[0].1,
+            )
+            .add_header(
+                &add_auth_headers(&platform_manager2)[1].0,
+                &add_auth_headers(&platform_manager2)[1].1,
+            )
             .await;
 
         response.assert_status(axum::http::StatusCode::NO_CONTENT);
@@ -1456,7 +1530,8 @@ mod tests {
 
         let response = app
             .post("/admin/api/v1/endpoints")
-            .add_header(add_auth_headers(&platform_manager).0, add_auth_headers(&platform_manager).1)
+            .add_header(&add_auth_headers(&platform_manager)[0].0, &add_auth_headers(&platform_manager)[0].1)
+            .add_header(&add_auth_headers(&platform_manager)[1].0, &add_auth_headers(&platform_manager)[1].1)
             .json(&create_request)
             .await;
 
@@ -1473,7 +1548,8 @@ mod tests {
         // Only PlatformManager should be able to validate
         let response = app
             .post("/admin/api/v1/endpoints/validate")
-            .add_header(add_auth_headers(&platform_manager).0, add_auth_headers(&platform_manager).1)
+            .add_header(&add_auth_headers(&platform_manager)[0].0, &add_auth_headers(&platform_manager)[0].1)
+            .add_header(&add_auth_headers(&platform_manager)[1].0, &add_auth_headers(&platform_manager)[1].1)
             .json(&validate_new)
             .await;
 
@@ -1482,7 +1558,8 @@ mod tests {
         // StandardUser should be forbidden
         let response = app
             .post("/admin/api/v1/endpoints/validate")
-            .add_header(add_auth_headers(&standard_user).0, add_auth_headers(&standard_user).1)
+            .add_header(&add_auth_headers(&standard_user)[0].0, &add_auth_headers(&standard_user)[0].1)
+            .add_header(&add_auth_headers(&standard_user)[1].0, &add_auth_headers(&standard_user)[1].1)
             .json(&validate_new)
             .await;
 
@@ -1491,7 +1568,8 @@ mod tests {
         // RequestViewer should be forbidden
         let response = app
             .post("/admin/api/v1/endpoints/validate")
-            .add_header(add_auth_headers(&request_viewer).0, add_auth_headers(&request_viewer).1)
+            .add_header(&add_auth_headers(&request_viewer)[0].0, &add_auth_headers(&request_viewer)[0].1)
+            .add_header(&add_auth_headers(&request_viewer)[1].0, &add_auth_headers(&request_viewer)[1].1)
             .json(&validate_new)
             .await;
 
@@ -1506,7 +1584,8 @@ mod tests {
         // Only PlatformManager should be able to validate existing endpoints
         let response = app
             .post("/admin/api/v1/endpoints/validate")
-            .add_header(add_auth_headers(&platform_manager).0, add_auth_headers(&platform_manager).1)
+            .add_header(&add_auth_headers(&platform_manager)[0].0, &add_auth_headers(&platform_manager)[0].1)
+            .add_header(&add_auth_headers(&platform_manager)[1].0, &add_auth_headers(&platform_manager)[1].1)
             .json(&validate_existing)
             .await;
 
@@ -1515,7 +1594,8 @@ mod tests {
         // Others should be forbidden
         let response = app
             .post("/admin/api/v1/endpoints/validate")
-            .add_header(add_auth_headers(&standard_user).0, add_auth_headers(&standard_user).1)
+            .add_header(&add_auth_headers(&standard_user)[0].0, &add_auth_headers(&standard_user)[0].1)
+            .add_header(&add_auth_headers(&standard_user)[1].0, &add_auth_headers(&standard_user)[1].1)
             .json(&validate_existing)
             .await;
 
@@ -1536,7 +1616,8 @@ mod tests {
         // Only PlatformManager should be able to synchronize
         let response = app
             .post(&format!("/admin/api/v1/endpoints/{test_endpoint_id}/synchronize"))
-            .add_header(add_auth_headers(&platform_manager).0, add_auth_headers(&platform_manager).1)
+            .add_header(&add_auth_headers(&platform_manager)[0].0, &add_auth_headers(&platform_manager)[0].1)
+            .add_header(&add_auth_headers(&platform_manager)[1].0, &add_auth_headers(&platform_manager)[1].1)
             .await;
 
         assert!(response.status_code() != axum::http::StatusCode::FORBIDDEN);
@@ -1544,7 +1625,8 @@ mod tests {
         // StandardUser should be forbidden
         let response = app
             .post(&format!("/admin/api/v1/endpoints/{test_endpoint_id}/synchronize"))
-            .add_header(add_auth_headers(&standard_user).0, add_auth_headers(&standard_user).1)
+            .add_header(&add_auth_headers(&standard_user)[0].0, &add_auth_headers(&standard_user)[0].1)
+            .add_header(&add_auth_headers(&standard_user)[1].0, &add_auth_headers(&standard_user)[1].1)
             .await;
 
         response.assert_status_forbidden();
@@ -1552,7 +1634,8 @@ mod tests {
         // RequestViewer should be forbidden
         let response = app
             .post(&format!("/admin/api/v1/endpoints/{test_endpoint_id}/synchronize"))
-            .add_header(add_auth_headers(&request_viewer).0, add_auth_headers(&request_viewer).1)
+            .add_header(&add_auth_headers(&request_viewer)[0].0, &add_auth_headers(&request_viewer)[0].1)
+            .add_header(&add_auth_headers(&request_viewer)[1].0, &add_auth_headers(&request_viewer)[1].1)
             .await;
 
         response.assert_status_forbidden();
@@ -1560,7 +1643,8 @@ mod tests {
         // Multi-role user without PlatformManager should be forbidden
         let response = app
             .post(&format!("/admin/api/v1/endpoints/{test_endpoint_id}/synchronize"))
-            .add_header(add_auth_headers(&multi_role_user).0, add_auth_headers(&multi_role_user).1)
+            .add_header(&add_auth_headers(&multi_role_user)[0].0, &add_auth_headers(&multi_role_user)[0].1)
+            .add_header(&add_auth_headers(&multi_role_user)[1].0, &add_auth_headers(&multi_role_user)[1].1)
             .await;
 
         response.assert_status_forbidden();
@@ -1575,7 +1659,8 @@ mod tests {
         // Standard user should be able to read endpoints
         let response = app
             .get("/admin/api/v1/endpoints")
-            .add_header(add_auth_headers(&standard_user).0, add_auth_headers(&standard_user).1)
+            .add_header(&add_auth_headers(&standard_user)[0].0, &add_auth_headers(&standard_user)[0].1)
+            .add_header(&add_auth_headers(&standard_user)[1].0, &add_auth_headers(&standard_user)[1].1)
             .await;
         response.assert_status_ok();
 
@@ -1586,7 +1671,8 @@ mod tests {
         });
         let response = app
             .post("/admin/api/v1/endpoints")
-            .add_header(add_auth_headers(&standard_user).0, add_auth_headers(&standard_user).1)
+            .add_header(&add_auth_headers(&standard_user)[0].0, &add_auth_headers(&standard_user)[0].1)
+            .add_header(&add_auth_headers(&standard_user)[1].0, &add_auth_headers(&standard_user)[1].1)
             .json(&create_request)
             .await;
         response.assert_status_forbidden();
@@ -1601,7 +1687,8 @@ mod tests {
         // Request viewer should NOT be able to read endpoints
         let response = app
             .get("/admin/api/v1/endpoints")
-            .add_header(add_auth_headers(&request_viewer).0, add_auth_headers(&request_viewer).1)
+            .add_header(&add_auth_headers(&request_viewer)[0].0, &add_auth_headers(&request_viewer)[0].1)
+            .add_header(&add_auth_headers(&request_viewer)[1].0, &add_auth_headers(&request_viewer)[1].1)
             .await;
         response.assert_status_forbidden();
 
@@ -1612,7 +1699,8 @@ mod tests {
         });
         let response = app
             .post("/admin/api/v1/endpoints")
-            .add_header(add_auth_headers(&request_viewer).0, add_auth_headers(&request_viewer).1)
+            .add_header(&add_auth_headers(&request_viewer)[0].0, &add_auth_headers(&request_viewer)[0].1)
+            .add_header(&add_auth_headers(&request_viewer)[1].0, &add_auth_headers(&request_viewer)[1].1)
             .json(&create_request)
             .await;
         response.assert_status_forbidden();
@@ -1627,7 +1715,8 @@ mod tests {
         // Multi-role user should be able to read (StandardUser permission)
         let response = app
             .get("/admin/api/v1/endpoints")
-            .add_header(add_auth_headers(&multi_role_user).0, add_auth_headers(&multi_role_user).1)
+            .add_header(&add_auth_headers(&multi_role_user)[0].0, &add_auth_headers(&multi_role_user)[0].1)
+            .add_header(&add_auth_headers(&multi_role_user)[1].0, &add_auth_headers(&multi_role_user)[1].1)
             .await;
         response.assert_status_ok();
 
@@ -1638,7 +1727,8 @@ mod tests {
         });
         let response = app
             .post("/admin/api/v1/endpoints")
-            .add_header(add_auth_headers(&multi_role_user).0, add_auth_headers(&multi_role_user).1)
+            .add_header(&add_auth_headers(&multi_role_user)[0].0, &add_auth_headers(&multi_role_user)[0].1)
+            .add_header(&add_auth_headers(&multi_role_user)[1].0, &add_auth_headers(&multi_role_user)[1].1)
             .json(&create_request)
             .await;
         response.assert_status_forbidden();
@@ -1653,7 +1743,8 @@ mod tests {
         // Platform user should be able to read
         let response = app
             .get("/admin/api/v1/endpoints")
-            .add_header(add_auth_headers(&platform_user).0, add_auth_headers(&platform_user).1)
+            .add_header(&add_auth_headers(&platform_user)[0].0, &add_auth_headers(&platform_user)[0].1)
+            .add_header(&add_auth_headers(&platform_user)[1].0, &add_auth_headers(&platform_user)[1].1)
             .await;
         response.assert_status_ok();
 
@@ -1665,7 +1756,8 @@ mod tests {
         });
         let response = app
             .post("/admin/api/v1/endpoints")
-            .add_header(add_auth_headers(&platform_user).0, add_auth_headers(&platform_user).1)
+            .add_header(&add_auth_headers(&platform_user)[0].0, &add_auth_headers(&platform_user)[0].1)
+            .add_header(&add_auth_headers(&platform_user)[1].0, &add_auth_headers(&platform_user)[1].1)
             .json(&create_request)
             .await;
         response.assert_status(axum::http::StatusCode::CREATED);
@@ -1673,7 +1765,8 @@ mod tests {
         // Clean up the endpoint we created
         let endpoint: InferenceEndpointResponse = response.json();
         app.delete(&format!("/admin/api/v1/endpoints/{}", endpoint.id))
-            .add_header(add_auth_headers(&platform_user).0, add_auth_headers(&platform_user).1)
+            .add_header(&add_auth_headers(&platform_user)[0].0, &add_auth_headers(&platform_user)[0].1)
+            .add_header(&add_auth_headers(&platform_user)[1].0, &add_auth_headers(&platform_user)[1].1)
             .await
             .assert_status(axum::http::StatusCode::NO_CONTENT);
     }
@@ -1698,7 +1791,8 @@ mod tests {
 
         let response = app
             .post("/admin/api/v1/endpoints")
-            .add_header(add_auth_headers(&admin_user).0, add_auth_headers(&admin_user).1)
+            .add_header(&add_auth_headers(&admin_user)[0].0, &add_auth_headers(&admin_user)[0].1)
+            .add_header(&add_auth_headers(&admin_user)[1].0, &add_auth_headers(&admin_user)[1].1)
             .json(&create_request)
             .await;
 
@@ -1724,7 +1818,8 @@ mod tests {
         });
         let resp1 = app
             .post("/admin/api/v1/endpoints")
-            .add_header(add_auth_headers(&admin_user).0, add_auth_headers(&admin_user).1)
+            .add_header(&add_auth_headers(&admin_user)[0].0, &add_auth_headers(&admin_user)[0].1)
+            .add_header(&add_auth_headers(&admin_user)[1].0, &add_auth_headers(&admin_user)[1].1)
             .json(&create_request1)
             .await;
         resp1.assert_status(axum::http::StatusCode::CREATED);
@@ -1740,7 +1835,8 @@ mod tests {
         });
         let resp2 = app
             .post("/admin/api/v1/endpoints")
-            .add_header(add_auth_headers(&admin_user).0, add_auth_headers(&admin_user).1)
+            .add_header(&add_auth_headers(&admin_user)[0].0, &add_auth_headers(&admin_user)[0].1)
+            .add_header(&add_auth_headers(&admin_user)[1].0, &add_auth_headers(&admin_user)[1].1)
             .json(&create_request2)
             .await;
         resp2.assert_status(axum::http::StatusCode::CONFLICT);
@@ -1763,7 +1859,8 @@ mod tests {
         });
         let resp1 = app
             .post("/admin/api/v1/endpoints")
-            .add_header(add_auth_headers(&admin_user).0, add_auth_headers(&admin_user).1)
+            .add_header(&add_auth_headers(&admin_user)[0].0, &add_auth_headers(&admin_user)[0].1)
+            .add_header(&add_auth_headers(&admin_user)[1].0, &add_auth_headers(&admin_user)[1].1)
             .json(&create1)
             .await;
         resp1.assert_status(axum::http::StatusCode::CREATED);
@@ -1777,7 +1874,8 @@ mod tests {
         });
         let resp2 = app
             .post("/admin/api/v1/endpoints")
-            .add_header(add_auth_headers(&admin_user).0, add_auth_headers(&admin_user).1)
+            .add_header(&add_auth_headers(&admin_user)[0].0, &add_auth_headers(&admin_user)[0].1)
+            .add_header(&add_auth_headers(&admin_user)[1].0, &add_auth_headers(&admin_user)[1].1)
             .json(&create2)
             .await;
         resp2.assert_status(axum::http::StatusCode::CREATED);
@@ -1789,7 +1887,8 @@ mod tests {
         });
         let resp_update = app
             .patch(&format!("/admin/api/v1/endpoints/{}", endpoint_b.id))
-            .add_header(add_auth_headers(&admin_user).0, add_auth_headers(&admin_user).1)
+            .add_header(&add_auth_headers(&admin_user)[0].0, &add_auth_headers(&admin_user)[0].1)
+            .add_header(&add_auth_headers(&admin_user)[1].0, &add_auth_headers(&admin_user)[1].1)
             .json(&update)
             .await;
         resp_update.assert_status(axum::http::StatusCode::CONFLICT);
@@ -1812,7 +1911,8 @@ mod tests {
         });
         let resp = app
             .post("/admin/api/v1/endpoints")
-            .add_header(add_auth_headers(&admin_user).0, add_auth_headers(&admin_user).1)
+            .add_header(&add_auth_headers(&admin_user)[0].0, &add_auth_headers(&admin_user)[0].1)
+            .add_header(&add_auth_headers(&admin_user)[1].0, &add_auth_headers(&admin_user)[1].1)
             .json(&create)
             .await;
         resp.assert_status(axum::http::StatusCode::CREATED);
@@ -1824,7 +1924,8 @@ mod tests {
         });
         let resp_update = app
             .patch(&format!("/admin/api/v1/endpoints/{}", endpoint.id))
-            .add_header(add_auth_headers(&admin_user).0, add_auth_headers(&admin_user).1)
+            .add_header(&add_auth_headers(&admin_user)[0].0, &add_auth_headers(&admin_user)[0].1)
+            .add_header(&add_auth_headers(&admin_user)[1].0, &add_auth_headers(&admin_user)[1].1)
             .json(&update)
             .await;
         resp_update.assert_status(axum::http::StatusCode::OK);
@@ -1847,7 +1948,8 @@ mod tests {
         });
         let resp1 = app
             .post("/admin/api/v1/endpoints")
-            .add_header(add_auth_headers(&admin_user).0, add_auth_headers(&admin_user).1)
+            .add_header(&add_auth_headers(&admin_user)[0].0, &add_auth_headers(&admin_user)[0].1)
+            .add_header(&add_auth_headers(&admin_user)[1].0, &add_auth_headers(&admin_user)[1].1)
             .json(&create1)
             .await;
         resp1.assert_status(axum::http::StatusCode::CREATED);
@@ -1861,7 +1963,8 @@ mod tests {
         });
         let resp2 = app
             .post("/admin/api/v1/endpoints")
-            .add_header(add_auth_headers(&admin_user).0, add_auth_headers(&admin_user).1)
+            .add_header(&add_auth_headers(&admin_user)[0].0, &add_auth_headers(&admin_user)[0].1)
+            .add_header(&add_auth_headers(&admin_user)[1].0, &add_auth_headers(&admin_user)[1].1)
             .json(&create2)
             .await;
         resp2.assert_status(axum::http::StatusCode::CONFLICT);
@@ -1882,7 +1985,8 @@ mod tests {
         });
         let resp = app
             .post("/admin/api/v1/endpoints")
-            .add_header(add_auth_headers(&admin_user).0, add_auth_headers(&admin_user).1)
+            .add_header(&add_auth_headers(&admin_user)[0].0, &add_auth_headers(&admin_user)[0].1)
+            .add_header(&add_auth_headers(&admin_user)[1].0, &add_auth_headers(&admin_user)[1].1)
             .json(&create)
             .await;
         resp.assert_status(axum::http::StatusCode::CREATED);
@@ -1903,7 +2007,8 @@ mod tests {
         });
         let resp = app
             .post("/admin/api/v1/endpoints")
-            .add_header(add_auth_headers(&admin_user).0, add_auth_headers(&admin_user).1)
+            .add_header(&add_auth_headers(&admin_user)[0].0, &add_auth_headers(&admin_user)[0].1)
+            .add_header(&add_auth_headers(&admin_user)[1].0, &add_auth_headers(&admin_user)[1].1)
             .json(&create)
             .await;
         resp.assert_status(axum::http::StatusCode::CREATED);
@@ -1915,7 +2020,8 @@ mod tests {
         });
         let resp_update = app
             .patch(&format!("/admin/api/v1/endpoints/{}", endpoint.id))
-            .add_header(add_auth_headers(&admin_user).0, add_auth_headers(&admin_user).1)
+            .add_header(&add_auth_headers(&admin_user)[0].0, &add_auth_headers(&admin_user)[0].1)
+            .add_header(&add_auth_headers(&admin_user)[1].0, &add_auth_headers(&admin_user)[1].1)
             .json(&update)
             .await;
         resp_update.assert_status(axum::http::StatusCode::OK);
@@ -1939,7 +2045,8 @@ mod tests {
         });
         let resp1 = app
             .post("/admin/api/v1/endpoints")
-            .add_header(add_auth_headers(&admin_user).0, add_auth_headers(&admin_user).1)
+            .add_header(&add_auth_headers(&admin_user)[0].0, &add_auth_headers(&admin_user)[0].1)
+            .add_header(&add_auth_headers(&admin_user)[1].0, &add_auth_headers(&admin_user)[1].1)
             .json(&create1)
             .await;
         resp1.assert_status(axum::http::StatusCode::CREATED);
@@ -1956,7 +2063,8 @@ mod tests {
         });
         let resp2 = app
             .post("/admin/api/v1/endpoints")
-            .add_header(add_auth_headers(&admin_user).0, add_auth_headers(&admin_user).1)
+            .add_header(&add_auth_headers(&admin_user)[0].0, &add_auth_headers(&admin_user)[0].1)
+            .add_header(&add_auth_headers(&admin_user)[1].0, &add_auth_headers(&admin_user)[1].1)
             .json(&create2)
             .await;
         resp2.assert_status(axum::http::StatusCode::CREATED);
@@ -1977,7 +2085,8 @@ mod tests {
         });
         let resp1 = app
             .post("/admin/api/v1/endpoints")
-            .add_header(add_auth_headers(&admin_user).0, add_auth_headers(&admin_user).1)
+            .add_header(&add_auth_headers(&admin_user)[0].0, &add_auth_headers(&admin_user)[0].1)
+            .add_header(&add_auth_headers(&admin_user)[1].0, &add_auth_headers(&admin_user)[1].1)
             .json(&create1)
             .await;
         resp1.assert_status(axum::http::StatusCode::CREATED);
@@ -1991,7 +2100,8 @@ mod tests {
         });
         let resp2 = app
             .post("/admin/api/v1/endpoints")
-            .add_header(add_auth_headers(&admin_user).0, add_auth_headers(&admin_user).1)
+            .add_header(&add_auth_headers(&admin_user)[0].0, &add_auth_headers(&admin_user)[0].1)
+            .add_header(&add_auth_headers(&admin_user)[1].0, &add_auth_headers(&admin_user)[1].1)
             .json(&create2)
             .await;
         resp2.assert_status(axum::http::StatusCode::CONFLICT);
@@ -2014,7 +2124,8 @@ mod tests {
         });
         let resp1 = app
             .post("/admin/api/v1/endpoints")
-            .add_header(add_auth_headers(&admin_user).0, add_auth_headers(&admin_user).1)
+            .add_header(&add_auth_headers(&admin_user)[0].0, &add_auth_headers(&admin_user)[0].1)
+            .add_header(&add_auth_headers(&admin_user)[1].0, &add_auth_headers(&admin_user)[1].1)
             .json(&create1)
             .await;
         resp1.assert_status(axum::http::StatusCode::CREATED);
@@ -2028,7 +2139,8 @@ mod tests {
         });
         let resp2 = app
             .post("/admin/api/v1/endpoints")
-            .add_header(add_auth_headers(&admin_user).0, add_auth_headers(&admin_user).1)
+            .add_header(&add_auth_headers(&admin_user)[0].0, &add_auth_headers(&admin_user)[0].1)
+            .add_header(&add_auth_headers(&admin_user)[1].0, &add_auth_headers(&admin_user)[1].1)
             .json(&create2)
             .await;
         resp2.assert_status(axum::http::StatusCode::CONFLICT);
@@ -2055,7 +2167,8 @@ mod tests {
 
         let response = app
             .post("/admin/api/v1/endpoints")
-            .add_header(add_auth_headers(&admin_user).0, add_auth_headers(&admin_user).1)
+            .add_header(&add_auth_headers(&admin_user)[0].0, &add_auth_headers(&admin_user)[0].1)
+            .add_header(&add_auth_headers(&admin_user)[1].0, &add_auth_headers(&admin_user)[1].1)
             .json(&create_request)
             .await;
 
@@ -2066,7 +2179,8 @@ mod tests {
         // For demonstration, let's assume you have a helper:
         let response = app
             .get(&format!("/admin/api/v1/models?endpoint={}", endpoint.id))
-            .add_header(add_auth_headers(&admin_user).0, add_auth_headers(&admin_user).1)
+            .add_header(&add_auth_headers(&admin_user)[0].0, &add_auth_headers(&admin_user)[0].1)
+            .add_header(&add_auth_headers(&admin_user)[1].0, &add_auth_headers(&admin_user)[1].1)
             .await;
 
         response.assert_status_ok();

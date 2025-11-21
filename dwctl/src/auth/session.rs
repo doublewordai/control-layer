@@ -78,11 +78,34 @@ pub fn verify_session_token(token: &str, config: &Config) -> Result<CurrentUser,
     let validation = Validation::default();
 
     let token_data = decode::<SessionClaims>(token, &key, &validation).map_err(|e| match e.kind() {
-        jsonwebtoken::errors::ErrorKind::ExpiredSignature => Error::Unauthenticated { message: None },
-        jsonwebtoken::errors::ErrorKind::InvalidToken => Error::Unauthenticated { message: None },
-        // TODO: I'm not sure 500 is right here, lots of the other error variants are clearly 4xx
-        _ => Error::Internal {
+        // Client errors (401) - malformed tokens, invalid claims, expired tokens
+        jsonwebtoken::errors::ErrorKind::InvalidToken
+        | jsonwebtoken::errors::ErrorKind::InvalidSignature
+        | jsonwebtoken::errors::ErrorKind::ExpiredSignature
+        | jsonwebtoken::errors::ErrorKind::MissingRequiredClaim(_)
+        | jsonwebtoken::errors::ErrorKind::InvalidIssuer
+        | jsonwebtoken::errors::ErrorKind::InvalidAudience
+        | jsonwebtoken::errors::ErrorKind::InvalidSubject
+        | jsonwebtoken::errors::ErrorKind::ImmatureSignature
+        | jsonwebtoken::errors::ErrorKind::Base64(_)
+        | jsonwebtoken::errors::ErrorKind::InvalidAlgorithm => Error::Unauthenticated { message: None },
+
+        // Server errors (500) - key issues, internal failures
+        jsonwebtoken::errors::ErrorKind::InvalidEcdsaKey
+        | jsonwebtoken::errors::ErrorKind::InvalidRsaKey(_)
+        | jsonwebtoken::errors::ErrorKind::RsaFailedSigning
+        | jsonwebtoken::errors::ErrorKind::InvalidAlgorithmName
+        | jsonwebtoken::errors::ErrorKind::InvalidKeyFormat
+        | jsonwebtoken::errors::ErrorKind::MissingAlgorithm
+        | jsonwebtoken::errors::ErrorKind::Json(_)
+        | jsonwebtoken::errors::ErrorKind::Utf8(_)
+        | jsonwebtoken::errors::ErrorKind::Crypto(_) => Error::Internal {
             operation: format!("JWT verification: {e}"),
+        },
+
+        // Catch-all for any future error variants (default to server error for safety)
+        _ => Error::Internal {
+            operation: format!("JWT verification (unknown error): {e}"),
         },
     })?;
 
@@ -162,5 +185,53 @@ mod tests {
         config.secret_key = Some("different-secret".to_string());
         let result = verify_session_token(&token, &config);
         assert!(result.is_err());
+        // Should be Unauthenticated (InvalidSignature), not Internal error
+        assert!(matches!(result.unwrap_err(), Error::Unauthenticated { .. }));
+    }
+
+    #[test]
+    fn test_verify_expired_token() {
+        let config = create_test_config();
+        let user = create_test_user();
+
+        // Manually create an expired token by setting exp in the past
+        let now = Utc::now();
+        let claims = SessionClaims {
+            sub: user.id,
+            email: user.email.clone(),
+            username: user.username.clone(),
+            roles: user.roles.clone(),
+            is_admin: user.is_admin,
+            exp: (now - chrono::Duration::seconds(3600)).timestamp(), // 1 hour ago
+            iat: now.timestamp(),
+        };
+
+        let secret_key = config.secret_key.as_ref().unwrap();
+        let key = EncodingKey::from_secret(secret_key.as_bytes());
+        let token = encode(&Header::default(), &claims, &key).unwrap();
+
+        let result = verify_session_token(&token, &config);
+        assert!(result.is_err());
+        // Should be Unauthenticated (ExpiredSignature), not Internal error
+        assert!(matches!(result.unwrap_err(), Error::Unauthenticated { .. }));
+    }
+
+    #[test]
+    fn test_verify_malformed_token() {
+        let config = create_test_config();
+
+        // Test various malformed tokens
+        let malformed_tokens = vec!["not.a.token", "invalid", "", "too.many.parts.in.this.token"];
+
+        for token in malformed_tokens {
+            let result = verify_session_token(token, &config);
+            assert!(result.is_err());
+            // Should be Unauthenticated (InvalidToken/Base64), not Internal error
+            assert!(
+                matches!(result.unwrap_err(), Error::Unauthenticated { .. }),
+                "Expected Unauthenticated error for token: {}",
+                token
+            );
+        }
     }
 }

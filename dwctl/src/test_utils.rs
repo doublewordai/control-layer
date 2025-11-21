@@ -131,7 +131,7 @@ pub async fn create_test_user(pool: &PgPool, role: Role) -> UserResponse {
     let roles = vec![role];
 
     let user_create = UserCreateDBRequest {
-        username,
+        username: username.clone(),
         email,
         display_name: Some("Test User".to_string()),
         avatar_url: None,
@@ -139,6 +139,7 @@ pub async fn create_test_user(pool: &PgPool, role: Role) -> UserResponse {
         roles,
         auth_source: "test".to_string(),
         password_hash: None,
+        external_user_id: Some(username.clone()),
     };
 
     let user = users_repo.create(&user_create).await.expect("Failed to create test user");
@@ -155,7 +156,7 @@ pub async fn create_test_admin_user(pool: &PgPool, role: Role) -> UserResponse {
     let roles = vec![role];
 
     let user_create = UserCreateDBRequest {
-        username,
+        username: username.clone(),
         email,
         display_name: Some("Test Admin User".to_string()),
         avatar_url: None,
@@ -163,6 +164,7 @@ pub async fn create_test_admin_user(pool: &PgPool, role: Role) -> UserResponse {
         roles,
         auth_source: "test".to_string(),
         password_hash: None,
+        external_user_id: Some(username.clone()),
     };
 
     let user = users_repo.create(&user_create).await.expect("Failed to create test admin user");
@@ -177,7 +179,7 @@ pub async fn create_test_user_with_roles(pool: &PgPool, roles: Vec<Role>) -> Use
     let email = format!("{username}@example.com");
 
     let user_create = UserCreateDBRequest {
-        username,
+        username: username.clone(),
         email,
         display_name: Some("Test Multi-Role User".to_string()),
         avatar_url: None,
@@ -185,6 +187,7 @@ pub async fn create_test_user_with_roles(pool: &PgPool, roles: Vec<Role>) -> Use
         roles,
         auth_source: "test".to_string(),
         password_hash: None,
+        external_user_id: Some(username.clone()),
     };
 
     let user = users_repo
@@ -194,8 +197,13 @@ pub async fn create_test_user_with_roles(pool: &PgPool, roles: Vec<Role>) -> Use
     UserResponse::from(user)
 }
 
-pub fn add_auth_headers(user: &UserResponse) -> (String, String) {
-    (ProxyHeaderAuthConfig::default().header_name, user.email.clone())
+pub fn add_auth_headers(user: &UserResponse) -> Vec<(String, String)> {
+    let config = ProxyHeaderAuthConfig::default();
+    let external_user_id = user.external_user_id.as_ref().unwrap_or(&user.username);
+    vec![
+        (config.header_name, external_user_id.clone()),
+        (config.email_header_name, user.email.clone()),
+    ]
 }
 
 pub async fn create_test_group(pool: &PgPool) -> GroupDBResponse {
@@ -246,6 +254,7 @@ pub async fn get_system_user(pool: &mut PgConnection) -> UserResponse {
         updated_at: user.updated_at,
         last_login: None,
         auth_source: user.auth_source,
+        external_user_id: None,
         groups: None, // Groups not included in test users by default
         credit_balance: None,
     }

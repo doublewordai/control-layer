@@ -25,7 +25,7 @@ export default defineConfig(({ mode }) => {
       },
     },
     server: {
-      allowedHosts: ["clay-frontend", "localhost"],
+      allowedHosts: ["clay-frontend", "localhost", "host.docker.internal"],
       hmr: {
         protocol: "ws",
         port: 5173,

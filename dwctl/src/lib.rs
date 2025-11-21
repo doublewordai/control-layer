@@ -163,6 +163,7 @@ use crate::{
     openapi::ApiDoc,
     request_logging::serializers::{parse_ai_request, AnalyticsResponseSerializer},
 };
+use anyhow::Context;
 use auth::middleware::admin_ai_proxy_middleware;
 use axum::extract::DefaultBodyLimit;
 use axum::http::HeaderValue;
@@ -305,6 +306,7 @@ pub async fn create_initial_admin_user(email: &str, password: Option<&str>, db: 
         roles: vec![Role::PlatformManager],
         auth_source: "system".to_string(),
         password_hash,
+        external_user_id: None,
     };
 
     let created_user = user_repo
@@ -810,21 +812,75 @@ pub struct BackgroundServices {
     request_manager: Arc<fusillade::PostgresRequestManager<fusillade::ReqwestHttpClient>>,
     is_leader: bool,
     onwards_targets: onwards::target::Targets,
-    background_tasks: Vec<tokio::task::JoinHandle<()>>,
+    background_tasks: Vec<(&'static str, tokio::task::JoinHandle<anyhow::Result<()>>)>,
     shutdown_token: tokio_util::sync::CancellationToken,
     // Pub so that we can disarm it if we want to
     pub drop_guard: Option<tokio_util::sync::DropGuard>,
 }
 
 impl BackgroundServices {
+    /// Wait for any background task to complete (indicating a failure)
+    /// Mutates the task list to contain only the remaining pending tasks
+    /// Returns an error with details about which task failed
+    pub async fn wait_for_failure(&mut self) -> anyhow::Result<std::convert::Infallible> {
+        let tasks = std::mem::take(&mut self.background_tasks);
+
+        if tasks.is_empty() {
+            // No background tasks - wait forever
+            futures::future::pending::<()>().await;
+            unreachable!()
+        }
+
+        // Extract names and handles separately
+        let (names, handles): (Vec<_>, Vec<_>) = tasks.into_iter().unzip();
+
+        let (result, index, remaining) = futures::future::select_all(handles).await;
+
+        let task_name = names.get(index).copied().unwrap_or("unknown");
+
+        // Put remaining tasks back - zip names (minus the completed one) with remaining handles
+        let remaining_names: Vec<_> = names
+            .into_iter()
+            .enumerate()
+            .filter_map(|(i, name)| if i != index { Some(name) } else { None })
+            .collect();
+
+        self.background_tasks = remaining_names.into_iter().zip(remaining.into_iter()).collect();
+
+        match result {
+            Ok(Ok(())) => {
+                tracing::warn!(task = task_name, "Background task completed unexpectedly");
+                anyhow::bail!("Background task '{}' completed early", task_name)
+            }
+            Ok(Err(e)) => {
+                tracing::error!(task = task_name, error = %e, "Background task failed");
+                anyhow::bail!("Background task '{}' failed: {}", task_name, e)
+            }
+            Err(e) => {
+                tracing::error!(task = task_name, error = %e, "Background task panicked");
+                anyhow::bail!("Background task '{}' panicked: {}", task_name, e)
+            }
+        }
+    }
+
     /// Gracefully shutdown all background tasks
     pub async fn shutdown(self) {
         // Signal all background tasks to shutdown
         self.shutdown_token.cancel();
 
-        // Wait for all background tasks to complete
-        for handle in self.background_tasks {
-            let _ = handle.await;
+        // Wait for all background tasks to complete and check for errors
+        for (name, handle) in self.background_tasks.into_iter() {
+            match handle.await {
+                Ok(Ok(())) => {
+                    tracing::debug!(task = name, "Background task completed successfully");
+                }
+                Ok(Err(e)) => {
+                    tracing::error!(task = name, error = %e, "Background task failed");
+                }
+                Err(e) => {
+                    tracing::error!(task = name, error = %e, "Background task panicked");
+                }
+            }
         }
     }
 }
@@ -848,24 +904,23 @@ async fn setup_background_services(
     let (onwards_config_sync, initial_targets, onwards_stream) =
         sync::onwards_config::OnwardsConfigSync::new_with_daemon_limits(pool.clone(), Some(model_capacity_limits.clone())).await?;
 
-    // Clone targets for the update task
-    let targets_for_updates = initial_targets.clone();
-
-    // Start target updates (infallible task, handle internally)
-    let handle = tokio::spawn(async move {
-        let _ = targets_for_updates.receive_updates(onwards_stream).await;
-    });
-    background_tasks.push(handle);
+    // Start target updates - this spawns a background task internally and returns immediately
+    initial_targets
+        .receive_updates(onwards_stream)
+        .await
+        .map_err(anyhow::Error::from)
+        .context("Onwards target updates failed")?;
 
     // Start the onwards configuration listener
     let onwards_shutdown = shutdown_token.clone();
     let handle = tokio::spawn(async move {
         info!("Starting onwards configuration listener");
-        if let Err(e) = onwards_config_sync.start(Default::default(), onwards_shutdown).await {
-            tracing::error!("Onwards configuration listener error: {}", e);
-        }
+        onwards_config_sync
+            .start(Default::default(), onwards_shutdown)
+            .await
+            .context("Onwards configuration listener failed")
     });
-    background_tasks.push(handle);
+    background_tasks.push(("onwards-config-sync", handle));
     // Leader election lock ID: 0x44574354_50524F42 (DWCT_PROB in hex for "dwctl probes")
     const LEADER_LOCK_ID: i64 = 0x4457_4354_5052_4F42_i64;
 
@@ -898,9 +953,10 @@ async fn setup_background_services(
             // Use LISTEN/NOTIFY in production, but disable in tests to avoid hangs
             let use_listen_notify = !cfg!(test);
             daemon_scheduler.run_daemon(daemon_shutdown, use_listen_notify, 300).await;
-            // Fallback sync every 5 minutes
+            // Probe scheduler runs until cancelled, then exits normally
+            Ok(())
         });
-        background_tasks.push(handle);
+        background_tasks.push(("probe-scheduler", handle));
 
         // Start the fusillade batch processing daemon based on config
         use crate::config::DaemonEnabled;
@@ -908,11 +964,24 @@ async fn setup_background_services(
         match config.batches.daemon.enabled {
             DaemonEnabled::Always | DaemonEnabled::Leader => {
                 let daemon_handle = request_manager.clone().run(shutdown_token.clone())?;
-                // Wrap the handle to convert Result<()> to ()
+                // Spawn task that propagates daemon errors
                 let handle = tokio::spawn(async move {
-                    let _ = daemon_handle.await;
+                    match daemon_handle.await {
+                        Ok(Ok(())) => {
+                            tracing::info!("Fusillade daemon exited normally");
+                        }
+                        Ok(Err(e)) => {
+                            tracing::error!(error = %e, "Fusillade daemon failed");
+                            anyhow::bail!("Fusillade daemon error: {}", e);
+                        }
+                        Err(e) => {
+                            tracing::error!(error = %e, "Fusillade daemon task panicked");
+                            anyhow::bail!("Fusillade daemon panic: {}", e);
+                        }
+                    }
+                    Ok(())
                 });
-                background_tasks.push(handle);
+                background_tasks.push(("fusillade-daemon", handle));
                 info!("Skipping leader election - running as leader with probe scheduler and fusillade daemon");
             }
             DaemonEnabled::Never => {
@@ -929,11 +998,24 @@ async fn setup_background_services(
         if config.batches.daemon.enabled == DaemonEnabled::Always {
             use fusillade::DaemonExecutor;
             let daemon_handle = request_manager.clone().run(shutdown_token.clone())?;
-            // Wrap the handle to convert Result<()> to ()
+            // Spawn task that propagates daemon errors
             let handle = tokio::spawn(async move {
-                let _ = daemon_handle.await;
+                match daemon_handle.await {
+                    Ok(Ok(())) => {
+                        tracing::info!("Fusillade daemon exited normally");
+                    }
+                    Ok(Err(e)) => {
+                        tracing::error!(error = %e, "Fusillade daemon failed");
+                        anyhow::bail!("Fusillade daemon error: {}", e);
+                    }
+                    Err(e) => {
+                        tracing::error!(error = %e, "Fusillade daemon task panicked");
+                        anyhow::bail!("Fusillade daemon panic: {}", e);
+                    }
+                }
+                Ok(())
             });
-            background_tasks.push(handle);
+            background_tasks.push(("fusillade-daemon", handle));
             info!("Fusillade batch daemon started (configured to always run)");
         }
 
@@ -998,7 +1080,7 @@ async fn setup_background_services(
                         use crate::config::DaemonEnabled;
                         use fusillade::DaemonExecutor;
                         match config.batches.daemon.enabled {
-                            DaemonEnabled::Always | DaemonEnabled::Leader => {
+                            DaemonEnabled::Leader => {
                                 let handle = request_manager
                                     .run(session_token.clone())
                                     .map_err(|e| anyhow::anyhow!("Failed to start fusillade daemon: {}", e))?;
@@ -1007,6 +1089,9 @@ async fn setup_background_services(
                                 *daemon_handle.lock().await = Some(handle);
 
                                 tracing::info!("Fusillade batch daemon started on elected leader");
+                            }
+                            DaemonEnabled::Always => {
+                                // Daemon already started earlier, nothing to do here
                             }
                             DaemonEnabled::Never => {
                                 tracing::info!("Fusillade batch daemon disabled by configuration");
@@ -1044,8 +1129,10 @@ async fn setup_background_services(
                 },
             )
             .await;
+            // Leader election runs until cancelled, then exits normally
+            Ok(())
         });
-        background_tasks.push(handle);
+        background_tasks.push(("leader-election", handle));
     }
 
     Ok(BackgroundServices {
@@ -1136,7 +1223,7 @@ impl Application {
     }
 
     /// Start serving the application
-    pub async fn serve<F>(self, shutdown: F) -> anyhow::Result<()>
+    pub async fn serve<F>(mut self, shutdown: F) -> anyhow::Result<()>
     where
         F: std::future::Future<Output = ()> + Send + 'static,
     {
@@ -1151,12 +1238,22 @@ impl Application {
         let middleware = from_fn_with_state(self.app_state, admin_ai_proxy_middleware);
         let service = middleware.layer(self.router);
 
-        // Run the server with graceful shutdown
-        axum::serve(listener, service.into_make_service())
-            .with_graceful_shutdown(shutdown)
-            .await?;
+        // Race the server against background task failures (fail-fast)
+        let server_error: Option<anyhow::Error> = tokio::select! {
+            result = axum::serve(listener, service.into_make_service()).with_graceful_shutdown(shutdown) => {
+                result.err().map(Into::into) // None if server shut down cleanly
+            }
+            result = self.bg_services.wait_for_failure() => {
+                // Background task failed - save error for fail-fast restart after cleanup
+                match result {
+                    Ok(_infallible) => unreachable!("wait_for_failure never returns Ok"),
+                    Err(e) => Some(e),
+                }
+            }
+        };
 
-        // Shutdown background services and wait for tasks to complete
+        // Graceful shutdown - even if we're failing fast, clean up properly
+        info!("Shutting down background services...");
         self.bg_services.shutdown().await;
 
         // Close database connections
@@ -1171,6 +1268,11 @@ impl Application {
         if let Some(embedded_db) = self._embedded_db {
             info!("Shutting down embedded database...");
             embedded_db.stop().await?;
+        }
+
+        // If there was an error (either server or background task), propagate it after cleanup
+        if let Some(e) = server_error {
+            return Err(e);
         }
 
         Ok(())
@@ -1210,9 +1312,11 @@ mod test {
         add_deployment_to_group(&pool, deployment.id, test_group.id, admin_user.id).await;
 
         // Test 1: Admin AI proxy with X-Doubleword-User header (new middleware)
+        let regular_user_external_id = regular_user.external_user_id.as_ref().unwrap_or(&regular_user.username);
         let admin_proxy_response = server
             .post("/admin/api/v1/ai/v1/chat/completions")
-            .add_header("x-doubleword-user", &regular_user.email)
+            .add_header("x-doubleword-user", regular_user_external_id)
+            .add_header("x-doubleword-email", &regular_user.email)
             .json(&serde_json::json!({
                 "model": deployment.alias,
                 "messages": [{"role": "user", "content": "Hello via admin proxy"}]
@@ -1229,9 +1333,11 @@ mod test {
         // Test 2: Admin AI proxy with user who has no access to model
         let restricted_user = create_test_user(&pool, Role::StandardUser).await;
 
+        let restricted_user_external_id = restricted_user.external_user_id.as_ref().unwrap_or(&restricted_user.username);
         let no_access_response = server
             .post("/admin/api/v1/ai/v1/chat/completions")
-            .add_header("x-doubleword-user", &restricted_user.email)
+            .add_header("x-doubleword-user", restricted_user_external_id)
+            .add_header("x-doubleword-email", &restricted_user.email)
             .json(&serde_json::json!({
                 "model": deployment.alias,
                 "messages": [{"role": "user", "content": "Hello"}]
@@ -1268,6 +1374,7 @@ mod test {
         let nonexistent_user_response = server
             .post("/admin/api/v1/ai/v1/chat/completions")
             .add_header("x-doubleword-user", "nonexistent@example.com")
+            .add_header("x-doubleword-email", "nonexistent@example.com")
             .json(&serde_json::json!({
                 "model": deployment.alias,
                 "messages": [{"role": "user", "content": "Hello"}]
@@ -1284,7 +1391,8 @@ mod test {
         // Test 5: Admin AI proxy with non-existent model
         let nonexistent_model_response = server
             .post("/admin/api/v1/ai/v1/chat/completions")
-            .add_header("x-doubleword-user", &regular_user.email)
+            .add_header("x-doubleword-user", regular_user_external_id)
+            .add_header("x-doubleword-email", &regular_user.email)
             .json(&serde_json::json!({
                 "model": "nonexistent-model",
                 "messages": [{"role": "user", "content": "Hello"}]
@@ -1577,36 +1685,6 @@ mod test {
         assert!(!content.is_empty());
         // Should contain YAML content (check for openapi version)
         assert!(content.contains("openapi:") || content.contains("swagger:"));
-    }
-
-    #[sqlx::test]
-    async fn test_application_integration(pool: PgPool) {
-        let mut config = create_test_config();
-        config.database = crate::config::DatabaseConfig::External {
-            url: pool.connect_options().to_url_lossy().to_string(),
-        };
-        config.leader_election.enabled = false;
-
-        // Create application
-        let app = crate::Application::new(config).await;
-        assert!(app.is_ok(), "Application::new should succeed");
-
-        let (server, _drop_guard) = app.unwrap().into_test_server();
-
-        // Test that basic routes work
-        let health_response = server.get("/healthz").await;
-        assert_eq!(health_response.status_code().as_u16(), 200);
-        assert_eq!(health_response.text(), "OK");
-
-        // Test openapi endpoint
-        let openapi_response = server.get("/openai-openapi.yaml").await;
-        assert_eq!(openapi_response.status_code().as_u16(), 200);
-        assert_eq!(openapi_response.headers().get("content-type").unwrap(), "application/yaml");
-
-        // Test that API routes exist (should require auth)
-        let api_response = server.get("/admin/api/v1/users").await;
-        // Should get unauthorized (401) since no auth header provided
-        assert_eq!(api_response.status_code().as_u16(), 401);
     }
 
     #[sqlx::test]

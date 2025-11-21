@@ -236,13 +236,15 @@ export const Profile: React.FC = () => {
                     className="w-24 h-24 mx-auto mb-4"
                   />
                 )}
-                <h3 className="text-lg font-medium text-gray-900">
+                <h3 className="text-lg font-medium text-gray-900 truncate px-2">
+                  {currentUser?.email}
+                </h3>
+                <p className="text-sm text-gray-500 truncate px-2">
                   {displayName ||
                     currentUser?.display_name ||
                     currentUser?.username ||
                     "Unknown User"}
-                </h3>
-                <p className="text-sm text-gray-500">{currentUser?.email}</p>
+                </p>
               </div>
             </div>
 
@@ -252,22 +254,6 @@ export const Profile: React.FC = () => {
                 Account Details
               </h4>
               <div className="space-y-3">
-                <div className="flex items-center text-sm">
-                  <User className="w-4 h-4 text-gray-400 mr-2 flex-shrink-0" />
-                  <span className="text-gray-600 w-20 flex-shrink-0">
-                    Username:
-                  </span>
-                  <Tooltip>
-                    <TooltipTrigger asChild>
-                      <span className="text-gray-900 truncate">
-                        {currentUser?.username}
-                      </span>
-                    </TooltipTrigger>
-                    <TooltipContent>
-                      <p>{currentUser?.username || ""}</p>
-                    </TooltipContent>
-                  </Tooltip>
-                </div>
                 <div className="flex items-center text-sm">
                   <AtSign className="w-4 h-4 text-gray-400 mr-2 flex-shrink-0" />
                   <span className="text-gray-600 w-20 flex-shrink-0">
@@ -281,6 +267,22 @@ export const Profile: React.FC = () => {
                     </TooltipTrigger>
                     <TooltipContent>
                       <p>{currentUser?.email || ""}</p>
+                    </TooltipContent>
+                  </Tooltip>
+                </div>
+                <div className="flex items-center text-sm">
+                  <User className="w-4 h-4 text-gray-400 mr-2 flex-shrink-0" />
+                  <span className="text-gray-600 w-20 flex-shrink-0">
+                    Username:
+                  </span>
+                  <Tooltip>
+                    <TooltipTrigger asChild>
+                      <span className="text-gray-900 truncate">
+                        {currentUser?.username}
+                      </span>
+                    </TooltipTrigger>
+                    <TooltipContent>
+                      <p>{currentUser?.username || ""}</p>
                     </TooltipContent>
                   </Tooltip>
                 </div>

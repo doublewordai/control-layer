@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "\n            UPDATE users SET\n                display_name = COALESCE($2, display_name),\n                avatar_url = COALESCE($3, avatar_url),\n                password_hash = COALESCE($4, password_hash),\n                updated_at = NOW()\n            WHERE id = $1\n            RETURNING *\n            ",
+  "query": "SELECT * FROM users WHERE external_user_id = $1 AND id != '00000000-0000-0000-0000-000000000000'",
   "describe": {
     "columns": [
       {
@@ -66,9 +66,6 @@
     ],
     "parameters": {
       "Left": [
-        "Uuid",
-        "Varchar",
-        "Varchar",
         "Text"
       ]
     },
@@ -87,5 +84,5 @@
       true
     ]
   },
-  "hash": "370386c627cf888c4aa7100163482dc4fe8be6df3d88e589447671f6c6d130d0"
+  "hash": "dc24b06c4538619e59c36a784398488d6c43d0729450081b1d6fceafad7949f2"
 }

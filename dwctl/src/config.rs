@@ -272,19 +272,44 @@ pub struct NativeAuthConfig {
 #[serde(default)]
 pub struct ProxyHeaderAuthConfig {
     /// Enable proxy header authentication
+    ///
+    /// This configuration is for deploying the control layer
+    /// with trusted HTTP headers from an upstream proxy
+    /// (for example oauth2-proxy or vouch).
     pub enabled: bool,
-    /// HTTP header name containing user email/identity
+    /// The name of the HTTP header containing a unique user identifier.
+    /// This serves as a unique identifier for the user.
+    /// It's possible to use an email address here, but make sure if
+    /// you do so that all distinct users have unique email addresses.
+    ///
+    /// For example, if you have multiple authentication providers
+    /// configured upstream, the accounts with different providers
+    /// might have the same email address - a nefarious user could
+    /// signup at a different provider and perform an account takeover.
     pub header_name: String,
+    /// HTTP header name containing the user's email.
+    /// Optional per-request - if not provided, the value from header_name
+    /// will be used as the email (for backwards compatibility).
+    /// For federated authentication where users can log in via multiple
+    /// providers, send both headers to keep users separate.
+    pub email_header_name: String,
     /// HTTP header name containing user groups (comma-separated)
+    /// Not required, but will be respected if auto_create_users
+    /// is enabled, and import_idp_groups is true.
     pub groups_field_name: String,
-    /// Automatically create users if they don't exist
-    pub auto_create_users: bool,
+    /// Import and sync user groups from groups_field_name header.
+    pub import_idp_groups: bool,
     /// SSO groups to exclude from import
     pub blacklisted_sso_groups: Vec<String>,
-    /// HTTP header name containing SSO provider name
+    /// HTTP header name containing SSO provider name.
+    /// Stored per-user in the database.
     pub provider_field_name: String,
-    /// Import and sync user groups from SSO provider
-    pub import_idp_groups: bool,
+    /// Automatically create users if they don't exist.
+    /// Per-request, look up 'header_name' in the
+    /// external_user_id table, and if not found, creates
+    /// a new user with email taken from 'email_header_name',
+    /// and groups taken from groups_field_name.
+    pub auto_create_users: bool,
 }
 
 /// Session cookie configuration.
@@ -671,6 +696,7 @@ impl Default for ProxyHeaderAuthConfig {
         Self {
             enabled: false,
             header_name: "x-doubleword-user".to_string(),
+            email_header_name: "x-doubleword-email".to_string(),
             groups_field_name: "x-doubleword-user-groups".to_string(),
             provider_field_name: "x-doubleword-sso-provider".to_string(),
             auto_create_users: true,
