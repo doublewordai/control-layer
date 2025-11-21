@@ -155,7 +155,7 @@ impl FetchModels for FetchModelsReqwest {
             }
             ModelFormat::Anthropic => {
                 if let Some(api_key) = &self.openai_api_key {
-                    request = request.header(&self.auth_header_name, format!("{}{}", self.auth_header_prefix, api_key));
+                    request = request.header("X-APi-Key", api_key.to_string());
                 };
 
                 // Have to set this
