@@ -454,7 +454,7 @@ pub async fn upload_file(
         ListFilesQuery
     )
 )]
-#[tracing::instrument(skip(state, current_user), fields(user_id = %current_user.id, limit = ?query.limit, order = %query.order))]
+#[tracing::instrument(skip(state, current_user), fields(user_id = %current_user.id, limit = ?query.pagination.limit, order = %query.order))]
 pub async fn list_files(
     State(state): State<AppState>,
     Query(query): Query<ListFilesQuery>,
@@ -468,10 +468,11 @@ pub async fn list_files(
         });
     }
 
-    let limit = query.limit.unwrap_or(10000).clamp(1, 10000);
+    let limit = query.pagination.limit();
 
     // Parse the 'after' cursor if provided
     let after = query
+        .pagination
         .after
         .as_ref()
         .and_then(|id_str| uuid::Uuid::parse_str(id_str).ok().map(fusillade::FileId::from));
@@ -620,7 +621,7 @@ pub async fn get_file(
         FileContentQuery
     )
 )]
-#[tracing::instrument(skip(state, current_user), fields(user_id = %current_user.id, file_id = %file_id_str, limit = ?query.limit, offset = ?query.offset))]
+#[tracing::instrument(skip(state, current_user), fields(user_id = %current_user.id, file_id = %file_id_str, limit = ?query.pagination.limit, offset = ?query.pagination.skip))]
 pub async fn get_file_content(
     State(state): State<AppState>,
     Path(file_id_str): Path<String>,
@@ -657,11 +658,11 @@ pub async fn get_file_content(
     }
 
     // Stream the file content as JSONL, starting from offset
-    let offset = query.offset.unwrap_or(0) as usize;
+    let offset = query.pagination.skip.unwrap_or(0) as usize;
     let content_stream = state.request_manager.get_file_content_stream(fusillade::FileId(file_id), offset);
 
     // Apply limit if specified, fetching one extra to detect if there are more results
-    let requested_limit = query.limit.map(|l| l as usize);
+    let requested_limit = query.pagination.limit.map(|l| l as usize);
     let fetch_limit = requested_limit.map(|l| l + 1); // Fetch one extra to check for more results
 
     let content_stream: Pin<Box<dyn Stream<Item = fusillade::Result<fusillade::FileContentItem>> + Send>> = if let Some(limit) = fetch_limit

@@ -86,8 +86,8 @@ pub async fn list_inference_endpoints(
 ) -> Result<Json<Vec<InferenceEndpointResponse>>> {
     let mut conn = state.db.acquire().await.map_err(|e| Error::Database(e.into()))?;
     let mut repo = InferenceEndpoints::new(&mut conn);
-    let skip = query.skip.unwrap_or(0);
-    let limit = query.limit.unwrap_or(100).min(1000);
+    let skip = query.pagination.skip();
+    let limit = query.pagination.limit();
 
     let endpoints = repo.list(&InferenceEndpointFilter::new(skip, limit)).await?;
     Ok(Json(endpoints.into_iter().map(Into::into).collect()))

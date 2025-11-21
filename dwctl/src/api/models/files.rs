@@ -1,17 +1,18 @@
 //! API request/response models for file management.
 
+use crate::api::models::Pagination;
+
+use super::pagination::CursorPagination;
 use serde::{Deserialize, Serialize};
 use utoipa::{IntoParams, ToSchema};
 
 /// Query parameters for listing files (OpenAI-compatible cursor-based pagination)
 #[derive(Debug, Deserialize, IntoParams, ToSchema)]
 pub struct ListFilesQuery {
-    /// A cursor for use in pagination. after is an object ID that defines your place in the list.
-    pub after: Option<String>,
-
-    /// Maximum number of files to return (1-10000, default 10000)
-    #[param(default = 10000, minimum = 1, maximum = 10000)]
-    pub limit: Option<i64>,
+    /// Pagination parameters
+    #[serde(flatten)]
+    #[param(inline)]
+    pub pagination: CursorPagination,
 
     /// Sort order by created_at (asc or desc, default desc)
     #[serde(default = "default_order")]
@@ -28,13 +29,10 @@ fn default_order() -> String {
 /// Query parameters for file content
 #[derive(Debug, Deserialize, IntoParams, ToSchema)]
 pub struct FileContentQuery {
-    /// Maximum number of items to return (default: unlimited)
-    #[param(minimum = 1)]
-    pub limit: Option<i64>,
-
-    /// Number of items to skip (default 0)
-    #[param(default = 0, minimum = 0)]
-    pub offset: Option<i64>,
+    /// Pagination parameters
+    #[serde(flatten)]
+    #[param(inline)]
+    pub pagination: Pagination,
 }
 
 /// File object response (OpenAI-compatible)
