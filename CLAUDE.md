@@ -271,7 +271,8 @@ TAGS=v1.0.0 PLATFORMS=linux/amd64,linux/arm64 docker buildx bake --push
 
 **Import Style:**
 
-- Use unqualified imports at the top of the file unless they would clash with other imports
+- Use unqualified names for imports, and put identifier imports at the top of the file. DON'T use fully qualified names unless absolutely necessary, to
+prevent name clashes.
 - Organize imports in groups: std → external crates → internal modules
 - Example: `use crate::errors::{Error, Result};` then use `Result` directly, not `errors::Result`
 

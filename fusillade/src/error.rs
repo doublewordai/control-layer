@@ -14,6 +14,14 @@ pub enum FusilladeError {
     #[error("Request not found: {0}")]
     RequestNotFound(RequestId),
 
+    /// Cancelled request
+    #[error("Request cancelled: {0}")]
+    RequestCancelled(RequestId),
+
+    /// Daemon is shutting down
+    #[error("Daemon is shutting down")]
+    Shutdown,
+
     /// Request is in an invalid state for the requested operation
     #[error("Invalid state transition: request {0} is in state '{1}', expected '{2}'")]
     InvalidState(RequestId, String, String),

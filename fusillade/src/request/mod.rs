@@ -9,4 +9,5 @@ pub mod transitions;
 pub mod types;
 
 // Re-export commonly used types
+pub use transitions::CancellationReason;
 pub use types::*;
