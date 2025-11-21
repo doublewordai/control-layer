@@ -41,7 +41,7 @@ export function CostManagement() {
       setIsProcessingPayment(true);
       setProcessingError(null);
 
-      dwctlApi.payments.processPayment(sessionId)
+      dwctlApi.payments.process(sessionId)
         .then(() => {
           setIsProcessingPayment(false);
           refetchUser();
@@ -86,17 +86,17 @@ export function CostManagement() {
     } else if (config?.payment_enabled) {
       // Payment processing enabled: Get checkout URL and redirect
       try {
-        const data = await dwctlApi.payments.createCheckout();
+        const data = await dwctlApi.payments.create();
         if (data.url) {
-          // Navigate to Stripe checkout page
+          // Navigate to payment provider checkout page
           window.location.href = data.url;
         } else {
           toast.error("Failed to get checkout URL");
         }
       } catch (error) {
-        const errorMessage = error instanceof Error ? error.message : "Failed to initiate checkout";
+        const errorMessage = error instanceof Error ? error.message : "Failed to initiate payment";
         toast.error(errorMessage);
-        console.error("Error creating checkout:", error);
+        console.error("Error creating payment:", error);
       }
     } else {
       toast.error("Payment processing is not configured");

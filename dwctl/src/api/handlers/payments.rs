@@ -126,14 +126,17 @@ pub mod stripe {
     }
 
     /// Process a Stripe checkout session and create a credit transaction
-    /// This function is idempotent - if a transaction with the same session_id already exists,
-    /// it will return successfully without creating a duplicate.
+    /// This function is idempotent using a two-layer approach:
+    /// 1. Early check for existing transactions (fast path for retries/duplicates)
+    /// 2. Database unique constraint on source_id (prevents race conditions between replicas)
     pub(super) async fn process_checkout_session(
         db_pool: &PgPool,
         api_key: &str,
         session_id: &CheckoutSessionId,
     ) -> Result<(), StatusCode> {
-        // Check if a transaction with this session_id already exists (idempotency check)
+        // Fast path: Check if we've already processed this payment
+        // This avoids expensive Stripe API calls for duplicate webhook deliveries,
+        // user retries, etc. The unique constraint below handles race conditions.
         let existing = sqlx::query!(
             r#"
             SELECT id FROM credits_transactions
@@ -150,7 +153,7 @@ pub mod stripe {
         })?;
 
         if existing.is_some() {
-            tracing::info!("Transaction for session_id {} already exists, skipping (idempotent)", session_id);
+            tracing::info!("Transaction for session_id {} already exists, skipping (fast path)", session_id);
             return Ok(());
         }
 
@@ -217,15 +220,30 @@ pub mod stripe {
             description: Some("Stripe payment".to_string()),
         };
 
-        credits.create_transaction(&request)
-            .await
-            .map_err(|e| {
+        match credits.create_transaction(&request).await {
+            Ok(_) => {
+                tracing::info!("Successfully fulfilled checkout session {} for user {}", session_id, user_id);
+                Ok(())
+            }
+            Err(crate::db::errors::DbError::UniqueViolation { constraint, .. }) => {
+                // Check if this is a unique constraint violation on source_id
+                // This can happen if two replicas try to process the same payment simultaneously
+                if constraint.as_deref() == Some("credits_transactions_source_id_unique") {
+                    tracing::info!(
+                        "Transaction for session_id {} already processed (caught unique constraint violation), returning success (idempotent)",
+                        session_id
+                    );
+                    Ok(())
+                } else {
+                    tracing::error!("Unexpected unique constraint violation: {:?}", constraint);
+                    Err(StatusCode::INTERNAL_SERVER_ERROR)
+                }
+            }
+            Err(e) => {
                 tracing::error!("Failed to create credit transaction: {:?}", e);
-                StatusCode::INTERNAL_SERVER_ERROR
-            })?;
-
-        tracing::info!("Successfully fulfilled checkout session {} for user {}", session_id, user_id);
-        Ok(())
+                Err(StatusCode::INTERNAL_SERVER_ERROR)
+            }
+        }
     }
 
     /// StripeEvent extractor that validates webhook signatures
@@ -323,12 +341,12 @@ pub mod stripe {
 
 #[utoipa::path(
     post,
-    path = "/create_checkout",
+    path = "/payments",
     tag = "payments",
-    summary = "Create checkout session",
-    description = "Creates a checkout session and redirects to the payment provider",
+    summary = "Create payment",
+    description = "Creates a payment checkout session with the payment provider. Returns a JSON object with the checkout URL for the client to handle navigation (better for SPAs).",
     responses(
-        (status = 303, description = "Redirect to payment provider checkout page"),
+        (status = 200, description = "Payment session created successfully. Returns JSON with checkout URL.", body = inline(Object)),
         (status = 501, description = "No payment provider configured"),
     ),
     security(
@@ -338,7 +356,7 @@ pub mod stripe {
     )
 )]
 #[tracing::instrument(skip_all)]
-pub async fn create_checkout(
+pub async fn create_payment(
     State(state): State<AppState>,
     headers: axum::http::HeaderMap,
     user: CurrentUser,
@@ -409,19 +427,19 @@ pub async fn create_checkout(
     })).into_response())
 }
 
-/// Manually process a checkout session
-/// This endpoint allows the frontend to trigger payment processing for a specific session ID.
+/// Process a payment
+/// This endpoint allows the frontend to trigger payment processing for a specific payment ID.
 /// Useful as a fallback when webhooks fail or for immediate payment confirmation.
 #[utoipa::path(
-    post,
-    path = "/process_payment/{session_id}",
+    patch,
+    path = "/payments/{id}",
     tag = "payments",
-    summary = "Process payment for checkout session",
-    description = "Processes a completed checkout session and credits the user account. This is idempotent.",
+    summary = "Process payment",
+    description = "Processes a completed payment session and credits the user account. This is idempotent.",
     responses(
         (status = 200, description = "Payment processed successfully"),
         (status = 402, description = "Payment not completed yet"),
-        (status = 400, description = "Invalid session ID or missing data"),
+        (status = 400, description = "Invalid payment ID or missing data"),
         (status = 501, description = "Payment provider not configured"),
     ),
     security(
@@ -433,7 +451,7 @@ pub async fn create_checkout(
 #[tracing::instrument(skip_all)]
 pub async fn process_payment(
     State(state): State<AppState>,
-    axum::extract::Path(session_id): axum::extract::Path<String>,
+    axum::extract::Path(id): axum::extract::Path<String>,
     _user: CurrentUser,
 ) -> Result<Response, StatusCode> {
     // Check which payment provider is configured and handle accordingly
@@ -441,7 +459,7 @@ pub async fn process_payment(
         Some(crate::config::PaymentConfig::Stripe(stripe_config)) => {
             // Stripe-specific processing
             let api_key = &stripe_config.api_key;
-            let checkout_session_id: stripe::CheckoutSessionId = session_id.parse()
+            let checkout_session_id: stripe::CheckoutSessionId = id.parse()
                 .map_err(|_| StatusCode::BAD_REQUEST)?;
 
             // Process the checkout session

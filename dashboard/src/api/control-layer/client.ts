@@ -760,23 +760,23 @@ const costApi = {
 
 // Payment processing API
 const paymentsApi = {
-  async createCheckout(): Promise<{ url: string }> {
-    const response = await fetch("/admin/api/v1/payments/create_checkout", {
+  async create(): Promise<{ url: string }> {
+    const response = await fetch("/admin/api/v1/payments", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
     });
 
     if (!response.ok) {
       const errorData = await response.json().catch(() => ({}));
-      throw new Error(errorData.message || `Failed to create checkout: ${response.status}`);
+      throw new Error(errorData.message || `Failed to create payment: ${response.status}`);
     }
 
     return response.json();
   },
 
-  async processPayment(sessionId: string): Promise<void> {
-    const response = await fetch(`/admin/api/v1/payments/process/${sessionId}`, {
-      method: "POST",
+  async process(paymentId: string): Promise<void> {
+    const response = await fetch(`/admin/api/v1/payments/${paymentId}`, {
+      method: "PATCH",
       headers: { "Content-Type": "application/json" },
     });
 
