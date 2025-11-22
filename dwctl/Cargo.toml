@@ -117,3 +117,4 @@ serial_test = "3.0"
 test-log = { version = "0.2", features = ["trace"] }
 criterion = { version = "0.5", features = ["async_tokio"] }
 tempfile = "3.0"
+wiremock = "0.6"
