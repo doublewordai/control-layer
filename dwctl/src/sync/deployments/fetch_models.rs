@@ -16,6 +16,8 @@ pub struct SyncConfig {
     pub auth_header_name: String,
     pub auth_header_prefix: String,
     pub(crate) request_timeout: Duration,
+    /// Override format detection (primarily for testing)
+    pub format_override: Option<ModelFormat>,
 }
 
 impl SyncConfig {
@@ -31,6 +33,7 @@ impl SyncConfig {
             auth_header_name: source.auth_header_name.clone(),
             auth_header_prefix: source.auth_header_prefix.clone(),
             request_timeout: Self::DEFAULT_REQUEST_TIMEOUT,
+            format_override: None, // Use automatic detection
         }
     }
 }
@@ -51,6 +54,7 @@ pub struct FetchModelsReqwest {
     auth_header_name: String,
     auth_header_prefix: String,
     request_timeout: Duration,
+    format_override: Option<ModelFormat>,
 }
 
 impl FetchModelsReqwest {
@@ -64,6 +68,7 @@ impl FetchModelsReqwest {
         let auth_header_name = config.auth_header_name.clone();
         let auth_header_prefix = config.auth_header_prefix.clone();
         let request_timeout = config.request_timeout;
+        let format_override = config.format_override.clone();
         Self {
             client,
             base_url,
@@ -71,6 +76,7 @@ impl FetchModelsReqwest {
             auth_header_name,
             auth_header_prefix,
             request_timeout,
+            format_override,
         }
     }
 }
@@ -111,8 +117,8 @@ impl From<&Url> for ModelFormat {
 impl FetchModels for FetchModelsReqwest {
     async fn fetch(&self) -> anyhow::Result<OpenAIModelsResponse> {
         debug!("Base URL for fetching models: {}", self.base_url);
-        let fmt = (&self.base_url).into();
-        debug!("Featching models in format: {:?}", fmt);
+        let fmt = self.format_override.clone().unwrap_or_else(|| (&self.base_url).into());
+        debug!("Fetching models in format: {:?}", fmt);
 
         let url = ensure_slash(&self.base_url)
             .join("models")
@@ -193,12 +199,10 @@ impl FetchModels for FetchModelsReqwest {
 
 /// A static implementation of FetchModels that returns a predefined list of models
 /// Used for endpoints where we have a known list of models (e.g., Snowflake Cortex AI)
-#[allow(dead_code)]
 pub struct StaticModelsFetcher {
     models: OpenAIModelsResponse,
 }
 
-#[allow(dead_code)]
 impl StaticModelsFetcher {
     pub fn new(model_names: Vec<String>) -> Self {
         let models = model_names
@@ -225,5 +229,352 @@ impl FetchModels for StaticModelsFetcher {
     async fn fetch(&self) -> anyhow::Result<OpenAIModelsResponse> {
         debug!("Returning static model list with {} models", self.models.data.len());
         Ok(self.models.clone())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use wiremock::matchers::{header, method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    #[tokio::test]
+    async fn test_fetch_openai_format_with_api_key() {
+        let mock_server = MockServer::start().await;
+
+        // Set up mock response
+        Mock::given(method("GET"))
+            .and(path("/models"))
+            .and(header("Authorization", "Bearer test-api-key"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "object": "list",
+                "data": [
+                    {
+                        "id": "gpt-4",
+                        "object": "model",
+                        "created": 1234567890,
+                        "owned_by": "openai"
+                    },
+                    {
+                        "id": "gpt-3.5-turbo",
+                        "object": "model",
+                        "created": 1234567891,
+                        "owned_by": "openai"
+                    }
+                ]
+            })))
+            .expect(1)
+            .mount(&mock_server)
+            .await;
+
+        let config = SyncConfig {
+            openai_api_key: Some("test-api-key".to_string()),
+            openai_base_url: mock_server.uri().parse().unwrap(),
+            auth_header_name: "Authorization".to_string(),
+            auth_header_prefix: "Bearer ".to_string(),
+            request_timeout: Duration::from_secs(30),
+            format_override: None,
+        };
+
+        let fetcher = FetchModelsReqwest::new(config);
+        let result = fetcher.fetch().await.unwrap();
+
+        assert_eq!(result.object, "list");
+        assert_eq!(result.data.len(), 2);
+        assert_eq!(result.data[0].id, "gpt-4");
+        assert_eq!(result.data[1].id, "gpt-3.5-turbo");
+    }
+
+    #[tokio::test]
+    async fn test_fetch_openai_format_without_api_key() {
+        let mock_server = MockServer::start().await;
+
+        // Set up mock response - should NOT have Authorization header
+        Mock::given(method("GET"))
+            .and(path("/models"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "object": "list",
+                "data": [
+                    {
+                        "id": "local-model",
+                        "object": "model",
+                        "created": 1234567890,
+                        "owned_by": "local"
+                    }
+                ]
+            })))
+            .expect(1)
+            .mount(&mock_server)
+            .await;
+
+        let config = SyncConfig {
+            openai_api_key: None,
+            openai_base_url: mock_server.uri().parse().unwrap(),
+            auth_header_name: "Authorization".to_string(),
+            auth_header_prefix: "Bearer ".to_string(),
+            request_timeout: Duration::from_secs(30),
+            format_override: None,
+        };
+
+        let fetcher = FetchModelsReqwest::new(config);
+        let result = fetcher.fetch().await.unwrap();
+
+        assert_eq!(result.object, "list");
+        assert_eq!(result.data.len(), 1);
+        assert_eq!(result.data[0].id, "local-model");
+    }
+
+    #[tokio::test]
+    async fn test_fetch_openai_format_custom_auth_headers() {
+        let mock_server = MockServer::start().await;
+
+        // Set up mock response with custom auth header
+        Mock::given(method("GET"))
+            .and(path("/models"))
+            .and(header("X-API-Key", "sk-custom-key"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "object": "list",
+                "data": [
+                    {
+                        "id": "custom-model",
+                        "object": "model",
+                        "created": 1234567890,
+                        "owned_by": "custom-provider"
+                    }
+                ]
+            })))
+            .expect(1)
+            .mount(&mock_server)
+            .await;
+
+        let config = SyncConfig {
+            openai_api_key: Some("custom-key".to_string()),
+            openai_base_url: mock_server.uri().parse().unwrap(),
+            auth_header_name: "X-API-Key".to_string(),
+            auth_header_prefix: "sk-".to_string(),
+            request_timeout: Duration::from_secs(30),
+            format_override: None,
+        };
+
+        let fetcher = FetchModelsReqwest::new(config);
+        let result = fetcher.fetch().await.unwrap();
+
+        assert_eq!(result.object, "list");
+        assert_eq!(result.data.len(), 1);
+        assert_eq!(result.data[0].id, "custom-model");
+    }
+
+    #[tokio::test]
+    async fn test_fetch_anthropic_format() {
+        let mock_server = MockServer::start().await;
+
+        // Set up mock response - Anthropic uses different header names
+        Mock::given(method("GET"))
+            .and(path("/models"))
+            .and(header("X-APi-Key", "anthropic-key")) // Note: Typo in original code - X-APi-Key
+            .and(header("anthropic-version", "2023-06-01"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "data": [
+                    {
+                        "id": "claude-3-5-sonnet-20241022",
+                        "display_name": "Claude 3.5 Sonnet",
+                        "type": "model",
+                        "created_at": "2024-10-22T00:00:00Z"
+                    }
+                ],
+                "first_id": "claude-3-5-sonnet-20241022",
+                "has_more": false,
+                "last_id": "claude-3-5-sonnet-20241022"
+            })))
+            .expect(1)
+            .mount(&mock_server)
+            .await;
+
+        // Use format_override to force Anthropic format with mock server URL
+        let config = SyncConfig {
+            openai_api_key: Some("anthropic-key".to_string()),
+            openai_base_url: mock_server.uri().parse().unwrap(),
+            auth_header_name: "Authorization".to_string(), // This will be ignored for Anthropic
+            auth_header_prefix: "Bearer ".to_string(),
+            request_timeout: Duration::from_secs(30),
+            format_override: Some(ModelFormat::Anthropic),
+        };
+
+        let fetcher = FetchModelsReqwest::new(config);
+        let result = fetcher.fetch().await.unwrap();
+
+        // Anthropic response gets converted to OpenAI format
+        assert_eq!(result.object, "list");
+        assert_eq!(result.data.len(), 1);
+        assert_eq!(result.data[0].id, "claude-3-5-sonnet-20241022");
+    }
+
+    #[tokio::test]
+    async fn test_fetch_error_non_success_status() {
+        let mock_server = MockServer::start().await;
+
+        // Set up mock to return 404
+        Mock::given(method("GET"))
+            .and(path("/models"))
+            .respond_with(ResponseTemplate::new(404).set_body_string("Not found"))
+            .expect(1)
+            .mount(&mock_server)
+            .await;
+
+        let config = SyncConfig {
+            openai_api_key: Some("test-key".to_string()),
+            openai_base_url: mock_server.uri().parse().unwrap(),
+            auth_header_name: "Authorization".to_string(),
+            auth_header_prefix: "Bearer ".to_string(),
+            request_timeout: Duration::from_secs(30),
+            format_override: None,
+        };
+
+        let fetcher = FetchModelsReqwest::new(config);
+        let result = fetcher.fetch().await;
+
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(err.to_string().contains("404"));
+    }
+
+    #[tokio::test]
+    async fn test_fetch_error_invalid_json() {
+        let mock_server = MockServer::start().await;
+
+        // Set up mock to return invalid JSON
+        Mock::given(method("GET"))
+            .and(path("/models"))
+            .respond_with(ResponseTemplate::new(200).set_body_string("not valid json"))
+            .expect(1)
+            .mount(&mock_server)
+            .await;
+
+        let config = SyncConfig {
+            openai_api_key: Some("test-key".to_string()),
+            openai_base_url: mock_server.uri().parse().unwrap(),
+            auth_header_name: "Authorization".to_string(),
+            auth_header_prefix: "Bearer ".to_string(),
+            request_timeout: Duration::from_secs(30),
+            format_override: None,
+        };
+
+        let fetcher = FetchModelsReqwest::new(config);
+        let result = fetcher.fetch().await;
+
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(err.to_string().contains("error decoding response body"));
+    }
+
+    #[tokio::test]
+    async fn test_fetch_url_joining_without_trailing_slash() {
+        let mock_server = MockServer::start().await;
+
+        Mock::given(method("GET"))
+            .and(path("/v1/models"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "object": "list",
+                "data": []
+            })))
+            .expect(1)
+            .mount(&mock_server)
+            .await;
+
+        // URL without trailing slash
+        let base_url = format!("{}/v1", mock_server.uri());
+        let config = SyncConfig {
+            openai_api_key: None,
+            openai_base_url: base_url.parse().unwrap(),
+            auth_header_name: "Authorization".to_string(),
+            auth_header_prefix: "Bearer ".to_string(),
+            request_timeout: Duration::from_secs(30),
+            format_override: None,
+        };
+
+        let fetcher = FetchModelsReqwest::new(config);
+        let result = fetcher.fetch().await.unwrap();
+
+        assert_eq!(result.object, "list");
+        assert_eq!(result.data.len(), 0);
+    }
+
+    #[tokio::test]
+    async fn test_fetch_url_joining_with_trailing_slash() {
+        let mock_server = MockServer::start().await;
+
+        Mock::given(method("GET"))
+            .and(path("/v1/models"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "object": "list",
+                "data": []
+            })))
+            .expect(1)
+            .mount(&mock_server)
+            .await;
+
+        // URL with trailing slash
+        let base_url = format!("{}/v1/", mock_server.uri());
+        let config = SyncConfig {
+            openai_api_key: None,
+            openai_base_url: base_url.parse().unwrap(),
+            auth_header_name: "Authorization".to_string(),
+            auth_header_prefix: "Bearer ".to_string(),
+            request_timeout: Duration::from_secs(30),
+            format_override: None,
+        };
+
+        let fetcher = FetchModelsReqwest::new(config);
+        let result = fetcher.fetch().await.unwrap();
+
+        assert_eq!(result.object, "list");
+        assert_eq!(result.data.len(), 0);
+    }
+
+    #[test]
+    fn test_ensure_slash() {
+        let url_without = Url::parse("http://example.com/api").unwrap();
+        let url_with_slash = ensure_slash(&url_without);
+        assert_eq!(url_with_slash.path(), "/api/");
+
+        // Should be idempotent
+        let url_already_with_slash = Url::parse("http://example.com/api/").unwrap();
+        let url_still_with_slash = ensure_slash(&url_already_with_slash);
+        assert_eq!(url_still_with_slash.path(), "/api/");
+    }
+
+    #[test]
+    fn test_model_format_detection_openai() {
+        let url = Url::parse("https://api.openai.com/v1/").unwrap();
+        let format: ModelFormat = (&url).into();
+        assert!(matches!(format, ModelFormat::OpenAI));
+    }
+
+    #[test]
+    fn test_model_format_detection_anthropic() {
+        let url = Url::parse("https://api.anthropic.com/v1/").unwrap();
+        let format: ModelFormat = (&url).into();
+        assert!(matches!(format, ModelFormat::Anthropic));
+    }
+
+    #[test]
+    fn test_model_format_detection_other() {
+        let url = Url::parse("https://some-other-provider.com/v1/").unwrap();
+        let format: ModelFormat = (&url).into();
+        assert!(matches!(format, ModelFormat::OpenAI));
+    }
+
+    #[tokio::test]
+    async fn test_static_models_fetcher() {
+        let model_names = vec!["snowflake/arctic-embed-m".to_string(), "snowflake/mistral-large2".to_string()];
+
+        let fetcher = StaticModelsFetcher::new(model_names.clone());
+        let result = fetcher.fetch().await.unwrap();
+
+        assert_eq!(result.object, "list");
+        assert_eq!(result.data.len(), 2);
+        assert_eq!(result.data[0].id, "snowflake/arctic-embed-m");
+        assert_eq!(result.data[1].id, "snowflake/mistral-large2");
+        assert_eq!(result.data[0].object, "model");
     }
 }

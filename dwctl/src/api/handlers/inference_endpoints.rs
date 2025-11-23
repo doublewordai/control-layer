@@ -496,6 +496,7 @@ async fn validate_endpoint_connection(
         auth_header_name,
         auth_header_prefix,
         request_timeout: Duration::from_secs(10),
+        format_override: None,
     };
 
     // Use the existing FetchModelsReqwest implementation
