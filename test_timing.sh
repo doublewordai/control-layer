@@ -26,10 +26,10 @@ TEST_COUNT=$(cargo test "$TEST_FILTER" -- --list 2>&1 | grep "test$" | wc -l)
 echo "Found $TEST_COUNT tests matching '$TEST_FILTER'"
 echo ""
 
-# Step 2: Run the tests with timing
-echo "Step 2: Running tests (cargo test $TEST_FILTER)..."
+# Step 2: Run the tests with timing (parallel)
+echo "Step 2: Running tests in parallel (cargo test $TEST_FILTER)..."
 RUN_START=$(date +%s.%N)
-cargo test "$TEST_FILTER" -- --nocapture --test-threads=1
+cargo test "$TEST_FILTER" 2>&1 | grep -E "(test result:|running [0-9]+ test)"
 RUN_END=$(date +%s.%N)
 RUN_TIME=$(echo "$RUN_END - $RUN_START" | bc)
 echo ""
