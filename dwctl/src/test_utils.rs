@@ -62,10 +62,13 @@ pub async fn setup_fusillade_for_tests(pool: &PgPool) -> PgPool {
 
 pub async fn create_test_app(pool: PgPool, _enable_sync: bool) -> (TestServer, crate::BackgroundServices) {
     let mut config = create_test_config();
-    // Override database config to use the test pool
-    config.database = crate::config::DatabaseConfig::External {
-        url: pool.connect_options().to_url_lossy().to_string(),
-    };
+    // Override database config to use the test pool with small pool sizes
+    config.database = crate::config::DatabaseConfig::external_with_pools(
+        pool.connect_options().to_url_lossy().to_string(),
+        2, // max_connections
+        2, // fusillade_max_connections
+        1, // outlet_max_connections
+    );
     // Disable leader election for tests
     config.leader_election.enabled = false;
 
@@ -81,7 +84,7 @@ pub fn create_test_config() -> crate::config::Config {
 
     crate::config::Config {
         database_url: None, // Deprecated field
-        database: crate::config::DatabaseConfig::External { url: database_url },
+        database: crate::config::DatabaseConfig::external_with_pools(database_url, 2, 2, 1),
         host: "127.0.0.1".to_string(),
         port: 0,
         admin_email: "admin@test.com".to_string(),

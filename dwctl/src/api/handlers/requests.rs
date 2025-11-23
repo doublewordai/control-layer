@@ -392,9 +392,12 @@ mod tests {
         // Create config with request logging enabled
         let mut config = create_test_config();
         config.enable_request_logging = true;
-        config.database = crate::config::DatabaseConfig::External {
-            url: pool.connect_options().to_url_lossy().to_string(),
-        };
+        config.database = crate::config::DatabaseConfig::external_with_pools(
+            pool.connect_options().to_url_lossy().to_string(),
+            2,
+            2,
+            1,
+        );
         config.leader_election.enabled = false;
 
         // Use Application::new to properly set up outlet_db
@@ -425,9 +428,12 @@ mod tests {
         // Create config with request logging enabled
         let mut config = create_test_config();
         config.enable_request_logging = true;
-        config.database = crate::config::DatabaseConfig::External {
-            url: pool.connect_options().to_url_lossy().to_string(),
-        };
+        config.database = crate::config::DatabaseConfig::external_with_pools(
+            pool.connect_options().to_url_lossy().to_string(),
+            2,
+            2,
+            1,
+        );
         config.leader_election.enabled = false;
 
         // Use Application::new to properly set up outlet_db
@@ -470,9 +476,12 @@ mod tests {
         // This exercises the outlet database query and conversion logic (lines 112-184)
         let mut config = create_test_config();
         config.enable_request_logging = true;
-        config.database = crate::config::DatabaseConfig::External {
-            url: pool.connect_options().to_url_lossy().to_string(),
-        };
+        config.database = crate::config::DatabaseConfig::external_with_pools(
+            pool.connect_options().to_url_lossy().to_string(),
+            2,
+            2,
+            1,
+        );
         config.leader_election.enabled = false;
 
         // Use Application::new to properly set up outlet_db
@@ -833,9 +842,12 @@ mod tests {
         // Create config with request logging enabled
         let mut config = create_test_config();
         config.enable_request_logging = true;
-        config.database = crate::config::DatabaseConfig::External {
-            url: pool.connect_options().to_url_lossy().to_string(),
-        };
+        config.database = crate::config::DatabaseConfig::external_with_pools(
+            pool.connect_options().to_url_lossy().to_string(),
+            2,
+            2,
+            1,
+        );
         config.leader_election.enabled = false;
 
         // Use Application::new to properly set up outlet_db
@@ -868,9 +880,12 @@ mod tests {
         // Create config with request logging enabled
         let mut config = create_test_config();
         config.enable_request_logging = true;
-        config.database = crate::config::DatabaseConfig::External {
-            url: pool.connect_options().to_url_lossy().to_string(),
-        };
+        config.database = crate::config::DatabaseConfig::external_with_pools(
+            pool.connect_options().to_url_lossy().to_string(),
+            2,
+            2,
+            1,
+        );
         config.leader_election.enabled = false;
 
         // Use Application::new to properly set up outlet_db
@@ -907,9 +922,12 @@ mod tests {
         // Create config with request logging enabled
         let mut config = create_test_config();
         config.enable_request_logging = true;
-        config.database = crate::config::DatabaseConfig::External {
-            url: pool.connect_options().to_url_lossy().to_string(),
-        };
+        config.database = crate::config::DatabaseConfig::external_with_pools(
+            pool.connect_options().to_url_lossy().to_string(),
+            2,
+            2,
+            1,
+        );
         config.leader_election.enabled = false;
 
         // Use Application::new to properly set up outlet_db
@@ -944,9 +962,12 @@ mod tests {
         // Create config with request logging enabled
         let mut config = create_test_config();
         config.enable_request_logging = true;
-        config.database = crate::config::DatabaseConfig::External {
-            url: pool.connect_options().to_url_lossy().to_string(),
-        };
+        config.database = crate::config::DatabaseConfig::external_with_pools(
+            pool.connect_options().to_url_lossy().to_string(),
+            2,
+            2,
+            1,
+        );
         config.leader_election.enabled = false;
 
         // Use Application::new to properly set up outlet_db
@@ -1002,9 +1023,12 @@ mod tests {
         // Create config with request logging enabled
         let mut config = create_test_config();
         config.enable_request_logging = true;
-        config.database = crate::config::DatabaseConfig::External {
-            url: pool.connect_options().to_url_lossy().to_string(),
-        };
+        config.database = crate::config::DatabaseConfig::external_with_pools(
+            pool.connect_options().to_url_lossy().to_string(),
+            2,
+            2,
+            1,
+        );
         config.leader_election.enabled = false;
 
         // Use Application::new to properly set up outlet_db
@@ -1051,9 +1075,12 @@ mod tests {
         // Create config with request logging enabled
         let mut config = create_test_config();
         config.enable_request_logging = true;
-        config.database = crate::config::DatabaseConfig::External {
-            url: pool.connect_options().to_url_lossy().to_string(),
-        };
+        config.database = crate::config::DatabaseConfig::external_with_pools(
+            pool.connect_options().to_url_lossy().to_string(),
+            2,
+            2,
+            1,
+        );
         config.leader_election.enabled = false;
 
         // Use Application::new to properly set up outlet_db
@@ -1099,9 +1126,12 @@ mod tests {
         // Create config with request logging enabled
         let mut config = create_test_config();
         config.enable_request_logging = true;
-        config.database = crate::config::DatabaseConfig::External {
-            url: pool.connect_options().to_url_lossy().to_string(),
-        };
+        config.database = crate::config::DatabaseConfig::external_with_pools(
+            pool.connect_options().to_url_lossy().to_string(),
+            2,
+            2,
+            1,
+        );
         config.leader_election.enabled = false;
 
         // Use Application::new to properly set up outlet_db
@@ -1164,9 +1194,12 @@ mod tests {
         // Create config with request logging enabled
         let mut config = create_test_config();
         config.enable_request_logging = true;
-        config.database = crate::config::DatabaseConfig::External {
-            url: pool.connect_options().to_url_lossy().to_string(),
-        };
+        config.database = crate::config::DatabaseConfig::external_with_pools(
+            pool.connect_options().to_url_lossy().to_string(),
+            2,
+            2,
+            1,
+        );
         config.leader_election.enabled = false;
 
         // Use Application::new to properly set up outlet_db

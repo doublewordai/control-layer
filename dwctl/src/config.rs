@@ -153,6 +153,15 @@ pub enum DatabaseConfig {
     External {
         /// Connection string for external database
         url: String,
+        /// Maximum connections for main pool (default: 10)
+        #[serde(skip_serializing_if = "Option::is_none")]
+        max_connections: Option<u32>,
+        /// Maximum connections for fusillade pool (default: 20)
+        #[serde(skip_serializing_if = "Option::is_none")]
+        fusillade_max_connections: Option<u32>,
+        /// Maximum connections for outlet pool (default: 5)
+        #[serde(skip_serializing_if = "Option::is_none")]
+        outlet_max_connections: Option<u32>,
     },
 }
 
@@ -170,6 +179,9 @@ impl Default for DatabaseConfig {
         {
             DatabaseConfig::External {
                 url: "postgres://localhost:5432/control_layer".to_string(),
+                max_connections: None,
+                fusillade_max_connections: None,
+                outlet_max_connections: None,
             }
         }
     }
@@ -185,7 +197,7 @@ impl DatabaseConfig {
     /// Get external URL if available
     pub fn external_url(&self) -> Option<&str> {
         match self {
-            DatabaseConfig::External { url } => Some(url),
+            DatabaseConfig::External { url, .. } => Some(url),
             DatabaseConfig::Embedded { .. } => None,
         }
     }
@@ -203,6 +215,26 @@ impl DatabaseConfig {
         match self {
             DatabaseConfig::Embedded { persistent, .. } => *persistent,
             DatabaseConfig::External { .. } => false,
+        }
+    }
+
+    /// Create an external database config with default pool sizes
+    pub fn external(url: String) -> Self {
+        DatabaseConfig::External {
+            url,
+            max_connections: None,
+            fusillade_max_connections: None,
+            outlet_max_connections: None,
+        }
+    }
+
+    /// Create an external database config with custom pool sizes (for tests)
+    pub fn external_with_pools(url: String, max: u32, fus_max: u32, out_max: u32) -> Self {
+        DatabaseConfig::External {
+            url,
+            max_connections: Some(max),
+            fusillade_max_connections: Some(fus_max),
+            outlet_max_connections: Some(out_max),
         }
     }
 }
@@ -780,7 +812,12 @@ impl Config {
 
         // if database_url is set, use it
         if let Some(url) = config.database_url.take() {
-            config.database = DatabaseConfig::External { url };
+            config.database = DatabaseConfig::External {
+                url,
+                max_connections: None,
+                fusillade_max_connections: None,
+                outlet_max_connections: None,
+            };
         }
 
         config.validate().map_err(|e| figment::Error::from(e.to_string()))?;

@@ -400,6 +400,21 @@ pub async fn seed_database(sources: &[config::ModelSource], db: &PgPool) -> Resu
 /// Setup database connections, run migrations, and initialize data
 /// Returns: (embedded_db, main_pool, fusillade_pool, outlet_pool)
 async fn setup_database(config: &Config) -> anyhow::Result<(Option<db::embedded::EmbeddedDatabase>, PgPool, PgPool, Option<PgPool>)> {
+    // Extract pool sizes from config (with defaults)
+    let (pool_max_conn, fusillade_max_conn, outlet_max_conn) = match &config.database {
+        config::DatabaseConfig::External {
+            max_connections,
+            fusillade_max_connections,
+            outlet_max_connections,
+            ..
+        } => (
+            max_connections.unwrap_or(10),
+            fusillade_max_connections.unwrap_or(20),
+            outlet_max_connections.unwrap_or(5),
+        ),
+        _ => (10, 20, 5), // defaults for embedded database
+    };
+
     // Database connection - handle both embedded and external
     let (_embedded_db, database_url) = match &config.database {
         config::DatabaseConfig::Embedded { .. } => {
@@ -423,18 +438,21 @@ async fn setup_database(config: &Config) -> anyhow::Result<(Option<db::embedded:
                 );
             }
         }
-        config::DatabaseConfig::External { url } => {
+        config::DatabaseConfig::External { url, .. } => {
             info!("Using external database");
             (None::<db::embedded::EmbeddedDatabase>, url.clone())
         }
     };
 
-    let pool = PgPool::connect(&database_url).await?;
+    let pool = sqlx::postgres::PgPoolOptions::new()
+        .max_connections(pool_max_conn)
+        .connect(&database_url)
+        .await?;
     migrator().run(&pool).await?;
 
     // Setup fusillade schema and pool
     let fusillade_pool = sqlx::postgres::PgPoolOptions::new()
-        .max_connections(20)
+        .max_connections(fusillade_max_conn)
         .after_connect(|conn, _meta| {
             Box::pin(async move {
                 // Set search path to fusillade schema for all connections in this pool
@@ -451,7 +469,7 @@ async fn setup_database(config: &Config) -> anyhow::Result<(Option<db::embedded:
     // Setup outlet schema and pool if request logging is enabled
     let outlet_pool = if config.enable_request_logging {
         let outlet_pool = sqlx::postgres::PgPoolOptions::new()
-            .max_connections(5) // Smaller pool for logging
+            .max_connections(outlet_max_conn)
             .after_connect(|conn, _meta| {
                 Box::pin(async move {
                     // Set search path to outlet schema for all connections in this pool
@@ -1527,9 +1545,12 @@ mod test {
         // Create test config with request logging enabled
         let mut config = crate::test_utils::create_test_config();
         config.enable_request_logging = true;
-        config.database = crate::config::DatabaseConfig::External {
-            url: pool.connect_options().to_url_lossy().to_string(),
-        };
+        config.database = crate::config::DatabaseConfig::external_with_pools(
+            pool.connect_options().to_url_lossy().to_string(),
+            2,
+            2,
+            1,
+        );
         config.leader_election.enabled = false;
 
         // Create application using proper setup (which will create outlet_db)
