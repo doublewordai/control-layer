@@ -1694,6 +1694,7 @@ mod tests {
             port: 3001,
             database_url: None,
             database: crate::config::DatabaseConfig::External {
+                pool_config: crate::config::DatabasePoolConfig::default(),
                 url: "postgres://test@localhost/test".to_string(),
             },
             admin_email: "admin@example.org".to_string(),

@@ -133,6 +133,34 @@ pub struct Config {
     pub credits: CreditsConfig,
 }
 
+/// Database connection pool configuration.
+///
+/// Controls the maximum number of connections for each database pool.
+/// Each pool serves a different schema/purpose:
+/// - Main pool: public schema for application data
+/// - Fusillade pool: fusillade schema for batch processing
+/// - Outlet pool: outlet schema for request logging
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(default)]
+pub struct DatabasePoolConfig {
+    /// Maximum connections for the main application pool (default: 10)
+    pub max_connections: u32,
+    /// Maximum connections for the fusillade batch processing pool (default: 20)
+    pub fusillade_max_connections: u32,
+    /// Maximum connections for the outlet request logging pool (default: 5)
+    pub outlet_max_connections: u32,
+}
+
+impl Default for DatabasePoolConfig {
+    fn default() -> Self {
+        Self {
+            max_connections: 10,
+            fusillade_max_connections: 20,
+            outlet_max_connections: 5,
+        }
+    }
+}
+
 /// Database configuration.
 ///
 /// Supports either an embedded PostgreSQL instance (for development) or an external
@@ -148,11 +176,17 @@ pub enum DatabaseConfig {
         /// Whether to persist data between restarts (default: false/ephemeral)
         #[serde(default)]
         persistent: bool,
+        /// Connection pool configuration
+        #[serde(default)]
+        pool_config: DatabasePoolConfig,
     },
     /// Use external PostgreSQL database
     External {
         /// Connection string for external database
         url: String,
+        /// Connection pool configuration
+        #[serde(default)]
+        pool_config: DatabasePoolConfig,
     },
 }
 
@@ -164,12 +198,14 @@ impl Default for DatabaseConfig {
             DatabaseConfig::Embedded {
                 data_dir: None,
                 persistent: false,
+                pool_config: DatabasePoolConfig::default(),
             }
         }
         #[cfg(not(feature = "embedded-db"))]
         {
             DatabaseConfig::External {
                 url: "postgres://localhost:5432/control_layer".to_string(),
+                pool_config: DatabasePoolConfig::default(),
             }
         }
     }
@@ -185,7 +221,7 @@ impl DatabaseConfig {
     /// Get external URL if available
     pub fn external_url(&self) -> Option<&str> {
         match self {
-            DatabaseConfig::External { url } => Some(url),
+            DatabaseConfig::External { url, .. } => Some(url),
             DatabaseConfig::Embedded { .. } => None,
         }
     }
@@ -203,6 +239,14 @@ impl DatabaseConfig {
         match self {
             DatabaseConfig::Embedded { persistent, .. } => *persistent,
             DatabaseConfig::External { .. } => false,
+        }
+    }
+
+    /// Get the pool configuration
+    pub fn pool_config(&self) -> &DatabasePoolConfig {
+        match self {
+            DatabaseConfig::Embedded { pool_config, .. } => pool_config,
+            DatabaseConfig::External { pool_config, .. } => pool_config,
         }
     }
 }
@@ -778,9 +822,10 @@ impl Config {
     pub fn load(args: &Args) -> Result<Self, figment::Error> {
         let mut config: Self = Self::figment(args).extract()?;
 
-        // if database_url is set, use it
+        // if database_url is set, use it (preserving existing pool_config)
         if let Some(url) = config.database_url.take() {
-            config.database = DatabaseConfig::External { url };
+            let pool_config = config.database.pool_config().clone();
+            config.database = DatabaseConfig::External { url, pool_config };
         }
 
         config.validate().map_err(|e| figment::Error::from(e.to_string()))?;

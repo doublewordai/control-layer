@@ -399,42 +399,67 @@ pub async fn seed_database(sources: &[config::ModelSource], db: &PgPool) -> Resu
 
 /// Setup database connections, run migrations, and initialize data
 /// Returns: (embedded_db, main_pool, fusillade_pool, outlet_pool)
-async fn setup_database(config: &Config) -> anyhow::Result<(Option<db::embedded::EmbeddedDatabase>, PgPool, PgPool, Option<PgPool>)> {
-    // Database connection - handle both embedded and external
-    let (_embedded_db, database_url) = match &config.database {
-        config::DatabaseConfig::Embedded { .. } => {
-            let persistent = config.database.embedded_persistent();
-            info!("Starting with embedded database (persistent: {})", persistent);
-            if !persistent {
-                info!("persistent=false: database will be ephemeral and data will be lost on shutdown");
+///
+/// If `pool` is provided, it will be used directly instead of creating a new connection.
+/// This is useful for tests where sqlx::test provides a pool.
+async fn setup_database(
+    config: &Config,
+    pool: Option<PgPool>,
+) -> anyhow::Result<(Option<db::embedded::EmbeddedDatabase>, PgPool, PgPool, Option<PgPool>)> {
+    // If a pool is provided (e.g., from tests), use it directly
+    let (embedded_db, pool) = if let Some(existing_pool) = pool {
+        info!("Using provided database pool");
+        (None, existing_pool)
+    } else {
+        // Database connection - handle both embedded and external
+        let (_embedded_db, database_url) = match &config.database {
+            config::DatabaseConfig::Embedded { .. } => {
+                let persistent = config.database.embedded_persistent();
+                info!("Starting with embedded database (persistent: {})", persistent);
+                if !persistent {
+                    info!("persistent=false: database will be ephemeral and data will be lost on shutdown");
+                }
+                #[cfg(feature = "embedded-db")]
+                {
+                    let data_dir = config.database.embedded_data_dir();
+                    let embedded_db = db::embedded::EmbeddedDatabase::start(data_dir, persistent).await?;
+                    let url = embedded_db.connection_string().to_string();
+                    (Some(embedded_db), url)
+                }
+                #[cfg(not(feature = "embedded-db"))]
+                {
+                    anyhow::bail!(
+                        "Embedded database is configured but the feature is not enabled. \
+                         Rebuild with --features embedded-db to use embedded database."
+                    );
+                }
             }
-            #[cfg(feature = "embedded-db")]
-            {
-                let data_dir = config.database.embedded_data_dir();
-                let embedded_db = db::embedded::EmbeddedDatabase::start(data_dir, persistent).await?;
-                let url = embedded_db.connection_string().to_string();
-                (Some(embedded_db), url)
+            config::DatabaseConfig::External { url, .. } => {
+                info!("Using external database");
+                (None::<db::embedded::EmbeddedDatabase>, url.clone())
             }
-            #[cfg(not(feature = "embedded-db"))]
-            {
-                anyhow::bail!(
-                    "Embedded database is configured but the feature is not enabled. \
-                     Rebuild with --features embedded-db to use embedded database."
-                );
-            }
-        }
-        config::DatabaseConfig::External { url } => {
-            info!("Using external database");
-            (None::<db::embedded::EmbeddedDatabase>, url.clone())
-        }
+        };
+
+        let pool_config = config.database.pool_config();
+        let pool = sqlx::postgres::PgPoolOptions::new()
+            .max_connections(pool_config.max_connections)
+            .connect(&database_url)
+            .await?;
+        (_embedded_db, pool)
     };
 
-    let pool = PgPool::connect(&database_url).await?;
     migrator().run(&pool).await?;
+
+    // Get connection options from the main pool to create child pools
+    // This avoids URL serialization/parsing round-trips
+    let connect_opts = pool.connect_options().as_ref().clone();
+
+    // Get pool configuration
+    let pool_config = config.database.pool_config();
 
     // Setup fusillade schema and pool
     let fusillade_pool = sqlx::postgres::PgPoolOptions::new()
-        .max_connections(20)
+        .max_connections(pool_config.fusillade_max_connections)
         .after_connect(|conn, _meta| {
             Box::pin(async move {
                 // Set search path to fusillade schema for all connections in this pool
@@ -442,7 +467,7 @@ async fn setup_database(config: &Config) -> anyhow::Result<(Option<db::embedded:
                 Ok(())
             })
         })
-        .connect(&database_url)
+        .connect_with(connect_opts.clone())
         .await?;
 
     fusillade_pool.execute("CREATE SCHEMA IF NOT EXISTS fusillade").await?;
@@ -451,7 +476,7 @@ async fn setup_database(config: &Config) -> anyhow::Result<(Option<db::embedded:
     // Setup outlet schema and pool if request logging is enabled
     let outlet_pool = if config.enable_request_logging {
         let outlet_pool = sqlx::postgres::PgPoolOptions::new()
-            .max_connections(5) // Smaller pool for logging
+            .max_connections(pool_config.outlet_max_connections)
             .after_connect(|conn, _meta| {
                 Box::pin(async move {
                     // Set search path to outlet schema for all connections in this pool
@@ -459,7 +484,7 @@ async fn setup_database(config: &Config) -> anyhow::Result<(Option<db::embedded:
                     Ok(())
                 })
             })
-            .connect(&database_url)
+            .connect_with(connect_opts.clone())
             .await?;
 
         outlet_pool.execute("CREATE SCHEMA IF NOT EXISTS outlet").await?;
@@ -478,7 +503,7 @@ async fn setup_database(config: &Config) -> anyhow::Result<(Option<db::embedded:
     // Seed database with initial configuration (only runs once)
     seed_database(&config.model_sources, &pool).await?;
 
-    Ok((_embedded_db, pool, fusillade_pool, outlet_pool))
+    Ok((embedded_db, pool, fusillade_pool, outlet_pool))
 }
 
 /// Create CORS layer from configuration
@@ -1173,11 +1198,22 @@ pub struct Application {
 
 impl Application {
     /// Create a new application instance with all resources initialized
+    ///
+    /// If `pool` is provided, it will be used directly instead of creating a new connection.
+    /// This is useful for tests where sqlx::test provides a pool.
     pub async fn new(config: Config) -> anyhow::Result<Self> {
+        Self::new_with_pool(config, None).await
+    }
+
+    /// Create a new application instance with an existing database pool
+    ///
+    /// This method is primarily for tests where sqlx::test provides a pool.
+    /// For production use, prefer [`Application::new`] which will create its own pool.
+    pub async fn new_with_pool(config: Config, pool: Option<PgPool>) -> anyhow::Result<Self> {
         debug!("Starting control layer with configuration: {:#?}", config);
 
         // Setup database connections, run migrations, and initialize data
-        let (_embedded_db, pool, fusillade_pool, outlet_pool) = setup_database(&config).await?;
+        let (_embedded_db, pool, fusillade_pool, outlet_pool) = setup_database(&config, pool).await?;
 
         // Create a shutdown token for coordinating graceful shutdown of background tasks
         let shutdown_token = tokio_util::sync::CancellationToken::new();
@@ -1289,7 +1325,7 @@ mod test {
         test_utils::*,
     };
     use outlet_postgres::RequestFilter;
-    use sqlx::{ConnectOptions, PgPool};
+    use sqlx::PgPool;
 
     /// Integration test: setup the whole stack, including syncing the onwards config from
     /// LISTEN/NOTIFY, and then test user access via headers to /admin/api/v1/ai
@@ -1527,13 +1563,10 @@ mod test {
         // Create test config with request logging enabled
         let mut config = crate::test_utils::create_test_config();
         config.enable_request_logging = true;
-        config.database = crate::config::DatabaseConfig::External {
-            url: pool.connect_options().to_url_lossy().to_string(),
-        };
         config.leader_election.enabled = false;
 
         // Create application using proper setup (which will create outlet_db)
-        let app = crate::Application::new(config).await.expect("Failed to create application");
+        let app = crate::Application::new_with_pool(config, Some(pool)).await.expect("Failed to create application");
 
         // Get outlet_db from app_state to query logs
         let outlet_pool = app.app_state.outlet_db.clone().expect("outlet_db should exist");

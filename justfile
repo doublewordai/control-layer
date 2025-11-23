@@ -864,3 +864,45 @@ db-stop *args="":
 # Hidden recipes for internal use
 _drop-test-users:
     @./scripts/drop-test-users.sh
+    +# Profile a test with samply timeline profiler: 'just profile [TEST_FILTER]'
+
+
+# Profiles test execution with samply and opens a timeline view in Firefox Profiler.
+# The profile server runs at http://127.0.0.1:3001 - press Ctrl+C to stop.
+#
+# Arguments:
+# TEST_FILTER: Test name filter (optional, defaults to running all tests)
+#
+# Examples:
+#   just profile auth::middleware::tests::test_jwt_session_authentication
+#   just profile test_create_user
+#   just profile                     # Profile all tests
+profile test_filter="":
+    #!/usr/bin/env basH
+    set -euo pipefail
+
+    # Check if samply is installed
+    if ! command -v samply >/dev/null 2>&1; then
+        echo "❌ Error: samply not found. Install with:"
+        echo "  cargo install samply"
+        exit 1
+    fi
+
+    # Rebuild test binary and extract the binary path from cargo output
+    echo "Rebuilding test binary..."
+    BUILD_OUTPUT=$(cargo test --no-run --lib 2>&1)
+    echo "$BUILD_OUTPUT"
+
+    TEST_BINARY=$(echo "$BUILD_OUTPUT" | grep -o 'target/debug/deps/dwctl-[a-f0-9]*' | head -1)
+
+    if [ -z "$TEST_BINARY" ]; then
+        echo "❌ Error: Could not find test binary in cargo output"
+        exit 1
+    fi
+
+    echo "Profiling with samply: $TEST_BINARY"
+    echo "Test filter: {{test_filter}}"
+    echo ""
+
+    # Run samply with the test filter (DATABASE_URL set explicitly)
+    DATABASE_URL="postgres://postgres:password@127.0.0.1:5432/dwctl" samply record "$TEST_BINARY" {{test_filter}}

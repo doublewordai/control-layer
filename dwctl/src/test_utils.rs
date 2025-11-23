@@ -20,57 +20,19 @@ use crate::{
         },
     },
 };
-use sqlx::ConnectOptions;
-
 use axum_test::TestServer;
-use sqlx::{Executor, PgConnection, PgPool};
+use sqlx::{PgConnection, PgPool};
 use uuid::Uuid;
-
-/// Set up fusillade schema and run migrations for tests
-/// Only call this for tests that need fusillade (e.g., files tests)
-/// Returns a pool with search_path set to fusillade schema
-pub async fn setup_fusillade_for_tests(pool: &PgPool) -> PgPool {
-    // Create fusillade schema
-    pool.execute("CREATE SCHEMA IF NOT EXISTS fusillade")
-        .await
-        .expect("Failed to create fusillade schema");
-
-    // Get connection options from the existing pool
-    let conn_options = pool.connect_options();
-
-    // Create a pool with search_path set to fusillade
-    let fusillade_pool = sqlx::postgres::PgPoolOptions::new()
-        .max_connections(5)
-        .after_connect(|conn, _meta| {
-            Box::pin(async move {
-                conn.execute("SET search_path = 'fusillade'").await?;
-                Ok(())
-            })
-        })
-        .connect_with((*conn_options).clone())
-        .await
-        .expect("Failed to create fusillade pool");
-
-    // Run fusillade migrations
-    fusillade::migrator()
-        .run(&fusillade_pool)
-        .await
-        .expect("Failed to run fusillade migrations");
-
-    fusillade_pool
-}
 
 pub async fn create_test_app(pool: PgPool, _enable_sync: bool) -> (TestServer, crate::BackgroundServices) {
     let mut config = create_test_config();
-    // Override database config to use the test pool
-    config.database = crate::config::DatabaseConfig::External {
-        url: pool.connect_options().to_url_lossy().to_string(),
-    };
     // Disable leader election for tests
     config.leader_election.enabled = false;
 
-    // Create application using the same infrastructure as production
-    let app = crate::Application::new(config).await.expect("Failed to create application");
+    // Create application using the provided pool directly (no reconnection needed)
+    let app = crate::Application::new_with_pool(config, Some(pool))
+        .await
+        .expect("Failed to create application");
 
     // Convert to test server (sync is always enabled in new())
     app.into_test_server()
@@ -81,7 +43,10 @@ pub fn create_test_config() -> crate::config::Config {
 
     crate::config::Config {
         database_url: None, // Deprecated field
-        database: crate::config::DatabaseConfig::External { url: database_url },
+        database: crate::config::DatabaseConfig::External {
+            url: database_url,
+            pool_config: crate::config::DatabasePoolConfig::default(),
+        },
         host: "127.0.0.1".to_string(),
         port: 0,
         admin_email: "admin@test.com".to_string(),
