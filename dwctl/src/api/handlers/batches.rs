@@ -381,3 +381,598 @@ pub async fn list_batches(
         has_more,
     }))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::api::models::files::FileResponse;
+    use crate::api::models::users::Role;
+    use crate::test_utils::{
+        add_auth_headers, add_deployment_to_group, add_user_to_group, create_test_app, create_test_deployment, create_test_group,
+        create_test_user_with_roles,
+    };
+    use axum::http::StatusCode;
+    use sqlx::PgPool;
+
+    #[sqlx::test]
+    async fn test_create_batch_success(pool: PgPool) {
+        let (app, _bg_services) = create_test_app(pool.clone(), false).await;
+        let user = create_test_user_with_roles(&pool, vec![Role::StandardUser, Role::BatchAPIUser]).await;
+        let group = create_test_group(&pool).await;
+        add_user_to_group(&pool, user.id, group.id).await;
+
+        // Create a deployment and add to group so user has access to the model
+        let deployment = create_test_deployment(&pool, user.id, "gpt-3.5-turbo", "gpt-3.5-turbo").await;
+        add_deployment_to_group(&pool, deployment.id, group.id, user.id).await;
+
+        // First, upload a file for the batch
+        let file_content = r#"{"custom_id": "request-1", "method": "POST", "url": "/v1/chat/completions", "body": {"model": "gpt-3.5-turbo", "messages": [{"role": "user", "content": "Hello"}]}}"#;
+        let file_part = axum_test::multipart::Part::bytes(file_content.as_bytes()).file_name("test.jsonl");
+
+        let headers = add_auth_headers(&user);
+        let upload_response = app
+            .post("/ai/v1/files")
+            .add_header(&headers[0].0, &headers[0].1)
+            .add_header(&headers[1].0, &headers[1].1)
+            .multipart(
+                axum_test::multipart::MultipartForm::new()
+                    .add_text("purpose", "batch")
+                    .add_part("file", file_part),
+            )
+            .await;
+
+        upload_response.assert_status(StatusCode::CREATED);
+        let file: FileResponse = upload_response.json();
+
+        // Create batch
+        let create_req = CreateBatchRequest {
+            input_file_id: file.id.clone(),
+            endpoint: "/v1/chat/completions".to_string(),
+            completion_window: "24h".to_string(),
+            metadata: None,
+        };
+
+        let response = {
+            let headers = add_auth_headers(&user);
+            app.post("/ai/v1/batches")
+                .json(&create_req)
+                .add_header(&headers[0].0, &headers[0].1)
+                .add_header(&headers[1].0, &headers[1].1)
+        }
+        .await;
+
+        response.assert_status(StatusCode::CREATED);
+        let batch: BatchResponse = response.json();
+        assert_eq!(batch.endpoint, "/v1/chat/completions");
+        assert_eq!(batch.completion_window, "24h");
+        assert_eq!(batch.input_file_id, file.id);
+    }
+
+    #[sqlx::test]
+    async fn test_create_batch_invalid_completion_window(pool: PgPool) {
+        let (app, _bg_services) = create_test_app(pool.clone(), false).await;
+        let user = create_test_user_with_roles(&pool, vec![Role::StandardUser, Role::BatchAPIUser]).await;
+
+        let create_req = CreateBatchRequest {
+            input_file_id: "file-123".to_string(),
+            endpoint: "/v1/chat/completions".to_string(),
+            completion_window: "48h".to_string(), // Invalid
+            metadata: None,
+        };
+
+        let response = {
+            let headers = add_auth_headers(&user);
+            app.post("/ai/v1/batches")
+                .json(&create_req)
+                .add_header(&headers[0].0, &headers[0].1)
+                .add_header(&headers[1].0, &headers[1].1)
+        }
+        .await;
+
+        response.assert_status(StatusCode::BAD_REQUEST);
+        let body = response.text();
+        assert!(body.contains("24h"));
+    }
+
+    #[sqlx::test]
+    async fn test_create_batch_unsupported_endpoint(pool: PgPool) {
+        let (app, _bg_services) = create_test_app(pool.clone(), false).await;
+        let user = create_test_user_with_roles(&pool, vec![Role::StandardUser, Role::BatchAPIUser]).await;
+
+        let create_req = CreateBatchRequest {
+            input_file_id: "file-123".to_string(),
+            endpoint: "/v1/images/generations".to_string(), // Unsupported
+            completion_window: "24h".to_string(),
+            metadata: None,
+        };
+
+        let response = {
+            let headers = add_auth_headers(&user);
+            app.post("/ai/v1/batches")
+                .json(&create_req)
+                .add_header(&headers[0].0, &headers[0].1)
+                .add_header(&headers[1].0, &headers[1].1)
+        }
+        .await;
+
+        response.assert_status(StatusCode::BAD_REQUEST);
+        let body = response.text();
+        assert!(body.contains("Unsupported endpoint"));
+    }
+
+    #[sqlx::test]
+    async fn test_create_batch_invalid_file_id_format(pool: PgPool) {
+        let (app, _bg_services) = create_test_app(pool.clone(), false).await;
+        let user = create_test_user_with_roles(&pool, vec![Role::StandardUser, Role::BatchAPIUser]).await;
+
+        let create_req = CreateBatchRequest {
+            input_file_id: "not-a-uuid".to_string(),
+            endpoint: "/v1/chat/completions".to_string(),
+            completion_window: "24h".to_string(),
+            metadata: None,
+        };
+
+        let response = {
+            let headers = add_auth_headers(&user);
+            app.post("/ai/v1/batches")
+                .json(&create_req)
+                .add_header(&headers[0].0, &headers[0].1)
+                .add_header(&headers[1].0, &headers[1].1)
+        }
+        .await;
+
+        response.assert_status(StatusCode::BAD_REQUEST);
+        let body = response.text();
+        assert!(body.contains("Invalid input_file_id format"));
+    }
+
+    #[sqlx::test]
+    async fn test_create_batch_file_not_found(pool: PgPool) {
+        let (app, _bg_services) = create_test_app(pool.clone(), false).await;
+        let user = create_test_user_with_roles(&pool, vec![Role::StandardUser, Role::BatchAPIUser]).await;
+
+        let create_req = CreateBatchRequest {
+            input_file_id: uuid::Uuid::new_v4().to_string(),
+            endpoint: "/v1/chat/completions".to_string(),
+            completion_window: "24h".to_string(),
+            metadata: None,
+        };
+
+        let response = {
+            let headers = add_auth_headers(&user);
+            app.post("/ai/v1/batches")
+                .json(&create_req)
+                .add_header(&headers[0].0, &headers[0].1)
+                .add_header(&headers[1].0, &headers[1].1)
+        }
+        .await;
+
+        response.assert_status(StatusCode::NOT_FOUND);
+    }
+
+    #[sqlx::test]
+    async fn test_get_batch_success(pool: PgPool) {
+        let (app, _bg_services) = create_test_app(pool.clone(), false).await;
+        let user = create_test_user_with_roles(&pool, vec![Role::StandardUser, Role::BatchAPIUser]).await;
+        let group = create_test_group(&pool).await;
+        add_user_to_group(&pool, user.id, group.id).await;
+
+        let deployment = create_test_deployment(&pool, user.id, "gpt-3.5-turbo", "gpt-3.5-turbo").await;
+        add_deployment_to_group(&pool, deployment.id, group.id, user.id).await;
+
+        // Upload file and create batch
+        let file_content = r#"{"custom_id": "request-1", "method": "POST", "url": "/v1/chat/completions", "body": {"model": "gpt-3.5-turbo", "messages": [{"role": "user", "content": "Hello"}]}}"#;
+        let file_part = axum_test::multipart::Part::bytes(file_content.as_bytes()).file_name("test.jsonl");
+
+        let headers = add_auth_headers(&user);
+        let upload_response = app
+            .post("/ai/v1/files")
+            .add_header(&headers[0].0, &headers[0].1)
+            .add_header(&headers[1].0, &headers[1].1)
+            .multipart(
+                axum_test::multipart::MultipartForm::new()
+                    .add_text("purpose", "batch")
+                    .add_part("file", file_part),
+            )
+            .await;
+
+        let file: FileResponse = upload_response.json();
+
+        let create_req = CreateBatchRequest {
+            input_file_id: file.id,
+            endpoint: "/v1/chat/completions".to_string(),
+            completion_window: "24h".to_string(),
+            metadata: None,
+        };
+
+        let create_response = {
+            let headers = add_auth_headers(&user);
+            app.post("/ai/v1/batches")
+                .json(&create_req)
+                .add_header(&headers[0].0, &headers[0].1)
+                .add_header(&headers[1].0, &headers[1].1)
+        }
+        .await;
+
+        let batch: BatchResponse = create_response.json();
+
+        // Get batch
+        let response = {
+            let headers = add_auth_headers(&user);
+            app.get(&format!("/ai/v1/batches/{}", batch.id))
+                .add_header(&headers[0].0, &headers[0].1)
+                .add_header(&headers[1].0, &headers[1].1)
+        }
+        .await;
+
+        response.assert_status(StatusCode::OK);
+        let retrieved_batch: BatchResponse = response.json();
+        assert_eq!(retrieved_batch.id, batch.id);
+        assert_eq!(retrieved_batch.endpoint, "/v1/chat/completions");
+    }
+
+    #[sqlx::test]
+    async fn test_get_batch_not_found(pool: PgPool) {
+        let (app, _bg_services) = create_test_app(pool.clone(), false).await;
+        let user = create_test_user_with_roles(&pool, vec![Role::StandardUser, Role::BatchAPIUser]).await;
+
+        let batch_id = uuid::Uuid::new_v4();
+        let response = {
+            let headers = add_auth_headers(&user);
+            app.get(&format!("/ai/v1/batches/{}", batch_id))
+                .add_header(&headers[0].0, &headers[0].1)
+                .add_header(&headers[1].0, &headers[1].1)
+        }
+        .await;
+
+        response.assert_status(StatusCode::NOT_FOUND);
+    }
+
+    #[sqlx::test]
+    async fn test_get_batch_invalid_id_format(pool: PgPool) {
+        let (app, _bg_services) = create_test_app(pool.clone(), false).await;
+        let user = create_test_user_with_roles(&pool, vec![Role::StandardUser, Role::BatchAPIUser]).await;
+
+        let response = {
+            let headers = add_auth_headers(&user);
+            app.get("/ai/v1/batches/not-a-uuid")
+                .add_header(&headers[0].0, &headers[0].1)
+                .add_header(&headers[1].0, &headers[1].1)
+        }
+        .await;
+
+        response.assert_status(StatusCode::BAD_REQUEST);
+    }
+
+    #[sqlx::test]
+    async fn test_get_batch_ownership_check(pool: PgPool) {
+        let (app, _bg_services) = create_test_app(pool.clone(), false).await;
+        let user1 = create_test_user_with_roles(&pool, vec![Role::StandardUser, Role::BatchAPIUser]).await;
+        let user2 = create_test_user_with_roles(&pool, vec![Role::StandardUser, Role::BatchAPIUser]).await;
+        let group = create_test_group(&pool).await;
+        add_user_to_group(&pool, user1.id, group.id).await;
+
+        let deployment = create_test_deployment(&pool, user1.id, "gpt-3.5-turbo", "gpt-3.5-turbo").await;
+        add_deployment_to_group(&pool, deployment.id, group.id, user1.id).await;
+
+        // User1 creates a batch
+        let file_content = r#"{"custom_id": "request-1", "method": "POST", "url": "/v1/chat/completions", "body": {"model": "gpt-3.5-turbo", "messages": [{"role": "user", "content": "Hello"}]}}"#;
+        let file_part = axum_test::multipart::Part::bytes(file_content.as_bytes()).file_name("test.jsonl");
+
+        let headers = add_auth_headers(&user1);
+        let upload_response = app
+            .post("/ai/v1/files")
+            .add_header(&headers[0].0, &headers[0].1)
+            .add_header(&headers[1].0, &headers[1].1)
+            .multipart(
+                axum_test::multipart::MultipartForm::new()
+                    .add_text("purpose", "batch")
+                    .add_part("file", file_part),
+            )
+            .await;
+
+        let file: FileResponse = upload_response.json();
+
+        let create_req = CreateBatchRequest {
+            input_file_id: file.id,
+            endpoint: "/v1/chat/completions".to_string(),
+            completion_window: "24h".to_string(),
+            metadata: None,
+        };
+
+        let create_response = {
+            let headers = add_auth_headers(&user1);
+            app.post("/ai/v1/batches")
+                .json(&create_req)
+                .add_header(&headers[0].0, &headers[0].1)
+                .add_header(&headers[1].0, &headers[1].1)
+        }
+        .await;
+
+        let batch: BatchResponse = create_response.json();
+
+        // User2 tries to get user1's batch (should fail)
+        let response = {
+            let headers = add_auth_headers(&user2);
+            app.get(&format!("/ai/v1/batches/{}", batch.id))
+                .add_header(&headers[0].0, &headers[0].1)
+                .add_header(&headers[1].0, &headers[1].1)
+        }
+        .await;
+
+        response.assert_status(StatusCode::NOT_FOUND);
+    }
+
+    #[sqlx::test]
+    async fn test_list_batches_empty(pool: PgPool) {
+        let (app, _bg_services) = create_test_app(pool.clone(), false).await;
+        let user = create_test_user_with_roles(&pool, vec![Role::StandardUser, Role::BatchAPIUser]).await;
+
+        let response = {
+            let headers = add_auth_headers(&user);
+            app.get("/ai/v1/batches")
+                .add_header(&headers[0].0, &headers[0].1)
+                .add_header(&headers[1].0, &headers[1].1)
+        }
+        .await;
+
+        response.assert_status(StatusCode::OK);
+        let list: BatchListResponse = response.json();
+        assert_eq!(list.data.len(), 0);
+        assert!(!list.has_more);
+    }
+
+    #[sqlx::test]
+    async fn test_list_batches_with_results(pool: PgPool) {
+        let (app, _bg_services) = create_test_app(pool.clone(), false).await;
+        let user = create_test_user_with_roles(&pool, vec![Role::StandardUser, Role::BatchAPIUser]).await;
+        let group = create_test_group(&pool).await;
+        add_user_to_group(&pool, user.id, group.id).await;
+
+        let deployment = create_test_deployment(&pool, user.id, "gpt-3.5-turbo", "gpt-3.5-turbo").await;
+        add_deployment_to_group(&pool, deployment.id, group.id, user.id).await;
+
+        // Create a batch
+        let file_content = r#"{"custom_id": "request-1", "method": "POST", "url": "/v1/chat/completions", "body": {"model": "gpt-3.5-turbo", "messages": [{"role": "user", "content": "Hello"}]}}"#;
+        let file_part = axum_test::multipart::Part::bytes(file_content.as_bytes()).file_name("test.jsonl");
+
+        let headers = add_auth_headers(&user);
+        let upload_response = app
+            .post("/ai/v1/files")
+            .add_header(&headers[0].0, &headers[0].1)
+            .add_header(&headers[1].0, &headers[1].1)
+            .multipart(
+                axum_test::multipart::MultipartForm::new()
+                    .add_text("purpose", "batch")
+                    .add_part("file", file_part),
+            )
+            .await;
+
+        let file: FileResponse = upload_response.json();
+
+        let create_req = CreateBatchRequest {
+            input_file_id: file.id,
+            endpoint: "/v1/chat/completions".to_string(),
+            completion_window: "24h".to_string(),
+            metadata: None,
+        };
+
+        {
+            let headers = add_auth_headers(&user);
+            app.post("/ai/v1/batches")
+                .json(&create_req)
+                .add_header(&headers[0].0, &headers[0].1)
+                .add_header(&headers[1].0, &headers[1].1)
+        }
+        .await;
+
+        // List batches
+        let response = {
+            let headers = add_auth_headers(&user);
+            app.get("/ai/v1/batches")
+                .add_header(&headers[0].0, &headers[0].1)
+                .add_header(&headers[1].0, &headers[1].1)
+        }
+        .await;
+
+        response.assert_status(StatusCode::OK);
+        let list: BatchListResponse = response.json();
+        assert_eq!(list.data.len(), 1);
+        assert!(!list.has_more);
+    }
+
+    #[sqlx::test]
+    async fn test_list_batches_ownership_filtering(pool: PgPool) {
+        let (app, _bg_services) = create_test_app(pool.clone(), false).await;
+        let user1 = create_test_user_with_roles(&pool, vec![Role::StandardUser, Role::BatchAPIUser]).await;
+        let user2 = create_test_user_with_roles(&pool, vec![Role::StandardUser, Role::BatchAPIUser]).await;
+        let group = create_test_group(&pool).await;
+        add_user_to_group(&pool, user1.id, group.id).await;
+
+        let deployment = create_test_deployment(&pool, user1.id, "gpt-3.5-turbo", "gpt-3.5-turbo").await;
+        add_deployment_to_group(&pool, deployment.id, group.id, user1.id).await;
+
+        // User1 creates a batch
+        let file_content = r#"{"custom_id": "request-1", "method": "POST", "url": "/v1/chat/completions", "body": {"model": "gpt-3.5-turbo", "messages": [{"role": "user", "content": "Hello"}]}}"#;
+        let file_part = axum_test::multipart::Part::bytes(file_content.as_bytes()).file_name("test.jsonl");
+
+        let headers = add_auth_headers(&user1);
+        let upload_response = app
+            .post("/ai/v1/files")
+            .add_header(&headers[0].0, &headers[0].1)
+            .add_header(&headers[1].0, &headers[1].1)
+            .multipart(
+                axum_test::multipart::MultipartForm::new()
+                    .add_text("purpose", "batch")
+                    .add_part("file", file_part),
+            )
+            .await;
+
+        let file: FileResponse = upload_response.json();
+
+        let create_req = CreateBatchRequest {
+            input_file_id: file.id,
+            endpoint: "/v1/chat/completions".to_string(),
+            completion_window: "24h".to_string(),
+            metadata: None,
+        };
+
+        {
+            let headers = add_auth_headers(&user1);
+            app.post("/ai/v1/batches")
+                .json(&create_req)
+                .add_header(&headers[0].0, &headers[0].1)
+                .add_header(&headers[1].0, &headers[1].1)
+        }
+        .await;
+
+        // User2 lists batches (should see none)
+        let response = {
+            let headers = add_auth_headers(&user2);
+            app.get("/ai/v1/batches")
+                .add_header(&headers[0].0, &headers[0].1)
+                .add_header(&headers[1].0, &headers[1].1)
+        }
+        .await;
+
+        response.assert_status(StatusCode::OK);
+        let list: BatchListResponse = response.json();
+        assert_eq!(list.data.len(), 0);
+    }
+
+    #[sqlx::test]
+    async fn test_cancel_batch_success(pool: PgPool) {
+        let (app, _bg_services) = create_test_app(pool.clone(), false).await;
+        let user = create_test_user_with_roles(&pool, vec![Role::StandardUser, Role::BatchAPIUser]).await;
+        let group = create_test_group(&pool).await;
+        add_user_to_group(&pool, user.id, group.id).await;
+
+        let deployment = create_test_deployment(&pool, user.id, "gpt-3.5-turbo", "gpt-3.5-turbo").await;
+        add_deployment_to_group(&pool, deployment.id, group.id, user.id).await;
+
+        // Create a batch
+        let file_content = r#"{"custom_id": "request-1", "method": "POST", "url": "/v1/chat/completions", "body": {"model": "gpt-3.5-turbo", "messages": [{"role": "user", "content": "Hello"}]}}"#;
+        let file_part = axum_test::multipart::Part::bytes(file_content.as_bytes()).file_name("test.jsonl");
+
+        let headers = add_auth_headers(&user);
+        let upload_response = app
+            .post("/ai/v1/files")
+            .add_header(&headers[0].0, &headers[0].1)
+            .add_header(&headers[1].0, &headers[1].1)
+            .multipart(
+                axum_test::multipart::MultipartForm::new()
+                    .add_text("purpose", "batch")
+                    .add_part("file", file_part),
+            )
+            .await;
+
+        let file: FileResponse = upload_response.json();
+
+        let create_req = CreateBatchRequest {
+            input_file_id: file.id,
+            endpoint: "/v1/chat/completions".to_string(),
+            completion_window: "24h".to_string(),
+            metadata: None,
+        };
+
+        let create_response = {
+            let headers = add_auth_headers(&user);
+            app.post("/ai/v1/batches")
+                .json(&create_req)
+                .add_header(&headers[0].0, &headers[0].1)
+                .add_header(&headers[1].0, &headers[1].1)
+        }
+        .await;
+
+        let batch: BatchResponse = create_response.json();
+
+        // Cancel batch
+        let response = {
+            let headers = add_auth_headers(&user);
+            app.post(&format!("/ai/v1/batches/{}/cancel", batch.id))
+                .add_header(&headers[0].0, &headers[0].1)
+                .add_header(&headers[1].0, &headers[1].1)
+        }
+        .await;
+
+        response.assert_status(StatusCode::OK);
+        let cancelled_batch: BatchResponse = response.json();
+        assert!(cancelled_batch.status == "cancelling" || cancelled_batch.status == "cancelled");
+    }
+
+    #[sqlx::test]
+    async fn test_cancel_batch_not_found(pool: PgPool) {
+        let (app, _bg_services) = create_test_app(pool.clone(), false).await;
+        let user = create_test_user_with_roles(&pool, vec![Role::StandardUser, Role::BatchAPIUser]).await;
+
+        let batch_id = uuid::Uuid::new_v4();
+        let response = {
+            let headers = add_auth_headers(&user);
+            app.post(&format!("/ai/v1/batches/{}/cancel", batch_id))
+                .add_header(&headers[0].0, &headers[0].1)
+                .add_header(&headers[1].0, &headers[1].1)
+        }
+        .await;
+
+        response.assert_status(StatusCode::NOT_FOUND);
+    }
+
+    #[sqlx::test]
+    async fn test_cancel_batch_ownership_check(pool: PgPool) {
+        let (app, _bg_services) = create_test_app(pool.clone(), false).await;
+        let user1 = create_test_user_with_roles(&pool, vec![Role::StandardUser, Role::BatchAPIUser]).await;
+        let user2 = create_test_user_with_roles(&pool, vec![Role::StandardUser, Role::BatchAPIUser]).await;
+        let group = create_test_group(&pool).await;
+        add_user_to_group(&pool, user1.id, group.id).await;
+
+        let deployment = create_test_deployment(&pool, user1.id, "gpt-3.5-turbo", "gpt-3.5-turbo").await;
+        add_deployment_to_group(&pool, deployment.id, group.id, user1.id).await;
+
+        // User1 creates a batch
+        let file_content = r#"{"custom_id": "request-1", "method": "POST", "url": "/v1/chat/completions", "body": {"model": "gpt-3.5-turbo", "messages": [{"role": "user", "content": "Hello"}]}}"#;
+        let file_part = axum_test::multipart::Part::bytes(file_content.as_bytes()).file_name("test.jsonl");
+
+        let headers = add_auth_headers(&user1);
+        let upload_response = app
+            .post("/ai/v1/files")
+            .add_header(&headers[0].0, &headers[0].1)
+            .add_header(&headers[1].0, &headers[1].1)
+            .multipart(
+                axum_test::multipart::MultipartForm::new()
+                    .add_text("purpose", "batch")
+                    .add_part("file", file_part),
+            )
+            .await;
+
+        let file: FileResponse = upload_response.json();
+
+        let create_req = CreateBatchRequest {
+            input_file_id: file.id,
+            endpoint: "/v1/chat/completions".to_string(),
+            completion_window: "24h".to_string(),
+            metadata: None,
+        };
+
+        let create_response = {
+            let headers = add_auth_headers(&user1);
+            app.post("/ai/v1/batches")
+                .json(&create_req)
+                .add_header(&headers[0].0, &headers[0].1)
+                .add_header(&headers[1].0, &headers[1].1)
+        }
+        .await;
+
+        let batch: BatchResponse = create_response.json();
+
+        // User2 tries to cancel user1's batch (should fail)
+        let response = {
+            let headers = add_auth_headers(&user2);
+            app.post(&format!("/ai/v1/batches/{}/cancel", batch.id))
+                .add_header(&headers[0].0, &headers[0].1)
+                .add_header(&headers[1].0, &headers[1].1)
+        }
+        .await;
+
+        response.assert_status(StatusCode::NOT_FOUND);
+    }
+}
