@@ -276,6 +276,20 @@ impl std::ops::Deref for DaemonId {
 // Unified Request Representation
 // ============================================================================
 
+/// Result of completing a processing request.
+///
+/// After a request finishes processing, it transitions to one of three
+/// terminal states: Completed (success), Failed (error/retry), or Canceled.
+#[derive(Debug)]
+pub enum RequestCompletionResult {
+    /// The HTTP request completed successfully.
+    Completed(Request<Completed>),
+    /// The HTTP request failed and may be retried.
+    Failed(Request<Failed>),
+    /// The request was canceled before completion.
+    Canceled(Request<Canceled>),
+}
+
 /// Enum that can hold a request in any state.
 ///
 /// This is used for storage and API responses where we need to handle
@@ -301,6 +315,18 @@ impl AnyRequest {
             AnyRequest::Completed(r) => r.data.id,
             AnyRequest::Failed(r) => r.data.id,
             AnyRequest::Canceled(r) => r.data.id,
+        }
+    }
+
+    /// Get the variant name of the current state.
+    pub fn variant(&self) -> &'static str {
+        match self {
+            AnyRequest::Pending(_) => "Pending",
+            AnyRequest::Claimed(_) => "Claimed",
+            AnyRequest::Processing(_) => "Processing",
+            AnyRequest::Completed(_) => "Completed",
+            AnyRequest::Failed(_) => "Failed",
+            AnyRequest::Canceled(_) => "Canceled",
         }
     }
 

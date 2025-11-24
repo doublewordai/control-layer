@@ -149,10 +149,10 @@ export function AppSidebar() {
                     <UserAvatar user={currentUser} size="lg" />
                     <div className="flex-1 text-left min-w-0">
                       <p className="text-sm font-medium truncate">
-                        {currentUser.display_name || currentUser.username}
-                      </p>
-                      <p className="text-xs text-muted-foreground">
                         {currentUser.email}
+                      </p>
+                      <p className="text-xs text-muted-foreground truncate">
+                        {currentUser.display_name || currentUser.username}
                       </p>
                     </div>
                     <ChevronUp className="w-4 h-4 text-muted-foreground" />

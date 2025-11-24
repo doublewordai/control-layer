@@ -1,0 +1,23 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n            WITH canceled AS (\n                UPDATE requests\n                SET state = 'canceled', canceled_at = $2\n                WHERE batch_id = $1\n                    AND state IN ('pending', 'claimed', 'processing')\n                RETURNING id\n            )\n            SELECT pg_notify('request_cancellations', id::text)\n            FROM canceled\n            ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "pg_notify",
+        "type_info": "Void"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Timestamptz"
+      ]
+    },
+    "nullable": [
+      null
+    ]
+  },
+  "hash": "225991eaa280477d01b38e1a81703b20b9cce584dae913f4e223d1905998bd3e"
+}

@@ -1,5 +1,6 @@
 //! API request/response models for users.
 
+use super::pagination::Pagination;
 use crate::api::models::groups::GroupResponse;
 use crate::db::models::users::UserDBResponse;
 use crate::types::UserId;
@@ -50,6 +51,7 @@ pub struct UserResponse {
     pub updated_at: DateTime<Utc>,
     pub last_login: Option<DateTime<Utc>>,
     pub auth_source: String,
+    pub external_user_id: Option<String>,
     /// Groups this user belongs to (only included if requested)
     /// Note: no_recursion is important! utoipa will panic at runtime, because it overflows the
     /// stack trying to follow the relationship.
@@ -63,13 +65,10 @@ pub struct UserResponse {
 /// Query parameters for listing users
 #[derive(Debug, Deserialize, IntoParams, ToSchema)]
 pub struct ListUsersQuery {
-    /// Number of items to skip
-    #[param(default = 0, minimum = 0)]
-    pub skip: Option<i64>,
-
-    /// Maximum number of items to return
-    #[param(default = 100, minimum = 1, maximum = 1000)]
-    pub limit: Option<i64>,
+    /// Pagination parameters
+    #[serde(flatten)]
+    #[param(inline)]
+    pub pagination: Pagination,
 
     /// Include related data (comma-separated: "groups")
     pub include: Option<String>,
@@ -121,6 +120,7 @@ impl From<UserDBResponse> for UserResponse {
             created_at: db.created_at,
             updated_at: db.updated_at,
             auth_source: db.auth_source,
+            external_user_id: db.external_user_id,
             last_login: None,     // UserDBResponse doesn't have last_login
             groups: None,         // By default, relationships are not included
             credit_balance: None, // By default, credit balances are not included

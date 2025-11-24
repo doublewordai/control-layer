@@ -167,7 +167,7 @@ const ModelInfo: React.FC = () => {
       : null;
 
   // Find the specific model and endpoint
-  const model = rawModelsData?.find((m) => m.id === modelId);
+  const model = rawModelsData?.data.find((m) => m.id === modelId);
   const endpoint = endpointsData?.find((e) => e.id === model?.hosted_on);
 
   // Initialize form data when model is loaded
@@ -661,9 +661,14 @@ const ModelInfo: React.FC = () => {
                                 <HoverCardTrigger asChild>
                                   <Info className="h-3 w-3 text-gray-400 hover:text-gray-600" />
                                 </HoverCardTrigger>
-                                <HoverCardContent className="w-80" sideOffset={5}>
+                                <HoverCardContent
+                                  className="w-80"
+                                  sideOffset={5}
+                                >
                                   <p className="text-sm text-muted-foreground">
-                                    Sustained request rate limit. Temporary bursts can exceed this up to the burst size. Exceeding this limit returns 429 errors.
+                                    Sustained request rate limit. Temporary
+                                    bursts can exceed this up to the burst size.
+                                    Exceeding this limit returns 429 errors.
                                   </p>
                                 </HoverCardContent>
                               </HoverCard>
@@ -698,9 +703,13 @@ const ModelInfo: React.FC = () => {
                                 <HoverCardTrigger asChild>
                                   <Info className="h-3 w-3 text-gray-400 hover:text-gray-600" />
                                 </HoverCardTrigger>
-                                <HoverCardContent className="w-80" sideOffset={5}>
+                                <HoverCardContent
+                                  className="w-80"
+                                  sideOffset={5}
+                                >
                                   <p className="text-sm text-muted-foreground">
-                                    Maximum number of requests allowed in a temporary burst above the sustained rate.
+                                    Maximum number of requests allowed in a
+                                    temporary burst above the sustained rate.
                                   </p>
                                 </HoverCardContent>
                               </HoverCard>
@@ -734,9 +743,14 @@ const ModelInfo: React.FC = () => {
                                 <HoverCardTrigger asChild>
                                   <Info className="h-3 w-3 text-gray-400 hover:text-gray-600" />
                                 </HoverCardTrigger>
-                                <HoverCardContent className="w-80" sideOffset={5}>
+                                <HoverCardContent
+                                  className="w-80"
+                                  sideOffset={5}
+                                >
                                   <p className="text-sm text-muted-foreground">
-                                    Maximum number of requests that can be processed concurrently. Exceeding this limit returns 429 errors.
+                                    Maximum number of requests that can be
+                                    processed concurrently. Exceeding this limit
+                                    returns 429 errors.
                                   </p>
                                 </HoverCardContent>
                               </HoverCard>
@@ -770,9 +784,13 @@ const ModelInfo: React.FC = () => {
                                 <HoverCardTrigger asChild>
                                   <Info className="h-3 w-3 text-gray-400 hover:text-gray-600" />
                                 </HoverCardTrigger>
-                                <HoverCardContent className="w-80" sideOffset={5}>
+                                <HoverCardContent
+                                  className="w-80"
+                                  sideOffset={5}
+                                >
                                   <p className="text-sm text-muted-foreground">
-                                    Maximum number of concurrent requests the batching system can send to this model.
+                                    Maximum number of concurrent requests the
+                                    batching system can send to this model.
                                   </p>
                                 </HoverCardContent>
                               </HoverCard>
@@ -794,7 +812,8 @@ const ModelInfo: React.FC = () => {
                               }
                               placeholder={
                                 updateData.batch_capacity !== null
-                                  ? updateData.batch_capacity?.toString() || "None"
+                                  ? updateData.batch_capacity?.toString() ||
+                                    "None"
                                   : "None"
                               }
                             />
@@ -842,7 +861,9 @@ const ModelInfo: React.FC = () => {
                           updateData.batch_capacity > updateData.capacity && (
                             <div className="mt-2 p-2 bg-yellow-50 border border-yellow-200 rounded-md">
                               <p className="text-xs text-yellow-700">
-                                ⚠️ Maximum Batch Concurrent Requests is higher than Maximum Concurrent Requests. Batch requests may be rate limited.
+                                ⚠️ Maximum Batch Concurrent Requests is higher
+                                than Maximum Concurrent Requests. Batch requests
+                                may be rate limited.
                               </p>
                             </div>
                           )}
@@ -1039,7 +1060,8 @@ const ModelInfo: React.FC = () => {
                                 >
                                   <p className="text-sm text-muted-foreground">
                                     Customer-facing pricing rates per token.
-                                    {canManageGroups && ` Click ${model.pricing ? "Edit" : "Set Pricing"} to update pricing.`}
+                                    {canManageGroups &&
+                                      ` Click ${model.pricing ? "Edit" : "Set Pricing"} to update pricing.`}
                                   </p>
                                 </HoverCardContent>
                               </HoverCard>
@@ -1081,7 +1103,9 @@ const ModelInfo: React.FC = () => {
                             </div>
                           ) : (
                             <p className="text-sm text-gray-500 mt-2">
-                              No pricing configured.{canManageGroups && ' Click "Set Pricing" to add pricing information.'}
+                              No pricing configured.
+                              {canManageGroups &&
+                                ' Click "Set Pricing" to add pricing information.'}
                             </p>
                           )}
                         </div>
@@ -1107,7 +1131,8 @@ const ModelInfo: React.FC = () => {
                                   sideOffset={5}
                                 >
                                   <p className="text-sm text-muted-foreground">
-                                    Rate limits control request throughput. Capacity limits control concurrent requests.
+                                    Rate limits control request throughput.
+                                    Capacity limits control concurrent requests.
                                   </p>
                                 </HoverCardContent>
                               </HoverCard>
@@ -1120,9 +1145,15 @@ const ModelInfo: React.FC = () => {
                                     <HoverCardTrigger asChild>
                                       <Info className="h-3 w-3 text-gray-400 hover:text-gray-600" />
                                     </HoverCardTrigger>
-                                    <HoverCardContent className="w-80" sideOffset={5}>
+                                    <HoverCardContent
+                                      className="w-80"
+                                      sideOffset={5}
+                                    >
                                       <p className="text-sm text-muted-foreground">
-                                        Sustained request rate limit. Temporary bursts can exceed this up to the burst size. Exceeding this limit returns 429 errors.
+                                        Sustained request rate limit. Temporary
+                                        bursts can exceed this up to the burst
+                                        size. Exceeding this limit returns 429
+                                        errors.
                                       </p>
                                     </HoverCardContent>
                                   </HoverCard>
@@ -1140,9 +1171,14 @@ const ModelInfo: React.FC = () => {
                                     <HoverCardTrigger asChild>
                                       <Info className="h-3 w-3 text-gray-400 hover:text-gray-600" />
                                     </HoverCardTrigger>
-                                    <HoverCardContent className="w-80" sideOffset={5}>
+                                    <HoverCardContent
+                                      className="w-80"
+                                      sideOffset={5}
+                                    >
                                       <p className="text-sm text-muted-foreground">
-                                        Maximum number of requests allowed in a temporary burst above the sustained rate.
+                                        Maximum number of requests allowed in a
+                                        temporary burst above the sustained
+                                        rate.
                                       </p>
                                     </HoverCardContent>
                                   </HoverCard>
@@ -1160,9 +1196,14 @@ const ModelInfo: React.FC = () => {
                                     <HoverCardTrigger asChild>
                                       <Info className="h-3 w-3 text-gray-400 hover:text-gray-600" />
                                     </HoverCardTrigger>
-                                    <HoverCardContent className="w-80" sideOffset={5}>
+                                    <HoverCardContent
+                                      className="w-80"
+                                      sideOffset={5}
+                                    >
                                       <p className="text-sm text-muted-foreground">
-                                        Maximum number of requests that can be processed concurrently. Exceeding this limit returns 429 errors.
+                                        Maximum number of requests that can be
+                                        processed concurrently. Exceeding this
+                                        limit returns 429 errors.
                                       </p>
                                     </HoverCardContent>
                                   </HoverCard>
@@ -1180,9 +1221,14 @@ const ModelInfo: React.FC = () => {
                                     <HoverCardTrigger asChild>
                                       <Info className="h-3 w-3 text-gray-400 hover:text-gray-600" />
                                     </HoverCardTrigger>
-                                    <HoverCardContent className="w-80" sideOffset={5}>
+                                    <HoverCardContent
+                                      className="w-80"
+                                      sideOffset={5}
+                                    >
                                       <p className="text-sm text-muted-foreground">
-                                        Maximum number of concurrent requests the batching system can send to this model.
+                                        Maximum number of concurrent requests
+                                        the batching system can send to this
+                                        model.
                                       </p>
                                     </HoverCardContent>
                                   </HoverCard>
@@ -1197,17 +1243,23 @@ const ModelInfo: React.FC = () => {
                             {model.burst_size && !model.requests_per_second && (
                               <div className="mt-4 p-2 bg-yellow-50 border border-yellow-200 rounded-md">
                                 <p className="text-xs text-yellow-700">
-                                  ⚠️ Burst size will be ignored without requests per second. Set requests per second to enable rate limiting.
+                                  ⚠️ Burst size will be ignored without requests
+                                  per second. Set requests per second to enable
+                                  rate limiting.
                                 </p>
                               </div>
                             )}
-                            {model.batch_capacity && model.capacity && model.batch_capacity > model.capacity && (
-                              <div className="mt-4 p-2 bg-yellow-50 border border-yellow-200 rounded-md">
-                                <p className="text-xs text-yellow-700">
-                                  ⚠️ Maximum Batch Concurrent Requests is higher than Maximum Concurrent Requests. Batch requests may be rate limited.
-                                </p>
-                              </div>
-                            )}
+                            {model.batch_capacity &&
+                              model.capacity &&
+                              model.batch_capacity > model.capacity && (
+                                <div className="mt-4 p-2 bg-yellow-50 border border-yellow-200 rounded-md">
+                                  <p className="text-xs text-yellow-700">
+                                    ⚠️ Maximum Batch Concurrent Requests is
+                                    higher than Maximum Concurrent Requests.
+                                    Batch requests may be rate limited.
+                                  </p>
+                                </div>
+                              )}
                           </div>
                         )}
                     </div>
@@ -1447,7 +1499,10 @@ const ModelInfo: React.FC = () => {
 
         {canManageGroups && (
           <TabsContent value="usage">
-            <UserUsageTable modelAlias={model.alias} showPricing={showPricing} />
+            <UserUsageTable
+              modelAlias={model.alias}
+              showPricing={showPricing}
+            />
           </TabsContent>
         )}
 
