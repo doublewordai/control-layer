@@ -106,10 +106,10 @@ use std::sync::Arc;
 use tokio::sync::Mutex;
 
 use crate::{
+    FusilladeError,
     error::Result,
     http::{HttpClient, HttpResponse},
     manager::Storage,
-    FusilladeError,
 };
 
 use super::types::{

@@ -7,12 +7,12 @@ use std::time::Duration;
 use tokio::sync::{RwLock, Semaphore};
 use tokio::task::JoinSet;
 
+use crate::FusilladeError;
 use crate::error::Result;
 use crate::http::{HttpClient, HttpResponse};
 use crate::manager::{DaemonStorage, Storage};
 use crate::request::{DaemonId, RequestCompletionResult};
 use crate::types::RequestId;
-use crate::FusilladeError;
 use futures::StreamExt;
 
 pub mod transitions;
