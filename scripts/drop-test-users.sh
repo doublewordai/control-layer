@@ -24,9 +24,9 @@ fi
 
 echo "Fetching all users..." >&2
 
-# Get all users
+# Get all users (API returns paginated response)
 USERS=$(curl -s -X GET http://localhost:3001/admin/api/v1/users \
-  -b "dwctl_session=${ADMIN_JWT}" | jq -r '.[] | "\(.id):\(.email)"')
+  -b "dwctl_session=${ADMIN_JWT}" | jq -r '.data[] | "\(.id):\(.email)"')
 
 if [ -z "$USERS" ]; then
   echo "No users found or failed to fetch users" >&2
