@@ -1,5 +1,5 @@
 import { useEffect, useState } from "react";
-import { useUser, useAddFunds, useConfig, dwctlApi } from "@/api/control-layer";
+import { useUser, useAddFunds, useConfig, useCreatePayment, useProcessPayment } from "@/api/control-layer";
 import { toast } from "sonner";
 import { useSettings } from "@/contexts";
 import { TransactionHistory } from "@/components/features/cost-management/CostManagement/TransactionHistory.tsx";
@@ -19,13 +19,13 @@ export function CostManagement() {
   const { data: config } = useConfig();
 
   // Fetch current user
-  const { data: user, refetch: refetchUser } = useUser("current");
+  const { data: user } = useUser("current");
   const addFundsMutation = useAddFunds();
+  const createPaymentMutation = useCreatePayment();
+  const processPaymentMutation = useProcessPayment();
 
   const [showSuccessModal, setShowSuccessModal] = useState(false);
   const [showCancelledModal, setShowCancelledModal] = useState(false);
-  const [isProcessingPayment, setIsProcessingPayment] = useState(false);
-  const [processingError, setProcessingError] = useState<string | null>(null);
 
   // Handle return from payment provider
   useEffect(() => {
@@ -36,21 +36,9 @@ export function CostManagement() {
     const sessionId = urlParams.get("session_id");
 
     if (paymentStatus === "success" && sessionId) {
-      // Process payment with simple async/await
+      // Process payment using the mutation hook
       setShowSuccessModal(true);
-      setIsProcessingPayment(true);
-      setProcessingError(null);
-
-      dwctlApi.payments.process(sessionId)
-        .then(() => {
-          setIsProcessingPayment(false);
-          refetchUser();
-        })
-        .catch((error) => {
-          console.error("Error processing payment:", error);
-          setIsProcessingPayment(false);
-          setProcessingError(error instanceof Error ? error.message : "Failed to process payment");
-        });
+      processPaymentMutation.mutate(sessionId);
 
       // Clean up URL - this prevents re-processing on subsequent renders
       window.history.replaceState({}, "", window.location.pathname);
@@ -61,7 +49,6 @@ export function CostManagement() {
     } else if (paymentStatus === "success" && !sessionId) {
       // Legacy support for old payment_complete parameter
       toast.success("Payment completed! Your balance has been updated.");
-      refetchUser();
       window.history.replaceState({}, "", window.location.pathname);
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -84,9 +71,9 @@ export function CostManagement() {
         console.error("Error adding funds:", error);
       }
     } else if (config?.payment_enabled) {
-      // Payment processing enabled: Get checkout URL and redirect
+      // Payment processing enabled: Get checkout URL and redirect using the mutation hook
       try {
-        const data = await dwctlApi.payments.create();
+        const data = await createPaymentMutation.mutateAsync();
         if (data.url) {
           // Navigate to payment provider checkout page
           window.location.href = data.url;
@@ -131,12 +118,12 @@ export function CostManagement() {
         <DialogContent>
           <DialogHeader>
             <DialogTitle className="flex items-center gap-2">
-              {isProcessingPayment ? (
+              {processPaymentMutation.isPending ? (
                 <>
                   <Loader2 className="h-6 w-6 animate-spin text-blue-500" />
                   Processing Payment
                 </>
-              ) : processingError ? (
+              ) : processPaymentMutation.isError ? (
                 <>
                   <XCircle className="h-6 w-6 text-red-500" />
                   Payment Processing Failed
@@ -149,11 +136,15 @@ export function CostManagement() {
               )}
             </DialogTitle>
             <DialogDescription>
-              {isProcessingPayment ? (
+              {processPaymentMutation.isPending ? (
                 "Processing your payment and updating your account balance..."
-              ) : processingError ? (
+              ) : processPaymentMutation.isError ? (
                 <div className="space-y-2">
-                  <p className="text-red-600">{processingError}</p>
+                  <p className="text-red-600">
+                    {processPaymentMutation.error instanceof Error
+                      ? processPaymentMutation.error.message
+                      : "Failed to process payment"}
+                  </p>
                   <p className="text-sm text-gray-600">
                     Your payment may have been successful, but we couldn't confirm it yet.
                     If your balance doesn't update within a few minutes, please contact support.
@@ -169,7 +160,7 @@ export function CostManagement() {
               )}
             </DialogDescription>
           </DialogHeader>
-          {!isProcessingPayment && (
+          {!processPaymentMutation.isPending && (
             <div className="flex justify-end gap-2 mt-4">
               <Button onClick={() => setShowSuccessModal(false)}>
                 Close

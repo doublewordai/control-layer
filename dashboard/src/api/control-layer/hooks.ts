@@ -863,6 +863,34 @@ export function useAddFunds() {
   });
 }
 
+// Payment hooks
+
+export function useCreatePayment() {
+  return useMutation({
+    mutationKey: queryKeys.payments.create(),
+    mutationFn: () => dwctlApi.payments.create(),
+  });
+}
+
+export function useProcessPayment() {
+  const queryClient = useQueryClient();
+
+  return useMutation({
+    mutationKey: ["payments", "process"],
+    mutationFn: (sessionId: string) => dwctlApi.payments.process(sessionId),
+    onSuccess: () => {
+      // Refetch user data to update balance after successful payment
+      queryClient.invalidateQueries({
+        queryKey: queryKeys.users.all,
+      });
+      queryClient.invalidateQueries({
+        queryKey: ["cost", "transactions"],
+        exact: false,
+      });
+    },
+  });
+}
+
 // ===== DAEMONS HOOKS =====
 
 export function useDaemons(options?: DaemonsQuery) {
