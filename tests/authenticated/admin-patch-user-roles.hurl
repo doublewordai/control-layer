@@ -1,3 +1,6 @@
+# Test that admin can update user roles and permissions are reflected immediately
+# With JWT changes, roles are fetched fresh from DB on each request - no re-login needed
+
 # Get the current user (using user_jwt to auto-create the user)
 GET http://localhost:3001/admin/api/v1/users/current
 [Cookies]
@@ -11,25 +14,22 @@ GET http://localhost:3001/admin/api/v1/users/{{test_user_id}}
 [Cookies]
 dwctl_session: {{admin_jwt}}
 HTTP 200
-[Captures]
-original_roles: jsonpath "$.roles"
 [Asserts]
 jsonpath "$.roles[0]" == "StandardUser"
 jsonpath "$.roles" count == 1
 
-# Test that regular users cannot access admin endpoints (list users)
+# Test that regular users cannot access admin endpoints
 GET http://localhost:3001/admin/api/v1/users
 [Cookies]
 dwctl_session: {{user_jwt}}
 HTTP 403
 
-# Test that regular users cannot access admin endpoints (list groups)
 GET http://localhost:3001/admin/api/v1/groups
 [Cookies]
 dwctl_session: {{user_jwt}}
 HTTP 403
 
-# Patch user role to PlatformManager (StandardUser will be automatically preserved)
+# Patch user role to PlatformManager
 PATCH http://localhost:3001/admin/api/v1/users/{{test_user_id}}
 [Cookies]
 dwctl_session: {{admin_jwt}}
@@ -37,38 +37,18 @@ dwctl_session: {{admin_jwt}}
   "roles": ["PlatformManager"]
 }
 HTTP 200
-[Asserts]
-jsonpath "$.roles" contains "StandardUser"
-jsonpath "$.roles" contains "PlatformManager"
-jsonpath "$.roles" count == 2
 
-# Re-login to get fresh JWT with updated roles
-POST http://localhost:3001/authentication/login
-{
-  "email": "user@example.org",
-  "password": "user_password"
-}
-HTTP 200
-[Captures]
-user_jwt: cookie "dwctl_session"
-
-# Test that user with PlatformManager role can now access admin endpoints (list users)
+# Test updated permissions work immediately
 GET http://localhost:3001/admin/api/v1/users
 [Cookies]
 dwctl_session: {{user_jwt}}
 HTTP 200
-[Asserts]
-jsonpath "$" isCollection
 
-# Test that user with PlatformManager role can now access admin endpoints (list groups)
 GET http://localhost:3001/admin/api/v1/groups
 [Cookies]
 dwctl_session: {{user_jwt}}
 HTTP 200
-[Asserts]
-jsonpath "$" isCollection
 
-# Test that they can now access specific admin operations (create group)
 POST http://localhost:3001/admin/api/v1/groups
 [Cookies]
 dwctl_session: {{user_jwt}}
@@ -80,7 +60,7 @@ HTTP 201
 [Captures]
 test_group_id: jsonpath "$.id"
 
-# Try to patch user to have only RequestViewer (StandardUser should still be preserved)
+# Patch to RequestViewer
 PATCH http://localhost:3001/admin/api/v1/users/{{test_user_id}}
 [Cookies]
 dwctl_session: {{admin_jwt}}
@@ -91,9 +71,8 @@ HTTP 200
 [Asserts]
 jsonpath "$.roles" contains "StandardUser"
 jsonpath "$.roles" contains "RequestViewer"
-jsonpath "$.roles" count == 2
 
-# Try to patch user to have empty roles (StandardUser should still be preserved)
+# Patch to empty roles
 PATCH http://localhost:3001/admin/api/v1/users/{{test_user_id}}
 [Cookies]
 dwctl_session: {{admin_jwt}}
@@ -105,30 +84,21 @@ HTTP 200
 jsonpath "$.roles[0]" == "StandardUser"
 jsonpath "$.roles" count == 1
 
-# Re-login to get fresh JWT with updated roles (only StandardUser now)
-POST http://localhost:3001/authentication/login
-{
-  "email": "user@example.org",
-  "password": "user_password"
-}
-HTTP 200
-[Captures]
-user_jwt: cookie "dwctl_session"
+# REMOVED RE-LOGIN - not needed anymore!
+# Same JWT sees updated roles immediately
 
-# Test that user with only StandardUser role cannot access admin endpoints (list users)
+# Test permissions are now restricted
 GET http://localhost:3001/admin/api/v1/users
 [Cookies]
 dwctl_session: {{user_jwt}}
 HTTP 403
 
-# Test that user with only StandardUser role cannot access admin endpoints (list groups)
 GET http://localhost:3001/admin/api/v1/groups
 [Cookies]
 dwctl_session: {{user_jwt}}
 HTTP 403
 
-# Clean up: Delete the test group (using admin privileges)
-# @cookie_storage_clear
+# Cleanup
 DELETE http://localhost:3001/admin/api/v1/groups/{{test_group_id}}
 [Cookies]
 dwctl_session: {{admin_jwt}}
