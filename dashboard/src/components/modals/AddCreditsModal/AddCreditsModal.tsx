@@ -47,7 +47,7 @@ export function AddFundsModal({
     try {
       const result = await addFundsMutation.mutateAsync({
         user_id: targetUser.id,
-        source_id: currentUser.id,
+        source_id: `${currentUser.id}_${Date.now()}`,
         amount: amountNum,
         description:
           description ||

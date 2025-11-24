@@ -28,6 +28,19 @@ pub struct CreditTransactionCreateDBRequest {
     pub description: Option<String>,
 }
 
+impl CreditTransactionCreateDBRequest {
+    /// Create an admin grant request with automatically timestamped source_id
+    pub fn admin_grant(user_id: UserId, grantor_id: UserId, amount: Decimal, description: Option<String>) -> Self {
+        Self {
+            user_id,
+            transaction_type: CreditTransactionType::AdminGrant,
+            amount,
+            source_id: format!("{}_{}", grantor_id, chrono::Utc::now().timestamp_millis()),
+            description,
+        }
+    }
+}
+
 /// Database response for a credit transaction
 #[derive(Debug, Clone)]
 pub struct CreditTransactionDBResponse {

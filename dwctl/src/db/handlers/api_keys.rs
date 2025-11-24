@@ -2614,7 +2614,7 @@ mod tests {
                 user_id: user_with_credits.id,
                 transaction_type: CreditTransactionType::Purchase,
                 amount: Decimal::new(1000, 0), // 1000 credits
-                source_id: "test".to_string(),
+                source_id: uuid::Uuid::new_v4().to_string(), // Mimics Stripe payment ID
                 description: Some("Initial credits".to_string()),
             })
             .await
@@ -2626,7 +2626,7 @@ mod tests {
                 user_id: user_without_credits.id,
                 transaction_type: CreditTransactionType::Purchase,
                 amount: Decimal::new(100, 0),
-                source_id: "test".to_string(),
+                source_id: uuid::Uuid::new_v4().to_string(), // Mimics Stripe payment ID
                 description: Some("Initial credits".to_string()),
             })
             .await
@@ -2637,7 +2637,7 @@ mod tests {
                 user_id: user_without_credits.id,
                 transaction_type: CreditTransactionType::Usage,
                 amount: Decimal::new(120, 0), // Deduct all credits
-                source_id: "test".to_string(),
+                source_id: uuid::Uuid::new_v4().to_string(), // Mimics request ID from http_analytics
                 description: Some("Used all credits".to_string()),
             })
             .await
@@ -2888,7 +2888,7 @@ mod tests {
                     user_id: user_negative.id,
                     transaction_type: CreditTransactionType::Purchase,
                     amount: Decimal::new(100, 2), // +1.00
-                    source_id: "test".to_string(),
+                    source_id: uuid::Uuid::new_v4().to_string(), // Mimics Stripe payment ID
                     description: Some("Initial credits".to_string()),
                 })
                 .await
@@ -2899,7 +2899,7 @@ mod tests {
                     user_id: user_negative.id,
                     transaction_type: CreditTransactionType::Usage,
                     amount: Decimal::new(1100, 2), // -11.00
-                    source_id: "test".to_string(),
+                    source_id: uuid::Uuid::new_v4().to_string(), // Mimics request ID from http_analytics
                     description: Some("Negative balance".to_string()),
                 })
                 .await

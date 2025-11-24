@@ -548,7 +548,7 @@ describe("Billing Hooks", () => {
 
       const fundsData = {
         user_id: "550e8400-e29b-41d4-a716-446655440001",
-        source_id: "550e8400-e29b-41d4-a716-446655440001",
+        source_id: `550e8400-e29b-41d4-a716-446655440001_${Date.now()}`,
         amount: 100.0,
         description: "Test funds addition",
       };
@@ -572,7 +572,7 @@ describe("Billing Hooks", () => {
       });
 
       const fundsData = {
-        source_id: "550e8400-e29b-41d4-a716-446655440001",
+        source_id: `550e8400-e29b-41d4-a716-446655440001_${Date.now()}`,
         user_id: "550e8400-e29b-41d4-a716-446655440002",
         amount: 50.0,
       };
@@ -604,7 +604,7 @@ describe("Billing Hooks", () => {
       });
 
       result.current.mutate({
-        source_id: "550e8400-e29b-41d4-a716-446655440001",
+        source_id: `550e8400-e29b-41d4-a716-446655440001_${Date.now()}`,
         user_id: "non-existent-user",
         amount: 100,
       });
@@ -633,7 +633,7 @@ describe("Billing Hooks", () => {
 
       const userId = "550e8400-e29b-41d4-a716-446655440001";
       result.current.mutate({
-        source_id: "550e8400-e29b-41d4-a716-446655440001",
+        source_id: `550e8400-e29b-41d4-a716-446655440001_${Date.now()}`,
         user_id: userId,
         amount: 100,
         description: "Test invalidation",
