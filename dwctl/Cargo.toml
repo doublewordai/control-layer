@@ -118,4 +118,3 @@ test-log = { version = "0.2", features = ["trace"] }
 criterion = { version = "0.5", features = ["async_tokio"] }
 tempfile = "3.0"
 wiremock = "0.6"
-serde_urlencoded = "0.7"
