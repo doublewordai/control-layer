@@ -1269,6 +1269,7 @@ dependencies = [
  "rust_decimal",
  "serde",
  "serde_json",
+ "serde_urlencoded",
  "serde_with",
  "serial_test",
  "sqlx",
