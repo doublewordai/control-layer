@@ -18,7 +18,7 @@ use crate::{
     db::{
         handlers::{credits::Credits, PasswordResetTokens, Repository, Users},
         models::{
-            credits::{CreditTransactionCreateDBRequest, CreditTransactionType},
+            credits::{CreditTransactionCreateDBRequest},
             users::UserCreateDBRequest,
         },
     },

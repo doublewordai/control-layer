@@ -68,11 +68,9 @@ impl PaymentProvider for DummyProvider {
         // This method is typically called after we already have the transaction in the database
         // Return a basic session with dummy data - the actual data comes from the database
         Ok(PaymentSession {
-            id: session_id.to_string(),
             user_id: "unknown".to_string(), // This will be overridden by database lookup
             amount: self.amount,
             is_paid: true, // Dummy sessions are always "paid"
-            customer_id: None,
         })
     }
 

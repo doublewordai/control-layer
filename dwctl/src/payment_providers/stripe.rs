@@ -5,7 +5,7 @@ use rust_decimal::Decimal;
 use sqlx::PgPool;
 use stripe::{
     CheckoutSession, CheckoutSessionCustomerCreation, CheckoutSessionMode, CheckoutSessionPaymentStatus, CheckoutSessionUiMode, Client,
-    CreateCheckoutSession, CreateCheckoutSessionAutomaticTax, CreateCheckoutSessionLineItems, CustomerId,
+    CreateCheckoutSession, CreateCheckoutSessionAutomaticTax, CreateCheckoutSessionLineItems,
 };
 
 use crate::{
@@ -71,11 +71,7 @@ impl PaymentProvider for StripeProvider {
         // Include existing customer ID if we have one
         if let Some(existing_id) = &user.payment_provider_id {
             tracing::info!("Using existing Stripe customer ID {} for user {}", existing_id, user.id);
-            checkout_params.customer = Some(CustomerId::from(
-                existing_id
-                    .parse()
-                    .map_err(|e| PaymentError::InvalidData(format!("Invalid customer ID: {}", e)))?,
-            ));
+            checkout_params.customer = Some(existing_id.as_str().parse().unwrap());
         } else {
             tracing::info!("No customer ID found for user {}, Stripe will create one", user.id);
             // Provide customer email for the new customer
@@ -140,16 +136,11 @@ impl PaymentProvider for StripeProvider {
                 PaymentError::InvalidData("Missing payment amount".to_string())
             })?
             / 100; // Convert cents to dollars
-
-        // Get customer ID if available
-        let customer_id = checkout_session.customer.map(|c| c.id().to_string());
-
+        
         Ok(PaymentSession {
-            id: session_id.to_string(),
             user_id,
             amount: Decimal::from(price),
             is_paid: checkout_session.payment_status == CheckoutSessionPaymentStatus::Paid,
-            customer_id,
         })
     }
 
@@ -256,7 +247,6 @@ impl PaymentProvider for StripeProvider {
         let webhook_event = WebhookEvent {
             event_type: format!("{:?}", event.type_),
             session_id,
-            raw_data: serde_json::to_value(&event).unwrap_or(serde_json::Value::Null),
         };
 
         Ok(Some(webhook_event))

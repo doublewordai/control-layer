@@ -70,16 +70,12 @@ impl From<PaymentError> for StatusCode {
 /// Represents a completed payment session
 #[derive(Debug, Clone)]
 pub struct PaymentSession {
-    /// Unique identifier for this payment session
-    pub id: String,
     /// User ID associated with this payment
     pub user_id: String,
     /// Amount paid (in dollars)
     pub amount: Decimal,
     /// Whether the payment has been completed
     pub is_paid: bool,
-    /// Provider-specific customer ID (optional)
-    pub customer_id: Option<String>,
 }
 
 /// Represents a webhook event from a payment provider
@@ -89,8 +85,6 @@ pub struct WebhookEvent {
     pub event_type: String,
     /// Session ID associated with this event, if applicable
     pub session_id: Option<String>,
-    /// Raw event data for provider-specific processing
-    pub raw_data: serde_json::Value,
 }
 
 /// Abstract payment provider interface
