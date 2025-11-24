@@ -48,10 +48,13 @@ fn to_batch_response(batch: fusillade::Batch) -> BatchResponse {
         "failed"
     } else if is_finished {
         "completed"
-    } else if batch.in_progress_requests > 0 || batch.completed_requests > 0 {
-        "in_progress"
     } else {
-        "validating"
+        // Any batch that has been validated (total_requests > 0) but not finished
+        // is considered "in_progress". This includes:
+        // - Batches actively processing (in_progress_requests > 0)
+        // - Batches with some completed work (completed_requests > 0)
+        // - Batches queued and waiting for capacity (only pending_requests > 0)
+        "in_progress"
     };
 
     // Compute timestamps based on status
