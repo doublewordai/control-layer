@@ -1,6 +1,9 @@
 //! Test utilities for integration testing (available with `test-utils` feature).
 
-use crate::config::{BatchConfig, FilesConfig, NativeAuthConfig, ProxyHeaderAuthConfig, SecurityConfig};
+use crate::config::{
+    BatchConfig, DaemonConfig, DaemonEnabled, FilesConfig, LeaderElectionConfig, NativeAuthConfig, OnwardsSyncConfig, PoolSettings,
+    ProbeSchedulerConfig, ProxyHeaderAuthConfig, SecurityConfig,
+};
 use crate::db::handlers::inference_endpoints::{InferenceEndpointFilter, InferenceEndpoints};
 use crate::db::handlers::repository::Repository;
 use crate::errors::Error;
@@ -25,11 +28,8 @@ use sqlx::{PgConnection, PgPool};
 use uuid::Uuid;
 
 pub async fn create_test_app(pool: PgPool, _enable_sync: bool) -> (TestServer, crate::BackgroundServices) {
-    let mut config = create_test_config();
-    // Disable leader election for tests
-    config.leader_election.enabled = false;
+    let config = create_test_config();
 
-    // Create application using the provided pool directly (no reconnection needed)
     let app = crate::Application::new_with_pool(config, Some(pool))
         .await
         .expect("Failed to create application");
@@ -39,13 +39,28 @@ pub async fn create_test_app(pool: PgPool, _enable_sync: bool) -> (TestServer, c
 }
 
 pub fn create_test_config() -> crate::config::Config {
-    let database_url = std::env::var("TEST_DATABASE_URL").unwrap_or_else(|_| "postgres://postgres@localhost/test".to_string());
-
     crate::config::Config {
-        database_url: None, // Deprecated field
+        database_url: None,
         database: crate::config::DatabaseConfig::External {
-            url: database_url,
-            pool_config: crate::config::DatabasePoolConfig::default(),
+            pool_config: crate::config::DatabasePoolConfig {
+                main: PoolSettings {
+                    max_connections: 1,
+                    min_connections: 1,
+                    ..Default::default()
+                },
+                fusillade: PoolSettings {
+                    max_connections: 1,
+                    min_connections: 0,
+                    ..Default::default()
+                },
+                outlet: PoolSettings {
+                    max_connections: 1,
+                    min_connections: 0,
+                    ..Default::default()
+                },
+            },
+            // Will get overriden by env var
+            url: "Something".to_string(),
         },
         host: "127.0.0.1".to_string(),
         port: 0,
@@ -82,7 +97,16 @@ pub fn create_test_config() -> crate::config::Config {
             },
             ..Default::default()
         },
-        leader_election: crate::config::LeaderElectionConfig::default(),
+        background_services: crate::config::BackgroundServicesConfig {
+            onwards_sync: OnwardsSyncConfig { enabled: false },
+            probe_scheduler: ProbeSchedulerConfig { enabled: false },
+            batch_daemon: DaemonConfig {
+                enabled: DaemonEnabled::Never,
+                ..Default::default()
+            },
+            leader_election: LeaderElectionConfig { enabled: false },
+            ..Default::default()
+        },
     }
 }
 

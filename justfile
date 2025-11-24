@@ -805,25 +805,33 @@ db-start:
             docker start test-postgres
         fi
     else
-        echo "Creating new test-postgres container with fsync disabled..."
+        echo "Creating new test-postgres container with fsync disabled and trust auth..."
         # Create volume if it doesn't exist
         docker volume create test-postgres-data >/dev/null 2>&1 || true
         docker run --name test-postgres \
           -e POSTGRES_PASSWORD=password \
+          -e POSTGRES_HOST_AUTH_METHOD=trust \
           -p 5432:5432 \
           -v test-postgres-data:/var/lib/postgresql/data \
           -d postgres:latest \
-          postgres -c fsync=off
+          postgres -c fsync=off \
+          -c full_page_writes=off \
+          -c synchronous_commit=off \
+          -c wal_level=minimal \
+          -c max_wal_senders=0 \
+          -c checkpoint_timeout=1h \
+          -c max_wal_size=4GB \
+          -c shared_buffers=256MB \
+          -c work_mem=16MB \
+          -c maintenance_work_mem=128MB
     fi
 
     echo "Waiting for postgres to be ready..."
-    sleep 2
+    sleep 3
 
     # Verify it's up
     if pg_isready -h localhost -p 5432 >/dev/null 2>&1; then
         echo "✅ PostgreSQL is ready on localhost:5432"
-        echo "   Credentials: postgres/password"
-        echo "   ⚠️  fsync is disabled - for testing only!"
     else
         echo "❌ PostgreSQL not responding"
         exit 1
@@ -831,11 +839,11 @@ db-start:
 
 # Stop Docker PostgreSQL container
 #
-# Stops the test-postgres container. Add --remove to also delete the container.
+# Stops the test-postgres container. Add --remove to also delete the container and volume.
 #
 # Examples:
 #   just db-stop          # Stop container
-#   just db-stop --remove # Stop and remove container
+#   just db-stop --remove # Stop and remove container + volume
 db-stop *args="":
     #!/usr/bin/env bash
     set -euo pipefail
@@ -847,12 +855,16 @@ db-stop *args="":
         if [[ "{{args}}" == *"--remove"* ]]; then
             echo "Removing test-postgres container..."
             docker rm test-postgres
+            echo "Removing test-postgres-data volume..."
+            docker volume rm test-postgres-data 2>/dev/null || echo "  (volume already removed)"
         fi
         echo "✅ Done"
     elif docker ps -a --format '{{{{.Names}}' | grep -q "^test-postgres$"; then
         if [[ "{{args}}" == *"--remove"* ]]; then
             echo "Removing stopped test-postgres container..."
             docker rm test-postgres
+            echo "Removing test-postgres-data volume..."
+            docker volume rm test-postgres-data 2>/dev/null || echo "  (volume already removed)"
             echo "✅ Done"
         else
             echo "ℹ️  test-postgres container is already stopped"

@@ -45,7 +45,8 @@
 //! - **Security**: `secret_key`, `auth.security.cors` - Security and CORS settings
 //! - **Credits**: `credits.initial_credits_for_standard_users` - Credit system configuration
 //! - **Features**: `enable_metrics`, `enable_request_logging` - Optional feature toggles
-//! - **Batches**: `batches.enabled`, `batches.daemon` - Batch API configuration
+//! - **Batches**: `batches.enabled` - Batch API configuration
+//! - **Background Services**: `background_services.batch_daemon`, `background_services.leader_election` - Background service configuration
 //!
 //! ## Environment Variable Examples
 //!
@@ -119,10 +120,10 @@ pub struct Config {
     pub metadata: Metadata,
     /// Authentication configuration for various auth methods
     pub auth: AuthConfig,
-    /// Batch API configuration
+    /// Batch API configuration (endpoints and file handling)
     pub batches: BatchConfig,
-    /// Leader election configuration for multi-instance deployments
-    pub leader_election: LeaderElectionConfig,
+    /// Background services configuration (daemons, leader election, etc.)
+    pub background_services: BackgroundServicesConfig,
     /// Enable Prometheus metrics endpoint at `/internal/metrics`
     pub enable_metrics: bool,
     /// Enable request/response logging to PostgreSQL
@@ -133,30 +134,73 @@ pub struct Config {
     pub credits: CreditsConfig,
 }
 
+/// Individual pool configuration with all SQLx parameters.
+///
+/// These settings control connection pool behavior for optimal performance.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(default)]
+pub struct PoolSettings {
+    /// Maximum number of connections in the pool
+    pub max_connections: u32,
+    /// Minimum number of idle connections to maintain
+    pub min_connections: u32,
+    /// Maximum time to wait for a connection (seconds)
+    pub acquire_timeout_secs: u64,
+    /// Time before idle connections are closed (seconds, 0 = never)
+    pub idle_timeout_secs: u64,
+    /// Maximum lifetime of a connection (seconds, 0 = never)
+    pub max_lifetime_secs: u64,
+}
+
+impl Default for PoolSettings {
+    /// Production defaults: balanced for reliability and resource usage
+    fn default() -> Self {
+        Self {
+            max_connections: 10,
+            min_connections: 0,
+            acquire_timeout_secs: 30,
+            idle_timeout_secs: 600,  // 10 minutes
+            max_lifetime_secs: 1800, // 30 minutes
+        }
+    }
+}
+
 /// Database connection pool configuration.
 ///
-/// Controls the maximum number of connections for each database pool.
+/// Controls connection pooling for each database pool.
 /// Each pool serves a different schema/purpose:
 /// - Main pool: public schema for application data
-/// - Fusillade pool: fusillade schema for batch processing
-/// - Outlet pool: outlet schema for request logging
+/// - Fusillade pool: fusillade schema for batch processing (only if batches.enabled)
+/// - Outlet pool: outlet schema for request logging (only if enable_request_logging)
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(default)]
 pub struct DatabasePoolConfig {
-    /// Maximum connections for the main application pool (default: 10)
-    pub max_connections: u32,
-    /// Maximum connections for the fusillade batch processing pool (default: 20)
-    pub fusillade_max_connections: u32,
-    /// Maximum connections for the outlet request logging pool (default: 5)
-    pub outlet_max_connections: u32,
+    /// Main application pool settings
+    pub main: PoolSettings,
+    /// Fusillade batch processing pool settings (used only if batches.enabled)
+    pub fusillade: PoolSettings,
+    /// Outlet request logging pool settings (used only if enable_request_logging)
+    pub outlet: PoolSettings,
 }
 
 impl Default for DatabasePoolConfig {
     fn default() -> Self {
         Self {
-            max_connections: 10,
-            fusillade_max_connections: 20,
-            outlet_max_connections: 5,
+            main: PoolSettings::default(),
+            fusillade: PoolSettings {
+                max_connections: 20,
+                min_connections: 2,
+                acquire_timeout_secs: 30,
+                idle_timeout_secs: 600,
+                max_lifetime_secs: 1800,
+            },
+            outlet: PoolSettings {
+                max_connections: 5,
+                min_connections: 0,
+                acquire_timeout_secs: 30,
+                idle_timeout_secs: 600,
+                max_lifetime_secs: 1800,
+            },
         }
     }
 }
@@ -478,14 +522,13 @@ impl Default for FilesConfig {
 /// Batch API configuration.
 ///
 /// The batch API provides OpenAI-compatible batch processing endpoints for asynchronous
-/// request processing.
+/// request processing. Note: The batch processing daemon configuration has been moved
+/// to `background_services.batch_daemon`.
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(default)]
 pub struct BatchConfig {
     /// Enable batches API endpoints (default: true)
     pub enabled: bool,
-    /// Daemon configuration for processing batch requests
-    pub daemon: DaemonConfig,
     /// Files configuration for batch file uploads/downloads
     pub files: FilesConfig,
 }
@@ -494,7 +537,6 @@ impl Default for BatchConfig {
     fn default() -> Self {
         Self {
             enabled: true,
-            daemon: DaemonConfig::default(),
             files: FilesConfig::default(),
         }
     }
@@ -626,6 +668,56 @@ impl Default for LeaderElectionConfig {
     }
 }
 
+/// Background services configuration.
+///
+/// Controls which background services are enabled on this instance.
+#[derive(Debug, Clone, Deserialize, Serialize, Default)]
+#[serde(default)]
+pub struct BackgroundServicesConfig {
+    /// Configuration for onwards config sync service
+    pub onwards_sync: OnwardsSyncConfig,
+    /// Configuration for probe scheduler service
+    pub probe_scheduler: ProbeSchedulerConfig,
+    /// Configuration for batch processing daemon
+    pub batch_daemon: DaemonConfig,
+    /// Leader election configuration for multi-instance deployments
+    pub leader_election: LeaderElectionConfig,
+}
+
+/// Onwards configuration sync service configuration.
+///
+/// This service syncs database configuration changes to the onwards routing layer via PostgreSQL LISTEN/NOTIFY.
+/// Disabling this will prevent the AI proxy from receiving config updates (not recommended for production).
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(default)]
+pub struct OnwardsSyncConfig {
+    /// Enable onwards config sync service (default: true)
+    pub enabled: bool,
+}
+
+impl Default for OnwardsSyncConfig {
+    fn default() -> Self {
+        Self { enabled: true }
+    }
+}
+
+/// Probe scheduler service configuration.
+///
+/// The probe scheduler periodically checks inference endpoint health and removes failing backends from rotation.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(default)]
+pub struct ProbeSchedulerConfig {
+    /// Enable probe scheduler service (default: true)
+    /// When leader election is enabled, the probe scheduler only runs on the elected leader
+    pub enabled: bool,
+}
+
+impl Default for ProbeSchedulerConfig {
+    fn default() -> Self {
+        Self { enabled: true }
+    }
+}
+
 /// CORS origin specification.
 ///
 /// Can be either a wildcard (`*`) to allow all origins, or a specific URL.
@@ -693,7 +785,7 @@ impl Default for Config {
             metadata: Metadata::default(),
             auth: AuthConfig::default(),
             batches: BatchConfig::default(),
-            leader_election: LeaderElectionConfig::default(),
+            background_services: BackgroundServicesConfig::default(),
             enable_metrics: true,
             enable_request_logging: true,
             enable_otel_export: false,

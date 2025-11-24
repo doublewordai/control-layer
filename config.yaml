@@ -123,8 +123,27 @@ batches:
   # When disabled, these endpoints will not be available (default: true)
   enabled: true
 
-  # Daemon configuration for processing batch requests
-  daemon:
+  # Files configuration for batch file uploads/downloads
+  files:
+    max_file_size: 2147483648 # 2 GB - maximum size for file uploads
+    upload_buffer_size: 100 # Buffer size for file upload streams (default: 100)
+    download_buffer_size: 100 # Buffer size for file download streams (default: 100)
+
+# Background services configuration
+# Controls which background services run on this instance
+background_services:
+  # Onwards config sync - syncs database changes to the AI proxy routing layer
+  # Disabling this will prevent the AI proxy from receiving config updates
+  onwards_sync:
+    enabled: true # Default: true (recommended)
+
+  # Probe scheduler - periodically checks inference endpoint health
+  # When leader_election is enabled, only runs on the elected leader
+  probe_scheduler:
+    enabled: true # Default: true
+
+  # Batch processing daemon - processes batch requests asynchronously
+  batch_daemon:
     # Controls when the batch processing daemon runs
     # - "always": Run on all instances (default)
     # - "leader": Only run on the elected leader instance
@@ -150,9 +169,8 @@ batches:
     # Observability
     status_log_interval_ms: 2000 # Interval for logging daemon status (set to null to disable)
 
-  # Files configuration for batch file uploads/downloads
-  files:
-    max_file_size: 2147483648 # 2 GB - maximum size for file uploads
-    upload_buffer_size: 100 # Buffer size for file upload streams (default: 100)
-    download_buffer_size: 100 # Buffer size for file download streams (default: 100)
+  # Leader election - coordinates which instance runs leader-only services
+  # When disabled, all instances run as leader (useful for single-instance deployments)
+  leader_election:
+    enabled: true # Default: true
 

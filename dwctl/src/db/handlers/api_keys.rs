@@ -1717,7 +1717,7 @@ mod tests {
             enable_otel_export: false,
             credits: Default::default(),
             batches: Default::default(),
-            leader_election: crate::config::LeaderElectionConfig::default(),
+            background_services: crate::config::BackgroundServicesConfig::default(),
         };
         crate::seed_database(&config.model_sources, &pool).await.unwrap();
 
