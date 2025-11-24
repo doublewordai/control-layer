@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.8.1](https://github.com/doublewordai/control-layer/compare/v0.8.0...v0.8.1) (2025-11-24)
+
+
+### Bug Fixes
+
+* **dwctl:** batch file pagination ([#200](https://github.com/doublewordai/control-layer/issues/200)) ([0cd01b4](https://github.com/doublewordai/control-layer/commit/0cd01b4ef5dc2cd3ebc0788919684a80946019bd))
+
 ## [0.8.0](https://github.com/doublewordai/control-layer/compare/v0.7.1...v0.8.0) (2025-11-24)
 
 
