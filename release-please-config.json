@@ -2,13 +2,7 @@
   "packages": {
     "fusillade": {
       "release-type": "rust",
-      "include-component-in-tag": true,
-      "extra-files": [
-        {
-          "type": "cargo",
-          "path": "dwctl/Cargo.toml"
-        }
-      ]
+      "include-component-in-tag": true
     },
     "dwctl": {
       "release-type": "rust"
@@ -19,6 +13,5 @@
       "type": "cargo-workspace"
     }
   ],
-  "include-component-in-tag": false,
-  "separate-pull-requests": true
+  "include-component-in-tag": false
 }
