@@ -12,8 +12,14 @@ export const queryKeys = {
   // Models
   models: {
     all: ["models"] as const,
-    query: (options?: { endpoint?: string; include?: string; accessible?: boolean }) =>
-      ["models", "query", options] as const,
+    query: (options?: {
+      skip?: number;
+      limit?: number;
+      endpoint?: string;
+      include?: string;
+      accessible?: boolean;
+      search?: string;
+    }) => ["models", "query", options] as const,
     byId: (id: string) => ["models", "byId", id] as const,
   },
 

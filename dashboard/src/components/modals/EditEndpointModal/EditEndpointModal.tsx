@@ -133,7 +133,7 @@ export const EditEndpointModal: React.FC<EditEndpointModalProps> = ({
 
         // Build current alias mapping from deployed models
         const currentAliases: Record<string, string> = {};
-        currentModels.forEach((model) => {
+        currentModels.data.forEach((model) => {
           currentAliases[model.model_name] = model.alias;
         });
 

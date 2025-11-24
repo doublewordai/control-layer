@@ -1,5 +1,6 @@
 //! API request/response models for credit transactions.
 
+use super::pagination::Pagination;
 use crate::{
     db::models::credits::{CreditTransactionDBResponse, CreditTransactionType},
     types::UserId,
@@ -84,11 +85,10 @@ pub struct ListTransactionsQuery {
     /// Return all transactions across all users (BillingManager only)
     pub all: Option<bool>,
 
-    /// Number of items to skip
-    pub skip: Option<i64>,
-
-    /// Maximum number of items to return
-    pub limit: Option<i64>,
+    /// Pagination parameters
+    #[serde(flatten)]
+    #[param(inline)]
+    pub pagination: Pagination,
 }
 
 // Conversions
