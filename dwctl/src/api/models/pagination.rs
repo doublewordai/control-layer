@@ -95,6 +95,7 @@ pub const MAX_CURSOR_LIMIT: i64 = 100;
 /// Used by batch and files APIs following OpenAI's pagination pattern:
 /// - `after`: Cursor ID to start after (exclusive)
 /// - `limit`: Maximum items to return (default: 20, max: 100)
+#[serde_as]
 #[derive(Debug, Default, Deserialize, IntoParams, ToSchema)]
 pub struct CursorPagination {
     /// A cursor for use in pagination. `after` is an object ID that defines your place in the list.
@@ -102,6 +103,7 @@ pub struct CursorPagination {
 
     /// Maximum number of items to return (default: 20, max: 100)
     #[param(default = 20, minimum = 1, maximum = 100)]
+    #[serde_as(as = "Option<DisplayFromStr>")]
     pub limit: Option<i64>,
 }
 
@@ -226,5 +228,107 @@ mod tests {
             limit: None,
         };
         assert_eq!(p.after(), Some("cursor_123"));
+    }
+
+    #[test]
+    fn test_cursor_limit_negative() {
+        // Negative is clamped to 1
+        let p = CursorPagination {
+            after: None,
+            limit: Some(-5),
+        };
+        assert_eq!(p.limit(), 1);
+    }
+
+    #[test]
+    fn test_pagination_deserialization_from_query_string() {
+        // Test that query string values deserialize correctly
+        let query = "skip=10&limit=25";
+        let p: Pagination = serde_urlencoded::from_str(query).unwrap();
+        assert_eq!(p.skip(), 10);
+        assert_eq!(p.limit(), 25);
+
+        // Test with only limit
+        let query = "limit=50";
+        let p: Pagination = serde_urlencoded::from_str(query).unwrap();
+        assert_eq!(p.skip(), 0);
+        assert_eq!(p.limit(), 50);
+
+        // Test with only skip
+        let query = "skip=100";
+        let p: Pagination = serde_urlencoded::from_str(query).unwrap();
+        assert_eq!(p.skip(), 100);
+        assert_eq!(p.limit(), DEFAULT_LIMIT);
+
+        // Test empty query string (defaults)
+        let query = "";
+        let p: Pagination = serde_urlencoded::from_str(query).unwrap();
+        assert_eq!(p.skip(), 0);
+        assert_eq!(p.limit(), DEFAULT_LIMIT);
+    }
+
+    #[test]
+    fn test_cursor_pagination_deserialization_from_query_string() {
+        // Test that query strings with string values deserialize correctly
+        let query = "limit=11";
+        let p: CursorPagination = serde_urlencoded::from_str(query).unwrap();
+        assert_eq!(p.limit(), 11);
+        assert_eq!(p.after(), None);
+
+        // Test with after cursor
+        let query = "after=cursor_abc&limit=30";
+        let p: CursorPagination = serde_urlencoded::from_str(query).unwrap();
+        assert_eq!(p.limit(), 30);
+        assert_eq!(p.after(), Some("cursor_abc"));
+
+        // Test with only after
+        let query = "after=cursor_xyz";
+        let p: CursorPagination = serde_urlencoded::from_str(query).unwrap();
+        assert_eq!(p.limit(), DEFAULT_CURSOR_LIMIT);
+        assert_eq!(p.after(), Some("cursor_xyz"));
+
+        // Test empty query string (defaults)
+        let query = "";
+        let p: CursorPagination = serde_urlencoded::from_str(query).unwrap();
+        assert_eq!(p.limit(), DEFAULT_CURSOR_LIMIT);
+        assert_eq!(p.after(), None);
+    }
+
+    #[test]
+    fn test_paginated_response_creation() {
+        #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+        struct TestItem {
+            id: i64,
+        }
+
+        let items = vec![TestItem { id: 1 }, TestItem { id: 2 }];
+        let response = PaginatedResponse::new(items.clone(), 100, 10, 20);
+
+        assert_eq!(response.data.len(), 2);
+        assert_eq!(response.data[0].id, 1);
+        assert_eq!(response.total_count, 100);
+        assert_eq!(response.skip, 10);
+        assert_eq!(response.limit, 20);
+    }
+
+    #[test]
+    fn test_paginated_response_serialization() {
+        #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+        struct TestItem {
+            id: i64,
+        }
+
+        let items = vec![TestItem { id: 1 }];
+        let response = PaginatedResponse::new(items, 50, 0, 10);
+
+        let json = serde_json::to_string(&response).unwrap();
+        assert!(json.contains("\"total_count\":50"));
+        assert!(json.contains("\"skip\":0"));
+        assert!(json.contains("\"limit\":10"));
+
+        // Test round-trip
+        let deserialized: PaginatedResponse<TestItem> = serde_json::from_str(&json).unwrap();
+        assert_eq!(deserialized.total_count, 50);
+        assert_eq!(deserialized.data.len(), 1);
     }
 }

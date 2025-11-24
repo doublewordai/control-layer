@@ -1226,7 +1226,7 @@ checksum = "1aaf95b3e5c8f23aa320147307562d361db0ae0d51242340f558153b4eb2439b"
 
 [[package]]
 name = "dwctl"
-version = "0.7.1"
+version = "0.8.1"
 dependencies = [
  "aes-gcm",
  "anyhow",
@@ -1269,6 +1269,7 @@ dependencies = [
  "rust_decimal",
  "serde",
  "serde_json",
+ "serde_urlencoded",
  "serde_with",
  "serial_test",
  "sqlx",
@@ -1525,7 +1526,7 @@ checksum = "e6d5a32815ae3f33302d95fdcb2ce17862f8c65363dcfd29360480ba1001fc9c"
 
 [[package]]
 name = "fusillade"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "anyhow",
  "async-trait",
