@@ -24,8 +24,8 @@ fi
 
 echo "Fetching all groups..." >&2
 
-# Get all groups (API returns paginated response)
-GROUPS=$(curl -s -X GET https://localhost/admin/api/v1/groups \
+# Get all groups (API returns paginated response, use max limit of 100)
+GROUPS=$(curl -s -X GET "https://localhost/admin/api/v1/groups?limit=100" \
   -b "dwctl_session=${ADMIN_JWT}" | jq -r '.data[] | "\(.id):\(.name)"')
 
 if [ -z "$GROUPS" ]; then

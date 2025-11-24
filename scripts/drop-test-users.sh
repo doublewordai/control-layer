@@ -24,8 +24,8 @@ fi
 
 echo "Fetching all users..." >&2
 
-# Get all users (API returns paginated response)
-USERS=$(curl -s -X GET http://localhost:3001/admin/api/v1/users \
+# Get all users (API returns paginated response, use max limit of 100)
+USERS=$(curl -s -X GET "http://localhost:3001/admin/api/v1/users?limit=100" \
   -b "dwctl_session=${ADMIN_JWT}" | jq -r '.data[] | "\(.id):\(.email)"')
 
 if [ -z "$USERS" ]; then
