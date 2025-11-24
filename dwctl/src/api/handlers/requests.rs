@@ -120,8 +120,7 @@ pub async fn list_requests(
     _: RequiresPermission<resource::Requests, operation::ReadAll>,
 ) -> Result<Json<ListRequestsResponse>, Error> {
     // Validate and apply limits
-    let limit = query.limit.unwrap_or(50).clamp(1, 1000);
-    let offset = query.offset.unwrap_or(0).max(0);
+    let (skip, limit) = query.pagination.params();
 
     // If request logging is not enabled, return 404
     let outlet_pool = state.outlet_db.as_ref().ok_or_else(|| {
@@ -138,7 +137,7 @@ pub async fn list_requests(
     let mut filter = RequestFilter {
         uri_pattern: None,
         limit: Some(limit),
-        offset: Some(offset),
+        offset: Some(skip),
         order_by_timestamp_desc: query.order_desc.unwrap_or(true),
         ..Default::default()
     };
@@ -315,7 +314,7 @@ mod tests {
         sqlx::query!(
             r#"
             INSERT INTO http_analytics (
-                instance_id, correlation_id, timestamp, uri, method, status_code, duration_ms, 
+                instance_id, correlation_id, timestamp, uri, method, status_code, duration_ms,
                 model, prompt_tokens, completion_tokens, total_tokens
             ) VALUES ($1, $2, $3, '/ai/chat/completions', 'POST', $4, $5, $6, $7, $8, $9)
             "#,
@@ -492,8 +491,8 @@ mod tests {
     #[test]
     fn test_list_requests_query_default() {
         let query = ListRequestsQuery::default();
-        assert_eq!(query.limit, Some(50));
-        assert_eq!(query.offset, Some(0));
+        assert_eq!(query.pagination.skip(), 0);
+        assert_eq!(query.pagination.limit(), 10); // DEFAULT_LIMIT from pagination module
         assert_eq!(query.order_desc, Some(true));
         assert!(query.method.is_none());
         assert!(query.uri_pattern.is_none());
@@ -1167,7 +1166,7 @@ mod tests {
         let boundary_tests = vec![
             ("limit=1", "Minimum limit"),
             ("limit=1000", "Maximum limit"),
-            ("offset=0", "Zero offset"),
+            ("skip=0", "Zero skip"),
             ("status_code=200", "Specific status code"),
             ("status_code_min=100&status_code_max=599", "Status code range"),
             ("order_desc=true", "Descending order"),

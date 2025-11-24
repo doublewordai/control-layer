@@ -1,5 +1,13 @@
 import { z } from "zod";
 
+// Generic paginated response wrapper
+export interface PaginatedResponse<T> {
+  data: T[];
+  total_count: number;
+  skip: number;
+  limit: number;
+}
+
 export type ModelType = "CHAT" | "EMBEDDINGS" | "RERANKER";
 export type AuthSource = "vouch" | "native" | "system" | "proxy-header";
 export type Role =
@@ -163,9 +171,12 @@ export type UsersInclude = "groups";
 
 // List endpoint query parameters
 export interface ModelsQuery {
+  skip?: number;
+  limit?: number;
   endpoint?: string;
   include?: ModelsInclude;
   accessible?: boolean; // Filter to only models the current user can access
+  search?: string; // Search query to filter models by alias or model_name
 }
 
 export interface EndpointsQuery {

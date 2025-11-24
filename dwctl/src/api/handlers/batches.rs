@@ -334,16 +334,17 @@ pub async fn cancel_batch(
         ListBatchesQuery
     )
 )]
-#[tracing::instrument(skip(state, current_user), fields(user_id = %current_user.id, limit = ?query.limit, after = ?query.after))]
+#[tracing::instrument(skip(state, current_user), fields(user_id = %current_user.id, limit = ?query.pagination.limit, after = ?query.pagination.after))]
 pub async fn list_batches(
     State(state): State<AppState>,
     Query(query): Query<ListBatchesQuery>,
     current_user: RequiresPermission<resource::Batches, operation::ReadOwn>,
 ) -> Result<Json<BatchListResponse>> {
-    let limit = query.limit.unwrap_or(20).clamp(1, 100);
+    let limit = query.pagination.limit();
 
     // Parse the after cursor if provided
     let after = query
+        .pagination
         .after
         .as_ref()
         .and_then(|after_str| Uuid::parse_str(after_str).ok().map(fusillade::BatchId));
