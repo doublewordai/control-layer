@@ -120,8 +120,7 @@ pub async fn list_requests(
     _: RequiresPermission<resource::Requests, operation::ReadAll>,
 ) -> Result<Json<ListRequestsResponse>, Error> {
     // Validate and apply limits
-    let limit = query.limit.unwrap_or(50).clamp(1, 1000);
-    let offset = query.offset.unwrap_or(0).max(0);
+    let (skip, limit) = query.pagination.params();
 
     // If request logging is not enabled, return 404
     let outlet_pool = state.outlet_db.as_ref().ok_or_else(|| {
@@ -138,7 +137,7 @@ pub async fn list_requests(
     let mut filter = RequestFilter {
         uri_pattern: None,
         limit: Some(limit),
-        offset: Some(offset),
+        offset: Some(skip),
         order_by_timestamp_desc: query.order_desc.unwrap_or(true),
         ..Default::default()
     };
@@ -298,7 +297,7 @@ mod tests {
     use crate::{api::models::users::Role, test_utils::*};
     use chrono::{Duration, Utc};
     use serde_json::json;
-    use sqlx::{ConnectOptions, PgPool};
+    use sqlx::PgPool;
 
     // Helper function to insert test analytics data for aggregate tests
     async fn insert_test_analytics_data(
@@ -315,7 +314,7 @@ mod tests {
         sqlx::query!(
             r#"
             INSERT INTO http_analytics (
-                instance_id, correlation_id, timestamp, uri, method, status_code, duration_ms, 
+                instance_id, correlation_id, timestamp, uri, method, status_code, duration_ms,
                 model, prompt_tokens, completion_tokens, total_tokens
             ) VALUES ($1, $2, $3, '/ai/chat/completions', 'POST', $4, $5, $6, $7, $8, $9)
             "#,
@@ -342,7 +341,8 @@ mod tests {
 
         let response = app
             .get("/admin/api/v1/requests")
-            .add_header(add_auth_headers(&admin_user).0, add_auth_headers(&admin_user).1)
+            .add_header(&add_auth_headers(&admin_user)[0].0, &add_auth_headers(&admin_user)[0].1)
+            .add_header(&add_auth_headers(&admin_user)[1].0, &add_auth_headers(&admin_user)[1].1)
             .await;
 
         // Should return 404 since request logging is disabled
@@ -357,7 +357,8 @@ mod tests {
 
         let response = app
             .get("/admin/api/v1/requests")
-            .add_header(add_auth_headers(&user).0, add_auth_headers(&user).1)
+            .add_header(&add_auth_headers(&user)[0].0, &add_auth_headers(&user)[0].1)
+            .add_header(&add_auth_headers(&user)[1].0, &add_auth_headers(&user)[1].1)
             .await;
 
         // Should be forbidden since user doesn't have Requests:Read permission
@@ -372,7 +373,8 @@ mod tests {
 
         let response = app
             .get("/admin/api/v1/requests/aggregate")
-            .add_header(add_auth_headers(&admin_user).0, add_auth_headers(&admin_user).1)
+            .add_header(&add_auth_headers(&admin_user)[0].0, &add_auth_headers(&admin_user)[0].1)
+            .add_header(&add_auth_headers(&admin_user)[1].0, &add_auth_headers(&admin_user)[1].1)
             .await;
 
         // Should return 404 since request logging is disabled
@@ -389,19 +391,19 @@ mod tests {
         // Create config with request logging enabled
         let mut config = create_test_config();
         config.enable_request_logging = true;
-        config.database = crate::config::DatabaseConfig::External {
-            url: pool.connect_options().to_url_lossy().to_string(),
-        };
-        config.leader_election.enabled = false;
+        config.background_services.leader_election.enabled = false;
 
-        // Use Application::new to properly set up outlet_db
-        let app = crate::Application::new(config).await.expect("Failed to create application");
+        // Use Application::new_with_pool to properly set up outlet_db with provided pool
+        let app = crate::Application::new_with_pool(config, Some(pool.clone()))
+            .await
+            .expect("Failed to create application");
         let (server, _drop_guard) = app.into_test_server();
         let admin_user = create_test_admin_user(&pool, Role::PlatformManager).await;
 
         let response = server
             .get("/admin/api/v1/requests/aggregate")
-            .add_header(add_auth_headers(&admin_user).0, add_auth_headers(&admin_user).1)
+            .add_header(&add_auth_headers(&admin_user)[0].0, &add_auth_headers(&admin_user)[0].1)
+            .add_header(&add_auth_headers(&admin_user)[1].0, &add_auth_headers(&admin_user)[1].1)
             .await;
 
         response.assert_status_ok();
@@ -421,19 +423,19 @@ mod tests {
         // Create config with request logging enabled
         let mut config = create_test_config();
         config.enable_request_logging = true;
-        config.database = crate::config::DatabaseConfig::External {
-            url: pool.connect_options().to_url_lossy().to_string(),
-        };
-        config.leader_election.enabled = false;
+        config.background_services.leader_election.enabled = false;
 
-        // Use Application::new to properly set up outlet_db
-        let app = crate::Application::new(config).await.expect("Failed to create application");
+        // Use Application::new_with_pool to properly set up outlet_db with provided pool
+        let app = crate::Application::new_with_pool(config, Some(pool.clone()))
+            .await
+            .expect("Failed to create application");
         let (server, _drop_guard) = app.into_test_server();
         let admin_user = create_test_admin_user(&pool, Role::PlatformManager).await;
 
         let response = server
             .get("/admin/api/v1/requests/aggregate?model=gpt-4")
-            .add_header(add_auth_headers(&admin_user).0, add_auth_headers(&admin_user).1)
+            .add_header(&add_auth_headers(&admin_user)[0].0, &add_auth_headers(&admin_user)[0].1)
+            .add_header(&add_auth_headers(&admin_user)[1].0, &add_auth_headers(&admin_user)[1].1)
             .await;
 
         response.assert_status_ok();
@@ -450,7 +452,8 @@ mod tests {
 
         let response = app
             .get("/admin/api/v1/requests/aggregate")
-            .add_header(add_auth_headers(&user).0, add_auth_headers(&user).1)
+            .add_header(&add_auth_headers(&user)[0].0, &add_auth_headers(&user)[0].1)
+            .add_header(&add_auth_headers(&user)[1].0, &add_auth_headers(&user)[1].1)
             .await;
 
         // Should be forbidden since user doesn't have Analytics:Read permission
@@ -464,19 +467,19 @@ mod tests {
         // This exercises the outlet database query and conversion logic (lines 112-184)
         let mut config = create_test_config();
         config.enable_request_logging = true;
-        config.database = crate::config::DatabaseConfig::External {
-            url: pool.connect_options().to_url_lossy().to_string(),
-        };
-        config.leader_election.enabled = false;
+        config.background_services.leader_election.enabled = false;
 
-        // Use Application::new to properly set up outlet_db
-        let app = crate::Application::new(config).await.expect("Failed to create application");
+        // Use Application::new_with_pool to properly set up outlet_db with provided pool
+        let app = crate::Application::new_with_pool(config, Some(pool.clone()))
+            .await
+            .expect("Failed to create application");
         let (server, _drop_guard) = app.into_test_server();
         let admin_user = create_test_admin_user(&pool, Role::PlatformManager).await;
 
         let response = server
             .get("/admin/api/v1/requests")
-            .add_header(add_auth_headers(&admin_user).0, add_auth_headers(&admin_user).1)
+            .add_header(&add_auth_headers(&admin_user)[0].0, &add_auth_headers(&admin_user)[0].1)
+            .add_header(&add_auth_headers(&admin_user)[1].0, &add_auth_headers(&admin_user)[1].1)
             .await;
 
         response.assert_status_ok();
@@ -488,8 +491,8 @@ mod tests {
     #[test]
     fn test_list_requests_query_default() {
         let query = ListRequestsQuery::default();
-        assert_eq!(query.limit, Some(50));
-        assert_eq!(query.offset, Some(0));
+        assert_eq!(query.pagination.skip(), 0);
+        assert_eq!(query.pagination.limit(), 10); // DEFAULT_LIMIT from pagination module
         assert_eq!(query.order_desc, Some(true));
         assert!(query.method.is_none());
         assert!(query.uri_pattern.is_none());
@@ -826,20 +829,20 @@ mod tests {
         // Create config with request logging enabled
         let mut config = create_test_config();
         config.enable_request_logging = true;
-        config.database = crate::config::DatabaseConfig::External {
-            url: pool.connect_options().to_url_lossy().to_string(),
-        };
-        config.leader_election.enabled = false;
+        config.background_services.leader_election.enabled = false;
 
-        // Use Application::new to properly set up outlet_db
-        let app = crate::Application::new(config).await.expect("Failed to create application");
+        // Use Application::new_with_pool to properly set up outlet_db with provided pool
+        let app = crate::Application::new_with_pool(config, Some(pool.clone()))
+            .await
+            .expect("Failed to create application");
         let (app, _drop_guard) = app.into_test_server();
         let standard_user = create_test_user(&pool, Role::StandardUser).await;
 
         // StandardUser should NOT be able to list requests (no Requests permissions)
         let response = app
             .get("/admin/api/v1/requests")
-            .add_header(add_auth_headers(&standard_user).0, add_auth_headers(&standard_user).1)
+            .add_header(&add_auth_headers(&standard_user)[0].0, &add_auth_headers(&standard_user)[0].1)
+            .add_header(&add_auth_headers(&standard_user)[1].0, &add_auth_headers(&standard_user)[1].1)
             .await;
 
         response.assert_status_forbidden();
@@ -847,7 +850,8 @@ mod tests {
         // StandardUser should NOT be able to access aggregated requests (no Analytics permissions)
         let response = app
             .get("/admin/api/v1/requests/aggregate")
-            .add_header(add_auth_headers(&standard_user).0, add_auth_headers(&standard_user).1)
+            .add_header(&add_auth_headers(&standard_user)[0].0, &add_auth_headers(&standard_user)[0].1)
+            .add_header(&add_auth_headers(&standard_user)[1].0, &add_auth_headers(&standard_user)[1].1)
             .await;
 
         response.assert_status_forbidden();
@@ -859,20 +863,20 @@ mod tests {
         // Create config with request logging enabled
         let mut config = create_test_config();
         config.enable_request_logging = true;
-        config.database = crate::config::DatabaseConfig::External {
-            url: pool.connect_options().to_url_lossy().to_string(),
-        };
-        config.leader_election.enabled = false;
+        config.background_services.leader_election.enabled = false;
 
-        // Use Application::new to properly set up outlet_db
-        let app = crate::Application::new(config).await.expect("Failed to create application");
+        // Use Application::new_with_pool to properly set up outlet_db with provided pool
+        let app = crate::Application::new_with_pool(config, Some(pool.clone()))
+            .await
+            .expect("Failed to create application");
         let (app, _drop_guard) = app.into_test_server();
         let request_viewer = create_test_user(&pool, Role::RequestViewer).await;
 
         // RequestViewer should be able to list requests (has ReadAll for Requests)
         let response = app
             .get("/admin/api/v1/requests")
-            .add_header(add_auth_headers(&request_viewer).0, add_auth_headers(&request_viewer).1)
+            .add_header(&add_auth_headers(&request_viewer)[0].0, &add_auth_headers(&request_viewer)[0].1)
+            .add_header(&add_auth_headers(&request_viewer)[1].0, &add_auth_headers(&request_viewer)[1].1)
             .await;
 
         response.assert_status_ok();
@@ -882,7 +886,8 @@ mod tests {
         // RequestViewer should be able to access aggregated requests (has ReadAll for Analytics)
         let response = app
             .get("/admin/api/v1/requests/aggregate")
-            .add_header(add_auth_headers(&request_viewer).0, add_auth_headers(&request_viewer).1)
+            .add_header(&add_auth_headers(&request_viewer)[0].0, &add_auth_headers(&request_viewer)[0].1)
+            .add_header(&add_auth_headers(&request_viewer)[1].0, &add_auth_headers(&request_viewer)[1].1)
             .await;
 
         response.assert_status_ok();
@@ -896,13 +901,12 @@ mod tests {
         // Create config with request logging enabled
         let mut config = create_test_config();
         config.enable_request_logging = true;
-        config.database = crate::config::DatabaseConfig::External {
-            url: pool.connect_options().to_url_lossy().to_string(),
-        };
-        config.leader_election.enabled = false;
+        config.background_services.leader_election.enabled = false;
 
-        // Use Application::new to properly set up outlet_db
-        let app = crate::Application::new(config).await.expect("Failed to create application");
+        // Use Application::new_with_pool to properly set up outlet_db with provided pool
+        let app = crate::Application::new_with_pool(config, Some(pool.clone()))
+            .await
+            .expect("Failed to create application");
         let (app, _drop_guard) = app.into_test_server();
 
         // Create a NON-ADMIN PlatformManager (so role permissions are checked)
@@ -911,7 +915,8 @@ mod tests {
         // PlatformManager should NOT be able to list requests (no Requests permissions)
         let response = app
             .get("/admin/api/v1/requests")
-            .add_header(add_auth_headers(&platform_manager).0, add_auth_headers(&platform_manager).1)
+            .add_header(&add_auth_headers(&platform_manager)[0].0, &add_auth_headers(&platform_manager)[0].1)
+            .add_header(&add_auth_headers(&platform_manager)[1].0, &add_auth_headers(&platform_manager)[1].1)
             .await;
 
         response.assert_status_forbidden();
@@ -919,7 +924,8 @@ mod tests {
         // But PlatformManager should be able to access aggregated analytics (has Analytics permissions)
         let response = app
             .get("/admin/api/v1/requests/aggregate")
-            .add_header(add_auth_headers(&platform_manager).0, add_auth_headers(&platform_manager).1)
+            .add_header(&add_auth_headers(&platform_manager)[0].0, &add_auth_headers(&platform_manager)[0].1)
+            .add_header(&add_auth_headers(&platform_manager)[1].0, &add_auth_headers(&platform_manager)[1].1)
             .await;
 
         response.assert_status_ok();
@@ -931,13 +937,12 @@ mod tests {
         // Create config with request logging enabled
         let mut config = create_test_config();
         config.enable_request_logging = true;
-        config.database = crate::config::DatabaseConfig::External {
-            url: pool.connect_options().to_url_lossy().to_string(),
-        };
-        config.leader_election.enabled = false;
+        config.background_services.leader_election.enabled = false;
 
-        // Use Application::new to properly set up outlet_db
-        let app = crate::Application::new(config).await.expect("Failed to create application");
+        // Use Application::new_with_pool to properly set up outlet_db with provided pool
+        let app = crate::Application::new_with_pool(config, Some(pool.clone()))
+            .await
+            .expect("Failed to create application");
         let (app, _drop_guard) = app.into_test_server();
 
         // User with StandardUser + RequestViewer should have monitoring access
@@ -946,7 +951,8 @@ mod tests {
         // Should be able to list requests (RequestViewer permission)
         let response = app
             .get("/admin/api/v1/requests")
-            .add_header(add_auth_headers(&monitoring_user).0, add_auth_headers(&monitoring_user).1)
+            .add_header(&add_auth_headers(&monitoring_user)[0].0, &add_auth_headers(&monitoring_user)[0].1)
+            .add_header(&add_auth_headers(&monitoring_user)[1].0, &add_auth_headers(&monitoring_user)[1].1)
             .await;
 
         response.assert_status_ok();
@@ -954,7 +960,8 @@ mod tests {
         // Should be able to access analytics (RequestViewer permission)
         let response = app
             .get("/admin/api/v1/requests/aggregate")
-            .add_header(add_auth_headers(&monitoring_user).0, add_auth_headers(&monitoring_user).1)
+            .add_header(&add_auth_headers(&monitoring_user)[0].0, &add_auth_headers(&monitoring_user)[0].1)
+            .add_header(&add_auth_headers(&monitoring_user)[1].0, &add_auth_headers(&monitoring_user)[1].1)
             .await;
 
         response.assert_status_ok();
@@ -965,7 +972,8 @@ mod tests {
         // Should be able to list requests (RequestViewer permission)
         let response = app
             .get("/admin/api/v1/requests")
-            .add_header(add_auth_headers(&full_admin).0, add_auth_headers(&full_admin).1)
+            .add_header(&add_auth_headers(&full_admin)[0].0, &add_auth_headers(&full_admin)[0].1)
+            .add_header(&add_auth_headers(&full_admin)[1].0, &add_auth_headers(&full_admin)[1].1)
             .await;
 
         response.assert_status_ok();
@@ -973,7 +981,8 @@ mod tests {
         // Should be able to access analytics (both roles have this)
         let response = app
             .get("/admin/api/v1/requests/aggregate")
-            .add_header(add_auth_headers(&full_admin).0, add_auth_headers(&full_admin).1)
+            .add_header(&add_auth_headers(&full_admin)[0].0, &add_auth_headers(&full_admin)[0].1)
+            .add_header(&add_auth_headers(&full_admin)[1].0, &add_auth_headers(&full_admin)[1].1)
             .await;
 
         response.assert_status_ok();
@@ -985,13 +994,12 @@ mod tests {
         // Create config with request logging enabled
         let mut config = create_test_config();
         config.enable_request_logging = true;
-        config.database = crate::config::DatabaseConfig::External {
-            url: pool.connect_options().to_url_lossy().to_string(),
-        };
-        config.leader_election.enabled = false;
+        config.background_services.leader_election.enabled = false;
 
-        // Use Application::new to properly set up outlet_db
-        let app = crate::Application::new(config).await.expect("Failed to create application");
+        // Use Application::new_with_pool to properly set up outlet_db with provided pool
+        let app = crate::Application::new_with_pool(config, Some(pool.clone()))
+            .await
+            .expect("Failed to create application");
         let (app, _drop_guard) = app.into_test_server();
         let request_viewer = create_test_user(&pool, Role::RequestViewer).await;
         let standard_user = create_test_user(&pool, Role::StandardUser).await;
@@ -999,14 +1007,16 @@ mod tests {
         // RequestViewer should be able to use all query parameters
         let response = app
             .get("/admin/api/v1/requests?limit=10&offset=0&method=POST&status_code_min=200&status_code_max=299")
-            .add_header(add_auth_headers(&request_viewer).0, add_auth_headers(&request_viewer).1)
+            .add_header(&add_auth_headers(&request_viewer)[0].0, &add_auth_headers(&request_viewer)[0].1)
+            .add_header(&add_auth_headers(&request_viewer)[1].0, &add_auth_headers(&request_viewer)[1].1)
             .await;
 
         response.assert_status_ok();
 
         let response = app
             .get("/admin/api/v1/requests?uri_pattern=chat/completions&order_desc=false")
-            .add_header(add_auth_headers(&request_viewer).0, add_auth_headers(&request_viewer).1)
+            .add_header(&add_auth_headers(&request_viewer)[0].0, &add_auth_headers(&request_viewer)[0].1)
+            .add_header(&add_auth_headers(&request_viewer)[1].0, &add_auth_headers(&request_viewer)[1].1)
             .await;
 
         response.assert_status_ok();
@@ -1014,7 +1024,8 @@ mod tests {
         // StandardUser should be forbidden regardless of query parameters
         let response = app
             .get("/admin/api/v1/requests?limit=1")
-            .add_header(add_auth_headers(&standard_user).0, add_auth_headers(&standard_user).1)
+            .add_header(&add_auth_headers(&standard_user)[0].0, &add_auth_headers(&standard_user)[0].1)
+            .add_header(&add_auth_headers(&standard_user)[1].0, &add_auth_headers(&standard_user)[1].1)
             .await;
 
         response.assert_status_forbidden();
@@ -1031,13 +1042,12 @@ mod tests {
         // Create config with request logging enabled
         let mut config = create_test_config();
         config.enable_request_logging = true;
-        config.database = crate::config::DatabaseConfig::External {
-            url: pool.connect_options().to_url_lossy().to_string(),
-        };
-        config.leader_election.enabled = false;
+        config.background_services.leader_election.enabled = false;
 
-        // Use Application::new to properly set up outlet_db
-        let app = crate::Application::new(config).await.expect("Failed to create application");
+        // Use Application::new_with_pool to properly set up outlet_db with provided pool
+        let app = crate::Application::new_with_pool(config, Some(pool.clone()))
+            .await
+            .expect("Failed to create application");
         let (app, _drop_guard) = app.into_test_server();
         let request_viewer = create_test_user(&pool, Role::RequestViewer).await;
         let platform_manager = create_test_admin_user(&pool, Role::PlatformManager).await;
@@ -1046,7 +1056,8 @@ mod tests {
         // RequestViewer should be able to filter analytics by model
         let response = app
             .get("/admin/api/v1/requests/aggregate?model=gpt-4")
-            .add_header(add_auth_headers(&request_viewer).0, add_auth_headers(&request_viewer).1)
+            .add_header(&add_auth_headers(&request_viewer)[0].0, &add_auth_headers(&request_viewer)[0].1)
+            .add_header(&add_auth_headers(&request_viewer)[1].0, &add_auth_headers(&request_viewer)[1].1)
             .await;
 
         response.assert_status_ok();
@@ -1056,7 +1067,8 @@ mod tests {
         // PlatformManager should be able to access analytics (but not requests)
         let response = app
             .get("/admin/api/v1/requests/aggregate")
-            .add_header(add_auth_headers(&platform_manager).0, add_auth_headers(&platform_manager).1)
+            .add_header(&add_auth_headers(&platform_manager)[0].0, &add_auth_headers(&platform_manager)[0].1)
+            .add_header(&add_auth_headers(&platform_manager)[1].0, &add_auth_headers(&platform_manager)[1].1)
             .await;
 
         response.assert_status_ok();
@@ -1064,7 +1076,8 @@ mod tests {
         // StandardUser should be forbidden from analytics
         let response = app
             .get("/admin/api/v1/requests/aggregate?model=gpt-4")
-            .add_header(add_auth_headers(&standard_user).0, add_auth_headers(&standard_user).1)
+            .add_header(&add_auth_headers(&standard_user)[0].0, &add_auth_headers(&standard_user)[0].1)
+            .add_header(&add_auth_headers(&standard_user)[1].0, &add_auth_headers(&standard_user)[1].1)
             .await;
 
         response.assert_status_forbidden();
@@ -1076,13 +1089,12 @@ mod tests {
         // Create config with request logging enabled
         let mut config = create_test_config();
         config.enable_request_logging = true;
-        config.database = crate::config::DatabaseConfig::External {
-            url: pool.connect_options().to_url_lossy().to_string(),
-        };
-        config.leader_election.enabled = false;
+        config.background_services.leader_election.enabled = false;
 
-        // Use Application::new to properly set up outlet_db
-        let app = crate::Application::new(config).await.expect("Failed to create application");
+        // Use Application::new_with_pool to properly set up outlet_db with provided pool
+        let app = crate::Application::new_with_pool(config, Some(pool.clone()))
+            .await
+            .expect("Failed to create application");
         let (app, _drop_guard) = app.into_test_server();
 
         // Test different role combinations for monitoring access
@@ -1110,7 +1122,8 @@ mod tests {
             // Test requests access
             let response = app
                 .get("/admin/api/v1/requests")
-                .add_header(add_auth_headers(&user).0, add_auth_headers(&user).1)
+                .add_header(&add_auth_headers(&user)[0].0, &add_auth_headers(&user)[0].1)
+                .add_header(&add_auth_headers(&user)[1].0, &add_auth_headers(&user)[1].1)
                 .await;
 
             if can_access_requests {
@@ -1122,7 +1135,8 @@ mod tests {
             // Test analytics access
             let response = app
                 .get("/admin/api/v1/requests/aggregate")
-                .add_header(add_auth_headers(&user).0, add_auth_headers(&user).1)
+                .add_header(&add_auth_headers(&user)[0].0, &add_auth_headers(&user)[0].1)
+                .add_header(&add_auth_headers(&user)[1].0, &add_auth_headers(&user)[1].1)
                 .await;
 
             if can_access_analytics {
@@ -1139,13 +1153,12 @@ mod tests {
         // Create config with request logging enabled
         let mut config = create_test_config();
         config.enable_request_logging = true;
-        config.database = crate::config::DatabaseConfig::External {
-            url: pool.connect_options().to_url_lossy().to_string(),
-        };
-        config.leader_election.enabled = false;
+        config.background_services.leader_election.enabled = false;
 
-        // Use Application::new to properly set up outlet_db
-        let app = crate::Application::new(config).await.expect("Failed to create application");
+        // Use Application::new_with_pool to properly set up outlet_db with provided pool
+        let app = crate::Application::new_with_pool(config, Some(pool.clone()))
+            .await
+            .expect("Failed to create application");
         let (app, _drop_guard) = app.into_test_server();
         let request_viewer = create_test_user(&pool, Role::RequestViewer).await;
 
@@ -1153,7 +1166,7 @@ mod tests {
         let boundary_tests = vec![
             ("limit=1", "Minimum limit"),
             ("limit=1000", "Maximum limit"),
-            ("offset=0", "Zero offset"),
+            ("skip=0", "Zero skip"),
             ("status_code=200", "Specific status code"),
             ("status_code_min=100&status_code_max=599", "Status code range"),
             ("order_desc=true", "Descending order"),
@@ -1163,7 +1176,8 @@ mod tests {
         for (query_params, _description) in boundary_tests {
             let response = app
                 .get(&format!("/admin/api/v1/requests?{query_params}"))
-                .add_header(add_auth_headers(&request_viewer).0, add_auth_headers(&request_viewer).1)
+                .add_header(&add_auth_headers(&request_viewer)[0].0, &add_auth_headers(&request_viewer)[0].1)
+                .add_header(&add_auth_headers(&request_viewer)[1].0, &add_auth_headers(&request_viewer)[1].1)
                 .await;
 
             response.assert_status_ok();

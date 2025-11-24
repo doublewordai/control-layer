@@ -50,8 +50,8 @@ pub async fn list_groups(
     let groups;
     {
         let mut repo = Groups::new(tx.acquire().await.map_err(|e| Error::Database(e.into()))?);
-        let skip = query.skip.unwrap_or(0);
-        let limit = query.limit.unwrap_or(100).min(1000);
+        let skip = query.pagination.skip();
+        let limit = query.pagination.limit();
 
         groups = repo.list(&GroupFilter::new(skip, limit)).await?;
     }
@@ -686,7 +686,8 @@ mod tests {
         // Test with limit
         let response = app
             .get("/admin/api/v1/groups?limit=3")
-            .add_header(add_auth_headers(&user).0, add_auth_headers(&user).1)
+            .add_header(&add_auth_headers(&user)[0].0, &add_auth_headers(&user)[0].1)
+            .add_header(&add_auth_headers(&user)[1].0, &add_auth_headers(&user)[1].1)
             .await;
 
         response.assert_status_ok();
@@ -696,7 +697,8 @@ mod tests {
         // Test with skip and limit
         let response = app
             .get("/admin/api/v1/groups?skip=2&limit=2")
-            .add_header(add_auth_headers(&user).0, add_auth_headers(&user).1)
+            .add_header(&add_auth_headers(&user)[0].0, &add_auth_headers(&user)[0].1)
+            .add_header(&add_auth_headers(&user)[1].0, &add_auth_headers(&user)[1].1)
             .await;
 
         response.assert_status_ok();
@@ -706,7 +708,8 @@ mod tests {
         // Test skip beyond available groups
         let response = app
             .get("/admin/api/v1/groups?skip=1000&limit=10")
-            .add_header(add_auth_headers(&user).0, add_auth_headers(&user).1)
+            .add_header(&add_auth_headers(&user)[0].0, &add_auth_headers(&user)[0].1)
+            .add_header(&add_auth_headers(&user)[1].0, &add_auth_headers(&user)[1].1)
             .await;
 
         response.assert_status_ok();
@@ -716,7 +719,8 @@ mod tests {
         // Test default pagination values (no params)
         let response = app
             .get("/admin/api/v1/groups")
-            .add_header(add_auth_headers(&user).0, add_auth_headers(&user).1)
+            .add_header(&add_auth_headers(&user)[0].0, &add_auth_headers(&user)[0].1)
+            .add_header(&add_auth_headers(&user)[1].0, &add_auth_headers(&user)[1].1)
             .await;
 
         response.assert_status_ok();
@@ -744,7 +748,8 @@ mod tests {
         // Add user2 to the group
         let response = app
             .post(&format!("/admin/api/v1/groups/{}/users/{}", group.id, user2.id))
-            .add_header(add_auth_headers(&user1).0, add_auth_headers(&user1).1)
+            .add_header(&add_auth_headers(&user1)[0].0, &add_auth_headers(&user1)[0].1)
+            .add_header(&add_auth_headers(&user1)[1].0, &add_auth_headers(&user1)[1].1)
             .await;
 
         response.assert_status(StatusCode::NO_CONTENT);
@@ -752,7 +757,8 @@ mod tests {
         // Verify user is in group by getting group users
         let response = app
             .get(&format!("/admin/api/v1/groups/{}/users", group.id))
-            .add_header(add_auth_headers(&user1).0, add_auth_headers(&user1).1)
+            .add_header(&add_auth_headers(&user1)[0].0, &add_auth_headers(&user1)[0].1)
+            .add_header(&add_auth_headers(&user1)[1].0, &add_auth_headers(&user1)[1].1)
             .await;
 
         response.assert_status_ok();
@@ -780,14 +786,16 @@ mod tests {
         // Add user2 to the group first
         let response = app
             .post(&format!("/admin/api/v1/groups/{}/users/{}", group.id, user2.id))
-            .add_header(add_auth_headers(&user1).0, add_auth_headers(&user1).1)
+            .add_header(&add_auth_headers(&user1)[0].0, &add_auth_headers(&user1)[0].1)
+            .add_header(&add_auth_headers(&user1)[1].0, &add_auth_headers(&user1)[1].1)
             .await;
         response.assert_status(StatusCode::NO_CONTENT);
 
         // Remove user2 from the group
         let response = app
             .delete(&format!("/admin/api/v1/groups/{}/users/{}", group.id, user2.id))
-            .add_header(add_auth_headers(&user1).0, add_auth_headers(&user1).1)
+            .add_header(&add_auth_headers(&user1)[0].0, &add_auth_headers(&user1)[0].1)
+            .add_header(&add_auth_headers(&user1)[1].0, &add_auth_headers(&user1)[1].1)
             .await;
 
         response.assert_status(StatusCode::NO_CONTENT);
@@ -795,7 +803,8 @@ mod tests {
         // Verify user is no longer in group
         let response = app
             .get(&format!("/admin/api/v1/groups/{}/users", group.id))
-            .add_header(add_auth_headers(&user1).0, add_auth_headers(&user1).1)
+            .add_header(&add_auth_headers(&user1)[0].0, &add_auth_headers(&user1)[0].1)
+            .add_header(&add_auth_headers(&user1)[1].0, &add_auth_headers(&user1)[1].1)
             .await;
 
         response.assert_status_ok();
@@ -823,19 +832,22 @@ mod tests {
 
         // Add users to the group
         app.post(&format!("/admin/api/v1/groups/{}/users/{}", group.id, user2.id))
-            .add_header(add_auth_headers(&user1).0, add_auth_headers(&user1).1)
+            .add_header(&add_auth_headers(&user1)[0].0, &add_auth_headers(&user1)[0].1)
+            .add_header(&add_auth_headers(&user1)[1].0, &add_auth_headers(&user1)[1].1)
             .await
             .assert_status(StatusCode::NO_CONTENT);
 
         app.post(&format!("/admin/api/v1/groups/{}/users/{}", group.id, user3.id))
-            .add_header(add_auth_headers(&user1).0, add_auth_headers(&user1).1)
+            .add_header(&add_auth_headers(&user1)[0].0, &add_auth_headers(&user1)[0].1)
+            .add_header(&add_auth_headers(&user1)[1].0, &add_auth_headers(&user1)[1].1)
             .await
             .assert_status(StatusCode::NO_CONTENT);
 
         // List group users
         let response = app
             .get(&format!("/admin/api/v1/groups/{}/users", group.id))
-            .add_header(add_auth_headers(&user1).0, add_auth_headers(&user1).1)
+            .add_header(&add_auth_headers(&user1)[0].0, &add_auth_headers(&user1)[0].1)
+            .add_header(&add_auth_headers(&user1)[1].0, &add_auth_headers(&user1)[1].1)
             .await;
 
         response.assert_status_ok();
@@ -867,7 +879,8 @@ mod tests {
 
             // Add user to each group
             app.post(&format!("/admin/api/v1/groups/{}/users/{}", group.id, user.id))
-                .add_header(add_auth_headers(&user).0, add_auth_headers(&user).1)
+                .add_header(&add_auth_headers(&user)[0].0, &add_auth_headers(&user)[0].1)
+                .add_header(&add_auth_headers(&user)[1].0, &add_auth_headers(&user)[1].1)
                 .await
                 .assert_status(StatusCode::NO_CONTENT);
         }
@@ -875,7 +888,8 @@ mod tests {
         // List user's groups
         let response = app
             .get(&format!("/admin/api/v1/users/{}/groups", user.id))
-            .add_header(add_auth_headers(&user).0, add_auth_headers(&user).1)
+            .add_header(&add_auth_headers(&user)[0].0, &add_auth_headers(&user)[0].1)
+            .add_header(&add_auth_headers(&user)[1].0, &add_auth_headers(&user)[1].1)
             .await;
 
         response.assert_status_ok();
@@ -908,21 +922,24 @@ mod tests {
         // Add user2 to the group
         let response = app
             .post(&format!("/admin/api/v1/groups/{}/users/{}", group.id, user2.id))
-            .add_header(add_auth_headers(&user1).0, add_auth_headers(&user1).1)
+            .add_header(&add_auth_headers(&user1)[0].0, &add_auth_headers(&user1)[0].1)
+            .add_header(&add_auth_headers(&user1)[1].0, &add_auth_headers(&user1)[1].1)
             .await;
         response.assert_status(StatusCode::NO_CONTENT);
 
         // Try to add user2 again - should succeed but not create duplicate
         let response = app
             .post(&format!("/admin/api/v1/groups/{}/users/{}", group.id, user2.id))
-            .add_header(add_auth_headers(&user1).0, add_auth_headers(&user1).1)
+            .add_header(&add_auth_headers(&user1)[0].0, &add_auth_headers(&user1)[0].1)
+            .add_header(&add_auth_headers(&user1)[1].0, &add_auth_headers(&user1)[1].1)
             .await;
         response.assert_status(StatusCode::NO_CONTENT);
 
         // Verify user is in group only once
         let response = app
             .get(&format!("/admin/api/v1/groups/{}/users", group.id))
-            .add_header(add_auth_headers(&user1).0, add_auth_headers(&user1).1)
+            .add_header(&add_auth_headers(&user1)[0].0, &add_auth_headers(&user1)[0].1)
+            .add_header(&add_auth_headers(&user1)[1].0, &add_auth_headers(&user1)[1].1)
             .await;
 
         response.assert_status_ok();
@@ -950,14 +967,16 @@ mod tests {
         // Add group to user (using the /users/{id}/groups/{id} endpoint)
         let response = app
             .post(&format!("/admin/api/v1/users/{}/groups/{}", user.id, group.id))
-            .add_header(add_auth_headers(&user).0, add_auth_headers(&user).1)
+            .add_header(&add_auth_headers(&user)[0].0, &add_auth_headers(&user)[0].1)
+            .add_header(&add_auth_headers(&user)[1].0, &add_auth_headers(&user)[1].1)
             .await;
         response.assert_status(StatusCode::NO_CONTENT);
 
         // Verify via both endpoints
         let response = app
             .get(&format!("/admin/api/v1/groups/{}/users", group.id))
-            .add_header(add_auth_headers(&user).0, add_auth_headers(&user).1)
+            .add_header(&add_auth_headers(&user)[0].0, &add_auth_headers(&user)[0].1)
+            .add_header(&add_auth_headers(&user)[1].0, &add_auth_headers(&user)[1].1)
             .await;
         response.assert_status_ok();
         let user_ids: Vec<UserId> = response.json();
@@ -965,7 +984,8 @@ mod tests {
 
         let response = app
             .get(&format!("/admin/api/v1/users/{}/groups", user.id))
-            .add_header(add_auth_headers(&user).0, add_auth_headers(&user).1)
+            .add_header(&add_auth_headers(&user)[0].0, &add_auth_headers(&user)[0].1)
+            .add_header(&add_auth_headers(&user)[1].0, &add_auth_headers(&user)[1].1)
             .await;
         response.assert_status_ok();
         let groups: Vec<GroupResponse> = response.json();
@@ -974,14 +994,16 @@ mod tests {
         // Remove using the /users/{id}/groups/{id} endpoint
         let response = app
             .delete(&format!("/admin/api/v1/users/{}/groups/{}", user.id, group.id))
-            .add_header(add_auth_headers(&user).0, add_auth_headers(&user).1)
+            .add_header(&add_auth_headers(&user)[0].0, &add_auth_headers(&user)[0].1)
+            .add_header(&add_auth_headers(&user)[1].0, &add_auth_headers(&user)[1].1)
             .await;
         response.assert_status(StatusCode::NO_CONTENT);
 
         // Verify removal via both endpoints
         let response = app
             .get(&format!("/admin/api/v1/groups/{}/users", group.id))
-            .add_header(add_auth_headers(&user).0, add_auth_headers(&user).1)
+            .add_header(&add_auth_headers(&user)[0].0, &add_auth_headers(&user)[0].1)
+            .add_header(&add_auth_headers(&user)[1].0, &add_auth_headers(&user)[1].1)
             .await;
         response.assert_status_ok();
         let user_ids: Vec<UserId> = response.json();
@@ -1002,7 +1024,8 @@ mod tests {
 
         let response = app
             .post("/admin/api/v1/groups")
-            .add_header(add_auth_headers(&admin_user).0, add_auth_headers(&admin_user).1)
+            .add_header(&add_auth_headers(&admin_user)[0].0, &add_auth_headers(&admin_user)[0].1)
+            .add_header(&add_auth_headers(&admin_user)[1].0, &add_auth_headers(&admin_user)[1].1)
             .json(&group_create)
             .await;
 
@@ -1029,7 +1052,8 @@ mod tests {
         // Add deployment to group via API
         let response = app
             .post(&format!("/admin/api/v1/groups/{}/models/{}", group.id, deployment.id))
-            .add_header(add_auth_headers(&admin_user).0, add_auth_headers(&admin_user).1)
+            .add_header(&add_auth_headers(&admin_user)[0].0, &add_auth_headers(&admin_user)[0].1)
+            .add_header(&add_auth_headers(&admin_user)[1].0, &add_auth_headers(&admin_user)[1].1)
             .await;
 
         response.assert_status(StatusCode::NO_CONTENT);
@@ -1037,7 +1061,8 @@ mod tests {
         // Verify deployment is in group
         let response = app
             .get(&format!("/admin/api/v1/groups/{}/models", group.id))
-            .add_header(add_auth_headers(&admin_user).0, add_auth_headers(&admin_user).1)
+            .add_header(&add_auth_headers(&admin_user)[0].0, &add_auth_headers(&admin_user)[0].1)
+            .add_header(&add_auth_headers(&admin_user)[1].0, &add_auth_headers(&admin_user)[1].1)
             .await;
 
         response.assert_status_ok();
@@ -1047,7 +1072,8 @@ mod tests {
         // Verify group has access to deployment
         let response = app
             .get(&format!("/admin/api/v1/models/{}/groups", deployment.id))
-            .add_header(add_auth_headers(&admin_user).0, add_auth_headers(&admin_user).1)
+            .add_header(&add_auth_headers(&admin_user)[0].0, &add_auth_headers(&admin_user)[0].1)
+            .add_header(&add_auth_headers(&admin_user)[1].0, &add_auth_headers(&admin_user)[1].1)
             .await;
 
         response.assert_status_ok();
@@ -1069,7 +1095,8 @@ mod tests {
 
         let response = app
             .post("/admin/api/v1/groups")
-            .add_header(add_auth_headers(&admin_user).0, add_auth_headers(&admin_user).1)
+            .add_header(&add_auth_headers(&admin_user)[0].0, &add_auth_headers(&admin_user)[0].1)
+            .add_header(&add_auth_headers(&admin_user)[1].0, &add_auth_headers(&admin_user)[1].1)
             .json(&group_create)
             .await;
 
@@ -1096,7 +1123,8 @@ mod tests {
         // Add deployment to group first
         let response = app
             .post(&format!("/admin/api/v1/groups/{}/models/{}", group.id, deployment.id))
-            .add_header(add_auth_headers(&admin_user).0, add_auth_headers(&admin_user).1)
+            .add_header(&add_auth_headers(&admin_user)[0].0, &add_auth_headers(&admin_user)[0].1)
+            .add_header(&add_auth_headers(&admin_user)[1].0, &add_auth_headers(&admin_user)[1].1)
             .await;
 
         response.assert_status(StatusCode::NO_CONTENT);
@@ -1104,7 +1132,8 @@ mod tests {
         // Remove deployment from group
         let response = app
             .delete(&format!("/admin/api/v1/groups/{}/models/{}", group.id, deployment.id))
-            .add_header(add_auth_headers(&admin_user).0, add_auth_headers(&admin_user).1)
+            .add_header(&add_auth_headers(&admin_user)[0].0, &add_auth_headers(&admin_user)[0].1)
+            .add_header(&add_auth_headers(&admin_user)[1].0, &add_auth_headers(&admin_user)[1].1)
             .await;
 
         response.assert_status(StatusCode::NO_CONTENT);
@@ -1112,7 +1141,8 @@ mod tests {
         // Verify deployment is no longer in group
         let response = app
             .get(&format!("/admin/api/v1/groups/{}/models", group.id))
-            .add_header(add_auth_headers(&admin_user).0, add_auth_headers(&admin_user).1)
+            .add_header(&add_auth_headers(&admin_user)[0].0, &add_auth_headers(&admin_user)[0].1)
+            .add_header(&add_auth_headers(&admin_user)[1].0, &add_auth_headers(&admin_user)[1].1)
             .await;
 
         response.assert_status_ok();
@@ -1122,7 +1152,8 @@ mod tests {
         // Verify group no longer has access to deployment
         let response = app
             .get(&format!("/admin/api/v1/models/{}/groups", deployment.id))
-            .add_header(add_auth_headers(&admin_user).0, add_auth_headers(&admin_user).1)
+            .add_header(&add_auth_headers(&admin_user)[0].0, &add_auth_headers(&admin_user)[0].1)
+            .add_header(&add_auth_headers(&admin_user)[1].0, &add_auth_headers(&admin_user)[1].1)
             .await;
 
         response.assert_status_ok();
@@ -1145,7 +1176,8 @@ mod tests {
 
         let response = app
             .post("/admin/api/v1/groups")
-            .add_header(add_auth_headers(&admin_user).0, add_auth_headers(&admin_user).1)
+            .add_header(&add_auth_headers(&admin_user)[0].0, &add_auth_headers(&admin_user)[0].1)
+            .add_header(&add_auth_headers(&admin_user)[1].0, &add_auth_headers(&admin_user)[1].1)
             .json(&group_create)
             .await;
 
@@ -1172,7 +1204,8 @@ mod tests {
         // Regular user should not be able to add deployment to group
         let response = app
             .post(&format!("/admin/api/v1/groups/{}/models/{}", group.id, deployment.id))
-            .add_header(add_auth_headers(&regular_user).0, add_auth_headers(&regular_user).1)
+            .add_header(&add_auth_headers(&regular_user)[0].0, &add_auth_headers(&regular_user)[0].1)
+            .add_header(&add_auth_headers(&regular_user)[1].0, &add_auth_headers(&regular_user)[1].1)
             .await;
 
         response.assert_status(StatusCode::FORBIDDEN);
@@ -1180,7 +1213,8 @@ mod tests {
         // Regular user should not be able to list group deployments
         let response = app
             .get(&format!("/admin/api/v1/groups/{}/models", group.id))
-            .add_header(add_auth_headers(&regular_user).0, add_auth_headers(&regular_user).1)
+            .add_header(&add_auth_headers(&regular_user)[0].0, &add_auth_headers(&regular_user)[0].1)
+            .add_header(&add_auth_headers(&regular_user)[1].0, &add_auth_headers(&regular_user)[1].1)
             .await;
 
         response.assert_status(StatusCode::FORBIDDEN);
@@ -1188,7 +1222,8 @@ mod tests {
         // Regular user should not be able to list deployment groups
         let response = app
             .get(&format!("/admin/api/v1/models/{}/groups", deployment.id))
-            .add_header(add_auth_headers(&regular_user).0, add_auth_headers(&regular_user).1)
+            .add_header(&add_auth_headers(&regular_user)[0].0, &add_auth_headers(&regular_user)[0].1)
+            .add_header(&add_auth_headers(&regular_user)[1].0, &add_auth_headers(&regular_user)[1].1)
             .await;
 
         response.assert_status(StatusCode::FORBIDDEN);
@@ -1209,7 +1244,8 @@ mod tests {
 
         let response = app
             .post("/admin/api/v1/groups")
-            .add_header(add_auth_headers(&admin_user).0, add_auth_headers(&admin_user).1)
+            .add_header(&add_auth_headers(&admin_user)[0].0, &add_auth_headers(&admin_user)[0].1)
+            .add_header(&add_auth_headers(&admin_user)[1].0, &add_auth_headers(&admin_user)[1].1)
             .json(&group_create)
             .await;
 
@@ -1218,7 +1254,8 @@ mod tests {
 
         // Add user to group
         app.post(&format!("/admin/api/v1/groups/{}/users/{}", group.id, regular_user.id))
-            .add_header(add_auth_headers(&admin_user).0, add_auth_headers(&admin_user).1)
+            .add_header(&add_auth_headers(&admin_user)[0].0, &add_auth_headers(&admin_user)[0].1)
+            .add_header(&add_auth_headers(&admin_user)[1].0, &add_auth_headers(&admin_user)[1].1)
             .await
             .assert_status(StatusCode::NO_CONTENT);
 
@@ -1240,14 +1277,16 @@ mod tests {
             .expect("Failed to create test deployment");
 
         app.post(&format!("/admin/api/v1/groups/{}/models/{}", group.id, deployment.id))
-            .add_header(add_auth_headers(&admin_user).0, add_auth_headers(&admin_user).1)
+            .add_header(&add_auth_headers(&admin_user)[0].0, &add_auth_headers(&admin_user)[0].1)
+            .add_header(&add_auth_headers(&admin_user)[1].0, &add_auth_headers(&admin_user)[1].1)
             .await
             .assert_status(StatusCode::NO_CONTENT);
 
         // Test without include parameters - should not include relationships
         let response = app
             .get("/admin/api/v1/groups")
-            .add_header(add_auth_headers(&admin_user).0, add_auth_headers(&admin_user).1)
+            .add_header(&add_auth_headers(&admin_user)[0].0, &add_auth_headers(&admin_user)[0].1)
+            .add_header(&add_auth_headers(&admin_user)[1].0, &add_auth_headers(&admin_user)[1].1)
             .await;
 
         response.assert_status_ok();
@@ -1259,7 +1298,8 @@ mod tests {
         // Test with include=users - should include users but not models
         let response = app
             .get("/admin/api/v1/groups?include=users")
-            .add_header(add_auth_headers(&admin_user).0, add_auth_headers(&admin_user).1)
+            .add_header(&add_auth_headers(&admin_user)[0].0, &add_auth_headers(&admin_user)[0].1)
+            .add_header(&add_auth_headers(&admin_user)[1].0, &add_auth_headers(&admin_user)[1].1)
             .await;
 
         response.assert_status_ok();
@@ -1273,7 +1313,8 @@ mod tests {
         // Test with include=models - should include models but not users
         let response = app
             .get("/admin/api/v1/groups?include=models")
-            .add_header(add_auth_headers(&admin_user).0, add_auth_headers(&admin_user).1)
+            .add_header(&add_auth_headers(&admin_user)[0].0, &add_auth_headers(&admin_user)[0].1)
+            .add_header(&add_auth_headers(&admin_user)[1].0, &add_auth_headers(&admin_user)[1].1)
             .await;
 
         response.assert_status_ok();
@@ -1287,7 +1328,8 @@ mod tests {
         // Test with include=users,models - should include both
         let response = app
             .get("/admin/api/v1/groups?include=users,models")
-            .add_header(add_auth_headers(&admin_user).0, add_auth_headers(&admin_user).1)
+            .add_header(&add_auth_headers(&admin_user)[0].0, &add_auth_headers(&admin_user)[0].1)
+            .add_header(&add_auth_headers(&admin_user)[1].0, &add_auth_headers(&admin_user)[1].1)
             .await;
 
         response.assert_status_ok();
@@ -1303,7 +1345,8 @@ mod tests {
         // Test with include=users,models and pagination
         let response = app
             .get("/admin/api/v1/groups?include=users,models&limit=10")
-            .add_header(add_auth_headers(&admin_user).0, add_auth_headers(&admin_user).1)
+            .add_header(&add_auth_headers(&admin_user)[0].0, &add_auth_headers(&admin_user)[0].1)
+            .add_header(&add_auth_headers(&admin_user)[1].0, &add_auth_headers(&admin_user)[1].1)
             .await;
 
         response.assert_status_ok();
@@ -1340,19 +1383,22 @@ mod tests {
 
         // Add standard_user to both groups
         app.post(&format!("/admin/api/v1/groups/{}/users/{}", group1.id, standard_user.id))
-            .add_header(add_auth_headers(&platform_manager).0, add_auth_headers(&platform_manager).1)
+            .add_header(&add_auth_headers(&platform_manager)[0].0, &add_auth_headers(&platform_manager)[0].1)
+            .add_header(&add_auth_headers(&platform_manager)[1].0, &add_auth_headers(&platform_manager)[1].1)
             .await
             .assert_status(StatusCode::NO_CONTENT);
 
         app.post(&format!("/admin/api/v1/groups/{}/users/{}", group2.id, standard_user.id))
-            .add_header(add_auth_headers(&platform_manager).0, add_auth_headers(&platform_manager).1)
+            .add_header(&add_auth_headers(&platform_manager)[0].0, &add_auth_headers(&platform_manager)[0].1)
+            .add_header(&add_auth_headers(&platform_manager)[1].0, &add_auth_headers(&platform_manager)[1].1)
             .await
             .assert_status(StatusCode::NO_CONTENT);
 
         // Platform manager should be able to see other user's groups (this should succeed)
         let response = app
             .get(&format!("/admin/api/v1/users/{}/groups", standard_user.id))
-            .add_header(add_auth_headers(&platform_manager).0, add_auth_headers(&platform_manager).1)
+            .add_header(&add_auth_headers(&platform_manager)[0].0, &add_auth_headers(&platform_manager)[0].1)
+            .add_header(&add_auth_headers(&platform_manager)[1].0, &add_auth_headers(&platform_manager)[1].1)
             .await;
 
         response.assert_status_ok(); // Changed from expecting 403 to expecting 200
@@ -1368,14 +1414,16 @@ mod tests {
 
         // Add to only one group
         app.post(&format!("/admin/api/v1/groups/{}/users/{}", group1.id, another_standard_user.id))
-            .add_header(add_auth_headers(&platform_manager).0, add_auth_headers(&platform_manager).1)
+            .add_header(&add_auth_headers(&platform_manager)[0].0, &add_auth_headers(&platform_manager)[0].1)
+            .add_header(&add_auth_headers(&platform_manager)[1].0, &add_auth_headers(&platform_manager)[1].1)
             .await
             .assert_status(StatusCode::NO_CONTENT);
 
         // Platform manager should see only the groups this user is in
         let response = app
             .get(&format!("/admin/api/v1/users/{}/groups", another_standard_user.id))
-            .add_header(add_auth_headers(&platform_manager).0, add_auth_headers(&platform_manager).1)
+            .add_header(&add_auth_headers(&platform_manager)[0].0, &add_auth_headers(&platform_manager)[0].1)
+            .add_header(&add_auth_headers(&platform_manager)[1].0, &add_auth_headers(&platform_manager)[1].1)
             .await;
 
         response.assert_status_ok();
@@ -1390,7 +1438,14 @@ mod tests {
         let request_viewer_only = create_test_user(&pool, Role::RequestViewer).await; // RequestViewer without PlatformManager role
         let response = app
             .get(&format!("/admin/api/v1/users/{}/groups", standard_user.id))
-            .add_header(add_auth_headers(&request_viewer_only).0, add_auth_headers(&request_viewer_only).1)
+            .add_header(
+                &add_auth_headers(&request_viewer_only)[0].0,
+                &add_auth_headers(&request_viewer_only)[0].1,
+            )
+            .add_header(
+                &add_auth_headers(&request_viewer_only)[1].0,
+                &add_auth_headers(&request_viewer_only)[1].1,
+            )
             .await;
 
         response.assert_status(StatusCode::FORBIDDEN); // This should still be forbidden
@@ -1398,7 +1453,8 @@ mod tests {
         // Verify standard users can only see their own groups
         let response = app
             .get(&format!("/admin/api/v1/users/{}/groups", standard_user.id))
-            .add_header(add_auth_headers(&standard_user).0, add_auth_headers(&standard_user).1) // standard_user accessing their own groups
+            .add_header(&add_auth_headers(&standard_user)[0].0, &add_auth_headers(&standard_user)[0].1)
+            .add_header(&add_auth_headers(&standard_user)[1].0, &add_auth_headers(&standard_user)[1].1) // standard_user accessing their own groups
             .await;
 
         response.assert_status_ok(); // Should work - users can see their own groups
@@ -1406,7 +1462,8 @@ mod tests {
         // But standard users cannot see other users' groups
         let response = app
             .get(&format!("/admin/api/v1/users/{}/groups", another_standard_user.id))
-            .add_header(add_auth_headers(&standard_user).0, add_auth_headers(&standard_user).1) // standard_user accessing another_standard_user's groups
+            .add_header(&add_auth_headers(&standard_user)[0].0, &add_auth_headers(&standard_user)[0].1)
+            .add_header(&add_auth_headers(&standard_user)[1].0, &add_auth_headers(&standard_user)[1].1) // standard_user accessing another_standard_user's groups
             .await;
 
         response.assert_status(StatusCode::FORBIDDEN); // This should be forbidden
@@ -1433,14 +1490,16 @@ mod tests {
         let group = group_repo.create(&group_create).await.expect("Failed to create test group");
 
         app.post(&format!("/admin/api/v1/groups/{}/users/{}", group.id, standard_user.id))
-            .add_header(add_auth_headers(&multi_role_user).0, add_auth_headers(&multi_role_user).1)
+            .add_header(&add_auth_headers(&multi_role_user)[0].0, &add_auth_headers(&multi_role_user)[0].1)
+            .add_header(&add_auth_headers(&multi_role_user)[1].0, &add_auth_headers(&multi_role_user)[1].1)
             .await
             .assert_status(StatusCode::NO_CONTENT);
 
         // User with PlatformManager role should be able to see other user's groups
         let response = app
             .get(&format!("/admin/api/v1/users/{}/groups", standard_user.id))
-            .add_header(add_auth_headers(&multi_role_user).0, add_auth_headers(&multi_role_user).1)
+            .add_header(&add_auth_headers(&multi_role_user)[0].0, &add_auth_headers(&multi_role_user)[0].1)
+            .add_header(&add_auth_headers(&multi_role_user)[1].0, &add_auth_headers(&multi_role_user)[1].1)
             .await;
 
         response.assert_status_ok();
@@ -1466,7 +1525,8 @@ mod tests {
 
         let response = app
             .post("/admin/api/v1/groups")
-            .add_header(add_auth_headers(&platform_manager).0, add_auth_headers(&platform_manager).1)
+            .add_header(&add_auth_headers(&platform_manager)[0].0, &add_auth_headers(&platform_manager)[0].1)
+            .add_header(&add_auth_headers(&platform_manager)[1].0, &add_auth_headers(&platform_manager)[1].1)
             .json(&group_create)
             .await;
 
@@ -1474,14 +1534,16 @@ mod tests {
         let group: GroupResponse = response.json();
 
         app.post(&format!("/admin/api/v1/groups/{}/users/{}", group.id, user1.id))
-            .add_header(add_auth_headers(&platform_manager).0, add_auth_headers(&platform_manager).1)
+            .add_header(&add_auth_headers(&platform_manager)[0].0, &add_auth_headers(&platform_manager)[0].1)
+            .add_header(&add_auth_headers(&platform_manager)[1].0, &add_auth_headers(&platform_manager)[1].1)
             .await
             .assert_status(StatusCode::NO_CONTENT);
 
         // User1 should be able to see their own groups
         let response = app
             .get(&format!("/admin/api/v1/users/{}/groups", user1.id))
-            .add_header(add_auth_headers(&user1).0, add_auth_headers(&user1).1)
+            .add_header(&add_auth_headers(&user1)[0].0, &add_auth_headers(&user1)[0].1)
+            .add_header(&add_auth_headers(&user1)[1].0, &add_auth_headers(&user1)[1].1)
             .await;
 
         response.assert_status_ok();
@@ -1491,7 +1553,8 @@ mod tests {
         // User1 should NOT be able to see user2's groups
         let response = app
             .get(&format!("/admin/api/v1/users/{}/groups", user2.id))
-            .add_header(add_auth_headers(&user1).0, add_auth_headers(&user1).1)
+            .add_header(&add_auth_headers(&user1)[0].0, &add_auth_headers(&user1)[0].1)
+            .add_header(&add_auth_headers(&user1)[1].0, &add_auth_headers(&user1)[1].1)
             .await;
 
         response.assert_status_forbidden();
@@ -1499,7 +1562,8 @@ mod tests {
         // User2 should be able to see their own groups (but shouldn't see the group they're not in)
         let response = app
             .get(&format!("/admin/api/v1/users/{}/groups", user2.id))
-            .add_header(add_auth_headers(&user2).0, add_auth_headers(&user2).1)
+            .add_header(&add_auth_headers(&user2)[0].0, &add_auth_headers(&user2)[0].1)
+            .add_header(&add_auth_headers(&user2)[1].0, &add_auth_headers(&user2)[1].1)
             .await;
 
         response.assert_status_ok();
@@ -1509,14 +1573,16 @@ mod tests {
         // Both users should NOT be able to see group membership lists
         let response = app
             .get(&format!("/admin/api/v1/groups/{}/users", group.id))
-            .add_header(add_auth_headers(&user1).0, add_auth_headers(&user1).1)
+            .add_header(&add_auth_headers(&user1)[0].0, &add_auth_headers(&user1)[0].1)
+            .add_header(&add_auth_headers(&user1)[1].0, &add_auth_headers(&user1)[1].1)
             .await;
 
         response.assert_status_forbidden();
 
         let response = app
             .get(&format!("/admin/api/v1/groups/{}/users", group.id))
-            .add_header(add_auth_headers(&user2).0, add_auth_headers(&user2).1)
+            .add_header(&add_auth_headers(&user2)[0].0, &add_auth_headers(&user2)[0].1)
+            .add_header(&add_auth_headers(&user2)[1].0, &add_auth_headers(&user2)[1].1)
             .await;
 
         response.assert_status_forbidden();
@@ -1538,7 +1604,8 @@ mod tests {
 
         let response = app
             .post("/admin/api/v1/groups")
-            .add_header(add_auth_headers(&platform_manager).0, add_auth_headers(&platform_manager).1)
+            .add_header(&add_auth_headers(&platform_manager)[0].0, &add_auth_headers(&platform_manager)[0].1)
+            .add_header(&add_auth_headers(&platform_manager)[1].0, &add_auth_headers(&platform_manager)[1].1)
             .json(&group_create)
             .await;
 
@@ -1559,7 +1626,8 @@ mod tests {
         // Only PlatformManager should be able to add deployment to group
         let response = app
             .post(&format!("/admin/api/v1/groups/{}/models/{}", group.id, deployment.id))
-            .add_header(add_auth_headers(&platform_manager).0, add_auth_headers(&platform_manager).1)
+            .add_header(&add_auth_headers(&platform_manager)[0].0, &add_auth_headers(&platform_manager)[0].1)
+            .add_header(&add_auth_headers(&platform_manager)[1].0, &add_auth_headers(&platform_manager)[1].1)
             .await;
 
         response.assert_status(StatusCode::NO_CONTENT);
@@ -1567,7 +1635,8 @@ mod tests {
         // StandardUser should NOT be able to add deployment to group
         let response = app
             .post(&format!("/admin/api/v1/groups/{}/models/{}", group.id, deployment.id))
-            .add_header(add_auth_headers(&standard_user).0, add_auth_headers(&standard_user).1)
+            .add_header(&add_auth_headers(&standard_user)[0].0, &add_auth_headers(&standard_user)[0].1)
+            .add_header(&add_auth_headers(&standard_user)[1].0, &add_auth_headers(&standard_user)[1].1)
             .await;
 
         response.assert_status_forbidden();
@@ -1575,7 +1644,8 @@ mod tests {
         // RequestViewer should NOT be able to add deployment to group
         let response = app
             .post(&format!("/admin/api/v1/groups/{}/models/{}", group.id, deployment.id))
-            .add_header(add_auth_headers(&request_viewer).0, add_auth_headers(&request_viewer).1)
+            .add_header(&add_auth_headers(&request_viewer)[0].0, &add_auth_headers(&request_viewer)[0].1)
+            .add_header(&add_auth_headers(&request_viewer)[1].0, &add_auth_headers(&request_viewer)[1].1)
             .await;
 
         response.assert_status_forbidden();
@@ -1583,14 +1653,16 @@ mod tests {
         // Only PlatformManager should be able to remove deployment from group
         let response = app
             .delete(&format!("/admin/api/v1/groups/{}/models/{}", group.id, deployment.id))
-            .add_header(add_auth_headers(&standard_user).0, add_auth_headers(&standard_user).1)
+            .add_header(&add_auth_headers(&standard_user)[0].0, &add_auth_headers(&standard_user)[0].1)
+            .add_header(&add_auth_headers(&standard_user)[1].0, &add_auth_headers(&standard_user)[1].1)
             .await;
 
         response.assert_status_forbidden();
 
         let response = app
             .delete(&format!("/admin/api/v1/groups/{}/models/{}", group.id, deployment.id))
-            .add_header(add_auth_headers(&request_viewer).0, add_auth_headers(&request_viewer).1)
+            .add_header(&add_auth_headers(&request_viewer)[0].0, &add_auth_headers(&request_viewer)[0].1)
+            .add_header(&add_auth_headers(&request_viewer)[1].0, &add_auth_headers(&request_viewer)[1].1)
             .await;
 
         response.assert_status_forbidden();
@@ -1598,14 +1670,16 @@ mod tests {
         // Only PlatformManager should be able to list group deployments
         let response = app
             .get(&format!("/admin/api/v1/groups/{}/models", group.id))
-            .add_header(add_auth_headers(&standard_user).0, add_auth_headers(&standard_user).1)
+            .add_header(&add_auth_headers(&standard_user)[0].0, &add_auth_headers(&standard_user)[0].1)
+            .add_header(&add_auth_headers(&standard_user)[1].0, &add_auth_headers(&standard_user)[1].1)
             .await;
 
         response.assert_status_forbidden();
 
         let response = app
             .get(&format!("/admin/api/v1/groups/{}/models", group.id))
-            .add_header(add_auth_headers(&request_viewer).0, add_auth_headers(&request_viewer).1)
+            .add_header(&add_auth_headers(&request_viewer)[0].0, &add_auth_headers(&request_viewer)[0].1)
+            .add_header(&add_auth_headers(&request_viewer)[1].0, &add_auth_headers(&request_viewer)[1].1)
             .await;
 
         response.assert_status_forbidden();
@@ -1613,14 +1687,16 @@ mod tests {
         // Only PlatformManager should be able to list deployment groups
         let response = app
             .get(&format!("/admin/api/v1/models/{}/groups", deployment.id))
-            .add_header(add_auth_headers(&standard_user).0, add_auth_headers(&standard_user).1)
+            .add_header(&add_auth_headers(&standard_user)[0].0, &add_auth_headers(&standard_user)[0].1)
+            .add_header(&add_auth_headers(&standard_user)[1].0, &add_auth_headers(&standard_user)[1].1)
             .await;
 
         response.assert_status_forbidden();
 
         let response = app
             .get(&format!("/admin/api/v1/models/{}/groups", deployment.id))
-            .add_header(add_auth_headers(&request_viewer).0, add_auth_headers(&request_viewer).1)
+            .add_header(&add_auth_headers(&request_viewer)[0].0, &add_auth_headers(&request_viewer)[0].1)
+            .add_header(&add_auth_headers(&request_viewer)[1].0, &add_auth_headers(&request_viewer)[1].1)
             .await;
 
         response.assert_status_forbidden();
@@ -1628,14 +1704,16 @@ mod tests {
         // PlatformManager should be able to do all operations
         let response = app
             .get(&format!("/admin/api/v1/groups/{}/models", group.id))
-            .add_header(add_auth_headers(&platform_manager).0, add_auth_headers(&platform_manager).1)
+            .add_header(&add_auth_headers(&platform_manager)[0].0, &add_auth_headers(&platform_manager)[0].1)
+            .add_header(&add_auth_headers(&platform_manager)[1].0, &add_auth_headers(&platform_manager)[1].1)
             .await;
 
         response.assert_status_ok();
 
         let response = app
             .get(&format!("/admin/api/v1/models/{}/groups", deployment.id))
-            .add_header(add_auth_headers(&platform_manager).0, add_auth_headers(&platform_manager).1)
+            .add_header(&add_auth_headers(&platform_manager)[0].0, &add_auth_headers(&platform_manager)[0].1)
+            .add_header(&add_auth_headers(&platform_manager)[1].0, &add_auth_headers(&platform_manager)[1].1)
             .await;
 
         response.assert_status_ok();
@@ -1657,7 +1735,8 @@ mod tests {
 
         let response = app
             .post("/admin/api/v1/groups")
-            .add_header(add_auth_headers(&platform_manager).0, add_auth_headers(&platform_manager).1)
+            .add_header(&add_auth_headers(&platform_manager)[0].0, &add_auth_headers(&platform_manager)[0].1)
+            .add_header(&add_auth_headers(&platform_manager)[1].0, &add_auth_headers(&platform_manager)[1].1)
             .json(&group_create)
             .await;
 
@@ -1666,7 +1745,8 @@ mod tests {
         // RequestViewer should NOT be able to list all groups (no Groups permissions)
         let response = app
             .get("/admin/api/v1/groups")
-            .add_header(add_auth_headers(&request_viewer).0, add_auth_headers(&request_viewer).1)
+            .add_header(&add_auth_headers(&request_viewer)[0].0, &add_auth_headers(&request_viewer)[0].1)
+            .add_header(&add_auth_headers(&request_viewer)[1].0, &add_auth_headers(&request_viewer)[1].1)
             .await;
 
         response.assert_status_forbidden(); // Changed expectation
@@ -1674,7 +1754,8 @@ mod tests {
         // RequestViewer should NOT be able to get specific group
         let response = app
             .get("/admin/api/v1/groups/00000000-0000-0000-0000-000000000000")
-            .add_header(add_auth_headers(&request_viewer).0, add_auth_headers(&request_viewer).1)
+            .add_header(&add_auth_headers(&request_viewer)[0].0, &add_auth_headers(&request_viewer)[0].1)
+            .add_header(&add_auth_headers(&request_viewer)[1].0, &add_auth_headers(&request_viewer)[1].1)
             .await;
 
         response.assert_status_forbidden(); // Changed expectation
@@ -1698,7 +1779,8 @@ mod tests {
 
         let response = app
             .post("/admin/api/v1/groups")
-            .add_header(add_auth_headers(&full_admin).0, add_auth_headers(&full_admin).1)
+            .add_header(&add_auth_headers(&full_admin)[0].0, &add_auth_headers(&full_admin)[0].1)
+            .add_header(&add_auth_headers(&full_admin)[1].0, &add_auth_headers(&full_admin)[1].1)
             .json(&group_create)
             .await;
 
@@ -1707,7 +1789,8 @@ mod tests {
         // Should be able to list groups (PlatformManager)
         let response = app
             .get("/admin/api/v1/groups")
-            .add_header(add_auth_headers(&full_admin).0, add_auth_headers(&full_admin).1)
+            .add_header(&add_auth_headers(&full_admin)[0].0, &add_auth_headers(&full_admin)[0].1)
+            .add_header(&add_auth_headers(&full_admin)[1].0, &add_auth_headers(&full_admin)[1].1)
             .await;
 
         response.assert_status_ok();
@@ -1715,7 +1798,8 @@ mod tests {
         // Should be able to see other users' groups (PlatformManager)
         let response = app
             .get(&format!("/admin/api/v1/users/{}/groups", standard_user.id))
-            .add_header(add_auth_headers(&full_admin).0, add_auth_headers(&full_admin).1)
+            .add_header(&add_auth_headers(&full_admin)[0].0, &add_auth_headers(&full_admin)[0].1)
+            .add_header(&add_auth_headers(&full_admin)[1].0, &add_auth_headers(&full_admin)[1].1)
             .await;
 
         response.assert_status_ok();

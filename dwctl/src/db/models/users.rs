@@ -15,6 +15,7 @@ pub struct UserCreateDBRequest {
     pub roles: Vec<Role>,
     pub auth_source: String,
     pub password_hash: Option<String>,
+    pub external_user_id: Option<String>,
 }
 
 impl From<UserCreate> for UserCreateDBRequest {
@@ -28,6 +29,7 @@ impl From<UserCreate> for UserCreateDBRequest {
             roles: api.roles,
             auth_source: "proxy-header".to_string(), // Default auth source
             password_hash: None,                     // No password for SSO proxy users
+            external_user_id: None,                  // Not set via API
         }
     }
 }
@@ -66,5 +68,6 @@ pub struct UserDBResponse {
     pub is_admin: bool,
     pub roles: Vec<Role>,
     pub password_hash: Option<String>,
+    pub external_user_id: Option<String>,
     pub payment_provider_id: Option<String>,
 }

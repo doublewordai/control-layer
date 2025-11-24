@@ -12,9 +12,9 @@ use anyhow::anyhow;
 use async_trait::async_trait;
 use chrono::Utc;
 use futures::stream::Stream;
-use sqlx::postgres::{PgListener, PgPool};
 use sqlx::Row;
-use tokio::sync::{mpsc, Mutex};
+use sqlx::postgres::{PgListener, PgPool};
+use tokio::sync::{Mutex, mpsc};
 use tokio::task::JoinHandle;
 use tokio_stream::wrappers::ReceiverStream;
 use uuid::Uuid;
@@ -195,27 +195,25 @@ impl<H: HttpClient + 'static> PostgresRequestManager<H> {
         }
 
         // Check if file has an expiration date and it has passed
-        if let Some(expires_at) = file.expires_at {
-            if Utc::now() > expires_at {
-                // Mark as expired in the database
-                sqlx::query!(
-                    r#"
-                    UPDATE files
-                    SET status = 'expired'
-                    WHERE id = $1 AND status = 'processed'
-                    "#,
-                    *file.id as Uuid,
-                )
-                .execute(&self.pool)
-                .await
-                .map_err(|e| {
-                    FusilladeError::Other(anyhow!("Failed to mark file as expired: {}", e))
-                })?;
+        if let Some(expires_at) = file.expires_at
+            && Utc::now() > expires_at
+        {
+            // Mark as expired in the database
+            sqlx::query!(
+                r#"
+                UPDATE files
+                SET status = 'expired'
+                WHERE id = $1 AND status = 'processed'
+                "#,
+                *file.id as Uuid,
+            )
+            .execute(&self.pool)
+            .await
+            .map_err(|e| FusilladeError::Other(anyhow!("Failed to mark file as expired: {}", e)))?;
 
-                // Update the in-memory file object
-                file.status = crate::batch::FileStatus::Expired;
-                return Ok(true);
-            }
+            // Update the in-memory file object
+            file.status = crate::batch::FileStatus::Expired;
+            return Ok(true);
         }
 
         Ok(false)
@@ -701,6 +699,10 @@ impl<H: HttpClient + 'static> Storage for PostgresRequestManager<H> {
         let mut file_id: Option<Uuid> = None;
         let mut template_count = 0;
 
+        // Track what we've seen and checked
+        let mut stub_filename: Option<String> = None; // The filename used when creating stub
+        let mut uniqueness_checked_for_final_filename = false; // Only true if we've checked the final filename from metadata
+
         while let Some(item) = stream.next().await {
             match item {
                 FileStreamItem::Metadata(meta) => {
@@ -726,6 +728,61 @@ impl<H: HttpClient + 'static> Storage for PostgresRequestManager<H> {
                     if meta.uploaded_by.is_some() {
                         metadata.uploaded_by = meta.uploaded_by;
                     }
+
+                    // CASE 1: Filename arrives AFTER stub was created with auto-generated name
+                    // We need to check uniqueness now before continuing to stream templates
+                    if let Some(_fid) = file_id
+                        && let Some(_filename) = metadata.filename.as_ref()
+                        && !uniqueness_checked_for_final_filename
+                    {
+                        let final_filename = metadata.filename.as_ref().unwrap();
+
+                        // Only check if the filename differs from what we used for the stub
+                        // (if stub used this exact filename, DB constraint already checked it)
+                        if stub_filename.as_ref() != Some(final_filename) {
+                            let uploaded_by = metadata.uploaded_by.as_deref();
+
+                            // Check uniqueness outside transaction for speed
+                            // - Fast rejection path for duplicates (no transaction overhead)
+                            // - DB constraint is still the source of truth (catches races)
+                            let exists = sqlx::query_scalar!(
+                                r#"
+                                SELECT EXISTS(
+                                    SELECT 1 FROM files
+                                    WHERE name = $1 
+                                    AND ($2::TEXT IS NULL AND uploaded_by IS NULL OR uploaded_by = $2)
+                                ) as "exists!"
+                                "#,
+                                final_filename,
+                                uploaded_by,
+                            )
+                            .fetch_one(&self.pool)
+                            .await
+                            .map_err(|e| {
+                                FusilladeError::Other(anyhow!(
+                                    "Failed to check filename uniqueness: {}", 
+                                    e
+                                ))
+                            })?;
+
+                            if exists {
+                                // Rollback and fail fast
+                                tx.rollback().await.ok();
+                                return Err(FusilladeError::ValidationError(format!(
+                                    "A file with the name '{}' already exists",
+                                    final_filename
+                                )));
+                            }
+
+                            tracing::debug!(
+                                filename = %final_filename,
+                                uploaded_by = ?uploaded_by,
+                                "Late-arriving filename uniqueness check passed"
+                            );
+                        }
+
+                        uniqueness_checked_for_final_filename = true;
+                    }
                 }
                 FileStreamItem::Error(error_message) => {
                     // Rollback transaction and return validation error
@@ -740,33 +797,52 @@ impl<H: HttpClient + 'static> Storage for PostgresRequestManager<H> {
                             .clone()
                             .unwrap_or_else(|| format!("file_{}", uuid::Uuid::new_v4()));
 
+                        // Remember what filename we used for the stub
+                        stub_filename = Some(name.clone());
+
+                        // CASE 2a: Creating stub with final filename from metadata
+                        // The DB constraint will check uniqueness
+                        // CASE 2b: Creating stub with auto-generated filename
+                        // No uniqueness check needed (UUID is unique), but we don't mark as checked
+                        // because the real filename might come later in metadata
+
                         let created_file_id = sqlx::query_scalar!(
                             r#"
-                            INSERT INTO files (name)
-                            VALUES ($1)
+                            INSERT INTO files (name, uploaded_by)
+                            VALUES ($1, $2)
                             RETURNING id
                             "#,
                             name,
+                            metadata.uploaded_by.as_deref(),
                         )
                         .fetch_one(&mut *tx)
                         .await
                         .map_err(|e| {
-                            // Check for unique constraint violation (PostgreSQL error code 23505)
-                            if let sqlx::Error::Database(db_err) = &e {
-                                if db_err.code().as_deref() == Some("23505") {
-                                    return FusilladeError::ValidationError(format!(
-                                        "A file with the name '{}' already exists",
-                                        name
-                                    ));
-                                }
+                            // Database constraint catches duplicates (filename scoped by uploaded_by)
+                            if let sqlx::Error::Database(db_err) = &e
+                                && db_err.code().as_deref() == Some("23505")
+                            {
+                                return FusilladeError::ValidationError(format!(
+                                    "A file with the name '{}' already exists",
+                                    name
+                                ));
                             }
                             FusilladeError::Other(anyhow!("Failed to create file: {}", e))
                         })?;
 
                         file_id = Some(created_file_id);
+
+                        // Only mark as checked if we used the actual filename from metadata
+                        if metadata.filename.is_some() {
+                            uniqueness_checked_for_final_filename = true;
+                        }
+
                         tracing::debug!(
-                            "Created file stub {} for streaming upload",
-                            created_file_id
+                            file_id = %created_file_id,
+                            name = %name,
+                            uploaded_by = ?metadata.uploaded_by,
+                            auto_generated = metadata.filename.is_none(),
+                            "Created file stub for streaming upload"
                         );
                     }
 
@@ -807,23 +883,24 @@ impl<H: HttpClient + 'static> Storage for PostgresRequestManager<H> {
 
             sqlx::query_scalar!(
                 r#"
-                INSERT INTO files (name)
-                VALUES ($1)
+                INSERT INTO files (name, uploaded_by)
+                VALUES ($1, $2)
                 RETURNING id
                 "#,
-                name.clone(),
+                name,
+                metadata.uploaded_by.as_deref(),
             )
             .fetch_one(&mut *tx)
             .await
             .map_err(|e| {
-                // Check for unique constraint violation (PostgreSQL error code 23505)
-                if let sqlx::Error::Database(db_err) = &e {
-                    if db_err.code().as_deref() == Some("23505") {
-                        return FusilladeError::ValidationError(format!(
-                            "A file with the name '{}' already exists",
-                            name
-                        ));
-                    }
+                // Database constraint catches duplicates (filename scoped by uploaded_by)
+                if let sqlx::Error::Database(db_err) = &e
+                    && db_err.code().as_deref() == Some("23505")
+                {
+                    return FusilladeError::ValidationError(format!(
+                        "A file with the name '{}' already exists",
+                        name
+                    ));
                 }
                 FusilladeError::Other(anyhow!("Failed to create file: {}", e))
             })?
@@ -854,6 +931,10 @@ impl<H: HttpClient + 'static> Storage for PostgresRequestManager<H> {
         let uploaded_by = metadata.uploaded_by.clone();
         let name = metadata.filename.clone();
 
+        // CASE 3: Final update with metadata - DB constraint will catch any violations here
+        // This is our last-resort safety net if:
+        // - uploaded_by changed after stub creation (shouldn't happen, but handled)
+        // - filename sent multiple times, and now clashes (shouldn't happen, but handled)
         sqlx::query!(
             r#"
             UPDATE files
@@ -871,7 +952,16 @@ impl<H: HttpClient + 'static> Storage for PostgresRequestManager<H> {
         )
         .execute(&mut *tx)
         .await
-        .map_err(|e| FusilladeError::Other(anyhow!("Failed to update file metadata: {}", e)))?;
+        .map_err(|e| {
+            // Catch uniqueness violations from the update
+            if let sqlx::Error::Database(db_err) = &e
+                && db_err.code().as_deref() == Some("23505") {
+                    return FusilladeError::ValidationError(
+                        "A file with this name already exists".to_string()
+                    );
+                }
+            FusilladeError::Other(anyhow!("Failed to update file metadata: {}", e))
+        })?;
 
         // Commit the transaction
         tx.commit()
@@ -879,9 +969,9 @@ impl<H: HttpClient + 'static> Storage for PostgresRequestManager<H> {
             .map_err(|e| FusilladeError::Other(anyhow!("Failed to commit transaction: {}", e)))?;
 
         tracing::info!(
-            "File {} created with {} templates via streaming upload",
-            fid,
-            template_count
+            file_id = %fid,
+            template_count,
+            "File created successfully via streaming upload"
         );
 
         Ok(FileId(fid))
@@ -1019,7 +1109,7 @@ impl<H: HttpClient + 'static> Storage for PostgresRequestManager<H> {
         };
 
         let mut query_builder = QueryBuilder::new(
-            "SELECT id, name, description, size_bytes, status, error_message, purpose, expires_at, deleted_at, uploaded_by, created_at, updated_at FROM files"
+            "SELECT id, name, description, size_bytes, status, error_message, purpose, expires_at, deleted_at, uploaded_by, created_at, updated_at FROM files",
         );
 
         // Build WHERE clause
@@ -1717,13 +1807,18 @@ impl<H: HttpClient + 'static> Storage for PostgresRequestManager<H> {
         .await
         .map_err(|e| FusilladeError::Other(anyhow!("Failed to set cancelling_at: {}", e)))?;
 
-        // Cancel all pending/in-progress requests
+        // Cancel all pending/in-progress requests and notify daemons
         sqlx::query!(
             r#"
-            UPDATE requests
-            SET state = 'canceled', canceled_at = $2
-            WHERE batch_id = $1
-                AND state IN ('pending', 'claimed', 'processing')
+            WITH canceled AS (
+                UPDATE requests
+                SET state = 'canceled', canceled_at = $2
+                WHERE batch_id = $1
+                    AND state IN ('pending', 'claimed', 'processing')
+                RETURNING id
+            )
+            SELECT pg_notify('request_cancellations', id::text)
+            FROM canceled
             "#,
             *batch_id as Uuid,
             now,
@@ -2447,7 +2542,7 @@ impl<H: HttpClient> DaemonStorage for PostgresRequestManager<H> {
                 return Err(FusilladeError::Other(anyhow!(
                     "Unknown daemon status: {}",
                     row.status
-                )))
+                )));
             }
         };
 
@@ -2569,11 +2664,126 @@ impl<H: HttpClient + 'static> DaemonExecutor<H> for PostgresRequestManager<H> {
             shutdown_token,
         ));
 
-        let handle = tokio::spawn(async move { daemon.run().await });
+        let manager = self.clone();
+        let handle = tokio::spawn(async move {
+            // Create a cancellation stream from PostgreSQL LISTEN/NOTIFY
+            // If we can't create the stream, return error for fail-fast behavior
+            let cancellation_stream = manager.create_cancellation_stream().await?;
+            daemon.run(Some(cancellation_stream)).await
+        });
 
         tracing::info!("Daemon spawned successfully");
 
         Ok(handle)
+    }
+}
+
+impl<H: HttpClient + 'static> PostgresRequestManager<H> {
+    /// Create a stream of request cancellations from PostgreSQL LISTEN/NOTIFY.
+    async fn create_cancellation_stream(
+        &self,
+    ) -> Result<std::pin::Pin<Box<dyn futures::Stream<Item = RequestId> + Send>>> {
+        use futures::StreamExt;
+
+        // Clone the pool so the stream can create new listeners on reconnection
+        let pool = self.pool.clone();
+
+        // Create a stream that handles reconnection internally
+        // State: (pool, optional listener) - we keep the listener alive across iterations
+        type State = (PgPool, Option<sqlx::postgres::PgListener>);
+
+        let stream = futures::stream::unfold((pool, None), |(pool, listener_opt): State| async move {
+            const RECONNECT_DELAY_SECS: u64 = 5;
+
+            let mut listener = match listener_opt {
+                Some(l) => l,
+                None => {
+                    // Need to establish a connection
+                    'reconnect: loop {
+                        // Try to create a new listener
+                        let mut listener = match sqlx::postgres::PgListener::connect_with(&pool).await {
+                            Ok(l) => {
+                                tracing::debug!("Connected to PostgreSQL for cancellation stream");
+                                l
+                            }
+                            Err(e) => {
+                                tracing::error!(
+                                    error = %e,
+                                    "Failed to connect listener for cancellations, retrying in {}s",
+                                    RECONNECT_DELAY_SECS
+                                );
+                                tokio::time::sleep(std::time::Duration::from_secs(RECONNECT_DELAY_SECS)).await;
+                                continue 'reconnect;
+                            }
+                        };
+
+                        // Try to listen to the channel
+                        if let Err(e) = listener.listen("request_cancellations").await {
+                            tracing::error!(
+                                error = %e,
+                                "Failed to LISTEN on request_cancellations channel, retrying in {}s",
+                                RECONNECT_DELAY_SECS
+                            );
+                            tokio::time::sleep(std::time::Duration::from_secs(RECONNECT_DELAY_SECS)).await;
+                            continue 'reconnect;
+                        }
+
+                        tracing::info!("Listening for request cancellations via PostgreSQL NOTIFY");
+                        break listener;
+                    }
+                }
+            };
+
+            // Try to receive a notification from the active listener
+            loop {
+                match listener.try_recv().await {
+                    Ok(Some(notification)) => {
+                        // Parse the request ID from the payload (UUID string)
+                        match notification.payload().parse::<uuid::Uuid>() {
+                            Ok(uuid) => {
+                                // Valid cancellation - return it and keep the connection alive
+                                return Some((RequestId(uuid), (pool, Some(listener))));
+                            }
+                            Err(e) => {
+                                tracing::error!(
+                                    payload = notification.payload(),
+                                    error = %e,
+                                    "Failed to parse request ID from notification, skipping"
+                                );
+                                // Skip invalid messages, continue listening on same connection
+                            }
+                        }
+                    }
+                    Ok(None) => {
+                        tracing::error!(
+                            "Connection closed while listening for cancellations, reconnecting in {}s",
+                            RECONNECT_DELAY_SECS
+                        );
+                        tokio::time::sleep(std::time::Duration::from_secs(RECONNECT_DELAY_SECS)).await;
+                        // Drop the listener to trigger reconnect on next iteration
+                        return Some((RequestId(uuid::Uuid::nil()), (pool, None)));
+                    }
+                    Err(e) => {
+                        tracing::error!(
+                            error = %e,
+                            "PostgreSQL error while listening for cancellations, reconnecting in {}s",
+                            RECONNECT_DELAY_SECS
+                        );
+                        tokio::time::sleep(std::time::Duration::from_secs(RECONNECT_DELAY_SECS)).await;
+                        // Drop the listener to trigger reconnect on next iteration
+                        return Some((RequestId(uuid::Uuid::nil()), (pool, None)));
+                    }
+                }
+            }
+        })
+        .filter(|request_id| {
+            // Filter out nil UUIDs (used for reconnection signaling)
+            let keep = !request_id.0.is_nil();
+            futures::future::ready(keep)
+        })
+        .boxed();
+
+        Ok(stream)
     }
 }
 
@@ -4550,5 +4760,801 @@ mod tests {
                 model
             );
         }
+    }
+
+    // ========================================================================
+    // Filename uniqueness tests
+    // ========================================================================
+
+    #[sqlx::test]
+    async fn test_duplicate_filename_same_user_rejected(pool: sqlx::PgPool) {
+        use crate::batch::{FileMetadata, FileStreamItem};
+        use futures::stream;
+
+        let http_client = Arc::new(MockHttpClient::new());
+        let manager = PostgresRequestManager::with_client(pool.clone(), http_client);
+
+        // Create first file with uploaded_by
+        let items1 = vec![
+            FileStreamItem::Metadata(FileMetadata {
+                filename: Some("duplicate-test.jsonl".to_string()),
+                uploaded_by: Some("user1".to_string()),
+                ..Default::default()
+            }),
+            FileStreamItem::Template(RequestTemplateInput {
+                custom_id: None,
+                endpoint: "https://api.example.com".to_string(),
+                method: "POST".to_string(),
+                path: "/test".to_string(),
+                body: "{}".to_string(),
+                model: "test".to_string(),
+                api_key: "key".to_string(),
+            }),
+        ];
+
+        let stream1 = stream::iter(items1);
+        let file1_result = manager.create_file_stream(stream1).await;
+        assert!(
+            file1_result.is_ok(),
+            "First file should be created successfully"
+        );
+
+        // Try to create second file with same name and user
+        let items2 = vec![
+            FileStreamItem::Metadata(FileMetadata {
+                filename: Some("duplicate-test.jsonl".to_string()),
+                uploaded_by: Some("user1".to_string()),
+                ..Default::default()
+            }),
+            FileStreamItem::Template(RequestTemplateInput {
+                custom_id: None,
+                endpoint: "https://api.example.com".to_string(),
+                method: "POST".to_string(),
+                path: "/test".to_string(),
+                body: "{}".to_string(),
+                model: "test".to_string(),
+                api_key: "key".to_string(),
+            }),
+        ];
+
+        let stream2 = stream::iter(items2);
+        let file2_result = manager.create_file_stream(stream2).await;
+
+        // Should fail with ValidationError
+        assert!(file2_result.is_err(), "Second file should be rejected");
+        match file2_result {
+            Err(FusilladeError::ValidationError(msg)) => {
+                assert!(
+                    msg.contains("already exists"),
+                    "Error message should mention file already exists, got: {}",
+                    msg
+                );
+            }
+            _ => panic!("Expected ValidationError"),
+        }
+    }
+
+    #[sqlx::test]
+    async fn test_duplicate_filename_different_users_allowed(pool: sqlx::PgPool) {
+        use crate::batch::{FileMetadata, FileStreamItem};
+        use futures::stream;
+
+        let http_client = Arc::new(MockHttpClient::new());
+        let manager = PostgresRequestManager::with_client(pool.clone(), http_client);
+
+        // Create first file for user1
+        let items1 = vec![
+            FileStreamItem::Metadata(FileMetadata {
+                filename: Some("shared-name.jsonl".to_string()),
+                uploaded_by: Some("user1".to_string()),
+                ..Default::default()
+            }),
+            FileStreamItem::Template(RequestTemplateInput {
+                custom_id: None,
+                endpoint: "https://api.example.com".to_string(),
+                method: "POST".to_string(),
+                path: "/test".to_string(),
+                body: "{}".to_string(),
+                model: "test".to_string(),
+                api_key: "key".to_string(),
+            }),
+        ];
+
+        let stream1 = stream::iter(items1);
+        let file1_result = manager.create_file_stream(stream1).await;
+        assert!(file1_result.is_ok(), "First file should be created");
+
+        // Create second file for user2 with same name
+        let items2 = vec![
+            FileStreamItem::Metadata(FileMetadata {
+                filename: Some("shared-name.jsonl".to_string()),
+                uploaded_by: Some("user2".to_string()),
+                ..Default::default()
+            }),
+            FileStreamItem::Template(RequestTemplateInput {
+                custom_id: None,
+                endpoint: "https://api.example.com".to_string(),
+                method: "POST".to_string(),
+                path: "/test".to_string(),
+                body: "{}".to_string(),
+                model: "test".to_string(),
+                api_key: "key".to_string(),
+            }),
+        ];
+
+        let stream2 = stream::iter(items2);
+        let file2_result = manager.create_file_stream(stream2).await;
+
+        // Should succeed - different users can have same filename
+        assert!(
+            file2_result.is_ok(),
+            "Second file should be created for different user"
+        );
+    }
+
+    #[sqlx::test]
+    async fn test_duplicate_filename_null_uploaded_by_rejected(pool: sqlx::PgPool) {
+        use crate::batch::{FileMetadata, FileStreamItem};
+        use futures::stream;
+
+        let http_client = Arc::new(MockHttpClient::new());
+        let manager = PostgresRequestManager::with_client(pool.clone(), http_client);
+
+        // Create first system file (NULL uploaded_by)
+        let items1 = vec![
+            FileStreamItem::Metadata(FileMetadata {
+                filename: Some("system-file.jsonl".to_string()),
+                uploaded_by: None,
+                ..Default::default()
+            }),
+            FileStreamItem::Template(RequestTemplateInput {
+                custom_id: None,
+                endpoint: "https://api.example.com".to_string(),
+                method: "POST".to_string(),
+                path: "/test".to_string(),
+                body: "{}".to_string(),
+                model: "test".to_string(),
+                api_key: "key".to_string(),
+            }),
+        ];
+
+        let stream1 = stream::iter(items1);
+        let file1_result = manager.create_file_stream(stream1).await;
+        assert!(file1_result.is_ok(), "First system file should be created");
+
+        // Try to create second system file with same name
+        let items2 = vec![
+            FileStreamItem::Metadata(FileMetadata {
+                filename: Some("system-file.jsonl".to_string()),
+                uploaded_by: None,
+                ..Default::default()
+            }),
+            FileStreamItem::Template(RequestTemplateInput {
+                custom_id: None,
+                endpoint: "https://api.example.com".to_string(),
+                method: "POST".to_string(),
+                path: "/test".to_string(),
+                body: "{}".to_string(),
+                model: "test".to_string(),
+                api_key: "key".to_string(),
+            }),
+        ];
+
+        let stream2 = stream::iter(items2);
+        let file2_result = manager.create_file_stream(stream2).await;
+
+        // Should fail - NULL uploaded_by values should also be deduplicated
+        assert!(
+            file2_result.is_err(),
+            "Second system file should be rejected"
+        );
+        match file2_result {
+            Err(FusilladeError::ValidationError(msg)) => {
+                assert!(msg.contains("already exists"));
+            }
+            _ => panic!("Expected ValidationError"),
+        }
+    }
+
+    #[sqlx::test]
+    async fn test_filename_arrives_before_template_early_check(pool: sqlx::PgPool) {
+        use crate::batch::{FileMetadata, FileStreamItem};
+        use futures::stream;
+
+        let http_client = Arc::new(MockHttpClient::new());
+        let manager = PostgresRequestManager::with_client(pool.clone(), http_client);
+
+        // Create first file
+        manager
+            .create_file_stream(stream::iter(vec![
+                FileStreamItem::Metadata(FileMetadata {
+                    filename: Some("early-check.jsonl".to_string()),
+                    uploaded_by: Some("user1".to_string()),
+                    ..Default::default()
+                }),
+                FileStreamItem::Template(RequestTemplateInput {
+                    custom_id: None,
+                    endpoint: "https://api.example.com".to_string(),
+                    method: "POST".to_string(),
+                    path: "/test".to_string(),
+                    body: "{}".to_string(),
+                    model: "test".to_string(),
+                    api_key: "key".to_string(),
+                }),
+            ]))
+            .await
+            .unwrap();
+
+        // Try to create duplicate - metadata with filename comes BEFORE any templates
+        // This should fail fast without streaming any templates
+        let items = vec![
+            FileStreamItem::Metadata(FileMetadata {
+                filename: Some("early-check.jsonl".to_string()),
+                uploaded_by: Some("user1".to_string()),
+                ..Default::default()
+            }),
+            // Add a large number of templates to verify we don't process them
+            FileStreamItem::Template(RequestTemplateInput {
+                custom_id: Some("should-not-be-created-1".to_string()),
+                endpoint: "https://api.example.com".to_string(),
+                method: "POST".to_string(),
+                path: "/test".to_string(),
+                body: "{}".to_string(),
+                model: "test".to_string(),
+                api_key: "key".to_string(),
+            }),
+            FileStreamItem::Template(RequestTemplateInput {
+                custom_id: Some("should-not-be-created-2".to_string()),
+                endpoint: "https://api.example.com".to_string(),
+                method: "POST".to_string(),
+                path: "/test".to_string(),
+                body: "{}".to_string(),
+                model: "test".to_string(),
+                api_key: "key".to_string(),
+            }),
+        ];
+
+        let result = manager.create_file_stream(stream::iter(items)).await;
+        assert!(result.is_err(), "Should fail before processing templates");
+
+        // Verify no templates were created with those custom_ids
+        let check = sqlx::query!(
+            r#"
+            SELECT COUNT(*) as "count!"
+            FROM request_templates
+            WHERE custom_id IN ('should-not-be-created-1', 'should-not-be-created-2')
+            "#
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+
+        assert_eq!(check.count, 0, "Templates should not have been created");
+    }
+
+    #[sqlx::test]
+    async fn test_filename_arrives_after_stub_created_late_check(pool: sqlx::PgPool) {
+        use crate::batch::{FileMetadata, FileStreamItem};
+        use futures::stream;
+
+        let http_client = Arc::new(MockHttpClient::new());
+        let manager = PostgresRequestManager::with_client(pool.clone(), http_client);
+
+        // Create first file
+        manager
+            .create_file_stream(stream::iter(vec![
+                FileStreamItem::Metadata(FileMetadata {
+                    filename: Some("late-check.jsonl".to_string()),
+                    uploaded_by: Some("user1".to_string()),
+                    ..Default::default()
+                }),
+                FileStreamItem::Template(RequestTemplateInput {
+                    custom_id: None,
+                    endpoint: "https://api.example.com".to_string(),
+                    method: "POST".to_string(),
+                    path: "/test".to_string(),
+                    body: "{}".to_string(),
+                    model: "test".to_string(),
+                    api_key: "key".to_string(),
+                }),
+            ]))
+            .await
+            .unwrap();
+
+        // Try to create duplicate - template comes FIRST (creates stub with auto-generated name)
+        // Then metadata with duplicate filename arrives
+        let items = vec![
+            FileStreamItem::Metadata(FileMetadata {
+                uploaded_by: Some("user1".to_string()),
+                // No filename yet - will be added later
+                ..Default::default()
+            }),
+            FileStreamItem::Template(RequestTemplateInput {
+                custom_id: Some("stub-created-first".to_string()),
+                endpoint: "https://api.example.com".to_string(),
+                method: "POST".to_string(),
+                path: "/test".to_string(),
+                body: "{}".to_string(),
+                model: "test".to_string(),
+                api_key: "key".to_string(),
+            }),
+            // NOW the real filename arrives (after stub is already created)
+            FileStreamItem::Metadata(FileMetadata {
+                filename: Some("late-check.jsonl".to_string()),
+                uploaded_by: Some("user1".to_string()),
+                ..Default::default()
+            }),
+            // More templates that shouldn't be processed
+            FileStreamItem::Template(RequestTemplateInput {
+                custom_id: Some("should-not-be-created".to_string()),
+                endpoint: "https://api.example.com".to_string(),
+                method: "POST".to_string(),
+                path: "/test".to_string(),
+                body: "{}".to_string(),
+                model: "test".to_string(),
+                api_key: "key".to_string(),
+            }),
+        ];
+
+        let result = manager.create_file_stream(stream::iter(items)).await;
+        assert!(
+            result.is_err(),
+            "Should fail when filename arrives after stub creation"
+        );
+
+        // Verify the stub template was created but not the later one
+        let check = sqlx::query!(
+            r#"
+            SELECT custom_id
+            FROM request_templates
+            WHERE custom_id IN ('stub-created-first', 'should-not-be-created')
+            "#
+        )
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+
+        // Should have created the first template (before we knew about duplicate)
+        // but rolled back, so actually nothing should exist
+        assert_eq!(
+            check.len(),
+            0,
+            "Transaction should have rolled back, no templates created"
+        );
+    }
+
+    #[sqlx::test]
+    async fn test_stub_creation_with_real_filename_db_constraint_check(pool: sqlx::PgPool) {
+        use crate::batch::{FileMetadata, FileStreamItem};
+        use futures::stream;
+
+        let http_client = Arc::new(MockHttpClient::new());
+        let manager = PostgresRequestManager::with_client(pool.clone(), http_client);
+
+        // Create first file
+        manager
+            .create_file_stream(stream::iter(vec![
+                FileStreamItem::Metadata(FileMetadata {
+                    filename: Some("constraint-check.jsonl".to_string()),
+                    uploaded_by: Some("user1".to_string()),
+                    ..Default::default()
+                }),
+                FileStreamItem::Template(RequestTemplateInput {
+                    custom_id: None,
+                    endpoint: "https://api.example.com".to_string(),
+                    method: "POST".to_string(),
+                    path: "/test".to_string(),
+                    body: "{}".to_string(),
+                    model: "test".to_string(),
+                    api_key: "key".to_string(),
+                }),
+            ]))
+            .await
+            .unwrap();
+
+        // Try to create duplicate where metadata with filename comes first,
+        // then template arrives and tries to create stub with that filename
+        // This tests the DB constraint is enforced on INSERT
+        let items = vec![
+            FileStreamItem::Metadata(FileMetadata {
+                filename: Some("constraint-check.jsonl".to_string()),
+                uploaded_by: Some("user1".to_string()),
+                ..Default::default()
+            }),
+            FileStreamItem::Template(RequestTemplateInput {
+                custom_id: None,
+                endpoint: "https://api.example.com".to_string(),
+                method: "POST".to_string(),
+                path: "/test".to_string(),
+                body: "{}".to_string(),
+                model: "test".to_string(),
+                api_key: "key".to_string(),
+            }),
+        ];
+
+        let result = manager.create_file_stream(stream::iter(items)).await;
+
+        // Should be caught by DB constraint on INSERT
+        assert!(
+            result.is_err(),
+            "Should fail on stub creation via DB constraint"
+        );
+        match result {
+            Err(FusilladeError::ValidationError(msg)) => {
+                assert!(msg.contains("already exists"));
+            }
+            _ => panic!("Expected ValidationError from DB constraint"),
+        }
+    }
+
+    #[sqlx::test]
+    async fn test_auto_generated_filename_then_real_filename_differs(pool: sqlx::PgPool) {
+        use crate::batch::{FileMetadata, FileStreamItem};
+        use futures::stream;
+
+        let http_client = Arc::new(MockHttpClient::new());
+        let manager = PostgresRequestManager::with_client(pool.clone(), http_client);
+
+        // Create a file where:
+        // 1. Template arrives first (creates stub with auto-generated UUID name)
+        // 2. Metadata arrives with a different, valid filename
+        // 3. Should succeed and update the stub name
+        let items = vec![
+            FileStreamItem::Metadata(FileMetadata {
+                uploaded_by: Some("user1".to_string()),
+                // No filename yet
+                ..Default::default()
+            }),
+            FileStreamItem::Template(RequestTemplateInput {
+                custom_id: Some("test-1".to_string()),
+                endpoint: "https://api.example.com".to_string(),
+                method: "POST".to_string(),
+                path: "/test".to_string(),
+                body: "{}".to_string(),
+                model: "test".to_string(),
+                api_key: "key".to_string(),
+            }),
+            // Real filename arrives
+            FileStreamItem::Metadata(FileMetadata {
+                filename: Some("updated-filename.jsonl".to_string()),
+                uploaded_by: Some("user1".to_string()),
+                ..Default::default()
+            }),
+            FileStreamItem::Template(RequestTemplateInput {
+                custom_id: Some("test-2".to_string()),
+                endpoint: "https://api.example.com".to_string(),
+                method: "POST".to_string(),
+                path: "/test".to_string(),
+                body: "{}".to_string(),
+                model: "test".to_string(),
+                api_key: "key".to_string(),
+            }),
+        ];
+
+        let file_id = manager
+            .create_file_stream(stream::iter(items))
+            .await
+            .expect("Should create file successfully");
+
+        // Verify the final filename is the one from metadata, not auto-generated
+        let file = manager.get_file(file_id).await.unwrap();
+        assert_eq!(file.name, "updated-filename.jsonl");
+        assert_eq!(file.uploaded_by, Some("user1".to_string()));
+
+        // Verify both templates were created
+        let content = manager.get_file_content(file_id).await.unwrap();
+        assert_eq!(content.len(), 2);
+    }
+
+    #[sqlx::test]
+    async fn test_multiple_metadata_updates_last_wins(pool: sqlx::PgPool) {
+        use crate::batch::{FileMetadata, FileStreamItem};
+        use futures::stream;
+
+        let http_client = Arc::new(MockHttpClient::new());
+        let manager = PostgresRequestManager::with_client(pool.clone(), http_client);
+
+        // Send multiple metadata items - last one should win
+        let items = vec![
+            FileStreamItem::Metadata(FileMetadata {
+                filename: Some("first-name.jsonl".to_string()),
+                description: Some("First description".to_string()),
+                uploaded_by: Some("user1".to_string()),
+                ..Default::default()
+            }),
+            FileStreamItem::Metadata(FileMetadata {
+                filename: Some("second-name.jsonl".to_string()),
+                description: Some("Second description".to_string()),
+                uploaded_by: Some("user1".to_string()),
+                ..Default::default()
+            }),
+            FileStreamItem::Metadata(FileMetadata {
+                filename: Some("final-name.jsonl".to_string()),
+                description: Some("Final description".to_string()),
+                uploaded_by: Some("user1".to_string()),
+                ..Default::default()
+            }),
+            FileStreamItem::Template(RequestTemplateInput {
+                custom_id: None,
+                endpoint: "https://api.example.com".to_string(),
+                method: "POST".to_string(),
+                path: "/test".to_string(),
+                body: "{}".to_string(),
+                model: "test".to_string(),
+                api_key: "key".to_string(),
+            }),
+        ];
+
+        let file_id = manager
+            .create_file_stream(stream::iter(items))
+            .await
+            .expect("Should create file");
+
+        let file = manager.get_file(file_id).await.unwrap();
+        assert_eq!(file.name, "final-name.jsonl");
+        assert_eq!(file.description, Some("Final description".to_string()));
+    }
+
+    #[sqlx::test]
+    async fn test_empty_file_no_templates_but_with_filename(pool: sqlx::PgPool) {
+        use crate::batch::{FileMetadata, FileStreamItem};
+        use futures::stream;
+
+        let http_client = Arc::new(MockHttpClient::new());
+        let manager = PostgresRequestManager::with_client(pool.clone(), http_client);
+
+        // Create a file with metadata but no templates
+        let items = vec![FileStreamItem::Metadata(FileMetadata {
+            filename: Some("empty-file.jsonl".to_string()),
+            description: Some("A file with no templates".to_string()),
+            uploaded_by: Some("user1".to_string()),
+            ..Default::default()
+        })];
+
+        let file_id = manager
+            .create_file_stream(stream::iter(items))
+            .await
+            .expect("Should create empty file");
+
+        let file = manager.get_file(file_id).await.unwrap();
+        assert_eq!(file.name, "empty-file.jsonl");
+        assert_eq!(
+            file.description,
+            Some("A file with no templates".to_string())
+        );
+
+        // Verify no templates
+        let content = manager.get_file_content(file_id).await.unwrap();
+        assert_eq!(content.len(), 0);
+    }
+
+    #[sqlx::test]
+    async fn test_duplicate_empty_file_rejected(pool: sqlx::PgPool) {
+        use crate::batch::{FileMetadata, FileStreamItem};
+        use futures::stream;
+
+        let http_client = Arc::new(MockHttpClient::new());
+        let manager = PostgresRequestManager::with_client(pool.clone(), http_client);
+
+        // Create first empty file
+        manager
+            .create_file_stream(stream::iter(vec![FileStreamItem::Metadata(FileMetadata {
+                filename: Some("empty-duplicate.jsonl".to_string()),
+                uploaded_by: Some("user1".to_string()),
+                ..Default::default()
+            })]))
+            .await
+            .expect("First empty file should be created");
+
+        // Try to create duplicate empty file
+        let result = manager
+            .create_file_stream(stream::iter(vec![FileStreamItem::Metadata(FileMetadata {
+                filename: Some("empty-duplicate.jsonl".to_string()),
+                uploaded_by: Some("user1".to_string()),
+                ..Default::default()
+            })]))
+            .await;
+
+        // Should fail even for empty files
+        assert!(result.is_err(), "Duplicate empty file should be rejected");
+        match result {
+            Err(FusilladeError::ValidationError(msg)) => {
+                assert!(msg.contains("already exists"));
+            }
+            _ => panic!("Expected ValidationError"),
+        }
+    }
+    /// Helper to poll for a condition with timeout
+    async fn wait_for<F, Fut>(mut check: F, timeout: std::time::Duration) -> bool
+    where
+        F: FnMut() -> Fut,
+        Fut: std::future::Future<Output = bool>,
+    {
+        let start = std::time::Instant::now();
+        while start.elapsed() < timeout {
+            if check().await {
+                return true;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        false
+    }
+
+    #[sqlx::test]
+    async fn test_batch_cancellation_with_stream(pool: sqlx::PgPool) {
+        use crate::http::HttpResponse;
+        use std::time::Duration;
+        use tokio::sync::mpsc;
+
+        let http_client = Arc::new(MockHttpClient::new());
+        let manager = Arc::new(PostgresRequestManager::with_client(
+            pool.clone(),
+            http_client.clone(),
+        ));
+
+        // Create a file with templates
+        let file_id = manager
+            .create_file(
+                "test_cancellation".to_string(),
+                None,
+                vec![
+                    RequestTemplateInput {
+                        custom_id: Some("req1".to_string()),
+                        endpoint: "http://example.com".to_string(),
+                        method: "POST".to_string(),
+                        path: "/test".to_string(),
+                        body: r#"{"test": 1}"#.to_string(),
+                        model: "model-a".to_string(),
+                        api_key: "test-key".to_string(),
+                    },
+                    RequestTemplateInput {
+                        custom_id: Some("req2".to_string()),
+                        endpoint: "http://example.com".to_string(),
+                        method: "POST".to_string(),
+                        path: "/test".to_string(),
+                        body: r#"{"test": 2}"#.to_string(),
+                        model: "model-a".to_string(),
+                        api_key: "test-key".to_string(),
+                    },
+                ],
+            )
+            .await
+            .unwrap();
+
+        // Create a batch
+        let batch = manager
+            .create_batch(BatchInput {
+                file_id,
+                created_by: Some("test-user".to_string()),
+                completion_window: "24h".to_string(),
+                endpoint: "/v1/chat/completions".to_string(),
+                metadata: None,
+            })
+            .await
+            .unwrap();
+
+        // Create a mock cancellation stream using mpsc channel
+        let (cancel_tx, cancel_rx) = mpsc::unbounded_channel::<RequestId>();
+        let cancellation_stream = tokio_stream::wrappers::UnboundedReceiverStream::new(cancel_rx);
+
+        // Set up triggered responses that won't complete until we tell them to
+        http_client.clear_calls();
+        let trigger1 = http_client.add_response_with_trigger(
+            "POST /test",
+            Ok(HttpResponse {
+                status: 200,
+                body: "ok".to_string(),
+            }),
+        );
+        let trigger2 = http_client.add_response_with_trigger(
+            "POST /test",
+            Ok(HttpResponse {
+                status: 200,
+                body: "ok".to_string(),
+            }),
+        );
+
+        // Start a daemon with the mock cancellation stream
+        let shutdown_token = tokio_util::sync::CancellationToken::new();
+        let config = crate::daemon::DaemonConfig {
+            claim_batch_size: 10,
+            default_model_concurrency: 5,
+            model_concurrency_limits: Arc::new(dashmap::DashMap::new()),
+            claim_interval_ms: 10,
+            max_retries: 3,
+            backoff_ms: 100,
+            backoff_factor: 2,
+            max_backoff_ms: 1000,
+            timeout_ms: 30000,
+            status_log_interval_ms: None,
+            heartbeat_interval_ms: 1000,
+            should_retry: Arc::new(|_| false),
+            claim_timeout_ms: 5000,
+            processing_timeout_ms: 10000,
+        };
+
+        let daemon = Arc::new(crate::daemon::Daemon::new(
+            manager.clone(),
+            http_client.clone(),
+            config,
+            shutdown_token.clone(),
+        ));
+
+        // Run daemon with cancellation stream
+        let daemon_handle = tokio::spawn({
+            let daemon = daemon.clone();
+            async move { daemon.run(Some(cancellation_stream)).await }
+        });
+
+        // Get the request IDs from the batch
+        let requests = manager.get_batch_requests(batch.id).await.unwrap();
+        assert_eq!(requests.len(), 2);
+        let request_ids: Vec<RequestId> = requests.iter().map(|r| r.id()).collect();
+
+        // Wait for both requests to be processing (blocked on triggers)
+        let manager_clone = manager.clone();
+        let batch_id = batch.id;
+        let reached_processing = wait_for(
+            || async {
+                if let Ok(reqs) = manager_clone.get_batch_requests(batch_id).await {
+                    reqs.iter().all(|r| matches!(r, AnyRequest::Processing(_)))
+                } else {
+                    false
+                }
+            },
+            Duration::from_secs(3),
+        )
+        .await;
+        assert!(
+            reached_processing,
+            "Both requests should reach processing state"
+        );
+
+        // Send cancellation for first request via the stream
+        cancel_tx.send(request_ids[0]).unwrap();
+
+        // Wait for first request to be canceled
+        let manager_clone = manager.clone();
+        let req_id_0 = request_ids[0];
+        let reached_canceled = wait_for(
+            || async {
+                if let Ok(reqs) = manager_clone.get_batch_requests(batch_id).await {
+                    if let Some(req) = reqs.iter().find(|r| r.id() == req_id_0) {
+                        return matches!(req, AnyRequest::Canceled(_));
+                    }
+                }
+                false
+            },
+            Duration::from_secs(3),
+        )
+        .await;
+        assert!(reached_canceled, "First request should be canceled");
+
+        // Trigger the second request to complete normally
+        trigger2.send(()).ok();
+
+        // Wait for second request to complete
+        let manager_clone = manager.clone();
+        let req_id_1 = request_ids[1];
+        let reached_completed = wait_for(
+            || async {
+                if let Ok(reqs) = manager_clone.get_batch_requests(batch_id).await {
+                    if let Some(req) = reqs.iter().find(|r| r.id() == req_id_1) {
+                        return matches!(req, AnyRequest::Completed(_));
+                    }
+                }
+                false
+            },
+            Duration::from_secs(3),
+        )
+        .await;
+        assert!(reached_completed, "Second request should complete");
+
+        // Shutdown daemon
+        shutdown_token.cancel();
+        let _ = tokio::time::timeout(Duration::from_secs(5), daemon_handle).await;
+
+        // Drop trigger1 to unblock if still waiting
+        drop(trigger1);
     }
 }

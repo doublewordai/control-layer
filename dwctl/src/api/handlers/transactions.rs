@@ -160,8 +160,8 @@ pub async fn list_transactions(
     Query(query): Query<ListTransactionsQuery>,
     current_user: CurrentUser,
 ) -> Result<Json<Vec<CreditTransactionResponse>>> {
-    let skip = query.skip.unwrap_or(0);
-    let limit = query.limit.unwrap_or(100).min(1000);
+    let skip = query.pagination.skip();
+    let limit = query.pagination.limit();
 
     // Check if user has ReadAll permission
     let has_read_all = permissions::has_permission(&current_user, Resource::Credits, Operation::ReadAll);
@@ -254,7 +254,8 @@ mod tests {
 
         let response = app
             .post("/admin/api/v1/transactions")
-            .add_header(add_auth_headers(&billing_manager).0, add_auth_headers(&billing_manager).1)
+            .add_header(&add_auth_headers(&billing_manager)[0].0, &add_auth_headers(&billing_manager)[0].1)
+            .add_header(&add_auth_headers(&billing_manager)[1].0, &add_auth_headers(&billing_manager)[1].1)
             .json(&transaction_data)
             .await;
 
@@ -285,7 +286,8 @@ mod tests {
 
         let response = app
             .post("/admin/api/v1/transactions")
-            .add_header(add_auth_headers(&user).0, add_auth_headers(&user).1)
+            .add_header(&add_auth_headers(&user)[0].0, &add_auth_headers(&user)[0].1)
+            .add_header(&add_auth_headers(&user)[1].0, &add_auth_headers(&user)[1].1)
             .json(&transaction_data)
             .await;
 
@@ -310,7 +312,8 @@ mod tests {
 
         let response = app
             .post("/admin/api/v1/transactions")
-            .add_header(add_auth_headers(&platform_manager).0, add_auth_headers(&platform_manager).1)
+            .add_header(&add_auth_headers(&platform_manager)[0].0, &add_auth_headers(&platform_manager)[0].1)
+            .add_header(&add_auth_headers(&platform_manager)[1].0, &add_auth_headers(&platform_manager)[1].1)
             .json(&transaction_data)
             .await;
 
@@ -341,7 +344,8 @@ mod tests {
 
         let response = app
             .post("/admin/api/v1/transactions")
-            .add_header(add_auth_headers(&user).0, add_auth_headers(&user).1)
+            .add_header(&add_auth_headers(&user)[0].0, &add_auth_headers(&user)[0].1)
+            .add_header(&add_auth_headers(&user)[1].0, &add_auth_headers(&user)[1].1)
             .json(&transaction_data)
             .await;
 
@@ -360,7 +364,8 @@ mod tests {
 
         let response = app
             .get(&format!("/admin/api/v1/transactions/{}", transaction_id))
-            .add_header(add_auth_headers(&user).0, add_auth_headers(&user).1)
+            .add_header(&add_auth_headers(&user)[0].0, &add_auth_headers(&user)[0].1)
+            .add_header(&add_auth_headers(&user)[1].0, &add_auth_headers(&user)[1].1)
             .await;
 
         response.assert_status_ok();
@@ -386,7 +391,8 @@ mod tests {
         // user1 tries to access user2's transaction
         let response = app
             .get(&format!("/admin/api/v1/transactions/{}", transaction_id))
-            .add_header(add_auth_headers(&user1).0, add_auth_headers(&user1).1)
+            .add_header(&add_auth_headers(&user1)[0].0, &add_auth_headers(&user1)[0].1)
+            .add_header(&add_auth_headers(&user1)[1].0, &add_auth_headers(&user1)[1].1)
             .await;
 
         // Should return 404 (not 403) to avoid leaking transaction existence
@@ -406,7 +412,8 @@ mod tests {
 
         let response = app
             .get(&format!("/admin/api/v1/transactions/{}", transaction_id))
-            .add_header(add_auth_headers(&billing_manager).0, add_auth_headers(&billing_manager).1)
+            .add_header(&add_auth_headers(&billing_manager)[0].0, &add_auth_headers(&billing_manager)[0].1)
+            .add_header(&add_auth_headers(&billing_manager)[1].0, &add_auth_headers(&billing_manager)[1].1)
             .await;
 
         response.assert_status_ok();
@@ -432,7 +439,8 @@ mod tests {
         // user1 lists transactions
         let response = app
             .get("/admin/api/v1/transactions")
-            .add_header(add_auth_headers(&user1).0, add_auth_headers(&user1).1)
+            .add_header(&add_auth_headers(&user1)[0].0, &add_auth_headers(&user1)[0].1)
+            .add_header(&add_auth_headers(&user1)[1].0, &add_auth_headers(&user1)[1].1)
             .await;
 
         response.assert_status_ok();
@@ -453,7 +461,8 @@ mod tests {
         // user1 tries to list user2's transactions
         let response = app
             .get(&format!("/admin/api/v1/transactions?user_id={}", user2.id))
-            .add_header(add_auth_headers(&user1).0, add_auth_headers(&user1).1)
+            .add_header(&add_auth_headers(&user1)[0].0, &add_auth_headers(&user1)[0].1)
+            .add_header(&add_auth_headers(&user1)[1].0, &add_auth_headers(&user1)[1].1)
             .await;
 
         response.assert_status_forbidden();
@@ -476,7 +485,8 @@ mod tests {
         // Without all=true, should only see own transactions
         let response = app
             .get("/admin/api/v1/transactions")
-            .add_header(add_auth_headers(&billing_manager).0, add_auth_headers(&billing_manager).1)
+            .add_header(&add_auth_headers(&billing_manager)[0].0, &add_auth_headers(&billing_manager)[0].1)
+            .add_header(&add_auth_headers(&billing_manager)[1].0, &add_auth_headers(&billing_manager)[1].1)
             .await;
 
         response.assert_status_ok();
@@ -501,7 +511,8 @@ mod tests {
 
         let response = app
             .get(&format!("/admin/api/v1/transactions?user_id={}", user1.id))
-            .add_header(add_auth_headers(&billing_manager).0, add_auth_headers(&billing_manager).1)
+            .add_header(&add_auth_headers(&billing_manager)[0].0, &add_auth_headers(&billing_manager)[0].1)
+            .add_header(&add_auth_headers(&billing_manager)[1].0, &add_auth_headers(&billing_manager)[1].1)
             .await;
 
         response.assert_status_ok();
@@ -530,7 +541,8 @@ mod tests {
 
         let response = app
             .post("/admin/api/v1/transactions")
-            .add_header(add_auth_headers(&billing_manager).0, add_auth_headers(&billing_manager).1)
+            .add_header(&add_auth_headers(&billing_manager)[0].0, &add_auth_headers(&billing_manager)[0].1)
+            .add_header(&add_auth_headers(&billing_manager)[1].0, &add_auth_headers(&billing_manager)[1].1)
             .json(&transaction_data)
             .await;
 
@@ -556,7 +568,8 @@ mod tests {
 
         let response = app
             .post("/admin/api/v1/transactions")
-            .add_header(add_auth_headers(&billing_manager).0, add_auth_headers(&billing_manager).1)
+            .add_header(&add_auth_headers(&billing_manager)[0].0, &add_auth_headers(&billing_manager)[0].1)
+            .add_header(&add_auth_headers(&billing_manager)[1].0, &add_auth_headers(&billing_manager)[1].1)
             .json(&transaction_data)
             .await;
 
@@ -581,7 +594,8 @@ mod tests {
 
         let response = app
             .post("/admin/api/v1/transactions")
-            .add_header(add_auth_headers(&billing_manager).0, add_auth_headers(&billing_manager).1)
+            .add_header(&add_auth_headers(&billing_manager)[0].0, &add_auth_headers(&billing_manager)[0].1)
+            .add_header(&add_auth_headers(&billing_manager)[1].0, &add_auth_headers(&billing_manager)[1].1)
             .json(&transaction_data)
             .await;
 
@@ -605,7 +619,8 @@ mod tests {
 
         let response = app
             .post("/admin/api/v1/transactions")
-            .add_header(add_auth_headers(&billing_manager).0, add_auth_headers(&billing_manager).1)
+            .add_header(&add_auth_headers(&billing_manager)[0].0, &add_auth_headers(&billing_manager)[0].1)
+            .add_header(&add_auth_headers(&billing_manager)[1].0, &add_auth_headers(&billing_manager)[1].1)
             .json(&transaction_data)
             .await;
 
@@ -634,7 +649,8 @@ mod tests {
 
         let response = app
             .post("/admin/api/v1/transactions")
-            .add_header(add_auth_headers(&billing_manager).0, add_auth_headers(&billing_manager).1)
+            .add_header(&add_auth_headers(&billing_manager)[0].0, &add_auth_headers(&billing_manager)[0].1)
+            .add_header(&add_auth_headers(&billing_manager)[1].0, &add_auth_headers(&billing_manager)[1].1)
             .json(&transaction_data)
             .await;
 
@@ -660,7 +676,8 @@ mod tests {
 
         let response = app
             .get(&format!("/admin/api/v1/transactions/{}", transaction_id))
-            .add_header(add_auth_headers(&user).0, add_auth_headers(&user).1)
+            .add_header(&add_auth_headers(&user)[0].0, &add_auth_headers(&user)[0].1)
+            .add_header(&add_auth_headers(&user)[1].0, &add_auth_headers(&user)[1].1)
             .await;
 
         response.assert_status_ok();
@@ -683,7 +700,8 @@ mod tests {
         // user1 tries to access user2's transaction
         let response = app
             .get(&format!("/admin/api/v1/transactions/{}", transaction_id))
-            .add_header(add_auth_headers(&user1).0, add_auth_headers(&user1).1)
+            .add_header(&add_auth_headers(&user1)[0].0, &add_auth_headers(&user1)[0].1)
+            .add_header(&add_auth_headers(&user1)[1].0, &add_auth_headers(&user1)[1].1)
             .await;
 
         // Should return 404 (not 403) to avoid leaking transaction existence
@@ -703,7 +721,8 @@ mod tests {
 
         let response = app
             .get(&format!("/admin/api/v1/transactions/{}", transaction_id))
-            .add_header(add_auth_headers(&platform_manager).0, add_auth_headers(&platform_manager).1)
+            .add_header(&add_auth_headers(&platform_manager)[0].0, &add_auth_headers(&platform_manager)[0].1)
+            .add_header(&add_auth_headers(&platform_manager)[1].0, &add_auth_headers(&platform_manager)[1].1)
             .await;
 
         response.assert_status_ok();
@@ -726,7 +745,8 @@ mod tests {
         // user1 lists transactions
         let response = app
             .get("/admin/api/v1/transactions")
-            .add_header(add_auth_headers(&user1).0, add_auth_headers(&user1).1)
+            .add_header(&add_auth_headers(&user1)[0].0, &add_auth_headers(&user1)[0].1)
+            .add_header(&add_auth_headers(&user1)[1].0, &add_auth_headers(&user1)[1].1)
             .await;
 
         response.assert_status_ok();
@@ -753,7 +773,8 @@ mod tests {
         // Without all=true, should only see own transactions
         let response = app
             .get("/admin/api/v1/transactions")
-            .add_header(add_auth_headers(&platform_manager).0, add_auth_headers(&platform_manager).1)
+            .add_header(&add_auth_headers(&platform_manager)[0].0, &add_auth_headers(&platform_manager)[0].1)
+            .add_header(&add_auth_headers(&platform_manager)[1].0, &add_auth_headers(&platform_manager)[1].1)
             .await;
 
         response.assert_status_ok();
@@ -774,7 +795,8 @@ mod tests {
         // user1 tries to list user2's transactions
         let response = app
             .get(&format!("/admin/api/v1/transactions?user_id={}", user2.id))
-            .add_header(add_auth_headers(&user1).0, add_auth_headers(&user1).1)
+            .add_header(&add_auth_headers(&user1)[0].0, &add_auth_headers(&user1)[0].1)
+            .add_header(&add_auth_headers(&user1)[1].0, &add_auth_headers(&user1)[1].1)
             .await;
 
         response.assert_status_forbidden();
@@ -795,7 +817,8 @@ mod tests {
 
         let response = app
             .get(&format!("/admin/api/v1/transactions?user_id={}", user1.id))
-            .add_header(add_auth_headers(&platform_manager).0, add_auth_headers(&platform_manager).1)
+            .add_header(&add_auth_headers(&platform_manager)[0].0, &add_auth_headers(&platform_manager)[0].1)
+            .add_header(&add_auth_headers(&platform_manager)[1].0, &add_auth_headers(&platform_manager)[1].1)
             .await;
 
         response.assert_status_ok();
@@ -820,7 +843,8 @@ mod tests {
         // Test limit
         let response = app
             .get("/admin/api/v1/transactions?limit=2")
-            .add_header(add_auth_headers(&user).0, add_auth_headers(&user).1)
+            .add_header(&add_auth_headers(&user)[0].0, &add_auth_headers(&user)[0].1)
+            .add_header(&add_auth_headers(&user)[1].0, &add_auth_headers(&user)[1].1)
             .await;
 
         response.assert_status_ok();
@@ -830,7 +854,8 @@ mod tests {
         // Test skip
         let response = app
             .get("/admin/api/v1/transactions?skip=2&limit=2")
-            .add_header(add_auth_headers(&user).0, add_auth_headers(&user).1)
+            .add_header(&add_auth_headers(&user)[0].0, &add_auth_headers(&user)[0].1)
+            .add_header(&add_auth_headers(&user)[1].0, &add_auth_headers(&user)[1].1)
             .await;
 
         response.assert_status_ok();
@@ -854,7 +879,8 @@ mod tests {
 
         let response = app
             .get("/admin/api/v1/transactions")
-            .add_header(add_auth_headers(&billing_manager).0, add_auth_headers(&billing_manager).1)
+            .add_header(&add_auth_headers(&billing_manager)[0].0, &add_auth_headers(&billing_manager)[0].1)
+            .add_header(&add_auth_headers(&billing_manager)[1].0, &add_auth_headers(&billing_manager)[1].1)
             .await;
 
         response.assert_status_ok();
@@ -881,7 +907,8 @@ mod tests {
 
         let response = app
             .get("/admin/api/v1/transactions?all=true")
-            .add_header(add_auth_headers(&billing_manager).0, add_auth_headers(&billing_manager).1)
+            .add_header(&add_auth_headers(&billing_manager)[0].0, &add_auth_headers(&billing_manager)[0].1)
+            .add_header(&add_auth_headers(&billing_manager)[1].0, &add_auth_headers(&billing_manager)[1].1)
             .await;
 
         response.assert_status_ok();
@@ -902,7 +929,8 @@ mod tests {
 
         let response = app
             .get("/admin/api/v1/transactions?all=true")
-            .add_header(add_auth_headers(&user).0, add_auth_headers(&user).1)
+            .add_header(&add_auth_headers(&user)[0].0, &add_auth_headers(&user)[0].1)
+            .add_header(&add_auth_headers(&user)[1].0, &add_auth_headers(&user)[1].1)
             .await;
 
         response.assert_status_forbidden();
@@ -924,7 +952,8 @@ mod tests {
         // Request with both all=true and user_id - all should take precedence
         let response = app
             .get(&format!("/admin/api/v1/transactions?all=true&user_id={}", user1.id))
-            .add_header(add_auth_headers(&billing_manager).0, add_auth_headers(&billing_manager).1)
+            .add_header(&add_auth_headers(&billing_manager)[0].0, &add_auth_headers(&billing_manager)[0].1)
+            .add_header(&add_auth_headers(&billing_manager)[1].0, &add_auth_headers(&billing_manager)[1].1)
             .await;
 
         response.assert_status_ok();
@@ -951,7 +980,8 @@ mod tests {
 
         let response = app
             .get("/admin/api/v1/transactions?all=true")
-            .add_header(add_auth_headers(&platform_manager).0, add_auth_headers(&platform_manager).1)
+            .add_header(&add_auth_headers(&platform_manager)[0].0, &add_auth_headers(&platform_manager)[0].1)
+            .add_header(&add_auth_headers(&platform_manager)[1].0, &add_auth_headers(&platform_manager)[1].1)
             .await;
 
         response.assert_status_ok();
@@ -972,7 +1002,8 @@ mod tests {
 
         let response = app
             .get("/admin/api/v1/transactions?all=true")
-            .add_header(add_auth_headers(&user).0, add_auth_headers(&user).1)
+            .add_header(&add_auth_headers(&user)[0].0, &add_auth_headers(&user)[0].1)
+            .add_header(&add_auth_headers(&user)[1].0, &add_auth_headers(&user)[1].1)
             .await;
 
         response.assert_status_forbidden();

@@ -1,5 +1,36 @@
 # Changelog
 
+## [0.8.1](https://github.com/doublewordai/control-layer/compare/v0.8.0...v0.8.1) (2025-11-24)
+
+
+### Bug Fixes
+
+* **dwctl:** batch file pagination ([#200](https://github.com/doublewordai/control-layer/issues/200)) ([0cd01b4](https://github.com/doublewordai/control-layer/commit/0cd01b4ef5dc2cd3ebc0788919684a80946019bd))
+
+## [0.8.0](https://github.com/doublewordai/control-layer/compare/v0.7.1...v0.8.0) (2025-11-24)
+
+
+### Features
+
+* add actual cancellation of in-progress batch requests ([#170](https://github.com/doublewordai/control-layer/issues/170)) ([2044218](https://github.com/doublewordai/control-layer/commit/2044218ecaffbb763b1cf8750e4d072469b4be62))
+* **dwctl:** add pagination to models endpoint and improve files pagination docs ([#177](https://github.com/doublewordai/control-layer/issues/177)) ([440bea6](https://github.com/doublewordai/control-layer/commit/440bea6d91b53ffaefdb481871e271247eb87de3))
+* improve the usability of the proxy-header configuration ([#174](https://github.com/doublewordai/control-layer/issues/174)) ([a560508](https://github.com/doublewordai/control-layer/commit/a56050895c1f1475e352357f54e49c61c382e55d))
+
+
+### Bug Fixes
+
+* broken anthropic ([b3b190f](https://github.com/doublewordai/control-layer/commit/b3b190fb43d974c825a571048b417ed1da65b807))
+* issue with duplicate batch daemons on leader ([#183](https://github.com/doublewordai/control-layer/issues/183)) ([fe816a1](https://github.com/doublewordai/control-layer/commit/fe816a16a3777c33ba60947f1be95138361aadfd))
+
+## [0.7.1](https://github.com/doublewordai/control-layer/compare/v0.7.0...v0.7.1) (2025-11-21)
+
+
+### Bug Fixes
+
+* **dwctl:** improve JWT error code mapping ([#173](https://github.com/doublewordai/control-layer/issues/173)) ([4b22293](https://github.com/doublewordai/control-layer/commit/4b222939f083f1e720d1ea0926a5c53977178470)), closes [#80](https://github.com/doublewordai/control-layer/issues/80)
+* SSE parser now correctly handles empty data fields per spec ([#171](https://github.com/doublewordai/control-layer/issues/171)) ([4b9d04c](https://github.com/doublewordai/control-layer/commit/4b9d04c1c7ff0b24d21f0d1af9d29914fd456cf3))
+* transaction credit precision + no admin negative access ([#176](https://github.com/doublewordai/control-layer/issues/176)) ([218596c](https://github.com/doublewordai/control-layer/commit/218596cc10637852bf783e259117787b2ea0c2f7))
+
 ## [0.7.0](https://github.com/doublewordai/control-layer/compare/v0.6.0...v0.7.0) (2025-11-19)
 
 

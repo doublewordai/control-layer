@@ -169,8 +169,8 @@ pub async fn list_user_api_keys(
     let mut repo = ApiKeys::new(&mut pool_conn);
 
     // Extract pagination parameters with defaults & validation
-    let skip = query.skip.unwrap_or(0);
-    let limit = query.limit.unwrap_or(100).min(1000);
+    let skip = query.pagination.skip();
+    let limit = query.pagination.limit();
 
     let filter = ApiKeyFilter {
         skip,
@@ -365,7 +365,8 @@ mod tests {
 
         let response = app
             .post("/admin/api/v1/users/current/api-keys")
-            .add_header(add_auth_headers(&user).0, add_auth_headers(&user).1)
+            .add_header(&add_auth_headers(&user)[0].0, &add_auth_headers(&user)[0].1)
+            .add_header(&add_auth_headers(&user)[1].0, &add_auth_headers(&user)[1].1)
             .json(&api_key_data)
             .await;
 
@@ -393,7 +394,8 @@ mod tests {
 
         let response = app
             .post(&format!("/admin/api/v1/users/{}/api-keys", regular_user.id))
-            .add_header(add_auth_headers(&admin_user).0, add_auth_headers(&admin_user).1)
+            .add_header(&add_auth_headers(&admin_user)[0].0, &add_auth_headers(&admin_user)[0].1)
+            .add_header(&add_auth_headers(&admin_user)[1].0, &add_auth_headers(&admin_user)[1].1)
             .json(&api_key_data)
             .await;
 
@@ -418,7 +420,8 @@ mod tests {
 
         let response = app
             .post(&format!("/admin/api/v1/users/{}/api-keys", user2.id))
-            .add_header(add_auth_headers(&user1).0, add_auth_headers(&user1).1)
+            .add_header(&add_auth_headers(&user1)[0].0, &add_auth_headers(&user1)[0].1)
+            .add_header(&add_auth_headers(&user1)[1].0, &add_auth_headers(&user1)[1].1)
             .json(&api_key_data)
             .await;
 
@@ -436,7 +439,8 @@ mod tests {
 
         let response = app
             .get("/admin/api/v1/users/current/api-keys")
-            .add_header(add_auth_headers(&user).0, add_auth_headers(&user).1)
+            .add_header(&add_auth_headers(&user)[0].0, &add_auth_headers(&user)[0].1)
+            .add_header(&add_auth_headers(&user)[1].0, &add_auth_headers(&user)[1].1)
             .await;
 
         response.assert_status_ok();
@@ -463,7 +467,8 @@ mod tests {
             });
 
             app.post("/admin/api/v1/users/current/api-keys")
-                .add_header(add_auth_headers(&user).0, add_auth_headers(&user).1)
+                .add_header(&add_auth_headers(&user)[0].0, &add_auth_headers(&user)[0].1)
+                .add_header(&add_auth_headers(&user)[1].0, &add_auth_headers(&user)[1].1)
                 .json(&api_key_data)
                 .await
                 .assert_status(axum::http::StatusCode::CREATED);
@@ -472,7 +477,8 @@ mod tests {
         // Test with pagination parameters
         let response = app
             .get("/admin/api/v1/users/current/api-keys?skip=1&limit=2")
-            .add_header(add_auth_headers(&user).0, add_auth_headers(&user).1)
+            .add_header(&add_auth_headers(&user)[0].0, &add_auth_headers(&user)[0].1)
+            .add_header(&add_auth_headers(&user)[1].0, &add_auth_headers(&user)[1].1)
             .await;
 
         response.assert_status_ok();
@@ -482,7 +488,8 @@ mod tests {
         // Test with no pagination parameters (should use defaults)
         let response = app
             .get("/admin/api/v1/users/current/api-keys")
-            .add_header(add_auth_headers(&user).0, add_auth_headers(&user).1)
+            .add_header(&add_auth_headers(&user)[0].0, &add_auth_headers(&user)[0].1)
+            .add_header(&add_auth_headers(&user)[1].0, &add_auth_headers(&user)[1].1)
             .await;
 
         response.assert_status_ok();
@@ -492,7 +499,8 @@ mod tests {
         // Test with large limit (should be capped)
         let response = app
             .get("/admin/api/v1/users/current/api-keys?limit=9999")
-            .add_header(add_auth_headers(&user).0, add_auth_headers(&user).1)
+            .add_header(&add_auth_headers(&user)[0].0, &add_auth_headers(&user)[0].1)
+            .add_header(&add_auth_headers(&user)[1].0, &add_auth_headers(&user)[1].1)
             .await;
 
         response.assert_status_ok();
@@ -511,7 +519,8 @@ mod tests {
 
         let response = app
             .delete(&format!("/admin/api/v1/users/current/api-keys/{}", api_key.id))
-            .add_header(add_auth_headers(&user).0, add_auth_headers(&user).1)
+            .add_header(&add_auth_headers(&user)[0].0, &add_auth_headers(&user)[0].1)
+            .add_header(&add_auth_headers(&user)[1].0, &add_auth_headers(&user)[1].1)
             .await;
 
         response.assert_status(axum::http::StatusCode::NO_CONTENT);
@@ -519,7 +528,8 @@ mod tests {
         // Verify the API key was deleted by trying to list them
         let list_response = app
             .get("/admin/api/v1/users/current/api-keys")
-            .add_header(add_auth_headers(&user).0, add_auth_headers(&user).1)
+            .add_header(&add_auth_headers(&user)[0].0, &add_auth_headers(&user)[0].1)
+            .add_header(&add_auth_headers(&user)[1].0, &add_auth_headers(&user)[1].1)
             .await;
 
         list_response.assert_status_ok();
@@ -539,7 +549,8 @@ mod tests {
 
         let response = app
             .delete(&format!("/admin/api/v1/users/{}/api-keys/{}", regular_user.id, api_key.id))
-            .add_header(add_auth_headers(&admin_user).0, add_auth_headers(&admin_user).1)
+            .add_header(&add_auth_headers(&admin_user)[0].0, &add_auth_headers(&admin_user)[0].1)
+            .add_header(&add_auth_headers(&admin_user)[1].0, &add_auth_headers(&admin_user)[1].1)
             .await;
 
         response.assert_status(axum::http::StatusCode::NO_CONTENT);
@@ -547,7 +558,8 @@ mod tests {
         // Verify the API key was deleted
         let list_response = app
             .get(&format!("/admin/api/v1/users/{}/api-keys", regular_user.id))
-            .add_header(add_auth_headers(&admin_user).0, add_auth_headers(&admin_user).1)
+            .add_header(&add_auth_headers(&admin_user)[0].0, &add_auth_headers(&admin_user)[0].1)
+            .add_header(&add_auth_headers(&admin_user)[1].0, &add_auth_headers(&admin_user)[1].1)
             .await;
 
         list_response.assert_status_ok();
@@ -567,7 +579,8 @@ mod tests {
 
         let response = app
             .delete(&format!("/admin/api/v1/users/{}/api-keys/{}", user2.id, api_key.id))
-            .add_header(add_auth_headers(&user1).0, add_auth_headers(&user1).1)
+            .add_header(&add_auth_headers(&user1)[0].0, &add_auth_headers(&user1)[0].1)
+            .add_header(&add_auth_headers(&user1)[1].0, &add_auth_headers(&user1)[1].1)
             .await;
 
         response.assert_status_forbidden();
@@ -575,7 +588,8 @@ mod tests {
         // Verify the API key still exists
         let list_response = app
             .get(&format!("/admin/api/v1/users/{}/api-keys", user2.id))
-            .add_header(add_auth_headers(&user2).0, add_auth_headers(&user2).1)
+            .add_header(&add_auth_headers(&user2)[0].0, &add_auth_headers(&user2)[0].1)
+            .add_header(&add_auth_headers(&user2)[1].0, &add_auth_headers(&user2)[1].1)
             .await;
 
         list_response.assert_status_ok();
@@ -594,7 +608,8 @@ mod tests {
 
         let response = app
             .delete(&format!("/admin/api/v1/users/current/api-keys/{fake_api_key_id}"))
-            .add_header(add_auth_headers(&user).0, add_auth_headers(&user).1)
+            .add_header(&add_auth_headers(&user)[0].0, &add_auth_headers(&user)[0].1)
+            .add_header(&add_auth_headers(&user)[1].0, &add_auth_headers(&user)[1].1)
             .await;
 
         response.assert_status_not_found();
@@ -616,7 +631,8 @@ mod tests {
         // Try to delete user2's API key as user1 (using current endpoint)
         let response = app
             .delete(&format!("/admin/api/v1/users/current/api-keys/{}", api_key.id))
-            .add_header(add_auth_headers(&user1).0, add_auth_headers(&user1).1)
+            .add_header(&add_auth_headers(&user1)[0].0, &add_auth_headers(&user1)[0].1)
+            .add_header(&add_auth_headers(&user1)[1].0, &add_auth_headers(&user1)[1].1)
             .await;
 
         response.assert_status_not_found();
@@ -637,7 +653,8 @@ mod tests {
 
         let response = app
             .get(&format!("/admin/api/v1/users/{}/api-keys", regular_user.id))
-            .add_header(add_auth_headers(&admin_user).0, add_auth_headers(&admin_user).1)
+            .add_header(&add_auth_headers(&admin_user)[0].0, &add_auth_headers(&admin_user)[0].1)
+            .add_header(&add_auth_headers(&admin_user)[1].0, &add_auth_headers(&admin_user)[1].1)
             .await;
 
         response.assert_status_ok();
@@ -662,7 +679,8 @@ mod tests {
 
         let response = app
             .get(&format!("/admin/api/v1/users/{}/api-keys", user2.id))
-            .add_header(add_auth_headers(&user1).0, add_auth_headers(&user1).1)
+            .add_header(&add_auth_headers(&user1)[0].0, &add_auth_headers(&user1)[0].1)
+            .add_header(&add_auth_headers(&user1)[1].0, &add_auth_headers(&user1)[1].1)
             .await;
 
         response.assert_status_forbidden();
@@ -680,7 +698,8 @@ mod tests {
 
         let response = app
             .get(&format!("/admin/api/v1/users/{}/api-keys/{}", regular_user.id, api_key.id))
-            .add_header(add_auth_headers(&admin_user).0, add_auth_headers(&admin_user).1)
+            .add_header(&add_auth_headers(&admin_user)[0].0, &add_auth_headers(&admin_user)[0].1)
+            .add_header(&add_auth_headers(&admin_user)[1].0, &add_auth_headers(&admin_user)[1].1)
             .await;
 
         response.assert_status_ok();
@@ -701,7 +720,8 @@ mod tests {
 
         let response = app
             .get(&format!("/admin/api/v1/users/{}/api-keys/{}", user2.id, api_key.id))
-            .add_header(add_auth_headers(&user1).0, add_auth_headers(&user1).1)
+            .add_header(&add_auth_headers(&user1)[0].0, &add_auth_headers(&user1)[0].1)
+            .add_header(&add_auth_headers(&user1)[1].0, &add_auth_headers(&user1)[1].1)
             .await;
 
         response.assert_status_forbidden();
@@ -723,7 +743,8 @@ mod tests {
 
         let response = app
             .post("/admin/api/v1/users/current/api-keys")
-            .add_header(add_auth_headers(&request_viewer).0, add_auth_headers(&request_viewer).1)
+            .add_header(&add_auth_headers(&request_viewer)[0].0, &add_auth_headers(&request_viewer)[0].1)
+            .add_header(&add_auth_headers(&request_viewer)[1].0, &add_auth_headers(&request_viewer)[1].1)
             .json(&api_key_data)
             .await;
 
@@ -732,7 +753,8 @@ mod tests {
         // RequestViewer should not be able to list their own API keys
         let response = app
             .get("/admin/api/v1/users/current/api-keys")
-            .add_header(add_auth_headers(&request_viewer).0, add_auth_headers(&request_viewer).1)
+            .add_header(&add_auth_headers(&request_viewer)[0].0, &add_auth_headers(&request_viewer)[0].1)
+            .add_header(&add_auth_headers(&request_viewer)[1].0, &add_auth_headers(&request_viewer)[1].1)
             .await;
 
         response.assert_status_forbidden();
@@ -740,7 +762,8 @@ mod tests {
         // RequestViewer should not be able to list other users' API keys
         let response = app
             .get(&format!("/admin/api/v1/users/{}/api-keys", standard_user.id))
-            .add_header(add_auth_headers(&request_viewer).0, add_auth_headers(&request_viewer).1)
+            .add_header(&add_auth_headers(&request_viewer)[0].0, &add_auth_headers(&request_viewer)[0].1)
+            .add_header(&add_auth_headers(&request_viewer)[1].0, &add_auth_headers(&request_viewer)[1].1)
             .await;
 
         response.assert_status_forbidden();
@@ -765,7 +788,8 @@ mod tests {
 
         let response = app
             .post("/admin/api/v1/users/current/api-keys")
-            .add_header(add_auth_headers(&multi_role_user).0, add_auth_headers(&multi_role_user).1)
+            .add_header(&add_auth_headers(&multi_role_user)[0].0, &add_auth_headers(&multi_role_user)[0].1)
+            .add_header(&add_auth_headers(&multi_role_user)[1].0, &add_auth_headers(&multi_role_user)[1].1)
             .json(&api_key_data)
             .await;
 
@@ -774,7 +798,8 @@ mod tests {
         // Should be able to list their own API keys (from StandardUser role)
         let response = app
             .get("/admin/api/v1/users/current/api-keys")
-            .add_header(add_auth_headers(&multi_role_user).0, add_auth_headers(&multi_role_user).1)
+            .add_header(&add_auth_headers(&multi_role_user)[0].0, &add_auth_headers(&multi_role_user)[0].1)
+            .add_header(&add_auth_headers(&multi_role_user)[1].0, &add_auth_headers(&multi_role_user)[1].1)
             .await;
 
         response.assert_status_ok();
@@ -786,7 +811,8 @@ mod tests {
         let api_key_id = api_keys[0].id;
         let response = app
             .get(&format!("/admin/api/v1/users/current/api-keys/{api_key_id}"))
-            .add_header(add_auth_headers(&multi_role_user).0, add_auth_headers(&multi_role_user).1)
+            .add_header(&add_auth_headers(&multi_role_user)[0].0, &add_auth_headers(&multi_role_user)[0].1)
+            .add_header(&add_auth_headers(&multi_role_user)[1].0, &add_auth_headers(&multi_role_user)[1].1)
             .await;
 
         response.assert_status_ok();
@@ -794,7 +820,8 @@ mod tests {
         // Should be able to delete their own API keys
         let response = app
             .delete(&format!("/admin/api/v1/users/current/api-keys/{api_key_id}"))
-            .add_header(add_auth_headers(&multi_role_user).0, add_auth_headers(&multi_role_user).1)
+            .add_header(&add_auth_headers(&multi_role_user)[0].0, &add_auth_headers(&multi_role_user)[0].1)
+            .add_header(&add_auth_headers(&multi_role_user)[1].0, &add_auth_headers(&multi_role_user)[1].1)
             .await;
 
         response.assert_status(axum::http::StatusCode::NO_CONTENT);
@@ -818,7 +845,8 @@ mod tests {
 
         let response = app
             .post(&format!("/admin/api/v1/users/{}/api-keys", standard_user.id))
-            .add_header(add_auth_headers(&platform_manager).0, add_auth_headers(&platform_manager).1)
+            .add_header(&add_auth_headers(&platform_manager)[0].0, &add_auth_headers(&platform_manager)[0].1)
+            .add_header(&add_auth_headers(&platform_manager)[1].0, &add_auth_headers(&platform_manager)[1].1)
             .json(&api_key_data)
             .await;
 
@@ -827,7 +855,8 @@ mod tests {
         // Platform manager should be able to list all users' API keys
         let response = app
             .get(&format!("/admin/api/v1/users/{}/api-keys", standard_user.id))
-            .add_header(add_auth_headers(&platform_manager).0, add_auth_headers(&platform_manager).1)
+            .add_header(&add_auth_headers(&platform_manager)[0].0, &add_auth_headers(&platform_manager)[0].1)
+            .add_header(&add_auth_headers(&platform_manager)[1].0, &add_auth_headers(&platform_manager)[1].1)
             .await;
 
         response.assert_status_ok();
@@ -838,7 +867,8 @@ mod tests {
         let api_key_id = api_keys[0].id;
         let response = app
             .get(&format!("/admin/api/v1/users/{}/api-keys/{}", standard_user.id, api_key_id))
-            .add_header(add_auth_headers(&platform_manager).0, add_auth_headers(&platform_manager).1)
+            .add_header(&add_auth_headers(&platform_manager)[0].0, &add_auth_headers(&platform_manager)[0].1)
+            .add_header(&add_auth_headers(&platform_manager)[1].0, &add_auth_headers(&platform_manager)[1].1)
             .await;
 
         response.assert_status_ok();
@@ -846,7 +876,8 @@ mod tests {
         // Platform manager should be able to delete other users' API keys
         let response = app
             .delete(&format!("/admin/api/v1/users/{}/api-keys/{}", standard_user.id, api_key_id))
-            .add_header(add_auth_headers(&platform_manager).0, add_auth_headers(&platform_manager).1)
+            .add_header(&add_auth_headers(&platform_manager)[0].0, &add_auth_headers(&platform_manager)[0].1)
+            .add_header(&add_auth_headers(&platform_manager)[1].0, &add_auth_headers(&platform_manager)[1].1)
             .await;
 
         response.assert_status(axum::http::StatusCode::NO_CONTENT);
@@ -869,7 +900,8 @@ mod tests {
         // User1 should only see their own API keys
         let response = app
             .get("/admin/api/v1/users/current/api-keys")
-            .add_header(add_auth_headers(&user1).0, add_auth_headers(&user1).1)
+            .add_header(&add_auth_headers(&user1)[0].0, &add_auth_headers(&user1)[0].1)
+            .add_header(&add_auth_headers(&user1)[1].0, &add_auth_headers(&user1)[1].1)
             .await;
 
         response.assert_status_ok();
@@ -880,7 +912,8 @@ mod tests {
         // User2 should only see their own API keys
         let response = app
             .get("/admin/api/v1/users/current/api-keys")
-            .add_header(add_auth_headers(&user2).0, add_auth_headers(&user2).1)
+            .add_header(&add_auth_headers(&user2)[0].0, &add_auth_headers(&user2)[0].1)
+            .add_header(&add_auth_headers(&user2)[1].0, &add_auth_headers(&user2)[1].1)
             .await;
 
         response.assert_status_ok();
@@ -891,7 +924,8 @@ mod tests {
         // User1 should not be able to access user2's specific API key
         let response = app
             .get(&format!("/admin/api/v1/users/current/api-keys/{}", api_key2.id))
-            .add_header(add_auth_headers(&user1).0, add_auth_headers(&user1).1)
+            .add_header(&add_auth_headers(&user1)[0].0, &add_auth_headers(&user1)[0].1)
+            .add_header(&add_auth_headers(&user1)[1].0, &add_auth_headers(&user1)[1].1)
             .await;
 
         response.assert_status_not_found(); // 404 because the key doesn't belong to user1
@@ -907,7 +941,8 @@ mod tests {
         // Try to access another user's API keys - should get user-friendly error
         let response = app
             .get(&format!("/admin/api/v1/users/{}/api-keys", user2.id))
-            .add_header(add_auth_headers(&user1).0, add_auth_headers(&user1).1)
+            .add_header(&add_auth_headers(&user1)[0].0, &add_auth_headers(&user1)[0].1)
+            .add_header(&add_auth_headers(&user1)[1].0, &add_auth_headers(&user1)[1].1)
             .await;
 
         response.assert_status_forbidden();
@@ -930,7 +965,8 @@ mod tests {
 
         let response = app
             .get(&format!("/admin/api/v1/users/current/api-keys/{}", api_key.id))
-            .add_header(add_auth_headers(&user).0, add_auth_headers(&user).1)
+            .add_header(&add_auth_headers(&user)[0].0, &add_auth_headers(&user)[0].1)
+            .add_header(&add_auth_headers(&user)[1].0, &add_auth_headers(&user)[1].1)
             .await;
 
         response.assert_status_ok();
@@ -958,7 +994,8 @@ mod tests {
 
         let create_response = app
             .post("/admin/api/v1/users/current/api-keys")
-            .add_header(add_auth_headers(&user).0, add_auth_headers(&user).1)
+            .add_header(&add_auth_headers(&user)[0].0, &add_auth_headers(&user)[0].1)
+            .add_header(&add_auth_headers(&user)[1].0, &add_auth_headers(&user)[1].1)
             .json(&api_key_data)
             .await;
 
@@ -972,7 +1009,8 @@ mod tests {
         // List API keys - should NOT return key values (uses ApiKeyInfoResponse)
         let list_response = app
             .get("/admin/api/v1/users/current/api-keys")
-            .add_header(add_auth_headers(&user).0, add_auth_headers(&user).1)
+            .add_header(&add_auth_headers(&user)[0].0, &add_auth_headers(&user)[0].1)
+            .add_header(&add_auth_headers(&user)[1].0, &add_auth_headers(&user)[1].1)
             .await;
 
         list_response.assert_status_ok();
@@ -984,7 +1022,8 @@ mod tests {
         // Get specific API key - should NOT return key value (uses ApiKeyInfoResponse)
         let get_response = app
             .get(&format!("/admin/api/v1/users/current/api-keys/{}", created_key.id))
-            .add_header(add_auth_headers(&user).0, add_auth_headers(&user).1)
+            .add_header(&add_auth_headers(&user)[0].0, &add_auth_headers(&user)[0].1)
+            .add_header(&add_auth_headers(&user)[1].0, &add_auth_headers(&user)[1].1)
             .await;
 
         get_response.assert_status_ok();

@@ -1,0 +1,23 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n                                SELECT EXISTS(\n                                    SELECT 1 FROM files\n                                    WHERE name = $1 \n                                    AND ($2::TEXT IS NULL AND uploaded_by IS NULL OR uploaded_by = $2)\n                                ) as \"exists!\"\n                                ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "exists!",
+        "type_info": "Bool"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Text",
+        "Text"
+      ]
+    },
+    "nullable": [
+      null
+    ]
+  },
+  "hash": "584dbf15efbd2ba6892313841d960bbd30307c7e038cb0b9658ccc66bc5d2f21"
+}

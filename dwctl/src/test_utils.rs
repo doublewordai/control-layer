@@ -1,6 +1,9 @@
 //! Test utilities for integration testing (available with `test-utils` feature).
 
-use crate::config::{BatchConfig, FilesConfig, NativeAuthConfig, ProxyHeaderAuthConfig, SecurityConfig};
+use crate::config::{
+    BatchConfig, DaemonConfig, DaemonEnabled, FilesConfig, LeaderElectionConfig, NativeAuthConfig, OnwardsSyncConfig, PoolSettings,
+    ProbeSchedulerConfig, ProxyHeaderAuthConfig, SecurityConfig,
+};
 use crate::db::handlers::inference_endpoints::{InferenceEndpointFilter, InferenceEndpoints};
 use crate::db::handlers::repository::Repository;
 use crate::errors::Error;
@@ -20,68 +23,48 @@ use crate::{
         },
     },
 };
-use sqlx::ConnectOptions;
-
 use axum_test::TestServer;
-use sqlx::{Executor, PgConnection, PgPool};
+use sqlx::{PgConnection, PgPool};
 use uuid::Uuid;
 
-/// Set up fusillade schema and run migrations for tests
-/// Only call this for tests that need fusillade (e.g., files tests)
-/// Returns a pool with search_path set to fusillade schema
-pub async fn setup_fusillade_for_tests(pool: &PgPool) -> PgPool {
-    // Create fusillade schema
-    pool.execute("CREATE SCHEMA IF NOT EXISTS fusillade")
-        .await
-        .expect("Failed to create fusillade schema");
-
-    // Get connection options from the existing pool
-    let conn_options = pool.connect_options();
-
-    // Create a pool with search_path set to fusillade
-    let fusillade_pool = sqlx::postgres::PgPoolOptions::new()
-        .max_connections(5)
-        .after_connect(|conn, _meta| {
-            Box::pin(async move {
-                conn.execute("SET search_path = 'fusillade'").await?;
-                Ok(())
-            })
-        })
-        .connect_with((*conn_options).clone())
-        .await
-        .expect("Failed to create fusillade pool");
-
-    // Run fusillade migrations
-    fusillade::migrator()
-        .run(&fusillade_pool)
-        .await
-        .expect("Failed to run fusillade migrations");
-
-    fusillade_pool
-}
-
 pub async fn create_test_app(pool: PgPool, _enable_sync: bool) -> (TestServer, crate::BackgroundServices) {
-    let mut config = create_test_config();
-    // Override database config to use the test pool
-    config.database = crate::config::DatabaseConfig::External {
-        url: pool.connect_options().to_url_lossy().to_string(),
-    };
-    // Disable leader election for tests
-    config.leader_election.enabled = false;
+    let config = create_test_config();
 
-    // Create application using the same infrastructure as production
-    let app = crate::Application::new(config).await.expect("Failed to create application");
+    let app = crate::Application::new_with_pool(config, Some(pool))
+        .await
+        .expect("Failed to create application");
 
     // Convert to test server (sync is always enabled in new())
     app.into_test_server()
 }
 
 pub fn create_test_config() -> crate::config::Config {
-    let database_url = std::env::var("TEST_DATABASE_URL").unwrap_or_else(|_| "postgres://postgres@localhost/test".to_string());
+    // Use temp directory for test emails
+    let temp_dir = std::env::temp_dir().join(format!("dwctl-test-emails-{}", std::process::id()));
 
     crate::config::Config {
-        database_url: None, // Deprecated field
-        database: crate::config::DatabaseConfig::External { url: database_url },
+        database_url: None,
+        database: crate::config::DatabaseConfig::External {
+            pool_config: crate::config::DatabasePoolConfig {
+                main: PoolSettings {
+                    max_connections: 1,
+                    min_connections: 1,
+                    ..Default::default()
+                },
+                fusillade: PoolSettings {
+                    max_connections: 1,
+                    min_connections: 0,
+                    ..Default::default()
+                },
+                outlet: PoolSettings {
+                    max_connections: 1,
+                    min_connections: 0,
+                    ..Default::default()
+                },
+            },
+            // Will get overriden by env var
+            url: "Something".to_string(),
+        },
         host: "127.0.0.1".to_string(),
         port: 0,
         admin_email: "admin@test.com".to_string(),
@@ -97,6 +80,12 @@ pub fn create_test_config() -> crate::config::Config {
         auth: crate::config::AuthConfig {
             native: NativeAuthConfig {
                 enabled: false,
+                email: crate::config::EmailConfig {
+                    transport: crate::config::EmailTransportConfig::File {
+                        path: temp_dir.to_string_lossy().to_string(),
+                    },
+                    ..Default::default()
+                },
                 ..Default::default()
             },
             proxy_header: ProxyHeaderAuthConfig {
@@ -117,8 +106,16 @@ pub fn create_test_config() -> crate::config::Config {
             },
             ..Default::default()
         },
-        leader_election: crate::config::LeaderElectionConfig::default(),
-        payment: None,
+        background_services: crate::config::BackgroundServicesConfig {
+            onwards_sync: OnwardsSyncConfig { enabled: false },
+            probe_scheduler: ProbeSchedulerConfig { enabled: false },
+            batch_daemon: DaemonConfig {
+                enabled: DaemonEnabled::Never,
+                ..Default::default()
+            },
+            leader_election: LeaderElectionConfig { enabled: false },
+            ..Default::default()
+        },
     }
 }
 
@@ -132,7 +129,7 @@ pub async fn create_test_user(pool: &PgPool, role: Role) -> UserResponse {
     let roles = vec![role];
 
     let user_create = UserCreateDBRequest {
-        username,
+        username: username.clone(),
         email,
         display_name: Some("Test User".to_string()),
         avatar_url: None,
@@ -140,6 +137,7 @@ pub async fn create_test_user(pool: &PgPool, role: Role) -> UserResponse {
         roles,
         auth_source: "test".to_string(),
         password_hash: None,
+        external_user_id: Some(username.clone()),
     };
 
     let user = users_repo.create(&user_create).await.expect("Failed to create test user");
@@ -156,7 +154,7 @@ pub async fn create_test_admin_user(pool: &PgPool, role: Role) -> UserResponse {
     let roles = vec![role];
 
     let user_create = UserCreateDBRequest {
-        username,
+        username: username.clone(),
         email,
         display_name: Some("Test Admin User".to_string()),
         avatar_url: None,
@@ -164,6 +162,7 @@ pub async fn create_test_admin_user(pool: &PgPool, role: Role) -> UserResponse {
         roles,
         auth_source: "test".to_string(),
         password_hash: None,
+        external_user_id: Some(username.clone()),
     };
 
     let user = users_repo.create(&user_create).await.expect("Failed to create test admin user");
@@ -178,7 +177,7 @@ pub async fn create_test_user_with_roles(pool: &PgPool, roles: Vec<Role>) -> Use
     let email = format!("{username}@example.com");
 
     let user_create = UserCreateDBRequest {
-        username,
+        username: username.clone(),
         email,
         display_name: Some("Test Multi-Role User".to_string()),
         avatar_url: None,
@@ -186,6 +185,7 @@ pub async fn create_test_user_with_roles(pool: &PgPool, roles: Vec<Role>) -> Use
         roles,
         auth_source: "test".to_string(),
         password_hash: None,
+        external_user_id: Some(username.clone()),
     };
 
     let user = users_repo
@@ -195,8 +195,13 @@ pub async fn create_test_user_with_roles(pool: &PgPool, roles: Vec<Role>) -> Use
     UserResponse::from(user)
 }
 
-pub fn add_auth_headers(user: &UserResponse) -> (String, String) {
-    (ProxyHeaderAuthConfig::default().header_name, user.email.clone())
+pub fn add_auth_headers(user: &UserResponse) -> Vec<(String, String)> {
+    let config = ProxyHeaderAuthConfig::default();
+    let external_user_id = user.external_user_id.as_ref().unwrap_or(&user.username);
+    vec![
+        (config.header_name, external_user_id.clone()),
+        (config.email_header_name, user.email.clone()),
+    ]
 }
 
 pub async fn create_test_group(pool: &PgPool) -> GroupDBResponse {
@@ -247,6 +252,7 @@ pub async fn get_system_user(pool: &mut PgConnection) -> UserResponse {
         updated_at: user.updated_at,
         last_login: None,
         auth_source: user.auth_source,
+        external_user_id: None,
         groups: None, // Groups not included in test users by default
         credit_balance: None,
         payment_provider_id: None,

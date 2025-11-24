@@ -54,8 +54,8 @@ pub async fn list_users(
     _: RequiresPermission<resource::Users, operation::ReadAll>,
 ) -> Result<Json<Vec<UserResponse>>> {
     let mut tx = state.db.begin().await.map_err(|e| Error::Database(e.into()))?;
-    let skip = query.skip.unwrap_or(0);
-    let limit = query.limit.unwrap_or(100).min(1000);
+    let skip = query.pagination.skip();
+    let limit = query.pagination.limit();
 
     let users;
     {
@@ -377,7 +377,8 @@ mod tests {
 
         let response = app
             .get("/admin/api/v1/users/current")
-            .add_header(add_auth_headers(&user).0, add_auth_headers(&user).1)
+            .add_header(&add_auth_headers(&user)[0].0, &add_auth_headers(&user)[0].1)
+            .add_header(&add_auth_headers(&user)[1].0, &add_auth_headers(&user)[1].1)
             .await;
 
         response.assert_status_ok();
@@ -395,7 +396,8 @@ mod tests {
 
         let response = app
             .get("/admin/api/v1/users")
-            .add_header(add_auth_headers(&admin_user).0, add_auth_headers(&admin_user).1)
+            .add_header(&add_auth_headers(&admin_user)[0].0, &add_auth_headers(&admin_user)[0].1)
+            .add_header(&add_auth_headers(&admin_user)[1].0, &add_auth_headers(&admin_user)[1].1)
             .await;
 
         response.assert_status_ok();
@@ -411,7 +413,8 @@ mod tests {
 
         let response = app
             .get("/admin/api/v1/users")
-            .add_header(add_auth_headers(&user).0, add_auth_headers(&user).1)
+            .add_header(&add_auth_headers(&user)[0].0, &add_auth_headers(&user)[0].1)
+            .add_header(&add_auth_headers(&user)[1].0, &add_auth_headers(&user)[1].1)
             .await;
 
         response.assert_status_forbidden();
@@ -433,7 +436,8 @@ mod tests {
 
         let response = app
             .post("/admin/api/v1/users")
-            .add_header(add_auth_headers(&admin_user).0, add_auth_headers(&admin_user).1)
+            .add_header(&add_auth_headers(&admin_user)[0].0, &add_auth_headers(&admin_user)[0].1)
+            .add_header(&add_auth_headers(&admin_user)[1].0, &add_auth_headers(&admin_user)[1].1)
             .json(&new_user)
             .await;
 
@@ -466,7 +470,8 @@ mod tests {
         // Test with limit
         let response = app
             .get("/admin/api/v1/users?limit=3")
-            .add_header(add_auth_headers(&admin_user).0, add_auth_headers(&admin_user).1)
+            .add_header(&add_auth_headers(&admin_user)[0].0, &add_auth_headers(&admin_user)[0].1)
+            .add_header(&add_auth_headers(&admin_user)[1].0, &add_auth_headers(&admin_user)[1].1)
             .await;
 
         response.assert_status_ok();
@@ -476,7 +481,8 @@ mod tests {
         // Test with skip and limit
         let response = app
             .get("/admin/api/v1/users?skip=2&limit=2")
-            .add_header(add_auth_headers(&admin_user).0, add_auth_headers(&admin_user).1)
+            .add_header(&add_auth_headers(&admin_user)[0].0, &add_auth_headers(&admin_user)[0].1)
+            .add_header(&add_auth_headers(&admin_user)[1].0, &add_auth_headers(&admin_user)[1].1)
             .await;
 
         response.assert_status_ok();
@@ -486,7 +492,8 @@ mod tests {
         // Test skip beyond available users
         let response = app
             .get("/admin/api/v1/users?skip=1000&limit=10")
-            .add_header(add_auth_headers(&admin_user).0, add_auth_headers(&admin_user).1)
+            .add_header(&add_auth_headers(&admin_user)[0].0, &add_auth_headers(&admin_user)[0].1)
+            .add_header(&add_auth_headers(&admin_user)[1].0, &add_auth_headers(&admin_user)[1].1)
             .await;
 
         response.assert_status_ok();
@@ -496,7 +503,8 @@ mod tests {
         // Test maximum limit enforcement
         let response = app
             .get("/admin/api/v1/users?limit=2000")
-            .add_header(add_auth_headers(&admin_user).0, add_auth_headers(&admin_user).1)
+            .add_header(&add_auth_headers(&admin_user)[0].0, &add_auth_headers(&admin_user)[0].1)
+            .add_header(&add_auth_headers(&admin_user)[1].0, &add_auth_headers(&admin_user)[1].1)
             .await;
 
         response.assert_status_ok();
@@ -513,7 +521,8 @@ mod tests {
 
         let response = app
             .get(&format!("/admin/api/v1/users/{}", regular_user.id))
-            .add_header(add_auth_headers(&admin_user).0, add_auth_headers(&admin_user).1)
+            .add_header(&add_auth_headers(&admin_user)[0].0, &add_auth_headers(&admin_user)[0].1)
+            .add_header(&add_auth_headers(&admin_user)[1].0, &add_auth_headers(&admin_user)[1].1)
             .await;
 
         response.assert_status_ok();
@@ -531,7 +540,8 @@ mod tests {
 
         let response = app
             .get(&format!("/admin/api/v1/users/{}", user2.id))
-            .add_header(add_auth_headers(&user1).0, add_auth_headers(&user1).1)
+            .add_header(&add_auth_headers(&user1)[0].0, &add_auth_headers(&user1)[0].1)
+            .add_header(&add_auth_headers(&user1)[1].0, &add_auth_headers(&user1)[1].1)
             .await;
 
         response.assert_status_forbidden();
@@ -546,7 +556,8 @@ mod tests {
 
         let response = app
             .get(&format!("/admin/api/v1/users/{nonexistent_id}"))
-            .add_header(add_auth_headers(&admin_user).0, add_auth_headers(&admin_user).1)
+            .add_header(&add_auth_headers(&admin_user)[0].0, &add_auth_headers(&admin_user)[0].1)
+            .add_header(&add_auth_headers(&admin_user)[1].0, &add_auth_headers(&admin_user)[1].1)
             .await;
 
         response.assert_status_not_found();
@@ -576,7 +587,8 @@ mod tests {
         // Test without include parameter - should not include groups
         let response = app
             .get("/admin/api/v1/users")
-            .add_header(add_auth_headers(&admin_user).0, add_auth_headers(&admin_user).1)
+            .add_header(&add_auth_headers(&admin_user)[0].0, &add_auth_headers(&admin_user)[0].1)
+            .add_header(&add_auth_headers(&admin_user)[1].0, &add_auth_headers(&admin_user)[1].1)
             .await;
 
         response.assert_status_ok();
@@ -587,7 +599,8 @@ mod tests {
         // Test with include=groups - should include groups
         let response = app
             .get("/admin/api/v1/users?include=groups")
-            .add_header(add_auth_headers(&admin_user).0, add_auth_headers(&admin_user).1)
+            .add_header(&add_auth_headers(&admin_user)[0].0, &add_auth_headers(&admin_user)[0].1)
+            .add_header(&add_auth_headers(&admin_user)[1].0, &add_auth_headers(&admin_user)[1].1)
             .await;
 
         response.assert_status_ok();
@@ -600,7 +613,8 @@ mod tests {
         // Test with include=groups and pagination
         let response = app
             .get("/admin/api/v1/users?include=groups&limit=10")
-            .add_header(add_auth_headers(&admin_user).0, add_auth_headers(&admin_user).1)
+            .add_header(&add_auth_headers(&admin_user)[0].0, &add_auth_headers(&admin_user)[0].1)
+            .add_header(&add_auth_headers(&admin_user)[1].0, &add_auth_headers(&admin_user)[1].1)
             .await;
 
         response.assert_status_ok();
@@ -613,7 +627,8 @@ mod tests {
         // Test with include=invalid - should ignore invalid includes
         let response = app
             .get("/admin/api/v1/users?include=invalid,groups")
-            .add_header(add_auth_headers(&admin_user).0, add_auth_headers(&admin_user).1)
+            .add_header(&add_auth_headers(&admin_user)[0].0, &add_auth_headers(&admin_user)[0].1)
+            .add_header(&add_auth_headers(&admin_user)[1].0, &add_auth_headers(&admin_user)[1].1)
             .await;
 
         response.assert_status_ok();
@@ -637,7 +652,8 @@ mod tests {
         // Test without include parameter - should not include billing
         let response = app
             .get("/admin/api/v1/users")
-            .add_header(add_auth_headers(&admin_user).0, add_auth_headers(&admin_user).1)
+            .add_header(&add_auth_headers(&admin_user)[0].0, &add_auth_headers(&admin_user)[0].1)
+            .add_header(&add_auth_headers(&admin_user)[1].0, &add_auth_headers(&admin_user)[1].1)
             .await;
 
         response.assert_status_ok();
@@ -648,7 +664,8 @@ mod tests {
         // Test with include=billing - should include credit balance
         let response = app
             .get("/admin/api/v1/users?include=billing")
-            .add_header(add_auth_headers(&admin_user).0, add_auth_headers(&admin_user).1)
+            .add_header(&add_auth_headers(&admin_user)[0].0, &add_auth_headers(&admin_user)[0].1)
+            .add_header(&add_auth_headers(&admin_user)[1].0, &add_auth_headers(&admin_user)[1].1)
             .await;
 
         response.assert_status_ok();
@@ -660,7 +677,8 @@ mod tests {
         // Test with include=billing and pagination
         let response = app
             .get("/admin/api/v1/users?include=billing&limit=10")
-            .add_header(add_auth_headers(&admin_user).0, add_auth_headers(&admin_user).1)
+            .add_header(&add_auth_headers(&admin_user)[0].0, &add_auth_headers(&admin_user)[0].1)
+            .add_header(&add_auth_headers(&admin_user)[1].0, &add_auth_headers(&admin_user)[1].1)
             .await;
 
         response.assert_status_ok();
@@ -672,7 +690,8 @@ mod tests {
         // Test with include=invalid,billing - should ignore invalid and include billing
         let response = app
             .get("/admin/api/v1/users?include=invalid,billing")
-            .add_header(add_auth_headers(&admin_user).0, add_auth_headers(&admin_user).1)
+            .add_header(&add_auth_headers(&admin_user)[0].0, &add_auth_headers(&admin_user)[0].1)
+            .add_header(&add_auth_headers(&admin_user)[1].0, &add_auth_headers(&admin_user)[1].1)
             .await;
 
         response.assert_status_ok();
@@ -709,7 +728,8 @@ mod tests {
         // Test with include=groups,billing - should include both
         let response = app
             .get("/admin/api/v1/users?include=groups,billing")
-            .add_header(add_auth_headers(&admin_user).0, add_auth_headers(&admin_user).1)
+            .add_header(&add_auth_headers(&admin_user)[0].0, &add_auth_headers(&admin_user)[0].1)
+            .add_header(&add_auth_headers(&admin_user)[1].0, &add_auth_headers(&admin_user)[1].1)
             .await;
 
         response.assert_status_ok();
@@ -738,7 +758,8 @@ mod tests {
         // Test with include=billing - should show 0.0 for users with no transactions
         let response = app
             .get("/admin/api/v1/users?include=billing")
-            .add_header(add_auth_headers(&admin_user).0, add_auth_headers(&admin_user).1)
+            .add_header(&add_auth_headers(&admin_user)[0].0, &add_auth_headers(&admin_user)[0].1)
+            .add_header(&add_auth_headers(&admin_user)[1].0, &add_auth_headers(&admin_user)[1].1)
             .await;
 
         response.assert_status_ok();
@@ -779,7 +800,8 @@ mod tests {
         // Test with include=billing - should show latest balance for all users
         let response = app
             .get("/admin/api/v1/users?include=billing")
-            .add_header(add_auth_headers(&admin_user).0, add_auth_headers(&admin_user).1)
+            .add_header(&add_auth_headers(&admin_user)[0].0, &add_auth_headers(&admin_user)[0].1)
+            .add_header(&add_auth_headers(&admin_user)[1].0, &add_auth_headers(&admin_user)[1].1)
             .await;
 
         response.assert_status_ok();
@@ -808,7 +830,8 @@ mod tests {
         // Test with include=billing - BillingManager should see balances
         let response = app
             .get("/admin/api/v1/users?include=billing")
-            .add_header(add_auth_headers(&billing_manager).0, add_auth_headers(&billing_manager).1)
+            .add_header(&add_auth_headers(&billing_manager)[0].0, &add_auth_headers(&billing_manager)[0].1)
+            .add_header(&add_auth_headers(&billing_manager)[1].0, &add_auth_headers(&billing_manager)[1].1)
             .await;
 
         response.assert_status_ok();
@@ -832,7 +855,8 @@ mod tests {
 
         let response = app
             .patch(&format!("/admin/api/v1/users/{}", regular_user.id))
-            .add_header(add_auth_headers(&admin_user).0, add_auth_headers(&admin_user).1)
+            .add_header(&add_auth_headers(&admin_user)[0].0, &add_auth_headers(&admin_user)[0].1)
+            .add_header(&add_auth_headers(&admin_user)[1].0, &add_auth_headers(&admin_user)[1].1)
             .json(&update_data)
             .await;
 
@@ -856,7 +880,8 @@ mod tests {
 
         let response = app
             .patch(&format!("/admin/api/v1/users/{}", user2.id))
-            .add_header(add_auth_headers(&user1).0, add_auth_headers(&user1).1)
+            .add_header(&add_auth_headers(&user1)[0].0, &add_auth_headers(&user1)[0].1)
+            .add_header(&add_auth_headers(&user1)[1].0, &add_auth_headers(&user1)[1].1)
             .json(&update_data)
             .await;
 
@@ -876,7 +901,8 @@ mod tests {
 
         let response = app
             .patch(&format!("/admin/api/v1/users/{nonexistent_id}"))
-            .add_header(add_auth_headers(&admin_user).0, add_auth_headers(&admin_user).1)
+            .add_header(&add_auth_headers(&admin_user)[0].0, &add_auth_headers(&admin_user)[0].1)
+            .add_header(&add_auth_headers(&admin_user)[1].0, &add_auth_headers(&admin_user)[1].1)
             .json(&update_data)
             .await;
 
@@ -892,7 +918,8 @@ mod tests {
 
         let response = app
             .delete(&format!("/admin/api/v1/users/{}", regular_user.id))
-            .add_header(add_auth_headers(&admin_user).0, add_auth_headers(&admin_user).1)
+            .add_header(&add_auth_headers(&admin_user)[0].0, &add_auth_headers(&admin_user)[0].1)
+            .add_header(&add_auth_headers(&admin_user)[1].0, &add_auth_headers(&admin_user)[1].1)
             .await;
 
         response.assert_status(axum::http::StatusCode::NO_CONTENT);
@@ -900,7 +927,8 @@ mod tests {
         // Verify user is deleted by trying to get it
         let get_response = app
             .get(&format!("/admin/api/v1/users/{}", regular_user.id))
-            .add_header(add_auth_headers(&admin_user).0, add_auth_headers(&admin_user).1)
+            .add_header(&add_auth_headers(&admin_user)[0].0, &add_auth_headers(&admin_user)[0].1)
+            .add_header(&add_auth_headers(&admin_user)[1].0, &add_auth_headers(&admin_user)[1].1)
             .await;
 
         get_response.assert_status_not_found();
@@ -915,7 +943,8 @@ mod tests {
 
         let response = app
             .delete(&format!("/admin/api/v1/users/{}", user2.id))
-            .add_header(add_auth_headers(&user1).0, add_auth_headers(&user1).1)
+            .add_header(&add_auth_headers(&user1)[0].0, &add_auth_headers(&user1)[0].1)
+            .add_header(&add_auth_headers(&user1)[1].0, &add_auth_headers(&user1)[1].1)
             .await;
 
         response.assert_status_forbidden();
@@ -930,7 +959,8 @@ mod tests {
 
         let response = app
             .delete(&format!("/admin/api/v1/users/{nonexistent_id}"))
-            .add_header(add_auth_headers(&admin_user).0, add_auth_headers(&admin_user).1)
+            .add_header(&add_auth_headers(&admin_user)[0].0, &add_auth_headers(&admin_user)[0].1)
+            .add_header(&add_auth_headers(&admin_user)[1].0, &add_auth_headers(&admin_user)[1].1)
             .await;
 
         response.assert_status_not_found();
@@ -944,7 +974,8 @@ mod tests {
 
         let response = app
             .delete(&format!("/admin/api/v1/users/{}", admin_user.id))
-            .add_header(add_auth_headers(&admin_user).0, add_auth_headers(&admin_user).1)
+            .add_header(&add_auth_headers(&admin_user)[0].0, &add_auth_headers(&admin_user)[0].1)
+            .add_header(&add_auth_headers(&admin_user)[1].0, &add_auth_headers(&admin_user)[1].1)
             .await;
 
         response.assert_status_bad_request();
@@ -960,27 +991,31 @@ mod tests {
         // StandardUser should be able to get their own info
         let response = app
             .get("/admin/api/v1/users/current")
-            .add_header(add_auth_headers(&standard_user).0, add_auth_headers(&standard_user).1)
+            .add_header(&add_auth_headers(&standard_user)[0].0, &add_auth_headers(&standard_user)[0].1)
+            .add_header(&add_auth_headers(&standard_user)[1].0, &add_auth_headers(&standard_user)[1].1)
             .await;
         response.assert_status_ok();
 
         let response = app
             .get(&format!("/admin/api/v1/users/{}", standard_user.id))
-            .add_header(add_auth_headers(&standard_user).0, add_auth_headers(&standard_user).1)
+            .add_header(&add_auth_headers(&standard_user)[0].0, &add_auth_headers(&standard_user)[0].1)
+            .add_header(&add_auth_headers(&standard_user)[1].0, &add_auth_headers(&standard_user)[1].1)
             .await;
         response.assert_status_ok();
 
         // StandardUser should NOT be able to list all users (no ReadAll permission)
         let response = app
             .get("/admin/api/v1/users")
-            .add_header(add_auth_headers(&standard_user).0, add_auth_headers(&standard_user).1)
+            .add_header(&add_auth_headers(&standard_user)[0].0, &add_auth_headers(&standard_user)[0].1)
+            .add_header(&add_auth_headers(&standard_user)[1].0, &add_auth_headers(&standard_user)[1].1)
             .await;
         response.assert_status_forbidden();
 
         // StandardUser should NOT be able to get other users (no ReadAll permission)
         let response = app
             .get(&format!("/admin/api/v1/users/{}", other_user.id))
-            .add_header(add_auth_headers(&standard_user).0, add_auth_headers(&standard_user).1)
+            .add_header(&add_auth_headers(&standard_user)[0].0, &add_auth_headers(&standard_user)[0].1)
+            .add_header(&add_auth_headers(&standard_user)[1].0, &add_auth_headers(&standard_user)[1].1)
             .await;
         response.assert_status_forbidden();
 
@@ -993,7 +1028,8 @@ mod tests {
 
         let response = app
             .post("/admin/api/v1/users")
-            .add_header(add_auth_headers(&standard_user).0, add_auth_headers(&standard_user).1)
+            .add_header(&add_auth_headers(&standard_user)[0].0, &add_auth_headers(&standard_user)[0].1)
+            .add_header(&add_auth_headers(&standard_user)[1].0, &add_auth_headers(&standard_user)[1].1)
             .json(&new_user)
             .await;
         response.assert_status_forbidden();
@@ -1002,7 +1038,8 @@ mod tests {
         let update_data = json!({"display_name": "Should Not Work"});
         let response = app
             .patch(&format!("/admin/api/v1/users/{}", other_user.id))
-            .add_header(add_auth_headers(&standard_user).0, add_auth_headers(&standard_user).1)
+            .add_header(&add_auth_headers(&standard_user)[0].0, &add_auth_headers(&standard_user)[0].1)
+            .add_header(&add_auth_headers(&standard_user)[1].0, &add_auth_headers(&standard_user)[1].1)
             .json(&update_data)
             .await;
         response.assert_status_forbidden();
@@ -1010,7 +1047,8 @@ mod tests {
         // StandardUser should NOT be able to delete users
         let response = app
             .delete(&format!("/admin/api/v1/users/{}", other_user.id))
-            .add_header(add_auth_headers(&standard_user).0, add_auth_headers(&standard_user).1)
+            .add_header(&add_auth_headers(&standard_user)[0].0, &add_auth_headers(&standard_user)[0].1)
+            .add_header(&add_auth_headers(&standard_user)[1].0, &add_auth_headers(&standard_user)[1].1)
             .await;
         response.assert_status_forbidden();
     }
@@ -1025,21 +1063,24 @@ mod tests {
         // RequestViewer should be able to get their own info (has ReadOwn for Users)
         let response = app
             .get("/admin/api/v1/users/current")
-            .add_header(add_auth_headers(&request_viewer).0, add_auth_headers(&request_viewer).1)
+            .add_header(&add_auth_headers(&request_viewer)[0].0, &add_auth_headers(&request_viewer)[0].1)
+            .add_header(&add_auth_headers(&request_viewer)[1].0, &add_auth_headers(&request_viewer)[1].1)
             .await;
         response.assert_status_ok();
 
         // RequestViewer should NOT be able to list all users (no ReadAll for Users)
         let response = app
             .get("/admin/api/v1/users")
-            .add_header(add_auth_headers(&request_viewer).0, add_auth_headers(&request_viewer).1)
+            .add_header(&add_auth_headers(&request_viewer)[0].0, &add_auth_headers(&request_viewer)[0].1)
+            .add_header(&add_auth_headers(&request_viewer)[1].0, &add_auth_headers(&request_viewer)[1].1)
             .await;
         response.assert_status_forbidden();
 
         // RequestViewer should NOT be able to get other users (no ReadAll for Users)
         let response = app
             .get(&format!("/admin/api/v1/users/{}", other_user.id))
-            .add_header(add_auth_headers(&request_viewer).0, add_auth_headers(&request_viewer).1)
+            .add_header(&add_auth_headers(&request_viewer)[0].0, &add_auth_headers(&request_viewer)[0].1)
+            .add_header(&add_auth_headers(&request_viewer)[1].0, &add_auth_headers(&request_viewer)[1].1)
             .await;
         response.assert_status_forbidden();
 
@@ -1052,7 +1093,8 @@ mod tests {
 
         let response = app
             .post("/admin/api/v1/users")
-            .add_header(add_auth_headers(&request_viewer).0, add_auth_headers(&request_viewer).1)
+            .add_header(&add_auth_headers(&request_viewer)[0].0, &add_auth_headers(&request_viewer)[0].1)
+            .add_header(&add_auth_headers(&request_viewer)[1].0, &add_auth_headers(&request_viewer)[1].1)
             .json(&new_user)
             .await;
         response.assert_status_forbidden();
@@ -1068,14 +1110,16 @@ mod tests {
         // PlatformManager should be able to list all users
         let response = app
             .get("/admin/api/v1/users")
-            .add_header(add_auth_headers(&platform_manager).0, add_auth_headers(&platform_manager).1)
+            .add_header(&add_auth_headers(&platform_manager)[0].0, &add_auth_headers(&platform_manager)[0].1)
+            .add_header(&add_auth_headers(&platform_manager)[1].0, &add_auth_headers(&platform_manager)[1].1)
             .await;
         response.assert_status_ok();
 
         // PlatformManager should be able to get any user
         let response = app
             .get(&format!("/admin/api/v1/users/{}", standard_user.id))
-            .add_header(add_auth_headers(&platform_manager).0, add_auth_headers(&platform_manager).1)
+            .add_header(&add_auth_headers(&platform_manager)[0].0, &add_auth_headers(&platform_manager)[0].1)
+            .add_header(&add_auth_headers(&platform_manager)[1].0, &add_auth_headers(&platform_manager)[1].1)
             .await;
         response.assert_status_ok();
 
@@ -1088,7 +1132,8 @@ mod tests {
 
         let response = app
             .post("/admin/api/v1/users")
-            .add_header(add_auth_headers(&platform_manager).0, add_auth_headers(&platform_manager).1)
+            .add_header(&add_auth_headers(&platform_manager)[0].0, &add_auth_headers(&platform_manager)[0].1)
+            .add_header(&add_auth_headers(&platform_manager)[1].0, &add_auth_headers(&platform_manager)[1].1)
             .json(&new_user)
             .await;
         response.assert_status(axum::http::StatusCode::CREATED);
@@ -1098,7 +1143,8 @@ mod tests {
         let update_data = json!({"display_name": "Updated by PM"});
         let response = app
             .patch(&format!("/admin/api/v1/users/{}", created_user.id))
-            .add_header(add_auth_headers(&platform_manager).0, add_auth_headers(&platform_manager).1)
+            .add_header(&add_auth_headers(&platform_manager)[0].0, &add_auth_headers(&platform_manager)[0].1)
+            .add_header(&add_auth_headers(&platform_manager)[1].0, &add_auth_headers(&platform_manager)[1].1)
             .json(&update_data)
             .await;
         response.assert_status_ok();
@@ -1106,7 +1152,8 @@ mod tests {
         // PlatformManager should be able to delete users
         let response = app
             .delete(&format!("/admin/api/v1/users/{}", created_user.id))
-            .add_header(add_auth_headers(&platform_manager).0, add_auth_headers(&platform_manager).1)
+            .add_header(&add_auth_headers(&platform_manager)[0].0, &add_auth_headers(&platform_manager)[0].1)
+            .add_header(&add_auth_headers(&platform_manager)[1].0, &add_auth_headers(&platform_manager)[1].1)
             .await;
         response.assert_status(axum::http::StatusCode::NO_CONTENT);
     }
@@ -1123,21 +1170,24 @@ mod tests {
         // Should be able to get their own info (both roles have ReadOwn for Users)
         let response = app
             .get("/admin/api/v1/users/current")
-            .add_header(add_auth_headers(&multi_role_user).0, add_auth_headers(&multi_role_user).1)
+            .add_header(&add_auth_headers(&multi_role_user)[0].0, &add_auth_headers(&multi_role_user)[0].1)
+            .add_header(&add_auth_headers(&multi_role_user)[1].0, &add_auth_headers(&multi_role_user)[1].1)
             .await;
         response.assert_status_ok();
 
         // Should NOT be able to list all users (neither role has ReadAll for Users)
         let response = app
             .get("/admin/api/v1/users")
-            .add_header(add_auth_headers(&multi_role_user).0, add_auth_headers(&multi_role_user).1)
+            .add_header(&add_auth_headers(&multi_role_user)[0].0, &add_auth_headers(&multi_role_user)[0].1)
+            .add_header(&add_auth_headers(&multi_role_user)[1].0, &add_auth_headers(&multi_role_user)[1].1)
             .await;
         response.assert_status_forbidden();
 
         // Should NOT be able to get other users (neither role has ReadAll for Users)
         let response = app
             .get(&format!("/admin/api/v1/users/{}", other_user.id))
-            .add_header(add_auth_headers(&multi_role_user).0, add_auth_headers(&multi_role_user).1)
+            .add_header(&add_auth_headers(&multi_role_user)[0].0, &add_auth_headers(&multi_role_user)[0].1)
+            .add_header(&add_auth_headers(&multi_role_user)[1].0, &add_auth_headers(&multi_role_user)[1].1)
             .await;
         response.assert_status_forbidden();
 
@@ -1150,7 +1200,8 @@ mod tests {
 
         let response = app
             .post("/admin/api/v1/users")
-            .add_header(add_auth_headers(&multi_role_user).0, add_auth_headers(&multi_role_user).1)
+            .add_header(&add_auth_headers(&multi_role_user)[0].0, &add_auth_headers(&multi_role_user)[0].1)
+            .add_header(&add_auth_headers(&multi_role_user)[1].0, &add_auth_headers(&multi_role_user)[1].1)
             .json(&new_user)
             .await;
         response.assert_status_forbidden();
@@ -1160,13 +1211,15 @@ mod tests {
 
         let response = app
             .get("/admin/api/v1/users")
-            .add_header(add_auth_headers(&full_admin).0, add_auth_headers(&full_admin).1)
+            .add_header(&add_auth_headers(&full_admin)[0].0, &add_auth_headers(&full_admin)[0].1)
+            .add_header(&add_auth_headers(&full_admin)[1].0, &add_auth_headers(&full_admin)[1].1)
             .await;
         response.assert_status_ok();
 
         let response = app
             .post("/admin/api/v1/users")
-            .add_header(add_auth_headers(&full_admin).0, add_auth_headers(&full_admin).1)
+            .add_header(&add_auth_headers(&full_admin)[0].0, &add_auth_headers(&full_admin)[0].1)
+            .add_header(&add_auth_headers(&full_admin)[1].0, &add_auth_headers(&full_admin)[1].1)
             .json(&new_user)
             .await;
         response.assert_status(axum::http::StatusCode::CREATED);
@@ -1188,7 +1241,8 @@ mod tests {
             for target in &targets {
                 let response = app
                     .get(&format!("/admin/api/v1/users/{}", target.id))
-                    .add_header(add_auth_headers(user).0, add_auth_headers(user).1)
+                    .add_header(&add_auth_headers(user)[0].0, &add_auth_headers(user)[0].1)
+                    .add_header(&add_auth_headers(user)[1].0, &add_auth_headers(user)[1].1)
                     .await;
 
                 if user.id == target.id {
@@ -1243,7 +1297,8 @@ mod tests {
             // Test list users access
             let response = app
                 .get("/admin/api/v1/users")
-                .add_header(add_auth_headers(&user).0, add_auth_headers(&user).1)
+                .add_header(&add_auth_headers(&user)[0].0, &add_auth_headers(&user)[0].1)
+                .add_header(&add_auth_headers(&user)[1].0, &add_auth_headers(&user)[1].1)
                 .await;
 
             if can_list_users {
@@ -1255,7 +1310,8 @@ mod tests {
             // Test read own user access
             let response = app
                 .get("/admin/api/v1/users/current")
-                .add_header(add_auth_headers(&user).0, add_auth_headers(&user).1)
+                .add_header(&add_auth_headers(&user)[0].0, &add_auth_headers(&user)[0].1)
+                .add_header(&add_auth_headers(&user)[1].0, &add_auth_headers(&user)[1].1)
                 .await;
 
             if can_read_own {
@@ -1273,7 +1329,8 @@ mod tests {
 
             let response = app
                 .post("/admin/api/v1/users")
-                .add_header(add_auth_headers(&user).0, add_auth_headers(&user).1)
+                .add_header(&add_auth_headers(&user)[0].0, &add_auth_headers(&user)[0].1)
+                .add_header(&add_auth_headers(&user)[1].0, &add_auth_headers(&user)[1].1)
                 .json(&new_user)
                 .await;
 
@@ -1282,7 +1339,8 @@ mod tests {
                 // Clean up created user
                 let created_user: UserResponse = response.json();
                 app.delete(&format!("/admin/api/v1/users/{}", created_user.id))
-                    .add_header(add_auth_headers(&user).0, add_auth_headers(&user).1)
+                    .add_header(&add_auth_headers(&user)[0].0, &add_auth_headers(&user)[0].1)
+                    .add_header(&add_auth_headers(&user)[1].0, &add_auth_headers(&user)[1].1)
                     .await
                     .assert_status(axum::http::StatusCode::NO_CONTENT);
             } else {
@@ -1306,13 +1364,15 @@ mod tests {
 
         let admin_response = app
             .get("/admin/api/v1/users")
-            .add_header(add_auth_headers(&admin_user).0, add_auth_headers(&admin_user).1)
+            .add_header(&add_auth_headers(&admin_user)[0].0, &add_auth_headers(&admin_user)[0].1)
+            .add_header(&add_auth_headers(&admin_user)[1].0, &add_auth_headers(&admin_user)[1].1)
             .await;
         admin_response.assert_status_ok();
 
         let pm_response = app
             .get("/admin/api/v1/users")
-            .add_header(add_auth_headers(&non_admin_pm).0, add_auth_headers(&non_admin_pm).1)
+            .add_header(&add_auth_headers(&non_admin_pm)[0].0, &add_auth_headers(&non_admin_pm)[0].1)
+            .add_header(&add_auth_headers(&non_admin_pm)[1].0, &add_auth_headers(&non_admin_pm)[1].1)
             .await;
         pm_response.assert_status_ok();
 
@@ -1320,7 +1380,8 @@ mod tests {
         let standard_user = create_test_user(&pool, Role::StandardUser).await;
         let standard_response = app
             .get("/admin/api/v1/users")
-            .add_header(add_auth_headers(&standard_user).0, add_auth_headers(&standard_user).1)
+            .add_header(&add_auth_headers(&standard_user)[0].0, &add_auth_headers(&standard_user)[0].1)
+            .add_header(&add_auth_headers(&standard_user)[1].0, &add_auth_headers(&standard_user)[1].1)
             .await;
         standard_response.assert_status_forbidden();
     }
@@ -1339,7 +1400,8 @@ mod tests {
 
         let response = app
             .patch(&format!("/admin/api/v1/users/{}", regular_user.id))
-            .add_header(add_auth_headers(&admin_user).0, add_auth_headers(&admin_user).1)
+            .add_header(&add_auth_headers(&admin_user)[0].0, &add_auth_headers(&admin_user)[0].1)
+            .add_header(&add_auth_headers(&admin_user)[1].0, &add_auth_headers(&admin_user)[1].1)
             .json(&update_data)
             .await;
 
@@ -1359,7 +1421,8 @@ mod tests {
 
         let response = app
             .patch(&format!("/admin/api/v1/users/{}", regular_user.id))
-            .add_header(add_auth_headers(&admin_user).0, add_auth_headers(&admin_user).1)
+            .add_header(&add_auth_headers(&admin_user)[0].0, &add_auth_headers(&admin_user)[0].1)
+            .add_header(&add_auth_headers(&admin_user)[1].0, &add_auth_headers(&admin_user)[1].1)
             .json(&update_data)
             .await;
 
@@ -1402,7 +1465,8 @@ mod tests {
 
         let response = app
             .get(&format!("/admin/api/v1/users/{}?include=billing", user.id))
-            .add_header(add_auth_headers(&user).0, add_auth_headers(&user).1)
+            .add_header(&add_auth_headers(&user)[0].0, &add_auth_headers(&user)[0].1)
+            .add_header(&add_auth_headers(&user)[1].0, &add_auth_headers(&user)[1].1)
             .await;
 
         response.assert_status_ok();
@@ -1423,7 +1487,8 @@ mod tests {
 
         let response = app
             .get("/admin/api/v1/users/current?include=billing")
-            .add_header(add_auth_headers(&user).0, add_auth_headers(&user).1)
+            .add_header(&add_auth_headers(&user)[0].0, &add_auth_headers(&user)[0].1)
+            .add_header(&add_auth_headers(&user)[1].0, &add_auth_headers(&user)[1].1)
             .await;
 
         response.assert_status_ok();
@@ -1442,7 +1507,8 @@ mod tests {
 
         let response = app
             .get(&format!("/admin/api/v1/users/{}?include=billing", user2.id))
-            .add_header(add_auth_headers(&user1).0, add_auth_headers(&user1).1)
+            .add_header(&add_auth_headers(&user1)[0].0, &add_auth_headers(&user1)[0].1)
+            .add_header(&add_auth_headers(&user1)[1].0, &add_auth_headers(&user1)[1].1)
             .await;
 
         response.assert_status_forbidden();
@@ -1460,7 +1526,8 @@ mod tests {
 
         let response = app
             .get(&format!("/admin/api/v1/users/{}?include=billing", user.id))
-            .add_header(add_auth_headers(&user).0, add_auth_headers(&user).1)
+            .add_header(&add_auth_headers(&user)[0].0, &add_auth_headers(&user)[0].1)
+            .add_header(&add_auth_headers(&user)[1].0, &add_auth_headers(&user)[1].1)
             .await;
 
         response.assert_status_ok();
@@ -1481,7 +1548,8 @@ mod tests {
 
         let response = app
             .get("/admin/api/v1/users/current?include=billing")
-            .add_header(add_auth_headers(&user).0, add_auth_headers(&user).1)
+            .add_header(&add_auth_headers(&user)[0].0, &add_auth_headers(&user)[0].1)
+            .add_header(&add_auth_headers(&user)[1].0, &add_auth_headers(&user)[1].1)
             .await;
 
         response.assert_status_ok();
@@ -1502,7 +1570,8 @@ mod tests {
 
         let response = app
             .get("/admin/api/v1/users/current?include=billing")
-            .add_header(add_auth_headers(&user).0, add_auth_headers(&user).1)
+            .add_header(&add_auth_headers(&user)[0].0, &add_auth_headers(&user)[0].1)
+            .add_header(&add_auth_headers(&user)[1].0, &add_auth_headers(&user)[1].1)
             .await;
 
         response.assert_status_ok();
@@ -1524,7 +1593,8 @@ mod tests {
 
         let response = app
             .get(&format!("/admin/api/v1/users/{}?include=billing", user.id))
-            .add_header(add_auth_headers(&platform_manager).0, add_auth_headers(&platform_manager).1)
+            .add_header(&add_auth_headers(&platform_manager)[0].0, &add_auth_headers(&platform_manager)[0].1)
+            .add_header(&add_auth_headers(&platform_manager)[1].0, &add_auth_headers(&platform_manager)[1].1)
             .await;
 
         response.assert_status_ok();
@@ -1546,7 +1616,8 @@ mod tests {
 
         let response = app
             .get(&format!("/admin/api/v1/users/{}?include=billing", user.id))
-            .add_header(add_auth_headers(&billing_manager).0, add_auth_headers(&billing_manager).1)
+            .add_header(&add_auth_headers(&billing_manager)[0].0, &add_auth_headers(&billing_manager)[0].1)
+            .add_header(&add_auth_headers(&billing_manager)[1].0, &add_auth_headers(&billing_manager)[1].1)
             .await;
 
         response.assert_status_ok();
