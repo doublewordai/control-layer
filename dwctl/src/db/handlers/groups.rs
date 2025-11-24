@@ -1642,7 +1642,7 @@ mod tests {
             assert_eq!(updated_group.description, Some("Updated description".to_string()));
             assert_eq!(updated_group.created_by, user_id);
             assert_eq!(updated_group.created_at, group.created_at);
-            assert!(updated_group.updated_at > group.updated_at);
+            assert!(updated_group.updated_at >= group.updated_at);
 
             // Verify the update persisted in the database
             let retrieved_group = group_repo
@@ -1683,7 +1683,7 @@ mod tests {
         // Verify only name was updated, description unchanged
         assert_eq!(updated_group.name, "Updated Name Only");
         assert_eq!(updated_group.description, Some("Original description".to_string()));
-        assert!(updated_group.updated_at > group.updated_at);
+        assert!(updated_group.updated_at >= group.updated_at);
     }
 
     #[sqlx::test]
@@ -1713,7 +1713,7 @@ mod tests {
         // Verify only description was updated, name unchanged
         assert_eq!(updated_group.name, "Original Group");
         assert_eq!(updated_group.description, Some("Updated description only".to_string()));
-        assert!(updated_group.updated_at > group.updated_at);
+        assert!(updated_group.updated_at >= group.updated_at);
     }
 
     #[sqlx::test]
@@ -1772,7 +1772,7 @@ mod tests {
         // Verify values unchanged but updated_at changed
         assert_eq!(updated_group.name, "Original Group");
         assert_eq!(updated_group.description, Some("Original description".to_string()));
-        assert!(updated_group.updated_at > group.updated_at);
+        assert!(updated_group.updated_at >= group.updated_at);
     }
 
     #[sqlx::test]

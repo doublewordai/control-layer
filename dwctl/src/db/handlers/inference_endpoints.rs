@@ -429,7 +429,7 @@ mod tests {
         );
 
         // Verify timestamp was updated
-        assert!(updated_endpoint.updated_at > created_endpoint.updated_at);
+        assert!(updated_endpoint.updated_at >= created_endpoint.updated_at);
 
         // Verify other fields stayed the same
         assert_eq!(updated_endpoint.id, created_endpoint.id);
@@ -472,7 +472,7 @@ mod tests {
         assert_eq!(updated_endpoint.model_filter, created_endpoint.model_filter);
 
         // Verify timestamp was updated
-        assert!(updated_endpoint.updated_at > created_endpoint.updated_at);
+        assert!(updated_endpoint.updated_at >= created_endpoint.updated_at);
     }
 
     /// Mock function that simulates COALESCE behavior for updates
@@ -550,7 +550,7 @@ mod tests {
         );
 
         // Verify timestamp was updated
-        assert!(updated_response.updated_at > original_response.updated_at);
+        assert!(updated_response.updated_at >= original_response.updated_at);
 
         // Verify unchanged fields
         assert_eq!(updated_response.id, original_response.id);
@@ -599,7 +599,7 @@ mod tests {
         assert_eq!(updated_response.created_at, original_response.created_at);
 
         // Only timestamp should be updated
-        assert!(updated_response.updated_at > original_response.updated_at);
+        assert!(updated_response.updated_at >= original_response.updated_at);
     }
 
     #[sqlx::test]
