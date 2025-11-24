@@ -74,7 +74,7 @@ async fn try_jwt_session_auth(
                     roles: user.roles,
                     display_name: user.display_name,
                     avatar_url: user.avatar_url,
-                    payment_provider_id: user.payment_provider_id
+                    payment_provider_id: user.payment_provider_id,
                 }));
             }
         }
@@ -1056,6 +1056,7 @@ mod tests {
             roles: user.roles.clone(),
             display_name: user.display_name.clone(),
             avatar_url: user.avatar_url.clone(),
+            payment_provider_id: user.payment_provider_id.clone(),
         };
         let jwt_token = session::create_session_token(&current_user, &config).unwrap();
 
@@ -1126,6 +1127,7 @@ mod tests {
             roles: user.roles.clone(),
             display_name: user.display_name.clone(),
             avatar_url: user.avatar_url.clone(),
+            payment_provider_id: user.payment_provider_id.clone(),
         };
         let jwt_token = session::create_session_token(&current_user, &config).unwrap();
 

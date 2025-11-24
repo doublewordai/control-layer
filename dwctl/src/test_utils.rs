@@ -77,6 +77,7 @@ pub fn create_test_config() -> crate::config::Config {
             sync_interval: std::time::Duration::from_secs(60),
         }],
         metadata: crate::config::Metadata::default(),
+        payment: None,
         auth: crate::config::AuthConfig {
             native: NativeAuthConfig {
                 enabled: false,
