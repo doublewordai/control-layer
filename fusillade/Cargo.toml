@@ -33,6 +33,7 @@ humantime = "2"
 hostname = "0.4"
 dashmap = { version = "6", features = ["serde"] }
 sqlx = { version = "0.8", features = ["runtime-tokio", "postgres", "uuid", "chrono", "json"], optional = true }
+test-log = "0.2.18"
 
 [dev-dependencies]
 tokio-test = "0.4"
