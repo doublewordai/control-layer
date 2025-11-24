@@ -86,8 +86,8 @@ pub async fn list_inference_endpoints(
 ) -> Result<Json<Vec<InferenceEndpointResponse>>> {
     let mut conn = state.db.acquire().await.map_err(|e| Error::Database(e.into()))?;
     let mut repo = InferenceEndpoints::new(&mut conn);
-    let skip = query.skip.unwrap_or(0);
-    let limit = query.limit.unwrap_or(100).min(1000);
+    let skip = query.pagination.skip();
+    let limit = query.pagination.limit();
 
     let endpoints = repo.list(&InferenceEndpointFilter::new(skip, limit)).await?;
     Ok(Json(endpoints.into_iter().map(Into::into).collect()))
@@ -500,6 +500,7 @@ async fn validate_endpoint_connection(
         auth_header_name,
         auth_header_prefix,
         request_timeout: Duration::from_secs(10),
+        format_override: None,
     };
 
     // Use the existing FetchModelsReqwest implementation
@@ -572,6 +573,7 @@ pub async fn synchronize_endpoint(
 mod tests {
     use crate::api::models::deployments::DeployedModelResponse;
     use crate::api::models::inference_endpoints::InferenceEndpointResponse;
+    use crate::api::models::pagination::PaginatedResponse;
     use crate::api::models::users::Role;
     use crate::test_utils::*;
     use serde_json::json;
@@ -2281,8 +2283,8 @@ mod tests {
             .await;
 
         response.assert_status_ok();
-        let deployments: Vec<DeployedModelResponse> = response.json();
-        assert!(deployments.iter().any(|d| d.alias == "google/gemma-3-12b-it"));
-        assert!(deployments.iter().any(|d| d.alias == "openai/gpt-4"));
+        let deployments: PaginatedResponse<DeployedModelResponse> = response.json();
+        assert!(deployments.data.iter().any(|d| d.alias == "google/gemma-3-12b-it"));
+        assert!(deployments.data.iter().any(|d| d.alias == "openai/gpt-4"));
     }
 }

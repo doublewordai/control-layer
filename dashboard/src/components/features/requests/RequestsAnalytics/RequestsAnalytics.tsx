@@ -36,7 +36,10 @@ export function RequestsAnalytics({
   dateRange,
 }: RequestsAnalyticsProps) {
   // MSW will intercept these calls in demo mode
-  const { data, isLoading, error } = useRequestsAggregate(selectedModel, dateRange);
+  const { data, isLoading, error } = useRequestsAggregate(
+    selectedModel,
+    dateRange,
+  );
   const { data: allModelsData } = useRequestsAggregate(undefined, dateRange);
   const { data: modelsData } = useModels();
 
@@ -91,7 +94,7 @@ export function RequestsAnalytics({
   // Find the selected model details if a model is selected
   const selectedModelDetails =
     selectedModel && modelsData
-      ? modelsData.find((model) => model.model_name === selectedModel)
+      ? modelsData.data.find((model) => model.model_name === selectedModel)
       : null;
 
   // Show loading state
