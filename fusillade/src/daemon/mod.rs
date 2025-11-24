@@ -609,6 +609,7 @@ mod tests {
     use std::time::Duration;
 
     #[sqlx::test]
+    #[test_log::test]
     async fn test_daemon_claims_and_completes_request(pool: sqlx::PgPool) {
         // Setup: Create HTTP client with mock response
         let http_client = Arc::new(MockHttpClient::new());
@@ -682,7 +683,7 @@ mod tests {
 
         // Start the daemon
         let shutdown_token = tokio_util::sync::CancellationToken::new();
-        let daemon_handle = manager
+        manager
             .clone()
             .run(shutdown_token.clone())
             .expect("Failed to start daemon");
@@ -719,7 +720,7 @@ mod tests {
         }
 
         // Stop the daemon
-        daemon_handle.abort();
+        shutdown_token.cancel();
 
         // Assert that the request completed
         assert!(
@@ -872,7 +873,7 @@ mod tests {
 
         // Start the daemon
         let shutdown_token = tokio_util::sync::CancellationToken::new();
-        let daemon_handle = manager
+        manager
             .clone()
             .run(shutdown_token.clone())
             .expect("Failed to start daemon");
@@ -958,7 +959,7 @@ mod tests {
         }
 
         // Stop the daemon
-        daemon_handle.abort();
+        shutdown_token.cancel();
 
         assert!(all_completed, "All 5 requests should have completed");
 
@@ -1059,7 +1060,7 @@ mod tests {
 
         // Start the daemon
         let shutdown_token = tokio_util::sync::CancellationToken::new();
-        let daemon_handle = manager
+        manager
             .clone()
             .run(shutdown_token.clone())
             .expect("Failed to start daemon");
@@ -1092,7 +1093,7 @@ mod tests {
         }
 
         // Stop the daemon
-        daemon_handle.abort();
+        shutdown_token.cancel();
 
         assert!(completed, "Request should have completed after retries");
 
@@ -1183,7 +1184,7 @@ mod tests {
 
         // Start the daemon
         let shutdown_token = tokio_util::sync::CancellationToken::new();
-        let daemon_handle = manager
+        manager
             .clone()
             .run(shutdown_token.clone())
             .expect("Failed to start daemon");
@@ -1265,7 +1266,7 @@ mod tests {
         }
 
         // Stop the daemon
-        daemon_handle.abort();
+        shutdown_token.cancel();
 
         assert!(all_completed, "All 10 requests should have completed");
         assert_eq!(http_client.call_count(), 10);

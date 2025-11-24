@@ -297,7 +297,7 @@ mod tests {
     use crate::{api::models::users::Role, test_utils::*};
     use chrono::{Duration, Utc};
     use serde_json::json;
-    use sqlx::{ConnectOptions, PgPool};
+    use sqlx::PgPool;
 
     // Helper function to insert test analytics data for aggregate tests
     async fn insert_test_analytics_data(
@@ -391,13 +391,12 @@ mod tests {
         // Create config with request logging enabled
         let mut config = create_test_config();
         config.enable_request_logging = true;
-        config.database = crate::config::DatabaseConfig::External {
-            url: pool.connect_options().to_url_lossy().to_string(),
-        };
-        config.leader_election.enabled = false;
+        config.background_services.leader_election.enabled = false;
 
-        // Use Application::new to properly set up outlet_db
-        let app = crate::Application::new(config).await.expect("Failed to create application");
+        // Use Application::new_with_pool to properly set up outlet_db with provided pool
+        let app = crate::Application::new_with_pool(config, Some(pool.clone()))
+            .await
+            .expect("Failed to create application");
         let (server, _drop_guard) = app.into_test_server();
         let admin_user = create_test_admin_user(&pool, Role::PlatformManager).await;
 
@@ -424,13 +423,12 @@ mod tests {
         // Create config with request logging enabled
         let mut config = create_test_config();
         config.enable_request_logging = true;
-        config.database = crate::config::DatabaseConfig::External {
-            url: pool.connect_options().to_url_lossy().to_string(),
-        };
-        config.leader_election.enabled = false;
+        config.background_services.leader_election.enabled = false;
 
-        // Use Application::new to properly set up outlet_db
-        let app = crate::Application::new(config).await.expect("Failed to create application");
+        // Use Application::new_with_pool to properly set up outlet_db with provided pool
+        let app = crate::Application::new_with_pool(config, Some(pool.clone()))
+            .await
+            .expect("Failed to create application");
         let (server, _drop_guard) = app.into_test_server();
         let admin_user = create_test_admin_user(&pool, Role::PlatformManager).await;
 
@@ -469,13 +467,12 @@ mod tests {
         // This exercises the outlet database query and conversion logic (lines 112-184)
         let mut config = create_test_config();
         config.enable_request_logging = true;
-        config.database = crate::config::DatabaseConfig::External {
-            url: pool.connect_options().to_url_lossy().to_string(),
-        };
-        config.leader_election.enabled = false;
+        config.background_services.leader_election.enabled = false;
 
-        // Use Application::new to properly set up outlet_db
-        let app = crate::Application::new(config).await.expect("Failed to create application");
+        // Use Application::new_with_pool to properly set up outlet_db with provided pool
+        let app = crate::Application::new_with_pool(config, Some(pool.clone()))
+            .await
+            .expect("Failed to create application");
         let (server, _drop_guard) = app.into_test_server();
         let admin_user = create_test_admin_user(&pool, Role::PlatformManager).await;
 
@@ -832,13 +829,12 @@ mod tests {
         // Create config with request logging enabled
         let mut config = create_test_config();
         config.enable_request_logging = true;
-        config.database = crate::config::DatabaseConfig::External {
-            url: pool.connect_options().to_url_lossy().to_string(),
-        };
-        config.leader_election.enabled = false;
+        config.background_services.leader_election.enabled = false;
 
-        // Use Application::new to properly set up outlet_db
-        let app = crate::Application::new(config).await.expect("Failed to create application");
+        // Use Application::new_with_pool to properly set up outlet_db with provided pool
+        let app = crate::Application::new_with_pool(config, Some(pool.clone()))
+            .await
+            .expect("Failed to create application");
         let (app, _drop_guard) = app.into_test_server();
         let standard_user = create_test_user(&pool, Role::StandardUser).await;
 
@@ -867,13 +863,12 @@ mod tests {
         // Create config with request logging enabled
         let mut config = create_test_config();
         config.enable_request_logging = true;
-        config.database = crate::config::DatabaseConfig::External {
-            url: pool.connect_options().to_url_lossy().to_string(),
-        };
-        config.leader_election.enabled = false;
+        config.background_services.leader_election.enabled = false;
 
-        // Use Application::new to properly set up outlet_db
-        let app = crate::Application::new(config).await.expect("Failed to create application");
+        // Use Application::new_with_pool to properly set up outlet_db with provided pool
+        let app = crate::Application::new_with_pool(config, Some(pool.clone()))
+            .await
+            .expect("Failed to create application");
         let (app, _drop_guard) = app.into_test_server();
         let request_viewer = create_test_user(&pool, Role::RequestViewer).await;
 
@@ -906,13 +901,12 @@ mod tests {
         // Create config with request logging enabled
         let mut config = create_test_config();
         config.enable_request_logging = true;
-        config.database = crate::config::DatabaseConfig::External {
-            url: pool.connect_options().to_url_lossy().to_string(),
-        };
-        config.leader_election.enabled = false;
+        config.background_services.leader_election.enabled = false;
 
-        // Use Application::new to properly set up outlet_db
-        let app = crate::Application::new(config).await.expect("Failed to create application");
+        // Use Application::new_with_pool to properly set up outlet_db with provided pool
+        let app = crate::Application::new_with_pool(config, Some(pool.clone()))
+            .await
+            .expect("Failed to create application");
         let (app, _drop_guard) = app.into_test_server();
 
         // Create a NON-ADMIN PlatformManager (so role permissions are checked)
@@ -943,13 +937,12 @@ mod tests {
         // Create config with request logging enabled
         let mut config = create_test_config();
         config.enable_request_logging = true;
-        config.database = crate::config::DatabaseConfig::External {
-            url: pool.connect_options().to_url_lossy().to_string(),
-        };
-        config.leader_election.enabled = false;
+        config.background_services.leader_election.enabled = false;
 
-        // Use Application::new to properly set up outlet_db
-        let app = crate::Application::new(config).await.expect("Failed to create application");
+        // Use Application::new_with_pool to properly set up outlet_db with provided pool
+        let app = crate::Application::new_with_pool(config, Some(pool.clone()))
+            .await
+            .expect("Failed to create application");
         let (app, _drop_guard) = app.into_test_server();
 
         // User with StandardUser + RequestViewer should have monitoring access
@@ -1001,13 +994,12 @@ mod tests {
         // Create config with request logging enabled
         let mut config = create_test_config();
         config.enable_request_logging = true;
-        config.database = crate::config::DatabaseConfig::External {
-            url: pool.connect_options().to_url_lossy().to_string(),
-        };
-        config.leader_election.enabled = false;
+        config.background_services.leader_election.enabled = false;
 
-        // Use Application::new to properly set up outlet_db
-        let app = crate::Application::new(config).await.expect("Failed to create application");
+        // Use Application::new_with_pool to properly set up outlet_db with provided pool
+        let app = crate::Application::new_with_pool(config, Some(pool.clone()))
+            .await
+            .expect("Failed to create application");
         let (app, _drop_guard) = app.into_test_server();
         let request_viewer = create_test_user(&pool, Role::RequestViewer).await;
         let standard_user = create_test_user(&pool, Role::StandardUser).await;
@@ -1050,13 +1042,12 @@ mod tests {
         // Create config with request logging enabled
         let mut config = create_test_config();
         config.enable_request_logging = true;
-        config.database = crate::config::DatabaseConfig::External {
-            url: pool.connect_options().to_url_lossy().to_string(),
-        };
-        config.leader_election.enabled = false;
+        config.background_services.leader_election.enabled = false;
 
-        // Use Application::new to properly set up outlet_db
-        let app = crate::Application::new(config).await.expect("Failed to create application");
+        // Use Application::new_with_pool to properly set up outlet_db with provided pool
+        let app = crate::Application::new_with_pool(config, Some(pool.clone()))
+            .await
+            .expect("Failed to create application");
         let (app, _drop_guard) = app.into_test_server();
         let request_viewer = create_test_user(&pool, Role::RequestViewer).await;
         let platform_manager = create_test_admin_user(&pool, Role::PlatformManager).await;
@@ -1098,13 +1089,12 @@ mod tests {
         // Create config with request logging enabled
         let mut config = create_test_config();
         config.enable_request_logging = true;
-        config.database = crate::config::DatabaseConfig::External {
-            url: pool.connect_options().to_url_lossy().to_string(),
-        };
-        config.leader_election.enabled = false;
+        config.background_services.leader_election.enabled = false;
 
-        // Use Application::new to properly set up outlet_db
-        let app = crate::Application::new(config).await.expect("Failed to create application");
+        // Use Application::new_with_pool to properly set up outlet_db with provided pool
+        let app = crate::Application::new_with_pool(config, Some(pool.clone()))
+            .await
+            .expect("Failed to create application");
         let (app, _drop_guard) = app.into_test_server();
 
         // Test different role combinations for monitoring access
@@ -1163,13 +1153,12 @@ mod tests {
         // Create config with request logging enabled
         let mut config = create_test_config();
         config.enable_request_logging = true;
-        config.database = crate::config::DatabaseConfig::External {
-            url: pool.connect_options().to_url_lossy().to_string(),
-        };
-        config.leader_election.enabled = false;
+        config.background_services.leader_election.enabled = false;
 
-        // Use Application::new to properly set up outlet_db
-        let app = crate::Application::new(config).await.expect("Failed to create application");
+        // Use Application::new_with_pool to properly set up outlet_db with provided pool
+        let app = crate::Application::new_with_pool(config, Some(pool.clone()))
+            .await
+            .expect("Failed to create application");
         let (app, _drop_guard) = app.into_test_server();
         let request_viewer = create_test_user(&pool, Role::RequestViewer).await;
 
