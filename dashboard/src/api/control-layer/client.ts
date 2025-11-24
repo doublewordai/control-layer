@@ -59,10 +59,16 @@ import { ApiError } from "./errors";
 
 // Resource APIs
 const userApi = {
-  async list(options?: UsersQuery): Promise<User[]> {
+  async list(options?: UsersQuery): Promise<PaginatedResponse<User>> {
     const params = new URLSearchParams();
     if (options?.include) {
       params.set("include", options.include);
+    }
+    if (options?.skip !== undefined) {
+      params.set("skip", options.skip.toString());
+    }
+    if (options?.limit !== undefined) {
+      params.set("limit", options.limit.toString());
     }
 
     const url = `/admin/api/v1/users${params.toString() ? "?" + params.toString() : ""}`;
@@ -405,9 +411,15 @@ const endpointApi = {
 };
 
 const groupApi = {
-  async list(options?: GroupsQuery): Promise<Group[]> {
+  async list(options?: GroupsQuery): Promise<PaginatedResponse<Group>> {
     const params = new URLSearchParams();
     if (options?.include) params.set("include", options.include);
+    if (options?.skip !== undefined) {
+      params.set("skip", options.skip.toString());
+    }
+    if (options?.limit !== undefined) {
+      params.set("limit", options.limit.toString());
+    }
 
     const url = `/admin/api/v1/groups${params.toString() ? "?" + params.toString() : ""}`;
     const response = await fetch(url);
@@ -523,8 +535,8 @@ const requestsApi = {
     const params = new URLSearchParams();
     if (options?.limit !== undefined)
       params.set("limit", options.limit.toString());
-    if (options?.offset !== undefined)
-      params.set("offset", options.offset.toString());
+    if (options?.skip !== undefined)
+      params.set("skip", options.skip.toString());
     if (options?.method) params.set("method", options.method);
     if (options?.uri_pattern) params.set("uri_pattern", options.uri_pattern);
     if (options?.status_code !== undefined)

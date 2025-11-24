@@ -25,15 +25,7 @@ import {
 } from "../../../../api/control-layer";
 import { AccessManagementModal } from "../../../modals";
 import { ApiExamples } from "../../../modals";
-import {
-  Pagination,
-  PaginationContent,
-  PaginationEllipsis,
-  PaginationItem,
-  PaginationLink,
-  PaginationNext,
-  PaginationPrevious,
-} from "../../../ui/pagination";
+import { TablePagination } from "../../../ui/table-pagination";
 import {
   Card,
   CardContent,
@@ -171,12 +163,6 @@ export const ModelsContent: React.FC<ModelsContentProps> = ({
     return matchesProvider;
   });
 
-  const totalItems = totalCount;
-  const totalPages = Math.ceil(totalItems / itemsPerPage);
-  const startIndex = (currentPage - 1) * itemsPerPage;
-  const endIndex = Math.min(startIndex + itemsPerPage, totalItems);
-  const paginatedModels = filteredModels;
-
   const hasNoModels = totalCount === 0 && currentPage === 1;
   const hasNoFilteredResults = !hasNoModels && filteredModels.length === 0;
 
@@ -304,7 +290,7 @@ export const ModelsContent: React.FC<ModelsContentProps> = ({
             role="list"
             className="grid grid-cols-1 lg:grid-cols-2 2xl:grid-cols-3 gap-6"
           >
-            {paginatedModels.map((model) => (
+            {filteredModels.map((model) => (
               <Card
                 key={model.id}
                 role="listitem"
@@ -694,134 +680,13 @@ export const ModelsContent: React.FC<ModelsContentProps> = ({
             ))}
           </div>
 
-          {totalPages > 1 && (
-            <Pagination className="mt-8">
-              <PaginationContent>
-                <PaginationItem>
-                  <PaginationPrevious
-                    href="#"
-                    onClick={(e) => {
-                      e.preventDefault();
-                      setCurrentPage(Math.max(1, currentPage - 1));
-                    }}
-                    className={
-                      currentPage === 1
-                        ? "pointer-events-none opacity-50"
-                        : "cursor-pointer"
-                    }
-                  />
-                </PaginationItem>
-
-                {(() => {
-                  const items = [];
-                  let startPage = 1;
-                  let endPage = totalPages;
-
-                  if (totalPages > 7) {
-                    if (currentPage <= 3) {
-                      endPage = 5;
-                    } else if (currentPage >= totalPages - 2) {
-                      startPage = totalPages - 4;
-                    } else {
-                      startPage = currentPage - 2;
-                      endPage = currentPage + 2;
-                    }
-                  }
-
-                  if (startPage > 1) {
-                    items.push(
-                      <PaginationItem key={1}>
-                        <PaginationLink
-                          href="#"
-                          onClick={(e) => {
-                            e.preventDefault();
-                            setCurrentPage(1);
-                          }}
-                          isActive={currentPage === 1}
-                        >
-                          1
-                        </PaginationLink>
-                      </PaginationItem>,
-                    );
-
-                    if (startPage > 2) {
-                      items.push(
-                        <PaginationItem key="ellipsis-start">
-                          <PaginationEllipsis />
-                        </PaginationItem>,
-                      );
-                    }
-                  }
-
-                  for (let i = startPage; i <= endPage; i++) {
-                    items.push(
-                      <PaginationItem key={i}>
-                        <PaginationLink
-                          href="#"
-                          onClick={(e) => {
-                            e.preventDefault();
-                            setCurrentPage(i);
-                          }}
-                          isActive={currentPage === i}
-                        >
-                          {i}
-                        </PaginationLink>
-                      </PaginationItem>,
-                    );
-                  }
-
-                  if (endPage < totalPages) {
-                    if (endPage < totalPages - 1) {
-                      items.push(
-                        <PaginationItem key="ellipsis-end">
-                          <PaginationEllipsis />
-                        </PaginationItem>,
-                      );
-                    }
-
-                    items.push(
-                      <PaginationItem key={totalPages}>
-                        <PaginationLink
-                          href="#"
-                          onClick={(e) => {
-                            e.preventDefault();
-                            setCurrentPage(totalPages);
-                          }}
-                          isActive={currentPage === totalPages}
-                        >
-                          {totalPages}
-                        </PaginationLink>
-                      </PaginationItem>,
-                    );
-                  }
-
-                  return items;
-                })()}
-
-                <PaginationItem>
-                  <PaginationNext
-                    href="#"
-                    onClick={(e) => {
-                      e.preventDefault();
-                      setCurrentPage(Math.min(totalPages, currentPage + 1));
-                    }}
-                    className={
-                      currentPage === totalPages
-                        ? "pointer-events-none opacity-50"
-                        : "cursor-pointer"
-                    }
-                  />
-                </PaginationItem>
-              </PaginationContent>
-            </Pagination>
-          )}
-
-          {filteredModels.length > 0 && (
-            <div className="flex items-center justify-center mt-4 text-sm text-gray-600">
-              Showing {startIndex + 1}-{Math.min(endIndex, totalItems)} of{" "}
-              {totalItems} models
-            </div>
-          )}
+          <TablePagination
+            itemName="models"
+            itemsPerPage={itemsPerPage}
+            currentPage={currentPage}
+            onPageChange={setCurrentPage}
+            totalItems={rawModelsData?.total_count || 0}
+          />
         </>
       )}
 

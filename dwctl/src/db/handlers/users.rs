@@ -329,6 +329,17 @@ impl<'c> Users<'c> {
         Self { db }
     }
 
+    #[instrument(skip(self), err)]
+    pub async fn count(&mut self) -> Result<i64> {
+        // Note: This query counts the number of users excluding the admin user.
+        // It will likely need to filter by organization etc in future
+        let count = sqlx::query_scalar!("SELECT COUNT(*) FROM users WHERE id != '00000000-0000-0000-0000-000000000000'")
+            .fetch_one(&mut *self.db)
+            .await?;
+
+        Ok(count.unwrap_or(0))
+    }
+
     #[instrument(skip(self, email), err)]
     pub async fn get_user_by_email(&mut self, email: &str) -> Result<Option<UserDBResponse>> {
         let user = sqlx::query_as!(

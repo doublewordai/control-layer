@@ -2,6 +2,7 @@
 
 use crate::api::models::deployments::DeployedModelResponse;
 use crate::api::models::groups::{GroupCreate, GroupResponse, GroupUpdate, ListGroupsQuery};
+use crate::api::models::pagination::PaginatedResponse;
 use crate::api::models::users::{CurrentUser, UserResponse};
 use crate::auth::permissions::{can_read_all_resources, can_read_own_resource, operation, resource, RequiresPermission};
 use crate::db::handlers::{groups::GroupFilter, Deployments, Groups, Repository, Users};
@@ -44,16 +45,20 @@ pub async fn list_groups(
     State(state): State<AppState>,
     Query(query): Query<ListGroupsQuery>,
     _: RequiresPermission<resource::Groups, operation::ReadAll>,
-) -> Result<Json<Vec<GroupResponse>>> {
+) -> Result<Json<PaginatedResponse<GroupResponse>>> {
     let mut tx = state.db.begin().await.map_err(|e| Error::Database(e.into()))?;
 
     let groups;
+    let total_count;
+    let skip;
+    let limit;
     {
         let mut repo = Groups::new(tx.acquire().await.map_err(|e| Error::Database(e.into()))?);
-        let skip = query.pagination.skip();
-        let limit = query.pagination.limit();
+        skip = query.pagination.skip();
+        limit = query.pagination.limit();
 
         groups = repo.list(&GroupFilter::new(skip, limit)).await?;
+        total_count = repo.count().await?;
     }
 
     // Parse include parameter
@@ -159,7 +164,8 @@ pub async fn list_groups(
     // Commit the transaction to ensure all reads were atomic
     tx.commit().await.map_err(|e| Error::Database(e.into()))?;
 
-    Ok(Json(response_groups))
+    let paginated_response = PaginatedResponse::new(response_groups, total_count, skip, limit);
+    Ok(Json(paginated_response))
 }
 
 #[utoipa::path(

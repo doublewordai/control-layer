@@ -462,8 +462,8 @@ export interface RerankResponse {
 
 // Query parameters for backend API
 export interface ListRequestsQuery {
+  skip?: number;
   limit?: number;
-  offset?: number;
   method?: string;
   uri_pattern?: string;
   status_code?: number;
@@ -478,8 +478,8 @@ export interface ListRequestsQuery {
 
 // Validation schemas
 export const listRequestsQuerySchema = z.object({
+  skip: z.number().min(0).optional(),
   limit: z.number().min(1).max(1000).optional(),
-  offset: z.number().min(0).optional(),
   method: z.string().optional(),
   uri_pattern: z.string().optional(),
   status_code: z.number().optional(),
@@ -632,7 +632,7 @@ export interface TransactionsListResponse {
   transactions: Transaction[];
   total: number;
   limit: number;
-  offset: number;
+  skip: number;
 }
 
 export interface TransactionsQuery {

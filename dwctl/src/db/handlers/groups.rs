@@ -195,6 +195,13 @@ impl<'c> Groups<'c> {
         Self { db }
     }
 
+    #[instrument(skip(self), err)]
+    pub async fn count(&mut self) -> Result<i64> {
+        let count = sqlx::query_scalar!("SELECT COUNT(*) FROM groups").fetch_one(&mut *self.db).await?;
+
+        Ok(count.unwrap_or(0))
+    }
+
     #[instrument(skip(self), fields(user_id = %abbrev_uuid(&user_id), group_id = %abbrev_uuid(&group_id)), err)]
     pub async fn add_user_to_group(&mut self, user_id: UserId, group_id: GroupId) -> Result<()> {
         match sqlx::query!(
@@ -309,8 +316,8 @@ impl<'c> Groups<'c> {
     #[instrument(skip(self), fields(group_id = %abbrev_uuid(&group_id)), err)]
     pub async fn get_group_deployments(&mut self, group_id: GroupId) -> Result<Vec<DeploymentId>> {
         let deployments = sqlx::query!(
-            "SELECT dg.deployment_id FROM deployment_groups dg 
-             JOIN deployed_models dm ON dg.deployment_id = dm.id 
+            "SELECT dg.deployment_id FROM deployment_groups dg
+             JOIN deployed_models dm ON dg.deployment_id = dm.id
              WHERE dg.group_id = $1 AND dm.deleted = false",
             group_id
         )
