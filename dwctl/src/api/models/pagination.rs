@@ -242,7 +242,7 @@ mod tests {
 
     #[test]
     fn test_pagination_deserialization_from_query_string() {
-        // Test that query strings with string values deserialize correctly
+        // Test that query string values deserialize correctly
         let query = "skip=10&limit=25";
         let p: Pagination = serde_urlencoded::from_str(query).unwrap();
         assert_eq!(p.skip(), 10);
