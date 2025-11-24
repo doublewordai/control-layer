@@ -291,13 +291,17 @@ pub async fn validate_inference_endpoint(
             (parsed_url, api_key, auth_header_name, auth_header_prefix)
         }
         InferenceEndpointValidate::Existing { endpoint_id } => {
-            let mut conn = state.db.acquire().await.map_err(|e| Error::Database(e.into()))?;
-            let mut endpoints_repo = InferenceEndpoints::new(&mut conn);
-            let endpoint = endpoints_repo.get_by_id(endpoint_id).await?;
-            let endpoint = endpoint.ok_or_else(|| Error::NotFound {
-                resource: "Endpoint".to_string(),
-                id: endpoint_id.to_string(),
-            })?;
+            // Scope the connection acquisition to release it before making HTTP request
+            let endpoint = {
+                let mut conn = state.db.acquire().await.map_err(|e| Error::Database(e.into()))?;
+                let mut endpoints_repo = InferenceEndpoints::new(&mut conn);
+                let endpoint = endpoints_repo.get_by_id(endpoint_id).await?;
+                endpoint.ok_or_else(|| Error::NotFound {
+                    resource: "Endpoint".to_string(),
+                    id: endpoint_id.to_string(),
+                })?
+            }; // Connection is released here before HTTP call
+
             (
                 endpoint.url,
                 endpoint.api_key,
@@ -1515,6 +1519,31 @@ mod tests {
     #[sqlx::test]
     #[test_log::test]
     async fn test_validation_permission_requirements(pool: PgPool) {
+        use wiremock::{
+            matchers::{method, path},
+            Mock, MockServer, ResponseTemplate,
+        };
+
+        // Start mock HTTP server for endpoint validation
+        let mock_server = MockServer::start().await;
+
+        // Mock the /v1/models endpoint to return a valid OpenAI-style response
+        Mock::given(method("GET"))
+            .and(path("/v1/models"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "object": "list",
+                "data": [
+                    {
+                        "id": "gpt-4",
+                        "object": "model",
+                        "created": 1687882411,
+                        "owned_by": "openai"
+                    }
+                ]
+            })))
+            .mount(&mock_server)
+            .await;
+
         let (app, _bg_services) = create_test_app(pool.clone(), false).await;
         let platform_manager = create_test_admin_user(&pool, Role::PlatformManager).await;
         let standard_user = create_test_user(&pool, Role::StandardUser).await;
@@ -1523,7 +1552,7 @@ mod tests {
         // Create an endpoint for testing existing validation
         let create_request = json!({
             "name": "Validation Test Endpoint",
-            "url": "https://api.validation.com/v1",
+            "url": format!("{}/v1", mock_server.uri()),
             "api_key": "test-key"
         });
 
@@ -1540,7 +1569,7 @@ mod tests {
         // Test new endpoint validation permissions
         let validate_new = json!({
             "type": "new",
-            "url": "https://api.test.com/v1",
+            "url": format!("{}/v1", mock_server.uri()),
             "api_key": "test-key"
         });
 
