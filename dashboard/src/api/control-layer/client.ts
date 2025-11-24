@@ -411,7 +411,7 @@ const endpointApi = {
 };
 
 const groupApi = {
-  async list(options?: GroupsQuery): Promise<Group[]> {
+  async list(options?: GroupsQuery): Promise<PaginatedResponse<Group>> {
     const params = new URLSearchParams();
     if (options?.include) params.set("include", options.include);
     if (options?.skip !== undefined) {

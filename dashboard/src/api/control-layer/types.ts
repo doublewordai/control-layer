@@ -87,6 +87,8 @@ export interface Endpoint {
   updated_at: string; // ISO 8601 timestamp
   requires_api_key: boolean; // Whether this endpoint requires an API key
   model_filter?: string[] | null; // Optional list of models to sync
+  auth_header_name: string;
+  auth_header_prefix: string;
 }
 
 export interface EndpointSyncResponse {

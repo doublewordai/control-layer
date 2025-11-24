@@ -1,4 +1,4 @@
-import React, { useState, useRef, useEffect, useMemo } from "react";
+import React, { useState, useRef, useEffect } from "react";
 import { useSearchParams, useNavigate } from "react-router-dom";
 import { Users, UserPlus, Search, X, Trash2 } from "lucide-react";
 import {
@@ -61,6 +61,7 @@ const UsersGroups: React.FC = () => {
   const navigate = useNavigate();
   const { isFeatureEnabled } = useSettings();
   const [userPage, setUserPage] = useState<number>(1);
+  const [groupPage, setGroupPage] = useState<number>(1);
   const [itemsPerPage] = useState(12);
 
   // Get tab from URL or default to "users"
@@ -102,6 +103,8 @@ const UsersGroups: React.FC = () => {
     error: groupsError,
   } = useGroups({
     include: "users",
+    skip: (groupPage - 1) * itemsPerPage,
+    limit: itemsPerPage,
   });
 
   const loading = usersLoading || groupsLoading;
@@ -195,24 +198,20 @@ const UsersGroups: React.FC = () => {
   };
 
   // Transform API data
-  const users: DisplayUser[] = useMemo(
-    () =>
-      usersData
-        ? usersData.data.map((user) => ({
-            ...user,
-            name: user.display_name || user.username,
-            avatar: user.avatar_url || "",
-            isAdmin: user.is_admin ?? false,
-            groupNames: user.groups
-              ? user.groups.map((group: BackendGroup) => group.name)
-              : [],
-          }))
-        : [],
-    [usersData],
-  );
+  const users: DisplayUser[] = usersData
+    ? usersData.data.map((user) => ({
+        ...user,
+        name: user.display_name || user.username,
+        avatar: user.avatar_url || "",
+        isAdmin: user.is_admin ?? false,
+        groupNames: user.groups
+          ? user.groups.map((group: BackendGroup) => group.name)
+          : [],
+      }))
+    : [];
 
   const groups: DisplayGroup[] = groupsData
-    ? groupsData.map((group: BackendGroup) => ({
+    ? groupsData.data.map((group: BackendGroup) => ({
         ...group, // Keep all backend fields
         memberCount: group.users ? group.users.length : 0,
         memberIds: group.users ? group.users.map((user) => user.id) : [],
@@ -534,6 +533,13 @@ const UsersGroups: React.FC = () => {
                 </div>
               );
             })}
+            <TablePagination
+              itemName="group"
+              itemsPerPage={itemsPerPage}
+              currentPage={groupPage}
+              onPageChange={setGroupPage}
+              totalItems={groupsData?.total_count || 0}
+            />
           </div>
         )}
       </div>

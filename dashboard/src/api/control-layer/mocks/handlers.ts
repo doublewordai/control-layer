@@ -301,6 +301,8 @@ export const handlers = [
   http.get("/admin/api/v1/users", ({ request }) => {
     const url = new URL(request.url);
     const include = url.searchParams.get("include");
+    const skip = parseInt(url.searchParams.get("skip") || "0");
+    const limit = parseInt(url.searchParams.get("limit") || "10");
 
     let users = [...usersData];
 
@@ -314,7 +316,15 @@ export const handlers = [
       }));
     }
 
-    return HttpResponse.json(users);
+    const totalCount = users.length;
+    const paginatedUsers = users.slice(skip, skip + limit);
+
+    return HttpResponse.json({
+      data: paginatedUsers,
+      total_count: totalCount,
+      skip,
+      limit,
+    });
   }),
 
   http.get("/admin/api/v1/users/:id", ({ params, request }) => {
@@ -751,6 +761,8 @@ export const handlers = [
   http.get("/admin/api/v1/groups", ({ request }) => {
     const url = new URL(request.url);
     const include = url.searchParams.get("include");
+    const skip = parseInt(url.searchParams.get("skip") || "0");
+    const limit = parseInt(url.searchParams.get("limit") || "10");
 
     let groups: Group[] = [...groupsData];
 
@@ -775,7 +787,15 @@ export const handlers = [
       }));
     }
 
-    return HttpResponse.json(groups);
+    const totalCount = groups.length;
+    const paginatedGroups = groups.slice(skip, skip + limit);
+
+    return HttpResponse.json({
+      data: paginatedGroups,
+      total_count: totalCount,
+      skip,
+      limit,
+    });
   }),
 
   http.get("/admin/api/v1/groups/:id", ({ params }) => {
