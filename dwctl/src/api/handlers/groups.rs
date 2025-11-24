@@ -659,7 +659,7 @@ mod tests {
     use std::collections::HashSet;
 
     use crate::{
-        api::models::{groups::GroupResponse, users::Role},
+        api::models::{groups::GroupResponse, pagination::PaginatedResponse, users::Role},
         db::{
             handlers::{Deployments, Groups, Repository},
             models::{deployments::DeploymentCreateDBRequest, groups::GroupCreateDBRequest},
@@ -697,8 +697,9 @@ mod tests {
             .await;
 
         response.assert_status_ok();
-        let groups: Vec<GroupResponse> = response.json();
-        assert_eq!(groups.len(), 3);
+        let paginated_response: PaginatedResponse<GroupResponse> = response.json();
+        assert_eq!(paginated_response.data.len(), 3);
+        assert_eq!(paginated_response.limit, 3);
 
         // Test with skip and limit
         let response = app
@@ -708,8 +709,10 @@ mod tests {
             .await;
 
         response.assert_status_ok();
-        let groups: Vec<GroupResponse> = response.json();
-        assert_eq!(groups.len(), 2);
+        let paginated_response: PaginatedResponse<GroupResponse> = response.json();
+        assert_eq!(paginated_response.data.len(), 2);
+        assert_eq!(paginated_response.skip, 2);
+        assert_eq!(paginated_response.limit, 2);
 
         // Test skip beyond available groups
         let response = app
@@ -719,8 +722,8 @@ mod tests {
             .await;
 
         response.assert_status_ok();
-        let groups: Vec<GroupResponse> = response.json();
-        assert!(groups.is_empty());
+        let paginated_response: PaginatedResponse<GroupResponse> = response.json();
+        assert!(paginated_response.data.is_empty());
 
         // Test default pagination values (no params)
         let response = app
@@ -730,8 +733,8 @@ mod tests {
             .await;
 
         response.assert_status_ok();
-        let groups: Vec<GroupResponse> = response.json();
-        assert_eq!(groups.len(), 6); // Should return all 6 groups (5 test groups + Everyone group)
+        let paginated_response: PaginatedResponse<GroupResponse> = response.json();
+        assert_eq!(paginated_response.data.len(), 6); // Should return all 6 groups (5 test groups + Everyone group)
     }
 
     #[sqlx::test]
@@ -1296,8 +1299,8 @@ mod tests {
             .await;
 
         response.assert_status_ok();
-        let groups: Vec<GroupResponse> = response.json();
-        let found_group = groups.iter().find(|g| g.id == group.id).expect("Group not found");
+        let paginated_response: PaginatedResponse<GroupResponse> = response.json();
+        let found_group = paginated_response.data.iter().find(|g| g.id == group.id).expect("Group not found");
         assert!(found_group.users.is_none());
         assert!(found_group.models.is_none());
 
@@ -1309,8 +1312,8 @@ mod tests {
             .await;
 
         response.assert_status_ok();
-        let groups: Vec<GroupResponse> = response.json();
-        let found_group = groups.iter().find(|g| g.id == group.id).expect("Group not found");
+        let paginated_response: PaginatedResponse<GroupResponse> = response.json();
+        let found_group = paginated_response.data.iter().find(|g| g.id == group.id).expect("Group not found");
         assert!(found_group.users.is_some());
         assert!(found_group.models.is_none());
         let users = found_group.users.as_ref().unwrap().iter().map(|x| x.id).collect::<HashSet<_>>();
@@ -1324,8 +1327,8 @@ mod tests {
             .await;
 
         response.assert_status_ok();
-        let groups: Vec<GroupResponse> = response.json();
-        let found_group = groups.iter().find(|g| g.id == group.id).expect("Group not found");
+        let paginated_response: PaginatedResponse<GroupResponse> = response.json();
+        let found_group = paginated_response.data.iter().find(|g| g.id == group.id).expect("Group not found");
         assert!(found_group.users.is_none());
         assert!(found_group.models.is_some());
         let models = found_group.models.as_ref().unwrap().iter().map(|x| x.id).collect::<HashSet<_>>();
@@ -1339,8 +1342,8 @@ mod tests {
             .await;
 
         response.assert_status_ok();
-        let groups: Vec<GroupResponse> = response.json();
-        let found_group = groups.iter().find(|g| g.id == group.id).expect("Group not found");
+        let paginated_response: PaginatedResponse<GroupResponse> = response.json();
+        let found_group = paginated_response.data.iter().find(|g| g.id == group.id).expect("Group not found");
         assert!(found_group.users.is_some());
         assert!(found_group.models.is_some());
         let users = found_group.users.as_ref().unwrap().iter().map(|x| x.id).collect::<HashSet<_>>();
@@ -1356,8 +1359,8 @@ mod tests {
             .await;
 
         response.assert_status_ok();
-        let groups: Vec<GroupResponse> = response.json();
-        let found_group = groups.iter().find(|g| g.id == group.id).expect("Group not found");
+        let paginated_response: PaginatedResponse<GroupResponse> = response.json();
+        let found_group = paginated_response.data.iter().find(|g| g.id == group.id).expect("Group not found");
         assert!(found_group.users.is_some());
         assert!(found_group.models.is_some());
     }
