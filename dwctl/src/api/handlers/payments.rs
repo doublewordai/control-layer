@@ -33,8 +33,8 @@ pub async fn create_payment(
     user: CurrentUser,
 ) -> Result<Response, StatusCode> {
     // Get payment provider from config (generic - works for any provider)
-    let provider = match state.config.payment.clone() {
-        Some(payment_config) => payment_providers::create_provider(payment_config),
+    let payment_config = match state.config.payment.clone() {
+        Some(config) => config,
         None => {
             tracing::warn!("Checkout requested but no payment provider is configured");
             let error_response = Json(json!({
@@ -45,33 +45,43 @@ pub async fn create_payment(
         }
     };
 
-    // Build redirect URLs from request origin
-    let origin = headers
-        .get(header::ORIGIN)
-        .or_else(|| headers.get(header::REFERER))
-        .and_then(|h| h.to_str().ok())
-        .and_then(|s| {
-            // If it's a referer, extract just the origin part
-            if let Ok(url) = url::Url::parse(s) {
-                url.origin().ascii_serialization().into()
-            } else {
-                Some(s.to_string())
-            }
-        })
-        .unwrap_or_else(|| {
-            // Fallback to constructing from Host header
-            let host = headers.get(header::HOST).and_then(|h| h.to_str().ok()).unwrap_or("localhost:3001");
+    // Build redirect URLs from configured host URL (preferred) or fallback to request headers
+    let origin = if let Some(configured_host) = payment_config.host_url() {
+        // Use configured host URL - this is the reliable, recommended approach
+        tracing::info!("Using configured host URL for checkout redirect: {}", configured_host);
+        configured_host.to_string()
+    } else {
+        // Fallback to reading from request headers (less reliable)
+        tracing::warn!("No host_url configured in payment config, falling back to request headers (unreliable)");
+        headers
+            .get(header::ORIGIN)
+            .or_else(|| headers.get(header::REFERER))
+            .and_then(|h| h.to_str().ok())
+            .and_then(|s| {
+                // If it's a referer, extract just the origin part
+                if let Ok(url) = url::Url::parse(s) {
+                    url.origin().ascii_serialization().into()
+                } else {
+                    Some(s.to_string())
+                }
+            })
+            .unwrap_or_else(|| {
+                // Fallback to constructing from Host header
+                let host = headers.get(header::HOST).and_then(|h| h.to_str().ok()).unwrap_or("localhost:3001");
 
-            // Determine protocol - check X-Forwarded-Proto for proxied requests
-            let proto = headers.get("x-forwarded-proto").and_then(|h| h.to_str().ok()).unwrap_or("http");
+                // Determine protocol - check X-Forwarded-Proto for proxied requests
+                let proto = headers.get("x-forwarded-proto").and_then(|h| h.to_str().ok()).unwrap_or("http");
 
-            format!("{}://{}", proto, host)
-        });
+                format!("{}://{}", proto, host)
+            })
+    };
 
     let success_url = format!("{}/cost-management?payment=success&session_id={{CHECKOUT_SESSION_ID}}", origin);
     let cancel_url = format!("{}/cost-management?payment=cancelled&session_id={{CHECKOUT_SESSION_ID}}", origin);
 
     tracing::info!("Building checkout URLs with origin: {}", origin);
+
+    let provider = payment_providers::create_provider(payment_config);
 
     // Create checkout session using the provider trait
     let checkout_url = provider

@@ -310,11 +310,23 @@ pub enum PaymentConfig {
     /// - `DWCTL_PAYMENT__STRIPE__API_KEY` - Stripe secret API key
     /// - `DWCTL_PAYMENT__STRIPE__WEBHOOK_SECRET` - Webhook signing secret
     /// - `DWCTL_PAYMENT__STRIPE__PRICE_ID` - Price ID for the payment product
+    /// - `DWCTL_PAYMENT__STRIPE__HOST_URL` - Base URL for redirect URLs (e.g., "https://app.example.com")
     Stripe(StripeConfig),
     /// Dummy payment provider for testing
     /// Set configuration via:
     /// - `DWCTL_PAYMENT__DUMMY__AMOUNT` - Amount to add (defaults to $50)
+    /// - `DWCTL_PAYMENT__DUMMY__HOST_URL` - Base URL for redirect URLs (e.g., "https://app.example.com")
     Dummy(DummyConfig),
+}
+
+impl PaymentConfig {
+    /// Get the host URL configured for this payment provider
+    pub fn host_url(&self) -> Option<&str> {
+        match self {
+            PaymentConfig::Stripe(config) => Some(&config.host_url),
+            PaymentConfig::Dummy(config) => config.host_url.as_deref(),
+        }
+    }
 }
 
 /// Stripe payment configuration.
@@ -326,6 +338,9 @@ pub struct StripeConfig {
     pub webhook_secret: String,
     /// Stripe price ID for the payment (starts with price_)
     pub price_id: String,
+    /// Base URL for redirect URLs (e.g., "https://app.example.com")
+    /// This is used to construct success/cancel URLs for checkout sessions
+    pub host_url: String,
 }
 
 /// Dummy payment configuration for testing.
@@ -334,6 +349,10 @@ pub struct DummyConfig {
     /// Amount to add in dollars (defaults to $50)
     #[serde(default)]
     pub amount: Option<rust_decimal::Decimal>,
+    /// Base URL for redirect URLs (e.g., "https://app.example.com")
+    /// This is used to construct success/cancel URLs for checkout sessions
+    #[serde(default)]
+    pub host_url: Option<String>,
 }
 
 /// Frontend metadata displayed in the UI.
