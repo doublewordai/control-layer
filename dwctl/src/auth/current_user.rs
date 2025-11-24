@@ -74,6 +74,7 @@ async fn try_jwt_session_auth(
                     roles: user.roles,
                     display_name: user.display_name,
                     avatar_url: user.avatar_url,
+                    payment_provider_id: user.payment_provider_id
                 }));
             }
         }

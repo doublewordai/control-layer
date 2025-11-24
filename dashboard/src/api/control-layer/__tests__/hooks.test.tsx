@@ -291,7 +291,12 @@ describe("User Hooks", () => {
 
     it("should invalidate all user queries when creating a user", async () => {
       const queryClient = new QueryClient({
-        defaultOptions: { queries: { retry: false } },
+        defaultOptions: {
+          queries: {
+            retry: false,
+            staleTime: 0, // Override any staleTime set in hooks
+          },
+        },
       });
 
       const wrapper = ({ children }: { children: ReactNode }) => (
@@ -317,11 +322,8 @@ describe("User Hooks", () => {
         expect(userResult.current.isSuccess).toBe(true);
       });
 
-      // Mark queries as stale to test invalidation
-      const queries = queryClient.getQueryCache().getAll();
-      queries.forEach((query) => {
-        query.state.dataUpdatedAt = Date.now() - 10000; // 10 seconds ago
-      });
+      // Spy on invalidateQueries to verify it's called correctly
+      const invalidateQueriesSpy = vi.spyOn(queryClient, "invalidateQueries");
 
       // Create a new user
       const { result: createResult } = renderHook(() => useCreateUser(), {
@@ -339,15 +341,12 @@ describe("User Hooks", () => {
         expect(createResult.current.isSuccess).toBe(true);
       });
 
-      // All user queries should be marked as stale/invalid
-      const updatedQueries = queryClient.getQueryCache().getAll();
-      const userQueries = updatedQueries.filter(
-        (q) => q.queryKey[0] === "users",
-      );
-
-      // Check that queries are marked as stale due to invalidation
-      userQueries.forEach((query) => {
-        expect(query.isStale()).toBe(true);
+      // Verify that invalidateQueries was called with the correct keys
+      expect(invalidateQueriesSpy).toHaveBeenCalledWith({
+        queryKey: ["users"],
+      });
+      expect(invalidateQueriesSpy).toHaveBeenCalledWith({
+        queryKey: ["groups"],
       });
     });
 
