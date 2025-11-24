@@ -61,7 +61,6 @@ const UsersGroups: React.FC = () => {
   const navigate = useNavigate();
   const { isFeatureEnabled } = useSettings();
   const [userPage, setUserPage] = useState<number>(1);
-  const [groupPage, setGroupPage] = useState<number>(1);
   const [itemsPerPage] = useState(12);
 
   // Get tab from URL or default to "users"
@@ -103,8 +102,6 @@ const UsersGroups: React.FC = () => {
     error: groupsError,
   } = useGroups({
     include: "users",
-    skip: (groupPage - 1) * itemsPerPage,
-    limit: itemsPerPage,
   });
 
   const loading = usersLoading || groupsLoading;
@@ -537,13 +534,6 @@ const UsersGroups: React.FC = () => {
                 </div>
               );
             })}
-            <TablePagination
-              itemName="groups"
-              itemsPerPage={itemsPerPage}
-              currentPage={groupPage}
-              onPageChange={setGroupPage}
-              totalItems={groupsData?.total_count || 0}
-            />
           </div>
         )}
       </div>
