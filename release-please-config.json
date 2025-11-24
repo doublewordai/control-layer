@@ -13,5 +13,6 @@
       "type": "cargo-workspace"
     }
   ],
-  "include-component-in-tag": false
+  "include-component-in-tag": false,
+  "separate-pull-requests": false
 }
