@@ -12,9 +12,9 @@ use anyhow::anyhow;
 use async_trait::async_trait;
 use chrono::Utc;
 use futures::stream::Stream;
-use sqlx::postgres::{PgListener, PgPool};
 use sqlx::Row;
-use tokio::sync::{mpsc, Mutex};
+use sqlx::postgres::{PgListener, PgPool};
+use tokio::sync::{Mutex, mpsc};
 use tokio::task::JoinHandle;
 use tokio_stream::wrappers::ReceiverStream;
 use uuid::Uuid;
@@ -195,27 +195,25 @@ impl<H: HttpClient + 'static> PostgresRequestManager<H> {
         }
 
         // Check if file has an expiration date and it has passed
-        if let Some(expires_at) = file.expires_at {
-            if Utc::now() > expires_at {
-                // Mark as expired in the database
-                sqlx::query!(
-                    r#"
-                    UPDATE files
-                    SET status = 'expired'
-                    WHERE id = $1 AND status = 'processed'
-                    "#,
-                    *file.id as Uuid,
-                )
-                .execute(&self.pool)
-                .await
-                .map_err(|e| {
-                    FusilladeError::Other(anyhow!("Failed to mark file as expired: {}", e))
-                })?;
+        if let Some(expires_at) = file.expires_at
+            && Utc::now() > expires_at
+        {
+            // Mark as expired in the database
+            sqlx::query!(
+                r#"
+                UPDATE files
+                SET status = 'expired'
+                WHERE id = $1 AND status = 'processed'
+                "#,
+                *file.id as Uuid,
+            )
+            .execute(&self.pool)
+            .await
+            .map_err(|e| FusilladeError::Other(anyhow!("Failed to mark file as expired: {}", e)))?;
 
-                // Update the in-memory file object
-                file.status = crate::batch::FileStatus::Expired;
-                return Ok(true);
-            }
+            // Update the in-memory file object
+            file.status = crate::batch::FileStatus::Expired;
+            return Ok(true);
         }
 
         Ok(false)
@@ -733,9 +731,9 @@ impl<H: HttpClient + 'static> Storage for PostgresRequestManager<H> {
 
                     // CASE 1: Filename arrives AFTER stub was created with auto-generated name
                     // We need to check uniqueness now before continuing to stream templates
-                    if let Some(fid) = file_id 
-                        && let Some(filename) = metadata.filename.as_ref() 
-                        && !uniqueness_checked_for_final_filename 
+                    if let Some(_fid) = file_id
+                        && let Some(_filename) = metadata.filename.as_ref()
+                        && !uniqueness_checked_for_final_filename
                     {
                         let final_filename = metadata.filename.as_ref().unwrap();
 
@@ -819,13 +817,13 @@ impl<H: HttpClient + 'static> Storage for PostgresRequestManager<H> {
                         .await
                         .map_err(|e| {
                             // Database constraint catches duplicates (filename scoped by uploaded_by)
-                            if let sqlx::Error::Database(db_err) = &e {
-                                if db_err.code().as_deref() == Some("23505") {
-                                    return FusilladeError::ValidationError(format!(
-                                        "A file with the name '{}' already exists",
-                                        name
-                                    ));
-                                }
+                            if let sqlx::Error::Database(db_err) = &e
+                                && db_err.code().as_deref() == Some("23505")
+                            {
+                                return FusilladeError::ValidationError(format!(
+                                    "A file with the name '{}' already exists",
+                                    name
+                                ));
                             }
                             FusilladeError::Other(anyhow!("Failed to create file: {}", e))
                         })?;
@@ -881,7 +879,7 @@ impl<H: HttpClient + 'static> Storage for PostgresRequestManager<H> {
                 .clone()
                 .unwrap_or_else(|| format!("file_{}", uuid::Uuid::new_v4()));
 
-            let created_file_id = sqlx::query_scalar!(
+            sqlx::query_scalar!(
                 r#"
                 INSERT INTO files (name, uploaded_by)
                 VALUES ($1, $2)
@@ -894,18 +892,16 @@ impl<H: HttpClient + 'static> Storage for PostgresRequestManager<H> {
             .await
             .map_err(|e| {
                 // Database constraint catches duplicates (filename scoped by uploaded_by)
-                if let sqlx::Error::Database(db_err) = &e {
-                    if db_err.code().as_deref() == Some("23505") {
-                        return FusilladeError::ValidationError(format!(
-                            "A file with the name '{}' already exists",
-                            name
-                        ));
-                    }
+                if let sqlx::Error::Database(db_err) = &e
+                    && db_err.code().as_deref() == Some("23505")
+                {
+                    return FusilladeError::ValidationError(format!(
+                        "A file with the name '{}' already exists",
+                        name
+                    ));
                 }
                 FusilladeError::Other(anyhow!("Failed to create file: {}", e))
-            })?;
-
-            created_file_id
+            })?
         };
 
         // Now update the file with all the final metadata
@@ -956,13 +952,12 @@ impl<H: HttpClient + 'static> Storage for PostgresRequestManager<H> {
         .await
         .map_err(|e| {
             // Catch uniqueness violations from the update
-            if let sqlx::Error::Database(db_err) = &e {
-                if db_err.code().as_deref() == Some("23505") {
+            if let sqlx::Error::Database(db_err) = &e
+                && db_err.code().as_deref() == Some("23505") {
                     return FusilladeError::ValidationError(
                         "A file with this name already exists".to_string()
                     );
                 }
-            }
             FusilladeError::Other(anyhow!("Failed to update file metadata: {}", e))
         })?;
 
@@ -1112,7 +1107,7 @@ impl<H: HttpClient + 'static> Storage for PostgresRequestManager<H> {
         };
 
         let mut query_builder = QueryBuilder::new(
-            "SELECT id, name, description, size_bytes, status, error_message, purpose, expires_at, deleted_at, uploaded_by, created_at, updated_at FROM files"
+            "SELECT id, name, description, size_bytes, status, error_message, purpose, expires_at, deleted_at, uploaded_by, created_at, updated_at FROM files",
         );
 
         // Build WHERE clause
@@ -2540,7 +2535,7 @@ impl<H: HttpClient> DaemonStorage for PostgresRequestManager<H> {
                 return Err(FusilladeError::Other(anyhow!(
                     "Unknown daemon status: {}",
                     row.status
-                )))
+                )));
             }
         };
 
