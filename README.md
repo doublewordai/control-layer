@@ -104,6 +104,23 @@ auth:
       cookie_name: "dwctl_session"
       cookie_secure: true
       cookie_same_site: "strict"
+    # Email configuration for password resets and notifications
+    email:
+      # Email transport - either 'file' (for development) or 'smtp' (for production)
+      type: file
+      path: "./emails" # Directory for file-based email (when type=file)
+      # For SMTP (production), use:
+      # type: smtp
+      # host: "smtp.example.com"
+      # port: 587
+      # username: "noreply@example.com"
+      # password: "your-smtp-password"
+      # use_tls: true
+      from_email: "noreply@example.com"
+      from_name: "Control Layer"
+      password_reset:
+        token_expiry: "30m" # How long reset tokens are valid
+        base_url: "http://localhost:3001" # Frontend URL for reset links
 
   # Proxy header authentication
   # Accepts user identity from HTTP headers set by an upstream authentication proxy
@@ -256,3 +273,4 @@ credits:
    `openssl rand -base64 32` to generate a secure random key.
 3. Make sure user registration is enabled or disabled, as per your requirements.
 4. Make sure the CORS settings are correct for your frontend.
+5. If using native auth, configure SMTP email transport for password resets (the default `file` transport is only suitable for development/testing). Update `auth.native.email.type` to `smtp` and provide your SMTP credentials.
