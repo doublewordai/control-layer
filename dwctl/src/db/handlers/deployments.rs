@@ -25,6 +25,7 @@ pub struct DeploymentFilter {
     pub deleted: Option<bool>, // None = show all, Some(false) = show non-deleted only, Some(true) = show deleted only
     pub accessible_to: Option<UserId>, // None = show all deployments, Some(user_id) = show only deployments accessible to that user
     pub aliases: Option<Vec<String>>,
+    pub search: Option<String>, // Case-insensitive substring search on alias and model_name
 }
 
 impl DeploymentFilter {
@@ -37,6 +38,7 @@ impl DeploymentFilter {
             deleted: None,       // Default: show all models
             accessible_to: None, // Default: show all deployments
             aliases: None,
+            search: None,
         }
     }
 
@@ -62,6 +64,11 @@ impl DeploymentFilter {
 
     pub fn with_aliases(mut self, aliases: Vec<String>) -> Self {
         self.aliases = Some(aliases);
+        self
+    }
+
+    pub fn with_search(mut self, search: String) -> Self {
+        self.search = Some(search);
         self
     }
 }
@@ -513,6 +520,16 @@ impl<'c> Repository for Deployments<'c> {
             query.push("))");
         }
 
+        // Add search filter if specified (case-insensitive substring match on alias or model_name)
+        if let Some(ref search) = filter.search {
+            let search_pattern = format!("%{}%", search.to_lowercase());
+            query.push(" AND (LOWER(alias) LIKE ");
+            query.push_bind(search_pattern.clone());
+            query.push(" OR LOWER(model_name) LIKE ");
+            query.push_bind(search_pattern);
+            query.push(")");
+        }
+
         // Add ordering and pagination
         query.push(" ORDER BY created_at DESC LIMIT ");
         query.push_bind(filter.limit);
@@ -548,16 +565,16 @@ impl<'c> Deployments<'c> {
         let result = sqlx::query_as!(
             DeploymentAccessInfo,
             r#"
-            SELECT 
-                d.id as deployment_id, 
-                d.alias as deployment_alias, 
+            SELECT
+                d.id as deployment_id,
+                d.alias as deployment_alias,
                 ak.secret as system_api_key
             FROM users u
             JOIN deployment_groups dg ON (
                 dg.group_id IN (
                     SELECT ug.group_id FROM user_groups ug WHERE ug.user_id = u.id
-                    UNION 
-                    SELECT '00000000-0000-0000-0000-000000000000'::uuid 
+                    UNION
+                    SELECT '00000000-0000-0000-0000-000000000000'::uuid
                     WHERE u.id != '00000000-0000-0000-0000-000000000000'
                 )
             )
@@ -573,6 +590,66 @@ impl<'c> Deployments<'c> {
         .await?;
 
         Ok(result)
+    }
+
+    /// Count deployments matching the given filter (without pagination)
+    #[instrument(skip(self, filter), err)]
+    pub async fn count(&mut self, filter: &DeploymentFilter) -> Result<i64> {
+        let mut query = QueryBuilder::new("SELECT COUNT(*) FROM deployed_models WHERE 1=1");
+
+        // Add endpoint filter if specified
+        if let Some(endpoint_id) = filter.endpoint_id {
+            query.push(" AND hosted_on = ");
+            query.push_bind(endpoint_id);
+        }
+
+        // Add status filter if specified
+        if let Some(ref statuses) = filter.statuses {
+            let status_strings: Vec<String> = statuses.iter().map(|s| s.to_db_string().to_string()).collect();
+            query.push(" AND status = ANY(");
+            query.push_bind(status_strings);
+            query.push(")");
+        }
+
+        // Add deleted filter if specified
+        if let Some(deleted) = filter.deleted {
+            query.push(" AND deleted = ");
+            query.push_bind(deleted);
+        }
+
+        // Add aliases filter if specified
+        if let Some(ref aliases) = filter.aliases {
+            if !aliases.is_empty() {
+                query.push(" AND alias = ANY(");
+                query.push_bind(aliases);
+                query.push(")");
+            }
+        }
+
+        // Add accessibility filter if specified
+        if let Some(user_id) = filter.accessible_to {
+            query.push(" AND id IN (");
+            query.push("SELECT dg.deployment_id FROM deployment_groups dg WHERE dg.group_id IN (");
+            query.push("SELECT ug.group_id FROM user_groups ug WHERE ug.user_id = ");
+            query.push_bind(user_id);
+            query.push(" UNION SELECT '00000000-0000-0000-0000-000000000000'::uuid WHERE ");
+            query.push_bind(user_id);
+            query.push(" != '00000000-0000-0000-0000-000000000000'::uuid");
+            query.push("))");
+        }
+
+        // Add search filter if specified (case-insensitive substring match on alias or model_name)
+        if let Some(ref search) = filter.search {
+            let search_pattern = format!("%{}%", search.to_lowercase());
+            query.push(" AND (LOWER(alias) LIKE ");
+            query.push_bind(search_pattern.clone());
+            query.push(" OR LOWER(model_name) LIKE ");
+            query.push_bind(search_pattern);
+            query.push(")");
+        }
+
+        let count: (i64,) = query.build_query_as().fetch_one(&mut *self.db).await?;
+        Ok(count.0)
     }
 }
 

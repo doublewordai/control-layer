@@ -80,6 +80,11 @@ describe("Models Component - Functional Tests", () => {
         ).toBeInTheDocument();
       });
 
+      // Wait for models to load and render
+      await waitFor(() => {
+        expect(screen.getAllByRole("listitem").length).toBeGreaterThan(0);
+      });
+
       // Verify initial state - should show multiple model cards
       const modelCards = screen.getAllByRole("listitem");
       expect(modelCards.length).toBeGreaterThan(0);
@@ -130,6 +135,11 @@ describe("Models Component - Functional Tests", () => {
         ).toBeInTheDocument();
       });
 
+      // Wait for model cards to render
+      await waitFor(() => {
+        expect(screen.getAllByRole("listitem").length).toBeGreaterThan(0);
+      });
+
       // Find first model card and click its playground button
       const modelCards = screen.getAllByRole("listitem");
       expect(modelCards.length).toBeGreaterThan(0);
@@ -158,6 +168,11 @@ describe("Models Component - Functional Tests", () => {
         expect(
           screen.getByRole("heading", { name: /models/i }),
         ).toBeInTheDocument();
+      });
+
+      // Wait for model cards to render
+      await waitFor(() => {
+        expect(screen.getAllByRole("listitem").length).toBeGreaterThan(0);
       });
 
       // Find first model card and click its API button
@@ -205,6 +220,11 @@ describe("Models Component - Functional Tests", () => {
         expect(
           screen.getByRole("heading", { name: /models/i }),
         ).toBeInTheDocument();
+      });
+
+      // Wait for model cards to render
+      await waitFor(() => {
+        expect(screen.getAllByRole("listitem").length).toBeGreaterThan(0);
       });
 
       // Get initial model count
@@ -287,6 +307,11 @@ describe("Models Component - Functional Tests", () => {
         ).toBeInTheDocument();
       });
 
+      // Wait for model cards to render
+      await waitFor(() => {
+        expect(screen.getAllByRole("listitem").length).toBeGreaterThan(0);
+      });
+
       // Find a model card and look for "Add groups" button
       const modelCards = screen.getAllByRole("listitem");
       expect(modelCards.length).toBeGreaterThan(0);
@@ -356,6 +381,11 @@ describe("Models Component - Functional Tests", () => {
         ).toBeInTheDocument();
       });
 
+      // Wait for model cards to render
+      await waitFor(() => {
+        expect(screen.getAllByRole("listitem").length).toBeGreaterThan(0);
+      });
+
       // Verify admin-specific elements are present
       const accessFilter = screen.getByRole("combobox", {
         name: /model access filter/i,
@@ -418,6 +448,11 @@ describe("Models Component - Functional Tests", () => {
         expect(
           screen.getByRole("heading", { name: /models/i }),
         ).toBeInTheDocument();
+      });
+
+      // Wait for model cards to render
+      await waitFor(() => {
+        expect(screen.getAllByRole("listitem").length).toBeGreaterThan(0);
       });
 
       const modelCards = screen.getAllByRole("listitem");

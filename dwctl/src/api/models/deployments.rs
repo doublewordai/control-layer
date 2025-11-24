@@ -1,5 +1,6 @@
 //! API request/response models for model deployments.
 
+use super::pagination::Pagination;
 use crate::api::models::groups::GroupResponse;
 use crate::db::models::deployments::{
     DeploymentDBResponse, ModelType, ProviderPricing, ProviderPricingUpdate, TokenPricing, TokenPricingUpdate,
@@ -12,9 +13,12 @@ use utoipa::{IntoParams, ToSchema};
 use uuid::Uuid;
 
 /// Query parameters for listing deployed models
-/// TODO: Pagination
 #[derive(Debug, Deserialize, IntoParams, ToSchema)]
 pub struct ListModelsQuery {
+    /// Pagination parameters
+    #[serde(flatten)]
+    #[param(inline)]
+    pub pagination: Pagination,
     /// Filter by inference endpoint ID
     #[param(value_type = Option<String>, format = "uuid")]
     #[schema(value_type = Option<String>, format = "uuid")]
@@ -27,6 +31,8 @@ pub struct ListModelsQuery {
     pub inactive: Option<bool>,
     /// Filter to only models the current user can access (defaults to false for admins, true for users)
     pub accessible: Option<bool>,
+    /// Search query to filter models by alias or model_name (case-insensitive substring match)
+    pub search: Option<String>,
 }
 
 /// Query parameters for getting a single deployed model
