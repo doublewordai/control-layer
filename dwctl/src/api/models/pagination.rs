@@ -95,6 +95,7 @@ pub const MAX_CURSOR_LIMIT: i64 = 100;
 /// Used by batch and files APIs following OpenAI's pagination pattern:
 /// - `after`: Cursor ID to start after (exclusive)
 /// - `limit`: Maximum items to return (default: 20, max: 100)
+#[serde_as]
 #[derive(Debug, Default, Deserialize, IntoParams, ToSchema)]
 pub struct CursorPagination {
     /// A cursor for use in pagination. `after` is an object ID that defines your place in the list.
@@ -102,6 +103,7 @@ pub struct CursorPagination {
 
     /// Maximum number of items to return (default: 20, max: 100)
     #[param(default = 20, minimum = 1, maximum = 100)]
+    #[serde_as(as = "Option<DisplayFromStr>")]
     pub limit: Option<i64>,
 }
 
