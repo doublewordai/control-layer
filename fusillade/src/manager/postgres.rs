@@ -743,6 +743,8 @@ impl<H: HttpClient + 'static> Storage for PostgresRequestManager<H> {
                             let uploaded_by = metadata.uploaded_by.as_deref();
 
                             // Check uniqueness outside transaction for speed
+                            // - Fast rejection path for duplicates (no transaction overhead)  
+                            // - DB constraint is still the source of truth (catches races)
                             let exists = sqlx::query_scalar!(
                                 r#"
                                 SELECT EXISTS(
