@@ -452,8 +452,9 @@ pub struct CorsConfig {
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(default)]
 pub struct EmailConfig {
-    /// SMTP server configuration (required for email functionality)
-    pub smtp: Option<SmtpConfig>,
+    /// Email transport method
+    #[serde(flatten)]
+    pub transport: EmailTransportConfig,
     /// Sender email address
     pub from_email: String,
     /// Sender display name
@@ -462,19 +463,28 @@ pub struct EmailConfig {
     pub password_reset: PasswordResetEmailConfig,
 }
 
-/// SMTP server configuration for sending emails.
+/// Email transport configuration - either SMTP or file-based for testing.
 #[derive(Debug, Clone, Deserialize, Serialize)]
-pub struct SmtpConfig {
-    /// SMTP server hostname
-    pub host: String,
-    /// SMTP server port
-    pub port: u16,
-    /// SMTP authentication username
-    pub username: String,
-    /// SMTP authentication password
-    pub password: String,
-    /// Use TLS encryption
-    pub use_tls: bool,
+#[serde(tag = "type", rename_all = "lowercase")]
+pub enum EmailTransportConfig {
+    /// Send emails via SMTP server
+    Smtp {
+        /// SMTP server hostname
+        host: String,
+        /// SMTP server port
+        port: u16,
+        /// SMTP authentication username
+        username: String,
+        /// SMTP authentication password
+        password: String,
+        /// Use TLS encryption
+        use_tls: bool,
+    },
+    /// Write emails to files (for development/testing)
+    File {
+        /// Directory path where email files will be written
+        path: String,
+    },
 }
 
 /// Password reset email configuration.
@@ -886,10 +896,18 @@ impl Default for CorsConfig {
 impl Default for EmailConfig {
     fn default() -> Self {
         Self {
-            smtp: None, // Will use file transport in development
+            transport: EmailTransportConfig::default(),
             from_email: "noreply@example.com".to_string(),
             from_name: "Control Layer".to_string(),
             password_reset: PasswordResetEmailConfig::default(),
+        }
+    }
+}
+
+impl Default for EmailTransportConfig {
+    fn default() -> Self {
+        Self::File {
+            path: "./emails".to_string(),
         }
     }
 }

@@ -39,6 +39,9 @@ pub async fn create_test_app(pool: PgPool, _enable_sync: bool) -> (TestServer, c
 }
 
 pub fn create_test_config() -> crate::config::Config {
+    // Use temp directory for test emails
+    let temp_dir = std::env::temp_dir().join(format!("dwctl-test-emails-{}", std::process::id()));
+
     crate::config::Config {
         database_url: None,
         database: crate::config::DatabaseConfig::External {
@@ -77,6 +80,12 @@ pub fn create_test_config() -> crate::config::Config {
         auth: crate::config::AuthConfig {
             native: NativeAuthConfig {
                 enabled: false,
+                email: crate::config::EmailConfig {
+                    transport: crate::config::EmailTransportConfig::File {
+                        path: temp_dir.to_string_lossy().to_string(),
+                    },
+                    ..Default::default()
+                },
                 ..Default::default()
             },
             proxy_header: ProxyHeaderAuthConfig {
