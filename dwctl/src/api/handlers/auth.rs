@@ -715,4 +715,1140 @@ mod tests {
             "Should have no credit transactions when initial credits is zero"
         );
     }
+
+    #[sqlx::test]
+    async fn test_get_registration_info_enabled(pool: PgPool) {
+        let mut config = create_test_config();
+        config.auth.native.enabled = true;
+        config.auth.native.allow_registration = true;
+
+        let request_manager = std::sync::Arc::new(fusillade::PostgresRequestManager::new(pool.clone()));
+        let state = AppState::builder().db(pool).config(config).request_manager(request_manager).build();
+
+        let app = axum::Router::new()
+            .route("/auth/register-info", axum::routing::get(get_registration_info))
+            .with_state(state);
+
+        let server = TestServer::new(app).unwrap();
+        let response = server.get("/auth/register-info").await;
+
+        response.assert_status(axum::http::StatusCode::OK);
+        let body: RegistrationInfo = response.json();
+        assert!(body.enabled);
+        assert_eq!(body.message, "Registration is enabled");
+    }
+
+    #[sqlx::test]
+    async fn test_get_registration_info_disabled_native_auth(pool: PgPool) {
+        let mut config = create_test_config();
+        config.auth.native.enabled = false;
+        config.auth.native.allow_registration = true;
+
+        let request_manager = std::sync::Arc::new(fusillade::PostgresRequestManager::new(pool.clone()));
+        let state = AppState::builder().db(pool).config(config).request_manager(request_manager).build();
+
+        let app = axum::Router::new()
+            .route("/auth/register-info", axum::routing::get(get_registration_info))
+            .with_state(state);
+
+        let server = TestServer::new(app).unwrap();
+        let response = server.get("/auth/register-info").await;
+
+        response.assert_status(axum::http::StatusCode::OK);
+        let body: RegistrationInfo = response.json();
+        assert!(!body.enabled);
+        assert_eq!(body.message, "Registration is disabled");
+    }
+
+    #[sqlx::test]
+    async fn test_get_registration_info_disabled_allow_registration(pool: PgPool) {
+        let mut config = create_test_config();
+        config.auth.native.enabled = true;
+        config.auth.native.allow_registration = false;
+
+        let request_manager = std::sync::Arc::new(fusillade::PostgresRequestManager::new(pool.clone()));
+        let state = AppState::builder().db(pool).config(config).request_manager(request_manager).build();
+
+        let app = axum::Router::new()
+            .route("/auth/register-info", axum::routing::get(get_registration_info))
+            .with_state(state);
+
+        let server = TestServer::new(app).unwrap();
+        let response = server.get("/auth/register-info").await;
+
+        response.assert_status(axum::http::StatusCode::OK);
+        let body: RegistrationInfo = response.json();
+        assert!(!body.enabled);
+        assert_eq!(body.message, "Registration is disabled");
+    }
+
+    #[sqlx::test]
+    async fn test_get_login_info_enabled(pool: PgPool) {
+        let mut config = create_test_config();
+        config.auth.native.enabled = true;
+
+        let request_manager = std::sync::Arc::new(fusillade::PostgresRequestManager::new(pool.clone()));
+        let state = AppState::builder().db(pool).config(config).request_manager(request_manager).build();
+
+        let app = axum::Router::new()
+            .route("/auth/login-info", axum::routing::get(get_login_info))
+            .with_state(state);
+
+        let server = TestServer::new(app).unwrap();
+        let response = server.get("/auth/login-info").await;
+
+        response.assert_status(axum::http::StatusCode::OK);
+        let body: LoginInfo = response.json();
+        assert!(body.enabled);
+        assert_eq!(body.message, "Native login is enabled");
+    }
+
+    #[sqlx::test]
+    async fn test_get_login_info_disabled(pool: PgPool) {
+        let mut config = create_test_config();
+        config.auth.native.enabled = false;
+
+        let request_manager = std::sync::Arc::new(fusillade::PostgresRequestManager::new(pool.clone()));
+        let state = AppState::builder().db(pool).config(config).request_manager(request_manager).build();
+
+        let app = axum::Router::new()
+            .route("/auth/login-info", axum::routing::get(get_login_info))
+            .with_state(state);
+
+        let server = TestServer::new(app).unwrap();
+        let response = server.get("/auth/login-info").await;
+
+        response.assert_status(axum::http::StatusCode::OK);
+        let body: LoginInfo = response.json();
+        assert!(!body.enabled);
+        assert_eq!(body.message, "Native login is disabled");
+    }
+
+    #[sqlx::test]
+    async fn test_login_success(pool: PgPool) {
+        let mut config = create_test_config();
+        config.auth.native.enabled = true;
+
+        let request_manager = std::sync::Arc::new(fusillade::PostgresRequestManager::new(pool.clone()));
+        let state = AppState::builder()
+            .db(pool.clone())
+            .config(config)
+            .request_manager(request_manager)
+            .build();
+
+        // Create a user using the repository
+        let password_hash = password::hash_string("testpassword").unwrap();
+        let mut conn = pool.acquire().await.unwrap();
+        let mut user_repo = Users::new(&mut conn);
+
+        let user_create = UserCreateDBRequest {
+            username: "loginuser".to_string(),
+            email: "login@example.com".to_string(),
+            display_name: Some("Login User".to_string()),
+            avatar_url: None,
+            is_admin: false,
+            roles: vec![Role::StandardUser],
+            auth_source: "native".to_string(),
+            password_hash: Some(password_hash),
+            external_user_id: None,
+        };
+
+        let created_user = user_repo.create(&user_create).await.unwrap();
+        drop(user_repo);
+        drop(conn);
+
+        let app = axum::Router::new()
+            .route("/auth/login", axum::routing::post(login))
+            .with_state(state);
+
+        let server = TestServer::new(app).unwrap();
+
+        let request = LoginRequest {
+            email: "login@example.com".to_string(),
+            password: "testpassword".to_string(),
+        };
+
+        let response = server.post("/auth/login").json(&request).await;
+
+        response.assert_status(axum::http::StatusCode::OK);
+        assert!(response.headers().get("set-cookie").is_some());
+
+        let body: AuthResponse = response.json();
+        assert_eq!(body.user.email, "login@example.com");
+        assert_eq!(body.user.id, created_user.id);
+        assert_eq!(body.message, "Login successful");
+    }
+
+    #[sqlx::test]
+    async fn test_login_disabled(pool: PgPool) {
+        let mut config = create_test_config();
+        config.auth.native.enabled = false;
+
+        let request_manager = std::sync::Arc::new(fusillade::PostgresRequestManager::new(pool.clone()));
+        let state = AppState::builder().db(pool).config(config).request_manager(request_manager).build();
+
+        let app = axum::Router::new()
+            .route("/auth/login", axum::routing::post(login))
+            .with_state(state);
+
+        let server = TestServer::new(app).unwrap();
+
+        let request = LoginRequest {
+            email: "test@example.com".to_string(),
+            password: "password".to_string(),
+        };
+
+        let response = server.post("/auth/login").json(&request).await;
+        response.assert_status(axum::http::StatusCode::BAD_REQUEST);
+    }
+
+    #[sqlx::test]
+    async fn test_login_invalid_email(pool: PgPool) {
+        let mut config = create_test_config();
+        config.auth.native.enabled = true;
+
+        let request_manager = std::sync::Arc::new(fusillade::PostgresRequestManager::new(pool.clone()));
+        let state = AppState::builder().db(pool).config(config).request_manager(request_manager).build();
+
+        let app = axum::Router::new()
+            .route("/auth/login", axum::routing::post(login))
+            .with_state(state);
+
+        let server = TestServer::new(app).unwrap();
+
+        let request = LoginRequest {
+            email: "nonexistent@example.com".to_string(),
+            password: "password".to_string(),
+        };
+
+        let response = server.post("/auth/login").json(&request).await;
+        response.assert_status(axum::http::StatusCode::UNAUTHORIZED);
+    }
+
+    #[sqlx::test]
+    async fn test_login_invalid_password(pool: PgPool) {
+        let mut config = create_test_config();
+        config.auth.native.enabled = true;
+
+        let request_manager = std::sync::Arc::new(fusillade::PostgresRequestManager::new(pool.clone()));
+        let state = AppState::builder()
+            .db(pool.clone())
+            .config(config)
+            .request_manager(request_manager)
+            .build();
+
+        // Create a user using the repository
+        let password_hash = password::hash_string("correctpassword").unwrap();
+        let mut conn = pool.acquire().await.unwrap();
+        let mut user_repo = Users::new(&mut conn);
+
+        let user_create = UserCreateDBRequest {
+            username: "wrongpwuser".to_string(),
+            email: "wrongpw@example.com".to_string(),
+            display_name: Some("Wrong Password User".to_string()),
+            avatar_url: None,
+            is_admin: false,
+            roles: vec![Role::StandardUser],
+            auth_source: "native".to_string(),
+            password_hash: Some(password_hash),
+            external_user_id: None,
+        };
+
+        user_repo.create(&user_create).await.unwrap();
+        drop(user_repo);
+        drop(conn);
+
+        let app = axum::Router::new()
+            .route("/auth/login", axum::routing::post(login))
+            .with_state(state);
+
+        let server = TestServer::new(app).unwrap();
+
+        let request = LoginRequest {
+            email: "wrongpw@example.com".to_string(),
+            password: "wrongpassword".to_string(),
+        };
+
+        let response = server.post("/auth/login").json(&request).await;
+        response.assert_status(axum::http::StatusCode::UNAUTHORIZED);
+    }
+
+    #[sqlx::test]
+    async fn test_login_user_without_password(pool: PgPool) {
+        let mut config = create_test_config();
+        config.auth.native.enabled = true;
+
+        let request_manager = std::sync::Arc::new(fusillade::PostgresRequestManager::new(pool.clone()));
+        let state = AppState::builder()
+            .db(pool.clone())
+            .config(config)
+            .request_manager(request_manager)
+            .build();
+
+        // Create a user without password_hash (e.g., SSO user)
+        let mut conn = pool.acquire().await.unwrap();
+        let mut user_repo = Users::new(&mut conn);
+
+        let user_create = UserCreateDBRequest {
+            username: "ssouser".to_string(),
+            email: "sso@example.com".to_string(),
+            display_name: Some("SSO User".to_string()),
+            avatar_url: None,
+            is_admin: false,
+            roles: vec![Role::StandardUser],
+            auth_source: "proxy".to_string(),
+            password_hash: None,
+            external_user_id: None,
+        };
+
+        user_repo.create(&user_create).await.unwrap();
+        drop(user_repo);
+        drop(conn);
+
+        let app = axum::Router::new()
+            .route("/auth/login", axum::routing::post(login))
+            .with_state(state);
+
+        let server = TestServer::new(app).unwrap();
+
+        let request = LoginRequest {
+            email: "sso@example.com".to_string(),
+            password: "anypassword".to_string(),
+        };
+
+        let response = server.post("/auth/login").json(&request).await;
+        response.assert_status(axum::http::StatusCode::UNAUTHORIZED);
+    }
+
+    #[sqlx::test]
+    async fn test_logout(pool: PgPool) {
+        let config = create_test_config();
+        let request_manager = std::sync::Arc::new(fusillade::PostgresRequestManager::new(pool.clone()));
+        let state = AppState::builder().db(pool).config(config).request_manager(request_manager).build();
+
+        let app = axum::Router::new()
+            .route("/auth/logout", axum::routing::post(logout))
+            .with_state(state);
+
+        let server = TestServer::new(app).unwrap();
+        let response = server.post("/auth/logout").await;
+
+        response.assert_status(axum::http::StatusCode::OK);
+
+        // Verify cookie is set to expire
+        let cookie_header = response.headers().get("set-cookie");
+        assert!(cookie_header.is_some());
+        let cookie_str = cookie_header.unwrap().to_str().unwrap();
+        assert!(cookie_str.contains("Max-Age=0"));
+
+        let body: AuthSuccessResponse = response.json();
+        assert_eq!(body.message, "Logout successful");
+    }
+
+    #[sqlx::test]
+    async fn test_register_duplicate_email(pool: PgPool) {
+        let mut config = create_test_config();
+        config.auth.native.enabled = true;
+        config.auth.native.allow_registration = true;
+
+        let request_manager = std::sync::Arc::new(fusillade::PostgresRequestManager::new(pool.clone()));
+        let state = AppState::builder()
+            .db(pool.clone())
+            .config(config)
+            .request_manager(request_manager)
+            .build();
+
+        // Create a user first
+        let mut conn = pool.acquire().await.unwrap();
+        let mut user_repo = Users::new(&mut conn);
+
+        let user_create = UserCreateDBRequest {
+            username: "existinguser".to_string(),
+            email: "duplicate@example.com".to_string(),
+            display_name: Some("Existing User".to_string()),
+            avatar_url: None,
+            is_admin: false,
+            roles: vec![Role::StandardUser],
+            auth_source: "native".to_string(),
+            password_hash: Some(password::hash_string("password").unwrap()),
+            external_user_id: None,
+        };
+
+        user_repo.create(&user_create).await.unwrap();
+        drop(user_repo);
+        drop(conn);
+
+        let app = axum::Router::new()
+            .route("/auth/register", axum::routing::post(register))
+            .with_state(state);
+
+        let server = TestServer::new(app).unwrap();
+
+        // Try to register with the same email
+        let request = RegisterRequest {
+            username: "newuser".to_string(),
+            email: "duplicate@example.com".to_string(),
+            password: "password123".to_string(),
+            display_name: None,
+        };
+
+        let response = server.post("/auth/register").json(&request).await;
+        response.assert_status(axum::http::StatusCode::BAD_REQUEST);
+    }
+
+    #[sqlx::test]
+    async fn test_register_password_too_long(pool: PgPool) {
+        let mut config = create_test_config();
+        config.auth.native.enabled = true;
+        config.auth.native.allow_registration = true;
+        config.auth.native.password.max_length = 20;
+
+        let request_manager = std::sync::Arc::new(fusillade::PostgresRequestManager::new(pool.clone()));
+        let state = AppState::builder().db(pool).config(config).request_manager(request_manager).build();
+
+        let app = axum::Router::new()
+            .route("/auth/register", axum::routing::post(register))
+            .with_state(state);
+
+        let server = TestServer::new(app).unwrap();
+
+        let request = RegisterRequest {
+            username: "testuser".to_string(),
+            email: "test@example.com".to_string(),
+            password: "thispasswordiswaytoolongandexceedsthelimit".to_string(),
+            display_name: None,
+        };
+
+        let response = server.post("/auth/register").json(&request).await;
+        response.assert_status(axum::http::StatusCode::BAD_REQUEST);
+    }
+
+    #[sqlx::test]
+    async fn test_register_registration_disabled(pool: PgPool) {
+        let mut config = create_test_config();
+        config.auth.native.enabled = true;
+        config.auth.native.allow_registration = false;
+
+        let request_manager = std::sync::Arc::new(fusillade::PostgresRequestManager::new(pool.clone()));
+        let state = AppState::builder().db(pool).config(config).request_manager(request_manager).build();
+
+        let app = axum::Router::new()
+            .route("/auth/register", axum::routing::post(register))
+            .with_state(state);
+
+        let server = TestServer::new(app).unwrap();
+
+        let request = RegisterRequest {
+            username: "testuser".to_string(),
+            email: "test@example.com".to_string(),
+            password: "password123".to_string(),
+            display_name: None,
+        };
+
+        let response = server.post("/auth/register").json(&request).await;
+        response.assert_status(axum::http::StatusCode::BAD_REQUEST);
+    }
+
+    #[sqlx::test]
+    async fn test_request_password_reset_disabled(pool: PgPool) {
+        let mut config = create_test_config();
+        config.auth.native.enabled = false;
+
+        let request_manager = std::sync::Arc::new(fusillade::PostgresRequestManager::new(pool.clone()));
+        let state = AppState::builder().db(pool).config(config).request_manager(request_manager).build();
+
+        let app = axum::Router::new()
+            .route("/auth/password-reset", axum::routing::post(request_password_reset))
+            .with_state(state);
+
+        let server = TestServer::new(app).unwrap();
+
+        let request = PasswordResetRequest {
+            email: "test@example.com".to_string(),
+        };
+
+        let response = server.post("/auth/password-reset").json(&request).await;
+        response.assert_status(axum::http::StatusCode::BAD_REQUEST);
+    }
+
+    #[sqlx::test]
+    async fn test_request_password_reset_nonexistent_user(pool: PgPool) {
+        let mut config = create_test_config();
+        config.auth.native.enabled = true;
+
+        let request_manager = std::sync::Arc::new(fusillade::PostgresRequestManager::new(pool.clone()));
+        let state = AppState::builder().db(pool).config(config).request_manager(request_manager).build();
+
+        let app = axum::Router::new()
+            .route("/auth/password-reset", axum::routing::post(request_password_reset))
+            .with_state(state);
+
+        let server = TestServer::new(app).unwrap();
+
+        let request = PasswordResetRequest {
+            email: "nonexistent@example.com".to_string(),
+        };
+
+        let response = server.post("/auth/password-reset").json(&request).await;
+
+        // Should return success to prevent email enumeration
+        response.assert_status(axum::http::StatusCode::OK);
+        let body: PasswordResetResponse = response.json();
+        assert!(body.message.contains("If an account with that email exists"));
+    }
+
+    #[sqlx::test]
+    async fn test_request_password_reset_sso_user(pool: PgPool) {
+        let mut config = create_test_config();
+        config.auth.native.enabled = true;
+
+        let request_manager = std::sync::Arc::new(fusillade::PostgresRequestManager::new(pool.clone()));
+        let state = AppState::builder()
+            .db(pool.clone())
+            .config(config)
+            .request_manager(request_manager)
+            .build();
+
+        // Create an SSO user (no password_hash)
+        let mut conn = pool.acquire().await.unwrap();
+        let mut user_repo = Users::new(&mut conn);
+
+        let user_create = UserCreateDBRequest {
+            username: "ssouser".to_string(),
+            email: "sso@example.com".to_string(),
+            display_name: None,
+            avatar_url: None,
+            is_admin: false,
+            roles: vec![Role::StandardUser],
+            auth_source: "proxy".to_string(),
+            password_hash: None,
+            external_user_id: None,
+        };
+
+        user_repo.create(&user_create).await.unwrap();
+        drop(user_repo);
+        drop(conn);
+
+        let app = axum::Router::new()
+            .route("/auth/password-reset", axum::routing::post(request_password_reset))
+            .with_state(state);
+
+        let server = TestServer::new(app).unwrap();
+
+        let request = PasswordResetRequest {
+            email: "sso@example.com".to_string(),
+        };
+
+        let response = server.post("/auth/password-reset").json(&request).await;
+
+        // Should return success even though no email will be sent
+        response.assert_status(axum::http::StatusCode::OK);
+        let body: PasswordResetResponse = response.json();
+        assert!(body.message.contains("If an account with that email exists"));
+    }
+
+    #[sqlx::test]
+    async fn test_confirm_password_reset_disabled(pool: PgPool) {
+        let mut config = create_test_config();
+        config.auth.native.enabled = false;
+
+        let request_manager = std::sync::Arc::new(fusillade::PostgresRequestManager::new(pool.clone()));
+        let state = AppState::builder().db(pool).config(config).request_manager(request_manager).build();
+
+        let app = axum::Router::new()
+            .route(
+                "/auth/password-reset/{token_id}/confirm",
+                axum::routing::post(confirm_password_reset),
+            )
+            .with_state(state);
+
+        let server = TestServer::new(app).unwrap();
+
+        let token_id = Uuid::new_v4();
+        let request = PasswordResetConfirmRequest {
+            token: "sometoken".to_string(),
+            new_password: "newpassword123".to_string(),
+        };
+
+        let response = server
+            .post(&format!("/auth/password-reset/{}/confirm", token_id))
+            .json(&request)
+            .await;
+
+        response.assert_status(axum::http::StatusCode::BAD_REQUEST);
+    }
+
+    #[sqlx::test]
+    async fn test_confirm_password_reset_invalid_token(pool: PgPool) {
+        let mut config = create_test_config();
+        config.auth.native.enabled = true;
+
+        let request_manager = std::sync::Arc::new(fusillade::PostgresRequestManager::new(pool.clone()));
+        let state = AppState::builder().db(pool).config(config).request_manager(request_manager).build();
+
+        let app = axum::Router::new()
+            .route(
+                "/auth/password-reset/{token_id}/confirm",
+                axum::routing::post(confirm_password_reset),
+            )
+            .with_state(state);
+
+        let server = TestServer::new(app).unwrap();
+
+        let token_id = Uuid::new_v4();
+        let request = PasswordResetConfirmRequest {
+            token: "invalidtoken".to_string(),
+            new_password: "newpassword123".to_string(),
+        };
+
+        let response = server
+            .post(&format!("/auth/password-reset/{}/confirm", token_id))
+            .json(&request)
+            .await;
+
+        response.assert_status(axum::http::StatusCode::BAD_REQUEST);
+    }
+
+    #[sqlx::test]
+    async fn test_confirm_password_reset_password_too_short(pool: PgPool) {
+        let mut config = create_test_config();
+        config.auth.native.enabled = true;
+        config.auth.native.password.min_length = 10;
+
+        let request_manager = std::sync::Arc::new(fusillade::PostgresRequestManager::new(pool.clone()));
+        let state = AppState::builder().db(pool).config(config).request_manager(request_manager).build();
+
+        let app = axum::Router::new()
+            .route(
+                "/auth/password-reset/{token_id}/confirm",
+                axum::routing::post(confirm_password_reset),
+            )
+            .with_state(state);
+
+        let server = TestServer::new(app).unwrap();
+
+        let token_id = Uuid::new_v4();
+        let request = PasswordResetConfirmRequest {
+            token: "sometoken".to_string(),
+            new_password: "short".to_string(),
+        };
+
+        let response = server
+            .post(&format!("/auth/password-reset/{}/confirm", token_id))
+            .json(&request)
+            .await;
+
+        response.assert_status(axum::http::StatusCode::BAD_REQUEST);
+    }
+
+    #[sqlx::test]
+    async fn test_confirm_password_reset_password_too_long(pool: PgPool) {
+        let mut config = create_test_config();
+        config.auth.native.enabled = true;
+        config.auth.native.password.max_length = 20;
+
+        let request_manager = std::sync::Arc::new(fusillade::PostgresRequestManager::new(pool.clone()));
+        let state = AppState::builder().db(pool).config(config).request_manager(request_manager).build();
+
+        let app = axum::Router::new()
+            .route(
+                "/auth/password-reset/{token_id}/confirm",
+                axum::routing::post(confirm_password_reset),
+            )
+            .with_state(state);
+
+        let server = TestServer::new(app).unwrap();
+
+        let token_id = Uuid::new_v4();
+        let request = PasswordResetConfirmRequest {
+            token: "sometoken".to_string(),
+            new_password: "thispasswordiswaytoolongandexceedsthelimit".to_string(),
+        };
+
+        let response = server
+            .post(&format!("/auth/password-reset/{}/confirm", token_id))
+            .json(&request)
+            .await;
+
+        response.assert_status(axum::http::StatusCode::BAD_REQUEST);
+    }
+
+    #[sqlx::test]
+    async fn test_password_reset_full_flow(pool: PgPool) {
+        use crate::test_utils::create_test_config;
+
+        // Create a custom config with native auth enabled
+        let mut config = create_test_config();
+        config.auth.native.enabled = true;
+
+        let app = crate::Application::new_with_pool(config, Some(pool.clone()))
+            .await
+            .expect("Failed to create application");
+
+        let (app, _bg_services) = app.into_test_server();
+
+        // Create a user with a password
+        let old_password_hash = password::hash_string("oldpassword123").unwrap();
+        let mut conn = pool.acquire().await.unwrap();
+        let mut user_repo = Users::new(&mut conn);
+
+        let user_create = UserCreateDBRequest {
+            username: "resetuser".to_string(),
+            email: "reset@example.com".to_string(),
+            display_name: Some("Reset User".to_string()),
+            avatar_url: None,
+            is_admin: false,
+            roles: vec![Role::StandardUser],
+            auth_source: "native".to_string(),
+            password_hash: Some(old_password_hash.clone()),
+            external_user_id: None,
+        };
+
+        let _created_user = user_repo.create(&user_create).await.unwrap();
+        drop(user_repo);
+        drop(conn);
+
+        // Step 1: Request password reset
+        let reset_request = PasswordResetRequest {
+            email: "reset@example.com".to_string(),
+        };
+
+        let response = app.post("/authentication/password-resets").json(&reset_request).await;
+
+        response.assert_status(axum::http::StatusCode::OK);
+        let body: PasswordResetResponse = response.json();
+        assert!(body.message.contains("If an account with that email exists"));
+
+        // Step 2: Extract the reset link from the email file (simulating clicking email link)
+        // The email service writes to ./emails/ directory when not using SMTP
+        let emails_dir = std::path::Path::new("./emails");
+
+        // Find the most recent email file
+        let mut email_files: Vec<_> = std::fs::read_dir(emails_dir).unwrap().filter_map(|e| e.ok()).collect();
+        email_files.sort_by_key(|e| e.metadata().unwrap().modified().unwrap());
+
+        let email_file = email_files.last().expect("No email file found");
+        let email_content = std::fs::read_to_string(email_file.path()).unwrap();
+
+        // Decode quoted-printable encoding (=3D is =, = at end of line is continuation)
+        let decoded_content = email_content.replace("=\r\n", "").replace("=\n", "").replace("=3D", "=");
+
+        // Parse the reset link from the email content
+        // Format: {base_url}/reset-password?id={token_id}&token={raw_token}
+        let reset_link_start = decoded_content.find("/reset-password?id=").expect("Reset link not found");
+        let link_portion = &decoded_content[reset_link_start..];
+
+        // Find the end of the URL (could be whitespace, quote, or bracket)
+        let link_end = link_portion
+            .find(&[' ', '\n', '\r', '"', '<', '>'][..])
+            .unwrap_or(link_portion.len());
+        let reset_link = &link_portion[..link_end];
+
+        // Extract token_id and token from URL
+        let url_parts: Vec<&str> = reset_link.split(&['?', '&'][..]).collect();
+        let token_id_str = url_parts
+            .iter()
+            .find(|s| s.starts_with("id="))
+            .and_then(|s| s.strip_prefix("id="))
+            .expect("token_id not found in reset link");
+        let token_str = url_parts
+            .iter()
+            .find(|s| s.starts_with("token="))
+            .and_then(|s| s.strip_prefix("token="))
+            .expect("token not found in reset link");
+
+        let token_id = Uuid::parse_str(token_id_str).unwrap();
+        let raw_token = token_str.to_string();
+
+        // Step 3: Confirm password reset with the token
+        let confirm_request = PasswordResetConfirmRequest {
+            token: raw_token.clone(),
+            new_password: "newpassword456".to_string(),
+        };
+
+        let response = app
+            .post(&format!("/authentication/password-resets/{}/confirm", token_id))
+            .json(&confirm_request)
+            .await;
+
+        response.assert_status(axum::http::StatusCode::OK);
+        let body: PasswordResetResponse = response.json();
+        assert_eq!(body.message, "Password has been reset successfully");
+
+        // Step 4: Verify the password was actually changed by trying to login
+        let login_old_password = LoginRequest {
+            email: "reset@example.com".to_string(),
+            password: "oldpassword123".to_string(),
+        };
+
+        let response = app.post("/authentication/login").json(&login_old_password).await;
+
+        // Old password should not work
+        response.assert_status(axum::http::StatusCode::UNAUTHORIZED);
+
+        // Step 5: Login with new password should work
+        let login_new_password = LoginRequest {
+            email: "reset@example.com".to_string(),
+            password: "newpassword456".to_string(),
+        };
+
+        let response = app.post("/authentication/login").json(&login_new_password).await;
+
+        response.assert_status(axum::http::StatusCode::OK);
+        let body: AuthResponse = response.json();
+        assert_eq!(body.user.email, "reset@example.com");
+        assert_eq!(body.message, "Login successful");
+
+        // Step 6: Verify the token was invalidated and cannot be reused
+        let reuse_request = PasswordResetConfirmRequest {
+            token: raw_token,
+            new_password: "anotherpassword789".to_string(),
+        };
+
+        let response = app
+            .post(&format!("/authentication/password-resets/{}/confirm", token_id))
+            .json(&reuse_request)
+            .await;
+
+        // Token should be invalid now
+        response.assert_status(axum::http::StatusCode::BAD_REQUEST);
+
+        // Cleanup: remove the email file
+        std::fs::remove_file(email_file.path()).ok();
+    }
+
+    #[sqlx::test]
+    async fn test_change_password_success_full(pool: PgPool) {
+        use crate::test_utils::create_test_config;
+
+        // Create a custom config with native auth enabled
+        let mut config = create_test_config();
+        config.auth.native.enabled = true;
+
+        let app = crate::Application::new_with_pool(config, Some(pool.clone()))
+            .await
+            .expect("Failed to create application");
+
+        let (app, _bg_services) = app.into_test_server();
+
+        // Create a user with a password
+        let old_password_hash = password::hash_string("oldpassword123").unwrap();
+        let mut conn = pool.acquire().await.unwrap();
+        let mut user_repo = Users::new(&mut conn);
+
+        let user_create = UserCreateDBRequest {
+            username: "changepassworduser".to_string(),
+            email: "changepassword@example.com".to_string(),
+            display_name: Some("Change Password User".to_string()),
+            avatar_url: None,
+            is_admin: false,
+            roles: vec![Role::StandardUser],
+            auth_source: "native".to_string(),
+            password_hash: Some(old_password_hash.clone()),
+            external_user_id: Some("changepassworduser".to_string()),
+        };
+
+        let created_user = user_repo.create(&user_create).await.unwrap();
+        drop(user_repo);
+        drop(conn);
+
+        let user_response = UserResponse::from(created_user);
+
+        // Change password
+        let change_request = ChangePasswordRequest {
+            current_password: "oldpassword123".to_string(),
+            new_password: "newpassword456".to_string(),
+        };
+
+        let auth_headers = crate::test_utils::add_auth_headers(&user_response);
+        let response = app
+            .post("/authentication/password-change")
+            .json(&change_request)
+            .add_header(&auth_headers[0].0, &auth_headers[0].1)
+            .add_header(&auth_headers[1].0, &auth_headers[1].1)
+            .await;
+
+        response.assert_status(axum::http::StatusCode::OK);
+        let body: AuthSuccessResponse = response.json();
+        assert_eq!(body.message, "Password changed successfully");
+
+        // Verify old password doesn't work
+        let login_old = LoginRequest {
+            email: "changepassword@example.com".to_string(),
+            password: "oldpassword123".to_string(),
+        };
+
+        let response = app.post("/authentication/login").json(&login_old).await;
+        response.assert_status(axum::http::StatusCode::UNAUTHORIZED);
+
+        // Verify new password works
+        let login_new = LoginRequest {
+            email: "changepassword@example.com".to_string(),
+            password: "newpassword456".to_string(),
+        };
+
+        let response = app.post("/authentication/login").json(&login_new).await;
+        response.assert_status(axum::http::StatusCode::OK);
+    }
+
+    #[sqlx::test]
+    async fn test_change_password_wrong_current(pool: PgPool) {
+        use crate::test_utils::create_test_config;
+
+        let mut config = create_test_config();
+        config.auth.native.enabled = true;
+
+        let app = crate::Application::new_with_pool(config, Some(pool.clone()))
+            .await
+            .expect("Failed to create application");
+
+        let (app, _bg_services) = app.into_test_server();
+
+        // Create a user with a password
+        let password_hash = password::hash_string("correctpassword").unwrap();
+        let mut conn = pool.acquire().await.unwrap();
+        let mut user_repo = Users::new(&mut conn);
+
+        let user_create = UserCreateDBRequest {
+            username: "wrongcurrentuser".to_string(),
+            email: "wrongcurrent@example.com".to_string(),
+            display_name: None,
+            avatar_url: None,
+            is_admin: false,
+            roles: vec![Role::StandardUser],
+            auth_source: "native".to_string(),
+            password_hash: Some(password_hash),
+            external_user_id: Some("wrongcurrentuser".to_string()),
+        };
+
+        let created_user = user_repo.create(&user_create).await.unwrap();
+        drop(user_repo);
+        drop(conn);
+
+        let user_response = UserResponse::from(created_user);
+
+        let change_request = ChangePasswordRequest {
+            current_password: "wrongpassword".to_string(),
+            new_password: "newpassword456".to_string(),
+        };
+
+        let auth_headers = crate::test_utils::add_auth_headers(&user_response);
+        let response = app
+            .post("/authentication/password-change")
+            .json(&change_request)
+            .add_header(&auth_headers[0].0, &auth_headers[0].1)
+            .add_header(&auth_headers[1].0, &auth_headers[1].1)
+            .await;
+
+        response.assert_status(axum::http::StatusCode::UNAUTHORIZED);
+    }
+
+    #[sqlx::test]
+    async fn test_change_password_sso_user_cannot_change(pool: PgPool) {
+        use crate::test_utils::create_test_config;
+
+        let mut config = create_test_config();
+        config.auth.native.enabled = true;
+
+        let app = crate::Application::new_with_pool(config, Some(pool.clone()))
+            .await
+            .expect("Failed to create application");
+
+        let (app, _bg_services) = app.into_test_server();
+
+        // Create an SSO user (no password_hash)
+        let mut conn = pool.acquire().await.unwrap();
+        let mut user_repo = Users::new(&mut conn);
+
+        let user_create = UserCreateDBRequest {
+            username: "ssochangeuser".to_string(),
+            email: "ssochange@example.com".to_string(),
+            display_name: None,
+            avatar_url: None,
+            is_admin: false,
+            roles: vec![Role::StandardUser],
+            auth_source: "proxy".to_string(),
+            password_hash: None,
+            external_user_id: Some("ssochangeuser".to_string()),
+        };
+
+        let created_user = user_repo.create(&user_create).await.unwrap();
+        drop(user_repo);
+        drop(conn);
+
+        let user_response = UserResponse::from(created_user);
+
+        let change_request = ChangePasswordRequest {
+            current_password: "anypassword".to_string(),
+            new_password: "newpassword456".to_string(),
+        };
+
+        let auth_headers = crate::test_utils::add_auth_headers(&user_response);
+        let response = app
+            .post("/authentication/password-change")
+            .json(&change_request)
+            .add_header(&auth_headers[0].0, &auth_headers[0].1)
+            .add_header(&auth_headers[1].0, &auth_headers[1].1)
+            .await;
+
+        response.assert_status(axum::http::StatusCode::BAD_REQUEST);
+    }
+
+    #[sqlx::test]
+    async fn test_change_password_too_short(pool: PgPool) {
+        use crate::test_utils::create_test_config;
+
+        let mut config = create_test_config();
+        config.auth.native.enabled = true;
+        config.auth.native.password.min_length = 10;
+
+        let app = crate::Application::new_with_pool(config, Some(pool.clone()))
+            .await
+            .expect("Failed to create application");
+
+        let (app, _bg_services) = app.into_test_server();
+
+        // Create a user with a password
+        let password_hash = password::hash_string("oldpassword123").unwrap();
+        let mut conn = pool.acquire().await.unwrap();
+        let mut user_repo = Users::new(&mut conn);
+
+        let user_create = UserCreateDBRequest {
+            username: "shortpwchangeuser".to_string(),
+            email: "shortpwchange@example.com".to_string(),
+            display_name: None,
+            avatar_url: None,
+            is_admin: false,
+            roles: vec![Role::StandardUser],
+            auth_source: "native".to_string(),
+            password_hash: Some(password_hash),
+            external_user_id: Some("shortpwchangeuser".to_string()),
+        };
+
+        let created_user = user_repo.create(&user_create).await.unwrap();
+        drop(user_repo);
+        drop(conn);
+
+        let user_response = UserResponse::from(created_user);
+
+        let change_request = ChangePasswordRequest {
+            current_password: "oldpassword123".to_string(),
+            new_password: "short".to_string(),
+        };
+
+        let auth_headers = crate::test_utils::add_auth_headers(&user_response);
+        let response = app
+            .post("/authentication/password-change")
+            .json(&change_request)
+            .add_header(&auth_headers[0].0, &auth_headers[0].1)
+            .add_header(&auth_headers[1].0, &auth_headers[1].1)
+            .await;
+
+        response.assert_status(axum::http::StatusCode::BAD_REQUEST);
+    }
+
+    #[sqlx::test]
+    async fn test_change_password_too_long(pool: PgPool) {
+        use crate::test_utils::create_test_config;
+
+        let mut config = create_test_config();
+        config.auth.native.enabled = true;
+        config.auth.native.password.max_length = 20;
+
+        let app = crate::Application::new_with_pool(config, Some(pool.clone()))
+            .await
+            .expect("Failed to create application");
+
+        let (app, _bg_services) = app.into_test_server();
+
+        // Create a user with a password
+        let password_hash = password::hash_string("oldpassword").unwrap();
+        let mut conn = pool.acquire().await.unwrap();
+        let mut user_repo = Users::new(&mut conn);
+
+        let user_create = UserCreateDBRequest {
+            username: "longpwchangeuser".to_string(),
+            email: "longpwchange@example.com".to_string(),
+            display_name: None,
+            avatar_url: None,
+            is_admin: false,
+            roles: vec![Role::StandardUser],
+            auth_source: "native".to_string(),
+            password_hash: Some(password_hash),
+            external_user_id: Some("longpwchangeuser".to_string()),
+        };
+
+        let created_user = user_repo.create(&user_create).await.unwrap();
+        drop(user_repo);
+        drop(conn);
+
+        let user_response = UserResponse::from(created_user);
+
+        let change_request = ChangePasswordRequest {
+            current_password: "oldpassword".to_string(),
+            new_password: "thispasswordiswaytoolongandexceedsthelimit".to_string(),
+        };
+
+        let auth_headers = crate::test_utils::add_auth_headers(&user_response);
+        let response = app
+            .post("/authentication/password-change")
+            .json(&change_request)
+            .add_header(&auth_headers[0].0, &auth_headers[0].1)
+            .add_header(&auth_headers[1].0, &auth_headers[1].1)
+            .await;
+
+        response.assert_status(axum::http::StatusCode::BAD_REQUEST);
+    }
+
+    #[sqlx::test]
+    async fn test_change_password_when_disabled(pool: PgPool) {
+        use crate::test_utils::create_test_config;
+
+        let mut config = create_test_config();
+        config.auth.native.enabled = false; // Disabled!
+
+        let app = crate::Application::new_with_pool(config, Some(pool.clone()))
+            .await
+            .expect("Failed to create application");
+
+        let (app, _bg_services) = app.into_test_server();
+
+        // Create a user with a password
+        let password_hash = password::hash_string("oldpassword").unwrap();
+        let mut conn = pool.acquire().await.unwrap();
+        let mut user_repo = Users::new(&mut conn);
+
+        let user_create = UserCreateDBRequest {
+            username: "disabledchangeuser".to_string(),
+            email: "disabledchange@example.com".to_string(),
+            display_name: None,
+            avatar_url: None,
+            is_admin: false,
+            roles: vec![Role::StandardUser],
+            auth_source: "native".to_string(),
+            password_hash: Some(password_hash),
+            external_user_id: Some("disabledchangeuser".to_string()),
+        };
+
+        let created_user = user_repo.create(&user_create).await.unwrap();
+        drop(user_repo);
+        drop(conn);
+
+        let user_response = UserResponse::from(created_user);
+
+        let change_request = ChangePasswordRequest {
+            current_password: "oldpassword".to_string(),
+            new_password: "newpassword".to_string(),
+        };
+
+        let auth_headers = crate::test_utils::add_auth_headers(&user_response);
+        let response = app
+            .post("/authentication/password-change")
+            .json(&change_request)
+            .add_header(&auth_headers[0].0, &auth_headers[0].1)
+            .add_header(&auth_headers[1].0, &auth_headers[1].1)
+            .await;
+
+        response.assert_status(axum::http::StatusCode::BAD_REQUEST);
+    }
 }
