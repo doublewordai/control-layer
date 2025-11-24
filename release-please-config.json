@@ -5,8 +5,9 @@
       "include-component-in-tag": true,
       "extra-files": [
         {
-          "type": "cargo",
-          "path": "dwctl/Cargo.toml"
+          "type": "toml",
+          "path": "dwctl/Cargo.toml",
+          "jsonpath": "$.dependencies.fusillade.version"
         }
       ]
     },
