@@ -19,21 +19,18 @@ pub mod stripe;
 /// Adding a new provider requires adding a match arm here.
 pub fn create_provider(config: PaymentConfig) -> Box<dyn PaymentProvider> {
     match config {
-        PaymentConfig::Stripe(stripe_config) => {
-            Box::new(stripe::StripeProvider::new(
-                stripe_config.api_key,
-                stripe_config.price_id,
-                stripe_config.webhook_secret,
-            ))
-        }
+        PaymentConfig::Stripe(stripe_config) => Box::new(stripe::StripeProvider::new(
+            stripe_config.api_key,
+            stripe_config.price_id,
+            stripe_config.webhook_secret,
+        )),
         PaymentConfig::Dummy(dummy_config) => {
             let amount = dummy_config.amount.unwrap_or(Decimal::new(50, 0));
             Box::new(dummy::DummyProvider::new(amount))
-        }
-        // Future providers:
-        // PaymentConfig::PayPal(paypal_config) => {
-        //     Box::new(paypal::PayPalProvider::new(...))
-        // }
+        } // Future providers:
+          // PaymentConfig::PayPal(paypal_config) => {
+          //     Box::new(paypal::PayPalProvider::new(...))
+          // }
     }
 }
 
@@ -65,9 +62,7 @@ impl From<PaymentError> for StatusCode {
             PaymentError::PaymentNotCompleted => StatusCode::PAYMENT_REQUIRED,
             PaymentError::InvalidData(_) => StatusCode::BAD_REQUEST,
             PaymentError::AlreadyProcessed => StatusCode::OK,
-            PaymentError::ProviderApi(_) | PaymentError::Database(_) => {
-                StatusCode::INTERNAL_SERVER_ERROR
-            }
+            PaymentError::ProviderApi(_) | PaymentError::Database(_) => StatusCode::INTERNAL_SERVER_ERROR,
         }
     }
 }
@@ -107,50 +102,28 @@ pub trait PaymentProvider: Send + Sync {
     /// Create a new checkout session
     ///
     /// Returns a URL that the user should be redirected to for payment.
-    async fn create_checkout_session(
-        &self,
-        db_pool: &PgPool,
-        user: &CurrentUser,
-        cancel_url: &str,
-        success_url: &str,
-    ) -> Result<String>;
+    async fn create_checkout_session(&self, db_pool: &PgPool, user: &CurrentUser, cancel_url: &str, success_url: &str) -> Result<String>;
 
     /// Retrieve and validate a payment session
     ///
     /// Fetches the payment session from the provider and returns validated details.
-    async fn get_payment_session(
-        &self,
-        session_id: &str,
-    ) -> Result<PaymentSession>;
+    async fn get_payment_session(&self, session_id: &str) -> Result<PaymentSession>;
 
     /// Process a completed payment session
     ///
     /// This is idempotent - calling multiple times with the same session_id
     /// should not create duplicate transactions.
-    async fn process_payment_session(
-        &self,
-        db_pool: &PgPool,
-        session_id: &str,
-    ) -> Result<()>;
+    async fn process_payment_session(&self, db_pool: &PgPool, session_id: &str) -> Result<()>;
 
     /// Validate and extract webhook event from raw request data
     ///
     /// Returns None if this provider doesn't support webhooks.
     /// Returns Err if validation fails (invalid signature, malformed data, etc.)
-    async fn validate_webhook(
-        &self,
-        headers: &axum::http::HeaderMap,
-        body: &str,
-    ) -> Result<Option<WebhookEvent>>;
+    async fn validate_webhook(&self, headers: &axum::http::HeaderMap, body: &str) -> Result<Option<WebhookEvent>>;
 
     /// Process a validated webhook event
     ///
     /// This is called after validate_webhook succeeds.
     /// Should be idempotent - processing the same event multiple times should be safe.
-    async fn process_webhook_event(
-        &self,
-        db_pool: &PgPool,
-        event: &WebhookEvent,
-    ) -> Result<()>;
-
+    async fn process_webhook_event(&self, db_pool: &PgPool, event: &WebhookEvent) -> Result<()>;
 }

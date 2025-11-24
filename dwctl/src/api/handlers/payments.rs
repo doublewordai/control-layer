@@ -8,11 +8,7 @@ use axum::{
 };
 use serde_json::json;
 
-use crate::{
-    api::models::users::CurrentUser,
-    payment_providers,
-    AppState,
-};
+use crate::{api::models::users::CurrentUser, payment_providers, AppState};
 
 #[utoipa::path(
     post,
@@ -64,16 +60,10 @@ pub async fn create_payment(
         })
         .unwrap_or_else(|| {
             // Fallback to constructing from Host header
-            let host = headers
-                .get(header::HOST)
-                .and_then(|h| h.to_str().ok())
-                .unwrap_or("localhost:3001");
+            let host = headers.get(header::HOST).and_then(|h| h.to_str().ok()).unwrap_or("localhost:3001");
 
             // Determine protocol - check X-Forwarded-Proto for proxied requests
-            let proto = headers
-                .get("x-forwarded-proto")
-                .and_then(|h| h.to_str().ok())
-                .unwrap_or("http");
+            let proto = headers.get("x-forwarded-proto").and_then(|h| h.to_str().ok()).unwrap_or("http");
 
             format!("{}://{}", proto, host)
         });
@@ -95,7 +85,8 @@ pub async fn create_payment(
     // Return the checkout URL as JSON for the frontend to navigate to
     Ok(Json(json!({
         "url": checkout_url
-    })).into_response())
+    }))
+    .into_response())
 }
 
 /// Process a payment
@@ -135,19 +126,19 @@ pub async fn process_payment(
                 Json(json!({
                     "error": "No payment provider configured",
                     "message": "Payment provider is not configured"
-                }))
-            ).into_response());
+                })),
+            )
+                .into_response());
         }
     };
 
     // Process the payment session using the provider trait
     match provider.process_payment_session(&state.db, &id).await {
-        Ok(()) => {
-            Ok(Json(json!({
-                "success": true,
-                "message": "Payment processed successfully"
-            })).into_response())
-        }
+        Ok(()) => Ok(Json(json!({
+            "success": true,
+            "message": "Payment processed successfully"
+        }))
+        .into_response()),
         Err(e) => {
             let status = StatusCode::from(e);
             if status == StatusCode::PAYMENT_REQUIRED {
@@ -156,8 +147,9 @@ pub async fn process_payment(
                     Json(json!({
                         "error": "Payment not completed",
                         "message": "The payment has not been completed yet"
-                    }))
-                ).into_response())
+                    })),
+                )
+                    .into_response())
             } else {
                 Err(status)
             }
@@ -182,11 +174,7 @@ pub async fn process_payment(
     ),
 )]
 #[tracing::instrument(skip_all)]
-pub async fn webhook_handler(
-    State(state): State<AppState>,
-    headers: axum::http::HeaderMap,
-    body: String,
-) -> StatusCode {
+pub async fn webhook_handler(State(state): State<AppState>, headers: axum::http::HeaderMap, body: String) -> StatusCode {
     // Get payment provider from config
     let provider = match state.config.payment.clone() {
         Some(payment_config) => payment_providers::create_provider(payment_config),

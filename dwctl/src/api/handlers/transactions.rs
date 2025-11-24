@@ -226,12 +226,8 @@ mod tests {
         let mut credits_repo = CreditsHandler::new(&mut conn);
 
         let amount_decimal = Decimal::from_str(amount).expect("Invalid decimal amount");
-        let request = CreditTransactionCreateDBRequest::admin_grant(
-            user_id,
-            user_id,
-            amount_decimal,
-            Some("Initial credit grant".to_string()),
-        );
+        let request =
+            CreditTransactionCreateDBRequest::admin_grant(user_id, user_id, amount_decimal, Some("Initial credit grant".to_string()));
 
         credits_repo
             .create_transaction(&request)

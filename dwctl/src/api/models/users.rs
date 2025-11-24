@@ -58,7 +58,7 @@ pub struct UserResponse {
     pub groups: Option<Vec<GroupResponse>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub credit_balance: Option<f64>,
-    pub payment_provider_id: Option<String>
+    pub payment_provider_id: Option<String>,
 }
 
 /// Query parameters for listing users

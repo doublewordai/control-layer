@@ -4,9 +4,8 @@ use async_trait::async_trait;
 use rust_decimal::Decimal;
 use sqlx::PgPool;
 use stripe::{
-    CheckoutSession, CheckoutSessionCustomerCreation, CheckoutSessionMode,
-    CheckoutSessionPaymentStatus, CheckoutSessionUiMode, Client, CreateCheckoutSession,
-    CreateCheckoutSessionAutomaticTax, CreateCheckoutSessionLineItems, CustomerId,
+    CheckoutSession, CheckoutSessionCustomerCreation, CheckoutSessionMode, CheckoutSessionPaymentStatus, CheckoutSessionUiMode, Client,
+    CreateCheckoutSession, CreateCheckoutSessionAutomaticTax, CreateCheckoutSessionLineItems, CustomerId,
 };
 
 use crate::{
@@ -44,13 +43,7 @@ impl StripeProvider {
 
 #[async_trait]
 impl PaymentProvider for StripeProvider {
-    async fn create_checkout_session(
-        &self,
-        db_pool: &PgPool,
-        user: &CurrentUser,
-        cancel_url: &str,
-        success_url: &str,
-    ) -> Result<String> {
+    async fn create_checkout_session(&self, db_pool: &PgPool, user: &CurrentUser, cancel_url: &str, success_url: &str) -> Result<String> {
         let client = self.client();
 
         // Build checkout session parameters
@@ -77,55 +70,35 @@ impl PaymentProvider for StripeProvider {
 
         // Include existing customer ID if we have one
         if let Some(existing_id) = &user.payment_provider_id {
-            tracing::info!(
-                "Using existing Stripe customer ID {} for user {}",
-                existing_id,
-                user.id
-            );
-            checkout_params.customer =
-                Some(CustomerId::from(existing_id.parse().map_err(|e| {
-                    PaymentError::InvalidData(format!("Invalid customer ID: {}", e))
-                })?));
+            tracing::info!("Using existing Stripe customer ID {} for user {}", existing_id, user.id);
+            checkout_params.customer = Some(CustomerId::from(
+                existing_id
+                    .parse()
+                    .map_err(|e| PaymentError::InvalidData(format!("Invalid customer ID: {}", e)))?,
+            ));
         } else {
-            tracing::info!(
-                "No customer ID found for user {}, Stripe will create one",
-                user.id
-            );
+            tracing::info!("No customer ID found for user {}, Stripe will create one", user.id);
             // Provide customer email for the new customer
             checkout_params.customer_email = Some(&user.email);
         }
 
         // Create checkout session
-        let checkout_session = CheckoutSession::create(&client, checkout_params)
-            .await
-            .map_err(|e| {
-                tracing::error!("Failed to create Stripe checkout session: {:?}", e);
-                PaymentError::ProviderApi(e.to_string())
-            })?;
+        let checkout_session = CheckoutSession::create(&client, checkout_params).await.map_err(|e| {
+            tracing::error!("Failed to create Stripe checkout session: {:?}", e);
+            PaymentError::ProviderApi(e.to_string())
+        })?;
 
-        tracing::info!(
-            "Created checkout session {} for user {}",
-            checkout_session.id,
-            user.id
-        );
+        tracing::info!("Created checkout session {} for user {}", checkout_session.id, user.id);
 
         // If we didn't have a customer ID before, save the newly created one
         if user.payment_provider_id.is_none() {
             if let Some(customer) = &checkout_session.customer {
                 let customer_id = customer.id().to_string();
-                tracing::info!(
-                    "Saving newly created customer ID {} for user {}",
-                    customer_id,
-                    user.id
-                );
+                tracing::info!("Saving newly created customer ID {} for user {}", customer_id, user.id);
 
-                sqlx::query!(
-                    "UPDATE users SET payment_provider_id = $1 WHERE id = $2",
-                    customer_id,
-                    user.id
-                )
-                .execute(db_pool)
-                .await?;
+                sqlx::query!("UPDATE users SET payment_provider_id = $1 WHERE id = $2", customer_id, user.id)
+                    .execute(db_pool)
+                    .await?;
             }
         }
 
@@ -139,9 +112,9 @@ impl PaymentProvider for StripeProvider {
     async fn get_payment_session(&self, session_id: &str) -> Result<PaymentSession> {
         let client = self.client();
 
-        let session_id: stripe::CheckoutSessionId = session_id.parse().map_err(|_| {
-            PaymentError::InvalidData("Invalid Stripe session ID".to_string())
-        })?;
+        let session_id: stripe::CheckoutSessionId = session_id
+            .parse()
+            .map_err(|_| PaymentError::InvalidData("Invalid Stripe session ID".to_string()))?;
 
         // Retrieve full checkout session with line items
         let checkout_session = CheckoutSession::retrieve(&client, &session_id, &["line_items"])
@@ -152,12 +125,10 @@ impl PaymentProvider for StripeProvider {
             })?;
 
         // Extract user ID from client_reference_id
-        let user_id = checkout_session
-            .client_reference_id
-            .ok_or_else(|| {
-                tracing::error!("Checkout session missing client_reference_id");
-                PaymentError::InvalidData("Missing client_reference_id".to_string())
-            })?;
+        let user_id = checkout_session.client_reference_id.ok_or_else(|| {
+            tracing::error!("Checkout session missing client_reference_id");
+            PaymentError::InvalidData("Missing client_reference_id".to_string())
+        })?;
 
         // Get price from line_items or amount_total
         let price = checkout_session
@@ -198,10 +169,7 @@ impl PaymentProvider for StripeProvider {
         .await?;
 
         if existing.is_some() {
-            tracing::info!(
-                "Transaction for session_id {} already exists, skipping (fast path)",
-                session_id
-            );
+            tracing::info!("Transaction for session_id {} already exists, skipping (fast path)", session_id);
             return Ok(());
         }
 
@@ -210,10 +178,7 @@ impl PaymentProvider for StripeProvider {
 
         // Verify payment status
         if !payment_session.is_paid {
-            tracing::info!(
-                "Transaction for session_id {} has not been paid, skipping.",
-                session_id
-            );
+            tracing::info!("Transaction for session_id {} has not been paid, skipping.", session_id);
             return Err(PaymentError::PaymentNotCompleted);
         }
 
@@ -236,11 +201,7 @@ impl PaymentProvider for StripeProvider {
 
         match credits.create_transaction(&request).await {
             Ok(_) => {
-                tracing::info!(
-                    "Successfully fulfilled checkout session {} for user {}",
-                    session_id,
-                    user_id
-                );
+                tracing::info!("Successfully fulfilled checkout session {} for user {}", session_id, user_id);
                 Ok(())
             }
             Err(crate::db::errors::DbError::UniqueViolation { constraint, .. }) => {
@@ -264,11 +225,7 @@ impl PaymentProvider for StripeProvider {
         }
     }
 
-    async fn validate_webhook(
-        &self,
-        headers: &axum::http::HeaderMap,
-        body: &str,
-    ) -> Result<Option<WebhookEvent>> {
+    async fn validate_webhook(&self, headers: &axum::http::HeaderMap, body: &str) -> Result<Option<WebhookEvent>> {
         // Get the Stripe signature from headers
         let signature = headers
             .get("stripe-signature")
@@ -283,11 +240,10 @@ impl PaymentProvider for StripeProvider {
             })?;
 
         // Validate the webhook signature and construct the event
-        let event = stripe::Webhook::construct_event(body, signature, &self.webhook_secret)
-            .map_err(|e| {
-                tracing::error!("Failed to construct webhook event: {:?}", e);
-                PaymentError::InvalidData(format!("Webhook validation failed: {}", e))
-            })?;
+        let event = stripe::Webhook::construct_event(body, signature, &self.webhook_secret).map_err(|e| {
+            tracing::error!("Failed to construct webhook event: {:?}", e);
+            PaymentError::InvalidData(format!("Webhook validation failed: {}", e))
+        })?;
 
         tracing::info!("Validated Stripe webhook event: {:?}", event.type_);
 
@@ -306,14 +262,9 @@ impl PaymentProvider for StripeProvider {
         Ok(Some(webhook_event))
     }
 
-    async fn process_webhook_event(
-        &self,
-        db_pool: &PgPool,
-        event: &WebhookEvent,
-    ) -> Result<()> {
+    async fn process_webhook_event(&self, db_pool: &PgPool, event: &WebhookEvent) -> Result<()> {
         // Only process checkout session completion events
-        if event.event_type != "CheckoutSessionCompleted"
-            && event.event_type != "CheckoutSessionAsyncPaymentSucceeded" {
+        if event.event_type != "CheckoutSessionCompleted" && event.event_type != "CheckoutSessionAsyncPaymentSucceeded" {
             tracing::debug!("Ignoring webhook event type: {}", event.event_type);
             return Ok(());
         }
@@ -324,14 +275,9 @@ impl PaymentProvider for StripeProvider {
             PaymentError::InvalidData("Missing session_id in webhook event".to_string())
         })?;
 
-        tracing::info!(
-            "Processing webhook event {} for session: {}",
-            event.event_type,
-            session_id
-        );
+        tracing::info!("Processing webhook event {} for session: {}", event.event_type, session_id);
 
         // Use the existing process_payment_session method
         self.process_payment_session(db_pool, session_id).await
     }
-
 }

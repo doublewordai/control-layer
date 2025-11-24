@@ -30,13 +30,7 @@ impl DummyProvider {
 
 #[async_trait]
 impl PaymentProvider for DummyProvider {
-    async fn create_checkout_session(
-        &self,
-        db_pool: &PgPool,
-        user: &CurrentUser,
-        _cancel_url: &str,
-        success_url: &str,
-    ) -> Result<String> {
+    async fn create_checkout_session(&self, db_pool: &PgPool, user: &CurrentUser, _cancel_url: &str, success_url: &str) -> Result<String> {
         // Generate a unique session ID
         let session_id = format!("dummy_session_{}", uuid::Uuid::new_v4());
 
@@ -57,11 +51,7 @@ impl PaymentProvider for DummyProvider {
             PaymentError::Database(sqlx::Error::RowNotFound)
         })?;
 
-        tracing::info!(
-            "Dummy provider added {} credits to user {}",
-            self.amount,
-            user.id
-        );
+        tracing::info!("Dummy provider added {} credits to user {}", self.amount, user.id);
 
         // Return the success URL since payment is "complete"
         Ok(success_url.to_string())
@@ -71,9 +61,7 @@ impl PaymentProvider for DummyProvider {
         // Parse the user ID from the session_id
         // Format: dummy_session_{uuid}
         if !session_id.starts_with("dummy_session_") {
-            return Err(PaymentError::InvalidData(
-                "Invalid dummy session ID format".to_string(),
-            ));
+            return Err(PaymentError::InvalidData("Invalid dummy session ID format".to_string()));
         }
 
         // For the dummy provider, we can't reconstruct user_id from session_id alone
@@ -102,36 +90,22 @@ impl PaymentProvider for DummyProvider {
         .await?;
 
         if existing.is_some() {
-            tracing::info!(
-                "Transaction for session_id {} already exists, skipping",
-                session_id
-            );
+            tracing::info!("Transaction for session_id {} already exists, skipping", session_id);
             return Ok(());
         }
 
         // For the dummy provider, the transaction was already created during checkout
         // This method serves as a verification that the transaction exists
-        tracing::info!(
-            "Dummy provider verification complete for session {}",
-            session_id
-        );
+        tracing::info!("Dummy provider verification complete for session {}", session_id);
         Ok(())
     }
 
-    async fn validate_webhook(
-        &self,
-        _headers: &axum::http::HeaderMap,
-        _body: &str,
-    ) -> Result<Option<WebhookEvent>> {
+    async fn validate_webhook(&self, _headers: &axum::http::HeaderMap, _body: &str) -> Result<Option<WebhookEvent>> {
         // Dummy provider doesn't use webhooks
         Ok(None)
     }
 
-    async fn process_webhook_event(
-        &self,
-        _db_pool: &PgPool,
-        _event: &WebhookEvent,
-    ) -> Result<()> {
+    async fn process_webhook_event(&self, _db_pool: &PgPool, _event: &WebhookEvent) -> Result<()> {
         // Dummy provider doesn't use webhooks
         Ok(())
     }
