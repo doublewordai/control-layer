@@ -1,18 +1,18 @@
 //! Daemon for processing batched requests with per-model concurrency control.
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::time::Duration;
 
 use tokio::sync::{RwLock, Semaphore};
 use tokio::task::JoinSet;
 
+use crate::FusilladeError;
 use crate::error::Result;
 use crate::http::{HttpClient, HttpResponse};
 use crate::manager::{DaemonStorage, Storage};
 use crate::request::{DaemonId, RequestCompletionResult};
 use crate::types::RequestId;
-use crate::FusilladeError;
 use futures::StreamExt;
 
 pub mod transitions;
@@ -605,7 +605,7 @@ where
 mod tests {
     use super::*;
     use crate::http::{HttpResponse, MockHttpClient};
-    use crate::manager::{postgres::PostgresRequestManager, DaemonExecutor};
+    use crate::manager::{DaemonExecutor, postgres::PostgresRequestManager};
     use std::time::Duration;
 
     #[sqlx::test]

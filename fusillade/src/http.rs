@@ -163,8 +163,8 @@ impl HttpClient for ReqwestHttpClient {
 // TODO: this should be a separate file within an http/ module.
 use parking_lot::Mutex;
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use tokio::sync::oneshot;
 
 /// Mock HTTP client for testing.
