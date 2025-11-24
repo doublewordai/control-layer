@@ -4,9 +4,7 @@ use crate::db::errors::DbError;
 use crate::{
     api::models::users::{CurrentUser, Role},
     auth::session,
-    db::{
-        handlers::{Repository, Users},
-    },
+    db::handlers::{Repository, Users},
     errors::{Error, Result},
     AppState,
 };
@@ -395,8 +393,8 @@ impl FromRequestParts<AppState> for CurrentUser {
 mod tests {
     use crate::{
         api::models::users::{CurrentUser, Role},
-        errors::Error,
         db::handlers::{repository::Repository, Users},
+        errors::Error,
         test_utils::create_test_config,
         test_utils::require_admin,
         AppState,
