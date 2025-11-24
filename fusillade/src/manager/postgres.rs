@@ -733,9 +733,9 @@ impl<H: HttpClient + 'static> Storage for PostgresRequestManager<H> {
 
                     // CASE 1: Filename arrives AFTER stub was created with auto-generated name
                     // We need to check uniqueness now before continuing to stream templates
-                    if file_id.is_some()
-                        && metadata.filename.is_some()
-                        && !uniqueness_checked_for_final_filename
+                    if let Some(fid) = file_id 
+                        && let Some(filename) = metadata.filename.as_ref() 
+                        && !uniqueness_checked_for_final_filename 
                     {
                         let final_filename = metadata.filename.as_ref().unwrap();
 
