@@ -25,34 +25,43 @@ impl EmailService {
     pub fn new(config: &Config) -> Result<Self, Error> {
         let email_config = &config.auth.native.email;
 
-        let transport = if let Some(smtp_config) = &email_config.smtp {
-            // Use SMTP transport
-            if !smtp_config.use_tls {
-                tracing::warn!("SMTP TLS is disabled - this is not recommended for production");
-            }
+        let transport = match &email_config.transport {
+            crate::config::EmailTransportConfig::Smtp {
+                host,
+                port,
+                username,
+                password,
+                use_tls,
+            } => {
+                // Use SMTP transport
+                if !use_tls {
+                    tracing::warn!("SMTP TLS is disabled - this is not recommended for production");
+                }
 
-            let smtp_builder = if smtp_config.use_tls {
-                AsyncSmtpTransport::<Tokio1Executor>::starttls_relay(&smtp_config.host)
-            } else {
-                Ok(AsyncSmtpTransport::<Tokio1Executor>::builder_dangerous(&smtp_config.host))
-            }
-            .map_err(|e| Error::Internal {
-                operation: format!("create SMTP transport: {e}"),
-            })?
-            .port(smtp_config.port)
-            .credentials(Credentials::new(smtp_config.username.clone(), smtp_config.password.clone()));
+                let smtp_builder = if *use_tls {
+                    AsyncSmtpTransport::<Tokio1Executor>::starttls_relay(host)
+                } else {
+                    Ok(AsyncSmtpTransport::<Tokio1Executor>::builder_dangerous(host))
+                }
+                .map_err(|e| Error::Internal {
+                    operation: format!("create SMTP transport: {e}"),
+                })?
+                .port(*port)
+                .credentials(Credentials::new(username.clone(), password.clone()));
 
-            EmailTransport::Smtp(smtp_builder.build())
-        } else {
-            // Use file transport for development
-            let emails_dir = Path::new("./emails");
-            if !emails_dir.exists() {
-                std::fs::create_dir_all(emails_dir).map_err(|e| Error::Internal {
-                    operation: format!("create emails directory: {e}"),
-                })?;
+                EmailTransport::Smtp(smtp_builder.build())
             }
-            let file_transport = AsyncFileTransport::<Tokio1Executor>::new(emails_dir);
-            EmailTransport::File(file_transport)
+            crate::config::EmailTransportConfig::File { path } => {
+                // Use file transport for development/testing
+                let emails_dir = Path::new(path);
+                if !emails_dir.exists() {
+                    std::fs::create_dir_all(emails_dir).map_err(|e| Error::Internal {
+                        operation: format!("create emails directory: {e}"),
+                    })?;
+                }
+                let file_transport = AsyncFileTransport::<Tokio1Executor>::new(emails_dir);
+                EmailTransport::File(file_transport)
+            }
         };
 
         Ok(Self {

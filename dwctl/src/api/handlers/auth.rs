@@ -1381,6 +1381,13 @@ mod tests {
         let mut config = create_test_config();
         config.auth.native.enabled = true;
 
+        // Save the email path before moving config
+        let email_path = if let crate::config::EmailTransportConfig::File { path } = &config.auth.native.email.transport {
+            path.clone()
+        } else {
+            panic!("Expected File transport in test config");
+        };
+
         let app = crate::Application::new_with_pool(config, Some(pool.clone()))
             .await
             .expect("Failed to create application");
@@ -1420,8 +1427,8 @@ mod tests {
         assert!(body.message.contains("If an account with that email exists"));
 
         // Step 2: Extract the reset link from the email file (simulating clicking email link)
-        // The email service writes to ./emails/ directory when not using SMTP
-        let emails_dir = std::path::Path::new("./emails");
+        // Use the email path we saved earlier
+        let emails_dir = std::path::Path::new(&email_path);
 
         // Find the most recent email file
         let mut email_files: Vec<_> = std::fs::read_dir(emails_dir).unwrap().filter_map(|e| e.ok()).collect();
