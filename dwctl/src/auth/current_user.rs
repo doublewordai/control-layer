@@ -75,6 +75,7 @@ async fn try_jwt_session_auth(
                 roles: user.roles,
                 display_name: user.display_name,
                 avatar_url: user.avatar_url,
+                payment_provider_id: user.payment_provider_id,
             }));
         }
     }
@@ -162,6 +163,7 @@ async fn try_proxy_header_auth(
                 roles: user.roles,
                 display_name: user.display_name,
                 avatar_url: user.avatar_url,
+                payment_provider_id: user.payment_provider_id,
             }),
             Err(e) => return Some(Err(Error::Database(e))),
         }
@@ -179,6 +181,7 @@ async fn try_proxy_header_auth(
                     roles: user.roles,
                     display_name: user.display_name,
                     avatar_url: user.avatar_url,
+                    payment_provider_id: user.payment_provider_id,
                 })
             }
             Ok(None) => {
@@ -232,7 +235,7 @@ async fn try_api_key_auth(parts: &axum::http::request::Parts, db: &PgPool) -> Op
     };
     let api_key_result = match sqlx::query!(
         r#"
-        SELECT ak.user_id, ak.purpose, u.username, u.email, u.is_admin, u.display_name, u.avatar_url
+        SELECT ak.user_id, ak.purpose, u.username, u.email, u.is_admin, u.display_name, u.avatar_url, u.payment_provider_id
         FROM api_keys ak
         INNER JOIN users u ON ak.user_id = u.id
         WHERE ak.secret = $1
@@ -300,6 +303,7 @@ async fn try_api_key_auth(parts: &axum::http::request::Parts, db: &PgPool) -> Op
         roles,
         display_name: api_key_data.display_name,
         avatar_url: api_key_data.avatar_url,
+        payment_provider_id: api_key_data.payment_provider_id,
     }))
 }
 
@@ -1009,6 +1013,7 @@ mod tests {
             roles: vec![Role::PlatformManager],
             display_name: None,
             avatar_url: None,
+            payment_provider_id: None,
         };
 
         let result = require_admin(admin_user);
@@ -1023,6 +1028,7 @@ mod tests {
             roles: vec![Role::StandardUser],
             display_name: None,
             avatar_url: None,
+            payment_provider_id: None,
         };
 
         let result = require_admin(regular_user);
@@ -1050,6 +1056,7 @@ mod tests {
             roles: user.roles.clone(),
             display_name: user.display_name.clone(),
             avatar_url: user.avatar_url.clone(),
+            payment_provider_id: user.payment_provider_id.clone(),
         };
         let jwt_token = session::create_session_token(&current_user, &config).unwrap();
 
@@ -1120,6 +1127,7 @@ mod tests {
             roles: user.roles.clone(),
             display_name: user.display_name.clone(),
             avatar_url: user.avatar_url.clone(),
+            payment_provider_id: user.payment_provider_id.clone(),
         };
         let jwt_token = session::create_session_token(&current_user, &config).unwrap();
 

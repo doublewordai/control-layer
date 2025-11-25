@@ -386,6 +386,7 @@ mod tests {
             roles,
             display_name: None,
             avatar_url: None,
+            payment_provider_id: None,
         }
     }
 

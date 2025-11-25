@@ -79,10 +79,20 @@ describe("UsersGroups Component", () => {
   it("renders empty state when no data exists", async () => {
     server.use(
       http.get("/admin/api/v1/users", () => {
-        return HttpResponse.json([]);
+        return HttpResponse.json({
+          data: [],
+          total_count: 0,
+          skip: 0,
+          limit: 10,
+        });
       }),
       http.get("/admin/api/v1/groups", () => {
-        return HttpResponse.json([]);
+        return HttpResponse.json({
+          data: [],
+          total_count: 0,
+          skip: 0,
+          limit: 10,
+        });
       }),
     );
 

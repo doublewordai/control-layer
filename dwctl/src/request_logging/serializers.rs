@@ -417,8 +417,8 @@ pub async fn store_analytics_record(pool: &PgPool, metrics: &UsageMetrics, auth:
         provider_name,
     };
 
-    // Insert the analytics record using the row data
-    sqlx::query!(
+    // Insert the analytics record and get the ID
+    let analytics_id = sqlx::query_scalar!(
         r#"
         INSERT INTO http_analytics (
             instance_id, correlation_id, timestamp, method, uri, model,
@@ -441,6 +441,7 @@ pub async fn store_analytics_record(pool: &PgPool, metrics: &UsageMetrics, auth:
             access_source = EXCLUDED.access_source,
             input_price_per_token = EXCLUDED.input_price_per_token,
             output_price_per_token = EXCLUDED.output_price_per_token
+        RETURNING id
         "#,
         row.instance_id,
         row.correlation_id,
@@ -461,7 +462,7 @@ pub async fn store_analytics_record(pool: &PgPool, metrics: &UsageMetrics, auth:
         row.input_price_per_token,
         row.output_price_per_token
     )
-    .execute(pool)
+    .fetch_one(pool)
     .await?;
 
     // =======================================================================
@@ -499,13 +500,13 @@ pub async fn store_analytics_record(pool: &PgPool, metrics: &UsageMetrics, auth:
                                 );
                             }
 
-                            // Create usage transaction
+                            // Create usage transaction referencing the analytics record
                             match credits
                                 .create_transaction(&CreditTransactionCreateDBRequest {
                                     user_id,
                                     transaction_type: CreditTransactionType::Usage,
                                     amount: total_cost,
-                                    source_id: user_id.to_string(),
+                                    source_id: analytics_id.to_string(),
                                     description: Some(format!(
                                         "API usage: {} ({} input + {} output tokens)",
                                         model, row.prompt_tokens, row.completion_tokens

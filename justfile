@@ -106,7 +106,6 @@ db-setup:
     # Write .env files for sqlx compile-time verification
     echo "Writing .env files..."
     echo "DATABASE_URL=postgres://$DB_USER:$DB_PASS@$DB_HOST:$DB_PORT/dwctl" > dwctl/.env
-    echo "DATABASE_URL=postgres://$DB_USER:$DB_PASS@$DB_HOST:$DB_PORT/fusillade" > fusillade/.env
 
     # Run migrations
     echo "Running migrations..."
@@ -118,20 +117,11 @@ db-setup:
         exit 1
     fi
 
-    echo "Running fusillade migrations..."
-    if (cd fusillade && sqlx migrate run); then
-        echo "  ✅ fusillade migrations complete"
-    else
-        echo "  ❌ fusillade migrations failed"
-        exit 1
-    fi
-
     echo ""
     echo "✅ Database setup complete!"
     echo ""
     echo "Database URLs configured:"
     echo "  dwctl:     postgres://$DB_USER:$DB_PASS@$DB_HOST:$DB_PORT/dwctl"
-    echo "  fusillade: postgres://$DB_USER:$DB_PASS@$DB_HOST:$DB_PORT/fusillade"
 
 # Start the full development stack with hot reload
 #
@@ -344,11 +334,13 @@ test target="" *args="":
             echo "🕐 [$(date '+%H:%M:%S')] Starting docker test (total time: 0s)"
 
             if [ "$BUILD_LOCAL" = "true" ]; then
-                echo "🔨 [$(date '+%H:%M:%S')] Building local images with latest tag..."
-                TAGS=latest PLATFORMS=linux/amd64 ATTESTATIONS=false docker buildx bake --load
+                echo "🔨 [$(date '+%H:%M:%S')] Building local images..."
+                PULL_POLICY=never docker compose build
                 BUILD_TIME=$(date +%s)
                 echo "🚀 [$(date '+%H:%M:%S')] Starting docker services with local images... (build took: $((BUILD_TIME - START_TIME))s)"
-                TAG=latest PULL_POLICY=never just up -d --wait
+                PULL_POLICY=never docker compose up -d
+                echo "⏳ Waiting for services to be ready..."
+                sleep 5
             else
                 echo "🚀 [$(date '+%H:%M:%S')] Starting docker services..."
                 just up -d --wait
@@ -400,7 +392,7 @@ test target="" *args="":
                     echo "  cargo binstall cargo-llvm-cov"
                     exit 1
                 fi
-                cargo llvm-cov --fail-under-lines 60 --lcov --output-path lcov.info
+                cargo llvm-cov --fail-under-lines 60 --lcov --output-path lcov.info -- --test-threads=4
             else
                 cargo test {{args}}
             fi
