@@ -136,7 +136,6 @@ const ModelInfo: React.FC = () => {
   // IMPORTANT: Order must match Models.tsx to ensure cache reuse
   const includeParam = useMemo(() => {
     const parts: string[] = ["status"]; // Always include status to reuse cache from Models page
-    if (showPricing) parts.push("pricing");
     if (canManageGroups) parts.push("groups");
     if (canViewAnalytics) parts.push("metrics");
     parts.push("pricing"); // Always fetch pricing
