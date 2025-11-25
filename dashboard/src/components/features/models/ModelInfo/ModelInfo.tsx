@@ -13,10 +13,9 @@ import {
   Check,
 } from "lucide-react";
 import {
-  useModels,
-  useEndpoints,
+  useModel,
+  useEndpoint,
   useUpdateModel,
-  type ModelsInclude,
 } from "../../../../api/control-layer";
 import { useAuthorization } from "../../../../utils";
 import {
@@ -132,41 +131,33 @@ const ModelInfo: React.FC = () => {
 
   const updateModelMutation = useUpdateModel();
 
-  // Build include parameter based on permissions - always include status to match Models page cache
-  // IMPORTANT: Order must match Models.tsx to ensure cache reuse
+  // Build include parameter based on permissions
   const includeParam = useMemo(() => {
-    const parts: string[] = ["status"]; // Always include status to reuse cache from Models page
+    const parts: string[] = ["status"];
     if (canManageGroups) parts.push("groups");
     if (canViewAnalytics) parts.push("metrics");
-    parts.push("pricing"); // Always fetch pricing
+    if (showPricing) parts.push("pricing");
     return parts.join(",");
-  }, [canManageGroups, canViewAnalytics]);
+  }, [canManageGroups, canViewAnalytics, showPricing]);
 
   const {
-    data: rawModelsData,
-    isLoading: modelsLoading,
-    error: modelsError,
-  } = useModels({
-    include: includeParam as ModelsInclude,
-    accessible: !canManageGroups, // Match Models page: admins see all (false), non-admins see accessible only (true)
-  });
+    data: model,
+    isLoading: modelLoading,
+    error: modelError,
+  } = useModel(modelId!, { include: includeParam });
 
   const {
-    data: endpointsData,
-    isLoading: endpointsLoading,
-    error: endpointsError,
-  } = useEndpoints();
+    data: endpoint,
+    isLoading: endpointLoading,
+    error: endpointError,
+  } = useEndpoint(model?.hosted_on || "", { enabled: !!model?.hosted_on });
 
-  const loading = modelsLoading || endpointsLoading;
-  const error = modelsError
-    ? (modelsError as Error).message
-    : endpointsError
-      ? (endpointsError as Error).message
+  const loading = modelLoading || endpointLoading;
+  const error = modelError
+    ? (modelError as Error).message
+    : endpointError
+      ? (endpointError as Error).message
       : null;
-
-  // Find the specific model and endpoint
-  const model = rawModelsData?.data.find((m) => m.id === modelId);
-  const endpoint = endpointsData?.find((e) => e.id === model?.hosted_on);
 
   // Initialize form data when model is loaded
   useEffect(() => {
@@ -1085,7 +1076,10 @@ const ModelInfo: React.FC = () => {
                                 <p className="font-medium">
                                   {model.pricing.input_price_per_token
                                     ? (() => {
-                                        const price = Number(model.pricing.input_price_per_token) * 1000000;
+                                        const price =
+                                          Number(
+                                            model.pricing.input_price_per_token,
+                                          ) * 1000000;
                                         return `$${price % 1 === 0 ? price.toFixed(0) : price.toFixed(2)}`;
                                       })()
                                     : "Not set"}
@@ -1098,7 +1092,11 @@ const ModelInfo: React.FC = () => {
                                 <p className="font-medium">
                                   {model.pricing.output_price_per_token
                                     ? (() => {
-                                        const price = Number(model.pricing.output_price_per_token) * 1000000;
+                                        const price =
+                                          Number(
+                                            model.pricing
+                                              .output_price_per_token,
+                                          ) * 1000000;
                                         return `$${price % 1 === 0 ? price.toFixed(0) : price.toFixed(2)}`;
                                       })()
                                     : "Not set"}
