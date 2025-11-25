@@ -399,7 +399,7 @@ export function TransactionHistory({
         )}
 
         {/* Pagination Controls */}
-        {filteredTransactions.length > itemsPerPage && (
+        {filteredTransactions.length > 12 && (
           <div className="flex items-center justify-between border-t border-doubleword-neutral-200 pt-2">
             <div className="text-sm text-doubleword-neutral-600">
               Showing {(currentPage - 1) * itemsPerPage + 1} to{" "}
