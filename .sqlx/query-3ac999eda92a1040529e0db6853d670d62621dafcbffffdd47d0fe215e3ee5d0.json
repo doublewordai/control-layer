@@ -1,11 +1,11 @@
 {
   "db_name": "PostgreSQL",
-  "query": "\n        SELECT user_id\n        FROM api_keys\n        WHERE secret = $1\n        ",
+  "query": "\n            SELECT id FROM credits_transactions\n            WHERE source_id = $1\n            LIMIT 1\n            ",
   "describe": {
     "columns": [
       {
         "ordinal": 0,
-        "name": "user_id",
+        "name": "id",
         "type_info": "Uuid"
       }
     ],
@@ -18,5 +18,5 @@
       false
     ]
   },
-  "hash": "3e346c3ee16991f915c3623c051a20d795b2038811f56c44882dd570114d1c60"
+  "hash": "3ac999eda92a1040529e0db6853d670d62621dafcbffffdd47d0fe215e3ee5d0"
 }

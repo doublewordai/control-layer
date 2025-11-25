@@ -170,8 +170,7 @@ use auth::middleware::admin_ai_proxy_middleware;
 use axum::extract::DefaultBodyLimit;
 use axum::http::HeaderValue;
 use axum::{
-    Router, ServiceExt, middleware, http,
-    middleware::from_fn_with_state,
+    Router, ServiceExt, http, middleware,
     routing::{delete, get, patch, post},
 };
 use axum_prometheus::PrometheusMetricLayer;
