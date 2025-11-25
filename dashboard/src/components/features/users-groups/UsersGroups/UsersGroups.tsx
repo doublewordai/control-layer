@@ -33,6 +33,7 @@ import {
   DialogFooter,
 } from "../../../ui/dialog";
 import type { DisplayUser, DisplayGroup } from "../../../../types/display";
+import { TablePagination } from "@/components/ui/table-pagination";
 
 // Predefined color classes that Tailwind will include
 const GROUP_COLOR_CLASSES = [
@@ -57,6 +58,9 @@ const getGroupColor = (_groupId: string, index: number): string => {
 const UsersGroups: React.FC = () => {
   const [searchParams] = useSearchParams();
   const navigate = useNavigate();
+  const [userPage, setUserPage] = useState<number>(1);
+  const [groupPage, setGroupPage] = useState<number>(1);
+  const [itemsPerPage] = useState(12);
 
   // Get tab from URL or default to "users"
   const tabFromUrl = searchParams.get("tab");
@@ -79,17 +83,28 @@ const UsersGroups: React.FC = () => {
     newParams.set("tab", tab);
     navigate(`/users-groups?${newParams.toString()}`, { replace: true });
   };
+
   // Data from the API: uses the tanstack query hooks to fetch both users and groups TODO: (this is a bit redundant right now, but we can optimize later)
   const {
     data: usersData,
     isLoading: usersLoading,
     error: usersError,
-  } = useUsers({ include: "groups" });
+  } = useUsers({
+    include: "groups",
+    skip: (userPage - 1) * itemsPerPage,
+    limit: itemsPerPage,
+  });
+
   const {
     data: groupsData,
     isLoading: groupsLoading,
     error: groupsError,
-  } = useGroups({ include: "users" });
+  } = useGroups({
+    include: "users",
+    skip: (groupPage - 1) * itemsPerPage,
+    limit: itemsPerPage,
+  });
+
   const loading = usersLoading || groupsLoading;
   const error = usersError || groupsError;
 
@@ -182,7 +197,7 @@ const UsersGroups: React.FC = () => {
 
   // Transform API data
   const users: DisplayUser[] = usersData
-    ? usersData.map((user) => ({
+    ? usersData.data.map((user) => ({
         ...user,
         name: user.display_name || user.username,
         avatar: user.avatar_url || "",
@@ -194,7 +209,7 @@ const UsersGroups: React.FC = () => {
     : [];
 
   const groups: DisplayGroup[] = groupsData
-    ? groupsData.map((group: BackendGroup) => ({
+    ? groupsData.data.map((group: BackendGroup) => ({
         ...group, // Keep all backend fields
         memberCount: group.users ? group.users.length : 0,
         memberIds: group.users ? group.users.map((user) => user.id) : [],
@@ -419,6 +434,13 @@ const UsersGroups: React.FC = () => {
             }
           />
         )}
+        <TablePagination
+          itemName="users"
+          itemsPerPage={itemsPerPage}
+          currentPage={userPage}
+          onPageChange={setUserPage}
+          totalItems={usersData?.total_count || 0}
+        />
       </div>
       <div
         role="tabpanel"
@@ -481,7 +503,7 @@ const UsersGroups: React.FC = () => {
                       />
                     </div>
                   </div>
-                  <p className="text-sm text-doubleword-neutral-600 mb-4 break-words">
+                  <p className="text-sm text-doubleword-neutral-600 mb-4 wrap-break-word">
                     {group.description}
                   </p>
                   <div className="flex items-center justify-start pt-4 border-t border-doubleword-neutral-100">
@@ -509,6 +531,13 @@ const UsersGroups: React.FC = () => {
                 </div>
               );
             })}
+            <TablePagination
+              itemName="group"
+              itemsPerPage={itemsPerPage}
+              currentPage={groupPage}
+              onPageChange={setGroupPage}
+              totalItems={groupsData?.total_count || 0}
+            />
           </div>
         )}
       </div>
