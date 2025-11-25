@@ -30,11 +30,6 @@ secret_key: insecure-change-in-production
 
 # Payment configuration
 payment:
-  stripe:
-    api_key: "TEST API KEY you'll need to replace this with the one from stripe"
-    webhook_secret: "whsec_8c7f1687b9e1ca58dfe81a28a5de3fd1fdffac83821f8f4cabc6ad2145669cde"
-    price_id: "price_1SUSd1GdjfBnc3h7uHVkmhGg"
-    host_url: "http://localhost:3001"  # Base URL for webhooks and redirects
 
 # Model sources - inference endpoints to connect to
 # Uncomment and configure as needed
