@@ -17,7 +17,6 @@ import {
   DeleteUserModal,
   GroupManagementModal,
   DeleteGroupModal,
-  UserTransactionsModal,
 } from "../../../modals";
 import { GroupActionsDropdown } from "../";
 import { UserAvatar, Button } from "../../../ui";
@@ -113,8 +112,6 @@ const UsersGroups: React.FC = () => {
   const [showEditGroupModal, setShowEditGroupModal] = useState(false);
   const [showBulkDeleteModal, setShowBulkDeleteModal] = useState(false);
   const [showBulkDeleteGroupsModal, setShowBulkDeleteGroupsModal] =
-    useState(false);
-  const [showUserTransactionsModal, setShowUserTransactionsModal] =
     useState(false);
 
   // 'active' means the 3 dots have been clicked on a user or group, vs. selected in the table.
@@ -628,17 +625,6 @@ const UsersGroups: React.FC = () => {
           }}
         />
       )}
-      {activeUser && (
-        <UserTransactionsModal
-          isOpen={showUserTransactionsModal}
-          onClose={() => {
-            setShowUserTransactionsModal(false);
-            setActiveUser(null);
-          }}
-          user={activeUser}
-        />
-      )}
-
       {/* Bulk Delete Confirmation Modal */}
       <Dialog open={showBulkDeleteModal} onOpenChange={setShowBulkDeleteModal}>
         <DialogContent className="sm:max-w-md">
