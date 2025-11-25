@@ -43,6 +43,7 @@ struct User {
     pub is_admin: bool,
     pub password_hash: Option<String>,
     pub external_user_id: Option<String>,
+    pub payment_provider_id: Option<String>,
 }
 
 pub struct Users<'c> {
@@ -64,6 +65,7 @@ impl From<(Vec<Role>, User)> for UserDBResponse {
             roles,
             password_hash: user.password_hash,
             external_user_id: user.external_user_id,
+            payment_provider_id: user.payment_provider_id,
         }
     }
 }
@@ -132,11 +134,12 @@ impl<'c> Repository for Users<'c> {
                 u.is_admin,
                 u.password_hash,
                 u.external_user_id,
+                u.payment_provider_id,
                 ARRAY_AGG(ur.role) FILTER (WHERE ur.role IS NOT NULL) as "roles: Vec<Role>"
             FROM users u
             LEFT JOIN user_roles ur ON ur.user_id = u.id
             WHERE u.id = $1 AND u.id != '00000000-0000-0000-0000-000000000000'
-            GROUP BY u.id, u.username, u.email, u.display_name, u.avatar_url, u.auth_source, u.created_at, u.updated_at, u.last_login, u.is_admin, u.password_hash, u.external_user_id
+            GROUP BY u.id, u.username, u.email, u.display_name, u.avatar_url, u.auth_source, u.created_at, u.updated_at, u.last_login, u.is_admin, u.password_hash, u.external_user_id, u.payment_provider_id
             "#,
             id
         )
@@ -157,6 +160,7 @@ impl<'c> Repository for Users<'c> {
                 is_admin: row.is_admin,
                 password_hash: row.password_hash,
                 external_user_id: row.external_user_id,
+                payment_provider_id: row.payment_provider_id,
             };
 
             let roles = row.roles.unwrap_or_default();
@@ -189,11 +193,12 @@ impl<'c> Repository for Users<'c> {
                 u.is_admin,
                 u.password_hash,
                 u.external_user_id,
+                u.payment_provider_id,
                 ARRAY_AGG(ur.role) FILTER (WHERE ur.role IS NOT NULL) as "roles: Vec<Role>"
             FROM users u
             LEFT JOIN user_roles ur ON ur.user_id = u.id
             WHERE u.id = ANY($1) AND u.id != '00000000-0000-0000-0000-000000000000'
-            GROUP BY u.id, u.username, u.email, u.display_name, u.avatar_url, u.auth_source, u.created_at, u.updated_at, u.last_login, u.is_admin, u.password_hash, u.external_user_id
+            GROUP BY u.id, u.username, u.email, u.display_name, u.avatar_url, u.auth_source, u.created_at, u.updated_at, u.last_login, u.is_admin, u.password_hash, u.external_user_id, u.payment_provider_id
             "#,
             ids.as_slice()
         )
@@ -216,6 +221,7 @@ impl<'c> Repository for Users<'c> {
                 is_admin: row.is_admin,
                 password_hash: row.password_hash,
                 external_user_id: row.external_user_id,
+                payment_provider_id: row.payment_provider_id,
             };
 
             let roles = row.roles.unwrap_or_default();
