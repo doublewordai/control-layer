@@ -1,4 +1,68 @@
 //! HTTP handlers for payment processing endpoints.
+//!
+//! # Payment Flow
+//!
+//! The payment system supports multiple payment providers (Stripe, PayPal, etc.) through
+//! a unified abstraction layer. The flow works as follows:
+//!
+//! ## 1. Checkout Session Creation
+//!
+//! **Endpoint**: `POST /admin/api/v1/payments`
+//!
+//! - User initiates payment from the frontend
+//! - Backend creates a checkout session with the configured payment provider
+//! - Returns a checkout URL for the frontend to redirect the user to
+//! - Requires configured `host_url` in payment config for building redirect URLs
+//!
+//! ## 2. User Completes Payment
+//!
+//! - User is redirected to payment provider (e.g., Stripe Checkout)
+//! - User completes payment on provider's secure page
+//! - Provider redirects user back to success or cancel URL
+//!
+//! ## 3. Payment Confirmation
+//!
+//! ### Path A: Webhook (Primary, Automatic)
+//!
+//! **Endpoint**: `POST /admin/api/v1/webhooks/payments`
+//!
+//! - Payment provider sends webhook event when payment completes
+//! - Backend validates webhook signature
+//! - Processes payment and credits user account
+//! - Returns 200 OK (even on processing errors to prevent retries)
+//!
+//! ### Path B: Manual Processing (Fallback)
+//!
+//! **Endpoint**: `PATCH /admin/api/v1/payments/{session_id}`
+//!
+//! - Frontend can trigger payment processing manually using session ID
+//! - Useful when webhooks fail or for immediate confirmation
+//! - Idempotent - safe to call multiple times
+//! - Returns 402 if payment not yet completed by provider
+//!
+//! ## Idempotency
+//!
+//! Payment processing is idempotent - processing the same session multiple times
+//! (via webhooks or manual triggers) will not create duplicate transactions.
+//!
+//! ## Frontend Integration
+//!
+//! The frontend payment flow:
+//!
+//! 1. **Initiate Payment**: Call `POST /admin/api/v1/payments` to get checkout URL
+//! 2. **Redirect**: Navigate user to the returned checkout URL (payment provider page)
+//! 3. **Handle Return**: Payment provider redirects back with query parameters:
+//!    - Success: `?payment=success&session_id={SESSION_ID}`
+//!    - Cancelled: `?payment=cancelled&session_id={SESSION_ID}`
+//! 4. **Process Payment**: On success, call `PATCH /admin/api/v1/payments/{session_id}`
+//!    to confirm and apply payment to account
+//! 5. **Show Feedback**: Display appropriate UI based on result:
+//!    - Success: "Payment processed successfully"
+//!    - Error: "Payment captured but not yet applied. Will update automatically."
+//! 6. **Clean URL**: Remove query parameters from URL after processing
+//!
+//! The frontend should handle errors gracefully - if manual processing fails,
+//! the webhook will eventually process the payment automatically.
 
 use axum::{
     Json,
