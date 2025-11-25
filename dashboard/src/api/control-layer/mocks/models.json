@@ -7,7 +7,11 @@
       "description": "Claude Sonnet 4 model by Anthropic",
       "model_type": "CHAT",
       "capabilities": ["text"],
-      "hosted_on": "b2c3d4e5-f678-9012-3456-7890abcdef01"
+      "hosted_on": "b2c3d4e5-f678-9012-3456-7890abcdef01",
+      "pricing": {
+        "input_price_per_token": "0.000003",
+        "output_price_per_token": "0.000015"
+      }
     },
     {
       "id": "4c561f35-4823-4d25-aa70-72bbf314a6ba",
@@ -16,7 +20,11 @@
       "description": "OpenAI GPT-4o model with vision capabilities",
       "model_type": "CHAT",
       "capabilities": ["text", "vision"],
-      "hosted_on": "c3d4e5f6-7890-1234-5678-90abcdef0123"
+      "hosted_on": "c3d4e5f6-7890-1234-5678-90abcdef0123",
+      "pricing": {
+        "input_price_per_token": "0.0000025",
+        "output_price_per_token": "0.00001"
+      }
     },
     {
       "id": "beb5ecb0-8f93-499f-aae0-a9aee9512adf",
@@ -25,7 +33,11 @@
       "description": "DeepSeek V3 model for reasoning and coding",
       "model_type": "CHAT",
       "capabilities": ["text", "reasoning"],
-      "hosted_on": "a1b2c3d4-e5f6-7890-1234-567890abcdef"
+      "hosted_on": "a1b2c3d4-e5f6-7890-1234-567890abcdef",
+      "pricing": {
+        "input_price_per_token": null,
+        "output_price_per_token": null
+      }
     },
     {
       "id": "b8c9d0e1-2345-6789-0123-bcdef1234567",
@@ -34,7 +46,11 @@
       "description": "Meta Llama 3.2 11B with vision capabilities",
       "model_type": "CHAT",
       "capabilities": ["text", "vision"],
-      "hosted_on": "a1b2c3d4-e5f6-7890-1234-567890abcdef"
+      "hosted_on": "a1b2c3d4-e5f6-7890-1234-567890abcdef",
+      "pricing": {
+        "input_price_per_token": null,
+        "output_price_per_token": null
+      }
     },
     {
       "id": "c9d0e1f2-3456-7890-1234-cdef12345678",
@@ -43,7 +59,11 @@
       "description": "OpenAI embeddings model",
       "model_type": "EMBEDDINGS",
       "capabilities": ["embeddings"],
-      "hosted_on": "c3d4e5f6-7890-1234-5678-90abcdef0123"
+      "hosted_on": "c3d4e5f6-7890-1234-5678-90abcdef0123",
+      "pricing": {
+        "input_price_per_token": "0.00000002",
+        "output_price_per_token": "0.00000002"
+      }
     }
   ]
 }

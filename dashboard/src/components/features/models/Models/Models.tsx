@@ -2,7 +2,6 @@ import React, { useState, useEffect } from "react";
 import { useSearchParams } from "react-router-dom";
 import { Search, Activity, LayoutGrid } from "lucide-react";
 import { useAuthorization } from "../../../../utils";
-import { useSettings } from "../../../../contexts";
 import {
   Select,
   SelectContent,
