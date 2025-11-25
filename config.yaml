@@ -29,7 +29,12 @@ admin_password: "hunter2"
 secret_key: insecure-change-in-production
 
 # Payment configuration
+# Dummy provider is enabled by default for testing
+# For production, configure Stripe or another provider
 payment:
+  dummy:
+    host_url: "http://localhost:3001"
+    amount: 100.00
 
 # Model sources - inference endpoints to connect to
 # Uncomment and configure as needed

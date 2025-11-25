@@ -271,3 +271,111 @@ impl PaymentProvider for StripeProvider {
         self.process_payment_session(db_pool, session_id).await
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use rust_decimal::Decimal;
+    use sqlx::PgPool;
+    use uuid::Uuid;
+
+    /// Helper to create a test user in the database
+    async fn create_test_user(pool: &PgPool) -> Uuid {
+        let user_id = Uuid::new_v4();
+        sqlx::query!(
+            r#"
+            INSERT INTO users (id, email, display_name, roles, password_hash)
+            VALUES ($1, $2, $3, $4, $5)
+            "#,
+            user_id,
+            "test@example.com",
+            "Test User",
+            &vec!["StandardUser"],
+            "dummy_hash"
+        )
+        .execute(pool)
+        .await
+        .unwrap();
+
+        user_id
+    }
+
+    #[test]
+    fn test_stripe_provider_creation() {
+        let provider = StripeProvider::new("sk_test_fake".to_string(), "price_fake".to_string(), "whsec_fake".to_string());
+
+        assert_eq!(provider.api_key, "sk_test_fake");
+        assert_eq!(provider.price_id, "price_fake");
+        assert_eq!(provider.webhook_secret, "whsec_fake");
+    }
+
+    #[sqlx::test]
+    async fn test_stripe_idempotency_fast_path(pool: PgPool) {
+        // Test the fast path: transaction already exists in DB
+        let user_id = create_test_user(&pool).await;
+        let session_id = "cs_test_fake_session_123";
+
+        // Manually create a transaction
+        sqlx::query!(
+            r#"
+            INSERT INTO credits_transactions (id, user_id, transaction_type, amount, source_id, description, created_at)
+            VALUES ($1, $2, 'purchase', $3, $4, $5, NOW())
+            "#,
+            Uuid::new_v4(),
+            user_id,
+            Decimal::new(5000, 2), // $50.00
+            session_id,
+            "Test Stripe payment"
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let provider = StripeProvider::new("sk_test_fake".to_string(), "price_fake".to_string(), "whsec_fake".to_string());
+
+        // Process the same session - should hit fast path and succeed
+        let result = provider.process_payment_session(&pool, session_id).await;
+        assert!(result.is_ok(), "Should succeed via fast path (transaction already exists)");
+
+        // Verify only one transaction exists
+        let count = sqlx::query!(
+            r#"
+            SELECT COUNT(*) as count
+            FROM credits_transactions
+            WHERE source_id = $1
+            "#,
+            session_id
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+
+        assert_eq!(count.count.unwrap(), 1, "Should still have exactly one transaction");
+    }
+
+    #[test]
+    fn test_payment_session_parsing() {
+        // Test that PaymentSession structure is correct
+        let session = PaymentSession {
+            user_id: "550e8400-e29b-41d4-a716-446655440000".to_string(),
+            amount: Decimal::new(5000, 2),
+            is_paid: true,
+        };
+
+        assert_eq!(session.user_id, "550e8400-e29b-41d4-a716-446655440000");
+        assert_eq!(session.amount, Decimal::new(5000, 2));
+        assert!(session.is_paid);
+    }
+
+    #[test]
+    fn test_webhook_event_parsing() {
+        // Test WebhookEvent structure
+        let event = WebhookEvent {
+            event_type: "CheckoutSessionCompleted".to_string(),
+            session_id: Some("cs_test_123".to_string()),
+        };
+
+        assert_eq!(event.event_type, "CheckoutSessionCompleted");
+        assert_eq!(event.session_id, Some("cs_test_123".to_string()));
+    }
+}

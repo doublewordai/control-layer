@@ -91,10 +91,7 @@ use crate::{AppState, api::models::users::CurrentUser, payment_providers};
     )
 )]
 #[tracing::instrument(skip_all)]
-pub async fn create_payment(
-    State(state): State<AppState>,
-    user: CurrentUser,
-) -> Result<Response, StatusCode> {
+pub async fn create_payment(State(state): State<AppState>, user: CurrentUser) -> Result<Response, StatusCode> {
     // Get payment provider from config (generic - works for any provider)
     let payment_config = match state.config.payment.clone() {
         Some(config) => config,
@@ -109,9 +106,7 @@ pub async fn create_payment(
 
     // Build redirect URLs from configured host URL
     let origin = match payment_config.host_url() {
-        Some(configured_host) => {
-            configured_host.to_string()
-        }
+        Some(configured_host) => configured_host.to_string(),
         None => {
             tracing::error!("No host_url configured in payment config - this is required for payment processing");
             let error_response = Json(json!({
@@ -192,8 +187,7 @@ pub async fn process_payment(
         .into_response()),
         Err(e) => {
             tracing::error!("Failed to process payment session: {:?}", e);
-            let status = StatusCode::from(&e);
-            if status == StatusCode::PAYMENT_REQUIRED {
+            if matches!(e, payment_providers::PaymentError::PaymentNotCompleted) {
                 Ok((
                     StatusCode::PAYMENT_REQUIRED,
                     Json(json!({
@@ -267,5 +261,208 @@ pub async fn webhook_handler(State(state): State<AppState>, headers: axum::http:
             // Always return 200 to prevent provider retries for events we've already seen
             StatusCode::OK
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{
+        config::{DummyPaymentConfig, PaymentConfig},
+        test_utils::create_test_config,
+    };
+    use axum::Router;
+    use axum::routing::{patch, post};
+    use axum_test::TestServer;
+    use rust_decimal::Decimal;
+    use sqlx::PgPool;
+
+    #[sqlx::test]
+    async fn test_dummy_payment_flow(pool: PgPool) {
+        // Setup config with dummy payment provider
+        let mut config = create_test_config();
+        config.payment = Some(PaymentConfig::Dummy(DummyPaymentConfig {
+            host_url: Some("http://localhost:3001".to_string()),
+            amount: Some(Decimal::new(100, 0)), // $100
+        }));
+
+        let request_manager = std::sync::Arc::new(fusillade::PostgresRequestManager::new(pool.clone()));
+        let state = AppState::builder()
+            .db(pool.clone())
+            .config(config)
+            .request_manager(request_manager)
+            .build();
+
+        // Create a test user
+        let user = sqlx::query!(
+            r#"
+            INSERT INTO users (id, email, display_name, roles, password_hash)
+            VALUES ($1, $2, $3, $4, $5)
+            RETURNING id
+            "#,
+            uuid::Uuid::new_v4(),
+            "test@example.com",
+            "Test User",
+            &vec!["StandardUser"],
+            "dummy_hash"
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+
+        let app = Router::new()
+            .route("/payments", post(create_payment))
+            .route("/payments/:id", patch(process_payment))
+            .with_state(state);
+
+        let server = TestServer::new(app).unwrap();
+
+        // Step 1: Create checkout session
+        let response = server
+            .post("/payments")
+            .add_header("x-doubleword-user", user.id.to_string().as_str())
+            .await;
+
+        response.assert_status(StatusCode::OK);
+        let checkout_response: serde_json::Value = response.json();
+        let checkout_url = checkout_response["url"].as_str().unwrap();
+
+        // Verify URL contains session_id
+        assert!(checkout_url.contains("session_id="));
+        assert!(checkout_url.contains("payment=success"));
+
+        // Extract session_id from URL
+        let url = url::Url::parse(checkout_url).unwrap();
+        let query_pairs: std::collections::HashMap<_, _> = url.query_pairs().collect();
+        let session_id = query_pairs.get("session_id").unwrap();
+
+        // Step 2: Verify transaction was created
+        let transaction = sqlx::query!(
+            r#"
+            SELECT amount, user_id, source_id
+            FROM credits_transactions
+            WHERE source_id = $1
+            "#,
+            session_id.to_string()
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+
+        assert_eq!(transaction.amount, Decimal::new(100, 0));
+        assert_eq!(transaction.user_id, user.id);
+
+        // Step 3: Process payment (idempotency check)
+        let response = server
+            .patch(&format!("/payments/{}", session_id))
+            .add_header("x-doubleword-user", user.id.to_string().as_str())
+            .await;
+
+        response.assert_status(StatusCode::OK);
+        let process_response: serde_json::Value = response.json();
+        assert_eq!(process_response["message"], "Payment processed successfully");
+
+        // Step 4: Verify no duplicate transactions
+        let count = sqlx::query!(
+            r#"
+            SELECT COUNT(*) as count
+            FROM credits_transactions
+            WHERE source_id = $1
+            "#,
+            session_id.to_string()
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+
+        assert_eq!(count.count.unwrap(), 1, "Should only have one transaction (idempotent)");
+    }
+
+    #[sqlx::test]
+    async fn test_payment_no_provider_configured(pool: PgPool) {
+        // Setup config WITHOUT payment provider
+        let config = create_test_config();
+
+        let request_manager = std::sync::Arc::new(fusillade::PostgresRequestManager::new(pool.clone()));
+        let state = AppState::builder()
+            .db(pool.clone())
+            .config(config)
+            .request_manager(request_manager)
+            .build();
+
+        let user = sqlx::query!(
+            r#"
+            INSERT INTO users (id, email, display_name, roles, password_hash)
+            VALUES ($1, $2, $3, $4, $5)
+            RETURNING id
+            "#,
+            uuid::Uuid::new_v4(),
+            "test@example.com",
+            "Test User",
+            &vec!["StandardUser"],
+            "dummy_hash"
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+
+        let app = Router::new().route("/payments", post(create_payment)).with_state(state);
+
+        let server = TestServer::new(app).unwrap();
+
+        let response = server
+            .post("/payments")
+            .add_header("x-doubleword-user", user.id.to_string().as_str())
+            .await;
+
+        response.assert_status(StatusCode::SERVICE_UNAVAILABLE);
+        let error_response: serde_json::Value = response.json();
+        assert!(error_response["message"].as_str().unwrap().contains("unavailable"));
+    }
+
+    #[sqlx::test]
+    async fn test_payment_no_host_url(pool: PgPool) {
+        // Setup config with dummy provider but NO host_url
+        let mut config = create_test_config();
+        config.payment = Some(PaymentConfig::Dummy(DummyPaymentConfig {
+            host_url: None,
+            amount: Some(Decimal::new(50, 0)),
+        }));
+
+        let request_manager = std::sync::Arc::new(fusillade::PostgresRequestManager::new(pool.clone()));
+        let state = AppState::builder()
+            .db(pool.clone())
+            .config(config)
+            .request_manager(request_manager)
+            .build();
+
+        let user = sqlx::query!(
+            r#"
+            INSERT INTO users (id, email, display_name, roles, password_hash)
+            VALUES ($1, $2, $3, $4, $5)
+            RETURNING id
+            "#,
+            uuid::Uuid::new_v4(),
+            "test@example.com",
+            "Test User",
+            &vec!["StandardUser"],
+            "dummy_hash"
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+
+        let app = Router::new().route("/payments", post(create_payment)).with_state(state);
+
+        let server = TestServer::new(app).unwrap();
+
+        let response = server
+            .post("/payments")
+            .add_header("x-doubleword-user", user.id.to_string().as_str())
+            .await;
+
+        response.assert_status(StatusCode::SERVICE_UNAVAILABLE);
+        let error_response: serde_json::Value = response.json();
+        assert!(error_response["message"].as_str().unwrap().contains("unavailable"));
     }
 }
