@@ -1,11 +1,11 @@
 //! Database repository for users.
 
-use crate::types::{abbrev_uuid, UserId};
+use crate::types::{UserId, abbrev_uuid};
 use crate::{
     api::models::users::Role,
     db::{
         errors::{DbError, Result},
-        handlers::{repository::Repository, Groups},
+        handlers::{Groups, repository::Repository},
         models::users::{UserCreateDBRequest, UserDBResponse, UserUpdateDBRequest},
     },
 };
@@ -333,6 +333,17 @@ impl<'c> Repository for Users<'c> {
 impl<'c> Users<'c> {
     pub fn new(db: &'c mut PgConnection) -> Self {
         Self { db }
+    }
+
+    #[instrument(skip(self), err)]
+    pub async fn count(&mut self) -> Result<i64> {
+        // Note: This query counts the number of users excluding the admin user.
+        // It will likely need to filter by organization etc in future
+        let count = sqlx::query_scalar!("SELECT COUNT(*) FROM users WHERE id != '00000000-0000-0000-0000-000000000000'")
+            .fetch_one(&mut *self.db)
+            .await?;
+
+        Ok(count.unwrap_or(0))
     }
 
     #[instrument(skip(self, email), err)]

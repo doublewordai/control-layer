@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "\n            INSERT INTO groups (name, description, created_by, created_at, updated_at, source)\n            VALUES ($1, $2, $3, $4, $5, 'native')\n            RETURNING *\n            ",
+  "query": "\n            INSERT INTO groups (name, description, created_by, source)\n            VALUES ($1, $2, $3, 'native')\n            RETURNING *\n            ",
   "describe": {
     "columns": [
       {
@@ -43,9 +43,7 @@
       "Left": [
         "Varchar",
         "Text",
-        "Uuid",
-        "Timestamptz",
-        "Timestamptz"
+        "Uuid"
       ]
     },
     "nullable": [
@@ -58,5 +56,5 @@
       false
     ]
   },
-  "hash": "693115f4302a611508670602d0e3701bd2306e47366d90280eecfacd90d0c5e4"
+  "hash": "6afd42e77c2350436b0d52248ec850d57892b6410d283c6139cb5a6b875bc02d"
 }

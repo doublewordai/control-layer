@@ -3,7 +3,7 @@ export const queryKeys = {
   // Users
   users: {
     all: ["users"] as const,
-    query: (options?: { include?: string }) =>
+    query: (options?: { include?: string; skip?: number; limit?: number }) =>
       ["users", "query", options] as const,
     byId: (id: string, include?: string) =>
       ["users", "byId", id, include] as const,
@@ -26,7 +26,7 @@ export const queryKeys = {
   // Groups
   groups: {
     all: ["groups"] as const,
-    query: (options?: { include?: string }) =>
+    query: (options?: { include?: string; skip?: number; limit?: number }) =>
       ["groups", "query", options] as const,
     byId: (id: string) => ["groups", "byId", id] as const,
   },

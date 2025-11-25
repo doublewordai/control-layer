@@ -2,11 +2,11 @@
 
 use crate::db::errors::DbError;
 use crate::{
+    AppState,
     api::models::users::{CurrentUser, Role},
     auth::session,
     db::handlers::{Repository, Users},
     errors::{Error, Result},
-    AppState,
 };
 use axum::{extract::FromRequestParts, http::request::Parts};
 use sqlx::PgPool;
@@ -30,41 +30,42 @@ async fn try_jwt_session_auth(
         Err(e) => {
             return Some(Err(Error::BadRequest {
                 message: format!("Invalid cookie header: {e}"),
-            }))
+            }));
         }
     };
     let cookie_name = &config.auth.native.session.cookie_name;
 
     for cookie in cookie_str.split(';') {
         let cookie = cookie.trim();
-        if let Some((name, value)) = cookie.split_once('=') {
-            if name == cookie_name {
-                // Verify the JWT and extract user ID
-                let user_id = match session::verify_session_token(value, config) {
-                    Ok(id) => id,
-                    Err(_) => {
-                        // Invalid/expired token, continue checking other cookies
-                        continue;
-                    }
-                };
+        if let Some((name, value)) = cookie.split_once('=')
+            && name == cookie_name
+        {
+            // Verify the JWT and extract user ID
+            let user_id = match session::verify_session_token(value, config) {
+                Ok(id) => id,
+                Err(_) => {
+                    // Invalid/expired token, continue checking other cookies
+                    continue;
+                }
+            };
 
-                // Fetch fresh user data from database
-                let mut conn = match db.acquire().await {
-                    Ok(conn) => conn,
-                    Err(e) => return Some(Err(DbError::from(e).into())),
-                };
-                let mut user_repo = Users::new(&mut conn);
+            // Fetch fresh user data from database
+            let mut conn = match db.acquire().await {
+                Ok(conn) => conn,
+                Err(e) => return Some(Err(DbError::from(e).into())),
+            };
+            let mut user_repo = Users::new(&mut conn);
 
-                let user = match user_repo.get_by_id(user_id).await {
-                    Ok(Some(user)) => user,
-                    Ok(None) => {
-                        // User was deleted - invalidate session
-                        return Some(Err(Error::Unauthenticated {
-                            message: Some("User no longer exists".to_string()),
-                        }));
-                    }
-                    Err(e) => return Some(Err(Error::Database(e))),
-                };
+            let user = match user_repo.get_by_id(user_id).await {
+                Ok(Some(user)) => user,
+                Ok(None) => {
+                    // User was deleted - invalidate session
+                    return Some(Err(Error::Unauthenticated {
+                        message: Some("User no longer exists".to_string()),
+                    }));
+                }
+                Err(e) => return Some(Err(Error::Database(e))),
+            };
 
                 return Some(Ok(CurrentUser {
                     id: user.id,
@@ -218,7 +219,7 @@ async fn try_api_key_auth(parts: &axum::http::request::Parts, db: &PgPool) -> Op
         Err(e) => {
             return Some(Err(Error::BadRequest {
                 message: format!("Invalid authorization header: {e}"),
-            }))
+            }));
         }
     };
 
@@ -254,7 +255,7 @@ async fn try_api_key_auth(parts: &axum::http::request::Parts, db: &PgPool) -> Op
         None => {
             return Some(Err(Error::Unauthenticated {
                 message: Some("Invalid API key".to_string()),
-            }))
+            }));
         }
     };
 
@@ -396,12 +397,12 @@ impl FromRequestParts<AppState> for CurrentUser {
 #[cfg(test)]
 mod tests {
     use crate::{
+        AppState,
         api::models::users::{CurrentUser, Role},
-        db::handlers::{repository::Repository, Users},
+        db::handlers::{Users, repository::Repository},
         errors::Error,
         test_utils::create_test_config,
         test_utils::require_admin,
-        AppState,
     };
     use axum::{extract::FromRequestParts as _, http::request::Parts};
     use sqlx::PgPool;

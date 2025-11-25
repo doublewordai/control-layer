@@ -29,9 +29,14 @@ wget https://raw.githubusercontent.com/doublewordai/control-layer/refs/heads/mai
 docker compose -f docker-compose.yml up -d
 ```
 
-Navigate to `http://localhost:3001` to get started. When you get to the login page you will be prompting to sign in with a username and password. Please refer to the configuration section below for how to set up an admin user. You can then refer to the documentation [here](https://docs.doubleword.ai/control-layer/usage/models-and-access) to start playing around with Control Layer features.  
+Navigate to `http://localhost:3001` to get started. When you get to the login page you will be prompting to sign in with a username and password. Please refer to the configuration section below for how to set up an admin user. You can then refer to the documentation [here](https://docs.doubleword.ai/control-layer/usage/models-and-access) to start playing around with Control Layer features.
 
-To upgrade to new versions of the control layer as they comes out, just run `docker compose down && docker compose up -f docker-compose.yml up -d` from the same directory you ran the above commands. 
+To upgrade to new versions of the control layer as they come out, run the following from the same directory:
+
+```bash
+docker compose pull
+docker compose up -d
+``` 
 
 ### Option 2. Docker Run
 

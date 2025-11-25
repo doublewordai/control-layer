@@ -32,30 +32,32 @@ afterAll(() => {
 describe("dwctlApi.users", () => {
   describe("list", () => {
     it("should fetch users without query parameters", async () => {
-      const users = await dwctlApi.users.list();
+      const response = await dwctlApi.users.list();
 
-      expect(users).toBeInstanceOf(Array);
-      expect(users.length).toBeGreaterThan(0);
-      expect(users[0]).toHaveProperty("id");
-      expect(users[0]).toHaveProperty("username");
-      expect(users[0]).toHaveProperty("email");
-      expect(users[0]).toHaveProperty("roles");
+      expect(response).toHaveProperty("data");
+      expect(response.data).toBeInstanceOf(Array);
+      expect(response.data.length).toBeGreaterThan(0);
+      expect(response.data[0]).toHaveProperty("id");
+      expect(response.data[0]).toHaveProperty("username");
+      expect(response.data[0]).toHaveProperty("email");
+      expect(response.data[0]).toHaveProperty("roles");
     });
 
     it("should fetch users with include=groups parameter", async () => {
-      const users = await dwctlApi.users.list({ include: "groups" });
+      const response = await dwctlApi.users.list({ include: "groups" });
 
-      expect(users).toBeInstanceOf(Array);
-      expect(users[0]).toHaveProperty("groups");
-      expect(users[0].groups).toBeInstanceOf(Array);
+      expect(response).toHaveProperty("data");
+      expect(response.data).toBeInstanceOf(Array);
+      expect(response.data[0]).toHaveProperty("groups");
+      expect(response.data[0].groups).toBeInstanceOf(Array);
     });
 
     it("should construct URL correctly with query parameters", async () => {
       // Test that the URL is constructed properly by checking the response
-      const users = await dwctlApi.users.list({ include: "groups" });
+      const response = await dwctlApi.users.list({ include: "groups" });
 
       // The handler should return users with groups when include=groups
-      expect(users[0]).toHaveProperty("groups");
+      expect(response.data[0]).toHaveProperty("groups");
     });
   });
 
@@ -381,33 +383,34 @@ describe("dwctlApi.endpoints", () => {
 describe("dwctlApi.groups", () => {
   describe("list", () => {
     it("should fetch all groups", async () => {
-      const groups = await dwctlApi.groups.list();
+      const response = await dwctlApi.groups.list();
 
-      expect(groups).toBeInstanceOf(Array);
-      expect(groups.length).toBeGreaterThan(0);
-      expect(groups[0]).toHaveProperty("id");
-      expect(groups[0]).toHaveProperty("name");
+      expect(response).toHaveProperty("data");
+      expect(response.data).toBeInstanceOf(Array);
+      expect(response.data.length).toBeGreaterThan(0);
+      expect(response.data[0]).toHaveProperty("id");
+      expect(response.data[0]).toHaveProperty("name");
     });
 
     it("should include users when requested", async () => {
-      const groups = await dwctlApi.groups.list({ include: "users" });
+      const response = await dwctlApi.groups.list({ include: "users" });
 
-      expect(groups[0]).toHaveProperty("users");
-      expect(groups[0].users).toBeInstanceOf(Array);
+      expect(response.data[0]).toHaveProperty("users");
+      expect(response.data[0].users).toBeInstanceOf(Array);
     });
 
     it("should include models when requested", async () => {
-      const groups = await dwctlApi.groups.list({ include: "models" });
+      const response = await dwctlApi.groups.list({ include: "models" });
 
-      expect(groups[0]).toHaveProperty("models");
-      expect(groups[0].models).toBeInstanceOf(Array);
+      expect(response.data[0]).toHaveProperty("models");
+      expect(response.data[0].models).toBeInstanceOf(Array);
     });
 
     it("should include both users and models when requested", async () => {
-      const groups = await dwctlApi.groups.list({ include: "users,models" });
+      const response = await dwctlApi.groups.list({ include: "users,models" });
 
-      expect(groups[0]).toHaveProperty("users");
-      expect(groups[0]).toHaveProperty("models");
+      expect(response.data[0]).toHaveProperty("users");
+      expect(response.data[0]).toHaveProperty("models");
     });
   });
 
@@ -555,21 +558,23 @@ describe("Error Handling", () => {
 describe("URL Construction", () => {
   it("should handle empty query parameters correctly", async () => {
     // Test that URLs are constructed correctly when no parameters are provided
-    const users = await dwctlApi.users.list();
+    const usersResponse = await dwctlApi.users.list();
     const modelsResponse = await dwctlApi.models.list();
-    const groups = await dwctlApi.groups.list();
+    const groupsResponse = await dwctlApi.groups.list();
 
-    expect(users).toBeInstanceOf(Array);
+    expect(usersResponse).toHaveProperty("data");
+    expect(usersResponse.data).toBeInstanceOf(Array);
     expect(modelsResponse).toHaveProperty("data");
     expect(modelsResponse.data).toBeInstanceOf(Array);
-    expect(groups).toBeInstanceOf(Array);
+    expect(groupsResponse).toHaveProperty("data");
+    expect(groupsResponse.data).toBeInstanceOf(Array);
   });
 
   it("should handle single query parameters", async () => {
     const usersWithGroups = await dwctlApi.users.list({ include: "groups" });
     const modelsFiltered = await dwctlApi.models.list({ endpoint: "2" });
 
-    expect(usersWithGroups[0]).toHaveProperty("groups");
+    expect(usersWithGroups.data[0]).toHaveProperty("groups");
     expect(modelsFiltered.data.every((model) => model.hosted_on === 2)).toBe(
       true,
     );
@@ -580,7 +585,9 @@ describe("URL Construction", () => {
       endpoint: "c3d4e5f6-7890-1234-5678-90abcdef0123",
       include: "groups",
     });
-    const groups = await dwctlApi.groups.list({ include: "users,models" });
+    const groupsResponse = await dwctlApi.groups.list({
+      include: "users,models",
+    });
 
     expect(
       modelsResponse.data.every(
@@ -589,8 +596,8 @@ describe("URL Construction", () => {
     ).toBe(true);
     expect(modelsResponse.data[0]).toHaveProperty("groups");
 
-    expect(groups[0]).toHaveProperty("users");
-    expect(groups[0]).toHaveProperty("models");
+    expect(groupsResponse.data[0]).toHaveProperty("users");
+    expect(groupsResponse.data[0]).toHaveProperty("models");
   });
 });
 
@@ -633,7 +640,7 @@ describe("Type Safety", () => {
     });
 
     // Optional fields should be present when requested
-    expect(usersWithGroups[0].groups).toBeDefined();
+    expect(usersWithGroups.data[0].groups).toBeDefined();
     expect(modelsWithGroups.data[0].groups).toBeDefined();
   });
 });
@@ -745,10 +752,10 @@ describe("User Billing Integration", () => {
   });
 
   it("should include billing with groups when both requested", async () => {
-    const users = await dwctlApi.users.list({ include: "groups" });
+    const response = await dwctlApi.users.list({ include: "groups" });
 
-    expect(users[0]).toHaveProperty("credit_balance");
-    expect(users[0]).toHaveProperty("groups");
-    expect(Array.isArray(users[0].groups)).toBe(true);
+    expect(response.data[0]).toHaveProperty("credit_balance");
+    expect(response.data[0]).toHaveProperty("groups");
+    expect(Array.isArray(response.data[0].groups)).toBe(true);
   });
 });

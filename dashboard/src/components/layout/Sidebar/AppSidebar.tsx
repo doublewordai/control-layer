@@ -64,12 +64,6 @@ export function AppSidebar() {
     { path: "/playground", icon: Play, label: "Playground" },
     { path: "/batches", icon: Box, label: "Batches", demoOnly: false },
     { path: "/analytics", icon: Activity, label: "Traffic" },
-    {
-      path: "/cost-management",
-      icon: DollarSign,
-      label: "Cost Management",
-      featureFlag: "use_billing",
-    },
     { path: "/users-groups", icon: Users, label: "Users & Groups" },
     { path: "/api-keys", icon: Key, label: "API Keys" },
     { path: "/system", icon: Settings, label: "System" },
@@ -178,6 +172,10 @@ export function AppSidebar() {
             <DropdownMenuItem onClick={() => navigate("/profile")}>
               <User className="w-4 h-4 mr-2" />
               Profile
+            </DropdownMenuItem>
+            <DropdownMenuItem onClick={() => navigate("/cost-management")}>
+              <DollarSign className="w-4 h-4 mr-2" />
+              Billing
             </DropdownMenuItem>
             <DropdownMenuItem onClick={() => logout()}>
               <LogOut className="w-4 h-4 mr-2" />

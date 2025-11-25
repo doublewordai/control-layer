@@ -5,7 +5,7 @@ use crate::db::{
     handlers::repository::Repository,
     models::groups::{GroupCreateDBRequest, GroupDBResponse, GroupUpdateDBRequest},
 };
-use crate::types::{abbrev_uuid, DeploymentId, GroupId, Operation, UserId};
+use crate::types::{DeploymentId, GroupId, Operation, UserId, abbrev_uuid};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use sqlx::{FromRow, PgConnection};
@@ -65,22 +65,18 @@ impl<'c> Repository for Groups<'c> {
 
     #[instrument(skip(self, request), fields(name = %request.name), err)]
     async fn create(&mut self, request: &Self::CreateRequest) -> Result<Self::Response> {
-        let created_at = Utc::now();
-        let updated_at = created_at;
-
         // all groups created via handler/api are native, sso groups use the sync function instead
+        // created_at and updated_at use database DEFAULT NOW() for consistency
         let group = sqlx::query_as!(
             Group,
             r#"
-            INSERT INTO groups (name, description, created_by, created_at, updated_at, source)
-            VALUES ($1, $2, $3, $4, $5, 'native')
+            INSERT INTO groups (name, description, created_by, source)
+            VALUES ($1, $2, $3, 'native')
             RETURNING *
             "#,
             request.name,
             request.description,
-            request.created_by,
-            created_at,
-            updated_at
+            request.created_by
         )
         .fetch_one(&mut *self.db)
         .await?;
@@ -193,6 +189,13 @@ impl<'c> Repository for Groups<'c> {
 impl<'c> Groups<'c> {
     pub fn new(db: &'c mut PgConnection) -> Self {
         Self { db }
+    }
+
+    #[instrument(skip(self), err)]
+    pub async fn count(&mut self) -> Result<i64> {
+        let count = sqlx::query_scalar!("SELECT COUNT(*) FROM groups").fetch_one(&mut *self.db).await?;
+
+        Ok(count.unwrap_or(0))
     }
 
     #[instrument(skip(self), fields(user_id = %abbrev_uuid(&user_id), group_id = %abbrev_uuid(&group_id)), err)]
@@ -309,8 +312,8 @@ impl<'c> Groups<'c> {
     #[instrument(skip(self), fields(group_id = %abbrev_uuid(&group_id)), err)]
     pub async fn get_group_deployments(&mut self, group_id: GroupId) -> Result<Vec<DeploymentId>> {
         let deployments = sqlx::query!(
-            "SELECT dg.deployment_id FROM deployment_groups dg 
-             JOIN deployed_models dm ON dg.deployment_id = dm.id 
+            "SELECT dg.deployment_id FROM deployment_groups dg
+             JOIN deployed_models dm ON dg.deployment_id = dm.id
              WHERE dg.group_id = $1 AND dm.deleted = false",
             group_id
         )
@@ -539,7 +542,7 @@ mod tests {
     use crate::test_utils::get_test_endpoint_id;
     use crate::{
         db::{
-            handlers::{users::UserFilter, Credits, Deployments, Users},
+            handlers::{Credits, Deployments, Users, users::UserFilter},
             models::{
                 api_keys::ApiKeyCreateDBRequest,
                 credits::{CreditTransactionCreateDBRequest, CreditTransactionType},

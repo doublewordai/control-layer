@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "SELECT dg.deployment_id FROM deployment_groups dg \n             JOIN deployed_models dm ON dg.deployment_id = dm.id \n             WHERE dg.group_id = $1 AND dm.deleted = false",
+  "query": "SELECT dg.deployment_id FROM deployment_groups dg\n             JOIN deployed_models dm ON dg.deployment_id = dm.id\n             WHERE dg.group_id = $1 AND dm.deleted = false",
   "describe": {
     "columns": [
       {
@@ -18,5 +18,5 @@
       false
     ]
   },
-  "hash": "abe7c1073678f51d32609e436fe704e1de3d563ac7096d771bdde938c94431ca"
+  "hash": "0f8fde4ef24e03a9b1af8205c0285fe091a6891b01fb59c596256159ccabb5f0"
 }

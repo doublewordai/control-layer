@@ -11,15 +11,15 @@ use outlet_postgres::{RequestFilter, RequestRepository};
 use tracing::{debug, error};
 
 use crate::{
+    AppState,
     api::models::requests::{
         AggregateRequestsQuery, ApiAiRequest, ApiAiResponse, HttpRequest, HttpResponse, ListRequestsQuery, ListRequestsResponse,
         ModelUserUsageResponse, RequestResponsePair, RequestsAggregateResponse,
     },
-    auth::permissions::{operation, resource, RequiresPermission},
+    auth::permissions::{RequiresPermission, operation, resource},
     db::handlers::analytics::{get_model_user_usage, get_requests_aggregate},
     errors::Error,
     request_logging::{AiRequest, AiResponse},
-    AppState,
 };
 use chrono::{DateTime, Duration, Utc};
 use serde::Deserialize;

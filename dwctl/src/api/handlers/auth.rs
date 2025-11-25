@@ -1,12 +1,13 @@
 //! HTTP handlers for authentication endpoints.
 
 use axum::{
-    extract::{Path, State},
     Json,
+    extract::{Path, State},
 };
 use uuid::Uuid;
 
 use crate::{
+    AppState,
     api::models::{
         auth::{
             AuthResponse, AuthSuccessResponse, ChangePasswordRequest, LoginInfo, LoginRequest, LoginResponse, LogoutResponse,
@@ -16,12 +17,14 @@ use crate::{
     },
     auth::{password, session},
     db::{
-        handlers::{credits::Credits, PasswordResetTokens, Repository, Users},
-        models::{credits::CreditTransactionCreateDBRequest, users::UserCreateDBRequest},
+        handlers::{PasswordResetTokens, Repository, Users, credits::Credits},
+        models::{
+            credits::{CreditTransactionCreateDBRequest, CreditTransactionType},
+            users::UserCreateDBRequest,
+        },
     },
     email::EmailService,
     errors::Error,
-    AppState,
 };
 
 /// Get registration information
@@ -293,18 +296,18 @@ pub async fn request_password_reset(
 
     let mut token_repo = PasswordResetTokens::new(&mut tx);
 
-    if let Some(user) = user {
-        if user.password_hash.is_some() {
-            // Only send reset email for native auth users (have password_hash)
-            // Create reset token
-            let (raw_token, token) = token_repo.create_for_user(user.id, &state.config).await?;
+    if let Some(user) = user
+        && user.password_hash.is_some()
+    {
+        // Only send reset email for native auth users (have password_hash)
+        // Create reset token
+        let (raw_token, token) = token_repo.create_for_user(user.id, &state.config).await?;
 
-            // Send email with token ID
-            let email_service = EmailService::new(&state.config)?;
-            email_service
-                .send_password_reset_email(&user.email, user.display_name.as_deref(), &token.id, &raw_token)
-                .await?;
-        }
+        // Send email with token ID
+        let email_service = EmailService::new(&state.config)?;
+        email_service
+            .send_password_reset_email(&user.email, user.display_name.as_deref(), &token.id, &raw_token)
+            .await?;
     }
     tx.commit().await.map_err(|e| Error::Database(e.into()))?;
 

@@ -1,18 +1,19 @@
 //! HTTP handlers for user management endpoints.
 
 use crate::{
+    AppState,
     api::models::{
         groups::GroupResponse,
+        pagination::PaginatedResponse,
         users::{CurrentUser, GetUserQuery, ListUsersQuery, UserCreate, UserResponse, UserUpdate},
     },
-    auth::permissions::{self as permissions, can_read_all_resources, can_read_own_resource, operation, resource, RequiresPermission},
+    auth::permissions::{self as permissions, RequiresPermission, can_read_all_resources, can_read_own_resource, operation, resource},
     db::{
-        handlers::{users::UserFilter, Credits, Groups, Repository, Users},
+        handlers::{Credits, Groups, Repository, Users, users::UserFilter},
         models::users::{UserCreateDBRequest, UserUpdateDBRequest},
     },
     errors::{Error, Result},
     types::{GroupId, Operation, Permission, Resource, UserId, UserIdOrCurrent},
-    AppState,
 };
 use axum::{
     extract::{Path, Query, State},
@@ -52,15 +53,17 @@ pub async fn list_users(
     Query(query): Query<ListUsersQuery>,
     current_user: CurrentUser,
     _: RequiresPermission<resource::Users, operation::ReadAll>,
-) -> Result<Json<Vec<UserResponse>>> {
+) -> Result<Json<PaginatedResponse<UserResponse>>> {
     let mut tx = state.db.begin().await.map_err(|e| Error::Database(e.into()))?;
     let skip = query.pagination.skip();
     let limit = query.pagination.limit();
 
     let users;
+    let total_count;
     {
         let mut repo = Users::new(&mut tx);
         users = repo.list(&UserFilter::new(skip, limit)).await?;
+        total_count = repo.count().await?;
     }
     // Parse include parameter
     let includes: Vec<&str> = query
@@ -112,17 +115,17 @@ pub async fn list_users(
     for user in users {
         let mut response_user = UserResponse::from(user);
         // If includes groups
-        if let Some(groups_map) = &groups_map {
-            if let Some(user_groups_map) = &user_groups_map {
-                let group_ids = user_groups_map.get(&response_user.id).cloned().unwrap_or_default();
-                let groups: Vec<GroupResponse> = group_ids
-                    .iter()
-                    .filter_map(|group_id| groups_map.get(group_id))
-                    .cloned()
-                    .map(|group| group.into())
-                    .collect();
-                response_user = response_user.with_groups(groups);
-            }
+        if let Some(groups_map) = &groups_map
+            && let Some(user_groups_map) = &user_groups_map
+        {
+            let group_ids = user_groups_map.get(&response_user.id).cloned().unwrap_or_default();
+            let groups: Vec<GroupResponse> = group_ids
+                .iter()
+                .filter_map(|group_id| groups_map.get(group_id))
+                .cloned()
+                .map(|group| group.into())
+                .collect();
+            response_user = response_user.with_groups(groups);
         }
 
         // If includes billing
@@ -135,7 +138,9 @@ pub async fn list_users(
     }
 
     tx.commit().await.map_err(|e| Error::Database(e.into()))?;
-    Ok(Json(response_users))
+
+    let paginated_response = PaginatedResponse::new(response_users, total_count, skip, limit);
+    Ok(Json(paginated_response))
 }
 
 // GET /users/{user_id} - Get specific user (admin only) or current user
@@ -401,8 +406,9 @@ mod tests {
             .await;
 
         response.assert_status_ok();
-        let users: Vec<UserResponse> = response.json();
-        assert!(!users.is_empty());
+        let paginated: PaginatedResponse<UserResponse> = response.json();
+        assert!(!paginated.data.is_empty());
+        assert!(paginated.total_count > 0);
     }
 
     #[sqlx::test]
@@ -475,8 +481,10 @@ mod tests {
             .await;
 
         response.assert_status_ok();
-        let users: Vec<UserResponse> = response.json();
-        assert_eq!(users.len(), 3);
+        let paginated: PaginatedResponse<UserResponse> = response.json();
+        assert_eq!(paginated.data.len(), 3);
+        assert_eq!(paginated.limit, 3);
+        assert_eq!(paginated.skip, 0);
 
         // Test with skip and limit
         let response = app
@@ -486,8 +494,10 @@ mod tests {
             .await;
 
         response.assert_status_ok();
-        let users: Vec<UserResponse> = response.json();
-        assert!(users.len() <= 2);
+        let paginated: PaginatedResponse<UserResponse> = response.json();
+        assert!(paginated.data.len() <= 2);
+        assert_eq!(paginated.skip, 2);
+        assert_eq!(paginated.limit, 2);
 
         // Test skip beyond available users
         let response = app
@@ -497,8 +507,9 @@ mod tests {
             .await;
 
         response.assert_status_ok();
-        let users: Vec<UserResponse> = response.json();
-        assert!(users.is_empty());
+        let paginated: PaginatedResponse<UserResponse> = response.json();
+        assert!(paginated.data.is_empty());
+        assert_eq!(paginated.skip, 1000);
 
         // Test maximum limit enforcement
         let response = app
@@ -508,8 +519,9 @@ mod tests {
             .await;
 
         response.assert_status_ok();
-        let users: Vec<UserResponse> = response.json();
-        assert!(users.len() <= 1000); // Should be capped at 1000
+        let paginated: PaginatedResponse<UserResponse> = response.json();
+        assert!(paginated.data.len() <= 100); // Should be capped at MAX_LIMIT (100)
+        assert_eq!(paginated.limit, 100); // Limit should be clamped
     }
 
     #[sqlx::test]
@@ -592,8 +604,8 @@ mod tests {
             .await;
 
         response.assert_status_ok();
-        let users: Vec<UserResponse> = response.json();
-        let found_user = users.iter().find(|u| u.id == regular_user.id).expect("User not found");
+        let paginated: PaginatedResponse<UserResponse> = response.json();
+        let found_user = paginated.data.iter().find(|u| u.id == regular_user.id).expect("User not found");
         assert!(found_user.groups.is_none());
 
         // Test with include=groups - should include groups
@@ -604,8 +616,8 @@ mod tests {
             .await;
 
         response.assert_status_ok();
-        let users: Vec<UserResponse> = response.json();
-        let found_user = users.iter().find(|u| u.id == regular_user.id).expect("User not found");
+        let paginated: PaginatedResponse<UserResponse> = response.json();
+        let found_user = paginated.data.iter().find(|u| u.id == regular_user.id).expect("User not found");
         assert!(found_user.groups.is_some());
         let groups = found_user.groups.as_ref().unwrap().iter().map(|x| x.id).collect::<HashSet<_>>();
         assert!(groups.contains(&group.id));
@@ -618,8 +630,8 @@ mod tests {
             .await;
 
         response.assert_status_ok();
-        let users: Vec<UserResponse> = response.json();
-        let found_user = users.iter().find(|u| u.id == regular_user.id).expect("User not found");
+        let paginated: PaginatedResponse<UserResponse> = response.json();
+        let found_user = paginated.data.iter().find(|u| u.id == regular_user.id).expect("User not found");
         assert!(found_user.groups.is_some());
         let groups = found_user.groups.as_ref().unwrap().iter().map(|x| x.id).collect::<HashSet<_>>();
         assert!(groups.contains(&group.id));
@@ -632,8 +644,8 @@ mod tests {
             .await;
 
         response.assert_status_ok();
-        let users: Vec<UserResponse> = response.json();
-        let found_user = users.iter().find(|u| u.id == regular_user.id).expect("User not found");
+        let paginated: PaginatedResponse<UserResponse> = response.json();
+        let found_user = paginated.data.iter().find(|u| u.id == regular_user.id).expect("User not found");
         assert!(found_user.groups.is_some());
         let groups = found_user.groups.as_ref().unwrap().iter().map(|x| x.id).collect::<HashSet<_>>();
         assert!(groups.contains(&group.id));
@@ -657,8 +669,8 @@ mod tests {
             .await;
 
         response.assert_status_ok();
-        let users: Vec<UserResponse> = response.json();
-        let found_user = users.iter().find(|u| u.id == regular_user.id).expect("User not found");
+        let paginated: PaginatedResponse<UserResponse> = response.json();
+        let found_user = paginated.data.iter().find(|u| u.id == regular_user.id).expect("User not found");
         assert!(found_user.credit_balance.is_none());
 
         // Test with include=billing - should include credit balance
@@ -669,8 +681,8 @@ mod tests {
             .await;
 
         response.assert_status_ok();
-        let users: Vec<UserResponse> = response.json();
-        let found_user = users.iter().find(|u| u.id == regular_user.id).expect("User not found");
+        let paginated: PaginatedResponse<UserResponse> = response.json();
+        let found_user = paginated.data.iter().find(|u| u.id == regular_user.id).expect("User not found");
         assert!(found_user.credit_balance.is_some());
         assert_eq!(found_user.credit_balance.unwrap(), 250.0);
 
@@ -682,8 +694,8 @@ mod tests {
             .await;
 
         response.assert_status_ok();
-        let users: Vec<UserResponse> = response.json();
-        let found_user = users.iter().find(|u| u.id == regular_user.id).expect("User not found");
+        let paginated: PaginatedResponse<UserResponse> = response.json();
+        let found_user = paginated.data.iter().find(|u| u.id == regular_user.id).expect("User not found");
         assert!(found_user.credit_balance.is_some());
         assert_eq!(found_user.credit_balance.unwrap(), 250.0);
 
@@ -695,8 +707,8 @@ mod tests {
             .await;
 
         response.assert_status_ok();
-        let users: Vec<UserResponse> = response.json();
-        let found_user = users.iter().find(|u| u.id == regular_user.id).expect("User not found");
+        let paginated: PaginatedResponse<UserResponse> = response.json();
+        let found_user = paginated.data.iter().find(|u| u.id == regular_user.id).expect("User not found");
         assert!(found_user.credit_balance.is_some());
         assert_eq!(found_user.credit_balance.unwrap(), 250.0);
     }
@@ -733,8 +745,8 @@ mod tests {
             .await;
 
         response.assert_status_ok();
-        let users: Vec<UserResponse> = response.json();
-        let found_user = users.iter().find(|u| u.id == regular_user.id).expect("User not found");
+        let paginated: PaginatedResponse<UserResponse> = response.json();
+        let found_user = paginated.data.iter().find(|u| u.id == regular_user.id).expect("User not found");
 
         // Verify groups are included
         assert!(found_user.groups.is_some());
@@ -763,8 +775,8 @@ mod tests {
             .await;
 
         response.assert_status_ok();
-        let users: Vec<UserResponse> = response.json();
-        let found_user = users.iter().find(|u| u.id == regular_user.id).expect("User not found");
+        let paginated: PaginatedResponse<UserResponse> = response.json();
+        let found_user = paginated.data.iter().find(|u| u.id == regular_user.id).expect("User not found");
         assert!(found_user.credit_balance.is_some());
         assert_eq!(found_user.credit_balance.unwrap(), 0.0);
     }
@@ -805,15 +817,15 @@ mod tests {
             .await;
 
         response.assert_status_ok();
-        let users: Vec<UserResponse> = response.json();
+        let paginated: PaginatedResponse<UserResponse> = response.json();
 
-        let found_user1 = users.iter().find(|u| u.id == user1.id).expect("User1 not found");
+        let found_user1 = paginated.data.iter().find(|u| u.id == user1.id).expect("User1 not found");
         assert_eq!(found_user1.credit_balance.unwrap(), 150.0); // 100 + 50
 
-        let found_user2 = users.iter().find(|u| u.id == user2.id).expect("User2 not found");
+        let found_user2 = paginated.data.iter().find(|u| u.id == user2.id).expect("User2 not found");
         assert_eq!(found_user2.credit_balance.unwrap(), 200.0);
 
-        let found_user3 = users.iter().find(|u| u.id == user3.id).expect("User3 not found");
+        let found_user3 = paginated.data.iter().find(|u| u.id == user3.id).expect("User3 not found");
         assert_eq!(found_user3.credit_balance.unwrap(), 300.0);
     }
 
@@ -835,8 +847,8 @@ mod tests {
             .await;
 
         response.assert_status_ok();
-        let users: Vec<UserResponse> = response.json();
-        let found_user = users.iter().find(|u| u.id == regular_user.id).expect("User not found");
+        let paginated: PaginatedResponse<UserResponse> = response.json();
+        let found_user = paginated.data.iter().find(|u| u.id == regular_user.id).expect("User not found");
         assert!(found_user.credit_balance.is_some());
         assert_eq!(found_user.credit_balance.unwrap(), 350.0);
     }

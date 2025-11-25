@@ -1,10 +1,10 @@
 //! Authorization and permission checking.
 
 use crate::{
+    AppState,
     api::models::users::{CurrentUser, Role},
     errors::Error,
     types::{Operation, Resource, UserId},
-    AppState,
 };
 use axum::{extract::FromRequestParts, http::request::Parts};
 use std::marker::PhantomData;

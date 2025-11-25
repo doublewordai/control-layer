@@ -106,7 +106,6 @@ db-setup:
     # Write .env files for sqlx compile-time verification
     echo "Writing .env files..."
     echo "DATABASE_URL=postgres://$DB_USER:$DB_PASS@$DB_HOST:$DB_PORT/dwctl" > dwctl/.env
-    echo "DATABASE_URL=postgres://$DB_USER:$DB_PASS@$DB_HOST:$DB_PORT/fusillade" > fusillade/.env
 
     # Run migrations
     echo "Running migrations..."
@@ -118,20 +117,11 @@ db-setup:
         exit 1
     fi
 
-    echo "Running fusillade migrations..."
-    if (cd fusillade && sqlx migrate run); then
-        echo "  ✅ fusillade migrations complete"
-    else
-        echo "  ❌ fusillade migrations failed"
-        exit 1
-    fi
-
     echo ""
     echo "✅ Database setup complete!"
     echo ""
     echo "Database URLs configured:"
     echo "  dwctl:     postgres://$DB_USER:$DB_PASS@$DB_HOST:$DB_PORT/dwctl"
-    echo "  fusillade: postgres://$DB_USER:$DB_PASS@$DB_HOST:$DB_PORT/fusillade"
 
 # Start the full development stack with hot reload
 #

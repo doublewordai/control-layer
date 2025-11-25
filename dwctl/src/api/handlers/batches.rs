@@ -4,17 +4,17 @@
 //!
 //! Repository methods are delegated to the fusillade/ crate.
 
+use crate::AppState;
 use crate::api::models::batches::{
     BatchErrors, BatchListResponse, BatchObjectType, BatchResponse, CreateBatchRequest, ListBatchesQuery, ListObjectType, RequestCounts,
 };
-use crate::auth::permissions::{can_read_all_resources, has_permission, operation, resource, RequiresPermission};
+use crate::auth::permissions::{RequiresPermission, can_read_all_resources, has_permission, operation, resource};
 use crate::errors::{Error, Result};
 use crate::types::{Operation, Resource};
-use crate::AppState;
 use axum::{
+    Json,
     extract::{Path, Query, State},
     http::StatusCode,
-    Json,
 };
 use fusillade::Storage;
 use std::collections::HashMap;
@@ -48,10 +48,13 @@ fn to_batch_response(batch: fusillade::Batch) -> BatchResponse {
         "failed"
     } else if is_finished {
         "completed"
-    } else if batch.in_progress_requests > 0 || batch.completed_requests > 0 {
-        "in_progress"
     } else {
-        "validating"
+        // Any batch that has been validated (total_requests > 0) but not finished
+        // is considered "in_progress". This includes:
+        // - Batches actively processing (in_progress_requests > 0)
+        // - Batches with some completed work (completed_requests > 0)
+        // - Batches queued and waiting for capacity (only pending_requests > 0)
+        "in_progress"
     };
 
     // Compute timestamps based on status

@@ -64,10 +64,11 @@ describe("User Hooks", () => {
       });
 
       expect(result.current.data).toBeDefined();
-      expect(Array.isArray(result.current.data)).toBe(true);
-      expect(result.current.data!.length).toBeGreaterThan(0);
-      expect(result.current.data![0]).toHaveProperty("id");
-      expect(result.current.data![0]).toHaveProperty("username");
+      expect(result.current.data).toHaveProperty("data");
+      expect(Array.isArray(result.current.data!.data)).toBe(true);
+      expect(result.current.data!.data.length).toBeGreaterThan(0);
+      expect(result.current.data!.data[0]).toHaveProperty("id");
+      expect(result.current.data!.data[0]).toHaveProperty("username");
     });
 
     it("should fetch users with include parameter", async () => {
@@ -79,8 +80,8 @@ describe("User Hooks", () => {
         expect(result.current.isSuccess).toBe(true);
       });
 
-      expect(result.current.data![0]).toHaveProperty("groups");
-      expect(Array.isArray(result.current.data![0].groups)).toBe(true);
+      expect(result.current.data!.data[0]).toHaveProperty("groups");
+      expect(Array.isArray(result.current.data!.data[0].groups)).toBe(true);
     });
 
     it("should handle errors", async () => {
@@ -280,13 +281,15 @@ describe("User Hooks", () => {
       expect(usersWithGroupsResult.current.data).toBeDefined();
 
       // Users without groups should not have groups property
-      expect(usersResult.current.data![0]).not.toHaveProperty("groups");
+      expect(usersResult.current.data!.data[0]).not.toHaveProperty("groups");
 
       // Users with groups should have groups property
-      expect(usersWithGroupsResult.current.data![0]).toHaveProperty("groups");
-      expect(Array.isArray(usersWithGroupsResult.current.data![0].groups)).toBe(
-        true,
+      expect(usersWithGroupsResult.current.data!.data[0]).toHaveProperty(
+        "groups",
       );
+      expect(
+        Array.isArray(usersWithGroupsResult.current.data!.data[0].groups),
+      ).toBe(true);
     });
 
     it("should invalidate all user queries when creating a user", async () => {
@@ -384,8 +387,8 @@ describe("User Hooks", () => {
       expect(users1.current.data).not.toBe(usersWithGroups.current.data);
 
       // Verify the data shapes are correct
-      expect(users1.current.data![0]).not.toHaveProperty("groups");
-      expect(usersWithGroups.current.data![0]).toHaveProperty("groups");
+      expect(users1.current.data!.data[0]).not.toHaveProperty("groups");
+      expect(usersWithGroups.current.data!.data[0]).toHaveProperty("groups");
     });
   });
 

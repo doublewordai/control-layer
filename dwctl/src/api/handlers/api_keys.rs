@@ -2,6 +2,7 @@
 
 use crate::api::models::api_keys::ListApiKeysQuery;
 use crate::{
+    AppState,
     api::models::{
         api_keys::{ApiKeyCreate, ApiKeyInfoResponse, ApiKeyResponse},
         users::CurrentUser,
@@ -10,11 +11,10 @@ use crate::{
         can_create_all_resources, can_create_own_resource, can_delete_all_resources, can_delete_own_resource, can_read_all_resources,
         can_read_own_resource,
     },
-    db::handlers::{api_keys::ApiKeyFilter, api_keys::ApiKeys, Repository},
+    db::handlers::{Repository, api_keys::ApiKeyFilter, api_keys::ApiKeys},
     db::models::api_keys::ApiKeyCreateDBRequest,
     errors::{Error, Result},
     types::{ApiKeyId, Operation, Permission, Resource, UserIdOrCurrent},
-    AppState,
 };
 use axum::{
     extract::{Path, Query, State},

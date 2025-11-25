@@ -2,7 +2,6 @@ import React, { useState, useEffect } from "react";
 import { useSearchParams } from "react-router-dom";
 import { Search, Activity, LayoutGrid } from "lucide-react";
 import { useAuthorization } from "../../../../utils";
-import { useSettings } from "../../../../contexts";
 import {
   Select,
   SelectContent,
@@ -18,10 +17,9 @@ import { useEndpoints } from "@/api/control-layer/hooks";
 const Models: React.FC = () => {
   const [searchParams, setSearchParams] = useSearchParams();
   const { hasPermission } = useAuthorization();
-  const { isFeatureEnabled } = useSettings();
   const canManageGroups = hasPermission("manage-groups");
   const canViewAnalytics = hasPermission("analytics");
-  const showPricing = isFeatureEnabled("use_billing");
+  const showPricing = true;
   const [filterProvider, setFilterProvider] = useState("all");
   const [currentPage, setCurrentPage] = useState(1);
   const [itemsPerPage] = useState(12);

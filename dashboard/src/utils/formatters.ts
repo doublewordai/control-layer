@@ -166,13 +166,13 @@ export function formatPricing(pricing?: {
     !pricing ||
     (!pricing.input_price_per_token && !pricing.output_price_per_token)
   ) {
-    return "N/A";
+    return "$0/$0";
   }
   const input = pricing.input_price_per_token
     ? `$${Number(pricing.input_price_per_token).toFixed(4)}`
-    : "N/A";
+    : "$0";
   const output = pricing.output_price_per_token
     ? `$${Number(pricing.output_price_per_token).toFixed(4)}`
-    : "N/A";
+    : "$0";
   return `${input} / ${output}`;
 }

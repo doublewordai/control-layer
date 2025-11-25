@@ -4,7 +4,7 @@ use crate::db::models::credits::{CreditTransactionCreateDBRequest, CreditTransac
 use crate::request_logging::models::{AiRequest, AiResponse, ChatCompletionChunk};
 use outlet::{RequestData, ResponseData};
 use outlet_postgres::SerializationError;
-use rust_decimal::{prelude::ToPrimitive, Decimal};
+use rust_decimal::{Decimal, prelude::ToPrimitive};
 use serde_json::Value;
 use sqlx::PgPool;
 use std::fmt;
@@ -261,12 +261,12 @@ impl Auth {
         }
 
         // Check for API key in Authorization header
-        if let Some(auth_header) = Self::get_header_value(request_data, "authorization") {
-            if let Some(bearer_token) = auth_header.strip_prefix("Bearer ") {
-                return Auth::ApiKey {
-                    bearer_token: bearer_token.to_string(),
-                };
-            }
+        if let Some(auth_header) = Self::get_header_value(request_data, "authorization")
+            && let Some(bearer_token) = auth_header.strip_prefix("Bearer ")
+        {
+            return Auth::ApiKey {
+                bearer_token: bearer_token.to_string(),
+            };
         }
 
         Auth::None
@@ -762,7 +762,7 @@ where
 
 #[cfg(test)]
 mod tests {
-    use super::{parse_ai_request, parse_ai_response, UsageMetrics};
+    use super::{UsageMetrics, parse_ai_request, parse_ai_response};
     use crate::request_logging::models::{AiRequest, AiResponse};
     use async_openai::types::{
         CreateBase64EmbeddingResponse, CreateChatCompletionResponse, CreateChatCompletionStreamResponse, CreateCompletionResponse,
@@ -1526,9 +1526,9 @@ mod tests {
     mod credit_deduction_tests {
         use super::super::*;
         use crate::api::models::users::Role;
+        use crate::db::handlers::Repository;
         use crate::db::handlers::api_keys::ApiKeys;
         use crate::db::handlers::credits::Credits;
-        use crate::db::handlers::Repository;
         use crate::db::models::api_keys::{ApiKeyCreateDBRequest, ApiKeyPurpose};
         use crate::db::models::credits::{CreditTransactionCreateDBRequest, CreditTransactionType};
         use crate::test_utils::create_test_user;
