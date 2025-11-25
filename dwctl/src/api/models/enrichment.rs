@@ -19,7 +19,7 @@ use std::collections::HashMap;
 use uuid::Uuid;
 
 /// Configuration for model enrichment operations
-pub struct ModelEnricher<'a> {
+pub struct DeployedModelEnricher<'a> {
     /// Database connection pool
     pub db: &'a PgPool,
     /// Whether to include group information
@@ -36,7 +36,7 @@ pub struct ModelEnricher<'a> {
     pub can_read_rate_limits: bool,
 }
 
-impl<'a> ModelEnricher<'a> {
+impl<'a> DeployedModelEnricher<'a> {
     /// Enriches multiple models in bulk with requested additional data.
     ///
     /// This method fetches all required data in parallel for maximum performance:

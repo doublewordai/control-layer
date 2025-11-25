@@ -4,7 +4,7 @@ use crate::{
     AppState,
     api::models::{
         deployments::{DeployedModelCreate, DeployedModelResponse, DeployedModelUpdate, GetModelQuery, ListModelsQuery},
-        enrichment::ModelEnricher,
+        enrichment::DeployedModelEnricher,
         pagination::PaginatedResponse,
         users::CurrentUser,
     },
@@ -181,7 +181,7 @@ pub async fn list_deployed_models(
     let include_pricing = includes.contains(&"pricing");
 
     // Use ModelEnricher to add requested data
-    let enricher = ModelEnricher {
+    let enricher = DeployedModelEnricher {
         db: &state.db,
         include_groups,
         include_metrics,
@@ -396,7 +396,7 @@ pub async fn get_deployed_model(
     let mut response = DeployedModelResponse::from(model);
 
     // Use ModelEnricher to add related data
-    let enricher = ModelEnricher {
+    let enricher = DeployedModelEnricher {
         db: &state.db,
         include_groups,
         include_metrics,
