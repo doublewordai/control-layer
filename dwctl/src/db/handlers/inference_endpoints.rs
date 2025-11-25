@@ -74,14 +74,12 @@ impl<'c> Repository for InferenceEndpoints<'c> {
 
     #[instrument(skip(self, request), fields(name = %request.name, url = %request.url), err)]
     async fn create(&mut self, request: &Self::CreateRequest) -> Result<Self::Response> {
-        let created_at = Utc::now();
-        let updated_at = created_at;
-
+        // created_at and updated_at use database DEFAULT NOW() for consistency
         let endpoint = sqlx::query_as!(
             InferenceEndpoint,
             r#"
-            INSERT INTO inference_endpoints (name, description, url, api_key, model_filter, auth_header_name, auth_header_prefix, created_by, created_at, updated_at)
-            VALUES ($1, $2, $3, $4, $5, COALESCE($6, 'Authorization'), COALESCE($7, 'Bearer '), $8, $9, $10)
+            INSERT INTO inference_endpoints (name, description, url, api_key, model_filter, auth_header_name, auth_header_prefix, created_by)
+            VALUES ($1, $2, $3, $4, $5, COALESCE($6, 'Authorization'), COALESCE($7, 'Bearer '), $8)
             RETURNING *
             "#,
             request.name,
@@ -91,9 +89,7 @@ impl<'c> Repository for InferenceEndpoints<'c> {
             request.model_filter.as_deref(),
             request.auth_header_name,
             request.auth_header_prefix,
-            request.created_by,
-            created_at,
-            updated_at
+            request.created_by
         )
         .fetch_one(&mut *self.db)
         .await?;

@@ -65,22 +65,18 @@ impl<'c> Repository for Groups<'c> {
 
     #[instrument(skip(self, request), fields(name = %request.name), err)]
     async fn create(&mut self, request: &Self::CreateRequest) -> Result<Self::Response> {
-        let created_at = Utc::now();
-        let updated_at = created_at;
-
         // all groups created via handler/api are native, sso groups use the sync function instead
+        // created_at and updated_at use database DEFAULT NOW() for consistency
         let group = sqlx::query_as!(
             Group,
             r#"
-            INSERT INTO groups (name, description, created_by, created_at, updated_at, source)
-            VALUES ($1, $2, $3, $4, $5, 'native')
+            INSERT INTO groups (name, description, created_by, source)
+            VALUES ($1, $2, $3, 'native')
             RETURNING *
             "#,
             request.name,
             request.description,
-            request.created_by,
-            created_at,
-            updated_at
+            request.created_by
         )
         .fetch_one(&mut *self.db)
         .await?;
