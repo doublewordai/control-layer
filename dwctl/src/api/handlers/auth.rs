@@ -17,10 +17,7 @@ use crate::{
     auth::{password, session},
     db::{
         handlers::{credits::Credits, PasswordResetTokens, Repository, Users},
-        models::{
-            credits::{CreditTransactionCreateDBRequest},
-            users::UserCreateDBRequest,
-        },
+        models::{credits::CreditTransactionCreateDBRequest, users::UserCreateDBRequest},
     },
     email::EmailService,
     errors::Error,
@@ -516,7 +513,7 @@ fn create_session_cookie(token: &str, config: &crate::config::Config) -> String 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::test_utils::create_test_config;
+    use crate::{db::models::credits::CreditTransactionType, test_utils::create_test_config};
     use axum_test::TestServer;
     use sqlx::PgPool;
 
@@ -649,15 +646,7 @@ mod tests {
         );
 
         // Verify the transaction exists with correct details
-        let transactions = sqlx::query!(
-            r#"SELECT amount, balance_after, transaction_type as "transaction_type: CreditTransactionType", source_id, description
-               FROM credits_transactions
-               WHERE user_id = $1"#,
-            body.user.id
-        )
-        .fetch_all(&pool)
-        .await
-        .unwrap();
+        let transactions = credits_repo.list_user_transactions(body.user.id, 0, 10).await.unwrap();
 
         assert_eq!(transactions.len(), 1, "Should have exactly one transaction");
         assert_eq!(transactions[0].amount, rust_decimal::Decimal::new(10000, 2));
