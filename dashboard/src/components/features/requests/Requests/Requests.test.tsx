@@ -115,9 +115,11 @@ afterEach(() => {
   server.resetHandlers();
   // Reset authorization mock to default state
   vi.mocked(useAuthorization).mockReturnValue({
+    isLoading: false,
     userRoles: ["PlatformManager"], // Default to full permissions
     hasPermission: vi.fn(() => true),
     canAccessRoute: vi.fn(() => true),
+    getFirstAccessibleRoute: vi.fn(() => "/models"),
   });
 });
 afterAll(() => server.close());
