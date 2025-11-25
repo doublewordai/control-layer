@@ -896,7 +896,6 @@ export function useProcessPayment(options?: {
       options?.onSuccess?.();
     },
     onError: (error) => {
-      console.error('[useProcessPayment] onError callback triggered:', error);
       // Call the component's error callback if provided
       options?.onError?.(error as Error);
     },

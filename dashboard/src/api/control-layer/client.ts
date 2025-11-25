@@ -806,12 +806,7 @@ const paymentsApi = {
           response,
         );
       }
-      const errorData = await response.json().catch(() => ({}));
-      throw new ApiError(
-        response.status,
-        errorData.message || "Failed to process payment",
-        response,
-      );
+      throw new Error(`Failed to process transaction: ${response.status}`);
     }
 
     // Explicitly return to ensure promise resolves
