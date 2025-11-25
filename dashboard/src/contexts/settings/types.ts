@@ -26,4 +26,6 @@ export interface AppSettings {
   features: FeatureFlags;
   /** Demo mode configuration */
   demoConfig?: DemoConfig;
+  /** External payment provider URL for redirecting users to purchase credits */
+  paymentProviderUrl?: string;
 }
