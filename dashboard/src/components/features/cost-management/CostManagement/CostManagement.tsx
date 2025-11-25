@@ -120,8 +120,8 @@ export function CostManagement() {
       const fundAmount = 100.0;
       try {
         await addFundsMutation.mutateAsync({
-          source_id: currentUser?.id || "",
-          user_id: currentUser?.id || "",
+          source_id: displayUser?.id || "",
+          user_id: displayUser?.id || "",
           amount: fundAmount,
           description: "Funds purchase - Demo top up"
         });
