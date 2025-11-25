@@ -13,6 +13,7 @@ import { Tabs, TabsList, TabsTrigger } from "../../../ui/tabs";
 import { Input } from "../../../ui/input";
 import { ModelsContent } from "./ModelsContent";
 import { useEndpoints } from "@/api/control-layer/hooks";
+import { useDebounce } from "@/hooks/useDebounce";
 
 const Models: React.FC = () => {
   const [searchParams, setSearchParams] = useSearchParams();
@@ -22,8 +23,13 @@ const Models: React.FC = () => {
   const showPricing = true;
 
   const [filterProvider, setFilterProvider] = useState("all");
-  const [searchQuery, setSearchQuery] = useState("");
-  const [currentPage, setCurrentPage] = useState(1);
+  const [searchQuery, setSearchQuery] = useState(
+    searchParams.get("search") || "",
+  );
+  const debouncedSearch = useDebounce(searchQuery, 300);
+  const [currentPage, setCurrentPage] = useState(
+    Number(searchParams.get("page")) || 1,
+  );
   const [showAccessibleOnly, setShowAccessibleOnly] = useState(false);
 
   const { data: endpointsData } = useEndpoints();
@@ -52,7 +58,7 @@ const Models: React.FC = () => {
   // reset pagination when search query changes
   useEffect(() => {
     setCurrentPage(1);
-  }, [searchQuery]);
+  }, [debouncedSearch]);
 
   const viewMode = searchParams.get("view") || "grid";
   const isStatusMode = viewMode === "status";
@@ -159,7 +165,7 @@ const Models: React.FC = () => {
         <ModelsContent
           currentPage={currentPage}
           setCurrentPage={setCurrentPage}
-          searchQuery={searchQuery}
+          searchQuery={debouncedSearch}
           filterProvider={filterProvider}
           showAccessibleOnly={showAccessibleOnly}
           isStatusMode={isStatusMode}
