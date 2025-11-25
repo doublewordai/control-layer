@@ -45,7 +45,8 @@
 //! - **Security**: `secret_key`, `auth.security.cors` - Security and CORS settings
 //! - **Credits**: `credits.initial_credits_for_standard_users` - Credit system configuration
 //! - **Features**: `enable_metrics`, `enable_request_logging` - Optional feature toggles
-//! - **Batches**: `batches.enabled`, `batches.daemon` - Batch API configuration
+//! - **Batches**: `batches.enabled` - Batch API configuration
+//! - **Background Services**: `background_services.batch_daemon`, `background_services.leader_election` - Background service configuration
 //!
 //! ## Environment Variable Examples
 //!
@@ -119,10 +120,10 @@ pub struct Config {
     pub metadata: Metadata,
     /// Authentication configuration for various auth methods
     pub auth: AuthConfig,
-    /// Batch API configuration
+    /// Batch API configuration (endpoints and file handling)
     pub batches: BatchConfig,
-    /// Leader election configuration for multi-instance deployments
-    pub leader_election: LeaderElectionConfig,
+    /// Background services configuration (daemons, leader election, etc.)
+    pub background_services: BackgroundServicesConfig,
     /// Enable Prometheus metrics endpoint at `/internal/metrics`
     pub enable_metrics: bool,
     /// Enable request/response logging to PostgreSQL
@@ -131,6 +132,77 @@ pub struct Config {
     pub enable_otel_export: bool,
     /// Credit system configuration
     pub credits: CreditsConfig,
+}
+
+/// Individual pool configuration with all SQLx parameters.
+///
+/// These settings control connection pool behavior for optimal performance.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(default)]
+pub struct PoolSettings {
+    /// Maximum number of connections in the pool
+    pub max_connections: u32,
+    /// Minimum number of idle connections to maintain
+    pub min_connections: u32,
+    /// Maximum time to wait for a connection (seconds)
+    pub acquire_timeout_secs: u64,
+    /// Time before idle connections are closed (seconds, 0 = never)
+    pub idle_timeout_secs: u64,
+    /// Maximum lifetime of a connection (seconds, 0 = never)
+    pub max_lifetime_secs: u64,
+}
+
+impl Default for PoolSettings {
+    /// Production defaults: balanced for reliability and resource usage
+    fn default() -> Self {
+        Self {
+            max_connections: 10,
+            min_connections: 0,
+            acquire_timeout_secs: 30,
+            idle_timeout_secs: 600,  // 10 minutes
+            max_lifetime_secs: 1800, // 30 minutes
+        }
+    }
+}
+
+/// Database connection pool configuration.
+///
+/// Controls connection pooling for each database pool.
+/// Each pool serves a different schema/purpose:
+/// - Main pool: public schema for application data
+/// - Fusillade pool: fusillade schema for batch processing (only if batches.enabled)
+/// - Outlet pool: outlet schema for request logging (only if enable_request_logging)
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(default)]
+pub struct DatabasePoolConfig {
+    /// Main application pool settings
+    pub main: PoolSettings,
+    /// Fusillade batch processing pool settings (used only if batches.enabled)
+    pub fusillade: PoolSettings,
+    /// Outlet request logging pool settings (used only if enable_request_logging)
+    pub outlet: PoolSettings,
+}
+
+impl Default for DatabasePoolConfig {
+    fn default() -> Self {
+        Self {
+            main: PoolSettings::default(),
+            fusillade: PoolSettings {
+                max_connections: 20,
+                min_connections: 2,
+                acquire_timeout_secs: 30,
+                idle_timeout_secs: 600,
+                max_lifetime_secs: 1800,
+            },
+            outlet: PoolSettings {
+                max_connections: 5,
+                min_connections: 0,
+                acquire_timeout_secs: 30,
+                idle_timeout_secs: 600,
+                max_lifetime_secs: 1800,
+            },
+        }
+    }
 }
 
 /// Database configuration.
@@ -148,11 +220,17 @@ pub enum DatabaseConfig {
         /// Whether to persist data between restarts (default: false/ephemeral)
         #[serde(default)]
         persistent: bool,
+        /// Connection pool configuration
+        #[serde(default)]
+        pool_config: DatabasePoolConfig,
     },
     /// Use external PostgreSQL database
     External {
         /// Connection string for external database
         url: String,
+        /// Connection pool configuration
+        #[serde(default)]
+        pool_config: DatabasePoolConfig,
     },
 }
 
@@ -164,12 +242,14 @@ impl Default for DatabaseConfig {
             DatabaseConfig::Embedded {
                 data_dir: None,
                 persistent: false,
+                pool_config: DatabasePoolConfig::default(),
             }
         }
         #[cfg(not(feature = "embedded-db"))]
         {
             DatabaseConfig::External {
                 url: "postgres://localhost:5432/control_layer".to_string(),
+                pool_config: DatabasePoolConfig::default(),
             }
         }
     }
@@ -185,7 +265,7 @@ impl DatabaseConfig {
     /// Get external URL if available
     pub fn external_url(&self) -> Option<&str> {
         match self {
-            DatabaseConfig::External { url } => Some(url),
+            DatabaseConfig::External { url, .. } => Some(url),
             DatabaseConfig::Embedded { .. } => None,
         }
     }
@@ -203,6 +283,14 @@ impl DatabaseConfig {
         match self {
             DatabaseConfig::Embedded { persistent, .. } => *persistent,
             DatabaseConfig::External { .. } => false,
+        }
+    }
+
+    /// Get the pool configuration
+    pub fn pool_config(&self) -> &DatabasePoolConfig {
+        match self {
+            DatabaseConfig::Embedded { pool_config, .. } => pool_config,
+            DatabaseConfig::External { pool_config, .. } => pool_config,
         }
     }
 }
@@ -364,8 +452,9 @@ pub struct CorsConfig {
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(default)]
 pub struct EmailConfig {
-    /// SMTP server configuration (required for email functionality)
-    pub smtp: Option<SmtpConfig>,
+    /// Email transport method
+    #[serde(flatten)]
+    pub transport: EmailTransportConfig,
     /// Sender email address
     pub from_email: String,
     /// Sender display name
@@ -374,19 +463,28 @@ pub struct EmailConfig {
     pub password_reset: PasswordResetEmailConfig,
 }
 
-/// SMTP server configuration for sending emails.
+/// Email transport configuration - either SMTP or file-based for testing.
 #[derive(Debug, Clone, Deserialize, Serialize)]
-pub struct SmtpConfig {
-    /// SMTP server hostname
-    pub host: String,
-    /// SMTP server port
-    pub port: u16,
-    /// SMTP authentication username
-    pub username: String,
-    /// SMTP authentication password
-    pub password: String,
-    /// Use TLS encryption
-    pub use_tls: bool,
+#[serde(tag = "type", rename_all = "lowercase")]
+pub enum EmailTransportConfig {
+    /// Send emails via SMTP server
+    Smtp {
+        /// SMTP server hostname
+        host: String,
+        /// SMTP server port
+        port: u16,
+        /// SMTP authentication username
+        username: String,
+        /// SMTP authentication password
+        password: String,
+        /// Use TLS encryption
+        use_tls: bool,
+    },
+    /// Write emails to files (for development/testing)
+    File {
+        /// Directory path where email files will be written
+        path: String,
+    },
 }
 
 /// Password reset email configuration.
@@ -434,14 +532,13 @@ impl Default for FilesConfig {
 /// Batch API configuration.
 ///
 /// The batch API provides OpenAI-compatible batch processing endpoints for asynchronous
-/// request processing.
+/// request processing. Note: The batch processing daemon configuration has been moved
+/// to `background_services.batch_daemon`.
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(default)]
 pub struct BatchConfig {
     /// Enable batches API endpoints (default: true)
     pub enabled: bool,
-    /// Daemon configuration for processing batch requests
-    pub daemon: DaemonConfig,
     /// Files configuration for batch file uploads/downloads
     pub files: FilesConfig,
 }
@@ -450,7 +547,6 @@ impl Default for BatchConfig {
     fn default() -> Self {
         Self {
             enabled: true,
-            daemon: DaemonConfig::default(),
             files: FilesConfig::default(),
         }
     }
@@ -582,6 +678,56 @@ impl Default for LeaderElectionConfig {
     }
 }
 
+/// Background services configuration.
+///
+/// Controls which background services are enabled on this instance.
+#[derive(Debug, Clone, Deserialize, Serialize, Default)]
+#[serde(default)]
+pub struct BackgroundServicesConfig {
+    /// Configuration for onwards config sync service
+    pub onwards_sync: OnwardsSyncConfig,
+    /// Configuration for probe scheduler service
+    pub probe_scheduler: ProbeSchedulerConfig,
+    /// Configuration for batch processing daemon
+    pub batch_daemon: DaemonConfig,
+    /// Leader election configuration for multi-instance deployments
+    pub leader_election: LeaderElectionConfig,
+}
+
+/// Onwards configuration sync service configuration.
+///
+/// This service syncs database configuration changes to the onwards routing layer via PostgreSQL LISTEN/NOTIFY.
+/// Disabling this will prevent the AI proxy from receiving config updates (not recommended for production).
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(default)]
+pub struct OnwardsSyncConfig {
+    /// Enable onwards config sync service (default: true)
+    pub enabled: bool,
+}
+
+impl Default for OnwardsSyncConfig {
+    fn default() -> Self {
+        Self { enabled: true }
+    }
+}
+
+/// Probe scheduler service configuration.
+///
+/// The probe scheduler periodically checks inference endpoint health and removes failing backends from rotation.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(default)]
+pub struct ProbeSchedulerConfig {
+    /// Enable probe scheduler service (default: true)
+    /// When leader election is enabled, the probe scheduler only runs on the elected leader
+    pub enabled: bool,
+}
+
+impl Default for ProbeSchedulerConfig {
+    fn default() -> Self {
+        Self { enabled: true }
+    }
+}
+
 /// CORS origin specification.
 ///
 /// Can be either a wildcard (`*`) to allow all origins, or a specific URL.
@@ -649,7 +795,7 @@ impl Default for Config {
             metadata: Metadata::default(),
             auth: AuthConfig::default(),
             batches: BatchConfig::default(),
-            leader_election: LeaderElectionConfig::default(),
+            background_services: BackgroundServicesConfig::default(),
             enable_metrics: true,
             enable_request_logging: true,
             enable_otel_export: false,
@@ -750,10 +896,18 @@ impl Default for CorsConfig {
 impl Default for EmailConfig {
     fn default() -> Self {
         Self {
-            smtp: None, // Will use file transport in development
+            transport: EmailTransportConfig::default(),
             from_email: "noreply@example.com".to_string(),
             from_name: "Control Layer".to_string(),
             password_reset: PasswordResetEmailConfig::default(),
+        }
+    }
+}
+
+impl Default for EmailTransportConfig {
+    fn default() -> Self {
+        Self::File {
+            path: "./emails".to_string(),
         }
     }
 }
@@ -778,9 +932,10 @@ impl Config {
     pub fn load(args: &Args) -> Result<Self, figment::Error> {
         let mut config: Self = Self::figment(args).extract()?;
 
-        // if database_url is set, use it
+        // if database_url is set, use it (preserving existing pool_config)
         if let Some(url) = config.database_url.take() {
-            config.database = DatabaseConfig::External { url };
+            let pool_config = config.database.pool_config().clone();
+            config.database = DatabaseConfig::External { url, pool_config };
         }
 
         config.validate().map_err(|e| figment::Error::from(e.to_string()))?;

@@ -162,7 +162,10 @@ DWCTL_SECRET_KEY="your-secret-key"
 - `auth.proxy_header.enabled`: Toggle proxy header authentication for SSO
 - `database.type`: `external` (default) or `embedded` (requires embedded-db feature)
 - `batches.enabled`: Enable OpenAI-compatible batch processing API
-- `batches.daemon.enabled`: When batch daemon runs (`leader`, `always`, `never`)
+- `background_services.batch_daemon.enabled`: When batch daemon runs (`leader`, `always`, `never`)
+- `background_services.leader_election.enabled`: Enable leader election for multi-instance deployments
+- `background_services.onwards_sync.enabled`: Enable onwards config sync (syncs DB changes to AI proxy)
+- `background_services.probe_scheduler.enabled`: Enable health probe scheduler
 
 ## Demo Mode
 

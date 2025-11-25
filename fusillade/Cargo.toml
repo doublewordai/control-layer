@@ -1,7 +1,7 @@
 [package]
 name = "fusillade"
-version = "0.2.0"
-edition = "2021"
+edition = "2024"
+version = "0.3.0"
 description = "A daemon implementation for sending batched LLM requests with efficient request coalescing"
 license = "MIT OR Apache-2.0"
 
@@ -33,6 +33,7 @@ humantime = "2"
 hostname = "0.4"
 dashmap = { version = "6", features = ["serde"] }
 sqlx = { version = "0.8", features = ["runtime-tokio", "postgres", "uuid", "chrono", "json"], optional = true }
+test-log = "0.2.18"
 
 [dev-dependencies]
 tokio-test = "0.4"

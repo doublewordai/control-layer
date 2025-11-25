@@ -86,8 +86,8 @@ pub async fn list_inference_endpoints(
 ) -> Result<Json<Vec<InferenceEndpointResponse>>> {
     let mut conn = state.db.acquire().await.map_err(|e| Error::Database(e.into()))?;
     let mut repo = InferenceEndpoints::new(&mut conn);
-    let skip = query.skip.unwrap_or(0);
-    let limit = query.limit.unwrap_or(100).min(1000);
+    let skip = query.pagination.skip();
+    let limit = query.pagination.limit();
 
     let endpoints = repo.list(&InferenceEndpointFilter::new(skip, limit)).await?;
     Ok(Json(endpoints.into_iter().map(Into::into).collect()))
@@ -291,13 +291,17 @@ pub async fn validate_inference_endpoint(
             (parsed_url, api_key, auth_header_name, auth_header_prefix)
         }
         InferenceEndpointValidate::Existing { endpoint_id } => {
-            let mut conn = state.db.acquire().await.map_err(|e| Error::Database(e.into()))?;
-            let mut endpoints_repo = InferenceEndpoints::new(&mut conn);
-            let endpoint = endpoints_repo.get_by_id(endpoint_id).await?;
-            let endpoint = endpoint.ok_or_else(|| Error::NotFound {
-                resource: "Endpoint".to_string(),
-                id: endpoint_id.to_string(),
-            })?;
+            // Scope the connection acquisition to release it before making HTTP request
+            let endpoint = {
+                let mut conn = state.db.acquire().await.map_err(|e| Error::Database(e.into()))?;
+                let mut endpoints_repo = InferenceEndpoints::new(&mut conn);
+                let endpoint = endpoints_repo.get_by_id(endpoint_id).await?;
+                endpoint.ok_or_else(|| Error::NotFound {
+                    resource: "Endpoint".to_string(),
+                    id: endpoint_id.to_string(),
+                })?
+            }; // Connection is released here before HTTP call
+
             (
                 endpoint.url,
                 endpoint.api_key,
@@ -496,6 +500,7 @@ async fn validate_endpoint_connection(
         auth_header_name,
         auth_header_prefix,
         request_timeout: Duration::from_secs(10),
+        format_override: None,
     };
 
     // Use the existing FetchModelsReqwest implementation
@@ -568,10 +573,15 @@ pub async fn synchronize_endpoint(
 mod tests {
     use crate::api::models::deployments::DeployedModelResponse;
     use crate::api::models::inference_endpoints::InferenceEndpointResponse;
+    use crate::api::models::pagination::PaginatedResponse;
     use crate::api::models::users::Role;
     use crate::test_utils::*;
     use serde_json::json;
     use sqlx::PgPool;
+    use wiremock::{
+        matchers::{method, path},
+        Mock, MockServer, ResponseTemplate,
+    };
 
     #[sqlx::test]
     #[test_log::test]
@@ -829,12 +839,32 @@ mod tests {
     #[sqlx::test]
     #[test_log::test]
     async fn test_validate_inference_endpoint_new_valid_url(pool: PgPool) {
+        // Start mock HTTP server for endpoint validation
+        let mock_server = MockServer::start().await;
+
+        // Mock the /v1/models endpoint to return a valid OpenAI-style response
+        Mock::given(method("GET"))
+            .and(path("/v1/models"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "object": "list",
+                "data": [
+                    {
+                        "id": "gpt-4",
+                        "object": "model",
+                        "created": 1687882411,
+                        "owned_by": "openai"
+                    }
+                ]
+            })))
+            .mount(&mock_server)
+            .await;
+
         let (app, _bg_services) = create_test_app(pool.clone(), false).await;
         let admin_user = create_test_admin_user(&pool, Role::PlatformManager).await;
 
         let validate_request = json!({
             "type": "new",
-            "url": "https://api.openai.com/v1",
+            "url": format!("{}/v1", mock_server.uri()),
             "api_key": "test-key"
         });
 
@@ -845,9 +875,7 @@ mod tests {
             .json(&validate_request)
             .await;
 
-        // This will likely fail due to network/auth, but we test the handler logic
-        // The important thing is that it doesn't return 400 for valid URL format
-        assert!(response.status_code() != axum::http::StatusCode::BAD_REQUEST);
+        response.assert_status_ok();
     }
 
     #[sqlx::test]
@@ -875,9 +903,43 @@ mod tests {
     #[sqlx::test]
     #[test_log::test]
     async fn test_validate_inference_endpoint_existing_endpoint(pool: PgPool) {
+        // Start mock HTTP server for endpoint validation
+        let mock_server = MockServer::start().await;
+
+        // Mock the /v1/models endpoint to return a valid OpenAI-style response
+        Mock::given(method("GET"))
+            .and(path("/v1/models"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "object": "list",
+                "data": [
+                    {
+                        "id": "gpt-4",
+                        "object": "model",
+                        "created": 1687882411,
+                        "owned_by": "openai"
+                    }
+                ]
+            })))
+            .mount(&mock_server)
+            .await;
+
         let (app, _bg_services) = create_test_app(pool.clone(), false).await;
         let admin_user = create_test_admin_user(&pool, Role::PlatformManager).await;
         let test_endpoint_id = get_test_endpoint_id(&app, &admin_user).await;
+
+        // Update the test endpoint to use the mock server URL
+        let update = json!({
+            "url": format!("{}/v1", mock_server.uri())
+        });
+
+        let update_response = app
+            .patch(&format!("/admin/api/v1/endpoints/{test_endpoint_id}"))
+            .add_header(&add_auth_headers(&admin_user)[0].0, &add_auth_headers(&admin_user)[0].1)
+            .add_header(&add_auth_headers(&admin_user)[1].0, &add_auth_headers(&admin_user)[1].1)
+            .json(&update)
+            .await;
+
+        update_response.assert_status_ok();
 
         let validate_request = json!({
             "type": "existing",
@@ -891,9 +953,7 @@ mod tests {
             .json(&validate_request)
             .await;
 
-        // This will likely fail due to network/auth, but we test the handler logic
-        assert!(response.status_code() != axum::http::StatusCode::BAD_REQUEST);
-        assert!(response.status_code() != axum::http::StatusCode::NOT_FOUND);
+        response.assert_status_ok();
     }
 
     #[sqlx::test]
@@ -921,12 +981,32 @@ mod tests {
     #[sqlx::test]
     #[test_log::test]
     async fn test_validate_inference_endpoint_as_non_admin_forbidden(pool: PgPool) {
+        // Start mock HTTP server for endpoint validation
+        let mock_server = MockServer::start().await;
+
+        // Mock the /v1/models endpoint to return a valid OpenAI-style response
+        Mock::given(method("GET"))
+            .and(path("/v1/models"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "object": "list",
+                "data": [
+                    {
+                        "id": "gpt-4",
+                        "object": "model",
+                        "created": 1687882411,
+                        "owned_by": "openai"
+                    }
+                ]
+            })))
+            .mount(&mock_server)
+            .await;
+
         let (app, _bg_services) = create_test_app(pool.clone(), false).await;
         let user = create_test_user(&pool, Role::StandardUser).await;
 
         let validate_request = json!({
             "type": "new",
-            "url": "https://api.openai.com/v1",
+            "url": format!("{}/v1", mock_server.uri()),
             "api_key": "test-key"
         });
 
@@ -1515,6 +1595,26 @@ mod tests {
     #[sqlx::test]
     #[test_log::test]
     async fn test_validation_permission_requirements(pool: PgPool) {
+        // Start mock HTTP server for endpoint validation
+        let mock_server = MockServer::start().await;
+
+        // Mock the /v1/models endpoint to return a valid OpenAI-style response
+        Mock::given(method("GET"))
+            .and(path("/v1/models"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "object": "list",
+                "data": [
+                    {
+                        "id": "gpt-4",
+                        "object": "model",
+                        "created": 1687882411,
+                        "owned_by": "openai"
+                    }
+                ]
+            })))
+            .mount(&mock_server)
+            .await;
+
         let (app, _bg_services) = create_test_app(pool.clone(), false).await;
         let platform_manager = create_test_admin_user(&pool, Role::PlatformManager).await;
         let standard_user = create_test_user(&pool, Role::StandardUser).await;
@@ -1523,7 +1623,7 @@ mod tests {
         // Create an endpoint for testing existing validation
         let create_request = json!({
             "name": "Validation Test Endpoint",
-            "url": "https://api.validation.com/v1",
+            "url": format!("{}/v1", mock_server.uri()),
             "api_key": "test-key"
         });
 
@@ -1540,7 +1640,7 @@ mod tests {
         // Test new endpoint validation permissions
         let validate_new = json!({
             "type": "new",
-            "url": "https://api.test.com/v1",
+            "url": format!("{}/v1", mock_server.uri()),
             "api_key": "test-key"
         });
 
@@ -2183,8 +2283,8 @@ mod tests {
             .await;
 
         response.assert_status_ok();
-        let deployments: Vec<DeployedModelResponse> = response.json();
-        assert!(deployments.iter().any(|d| d.alias == "google/gemma-3-12b-it"));
-        assert!(deployments.iter().any(|d| d.alias == "openai/gpt-4"));
+        let deployments: PaginatedResponse<DeployedModelResponse> = response.json();
+        assert!(deployments.data.iter().any(|d| d.alias == "google/gemma-3-12b-it"));
+        assert!(deployments.data.iter().any(|d| d.alias == "openai/gpt-4"));
     }
 }

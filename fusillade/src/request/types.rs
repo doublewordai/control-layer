@@ -7,7 +7,7 @@ use std::sync::Arc;
 
 use chrono::{DateTime, Utc};
 use serde::Serialize;
-use tokio::sync::{mpsc, Mutex};
+use tokio::sync::{Mutex, mpsc};
 use tokio::task::AbortHandle;
 use uuid::Uuid;
 
