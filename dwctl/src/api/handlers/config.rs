@@ -1,6 +1,6 @@
 //! HTTP handlers for configuration retrieval endpoints.
 
-use axum::{extract::State, response::IntoResponse, Json};
+use axum::{Json, extract::State, response::IntoResponse};
 use serde::Serialize;
 
 use crate::{AppState, api::models::users::CurrentUser};

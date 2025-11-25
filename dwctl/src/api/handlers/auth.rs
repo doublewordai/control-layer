@@ -18,10 +18,7 @@ use crate::{
     auth::{password, session},
     db::{
         handlers::{PasswordResetTokens, Repository, Users, credits::Credits},
-        models::{
-            credits::{CreditTransactionCreateDBRequest, CreditTransactionType},
-            users::UserCreateDBRequest,
-        },
+        models::{credits::CreditTransactionCreateDBRequest, users::UserCreateDBRequest},
     },
     email::EmailService,
     errors::Error,

@@ -67,17 +67,16 @@ async fn try_jwt_session_auth(
                 Err(e) => return Some(Err(Error::Database(e))),
             };
 
-                return Some(Ok(CurrentUser {
-                    id: user.id,
-                    username: user.username,
-                    email: user.email,
-                    is_admin: user.is_admin,
-                    roles: user.roles,
-                    display_name: user.display_name,
-                    avatar_url: user.avatar_url,
-                    payment_provider_id: user.payment_provider_id,
-                }));
-            }
+            return Some(Ok(CurrentUser {
+                id: user.id,
+                username: user.username,
+                email: user.email,
+                is_admin: user.is_admin,
+                roles: user.roles,
+                display_name: user.display_name,
+                avatar_url: user.avatar_url,
+                payment_provider_id: user.payment_provider_id,
+            }));
         }
     }
     None

@@ -1,14 +1,14 @@
 //! HTTP handlers for payment processing endpoints.
 
 use axum::{
-    extract::State,
-    http::{header, StatusCode},
-    response::{IntoResponse, Response},
     Json,
+    extract::State,
+    http::{StatusCode, header},
+    response::{IntoResponse, Response},
 };
 use serde_json::json;
 
-use crate::{api::models::users::CurrentUser, payment_providers, AppState};
+use crate::{AppState, api::models::users::CurrentUser, payment_providers};
 
 #[utoipa::path(
     post,

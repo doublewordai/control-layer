@@ -169,8 +169,7 @@ use auth::middleware::admin_ai_proxy_middleware;
 use axum::extract::DefaultBodyLimit;
 use axum::http::HeaderValue;
 use axum::{
-    Router, ServiceExt,
-    http,
+    Router, ServiceExt, http,
     middleware::from_fn_with_state,
     routing::{delete, get, patch, post},
 };
