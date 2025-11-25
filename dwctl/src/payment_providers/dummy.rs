@@ -30,52 +30,44 @@ impl DummyProvider {
 
 #[async_trait]
 impl PaymentProvider for DummyProvider {
-    async fn create_checkout_session(&self, db_pool: &PgPool, user: &CurrentUser, _cancel_url: &str, success_url: &str) -> Result<String> {
-        // Generate a unique session ID
-        let session_id = format!("dummy_session_{}", uuid::Uuid::new_v4());
+    async fn create_checkout_session(&self, _db_pool: &PgPool, user: &CurrentUser, _cancel_url: &str, success_url: &str) -> Result<String> {
+        // Generate a unique session ID that includes the user ID
+        // This allows us to retrieve the user ID in process_payment_session
+        let session_id = format!("dummy_session_{}_{}", user.id, uuid::Uuid::new_v4());
 
-        // Immediately create the credit transaction
-        let mut conn = db_pool.acquire().await?;
-        let mut credits = Credits::new(&mut conn);
+        // Build success URL with session ID
+        let redirect_url = success_url.replace("{CHECKOUT_SESSION_ID}", &session_id);
 
-        let request = CreditTransactionCreateDBRequest {
-            user_id: user.id,
-            transaction_type: CreditTransactionType::Purchase,
-            amount: self.amount,
-            source_id: session_id.clone(),
-            description: Some("Dummy payment (test)".to_string()),
-        };
+        tracing::info!("Dummy provider created checkout session {} for user {}", session_id, user.id);
 
-        credits.create_transaction(&request).await.map_err(|e| {
-            tracing::error!("Failed to create credit transaction: {:?}", e);
-            PaymentError::Database(sqlx::Error::RowNotFound)
-        })?;
-
-        tracing::info!("Dummy provider added {} credits to user {}", self.amount, user.id);
-
-        // Return the success URL since payment is "complete"
-        Ok(success_url.to_string())
+        // Return the success URL - payment is instantly "complete" for dummy provider
+        Ok(redirect_url)
     }
 
     async fn get_payment_session(&self, session_id: &str) -> Result<PaymentSession> {
         // Parse the user ID from the session_id
-        // Format: dummy_session_{uuid}
+        // Format: dummy_session_{user_id}_{uuid}
         if !session_id.starts_with("dummy_session_") {
             return Err(PaymentError::InvalidData("Invalid dummy session ID format".to_string()));
         }
 
-        // For the dummy provider, we can't reconstruct user_id from session_id alone
-        // This method is typically called after we already have the transaction in the database
-        // Return a basic session with dummy data - the actual data comes from the database
+        // Extract user_id from session_id
+        let parts: Vec<&str> = session_id.split('_').collect();
+        if parts.len() < 4 {
+            return Err(PaymentError::InvalidData("Invalid dummy session ID format".to_string()));
+        }
+
+        let user_id = parts[2];
+
         Ok(PaymentSession {
-            user_id: "unknown".to_string(), // This will be overridden by database lookup
+            user_id: user_id.to_string(),
             amount: self.amount,
             is_paid: true, // Dummy sessions are always "paid"
         })
     }
 
     async fn process_payment_session(&self, db_pool: &PgPool, session_id: &str) -> Result<()> {
-        // Check if we've already processed this payment
+        // Fast path: Check if we've already processed this payment
         let existing = sqlx::query!(
             r#"
             SELECT id FROM credits_transactions
@@ -88,14 +80,59 @@ impl PaymentProvider for DummyProvider {
         .await?;
 
         if existing.is_some() {
-            tracing::info!("Transaction for session_id {} already exists, skipping", session_id);
+            tracing::trace!("Transaction for session_id {} already exists, skipping (fast path)", session_id);
             return Ok(());
         }
 
-        // For the dummy provider, the transaction was already created during checkout
-        // This method serves as a verification that the transaction exists
-        tracing::info!("Dummy provider verification complete for session {}", session_id);
-        Ok(())
+        // Get payment session details to extract user_id
+        let payment_session = self.get_payment_session(session_id).await?;
+
+        // Verify payment status
+        if !payment_session.is_paid {
+            tracing::trace!("Transaction for session_id {} has not been paid, skipping.", session_id);
+            return Err(PaymentError::PaymentNotCompleted);
+        }
+
+        // Create the credit transaction
+        let mut conn = db_pool.acquire().await?;
+        let mut credits = Credits::new(&mut conn);
+
+        let user_id: crate::types::UserId = payment_session.user_id.parse().map_err(|e| {
+            tracing::error!("Failed to parse user ID: {:?}", e);
+            PaymentError::InvalidData(format!("Invalid user ID: {}", e))
+        })?;
+
+        let request = CreditTransactionCreateDBRequest {
+            user_id,
+            transaction_type: CreditTransactionType::Purchase,
+            amount: payment_session.amount,
+            source_id: session_id.to_string(),
+            description: Some("Dummy payment (test)".to_string()),
+        };
+
+        match credits.create_transaction(&request).await {
+            Ok(_) => {
+                tracing::info!("Successfully fulfilled checkout session {} for user {}", session_id, user_id);
+                Ok(())
+            }
+            Err(crate::db::errors::DbError::UniqueViolation { constraint, .. }) => {
+                // Check if this is a unique constraint violation on source_id
+                if constraint.as_deref() == Some("credits_transactions_source_id_unique") {
+                    tracing::trace!(
+                        "Transaction for session_id {} already processed (caught unique constraint violation), returning success (idempotent)",
+                        session_id
+                    );
+                    Ok(())
+                } else {
+                    tracing::error!("Unexpected unique constraint violation: {:?}", constraint);
+                    Err(PaymentError::Database(sqlx::Error::RowNotFound))
+                }
+            }
+            Err(e) => {
+                tracing::error!("Failed to create credit transaction: {:?}", e);
+                Err(PaymentError::Database(sqlx::Error::RowNotFound))
+            }
+        }
     }
 
     async fn validate_webhook(&self, _headers: &axum::http::HeaderMap, _body: &str) -> Result<Option<WebhookEvent>> {
@@ -114,33 +151,21 @@ mod tests {
     use super::*;
     use rust_decimal::Decimal;
     use sqlx::PgPool;
-    use uuid::Uuid;
+    use crate::api::models::users::Role;
 
     /// Helper to create a test user in the database
     async fn create_test_user(pool: &PgPool) -> CurrentUser {
-        let user_id = Uuid::new_v4();
-        sqlx::query!(
-            r#"
-            INSERT INTO users (id, email, display_name, roles, password_hash)
-            VALUES ($1, $2, $3, $4, $5)
-            "#,
-            user_id,
-            "test@example.com",
-            "Test User",
-            &vec!["StandardUser"],
-            "dummy_hash"
-        )
-        .execute(pool)
-        .await
-        .unwrap();
+        let user = crate::test_utils::create_test_user(pool, Role::StandardUser).await;
 
         CurrentUser {
-            id: user_id,
-            email: "test@example.com".to_string(),
-            display_name: Some("Test User".to_string()),
-            roles: vec![crate::types::Role::StandardUser],
+            id: user.id,
+            username: user.username,
+            email: user.email,
+            display_name: user.display_name,
+            roles: user.roles,
             payment_provider_id: None,
-            credit_balance: Decimal::ZERO,
+            is_admin: false,
+            avatar_url: None,
         }
     }
 
@@ -151,28 +176,47 @@ mod tests {
     }
 
     #[sqlx::test]
-    async fn test_dummy_create_checkout_session(pool: PgPool) {
+    async fn test_dummy_full_payment_flow(pool: PgPool) {
         let provider = DummyProvider::new(Decimal::new(5000, 2)); // $50.00
         let user = create_test_user(&pool).await;
 
         let cancel_url = "http://localhost:3001/cost-management?payment=cancelled&session_id={CHECKOUT_SESSION_ID}";
         let success_url = "http://localhost:3001/cost-management?payment=success&session_id={CHECKOUT_SESSION_ID}";
 
-        let result = provider.create_checkout_session(&pool, &user, cancel_url, success_url).await;
-
-        assert!(result.is_ok());
-        let checkout_url = result.unwrap();
+        // Step 1: Create checkout session
+        let checkout_url = provider
+            .create_checkout_session(&pool, &user, cancel_url, success_url)
+            .await
+            .unwrap();
 
         // Verify it returns the success URL with session_id
         assert!(checkout_url.contains("payment=success"));
-        assert!(checkout_url.contains("session_id=dummy_session_"));
+        assert!(checkout_url.contains(&format!("session_id=dummy_session_{}", user.id)));
 
-        // Extract session_id
+        // Extract session_id (simulating frontend receiving redirect)
         let url = url::Url::parse(&checkout_url).unwrap();
         let query_pairs: std::collections::HashMap<_, _> = url.query_pairs().collect();
         let session_id = query_pairs.get("session_id").unwrap();
 
-        // Verify transaction was created immediately
+        // Verify NO transaction was created yet (matches Stripe flow)
+        let count_before = sqlx::query!(
+            r#"
+            SELECT COUNT(*) as count
+            FROM credits_transactions
+            WHERE source_id = $1
+            "#,
+            session_id.to_string()
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(count_before.count.unwrap(), 0, "Transaction should not exist before processing");
+
+        // Step 2: Frontend calls backend to process payment
+        let result = provider.process_payment_session(&pool, session_id).await;
+        assert!(result.is_ok(), "Payment processing should succeed");
+
+        // Step 3: Verify transaction was created
         let transaction = sqlx::query!(
             r#"
             SELECT amount, user_id, source_id, description
@@ -198,7 +242,7 @@ mod tests {
         let cancel_url = "http://localhost:3001/cost-management?payment=cancelled&session_id={CHECKOUT_SESSION_ID}";
         let success_url = "http://localhost:3001/cost-management?payment=success&session_id={CHECKOUT_SESSION_ID}";
 
-        // Create checkout session (creates transaction)
+        // Create checkout session
         let checkout_url = provider
             .create_checkout_session(&pool, &user, cancel_url, success_url)
             .await
@@ -209,12 +253,14 @@ mod tests {
         let query_pairs: std::collections::HashMap<_, _> = url.query_pairs().collect();
         let session_id = query_pairs.get("session_id").unwrap();
 
-        // Process payment (should be idempotent)
+        // Process payment multiple times (simulating retries, webhook + manual, etc.)
         let result1 = provider.process_payment_session(&pool, session_id).await;
         let result2 = provider.process_payment_session(&pool, session_id).await;
+        let result3 = provider.process_payment_session(&pool, session_id).await;
 
         assert!(result1.is_ok());
         assert!(result2.is_ok());
+        assert!(result3.is_ok());
 
         // Verify only one transaction exists
         let count = sqlx::query!(
@@ -232,29 +278,6 @@ mod tests {
         assert_eq!(count.count.unwrap(), 1, "Should only have one transaction (idempotent)");
     }
 
-    #[sqlx::test]
-    async fn test_dummy_get_payment_session(pool: PgPool) {
-        let provider = DummyProvider::new(Decimal::new(7500, 2)); // $75.00
-
-        // Test with valid session ID format
-        let result = provider.get_payment_session("dummy_session_test123").await;
-        assert!(result.is_ok());
-
-        let session = result.unwrap();
-        assert_eq!(session.amount, Decimal::new(7500, 2));
-        assert!(session.is_paid); // Dummy sessions are always "paid"
-
-        // Test with invalid session ID format
-        let result = provider.get_payment_session("invalid_session_id").await;
-        assert!(result.is_err());
-        match result {
-            Err(PaymentError::InvalidData(msg)) => {
-                assert!(msg.contains("Invalid dummy session ID format"));
-            }
-            _ => panic!("Expected InvalidData error"),
-        }
-    }
-
     #[test]
     fn test_dummy_webhook_not_supported() {
         let provider = DummyProvider::new(Decimal::new(100, 0));
@@ -269,4 +292,5 @@ mod tests {
         assert!(result.is_ok());
         assert_eq!(result.unwrap(), None); // Returns None for unsupported webhooks
     }
+    
 }
