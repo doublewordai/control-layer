@@ -88,14 +88,15 @@ impl PaymentProvider for StripeProvider {
 
         // If we didn't have a customer ID before, save the newly created one
         if user.payment_provider_id.is_none()
-            && let Some(customer) = &checkout_session.customer {
-                let customer_id = customer.id().to_string();
-                tracing::info!("Saving newly created customer ID {} for user {}", customer_id, user.id);
+            && let Some(customer) = &checkout_session.customer
+        {
+            let customer_id = customer.id().to_string();
+            tracing::info!("Saving newly created customer ID {} for user {}", customer_id, user.id);
 
-                sqlx::query!("UPDATE users SET payment_provider_id = $1 WHERE id = $2", customer_id, user.id)
-                    .execute(db_pool)
-                    .await?;
-            }
+            sqlx::query!("UPDATE users SET payment_provider_id = $1 WHERE id = $2", customer_id, user.id)
+                .execute(db_pool)
+                .await?;
+        }
 
         // Return checkout URL for hosted checkout
         checkout_session.url.ok_or_else(|| {
