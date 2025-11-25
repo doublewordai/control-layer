@@ -165,7 +165,7 @@ export const createUserColumns = (
         <div className="flex items-center gap-2">
           <button
             onClick={() => actions.onEdit(user)}
-            className="h-8 w-8 p-0 text-gray-600 hover:text-gray-900 transition-colors"
+            className="h-8 w-8 p-0 text-gray-400 hover:text-gray-900 transition-colors"
             title="Edit user"
           >
             <Edit2 className="h-4 w-4" />
@@ -173,7 +173,7 @@ export const createUserColumns = (
           </button>
           <button
             onClick={() => actions.onManageGroups(user)}
-            className="h-8 w-8 p-0 text-gray-600 hover:text-gray-900 transition-colors"
+            className="h-8 w-8 p-0 text-gray-400 hover:text-gray-900 transition-colors"
             title="Manage groups"
           >
             <Users className="h-4 w-4" />
@@ -182,7 +182,7 @@ export const createUserColumns = (
           {actions.showTransactions && (
             <button
               onClick={() => actions.onViewTransactions(user)}
-              className="h-8 w-8 p-0 text-gray-600 hover:text-gray-900 transition-colors"
+              className="h-8 w-8 p-0 text-gray-400 hover:text-gray-900 transition-colors"
               title="Manage billing"
             >
               <Receipt className="h-4 w-4" />
@@ -191,7 +191,7 @@ export const createUserColumns = (
           )}
           <button
             onClick={() => actions.onDelete(user)}
-            className="h-8 w-8 p-0 text-red-500 hover:text-red-700 transition-colors"
+            className="h-8 w-8 p-0 text-red-400 hover:text-red-700 transition-colors"
             title="Delete user"
           >
             <Trash2 className="h-4 w-4" />
