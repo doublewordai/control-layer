@@ -3,43 +3,24 @@
 use crate::{
     AppState,
     api::models::{
-        deployments::{DeployedModelCreate, DeployedModelResponse, DeployedModelUpdate, GetModelQuery, ListModelsQuery, ModelProbeStatus},
+        deployments::{DeployedModelCreate, DeployedModelResponse, DeployedModelUpdate, GetModelQuery, ListModelsQuery},
+        enrichment::ModelEnricher,
         pagination::PaginatedResponse,
         users::CurrentUser,
     },
     auth::permissions::{RequiresPermission, can_read_all_resources, has_permission, operation, resource},
     db::{
-        handlers::{Deployments, Groups, InferenceEndpoints, Repository, analytics::get_model_metrics, deployments::DeploymentFilter},
+        handlers::{Deployments, InferenceEndpoints, Repository, deployments::DeploymentFilter},
         models::deployments::{DeploymentCreateDBRequest, DeploymentUpdateDBRequest, ModelPricing, ModelStatus},
     },
     errors::{Error, Result},
-    types::{DeploymentId, GroupId, Resource},
+    types::{DeploymentId, Resource},
 };
 use axum::{
     extract::{Path, Query, State},
     response::Json,
 };
 use sqlx::Acquire;
-
-/// Apply pricing information to model response based on user permissions
-/// - All users see customer-facing pricing rates
-/// - Users with Pricing::ReadAll also see downstream/provider pricing details
-fn apply_pricing_to_response(
-    mut response: DeployedModelResponse,
-    pricing: Option<ModelPricing>,
-    can_read_full_pricing: bool,
-) -> DeployedModelResponse {
-    if let Some(model_pricing) = pricing {
-        // All users get customer-facing pricing
-        response = response.with_pricing(model_pricing.to_customer_pricing());
-
-        // Only privileged users get downstream pricing
-        if can_read_full_pricing {
-            response = response.with_downstream_pricing(model_pricing.downstream);
-        }
-    }
-    response
-}
 
 #[utoipa::path(
     get,
@@ -184,154 +165,33 @@ pub async fn list_deployed_models(
     let total_count = repo.count(&filter).await?;
     let filtered_models = repo.list(&filter).await?;
 
-    let mut response: Vec<DeployedModelResponse> = vec![];
+    // Prepare models with their pricing for enrichment
+    let models_with_pricing: Vec<(DeployedModelResponse, Option<ModelPricing>)> = filtered_models
+        .into_iter()
+        .map(|model| {
+            let pricing = model.pricing.clone();
+            (model.into(), pricing)
+        })
+        .collect();
 
-    // Prepare data for bulk fetching if needed
-    let model_ids: Vec<DeploymentId> = filtered_models.iter().map(|m| m.id).collect();
+    // Configure enrichment based on includes and permissions
     let include_groups = includes.contains(&"groups");
     let include_metrics = includes.contains(&"metrics");
     let include_status = includes.contains(&"status");
     let include_pricing = includes.contains(&"pricing");
 
-    // Fetch all includes in parallel for maximum performance
-    let model_aliases: Vec<String> = filtered_models.iter().map(|m| m.alias.clone()).collect();
-
-    let (groups_result, status_map, metrics_map) = tokio::join!(
-        // Groups query
-        async {
-            if include_groups {
-                let groups_conn = tx.acquire().await.map_err(|e| Error::Database(e.into())).ok()?;
-                let mut groups_repo = Groups::new(&mut *groups_conn);
-
-                let model_groups_map = groups_repo.get_deployments_groups_bulk(&model_ids).await.ok()?;
-
-                // Collect all unique group IDs that we need to fetch
-                let all_group_ids: Vec<GroupId> = model_groups_map
-                    .values()
-                    .flatten()
-                    .copied()
-                    .collect::<std::collections::HashSet<_>>()
-                    .into_iter()
-                    .collect();
-
-                let groups_map = groups_repo.get_bulk(all_group_ids).await.ok()?;
-
-                Some((model_groups_map, groups_map))
-            } else {
-                None
-            }
-        },
-        // Probe status query
-        async {
-            if include_status {
-                use crate::probes::db::ProbeManager;
-                ProbeManager::get_deployment_statuses(&state.db, &model_ids).await.ok()
-            } else {
-                None
-            }
-        },
-        // Metrics query
-        async {
-            if include_metrics {
-                match get_model_metrics(&state.db, model_aliases).await {
-                    Ok(map) => Some(map),
-                    Err(e) => {
-                        tracing::warn!("Failed to fetch bulk metrics: {:?}", e);
-                        None
-                    }
-                }
-            } else {
-                None
-            }
-        }
-    );
-
-    let (model_groups_map, groups_map) = match groups_result {
-        Some((model_groups_map, groups_map)) => (Some(model_groups_map), Some(groups_map)),
-        None => (None, None),
+    // Use ModelEnricher to add requested data
+    let enricher = ModelEnricher {
+        db: &state.db,
+        include_groups,
+        include_metrics,
+        include_status,
+        include_pricing,
+        can_read_pricing,
+        can_read_rate_limits,
     };
 
-    // Build response with requested includes
-    for model in filtered_models {
-        // Extract pricing before conversion (for later filtering)
-        let model_pricing = model.pricing.clone();
-
-        // Convert to api response format
-        let mut model_response: DeployedModelResponse = model.into();
-
-        // Add groups if requested and available
-        if include_groups {
-            if let (Some(model_groups_map), Some(groups_map)) = (&model_groups_map, &groups_map) {
-                if let Some(group_ids) = model_groups_map.get(&model_response.id) {
-                    let model_groups: Vec<_> = group_ids
-                        .iter()
-                        .filter_map(|group_id| groups_map.get(group_id))
-                        .cloned()
-                        .map(|group| group.into())
-                        .collect();
-                    model_response = model_response.with_groups(model_groups);
-                } else {
-                    // No groups for this model, but groups were requested, so set empty array
-                    model_response = model_response.with_groups(vec![]);
-                }
-            } else {
-                // Groups requested but no data available, set empty array
-                model_response = model_response.with_groups(vec![]);
-            }
-        }
-
-        // Add metrics if requested
-        if include_metrics
-            && let Some(ref metrics_map) = metrics_map
-            && let Some(metrics) = metrics_map.get(&model_response.alias)
-        {
-            model_response = model_response.with_metrics(metrics.clone());
-        }
-        // If no metrics found for this model, just skip it (no warning needed - model might be new)
-
-        // Add probe status if requested
-        if include_status && let Some(ref statuses) = status_map {
-            if let Some((probe_id, active, interval_seconds, last_check, last_success, uptime_percentage)) =
-                statuses.get(&model_response.id)
-            {
-                let status = ModelProbeStatus {
-                    probe_id: *probe_id,
-                    active: *active,
-                    interval_seconds: *interval_seconds,
-                    last_check: *last_check,
-                    last_success: *last_success,
-                    uptime_percentage: *uptime_percentage,
-                };
-                model_response = model_response.with_status(status);
-            } else {
-                // No probe for this model - set default status
-                let status = ModelProbeStatus {
-                    probe_id: None,
-                    active: false,
-                    interval_seconds: None,
-                    last_check: None,
-                    last_success: None,
-                    uptime_percentage: None,
-                };
-                model_response = model_response.with_status(status);
-            }
-        }
-
-        // Add pricing if requested (filtered by user role)
-        if include_pricing {
-            model_response = apply_pricing_to_response(model_response, model_pricing, can_read_pricing);
-        }
-
-        // Mask rate limiting info for users without ModelRateLimits permission
-        if !can_read_rate_limits {
-            model_response = model_response.mask_rate_limiting();
-        }
-
-        response.push(model_response);
-    }
-
-    // Commit the transaction to ensure all reads were atomic
-    tx.commit().await.map_err(|e| Error::Database(e.into()))?;
+    let response = enricher.enrich_many(models_with_pricing).await?;
 
     Ok(Json(PaginatedResponse::new(response, total_count, skip, limit)))
 }
@@ -482,6 +342,7 @@ pub async fn get_deployed_model(
 ) -> Result<Json<DeployedModelResponse>> {
     let has_system_access = has_permission(&current_user, resource::Models.into(), operation::SystemAccess.into());
     let can_read_rate_limits = can_read_all_resources(&current_user, Resource::ModelRateLimits);
+    let can_read_pricing = can_read_all_resources(&current_user, Resource::Pricing);
 
     let mut pool_conn = state.db.acquire().await.map_err(|e| Error::Database(e.into()))?;
     let mut repo = Deployments::new(&mut pool_conn);
@@ -523,13 +384,29 @@ pub async fn get_deployed_model(
         }
     }
 
-    // Build and return response
+    // Parse include parameters
+    let include_params = query.include.as_deref().unwrap_or("");
+    let include_groups = include_params.contains("groups");
+    let include_metrics = include_params.contains("metrics");
+    let include_status = include_params.contains("status");
+    let include_pricing = include_params.contains("pricing");
+
+    // Build base response
+    let pricing = model.pricing.clone();
     let mut response = DeployedModelResponse::from(model);
 
-    // Mask rate limiting info for users without ModelRateLimits permission
-    if !can_read_rate_limits {
-        response = response.mask_rate_limiting();
-    }
+    // Use ModelEnricher to add related data
+    let enricher = ModelEnricher {
+        db: &state.db,
+        include_groups,
+        include_metrics,
+        include_status,
+        include_pricing,
+        can_read_pricing,
+        can_read_rate_limits,
+    };
+
+    response = enricher.enrich_one(response, pricing).await?;
 
     Ok(Json(response))
 }

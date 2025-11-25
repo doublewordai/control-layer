@@ -42,6 +42,8 @@ pub struct GetModelQuery {
     pub deleted: Option<bool>,
     /// Show inactive model when true, 404 when false/unspecified if model is inactive
     pub inactive: Option<bool>,
+    /// Include related data (comma-separated: "groups", "metrics")
+    pub include: Option<String>,
 }
 
 /// Time series point for model activity sparklines
