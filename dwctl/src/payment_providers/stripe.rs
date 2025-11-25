@@ -136,7 +136,7 @@ impl PaymentProvider for StripeProvider {
                 PaymentError::InvalidData("Missing payment amount".to_string())
             })?
             / 100; // Convert cents to dollars
-        
+
         Ok(PaymentSession {
             user_id,
             amount: Decimal::from(price),
