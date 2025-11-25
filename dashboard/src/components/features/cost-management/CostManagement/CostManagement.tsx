@@ -1,4 +1,5 @@
 import { useEffect } from "react";
+import { useSearchParams } from "react-router-dom";
 import { useUser, useAddFunds } from "@/api/control-layer";
 import { toast } from "sonner";
 import { useSettings } from "@/contexts";
@@ -7,6 +8,10 @@ import { TransactionHistory } from "@/components/features/cost-management/CostMa
 export function CostManagement() {
   const { isFeatureEnabled, settings } = useSettings();
   const isDemoMode = isFeatureEnabled("demo");
+  const [searchParams] = useSearchParams();
+
+  // Check if we're filtering by a specific user
+  const filterUserId = searchParams.get("user");
 
   // Fetch current user
   const { data: user, refetch: refetchUser } = useUser("current");
@@ -80,6 +85,7 @@ export function CostManagement() {
           onAddFunds={canAddFunds ? handleAddFunds : undefined}
           isAddingFunds={addFundsMutation.isPending}
           showCard={false}
+          filterUserId={filterUserId || undefined}
         />
       )}
     </div>

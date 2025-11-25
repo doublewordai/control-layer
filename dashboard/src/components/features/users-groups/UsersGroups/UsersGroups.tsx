@@ -222,8 +222,7 @@ const UsersGroups: React.FC = () => {
       setShowUserGroupsModal(true);
     },
     onViewTransactions: (user) => {
-      setActiveUser(user);
-      setShowUserTransactionsModal(true);
+      navigate(`/cost-management?user=${user.id}`);
     },
     groups: groups,
     showTransactions: true,

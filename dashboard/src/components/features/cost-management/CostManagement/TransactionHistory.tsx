@@ -37,6 +37,7 @@ export interface TransactionHistoryProps {
   showCard?: boolean;
   onAddFunds?: () => void;
   isAddingFunds?: boolean;
+  filterUserId?: string;
 }
 
 export function TransactionHistory({
@@ -44,6 +45,7 @@ export function TransactionHistory({
   showCard = true,
   onAddFunds,
   isAddingFunds = false,
+  filterUserId,
 }: TransactionHistoryProps) {
   const { isFeatureEnabled } = useSettings();
   const isDemoMode = isFeatureEnabled("demo");
@@ -111,6 +113,11 @@ export function TransactionHistory({
   const filteredTransactions = useMemo(() => {
     let filtered = [...transactions];
 
+    // Filter by specific user if provided
+    if (filterUserId) {
+      filtered = filtered.filter((t) => t.user_id === filterUserId);
+    }
+
     // Filter by search term
     if (searchTerm) {
       const lowerSearch = searchTerm.toLowerCase();
@@ -152,7 +159,7 @@ export function TransactionHistory({
     }
 
     return filtered;
-  }, [transactions, transactionType, dateRange, searchTerm]);
+  }, [transactions, transactionType, dateRange, searchTerm, filterUserId]);
 
   // Paginate filtered transactions
   const paginatedTransactions = useMemo(() => {
@@ -236,7 +243,7 @@ export function TransactionHistory({
               <button
                 onClick={onAddFunds}
                 disabled={isAddingFunds}
-                className="flex items-center px-4 py-2 bg-blue-600 hover:bg-blue-700 text-white border-l border-blue-500 disabled:opacity-50 disabled:cursor-not-allowed transition-colors"
+                className="flex items-center px-4 py-2 bg-gray-600 hover:bg-gray-700 text-white border-l border-gray-500 disabled:opacity-50 disabled:cursor-not-allowed transition-colors"
               >
                 <Plus className="w-5 h-5 mr-2" />
                 <span className="font-medium">
