@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.3.1](https://github.com/doublewordai/control-layer/compare/fusillade-v0.3.0...fusillade-v0.3.1) (2025-11-25)
+
+
+### Bug Fixes
+
+* Filename uniqueness is scoped to users ([99e2968](https://github.com/doublewordai/control-layer/commit/99e29685bfeb5255ebc5748038a80973ba1e9409))
+
 ## [0.3.0](https://github.com/doublewordai/control-layer/compare/fusillade-v0.2.0...fusillade-v0.3.0) (2025-11-24)
 
 
