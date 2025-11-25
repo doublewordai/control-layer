@@ -88,7 +88,7 @@ export function TransactionHistory({
 
   // Pagination state
   const [currentPage, setCurrentPage] = useState(1);
-  const itemsPerPage = 15;
+  const itemsPerPage = 12;
 
   // Helper functions
   const formatDate = (isoString: string) => {
@@ -399,7 +399,7 @@ export function TransactionHistory({
         )}
 
         {/* Pagination Controls */}
-        {filteredTransactions.length > 12 && (
+        {filteredTransactions.length > itemsPerPage && (
           <div className="flex items-center justify-between border-t border-doubleword-neutral-200 pt-2">
             <div className="text-sm text-doubleword-neutral-600">
               Showing {(currentPage - 1) * itemsPerPage + 1} to{" "}
