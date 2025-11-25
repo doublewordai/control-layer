@@ -51,6 +51,7 @@ export function useUser(id: string, options?: { include?: string }) {
   return useQuery({
     queryKey: queryKeys.users.byId(id, options?.include),
     queryFn: () => dwctlApi.users.get(id, options),
+    staleTime: 30 * 1000, // 30 seconds - matches useTransactions to keep balance in sync
   });
 }
 
@@ -900,8 +901,51 @@ export function useAddFunds() {
         queryClient.refetchQueries({
           queryKey: queryKeys.users.byId(variables.user_id, "billing"),
         }),
-        queryClient.refetchQueries({ queryKey: ["cost", "transactions"] }),
+        queryClient.invalidateQueries({
+          queryKey: ["cost", "transactions"],
+          exact: false,
+        }),
       ]);
+    },
+  });
+}
+
+// Payment hooks
+
+export function useCreatePayment() {
+  return useMutation({
+    mutationKey: queryKeys.payments.create(),
+    mutationFn: () => dwctlApi.payments.create(),
+  });
+}
+
+export function useProcessPayment(options?: {
+  onSuccess?: () => void;
+  onError?: (error: Error) => void;
+}) {
+  const queryClient = useQueryClient();
+
+  return useMutation({
+    mutationKey: ["payments", "process"],
+    mutationFn: async (sessionId: string) => {
+      await dwctlApi.payments.process(sessionId)
+    },
+    onSuccess: () => {
+      // Refetch user data to update balance after successful payment
+      queryClient.invalidateQueries({
+        queryKey: queryKeys.users.all,
+      });
+      queryClient.invalidateQueries({
+        queryKey: ["cost", "transactions"],
+        exact: false,
+      });
+      // Call the component's callback if provided
+      options?.onSuccess?.();
+    },
+    onError: (error) => {
+      console.error('[useProcessPayment] onError callback triggered:', error);
+      // Call the component's error callback if provided
+      options?.onError?.(error as Error);
     },
   });
 }

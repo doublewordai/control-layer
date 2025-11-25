@@ -59,10 +59,16 @@ import { ApiError } from "./errors";
 
 // Resource APIs
 const userApi = {
-  async list(options?: UsersQuery): Promise<User[]> {
+  async list(options?: UsersQuery): Promise<PaginatedResponse<User>> {
     const params = new URLSearchParams();
     if (options?.include) {
       params.set("include", options.include);
+    }
+    if (options?.skip !== undefined) {
+      params.set("skip", options.skip.toString());
+    }
+    if (options?.limit !== undefined) {
+      params.set("limit", options.limit.toString());
     }
 
     const url = `/admin/api/v1/users${params.toString() ? "?" + params.toString() : ""}`;
@@ -409,9 +415,15 @@ const endpointApi = {
 };
 
 const groupApi = {
-  async list(options?: GroupsQuery): Promise<Group[]> {
+  async list(options?: GroupsQuery): Promise<PaginatedResponse<Group>> {
     const params = new URLSearchParams();
     if (options?.include) params.set("include", options.include);
+    if (options?.skip !== undefined) {
+      params.set("skip", options.skip.toString());
+    }
+    if (options?.limit !== undefined) {
+      params.set("limit", options.limit.toString());
+    }
 
     const url = `/admin/api/v1/groups${params.toString() ? "?" + params.toString() : ""}`;
     const response = await fetch(url);
@@ -527,8 +539,8 @@ const requestsApi = {
     const params = new URLSearchParams();
     if (options?.limit !== undefined)
       params.set("limit", options.limit.toString());
-    if (options?.offset !== undefined)
-      params.set("offset", options.offset.toString());
+    if (options?.skip !== undefined)
+      params.set("skip", options.skip.toString());
     if (options?.method) params.set("method", options.method);
     if (options?.uri_pattern) params.set("uri_pattern", options.uri_pattern);
     if (options?.status_code !== undefined)
@@ -765,6 +777,49 @@ const costApi = {
       throw new Error(`Failed to add funds: ${response.status}`);
     }
     return response.json();
+  },
+};
+
+// Payment processing API
+const paymentsApi = {
+  async create(): Promise<{ url: string }> {
+    const response = await fetch("/admin/api/v1/payments", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+    });
+
+    if (!response.ok) {
+      const errorData = await response.json().catch(() => ({}));
+      throw new Error(errorData.message || `Failed to create payment: ${response.status}`);
+    }
+
+    return response.json();
+  },
+
+  async process(paymentId: string): Promise<void> {
+    const response = await fetch(`/admin/api/v1/payments/${paymentId}`, {
+      method: "PATCH",
+      headers: { "Content-Type": "application/json" },
+    });
+
+    if (!response.ok) {
+      if (response.status === 402) {
+        throw new ApiError(
+          402,
+          "Payment is still processing. Please check back in a moment.",
+          response,
+        );
+      }
+      const errorData = await response.json().catch(() => ({}));
+      throw new ApiError(
+        response.status,
+        errorData.message || "Failed to process payment",
+        response,
+      );
+    }
+
+    // Explicitly return to ensure promise resolves
+    return;
   },
 };
 
@@ -1106,6 +1161,7 @@ export const dwctlApi = {
   requests: requestsApi,
   auth: authApi,
   cost: costApi,
+  payments: paymentsApi,
   probes: probesApi,
   files: filesApi,
   batches: batchesApi,
