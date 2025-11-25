@@ -29,13 +29,13 @@ pub struct CreditTransactionCreateDBRequest {
 }
 
 impl CreditTransactionCreateDBRequest {
-    /// Create an admin grant request with automatically timestamped source_id
+    /// Create an admin grant request with automatically generated random source_id
     pub fn admin_grant(user_id: UserId, grantor_id: UserId, amount: Decimal, description: Option<String>) -> Self {
         Self {
             user_id,
             transaction_type: CreditTransactionType::AdminGrant,
             amount,
-            source_id: format!("{}_{}", grantor_id, chrono::Utc::now().timestamp_millis()),
+            source_id: format!("{}_{}", grantor_id, uuid::Uuid::new_v4()),
             description,
         }
     }

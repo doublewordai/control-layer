@@ -433,7 +433,6 @@ mod tests {
             );
             credits.create_transaction(&request).await.expect("Failed to create transaction");
             // Small delay to ensure unique timestamps in source_id
-            tokio::time::sleep(tokio::time::Duration::from_millis(2)).await;
         }
 
         let transactions = credits
@@ -470,8 +469,6 @@ mod tests {
                 Some(format!("Transaction {}", i + 1)),
             );
             transaction_ids.push(credits.create_transaction(&request).await.expect("Failed to create transaction").id);
-            // Small delay to ensure unique timestamps in source_id
-            tokio::time::sleep(tokio::time::Duration::from_millis(2)).await;
         }
 
         let mut total_balance: Decimal = Decimal::ZERO;
@@ -515,8 +512,6 @@ mod tests {
             cumulative_balance += amount;
             let request = CreditTransactionCreateDBRequest::admin_grant(user_id, user_id, amount, None);
             credits.create_transaction(&request).await.expect("Failed to create transaction");
-            // Small delay to ensure unique timestamps in source_id
-            tokio::time::sleep(tokio::time::Duration::from_millis(2)).await;
         }
 
         // Test limit
