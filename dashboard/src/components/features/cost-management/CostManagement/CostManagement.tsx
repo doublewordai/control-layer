@@ -28,13 +28,9 @@ export function CostManagement() {
   const processPaymentMutation = useProcessPayment({
     onSuccess: () => {
       setTimeout(() => {
-        console.log('Closing modal now');
         setShowSuccessModal(false);
       }, 2000);
     },
-    onError: (error) => {
-      console.error('Payment processing error:', error);
-    }
   });
 
   // Handle return from payment provider
@@ -89,7 +85,6 @@ export function CostManagement() {
         toast.success(`Added $${fundAmount.toFixed(2)}`);
       } catch (error) {
         toast.error("Failed to add funds");
-        console.error("Error adding funds:", error);
       }
     } else if (config?.payment_enabled) {
       // Payment processing enabled: Get checkout URL and redirect using the mutation hook
@@ -102,9 +97,7 @@ export function CostManagement() {
           toast.error("Failed to get checkout URL");
         }
       } catch (error) {
-        const errorMessage = error instanceof Error ? error.message : "Failed to initiate payment";
-        toast.error(errorMessage);
-        console.error("Error creating payment:", error);
+        toast.error("Failed to transfer to payment provider.");
       }
     } else {
       toast.error("Payment processing is not configured");
@@ -161,14 +154,9 @@ export function CostManagement() {
                 "Processing your payment and updating your account balance..."
               ) : processPaymentMutation.isError ? (
                 <div className="space-y-2">
-                  <p className="text-red-600">
-                    {processPaymentMutation.error instanceof Error
-                      ? processPaymentMutation.error.message
-                      : "Failed to process payment"}
-                  </p>
+                  <p>Your payment has been captured but not yet applied to your account.</p>
                   <p className="text-sm text-gray-600">
-                    Your payment may have been successful, but we couldn't confirm it yet.
-                    If your balance doesn't update within a few minutes, please contact support.
+                    Your balance should update automatically within a few minutes. If it doesn't, please contact support.
                   </p>
                 </div>
               ) : (
