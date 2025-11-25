@@ -212,47 +212,48 @@ export function TransactionHistory({
 
   const content = (
     <>
+      {/* Header with Title and Balance */}
+      <div className="flex items-center justify-between mb-6">
+        <div className="flex items-center gap-3">
+          <h2 className="text-2xl font-semibold text-doubleword-neutral-900">
+            Transaction History
+          </h2>
+          <Button
+            variant="ghost"
+            size="sm"
+            onClick={handleRefresh}
+            disabled={isRefreshing || isLoading}
+            className="h-8 w-8 p-0"
+            title="Refresh balance and transactions"
+          >
+            <RefreshCw
+              className={`h-4 w-4 ${isRefreshing ? "animate-spin" : ""}`}
+            />
+          </Button>
+        </div>
+        <div className="flex items-center gap-3">
+          <div className="flex items-center gap-2 text-sm">
+            <span className="text-gray-600">Balance:</span>
+            <span className="font-semibold text-gray-900">
+              {formatDollars(currentBalance)}
+            </span>
+          </div>
+          {onAddFunds && (
+            <Button
+              variant="outline"
+              size="sm"
+              onClick={onAddFunds}
+              disabled={isAddingFunds}
+            >
+              <Plus className="w-4 h-4 mr-2" />
+              {isAddingFunds ? "Adding..." : "Add Funds"}
+            </Button>
+          )}
+        </div>
+      </div>
+
       {/* Transaction History Card */}
       <Card className="p-4">
-        <div className="flex items-center justify-between mb-2">
-          <div className="flex items-center gap-3">
-            <h2 className="text-2xl font-semibold text-doubleword-neutral-900">
-              Transaction History
-            </h2>
-            <Button
-              variant="ghost"
-              size="sm"
-              onClick={handleRefresh}
-              disabled={isRefreshing || isLoading}
-              className="h-8 w-8 p-0"
-              title="Refresh balance and transactions"
-            >
-              <RefreshCw
-                className={`h-4 w-4 ${isRefreshing ? "animate-spin" : ""}`}
-              />
-            </Button>
-          </div>
-          <div className="flex items-stretch border border-blue-200 rounded-lg overflow-hidden bg-gradient-to-br from-blue-50 to-indigo-50">
-            <div className="flex items-center gap-3 px-4 py-2">
-              <span className="text-sm font-medium text-blue-700">Balance</span>
-              <span className="text-2xl font-bold text-blue-900">
-                {formatDollars(currentBalance)}
-              </span>
-            </div>
-            {onAddFunds && (
-              <button
-                onClick={onAddFunds}
-                disabled={isAddingFunds}
-                className="flex items-center px-4 py-2 bg-gray-600 hover:bg-gray-700 text-white border-l border-gray-500 disabled:opacity-50 disabled:cursor-not-allowed transition-colors"
-              >
-                <Plus className="w-5 h-5 mr-2" />
-                <span className="font-medium">
-                  {isAddingFunds ? "Adding..." : "Add Funds"}
-                </span>
-              </button>
-            )}
-          </div>
-        </div>
 
         {/* Search and Filters */}
         <div className="space-y-2">

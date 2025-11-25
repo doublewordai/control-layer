@@ -70,15 +70,6 @@ export function CostManagement() {
 
   return (
     <div className="p-6">
-      <div className="mb-8">
-        <h1 className="text-3xl font-bold text-doubleword-neutral-900">
-          Cost Management
-        </h1>
-        <p className="text-doubleword-neutral-600 mt-2">
-          Monitor your credit balance and transaction history
-        </p>
-      </div>
-
       {user && (
         <TransactionHistory
           userId={user.id}
