@@ -1,5 +1,5 @@
 import { useSearchParams } from "react-router-dom";
-import { Server, Settings as SettingsIcon, Database, AlertCircle, Check, DollarSign, Activity, Cpu } from "lucide-react";
+import { Server, Settings as SettingsIcon, Database, AlertCircle, Check, Activity, Cpu } from "lucide-react";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "../../../ui/tabs";
 import { DataTable } from "../../../ui/data-table";
 import { useDaemons } from "../../../../api/control-layer/hooks";
@@ -436,36 +436,6 @@ export function System() {
                 </div>
               </div>
 
-              {/* Billing Features Section */}
-              <div className="p-6 border-t border-doubleword-neutral-200">
-                <div className="flex items-center gap-2 mb-4">
-                  <DollarSign className="w-5 h-5 text-green-600" />
-                  <h2 className="text-lg font-semibold text-doubleword-neutral-900">
-                    Billing Features
-                  </h2>
-                </div>
-
-                <div className="space-y-6">
-                  <div className="flex items-center justify-between">
-                    <div className="flex-1">
-                      <h3 className="text-sm font-medium text-doubleword-neutral-900">
-                        Enable Cost Management
-                      </h3>
-                      <p className="text-sm text-doubleword-neutral-600 mt-1">
-                        Show billing and cost management features including
-                        account balance tracking and transaction history.
-                      </p>
-                    </div>
-                    <Switch
-                      checked={isFeatureEnabled("use_billing")}
-                      onCheckedChange={(checked) =>
-                        toggleFeature("use_billing", checked)
-                      }
-                      aria-label="Toggle billing features"
-                    />
-                  </div>
-                </div>
-              </div>
             </div>
           ) : (
             <div className="bg-gray-50 border border-gray-200 rounded-lg p-6">

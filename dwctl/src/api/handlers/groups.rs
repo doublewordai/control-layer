@@ -4,19 +4,19 @@ use crate::api::models::deployments::DeployedModelResponse;
 use crate::api::models::groups::{GroupCreate, GroupResponse, GroupUpdate, ListGroupsQuery};
 use crate::api::models::pagination::PaginatedResponse;
 use crate::api::models::users::{CurrentUser, UserResponse};
-use crate::auth::permissions::{can_read_all_resources, can_read_own_resource, operation, resource, RequiresPermission};
-use crate::db::handlers::{groups::GroupFilter, Deployments, Groups, Repository, Users};
+use crate::auth::permissions::{RequiresPermission, can_read_all_resources, can_read_own_resource, operation, resource};
+use crate::db::handlers::{Deployments, Groups, Repository, Users, groups::GroupFilter};
 use crate::db::models::groups::{GroupCreateDBRequest, GroupUpdateDBRequest};
 use crate::errors::{Error, Result};
 use crate::types::{Operation, Permission, Resource};
 use crate::{
-    types::{DeploymentId, GroupId, UserId},
     AppState,
+    types::{DeploymentId, GroupId, UserId},
 };
 use axum::{
+    Json,
     extract::{Path, Query, State},
     http::StatusCode,
-    Json,
 };
 use sqlx::Acquire;
 

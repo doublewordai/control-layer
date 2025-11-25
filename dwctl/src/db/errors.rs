@@ -110,10 +110,10 @@ fn extract_conflicting_alias(detail: &str, constraint: Option<&str>) -> Option<S
     if constraint == Some("deployed_models_alias_unique") {
         // PostgreSQL unique violation details typically look like:
         // "Key (alias)=(my-alias) already exists."
-        if let Some(start) = detail.find("=(") {
-            if let Some(end) = detail[start + 2..].find(')') {
-                return Some(detail[start + 2..start + 2 + end].to_string());
-            }
+        if let Some(start) = detail.find("=(")
+            && let Some(end) = detail[start + 2..].find(')')
+        {
+            return Some(detail[start + 2..start + 2 + end].to_string());
         }
     }
     None

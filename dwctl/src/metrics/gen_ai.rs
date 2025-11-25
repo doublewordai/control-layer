@@ -186,21 +186,19 @@ impl MetricsRecorder for GenAiMetrics {
         self.record_request_duration(row.duration_ms as f64 / 1000.0, &duration_labels);
 
         // Record time to first token (only for streaming)
-        if is_streaming {
-            if let Some(ttfb_ms) = row.duration_to_first_byte_ms {
-                let ttft_labels = vec![operation, provider_name, request_model, response_model, server_address, server_port];
-                self.record_time_to_first_token(ttfb_ms as f64 / 1000.0, &ttft_labels);
-            }
+        if is_streaming && let Some(ttfb_ms) = row.duration_to_first_byte_ms {
+            let ttft_labels = vec![operation, provider_name, request_model, response_model, server_address, server_port];
+            self.record_time_to_first_token(ttfb_ms as f64 / 1000.0, &ttft_labels);
         }
 
         // Record time per output token (only if we have completion tokens and ttfb)
-        if row.completion_tokens > 0 {
-            if let Some(ttfb_ms) = row.duration_to_first_byte_ms {
-                let time_after_first_token = (row.duration_ms - ttfb_ms) as f64 / 1000.0;
-                let time_per_token = time_after_first_token / row.completion_tokens as f64;
-                let tpot_labels = vec![operation, provider_name, request_model, response_model, server_address, server_port];
-                self.record_time_per_output_token(time_per_token, &tpot_labels);
-            }
+        if row.completion_tokens > 0
+            && let Some(ttfb_ms) = row.duration_to_first_byte_ms
+        {
+            let time_after_first_token = (row.duration_ms - ttfb_ms) as f64 / 1000.0;
+            let time_per_token = time_after_first_token / row.completion_tokens as f64;
+            let tpot_labels = vec![operation, provider_name, request_model, response_model, server_address, server_port];
+            self.record_time_per_output_token(time_per_token, &tpot_labels);
         }
 
         // Record token usage (input tokens)

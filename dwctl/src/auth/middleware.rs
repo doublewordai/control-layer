@@ -1,10 +1,10 @@
 //! Authentication middleware for HTTP requests.
 
 use crate::{
+    AppState,
     api::models::users::CurrentUser,
     db::{handlers::api_keys::ApiKeys, models::api_keys::ApiKeyPurpose},
     errors::Error,
-    AppState,
 };
 use anyhow::Context;
 use axum::{
@@ -41,7 +41,7 @@ pub(crate) async fn admin_ai_proxy(state: AppState, mut request: Request) -> Res
         Err(_) => {
             return Err(Error::BadRequest {
                 message: "Failed to read request body".to_string(),
-            })
+            });
         }
     };
 
@@ -265,7 +265,7 @@ mod tests {
         // No error on making request - user has access
         let request = admin_ai_proxy(state, request).await.unwrap();
         assert_eq!(request.uri().path(), "/ai/v1/chat/completions"); // stripped the
-                                                                     // /admin/api/v1/ prefix
+        // /admin/api/v1/ prefix
         assert!(request.headers().get("authorization").is_some());
     }
 

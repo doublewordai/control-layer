@@ -8,7 +8,6 @@ import {
   useDeleteGroup,
   type Group as BackendGroup,
 } from "../../../../api/control-layer";
-import { useSettings } from "../../../../contexts";
 import {
   CreateUserModal,
   CreateGroupModal,
@@ -59,7 +58,6 @@ const getGroupColor = (_groupId: string, index: number): string => {
 const UsersGroups: React.FC = () => {
   const [searchParams] = useSearchParams();
   const navigate = useNavigate();
-  const { isFeatureEnabled } = useSettings();
   const [userPage, setUserPage] = useState<number>(1);
   const [groupPage, setGroupPage] = useState<number>(1);
   const [itemsPerPage] = useState(12);
@@ -243,7 +241,7 @@ const UsersGroups: React.FC = () => {
       setShowUserTransactionsModal(true);
     },
     groups: groups,
-    showTransactions: isFeatureEnabled("use_billing"),
+    showTransactions: true,
   });
 
   if (loading) {

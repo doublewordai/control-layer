@@ -611,14 +611,14 @@ async fn get_model_metrics_impl(db: &PgPool, model_aliases: Vec<String>) -> Resu
 
     // Update metrics for models that have actual data
     for row in metrics_rows {
-        if let Some(model) = row.model {
-            if let Some(metrics) = metrics_map.get_mut(&model) {
-                metrics.avg_latency_ms = row.avg_latency_ms;
-                metrics.total_requests = row.total_requests.unwrap_or(0);
-                metrics.total_input_tokens = row.total_input_tokens.unwrap_or(0);
-                metrics.total_output_tokens = row.total_output_tokens.unwrap_or(0);
-                metrics.last_active_at = row.last_active_at;
-            }
+        if let Some(model) = row.model
+            && let Some(metrics) = metrics_map.get_mut(&model)
+        {
+            metrics.avg_latency_ms = row.avg_latency_ms;
+            metrics.total_requests = row.total_requests.unwrap_or(0);
+            metrics.total_input_tokens = row.total_input_tokens.unwrap_or(0);
+            metrics.total_output_tokens = row.total_output_tokens.unwrap_or(0);
+            metrics.last_active_at = row.last_active_at;
         }
     }
 

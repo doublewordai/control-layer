@@ -1,11 +1,11 @@
 //! Password hashing and verification.
 
 use argon2::{
-    password_hash::{PasswordHash, PasswordHasher, PasswordVerifier, SaltString},
     Argon2,
+    password_hash::{PasswordHash, PasswordHasher, PasswordVerifier, SaltString},
 };
-use base64::{engine::general_purpose, Engine as _};
-use rand::{rngs::OsRng, thread_rng, Rng};
+use base64::{Engine as _, engine::general_purpose};
+use rand::{Rng, rngs::OsRng, thread_rng};
 
 use crate::errors::Error;
 

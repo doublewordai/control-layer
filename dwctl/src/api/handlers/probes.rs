@@ -1,17 +1,17 @@
 //! HTTP handlers for health probe endpoints.
 
+use crate::AppState;
 use crate::api::models::probes::{
     CreateProbe, ProbeStatistics, ProbesQuery, ResultsQuery, StatsQuery, TestProbeRequest, UpdateProbeRequest,
 };
-use crate::auth::permissions::{operation, resource, RequiresPermission};
+use crate::auth::permissions::{RequiresPermission, operation, resource};
 use crate::db::models::probes::{Probe, ProbeResult};
 use crate::errors::Error;
 use crate::probes::db::ProbeManager;
-use crate::AppState;
 use axum::{
+    Json,
     extract::{Path, Query, State},
     http::StatusCode,
-    Json,
 };
 use uuid::Uuid;
 

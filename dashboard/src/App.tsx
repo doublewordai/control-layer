@@ -380,10 +380,7 @@ function AppRoutes() {
           path="/cost-management"
           element={
             <AppLayout>
-              <ProtectedRoute
-                path="/cost-management"
-                requiredFeatureFlag="use_billing"
-              >
+              <ProtectedRoute path="/cost-management">
                 <Suspense fallback={<RouteLoader />}>
                   <CostManagement />
                 </Suspense>

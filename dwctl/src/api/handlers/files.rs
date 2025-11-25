@@ -8,8 +8,9 @@
 use crate::api::models::files::{
     FileContentQuery, FileDeleteResponse, FileListResponse, FileResponse, ListFilesQuery, ListObject, ObjectType, Purpose,
 };
-use crate::auth::permissions::{can_read_all_resources, operation, resource, RequiresPermission};
+use crate::auth::permissions::{RequiresPermission, can_read_all_resources, operation, resource};
 
+use crate::AppState;
 use crate::db::{
     handlers::api_keys::ApiKeys,
     handlers::deployments::{DeploymentFilter, Deployments},
@@ -19,15 +20,14 @@ use crate::db::{
 };
 use crate::errors::{Error, Result};
 use crate::types::Resource;
-use crate::AppState;
 use axum::{
+    Json,
     extract::{Multipart, Path, Query, State},
     http::StatusCode,
-    Json,
 };
 use fusillade::Storage;
-use futures::stream::Stream;
 use futures::StreamExt;
+use futures::stream::Stream;
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 use std::pin::Pin;
@@ -151,10 +151,10 @@ fn create_file_stream(
                     }
                 }
                 "expires_after[seconds]" => {
-                    if let Ok(value) = field.text().await {
-                        if let Ok(seconds) = value.parse::<i64>() {
-                            metadata.expires_after_seconds = Some(seconds);
-                        }
+                    if let Ok(value) = field.text().await
+                        && let Ok(seconds) = value.parse::<i64>()
+                    {
+                        metadata.expires_after_seconds = Some(seconds);
                     }
                 }
                 "file" => {
@@ -410,12 +410,12 @@ pub async fn upload_file(
     })?;
 
     // Validate purpose (only batch is supported)
-    if let Some(purpose) = file.purpose {
-        if purpose != fusillade::Purpose::Batch {
-            return Err(Error::BadRequest {
-                message: format!("Invalid purpose '{}'. Only 'batch' is supported.", purpose),
-            });
-        }
+    if let Some(purpose) = file.purpose
+        && purpose != fusillade::Purpose::Batch
+    {
+        return Err(Error::BadRequest {
+            message: format!("Invalid purpose '{}'. Only 'batch' is supported.", purpose),
+        });
     }
 
     // Convert fusillade Purpose to API Purpose

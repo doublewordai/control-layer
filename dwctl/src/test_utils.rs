@@ -14,7 +14,7 @@ use crate::{
         users::{CurrentUser, Role, UserResponse},
     },
     db::{
-        handlers::{api_keys::ApiKeys, Deployments, Groups, Users},
+        handlers::{Deployments, Groups, Users, api_keys::ApiKeys},
         models::{
             api_keys::{ApiKeyCreateDBRequest, ApiKeyDBResponse},
             deployments::{DeploymentCreateDBRequest, DeploymentDBResponse},
@@ -47,17 +47,17 @@ pub fn create_test_config() -> crate::config::Config {
         database: crate::config::DatabaseConfig::External {
             pool_config: crate::config::DatabasePoolConfig {
                 main: PoolSettings {
-                    max_connections: 1,
+                    max_connections: 4,
                     min_connections: 1,
                     ..Default::default()
                 },
                 fusillade: PoolSettings {
-                    max_connections: 1,
+                    max_connections: 4,
                     min_connections: 0,
                     ..Default::default()
                 },
                 outlet: PoolSettings {
-                    max_connections: 1,
+                    max_connections: 4,
                     min_connections: 0,
                     ..Default::default()
                 },
