@@ -3,21 +3,12 @@
 import { type ColumnDef } from "@tanstack/react-table";
 import {
   ArrowUpDown,
-  MoreHorizontal,
   Edit2,
   Users,
   Trash2,
   Receipt,
 } from "lucide-react";
 import { Button, Checkbox, UserAvatar } from "@/components";
-import {
-  DropdownMenu,
-  DropdownMenuContent,
-  DropdownMenuItem,
-  DropdownMenuLabel,
-  DropdownMenuSeparator,
-  DropdownMenuTrigger,
-} from "../../../ui/dropdown-menu";
 import type { DisplayUser, DisplayGroup } from "@/types/display.ts";
 
 interface UserColumnActions {
@@ -171,41 +162,50 @@ export const createUserColumns = (
       const user = row.original;
 
       return (
-        <DropdownMenu>
-          <DropdownMenuTrigger asChild>
-            <Button variant="ghost" className="h-8 w-8 p-0">
-              <span className="sr-only">Open menu</span>
-              <MoreHorizontal className="h-4 w-4" />
-            </Button>
-          </DropdownMenuTrigger>
-          <DropdownMenuContent align="end">
-            <DropdownMenuLabel>Actions</DropdownMenuLabel>
-            <DropdownMenuItem onClick={() => actions.onEdit(user)}>
-              <Edit2 className="mr-2 h-4 w-4" />
-              Edit
-            </DropdownMenuItem>
-            <DropdownMenuItem onClick={() => actions.onManageGroups(user)}>
-              <Users className="mr-2 h-4 w-4" />
-              Manage Groups
-            </DropdownMenuItem>
-            {actions.showTransactions && (
-              <DropdownMenuItem
-                onClick={() => actions.onViewTransactions(user)}
-              >
-                <Receipt className="mr-2 h-4 w-4" />
-                Manage Billing
-              </DropdownMenuItem>
-            )}
-            <DropdownMenuSeparator />
-            <DropdownMenuItem
-              onClick={() => actions.onDelete(user)}
-              className="text-red-600"
+        <div className="flex items-center justify-end gap-2">
+          <Button
+            variant="ghost"
+            size="sm"
+            onClick={() => actions.onEdit(user)}
+            className="h-8 w-8 p-0 text-gray-600 hover:text-gray-900"
+            title="Edit user"
+          >
+            <Edit2 className="h-4 w-4" />
+            <span className="sr-only">Edit</span>
+          </Button>
+          <Button
+            variant="ghost"
+            size="sm"
+            onClick={() => actions.onManageGroups(user)}
+            className="h-8 w-8 p-0 text-gray-600 hover:text-gray-900"
+            title="Manage groups"
+          >
+            <Users className="h-4 w-4" />
+            <span className="sr-only">Manage Groups</span>
+          </Button>
+          {actions.showTransactions && (
+            <Button
+              variant="ghost"
+              size="sm"
+              onClick={() => actions.onViewTransactions(user)}
+              className="h-8 w-8 p-0 text-gray-600 hover:text-gray-900"
+              title="Manage billing"
             >
-              <Trash2 className="mr-2 h-4 w-4" />
-              Delete
-            </DropdownMenuItem>
-          </DropdownMenuContent>
-        </DropdownMenu>
+              <Receipt className="h-4 w-4" />
+              <span className="sr-only">Manage Billing</span>
+            </Button>
+          )}
+          <Button
+            variant="ghost"
+            size="sm"
+            onClick={() => actions.onDelete(user)}
+            className="h-8 w-8 p-0 text-red-500 hover:text-red-700 hover:bg-red-50"
+            title="Delete user"
+          >
+            <Trash2 className="h-4 w-4" />
+            <span className="sr-only">Delete</span>
+          </Button>
+        </div>
       );
     },
   },
