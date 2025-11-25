@@ -88,7 +88,7 @@ export function TransactionHistory({
 
   // Pagination state
   const [currentPage, setCurrentPage] = useState(1);
-  const itemsPerPage = 6;
+  const itemsPerPage = 15;
 
   // Helper functions
   const formatDate = (isoString: string) => {
