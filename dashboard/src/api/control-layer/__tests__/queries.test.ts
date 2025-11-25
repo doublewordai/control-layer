@@ -702,7 +702,7 @@ describe("dwctlApi.cost", () => {
 
       const result = await dwctlApi.cost.addFunds({
         user_id: userId,
-        source_id: "550e8400-e29b-41d4-a716-446655440001",
+        source_id: `550e8400-e29b-41d4-a716-446655440001_${Date.now()}`,
         amount,
         description: "Test fund addition",
       });
@@ -719,7 +719,7 @@ describe("dwctlApi.cost", () => {
       const amount = 50.0;
 
       const result = await dwctlApi.cost.addFunds({
-        source_id: "550e8400-e29b-41d4-a716-446655440001",
+        source_id: `550e8400-e29b-41d4-a716-446655440001_${Date.now()}`,
         user_id: userId,
         amount,
       });
@@ -733,7 +733,7 @@ describe("dwctlApi.cost", () => {
       await expect(
         dwctlApi.cost.addFunds({
           user_id: "non-existent-user",
-          source_id: "550e8400-e29b-41d4-a716-446655440001",
+          source_id: `550e8400-e29b-41d4-a716-446655440001_${Date.now()}`,
           amount: 100,
         }),
       ).rejects.toThrow();

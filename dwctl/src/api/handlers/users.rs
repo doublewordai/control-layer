@@ -365,7 +365,6 @@ mod tests {
     use super::*;
     use crate::api::models::users::Role;
     use crate::db::handlers::{Credits, Groups, Repository};
-    use crate::db::models::credits::CreditTransactionType;
     use crate::db::models::{credits::CreditTransactionCreateDBRequest, groups::GroupCreateDBRequest};
     use crate::test_utils::*;
     use rust_decimal::Decimal;
@@ -799,13 +798,12 @@ mod tests {
         // Add a second transaction to user1
         let mut conn = pool.acquire().await.expect("Failed to acquire connection");
         let mut credits_repo = Credits::new(&mut conn);
-        let request = CreditTransactionCreateDBRequest {
-            user_id: user1.id,
-            transaction_type: CreditTransactionType::AdminGrant,
-            amount: Decimal::from_str("50.0").unwrap(),
-            source_id: user1.id.to_string(),
-            description: Some("Additional grant".to_string()),
-        };
+        let request = CreditTransactionCreateDBRequest::admin_grant(
+            user1.id,
+            admin_user.id,
+            Decimal::from_str("50.0").unwrap(),
+            Some("Additional grant".to_string()),
+        );
         credits_repo
             .create_transaction(&request)
             .await
@@ -1453,13 +1451,12 @@ mod tests {
         let mut credits_repo = Credits::new(&mut conn);
 
         let amount_decimal = Decimal::from_str(amount).expect("Invalid decimal amount");
-        let request = CreditTransactionCreateDBRequest {
+        let request = CreditTransactionCreateDBRequest::admin_grant(
             user_id,
-            transaction_type: CreditTransactionType::AdminGrant,
-            amount: amount_decimal,
-            source_id: user_id.to_string(),
-            description: Some("Initial credit grant".to_string()),
-        };
+            uuid::Uuid::nil(), // System ID for initial credits
+            amount_decimal,
+            Some("Initial credit grant".to_string()),
+        );
 
         credits_repo
             .create_transaction(&request)

@@ -62,6 +62,11 @@
         "ordinal": 11,
         "name": "external_user_id",
         "type_info": "Text"
+      },
+      {
+        "ordinal": 12,
+        "name": "payment_provider_id",
+        "type_info": "Varchar"
       }
     ],
     "parameters": {
@@ -81,6 +86,7 @@
       false,
       true,
       false,
+      true,
       true,
       true
     ]

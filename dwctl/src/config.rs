@@ -118,6 +118,9 @@ pub struct Config {
     pub model_sources: Vec<ModelSource>,
     /// Frontend metadata displayed in the UI
     pub metadata: Metadata,
+    /// Payment provider configuration (Stripe, PayPal, etc.)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub payment: Option<PaymentConfig>,
     /// Authentication configuration for various auth methods
     pub auth: AuthConfig,
     /// Batch API configuration (endpoints and file handling)
@@ -293,6 +296,63 @@ impl DatabaseConfig {
             DatabaseConfig::External { pool_config, .. } => pool_config,
         }
     }
+}
+
+/// Payment provider configuration.
+///
+/// Supports different payment providers via an enum. Credentials should be
+/// set via environment variables for security.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum PaymentConfig {
+    /// Stripe payment processing
+    /// Set credentials via:
+    /// - `DWCTL_PAYMENT__STRIPE__API_KEY` - Stripe secret API key
+    /// - `DWCTL_PAYMENT__STRIPE__WEBHOOK_SECRET` - Webhook signing secret
+    /// - `DWCTL_PAYMENT__STRIPE__PRICE_ID` - Price ID for the payment product
+    /// - `DWCTL_PAYMENT__STRIPE__HOST_URL` - Base URL for redirect URLs (e.g., "https://app.example.com")
+    Stripe(StripeConfig),
+    /// Dummy payment provider for testing
+    /// Set configuration via:
+    /// - `DWCTL_PAYMENT__DUMMY__AMOUNT` - Amount to add (defaults to $50)
+    /// - `DWCTL_PAYMENT__DUMMY__HOST_URL` - Base URL for redirect URLs (e.g., "https://app.example.com")
+    Dummy(DummyConfig),
+}
+
+impl PaymentConfig {
+    /// Get the host URL configured for this payment provider
+    pub fn host_url(&self) -> Option<&str> {
+        match self {
+            PaymentConfig::Stripe(config) => config.host_url.as_deref(),
+            PaymentConfig::Dummy(config) => config.host_url.as_deref(),
+        }
+    }
+}
+
+/// Stripe payment configuration.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct StripeConfig {
+    /// Stripe API key (secret key starting with sk_)
+    pub api_key: String,
+    /// Stripe webhook signing secret (starts with whsec_)
+    pub webhook_secret: String,
+    /// Stripe price ID for the payment (starts with price_)
+    pub price_id: String,
+    /// Base URL for redirect URLs (e.g., "https://app.example.com")
+    /// This is used to construct success/cancel URLs for checkout sessions
+    pub host_url: Option<String>,
+}
+
+/// Dummy payment configuration for testing.
+#[derive(Debug, Clone, Deserialize, Serialize, Default)]
+pub struct DummyConfig {
+    /// Amount to add in dollars (defaults to $50)
+    #[serde(default)]
+    pub amount: Option<rust_decimal::Decimal>,
+    /// Base URL for redirect URLs (e.g., "https://app.example.com")
+    /// This is used to construct success/cancel URLs for checkout sessions
+    #[serde(default)]
+    pub host_url: Option<String>,
 }
 
 /// Frontend metadata displayed in the UI.
@@ -793,6 +853,7 @@ impl Default for Config {
             secret_key: None,
             model_sources: vec![],
             metadata: Metadata::default(),
+            payment: None,
             auth: AuthConfig::default(),
             batches: BatchConfig::default(),
             background_services: BackgroundServicesConfig::default(),
