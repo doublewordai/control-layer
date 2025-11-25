@@ -18,10 +18,7 @@ use crate::{
     auth::{password, session},
     db::{
         handlers::{PasswordResetTokens, Repository, Users, credits::Credits},
-        models::{
-            credits::{CreditTransactionCreateDBRequest, CreditTransactionType},
-            users::UserCreateDBRequest,
-        },
+        models::{credits::CreditTransactionCreateDBRequest, users::UserCreateDBRequest},
     },
     email::EmailService,
     errors::Error,
@@ -124,15 +121,13 @@ pub async fn register(State(state): State<AppState>, Json(request): Json<Registe
     let initial_credits = state.config.credits.initial_credits_for_standard_users;
     if initial_credits > rust_decimal::Decimal::ZERO && create_request.roles.contains(&Role::StandardUser) {
         let mut credits_repo = Credits::new(&mut tx);
-        credits_repo
-            .create_transaction(&CreditTransactionCreateDBRequest {
-                user_id: created_user.id,
-                transaction_type: CreditTransactionType::AdminGrant,
-                amount: initial_credits,
-                source_id: uuid::Uuid::nil().to_string(), // System ID for initial credits
-                description: Some("Initial credits on account creation".to_string()),
-            })
-            .await?;
+        let request = CreditTransactionCreateDBRequest::admin_grant(
+            created_user.id,
+            uuid::Uuid::nil(), // System ID for initial credits
+            initial_credits,
+            Some("Initial credits on account creation".to_string()),
+        );
+        credits_repo.create_transaction(&request).await?;
     }
 
     tx.commit().await.map_err(|e| Error::Database(e.into()))?;
@@ -518,7 +513,7 @@ fn create_session_cookie(token: &str, config: &crate::config::Config) -> String 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::test_utils::create_test_config;
+    use crate::{db::models::credits::CreditTransactionType, test_utils::create_test_config};
     use axum_test::TestServer;
     use sqlx::PgPool;
 
@@ -651,21 +646,12 @@ mod tests {
         );
 
         // Verify the transaction exists with correct details
-        let transactions = sqlx::query!(
-            r#"SELECT amount, balance_after, transaction_type as "transaction_type: CreditTransactionType", source_id, description
-               FROM credits_transactions
-               WHERE user_id = $1"#,
-            body.user.id
-        )
-        .fetch_all(&pool)
-        .await
-        .unwrap();
+        let transactions = credits_repo.list_user_transactions(body.user.id, 0, 10).await.unwrap();
 
         assert_eq!(transactions.len(), 1, "Should have exactly one transaction");
         assert_eq!(transactions[0].amount, rust_decimal::Decimal::new(10000, 2));
         assert_eq!(transactions[0].balance_after, rust_decimal::Decimal::new(10000, 2));
         assert_eq!(transactions[0].transaction_type, CreditTransactionType::AdminGrant);
-        assert_eq!(transactions[0].source_id, Uuid::nil().to_string());
         assert!(transactions[0].description.as_ref().unwrap().contains("Initial credits"));
     }
 

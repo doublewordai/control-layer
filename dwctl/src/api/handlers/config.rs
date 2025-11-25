@@ -1,8 +1,18 @@
 //! HTTP handlers for configuration retrieval endpoints.
 
 use axum::{Json, extract::State, response::IntoResponse};
+use serde::Serialize;
 
 use crate::{AppState, api::models::users::CurrentUser};
+
+/// Configuration response with computed fields
+#[derive(Debug, Clone, Serialize)]
+pub struct ConfigResponse {
+    pub region: String,
+    pub organization: String,
+    pub registration_enabled: bool,
+    pub payment_enabled: bool,
+}
 
 #[utoipa::path(
     delete,
@@ -21,12 +31,18 @@ use crate::{AppState, api::models::users::CurrentUser};
 )]
 #[tracing::instrument(skip_all)]
 pub async fn get_config(State(state): State<AppState>, _user: CurrentUser) -> impl IntoResponse {
-    let mut metadata = state.config.metadata.clone();
+    let metadata = &state.config.metadata;
 
-    // Set registration_enabled based on native auth configuration
-    metadata.registration_enabled = state.config.auth.native.enabled && state.config.auth.native.allow_registration;
+    let response = ConfigResponse {
+        region: metadata.region.clone(),
+        organization: metadata.organization.clone(),
+        // Compute registration_enabled based on native auth configuration
+        registration_enabled: state.config.auth.native.enabled && state.config.auth.native.allow_registration,
+        // Compute payment_enabled based on whether payment_processor is configured
+        payment_enabled: state.config.payment.is_some(),
+    };
 
-    Json(metadata)
+    Json(response)
 }
 
 #[cfg(test)]

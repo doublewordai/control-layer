@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "\n        SELECT ak.user_id, ak.purpose, u.username, u.email, u.is_admin, u.display_name, u.avatar_url\n        FROM api_keys ak\n        INNER JOIN users u ON ak.user_id = u.id\n        WHERE ak.secret = $1\n        ",
+  "query": "\n        SELECT ak.user_id, ak.purpose, u.username, u.email, u.is_admin, u.display_name, u.avatar_url, u.payment_provider_id\n        FROM api_keys ak\n        INNER JOIN users u ON ak.user_id = u.id\n        WHERE ak.secret = $1\n        ",
   "describe": {
     "columns": [
       {
@@ -37,6 +37,11 @@
         "ordinal": 6,
         "name": "avatar_url",
         "type_info": "Varchar"
+      },
+      {
+        "ordinal": 7,
+        "name": "payment_provider_id",
+        "type_info": "Varchar"
       }
     ],
     "parameters": {
@@ -51,8 +56,9 @@
       false,
       false,
       true,
+      true,
       true
     ]
   },
-  "hash": "5b9f3e7ec8176f2dcf45e5d5282a6e15e8d8924efa73d5e1381429e15ed5cb44"
+  "hash": "c29069a81edb900d37da11166829e5036b2922e721cf95c5922b548dea02ae51"
 }
