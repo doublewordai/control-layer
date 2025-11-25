@@ -195,8 +195,12 @@ const modelApi = {
     return response.json();
   },
 
-  async get(id: string): Promise<Model> {
-    const response = await fetch(`/admin/api/v1/models/${id}`);
+  async get(id: string, options?: { include?: string }): Promise<Model> {
+    const params = new URLSearchParams();
+    if (options?.include) params.set("include", options.include);
+
+    const url = `/admin/api/v1/models/${id}${params.toString() ? "?" + params.toString() : ""}`;
+    const response = await fetch(url);
     if (!response.ok) {
       throw new Error(`Failed to fetch model: ${response.status}`);
     }
@@ -776,6 +780,49 @@ const costApi = {
   },
 };
 
+// Payment processing API
+const paymentsApi = {
+  async create(): Promise<{ url: string }> {
+    const response = await fetch("/admin/api/v1/payments", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+    });
+
+    if (!response.ok) {
+      const errorData = await response.json().catch(() => ({}));
+      throw new Error(errorData.message || `Failed to create payment: ${response.status}`);
+    }
+
+    return response.json();
+  },
+
+  async process(paymentId: string): Promise<void> {
+    const response = await fetch(`/admin/api/v1/payments/${paymentId}`, {
+      method: "PATCH",
+      headers: { "Content-Type": "application/json" },
+    });
+
+    if (!response.ok) {
+      if (response.status === 402) {
+        throw new ApiError(
+          402,
+          "Payment is still processing. Please check back in a moment.",
+          response,
+        );
+      }
+      const errorData = await response.json().catch(() => ({}));
+      throw new ApiError(
+        response.status,
+        errorData.message || "Failed to process payment",
+        response,
+      );
+    }
+
+    // Explicitly return to ensure promise resolves
+    return;
+  },
+};
+
 // Probes API
 const probesApi = {
   async list(status?: string): Promise<Probe[]> {
@@ -1114,6 +1161,7 @@ export const dwctlApi = {
   requests: requestsApi,
   auth: authApi,
   cost: costApi,
+  payments: paymentsApi,
   probes: probesApi,
   files: filesApi,
   batches: batchesApi,

@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "\n            UPDATE users SET\n                display_name = COALESCE($2, display_name),\n                avatar_url = COALESCE($3, avatar_url),\n                password_hash = COALESCE($4, password_hash),\n                updated_at = NOW()\n            WHERE id = $1\n            RETURNING *\n            ",
+  "query": "\n            INSERT INTO users (id, username, email, display_name, avatar_url, auth_source, is_admin, password_hash, external_user_id)\n            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)\n            RETURNING *\n            ",
   "describe": {
     "columns": [
       {
@@ -62,6 +62,11 @@
         "ordinal": 11,
         "name": "external_user_id",
         "type_info": "Text"
+      },
+      {
+        "ordinal": 12,
+        "name": "payment_provider_id",
+        "type_info": "Varchar"
       }
     ],
     "parameters": {
@@ -69,6 +74,11 @@
         "Uuid",
         "Varchar",
         "Varchar",
+        "Varchar",
+        "Varchar",
+        "Varchar",
+        "Bool",
+        "Text",
         "Text"
       ]
     },
@@ -84,8 +94,9 @@
       true,
       false,
       true,
+      true,
       true
     ]
   },
-  "hash": "370386c627cf888c4aa7100163482dc4fe8be6df3d88e589447671f6c6d130d0"
+  "hash": "df59ccd8080d8eb0bd1e11ab6e5a2b8fcdfbb3ae2c95a05ccd9f76042320f41a"
 }

@@ -20,7 +20,8 @@ export const queryKeys = {
       accessible?: boolean;
       search?: string;
     }) => ["models", "query", options] as const,
-    byId: (id: string) => ["models", "byId", id] as const,
+    byId: (id: string, include?: string) =>
+      ["models", "byId", id, include] as const,
   },
 
   // Groups
@@ -89,5 +90,13 @@ export const queryKeys = {
       [...queryKeys.batches.detail(id), "requests"] as const,
     requestsList: (id: string, filters: any) =>
       [...queryKeys.batches.requests(id), filters] as const,
+  },
+
+  // Payments
+  payments: {
+    all: ["payments"] as const,
+    create: () => [...queryKeys.payments.all, "create"] as const,
+    process: (sessionId: string) =>
+      [...queryKeys.payments.all, "process", sessionId] as const,
   },
 } as const;

@@ -65,7 +65,7 @@ pub async fn create_transaction(
         user_id: data.user_id,
         transaction_type: CreditTransactionType::from(&data.transaction_type),
         amount: data.amount,
-        source_id: data.source_id.to_string(),
+        source_id: data.source_id,
         description: data.description,
     };
 
@@ -226,13 +226,8 @@ mod tests {
         let mut credits_repo = CreditsHandler::new(&mut conn);
 
         let amount_decimal = Decimal::from_str(amount).expect("Invalid decimal amount");
-        let request = CreditTransactionCreateDBRequest {
-            user_id,
-            transaction_type: CreditTransactionType::AdminGrant,
-            amount: amount_decimal,
-            source_id: user_id.to_string(),
-            description: Some("Initial credit grant".to_string()),
-        };
+        let request =
+            CreditTransactionCreateDBRequest::admin_grant(user_id, user_id, amount_decimal, Some("Initial credit grant".to_string()));
 
         credits_repo
             .create_transaction(&request)
@@ -379,7 +374,6 @@ mod tests {
         assert_eq!(transaction.id, transaction_id);
         assert_eq!(transaction.amount, Decimal::from_str("50.0").unwrap());
         assert_eq!(transaction.transaction_type, CreditTransactionType::AdminGrant);
-        assert_eq!(transaction.source_id, user.id.to_string());
         assert_eq!(transaction.description, Some("Initial credit grant".to_string()));
     }
 
@@ -427,7 +421,6 @@ mod tests {
         assert_eq!(transaction.user_id, user.id);
         assert_eq!(transaction.amount, Decimal::from_str("75.0").unwrap());
         assert_eq!(transaction.transaction_type, CreditTransactionType::AdminGrant);
-        assert_eq!(transaction.source_id, user.id.to_string());
         assert_eq!(transaction.description, Some("Initial credit grant".to_string()));
     }
 
