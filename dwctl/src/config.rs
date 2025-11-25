@@ -323,7 +323,7 @@ impl PaymentConfig {
     /// Get the host URL configured for this payment provider
     pub fn host_url(&self) -> Option<&str> {
         match self {
-            PaymentConfig::Stripe(config) => Some(&config.host_url),
+            PaymentConfig::Stripe(config) => config.host_url.as_deref(),
             PaymentConfig::Dummy(config) => config.host_url.as_deref(),
         }
     }
@@ -340,7 +340,7 @@ pub struct StripeConfig {
     pub price_id: String,
     /// Base URL for redirect URLs (e.g., "https://app.example.com")
     /// This is used to construct success/cancel URLs for checkout sessions
-    pub host_url: String,
+    pub host_url: Option<String>,
 }
 
 /// Dummy payment configuration for testing.
