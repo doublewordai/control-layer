@@ -16,6 +16,7 @@ import { Label } from "../../ui/label";
 import { Popover, PopoverContent, PopoverTrigger } from "../../ui/popover";
 import { toast } from "sonner";
 import { useCreateApiKey } from "../../../api/control-layer/hooks";
+import { AlertBox } from "@/components/ui/alert-box";
 
 interface DownloadFileModalProps {
   isOpen: boolean;
@@ -43,6 +44,7 @@ export function DownloadFileModal({
   const [copiedCode, setCopiedCode] = useState<string | null>(null);
   const [downloading, setDownloading] = useState(false);
   const [apiKey, setApiKey] = useState<string | null>(null);
+  const [error, setError] = useState<string | null>(null);
 
   // API Key creation popover states
   const [showCreateForm, setShowCreateForm] = useState(false);
@@ -71,7 +73,7 @@ export function DownloadFileModal({
       toast.success("API key created successfully!");
     } catch (error) {
       console.error("Error generating API key:", error);
-      toast.error("Failed to create API key. Please try again.");
+      setError("Failed to create API key. Please try again.");
     }
   };
 
@@ -80,12 +82,14 @@ export function DownloadFileModal({
       await navigator.clipboard.writeText(text);
       setCopiedCode(codeType);
       const message =
-        codeType === "api-key" ? "API key copied to clipboard" : "Code copied to clipboard";
+        codeType === "api-key"
+          ? "API key copied to clipboard"
+          : "Code copied to clipboard";
       toast.success(message);
       setTimeout(() => setCopiedCode(null), 2000);
     } catch (err) {
       console.error("Failed to copy to clipboard:", err);
-      toast.error("Failed to copy to clipboard");
+      setError("Failed to copy to clipboard");
     }
   };
 
@@ -125,7 +129,7 @@ export function DownloadFileModal({
       toast.success("File downloaded successfully!");
     } catch (error) {
       console.error("Download failed:", error);
-      toast.error("Failed to download file. Please try again.");
+      setError("Failed to download file. Please try again.");
     } finally {
       setDownloading(false);
     }
@@ -336,9 +340,13 @@ curl -i -X GET "${getBaseUrl()}/files/${resourceId}/content" \\
           </DialogDescription>
         </DialogHeader>
 
+        <AlertBox variant="error" className="mb-4">
+          {error}
+        </AlertBox>
+
         <div className="space-y-4 overflow-x-hidden">
           {/* Direct Download Option */}
-          <div className="bg-gradient-to-r from-blue-50 to-indigo-50 border border-blue-200 rounded-lg p-4">
+          <div className="bg-linear-to-r from-blue-50 to-indigo-50 border border-blue-200 rounded-lg p-4">
             <div className="flex items-start justify-between gap-4 mb-3">
               <div className="flex-1">
                 <h3 className="text-sm font-semibold text-gray-900 mb-1">
@@ -530,7 +538,14 @@ curl -i -X GET "${getBaseUrl()}/files/${resourceId}/content" \\
                 </div>
               </div>
               <div className="overflow-x-auto p-4">
-                <CodeBlock language={getLanguageForHighlighting(selectedLanguage) as "python" | "javascript" | "bash"}>
+                <CodeBlock
+                  language={
+                    getLanguageForHighlighting(selectedLanguage) as
+                      | "python"
+                      | "javascript"
+                      | "bash"
+                  }
+                >
                   {getCurrentCode()}
                 </CodeBlock>
               </div>

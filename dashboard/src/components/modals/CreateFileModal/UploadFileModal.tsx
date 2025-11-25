@@ -6,6 +6,7 @@ import {
   DialogHeader,
   DialogTitle,
   DialogFooter,
+  DialogDescription,
 } from "../../ui/dialog";
 import { Button } from "../../ui/button";
 import { Label } from "../../ui/label";
@@ -18,6 +19,7 @@ import {
 } from "../../ui/select";
 import { useUploadFile } from "../../../api/control-layer/hooks";
 import { toast } from "sonner";
+import { AlertBox } from "@/components/ui/alert-box";
 
 interface UploadFileModalProps {
   isOpen: boolean;
@@ -44,6 +46,7 @@ export function UploadFileModal({
   const [file, setFile] = useState<File | null>(preselectedFile || null);
   const [expirationSeconds, setExpirationSeconds] = useState<number>(2592000); // 30 days default
   const [dragActive, setDragActive] = useState(false);
+  const [error, setError] = useState<string | null>(null);
 
   const uploadMutation = useUploadFile();
 
@@ -74,7 +77,7 @@ export function UploadFileModal({
       if (droppedFile.name.endsWith(".jsonl")) {
         setFile(droppedFile);
       } else {
-        toast.error("Please upload a .jsonl file");
+        setError("Please upload a .jsonl file");
       }
     }
   };
@@ -85,14 +88,14 @@ export function UploadFileModal({
       if (selectedFile.name.endsWith(".jsonl")) {
         setFile(selectedFile);
       } else {
-        toast.error("Please upload a .jsonl file");
+        setError("Please upload a .jsonl file");
       }
     }
   };
 
   const handleSubmit = async () => {
     if (!file) {
-      toast.error("Please select a file");
+      setError("Please select a file");
       return;
     }
 
@@ -113,11 +116,7 @@ export function UploadFileModal({
       onClose();
     } catch (error) {
       console.error("Failed to upload file:", error);
-      toast.error(
-        error instanceof Error
-          ? error.message
-          : "Failed to upload file. Please try again.",
-      );
+      setError("Failed to upload file. Please try again.");
     }
   };
 
@@ -132,7 +131,14 @@ export function UploadFileModal({
       <DialogContent className="sm:max-w-lg">
         <DialogHeader>
           <DialogTitle>Upload Batch File</DialogTitle>
+          <DialogDescription>
+            Upload a batch file to process multiple requests asynchronously.
+          </DialogDescription>
         </DialogHeader>
+
+        <AlertBox variant="error" className="mb-4">
+          {error}
+        </AlertBox>
 
         <div className="space-y-6">
           {/* File Upload Area */}
@@ -222,7 +228,7 @@ export function UploadFileModal({
           {/* Help Text */}
           <div className="bg-blue-50 border border-blue-200 rounded-lg p-3">
             <div className="flex gap-2">
-              <AlertCircle className="w-4 h-4 text-blue-600 mt-0.5 flex-shrink-0" />
+              <AlertCircle className="w-4 h-4 text-blue-600 mt-0.5 shrink-0" />
               <div className="text-sm text-blue-800">
                 <p className="font-medium mb-1">JSONL Format Required</p>
                 <p className="text-blue-700">

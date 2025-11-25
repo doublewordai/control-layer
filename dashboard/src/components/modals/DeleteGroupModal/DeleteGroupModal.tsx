@@ -10,6 +10,7 @@ import {
   DialogFooter,
 } from "../../ui/dialog";
 import { Button } from "../../ui/button";
+import { AlertBox } from "@/components/ui/alert-box";
 
 interface DeleteGroupModalProps {
   isOpen: boolean;
@@ -64,11 +65,9 @@ export const DeleteGroupModal: React.FC<DeleteGroupModalProps> = ({
         </DialogHeader>
 
         <div>
-          {error && (
-            <div className="mb-4 p-3 bg-red-50 border border-red-200 rounded-lg">
-              <p className="text-sm text-red-600">{error}</p>
-            </div>
-          )}
+          <AlertBox variant="error" className="mb-4">
+            {error}
+          </AlertBox>
 
           <div className="mb-6">
             <p className="text-gray-700 mb-4">

@@ -10,6 +10,7 @@ import {
   DialogFooter,
 } from "../../ui/dialog";
 import { Button } from "../../ui/button";
+import { AlertBox } from "../../ui/alert-box";
 
 interface EditGroupModalProps {
   isOpen: boolean;
@@ -89,17 +90,15 @@ export const EditGroupModal: React.FC<EditGroupModalProps> = ({
           </div>
         </DialogHeader>
 
+        <AlertBox variant="error" className="mb-4">
+          {error}
+        </AlertBox>
+
         <form
           id="edit-group-form"
           onSubmit={handleSubmit}
           className="space-y-4"
         >
-          {error && (
-            <div className="mb-4 p-3 bg-red-50 border border-red-200 rounded-lg">
-              <p className="text-sm text-red-600">{error}</p>
-            </div>
-          )}
-
           <div className="space-y-4">
             <div>
               <label
