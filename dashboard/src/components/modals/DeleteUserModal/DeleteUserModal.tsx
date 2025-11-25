@@ -49,17 +49,14 @@ export const DeleteUserModal: React.FC<DeleteUserModalProps> = ({
 
   return (
     <Dialog open={isOpen} onOpenChange={onClose}>
-      <DialogContent
-        className="sm:max-w-md"
-        aria-labelledby="delete-user-title"
-      >
+      <DialogContent className="sm:max-w-md">
         <DialogHeader>
           <div className="flex items-center gap-3">
             <div className="w-10 h-10 bg-red-100 rounded-full flex items-center justify-center">
               <AlertTriangle className="w-5 h-5 text-red-600" />
             </div>
             <div>
-              <DialogTitle id="delete-user-title">Delete User</DialogTitle>
+              <DialogTitle>Delete User</DialogTitle>
               <DialogDescription>
                 This action cannot be undone
               </DialogDescription>
