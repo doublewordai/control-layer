@@ -3,8 +3,10 @@
 use crate::{
     AppState,
     api::models::{
-        deployments::{DeployedModelCreate, DeployedModelResponse, DeployedModelUpdate, GetModelQuery, ListModelsQuery},
-        enrichment::DeployedModelEnricher,
+        deployments::{
+            DeployedModelCreate, DeployedModelResponse, DeployedModelUpdate, GetModelQuery, ListModelsQuery,
+            enrichment::DeployedModelEnricher,
+        },
         pagination::PaginatedResponse,
         users::CurrentUser,
     },

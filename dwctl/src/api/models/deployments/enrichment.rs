@@ -194,10 +194,8 @@ impl<'a> DeployedModelEnricher<'a> {
                 // No groups for this model, but groups were requested, so set empty array
                 model = model.with_groups(vec![]);
             }
-        } else {
-            // Groups requested but no data available, set empty array
-            model = model.with_groups(vec![]);
         }
+        // If groups were not requested (both None), leave model.groups as None
         model
     }
 
@@ -256,5 +254,244 @@ impl<'a> DeployedModelEnricher<'a> {
             }
         }
         model
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{
+        api::models::deployments::ModelMetrics,
+        db::models::{
+            deployments::{ModelPricing, ProviderPricing, TokenPricing},
+            groups::GroupDBResponse,
+        },
+    };
+    use chrono::Utc;
+    use rust_decimal::Decimal;
+    use std::{collections::HashMap, str::FromStr};
+    use uuid::Uuid;
+
+    fn create_test_model() -> DeployedModelResponse {
+        DeployedModelResponse {
+            id: Uuid::new_v4().into(),
+            model_name: "test-model".to_string(),
+            alias: "test-alias".to_string(),
+            description: None,
+            model_type: None,
+            capabilities: None,
+            created_by: Uuid::new_v4().into(),
+            hosted_on: Uuid::new_v4().into(),
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+            requests_per_second: Some(100.0),
+            burst_size: Some(200),
+            capacity: None,
+            batch_capacity: None,
+            groups: None,
+            metrics: None,
+            status: None,
+            pricing: None,
+            downstream_pricing: None,
+        }
+    }
+
+    fn create_test_pricing() -> ModelPricing {
+        ModelPricing {
+            upstream: Some(TokenPricing {
+                input_price_per_token: Some(Decimal::from_str("0.001").unwrap()),
+                output_price_per_token: Some(Decimal::from_str("0.002").unwrap()),
+            }),
+            downstream: Some(ProviderPricing::PerToken {
+                input_price_per_token: Some(Decimal::from_str("0.0005").unwrap()),
+                output_price_per_token: Some(Decimal::from_str("0.001").unwrap()),
+            }),
+        }
+    }
+
+    #[test]
+    fn test_apply_groups_with_data() {
+        let model = create_test_model();
+        let model_id = model.id;
+
+        let group_id: GroupId = Uuid::new_v4().into();
+        let mut model_groups_map = HashMap::new();
+        model_groups_map.insert(model_id, vec![group_id]);
+
+        let mut groups_map = HashMap::new();
+        groups_map.insert(
+            group_id,
+            GroupDBResponse {
+                id: group_id,
+                name: "Test Group".to_string(),
+                description: Some("Test description".to_string()),
+                created_by: Uuid::new_v4().into(),
+                created_at: Utc::now(),
+                updated_at: Utc::now(),
+                source: "native".to_string(),
+            },
+        );
+
+        let result = DeployedModelEnricher::apply_groups(model, &Some(model_groups_map), &Some(groups_map));
+
+        assert!(result.groups.is_some());
+        let groups = result.groups.unwrap();
+        assert_eq!(groups.len(), 1);
+        assert_eq!(groups[0].name, "Test Group");
+    }
+
+    #[test]
+    fn test_apply_groups_empty() {
+        let model = create_test_model();
+
+        let model_groups_map = HashMap::new();
+        let groups_map = HashMap::new();
+
+        let result = DeployedModelEnricher::apply_groups(model, &Some(model_groups_map), &Some(groups_map));
+
+        // Model has no groups, but groups were requested, so should be empty array
+        assert!(result.groups.is_some());
+        assert_eq!(result.groups.unwrap().len(), 0);
+    }
+
+    #[test]
+    fn test_apply_groups_not_requested() {
+        let model = create_test_model();
+
+        let result = DeployedModelEnricher::apply_groups(model, &None, &None);
+
+        // Groups not requested, should be None
+        assert!(result.groups.is_none());
+    }
+
+    #[test]
+    fn test_apply_metrics_with_data() {
+        let model = create_test_model();
+        let alias = model.alias.clone();
+
+        let mut metrics_map = HashMap::new();
+        metrics_map.insert(
+            alias.clone(),
+            ModelMetrics {
+                avg_latency_ms: Some(123.45),
+                total_requests: 100,
+                total_input_tokens: 1000,
+                total_output_tokens: 2000,
+                last_active_at: Some(Utc::now()),
+                time_series: None,
+            },
+        );
+
+        let result = DeployedModelEnricher::apply_metrics(model, &Some(metrics_map));
+
+        assert!(result.metrics.is_some());
+        let metrics = result.metrics.unwrap();
+        assert_eq!(metrics.total_requests, 100);
+        assert_eq!(metrics.total_input_tokens, 1000);
+        assert_eq!(metrics.avg_latency_ms, Some(123.45));
+    }
+
+    #[test]
+    fn test_apply_metrics_no_data() {
+        let model = create_test_model();
+        let metrics_map = HashMap::new();
+
+        let result = DeployedModelEnricher::apply_metrics(model, &Some(metrics_map));
+
+        // No metrics for this model, should remain None
+        assert!(result.metrics.is_none());
+    }
+
+    #[test]
+    fn test_apply_status_with_data() {
+        let model = create_test_model();
+        let model_id = model.id;
+        let probe_id = Uuid::new_v4();
+        let last_check = Utc::now();
+
+        let mut status_map = HashMap::new();
+        status_map.insert(model_id, (Some(probe_id), true, Some(60), Some(last_check), Some(true), Some(99.5)));
+
+        let result = DeployedModelEnricher::apply_status(model, &Some(status_map));
+
+        assert!(result.status.is_some());
+        let status = result.status.unwrap();
+        assert_eq!(status.probe_id, Some(probe_id));
+        assert_eq!(status.active, true);
+        assert_eq!(status.interval_seconds, Some(60));
+        assert_eq!(status.uptime_percentage, Some(99.5));
+    }
+
+    #[test]
+    fn test_apply_status_no_probe() {
+        let model = create_test_model();
+        let status_map = HashMap::new();
+
+        let result = DeployedModelEnricher::apply_status(model, &Some(status_map));
+
+        // No probe for this model, should have default status
+        assert!(result.status.is_some());
+        let status = result.status.unwrap();
+        assert_eq!(status.probe_id, None);
+        assert_eq!(status.active, false);
+        assert_eq!(status.interval_seconds, None);
+    }
+
+    #[test]
+    fn test_apply_pricing_with_full_permissions() {
+        let model = create_test_model();
+        let pricing = create_test_pricing();
+
+        let result = DeployedModelEnricher::apply_pricing(model, Some(pricing.clone()), true);
+
+        // User has full pricing permissions
+        assert!(result.pricing.is_some());
+        assert!(result.downstream_pricing.is_some());
+
+        let upstream_pricing = result.pricing.unwrap();
+        assert_eq!(upstream_pricing.input_price_per_token, Some(Decimal::from_str("0.001").unwrap()));
+        assert_eq!(upstream_pricing.output_price_per_token, Some(Decimal::from_str("0.002").unwrap()));
+    }
+
+    #[test]
+    fn test_apply_pricing_without_full_permissions() {
+        let model = create_test_model();
+        let pricing = create_test_pricing();
+
+        let result = DeployedModelEnricher::apply_pricing(model, Some(pricing.clone()), false);
+
+        // User only sees customer-facing pricing
+        assert!(result.pricing.is_some());
+        assert!(result.downstream_pricing.is_none());
+
+        let upstream_pricing = result.pricing.unwrap();
+        assert_eq!(upstream_pricing.input_price_per_token, Some(Decimal::from_str("0.001").unwrap()));
+    }
+
+    #[test]
+    fn test_apply_pricing_no_pricing() {
+        let model = create_test_model();
+
+        let result = DeployedModelEnricher::apply_pricing(model, None, true);
+
+        // No pricing available
+        assert!(result.pricing.is_none());
+        assert!(result.downstream_pricing.is_none());
+    }
+
+    #[test]
+    fn test_mask_rate_limiting() {
+        let mut model = create_test_model();
+        model.requests_per_second = Some(100.0);
+        model.burst_size = Some(200);
+        model.capacity = Some(50);
+
+        let masked = model.mask_rate_limiting();
+
+        // Rate limits should be masked
+        assert_eq!(masked.requests_per_second, None);
+        assert_eq!(masked.burst_size, None);
+        // Capacity is not a rate limit, should remain
+        assert_eq!(masked.capacity, Some(50));
     }
 }

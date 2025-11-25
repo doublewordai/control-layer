@@ -1,5 +1,7 @@
 //! API request/response models for model deployments.
 
+pub mod enrichment;
+
 use super::pagination::Pagination;
 use crate::api::models::groups::GroupResponse;
 use crate::db::models::deployments::{

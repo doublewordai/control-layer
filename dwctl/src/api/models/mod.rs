@@ -7,7 +7,6 @@ pub mod auth;
 pub mod batches;
 pub mod daemons;
 pub mod deployments;
-pub mod enrichment;
 pub mod files;
 pub mod groups;
 pub mod inference_endpoints;
