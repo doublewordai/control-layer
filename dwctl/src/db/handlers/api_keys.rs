@@ -1709,7 +1709,6 @@ mod tests {
             metadata: crate::config::Metadata {
                 region: "Test Region".to_string(),
                 organization: "Test Org".to_string(),
-                registration_enabled: false,
             },
             auth: Default::default(),
             enable_metrics: false,

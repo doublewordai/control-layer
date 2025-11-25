@@ -365,8 +365,6 @@ pub struct Metadata {
     pub region: String,
     /// Organization name displayed in the UI
     pub organization: String,
-    /// Whether user registration is enabled (shown in frontend)
-    pub registration_enabled: bool,
 }
 
 /// External model source configuration.
@@ -870,7 +868,6 @@ impl Default for Metadata {
         Self {
             region: "UK South".to_string(),
             organization: "ACME Corp".to_string(),
-            registration_enabled: true,
         }
     }
 }

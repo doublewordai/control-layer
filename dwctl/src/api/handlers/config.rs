@@ -10,7 +10,6 @@ use crate::{AppState, api::models::users::CurrentUser};
 pub struct ConfigResponse {
     pub region: String,
     pub organization: String,
-    pub registration_enabled: bool,
     pub payment_enabled: bool,
 }
 
@@ -36,8 +35,6 @@ pub async fn get_config(State(state): State<AppState>, _user: CurrentUser) -> im
     let response = ConfigResponse {
         region: metadata.region.clone(),
         organization: metadata.organization.clone(),
-        // Compute registration_enabled based on native auth configuration
-        registration_enabled: state.config.auth.native.enabled && state.config.auth.native.allow_registration,
         // Compute payment_enabled based on whether payment_processor is configured
         payment_enabled: state.config.payment.is_some(),
     };
@@ -71,7 +68,6 @@ mod tests {
         // Check that metadata fields are present
         assert!(json.get("region").is_some());
         assert!(json.get("organization").is_some());
-        assert!(json.get("registration_enabled").is_some());
     }
 
     #[sqlx::test]
