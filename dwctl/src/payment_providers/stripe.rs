@@ -87,10 +87,8 @@ impl PaymentProvider for StripeProvider {
         tracing::info!("Created checkout session {} for user {}", checkout_session.id, user.id);
 
         // If we didn't have a customer ID before, save the newly created one
-        if user.payment_provider_id.is_none()
-            && let Some(customer) = &checkout_session.customer
-        {
-            let customer_id = customer.id().to_string();
+        if user.payment_provider_id.is_none() && checkout_session.customer.is_some() {
+            let customer_id = checkout_session.customer.as_ref().unwrap().id().to_string();
             tracing::trace!("Saving newly created customer ID {} for user {}", customer_id, user.id);
 
             sqlx::query!("UPDATE users SET payment_provider_id = $1 WHERE id = $2", customer_id, user.id)
@@ -281,23 +279,8 @@ mod tests {
 
     /// Helper to create a test user in the database
     async fn create_test_user(pool: &PgPool) -> Uuid {
-        let user_id = Uuid::new_v4();
-        sqlx::query!(
-            r#"
-            INSERT INTO users (id, email, display_name, roles, password_hash)
-            VALUES ($1, $2, $3, $4, $5)
-            "#,
-            user_id,
-            "test@example.com",
-            "Test User",
-            &vec!["StandardUser"],
-            "dummy_hash"
-        )
-        .execute(pool)
-        .await
-        .unwrap();
-
-        user_id
+        let user = crate::test_utils::create_test_user(pool, crate::api::models::users::Role::StandardUser).await;
+        user.id
     }
 
     #[test]
@@ -315,21 +298,19 @@ mod tests {
         let user_id = create_test_user(&pool).await;
         let session_id = "cs_test_fake_session_123";
 
-        // Manually create a transaction
-        sqlx::query!(
-            r#"
-            INSERT INTO credits_transactions (id, user_id, transaction_type, amount, source_id, description, created_at)
-            VALUES ($1, $2, 'purchase', $3, $4, $5, NOW())
-            "#,
-            Uuid::new_v4(),
+        // Create a transaction using the Credits repository (handles balance_after properly)
+        let mut conn = pool.acquire().await.unwrap();
+        let mut credits = crate::db::handlers::Credits::new(&mut conn);
+
+        let request = crate::db::models::credits::CreditTransactionCreateDBRequest {
             user_id,
-            Decimal::new(5000, 2), // $50.00
-            session_id,
-            "Test Stripe payment"
-        )
-        .execute(&pool)
-        .await
-        .unwrap();
+            transaction_type: crate::db::models::credits::CreditTransactionType::Purchase,
+            amount: Decimal::new(5000, 2),
+            source_id: session_id.to_string(),
+            description: Some("Test Stripe payment".to_string()),
+        };
+
+        credits.create_transaction(&request).await.unwrap();
 
         let provider = StripeProvider::new("sk_test_fake".to_string(), "price_fake".to_string(), "whsec_fake".to_string());
 

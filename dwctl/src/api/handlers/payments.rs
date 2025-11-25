@@ -67,7 +67,7 @@
 use axum::{
     Json,
     extract::State,
-    http::{StatusCode, header},
+    http::{StatusCode},
     response::{IntoResponse, Response},
 };
 use serde_json::json;
@@ -268,7 +268,7 @@ pub async fn webhook_handler(State(state): State<AppState>, headers: axum::http:
 mod tests {
     use super::*;
     use crate::{
-        config::{DummyPaymentConfig, PaymentConfig},
+        config::{PaymentConfig},
         test_utils::create_test_config,
     };
     use axum::Router;
@@ -276,12 +276,13 @@ mod tests {
     use axum_test::TestServer;
     use rust_decimal::Decimal;
     use sqlx::PgPool;
+    use crate::config::DummyConfig;
 
     #[sqlx::test]
     async fn test_dummy_payment_flow(pool: PgPool) {
         // Setup config with dummy payment provider
         let mut config = create_test_config();
-        config.payment = Some(PaymentConfig::Dummy(DummyPaymentConfig {
+        config.payment = Some(PaymentConfig::Dummy(DummyConfig {
             host_url: Some("http://localhost:3001".to_string()),
             amount: Some(Decimal::new(100, 0)), // $100
         }));
@@ -294,34 +295,22 @@ mod tests {
             .build();
 
         // Create a test user
-        let user = sqlx::query!(
-            r#"
-            INSERT INTO users (id, email, display_name, roles, password_hash)
-            VALUES ($1, $2, $3, $4, $5)
-            RETURNING id
-            "#,
-            uuid::Uuid::new_v4(),
-            "test@example.com",
-            "Test User",
-            &vec!["StandardUser"],
-            "dummy_hash"
-        )
-        .fetch_one(&pool)
-        .await
-        .unwrap();
+        let user = crate::test_utils::create_test_user(&pool, crate::api::models::users::Role::StandardUser).await;
+        let auth_headers = crate::test_utils::add_auth_headers(&user);
 
         let app = Router::new()
             .route("/payments", post(create_payment))
-            .route("/payments/:id", patch(process_payment))
+            .route("/payments/{id}", patch(process_payment))
             .with_state(state);
 
         let server = TestServer::new(app).unwrap();
 
         // Step 1: Create checkout session
-        let response = server
-            .post("/payments")
-            .add_header("x-doubleword-user", user.id.to_string().as_str())
-            .await;
+        let mut request = server.post("/payments");
+        for (key, value) in &auth_headers {
+            request = request.add_header(key.as_str(), value.as_str());
+        }
+        let response = request.await;
 
         response.assert_status(StatusCode::OK);
         let checkout_response: serde_json::Value = response.json();
@@ -336,7 +325,32 @@ mod tests {
         let query_pairs: std::collections::HashMap<_, _> = url.query_pairs().collect();
         let session_id = query_pairs.get("session_id").unwrap();
 
-        // Step 2: Verify transaction was created
+        // Step 2: Verify NO transaction was created yet (matches real payment flow)
+        let count_before = sqlx::query!(
+            r#"
+            SELECT COUNT(*) as count
+            FROM credits_transactions
+            WHERE source_id = $1
+            "#,
+            session_id.to_string()
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(count_before.count.unwrap(), 0, "Transaction should not exist before processing");
+
+        // Step 3: Process payment to create transaction
+        let mut request = server.patch(&format!("/payments/{}", session_id));
+        for (key, value) in &auth_headers {
+            request = request.add_header(key.as_str(), value.as_str());
+        }
+        let response = request.await;
+
+        response.assert_status(StatusCode::OK);
+        let process_response: serde_json::Value = response.json();
+        assert_eq!(process_response["message"], "Payment processed successfully");
+
+        // Step 4: Verify transaction was created
         let transaction = sqlx::query!(
             r#"
             SELECT amount, user_id, source_id
@@ -352,17 +366,16 @@ mod tests {
         assert_eq!(transaction.amount, Decimal::new(100, 0));
         assert_eq!(transaction.user_id, user.id);
 
-        // Step 3: Process payment (idempotency check)
-        let response = server
-            .patch(&format!("/payments/{}", session_id))
-            .add_header("x-doubleword-user", user.id.to_string().as_str())
-            .await;
+        // Step 5: Process again to verify idempotency
+        let mut request = server.patch(&format!("/payments/{}", session_id));
+        for (key, value) in &auth_headers {
+            request = request.add_header(key.as_str(), value.as_str());
+        }
+        let response = request.await;
 
         response.assert_status(StatusCode::OK);
-        let process_response: serde_json::Value = response.json();
-        assert_eq!(process_response["message"], "Payment processed successfully");
 
-        // Step 4: Verify no duplicate transactions
+        // Step 6: Verify no duplicate transactions
         let count = sqlx::query!(
             r#"
             SELECT COUNT(*) as count
@@ -390,30 +403,18 @@ mod tests {
             .request_manager(request_manager)
             .build();
 
-        let user = sqlx::query!(
-            r#"
-            INSERT INTO users (id, email, display_name, roles, password_hash)
-            VALUES ($1, $2, $3, $4, $5)
-            RETURNING id
-            "#,
-            uuid::Uuid::new_v4(),
-            "test@example.com",
-            "Test User",
-            &vec!["StandardUser"],
-            "dummy_hash"
-        )
-        .fetch_one(&pool)
-        .await
-        .unwrap();
+        let user = crate::test_utils::create_test_user(&pool, crate::api::models::users::Role::StandardUser).await;
+        let auth_headers = crate::test_utils::add_auth_headers(&user);
 
         let app = Router::new().route("/payments", post(create_payment)).with_state(state);
 
         let server = TestServer::new(app).unwrap();
 
-        let response = server
-            .post("/payments")
-            .add_header("x-doubleword-user", user.id.to_string().as_str())
-            .await;
+        let mut request = server.post("/payments");
+        for (key, value) in &auth_headers {
+            request = request.add_header(key.as_str(), value.as_str());
+        }
+        let response = request.await;
 
         response.assert_status(StatusCode::SERVICE_UNAVAILABLE);
         let error_response: serde_json::Value = response.json();
@@ -424,7 +425,7 @@ mod tests {
     async fn test_payment_no_host_url(pool: PgPool) {
         // Setup config with dummy provider but NO host_url
         let mut config = create_test_config();
-        config.payment = Some(PaymentConfig::Dummy(DummyPaymentConfig {
+        config.payment = Some(PaymentConfig::Dummy(DummyConfig {
             host_url: None,
             amount: Some(Decimal::new(50, 0)),
         }));
@@ -436,30 +437,18 @@ mod tests {
             .request_manager(request_manager)
             .build();
 
-        let user = sqlx::query!(
-            r#"
-            INSERT INTO users (id, email, display_name, roles, password_hash)
-            VALUES ($1, $2, $3, $4, $5)
-            RETURNING id
-            "#,
-            uuid::Uuid::new_v4(),
-            "test@example.com",
-            "Test User",
-            &vec!["StandardUser"],
-            "dummy_hash"
-        )
-        .fetch_one(&pool)
-        .await
-        .unwrap();
+        let user = crate::test_utils::create_test_user(&pool, crate::api::models::users::Role::StandardUser).await;
+        let auth_headers = crate::test_utils::add_auth_headers(&user);
 
         let app = Router::new().route("/payments", post(create_payment)).with_state(state);
 
         let server = TestServer::new(app).unwrap();
 
-        let response = server
-            .post("/payments")
-            .add_header("x-doubleword-user", user.id.to_string().as_str())
-            .await;
+        let mut request = server.post("/payments");
+        for (key, value) in &auth_headers {
+            request = request.add_header(key.as_str(), value.as_str());
+        }
+        let response = request.await;
 
         response.assert_status(StatusCode::SERVICE_UNAVAILABLE);
         let error_response: serde_json::Value = response.json();

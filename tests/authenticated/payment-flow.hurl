@@ -33,27 +33,17 @@ jsonpath "$.url" contains "payment=success"
 jsonpath "$.url" contains "session_id=dummy_session_"
 [Captures]
 checkout_url: jsonpath "$.url"
+session_id: regex "session_id=([^&]+)"
 
-# Extract session_id from checkout URL
-# In a real flow, the user would be redirected to the payment provider
-# The dummy provider immediately creates the transaction, so we can process it
-GET {{checkout_url}}
-HTTP 200
-[Captures]
-session_id: query "session_id"
-
-# Verify the transaction was created by the dummy provider
+# Verify NO transaction was created yet (matches real payment flow)
 GET http://localhost:3001/admin/api/v1/users/current
 [Cookies]
 dwctl_session: {{admin_jwt}}
 HTTP 200
 [Asserts]
-jsonpath "$.credit_balance" > {{initial_balance}}
-[Captures]
-balance_after_checkout: jsonpath "$.credit_balance"
+jsonpath "$.credit_balance" == {{initial_balance}}
 
-# Process payment manually (simulates frontend fallback path)
-# This should be idempotent - the transaction already exists
+# Process payment manually (simulates frontend callback after redirect)
 PATCH http://localhost:3001/admin/api/v1/payments/{{session_id}}
 [Cookies]
 dwctl_session: {{admin_jwt}}
