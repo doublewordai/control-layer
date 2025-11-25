@@ -8,7 +8,7 @@ import {
   Trash2,
   Receipt,
 } from "lucide-react";
-import { Button, Checkbox, UserAvatar } from "@/components";
+import { Checkbox, UserAvatar } from "@/components";
 import type { DisplayUser, DisplayGroup } from "@/types/display.ts";
 
 interface UserColumnActions {
@@ -162,49 +162,41 @@ export const createUserColumns = (
       const user = row.original;
 
       return (
-        <div className="flex items-center justify-end gap-2">
-          <Button
-            variant="ghost"
-            size="sm"
+        <div className="flex items-center gap-2">
+          <button
             onClick={() => actions.onEdit(user)}
-            className="h-8 w-8 p-0 text-gray-600 hover:text-gray-900"
+            className="h-8 w-8 p-0 text-gray-600 hover:text-gray-900 transition-colors"
             title="Edit user"
           >
             <Edit2 className="h-4 w-4" />
             <span className="sr-only">Edit</span>
-          </Button>
-          <Button
-            variant="ghost"
-            size="sm"
+          </button>
+          <button
             onClick={() => actions.onManageGroups(user)}
-            className="h-8 w-8 p-0 text-gray-600 hover:text-gray-900"
+            className="h-8 w-8 p-0 text-gray-600 hover:text-gray-900 transition-colors"
             title="Manage groups"
           >
             <Users className="h-4 w-4" />
             <span className="sr-only">Manage Groups</span>
-          </Button>
+          </button>
           {actions.showTransactions && (
-            <Button
-              variant="ghost"
-              size="sm"
+            <button
               onClick={() => actions.onViewTransactions(user)}
-              className="h-8 w-8 p-0 text-gray-600 hover:text-gray-900"
+              className="h-8 w-8 p-0 text-gray-600 hover:text-gray-900 transition-colors"
               title="Manage billing"
             >
               <Receipt className="h-4 w-4" />
               <span className="sr-only">Manage Billing</span>
-            </Button>
+            </button>
           )}
-          <Button
-            variant="ghost"
-            size="sm"
+          <button
             onClick={() => actions.onDelete(user)}
-            className="h-8 w-8 p-0 text-red-500 hover:text-red-700 hover:bg-red-50"
+            className="h-8 w-8 p-0 text-red-500 hover:text-red-700 transition-colors"
             title="Delete user"
           >
             <Trash2 className="h-4 w-4" />
             <span className="sr-only">Delete</span>
-          </Button>
+          </button>
         </div>
       );
     },
