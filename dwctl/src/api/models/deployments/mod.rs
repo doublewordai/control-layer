@@ -1,5 +1,7 @@
 //! API request/response models for model deployments.
 
+pub mod enrichment;
+
 use super::pagination::Pagination;
 use crate::api::models::groups::GroupResponse;
 use crate::db::models::deployments::{
@@ -42,6 +44,8 @@ pub struct GetModelQuery {
     pub deleted: Option<bool>,
     /// Show inactive model when true, 404 when false/unspecified if model is inactive
     pub inactive: Option<bool>,
+    /// Include related data (comma-separated: "groups", "metrics")
+    pub include: Option<String>,
 }
 
 /// Time series point for model activity sparklines

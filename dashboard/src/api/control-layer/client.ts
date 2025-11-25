@@ -195,8 +195,12 @@ const modelApi = {
     return response.json();
   },
 
-  async get(id: string): Promise<Model> {
-    const response = await fetch(`/admin/api/v1/models/${id}`);
+  async get(id: string, options?: { include?: string }): Promise<Model> {
+    const params = new URLSearchParams();
+    if (options?.include) params.set("include", options.include);
+
+    const url = `/admin/api/v1/models/${id}${params.toString() ? "?" + params.toString() : ""}`;
+    const response = await fetch(url);
     if (!response.ok) {
       throw new Error(`Failed to fetch model: ${response.status}`);
     }
