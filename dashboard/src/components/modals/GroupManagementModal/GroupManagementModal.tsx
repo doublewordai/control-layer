@@ -1,4 +1,4 @@
-import React, { useEffect, useState } from "react";
+import React, { useEffect, useMemo, useState } from "react";
 import { Users, Plus, Trash2 } from "lucide-react";
 import { UserAvatar } from "../../ui";
 import {
@@ -33,10 +33,12 @@ export const GroupManagementModal: React.FC<GroupManagementModalProps> = ({
 
   // Fetch all users data
   // Only fetch when modal is open to avoid 403 errors for users without permission
-  const { data: users = [], isLoading: loading } = useUsers({
+  const { data: usersResponse, isLoading: loading } = useUsers({
     include: "groups",
     enabled: isOpen,
   });
+
+  const users = useMemo(() => usersResponse?.data || [], [usersResponse]);
 
   const addUserToGroupMutation = useAddUserToGroup();
   const removeUserFromGroupMutation = useRemoveUserFromGroup();

@@ -24,9 +24,9 @@ fi
 
 echo "Fetching all groups..." >&2
 
-# Get all groups
-GROUPS=$(curl -s -X GET https://localhost/admin/api/v1/groups \
-  -b "dwctl_session=${ADMIN_JWT}" | jq -r '.[] | "\(.id):\(.name)"')
+# Get all groups (API returns paginated response, use max limit of 100)
+GROUPS=$(curl -s -X GET "https://localhost/admin/api/v1/groups?limit=100" \
+  -b "dwctl_session=${ADMIN_JWT}" | jq -r '.data[] | "\(.id):\(.name)"')
 
 if [ -z "$GROUPS" ]; then
   echo "No groups found or failed to fetch groups" >&2
@@ -58,4 +58,3 @@ done <<<"$GROUPS"
 
 echo "" >&2
 echo "Deleted $DELETED_COUNT test group(s)" >&2
-
