@@ -360,3 +360,4 @@ prevent name clashes.
 - Use PostgreSQL LISTEN/NOTIFY for real-time cache invalidation (see `sync/` module)
 - Avoid N+1 queries - batch fetch related data when possible
 - To run sqlx migrations, navigate to the appropriate directory (dwctl, or fusillade/) and run `cargo sqlx migrate run`. NEVER try to run sqlx migrate run --source ... --database-url from the root.
+- Instead of calling 'tokio::time::sleep' in tests, try to poll until the condition you're waiting for becomes true. Assert both against the state its in at first, then the state it changes to. Then the tests 1. Aren't slow - because they can change state immediately, and 2. test against the whole flow - both before and after the condition becomes true
