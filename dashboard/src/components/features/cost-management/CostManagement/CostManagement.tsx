@@ -54,6 +54,17 @@ export function CostManagement() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [isDemoMode]);
 
+  // Auto-close modal when payment processing completes successfully
+  useEffect(() => {
+    if (processPaymentMutation.isSuccess && showSuccessModal) {
+      // Wait a moment to show the success message, then auto-close
+      const timer = setTimeout(() => {
+        setShowSuccessModal(false);
+      }, 2000);
+      return () => clearTimeout(timer);
+    }
+  }, [processPaymentMutation.isSuccess, showSuccessModal]);
+
   const handleAddFunds = async () => {
     if (isDemoMode) {
       // Demo mode: Call the API (which will be intercepted by MSW)
@@ -160,13 +171,17 @@ export function CostManagement() {
               )}
             </DialogDescription>
           </DialogHeader>
-          {!processPaymentMutation.isPending && (
-            <div className="flex justify-end gap-2 mt-4">
+          <div className="flex justify-end gap-2 mt-4">
+            {processPaymentMutation.isPending ? (
+              <Button variant="outline" onClick={() => setShowSuccessModal(false)}>
+                Close (processing in background)
+              </Button>
+            ) : (
               <Button onClick={() => setShowSuccessModal(false)}>
                 Close
               </Button>
-            </div>
-          )}
+            )}
+          </div>
         </DialogContent>
       </Dialog>
 

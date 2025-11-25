@@ -813,6 +813,9 @@ const paymentsApi = {
         response,
       );
     }
+
+    // Explicitly return to ensure promise resolves
+    return;
   },
 };
 
