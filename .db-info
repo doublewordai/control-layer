@@ -1,0 +1,3 @@
+DB_CONTAINER_NAME=test-postgres-7130d19c
+DB_PORT=49556
+DB_VOLUME_NAME=test-postgres-data-7130d19c

@@ -19,7 +19,6 @@ import {
   type ModelsInclude,
 } from "../../../../api/control-layer";
 import { useAuthorization } from "../../../../utils";
-import { useSettings } from "../../../../contexts";
 import {
   ApiExamples,
   AccessManagementModal,
@@ -70,10 +69,9 @@ const ModelInfo: React.FC = () => {
   const navigate = useNavigate();
   const [searchParams] = useSearchParams();
   const { hasPermission } = useAuthorization();
-  const { isFeatureEnabled } = useSettings();
   const canManageGroups = hasPermission("manage-groups");
   const canViewAnalytics = hasPermission("analytics");
-  const showPricing = isFeatureEnabled("use_billing");
+  const showPricing = true;
 
   const fromUrl = searchParams.get("from");
 
@@ -140,9 +138,9 @@ const ModelInfo: React.FC = () => {
     const parts: string[] = ["status"]; // Always include status to reuse cache from Models page
     if (canManageGroups) parts.push("groups");
     if (canViewAnalytics) parts.push("metrics");
-    if (showPricing) parts.push("pricing");
+    parts.push("pricing"); // Always fetch pricing
     return parts.join(",");
-  }, [canManageGroups, canViewAnalytics, showPricing]);
+  }, [canManageGroups, canViewAnalytics]);
 
   const {
     data: rawModelsData,
@@ -1082,21 +1080,27 @@ const ModelInfo: React.FC = () => {
                             <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
                               <div>
                                 <p className="text-xs text-gray-500 mb-1">
-                                  Input Price per Token
+                                  Input Price per Million Tokens
                                 </p>
                                 <p className="font-medium">
                                   {model.pricing.input_price_per_token
-                                    ? `$${Number(model.pricing.input_price_per_token).toFixed(4)}`
+                                    ? (() => {
+                                        const price = Number(model.pricing.input_price_per_token) * 1000000;
+                                        return `$${price % 1 === 0 ? price.toFixed(0) : price.toFixed(2)}`;
+                                      })()
                                     : "Not set"}
                                 </p>
                               </div>
                               <div>
                                 <p className="text-xs text-gray-500 mb-1">
-                                  Output Price per Token
+                                  Output Price per Million Tokens
                                 </p>
                                 <p className="font-medium">
                                   {model.pricing.output_price_per_token
-                                    ? `$${Number(model.pricing.output_price_per_token).toFixed(4)}`
+                                    ? (() => {
+                                        const price = Number(model.pricing.output_price_per_token) * 1000000;
+                                        return `$${price % 1 === 0 ? price.toFixed(0) : price.toFixed(2)}`;
+                                      })()
                                     : "Not set"}
                                 </p>
                               </div>

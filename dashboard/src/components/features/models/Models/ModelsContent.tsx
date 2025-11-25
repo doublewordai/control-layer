@@ -14,6 +14,8 @@ import {
   Info,
   ChevronRight,
   DollarSign,
+  ArrowDown,
+  ArrowUp,
 } from "lucide-react";
 import {
   useModels,
@@ -53,7 +55,6 @@ import {
   formatNumber,
   formatLatency,
   formatRelativeTime,
-  formatPricing,
 } from "../../../../utils/formatters";
 import { StatusRow } from "./StatusRow";
 
@@ -319,8 +320,9 @@ export const ModelsContent: React.FC<ModelsContentProps> = ({
                   }}
                 >
                   <CardHeader className="px-6 pt-5 pb-0">
-                    <div className="flex items-start justify-between gap-4">
-                      <div className="flex-1 min-w-0">
+                    <div className="space-y-2">
+                      {/* ROW 1: Alias on left, groups/chevron on right */}
+                      <div className="flex items-center justify-between gap-4">
                         <div className="flex items-center gap-2">
                           <CardTitle className="text-lg truncate break-all">
                             {model.alias}
@@ -394,104 +396,238 @@ export const ModelsContent: React.FC<ModelsContentProps> = ({
                             </HoverCardContent>
                           </HoverCard>
                         </div>
-                        <CardDescription className="mt-1 truncate">
-                          <span className="break-all">{model.model_name}</span>{" "}
-                          •{" "}
-                          {endpointsRecord[model.hosted_on]?.name ||
-                            "Unknown endpoint"}
-                        </CardDescription>
-                      </div>
 
-                      <div className="flex items-center gap-3">
-                        {canManageGroups && (
-                          <div
-                            className="flex items-center gap-1 max-w-[180px]"
-                            onClick={(e) => e.stopPropagation()}
-                          >
-                            {!model.groups || model.groups.length === 0 ? (
-                              <Button
-                                variant="outline"
-                                size="sm"
-                                onClick={() => {
-                                  setAccessModelId(model.id);
-                                  setShowAccessModal(true);
-                                }}
-                                className="h-6 px-2 text-xs"
-                              >
-                                <Plus className="h-2.5 w-2.5" />
-                                Add groups
-                              </Button>
-                            ) : (
-                              <>
-                                {model.groups.slice(0, 1).map((group) => (
-                                  <Badge
-                                    key={group.id}
-                                    variant="secondary"
-                                    className="text-xs"
-                                    title={`Group: ${group.name}`}
-                                  >
-                                    <Users className="h-3 w-3" />
-                                    <span className="max-w-[60px] truncate break-all">
-                                      {group.name}
-                                    </span>
-                                  </Badge>
-                                ))}
-                                {model.groups.length > 1 ? (
-                                  <HoverCard openDelay={200} closeDelay={100}>
-                                    <HoverCardTrigger asChild>
-                                      <Badge
-                                        variant="outline"
-                                        className="text-xs hover:bg-gray-50 select-none"
-                                        onClick={() => {
-                                          setAccessModelId(model.id);
-                                          setShowAccessModal(true);
-                                        }}
-                                      >
-                                        +{model.groups.length - 1} more
-                                      </Badge>
-                                    </HoverCardTrigger>
-                                    <HoverCardContent
-                                      className="w-60"
-                                      align="start"
-                                      sideOffset={5}
+                        {/* Access Groups and Expand Icon */}
+                        <div className="flex items-center gap-3">
+                          {canManageGroups && (
+                            <div
+                              className="flex items-center gap-1 max-w-[180px]"
+                              onClick={(e) => e.stopPropagation()}
+                            >
+                              {!model.groups || model.groups.length === 0 ? (
+                                <Button
+                                  variant="outline"
+                                  size="sm"
+                                  onClick={() => {
+                                    setAccessModelId(model.id);
+                                    setShowAccessModal(true);
+                                  }}
+                                  className="h-6 px-2 text-xs"
+                                >
+                                  <Plus className="h-2.5 w-2.5" />
+                                  Add groups
+                                </Button>
+                              ) : (
+                                <>
+                                  {model.groups.slice(0, 1).map((group) => (
+                                    <Badge
+                                      key={group.id}
+                                      variant="secondary"
+                                      className="text-xs"
+                                      title={`Group: ${group.name}`}
                                     >
-                                      <div className="flex flex-wrap gap-1">
-                                        {model.groups.map((group) => (
-                                          <Badge
-                                            key={group.id}
-                                            variant="secondary"
-                                            className="text-xs max-w-[200px]"
-                                          >
-                                            <Users className="h-3 w-3 shrink-0" />
-                                            <span className="truncate break-all">
-                                              {group.name}
-                                            </span>
-                                          </Badge>
-                                        ))}
-                                      </div>
-                                    </HoverCardContent>
-                                  </HoverCard>
-                                ) : (
-                                  <Button
-                                    variant="outline"
-                                    size="icon"
-                                    onClick={() => {
-                                      setAccessModelId(model.id);
-                                      setShowAccessModal(true);
-                                    }}
-                                    className="h-6 w-6"
-                                    title="Manage access groups"
-                                  >
-                                    <Plus className="h-2.5 w-2.5" />
-                                  </Button>
-                                )}
-                              </>
-                            )}
-                          </div>
-                        )}
+                                      <Users className="h-3 w-3" />
+                                      <span className="max-w-[60px] truncate break-all">
+                                        {group.name}
+                                      </span>
+                                    </Badge>
+                                  ))}
+                                  {model.groups.length > 1 ? (
+                                    <HoverCard openDelay={200} closeDelay={100}>
+                                      <HoverCardTrigger asChild>
+                                        <Badge
+                                          variant="outline"
+                                          className="text-xs hover:bg-gray-50 select-none"
+                                          onClick={() => {
+                                            setAccessModelId(model.id);
+                                            setShowAccessModal(true);
+                                          }}
+                                        >
+                                          +{model.groups.length - 1} more
+                                        </Badge>
+                                      </HoverCardTrigger>
+                                      <HoverCardContent
+                                        className="w-60"
+                                        align="start"
+                                        sideOffset={5}
+                                      >
+                                        <div className="flex flex-wrap gap-1">
+                                          {model.groups.map((group) => (
+                                            <Badge
+                                              key={group.id}
+                                              variant="secondary"
+                                              className="text-xs max-w-[200px]"
+                                            >
+                                              <Users className="h-3 w-3 shrink-0" />
+                                              <span className="truncate break-all">
+                                                {group.name}
+                                              </span>
+                                            </Badge>
+                                          ))}
+                                        </div>
+                                      </HoverCardContent>
+                                    </HoverCard>
+                                  ) : (
+                                    <Button
+                                      variant="outline"
+                                      size="icon"
+                                      onClick={() => {
+                                        setAccessModelId(model.id);
+                                        setShowAccessModal(true);
+                                      }}
+                                      className="h-6 w-6"
+                                      title="Manage access groups"
+                                    >
+                                      <Plus className="h-2.5 w-2.5" />
+                                    </Button>
+                                  )}
+                                </>
+                              )}
+                            </div>
+                          )}
 
-                        <ChevronRight className="h-5 w-5 text-gray-400 group-hover:text-gray-600 transition-colors" />
+                          <ChevronRight className="h-5 w-5 text-gray-400 group-hover:text-gray-600 transition-colors" />
+                        </div>
                       </div>
+
+                      {/* ROW 2: Pricing, model name, endpoint */}
+                      <CardDescription className="flex items-center gap-1.5 min-w-0">
+                          {/* Show pricing for all users */}
+                          {showPricing && (
+                            <>
+                              <HoverCard openDelay={200} closeDelay={100}>
+                                <HoverCardTrigger asChild>
+                                  <button
+                                    className="flex items-center gap-0.5 flex-shrink-0 hover:opacity-70 transition-opacity"
+                                    onClick={(e) => e.stopPropagation()}
+                                  >
+                                    {!model.pricing?.input_price_per_token &&
+                                    !model.pricing?.output_price_per_token ? (
+                                      <span className="flex items-center gap-0.5 text-green-700">
+                                        <div className="relative h-2.5 w-2.5">
+                                          <DollarSign className="h-2.5 w-2.5" />
+                                          <div className="absolute inset-0 flex items-center justify-center">
+                                            <div className="w-5 h-[1px] bg-green-700 rotate-[-50deg]" />
+                                          </div>
+                                        </div>
+                                        <span>Free</span>
+                                      </span>
+                                    ) : (
+                                      <span className="flex items-center gap-0.5">
+                                        <ArrowDown className="h-2.5 w-2.5 text-gray-500 flex-shrink-0" />
+                                        <span className="whitespace-nowrap tabular-nums">
+                                          {model.pricing?.input_price_per_token
+                                            ? (() => {
+                                                const price = Number(model.pricing.input_price_per_token) * 1000000;
+                                                return `$${price % 1 === 0 ? price.toFixed(0) : price.toFixed(2)}`;
+                                              })()
+                                            : "$0"}
+                                        </span>
+                                        <span className="text-[8px] text-gray-400">/M</span>
+                                        <ArrowUp className="h-2.5 w-2.5 text-gray-500 flex-shrink-0 ml-0.5" />
+                                        <span className="whitespace-nowrap tabular-nums">
+                                          {model.pricing?.output_price_per_token
+                                            ? (() => {
+                                                const price = Number(model.pricing.output_price_per_token) * 1000000;
+                                                return `$${price % 1 === 0 ? price.toFixed(0) : price.toFixed(2)}`;
+                                              })()
+                                            : "$0"}
+                                        </span>
+                                        <span className="text-[8px] text-gray-400">/M</span>
+                                      </span>
+                                    )}
+                                    <span className="sr-only">
+                                      View pricing details
+                                    </span>
+                                  </button>
+                                </HoverCardTrigger>
+                                <HoverCardContent
+                                  className="w-48"
+                                  sideOffset={5}
+                                >
+                                  {!model.pricing?.input_price_per_token &&
+                                  !model.pricing?.output_price_per_token ? (
+                                    <div className="text-sm">
+                                      <p className="font-medium text-green-700">
+                                        Free
+                                      </p>
+                                      <p className="text-xs text-muted-foreground mt-1">
+                                        No charge for calls to this model
+                                      </p>
+                                    </div>
+                                  ) : (
+                                    <div className="space-y-1 text-xs">
+                                      <p className="text-muted-foreground">
+                                        Pricing per million tokens:
+                                      </p>
+                                      <p>
+                                        <span className="font-medium">
+                                          Input:
+                                        </span>{" "}
+                                        {model.pricing?.input_price_per_token
+                                          ? (() => {
+                                              const price = Number(model.pricing.input_price_per_token) * 1000000;
+                                              return `$${price % 1 === 0 ? price.toFixed(0) : price.toFixed(2)}`;
+                                            })()
+                                          : "$0"}
+                                      </p>
+                                      <p>
+                                        <span className="font-medium">
+                                          Output:
+                                        </span>{" "}
+                                        {model.pricing?.output_price_per_token
+                                          ? (() => {
+                                              const price = Number(model.pricing.output_price_per_token) * 1000000;
+                                              return `$${price % 1 === 0 ? price.toFixed(0) : price.toFixed(2)}`;
+                                            })()
+                                          : "$0"}
+                                      </p>
+                                    </div>
+                                  )}
+                                </HoverCardContent>
+                              </HoverCard>
+                              <span>•</span>
+                            </>
+                          )}
+                          <span className="flex items-center gap-1.5 min-w-0">
+                            {model.model_name.length > 30 ? (
+                              <HoverCard openDelay={200} closeDelay={100}>
+                                <HoverCardTrigger asChild>
+                                  <span className="truncate max-w-[200px] hover:opacity-70 transition-opacity">
+                                    {model.model_name}
+                                  </span>
+                                </HoverCardTrigger>
+                                <HoverCardContent className="w-auto max-w-sm" sideOffset={5}>
+                                  <p className="text-sm break-all">{model.model_name}</p>
+                                </HoverCardContent>
+                              </HoverCard>
+                            ) : (
+                              <span className="truncate max-w-[200px]">
+                                {model.model_name}
+                              </span>
+                            )}
+                            <span>•</span>
+                            {(() => {
+                              const endpointName = endpointsRecord[model.hosted_on]?.name || "Unknown endpoint";
+                              return endpointName.length > 25 ? (
+                                <HoverCard openDelay={200} closeDelay={100}>
+                                  <HoverCardTrigger asChild>
+                                    <span className="truncate max-w-[150px] hover:opacity-70 transition-opacity">
+                                      {endpointName}
+                                    </span>
+                                  </HoverCardTrigger>
+                                  <HoverCardContent className="w-auto max-w-sm" sideOffset={5}>
+                                    <p className="text-sm">{endpointName}</p>
+                                  </HoverCardContent>
+                                </HoverCard>
+                              ) : (
+                                <span className="truncate max-w-[150px]">
+                                  {endpointName}
+                                </span>
+                              );
+                            })()}
+                          </span>
+                        </CardDescription>
                     </div>
                   </CardHeader>
 
@@ -600,27 +736,6 @@ export const ModelsContent: React.FC<ModelsContentProps> = ({
                                 )}
                               </span>
                             </div>
-
-                            {showPricing && (
-                              <div className="flex items-center gap-1.5 col-span-2">
-                                <HoverCard openDelay={200} closeDelay={100}>
-                                  <HoverCardTrigger asChild>
-                                    <DollarSign className="h-3.5 w-3.5 text-gray-500 " />
-                                  </HoverCardTrigger>
-                                  <HoverCardContent
-                                    className="w-48"
-                                    sideOffset={5}
-                                  >
-                                    <p className="text-xs text-muted-foreground">
-                                      Pricing per token (input / output)
-                                    </p>
-                                  </HoverCardContent>
-                                </HoverCard>
-                                <span className="text-gray-600">
-                                  {formatPricing(model.pricing)}
-                                </span>
-                              </div>
-                            )}
                           </div>
                         </div>
 
@@ -637,29 +752,12 @@ export const ModelsContent: React.FC<ModelsContentProps> = ({
                       </div>
                     ) : (
                       <div
-                        className="px-6 pb-4 space-y-3"
+                        className="px-6 pb-4"
                         style={{ minHeight: "90px" }}
                       >
-                        <p className="text-sm text-gray-700 line-clamp-2">
+                        <p className="text-sm text-gray-700 line-clamp-3">
                           {model.description || "No description provided"}
                         </p>
-                        {showPricing && (
-                          <div className="flex items-center gap-1.5 text-xs">
-                            <HoverCard openDelay={200} closeDelay={100}>
-                              <HoverCardTrigger asChild>
-                                <DollarSign className="h-3.5 w-3.5 text-gray-500 " />
-                              </HoverCardTrigger>
-                              <HoverCardContent className="w-48" sideOffset={5}>
-                                <p className="text-xs text-muted-foreground">
-                                  Pricing per token (input / output)
-                                </p>
-                              </HoverCardContent>
-                            </HoverCard>
-                            <span className="text-gray-600">
-                              {formatPricing(model.pricing)}
-                            </span>
-                          </div>
-                        )}
                       </div>
                     )}
                   </CardContent>

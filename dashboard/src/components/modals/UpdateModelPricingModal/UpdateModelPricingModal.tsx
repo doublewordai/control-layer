@@ -44,14 +44,18 @@ export const UpdateModelPricingModal: React.FC<
     output?: string;
   }>({});
 
-  // Initialize with current pricing when modal opens
+  // Initialize with current pricing when modal opens (convert to per million)
   useEffect(() => {
     if (isOpen && currentPricing) {
       setInputPrice(
-        currentPricing.input_price_per_token?.toString() ?? ""
+        currentPricing.input_price_per_token
+          ? (currentPricing.input_price_per_token * 1000000).toString()
+          : ""
       );
       setOutputPrice(
-        currentPricing.output_price_per_token?.toString() ?? ""
+        currentPricing.output_price_per_token
+          ? (currentPricing.output_price_per_token * 1000000).toString()
+          : ""
       );
     } else if (isOpen && !currentPricing) {
       setInputPrice("");
@@ -87,13 +91,13 @@ export const UpdateModelPricingModal: React.FC<
       output_price_per_token?: number;
     } = {};
 
-    // Only include fields that have values
+    // Only include fields that have values (convert from per million to per token)
     if (inputPrice && inputPrice.trim() !== "") {
-      pricing.input_price_per_token = Number(inputPrice);
+      pricing.input_price_per_token = Number(inputPrice) / 1000000;
     }
 
     if (outputPrice && outputPrice.trim() !== "") {
-      pricing.output_price_per_token = Number(outputPrice);
+      pricing.output_price_per_token = Number(outputPrice) / 1000000;
     }
 
     onSubmit(pricing);
@@ -117,17 +121,17 @@ export const UpdateModelPricingModal: React.FC<
             Update Pricing for {modelName}
           </DialogTitle>
           <DialogDescription>
-            Set the upstream price per token for input and output
+            Set the upstream price per million tokens for input and output
           </DialogDescription>
         </DialogHeader>
 
         <div className="grid gap-4 py-4">
           <div className="grid gap-2">
-            <Label htmlFor="input-price">Input Price per Token</Label>
+            <Label htmlFor="input-price">Input Price per Million Tokens</Label>
             <Input
               id="input-price"
               type="text"
-              placeholder="e.g., 0.000003"
+              placeholder="e.g., 3.00"
               value={inputPrice}
               onChange={(e) => setInputPrice(e.target.value)}
               className={errors.input ? "border-red-500" : ""}
@@ -137,16 +141,16 @@ export const UpdateModelPricingModal: React.FC<
               <p className="text-sm text-red-500">{errors.input}</p>
             )}
             <p className="text-sm text-gray-500">
-              Price in dollars per input token
+              Price in dollars per million input tokens
             </p>
           </div>
 
           <div className="grid gap-2">
-            <Label htmlFor="output-price">Output Price per Token</Label>
+            <Label htmlFor="output-price">Output Price per Million Tokens</Label>
             <Input
               id="output-price"
               type="text"
-              placeholder="e.g., 0.000015"
+              placeholder="e.g., 15.00"
               value={outputPrice}
               onChange={(e) => setOutputPrice(e.target.value)}
               className={errors.output ? "border-red-500" : ""}
@@ -156,7 +160,7 @@ export const UpdateModelPricingModal: React.FC<
               <p className="text-sm text-red-500">{errors.output}</p>
             )}
             <p className="text-sm text-gray-500">
-              Price in dollars per output token
+              Price in dollars per million output tokens
             </p>
           </div>
         </div>
