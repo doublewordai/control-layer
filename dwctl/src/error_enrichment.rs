@@ -77,7 +77,7 @@ pub async fn get_balance_of_api_key(pool: PgPool, api_key: &str) -> Result<Decim
     let mut conn = pool.acquire().await?;
     let mut api_keys_repo = ApiKeys::new(&mut conn);
     let user_id = api_keys_repo
-        .get_user_id_by_secret(&api_key)
+        .get_user_id_by_secret(api_key)
         .await?
         .ok_or_else(|| anyhow::anyhow!("API key not found or associated user doesn't exist"))?;
 

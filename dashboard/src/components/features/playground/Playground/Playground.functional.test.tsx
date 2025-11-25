@@ -296,4 +296,53 @@ describe("Playground Component - Functional Tests", () => {
       ).toHaveTextContent(/very similar/i);
     });
   });
+
+  it("displays helpful error message when API returns 402 (insufficient credits)", async () => {
+    const user = userEvent.setup();
+
+    // Mock OpenAI client to throw a 402 error
+    const mockOpenAI402 = {
+      chat: {
+        completions: {
+          create: vi.fn().mockRejectedValue({
+            status: 402,
+            message: "Insufficient credits",
+          }),
+        },
+      },
+    };
+
+    // Replace the mock temporarily
+    vi.doMock("openai", () => ({
+      default: vi.fn(() => mockOpenAI402),
+    }));
+
+    render(<Playground />, { wrapper: createWrapper(["/gpt-4o"]) });
+
+    // Wait for model to load
+    await waitFor(() => {
+      expect(
+        screen.getByRole("button", { name: /gpt-4o/i }),
+      ).toBeInTheDocument();
+    });
+
+    // Type a message
+    const textarea = screen.getByPlaceholderText(/type your message/i);
+    await user.type(textarea, "Hello");
+
+    // Send the message
+    const sendButton = screen.getByRole("button", { name: /send/i });
+    await user.click(sendButton);
+
+    // Should display the 402 error message
+    await waitFor(
+      () => {
+        const errorText = screen.getByText(
+          /insufficient credits.*account balance.*too low.*add credits/i,
+        );
+        expect(errorText).toBeInTheDocument();
+      },
+      { timeout: 3000 },
+    );
+  });
 });

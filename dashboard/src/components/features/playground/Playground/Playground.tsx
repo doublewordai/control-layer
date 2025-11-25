@@ -550,6 +550,14 @@ const Playground: React.FC = () => {
           setStreamingContentModelB("");
         } catch (err) {
           console.error("Error sending message to Model B:", err);
+          if (err && typeof err === "object" && "status" in err) {
+            const statusCode = (err as any).status;
+            if (statusCode === 402) {
+              setError(
+                "Insufficient credits. Your account balance is too low to perform this operation. Please add credits to continue.",
+              );
+            }
+          }
         } finally {
           setIsStreamingModelB(false);
           setAbortControllerModelB(null);
@@ -656,6 +664,18 @@ const Playground: React.FC = () => {
       console.error("Error sending message:", err);
       if (err instanceof Error && err.name === "AbortError") {
         setError("Message cancelled");
+      } else if (err && typeof err === "object" && "status" in err) {
+        // Handle HTTP status codes from OpenAI SDK errors
+        const statusCode = (err as any).status;
+        if (statusCode === 402) {
+          setError(
+            "Insufficient credits. Your account balance is too low to perform this operation. Please add credits to continue.",
+          );
+        } else {
+          setError(
+            err instanceof Error ? err.message : "Failed to send message",
+          );
+        }
       } else {
         setError(err instanceof Error ? err.message : "Failed to send message");
       }
@@ -779,11 +799,27 @@ const Playground: React.FC = () => {
       setStreamingContentModelB("");
     } catch (err) {
       console.error("Error sending message to Model B:", err);
-      setError(
-        err instanceof Error
-          ? err.message
-          : "Failed to send message to Model B",
-      );
+      if (err && typeof err === "object" && "status" in err) {
+        // Handle HTTP status codes from OpenAI SDK errors
+        const statusCode = (err as any).status;
+        if (statusCode === 402) {
+          setError(
+            "Insufficient credits. Your account balance is too low to perform this operation. Please add credits to continue.",
+          );
+        } else {
+          setError(
+            err instanceof Error
+              ? err.message
+              : "Failed to send message to Model B",
+          );
+        }
+      } else {
+        setError(
+          err instanceof Error
+            ? err.message
+            : "Failed to send message to Model B",
+        );
+      }
     } finally {
       setIsStreamingModelB(false);
       setAbortControllerModelB(null);
