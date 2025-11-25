@@ -7,12 +7,12 @@ use crate::db::{
         DeploymentCreateDBRequest, DeploymentDBResponse, DeploymentUpdateDBRequest, FlatPricingFields, ModelPricing, ModelStatus, ModelType,
     },
 };
-use crate::types::{abbrev_uuid, DeploymentId, InferenceEndpointId, UserId};
+use crate::types::{DeploymentId, InferenceEndpointId, UserId, abbrev_uuid};
 use chrono::{DateTime, Utc};
 use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
 use sqlx::PgConnection;
-use sqlx::{query_builder::QueryBuilder, FromRow};
+use sqlx::{FromRow, query_builder::QueryBuilder};
 use tracing::instrument;
 
 /// Filter options for listing deployments
@@ -290,15 +290,15 @@ impl<'c> Repository for Deployments<'c> {
 
     #[instrument(skip(self, request), fields(deployment_id = %abbrev_uuid(&id)), err)]
     async fn update(&mut self, id: Self::Id, request: &Self::UpdateRequest) -> Result<Self::Response> {
-        if let Some(model_name) = &request.model_name {
-            if model_name.trim().is_empty() {
-                return Err(DbError::InvalidModelField { field: "model_name" });
-            }
+        if let Some(model_name) = &request.model_name
+            && model_name.trim().is_empty()
+        {
+            return Err(DbError::InvalidModelField { field: "model_name" });
         }
-        if let Some(alias) = &request.alias {
-            if alias.trim().is_empty() {
-                return Err(DbError::InvalidModelField { field: "alias" });
-            }
+        if let Some(alias) = &request.alias
+            && alias.trim().is_empty()
+        {
+            return Err(DbError::InvalidModelField { field: "alias" });
         }
 
         // Convert model_type into DB string if provided
@@ -500,12 +500,12 @@ impl<'c> Repository for Deployments<'c> {
         }
 
         // Add aliases filter if specified
-        if let Some(ref aliases) = filter.aliases {
-            if !aliases.is_empty() {
-                query.push(" AND alias = ANY(");
-                query.push_bind(aliases);
-                query.push(")");
-            }
+        if let Some(ref aliases) = filter.aliases
+            && !aliases.is_empty()
+        {
+            query.push(" AND alias = ANY(");
+            query.push_bind(aliases);
+            query.push(")");
         }
 
         // Add accessibility filter if specified
@@ -618,12 +618,12 @@ impl<'c> Deployments<'c> {
         }
 
         // Add aliases filter if specified
-        if let Some(ref aliases) = filter.aliases {
-            if !aliases.is_empty() {
-                query.push(" AND alias = ANY(");
-                query.push_bind(aliases);
-                query.push(")");
-            }
+        if let Some(ref aliases) = filter.aliases
+            && !aliases.is_empty()
+        {
+            query.push(" AND alias = ANY(");
+            query.push_bind(aliases);
+            query.push(")");
         }
 
         // Add accessibility filter if specified
@@ -659,7 +659,7 @@ mod tests {
     use crate::{
         api::models::users::{Role, UserCreate, UserResponse},
         db::{
-            handlers::{inference_endpoints::InferenceEndpoints, Groups, Users},
+            handlers::{Groups, Users, inference_endpoints::InferenceEndpoints},
             models::{
                 deployments::{ModelPricing, ModelPricingUpdate, ProviderPricing, ProviderPricingUpdate, TokenPricing, TokenPricingUpdate},
                 groups::GroupCreateDBRequest,

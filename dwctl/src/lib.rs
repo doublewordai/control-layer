@@ -161,16 +161,16 @@ use crate::{
     db::models::users::UserCreateDBRequest,
     metrics::GenAiMetrics,
     openapi::ApiDoc,
-    request_logging::serializers::{parse_ai_request, AnalyticsResponseSerializer},
+    request_logging::serializers::{AnalyticsResponseSerializer, parse_ai_request},
 };
 use anyhow::Context;
 use auth::middleware::admin_ai_proxy_middleware;
 use axum::extract::DefaultBodyLimit;
 use axum::http::HeaderValue;
 use axum::{
+    Router, ServiceExt,
     middleware::from_fn_with_state,
     routing::{delete, get, patch, post},
-    Router, ServiceExt,
 };
 use axum_prometheus::PrometheusMetricLayer;
 use bon::Builder;
@@ -186,7 +186,7 @@ use tower_http::{
     cors::CorsLayer,
     trace::{DefaultMakeSpan, DefaultOnRequest, DefaultOnResponse, TraceLayer},
 };
-use tracing::{debug, info, instrument, Level};
+use tracing::{Level, debug, info, instrument};
 use utoipa::OpenApi;
 use utoipa_rapidoc::RapiDoc;
 use uuid::Uuid;
@@ -1381,7 +1381,7 @@ impl Application {
 
 #[cfg(test)]
 mod test {
-    use super::{create_initial_admin_user, AppState};
+    use super::{AppState, create_initial_admin_user};
     use crate::{
         api::models::users::Role,
         db::handlers::Users,

@@ -1,11 +1,11 @@
 //! Database repository for users.
 
-use crate::types::{abbrev_uuid, UserId};
+use crate::types::{UserId, abbrev_uuid};
 use crate::{
     api::models::users::Role,
     db::{
         errors::{DbError, Result},
-        handlers::{repository::Repository, Groups},
+        handlers::{Groups, repository::Repository},
         models::users::{UserCreateDBRequest, UserDBResponse, UserUpdateDBRequest},
     },
 };

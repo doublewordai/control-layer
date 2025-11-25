@@ -94,12 +94,12 @@ pub async fn sync_endpoint_models<D, F>(
 ) -> Result<EndpointSyncResponse>
 where
     D: Repository<
-        CreateRequest = DeploymentCreateDBRequest,
-        UpdateRequest = DeploymentUpdateDBRequest,
-        Response = DeploymentDBResponse,
-        Id = DeploymentId,
-        Filter = DeploymentFilter,
-    >,
+            CreateRequest = DeploymentCreateDBRequest,
+            UpdateRequest = DeploymentUpdateDBRequest,
+            Response = DeploymentDBResponse,
+            Id = DeploymentId,
+            Filter = DeploymentFilter,
+        >,
     F: FetchModels,
 {
     // Get fetched + existing models
@@ -168,17 +168,17 @@ where
 
         // Check if model should be filtered out based on endpoint's model_filter
         // If there's a filter and this model isn't in it, delete it
-        if let Some(model_filter) = &endpoint_info.model_filter {
-            if !model_filter.contains(&existing_model.model_name) {
-                if let Err(e) = deployments_repo.delete(existing_model.id).await {
-                    warn!("Failed to delete filtered-out model {}: {}", existing_model.model_name, e);
-                } else {
-                    debug!("Deleted model {} (removed from filter)", existing_model.model_name);
-                    models_deleted += 1;
-                    changes_made += 1;
-                }
-                continue;
+        if let Some(model_filter) = &endpoint_info.model_filter
+            && !model_filter.contains(&existing_model.model_name)
+        {
+            if let Err(e) = deployments_repo.delete(existing_model.id).await {
+                warn!("Failed to delete filtered-out model {}: {}", existing_model.model_name, e);
+            } else {
+                debug!("Deleted model {} (removed from filter)", existing_model.model_name);
+                models_deleted += 1;
+                changes_made += 1;
             }
+            continue;
         }
 
         // Now handle models that are in the filter
@@ -267,12 +267,12 @@ pub async fn sync_endpoint_models_with_aliases<D, F>(
 ) -> std::result::Result<EndpointSyncResponse, SyncError>
 where
     D: Repository<
-        CreateRequest = DeploymentCreateDBRequest,
-        UpdateRequest = DeploymentUpdateDBRequest,
-        Response = DeploymentDBResponse,
-        Id = DeploymentId,
-        Filter = DeploymentFilter,
-    >,
+            CreateRequest = DeploymentCreateDBRequest,
+            UpdateRequest = DeploymentUpdateDBRequest,
+            Response = DeploymentDBResponse,
+            Id = DeploymentId,
+            Filter = DeploymentFilter,
+        >,
     F: FetchModels,
 {
     // Get fetched models
@@ -393,13 +393,12 @@ fn extract_alias_conflict_from_error(
         conflicting_value,
         ..
     }) = error.downcast_ref::<crate::db::errors::DbError>()
+        && constraint.as_deref() == Some("deployed_models_alias_unique")
     {
-        if constraint.as_deref() == Some("deployed_models_alias_unique") {
-            return Some(crate::errors::AliasConflict {
-                model_name: model_name.to_string(),
-                attempted_alias: conflicting_value.clone().unwrap_or_else(|| attempted_alias.to_string()),
-            });
-        }
+        return Some(crate::errors::AliasConflict {
+            model_name: model_name.to_string(),
+            attempted_alias: conflicting_value.clone().unwrap_or_else(|| attempted_alias.to_string()),
+        });
     }
     None
 }
@@ -486,12 +485,12 @@ pub async fn update_endpoint_aliases<D>(
 ) -> Result<EndpointSyncResponse, SyncError>
 where
     D: Repository<
-        CreateRequest = DeploymentCreateDBRequest,
-        UpdateRequest = DeploymentUpdateDBRequest,
-        Response = DeploymentDBResponse,
-        Id = DeploymentId,
-        Filter = DeploymentFilter,
-    >,
+            CreateRequest = DeploymentCreateDBRequest,
+            UpdateRequest = DeploymentUpdateDBRequest,
+            Response = DeploymentDBResponse,
+            Id = DeploymentId,
+            Filter = DeploymentFilter,
+        >,
 {
     let mut changes_made = 0;
     let mut new_models_created = 0;
@@ -522,14 +521,15 @@ where
     let mut update_alias_strings = Vec::new();
     let mut update_exclude_ids = Vec::new();
     for deployment in &current_deployments {
-        if models_to_deploy.contains(&deployment.model_name) && !deployment.deleted {
-            if let Some(new_alias) = alias_mapping.get(&deployment.model_name) {
-                let trimmed_alias = new_alias.trim().to_string();
-                if deployment.alias != trimmed_alias {
-                    update_aliases.push((deployment.model_name.clone(), trimmed_alias.clone(), deployment.id));
-                    update_alias_strings.push(trimmed_alias);
-                    update_exclude_ids.push(deployment.id);
-                }
+        if models_to_deploy.contains(&deployment.model_name)
+            && !deployment.deleted
+            && let Some(new_alias) = alias_mapping.get(&deployment.model_name)
+        {
+            let trimmed_alias = new_alias.trim().to_string();
+            if deployment.alias != trimmed_alias {
+                update_aliases.push((deployment.model_name.clone(), trimmed_alias.clone(), deployment.id));
+                update_alias_strings.push(trimmed_alias);
+                update_exclude_ids.push(deployment.id);
             }
         }
     }
@@ -685,10 +685,11 @@ where
 #[cfg(test)]
 mod tests {
     use crate::{
+        DeploymentId, UserId,
         api::models::inference_endpoints::{OpenAIModel, OpenAIModelsResponse},
         db::{
             errors::Result,
-            handlers::{deployments::DeploymentFilter, InferenceEndpoints, Repository},
+            handlers::{InferenceEndpoints, Repository, deployments::DeploymentFilter},
             models::{
                 deployments::{DeploymentCreateDBRequest, DeploymentDBResponse, DeploymentUpdateDBRequest, ModelStatus},
                 inference_endpoints::InferenceEndpointDBResponse,
@@ -697,7 +698,6 @@ mod tests {
         sync::{
             deployments::fetch_models::FetchModels, endpoint_sync::sync_endpoint_models, endpoint_sync::sync_endpoint_models_with_aliases,
         },
-        DeploymentId, UserId,
     };
     use anyhow::anyhow;
     use async_trait::async_trait;

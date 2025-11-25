@@ -5,7 +5,7 @@ use crate::db::handlers::repository::Repository;
 use crate::db::models::inference_endpoints::{
     InferenceEndpointCreateDBRequest, InferenceEndpointDBResponse, InferenceEndpointUpdateDBRequest,
 };
-use crate::types::{abbrev_uuid, InferenceEndpointId, UserId};
+use crate::types::{InferenceEndpointId, UserId, abbrev_uuid};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use sqlx::{FromRow, PgConnection};
@@ -233,7 +233,7 @@ mod tests {
     use crate::{
         api::models::users::{Role, UserCreate},
         db::{
-            handlers::{repository::Repository, Users},
+            handlers::{Users, repository::Repository},
             models::{
                 inference_endpoints::{InferenceEndpointCreateDBRequest, InferenceEndpointUpdateDBRequest},
                 users::UserCreateDBRequest,

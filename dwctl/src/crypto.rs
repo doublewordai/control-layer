@@ -1,7 +1,7 @@
 //! Cryptographic utilities for API key generation.
 
-use base64::{engine::general_purpose, Engine as _};
-use rand::{thread_rng, Rng};
+use base64::{Engine as _, engine::general_purpose};
+use rand::{Rng, thread_rng};
 
 /// Generates a cryptographically secure API key with 256 bits of entropy.
 ///
