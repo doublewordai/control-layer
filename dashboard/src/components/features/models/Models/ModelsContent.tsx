@@ -78,7 +78,7 @@ export const ModelsContent: React.FC<ModelsContentProps> = ({
 }) => {
   const navigate = useNavigate();
   const [showAccessModal, setShowAccessModal] = useState(false);
-  const [accessModelId, setAccessModelId] = useState<string | null>(null);
+  const [accessModel, setAccessModel] = useState<Model | null>(null);
   const [showApiExamples, setShowApiExamples] = useState(false);
   const [apiExamplesModel, setApiExamplesModel] = useState<Model | null>(null);
   const [itemsPerPage] = useState(12);
@@ -112,6 +112,16 @@ export const ModelsContent: React.FC<ModelsContentProps> = ({
 
   const { data: probesData } = useProbes();
 
+  const models = rawModelsData?.data || [];
+  const endpoints = endpointsData || [];
+  const endpointsRecord = endpoints.reduce(
+    (acc: Record<string, Endpoint>, endpoint: Endpoint) => {
+      acc[endpoint.id] = endpoint;
+      return acc;
+    },
+    {} as Record<string, Endpoint>,
+  );
+
   const loading = modelsLoading || endpointsLoading;
   const error = modelsError
     ? (modelsError as Error).message
@@ -119,40 +129,8 @@ export const ModelsContent: React.FC<ModelsContentProps> = ({
       ? (endpointsError as Error).message
       : null;
 
-  const { modelsRecord, modelsArray, endpointsRecord, totalCount } =
-    useMemo(() => {
-      if (!rawModelsData || !endpointsData)
-        return {
-          modelsRecord: {},
-          modelsArray: [],
-          endpointsRecord: {},
-          totalCount: 0,
-        };
-
-      const rec = Object.fromEntries(rawModelsData.data.map((m) => [m.id, m]));
-
-      const sorted = [...rawModelsData.data].sort((a, b) =>
-        a.alias.localeCompare(b.alias),
-      );
-
-      const epRec = endpointsData.reduce(
-        (acc, ep) => {
-          acc[ep.id] = ep;
-          return acc;
-        },
-        {} as Record<string, Endpoint>,
-      );
-
-      return {
-        modelsRecord: rec,
-        modelsArray: sorted,
-        endpointsRecord: epRec,
-        totalCount: rawModelsData.total_count,
-      };
-    }, [rawModelsData, endpointsData]);
-
   // TODO: filter providers on the server-side
-  const filteredModels = modelsArray.filter((model) => {
+  const filteredModels = models.filter((model) => {
     if (isStatusMode && !model.status?.probe_id) {
       return false;
     }
@@ -164,7 +142,8 @@ export const ModelsContent: React.FC<ModelsContentProps> = ({
     return matchesProvider;
   });
 
-  const hasNoModels = totalCount === 0 && currentPage === 1;
+  const hasNoModels =
+    (rawModelsData?.total_count || 0) === 0 && currentPage === 1;
   const hasNoFilteredResults = !hasNoModels && filteredModels.length === 0;
 
   if (loading) {
@@ -395,7 +374,7 @@ export const ModelsContent: React.FC<ModelsContentProps> = ({
                                   variant="outline"
                                   size="sm"
                                   onClick={() => {
-                                    setAccessModelId(model.id);
+                                    setAccessModel(model);
                                     setShowAccessModal(true);
                                   }}
                                   className="h-6 px-2 text-xs"
@@ -425,7 +404,7 @@ export const ModelsContent: React.FC<ModelsContentProps> = ({
                                           variant="outline"
                                           className="text-xs hover:bg-gray-50 select-none"
                                           onClick={() => {
-                                            setAccessModelId(model.id);
+                                            setAccessModel(model);
                                             setShowAccessModal(true);
                                           }}
                                         >
@@ -458,7 +437,7 @@ export const ModelsContent: React.FC<ModelsContentProps> = ({
                                       variant="outline"
                                       size="icon"
                                       onClick={() => {
-                                        setAccessModelId(model.id);
+                                        setAccessModel(model);
                                         setShowAccessModal(true);
                                       }}
                                       className="h-6 w-6"
@@ -812,14 +791,14 @@ export const ModelsContent: React.FC<ModelsContentProps> = ({
         </>
       )}
 
-      {canManageGroups && accessModelId && modelsRecord[accessModelId] && (
+      {canManageGroups && accessModel && (
         <AccessManagementModal
           isOpen={showAccessModal}
           onClose={() => {
             setShowAccessModal(false);
-            setAccessModelId(null);
+            setAccessModel(null);
           }}
-          model={modelsRecord[accessModelId]}
+          model={accessModel}
         />
       )}
 
