@@ -139,6 +139,7 @@ pub mod config;
 mod crypto;
 pub mod db;
 mod email;
+mod error_enrichment;
 pub mod errors;
 mod leader_election;
 mod metrics;
@@ -773,6 +774,12 @@ pub async fn build_router(state: &mut AppState, onwards_router: Router) -> anyho
 
     // Serve embedded static assets, falling back to SPA for unmatched routes
     let fallback = get(api::handlers::static_assets::serve_embedded_asset).fallback(get(api::handlers::static_assets::spa_fallback));
+
+    // Apply error enrichment middleware to onwards router (before outlet logging)
+    let onwards_router = onwards_router.layer(axum::middleware::from_fn_with_state(
+        state.db.clone(),
+        error_enrichment::error_enrichment_middleware,
+    ));
 
     // Apply request logging layer only to onwards router
     let onwards_router = if let Some(outlet_layer) = outlet_layer.clone() {
