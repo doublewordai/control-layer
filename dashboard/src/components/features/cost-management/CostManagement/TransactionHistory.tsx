@@ -29,7 +29,7 @@ import {
   TableRow,
 } from "../../../ui/table.tsx";
 import type { Transaction } from "@/api/control-layer";
-import { useUserBalance, useTransactions, useUser } from "@/api/control-layer";
+import { useUserBalance, useTransactions } from "@/api/control-layer";
 import { useSettings } from "@/contexts";
 
 export interface TransactionHistoryProps {
@@ -49,9 +49,6 @@ export function TransactionHistory({
 }: TransactionHistoryProps) {
   const { isFeatureEnabled } = useSettings();
   const isDemoMode = isFeatureEnabled("demo");
-
-  // Fetch user info for display
-  const { data: displayUser } = useUser(filterUserId || userId);
 
   // Fetch balance and transactions
   const {
@@ -217,29 +214,22 @@ export function TransactionHistory({
     <>
       {/* Header with Title and Balance */}
       <div className="flex items-center justify-between mb-6">
-        <div>
-          <div className="flex items-center gap-3">
-            <h2 className="text-2xl font-semibold text-doubleword-neutral-900">
-              Transaction History
-            </h2>
-            <Button
-              variant="ghost"
-              size="sm"
-              onClick={handleRefresh}
-              disabled={isRefreshing || isLoading}
-              className="h-8 w-8 p-0"
-              title="Refresh balance and transactions"
-            >
-              <RefreshCw
-                className={`h-4 w-4 ${isRefreshing ? "animate-spin" : ""}`}
-              />
-            </Button>
-          </div>
-          {displayUser && (
-            <p className="text-sm text-gray-600 mt-1">
-              Showing transactions for user <span className="font-medium">{displayUser.email}</span>
-            </p>
-          )}
+        <div className="flex items-center gap-3">
+          <h2 className="text-2xl font-semibold text-doubleword-neutral-900">
+            Transaction History
+          </h2>
+          <Button
+            variant="ghost"
+            size="sm"
+            onClick={handleRefresh}
+            disabled={isRefreshing || isLoading}
+            className="h-8 w-8 p-0"
+            title="Refresh balance and transactions"
+          >
+            <RefreshCw
+              className={`h-4 w-4 ${isRefreshing ? "animate-spin" : ""}`}
+            />
+          </Button>
         </div>
         <div className="flex items-center gap-3">
           <div className="flex items-center gap-2 text-sm">
@@ -322,15 +312,15 @@ export function TransactionHistory({
           )}
         </div>
 
-        <div className="mt-2 mb-0">
+        <div className="mb-0">
           <Table>
             <TableHeader>
               <TableRow>
-                <TableHead className="w-[50px] py-1.5"></TableHead>
-                <TableHead className="py-1.5">Description</TableHead>
-                <TableHead className="py-1.5">Date</TableHead>
-                <TableHead className="text-right py-1.5">Amount</TableHead>
-                <TableHead className="text-right py-1.5">Balance</TableHead>
+                <TableHead className="w-[50px]"></TableHead>
+                <TableHead>Description</TableHead>
+                <TableHead>Date</TableHead>
+                <TableHead className="text-right">Amount</TableHead>
+                <TableHead className="text-right">Balance</TableHead>
               </TableRow>
             </TableHeader>
             <TableBody>
@@ -342,7 +332,7 @@ export function TransactionHistory({
 
                 return (
                   <TableRow key={transaction.id}>
-                    <TableCell className="py-1.5">
+                    <TableCell>
                       <div
                         className={`p-2 rounded-full ${
                           isCredit ? "bg-green-100" : "bg-red-100"
@@ -355,17 +345,17 @@ export function TransactionHistory({
                         )}
                       </div>
                     </TableCell>
-                    <TableCell className="py-1.5">
+                    <TableCell>
                       <p className="font-medium text-doubleword-neutral-900">
                         {transaction.description || "No description"}
                       </p>
                     </TableCell>
-                    <TableCell className="py-1.5">
+                    <TableCell>
                       <p className="text-sm text-doubleword-neutral-600">
                         {formatDate(transaction.created_at)}
                       </p>
                     </TableCell>
-                    <TableCell className="text-right py-1.5">
+                    <TableCell className="text-right">
                       <p
                         className={`font-semibold ${
                           isCredit ? "text-green-600" : "text-red-600"
@@ -375,7 +365,7 @@ export function TransactionHistory({
                         {formatDollars(transaction.amount)}
                       </p>
                     </TableCell>
-                    <TableCell className="text-right py-1.5">
+                    <TableCell className="text-right">
                       <p className="text-sm text-doubleword-neutral-600">
                         {formatDollars(transaction.balance_after)}
                       </p>
