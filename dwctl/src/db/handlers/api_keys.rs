@@ -240,6 +240,32 @@ impl<'c> ApiKeys<'c> {
         Self { db }
     }
 
+    /// Get the user ID associated with an API key secret
+    ///
+    /// Joins with users table to verify the key exists and user is valid.
+    ///
+    /// # Arguments
+    /// * `secret` - The API key secret to look up
+    ///
+    /// # Returns
+    /// Returns Some(user_id) if found, None if the key doesn't exist
+    #[instrument(skip(self, secret), err)]
+    pub async fn get_user_id_by_secret(&mut self, secret: &str) -> Result<Option<UserId>> {
+        let user_id = sqlx::query_scalar!(
+            r#"
+            SELECT u.id
+            FROM api_keys ak
+            JOIN users u ON ak.user_id = u.id
+            WHERE ak.secret = $1
+            "#,
+            secret
+        )
+        .fetch_optional(&mut *self.db)
+        .await?;
+
+        Ok(user_id)
+    }
+
     /// Get or create a user-specific hidden API key for internal use
     ///
     /// Hidden API keys are automatically managed by the system and are not visible to users.
@@ -3383,5 +3409,65 @@ mod tests {
             keys_for_deployment.iter().any(|k| k.secret == key_no_credits.secret),
             "User with zero credits SHOULD have access to models with explicit $0.00 pricing"
         );
+    }
+
+    #[sqlx::test]
+    #[test_log::test]
+    async fn test_get_user_id_by_secret_success(pool: PgPool) {
+        let mut tx = pool.begin().await.unwrap();
+        let user;
+        let api_key;
+
+        {
+            let mut user_repo = Users::new(tx.acquire().await.unwrap());
+
+            let user_create = UserCreateDBRequest::from(UserCreate {
+                username: "secretuser".to_string(),
+                email: "secret@example.com".to_string(),
+                display_name: None,
+                avatar_url: None,
+                roles: vec![Role::StandardUser],
+            });
+
+            user = user_repo.create(&user_create).await.unwrap();
+        }
+
+        {
+            let mut api_repo = ApiKeys::new(tx.acquire().await.unwrap());
+
+            let api_key_create = ApiKeyCreateDBRequest {
+                user_id: user.id,
+                name: "Test Secret Key".to_string(),
+                description: Some("Key for testing secret lookup".to_string()),
+                purpose: ApiKeyPurpose::Inference,
+                requests_per_second: None,
+                burst_size: None,
+            };
+
+            api_key = api_repo.create(&api_key_create).await.unwrap();
+        }
+
+        tx.commit().await.unwrap();
+
+        // Look up user by API key secret
+        let mut pool_conn = pool.acquire().await.unwrap();
+        let mut api_repo = ApiKeys::new(&mut pool_conn);
+        let result = api_repo.get_user_id_by_secret(&api_key.secret).await.unwrap();
+
+        // Should return the correct user ID
+        assert_eq!(result, Some(user.id));
+    }
+
+    #[sqlx::test]
+    #[test_log::test]
+    async fn test_get_user_id_by_secret_not_found(pool: PgPool) {
+        let mut pool_conn = pool.acquire().await.unwrap();
+        let mut api_repo = ApiKeys::new(&mut pool_conn);
+
+        // Look up with a non-existent secret
+        let result = api_repo.get_user_id_by_secret("nonexistent_secret_key").await.unwrap();
+
+        // Should return None
+        assert_eq!(result, None);
     }
 }
