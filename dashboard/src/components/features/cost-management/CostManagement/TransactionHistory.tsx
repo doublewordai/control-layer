@@ -6,6 +6,7 @@ import {
   DollarSign,
   ChevronLeft,
   ChevronRight,
+  ChevronDown,
   Search,
   RefreshCw,
 } from "lucide-react";
@@ -28,23 +29,33 @@ import {
   TableHeader,
   TableRow,
 } from "../../../ui/table.tsx";
+import {
+  DropdownMenu,
+  DropdownMenuContent,
+  DropdownMenuItem,
+  DropdownMenuTrigger,
+} from "@/components/ui/dropdown-menu";
 import type { Transaction } from "@/api/control-layer";
 import { useUserBalance, useTransactions, useUser } from "@/api/control-layer";
 import { useSettings } from "@/contexts";
 
+export type AddFundsConfig =
+  | { type: 'direct'; onAddFunds: () => void }
+  | { type: 'redirect'; onAddFunds: () => void }
+  | { type: 'split'; onPrimaryAction: () => void; onDirectAction: () => void }
+  | undefined;
+
 export interface TransactionHistoryProps {
   userId: string;
   showCard?: boolean;
-  onAddFunds?: () => void;
-  isAddingFunds?: boolean;
+  addFundsConfig?: AddFundsConfig;
   filterUserId?: string;
 }
 
 export function TransactionHistory({
   userId,
   showCard = true,
-  onAddFunds,
-  isAddingFunds = false,
+  addFundsConfig,
   filterUserId,
 }: TransactionHistoryProps) {
   const { isFeatureEnabled } = useSettings();
@@ -248,16 +259,58 @@ export function TransactionHistory({
               {formatDollars(currentBalance)}
             </span>
           </div>
-          {onAddFunds && (
-            <Button
-              variant="outline"
-              size="sm"
-              onClick={onAddFunds}
-              disabled={isAddingFunds}
-            >
-              <Plus className="w-4 h-4 mr-2" />
-              {isAddingFunds ? "Adding..." : "Add Funds"}
-            </Button>
+          {addFundsConfig && (
+            <>
+              {addFundsConfig.type === 'direct' && (
+                <Button
+                  variant="outline"
+                  size="sm"
+                  onClick={addFundsConfig.onAddFunds}
+                >
+                  <Plus className="w-4 h-4 mr-2" />
+                  Add to Credit Balance
+                </Button>
+              )}
+              {addFundsConfig.type === 'redirect' && (
+                <Button
+                  variant="outline"
+                  size="sm"
+                  onClick={addFundsConfig.onAddFunds}
+                >
+                  <Plus className="w-4 h-4 mr-2" />
+                  Add to Credit Balance
+                </Button>
+              )}
+              {addFundsConfig.type === 'split' && (
+                <div className="flex">
+                  <Button
+                    variant="outline"
+                    size="sm"
+                    onClick={addFundsConfig.onPrimaryAction}
+                    className="rounded-r-none"
+                  >
+                    <Plus className="w-4 h-4 mr-2" />
+                    Add to Credit Balance
+                  </Button>
+                  <DropdownMenu>
+                    <DropdownMenuTrigger asChild>
+                      <Button
+                        variant="outline"
+                        size="sm"
+                        className="rounded-l-none border-l-0 px-2"
+                      >
+                        <ChevronDown className="w-4 h-4" />
+                      </Button>
+                    </DropdownMenuTrigger>
+                    <DropdownMenuContent align="end">
+                      <DropdownMenuItem onClick={addFundsConfig.onDirectAction}>
+                        Grant as admin
+                      </DropdownMenuItem>
+                    </DropdownMenuContent>
+                  </DropdownMenu>
+                </div>
+              )}
+            </>
           )}
         </div>
       </div>
