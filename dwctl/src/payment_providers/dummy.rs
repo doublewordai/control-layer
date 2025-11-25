@@ -108,3 +108,165 @@ impl PaymentProvider for DummyProvider {
         Ok(())
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use rust_decimal::Decimal;
+    use sqlx::PgPool;
+    use uuid::Uuid;
+
+    /// Helper to create a test user in the database
+    async fn create_test_user(pool: &PgPool) -> CurrentUser {
+        let user_id = Uuid::new_v4();
+        sqlx::query!(
+            r#"
+            INSERT INTO users (id, email, display_name, roles, password_hash)
+            VALUES ($1, $2, $3, $4, $5)
+            "#,
+            user_id,
+            "test@example.com",
+            "Test User",
+            &vec!["StandardUser"],
+            "dummy_hash"
+        )
+        .execute(pool)
+        .await
+        .unwrap();
+
+        CurrentUser {
+            id: user_id,
+            email: "test@example.com".to_string(),
+            display_name: Some("Test User".to_string()),
+            roles: vec![crate::types::Role::StandardUser],
+            payment_provider_id: None,
+            credit_balance: Decimal::ZERO,
+        }
+    }
+
+    #[test]
+    fn test_dummy_provider_creation() {
+        let provider = DummyProvider::new(Decimal::new(100, 0));
+        assert_eq!(provider.amount, Decimal::new(100, 0));
+    }
+
+    #[sqlx::test]
+    async fn test_dummy_create_checkout_session(pool: PgPool) {
+        let provider = DummyProvider::new(Decimal::new(5000, 2)); // $50.00
+        let user = create_test_user(&pool).await;
+
+        let cancel_url = "http://localhost:3001/cost-management?payment=cancelled&session_id={CHECKOUT_SESSION_ID}";
+        let success_url = "http://localhost:3001/cost-management?payment=success&session_id={CHECKOUT_SESSION_ID}";
+
+        let result = provider.create_checkout_session(&pool, &user, cancel_url, success_url).await;
+
+        assert!(result.is_ok());
+        let checkout_url = result.unwrap();
+
+        // Verify it returns the success URL with session_id
+        assert!(checkout_url.contains("payment=success"));
+        assert!(checkout_url.contains("session_id=dummy_session_"));
+
+        // Extract session_id
+        let url = url::Url::parse(&checkout_url).unwrap();
+        let query_pairs: std::collections::HashMap<_, _> = url.query_pairs().collect();
+        let session_id = query_pairs.get("session_id").unwrap();
+
+        // Verify transaction was created immediately
+        let transaction = sqlx::query!(
+            r#"
+            SELECT amount, user_id, source_id, description
+            FROM credits_transactions
+            WHERE source_id = $1
+            "#,
+            session_id.to_string()
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+
+        assert_eq!(transaction.amount, Decimal::new(5000, 2));
+        assert_eq!(transaction.user_id, user.id);
+        assert_eq!(transaction.description, Some("Dummy payment (test)".to_string()));
+    }
+
+    #[sqlx::test]
+    async fn test_dummy_idempotency(pool: PgPool) {
+        let provider = DummyProvider::new(Decimal::new(100, 0));
+        let user = create_test_user(&pool).await;
+
+        let cancel_url = "http://localhost:3001/cost-management?payment=cancelled&session_id={CHECKOUT_SESSION_ID}";
+        let success_url = "http://localhost:3001/cost-management?payment=success&session_id={CHECKOUT_SESSION_ID}";
+
+        // Create checkout session (creates transaction)
+        let checkout_url = provider
+            .create_checkout_session(&pool, &user, cancel_url, success_url)
+            .await
+            .unwrap();
+
+        // Extract session_id
+        let url = url::Url::parse(&checkout_url).unwrap();
+        let query_pairs: std::collections::HashMap<_, _> = url.query_pairs().collect();
+        let session_id = query_pairs.get("session_id").unwrap();
+
+        // Process payment (should be idempotent)
+        let result1 = provider.process_payment_session(&pool, session_id).await;
+        let result2 = provider.process_payment_session(&pool, session_id).await;
+
+        assert!(result1.is_ok());
+        assert!(result2.is_ok());
+
+        // Verify only one transaction exists
+        let count = sqlx::query!(
+            r#"
+            SELECT COUNT(*) as count
+            FROM credits_transactions
+            WHERE source_id = $1
+            "#,
+            session_id.to_string()
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+
+        assert_eq!(count.count.unwrap(), 1, "Should only have one transaction (idempotent)");
+    }
+
+    #[sqlx::test]
+    async fn test_dummy_get_payment_session(pool: PgPool) {
+        let provider = DummyProvider::new(Decimal::new(7500, 2)); // $75.00
+
+        // Test with valid session ID format
+        let result = provider.get_payment_session("dummy_session_test123").await;
+        assert!(result.is_ok());
+
+        let session = result.unwrap();
+        assert_eq!(session.amount, Decimal::new(7500, 2));
+        assert!(session.is_paid); // Dummy sessions are always "paid"
+
+        // Test with invalid session ID format
+        let result = provider.get_payment_session("invalid_session_id").await;
+        assert!(result.is_err());
+        match result {
+            Err(PaymentError::InvalidData(msg)) => {
+                assert!(msg.contains("Invalid dummy session ID format"));
+            }
+            _ => panic!("Expected InvalidData error"),
+        }
+    }
+
+    #[test]
+    fn test_dummy_webhook_not_supported() {
+        let provider = DummyProvider::new(Decimal::new(100, 0));
+
+        // Dummy provider doesn't support webhooks
+        let headers = axum::http::HeaderMap::new();
+        let body = "{}";
+
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let result = runtime.block_on(provider.validate_webhook(&headers, body));
+
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap(), None); // Returns None for unsupported webhooks
+    }
+}
