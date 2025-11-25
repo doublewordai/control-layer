@@ -60,7 +60,7 @@ pub struct ListDaemonsQuery {
 }
 
 /// Response for listing daemons.
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, Deserialize)]
 pub struct ListDaemonsResponse {
     pub daemons: Vec<DaemonResponse>,
 }
