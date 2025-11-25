@@ -1,5 +1,5 @@
-import React, { useState, useMemo } from "react";
-import { useNavigate } from "react-router-dom";
+import React, { useState, useMemo, useEffect } from "react";
+import { useNavigate, useSearchParams } from "react-router-dom";
 import {
   Users,
   X,
@@ -57,15 +57,14 @@ import {
   formatRelativeTime,
 } from "../../../../utils/formatters";
 import { StatusRow } from "./StatusRow";
+import { useDebounce } from "@/hooks/useDebounce";
 
 export interface ModelsContentProps {
-  debouncedSearchQuery: string;
+  currentPage: number;
+  setCurrentPage: (page: number) => void;
   searchQuery: string;
   filterProvider: string;
   showAccessibleOnly: boolean;
-  currentPage: number;
-  setCurrentPage: (page: number) => void;
-  itemsPerPage: number;
   isStatusMode: boolean;
   canManageGroups: boolean;
   canViewAnalytics: boolean;
@@ -74,13 +73,11 @@ export interface ModelsContentProps {
 }
 
 export const ModelsContent: React.FC<ModelsContentProps> = ({
-  debouncedSearchQuery,
+  currentPage,
+  setCurrentPage,
   searchQuery,
   filterProvider,
   showAccessibleOnly,
-  currentPage,
-  setCurrentPage,
-  itemsPerPage,
   isStatusMode,
   canManageGroups,
   canViewAnalytics,
@@ -92,6 +89,8 @@ export const ModelsContent: React.FC<ModelsContentProps> = ({
   const [accessModelId, setAccessModelId] = useState<string | null>(null);
   const [showApiExamples, setShowApiExamples] = useState(false);
   const [apiExamplesModel, setApiExamplesModel] = useState<Model | null>(null);
+  const [itemsPerPage] = useState(12);
+  const debouncedSearch = useDebounce(searchQuery, 300);
 
   const includeParam = useMemo(() => {
     const parts: string[] = ["status"];
@@ -110,7 +109,7 @@ export const ModelsContent: React.FC<ModelsContentProps> = ({
     limit: itemsPerPage,
     include: includeParam as ModelsInclude,
     accessible: isStatusMode ? true : !canManageGroups || showAccessibleOnly,
-    search: debouncedSearchQuery || undefined,
+    search: debouncedSearch || undefined, // ← API debounce only
   });
 
   const {
@@ -138,25 +137,24 @@ export const ModelsContent: React.FC<ModelsContentProps> = ({
           totalCount: 0,
         };
 
-      const modelsLookup: Record<string, Model> = Object.fromEntries(
-        rawModelsData.data.map((model) => [model.id, model]),
-      );
-      const sortedArray = [...rawModelsData.data].sort((a, b) =>
+      const rec = Object.fromEntries(rawModelsData.data.map((m) => [m.id, m]));
+
+      const sorted = [...rawModelsData.data].sort((a, b) =>
         a.alias.localeCompare(b.alias),
       );
 
-      const endpointsRec = endpointsData.reduce(
-        (acc, endpoint) => {
-          acc[endpoint.id] = endpoint;
+      const epRec = endpointsData.reduce(
+        (acc, ep) => {
+          acc[ep.id] = ep;
           return acc;
         },
         {} as Record<string, Endpoint>,
       );
 
       return {
-        modelsRecord: modelsLookup,
-        modelsArray: sortedArray,
-        endpointsRecord: endpointsRec,
+        modelsRecord: rec,
+        modelsArray: sorted,
+        endpointsRecord: epRec,
         totalCount: rawModelsData.total_count,
       };
     }, [rawModelsData, endpointsData]);
@@ -166,9 +164,11 @@ export const ModelsContent: React.FC<ModelsContentProps> = ({
     if (isStatusMode && !model.status?.probe_id) {
       return false;
     }
+
     const matchesProvider =
       filterProvider === "all" ||
       endpointsRecord[model.hosted_on]?.name === filterProvider;
+
     return matchesProvider;
   });
 
@@ -492,142 +492,169 @@ export const ModelsContent: React.FC<ModelsContentProps> = ({
 
                       {/* ROW 2: Pricing, model name, endpoint */}
                       <CardDescription className="flex items-center gap-1.5 min-w-0">
-                          {/* Show pricing for all users */}
-                          {showPricing && (
-                            <>
-                              <HoverCard openDelay={200} closeDelay={100}>
-                                <HoverCardTrigger asChild>
-                                  <button
-                                    className="flex items-center gap-0.5 flex-shrink-0 hover:opacity-70 transition-opacity"
-                                    onClick={(e) => e.stopPropagation()}
-                                  >
-                                    {!model.pricing?.input_price_per_token &&
-                                    !model.pricing?.output_price_per_token ? (
-                                      <span className="flex items-center gap-0.5 text-green-700">
-                                        <div className="relative h-2.5 w-2.5">
-                                          <DollarSign className="h-2.5 w-2.5" />
-                                          <div className="absolute inset-0 flex items-center justify-center">
-                                            <div className="w-5 h-[1px] bg-green-700 rotate-[-50deg]" />
-                                          </div>
-                                        </div>
-                                        <span>Free</span>
-                                      </span>
-                                    ) : (
-                                      <span className="flex items-center gap-0.5">
-                                        <ArrowDown className="h-2.5 w-2.5 text-gray-500 flex-shrink-0" />
-                                        <span className="whitespace-nowrap tabular-nums">
-                                          {model.pricing?.input_price_per_token
-                                            ? (() => {
-                                                const price = Number(model.pricing.input_price_per_token) * 1000000;
-                                                return `$${price % 1 === 0 ? price.toFixed(0) : price.toFixed(2)}`;
-                                              })()
-                                            : "$0"}
-                                        </span>
-                                        <span className="text-[8px] text-gray-400">/M</span>
-                                        <ArrowUp className="h-2.5 w-2.5 text-gray-500 flex-shrink-0 ml-0.5" />
-                                        <span className="whitespace-nowrap tabular-nums">
-                                          {model.pricing?.output_price_per_token
-                                            ? (() => {
-                                                const price = Number(model.pricing.output_price_per_token) * 1000000;
-                                                return `$${price % 1 === 0 ? price.toFixed(0) : price.toFixed(2)}`;
-                                              })()
-                                            : "$0"}
-                                        </span>
-                                        <span className="text-[8px] text-gray-400">/M</span>
-                                      </span>
-                                    )}
-                                    <span className="sr-only">
-                                      View pricing details
-                                    </span>
-                                  </button>
-                                </HoverCardTrigger>
-                                <HoverCardContent
-                                  className="w-48"
-                                  sideOffset={5}
+                        {/* Show pricing for all users */}
+                        {showPricing && (
+                          <>
+                            <HoverCard openDelay={200} closeDelay={100}>
+                              <HoverCardTrigger asChild>
+                                <button
+                                  className="flex items-center gap-0.5 shrink-0 hover:opacity-70 transition-opacity"
+                                  onClick={(e) => e.stopPropagation()}
                                 >
                                   {!model.pricing?.input_price_per_token &&
                                   !model.pricing?.output_price_per_token ? (
-                                    <div className="text-sm">
-                                      <p className="font-medium text-green-700">
-                                        Free
-                                      </p>
-                                      <p className="text-xs text-muted-foreground mt-1">
-                                        No charge for calls to this model
-                                      </p>
-                                    </div>
+                                    <span className="flex items-center gap-0.5 text-green-700">
+                                      <div className="relative h-2.5 w-2.5">
+                                        <DollarSign className="h-2.5 w-2.5" />
+                                        <div className="absolute inset-0 flex items-center justify-center">
+                                          <div className="w-5 h-px bg-green-700 rotate-[-50deg]" />
+                                        </div>
+                                      </div>
+                                      <span>Free</span>
+                                    </span>
                                   ) : (
-                                    <div className="space-y-1 text-xs">
-                                      <p className="text-muted-foreground">
-                                        Pricing per million tokens:
-                                      </p>
-                                      <p>
-                                        <span className="font-medium">
-                                          Input:
-                                        </span>{" "}
+                                    <span className="flex items-center gap-0.5">
+                                      <ArrowDown className="h-2.5 w-2.5 text-gray-500 shrink-0" />
+                                      <span className="whitespace-nowrap tabular-nums">
                                         {model.pricing?.input_price_per_token
                                           ? (() => {
-                                              const price = Number(model.pricing.input_price_per_token) * 1000000;
+                                              const price =
+                                                Number(
+                                                  model.pricing
+                                                    .input_price_per_token,
+                                                ) * 1000000;
                                               return `$${price % 1 === 0 ? price.toFixed(0) : price.toFixed(2)}`;
                                             })()
                                           : "$0"}
-                                      </p>
-                                      <p>
-                                        <span className="font-medium">
-                                          Output:
-                                        </span>{" "}
+                                      </span>
+                                      <span className="text-[8px] text-gray-400">
+                                        /M
+                                      </span>
+                                      <ArrowUp className="h-2.5 w-2.5 text-gray-500 shrink-0 ml-0.5" />
+                                      <span className="whitespace-nowrap tabular-nums">
                                         {model.pricing?.output_price_per_token
                                           ? (() => {
-                                              const price = Number(model.pricing.output_price_per_token) * 1000000;
+                                              const price =
+                                                Number(
+                                                  model.pricing
+                                                    .output_price_per_token,
+                                                ) * 1000000;
                                               return `$${price % 1 === 0 ? price.toFixed(0) : price.toFixed(2)}`;
                                             })()
                                           : "$0"}
-                                      </p>
-                                    </div>
+                                      </span>
+                                      <span className="text-[8px] text-gray-400">
+                                        /M
+                                      </span>
+                                    </span>
                                   )}
-                                </HoverCardContent>
-                              </HoverCard>
-                              <span>•</span>
-                            </>
+                                  <span className="sr-only">
+                                    View pricing details
+                                  </span>
+                                </button>
+                              </HoverCardTrigger>
+                              <HoverCardContent className="w-48" sideOffset={5}>
+                                {!model.pricing?.input_price_per_token &&
+                                !model.pricing?.output_price_per_token ? (
+                                  <div className="text-sm">
+                                    <p className="font-medium text-green-700">
+                                      Free
+                                    </p>
+                                    <p className="text-xs text-muted-foreground mt-1">
+                                      No charge for calls to this model
+                                    </p>
+                                  </div>
+                                ) : (
+                                  <div className="space-y-1 text-xs">
+                                    <p className="text-muted-foreground">
+                                      Pricing per million tokens:
+                                    </p>
+                                    <p>
+                                      <span className="font-medium">
+                                        Input:
+                                      </span>{" "}
+                                      {model.pricing?.input_price_per_token
+                                        ? (() => {
+                                            const price =
+                                              Number(
+                                                model.pricing
+                                                  .input_price_per_token,
+                                              ) * 1000000;
+                                            return `$${price % 1 === 0 ? price.toFixed(0) : price.toFixed(2)}`;
+                                          })()
+                                        : "$0"}
+                                    </p>
+                                    <p>
+                                      <span className="font-medium">
+                                        Output:
+                                      </span>{" "}
+                                      {model.pricing?.output_price_per_token
+                                        ? (() => {
+                                            const price =
+                                              Number(
+                                                model.pricing
+                                                  .output_price_per_token,
+                                              ) * 1000000;
+                                            return `$${price % 1 === 0 ? price.toFixed(0) : price.toFixed(2)}`;
+                                          })()
+                                        : "$0"}
+                                    </p>
+                                  </div>
+                                )}
+                              </HoverCardContent>
+                            </HoverCard>
+                            <span>•</span>
+                          </>
+                        )}
+                        <span className="flex items-center gap-1.5 min-w-0">
+                          {model.model_name.length > 30 ? (
+                            <HoverCard openDelay={200} closeDelay={100}>
+                              <HoverCardTrigger asChild>
+                                <span className="truncate max-w-[200px] hover:opacity-70 transition-opacity">
+                                  {model.model_name}
+                                </span>
+                              </HoverCardTrigger>
+                              <HoverCardContent
+                                className="w-auto max-w-sm"
+                                sideOffset={5}
+                              >
+                                <p className="text-sm break-all">
+                                  {model.model_name}
+                                </p>
+                              </HoverCardContent>
+                            </HoverCard>
+                          ) : (
+                            <span className="truncate max-w-[200px]">
+                              {model.model_name}
+                            </span>
                           )}
-                          <span className="flex items-center gap-1.5 min-w-0">
-                            {model.model_name.length > 30 ? (
+                          <span>•</span>
+                          {(() => {
+                            const endpointName =
+                              endpointsRecord[model.hosted_on]?.name ||
+                              "Unknown endpoint";
+                            return endpointName.length > 25 ? (
                               <HoverCard openDelay={200} closeDelay={100}>
                                 <HoverCardTrigger asChild>
-                                  <span className="truncate max-w-[200px] hover:opacity-70 transition-opacity">
-                                    {model.model_name}
+                                  <span className="truncate max-w-[150px] hover:opacity-70 transition-opacity">
+                                    {endpointName}
                                   </span>
                                 </HoverCardTrigger>
-                                <HoverCardContent className="w-auto max-w-sm" sideOffset={5}>
-                                  <p className="text-sm break-all">{model.model_name}</p>
+                                <HoverCardContent
+                                  className="w-auto max-w-sm"
+                                  sideOffset={5}
+                                >
+                                  <p className="text-sm">{endpointName}</p>
                                 </HoverCardContent>
                               </HoverCard>
                             ) : (
-                              <span className="truncate max-w-[200px]">
-                                {model.model_name}
+                              <span className="truncate max-w-[150px]">
+                                {endpointName}
                               </span>
-                            )}
-                            <span>•</span>
-                            {(() => {
-                              const endpointName = endpointsRecord[model.hosted_on]?.name || "Unknown endpoint";
-                              return endpointName.length > 25 ? (
-                                <HoverCard openDelay={200} closeDelay={100}>
-                                  <HoverCardTrigger asChild>
-                                    <span className="truncate max-w-[150px] hover:opacity-70 transition-opacity">
-                                      {endpointName}
-                                    </span>
-                                  </HoverCardTrigger>
-                                  <HoverCardContent className="w-auto max-w-sm" sideOffset={5}>
-                                    <p className="text-sm">{endpointName}</p>
-                                  </HoverCardContent>
-                                </HoverCard>
-                              ) : (
-                                <span className="truncate max-w-[150px]">
-                                  {endpointName}
-                                </span>
-                              );
-                            })()}
-                          </span>
-                        </CardDescription>
+                            );
+                          })()}
+                        </span>
+                      </CardDescription>
                     </div>
                   </CardHeader>
 
@@ -751,10 +778,7 @@ export const ModelsContent: React.FC<ModelsContentProps> = ({
                         </div>
                       </div>
                     ) : (
-                      <div
-                        className="px-6 pb-4"
-                        style={{ minHeight: "90px" }}
-                      >
+                      <div className="px-6 pb-4" style={{ minHeight: "90px" }}>
                         <p className="text-sm text-gray-700 line-clamp-3">
                           {model.description || "No description provided"}
                         </p>
