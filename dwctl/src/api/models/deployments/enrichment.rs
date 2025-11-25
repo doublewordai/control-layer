@@ -36,6 +36,8 @@ pub struct DeployedModelEnricher<'a> {
     pub can_read_rate_limits: bool,
 }
 
+type ProbeStatusTuple = (Option<Uuid>, bool, Option<i32>, Option<DateTime<Utc>>, Option<bool>, Option<f64>);
+
 impl<'a> DeployedModelEnricher<'a> {
     /// Enriches multiple models in bulk with requested additional data.
     ///
@@ -201,10 +203,10 @@ impl<'a> DeployedModelEnricher<'a> {
 
     /// Apply metrics to a model response
     fn apply_metrics(mut model: DeployedModelResponse, metrics_map: &Option<HashMap<String, ModelMetrics>>) -> DeployedModelResponse {
-        if let Some(metrics_map) = metrics_map {
-            if let Some(metrics) = metrics_map.get(&model.alias) {
-                model = model.with_metrics(metrics.clone());
-            }
+        if let Some(metrics_map) = metrics_map
+            && let Some(metrics) = metrics_map.get(&model.alias)
+        {
+            model = model.with_metrics(metrics.clone());
         }
         // If no metrics found for this model, just skip it (no warning needed - model might be new)
         model
@@ -213,7 +215,7 @@ impl<'a> DeployedModelEnricher<'a> {
     /// Apply probe status to a model response
     fn apply_status(
         mut model: DeployedModelResponse,
-        status_map: &Option<HashMap<DeploymentId, (Option<Uuid>, bool, Option<i32>, Option<DateTime<Utc>>, Option<bool>, Option<f64>)>>,
+        status_map: &Option<HashMap<DeploymentId, ProbeStatusTuple>>,
     ) -> DeployedModelResponse {
         if let Some(statuses) = status_map {
             if let Some((probe_id, active, interval_seconds, last_check, last_success, uptime_percentage)) = statuses.get(&model.id) {
