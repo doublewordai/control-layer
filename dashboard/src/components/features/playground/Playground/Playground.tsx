@@ -868,19 +868,19 @@ const Playground: React.FC = () => {
   return (
     <div className="h-[calc(100vh-4rem)] bg-white flex flex-col">
       {/* Header */}
-      <div className="bg-white border-b border-gray-200 px-4 md:px-8 py-3 flex-shrink-0">
+      <div className="bg-white border-b border-gray-200 px-4 md:px-8 py-3 shrink-0">
         <div className="flex flex-col md:flex-row items-start md:items-center justify-between gap-3">
           <div className="flex items-center gap-2 md:gap-4 w-full md:w-auto">
             <button
               onClick={() => navigate(fromUrl || "/models")}
-              className="p-2 text-gray-500 hover:bg-gray-100 rounded-lg transition-colors flex-shrink-0"
+              className="p-2 text-gray-500 hover:bg-gray-100 rounded-lg transition-colors shrink-0"
               aria-label={fromUrl ? "Go back" : "Back to Models"}
               title={fromUrl ? "Go back" : "Back to Models"}
             >
               <ArrowLeft className="w-5 h-5" />
             </button>
             <div className="flex items-center gap-2 md:gap-3 min-w-0">
-              <div className="w-8 h-8 md:w-10 md:h-10 bg-gray-100 rounded-lg flex items-center justify-center flex-shrink-0">
+              <div className="w-8 h-8 md:w-10 md:h-10 bg-gray-100 rounded-lg flex items-center justify-center shrink-0">
                 <Play className="w-4 h-4 md:w-5 md:h-5 text-gray-600" />
               </div>
               <div className="min-w-0">

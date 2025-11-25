@@ -3,7 +3,7 @@ import userEvent from "@testing-library/user-event";
 import { BrowserRouter } from "react-router-dom";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { setupServer } from "msw/node";
-import { ReactNode } from "react";
+import type { ReactNode } from "react";
 import {
   describe,
   it,
@@ -229,10 +229,10 @@ describe("API Keys Component - Functional Tests", () => {
 
       // Setup fresh clipboard mock for this test
       const testMockWrite = vi.fn().mockResolvedValue(undefined);
-      Object.defineProperty(navigator, 'clipboard', {
+      Object.defineProperty(navigator, "clipboard", {
         value: { writeText: testMockWrite },
         writable: true,
-        configurable: true
+        configurable: true,
       });
 
       render(<ApiKeys />, { wrapper: createWrapper() });
@@ -270,7 +270,7 @@ describe("API Keys Component - Functional Tests", () => {
 
       // Find and click the copy button
       const copyButton = await screen.findByRole("button", {
-        name: /copy api key/i
+        name: /copy api key/i,
       });
 
       expect(copyButton).toBeInTheDocument();
@@ -289,11 +289,13 @@ describe("API Keys Component - Functional Tests", () => {
       const user = userEvent.setup();
 
       // Setup fresh clipboard mock that rejects
-      const testMockWrite = vi.fn().mockRejectedValue(new Error("Clipboard access denied"));
-      Object.defineProperty(navigator, 'clipboard', {
+      const testMockWrite = vi
+        .fn()
+        .mockRejectedValue(new Error("Clipboard access denied"));
+      Object.defineProperty(navigator, "clipboard", {
         value: { writeText: testMockWrite },
         writable: true,
-        configurable: true
+        configurable: true,
       });
 
       render(<ApiKeys />, { wrapper: createWrapper() });
@@ -331,7 +333,7 @@ describe("API Keys Component - Functional Tests", () => {
 
       // Find the copy button
       const copyButton = await screen.findByRole("button", {
-        name: /copy api key/i
+        name: /copy api key/i,
       });
 
       expect(copyButton).toBeInTheDocument();
@@ -340,7 +342,9 @@ describe("API Keys Component - Functional Tests", () => {
       // Should call clipboard API, fail, and show error toast
       await waitFor(() => {
         expect(testMockWrite).toHaveBeenCalled();
-        expect(toast.error as unknown as Mock).toHaveBeenCalledWith("Failed to copy API key");
+        expect(toast.error as unknown as Mock).toHaveBeenCalledWith(
+          "Failed to copy API key",
+        );
       });
     });
 

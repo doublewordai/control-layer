@@ -9,6 +9,7 @@ import {
   DialogFooter,
 } from "../../ui/dialog";
 import { Button } from "../../ui/button";
+import { AlertBox } from "../../ui/alert-box";
 import {
   useGroups,
   useAddModelToGroup,
@@ -99,11 +100,9 @@ export const AccessManagementModal: React.FC<AccessManagementModalProps> = ({
         </DialogHeader>
 
         <div className="overflow-y-auto max-h-[60vh]">
-          {error && (
-            <div className="mb-4 p-3 bg-red-50 border border-red-200 rounded-lg">
-              <p className="text-sm text-red-600">{error}</p>
-            </div>
-          )}
+          <AlertBox variant="error" className="mb-4">
+            {error}
+          </AlertBox>
 
           {loading ? (
             <div className="flex items-center justify-center py-8">
