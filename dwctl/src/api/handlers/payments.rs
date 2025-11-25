@@ -29,7 +29,6 @@ use crate::{AppState, api::models::users::CurrentUser, payment_providers};
 #[tracing::instrument(skip_all)]
 pub async fn create_payment(
     State(state): State<AppState>,
-    headers: axum::http::HeaderMap,
     user: CurrentUser,
 ) -> Result<Response, StatusCode> {
     // Get payment provider from config (generic - works for any provider)
@@ -38,48 +37,28 @@ pub async fn create_payment(
         None => {
             tracing::warn!("Checkout requested but no payment provider is configured");
             let error_response = Json(json!({
-                "error": "No payment provider configured",
-                "message": "Sorry, there's no payment provider setup. Please contact support."
+                "message": "Payment processing is currently unavailable. Please contact support."
             }));
-            return Ok((StatusCode::NOT_IMPLEMENTED, error_response).into_response());
+            return Ok((StatusCode::SERVICE_UNAVAILABLE, error_response).into_response());
         }
     };
 
-    // Build redirect URLs from configured host URL (preferred) or fallback to request headers
-    let origin = if let Some(configured_host) = payment_config.host_url() {
-        // Use configured host URL - this is the reliable, recommended approach
-        tracing::info!("Using configured host URL for checkout redirect: {}", configured_host);
-        configured_host.to_string()
-    } else {
-        // Fallback to reading from request headers (less reliable)
-        tracing::warn!("No host_url configured in payment config, falling back to request headers (unreliable)");
-        headers
-            .get(header::ORIGIN)
-            .or_else(|| headers.get(header::REFERER))
-            .and_then(|h| h.to_str().ok())
-            .and_then(|s| {
-                // If it's a referer, extract just the origin part
-                if let Ok(url) = url::Url::parse(s) {
-                    url.origin().ascii_serialization().into()
-                } else {
-                    Some(s.to_string())
-                }
-            })
-            .unwrap_or_else(|| {
-                // Fallback to constructing from Host header
-                let host = headers.get(header::HOST).and_then(|h| h.to_str().ok()).unwrap_or("localhost:3001");
-
-                // Determine protocol - check X-Forwarded-Proto for proxied requests
-                let proto = headers.get("x-forwarded-proto").and_then(|h| h.to_str().ok()).unwrap_or("http");
-
-                format!("{}://{}", proto, host)
-            })
+    // Build redirect URLs from configured host URL
+    let origin = match payment_config.host_url() {
+        Some(configured_host) => {
+            configured_host.to_string()
+        }
+        None => {
+            tracing::error!("No host_url configured in payment config - this is required for payment processing");
+            let error_response = Json(json!({
+                "message": "Payment processing is currently unavailable. Please contact support."
+            }));
+            return Ok((StatusCode::SERVICE_UNAVAILABLE, error_response).into_response());
+        }
     };
 
     let success_url = format!("{}/cost-management?payment=success&session_id={{CHECKOUT_SESSION_ID}}", origin);
     let cancel_url = format!("{}/cost-management?payment=cancelled&session_id={{CHECKOUT_SESSION_ID}}", origin);
-
-    tracing::info!("Building checkout URLs with origin: {}", origin);
 
     let provider = payment_providers::create_provider(payment_config);
 
@@ -132,10 +111,9 @@ pub async fn process_payment(
         None => {
             tracing::warn!("Payment processing requested but no payment provider is configured");
             return Ok((
-                StatusCode::NOT_IMPLEMENTED,
+                StatusCode::SERVICE_UNAVAILABLE,
                 Json(json!({
-                    "error": "No payment provider configured",
-                    "message": "Payment provider is not configured"
+                    "message": "Payment processing is currently unavailable. Please contact support."
                 })),
             )
                 .into_response());
@@ -145,23 +123,28 @@ pub async fn process_payment(
     // Process the payment session using the provider trait
     match provider.process_payment_session(&state.db, &id).await {
         Ok(()) => Ok(Json(json!({
-            "success": true,
             "message": "Payment processed successfully"
         }))
         .into_response()),
         Err(e) => {
-            let status = StatusCode::from(e);
+            tracing::error!("Failed to process payment session: {:?}", e);
+            let status = StatusCode::from(&e);
             if status == StatusCode::PAYMENT_REQUIRED {
                 Ok((
                     StatusCode::PAYMENT_REQUIRED,
                     Json(json!({
-                        "error": "Payment not completed",
-                        "message": "The payment has not been completed yet"
+                        "message": "Payment is still processing. Please check back in a moment."
                     })),
                 )
                     .into_response())
             } else {
-                Err(status)
+                Ok((
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(json!({
+                        "message": "Unable to process payment. Please contact support."
+                    })),
+                )
+                    .into_response())
             }
         }
     }
@@ -207,12 +190,12 @@ pub async fn webhook_handler(State(state): State<AppState>, headers: axum::http:
         }
     };
 
-    tracing::info!("Received webhook event: {}", event.event_type);
+    tracing::trace!("Received webhook event: {}", event.event_type);
 
     // Process the webhook event
     match provider.process_webhook_event(&state.db, &event).await {
         Ok(()) => {
-            tracing::info!("Successfully processed webhook event: {}", event.event_type);
+            tracing::trace!("Successfully processed webhook event: {}", event.event_type);
             StatusCode::OK
         }
         Err(e) => {

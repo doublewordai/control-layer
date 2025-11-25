@@ -91,7 +91,7 @@ impl PaymentProvider for StripeProvider {
             && let Some(customer) = &checkout_session.customer
         {
             let customer_id = customer.id().to_string();
-            tracing::info!("Saving newly created customer ID {} for user {}", customer_id, user.id);
+            tracing::trace!("Saving newly created customer ID {} for user {}", customer_id, user.id);
 
             sqlx::query!("UPDATE users SET payment_provider_id = $1 WHERE id = $2", customer_id, user.id)
                 .execute(db_pool)
@@ -160,7 +160,7 @@ impl PaymentProvider for StripeProvider {
         .await?;
 
         if existing.is_some() {
-            tracing::info!("Transaction for session_id {} already exists, skipping (fast path)", session_id);
+            tracing::trace!("Transaction for session_id {} already exists, skipping (fast path)", session_id);
             return Ok(());
         }
 
@@ -169,7 +169,7 @@ impl PaymentProvider for StripeProvider {
 
         // Verify payment status
         if !payment_session.is_paid {
-            tracing::info!("Transaction for session_id {} has not been paid, skipping.", session_id);
+            tracing::trace!("Transaction for session_id {} has not been paid, skipping.", session_id);
             return Err(PaymentError::PaymentNotCompleted);
         }
 
@@ -199,7 +199,7 @@ impl PaymentProvider for StripeProvider {
                 // Check if this is a unique constraint violation on source_id
                 // This can happen if two replicas try to process the same payment simultaneously
                 if constraint.as_deref() == Some("credits_transactions_source_id_unique") {
-                    tracing::info!(
+                    tracing::trace!(
                         "Transaction for session_id {} already processed (caught unique constraint violation), returning success (idempotent)",
                         session_id
                     );
@@ -236,7 +236,7 @@ impl PaymentProvider for StripeProvider {
             PaymentError::InvalidData(format!("Webhook validation failed: {}", e))
         })?;
 
-        tracing::info!("Validated Stripe webhook event: {:?}", event.type_);
+        tracing::trace!("Validated Stripe webhook event: {:?}", event.type_);
 
         // Convert Stripe event to our generic WebhookEvent
         let session_id = match &event.data.object {
@@ -265,7 +265,7 @@ impl PaymentProvider for StripeProvider {
             PaymentError::InvalidData("Missing session_id in webhook event".to_string())
         })?;
 
-        tracing::info!("Processing webhook event {} for session: {}", event.event_type, session_id);
+        tracing::trace!("Processing webhook event {} for session: {}", event.event_type, session_id);
 
         // Use the existing process_payment_session method
         self.process_payment_session(db_pool, session_id).await
