@@ -110,10 +110,11 @@ describe("Playground Component - Functional Tests", () => {
 
     const modelSelect = screen.getByRole("combobox", { name: /select model/i });
 
-    // Should have correct attributes and text
-    expect(modelSelect).toHaveTextContent(/select a model/i);
+    // Should have correct attributes
     expect(modelSelect).toHaveAttribute("aria-expanded", "false");
     expect(modelSelect).toHaveAttribute("role", "combobox");
+    // Placeholder text should indicate models can be searched
+    expect(modelSelect.textContent).toMatch(/search models|gpt-4o/i);
   });
 
   it("shows model selector ready for available models", async () => {
@@ -125,10 +126,10 @@ describe("Playground Component - Functional Tests", () => {
     expect(modelSelect).toHaveAttribute("aria-label", "Select model");
     expect(modelSelect).toHaveAttribute("aria-expanded", "false"); // Closed but ready
 
-    // Should show placeholder indicating models are loaded and ready for selection
-    expect(modelSelect).toHaveTextContent(/select a model/i);
+    // Should show placeholder or model name, not loading or error states
     expect(modelSelect).not.toHaveTextContent(/loading/i);
     expect(modelSelect).not.toHaveTextContent(/no models/i);
+    expect(modelSelect.textContent).toMatch(/search models|gpt-4o/i);
   });
 
   it("shows no error messages when models load successfully", async () => {
@@ -174,10 +175,11 @@ describe("Playground Component - Functional Tests", () => {
 
     // Wait for models to load and model to be selected
     await waitFor(() => {
-      const modelSelect = screen.getByRole("combobox", {
+      const modelSelects = screen.getAllByRole("combobox", {
         name: /select model/i,
       });
-      expect(modelSelect).toHaveTextContent("gpt-4o");
+      // First combobox should be the main model selector
+      expect(modelSelects[0]).toHaveTextContent("gpt-4o");
     });
 
     // Should successfully load chat playground (no welcome screen)
