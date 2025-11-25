@@ -65,7 +65,7 @@ pub async fn create_transaction(
         user_id: data.user_id,
         transaction_type: CreditTransactionType::from(&data.transaction_type),
         amount: data.amount,
-        source_id: data.source_id.to_string(),
+        source_id: data.source_id,
         description: data.description,
     };
 

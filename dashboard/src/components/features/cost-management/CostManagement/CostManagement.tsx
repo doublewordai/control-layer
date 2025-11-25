@@ -18,14 +18,24 @@ export function CostManagement() {
   const isDemoMode = isFeatureEnabled("demo");
   const { data: config } = useConfig();
 
+  const [showSuccessModal, setShowSuccessModal] = useState(false);
+  const [showCancelledModal, setShowCancelledModal] = useState(false);
+
   // Fetch current user
   const { data: user } = useUser("current");
   const addFundsMutation = useAddFunds();
   const createPaymentMutation = useCreatePayment();
-  const processPaymentMutation = useProcessPayment();
-
-  const [showSuccessModal, setShowSuccessModal] = useState(false);
-  const [showCancelledModal, setShowCancelledModal] = useState(false);
+  const processPaymentMutation = useProcessPayment({
+    onSuccess: () => {
+      setTimeout(() => {
+        console.log('Closing modal now');
+        setShowSuccessModal(false);
+      }, 2000);
+    },
+    onError: (error) => {
+      console.error('Payment processing error:', error);
+    }
+  });
 
   // Handle return from payment provider
   useEffect(() => {

@@ -40,8 +40,7 @@ pub struct CreditTransactionCreate {
     #[schema(value_type = f64)]
     pub amount: Decimal,
     /// Source ID for the transaction (user UUID, or UUID-suffix for grants)
-    #[schema(value_type = String)]
-    pub source_id: UserId,
+    pub source_id: String,
     /// Optional description of the transaction
     pub description: Option<String>,
 }

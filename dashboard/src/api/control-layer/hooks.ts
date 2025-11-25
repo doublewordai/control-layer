@@ -872,12 +872,17 @@ export function useCreatePayment() {
   });
 }
 
-export function useProcessPayment() {
+export function useProcessPayment(options?: {
+  onSuccess?: () => void;
+  onError?: (error: Error) => void;
+}) {
   const queryClient = useQueryClient();
 
   return useMutation({
     mutationKey: ["payments", "process"],
-    mutationFn: (sessionId: string) => dwctlApi.payments.process(sessionId),
+    mutationFn: async (sessionId: string) => {
+      await dwctlApi.payments.process(sessionId)
+    },
     onSuccess: () => {
       // Refetch user data to update balance after successful payment
       queryClient.invalidateQueries({
@@ -887,6 +892,13 @@ export function useProcessPayment() {
         queryKey: ["cost", "transactions"],
         exact: false,
       });
+      // Call the component's callback if provided
+      options?.onSuccess?.();
+    },
+    onError: (error) => {
+      console.error('[useProcessPayment] onError callback triggered:', error);
+      // Call the component's error callback if provided
+      options?.onError?.(error as Error);
     },
   });
 }
