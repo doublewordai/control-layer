@@ -40,10 +40,11 @@ export function CostManagement() {
     if (isDemoMode) {
       // Demo mode: Call the API (which will be intercepted by MSW)
       const fundAmount = 100.0;
+      const targetUserId = filterUserId || user?.id || "";
       try {
         await addFundsMutation.mutateAsync({
           source_id: user?.id || "",
-          user_id: user?.id || "",
+          user_id: targetUserId,
           amount: fundAmount,
           description: "Funds purchase - Demo top up"
         });
@@ -72,7 +73,7 @@ export function CostManagement() {
     <div className="p-6">
       {user && (
         <TransactionHistory
-          userId={user.id}
+          userId={filterUserId || user.id}
           onAddFunds={canAddFunds ? handleAddFunds : undefined}
           isAddingFunds={addFundsMutation.isPending}
           showCard={false}

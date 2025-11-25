@@ -29,7 +29,7 @@ import {
   TableRow,
 } from "../../../ui/table.tsx";
 import type { Transaction } from "@/api/control-layer";
-import { useUserBalance, useTransactions } from "@/api/control-layer";
+import { useUserBalance, useTransactions, useUser } from "@/api/control-layer";
 import { useSettings } from "@/contexts";
 
 export interface TransactionHistoryProps {
@@ -49,6 +49,9 @@ export function TransactionHistory({
 }: TransactionHistoryProps) {
   const { isFeatureEnabled } = useSettings();
   const isDemoMode = isFeatureEnabled("demo");
+
+  // Fetch user info for display
+  const { data: displayUser } = useUser(filterUserId || userId);
 
   // Fetch balance and transactions
   const {
@@ -214,22 +217,29 @@ export function TransactionHistory({
     <>
       {/* Header with Title and Balance */}
       <div className="flex items-center justify-between mb-6">
-        <div className="flex items-center gap-3">
-          <h2 className="text-2xl font-semibold text-doubleword-neutral-900">
-            Transaction History
-          </h2>
-          <Button
-            variant="ghost"
-            size="sm"
-            onClick={handleRefresh}
-            disabled={isRefreshing || isLoading}
-            className="h-8 w-8 p-0"
-            title="Refresh balance and transactions"
-          >
-            <RefreshCw
-              className={`h-4 w-4 ${isRefreshing ? "animate-spin" : ""}`}
-            />
-          </Button>
+        <div>
+          <div className="flex items-center gap-3">
+            <h2 className="text-2xl font-semibold text-doubleword-neutral-900">
+              Transaction History
+            </h2>
+            <Button
+              variant="ghost"
+              size="sm"
+              onClick={handleRefresh}
+              disabled={isRefreshing || isLoading}
+              className="h-8 w-8 p-0"
+              title="Refresh balance and transactions"
+            >
+              <RefreshCw
+                className={`h-4 w-4 ${isRefreshing ? "animate-spin" : ""}`}
+              />
+            </Button>
+          </div>
+          {displayUser && (
+            <p className="text-sm text-gray-600 mt-1">
+              Showing transactions for user <span className="font-medium">{displayUser.email}</span>
+            </p>
+          )}
         </div>
         <div className="flex items-center gap-3">
           <div className="flex items-center gap-2 text-sm">
@@ -312,7 +322,7 @@ export function TransactionHistory({
           )}
         </div>
 
-        <div className="mb-0">
+        <div className="-mt-2 mb-0">
           <Table>
             <TableHeader>
               <TableRow>
