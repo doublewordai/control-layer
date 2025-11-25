@@ -1,13 +1,14 @@
 //! HTTP handlers for inference endpoint management.
 
 use crate::{
+    AppState,
     api::models::inference_endpoints::{
         InferenceEndpointCreate, InferenceEndpointResponse, InferenceEndpointUpdate, InferenceEndpointValidate,
         InferenceEndpointValidateResponse, ListEndpointsQuery, OpenAIModelsResponse,
     },
-    auth::permissions::{operation, resource, RequiresPermission},
+    auth::permissions::{RequiresPermission, operation, resource},
     db::{
-        handlers::{inference_endpoints::InferenceEndpointFilter, Deployments, InferenceEndpoints, Repository},
+        handlers::{Deployments, InferenceEndpoints, Repository, inference_endpoints::InferenceEndpointFilter},
         models::inference_endpoints::{InferenceEndpointCreateDBRequest, InferenceEndpointUpdateDBRequest},
     },
     errors::{Error, Result},
@@ -16,7 +17,6 @@ use crate::{
         endpoint_sync::{self, sync_endpoint_models_with_aliases, update_endpoint_aliases},
     },
     types::InferenceEndpointId,
-    AppState,
 };
 use axum::{
     extract::{Path, Query, State},
@@ -579,8 +579,8 @@ mod tests {
     use serde_json::json;
     use sqlx::PgPool;
     use wiremock::{
-        matchers::{method, path},
         Mock, MockServer, ResponseTemplate,
+        matchers::{method, path},
     };
 
     #[sqlx::test]
@@ -1419,7 +1419,22 @@ mod tests {
     #[sqlx::test]
     #[test_log::test]
     async fn test_multi_role_user_endpoint_permissions(pool: PgPool) {
-        let (app, _bg_services) = create_test_app(pool.clone(), false).await;
+        // Setup wiremock server to mock the inference endpoint
+        let mock_server = wiremock::MockServer::start().await;
+
+        // Mock the models list endpoint (used during synchronization and validation)
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/v1/models"))
+            .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "data": [
+                    {"id": "gpt-3.5-turbo", "object": "model"},
+                    {"id": "gpt-4", "object": "model"}
+                ]
+            })))
+            .mount(&mock_server)
+            .await;
+
+        let (app, bg_services) = create_test_app(pool.clone(), false).await;
 
         // User with StandardUser + RequestViewer should be able to read endpoints (from StandardUser)
         let multi_role_user = create_test_user_with_roles(&pool, vec![Role::StandardUser, Role::RequestViewer]).await;
@@ -1435,7 +1450,7 @@ mod tests {
         // But should NOT be able to modify endpoints (needs PlatformManager)
         let create_request = json!({
             "name": "Multi Role Endpoint",
-            "url": "https://api.multirole.com/v1"
+            "url": format!("{}/v1", mock_server.uri())
         });
 
         let response = app
@@ -1505,6 +1520,9 @@ mod tests {
             .await;
 
         response.assert_status(axum::http::StatusCode::NO_CONTENT);
+
+        // Gracefully shutdown background services to avoid slow test cleanup
+        bg_services.shutdown().await;
     }
 
     #[sqlx::test]

@@ -67,8 +67,8 @@
 
 use clap::Parser;
 use figment::{
-    providers::{Env, Format, Yaml},
     Figment,
+    providers::{Env, Format, Yaml},
 };
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;

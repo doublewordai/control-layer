@@ -1,8 +1,8 @@
 //! OpenAPI/Swagger documentation configuration for the admin API.
 
 use utoipa::{
-    openapi::security::{ApiKey, ApiKeyValue, HttpAuthScheme, HttpBuilder, SecurityScheme},
     Modify, OpenApi,
+    openapi::security::{ApiKey, ApiKeyValue, HttpAuthScheme, HttpBuilder, SecurityScheme},
 };
 
 use crate::{api, sync};

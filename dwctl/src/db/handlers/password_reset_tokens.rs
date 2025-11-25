@@ -18,7 +18,7 @@ use crate::{
             PasswordResetTokenUpdateRequest,
         },
     },
-    types::{abbrev_uuid, UserId},
+    types::{UserId, abbrev_uuid},
 };
 
 pub struct PasswordResetTokens<'c> {

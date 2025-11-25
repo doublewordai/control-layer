@@ -1,5 +1,5 @@
 use clap::Parser;
-use dwctl::{telemetry, Application, Config};
+use dwctl::{Application, Config, telemetry};
 
 /// Wait for shutdown signal (SIGTERM or Ctrl+C)
 async fn shutdown_signal() {
