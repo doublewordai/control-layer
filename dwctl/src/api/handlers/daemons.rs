@@ -2,13 +2,13 @@
 //!
 //! Provides endpoints for monitoring daemon status.
 
-use crate::api::models::daemons::{DaemonResponse, DaemonStats, DaemonStatus, ListDaemonsQuery, ListDaemonsResponse};
-use crate::auth::permissions::{operation, resource, RequiresPermission};
-use crate::errors::Result;
 use crate::AppState;
+use crate::api::models::daemons::{DaemonResponse, DaemonStats, DaemonStatus, ListDaemonsQuery, ListDaemonsResponse};
+use crate::auth::permissions::{RequiresPermission, operation, resource};
+use crate::errors::Result;
 use axum::{
-    extract::{Query, State},
     Json,
+    extract::{Query, State},
 };
 use fusillade::daemon::AnyDaemonRecord;
 use fusillade::manager::DaemonStorage;

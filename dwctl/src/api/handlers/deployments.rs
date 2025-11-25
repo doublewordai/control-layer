@@ -1,19 +1,19 @@
 //! HTTP handlers for model deployment endpoints.
 
 use crate::{
+    AppState,
     api::models::{
         deployments::{DeployedModelCreate, DeployedModelResponse, DeployedModelUpdate, GetModelQuery, ListModelsQuery, ModelProbeStatus},
         pagination::PaginatedResponse,
         users::CurrentUser,
     },
-    auth::permissions::{can_read_all_resources, has_permission, operation, resource, RequiresPermission},
+    auth::permissions::{RequiresPermission, can_read_all_resources, has_permission, operation, resource},
     db::{
-        handlers::{analytics::get_model_metrics, deployments::DeploymentFilter, Deployments, Groups, InferenceEndpoints, Repository},
+        handlers::{Deployments, Groups, InferenceEndpoints, Repository, analytics::get_model_metrics, deployments::DeploymentFilter},
         models::deployments::{DeploymentCreateDBRequest, DeploymentUpdateDBRequest, ModelPricing, ModelStatus},
     },
     errors::{Error, Result},
     types::{DeploymentId, GroupId, Resource},
-    AppState,
 };
 use axum::{
     extract::{Path, Query, State},
@@ -141,10 +141,10 @@ pub async fn list_deployed_models(
     }
 
     // Apply search filter if specified
-    if let Some(search) = query.search.as_ref() {
-        if !search.trim().is_empty() {
-            filter = filter.with_search(search.trim().to_string());
-        }
+    if let Some(search) = query.search.as_ref()
+        && !search.trim().is_empty()
+    {
+        filter = filter.with_search(search.trim().to_string());
     }
 
     // Parse include parameter
@@ -261,7 +261,7 @@ pub async fn list_deployed_models(
 
         // Add groups if requested and available
         if include_groups {
-            if let (Some(ref model_groups_map), Some(ref groups_map)) = (&model_groups_map, &groups_map) {
+            if let (Some(model_groups_map), Some(groups_map)) = (&model_groups_map, &groups_map) {
                 if let Some(group_ids) = model_groups_map.get(&model_response.id) {
                     let model_groups: Vec<_> = group_ids
                         .iter()
@@ -281,42 +281,39 @@ pub async fn list_deployed_models(
         }
 
         // Add metrics if requested
-        if include_metrics {
-            if let Some(ref metrics_map) = metrics_map {
-                if let Some(metrics) = metrics_map.get(&model_response.alias) {
-                    model_response = model_response.with_metrics(metrics.clone());
-                }
-                // If no metrics found for this model, just skip it (no warning needed - model might be new)
-            }
+        if include_metrics
+            && let Some(ref metrics_map) = metrics_map
+            && let Some(metrics) = metrics_map.get(&model_response.alias)
+        {
+            model_response = model_response.with_metrics(metrics.clone());
         }
+        // If no metrics found for this model, just skip it (no warning needed - model might be new)
 
         // Add probe status if requested
-        if include_status {
-            if let Some(ref statuses) = status_map {
-                if let Some((probe_id, active, interval_seconds, last_check, last_success, uptime_percentage)) =
-                    statuses.get(&model_response.id)
-                {
-                    let status = ModelProbeStatus {
-                        probe_id: *probe_id,
-                        active: *active,
-                        interval_seconds: *interval_seconds,
-                        last_check: *last_check,
-                        last_success: *last_success,
-                        uptime_percentage: *uptime_percentage,
-                    };
-                    model_response = model_response.with_status(status);
-                } else {
-                    // No probe for this model - set default status
-                    let status = ModelProbeStatus {
-                        probe_id: None,
-                        active: false,
-                        interval_seconds: None,
-                        last_check: None,
-                        last_success: None,
-                        uptime_percentage: None,
-                    };
-                    model_response = model_response.with_status(status);
-                }
+        if include_status && let Some(ref statuses) = status_map {
+            if let Some((probe_id, active, interval_seconds, last_check, last_success, uptime_percentage)) =
+                statuses.get(&model_response.id)
+            {
+                let status = ModelProbeStatus {
+                    probe_id: *probe_id,
+                    active: *active,
+                    interval_seconds: *interval_seconds,
+                    last_check: *last_check,
+                    last_success: *last_success,
+                    uptime_percentage: *uptime_percentage,
+                };
+                model_response = model_response.with_status(status);
+            } else {
+                // No probe for this model - set default status
+                let status = ModelProbeStatus {
+                    probe_id: None,
+                    active: false,
+                    interval_seconds: None,
+                    last_check: None,
+                    last_success: None,
+                    uptime_percentage: None,
+                };
+                model_response = model_response.with_status(status);
             }
         }
 
@@ -444,7 +441,7 @@ pub async fn update_deployed_model(
             return Err(Error::NotFound {
                 resource: "Deployment".to_string(),
                 id: deployment_id.to_string(),
-            })
+            });
         }
         Err(e) => return Err(e.into()),
     }
@@ -755,10 +752,12 @@ mod tests {
         response.assert_status_ok();
         let models: PaginatedResponse<DeployedModelResponse> = response.json();
 
-        assert!(models
-            .data
-            .iter()
-            .any(|it| { it.id == deployment.id && it.groups.as_deref().is_some_and(|gs| gs.len() == 1 && gs[0].id == group.id) }));
+        assert!(
+            models
+                .data
+                .iter()
+                .any(|it| { it.id == deployment.id && it.groups.as_deref().is_some_and(|gs| gs.len() == 1 && gs[0].id == group.id) })
+        );
 
         // Test with include=groups and endpoint filter
         let test_endpoint_id = get_test_endpoint_id(&pool).await;
@@ -770,10 +769,12 @@ mod tests {
 
         response.assert_status_ok();
         let models: PaginatedResponse<DeployedModelResponse> = response.json();
-        assert!(models
-            .data
-            .iter()
-            .any(|it| { it.id == deployment.id && it.groups.as_deref().is_some_and(|gs| gs.iter().any(|g| g.id == group.id)) }));
+        assert!(
+            models
+                .data
+                .iter()
+                .any(|it| { it.id == deployment.id && it.groups.as_deref().is_some_and(|gs| gs.iter().any(|g| g.id == group.id)) })
+        );
     }
 
     #[sqlx::test]

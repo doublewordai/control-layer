@@ -7,7 +7,7 @@ use crate::db::errors::DbError;
 use crate::db::errors::Result;
 use crate::db::handlers::repository::Repository;
 use crate::db::models::api_keys::{ApiKeyCreateDBRequest, ApiKeyDBResponse, ApiKeyPurpose, ApiKeyUpdateDBRequest};
-use crate::types::{abbrev_uuid, ApiKeyId, DeploymentId, UserId};
+use crate::types::{ApiKeyId, DeploymentId, UserId, abbrev_uuid};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use sqlx::FromRow;

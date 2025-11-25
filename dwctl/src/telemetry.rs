@@ -32,9 +32,9 @@ use opentelemetry_otlp::{Protocol, WithExportConfig, WithHttpConfig};
 use opentelemetry_sdk::trace::TracerProvider;
 use std::collections::HashMap;
 use tracing::info;
+use tracing_subscriber::EnvFilter;
 use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::util::SubscriberInitExt;
-use tracing_subscriber::EnvFilter;
 
 /// Initialize tracing with optional OpenTelemetry support
 ///

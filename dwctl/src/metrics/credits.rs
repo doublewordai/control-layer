@@ -1,7 +1,7 @@
 //! Credit balance metrics for Prometheus.
 
 use once_cell::sync::Lazy;
-use prometheus::{register_int_counter, register_int_counter_vec, IntCounter, IntCounterVec};
+use prometheus::{IntCounter, IntCounterVec, register_int_counter, register_int_counter_vec};
 
 /// Counter for successful credit deductions
 static CREDITS_DEDUCTED: Lazy<IntCounterVec> = Lazy::new(|| {

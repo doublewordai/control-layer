@@ -62,9 +62,9 @@ pub struct AuthSuccessResponse {
 
 /// Response models that implement IntoResponse for cleaner handler code
 use axum::{
-    http::{header, HeaderMap, StatusCode},
-    response::{IntoResponse, Response},
     Json,
+    http::{HeaderMap, StatusCode, header},
+    response::{IntoResponse, Response},
 };
 
 /// Structured response for successful registration

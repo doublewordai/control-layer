@@ -4,7 +4,7 @@
 //! All endpoints use offset-based pagination with `skip` and `limit` parameters.
 
 use serde::{Deserialize, Serialize};
-use serde_with::{serde_as, DisplayFromStr};
+use serde_with::{DisplayFromStr, serde_as};
 use utoipa::{IntoParams, ToSchema};
 
 /// Default number of items to return per page.

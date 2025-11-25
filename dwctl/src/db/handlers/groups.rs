@@ -5,7 +5,7 @@ use crate::db::{
     handlers::repository::Repository,
     models::groups::{GroupCreateDBRequest, GroupDBResponse, GroupUpdateDBRequest},
 };
-use crate::types::{abbrev_uuid, DeploymentId, GroupId, Operation, UserId};
+use crate::types::{DeploymentId, GroupId, Operation, UserId, abbrev_uuid};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use sqlx::{FromRow, PgConnection};
@@ -535,7 +535,7 @@ mod tests {
     use crate::test_utils::get_test_endpoint_id;
     use crate::{
         db::{
-            handlers::{users::UserFilter, Credits, Deployments, Users},
+            handlers::{Credits, Deployments, Users, users::UserFilter},
             models::{
                 api_keys::ApiKeyCreateDBRequest,
                 credits::{CreditTransactionCreateDBRequest, CreditTransactionType},

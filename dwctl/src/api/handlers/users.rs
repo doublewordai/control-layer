@@ -1,18 +1,18 @@
 //! HTTP handlers for user management endpoints.
 
 use crate::{
+    AppState,
     api::models::{
         groups::GroupResponse,
         users::{CurrentUser, GetUserQuery, ListUsersQuery, UserCreate, UserResponse, UserUpdate},
     },
-    auth::permissions::{self as permissions, can_read_all_resources, can_read_own_resource, operation, resource, RequiresPermission},
+    auth::permissions::{self as permissions, RequiresPermission, can_read_all_resources, can_read_own_resource, operation, resource},
     db::{
-        handlers::{users::UserFilter, Credits, Groups, Repository, Users},
+        handlers::{Credits, Groups, Repository, Users, users::UserFilter},
         models::users::{UserCreateDBRequest, UserUpdateDBRequest},
     },
     errors::{Error, Result},
     types::{GroupId, Operation, Permission, Resource, UserId, UserIdOrCurrent},
-    AppState,
 };
 use axum::{
     extract::{Path, Query, State},
@@ -112,17 +112,17 @@ pub async fn list_users(
     for user in users {
         let mut response_user = UserResponse::from(user);
         // If includes groups
-        if let Some(groups_map) = &groups_map {
-            if let Some(user_groups_map) = &user_groups_map {
-                let group_ids = user_groups_map.get(&response_user.id).cloned().unwrap_or_default();
-                let groups: Vec<GroupResponse> = group_ids
-                    .iter()
-                    .filter_map(|group_id| groups_map.get(group_id))
-                    .cloned()
-                    .map(|group| group.into())
-                    .collect();
-                response_user = response_user.with_groups(groups);
-            }
+        if let Some(groups_map) = &groups_map
+            && let Some(user_groups_map) = &user_groups_map
+        {
+            let group_ids = user_groups_map.get(&response_user.id).cloned().unwrap_or_default();
+            let groups: Vec<GroupResponse> = group_ids
+                .iter()
+                .filter_map(|group_id| groups_map.get(group_id))
+                .cloned()
+                .map(|group| group.into())
+                .collect();
+            response_user = response_user.with_groups(groups);
         }
 
         // If includes billing

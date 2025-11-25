@@ -999,7 +999,7 @@ mod tests {
     #[sqlx::test]
     async fn test_probe_notify_trigger(pool: PgPool) {
         use sqlx::postgres::PgListener;
-        use tokio::time::{timeout, Duration};
+        use tokio::time::{Duration, timeout};
 
         let deployment_id = setup_test_deployment(&pool).await;
 

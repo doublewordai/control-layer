@@ -5,7 +5,7 @@ use std::{collections::HashMap, num::NonZeroU32, sync::Arc};
 use onwards::target::{
     Auth, ConcurrencyLimitParameters, ConfigFile, KeyDefinition, RateLimitParameters, TargetSpec, Targets, WatchTargetsStream,
 };
-use sqlx::{postgres::PgListener, PgPool};
+use sqlx::{PgPool, postgres::PgListener};
 use tokio::sync::{mpsc, watch};
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, instrument, warn};
@@ -23,7 +23,7 @@ pub enum SyncStatus {
 use crate::{
     config::{ONWARDS_CONFIG_CHANGED_CHANNEL, ONWARDS_INPUT_TOKEN_PRICE_HEADER, ONWARDS_OUTPUT_TOKEN_PRICE_HEADER},
     db::{
-        handlers::{api_keys::ApiKeys, deployments::DeploymentFilter, Deployments, InferenceEndpoints, Repository as _},
+        handlers::{Deployments, InferenceEndpoints, Repository as _, api_keys::ApiKeys, deployments::DeploymentFilter},
         models::{api_keys::ApiKeyDBResponse, deployments::DeploymentDBResponse},
     },
     types::{DeploymentId, InferenceEndpointId},
@@ -147,10 +147,10 @@ impl OnwardsConfigSync {
                                         }
 
                                         // Update daemon capacity limits if configured
-                                        if let Some(ref limits) = self.daemon_capacity_limits {
-                                            if let Err(e) = update_daemon_capacity_limits(&self.db, limits).await {
-                                                error!("Failed to update daemon capacity limits: {}", e);
-                                            }
+                                        if let Some(ref limits) = self.daemon_capacity_limits
+                                            && let Err(e) = update_daemon_capacity_limits(&self.db, limits).await
+                                        {
+                                            error!("Failed to update daemon capacity limits: {}", e);
                                         }
 
                                         // Send update through watch channel
@@ -446,7 +446,7 @@ mod tests {
 
     use crate::{
         db::models::deployments::{DeploymentDBResponse, ModelStatus},
-        sync::onwards_config::{convert_to_config_file, SyncConfig},
+        sync::onwards_config::{SyncConfig, convert_to_config_file},
     };
 
     // Helper function to create a test deployed model

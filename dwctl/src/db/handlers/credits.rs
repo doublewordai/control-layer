@@ -5,10 +5,10 @@ use crate::{
         errors::Result,
         models::credits::{CreditTransactionCreateDBRequest, CreditTransactionDBResponse, CreditTransactionType},
     },
-    types::{abbrev_uuid, UserId},
+    types::{UserId, abbrev_uuid},
 };
 use chrono::{DateTime, Utc};
-use rust_decimal::{prelude::ToPrimitive, Decimal};
+use rust_decimal::{Decimal, prelude::ToPrimitive};
 use serde::{Deserialize, Serialize};
 use sqlx::{Connection, FromRow, PgConnection};
 use std::collections::HashMap;
@@ -523,11 +523,13 @@ mod tests {
             };
         }
         // Assert non existent transaction ID returns None
-        assert!(credits
-            .get_transaction_by_id(Uuid::new_v4())
-            .await
-            .expect("Failed to get transaction by ID 99999999999")
-            .is_none())
+        assert!(
+            credits
+                .get_transaction_by_id(Uuid::new_v4())
+                .await
+                .expect("Failed to get transaction by ID 99999999999")
+                .is_none()
+        )
     }
 
     #[sqlx::test]
