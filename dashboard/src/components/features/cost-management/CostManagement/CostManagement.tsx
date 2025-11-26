@@ -1,8 +1,10 @@
 import { useEffect, useState } from "react";
+import { useSearchParams } from "react-router-dom";
 import { useUser, useAddFunds, useConfig, useCreatePayment, useProcessPayment } from "@/api/control-layer";
 import { toast } from "sonner";
 import { useSettings } from "@/contexts";
 import { TransactionHistory } from "@/components/features/cost-management/CostManagement/TransactionHistory.tsx";
+import { AddFundsModal } from "@/components/modals/AddCreditsModal/AddCreditsModal";
 import {
   Dialog,
   DialogContent,
@@ -12,26 +14,63 @@ import {
 } from "@/components/ui/dialog";
 import { Button } from "@/components/ui/button";
 import { CheckCircle2, XCircle, Loader2 } from "lucide-react";
+import type { DisplayUser } from "@/types/display";
 
 export function CostManagement() {
-  const { isFeatureEnabled } = useSettings();
+  const [searchParams] = useSearchParams();
+  const { isFeatureEnabled, settings } = useSettings();
   const isDemoMode = isFeatureEnabled("demo");
   const { data: config } = useConfig();
 
   const [showSuccessModal, setShowSuccessModal] = useState(false);
   const [showCancelledModal, setShowCancelledModal] = useState(false);
+  const [showAddFundsModal, setShowAddFundsModal] = useState(false);
 
-  // Fetch current user
-  const { data: user } = useUser("current");
+  // Check if we're filtering by a specific user
+  const filterUserId = searchParams.get("user");
+
+  // Fetch current user and display user (the one we're viewing billing for)
+  const { data: currentUser, refetch: refetchCurrentUser } = useUser("current");
+  const { data: displayUser, refetch: refetchDisplayUser } = useUser(filterUserId || "current");
+
   const addFundsMutation = useAddFunds();
   const createPaymentMutation = useCreatePayment();
   const processPaymentMutation = useProcessPayment({
     onSuccess: () => {
       setTimeout(() => {
         setShowSuccessModal(false);
+        // Refetch user data to get latest balance
+        refetchCurrentUser();
+        refetchDisplayUser();
       }, 2000);
     },
   });
+
+  // Check if user has permission to add funds (PlatformManager or BillingManager)
+  const canManageFunds = currentUser?.roles?.some(
+    (role) => role === "PlatformManager" || role === "BillingManager"
+  );
+
+  const handleAddFundsSuccess = () => {
+    // Refetch user data to get latest balance
+    refetchCurrentUser();
+    refetchDisplayUser();
+  };
+
+  // Handle redirect to payment provider
+  const handleRedirectToPaymentProvider = () => {
+    const paymentProviderUrl = settings.paymentProviderUrl;
+    if (!paymentProviderUrl) {
+      return;
+    }
+
+    // Build callback URL to return to this page, including query parameters
+    const callbackUrl = `${window.location.origin}${window.location.pathname}${window.location.search}`;
+
+    // Redirect to payment provider with callback URL
+    const redirectUrl = `${paymentProviderUrl}?callback=${encodeURIComponent(callbackUrl)}`;
+    window.location.href = redirectUrl;
+  };
 
   // Handle return from payment provider
   useEffect(() => {
@@ -77,8 +116,8 @@ export function CostManagement() {
       const fundAmount = 100.0;
       try {
         await addFundsMutation.mutateAsync({
-          source_id: user?.id || "",
-          user_id: user?.id || "",
+          source_id: displayUser?.id || "",
+          user_id: displayUser?.id || "",
           amount: fundAmount,
           description: "Funds purchase - Demo top up"
         });
@@ -89,7 +128,8 @@ export function CostManagement() {
     } else if (config?.payment_enabled) {
       // Payment processing enabled: Get checkout URL and redirect using the mutation hook
       try {
-        const data = await createPaymentMutation.mutateAsync();
+        // Pass filterUserId as creditee_id when viewing another user's billing
+        const data = await createPaymentMutation.mutateAsync(filterUserId || undefined);
         if (data.url) {
           // Navigate to payment provider checkout page
           window.location.href = data.url;
@@ -104,27 +144,55 @@ export function CostManagement() {
     }
   };
 
-  // Only show Add Funds button if in demo mode or payment processing is enabled
-  const canAddFunds = isDemoMode || !!config?.payment_enabled;
+  // Determine add funds configuration
+  const addFundsConfig = (() => {
+    const hasPaymentEnabled = isDemoMode || !!config?.payment_enabled;
+    const hasPaymentProvider = !!settings.paymentProviderUrl;
+
+    if (!hasPaymentEnabled && !hasPaymentProvider) {
+      // No payment processing configured at all
+      return canManageFunds ? {
+        type: 'direct' as const,
+        onAddFunds: () => setShowAddFundsModal(true)
+      } : undefined;
+    }
+
+    // Payment processing is configured (either Stripe or external provider)
+    if (canManageFunds) {
+      // Admin: split button (payment redirect/checkout primary, direct in dropdown)
+      return {
+        type: 'split' as const,
+        onPrimaryAction: hasPaymentProvider ? handleRedirectToPaymentProvider : handleAddFunds,
+        onDirectAction: () => setShowAddFundsModal(true)
+      };
+    } else {
+      // Non-admin: simple payment button
+      return {
+        type: hasPaymentProvider ? 'redirect' as const : 'direct' as const,
+        onAddFunds: hasPaymentProvider ? handleRedirectToPaymentProvider : handleAddFunds
+      };
+    }
+  })();
 
   return (
     <div className="p-6">
-      <div className="mb-8">
-        <h1 className="text-3xl font-bold text-doubleword-neutral-900">
-          Cost Management
-        </h1>
-        <p className="text-doubleword-neutral-600 mt-2">
-          Monitor your credit balance and transaction history
-        </p>
-      </div>
-
-      {user && (
-        <TransactionHistory
-          userId={user.id}
-          onAddFunds={canAddFunds ? handleAddFunds : undefined}
-          isAddingFunds={addFundsMutation.isPending}
-          showCard={false}
-        />
+      {currentUser && displayUser && (
+        <>
+          <TransactionHistory
+            userId={filterUserId || currentUser.id}
+            addFundsConfig={addFundsConfig}
+            showCard={false}
+            filterUserId={filterUserId || undefined}
+          />
+          {canManageFunds && (
+            <AddFundsModal
+              isOpen={showAddFundsModal}
+              onClose={() => setShowAddFundsModal(false)}
+              targetUser={displayUser as DisplayUser}
+              onSuccess={handleAddFundsSuccess}
+            />
+          )}
+        </>
       )}
 
       {/* Payment Success Modal */}

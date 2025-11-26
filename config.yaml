@@ -33,7 +33,7 @@ secret_key: insecure-change-in-production
 # For production, configure Stripe or another provider
 payment:
   dummy:
-    host_url: "http://localhost:3001"
+    host_url: "http://localhost:5173"
     amount: 100.00
 
 # Model sources - inference endpoints to connect to

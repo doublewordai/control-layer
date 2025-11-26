@@ -30,39 +30,58 @@ impl DummyProvider {
 
 #[async_trait]
 impl PaymentProvider for DummyProvider {
-    async fn create_checkout_session(&self, _db_pool: &PgPool, user: &CurrentUser, _cancel_url: &str, success_url: &str) -> Result<String> {
-        // Generate a unique session ID that includes the user ID
-        // This allows us to retrieve the user ID in process_payment_session
-        let session_id = format!("dummy_session_{}_{}", user.id, uuid::Uuid::new_v4());
+    async fn create_checkout_session(
+        &self,
+        _db_pool: &PgPool,
+        user: &CurrentUser,
+        creditee_id: Option<&str>,
+        _cancel_url: &str,
+        success_url: &str,
+    ) -> Result<String> {
+        // Determine which user will receive the credits
+        // If creditee_id is provided, use that; otherwise use the authenticated user
+        let user_id_string = user.id.to_string();
+        let recipient_id = creditee_id.unwrap_or(&user_id_string);
+
+        // Generate a unique session ID that includes both payer and recipient user IDs
+        // Format: dummy_session_{recipient_id}_{payer_id}_{uuid}
+        let session_id = format!("dummy_session_{}_{}_{}", recipient_id, user.id, uuid::Uuid::new_v4());
 
         // Build success URL with session ID
         let redirect_url = success_url.replace("{CHECKOUT_SESSION_ID}", &session_id);
 
-        tracing::info!("Dummy provider created checkout session {} for user {}", session_id, user.id);
+        tracing::info!(
+            "Dummy provider created checkout session {} for user {} (payer: {})",
+            session_id,
+            recipient_id,
+            user.id
+        );
 
         // Return the success URL - payment is instantly "complete" for dummy provider
         Ok(redirect_url)
     }
 
     async fn get_payment_session(&self, session_id: &str) -> Result<PaymentSession> {
-        // Parse the user ID from the session_id
-        // Format: dummy_session_{user_id}_{uuid}
+        // Parse the user IDs from the session_id
+        // Format: dummy_session_{recipient_id}_{payer_id}_{uuid}
         if !session_id.starts_with("dummy_session_") {
             return Err(PaymentError::InvalidData("Invalid dummy session ID format".to_string()));
         }
 
-        // Extract user_id from session_id
+        // Extract recipient_id and payer_id from session_id
         let parts: Vec<&str> = session_id.split('_').collect();
-        if parts.len() < 4 {
+        if parts.len() < 5 {
             return Err(PaymentError::InvalidData("Invalid dummy session ID format".to_string()));
         }
 
-        let user_id = parts[2];
+        let recipient_id = parts[2];
+        let payer_id = parts[3];
 
         Ok(PaymentSession {
-            user_id: user_id.to_string(),
+            user_id: recipient_id.to_string(),
             amount: self.amount,
             is_paid: true, // Dummy sessions are always "paid"
+            payer_id: Some(payer_id.to_string()),
         })
     }
 
@@ -97,22 +116,55 @@ impl PaymentProvider for DummyProvider {
         let mut conn = db_pool.acquire().await?;
         let mut credits = Credits::new(&mut conn);
 
-        let user_id: crate::types::UserId = payment_session.user_id.parse().map_err(|e| {
+        let creditee_id: crate::types::UserId = payment_session.user_id.parse().map_err(|e| {
             tracing::error!("Failed to parse user ID: {:?}", e);
             PaymentError::InvalidData(format!("Invalid user ID: {}", e))
         })?;
 
+        // Build description with payer information if available (same logic as Stripe)
+        let description = if let Some(payer_id_str) = &payment_session.payer_id {
+            // Look up the payer by their user ID
+            if let Ok(payer_id) = payer_id_str.parse::<crate::types::UserId>() {
+                let payer = sqlx::query!(
+                    r#"
+                    SELECT id, display_name, email
+                    FROM users
+                    WHERE id = $1
+                    "#,
+                    payer_id
+                )
+                .fetch_optional(db_pool)
+                .await?;
+
+                if let Some(payer) = payer {
+                    // Only include "from {name}" if the payer is different from the recipient
+                    if payer.id != creditee_id {
+                        let payer_name = payer.display_name.unwrap_or(payer.email);
+                        format!("Dummy payment (test) from {}", payer_name)
+                    } else {
+                        "Dummy payment (test)".to_string()
+                    }
+                } else {
+                    "Dummy payment (test)".to_string()
+                }
+            } else {
+                "Dummy payment (test)".to_string()
+            }
+        } else {
+            "Dummy payment (test)".to_string()
+        };
+
         let request = CreditTransactionCreateDBRequest {
-            user_id,
+            user_id: creditee_id,
             transaction_type: CreditTransactionType::Purchase,
             amount: payment_session.amount,
             source_id: session_id.to_string(),
-            description: Some("Dummy payment (test)".to_string()),
+            description: Some(description),
         };
 
         match credits.create_transaction(&request).await {
             Ok(_) => {
-                tracing::info!("Successfully fulfilled checkout session {} for user {}", session_id, user_id);
+                tracing::info!("Successfully fulfilled checkout session {} for user {}", session_id, creditee_id);
                 Ok(())
             }
             Err(crate::db::errors::DbError::UniqueViolation { constraint, .. }) => {
@@ -185,7 +237,7 @@ mod tests {
 
         // Step 1: Create checkout session
         let checkout_url = provider
-            .create_checkout_session(&pool, &user, cancel_url, success_url)
+            .create_checkout_session(&pool, &user, None, cancel_url, success_url)
             .await
             .unwrap();
 
@@ -244,7 +296,7 @@ mod tests {
 
         // Create checkout session
         let checkout_url = provider
-            .create_checkout_session(&pool, &user, cancel_url, success_url)
+            .create_checkout_session(&pool, &user, None, cancel_url, success_url)
             .await
             .unwrap();
 

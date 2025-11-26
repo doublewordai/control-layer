@@ -1,5 +1,4 @@
 import { useState } from "react";
-import { X } from "lucide-react";
 import {
   Dialog,
   DialogContent,
@@ -8,6 +7,8 @@ import {
   DialogTitle,
 } from "../../ui/dialog";
 import { Button } from "../../ui/button";
+import { Input } from "../../ui/input";
+import { Textarea } from "../../ui/textarea";
 import { useAddFunds, useUser } from "../../../api/control-layer/hooks";
 import { toast } from "sonner";
 import type { DisplayUser } from "../../../types/display";
@@ -59,7 +60,7 @@ export function AddFundsModal({
 
       const sentAmount = Number(result.amount).toFixed(2);
 
-      toast.success(`Successfully added $${sentAmount} to ${targetUser.name}`);
+      toast.success(`Successfully added $${sentAmount} to ${targetUser.display_name || targetUser.email}`);
       onSuccess?.();
       onClose();
 
@@ -76,19 +77,10 @@ export function AddFundsModal({
     <Dialog open={isOpen} onOpenChange={onClose}>
       <DialogContent className="sm:max-w-md">
         <DialogHeader>
-          <div className="flex items-center justify-between">
-            <DialogTitle className="text-2xl">Add Funds</DialogTitle>
-            <button
-              onClick={onClose}
-              className="text-doubleword-neutral-400 hover:text-doubleword-neutral-600 transition-colors"
-              aria-label="Close modal"
-            >
-              <X className="w-5 h-5" />
-            </button>
-          </div>
+          <DialogTitle className="text-2xl">Add to Credit Balance</DialogTitle>
           <DialogDescription>
-            You are about to add funds to <strong>{targetUser.name}</strong> (
-            {targetUser.email})
+            You are about to add funds to <strong>{targetUser.display_name || targetUser.email}</strong>
+            {targetUser.display_name && ` (${targetUser.email})`}
           </DialogDescription>
         </DialogHeader>
 
@@ -97,6 +89,7 @@ export function AddFundsModal({
         </AlertBox>
 
         <form onSubmit={handleSubmit} className="space-y-4 mt-4">
+
           <div>
             <label
               htmlFor="amount"
@@ -104,14 +97,13 @@ export function AddFundsModal({
             >
               Amount (USD)
             </label>
-            <input
+            <Input
               id="amount"
               type="number"
               min="0"
               step="0.01"
               value={amount}
               onChange={(e) => setAmount(e.target.value)}
-              className="w-full px-3 py-2 border border-doubleword-neutral-300 rounded-md focus:outline-none focus:ring-2 focus:ring-blue-500"
               placeholder="10.00"
               required
             />
@@ -124,11 +116,10 @@ export function AddFundsModal({
             >
               Description (optional)
             </label>
-            <textarea
+            <Textarea
               id="description"
               value={description}
               onChange={(e) => setDescription(e.target.value)}
-              className="w-full px-3 py-2 border border-doubleword-neutral-300 rounded-md focus:outline-none focus:ring-2 focus:ring-blue-500"
               placeholder="Enter description"
               rows={3}
             />
@@ -145,10 +136,9 @@ export function AddFundsModal({
             </Button>
             <Button
               type="submit"
-              className="bg-blue-600 hover:bg-blue-700"
               disabled={addFundsMutation.isPending}
             >
-              {addFundsMutation.isPending ? "Adding..." : "Add Funds"}
+              {addFundsMutation.isPending ? "Adding..." : "Add to Credit Balance"}
             </Button>
           </div>
         </form>

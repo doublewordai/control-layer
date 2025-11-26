@@ -1,1 +1,0 @@
-export { UserTransactionsModal } from "./UserTransactionsModal";
