@@ -10,6 +10,7 @@ import {
   DialogTitle,
 } from "../../ui/dialog";
 import { Button } from "../../ui/button";
+import { AlertBox } from "@/components/ui/alert-box";
 
 interface DeleteEndpointModalProps {
   isOpen: boolean;
@@ -69,11 +70,9 @@ export const DeleteEndpointModal: React.FC<DeleteEndpointModalProps> = ({
         </DialogHeader>
 
         <div className="space-y-4">
-          {error && (
-            <div className="p-3 bg-red-50 border border-red-200 rounded-lg">
-              <p className="text-sm text-red-600">{error}</p>
-            </div>
-          )}
+          <AlertBox variant="error" className="mb-4">
+            {error}
+          </AlertBox>
 
           <p className="text-gray-700">
             Are you sure you want to delete the endpoint{" "}

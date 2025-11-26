@@ -2,7 +2,7 @@ import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 import OpenAI from "openai";
 
 describe("Playground OpenAI Client Authentication", () => {
-  let fetchSpy: ReturnType<typeof vi.spyOn>;
+  let fetchSpy: any;
   let originalFetch: typeof fetch;
 
   beforeEach(() => {
@@ -72,14 +72,17 @@ describe("Playground OpenAI Client Authentication", () => {
     expect(fetchSpy).toHaveBeenCalled();
 
     // Find the OpenAI API call
-    const openaiCalls = fetchSpy.mock.calls.filter((call) =>
+    const openaiCalls = fetchSpy.mock.calls.filter((call: any) =>
       call[0]?.toString().includes("/chat/completions"),
     );
 
     expect(openaiCalls.length).toBeGreaterThan(0);
 
     // Check that the Authorization header is not present
-    const [_url, requestInit] = openaiCalls[0];
+    const [_url, requestInit] = openaiCalls[0] as [
+      unknown,
+      RequestInit | undefined,
+    ];
     const headers = new Headers(requestInit?.headers);
 
     // The Authorization header should not be present at all (unset)
@@ -117,14 +120,17 @@ describe("Playground OpenAI Client Authentication", () => {
     expect(fetchSpy).toHaveBeenCalled();
 
     // Find the OpenAI API call
-    const openaiCalls = fetchSpy.mock.calls.filter((call) =>
+    const openaiCalls = fetchSpy.mock.calls.filter((call: any) =>
       call[0]?.toString().includes("/chat/completions"),
     );
 
     expect(openaiCalls.length).toBeGreaterThan(0);
 
     // Check that the Authorization header IS present with the API key
-    const [_url, requestInit] = openaiCalls[0];
+    const [_url, requestInit] = openaiCalls[0] as [
+      unknown,
+      RequestInit | undefined,
+    ];
     const headers = new Headers(requestInit?.headers);
 
     expect(headers.has("Authorization")).toBe(true);

@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, beforeEach } from "vitest";
-import { render, screen } from "@testing-library/react";
+import { render, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { MemoryRouter } from "react-router-dom";
@@ -212,32 +212,40 @@ describe("Batches", () => {
 
   describe("Rendering", () => {
     it("should render the page title and description", () => {
-      render(<Batches {...defaultProps} />, { wrapper: createWrapper() });
+      const { container } = render(<Batches {...defaultProps} />, {
+        wrapper: createWrapper(),
+      });
 
-      expect(screen.getByText("Batch Processing")).toBeInTheDocument();
       expect(
-        screen.getByText(
+        within(container).getByText("Batch Processing"),
+      ).toBeInTheDocument();
+      expect(
+        within(container).getByText(
           "Upload files and create batches to process requests at scale",
         ),
       ).toBeInTheDocument();
     });
 
     it("should render upload file button", () => {
-      render(<Batches {...defaultProps} />, { wrapper: createWrapper() });
+      const { container } = render(<Batches {...defaultProps} />, {
+        wrapper: createWrapper(),
+      });
 
       expect(
-        screen.getByRole("button", { name: /upload file/i }),
+        within(container).getByRole("button", { name: /upload file/i }),
       ).toBeInTheDocument();
     });
 
     it("should render tabs", () => {
-      render(<Batches {...defaultProps} />, { wrapper: createWrapper() });
+      const { container } = render(<Batches {...defaultProps} />, {
+        wrapper: createWrapper(),
+      });
 
       expect(
-        screen.getByRole("tab", { name: /files \(2\)/i }),
+        within(container).getByRole("tab", { name: /files \(2\)/i }),
       ).toBeInTheDocument();
       expect(
-        screen.getByRole("tab", { name: /batches \(2\)/i }),
+        within(container).getByRole("tab", { name: /batches \(2\)/i }),
       ).toBeInTheDocument();
     });
   });
@@ -251,10 +259,12 @@ describe("Batches", () => {
         refetch: vi.fn(),
       } as any);
 
-      render(<Batches {...defaultProps} />, { wrapper: createWrapper() });
+      const { container } = render(<Batches {...defaultProps} />, {
+        wrapper: createWrapper(),
+      });
 
       // Use getAllByText since there are multiple "Loading..." texts
-      const loadingTexts = screen.getAllByText("Loading...");
+      const loadingTexts = within(container).getAllByText("Loading...");
       expect(loadingTexts.length).toBeGreaterThan(0);
     });
 
@@ -266,10 +276,12 @@ describe("Batches", () => {
         refetch: vi.fn(),
       } as any);
 
-      render(<Batches {...defaultProps} />, { wrapper: createWrapper() });
+      const { container } = render(<Batches {...defaultProps} />, {
+        wrapper: createWrapper(),
+      });
 
       // Use getAllByText since there are multiple "Loading..." texts
-      const loadingTexts = screen.getAllByText("Loading...");
+      const loadingTexts = within(container).getAllByText("Loading...");
       expect(loadingTexts.length).toBeGreaterThan(0);
     });
 
@@ -299,16 +311,20 @@ describe("Batches", () => {
         refetch: vi.fn(),
       } as any);
 
-      render(<Batches {...defaultProps} />, { wrapper: createWrapper() });
+      const { container } = render(<Batches {...defaultProps} />, {
+        wrapper: createWrapper(),
+      });
 
-      expect(screen.getByText("No files uploaded")).toBeInTheDocument();
       expect(
-        screen.getByText(
+        within(container).getByText("No files uploaded"),
+      ).toBeInTheDocument();
+      expect(
+        within(container).getByText(
           "Upload a .jsonl file to get started with batch processing",
         ),
       ).toBeInTheDocument();
       expect(
-        screen.getByRole("button", { name: /upload first file/i }),
+        within(container).getByRole("button", { name: /upload first file/i }),
       ).toBeInTheDocument();
     });
 
@@ -322,49 +338,66 @@ describe("Batches", () => {
         refetch: vi.fn(),
       } as any);
 
-      render(<Batches {...defaultProps} />, { wrapper: createWrapper() });
+      const { container } = render(<Batches {...defaultProps} />, {
+        wrapper: createWrapper(),
+      });
 
       // Switch to batches tab
-      await user.click(screen.getByRole("tab", { name: /batches/i }));
+      await user.click(
+        within(container).getByRole("tab", { name: /batches/i }),
+      );
 
-      expect(screen.getByText("No batches created")).toBeInTheDocument();
       expect(
-        screen.getByText(
+        within(container).getByText("No batches created"),
+      ).toBeInTheDocument();
+      expect(
+        within(container).getByText(
           "Create a batch from an uploaded file to start processing requests",
         ),
       ).toBeInTheDocument();
       expect(
-        screen.getByRole("button", { name: /create first batch/i }),
+        within(container).getByRole("button", { name: /create first batch/i }),
       ).toBeInTheDocument();
     });
   });
 
   describe("Files Tab", () => {
     it("should display files in the table", () => {
-      render(<Batches {...defaultProps} />, { wrapper: createWrapper() });
+      const { container } = render(<Batches {...defaultProps} />, {
+        wrapper: createWrapper(),
+      });
 
-      expect(screen.getByText("test_file.jsonl")).toBeInTheDocument();
-      expect(screen.getByText("another_file.jsonl")).toBeInTheDocument();
+      expect(
+        within(container).getByText("test_file.jsonl"),
+      ).toBeInTheDocument();
+      expect(
+        within(container).getByText("another_file.jsonl"),
+      ).toBeInTheDocument();
     });
 
     it("should open upload modal when upload button is clicked", async () => {
       const user = userEvent.setup();
       const onOpenUploadModal = vi.fn();
-      render(
+      const { container } = render(
         <Batches {...defaultProps} onOpenUploadModal={onOpenUploadModal} />,
         { wrapper: createWrapper() },
       );
 
-      await user.click(screen.getByRole("button", { name: /upload file/i }));
+      await user.click(
+        within(container).getByRole("button", { name: /upload file/i }),
+      );
 
       expect(onOpenUploadModal).toHaveBeenCalledTimes(1);
     });
 
     it("should allow searching files", async () => {
       const user = userEvent.setup();
-      render(<Batches {...defaultProps} />, { wrapper: createWrapper() });
+      const { container } = render(<Batches {...defaultProps} />, {
+        wrapper: createWrapper(),
+      });
 
-      const searchInput = screen.getByPlaceholderText(/search files/i);
+      const searchInput =
+        within(container).getByPlaceholderText(/search files/i);
       await user.type(searchInput, "test");
 
       expect(searchInput).toHaveValue("test");
@@ -372,25 +405,35 @@ describe("Batches", () => {
 
     it("should filter files based on search query", async () => {
       const user = userEvent.setup();
-      render(<Batches {...defaultProps} />, { wrapper: createWrapper() });
+      const { container } = render(<Batches {...defaultProps} />, {
+        wrapper: createWrapper(),
+      });
 
-      const searchInput = screen.getByPlaceholderText(/search files/i);
+      const searchInput =
+        within(container).getByPlaceholderText(/search files/i);
       await user.type(searchInput, "test_file");
 
       // After filtering, only test_file.jsonl should be visible
-      expect(screen.getByText("test_file.jsonl")).toBeInTheDocument();
+      expect(
+        within(container).getByText("test_file.jsonl"),
+      ).toBeInTheDocument();
     });
   });
 
   describe("Batches Tab", () => {
     it("should allow searching batches", async () => {
       const user = userEvent.setup();
-      render(<Batches {...defaultProps} />, { wrapper: createWrapper() });
+      const { container } = render(<Batches {...defaultProps} />, {
+        wrapper: createWrapper(),
+      });
 
       // Switch to batches tab
-      await user.click(screen.getByRole("tab", { name: /batches/i }));
+      await user.click(
+        within(container).getByRole("tab", { name: /batches/i }),
+      );
 
-      const searchInput = screen.getByPlaceholderText(/search batches/i);
+      const searchInput =
+        within(container).getByPlaceholderText(/search batches/i);
       await user.type(searchInput, "batch-1");
 
       expect(searchInput).toHaveValue("batch-1");
@@ -398,12 +441,16 @@ describe("Batches", () => {
 
     it("should display batch status correctly", async () => {
       const user = userEvent.setup();
-      render(<Batches {...defaultProps} />, { wrapper: createWrapper() });
+      const { container } = render(<Batches {...defaultProps} />, {
+        wrapper: createWrapper(),
+      });
 
-      await user.click(screen.getByRole("tab", { name: /batches/i }));
+      await user.click(
+        within(container).getByRole("tab", { name: /batches/i }),
+      );
 
       // Check for status badges - there should be multiple "completed" texts
-      const completedElements = screen.getAllByText(/completed/i);
+      const completedElements = within(container).getAllByText(/completed/i);
       expect(completedElements.length).toBeGreaterThan(0);
 
       // Check specifically for the status badge with class
@@ -413,24 +460,30 @@ describe("Batches", () => {
       expect(statusBadge).toBeDefined();
 
       // Check for in_progress status
-      expect(screen.getByText(/in progress/i)).toBeInTheDocument();
+      expect(within(container).getByText(/in progress/i)).toBeInTheDocument();
     });
   });
 
   describe("Tab Switching", () => {
     it("should maintain search when switching tabs", async () => {
       const user = userEvent.setup();
-      render(<Batches {...defaultProps} />, { wrapper: createWrapper() });
+      const { container } = render(<Batches {...defaultProps} />, {
+        wrapper: createWrapper(),
+      });
 
       // Search in files tab
-      const fileSearch = screen.getByPlaceholderText(/search files/i);
+      const fileSearch =
+        within(container).getByPlaceholderText(/search files/i);
       await user.type(fileSearch, "test");
 
       // Switch to batches
-      await user.click(screen.getByRole("tab", { name: /batches/i }));
+      await user.click(
+        within(container).getByRole("tab", { name: /batches/i }),
+      );
 
       // Search should be cleared or independent
-      const batchSearch = screen.getByPlaceholderText(/search batches/i);
+      const batchSearch =
+        within(container).getByPlaceholderText(/search batches/i);
       expect(batchSearch).toHaveValue("");
     });
   });
@@ -439,56 +492,68 @@ describe("Batches", () => {
     it("should call onOpenUploadModal when upload button is clicked", async () => {
       const user = userEvent.setup();
       const onOpenUploadModal = vi.fn();
-      render(
+      const { container } = render(
         <Batches {...defaultProps} onOpenUploadModal={onOpenUploadModal} />,
         { wrapper: createWrapper() },
       );
 
-      await user.click(screen.getByRole("button", { name: /upload file/i }));
+      await user.click(
+        within(container).getByRole("button", { name: /upload file/i }),
+      );
       expect(onOpenUploadModal).toHaveBeenCalledTimes(1);
 
       // Clicking again should call it again
-      await user.click(screen.getByRole("button", { name: /upload file/i }));
+      await user.click(
+        within(container).getByRole("button", { name: /upload file/i }),
+      );
       expect(onOpenUploadModal).toHaveBeenCalledTimes(2);
     });
   });
 
   describe("File Size Display", () => {
     it("should display file sizes correctly", () => {
-      render(<Batches {...defaultProps} />, { wrapper: createWrapper() });
+      const { container } = render(<Batches {...defaultProps} />, {
+        wrapper: createWrapper(),
+      });
 
       // File sizes should be formatted (e.g., "142.19 KB", "87.11 KB")
-      const container = screen.getByText("test_file.jsonl").closest("table");
-      expect(container).toBeInTheDocument();
+      within(container).getByText("test_file.jsonl").closest("table");
     });
   });
 
   describe("Date Formatting", () => {
     it("should display created dates for files", () => {
-      render(<Batches {...defaultProps} />, { wrapper: createWrapper() });
+      const { container } = render(<Batches {...defaultProps} />, {
+        wrapper: createWrapper(),
+      });
 
       // Dates should be formatted and displayed
-      const container = screen.getByText("test_file.jsonl").closest("table");
-      expect(container).toBeInTheDocument();
+      within(container).getByText("test_file.jsonl").closest("table");
     });
   });
 
   describe("Accessibility", () => {
     it("should have accessible tab controls", () => {
-      render(<Batches {...defaultProps} />, { wrapper: createWrapper() });
+      const { container } = render(<Batches {...defaultProps} />, {
+        wrapper: createWrapper(),
+      });
 
-      const filesTab = screen.getByRole("tab", { name: /files/i });
-      const batchesTab = screen.getByRole("tab", { name: /batches/i });
+      const filesTab = within(container).getByRole("tab", { name: /files/i });
+      const batchesTab = within(container).getByRole("tab", {
+        name: /batches/i,
+      });
 
       expect(filesTab).toHaveAttribute("aria-selected");
       expect(batchesTab).not.toHaveAttribute("aria-selected", "true");
     });
 
     it("should have accessible action buttons", () => {
-      render(<Batches {...defaultProps} />, { wrapper: createWrapper() });
+      const { container } = render(<Batches {...defaultProps} />, {
+        wrapper: createWrapper(),
+      });
 
       expect(
-        screen.getByRole("button", { name: /upload file/i }),
+        within(container).getByRole("button", { name: /upload file/i }),
       ).toBeEnabled();
     });
   });

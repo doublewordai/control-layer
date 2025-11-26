@@ -19,6 +19,7 @@ import { Textarea } from "../../ui/textarea";
 import { Label } from "../../ui/label";
 import { Popover, PopoverContent, PopoverTrigger } from "../../ui/popover";
 import { ToggleGroup, ToggleGroupItem } from "../../ui/toggle-group";
+import { AlertBox } from "@/components/ui/alert-box";
 
 interface ApiExamplesModalProps {
   isOpen: boolean;
@@ -36,6 +37,7 @@ const ApiExamplesModal: React.FC<ApiExamplesModalProps> = ({
   const [selectedLanguage, setSelectedLanguage] = useState<Language>("python");
   const [apiKey, setApiKey] = useState<string | null>(null);
   const [copiedCode, setCopiedCode] = useState<string | null>(null);
+  const [error, setError] = useState<string | null>(null);
 
   // API Key creation popover states
   const [showCreateForm, setShowCreateForm] = useState(false);
@@ -63,6 +65,7 @@ const ApiExamplesModal: React.FC<ApiExamplesModalProps> = ({
       setNewKeyDescription("");
       setShowCreateForm(false);
     } catch (error) {
+      setError("Error generating API key");
       console.error("Error generating API key:", error);
     }
   };
@@ -72,12 +75,14 @@ const ApiExamplesModal: React.FC<ApiExamplesModalProps> = ({
       await navigator.clipboard.writeText(text);
       setCopiedCode(codeType);
       const message =
-        codeType === "api-key" ? "API key copied to clipboard" : "Code copied to clipboard";
+        codeType === "api-key"
+          ? "API key copied to clipboard"
+          : "Code copied to clipboard";
       toast.success(message);
       setTimeout(() => setCopiedCode(null), 2000);
     } catch (err) {
+      setError("Failed to copy to clipboard");
       console.error("Failed to copy to clipboard:", err);
-      toast.error("Failed to copy to clipboard");
     }
   };
 
@@ -342,6 +347,10 @@ chatCompletion();`;
             </DialogDescription>
           </DialogHeader>
 
+          <AlertBox variant="error" className="mb-4">
+            {error}
+          </AlertBox>
+
           <div>
             {/* Language Selection */}
             <div className="mb-6">
@@ -510,7 +519,14 @@ chatCompletion();`;
                 </div>
               </div>
               <div className="p-4">
-                <CodeBlock language={getLanguageForHighlighting(selectedLanguage) as "python" | "javascript" | "bash"}>
+                <CodeBlock
+                  language={
+                    getLanguageForHighlighting(selectedLanguage) as
+                      | "python"
+                      | "javascript"
+                      | "bash"
+                  }
+                >
                   {getCurrentCode()}
                 </CodeBlock>
               </div>

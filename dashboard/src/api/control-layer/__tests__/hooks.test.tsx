@@ -140,7 +140,7 @@ describe("User Hooks", () => {
         username: "newuser",
         email: "newuser@example.com",
         display_name: "New User",
-        roles: ["User" as const],
+        roles: ["StandardUser" as const],
       };
 
       // Trigger the mutation
@@ -173,7 +173,7 @@ describe("User Hooks", () => {
       const userData = {
         username: "invalid",
         email: "invalid-email",
-        roles: ["User" as const],
+        roles: ["StandardUser" as const],
       };
 
       result.current.mutate(userData);
@@ -335,7 +335,7 @@ describe("User Hooks", () => {
       const userData = {
         username: "newuser",
         email: "new@example.com",
-        roles: ["User" as const],
+        roles: ["StandardUser" as const],
       };
 
       createResult.current.mutate(userData);
