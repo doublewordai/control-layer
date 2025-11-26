@@ -11,6 +11,7 @@ import {
 import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { Button } from "../../../ui/button";
 import { DataTable } from "../../../ui/data-table";
+import { CursorPagination } from "../../../ui/cursor-pagination";
 import {
   Select,
   SelectContent,
@@ -50,17 +51,33 @@ export function FileRequests() {
     useState<FileRequestOrResponse | null>(null);
   const [requestBodyModalOpen, setRequestBodyModalOpen] = useState(false);
 
-  // Get pagination from URL or use defaults
-  const page = parseInt(searchParams.get("page") || "0", 10);
-  const pageSize = parseInt(searchParams.get("pageSize") || "10", 10);
+  // Pagination state (1-based like Models)
+  const [currentPage, setCurrentPage] = useState(
+    Number(searchParams.get("page")) || 1,
+  );
+  const [pageSize, setPageSize] = useState(
+    Number(searchParams.get("pageSize")) || 10,
+  );
 
-  // Update URL when pagination changes
-  const updatePagination = (newPage: number, newPageSize: number) => {
+  // Load pagination from URL params on mount
+  useEffect(() => {
+    const page = searchParams.get("page");
+    const size = searchParams.get("pageSize");
+
+    if (page) setCurrentPage(Number(page));
+    if (size) setPageSize(Number(size));
+  }, [searchParams]);
+
+  // Sync pagination to URL params
+  useEffect(() => {
     const params = new URLSearchParams(searchParams);
-    params.set("page", newPage.toString());
-    params.set("pageSize", newPageSize.toString());
+    params.set("page", String(currentPage));
+    params.set("pageSize", String(pageSize));
+    // Preserve returnTab
+    if (returnTab) params.set("returnTab", returnTab);
+
     setSearchParams(params, { replace: true });
-  };
+  }, [currentPage, pageSize, returnTab, searchParams, setSearchParams]);
 
   // Get file details - works for input, output, or error files
   const { data: file } = useFile(fileId || "");
@@ -79,13 +96,13 @@ export function FileRequests() {
         ["validating", "in_progress", "finalizing"].includes(b.status),
     );
 
-  // Fetch file content with pagination
+  // Fetch file content with pagination (convert 1-based page to 0-based offset)
   const { data, isLoading } = useQuery({
-    queryKey: ["file-content", fileId, page, pageSize],
+    queryKey: ["file-content", fileId, currentPage, pageSize],
     queryFn: () =>
       dwctlApi.files.getContent(fileId || "", {
         limit: pageSize,
-        offset: page * pageSize,
+        offset: (currentPage - 1) * pageSize,
       }),
     enabled: !!fileId,
   });
@@ -94,15 +111,15 @@ export function FileRequests() {
   useEffect(() => {
     if (fileId && data?.incomplete) {
       queryClient.prefetchQuery({
-        queryKey: ["file-content", fileId, page + 1, pageSize],
+        queryKey: ["file-content", fileId, currentPage + 1, pageSize],
         queryFn: () =>
           dwctlApi.files.getContent(fileId, {
             limit: pageSize,
-            offset: (page + 1) * pageSize,
+            offset: currentPage * pageSize,
           }),
       });
     }
-  }, [fileId, page, pageSize, data?.incomplete, queryClient]);
+  }, [fileId, currentPage, pageSize, data?.incomplete, queryClient]);
 
   // Parse JSONL into requests (could be templates or responses)
   const requests: FileRequestOrResponse[] = data?.content
@@ -136,7 +153,7 @@ export function FileRequests() {
       <div className="mb-6 flex items-center gap-4">
         <button
           onClick={() => navigate(`/batches?tab=${returnTab}`)}
-          className="p-2 text-gray-500 hover:bg-gray-100 rounded-lg transition-colors flex-shrink-0"
+          className="p-2 text-gray-500 hover:bg-gray-100 rounded-lg transition-colors shrink-0"
           aria-label="Back to Batches"
           title="Back to Batches"
         >
@@ -151,25 +168,15 @@ export function FileRequests() {
               <span className="truncate flex items-center gap-2">
                 <span className="font-medium">File:</span>
                 {file.purpose === "batch" && (
-                  <FileInput className="w-4 h-4 text-gray-500 flex-shrink-0" />
+                  <FileInput className="w-4 h-4 text-gray-500 shrink-0" />
                 )}
                 {file.purpose === "batch_output" && (
-                  <FileCheck className="w-4 h-4 text-green-600 flex-shrink-0" />
+                  <FileCheck className="w-4 h-4 text-green-600 shrink-0" />
                 )}
                 {file.purpose === "batch_error" && (
-                  <AlertCircle className="w-4 h-4 text-red-500 flex-shrink-0" />
+                  <AlertCircle className="w-4 h-4 text-red-500 shrink-0" />
                 )}
                 {file.filename}
-              </span>
-              <span className="flex-shrink-0">
-                <span className="font-medium">Showing:</span>{" "}
-                {page * pageSize + 1}-{page * pageSize + requests.length}
-                {isPartial && (
-                  <span className="inline-flex items-center gap-1 text-blue-600 ml-2">
-                    <Loader2 className="w-3 h-3 animate-spin" />
-                    Partial results (batch in progress)
-                  </span>
-                )}
               </span>
             </div>
           )}
@@ -223,10 +230,11 @@ export function FileRequests() {
                 <Select
                   value={pageSize.toString()}
                   onValueChange={(value) => {
-                    updatePagination(0, Number(value)); // Reset to first page when changing page size
+                    setPageSize(Number(value));
+                    setCurrentPage(1); // Reset to first page when changing page size
                   }}
                 >
-                  <SelectTrigger className="w-[80px] h-8">
+                  <SelectTrigger className="w-20 h-8">
                     <SelectValue />
                   </SelectTrigger>
                   <SelectContent>
@@ -241,44 +249,17 @@ export function FileRequests() {
               </div>
             }
           />
-          {/* Server-side pagination controls */}
-          <div className="flex items-center justify-between px-2 py-4">
-            <div className="text-sm text-gray-700">
-              Showing {page * pageSize + 1} -{" "}
-              {page * pageSize + requests.length}
-              {hasMore && " of many"}
-            </div>
-            <div className="flex items-center gap-2">
-              {page > 1 && (
-                <Button
-                  variant="outline"
-                  size="sm"
-                  onClick={() => updatePagination(0, pageSize)}
-                >
-                  First
-                </Button>
-              )}
-              <Button
-                variant="outline"
-                size="sm"
-                onClick={() =>
-                  updatePagination(Math.max(0, page - 1), pageSize)
-                }
-                disabled={page === 0}
-              >
-                Previous
-              </Button>
-              <span className="text-sm text-gray-700">Page {page + 1}</span>
-              <Button
-                variant="outline"
-                size="sm"
-                onClick={() => updatePagination(page + 1, pageSize)}
-                disabled={!hasMore}
-              >
-                Next
-              </Button>
-            </div>
-          </div>
+          <CursorPagination
+            currentPage={currentPage}
+            itemsPerPage={pageSize}
+            onNextPage={() => setCurrentPage(currentPage + 1)}
+            onPrevPage={() => setCurrentPage(Math.max(1, currentPage - 1))}
+            onFirstPage={() => setCurrentPage(1)}
+            hasNextPage={hasMore}
+            hasPrevPage={currentPage > 1}
+            currentPageItemCount={requests.length}
+            itemName="requests"
+          />
         </>
       )}
 

@@ -36,7 +36,7 @@ export function CursorPagination({
     <>
       <Pagination className={`mt-8 ${className}`}>
         <PaginationContent>
-          {/* First page button - only show if we're beyond page 2 */}
+          {/* First page button - only show if we're beyond page 1 */}
           {onFirstPage && currentPage > 1 && (
             <PaginationItem>
               <PaginationLink
@@ -46,11 +46,10 @@ export function CursorPagination({
                   onFirstPage();
                 }}
               >
-                1
+                First
               </PaginationLink>
             </PaginationItem>
           )}
-
           {/* Previous button */}
           <PaginationItem>
             <PaginationPrevious
