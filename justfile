@@ -804,7 +804,7 @@ db-start:
           -e POSTGRES_PASSWORD=password \
           -e POSTGRES_HOST_AUTH_METHOD=trust \
           -p 5432:5432 \
-          -v test-postgres-data:/var/lib/postgresql/data \
+          -v test-postgres-data:/var/lib/postgresql/ \
           -d postgres:latest \
           postgres -c fsync=off \
           -c full_page_writes=off \
