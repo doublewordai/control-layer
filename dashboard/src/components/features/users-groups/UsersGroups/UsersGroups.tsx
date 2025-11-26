@@ -28,6 +28,7 @@ import { toast } from "sonner";
 import {
   Dialog,
   DialogContent,
+  DialogDescription,
   DialogHeader,
   DialogTitle,
   DialogFooter,
@@ -673,18 +674,14 @@ const UsersGroups: React.FC = () => {
       <Dialog open={showBulkDeleteModal} onOpenChange={setShowBulkDeleteModal}>
         <DialogContent className="sm:max-w-md">
           <DialogHeader>
-            <div className="flex items-center gap-3">
-              <div className="w-10 h-10 bg-red-100 rounded-full flex items-center justify-center">
-                <Trash2 className="w-5 h-5 text-red-600" />
-              </div>
-              <div>
-                <DialogTitle>Delete Users</DialogTitle>
-                <p className="text-sm text-gray-600">
-                  This action cannot be undone
-                </p>
-              </div>
-            </div>
+            <DialogTitle>Delete Users</DialogTitle>
+            <DialogDescription>This action cannot be undone</DialogDescription>
           </DialogHeader>
+          <div className="flex items-center gap-3 pb-4">
+            <div className="w-10 h-10 bg-red-100 rounded-full flex items-center justify-center">
+              <Trash2 className="w-5 h-5 text-red-600" />
+            </div>
+          </div>
 
           <div className="space-y-4">
             <p className="text-gray-700">
@@ -758,18 +755,14 @@ const UsersGroups: React.FC = () => {
       >
         <DialogContent className="sm:max-w-md">
           <DialogHeader>
-            <div className="flex items-center gap-3">
-              <div className="w-10 h-10 bg-red-100 rounded-full flex items-center justify-center">
-                <Trash2 className="w-5 h-5 text-red-600" />
-              </div>
-              <div>
-                <DialogTitle>Delete Groups</DialogTitle>
-                <p className="text-sm text-gray-600">
-                  This action cannot be undone
-                </p>
-              </div>
-            </div>
+            <DialogTitle>Delete Groups</DialogTitle>
+            <DialogDescription>This action cannot be undone</DialogDescription>
           </DialogHeader>
+          <div className="flex items-center gap-3 pb-4">
+            <div className="w-10 h-10 bg-red-100 rounded-full flex items-center justify-center">
+              <Trash2 className="w-5 h-5 text-red-600" />
+            </div>
+          </div>
 
           <div className="space-y-4">
             <p className="text-gray-700">

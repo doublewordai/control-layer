@@ -16,6 +16,7 @@ import {
   type Group as BackendGroup,
 } from "../../../api/control-layer";
 import type { DisplayUser } from "../../../types/display";
+import { AlertBox } from "@/components/ui/alert-box";
 
 interface UserGroupsModalProps {
   isOpen: boolean;
@@ -107,11 +108,9 @@ export const UserGroupsModal: React.FC<UserGroupsModalProps> = ({
         </DialogHeader>
 
         <div className="overflow-y-auto max-h-[60vh]">
-          {error && (
-            <div className="mb-4 p-3 bg-red-50 border border-red-200 rounded-lg">
-              <p className="text-sm text-red-600">{error}</p>
-            </div>
-          )}
+          <AlertBox variant="error" className="mb-4">
+            {error}
+          </AlertBox>
 
           {loading ? (
             <div className="flex items-center justify-center py-8">

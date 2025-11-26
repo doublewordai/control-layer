@@ -392,7 +392,7 @@ test target="" *args="":
                     echo "  cargo binstall cargo-llvm-cov"
                     exit 1
                 fi
-                cargo llvm-cov --fail-under-lines 60 --lcov --output-path lcov.info -- --test-threads=4
+                cargo llvm-cov --fail-under-lines 60 --lcov --output-path lcov.info
             else
                 cargo test {{args}}
             fi

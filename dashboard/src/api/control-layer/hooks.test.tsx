@@ -62,6 +62,8 @@ const mockEndpoints: Endpoint[] = [
     updated_at: "2024-01-01T00:00:00Z",
     created_by: "user-1",
     requires_api_key: true,
+    auth_header_name: "Authorization",
+    auth_header_prefix: "Bearer ",
   },
   {
     id: "endpoint-2",
@@ -71,6 +73,8 @@ const mockEndpoints: Endpoint[] = [
     updated_at: "2024-01-01T00:00:00Z",
     created_by: "user-1",
     requires_api_key: true,
+    auth_header_name: "Authorization",
+    auth_header_prefix: "Bearer ",
   },
 ];
 
@@ -197,7 +201,7 @@ describe("Model cache optimization", () => {
 
     // Wait for the API to be called
     await waitFor(() => {
-      return dwctlApi.models.get.mock.calls.length > 0;
+      return vi.mocked(dwctlApi.models.get).mock.calls.length > 0;
     });
 
     // Verify the API was called with the include param

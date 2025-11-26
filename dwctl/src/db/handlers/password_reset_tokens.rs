@@ -35,7 +35,8 @@ impl<'c> Repository for PasswordResetTokens<'c> {
 
     #[instrument(skip(self, request), err)]
     async fn create(&mut self, request: &Self::CreateRequest) -> Result<Self::Response> {
-        let token_hash = password::hash_string(&request.raw_token).map_err(|e| DbError::Other(anyhow::anyhow!(e)))?;
+        let token_hash = password::hash_string_with_params(&request.raw_token, Some(request.argon2_params))
+            .map_err(|e| DbError::Other(anyhow::anyhow!(e)))?;
 
         let token = sqlx::query_as!(
             PasswordResetToken,
@@ -153,6 +154,11 @@ impl<'c> PasswordResetTokens<'c> {
             user_id,
             raw_token: raw_token.clone(),
             expires_at,
+            argon2_params: password::Argon2Params {
+                memory_kib: config.auth.native.password.argon2_memory_kib,
+                iterations: config.auth.native.password.argon2_iterations,
+                parallelism: config.auth.native.password.argon2_parallelism,
+            },
         };
 
         let token = self.create(&request).await?;

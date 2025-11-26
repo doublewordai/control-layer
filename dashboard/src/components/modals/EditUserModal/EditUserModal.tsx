@@ -12,6 +12,7 @@ import {
   DialogFooter,
 } from "../../ui/dialog";
 import { Button } from "../../ui/button";
+import { AlertBox } from "../../ui/alert-box";
 import { HoverCard, HoverCardContent, HoverCardTrigger } from "../../ui";
 
 interface EditUserModalProps {
@@ -95,26 +96,24 @@ export const EditUserModal: React.FC<EditUserModalProps> = ({
 
   return (
     <Dialog open={isOpen} onOpenChange={onClose}>
-      <DialogContent className="sm:max-w-md" aria-labelledby="edit-user-title">
+      <DialogContent className="sm:max-w-md">
         <DialogHeader>
-          <div className="flex items-center gap-3 mb-2">
+          <div className="flex items-center gap-3">
             <div className="w-10 h-10 bg-blue-100 rounded-full flex items-center justify-center">
               <User className="w-5 h-5 text-blue-600" />
             </div>
             <div>
-              <DialogTitle id="edit-user-title">Edit User</DialogTitle>
+              <DialogTitle>Edit User</DialogTitle>
               <DialogDescription>{currentUser.username}</DialogDescription>
             </div>
           </div>
         </DialogHeader>
 
-        <form id="edit-user-form" onSubmit={handleSubmit} className="space-y-4">
-          {error && (
-            <div className="mb-4 p-3 bg-red-50 border border-red-200 rounded-lg">
-              <p className="text-sm text-red-600">{error}</p>
-            </div>
-          )}
+        <AlertBox variant="error" className="mb-4">
+          {error}
+        </AlertBox>
 
+        <form id="edit-user-form" onSubmit={handleSubmit} className="space-y-4">
           <div className="space-y-4">
             <div>
               <label

@@ -9,8 +9,10 @@ import {
   DialogHeader,
   DialogTitle,
   DialogFooter,
+  DialogDescription,
 } from "../../ui/dialog";
 import { Button } from "../../ui/button";
+import { AlertBox } from "../../ui/alert-box";
 import { HoverCard, HoverCardContent, HoverCardTrigger } from "../../ui";
 
 interface CreateUserModalProps {
@@ -120,19 +122,20 @@ export const CreateUserModal: React.FC<CreateUserModalProps> = ({
       <DialogContent className="sm:max-w-md max-h-[90vh] overflow-y-auto">
         <DialogHeader>
           <DialogTitle>Create New User</DialogTitle>
+          <DialogDescription>
+            Create a new user with email, metadata, and role.
+          </DialogDescription>
         </DialogHeader>
+
+        <AlertBox variant="error" className="mb-4">
+          {error}
+        </AlertBox>
 
         <form
           id="create-user-form"
           onSubmit={handleSubmit}
           className="space-y-4"
         >
-          {error && (
-            <div className="mb-4 p-3 bg-red-50 border border-red-200 rounded-lg">
-              <p className="text-sm text-red-600">{error}</p>
-            </div>
-          )}
-
           <div className="mb-4">
             <label
               htmlFor="username"
