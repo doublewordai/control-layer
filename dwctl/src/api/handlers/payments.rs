@@ -70,16 +70,25 @@ use axum::{
     http::StatusCode,
     response::{IntoResponse, Response},
 };
+use serde::{Deserialize, Serialize};
 use serde_json::json;
 
 use crate::{AppState, api::models::users::CurrentUser, payment_providers};
+
+#[derive(Debug, Deserialize, Serialize)]
+pub struct PaymentQuery {
+    pub creditee_id: Option<String>,
+}
 
 #[utoipa::path(
     post,
     path = "/payments",
     tag = "payments",
     summary = "Create payment",
-    description = "Creates a payment checkout session with the payment provider. Returns a JSON object with the checkout URL for the client to handle navigation (better for SPAs).",
+    description = "Creates a payment checkout session with the payment provider. Returns a JSON object with the checkout URL for the client to handle navigation (better for SPAs). Optionally accepts a creditee_id query parameter to credit another user (admin feature).",
+    params(
+        ("creditee_id" = Option<String>, Query, description = "Optional user ID to credit (for admin granting credits to another user)")
+    ),
     responses(
         (status = 200, description = "Payment session created successfully. Returns JSON with checkout URL.", body = inline(Object)),
         (status = 501, description = "No payment provider configured"),
@@ -91,7 +100,11 @@ use crate::{AppState, api::models::users::CurrentUser, payment_providers};
     )
 )]
 #[tracing::instrument(skip_all)]
-pub async fn create_payment(State(state): State<AppState>, user: CurrentUser) -> Result<Response, StatusCode> {
+pub async fn create_payment(
+    State(state): State<AppState>,
+    user: CurrentUser,
+    axum::extract::Query(query): axum::extract::Query<PaymentQuery>,
+) -> Result<Response, StatusCode> {
     // Get payment provider from config (generic - works for any provider)
     let payment_config = match state.config.payment.clone() {
         Some(config) => config,
@@ -116,14 +129,23 @@ pub async fn create_payment(State(state): State<AppState>, user: CurrentUser) ->
         }
     };
 
-    let success_url = format!("{}/cost-management?payment=success&session_id={{CHECKOUT_SESSION_ID}}", origin);
-    let cancel_url = format!("{}/cost-management?payment=cancelled&session_id={{CHECKOUT_SESSION_ID}}", origin);
+    // Build success/cancel URLs, preserving the user query parameter if present
+    let base_path = if let Some(creditee_id) = &query.creditee_id {
+        format!("/cost-management?user={}", creditee_id)
+    } else {
+        "/cost-management".to_string()
+    };
+
+    let success_url = format!("{}{}payment=success&session_id={{CHECKOUT_SESSION_ID}}", origin,
+        if query.creditee_id.is_some() { format!("{}&", base_path) } else { format!("{}?", base_path) });
+    let cancel_url = format!("{}{}payment=cancelled&session_id={{CHECKOUT_SESSION_ID}}", origin,
+        if query.creditee_id.is_some() { format!("{}&", base_path) } else { format!("{}?", base_path) });
 
     let provider = payment_providers::create_provider(payment_config);
 
     // Create checkout session using the provider trait
     let checkout_url = provider
-        .create_checkout_session(&state.db, &user, &cancel_url, &success_url)
+        .create_checkout_session(&state.db, &user, query.creditee_id.as_deref(), &cancel_url, &success_url)
         .await
         .map_err(|e| {
             tracing::error!("Failed to create checkout session: {:?}", e);
@@ -450,5 +472,54 @@ mod tests {
         response.assert_status(StatusCode::SERVICE_UNAVAILABLE);
         let error_response: serde_json::Value = response.json();
         assert!(error_response["message"].as_str().unwrap().contains("unavailable"));
+    }
+
+    #[sqlx::test]
+    async fn test_payment_with_creditee_id(pool: PgPool) {
+        // Test that creditee_id query parameter works
+        let mut config = create_test_config();
+        config.payment = Some(PaymentConfig::Dummy(DummyConfig {
+            host_url: Some("http://localhost:3001".to_string()),
+            amount: Some(Decimal::new(100, 0)),
+        }));
+
+        let request_manager = std::sync::Arc::new(fusillade::PostgresRequestManager::new(pool.clone()));
+        let state = AppState::builder()
+            .db(pool.clone())
+            .config(config)
+            .request_manager(request_manager)
+            .build();
+
+        let payer = crate::test_utils::create_test_user(&pool, crate::api::models::users::Role::StandardUser).await;
+        let recipient = crate::test_utils::create_test_user(&pool, crate::api::models::users::Role::StandardUser).await;
+        let auth_headers = crate::test_utils::add_auth_headers(&payer);
+
+        let app = Router::new()
+            .route("/payments", post(create_payment))
+            .route("/payments/{id}", patch(process_payment))
+            .with_state(state);
+
+        let server = TestServer::new(app).unwrap();
+
+        // Create checkout session with creditee_id query param
+        let mut request = server.post(&format!("/payments?creditee_id={}", recipient.id));
+        for (key, value) in &auth_headers {
+            request = request.add_header(key.as_str(), value.as_str());
+        }
+        let response = request.await;
+
+        response.assert_status(StatusCode::OK);
+        let checkout_response: serde_json::Value = response.json();
+        let checkout_url = checkout_response["url"].as_str().unwrap();
+
+        // Verify URL contains session_id with recipient's ID (not payer's)
+        assert!(checkout_url.contains("session_id="));
+        assert!(checkout_url.contains(&format!("dummy_session_{}", recipient.id)));
+
+        // Verify URL contains the user query parameter to return to filtered view
+        assert!(checkout_url.contains(&format!("user={}", recipient.id)),
+            "Redirect URL should preserve user filter: {}", checkout_url);
+        assert!(checkout_url.contains("payment=success"),
+            "Redirect URL should contain payment status: {}", checkout_url);
     }
 }

@@ -70,12 +70,14 @@ impl From<PaymentError> for StatusCode {
 /// Represents a completed payment session
 #[derive(Debug, Clone)]
 pub struct PaymentSession {
-    /// User ID associated with this payment
+    /// User ID associated with this payment (creditee)
     pub user_id: String,
     /// Amount paid (in dollars)
     pub amount: Decimal,
     /// Whether the payment has been completed
     pub is_paid: bool,
+    /// Optional: User ID of the person who paid
+    pub payer_id: Option<String>,
 }
 
 /// Represents a webhook event from a payment provider
@@ -96,7 +98,14 @@ pub trait PaymentProvider: Send + Sync {
     /// Create a new checkout session
     ///
     /// Returns a URL that the user should be redirected to for payment.
-    async fn create_checkout_session(&self, db_pool: &PgPool, user: &CurrentUser, cancel_url: &str, success_url: &str) -> Result<String>;
+    ///
+    /// # Arguments
+    /// * `db_pool` - Database connection pool
+    /// * `user` - The authenticated user making the payment
+    /// * `creditee_id` - Optional user ID to credit (for admin granting credits to another user)
+    /// * `cancel_url` - URL to redirect to if payment is cancelled
+    /// * `success_url` - URL to redirect to if payment succeeds
+    async fn create_checkout_session(&self, db_pool: &PgPool, user: &CurrentUser, creditee_id: Option<&str>, cancel_url: &str, success_url: &str) -> Result<String>;
 
     /// Retrieve and validate a payment session
     ///

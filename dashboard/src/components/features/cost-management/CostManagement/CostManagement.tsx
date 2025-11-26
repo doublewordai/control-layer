@@ -128,7 +128,8 @@ export function CostManagement() {
     } else if (config?.payment_enabled) {
       // Payment processing enabled: Get checkout URL and redirect using the mutation hook
       try {
-        const data = await createPaymentMutation.mutateAsync();
+        // Pass filterUserId as creditee_id when viewing another user's billing
+        const data = await createPaymentMutation.mutateAsync(filterUserId || undefined);
         if (data.url) {
           // Navigate to payment provider checkout page
           window.location.href = data.url;

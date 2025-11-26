@@ -247,7 +247,7 @@ export function TransactionHistory({
             </Button>
           </div>
           {displayUser && (
-            <p className="text-sm text-gray-600 mt-1">
+            <p className={`text-sm mt-1 ${filterUserId && filterUserId !== userId ? 'text-red-600 font-semibold' : 'text-gray-600'}`}>
               Showing transactions for user <span className="font-medium">{displayUser.email}</span>
             </p>
           )}
