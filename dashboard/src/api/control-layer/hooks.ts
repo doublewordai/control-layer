@@ -694,14 +694,28 @@ export function useFile(id: string) {
   });
 }
 
-// Deprecated: Use dwctlApi.files.getContent() with useQuery directly instead
-// export function useFileRequests(id: string, options?: FileRequestsListQuery) {
-//   return useQuery({
-//     queryKey: queryKeys.files.requestsList(id, options || {}),
-//     queryFn: () => dwctlApi.files.getContent(id, {limit: options?.limit, offset: options?.skip}),
-//     enabled: !!id,
-//   });
-// }
+export function useFileContent(
+  id: string,
+  options?: { limit?: number; skip?: number },
+) {
+  const queryClient = useQueryClient();
+
+  return useQuery({
+    queryKey: queryKeys.files.requestsList(id, options || {}),
+    queryFn: () => dwctlApi.files.getFileContent(id, options),
+    enabled: !!id,
+    // Prefetch next page
+    select: (data) => {
+      if (data.incomplete && options?.limit && options?.skip) {
+        queryClient.prefetchQuery({
+          queryKey: queryKeys.files.requestsList(id, options),
+          queryFn: () => dwctlApi.files.getFileContent(id, options),
+        });
+      }
+      return data;
+    },
+  });
+}
 
 export function useUploadFile() {
   const queryClient = useQueryClient();
@@ -928,7 +942,7 @@ export function useProcessPayment(options?: {
   return useMutation({
     mutationKey: ["payments", "process"],
     mutationFn: async (sessionId: string) => {
-      await dwctlApi.payments.process(sessionId)
+      await dwctlApi.payments.process(sessionId);
     },
     onSuccess: () => {
       // Refetch user data to update balance after successful payment

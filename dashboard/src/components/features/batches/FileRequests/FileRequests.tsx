@@ -1,4 +1,4 @@
-import { useState, useEffect } from "react";
+import { useState } from "react";
 import { useParams, useNavigate, useSearchParams } from "react-router-dom";
 import {
   ArrowLeft,
@@ -6,9 +6,7 @@ import {
   FileCheck,
   AlertCircle,
   Download,
-  Loader2,
 } from "lucide-react";
-import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { Button } from "../../../ui/button";
 import { DataTable } from "../../../ui/data-table";
 import { CursorPagination } from "../../../ui/cursor-pagination";
@@ -19,8 +17,11 @@ import {
   SelectTrigger,
   SelectValue,
 } from "../../../ui/select";
-import { dwctlApi } from "../../../../api/control-layer/client";
-import { useFile, useBatches } from "../../../../api/control-layer/hooks";
+import {
+  useFile,
+  useBatches,
+  useFileContent,
+} from "../../../../api/control-layer/hooks";
 import {
   createFileRequestsColumns,
   type FileRequestOrResponse,
@@ -39,7 +40,6 @@ import type { FileRequest } from "../../../../api/control-layer/types";
 export function FileRequests() {
   const { fileId } = useParams<{ fileId: string }>();
   const navigate = useNavigate();
-  const queryClient = useQueryClient();
   const [searchParams, setSearchParams] = useSearchParams();
   const [downloadModalOpen, setDownloadModalOpen] = useState(false);
 
@@ -51,33 +51,22 @@ export function FileRequests() {
     useState<FileRequestOrResponse | null>(null);
   const [requestBodyModalOpen, setRequestBodyModalOpen] = useState(false);
 
-  // Pagination state (1-based like Models)
-  const [currentPage, setCurrentPage] = useState(
-    Number(searchParams.get("page")) || 1,
-  );
-  const [pageSize, setPageSize] = useState(
-    Number(searchParams.get("pageSize")) || 10,
-  );
+  // Pagination state (1-based page number)
+  const currentPage = Number(searchParams.get("page")) || 1;
+  const pageSize = Number(searchParams.get("pageSize")) || 10;
 
-  // Load pagination from URL params on mount
-  useEffect(() => {
-    const page = searchParams.get("page");
-    const size = searchParams.get("pageSize");
+  // Calculate 0-based offset for API
+  const offset = (currentPage - 1) * pageSize;
 
-    if (page) setCurrentPage(Number(page));
-    if (size) setPageSize(Number(size));
-  }, [searchParams]);
-
-  // Sync pagination to URL params
-  useEffect(() => {
+  // Update pagination in URL
+  const updatePagination = (page: number, size: number) => {
     const params = new URLSearchParams(searchParams);
-    params.set("page", String(currentPage));
-    params.set("pageSize", String(pageSize));
+    params.set("page", String(page));
+    params.set("pageSize", String(size));
     // Preserve returnTab
     if (returnTab) params.set("returnTab", returnTab);
-
     setSearchParams(params, { replace: true });
-  }, [currentPage, pageSize, returnTab, searchParams, setSearchParams]);
+  };
 
   // Get file details - works for input, output, or error files
   const { data: file } = useFile(fileId || "");
@@ -96,30 +85,11 @@ export function FileRequests() {
         ["validating", "in_progress", "finalizing"].includes(b.status),
     );
 
-  // Fetch file content with pagination (convert 1-based page to 0-based offset)
-  const { data, isLoading } = useQuery({
-    queryKey: ["file-content", fileId, currentPage, pageSize],
-    queryFn: () =>
-      dwctlApi.files.getContent(fileId || "", {
-        limit: pageSize,
-        offset: (currentPage - 1) * pageSize,
-      }),
-    enabled: !!fileId,
+  // Fetch file content with pagination using custom hook
+  const { data, isLoading } = useFileContent(fileId || "", {
+    limit: pageSize,
+    skip: offset,
   });
-
-  // Prefetch next page
-  useEffect(() => {
-    if (fileId && data?.incomplete) {
-      queryClient.prefetchQuery({
-        queryKey: ["file-content", fileId, currentPage + 1, pageSize],
-        queryFn: () =>
-          dwctlApi.files.getContent(fileId, {
-            limit: pageSize,
-            offset: currentPage * pageSize,
-          }),
-      });
-    }
-  }, [fileId, currentPage, pageSize, data?.incomplete, queryClient]);
 
   // Parse JSONL into requests (could be templates or responses)
   const requests: FileRequestOrResponse[] = data?.content
@@ -230,8 +200,7 @@ export function FileRequests() {
                 <Select
                   value={pageSize.toString()}
                   onValueChange={(value) => {
-                    setPageSize(Number(value));
-                    setCurrentPage(1); // Reset to first page when changing page size
+                    updatePagination(1, Number(value)); // Reset to first page when changing page size
                   }}
                 >
                   <SelectTrigger className="w-20 h-8">
@@ -252,9 +221,11 @@ export function FileRequests() {
           <CursorPagination
             currentPage={currentPage}
             itemsPerPage={pageSize}
-            onNextPage={() => setCurrentPage(currentPage + 1)}
-            onPrevPage={() => setCurrentPage(Math.max(1, currentPage - 1))}
-            onFirstPage={() => setCurrentPage(1)}
+            onNextPage={() => updatePagination(currentPage + 1, pageSize)}
+            onPrevPage={() =>
+              updatePagination(Math.max(1, currentPage - 1), pageSize)
+            }
+            onFirstPage={() => updatePagination(1, pageSize)}
             hasNextPage={hasMore}
             hasPrevPage={currentPage > 1}
             currentPageItemCount={requests.length}
