@@ -1,5 +1,5 @@
 import { useState } from "react";
-import { X, Plus } from "lucide-react";
+import { Plus } from "lucide-react";
 import {
   Dialog,
   DialogContent,
@@ -32,42 +32,28 @@ export function UserTransactionsModal({
   return (
     <>
       <Dialog open={isOpen} onOpenChange={onClose}>
-        <DialogContent className="max-w-[50vw]! max-h-[80vh] overflow-y-auto">
+        <DialogContent className="max-w-[50vw]! max-h-[80vh] overflow-y-auto [&>button]:hidden">
           <DialogHeader>
             <div className="flex items-center justify-between">
-              <div className="flex-1">
+              <div>
                 <DialogTitle className="text-2xl">
                   Transaction History
                 </DialogTitle>
-                <p className="text-sm text-doubleword-neutral-600 mt-1">
+                <DialogDescription>
                   Viewing transactions for <strong>{user.name}</strong> (
                   {user.email})
-                </p>
+                </DialogDescription>
               </div>
-              <div className="flex items-center gap-2">
-                <Button
-                  className="bg-blue-600 hover:bg-blue-700"
-                  size="sm"
-                  onClick={() => setIsAddFundsModalOpen(true)}
-                >
-                  <Plus className="w-4 h-4 mr-1" />
-                  Add Funds
-                </Button>
-                <button
-                  onClick={onClose}
-                  className="text-doubleword-neutral-400 hover:text-doubleword-neutral-600 transition-colors"
-                  aria-label="Close modal"
-                >
-                  <X className="w-5 h-5" />
-                </button>
-              </div>
+
+              <Button
+                className="bg-blue-600 hover:bg-blue-700"
+                size="sm"
+                onClick={() => setIsAddFundsModalOpen(true)}
+              >
+                <Plus className="w-4 h-4 mr-1" />
+                Add Funds
+              </Button>
             </div>
-            <DialogDescription>
-              <p className="text-sm text-doubleword-neutral-600 mt-1">
-                Viewing transactions for <strong>{user.name}</strong> (
-                {user.email})
-              </p>
-            </DialogDescription>
           </DialogHeader>
 
           <div className="mt-4">
