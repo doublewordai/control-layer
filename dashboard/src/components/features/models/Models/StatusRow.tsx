@@ -1,20 +1,18 @@
 import React from "react";
 import { useProbeResults } from "@/api/control-layer/hooks";
 import { ProbeTimeline } from "../ModelInfo/ProbeTimeline";
-import type { Endpoint, Model, Probe } from "@/api/control-layer/types";
+import type { Model, Probe } from "@/api/control-layer/types";
 
 // StatusRow component for status page layout
 interface StatusRowProps {
   model: Model;
   probesData?: Probe[];
-  endpointsRecord: Record<string, Endpoint>;
   onNavigate: (modelId: string) => void;
 }
 
 export const StatusRow: React.FC<StatusRowProps> = ({
   model,
   probesData,
-  endpointsRecord,
   onNavigate,
 }) => {
   const probe = probesData?.find((p) => p.deployment_id === model.id);
@@ -50,7 +48,7 @@ export const StatusRow: React.FC<StatusRowProps> = ({
                 {model.alias}
               </div>
               <div className="text-xs text-gray-500 truncate">
-                {endpointsRecord[model.hosted_on]?.name || "Unknown"}
+                {model.endpoint?.name || "Unknown"}
               </div>
             </div>
           </div>
