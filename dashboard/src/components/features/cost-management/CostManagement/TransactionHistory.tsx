@@ -261,17 +261,7 @@ export function TransactionHistory({
           </div>
           {addFundsConfig && (
             <>
-              {addFundsConfig.type === 'direct' && (
-                <Button
-                  variant="outline"
-                  size="sm"
-                  onClick={addFundsConfig.onAddFunds}
-                >
-                  <Plus className="w-4 h-4 mr-2" />
-                  Add to Credit Balance
-                </Button>
-              )}
-              {addFundsConfig.type === 'redirect' && (
+              {(addFundsConfig.type === 'direct' || addFundsConfig.type === 'redirect') && (
                 <Button
                   variant="outline"
                   size="sm"
