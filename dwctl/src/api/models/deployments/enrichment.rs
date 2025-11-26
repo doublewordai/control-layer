@@ -292,10 +292,10 @@ impl<'a> DeployedModelEnricher<'a> {
         mut model: DeployedModelResponse,
         endpoints_map: &Option<HashMap<InferenceEndpointId, InferenceEndpointResponse>>,
     ) -> DeployedModelResponse {
-        if let Some(endpoints_map) = endpoints_map {
-            if let Some(endpoint) = endpoints_map.get(&model.hosted_on) {
-                model = model.with_endpoint(endpoint.clone());
-            }
+        if let Some(endpoints_map) = endpoints_map
+            && let Some(endpoint) = endpoints_map.get(&model.hosted_on)
+        {
+            model = model.with_endpoint(endpoint.clone());
         }
         model
     }
