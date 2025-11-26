@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, beforeEach } from "vitest";
-import { render, screen, waitFor } from "@testing-library/react";
+import { render, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { MemoryRouter } from "react-router-dom";
@@ -100,6 +100,15 @@ const createWrapper = (initialEntries = ["/"]) => {
   );
 };
 
+// Helper to get the active tab panel (data-state="active")
+const getActiveTabPanel = () => {
+  const tabPanels = screen.getAllByRole("tabpanel");
+  return (
+    tabPanels.find((panel) => panel.getAttribute("data-state") === "active") ||
+    tabPanels[0]
+  );
+};
+
 describe("Batches - Pagination", () => {
   beforeEach(() => {
     vi.clearAllMocks();
@@ -195,7 +204,7 @@ describe("Batches - Pagination", () => {
 
       // Verify the correct cursor was used (last item from page 1)
       const page2Calls = useFilesCalls.filter(
-        (call) => call?.after === page1Files[9].id
+        (call) => call?.after === page1Files[9].id,
       );
       expect(page2Calls.length).toBeGreaterThan(0);
     });
@@ -269,21 +278,32 @@ describe("Batches - Pagination", () => {
         expect(screen.getByText("file_page1_0.jsonl")).toBeInTheDocument();
       });
 
+      // Get the active tab panel to scope our queries
+      const activePanel = getActiveTabPanel();
+
       // Navigate to page 2
-      const nextButton = screen.getByRole("button", { name: /Next/i });
+      const nextButton = within(activePanel).getByRole("button", {
+        name: /Next/i,
+      });
       await user.click(nextButton);
 
       await waitFor(() => {
-        expect(screen.getByText(/Page 2/i)).toBeInTheDocument();
+        expect(
+          within(getActiveTabPanel()).getByText(/Page 2/i),
+        ).toBeInTheDocument();
       });
 
       // Now click Previous - should go back to page 1 using cursor history
-      const prevButton = screen.getByRole("button", { name: /Previous/i });
+      const prevButton = within(getActiveTabPanel()).getByRole("button", {
+        name: /Previous/i,
+      });
       await user.click(prevButton);
 
       // Should be back on page 1
       await waitFor(() => {
-        expect(screen.getByText(/Page 1/i)).toBeInTheDocument();
+        expect(
+          within(getActiveTabPanel()).getByText(/Page 1/i),
+        ).toBeInTheDocument();
       });
 
       // The previous button should now be disabled (we're on page 0)
@@ -365,29 +385,45 @@ describe("Batches - Pagination", () => {
         expect(screen.getByText("file_page1_0.jsonl")).toBeInTheDocument();
       });
 
+      // Get the active tab panel
+      let activePanel = getActiveTabPanel();
+
       // Page 1: No First button
-      expect(screen.queryByRole("button", { name: /First/i })).not.toBeInTheDocument();
+      expect(
+        within(activePanel).queryByRole("button", { name: /First/i }),
+      ).not.toBeInTheDocument();
 
       // Navigate to page 2
-      const nextButton = screen.getByRole("button", { name: /Next/i });
+      const nextButton = within(activePanel).getByRole("button", {
+        name: /Next/i,
+      });
       await user.click(nextButton);
 
       await waitFor(() => {
-        expect(screen.getByText(/Page 2/i)).toBeInTheDocument();
+        activePanel = getActiveTabPanel();
+        expect(within(activePanel).getByText(/Page 2/i)).toBeInTheDocument();
       });
 
       // Page 2: Still no First button (only shows on page 3+)
-      expect(screen.queryByRole("button", { name: /First/i })).not.toBeInTheDocument();
+      expect(
+        within(activePanel).queryByRole("button", { name: /First/i }),
+      ).not.toBeInTheDocument();
 
       // Navigate to page 3
-      await user.click(nextButton);
+      const nextButton2 = within(activePanel).getByRole("button", {
+        name: /Next/i,
+      });
+      await user.click(nextButton2);
 
       await waitFor(() => {
-        expect(screen.getByText(/Page 3/i)).toBeInTheDocument();
+        activePanel = getActiveTabPanel();
+        expect(within(activePanel).getByText(/Page 3/i)).toBeInTheDocument();
       });
 
       // Page 3: First button should appear
-      expect(screen.getByRole("button", { name: /First/i })).toBeInTheDocument();
+      expect(
+        within(activePanel).getByRole("button", { name: /First/i }),
+      ).toBeInTheDocument();
     });
 
     it("should jump to first page and clear history when First button clicked", async () => {
@@ -478,29 +514,44 @@ describe("Batches - Pagination", () => {
         expect(screen.getByText("file_page1_0.jsonl")).toBeInTheDocument();
       });
 
+      // Get the active tab panel
+      let activePanel = getActiveTabPanel();
+
       // Navigate to page 2, then page 3
-      const nextButton = screen.getByRole("button", { name: /Next/i });
+      const nextButton = within(activePanel).getByRole("button", {
+        name: /Next/i,
+      });
       await user.click(nextButton);
       await waitFor(() => {
-        expect(screen.getByText(/Page 2/i)).toBeInTheDocument();
+        activePanel = getActiveTabPanel();
+        expect(within(activePanel).getByText(/Page 2/i)).toBeInTheDocument();
       });
 
-      await user.click(nextButton);
+      const nextButton2 = within(activePanel).getByRole("button", {
+        name: /Next/i,
+      });
+      await user.click(nextButton2);
       await waitFor(() => {
-        expect(screen.getByText(/Page 3/i)).toBeInTheDocument();
+        activePanel = getActiveTabPanel();
+        expect(within(activePanel).getByText(/Page 3/i)).toBeInTheDocument();
       });
 
       // Click First button
-      const firstButton = screen.getByRole("button", { name: /First/i });
+      const firstButton = within(activePanel).getByRole("button", {
+        name: /First/i,
+      });
       await user.click(firstButton);
 
       // Should be back on page 1
       await waitFor(() => {
-        expect(screen.getByText(/Page 1/i)).toBeInTheDocument();
+        activePanel = getActiveTabPanel();
+        expect(within(activePanel).getByText(/Page 1/i)).toBeInTheDocument();
       });
 
       // First button should no longer be visible
-      expect(screen.queryByRole("button", { name: /First/i })).not.toBeInTheDocument();
+      expect(
+        within(activePanel).queryByRole("button", { name: /First/i }),
+      ).not.toBeInTheDocument();
     });
 
     it("should clear cursor history when page size changes", async () => {
@@ -569,16 +620,22 @@ describe("Batches - Pagination", () => {
         expect(screen.getByText("file_page1_0.jsonl")).toBeInTheDocument();
       });
 
+      // Get the active tab panel
+      let activePanel = getActiveTabPanel();
+
       // Navigate to page 2
-      const nextButton = screen.getByRole("button", { name: /Next/i });
+      const nextButton = within(activePanel).getByRole("button", {
+        name: /Next/i,
+      });
       await user.click(nextButton);
 
       await waitFor(() => {
-        expect(screen.getByText(/Page 2/i)).toBeInTheDocument();
+        activePanel = getActiveTabPanel();
+        expect(within(activePanel).getByText(/Page 2/i)).toBeInTheDocument();
       });
 
       // Change page size by clicking the combobox trigger
-      const pageSizeSelect = screen.getByRole("combobox");
+      const pageSizeSelect = within(activePanel).getByRole("combobox");
       await user.click(pageSizeSelect);
 
       // Wait for the dropdown to open and find the option by text
@@ -593,11 +650,14 @@ describe("Batches - Pagination", () => {
 
       // Should reset to page 1 after changing page size
       await waitFor(() => {
-        expect(screen.getByText(/Page 1/i)).toBeInTheDocument();
+        activePanel = getActiveTabPanel();
+        expect(within(activePanel).getByText(/Page 1/i)).toBeInTheDocument();
       });
 
       // Previous button should be disabled (back at page 1)
-      expect(screen.getByRole("button", { name: /Previous/i })).toBeDisabled();
+      expect(
+        within(activePanel).getByRole("button", { name: /Previous/i }),
+      ).toBeDisabled();
     });
   });
 

@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, beforeEach } from "vitest";
-import { render, screen } from "@testing-library/react";
+import { render, screen, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { MemoryRouter } from "react-router-dom";
@@ -158,6 +158,15 @@ const createWrapper = () => {
   );
 };
 
+// Helper to get the active tab panel (data-state="active")
+const getActiveTabPanel = () => {
+  const tabPanels = screen.getAllByRole("tabpanel");
+  return (
+    tabPanels.find((panel) => panel.getAttribute("data-state") === "active") ||
+    tabPanels[0]
+  );
+};
+
 describe("Batches", () => {
   beforeEach(() => {
     vi.clearAllMocks();
@@ -223,21 +232,25 @@ describe("Batches", () => {
     });
 
     it("should render upload file button", () => {
-      render(<Batches {...defaultProps} />, { wrapper: createWrapper() });
+      const { container } = render(<Batches {...defaultProps} />, {
+        wrapper: createWrapper(),
+      });
 
       expect(
-        screen.getByRole("button", { name: /upload file/i }),
+        within(container).getByRole("button", { name: /upload file/i }),
       ).toBeInTheDocument();
     });
 
     it("should render tabs", () => {
-      render(<Batches {...defaultProps} />, { wrapper: createWrapper() });
+      const { container } = render(<Batches {...defaultProps} />, {
+        wrapper: createWrapper(),
+      });
 
       expect(
-        screen.getByRole("tab", { name: /files \(2\)/i }),
+        within(container).getByRole("tab", { name: /files \(2\)/i }),
       ).toBeInTheDocument();
       expect(
-        screen.getByRole("tab", { name: /batches \(2\)/i }),
+        within(container).getByRole("tab", { name: /batches \(2\)/i }),
       ).toBeInTheDocument();
     });
   });
@@ -322,29 +335,41 @@ describe("Batches", () => {
         refetch: vi.fn(),
       } as any);
 
-      render(<Batches {...defaultProps} />, { wrapper: createWrapper() });
+      const { container } = render(<Batches {...defaultProps} />, {
+        wrapper: createWrapper(),
+      });
 
       // Switch to batches tab
-      await user.click(screen.getByRole("tab", { name: /batches/i }));
+      await user.click(
+        within(container).getByRole("tab", { name: /batches/i }),
+      );
 
-      expect(screen.getByText("No batches created")).toBeInTheDocument();
       expect(
-        screen.getByText(
+        within(container).getByText("No batches created"),
+      ).toBeInTheDocument();
+      expect(
+        within(container).getByText(
           "Create a batch from an uploaded file to start processing requests",
         ),
       ).toBeInTheDocument();
       expect(
-        screen.getByRole("button", { name: /create first batch/i }),
+        within(container).getByRole("button", { name: /create first batch/i }),
       ).toBeInTheDocument();
     });
   });
 
   describe("Files Tab", () => {
     it("should display files in the table", () => {
-      render(<Batches {...defaultProps} />, { wrapper: createWrapper() });
+      const { container } = render(<Batches {...defaultProps} />, {
+        wrapper: createWrapper(),
+      });
 
-      expect(screen.getByText("test_file.jsonl")).toBeInTheDocument();
-      expect(screen.getByText("another_file.jsonl")).toBeInTheDocument();
+      expect(
+        within(container).getByText("test_file.jsonl"),
+      ).toBeInTheDocument();
+      expect(
+        within(container).getByText("another_file.jsonl"),
+      ).toBeInTheDocument();
     });
 
     it("should open upload modal when upload button is clicked", async () => {
