@@ -268,10 +268,18 @@ pub fn migrator() -> sqlx::migrate::Migrator {
 /// # }
 /// ```
 #[instrument(skip_all)]
-pub async fn create_initial_admin_user(email: &str, password: Option<&str>, db: &PgPool) -> Result<UserId, sqlx::Error> {
+pub async fn create_initial_admin_user(
+    email: &str,
+    password: Option<&str>,
+    argon2_params: password::Argon2Params,
+    db: &PgPool,
+) -> Result<UserId, sqlx::Error> {
     // Hash password if provided
     let password_hash = if let Some(pwd) = password {
-        Some(password::hash_string(pwd).map_err(|e| sqlx::Error::Encode(format!("Failed to hash admin password: {e}").into()))?)
+        Some(
+            password::hash_string_with_params(pwd, Some(argon2_params))
+                .map_err(|e| sqlx::Error::Encode(format!("Failed to hash admin password: {e}").into()))?,
+        )
     } else {
         None
     };
@@ -536,7 +544,12 @@ async fn setup_database(
     };
 
     // Create initial admin user if it doesn't exist
-    create_initial_admin_user(&config.admin_email, config.admin_password.as_deref(), &pool)
+    let argon2_params = password::Argon2Params {
+        memory_kib: config.auth.native.password.argon2_memory_kib,
+        iterations: config.auth.native.password.argon2_iterations,
+        parallelism: config.auth.native.password.argon2_parallelism,
+    };
+    create_initial_admin_user(&config.admin_email, config.admin_password.as_deref(), argon2_params, &pool)
         .await
         .map_err(|e| anyhow::anyhow!("Failed to create initial admin user: {}", e))?;
 
@@ -1420,6 +1433,7 @@ mod test {
     use super::{AppState, create_initial_admin_user};
     use crate::{
         api::models::{groups::GroupResponse, users::Role},
+        auth::password,
         db::handlers::Users,
         request_logging::{AiRequest, AiResponse},
         test_utils::*,
@@ -2022,9 +2036,18 @@ mod test {
         assert!(initial_user.is_err() || initial_user.unwrap().is_none());
 
         // Create the initial admin user
-        let user_id = create_initial_admin_user(test_email, None, &pool)
-            .await
-            .expect("Should create admin user successfully");
+        let user_id = create_initial_admin_user(
+            test_email,
+            None,
+            password::Argon2Params {
+                memory_kib: 128,
+                iterations: 1,
+                parallelism: 1,
+            },
+            &pool,
+        )
+        .await
+        .expect("Should create admin user successfully");
 
         // Verify user was created with correct properties
         let created_user = users_repo
@@ -2056,9 +2079,18 @@ mod test {
             .expect("Should update user email");
 
         // Call create_initial_admin_user - should be idempotent
-        let returned_user_id = create_initial_admin_user(test_email, None, &pool)
-            .await
-            .expect("Should handle existing user successfully");
+        let returned_user_id = create_initial_admin_user(
+            test_email,
+            None,
+            password::Argon2Params {
+                memory_kib: 128,
+                iterations: 1,
+                parallelism: 1,
+            },
+            &pool,
+        )
+        .await
+        .expect("Should handle existing user successfully");
 
         // Should return the existing user's ID
         assert_eq!(returned_user_id, existing_user_id);
