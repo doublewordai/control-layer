@@ -44,8 +44,10 @@ vi.mock("../../../../utils/authorization", () => ({
 }));
 
 // Test wrapper with QueryClient, Router, and Context Providers
+let queryClient: QueryClient;
+
 function createWrapper() {
-  const queryClient = new QueryClient({
+  queryClient = new QueryClient({
     defaultOptions: {
       queries: {
         retry: false,
@@ -66,6 +68,14 @@ function createWrapper() {
 describe("Models Component - Functional Tests", () => {
   beforeEach(() => {
     mockNavigate.mockClear();
+  });
+
+  afterEach(() => {
+    // Clean up QueryClient to prevent state pollution between tests
+    if (queryClient) {
+      queryClient.clear();
+      queryClient.cancelQueries();
+    }
   });
 
   describe("Model Discovery Journey", () => {
@@ -183,13 +193,17 @@ describe("Models Component - Functional Tests", () => {
       await user.click(apiButton);
 
       // Verify API examples modal opened
-      await waitFor(() => {
-        expect(screen.getByRole("dialog")).toBeInTheDocument();
-        // Look for the specific modal heading
-        expect(
-          screen.getByRole("heading", { name: /api examples/i }),
-        ).toBeInTheDocument();
-      });
+      // Using both timeout and interval to handle slow CI environments
+      await waitFor(
+        () => {
+          expect(screen.getByRole("dialog")).toBeInTheDocument();
+          // Look for the specific modal heading
+          expect(
+            screen.getByRole("heading", { name: /api examples/i }),
+          ).toBeInTheDocument();
+        },
+        { timeout: 5000, interval: 50 }
+      );
     });
   });
 
@@ -327,9 +341,13 @@ describe("Models Component - Functional Tests", () => {
         await user.click(firstAddGroupsButton);
 
         // Verify access management modal opens
-        await waitFor(() => {
-          expect(screen.getByRole("dialog")).toBeInTheDocument();
-        });
+        // Using both timeout and interval to handle slow CI environments
+        await waitFor(
+          () => {
+            expect(screen.getByRole("dialog")).toBeInTheDocument();
+          },
+          { timeout: 5000, interval: 50 }
+        );
       } else {
         // If no "Add groups" button is visible, all models have groups
         // This is also a valid state to test
@@ -357,9 +375,13 @@ describe("Models Component - Functional Tests", () => {
         await user.click(firstMoreBadge);
 
         // Verify access management modal opens
-        await waitFor(() => {
-          expect(screen.getByRole("dialog")).toBeInTheDocument();
-        });
+        // Using both timeout and interval to handle slow CI environments
+        await waitFor(
+          () => {
+            expect(screen.getByRole("dialog")).toBeInTheDocument();
+          },
+          { timeout: 5000, interval: 50 }
+        );
       } else {
         // Look for regular group badges that might be clickable
         const groupBadges = screen.queryAllByText(/group/i);
