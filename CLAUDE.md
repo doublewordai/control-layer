@@ -326,6 +326,11 @@ prevent name clashes.
   - Use `const { container } = render(...)` to get the component's container
   - Use `within(container).getByRole(...)` instead of `screen.getByRole(...)`
   - Import `within` from `@testing-library/react` when using this pattern
+  - **Exception - Portal-rendered elements**: For elements that render outside the component container (modals, dialogs, dropdown menus, popovers), use `screen` instead of `within(container)`:
+    - Modals and dialogs: `screen.getByRole("dialog")`
+    - Dropdown menus: `screen.getByRole("menu")` and `screen.getByRole("menuitem")`
+    - Popover content: `screen.getByPlaceholderText(...)` for inputs inside popovers
+    - These elements use portals and render at the document root, so they won't be found within the component container
 
 **Component Structure:**
 
