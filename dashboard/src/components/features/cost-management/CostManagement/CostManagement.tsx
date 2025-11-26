@@ -67,8 +67,8 @@ export function CostManagement() {
       return;
     }
 
-    // Build callback URL to return to this page
-    const callbackUrl = `${window.location.origin}${window.location.pathname}`;
+    // Build callback URL to return to this page, including query parameters
+    const callbackUrl = `${window.location.origin}${window.location.pathname}${window.location.search}`;
 
     // Redirect to payment provider with callback URL
     const redirectUrl = `${paymentProviderUrl}?callback=${encodeURIComponent(callbackUrl)}`;
