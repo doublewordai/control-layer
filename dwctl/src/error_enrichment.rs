@@ -39,8 +39,6 @@ use tracing::{debug, instrument};
 /// - 403 Forbidden errors (likely insufficient credits) → enriched with balance
 #[instrument(skip_all, fields(path = %request.uri().path(), method = %request.method()))]
 pub async fn error_enrichment_middleware(State(pool): State<PgPool>, request: Request<Body>, next: Next) -> Response<Body> {
-    let path = request.uri().path().to_string();
-
     // Extract API key from request headers before passing to onwards
     let api_key = request
         .headers()
@@ -52,15 +50,17 @@ pub async fn error_enrichment_middleware(State(pool): State<PgPool>, request: Re
     // Let the request proceed through onwards
     let response = next.run(request).await;
 
-    // Only enrich 403 errors under the /ai/ proxy path when we have an API key
-    if response.status() == StatusCode::FORBIDDEN && path.starts_with("/ai/") {
+    // Only enrich 403 errors when we have an API key
+    // Note: This middleware is applied only to the onwards router (AI proxy paths),
+    // so no path filtering is needed here
+    if response.status() == StatusCode::FORBIDDEN {
         if let Some(key) = api_key {
             debug!("Intercepted 403 response on AI proxy path, attempting enrichment");
             if let Ok(balance) = get_balance_of_api_key(pool, &key).await {
                 if balance < Decimal::ZERO {
                     return Error::InsufficientCredits {
                         current_balance: balance,
-                        message: "Your account has insufficient credits to perform this operation.".to_string(),
+                        message: "Account balance too low. Please add credits to continue.".to_string(),
                     }
                     .into_response();
                 }
