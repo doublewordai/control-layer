@@ -33,7 +33,7 @@ use sqlx::Acquire;
     params(
         ("endpoint" = Option<i32>, Query, description = "Filter by inference endpoint ID"),
         ("accessible" = Option<bool>, Query, description = "Filter to only models the current user can access (defaults to false for admins, true for users)"),
-        ("include" = Option<String>, Query, description = "Include additional data (comma-separated: 'groups', 'metrics', 'status', 'pricing'). Only platform managers can include groups. Status shows probe monitoring information. Pricing shows simple customer rates for regular users, full pricing structure for users with Pricing::ReadAll permission."),
+        ("include" = Option<String>, Query, description = "Include additional data (comma-separated: 'groups', 'metrics', 'status', 'pricing', 'endpoints'). Only platform managers can include groups. Status shows probe monitoring information. Pricing shows simple customer rates for regular users, full pricing structure for users with Pricing::ReadAll permission. Endpoints includes full inference endpoint details."),
         ("deleted" = Option<bool>, Query, description = "Show deleted models when true (admin only), non-deleted models when false, and all models when not specified"),
         ("inactive" = Option<bool>, Query, description = "Show inactive models when true (admin only)"),
         ("limit" = Option<i64>, Query, description = "Maximum number of items to return (default: 10, max: 100)"),
@@ -156,8 +156,12 @@ pub async fn list_deployed_models(
                     includes.push(include);
                 }
             }
+            "endpoints" => {
+                // Endpoints are public information, allow for all users
+                includes.push(include);
+            }
             _ => {
-                // Other includes (like pricing) are allowed for all users
+                // Other includes (like pricing, status) are allowed for all users
                 includes.push(include);
             }
         }
@@ -181,6 +185,7 @@ pub async fn list_deployed_models(
     let include_metrics = includes.contains(&"metrics");
     let include_status = includes.contains(&"status");
     let include_pricing = includes.contains(&"pricing");
+    let include_endpoints = includes.contains(&"endpoints");
 
     // Use ModelEnricher to add requested data
     let enricher = DeployedModelEnricher {
@@ -189,6 +194,7 @@ pub async fn list_deployed_models(
         include_metrics,
         include_status,
         include_pricing,
+        include_endpoints,
         can_read_pricing,
         can_read_rate_limits,
     };
@@ -392,6 +398,7 @@ pub async fn get_deployed_model(
     let include_metrics = include_params.contains("metrics");
     let include_status = include_params.contains("status");
     let include_pricing = include_params.contains("pricing");
+    let include_endpoints = include_params.contains("endpoints");
 
     // Build base response
     let pricing = model.pricing.clone();
@@ -404,6 +411,7 @@ pub async fn get_deployed_model(
         include_metrics,
         include_status,
         include_pricing,
+        include_endpoints,
         can_read_pricing,
         can_read_rate_limits,
     };

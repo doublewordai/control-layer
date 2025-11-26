@@ -21,8 +21,6 @@ import {
   useModels,
   type Model,
   type ModelsInclude,
-  useEndpoints,
-  type Endpoint,
   useProbes,
 } from "../../../../api/control-layer";
 import { AccessManagementModal } from "../../../modals";
@@ -83,7 +81,7 @@ export const ModelsContent: React.FC<ModelsContentProps> = ({
   const [itemsPerPage] = useState(12);
 
   const includeParam = useMemo(() => {
-    const parts: string[] = ["status"];
+    const parts: string[] = ["status", "endpoints"];
     if (canManageGroups) parts.push("groups");
     if (canViewAnalytics) parts.push("metrics");
     if (showPricing) parts.push("pricing");
@@ -102,30 +100,12 @@ export const ModelsContent: React.FC<ModelsContentProps> = ({
     search: searchQuery || undefined,
   });
 
-  const {
-    data: endpointsData,
-    isLoading: endpointsLoading,
-    error: endpointsError,
-  } = useEndpoints();
-
   const { data: probesData } = useProbes();
 
   const models = rawModelsData?.data || [];
-  const endpoints = endpointsData || [];
-  const endpointsRecord = endpoints.reduce(
-    (acc: Record<string, Endpoint>, endpoint: Endpoint) => {
-      acc[endpoint.id] = endpoint;
-      return acc;
-    },
-    {} as Record<string, Endpoint>,
-  );
 
-  const loading = modelsLoading || endpointsLoading;
-  const error = modelsError
-    ? (modelsError as Error).message
-    : endpointsError
-      ? (endpointsError as Error).message
-      : null;
+  const loading = modelsLoading;
+  const error = modelsError ? (modelsError as Error).message : null;
 
   // TODO: filter providers on the server-side
   const filteredModels = models.filter((model) => {
@@ -134,8 +114,7 @@ export const ModelsContent: React.FC<ModelsContentProps> = ({
     }
 
     const matchesProvider =
-      filterProvider === "all" ||
-      endpointsRecord[model.hosted_on]?.name === filterProvider;
+      filterProvider === "all" || model.endpoint?.name === filterProvider;
 
     return matchesProvider;
   });
@@ -233,7 +212,6 @@ export const ModelsContent: React.FC<ModelsContentProps> = ({
                 key={model.id}
                 model={model}
                 probesData={probesData}
-                endpointsRecord={endpointsRecord}
                 onNavigate={(modelId: string) =>
                   navigate(
                     `/models/${modelId}?from=${encodeURIComponent("/models?view=status")}`,
@@ -594,8 +572,7 @@ export const ModelsContent: React.FC<ModelsContentProps> = ({
                           <span>•</span>
                           {(() => {
                             const endpointName =
-                              endpointsRecord[model.hosted_on]?.name ||
-                              "Unknown endpoint";
+                              model.endpoint?.name || "Unknown endpoint";
                             return endpointName.length > 25 ? (
                               <HoverCard openDelay={200} closeDelay={100}>
                                 <HoverCardTrigger asChild>
