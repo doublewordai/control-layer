@@ -64,9 +64,8 @@ pub fn hash_string(input: &str) -> Result<String, Error> {
 
 /// Verify a string against a hash.
 ///
-/// Note: Verification uses the parameters embedded in the hash itself,
-/// so the params argument is ignored. It's included for API consistency.
-pub fn verify_string_with_params(input: &str, hash: &str, _params: Option<Argon2Params>) -> Result<bool, Error> {
+/// Note: Verification uses the parameters embedded in the hash itself.
+pub fn verify_string(input: &str, hash: &str) -> Result<bool, Error> {
     let parsed_hash = PasswordHash::new(hash).map_err(|e| Error::Internal {
         operation: format!("parse hash: {e}"),
     })?;
@@ -74,11 +73,6 @@ pub fn verify_string_with_params(input: &str, hash: &str, _params: Option<Argon2
     // Verification always uses params from the hash
     let argon2 = Argon2::default();
     Ok(argon2.verify_password(input.as_bytes(), &parsed_hash).is_ok())
-}
-
-/// Verify a string against a hash (convenience wrapper).
-pub fn verify_string(input: &str, hash: &str) -> Result<bool, Error> {
-    verify_string_with_params(input, hash, None)
 }
 
 /// Generate a secure random token for password reset
