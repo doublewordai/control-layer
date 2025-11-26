@@ -445,11 +445,6 @@ fn convert_to_config_file(targets: Vec<OnwardsTarget>) -> ConfigFile {
                 };
 
                 // Add all keys to key_definitions (whether they have rate limits or not)
-                debug!(
-                    "Adding API key to key_definitions: id={}, secret starts with: {}...",
-                    api_key.id,
-                    &api_key.secret[..api_key.secret.len().min(8)]
-                );
                 key_definitions.insert(
                     api_key.id.to_string(),
                     KeyDefinition {
