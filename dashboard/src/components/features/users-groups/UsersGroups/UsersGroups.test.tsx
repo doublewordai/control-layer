@@ -1,4 +1,4 @@
-import { render, screen, waitFor } from "@testing-library/react";
+import { render, within, waitFor, screen } from "@testing-library/react";
 import { MemoryRouter } from "react-router-dom";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { setupServer } from "msw/node";
@@ -38,24 +38,28 @@ function createWrapper() {
 
 describe("UsersGroups Component", () => {
   it("renders without crashing", async () => {
-    render(<UsersGroups />, { wrapper: createWrapper() });
+    const { container } = render(<UsersGroups />, { wrapper: createWrapper() });
 
     // Should show loading state initially
-    expect(screen.getByText("Loading users and groups...")).toBeInTheDocument();
+    expect(
+      within(container).getByText("Loading users and groups..."),
+    ).toBeInTheDocument();
 
     // Should render the component after loading
     await waitFor(() => {
-      expect(screen.getByText("Users & Groups")).toBeInTheDocument();
+      expect(within(container).getByText("Users & Groups")).toBeInTheDocument();
     });
   });
 
   it("renders users data when loaded", async () => {
-    render(<UsersGroups />, { wrapper: createWrapper() });
+    const { container } = render(<UsersGroups />, { wrapper: createWrapper() });
 
     await waitFor(() => {
       // Check that user data from mock is displayed
-      expect(screen.getByText("Sarah Chen")).toBeInTheDocument();
-      expect(screen.getByText("sarah.chen@doubleword.ai")).toBeInTheDocument();
+      expect(within(container).getByText("Sarah Chen")).toBeInTheDocument();
+      expect(
+        within(container).getByText("sarah.chen@doubleword.ai"),
+      ).toBeInTheDocument();
     });
   });
 
@@ -69,10 +73,10 @@ describe("UsersGroups Component", () => {
       }),
     );
 
-    render(<UsersGroups />, { wrapper: createWrapper() });
+    const { container } = render(<UsersGroups />, { wrapper: createWrapper() });
 
     await waitFor(() => {
-      expect(screen.getByText(/Error:/)).toBeInTheDocument();
+      expect(within(container).getByText(/Error:/)).toBeInTheDocument();
     });
   });
 
@@ -96,40 +100,50 @@ describe("UsersGroups Component", () => {
       }),
     );
 
-    render(<UsersGroups />, { wrapper: createWrapper() });
+    const { container } = render(<UsersGroups />, { wrapper: createWrapper() });
 
     await waitFor(() => {
       // Should still render the component structure
-      expect(screen.getByRole("heading", { level: 1 })).toBeInTheDocument();
-      expect(screen.getByRole("tab", { name: "Users" })).toBeInTheDocument();
+      expect(
+        within(container).getByRole("heading", { level: 1 }),
+      ).toBeInTheDocument();
+      expect(
+        within(container).getByRole("tab", { name: "Users" }),
+      ).toBeInTheDocument();
     });
   });
 
   describe("User Management Journey", () => {
     it("navigates users tab, searches for users, opens create user modal", async () => {
       const user = userEvent.setup();
-      render(<UsersGroups />, { wrapper: createWrapper() });
+      const { container } = render(<UsersGroups />, {
+        wrapper: createWrapper(),
+      });
 
       // Wait for initial load - check for main heading
       await waitFor(() => {
-        expect(screen.getByRole("heading", { level: 1 })).toBeInTheDocument();
+        expect(
+          within(container).getByRole("heading", { level: 1 }),
+        ).toBeInTheDocument();
       });
 
       // Step 1: Navigate to Users tab (should be default)
-      const usersTab = screen.getByRole("tab", { name: "Users" });
+      const usersTab = within(container).getByRole("tab", { name: "Users" });
       expect(usersTab).toHaveAttribute("aria-selected", "true");
 
       // Step 2: Search/filter users - test rich assertions
-      const searchInput = screen.getByRole("textbox", {
+      const searchInput = within(container).getByRole("textbox", {
         name: /search users/i,
       });
 
       // Initially, all users should be visible
       await waitFor(() => {
-        expect(screen.getByRole("table")).toBeInTheDocument();
-        expect(screen.getByText("Sarah Chen")).toBeInTheDocument();
-        expect(screen.getByText("James Wilson")).toBeInTheDocument();
-        expect(screen.getByText("Alex Rodriguez")).toBeInTheDocument();
+        expect(within(container).getByRole("table")).toBeInTheDocument();
+        expect(within(container).getByText("Sarah Chen")).toBeInTheDocument();
+        expect(within(container).getByText("James Wilson")).toBeInTheDocument();
+        expect(
+          within(container).getByText("Alex Rodriguez"),
+        ).toBeInTheDocument();
       });
 
       // Test search functionality
@@ -138,17 +152,21 @@ describe("UsersGroups Component", () => {
       // Wait for search results and verify specific user appears
       await waitFor(() => {
         // Should show Sarah Chen in search results
-        expect(screen.getByText("Sarah Chen")).toBeInTheDocument();
+        expect(within(container).getByText("Sarah Chen")).toBeInTheDocument();
         expect(
-          screen.getByText("sarah.chen@doubleword.ai"),
+          within(container).getByText("sarah.chen@doubleword.ai"),
         ).toBeInTheDocument();
       });
 
       // Verify other users are filtered out (but don't fail test if search is async)
       await waitFor(
         () => {
-          expect(screen.queryByText("James Wilson")).not.toBeInTheDocument();
-          expect(screen.queryByText("Alex Rodriguez")).not.toBeInTheDocument();
+          expect(
+            within(container).queryByText("James Wilson"),
+          ).not.toBeInTheDocument();
+          expect(
+            within(container).queryByText("Alex Rodriguez"),
+          ).not.toBeInTheDocument();
         },
         { timeout: 1000 },
       );
@@ -157,21 +175,25 @@ describe("UsersGroups Component", () => {
       await user.clear(searchInput);
 
       await waitFor(() => {
-        expect(screen.getByText("Sarah Chen")).toBeInTheDocument();
-        expect(screen.getByText("James Wilson")).toBeInTheDocument();
+        expect(within(container).getByText("Sarah Chen")).toBeInTheDocument();
+        expect(within(container).getByText("James Wilson")).toBeInTheDocument();
       });
 
       // Step 3: Create new user → opens CreateUserModal
-      const addUserButton = screen.getByRole("button", { name: /add user/i });
+      const addUserButton = within(container).getByRole("button", {
+        name: /add user/i,
+      });
       await user.click(addUserButton);
 
-      // Wait for modal to open - check for dialog
+      // Wait for modal to open - check for dialog (renders in portal)
       await waitFor(() => {
         expect(screen.getByRole("dialog")).toBeInTheDocument();
       });
 
       // Close modal using cancel button
-      const cancelButton = screen.getByRole("button", { name: /cancel/i });
+      const cancelButton = screen.getByRole("button", {
+        name: /cancel/i,
+      });
       await user.click(cancelButton);
 
       // Verify modal is closed
@@ -182,21 +204,27 @@ describe("UsersGroups Component", () => {
 
     it("explores user actions dropdown and modal workflows", async () => {
       const user = userEvent.setup();
-      render(<UsersGroups />, { wrapper: createWrapper() });
+      const { container } = render(<UsersGroups />, {
+        wrapper: createWrapper(),
+      });
 
       // Wait for users to load
       await waitFor(() => {
-        expect(screen.getByRole("heading", { level: 1 })).toBeInTheDocument();
-        expect(screen.getByText("Sarah Chen")).toBeInTheDocument();
+        expect(
+          within(container).getByRole("heading", { level: 1 }),
+        ).toBeInTheDocument();
+        expect(within(container).getByText("Sarah Chen")).toBeInTheDocument();
       });
 
       // Step 1: Open user actions dropdown
-      const actionMenus = screen.getAllByRole("button", { name: /open menu/i });
+      const actionMenus = within(container).getAllByRole("button", {
+        name: /open menu/i,
+      });
       expect(actionMenus.length).toBeGreaterThan(0);
 
       await user.click(actionMenus[0]);
 
-      // Verify all user action options are present
+      // Verify all user action options are present (dropdown renders in portal)
       await waitFor(() => {
         expect(
           screen.getByRole("menuitem", { name: "Edit" }),
@@ -210,11 +238,14 @@ describe("UsersGroups Component", () => {
       });
 
       // Step 2: Test Edit User workflow
-      const editButton = screen.getByRole("menuitem", { name: "Edit" });
+      const editButton = screen.getByRole("menuitem", {
+        name: "Edit",
+      });
       await user.click(editButton);
 
       await waitFor(() => {
         expect(
+          // assert on screen since modal renders outside of container
           screen.getByRole("dialog", { name: /edit user/i }),
         ).toBeInTheDocument();
         // Verify form fields with injected user data
@@ -230,7 +261,9 @@ describe("UsersGroups Component", () => {
       });
 
       // Close edit modal
-      const cancelEditButton = screen.getByRole("button", { name: /cancel/i });
+      const cancelEditButton = screen.getByRole("button", {
+        name: /cancel/i,
+      });
       await user.click(cancelEditButton);
 
       await waitFor(() => {
@@ -238,7 +271,7 @@ describe("UsersGroups Component", () => {
       });
 
       // Step 3: Test Manage Groups workflow - reopen dropdown
-      const reopenedMenus = screen.getAllByRole("button", {
+      const reopenedMenus = within(container).getAllByRole("button", {
         name: /open menu/i,
       });
       await user.click(reopenedMenus[0]);
@@ -263,7 +296,9 @@ describe("UsersGroups Component", () => {
       });
 
       // Close groups modal
-      const doneButton = screen.getByRole("button", { name: /done/i });
+      const doneButton = screen.getByRole("button", {
+        name: /done/i,
+      });
       await user.click(doneButton);
 
       await waitFor(() => {
@@ -271,7 +306,9 @@ describe("UsersGroups Component", () => {
       });
 
       // Step 4: Test Delete User workflow - reopen dropdown again
-      const finalMenus = screen.getAllByRole("button", { name: /open menu/i });
+      const finalMenus = within(container).getAllByRole("button", {
+        name: /open menu/i,
+      });
       await user.click(finalMenus[0]);
 
       await waitFor(() => {
@@ -280,7 +317,9 @@ describe("UsersGroups Component", () => {
         ).toBeInTheDocument();
       });
 
-      const deleteButton = screen.getByRole("menuitem", { name: "Delete" });
+      const deleteButton = screen.getByRole("menuitem", {
+        name: "Delete",
+      });
       await user.click(deleteButton);
 
       await waitFor(() => {
@@ -307,30 +346,34 @@ describe("UsersGroups Component", () => {
       await waitFor(() => {
         expect(screen.queryByRole("dialog")).not.toBeInTheDocument();
         // User should still be in the list
-        expect(screen.getByText("Sarah Chen")).toBeInTheDocument();
+        expect(within(container).getByText("Sarah Chen")).toBeInTheDocument();
       });
     });
 
     it("tests Edit Group Modal through group dropdown", async () => {
       const user = userEvent.setup();
-      render(<UsersGroups />, { wrapper: createWrapper() });
+      const { container } = render(<UsersGroups />, {
+        wrapper: createWrapper(),
+      });
 
       // Switch to Groups tab
       await waitFor(() => {
-        expect(screen.getByRole("heading", { level: 1 })).toBeInTheDocument();
+        expect(
+          within(container).getByRole("heading", { level: 1 }),
+        ).toBeInTheDocument();
       });
 
-      const groupsTab = screen.getByRole("tab", { name: "Groups" });
+      const groupsTab = within(container).getByRole("tab", { name: "Groups" });
       await user.click(groupsTab);
       expect(groupsTab).toHaveAttribute("aria-selected", "true");
 
       // Wait for groups to be visible
       await waitFor(() => {
-        expect(screen.getByText("Engineering")).toBeInTheDocument();
+        expect(within(container).getByText("Engineering")).toBeInTheDocument();
       });
 
       // Find and click group actions dropdown
-      const groupActionMenus = screen.getAllByRole("button", {
+      const groupActionMenus = within(container).getAllByRole("button", {
         name: /open menu/i,
       });
       expect(groupActionMenus.length).toBeGreaterThan(0);
@@ -361,7 +404,9 @@ describe("UsersGroups Component", () => {
       });
 
       // Cancel edit group modal
-      const cancelButton = screen.getByRole("button", { name: /cancel/i });
+      const cancelButton = screen.getByRole("button", {
+        name: /cancel/i,
+      });
       await user.click(cancelButton);
 
       await waitFor(() => {
@@ -371,22 +416,26 @@ describe("UsersGroups Component", () => {
 
     it("tests Delete Group Modal through group dropdown", async () => {
       const user = userEvent.setup();
-      render(<UsersGroups />, { wrapper: createWrapper() });
+      const { container } = render(<UsersGroups />, {
+        wrapper: createWrapper(),
+      });
 
       // Switch to Groups tab
       await waitFor(() => {
-        expect(screen.getByRole("heading", { level: 1 })).toBeInTheDocument();
+        expect(
+          within(container).getByRole("heading", { level: 1 }),
+        ).toBeInTheDocument();
       });
 
-      const groupsTab = screen.getByRole("tab", { name: "Groups" });
+      const groupsTab = within(container).getByRole("tab", { name: "Groups" });
       await user.click(groupsTab);
 
       // Wait for groups and find dropdown
       await waitFor(() => {
-        expect(screen.getByText("Engineering")).toBeInTheDocument();
+        expect(within(container).getByText("Engineering")).toBeInTheDocument();
       });
 
-      const groupActionMenus = screen.getAllByRole("button", {
+      const groupActionMenus = within(container).getAllByRole("button", {
         name: /open menu/i,
       });
       await user.click(groupActionMenus[0]);
@@ -416,7 +465,9 @@ describe("UsersGroups Component", () => {
       });
 
       // Cancel deletion
-      const cancelButton = screen.getByRole("button", { name: /cancel/i });
+      const cancelButton = screen.getByRole("button", {
+        name: /cancel/i,
+      });
       await user.click(cancelButton);
 
       await waitFor(() => {
@@ -426,22 +477,26 @@ describe("UsersGroups Component", () => {
 
     it("tests Group Management Modal through group dropdown", async () => {
       const user = userEvent.setup();
-      render(<UsersGroups />, { wrapper: createWrapper() });
+      const { container } = render(<UsersGroups />, {
+        wrapper: createWrapper(),
+      });
 
       // Switch to Groups tab
       await waitFor(() => {
-        expect(screen.getByRole("heading", { level: 1 })).toBeInTheDocument();
+        expect(
+          within(container).getByRole("heading", { level: 1 }),
+        ).toBeInTheDocument();
       });
 
-      const groupsTab = screen.getByRole("tab", { name: "Groups" });
+      const groupsTab = within(container).getByRole("tab", { name: "Groups" });
       await user.click(groupsTab);
 
       // Wait for groups and find dropdown
       await waitFor(() => {
-        expect(screen.getByText("Engineering")).toBeInTheDocument();
+        expect(within(container).getByText("Engineering")).toBeInTheDocument();
       });
 
-      const groupActionMenus = screen.getAllByRole("button", {
+      const groupActionMenus = within(container).getAllByRole("button", {
         name: /open menu/i,
       });
       await user.click(groupActionMenus[0]);
@@ -467,7 +522,9 @@ describe("UsersGroups Component", () => {
       });
 
       // Close modal
-      const doneButton = screen.getByRole("button", { name: /done/i });
+      const doneButton = screen.getByRole("button", {
+        name: /done/i,
+      });
       await user.click(doneButton);
 
       await waitFor(() => {
@@ -477,26 +534,32 @@ describe("UsersGroups Component", () => {
 
     it("associates users with groups through manage groups workflow", async () => {
       const user = userEvent.setup();
-      render(<UsersGroups />, { wrapper: createWrapper() });
+      const { container } = render(<UsersGroups />, {
+        wrapper: createWrapper(),
+      });
 
       // Wait for initial load
       await waitFor(() => {
-        expect(screen.getByRole("heading", { level: 1 })).toBeInTheDocument();
+        expect(
+          within(container).getByRole("heading", { level: 1 }),
+        ).toBeInTheDocument();
       });
 
       // Step 1: Switch to Users tab to ensure we're on the correct tab
-      const usersTab = screen.getByRole("tab", { name: "Users" });
+      const usersTab = within(container).getByRole("tab", { name: "Users" });
       await user.click(usersTab);
 
       expect(usersTab).toHaveAttribute("aria-selected", "true");
 
       // Wait for users to be visible
       await waitFor(() => {
-        expect(screen.getByText("Sarah Chen")).toBeInTheDocument();
+        expect(within(container).getByText("Sarah Chen")).toBeInTheDocument();
       });
 
       // Step 2: Open user actions dropdown for Sarah Chen
-      const actionMenus = screen.getAllByRole("button", { name: /open menu/i });
+      const actionMenus = within(container).getAllByRole("button", {
+        name: /open menu/i,
+      });
       expect(actionMenus.length).toBeGreaterThan(0);
 
       await user.click(actionMenus[0]);
@@ -571,13 +634,15 @@ describe("UsersGroups Component", () => {
       }
 
       // Step 6: Test save/done functionality
-      const doneButton = screen.getByRole("button", { name: /done/i });
+      const doneButton = screen.getByRole("button", {
+        name: /done/i,
+      });
       await user.click(doneButton);
 
       await waitFor(() => {
         expect(screen.queryByRole("dialog")).not.toBeInTheDocument();
         // Should return to main users list with Sarah Chen still visible
-        expect(screen.getByText("Sarah Chen")).toBeInTheDocument();
+        expect(within(container).getByText("Sarah Chen")).toBeInTheDocument();
       });
     });
   });

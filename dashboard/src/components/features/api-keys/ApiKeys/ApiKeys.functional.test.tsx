@@ -1,4 +1,4 @@
-import { render, screen, waitFor } from "@testing-library/react";
+import { render, waitFor, within, screen } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { MemoryRouter } from "react-router-dom";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
@@ -79,31 +79,35 @@ describe("API Keys Component - Functional Tests", () => {
   describe("API Keys List Journey", () => {
     it("displays existing API keys and allows creating new ones", async () => {
       const user = userEvent.setup();
-      render(<ApiKeys />, { wrapper: createWrapper() });
+      const { container } = render(<ApiKeys />, { wrapper: createWrapper() });
 
       // Wait for component to load
       await waitFor(() => {
         expect(
-          screen.getByRole("heading", { name: /api keys/i }),
+          within(container).getByRole("heading", { name: /api keys/i }),
         ).toBeInTheDocument();
       });
 
       // Should show management interface with existing keys
       expect(
-        screen.getByText(/manage your api keys for programmatic access/i),
+        within(container).getByText(
+          /manage your api keys for programmatic access/i,
+        ),
       ).toBeInTheDocument();
 
       // Should have create button
-      const createButton = screen.getByRole("button", {
+      const createButton = within(container).getByRole("button", {
         name: /create new api key/i,
       });
       await user.click(createButton);
 
-      // Should open create dialog
+      // Should open create dialog (renders in portal)
       await waitFor(() => {
         expect(screen.getByRole("dialog")).toBeInTheDocument();
         expect(
-          screen.getByRole("heading", { name: /create new api key/i }),
+          screen.getByRole("heading", {
+            name: /create new api key/i,
+          }),
         ).toBeInTheDocument();
       });
     });
@@ -112,17 +116,17 @@ describe("API Keys Component - Functional Tests", () => {
   describe("API Key Creation Journey", () => {
     it("creates new API key with name and description", async () => {
       const user = userEvent.setup();
-      render(<ApiKeys />, { wrapper: createWrapper() });
+      const { container } = render(<ApiKeys />, { wrapper: createWrapper() });
 
       // Wait for component to load
       await waitFor(() => {
         expect(
-          screen.getByRole("heading", { name: /api keys/i }),
+          within(container).getByRole("heading", { name: /api keys/i }),
         ).toBeInTheDocument();
       });
 
       // Click create API key button
-      const createButton = screen.getByRole("button", {
+      const createButton = within(container).getByRole("button", {
         name: /create new api key/i,
       });
       await user.click(createButton);
@@ -140,7 +144,9 @@ describe("API Keys Component - Functional Tests", () => {
       await user.type(descriptionInput, "For testing purposes");
 
       // Submit the form
-      const submitButton = screen.getByRole("button", { name: /create key/i });
+      const submitButton = screen.getByRole("button", {
+        name: /create key/i,
+      });
       await user.click(submitButton);
 
       // Should show success state with the created key
@@ -159,16 +165,16 @@ describe("API Keys Component - Functional Tests", () => {
 
     it("validates required name field", async () => {
       const user = userEvent.setup();
-      render(<ApiKeys />, { wrapper: createWrapper() });
+      const { container } = render(<ApiKeys />, { wrapper: createWrapper() });
 
       // Wait for component to load and click create button
       await waitFor(() => {
         expect(
-          screen.getByRole("heading", { name: /api keys/i }),
+          within(container).getByRole("heading", { name: /api keys/i }),
         ).toBeInTheDocument();
       });
 
-      const createButton = screen.getByRole("button", {
+      const createButton = within(container).getByRole("button", {
         name: /create new api key/i,
       });
       await user.click(createButton);
@@ -178,7 +184,9 @@ describe("API Keys Component - Functional Tests", () => {
         expect(screen.getByRole("dialog")).toBeInTheDocument();
       });
 
-      const submitButton = screen.getByRole("button", { name: /create key/i });
+      const submitButton = screen.getByRole("button", {
+        name: /create key/i,
+      });
       expect(submitButton).toBeDisabled();
 
       // Add name and button should be enabled
@@ -192,16 +200,16 @@ describe("API Keys Component - Functional Tests", () => {
   describe("API Key Management Journey", () => {
     it("copies API key to clipboard after creation", async () => {
       const user = userEvent.setup();
-      render(<ApiKeys />, { wrapper: createWrapper() });
+      const { container } = render(<ApiKeys />, { wrapper: createWrapper() });
 
       // Create an API key first
       await waitFor(() => {
         expect(
-          screen.getByRole("heading", { name: /api keys/i }),
+          within(container).getByRole("heading", { name: /api keys/i }),
         ).toBeInTheDocument();
       });
 
-      const createButton = screen.getByRole("button", {
+      const createButton = within(container).getByRole("button", {
         name: /create new api key/i,
       });
       await user.click(createButton);
@@ -213,7 +221,9 @@ describe("API Keys Component - Functional Tests", () => {
       const nameInput = screen.getByLabelText(/name/i);
       await user.type(nameInput, "Test Key");
 
-      const submitButton = screen.getByRole("button", { name: /create key/i });
+      const submitButton = screen.getByRole("button", {
+        name: /create key/i,
+      });
       await user.click(submitButton);
 
       // Wait for success state
@@ -226,7 +236,9 @@ describe("API Keys Component - Functional Tests", () => {
       });
 
       // Should show copy button with accessibility label
-      const copyButton = screen.getByRole("button", { name: /copy api key/i });
+      const copyButton = screen.getByRole("button", {
+        name: /copy api key/i,
+      });
       expect(copyButton).toBeInTheDocument();
 
       // Should show API key in code block
@@ -244,16 +256,16 @@ describe("API Keys Component - Functional Tests", () => {
         configurable: true,
       });
 
-      render(<ApiKeys />, { wrapper: createWrapper() });
+      const { container } = render(<ApiKeys />, { wrapper: createWrapper() });
 
       // Create an API key first
       await waitFor(() => {
         expect(
-          screen.getByRole("heading", { name: /api keys/i }),
+          within(container).getByRole("heading", { name: /api keys/i }),
         ).toBeInTheDocument();
       });
 
-      const createButton = screen.getByRole("button", {
+      const createButton = within(container).getByRole("button", {
         name: /create new api key/i,
       });
       await user.click(createButton);
@@ -265,7 +277,9 @@ describe("API Keys Component - Functional Tests", () => {
       const nameInput = screen.getByLabelText(/name/i);
       await user.type(nameInput, "Test Key");
 
-      const submitButton = screen.getByRole("button", { name: /create key/i });
+      const submitButton = screen.getByRole("button", {
+        name: /create key/i,
+      });
       await user.click(submitButton);
 
       // Wait for success state
@@ -307,16 +321,16 @@ describe("API Keys Component - Functional Tests", () => {
         configurable: true,
       });
 
-      render(<ApiKeys />, { wrapper: createWrapper() });
+      const { container } = render(<ApiKeys />, { wrapper: createWrapper() });
 
       // Create an API key first
       await waitFor(() => {
         expect(
-          screen.getByRole("heading", { name: /api keys/i }),
+          within(container).getByRole("heading", { name: /api keys/i }),
         ).toBeInTheDocument();
       });
 
-      const createButton = screen.getByRole("button", {
+      const createButton = within(container).getByRole("button", {
         name: /create new api key/i,
       });
       await user.click(createButton);
@@ -328,7 +342,9 @@ describe("API Keys Component - Functional Tests", () => {
       const nameInput = screen.getByLabelText(/name/i);
       await user.type(nameInput, "Test Key");
 
-      const submitButton = screen.getByRole("button", { name: /create key/i });
+      const submitButton = screen.getByRole("button", {
+        name: /create key/i,
+      });
       await user.click(submitButton);
 
       // Wait for success state
@@ -359,16 +375,16 @@ describe("API Keys Component - Functional Tests", () => {
 
     it("closes create dialog with cancel or done buttons", async () => {
       const user = userEvent.setup();
-      render(<ApiKeys />, { wrapper: createWrapper() });
+      const { container } = render(<ApiKeys />, { wrapper: createWrapper() });
 
       await waitFor(() => {
         expect(
-          screen.getByRole("heading", { name: /api keys/i }),
+          within(container).getByRole("heading", { name: /api keys/i }),
         ).toBeInTheDocument();
       });
 
       // Open dialog
-      const createButton = screen.getByRole("button", {
+      const createButton = within(container).getByRole("button", {
         name: /create new api key/i,
       });
       await user.click(createButton);
@@ -378,7 +394,9 @@ describe("API Keys Component - Functional Tests", () => {
       });
 
       // Cancel should close dialog
-      const cancelButton = screen.getByRole("button", { name: /cancel/i });
+      const cancelButton = screen.getByRole("button", {
+        name: /cancel/i,
+      });
       await user.click(cancelButton);
 
       await waitFor(() => {
@@ -390,17 +408,17 @@ describe("API Keys Component - Functional Tests", () => {
   describe("API Key Deletion Journey", () => {
     it("deletes individual API key with confirmation", async () => {
       const user = userEvent.setup();
-      render(<ApiKeys />, { wrapper: createWrapper() });
+      const { container } = render(<ApiKeys />, { wrapper: createWrapper() });
 
       // Wait for component to load - this test assumes there are existing API keys
       await waitFor(() => {
         expect(
-          screen.getByRole("heading", { name: /api keys/i }),
+          within(container).getByRole("heading", { name: /api keys/i }),
         ).toBeInTheDocument();
       });
 
       // Look for delete button in table (if API keys exist)
-      const deleteButtons = screen.queryAllByRole("button", {
+      const deleteButtons = within(container).queryAllByRole("button", {
         name: /delete/i,
       });
 
@@ -420,12 +438,16 @@ describe("API Keys Component - Functional Tests", () => {
         ).toBeInTheDocument();
 
         // Cancel should close dialog
-        const cancelButton = screen.getByRole("button", { name: /cancel/i });
+        const cancelButton = screen.getByRole("button", {
+          name: /cancel/i,
+        });
         await user.click(cancelButton);
 
         await waitFor(() => {
           expect(
-            screen.queryByRole("heading", { name: /delete api key/i }),
+            screen.queryByRole("heading", {
+              name: /delete api key/i,
+            }),
           ).not.toBeInTheDocument();
         });
       }
@@ -434,7 +456,7 @@ describe("API Keys Component - Functional Tests", () => {
 
   describe("Loading and Error States", () => {
     it("shows loading state initially", async () => {
-      render(<ApiKeys />, { wrapper: createWrapper() });
+      const { container } = render(<ApiKeys />, { wrapper: createWrapper() });
 
       // Should show loading skeleton initially with animate-pulse
       const loadingContainer = document.querySelector(".animate-pulse");
@@ -443,23 +465,23 @@ describe("API Keys Component - Functional Tests", () => {
       // Wait for actual content to load
       await waitFor(() => {
         expect(
-          screen.getByRole("heading", { name: /api keys/i }),
+          within(container).getByRole("heading", { name: /api keys/i }),
         ).toBeInTheDocument();
       });
     });
 
     it("handles form submission and shows success state", async () => {
       const user = userEvent.setup();
-      render(<ApiKeys />, { wrapper: createWrapper() });
+      const { container } = render(<ApiKeys />, { wrapper: createWrapper() });
 
       await waitFor(() => {
         expect(
-          screen.getByRole("heading", { name: /api keys/i }),
+          within(container).getByRole("heading", { name: /api keys/i }),
         ).toBeInTheDocument();
       });
 
       // Open create dialog
-      const createButton = screen.getByRole("button", {
+      const createButton = within(container).getByRole("button", {
         name: /create new api key/i,
       });
       await user.click(createButton);
@@ -473,7 +495,9 @@ describe("API Keys Component - Functional Tests", () => {
       await user.type(nameInput, "Test Success Key");
 
       // Submit form
-      const submitButton = screen.getByRole("button", { name: /create key/i });
+      const submitButton = screen.getByRole("button", {
+        name: /create key/i,
+      });
       await user.click(submitButton);
 
       // Should show success state
@@ -498,16 +522,16 @@ describe("API Keys Component - Functional Tests", () => {
         value: 375,
       });
 
-      render(<ApiKeys />, { wrapper: createWrapper() });
+      const { container } = render(<ApiKeys />, { wrapper: createWrapper() });
 
       await waitFor(() => {
         expect(
-          screen.getByRole("heading", { name: /api keys/i }),
+          within(container).getByRole("heading", { name: /api keys/i }),
         ).toBeInTheDocument();
       });
 
       // Core functionality should still work
-      const createButton = screen.getByRole("button", {
+      const createButton = within(container).getByRole("button", {
         name: /create new api key/i,
       });
       await user.click(createButton);

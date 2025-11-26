@@ -1,4 +1,4 @@
-import { render, waitFor, within } from "@testing-library/react";
+import { render, waitFor, within, screen } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { setupServer } from "msw/node";
@@ -176,7 +176,8 @@ describe("ModelCombobox", () => {
     // Search input should be visible
     await waitFor(() => {
       expect(
-        within(container).getByPlaceholderText("Search models..."),
+        // assert screen since popover renders outside of container
+        screen.getByPlaceholderText("Search models..."),
       ).toBeInTheDocument();
     });
   });
@@ -194,12 +195,10 @@ describe("ModelCombobox", () => {
 
     // Wait for models to load and display
     await waitFor(() => {
-      expect(within(container).getByText("gpt-4o")).toBeInTheDocument();
-      expect(within(container).getByText("gpt-4o-mini")).toBeInTheDocument();
-      expect(
-        within(container).getByText("text-embedding-3-large"),
-      ).toBeInTheDocument();
-      expect(within(container).getByText("claude-3-opus")).toBeInTheDocument();
+      expect(screen.getByText("gpt-4o")).toBeInTheDocument();
+      expect(screen.getByText("gpt-4o-mini")).toBeInTheDocument();
+      expect(screen.getByText("text-embedding-3-large")).toBeInTheDocument();
+      expect(screen.getByText("claude-3-opus")).toBeInTheDocument();
     });
   });
 
@@ -216,21 +215,18 @@ describe("ModelCombobox", () => {
 
     // Wait for models to load
     await waitFor(() => {
-      expect(within(container).getByText("gpt-4o")).toBeInTheDocument();
+      expect(screen.getByText("gpt-4o")).toBeInTheDocument();
     });
 
     // Type search query
-    const searchInput =
-      within(container).getByPlaceholderText("Search models...");
+    const searchInput = screen.getByPlaceholderText("Search models...");
     await user.type(searchInput, "claude");
 
     // Should show filtered results (debounced)
     await waitFor(
       () => {
-        expect(
-          within(container).getByText("claude-3-opus"),
-        ).toBeInTheDocument();
-        expect(within(container).queryByText("gpt-4o")).not.toBeInTheDocument();
+        expect(screen.getByText("claude-3-opus")).toBeInTheDocument();
+        expect(screen.queryByText("gpt-4o")).not.toBeInTheDocument();
       },
       { timeout: 1000 },
     );
@@ -254,11 +250,11 @@ describe("ModelCombobox", () => {
 
     // Wait for models to load
     await waitFor(() => {
-      expect(within(container).getByText("gpt-4o")).toBeInTheDocument();
+      expect(screen.getByText("gpt-4o")).toBeInTheDocument();
     });
 
     // Click on a model
-    await user.click(within(container).getByText("gpt-4o"));
+    await user.click(screen.getByText("gpt-4o"));
 
     // Should call onValueChange with the model alias
     expect(handleChange).toHaveBeenCalledWith("gpt-4o");
@@ -278,11 +274,11 @@ describe("ModelCombobox", () => {
 
     // Wait for models to load
     await waitFor(() => {
-      expect(within(container).getByText("gpt-4o")).toBeInTheDocument();
+      expect(screen.getByText("gpt-4o")).toBeInTheDocument();
     });
 
     // Click on a model
-    await user.click(within(container).getByText("gpt-4o"));
+    await user.click(screen.getByText("gpt-4o"));
 
     // Popover should close
     await waitFor(() => {
@@ -305,17 +301,17 @@ describe("ModelCombobox", () => {
 
     // Wait for models to load
     await waitFor(() => {
-      expect(within(container).getByText("gpt-4o")).toBeInTheDocument();
+      expect(screen.getByText("gpt-4o")).toBeInTheDocument();
     });
 
     // Should show only chat models
-    expect(within(container).getByText("gpt-4o")).toBeInTheDocument();
-    expect(within(container).getByText("gpt-4o-mini")).toBeInTheDocument();
-    expect(within(container).getByText("claude-3-opus")).toBeInTheDocument();
+    expect(screen.getByText("gpt-4o")).toBeInTheDocument();
+    expect(screen.getByText("gpt-4o-mini")).toBeInTheDocument();
+    expect(screen.getByText("claude-3-opus")).toBeInTheDocument();
 
     // Should not show embeddings model
     expect(
-      within(container).queryByText("text-embedding-3-large"),
+      screen.queryByText("text-embedding-3-large"),
     ).not.toBeInTheDocument();
   });
 
@@ -336,7 +332,7 @@ describe("ModelCombobox", () => {
     // Should show custom search placeholder
     await waitFor(() => {
       expect(
-        within(container).getByPlaceholderText("Find a model..."),
+        screen.getByPlaceholderText("Find a model..."),
       ).toBeInTheDocument();
     });
   });
@@ -357,19 +353,18 @@ describe("ModelCombobox", () => {
 
     // Wait for models to load
     await waitFor(() => {
-      expect(within(container).getByText("gpt-4o")).toBeInTheDocument();
+      expect(screen.getByText("gpt-4o")).toBeInTheDocument();
     });
 
     // Type search query that matches no models
-    const searchInput =
-      within(container).getByPlaceholderText("Search models...");
+    const searchInput = screen.getByPlaceholderText("Search models...");
     await user.type(searchInput, "nonexistent-model-xyz");
 
     // Should show custom empty message (debounced)
     await waitFor(
       () => {
         expect(
-          within(container).getByText("No matching models found"),
+          screen.getByText("No matching models found"),
         ).toBeInTheDocument();
       },
       { timeout: 1000 },
@@ -400,24 +395,21 @@ describe("ModelCombobox", () => {
 
     // Wait for initial models to load
     await waitFor(() => {
-      expect(within(container).getByText("gpt-4o")).toBeInTheDocument();
+      expect(screen.getByText("gpt-4o")).toBeInTheDocument();
     });
 
-    const searchInput =
-      within(container).getByPlaceholderText("Search models...");
+    const searchInput = screen.getByPlaceholderText("Search models...");
 
     // Type quickly (should debounce)
     await user.type(searchInput, "gp");
 
     // Should still show all models immediately (debounced)
-    expect(within(container).getByText("claude-3-opus")).toBeInTheDocument();
+    expect(screen.getByText("claude-3-opus")).toBeInTheDocument();
 
     // After debounce delay, should filter
     await waitFor(
       () => {
-        expect(
-          within(container).queryByText("claude-3-opus"),
-        ).not.toBeInTheDocument();
+        expect(screen.queryByText("claude-3-opus")).not.toBeInTheDocument();
       },
       { timeout: 500 },
     );
@@ -443,7 +435,7 @@ describe("ModelCombobox", () => {
 
     // Should still load and display models
     await waitFor(() => {
-      expect(within(container).getByText("gpt-4o")).toBeInTheDocument();
+      expect(screen.getByText("gpt-4o")).toBeInTheDocument();
     });
   });
 });
