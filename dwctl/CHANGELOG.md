@@ -1,5 +1,21 @@
 # Changelog
 
+## [0.10.0](https://github.com/doublewordai/control-layer/compare/v0.9.0...v0.10.0) (2025-11-26)
+
+
+### Features
+
+* Add include=endpoints support to resolve hosted_on references in backend ([#244](https://github.com/doublewordai/control-layer/issues/244)) ([e258dc3](https://github.com/doublewordai/control-layer/commit/e258dc33aa01aebf012dc999f95e3340a8501484))
+* make Argon2 parameters configurable for faster test execution ([#239](https://github.com/doublewordai/control-layer/issues/239)) ([65c1de9](https://github.com/doublewordai/control-layer/commit/65c1de9ee261d48720f8ebad37c90768d3772cb2))
+
+
+### Bug Fixes
+
+* dont truncate billing ([#227](https://github.com/doublewordai/control-layer/issues/227)) ([d4d5040](https://github.com/doublewordai/control-layer/commit/d4d50404b08ff86a890b3c58e309c5a21dfb7b33))
+* loosen test ([5a70dc1](https://github.com/doublewordai/control-layer/commit/5a70dc150183d2c0ab169591c2410a6996e77a07))
+* make hidden key when a user first logs in, rather than when they first make a playground request ([#233](https://github.com/doublewordai/control-layer/issues/233)) ([a491f54](https://github.com/doublewordai/control-layer/commit/a491f5408d0d2d8aaa0d49607bc4fade1a11561e))
+* simplify auth in serializers ([#242](https://github.com/doublewordai/control-layer/issues/242)) ([86568ee](https://github.com/doublewordai/control-layer/commit/86568ee244a04980871041cdff8164696c50f6cc))
+
 ## [0.9.0](https://github.com/doublewordai/control-layer/compare/v0.8.1...v0.9.0) (2025-11-25)
 
 
