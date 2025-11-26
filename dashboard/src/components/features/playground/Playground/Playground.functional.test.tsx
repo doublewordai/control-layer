@@ -67,8 +67,10 @@ vi.mock("openai", () => ({
   default: vi.fn(() => mockOpenAI),
 }));
 
+let queryClient: QueryClient;
+
 function createWrapper(initialEntries = ["/"]) {
-  const queryClient = new QueryClient({
+  queryClient = new QueryClient({
     defaultOptions: {
       queries: {
         retry: false,
@@ -85,6 +87,13 @@ function createWrapper(initialEntries = ["/"]) {
 }
 
 describe("Playground Component - Functional Tests", () => {
+  afterEach(() => {
+    // Clean up QueryClient to prevent state pollution between tests
+    if (queryClient) {
+      queryClient.clear();
+      queryClient.cancelQueries();
+    }
+  });
   it("loads playground page and shows welcome state", async () => {
     render(<Playground />, { wrapper: createWrapper() });
 
