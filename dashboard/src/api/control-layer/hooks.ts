@@ -929,7 +929,7 @@ export function useAddFunds() {
 export function useCreatePayment() {
   return useMutation({
     mutationKey: queryKeys.payments.create(),
-    mutationFn: () => dwctlApi.payments.create(),
+    mutationFn: (crediteeId?: string) => dwctlApi.payments.create(crediteeId),
   });
 }
 

@@ -17,7 +17,6 @@ import {
   DeleteUserModal,
   GroupManagementModal,
   DeleteGroupModal,
-  UserTransactionsModal,
 } from "../../../modals";
 import { GroupActionsDropdown } from "../";
 import { UserAvatar, Button } from "../../../ui";
@@ -130,8 +129,6 @@ const UsersGroups: React.FC = () => {
   const [showBulkDeleteModal, setShowBulkDeleteModal] = useState(false);
   const [showBulkDeleteGroupsModal, setShowBulkDeleteGroupsModal] =
     useState(false);
-  const [showUserTransactionsModal, setShowUserTransactionsModal] =
-    useState(false);
 
   // 'active' means the 3 dots have been clicked on a user or group, vs. selected in the table.
   const [activeUser, setActiveUser] = useState<DisplayUser | null>(null);
@@ -238,8 +235,7 @@ const UsersGroups: React.FC = () => {
       setShowUserGroupsModal(true);
     },
     onViewTransactions: (user) => {
-      setActiveUser(user);
-      setShowUserTransactionsModal(true);
+      navigate(`/cost-management?user=${user.id}`);
     },
     groups: groups,
     showTransactions: true,
@@ -659,17 +655,6 @@ const UsersGroups: React.FC = () => {
           }}
         />
       )}
-      {activeUser && (
-        <UserTransactionsModal
-          isOpen={showUserTransactionsModal}
-          onClose={() => {
-            setShowUserTransactionsModal(false);
-            setActiveUser(null);
-          }}
-          user={activeUser}
-        />
-      )}
-
       {/* Bulk Delete Confirmation Modal */}
       <Dialog open={showBulkDeleteModal} onOpenChange={setShowBulkDeleteModal}>
         <DialogContent className="sm:max-w-md">

@@ -216,32 +216,18 @@ describe("UsersGroups Component", () => {
         expect(within(container).getByText("Sarah Chen")).toBeInTheDocument();
       });
 
-      // Step 1: Open user actions dropdown
-      const actionMenus = within(container).getAllByRole("button", {
-        name: /open menu/i,
-      });
-      expect(actionMenus.length).toBeGreaterThan(0);
+      // Step 1: Verify user action buttons are present
+      const editButtons = screen.getAllByTitle("Edit user");
+      expect(editButtons.length).toBeGreaterThan(0);
 
-      await user.click(actionMenus[0]);
+      const manageGroupsButtons = screen.getAllByTitle("Manage groups");
+      expect(manageGroupsButtons.length).toBeGreaterThan(0);
 
-      // Verify all user action options are present (dropdown renders in portal)
-      await waitFor(() => {
-        expect(
-          screen.getByRole("menuitem", { name: "Edit" }),
-        ).toBeInTheDocument();
-        expect(
-          screen.getByRole("menuitem", { name: "Manage Groups" }),
-        ).toBeInTheDocument();
-        expect(
-          screen.getByRole("menuitem", { name: "Delete" }),
-        ).toBeInTheDocument();
-      });
+      const deleteButtons = screen.getAllByTitle("Delete user");
+      expect(deleteButtons.length).toBeGreaterThan(0);
 
       // Step 2: Test Edit User workflow
-      const editButton = screen.getByRole("menuitem", {
-        name: "Edit",
-      });
-      await user.click(editButton);
+      await user.click(editButtons[0]);
 
       await waitFor(() => {
         expect(
@@ -270,22 +256,9 @@ describe("UsersGroups Component", () => {
         expect(screen.queryByRole("dialog")).not.toBeInTheDocument();
       });
 
-      // Step 3: Test Manage Groups workflow - reopen dropdown
-      const reopenedMenus = within(container).getAllByRole("button", {
-        name: /open menu/i,
-      });
-      await user.click(reopenedMenus[0]);
-
-      await waitFor(() => {
-        expect(
-          screen.getByRole("menuitem", { name: "Manage Groups" }),
-        ).toBeInTheDocument();
-      });
-
-      const manageGroupsButton = screen.getByRole("menuitem", {
-        name: "Manage Groups",
-      });
-      await user.click(manageGroupsButton);
+      // Step 3: Test Manage Groups workflow
+      const manageGroupsBtns = screen.getAllByTitle("Manage groups");
+      await user.click(manageGroupsBtns[0]);
 
       await waitFor(() => {
         expect(screen.getByRole("dialog")).toBeInTheDocument();
@@ -305,22 +278,9 @@ describe("UsersGroups Component", () => {
         expect(screen.queryByRole("dialog")).not.toBeInTheDocument();
       });
 
-      // Step 4: Test Delete User workflow - reopen dropdown again
-      const finalMenus = within(container).getAllByRole("button", {
-        name: /open menu/i,
-      });
-      await user.click(finalMenus[0]);
-
-      await waitFor(() => {
-        expect(
-          screen.getByRole("menuitem", { name: "Delete" }),
-        ).toBeInTheDocument();
-      });
-
-      const deleteButton = screen.getByRole("menuitem", {
-        name: "Delete",
-      });
-      await user.click(deleteButton);
+      // Step 4: Test Delete User workflow
+      const deleteBtns = screen.getAllByTitle("Delete user");
+      await user.click(deleteBtns[0]);
 
       await waitFor(() => {
         expect(
@@ -556,25 +516,11 @@ describe("UsersGroups Component", () => {
         expect(within(container).getByText("Sarah Chen")).toBeInTheDocument();
       });
 
-      // Step 2: Open user actions dropdown for Sarah Chen
-      const actionMenus = within(container).getAllByRole("button", {
-        name: /open menu/i,
-      });
-      expect(actionMenus.length).toBeGreaterThan(0);
+      // Step 2: Click Manage Groups button to open UserGroupManagementModal
+      const manageGroupsButtons = screen.getAllByTitle("Manage groups");
+      expect(manageGroupsButtons.length).toBeGreaterThan(0);
 
-      await user.click(actionMenus[0]);
-
-      await waitFor(() => {
-        expect(
-          screen.getByRole("menuitem", { name: "Manage Groups" }),
-        ).toBeInTheDocument();
-      });
-
-      // Step 3: Click Manage Groups to open UserGroupManagementModal
-      const manageGroupsButton = screen.getByRole("menuitem", {
-        name: "Manage Groups",
-      });
-      await user.click(manageGroupsButton);
+      await user.click(manageGroupsButtons[0]);
 
       await waitFor(() => {
         expect(screen.getByRole("dialog")).toBeInTheDocument();

@@ -782,8 +782,14 @@ const costApi = {
 
 // Payment processing API
 const paymentsApi = {
-  async create(): Promise<{ url: string }> {
-    const response = await fetch("/admin/api/v1/payments", {
+  async create(crediteeId?: string): Promise<{ url: string }> {
+    const params = new URLSearchParams();
+    if (crediteeId) {
+      params.set("creditee_id", crediteeId);
+    }
+
+    const url = `/admin/api/v1/payments${params.toString() ? "?" + params.toString() : ""}`;
+    const response = await fetch(url, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
     });
