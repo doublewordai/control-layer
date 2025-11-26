@@ -67,6 +67,7 @@ use axum::{
     http::StatusCode,
     response::{IntoResponse, Response},
 };
+use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
 use thiserror::Error as ThisError;
 
@@ -114,6 +115,10 @@ pub enum Error {
     /// Payload exceeds maximum allowed size
     #[error("Payload too large: {message}")]
     PayloadTooLarge { message: String },
+
+    /// Insufficient credits to perform the requested operation
+    #[error("Insufficient credits: {message}")]
+    InsufficientCredits { current_balance: Decimal, message: String },
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -142,6 +147,7 @@ impl Error {
             Error::Other(_) => StatusCode::INTERNAL_SERVER_ERROR,
             Error::Conflict { .. } => StatusCode::CONFLICT,
             Error::PayloadTooLarge { .. } => StatusCode::PAYLOAD_TOO_LARGE,
+            Error::InsufficientCredits { .. } => StatusCode::PAYMENT_REQUIRED,
         }
     }
 
@@ -193,6 +199,7 @@ impl Error {
                     message.clone()
                 }
             }
+            Error::InsufficientCredits { message, .. } => message.clone(),
         }
     }
 }
@@ -216,11 +223,14 @@ impl IntoResponse for Error {
             Error::Conflict { .. } => {
                 tracing::warn!("Conflict error: {}", self);
             }
+            Error::InsufficientCredits { .. } => {
+                tracing::info!("Insufficient credits error: {}", self);
+            }
         }
 
         let status = self.status_code();
 
-        // Handle conflict errors with structured JSON response
+        // Handle structured JSON responses for specific error types
         match &self {
             Error::Conflict { message, conflicts } => {
                 use serde_json::json;

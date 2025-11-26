@@ -139,6 +139,7 @@ pub mod config;
 mod crypto;
 pub mod db;
 mod email;
+mod error_enrichment;
 pub mod errors;
 mod leader_election;
 mod metrics;
@@ -169,8 +170,7 @@ use auth::middleware::admin_ai_proxy_middleware;
 use axum::extract::DefaultBodyLimit;
 use axum::http::HeaderValue;
 use axum::{
-    Router, ServiceExt, http,
-    middleware::from_fn_with_state,
+    Router, ServiceExt, http, middleware,
     routing::{delete, get, patch, post},
 };
 use axum_prometheus::PrometheusMetricLayer;
@@ -794,6 +794,12 @@ pub async fn build_router(state: &mut AppState, onwards_router: Router) -> anyho
     // Serve embedded static assets, falling back to SPA for unmatched routes
     let fallback = get(api::handlers::static_assets::serve_embedded_asset).fallback(get(api::handlers::static_assets::spa_fallback));
 
+    // Apply error enrichment middleware to onwards router (before outlet logging)
+    let onwards_router = onwards_router.layer(middleware::from_fn_with_state(
+        state.db.clone(),
+        error_enrichment::error_enrichment_middleware,
+    ));
+
     // Apply request logging layer only to onwards router
     let onwards_router = if let Some(outlet_layer) = outlet_layer.clone() {
         onwards_router.layer(outlet_layer)
@@ -1367,7 +1373,7 @@ impl Application {
     #[cfg(test)]
     pub fn into_test_server(self) -> (axum_test::TestServer, BackgroundServices) {
         // Apply middleware before path matching for tests
-        let middleware = from_fn_with_state(self.app_state, admin_ai_proxy_middleware);
+        let middleware = middleware::from_fn_with_state(self.app_state, admin_ai_proxy_middleware);
         let service = middleware.layer(self.router).into_make_service();
         let server = axum_test::TestServer::new(service).expect("Failed to create test server");
         (server, self.bg_services)
@@ -1386,7 +1392,7 @@ impl Application {
         );
 
         // Apply middleware before path matching
-        let middleware = from_fn_with_state(self.app_state, admin_ai_proxy_middleware);
+        let middleware = middleware::from_fn_with_state(self.app_state, admin_ai_proxy_middleware);
         let service = middleware.layer(self.router);
 
         // Race the server against background task failures (fail-fast)
