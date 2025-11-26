@@ -899,6 +899,8 @@ pub struct BackgroundServices {
     request_manager: Arc<fusillade::PostgresRequestManager<fusillade::ReqwestHttpClient>>,
     is_leader: bool,
     onwards_targets: onwards::target::Targets,
+    #[cfg_attr(not(test), allow(dead_code))]
+    onwards_sender: Option<tokio::sync::watch::Sender<onwards::target::Targets>>,
     background_tasks: Vec<(&'static str, tokio::task::JoinHandle<anyhow::Result<()>>)>,
     shutdown_token: tokio_util::sync::CancellationToken,
     // Pub so that we can disarm it if we want to
@@ -970,6 +972,27 @@ impl BackgroundServices {
             }
         }
     }
+
+    /// Manually trigger a sync of onwards targets (for testing)
+    /// This reloads the configuration from the database and updates the live routing
+    /// Uses the same codepath as the automatic LISTEN/NOTIFY sync
+    #[cfg(test)]
+    pub async fn sync_onwards_config(&self, pool: &sqlx::PgPool) -> anyhow::Result<()> {
+        let sender = self
+            .onwards_sender
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("Onwards sync not enabled"))?;
+
+        // Use the same load function as the automatic sync
+        let new_targets = crate::sync::onwards_config::load_targets_from_db(pool).await?;
+
+        // Send through the watch channel (same as automatic sync)
+        sender
+            .send(new_targets)
+            .map_err(|_| anyhow::anyhow!("Failed to send targets update"))?;
+
+        Ok(())
+    }
 }
 
 /// Setup background services (probe scheduler, batch daemon, leader election, onwards integration)
@@ -988,9 +1011,13 @@ async fn setup_background_services(
     let model_capacity_limits = Arc::new(dashmap::DashMap::new());
 
     // Start onwards integration for proxying AI requests (if enabled)
-    let initial_targets = if config.background_services.onwards_sync.enabled {
+    #[cfg_attr(not(test), allow(unused_variables))]
+    let (initial_targets, onwards_sender) = if config.background_services.onwards_sync.enabled {
         let (onwards_config_sync, initial_targets, onwards_stream) =
             sync::onwards_config::OnwardsConfigSync::new_with_daemon_limits(pool.clone(), Some(model_capacity_limits.clone())).await?;
+
+        // Clone the sender before moving onwards_config_sync into the spawn (for manual sync)
+        let sender = onwards_config_sync.sender();
 
         // Start target updates - this spawns a background task internally and returns immediately
         initial_targets
@@ -1010,7 +1037,7 @@ async fn setup_background_services(
         });
         background_tasks.push(("onwards-config-sync", handle));
 
-        initial_targets
+        (initial_targets, Some(sender))
     } else {
         info!("Onwards config sync disabled - AI proxy will not receive config updates");
         // Create empty targets when onwards sync is disabled
@@ -1018,7 +1045,7 @@ async fn setup_background_services(
             targets: std::collections::HashMap::new(),
             auth: None,
         };
-        onwards::target::Targets::from_config(empty_config)?
+        (onwards::target::Targets::from_config(empty_config)?, None)
     };
     // Leader election lock ID: 0x44574354_50524F42 (DWCT_PROB in hex for "dwctl probes")
     const LEADER_LOCK_ID: i64 = 0x4457_4354_5052_4F42_i64;
@@ -1251,6 +1278,7 @@ async fn setup_background_services(
         request_manager,
         is_leader,
         onwards_targets: initial_targets,
+        onwards_sender,
         background_tasks,
         shutdown_token,
         drop_guard: Some(drop_guard),
@@ -1406,7 +1434,7 @@ impl Application {
 mod test {
     use super::{AppState, create_initial_admin_user};
     use crate::{
-        api::models::users::Role,
+        api::models::{groups::GroupResponse, users::Role},
         auth::password,
         db::handlers::Users,
         request_logging::{AiRequest, AiResponse},
@@ -1414,124 +1442,402 @@ mod test {
     };
     use outlet_postgres::RequestFilter;
     use sqlx::PgPool;
+    use tracing::info;
 
-    /// Integration test: setup the whole stack, including syncing the onwards config from
-    /// LISTEN/NOTIFY, and then test user access via headers to /admin/api/v1/ai
+    /// End-to-end integration test: Full AI proxy flow through API
+    /// Follows a real user journey: admin creates endpoint/model, user gets API key, user makes inference request
     #[sqlx::test]
     #[test_log::test]
-    async fn test_admin_ai_proxy_middleware_with_user_access(pool: PgPool) {
-        // Create test app (handles all setup including database seeding)
-        let (server, _bg_services) = crate::test_utils::create_test_app(pool.clone(), true).await;
+    async fn test_e2e_ai_proxy_with_mocked_inference(pool: PgPool) {
+        // Setup wiremock server to mock inference endpoint
+        let mock_server = wiremock::MockServer::start().await;
 
-        // Create test users
+        // Mock OpenAI-style chat completion response
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .and(wiremock::matchers::path("/v1/chat/completions"))
+            .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "id": "chatcmpl-123",
+                "object": "chat.completion",
+                "created": 1677652288,
+                "model": "gpt-3.5-turbo",
+                "choices": [{
+                    "index": 0,
+                    "message": {
+                        "role": "assistant",
+                        "content": "Hello! How can I help you today?"
+                    },
+                    "finish_reason": "stop"
+                }],
+                "usage": {
+                    "prompt_tokens": 9,
+                    "completion_tokens": 12,
+                    "total_tokens": 21
+                }
+            })))
+            .mount(&mock_server)
+            .await;
+
+        // Create test app with onwards_sync and request logging enabled
+        let mut config = crate::test_utils::create_test_config();
+        config.background_services.onwards_sync.enabled = true;
+        config.enable_request_logging = true;
+
+        let app = crate::Application::new_with_pool(config, Some(pool.clone()))
+            .await
+            .expect("Failed to create application");
+        let (server, bg_services) = app.into_test_server();
+
+        // Step 1: Create admin and regular users
         let admin_user = create_test_admin_user(&pool, Role::PlatformManager).await;
+        let admin_headers = add_auth_headers(&admin_user);
+
         let regular_user = create_test_user(&pool, Role::StandardUser).await;
+        let regular_headers = add_auth_headers(&regular_user);
 
-        // Create a group and add user
-        let test_group = create_test_group(&pool).await;
-        add_user_to_group(&pool, regular_user.id, test_group.id).await;
+        // Step 2: Admin creates a group via API
+        let group_response = server
+            .post("/admin/api/v1/groups")
+            .add_header(&admin_headers[0].0, &admin_headers[0].1)
+            .add_header(&admin_headers[1].0, &admin_headers[1].1)
+            .json(&serde_json::json!({
+                "name": "test-group",
+                "description": "Test group for E2E test"
+            }))
+            .await;
+        assert_eq!(group_response.status_code(), 201, "Failed to create group");
+        let group: GroupResponse = group_response.json();
 
-        // Create a deployment and add to group
-        let deployment = create_test_deployment(&pool, admin_user.id, "test-model", "test-alias").await;
-        add_deployment_to_group(&pool, deployment.id, test_group.id, admin_user.id).await;
+        // Step 3: Admin adds user to group via API
+        let add_user_response = server
+            .post(&format!("/admin/api/v1/groups/{}/users/{}", group.id, regular_user.id))
+            .add_header(&admin_headers[0].0, &admin_headers[0].1)
+            .add_header(&admin_headers[1].0, &admin_headers[1].1)
+            .await;
+        assert_eq!(add_user_response.status_code(), 204, "Failed to add user to group");
 
-        // Test 1: Admin AI proxy with X-Doubleword-User header (new middleware)
+        // Step 4: Admin grants credits to user via API
+        let credits_response = server
+            .post("/admin/api/v1/transactions")
+            .add_header(&admin_headers[0].0, &admin_headers[0].1)
+            .add_header(&admin_headers[1].0, &admin_headers[1].1)
+            .json(&serde_json::json!({
+                "user_id": regular_user.id,
+                "transaction_type": "admin_grant",
+                "amount": 1000,
+                "source_id": admin_user.id,
+                "description": "Test credits for E2E test"
+            }))
+            .await;
+        assert_eq!(credits_response.status_code(), 201, "Failed to grant credits");
+
+        // Step 5: Admin creates inference endpoint via API
+        let mock_endpoint_url = format!("{}/v1", mock_server.uri());
+        let endpoint_response = server
+            .post("/admin/api/v1/endpoints")
+            .add_header(&admin_headers[0].0, &admin_headers[0].1)
+            .add_header(&admin_headers[1].0, &admin_headers[1].1)
+            .json(&serde_json::json!({
+                "name": "Mock Inference Endpoint",
+                "url": mock_endpoint_url,
+                "description": "Mock OpenAI-compatible endpoint for testing"
+            }))
+            .await;
+        assert_eq!(endpoint_response.status_code(), 201, "Failed to create endpoint");
+        let endpoint: crate::api::models::inference_endpoints::InferenceEndpointResponse = endpoint_response.json();
+
+        // Step 6: Admin creates deployment via API (with pricing for credit deduction)
+        let deployment_response = server
+            .post("/admin/api/v1/models")
+            .add_header(&admin_headers[0].0, &admin_headers[0].1)
+            .add_header(&admin_headers[1].0, &admin_headers[1].1)
+            .json(&serde_json::json!({
+                "model_name": "gpt-3.5-turbo",
+                "alias": "test-model",
+                "description": "Test model deployment",
+                "hosted_on": endpoint.id,
+                "pricing": {
+                    "input_price_per_token": "0.001",
+                    "output_price_per_token": "0.003"
+                }
+            }))
+            .await;
+        assert_eq!(deployment_response.status_code(), 200, "Failed to create deployment");
+        let deployment: crate::api::models::deployments::DeployedModelResponse = deployment_response.json();
+
+        // Step 7: Admin adds deployment to group via API
+        let add_deployment_response = server
+            .post(&format!("/admin/api/v1/groups/{}/models/{}", group.id, deployment.id))
+            .add_header(&admin_headers[0].0, &admin_headers[0].1)
+            .add_header(&admin_headers[1].0, &admin_headers[1].1)
+            .await;
+        assert_eq!(add_deployment_response.status_code(), 204, "Failed to add deployment to group");
+
+        // Step 8: User creates API key via API
+        let api_key_response = server
+            .post(&format!("/admin/api/v1/users/{}/api-keys", regular_user.id))
+            .add_header(&regular_headers[0].0, &regular_headers[0].1)
+            .add_header(&regular_headers[1].0, &regular_headers[1].1)
+            .json(&serde_json::json!({
+                "name": "Test Inference Key",
+                "description": "API key for E2E test",
+                "purpose": "inference"
+            }))
+            .await;
+        assert_eq!(api_key_response.status_code(), 201, "Failed to create API key");
+        let api_key: crate::api::models::api_keys::ApiKeyResponse = api_key_response.json();
+
+        // Step 9: Sync once, then poll until model becomes available in onwards config
+        bg_services.sync_onwards_config(&pool).await.expect("Failed to sync onwards config");
+
+        // Poll: Initial state should be 404, target state is 200
+        let poll_start = std::time::Instant::now();
+        let mut status = 404;
+        let mut attempts = 0;
+        for i in 0..50 {
+            // 50 attempts * 10ms = 500ms max
+            attempts = i + 1;
+            let test_response = server
+                .post("/ai/v1/chat/completions")
+                .add_header("authorization", format!("Bearer {}", api_key.key))
+                .json(&serde_json::json!({
+                    "model": "test-model",
+                    "messages": [{"role": "user", "content": "test"}]
+                }))
+                .await;
+
+            status = test_response.status_code().as_u16();
+            if status != 404 {
+                // Model is now in onwards config
+                break;
+            }
+            tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
+        }
+        let poll_duration = poll_start.elapsed();
+        println!(
+            "Polled for {:?} over {} attempts, final status: {}",
+            poll_duration, attempts, status
+        );
+        assert_ne!(status, 404, "Model should be available in onwards config after polling");
+
+        // Test 1: User makes successful inference request via API key
+        let inference_response = server
+            .post("/ai/v1/chat/completions")
+            .add_header("authorization", format!("Bearer {}", api_key.key))
+            .json(&serde_json::json!({
+                "model": "test-model",
+                "messages": [{"role": "user", "content": "Hello from E2E test"}]
+            }))
+            .await;
+
+        assert_eq!(inference_response.status_code().as_u16(), 200, "Inference request should succeed");
+        let inference_body: serde_json::Value = inference_response.json();
+        assert_eq!(
+            inference_body["choices"][0]["message"]["content"], "Hello! How can I help you today?",
+            "Should receive mocked response from inference endpoint"
+        );
+
+        let mut tries = 0;
+        // Verify credit deduction: Check that credits were deducted based on token usage
+        // Credits can lag usage, so poll
+        let usage_tx = loop {
+            let transactions_response = server
+                .get(&format!("/admin/api/v1/transactions?user_id={}", regular_user.id))
+                .add_header(&admin_headers[0].0, &admin_headers[0].1)
+                .add_header(&admin_headers[1].0, &admin_headers[1].1)
+                .await;
+
+            assert_eq!(transactions_response.status_code(), 200, "Should fetch transactions");
+            let transactions: serde_json::Value = transactions_response.json();
+
+            info!("Received {:?}", serde_json::to_string(&transactions));
+            // Find the usage transaction (there should be an admin_grant and a usage transaction)
+            let usage_tx = transactions
+                .as_array()
+                .and_then(|x| x.iter().find(|tx| tx["transaction_type"] == "usage"));
+
+            if let Some(tx) = usage_tx {
+                break tx.clone();
+            } else {
+                tries += 1;
+                if tries >= 50 {
+                    panic!("Usage transaction not found after {} attempts", tries);
+                }
+                tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
+            }
+        };
+
+        assert_eq!(usage_tx["transaction_type"], "usage", "Should be usage transaction");
+        // Amount is returned as string due to high precision decimal
+        let amount: f64 = usage_tx["amount"].as_str().unwrap().parse().unwrap();
+        let balance: f64 = usage_tx["balance_after"].as_str().unwrap().parse().unwrap();
+        assert!(amount > 0.0, "Usage amount should be positive (absolute value), got: {}", amount);
+        assert!(
+            balance < 1000.0,
+            "Balance should be less than initial 1000 due to credit deduction, got: {}",
+            balance
+        );
+
+        // Verify request was logged: Check outlet recorded the request via API
+        let requests_response = server
+            .get(&format!("/admin/api/v1/requests?user_id={}&limit=1", regular_user.id))
+            .add_header(&admin_headers[0].0, &admin_headers[0].1)
+            .add_header(&admin_headers[1].0, &admin_headers[1].1)
+            .await;
+
+        assert_eq!(requests_response.status_code(), 200, "Should fetch logged requests");
+        let requests: serde_json::Value = requests_response.json();
+        let logged_entry = &requests["requests"][0];
+
+        // Request details
+        assert_eq!(logged_entry["request"]["method"], "POST");
+        assert_eq!(logged_entry["request"]["uri"], "http://localhost/chat/completions");
+
+        // Response details
+        assert_eq!(logged_entry["response"]["status_code"], 200);
+        let usage = &logged_entry["response"]["body"]["data"]["usage"];
+        assert_eq!(usage["prompt_tokens"], 9, "Should have 9 prompt tokens from mock");
+        assert_eq!(usage["completion_tokens"], 12, "Should have 12 completion tokens from mock");
+        assert_eq!(usage["total_tokens"], 21, "Should match mocked token count");
+
+        // Verify pricing headers were set by onwards
+        let headers = &logged_entry["response"]["headers"];
+        assert_eq!(headers["onwards-input-price-per-token"], "0.00100000");
+        assert_eq!(headers["onwards-output-price-per-token"], "0.00300000");
+
+        // Test 2: Proxy header auth also works (SSO-style authentication)
         let regular_user_external_id = regular_user.external_user_id.as_ref().unwrap_or(&regular_user.username);
-        let admin_proxy_response = server
+
+        // First request creates a hidden API key, but it's not synced yet - should be 403
+        let first_proxy_response = server
             .post("/admin/api/v1/ai/v1/chat/completions")
             .add_header("x-doubleword-user", regular_user_external_id)
             .add_header("x-doubleword-email", &regular_user.email)
             .json(&serde_json::json!({
-                "model": deployment.alias,
-                "messages": [{"role": "user", "content": "Hello via admin proxy"}]
+                "model": "test-model",
+                "messages": [{"role": "user", "content": "Hello via proxy headers"}]
+            }))
+            .await;
+        assert_eq!(
+            first_proxy_response.status_code().as_u16(),
+            403,
+            "First proxy request should fail before hidden key is synced"
+        );
+
+        // Sync to pick up the hidden API key
+        bg_services.sync_onwards_config(&pool).await.expect("Failed to sync onwards config");
+
+        // Poll until hidden key becomes available
+        for _ in 0..50 {
+            let test_response = server
+                .post("/admin/api/v1/ai/v1/chat/completions")
+                .add_header("x-doubleword-user", regular_user_external_id)
+                .add_header("x-doubleword-email", &regular_user.email)
+                .json(&serde_json::json!({
+                    "model": "test-model",
+                    "messages": [{"role": "user", "content": "test"}]
+                }))
+                .await;
+
+            status = test_response.status_code().as_u16();
+            if status == 200 {
+                break;
+            }
+            tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
+        }
+
+        // Now proxy auth should work
+        let proxy_response = server
+            .post("/admin/api/v1/ai/v1/chat/completions")
+            .add_header("x-doubleword-user", regular_user_external_id)
+            .add_header("x-doubleword-email", &regular_user.email)
+            .json(&serde_json::json!({
+                "model": "test-model",
+                "messages": [{"role": "user", "content": "Hello via proxy headers"}]
             }))
             .await;
 
-        // Should get to proxy through middleware (might 502 since no real backend, but auth should pass)
-        println!("Valid user response status: {}", admin_proxy_response.status_code());
-        assert!(
-            admin_proxy_response.status_code().as_u16() != 401,
-            "Admin proxy should accept user with model access"
+        assert_eq!(
+            proxy_response.status_code().as_u16(),
+            200,
+            "Proxy header auth should work after sync"
         );
+        let proxy_body: serde_json::Value = proxy_response.json();
+        assert_eq!(proxy_body["choices"][0]["message"]["content"], "Hello! How can I help you today?");
 
-        // Test 2: Admin AI proxy with user who has no access to model
+        // Test 3: User without model access should be rejected (not in group)
         let restricted_user = create_test_user(&pool, Role::StandardUser).await;
+        let restricted_headers = add_auth_headers(&restricted_user);
 
-        let restricted_user_external_id = restricted_user.external_user_id.as_ref().unwrap_or(&restricted_user.username);
-        let no_access_response = server
-            .post("/admin/api/v1/ai/v1/chat/completions")
-            .add_header("x-doubleword-user", restricted_user_external_id)
-            .add_header("x-doubleword-email", &restricted_user.email)
+        // Create API key for restricted user
+        let restricted_key_response = server
+            .post(&format!("/admin/api/v1/users/{}/api-keys", restricted_user.id))
+            .add_header(&restricted_headers[0].0, &restricted_headers[0].1)
+            .add_header(&restricted_headers[1].0, &restricted_headers[1].1)
             .json(&serde_json::json!({
-                "model": deployment.alias,
+                "name": "Restricted User Key",
+                "purpose": "inference"
+            }))
+            .await;
+        let restricted_key: crate::api::models::api_keys::ApiKeyResponse = restricted_key_response.json();
+
+        let no_access_response = server
+            .post("/ai/v1/chat/completions")
+            .add_header("authorization", format!("Bearer {}", restricted_key.key))
+            .json(&serde_json::json!({
+                "model": "test-model",
                 "messages": [{"role": "user", "content": "Hello"}]
             }))
             .await;
 
-        // Should reject access - either 403 (Forbidden - API key not yet synced to onwards)
-        // or 404 (Not Found - onwards knows about key but user has no model access)
-        // The difference depends on timing of onwards config sync after hidden API key creation
+        // Should reject - 403 (key not synced) or 404 (user has no access to model)
         let status = no_access_response.status_code().as_u16();
         assert!(
             status == 403 || status == 404,
-            "Admin proxy should reject user with no model access (got {})",
+            "Should reject user without model access, got {}",
             status
         );
 
-        // Test 3: Admin AI proxy with missing header
-        let missing_header_response = server
-            .post("/admin/api/v1/ai/v1/chat/completions")
+        // Test 4: Missing authentication should fail
+        let missing_auth_response = server
+            .post("/ai/v1/chat/completions")
             .json(&serde_json::json!({
-                "model": deployment.alias,
+                "model": "test-model",
                 "messages": [{"role": "user", "content": "Hello"}]
             }))
             .await;
 
-        // Should be unauthorized since no X-Doubleword-User header
-        assert_eq!(
-            missing_header_response.status_code().as_u16(),
-            401,
-            "Admin proxy should require X-Doubleword-User header"
-        );
+        assert_eq!(missing_auth_response.status_code().as_u16(), 401, "Should require authentication");
 
-        // Test 4: Admin AI proxy with non-existent user
-        let nonexistent_user_response = server
-            .post("/admin/api/v1/ai/v1/chat/completions")
-            .add_header("x-doubleword-user", "nonexistent@example.com")
-            .add_header("x-doubleword-email", "nonexistent@example.com")
+        // Test 5: Invalid API key should fail
+        let invalid_key_response = server
+            .post("/ai/v1/chat/completions")
+            .add_header("authorization", "Bearer invalid-key-12345")
             .json(&serde_json::json!({
-                "model": deployment.alias,
+                "model": "test-model",
                 "messages": [{"role": "user", "content": "Hello"}]
             }))
             .await;
 
-        // With auto_create_users, user is created but has no access, onwards returns 404
-        assert_eq!(
-            nonexistent_user_response.status_code().as_u16(),
-            404,
-            "Admin proxy should reject non-existent user"
-        );
+        assert_eq!(invalid_key_response.status_code().as_u16(), 403, "Should reject invalid API key");
 
-        // Test 5: Admin AI proxy with non-existent model
+        // Test 6: Non-existent model should return 404
         let nonexistent_model_response = server
-            .post("/admin/api/v1/ai/v1/chat/completions")
-            .add_header("x-doubleword-user", regular_user_external_id)
-            .add_header("x-doubleword-email", &regular_user.email)
+            .post("/ai/v1/chat/completions")
+            .add_header("authorization", format!("Bearer {}", api_key.key))
             .json(&serde_json::json!({
                 "model": "nonexistent-model",
                 "messages": [{"role": "user", "content": "Hello"}]
             }))
             .await;
 
-        // Should be not found since onwards returns 404 for nonexistent models
         assert_eq!(
             nonexistent_model_response.status_code().as_u16(),
             404,
-            "Admin proxy should reject non-existent model"
+            "Should return 404 for non-existent model"
         );
 
-        // Manually trigger shutdown to clean up background tasks
-        // bg_services.shutdown().await;
+        // Gracefully shutdown background services to avoid slow test cleanup
+        bg_services.shutdown().await;
     }
 
     #[sqlx::test]
