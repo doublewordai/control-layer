@@ -116,7 +116,11 @@ export function UploadFileModal({
       onClose();
     } catch (error) {
       console.error("Failed to upload file:", error);
-      setError("Failed to upload file. Please try again.");
+      setError(
+        error instanceof Error
+          ? error.message
+          : "Failed to upload file. Please try again.",
+      );
     }
   };
 
