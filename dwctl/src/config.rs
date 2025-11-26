@@ -483,6 +483,12 @@ pub struct PasswordConfig {
     pub min_length: usize,
     /// Maximum password length
     pub max_length: usize,
+    /// Argon2 memory cost in KiB (default: 19456 KiB = 19 MB, secure for production)
+    pub argon2_memory_kib: u32,
+    /// Argon2 iterations (default: 2, secure for production)
+    pub argon2_iterations: u32,
+    /// Argon2 parallelism (default: 1)
+    pub argon2_parallelism: u32,
 }
 
 /// Security configuration for JWT and CORS.
@@ -929,6 +935,10 @@ impl Default for PasswordConfig {
         Self {
             min_length: 8,
             max_length: 64,
+            // Secure defaults for production (Argon2id RFC recommendations)
+            argon2_memory_kib: 19456, // 19 MB
+            argon2_iterations: 2,
+            argon2_parallelism: 1,
         }
     }
 }
