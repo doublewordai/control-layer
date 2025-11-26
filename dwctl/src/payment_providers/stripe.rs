@@ -87,11 +87,9 @@ impl PaymentProvider for StripeProvider {
         tracing::info!("Created checkout session {} for user {}", checkout_session.id, user.id);
 
         // If we didn't have a customer ID before, save the newly created one
-        if user.payment_provider_id.is_none()
-            && let Some(customer) = &checkout_session.customer
-        {
-            let customer_id = customer.id().to_string();
-            tracing::info!("Saving newly created customer ID {} for user {}", customer_id, user.id);
+        if user.payment_provider_id.is_none() && checkout_session.customer.is_some() {
+            let customer_id = checkout_session.customer.as_ref().unwrap().id().to_string();
+            tracing::trace!("Saving newly created customer ID {} for user {}", customer_id, user.id);
 
             sqlx::query!("UPDATE users SET payment_provider_id = $1 WHERE id = $2", customer_id, user.id)
                 .execute(db_pool)
@@ -160,7 +158,7 @@ impl PaymentProvider for StripeProvider {
         .await?;
 
         if existing.is_some() {
-            tracing::info!("Transaction for session_id {} already exists, skipping (fast path)", session_id);
+            tracing::trace!("Transaction for session_id {} already exists, skipping (fast path)", session_id);
             return Ok(());
         }
 
@@ -169,7 +167,7 @@ impl PaymentProvider for StripeProvider {
 
         // Verify payment status
         if !payment_session.is_paid {
-            tracing::info!("Transaction for session_id {} has not been paid, skipping.", session_id);
+            tracing::trace!("Transaction for session_id {} has not been paid, skipping.", session_id);
             return Err(PaymentError::PaymentNotCompleted);
         }
 
@@ -199,7 +197,7 @@ impl PaymentProvider for StripeProvider {
                 // Check if this is a unique constraint violation on source_id
                 // This can happen if two replicas try to process the same payment simultaneously
                 if constraint.as_deref() == Some("credits_transactions_source_id_unique") {
-                    tracing::info!(
+                    tracing::trace!(
                         "Transaction for session_id {} already processed (caught unique constraint violation), returning success (idempotent)",
                         session_id
                     );
@@ -236,7 +234,7 @@ impl PaymentProvider for StripeProvider {
             PaymentError::InvalidData(format!("Webhook validation failed: {}", e))
         })?;
 
-        tracing::info!("Validated Stripe webhook event: {:?}", event.type_);
+        tracing::trace!("Validated Stripe webhook event: {:?}", event.type_);
 
         // Convert Stripe event to our generic WebhookEvent
         let session_id = match &event.data.object {
@@ -265,9 +263,100 @@ impl PaymentProvider for StripeProvider {
             PaymentError::InvalidData("Missing session_id in webhook event".to_string())
         })?;
 
-        tracing::info!("Processing webhook event {} for session: {}", event.event_type, session_id);
+        tracing::trace!("Processing webhook event {} for session: {}", event.event_type, session_id);
 
         // Use the existing process_payment_session method
         self.process_payment_session(db_pool, session_id).await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use rust_decimal::Decimal;
+    use sqlx::PgPool;
+    use uuid::Uuid;
+
+    /// Helper to create a test user in the database
+    async fn create_test_user(pool: &PgPool) -> Uuid {
+        let user = crate::test_utils::create_test_user(pool, crate::api::models::users::Role::StandardUser).await;
+        user.id
+    }
+
+    #[test]
+    fn test_stripe_provider_creation() {
+        let provider = StripeProvider::new("sk_test_fake".to_string(), "price_fake".to_string(), "whsec_fake".to_string());
+
+        assert_eq!(provider.api_key, "sk_test_fake");
+        assert_eq!(provider.price_id, "price_fake");
+        assert_eq!(provider.webhook_secret, "whsec_fake");
+    }
+
+    #[sqlx::test]
+    async fn test_stripe_idempotency_fast_path(pool: PgPool) {
+        // Test the fast path: transaction already exists in DB
+        let user_id = create_test_user(&pool).await;
+        let session_id = "cs_test_fake_session_123";
+
+        // Create a transaction using the Credits repository (handles balance_after properly)
+        let mut conn = pool.acquire().await.unwrap();
+        let mut credits = crate::db::handlers::Credits::new(&mut conn);
+
+        let request = crate::db::models::credits::CreditTransactionCreateDBRequest {
+            user_id,
+            transaction_type: crate::db::models::credits::CreditTransactionType::Purchase,
+            amount: Decimal::new(5000, 2),
+            source_id: session_id.to_string(),
+            description: Some("Test Stripe payment".to_string()),
+        };
+
+        credits.create_transaction(&request).await.unwrap();
+
+        let provider = StripeProvider::new("sk_test_fake".to_string(), "price_fake".to_string(), "whsec_fake".to_string());
+
+        // Process the same session - should hit fast path and succeed
+        let result = provider.process_payment_session(&pool, session_id).await;
+        assert!(result.is_ok(), "Should succeed via fast path (transaction already exists)");
+
+        // Verify only one transaction exists
+        let count = sqlx::query!(
+            r#"
+            SELECT COUNT(*) as count
+            FROM credits_transactions
+            WHERE source_id = $1
+            "#,
+            session_id
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+
+        assert_eq!(count.count.unwrap(), 1, "Should still have exactly one transaction");
+    }
+
+    #[test]
+    fn test_payment_session_parsing() {
+        // Test that PaymentSession structure is correct
+        let session = PaymentSession {
+            user_id: "550e8400-e29b-41d4-a716-446655440000".to_string(),
+            amount: Decimal::new(5000, 2),
+            is_paid: true,
+        };
+
+        assert_eq!(session.user_id, "550e8400-e29b-41d4-a716-446655440000");
+        assert_eq!(session.amount, Decimal::new(5000, 2));
+        assert!(session.is_paid);
+    }
+
+    #[test]
+    fn test_webhook_event_parsing() {
+        // Test WebhookEvent structure
+        let event = WebhookEvent {
+            event_type: "CheckoutSessionCompleted".to_string(),
+            session_id: Some("cs_test_123".to_string()),
+        };
+
+        assert_eq!(event.event_type, "CheckoutSessionCompleted");
+        assert_eq!(event.session_id, Some("cs_test_123".to_string()));
     }
 }
