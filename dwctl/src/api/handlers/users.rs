@@ -9,8 +9,11 @@ use crate::{
     },
     auth::permissions::{self as permissions, RequiresPermission, can_read_all_resources, can_read_own_resource, operation, resource},
     db::{
-        handlers::{Credits, Groups, Repository, Users, users::UserFilter},
-        models::users::{UserCreateDBRequest, UserUpdateDBRequest},
+        handlers::{Credits, Groups, Repository, Users, api_keys::ApiKeys, users::UserFilter},
+        models::{
+            api_keys::ApiKeyPurpose,
+            users::{UserCreateDBRequest, UserUpdateDBRequest},
+        },
     },
     errors::{Error, Result},
     types::{GroupId, Operation, Permission, Resource, UserId, UserIdOrCurrent},
@@ -268,6 +271,13 @@ pub async fn create_user(
     let db_request = UserCreateDBRequest::from(user_data);
 
     let user = repo.create(&db_request).await?;
+
+    // Pre-create hidden API key for inference to avoid race condition with onwards sync
+    let mut api_keys_repo = ApiKeys::new(&mut conn);
+    let _ = api_keys_repo
+        .get_or_create_hidden_key(user.id, ApiKeyPurpose::Inference)
+        .await?;
+
     Ok((StatusCode::CREATED, Json(UserResponse::from(user))))
 }
 

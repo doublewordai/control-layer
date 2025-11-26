@@ -5,8 +5,11 @@ use crate::{
     api::models::users::Role,
     db::{
         errors::{DbError, Result},
-        handlers::{Groups, repository::Repository},
-        models::users::{UserCreateDBRequest, UserDBResponse, UserUpdateDBRequest},
+        handlers::{Groups, api_keys::ApiKeys, repository::Repository},
+        models::{
+            api_keys::ApiKeyPurpose,
+            users::{UserCreateDBRequest, UserDBResponse, UserUpdateDBRequest},
+        },
     },
 };
 use chrono::{DateTime, Utc};
@@ -531,6 +534,13 @@ impl<'c> Users<'c> {
                 )
                 .await?;
         }
+
+        // Pre-create hidden API key for inference to avoid race condition with onwards sync
+        // This ensures the key exists before the user makes their first AI request
+        let mut api_keys_repo = ApiKeys::new(&mut *self.db);
+        let _ = api_keys_repo
+            .get_or_create_hidden_key(user.id, ApiKeyPurpose::Inference)
+            .await?;
 
         Ok(user)
     }
