@@ -149,9 +149,9 @@ impl PaymentProvider for DummyProvider {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::api::models::users::Role;
     use rust_decimal::Decimal;
     use sqlx::PgPool;
-    use crate::api::models::users::Role;
 
     /// Helper to create a test user in the database
     async fn create_test_user(pool: &PgPool) -> CurrentUser {
@@ -292,5 +292,4 @@ mod tests {
         assert!(result.is_ok());
         assert_eq!(result.unwrap(), None); // Returns None for unsupported webhooks
     }
-    
 }

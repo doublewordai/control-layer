@@ -83,7 +83,7 @@ export function CostManagement() {
           description: "Funds purchase - Demo top up"
         });
         toast.success(`Added $${fundAmount.toFixed(2)}`);
-      } catch (error) {
+      } catch {
         toast.error("Failed to add funds");
       }
     } else if (config?.payment_enabled) {
@@ -96,7 +96,7 @@ export function CostManagement() {
         } else {
           toast.error("Failed to get checkout URL");
         }
-      } catch (error) {
+      } catch {
         toast.error("Failed to transfer to payment provider.");
       }
     } else {

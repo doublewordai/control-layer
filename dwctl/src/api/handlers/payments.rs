@@ -67,7 +67,7 @@
 use axum::{
     Json,
     extract::State,
-    http::{StatusCode},
+    http::StatusCode,
     response::{IntoResponse, Response},
 };
 use serde_json::json;
@@ -267,16 +267,13 @@ pub async fn webhook_handler(State(state): State<AppState>, headers: axum::http:
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{
-        config::{PaymentConfig},
-        test_utils::create_test_config,
-    };
+    use crate::config::DummyConfig;
+    use crate::{config::PaymentConfig, test_utils::create_test_config};
     use axum::Router;
     use axum::routing::{patch, post};
     use axum_test::TestServer;
     use rust_decimal::Decimal;
     use sqlx::PgPool;
-    use crate::config::DummyConfig;
 
     #[sqlx::test]
     async fn test_dummy_payment_flow(pool: PgPool) {
