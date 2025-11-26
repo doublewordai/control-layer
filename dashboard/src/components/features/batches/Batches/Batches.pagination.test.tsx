@@ -185,12 +185,15 @@ describe("Batches - Pagination", () => {
         ).toBeInTheDocument();
       });
 
-      // Verify we're on page 1
-      expect(within(container).getByText(/Page 1/i)).toBeInTheDocument();
+      // Verify we're on page 1 - look for the active pagination link
+      const activePage = within(container).getByRole("link", {
+        current: "page",
+      });
+      expect(activePage).toHaveTextContent("1");
 
-      // Click Next button
-      const nextButton = within(container).getByRole("button", {
-        name: /Next/i,
+      // Click Next button - uses aria-label "Go to next page"
+      const nextButton = within(container).getByRole("link", {
+        name: /go to next page/i,
       });
       await user.click(nextButton);
 
