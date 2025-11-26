@@ -417,8 +417,8 @@ pub async fn store_analytics_record(pool: &PgPool, metrics: &UsageMetrics, auth:
         provider_name,
     };
 
-    // Insert the analytics record using the row data
-    sqlx::query!(
+    // Insert the analytics record and get the ID
+    let analytics_id = sqlx::query_scalar!(
         r#"
         INSERT INTO http_analytics (
             instance_id, correlation_id, timestamp, method, uri, model,
@@ -441,6 +441,7 @@ pub async fn store_analytics_record(pool: &PgPool, metrics: &UsageMetrics, auth:
             access_source = EXCLUDED.access_source,
             input_price_per_token = EXCLUDED.input_price_per_token,
             output_price_per_token = EXCLUDED.output_price_per_token
+        RETURNING id
         "#,
         row.instance_id,
         row.correlation_id,
@@ -461,7 +462,7 @@ pub async fn store_analytics_record(pool: &PgPool, metrics: &UsageMetrics, auth:
         row.input_price_per_token,
         row.output_price_per_token
     )
-    .execute(pool)
+    .fetch_one(pool)
     .await?;
 
     // =======================================================================
@@ -469,8 +470,16 @@ pub async fn store_analytics_record(pool: &PgPool, metrics: &UsageMetrics, auth:
     // =======================================================================
     // Deduct credits if applicable (user_id present and at least one price is set)
     if let (Some(user_id), Some(model)) = (row.user_id, &row.request_model) {
+        tracing::trace!(
+            user_id = %user_id,
+            model = %model,
+            "Checking if credit deduction is applicable"
+        );
+
         // skip deduction if originated from system user
         if user_id != Uuid::nil() {
+            tracing::trace!(user_id = %user_id, "User is not system user, checking pricing");
+
             // Check if at least one price is set
             if row.input_price_per_token.is_some() || row.output_price_per_token.is_some() {
                 // Calculate total cost - use zero for missing prices
@@ -478,11 +487,26 @@ pub async fn store_analytics_record(pool: &PgPool, metrics: &UsageMetrics, auth:
                 let output_cost = Decimal::from(row.completion_tokens) * row.output_price_per_token.unwrap_or(rust_decimal::Decimal::ZERO);
                 let total_cost = input_cost + output_cost;
 
-                // Round to 2 decimal places to match database schema (DECIMAL(12, 2))
-                // This prevents precision issues when storing fractional cent amounts
-                let total_cost = total_cost.round_dp(2);
+                tracing::debug!(
+                    user_id = %user_id,
+                    model = %model,
+                    prompt_tokens = row.prompt_tokens,
+                    completion_tokens = row.completion_tokens,
+                    input_price_per_token = ?row.input_price_per_token,
+                    output_price_per_token = ?row.output_price_per_token,
+                    input_cost = %input_cost,
+                    output_cost = %output_cost,
+                    total_cost = %total_cost,
+                    "Calculated API usage cost"
+                );
 
                 if total_cost > rust_decimal::Decimal::ZERO {
+                    tracing::trace!(
+                        user_id = %user_id,
+                        total_cost = %total_cost,
+                        "Cost is greater than zero, proceeding with credit deduction"
+                    );
+
                     let mut conn = pool.acquire().await?;
                     let mut credits = Credits::new(&mut conn);
 
@@ -499,13 +523,13 @@ pub async fn store_analytics_record(pool: &PgPool, metrics: &UsageMetrics, auth:
                                 );
                             }
 
-                            // Create usage transaction
+                            // Create usage transaction referencing the analytics record
                             match credits
                                 .create_transaction(&CreditTransactionCreateDBRequest {
                                     user_id,
                                     transaction_type: CreditTransactionType::Usage,
                                     amount: total_cost,
-                                    source_id: user_id.to_string(),
+                                    source_id: analytics_id.to_string(),
                                     description: Some(format!(
                                         "API usage: {} ({} input + {} output tokens)",
                                         model, row.prompt_tokens, row.completion_tokens
@@ -549,8 +573,25 @@ pub async fn store_analytics_record(pool: &PgPool, metrics: &UsageMetrics, auth:
                             crate::metrics::record_credit_deduction_error();
                         }
                     }
+                } else {
+                    tracing::trace!(
+                        user_id = %user_id,
+                        total_cost = %total_cost,
+                        "Skipping credit deduction: cost is zero"
+                    );
                 }
+            } else {
+                tracing::trace!(
+                    user_id = %user_id,
+                    model = %model,
+                    "Skipping credit deduction: no pricing configured"
+                );
             }
+        } else {
+            tracing::trace!(
+                user_id = %user_id,
+                "Skipping credit deduction: system user (UUID::nil)"
+            );
         }
     }
 
@@ -1623,7 +1664,6 @@ mod tests {
 
             // Usage: 1000 input tokens, 500 output tokens
             // Calculated cost: (1000 * 0.00001) + (500 * 0.00003) = 0.01 + 0.015 = 0.025
-            // Rounded cost: 0.025 rounds to 0.02 (banker's rounding to 2 decimal places)
             let metrics = create_test_usage_metrics(Some(input_price), Some(output_price), 1000, 500);
 
             // Execute
@@ -1635,8 +1675,8 @@ mod tests {
             let mut credits = Credits::new(&mut conn);
             let final_balance = credits.get_user_balance(user_id).await.unwrap();
 
-            // Expected cost is rounded to 2 decimal places (0.025 -> 0.02)
-            let expected_cost = Decimal::from_str("0.02").unwrap();
+            // Expected cost with full precision (DECIMAL(12, 8))
+            let expected_cost = Decimal::from_str("0.025").unwrap();
             let expected_balance = initial_balance - expected_cost;
             assert_eq!(final_balance, expected_balance, "Balance should be deducted correctly");
 
@@ -1646,10 +1686,7 @@ mod tests {
             assert!(usage_tx.is_some(), "Usage transaction should be created");
 
             let usage_tx = usage_tx.unwrap();
-            assert_eq!(
-                usage_tx.amount, expected_cost,
-                "Transaction amount should be rounded to 2 decimal places"
-            );
+            assert_eq!(usage_tx.amount, expected_cost, "Transaction amount should preserve full precision");
             assert_eq!(usage_tx.balance_after, expected_balance, "Balance after should match");
         }
 
@@ -1709,7 +1746,7 @@ mod tests {
             let user_id = setup_user_with_balance(&pool, initial_balance).await;
             let auth = create_test_auth_for_user(&pool, user_id).await;
 
-            // Usage that costs more than balance (0.025 calculated, rounds to 0.02)
+            // Usage that costs more than balance (0.025 calculated)
             let input_price = Decimal::from_str("0.00001").unwrap();
             let output_price = Decimal::from_str("0.00003").unwrap();
             let metrics = create_test_usage_metrics(Some(input_price), Some(output_price), 1000, 500);
@@ -1724,8 +1761,8 @@ mod tests {
             let mut credits = Credits::new(&mut conn);
             let final_balance = credits.get_user_balance(user_id).await.unwrap();
 
-            // Expected cost is rounded to 2 decimal places (0.025 -> 0.02)
-            let expected_cost = Decimal::from_str("0.02").unwrap();
+            // Expected cost with full precision
+            let expected_cost = Decimal::from_str("0.025").unwrap();
             let expected_balance = initial_balance - expected_cost;
             assert_eq!(final_balance, expected_balance, "Balance should reflect overdraft");
             // Verify: Usage transaction was created
@@ -1745,12 +1782,12 @@ mod tests {
             let auth = create_test_auth_for_user(&pool, user_id).await;
 
             // Test various token counts and pricing scenarios
-            // Note: Expected costs are rounded to 2 decimal places (banker's rounding)
+            // Note: Expected costs preserve full precision (DECIMAL(12, 8))
             let test_cases = vec![
-                // (input_tokens, output_tokens, input_price_per_token, output_price_per_token, expected_cost_rounded)
-                (1500, 750, "0.00001", "0.00003", "0.04"), // (1500*0.00001) + (750*0.00003) = 0.0375 -> rounds to 0.04
-                (100, 50, "0.000005", "0.000015", "0.00"), // (100*0.000005) + (50*0.000015) = 0.00125 -> rounds to 0.00
-                (1, 1, "0.01", "0.02", "0.03"),            // (1*0.01) + (1*0.02) = 0.03 (exact)
+                // (input_tokens, output_tokens, input_price_per_token, output_price_per_token, expected_cost)
+                (1500, 750, "0.00001", "0.00003", "0.0375"), // (1500*0.00001) + (750*0.00003) = 0.0375
+                (100, 50, "0.000005", "0.000015", "0.00125"), // (100*0.000005) + (50*0.000015) = 0.00125
+                (1, 1, "0.01", "0.02", "0.03"),              // (1*0.01) + (1*0.02) = 0.03 (exact)
             ];
 
             for (input_tokens, output_tokens, input_price_str, output_price_str, expected_cost_str) in test_cases {
@@ -1856,8 +1893,8 @@ mod tests {
             let mut credits = Credits::new(&mut conn);
             let final_balance = credits.get_user_balance(user_id).await.unwrap();
 
-            // Expected cost is rounded to 2 decimal places (0.025 -> 0.02)
-            let expected_cost = Decimal::from_str("0.02").unwrap();
+            // Expected cost with full precision
+            let expected_cost = Decimal::from_str("0.025").unwrap();
             let expected_balance = initial_balance - expected_cost;
             assert_eq!(
                 final_balance, expected_balance,
@@ -1870,10 +1907,7 @@ mod tests {
             assert!(usage_tx.is_some(), "Usage transaction should be created");
 
             let usage_tx = usage_tx.unwrap();
-            assert_eq!(
-                usage_tx.amount, expected_cost,
-                "Transaction amount should be rounded to 2 decimal places"
-            );
+            assert_eq!(usage_tx.amount, expected_cost, "Transaction amount should preserve full precision");
             assert_eq!(usage_tx.balance_after, expected_balance, "Balance after should match");
 
             // Verify: Analytics record WAS created (tracking, just not billing)
@@ -1958,8 +1992,8 @@ mod tests {
                 let pool_clone = pool.clone();
                 let auth_clone = auth.clone();
 
-                // Each request has different pricing that results in distinct costs after rounding to 2 decimals
-                // Use prices that yield costs like: 0.01, 0.02, 0.03, ..., 0.10 (all different after rounding)
+                // Each request has different pricing that results in distinct costs
+                // Use prices that yield costs like: 0.01, 0.02, 0.03, ..., 0.10
                 // For 100 input tokens, we want total costs of 0.01, 0.02, etc.
                 let target_cost = (i + 1) as i64; // 1, 2, 3, ..., 10
                 let input_price = Decimal::new(target_cost, 4); // 0.0001, 0.0002, ..., 0.0010
@@ -2073,9 +2107,9 @@ mod tests {
             let mut credits = Credits::new(&mut conn);
             let final_balance = credits.get_user_balance(user_id).await.unwrap();
 
-            // Expected cost: only output tokens counted: 500 * 0.00003 = 0.015, rounds to 0.02
+            // Expected cost: only output tokens counted: 500 * 0.00003 = 0.015
             // Input tokens (1000) should be ignored since no input price
-            let expected_cost = Decimal::from_str("0.02").unwrap();
+            let expected_cost = Decimal::from_str("0.015").unwrap();
             let expected_balance = Decimal::from_str("10.00").unwrap() - expected_cost;
             assert_eq!(final_balance, expected_balance, "Balance should only deduct for output tokens");
 

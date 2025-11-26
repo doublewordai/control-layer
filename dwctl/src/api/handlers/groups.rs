@@ -2,6 +2,7 @@
 
 use crate::api::models::deployments::DeployedModelResponse;
 use crate::api::models::groups::{GroupCreate, GroupResponse, GroupUpdate, ListGroupsQuery};
+use crate::api::models::pagination::PaginatedResponse;
 use crate::api::models::users::{CurrentUser, UserResponse};
 use crate::auth::permissions::{RequiresPermission, can_read_all_resources, can_read_own_resource, operation, resource};
 use crate::db::handlers::{Deployments, Groups, Repository, Users, groups::GroupFilter};
@@ -44,16 +45,20 @@ pub async fn list_groups(
     State(state): State<AppState>,
     Query(query): Query<ListGroupsQuery>,
     _: RequiresPermission<resource::Groups, operation::ReadAll>,
-) -> Result<Json<Vec<GroupResponse>>> {
+) -> Result<Json<PaginatedResponse<GroupResponse>>> {
     let mut tx = state.db.begin().await.map_err(|e| Error::Database(e.into()))?;
 
     let groups;
+    let total_count;
+    let skip;
+    let limit;
     {
         let mut repo = Groups::new(tx.acquire().await.map_err(|e| Error::Database(e.into()))?);
-        let skip = query.pagination.skip();
-        let limit = query.pagination.limit();
+        skip = query.pagination.skip();
+        limit = query.pagination.limit();
 
         groups = repo.list(&GroupFilter::new(skip, limit)).await?;
+        total_count = repo.count().await?;
     }
 
     // Parse include parameter
@@ -159,7 +164,8 @@ pub async fn list_groups(
     // Commit the transaction to ensure all reads were atomic
     tx.commit().await.map_err(|e| Error::Database(e.into()))?;
 
-    Ok(Json(response_groups))
+    let paginated_response = PaginatedResponse::new(response_groups, total_count, skip, limit);
+    Ok(Json(paginated_response))
 }
 
 #[utoipa::path(
@@ -653,7 +659,7 @@ mod tests {
     use std::collections::HashSet;
 
     use crate::{
-        api::models::{groups::GroupResponse, users::Role},
+        api::models::{groups::GroupResponse, pagination::PaginatedResponse, users::Role},
         db::{
             handlers::{Deployments, Groups, Repository},
             models::{deployments::DeploymentCreateDBRequest, groups::GroupCreateDBRequest},
@@ -691,8 +697,9 @@ mod tests {
             .await;
 
         response.assert_status_ok();
-        let groups: Vec<GroupResponse> = response.json();
-        assert_eq!(groups.len(), 3);
+        let paginated_response: PaginatedResponse<GroupResponse> = response.json();
+        assert_eq!(paginated_response.data.len(), 3);
+        assert_eq!(paginated_response.limit, 3);
 
         // Test with skip and limit
         let response = app
@@ -702,8 +709,10 @@ mod tests {
             .await;
 
         response.assert_status_ok();
-        let groups: Vec<GroupResponse> = response.json();
-        assert_eq!(groups.len(), 2);
+        let paginated_response: PaginatedResponse<GroupResponse> = response.json();
+        assert_eq!(paginated_response.data.len(), 2);
+        assert_eq!(paginated_response.skip, 2);
+        assert_eq!(paginated_response.limit, 2);
 
         // Test skip beyond available groups
         let response = app
@@ -713,8 +722,8 @@ mod tests {
             .await;
 
         response.assert_status_ok();
-        let groups: Vec<GroupResponse> = response.json();
-        assert!(groups.is_empty());
+        let paginated_response: PaginatedResponse<GroupResponse> = response.json();
+        assert!(paginated_response.data.is_empty());
 
         // Test default pagination values (no params)
         let response = app
@@ -724,8 +733,8 @@ mod tests {
             .await;
 
         response.assert_status_ok();
-        let groups: Vec<GroupResponse> = response.json();
-        assert_eq!(groups.len(), 6); // Should return all 6 groups (5 test groups + Everyone group)
+        let paginated_response: PaginatedResponse<GroupResponse> = response.json();
+        assert_eq!(paginated_response.data.len(), 6); // Should return all 6 groups (5 test groups + Everyone group)
     }
 
     #[sqlx::test]
@@ -1290,8 +1299,8 @@ mod tests {
             .await;
 
         response.assert_status_ok();
-        let groups: Vec<GroupResponse> = response.json();
-        let found_group = groups.iter().find(|g| g.id == group.id).expect("Group not found");
+        let paginated_response: PaginatedResponse<GroupResponse> = response.json();
+        let found_group = paginated_response.data.iter().find(|g| g.id == group.id).expect("Group not found");
         assert!(found_group.users.is_none());
         assert!(found_group.models.is_none());
 
@@ -1303,8 +1312,8 @@ mod tests {
             .await;
 
         response.assert_status_ok();
-        let groups: Vec<GroupResponse> = response.json();
-        let found_group = groups.iter().find(|g| g.id == group.id).expect("Group not found");
+        let paginated_response: PaginatedResponse<GroupResponse> = response.json();
+        let found_group = paginated_response.data.iter().find(|g| g.id == group.id).expect("Group not found");
         assert!(found_group.users.is_some());
         assert!(found_group.models.is_none());
         let users = found_group.users.as_ref().unwrap().iter().map(|x| x.id).collect::<HashSet<_>>();
@@ -1318,8 +1327,8 @@ mod tests {
             .await;
 
         response.assert_status_ok();
-        let groups: Vec<GroupResponse> = response.json();
-        let found_group = groups.iter().find(|g| g.id == group.id).expect("Group not found");
+        let paginated_response: PaginatedResponse<GroupResponse> = response.json();
+        let found_group = paginated_response.data.iter().find(|g| g.id == group.id).expect("Group not found");
         assert!(found_group.users.is_none());
         assert!(found_group.models.is_some());
         let models = found_group.models.as_ref().unwrap().iter().map(|x| x.id).collect::<HashSet<_>>();
@@ -1333,8 +1342,8 @@ mod tests {
             .await;
 
         response.assert_status_ok();
-        let groups: Vec<GroupResponse> = response.json();
-        let found_group = groups.iter().find(|g| g.id == group.id).expect("Group not found");
+        let paginated_response: PaginatedResponse<GroupResponse> = response.json();
+        let found_group = paginated_response.data.iter().find(|g| g.id == group.id).expect("Group not found");
         assert!(found_group.users.is_some());
         assert!(found_group.models.is_some());
         let users = found_group.users.as_ref().unwrap().iter().map(|x| x.id).collect::<HashSet<_>>();
@@ -1350,8 +1359,8 @@ mod tests {
             .await;
 
         response.assert_status_ok();
-        let groups: Vec<GroupResponse> = response.json();
-        let found_group = groups.iter().find(|g| g.id == group.id).expect("Group not found");
+        let paginated_response: PaginatedResponse<GroupResponse> = response.json();
+        let found_group = paginated_response.data.iter().find(|g| g.id == group.id).expect("Group not found");
         assert!(found_group.users.is_some());
         assert!(found_group.models.is_some());
     }

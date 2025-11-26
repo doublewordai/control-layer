@@ -295,13 +295,12 @@ mod tests {
         let mut conn = pool.acquire().await.expect("Failed to acquire connection");
         let mut credits = Credits::new(&mut conn);
 
-        let request = CreditTransactionCreateDBRequest {
+        let request = CreditTransactionCreateDBRequest::admin_grant(
             user_id,
-            transaction_type: CreditTransactionType::AdminGrant,
-            amount: Decimal::from_str("100.50").unwrap(),
-            source_id: user_id.to_string(),
-            description: Some("Test grant".to_string()),
-        };
+            user_id,
+            Decimal::from_str("100.50").unwrap(),
+            Some("Test grant".to_string()),
+        );
 
         let transaction = credits.create_transaction(&request).await.expect("Failed to create transaction");
 
@@ -320,26 +319,14 @@ mod tests {
         let mut credits = Credits::new(&mut conn);
 
         // Add credits
-        let request1 = CreditTransactionCreateDBRequest {
-            user_id,
-            transaction_type: CreditTransactionType::AdminGrant,
-            amount: Decimal::from_str("100.0").unwrap(),
-            source_id: user_id.to_string(),
-            description: None,
-        };
+        let request1 = CreditTransactionCreateDBRequest::admin_grant(user_id, user_id, Decimal::from_str("100.0").unwrap(), None);
         credits.create_transaction(&request1).await.expect("Failed to create transaction");
 
         let balance = credits.get_user_balance(user_id).await.expect("Failed to get balance");
         assert_eq!(balance, Decimal::from_str("100.0").unwrap());
 
         // Add more credits
-        let request2 = CreditTransactionCreateDBRequest {
-            user_id,
-            transaction_type: CreditTransactionType::AdminGrant,
-            amount: Decimal::from_str("50.0").unwrap(),
-            source_id: user_id.to_string(),
-            description: None,
-        };
+        let request2 = CreditTransactionCreateDBRequest::admin_grant(user_id, user_id, Decimal::from_str("50.0").unwrap(), None);
         credits.create_transaction(&request2).await.expect("Failed to create transaction");
 
         let balance = credits.get_user_balance(user_id).await.expect("Failed to get balance");
@@ -354,13 +341,7 @@ mod tests {
         let mut credits = Credits::new(&mut conn);
 
         // Add credits
-        let request1 = CreditTransactionCreateDBRequest {
-            user_id,
-            transaction_type: CreditTransactionType::AdminGrant,
-            amount: Decimal::from_str("100.0").unwrap(),
-            source_id: user_id.to_string(),
-            description: None,
-        };
+        let request1 = CreditTransactionCreateDBRequest::admin_grant(user_id, user_id, Decimal::from_str("100.0").unwrap(), None);
         credits.create_transaction(&request1).await.expect("Failed to create transaction");
 
         let balance = credits.get_user_balance(user_id).await.expect("Failed to get balance");
@@ -371,7 +352,7 @@ mod tests {
             user_id,
             transaction_type: CreditTransactionType::AdminRemoval,
             amount: Decimal::from_str("500.0").unwrap(),
-            source_id: user_id.to_string(),
+            source_id: Uuid::new_v4().to_string(),
             description: None,
         };
         credits.create_transaction(&request2).await.expect("Failed to create transaction");
@@ -388,13 +369,7 @@ mod tests {
         let mut credits = Credits::new(&mut conn);
 
         // Create first transaction
-        let request1 = CreditTransactionCreateDBRequest {
-            user_id,
-            transaction_type: CreditTransactionType::AdminGrant,
-            amount: Decimal::from_str("100.50").unwrap(),
-            source_id: user_id.to_string(),
-            description: None,
-        };
+        let request1 = CreditTransactionCreateDBRequest::admin_grant(user_id, user_id, Decimal::from_str("100.50").unwrap(), None);
         let transaction1 = credits
             .create_transaction(&request1)
             .await
@@ -407,13 +382,7 @@ mod tests {
         assert_eq!(transaction1.description, None);
 
         // Try to create second transaction with wrong balance_after
-        let request2 = CreditTransactionCreateDBRequest {
-            user_id,
-            transaction_type: CreditTransactionType::AdminGrant,
-            amount: Decimal::from_str("50.0").unwrap(),
-            source_id: user_id.to_string(),
-            description: None,
-        };
+        let request2 = CreditTransactionCreateDBRequest::admin_grant(user_id, user_id, Decimal::from_str("50.0").unwrap(), None);
 
         let transaction2 = credits
             .create_transaction(&request2)
@@ -431,7 +400,7 @@ mod tests {
             user_id,
             transaction_type: CreditTransactionType::AdminRemoval,
             amount: Decimal::from_str("30.0").unwrap(),
-            source_id: user_id.to_string(),
+            source_id: Uuid::new_v4().to_string(),
             description: Some("Usage deduction".to_string()),
         };
 
@@ -456,14 +425,14 @@ mod tests {
         let n_of_transactions = 10;
 
         for i in 1..n_of_transactions + 1 {
-            let request = CreditTransactionCreateDBRequest {
+            let request = CreditTransactionCreateDBRequest::admin_grant(
                 user_id,
-                transaction_type: CreditTransactionType::AdminGrant,
-                amount: Decimal::from(i * 10),
-                source_id: user_id.to_string(),
-                description: Some(format!("Transaction {}", i + 1)),
-            };
+                user_id,
+                Decimal::from(i * 10),
+                Some(format!("Transaction {}", i + 1)),
+            );
             credits.create_transaction(&request).await.expect("Failed to create transaction");
+            // Small delay to ensure unique timestamps in source_id
         }
 
         let transactions = credits
@@ -493,13 +462,12 @@ mod tests {
         let mut transaction_ids = Vec::new();
 
         for i in 1..n_of_transactions + 1 {
-            let request = CreditTransactionCreateDBRequest {
+            let request = CreditTransactionCreateDBRequest::admin_grant(
                 user_id,
-                transaction_type: CreditTransactionType::AdminGrant,
-                amount: Decimal::from(i * 10),
-                source_id: user_id.to_string(),
-                description: Some(format!("Transaction {}", i + 1)),
-            };
+                user_id,
+                Decimal::from(i * 10),
+                Some(format!("Transaction {}", i + 1)),
+            );
             transaction_ids.push(credits.create_transaction(&request).await.expect("Failed to create transaction").id);
         }
 
@@ -544,13 +512,7 @@ mod tests {
         for i in 1..=5 {
             let amount = Decimal::from(i * 10);
             cumulative_balance += amount;
-            let request = CreditTransactionCreateDBRequest {
-                user_id,
-                transaction_type: CreditTransactionType::AdminGrant,
-                amount,
-                source_id: user_id.to_string(),
-                description: None,
-            };
+            let request = CreditTransactionCreateDBRequest::admin_grant(user_id, user_id, amount, None);
             credits.create_transaction(&request).await.expect("Failed to create transaction");
         }
 
@@ -585,23 +547,11 @@ mod tests {
         let mut credits = Credits::new(&mut conn);
 
         // Create transactions for user1
-        let request1 = CreditTransactionCreateDBRequest {
-            user_id: user1_id,
-            transaction_type: CreditTransactionType::AdminGrant,
-            amount: Decimal::from_str("100.0").unwrap(),
-            source_id: user1_id.to_string(),
-            description: None,
-        };
+        let request1 = CreditTransactionCreateDBRequest::admin_grant(user1_id, user1_id, Decimal::from_str("100.0").unwrap(), None);
         credits.create_transaction(&request1).await.expect("Failed to create transaction");
 
         // Create transactions for user2
-        let request2 = CreditTransactionCreateDBRequest {
-            user_id: user2_id,
-            transaction_type: CreditTransactionType::AdminGrant,
-            amount: Decimal::from_str("200.0").unwrap(),
-            source_id: user2_id.to_string(),
-            description: None,
-        };
+        let request2 = CreditTransactionCreateDBRequest::admin_grant(user2_id, user2_id, Decimal::from_str("200.0").unwrap(), None);
         credits.create_transaction(&request2).await.expect("Failed to create transaction");
 
         // List user1's transactions
@@ -640,22 +590,20 @@ mod tests {
         let mut credits = Credits::new(&mut conn);
 
         // Create transactions for both users
-        let request1 = CreditTransactionCreateDBRequest {
-            user_id: user1_id,
-            transaction_type: CreditTransactionType::AdminGrant,
-            amount: Decimal::from_str("100.0").unwrap(),
-            source_id: user1_id.to_string(),
-            description: Some("User 1 grant".to_string()),
-        };
+        let request1 = CreditTransactionCreateDBRequest::admin_grant(
+            user1_id,
+            user1_id,
+            Decimal::from_str("100.0").unwrap(),
+            Some("User 1 grant".to_string()),
+        );
         credits.create_transaction(&request1).await.expect("Failed to create transaction");
 
-        let request2 = CreditTransactionCreateDBRequest {
-            user_id: user2_id,
-            transaction_type: CreditTransactionType::AdminGrant,
-            amount: Decimal::from_str("200.0").unwrap(),
-            source_id: user2_id.to_string(),
-            description: Some("User 2 grant".to_string()),
-        };
+        let request2 = CreditTransactionCreateDBRequest::admin_grant(
+            user2_id,
+            user2_id,
+            Decimal::from_str("200.0").unwrap(),
+            Some("User 2 grant".to_string()),
+        );
         credits.create_transaction(&request2).await.expect("Failed to create transaction");
 
         let transactions = credits.list_all_transactions(0, 10).await.expect("Failed to list transactions");
@@ -680,13 +628,7 @@ mod tests {
             let amount = Decimal::from(i * 10);
             cumulative_balance += amount;
             let user_id = create_test_user(&pool).await;
-            let request = CreditTransactionCreateDBRequest {
-                user_id,
-                transaction_type: CreditTransactionType::AdminGrant,
-                amount,
-                source_id: user_id.to_string(),
-                description: None,
-            };
+            let request = CreditTransactionCreateDBRequest::admin_grant(user_id, user_id, amount, None);
             credits.create_transaction(&request).await.expect("Failed to create transaction");
         }
 
@@ -707,13 +649,8 @@ mod tests {
         let mut credits = Credits::new(&mut conn);
 
         // Test AdminGrant
-        let request = CreditTransactionCreateDBRequest {
-            user_id,
-            transaction_type: CreditTransactionType::AdminGrant,
-            amount: Decimal::from_str("100.0").unwrap(),
-            source_id: user_id.to_string(),
-            description: Some("Grant".to_string()),
-        };
+        let request =
+            CreditTransactionCreateDBRequest::admin_grant(user_id, user_id, Decimal::from_str("100.0").unwrap(), Some("Grant".to_string()));
         let tx = credits.create_transaction(&request).await.expect("Failed to create AdminGrant");
         assert_eq!(tx.transaction_type, CreditTransactionType::AdminGrant);
 
@@ -722,7 +659,7 @@ mod tests {
             user_id,
             transaction_type: CreditTransactionType::Purchase,
             amount: Decimal::from_str("50.0").unwrap(),
-            source_id: user_id.to_string(),
+            source_id: Uuid::new_v4().to_string(), // Mimics Stripe payment ID
             description: Some("Purchase".to_string()),
         };
         let tx = credits.create_transaction(&request).await.expect("Failed to create Purchase");
@@ -733,7 +670,7 @@ mod tests {
             user_id,
             transaction_type: CreditTransactionType::Usage,
             amount: Decimal::from_str("25.0").unwrap(),
-            source_id: user_id.to_string(),
+            source_id: Uuid::new_v4().to_string(), // Mimics request ID from http_analytics
             description: Some("Usage".to_string()),
         };
         let tx = credits.create_transaction(&request).await.expect("Failed to create Usage");
@@ -744,7 +681,7 @@ mod tests {
             user_id,
             transaction_type: CreditTransactionType::AdminRemoval,
             amount: Decimal::from_str("25.0").unwrap(),
-            source_id: user_id.to_string(),
+            source_id: Uuid::new_v4().to_string(),
             description: Some("Removal".to_string()),
         };
         let tx = credits.create_transaction(&request).await.expect("Failed to create AdminRemoval");
@@ -763,23 +700,16 @@ mod tests {
         let mut credits = Credits::new(&mut conn);
 
         // Create a valid transaction
-        let request1 = CreditTransactionCreateDBRequest {
-            user_id,
-            transaction_type: CreditTransactionType::AdminGrant,
-            amount: Decimal::from_str("100.0").unwrap(),
-            source_id: user_id.to_string(),
-            description: None,
-        };
+        let request1 = CreditTransactionCreateDBRequest::admin_grant(user_id, user_id, Decimal::from_str("100.0").unwrap(), None);
         credits.create_transaction(&request1).await.expect("Failed to create transaction");
 
         // Try to create an invalid transaction (insufficient balance for removal)
-        let request2 = CreditTransactionCreateDBRequest {
+        let request2 = CreditTransactionCreateDBRequest::admin_grant(
             user_id,
-            transaction_type: CreditTransactionType::AdminGrant,
-            amount: Decimal::from_str("-200.0").unwrap(), // Invalid negative amount
-            source_id: user_id.to_string(),
-            description: None,
-        };
+            user_id,
+            Decimal::from_str("-200.0").unwrap(), // Invalid negative amount
+            None,
+        );
         let result = credits.create_transaction(&request2).await;
         assert!(result.is_err());
 
@@ -820,13 +750,12 @@ mod tests {
             let mut conn = pool.acquire().await.expect("Failed to acquire connection");
             let mut credits = Credits::new(&mut conn);
 
-            let request = CreditTransactionCreateDBRequest {
+            let request = CreditTransactionCreateDBRequest::admin_grant(
                 user_id,
-                transaction_type: CreditTransactionType::AdminGrant,
-                amount: Decimal::from_str("100.0").unwrap(),
-                source_id: user_id.to_string(),
-                description: Some("Initial grant".to_string()),
-            };
+                user_id,
+                Decimal::from_str("100.0").unwrap(),
+                Some("Initial grant".to_string()),
+            );
             credits.create_transaction(&request).await.expect("Failed to create transaction");
         }
 
@@ -854,7 +783,7 @@ mod tests {
                 user_id,
                 transaction_type: CreditTransactionType::Usage,
                 amount: Decimal::from_str("150.0").unwrap(),
-                source_id: user_id.to_string(),
+                source_id: Uuid::new_v4().to_string(), // Mimics request ID from http_analytics
                 description: Some("Usage that crosses zero".to_string()),
             };
             credits.create_transaction(&request).await.expect("Failed to create transaction");
@@ -881,13 +810,12 @@ mod tests {
             let mut conn = pool.acquire().await.expect("Failed to acquire connection");
             let mut credits = Credits::new(&mut conn);
 
-            let request = CreditTransactionCreateDBRequest {
+            let request = CreditTransactionCreateDBRequest::admin_grant(
                 user_id,
-                transaction_type: CreditTransactionType::AdminGrant,
-                amount: Decimal::from_str("100.0").unwrap(),
-                source_id: user_id.to_string(),
-                description: Some("Grant that crosses zero".to_string()),
-            };
+                user_id,
+                Decimal::from_str("100.0").unwrap(),
+                Some("Grant that crosses zero".to_string()),
+            );
             credits.create_transaction(&request).await.expect("Failed to create transaction");
         }
 
@@ -911,13 +839,12 @@ mod tests {
             let mut conn = pool.acquire().await.expect("Failed to acquire connection");
             let mut credits = Credits::new(&mut conn);
 
-            let request = CreditTransactionCreateDBRequest {
+            let request = CreditTransactionCreateDBRequest::admin_grant(
                 user_id,
-                transaction_type: CreditTransactionType::AdminGrant,
-                amount: Decimal::from_str("50.0").unwrap(),
-                source_id: user_id.to_string(),
-                description: Some("Another grant".to_string()),
-            };
+                user_id,
+                Decimal::from_str("50.0").unwrap(),
+                Some("Another grant".to_string()),
+            );
             credits.create_transaction(&request).await.expect("Failed to create transaction");
         }
 
@@ -937,13 +864,12 @@ mod tests {
         // Create initial balance
         let mut conn: sqlx::pool::PoolConnection<sqlx::Postgres> = pool.acquire().await.expect("Failed to acquire connection");
         let mut credits = Credits::new(&mut conn);
-        let initial_request = CreditTransactionCreateDBRequest {
+        let initial_request = CreditTransactionCreateDBRequest::admin_grant(
             user_id,
-            transaction_type: CreditTransactionType::AdminGrant,
-            amount: Decimal::from_str("1000.0").unwrap(),
-            source_id: user_id.to_string(),
-            description: Some("Initial balance".to_string()),
-        };
+            user_id,
+            Decimal::from_str("1000.0").unwrap(),
+            Some("Initial balance".to_string()),
+        );
         credits
             .create_transaction(&initial_request)
             .await
@@ -972,7 +898,7 @@ mod tests {
                     } else {
                         Decimal::from_str("5.0").unwrap()
                     },
-                    source_id: user_id.to_string(),
+                    source_id: Uuid::new_v4().to_string(),
                     description: Some(format!("Concurrent transaction {}", i)),
                 };
 
@@ -1087,13 +1013,7 @@ mod tests {
         // Test with large credit amount that fits in DECIMAL(12, 2)
         // Maximum is 9,999,999,999.99
         let large_amount = Decimal::from_str("1000000000.00").unwrap(); // 1 billion
-        let request = CreditTransactionCreateDBRequest {
-            user_id,
-            transaction_type: CreditTransactionType::AdminGrant,
-            amount: large_amount,
-            source_id: user_id.to_string(),
-            description: Some("Large credit grant".to_string()),
-        };
+        let request = CreditTransactionCreateDBRequest::admin_grant(user_id, user_id, large_amount, Some("Large credit grant".to_string()));
 
         let transaction = credits
             .create_transaction(&request)
@@ -1105,13 +1025,8 @@ mod tests {
         assert_eq!(transaction.balance_after, large_amount);
 
         // Add another large amount
-        let request2 = CreditTransactionCreateDBRequest {
-            user_id,
-            transaction_type: CreditTransactionType::AdminGrant,
-            amount: large_amount,
-            source_id: user_id.to_string(),
-            description: Some("Second large grant".to_string()),
-        };
+        let request2 =
+            CreditTransactionCreateDBRequest::admin_grant(user_id, user_id, large_amount, Some("Second large grant".to_string()));
 
         let transaction2 = credits
             .create_transaction(&request2)
@@ -1133,13 +1048,12 @@ mod tests {
         let mut credits = Credits::new(&mut conn);
 
         // Test with high precision amount (e.g., per-token micro-transaction)
-        let request = CreditTransactionCreateDBRequest {
+        let request = CreditTransactionCreateDBRequest::admin_grant(
             user_id,
-            transaction_type: CreditTransactionType::AdminGrant,
-            amount: Decimal::from_str("100.12345678").unwrap(),
-            source_id: user_id.to_string(),
-            description: Some("High precision grant".to_string()),
-        };
+            user_id,
+            Decimal::from_str("100.12345678").unwrap(),
+            Some("High precision grant".to_string()),
+        );
 
         let transaction = credits.create_transaction(&request).await.expect("Failed to create transaction");
 

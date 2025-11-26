@@ -1,5 +1,20 @@
 # Changelog
 
+## [0.9.0](https://github.com/doublewordai/control-layer/compare/v0.8.1...v0.9.0) (2025-11-25)
+
+
+### Features
+
+* change the email config format, and add tests for native auth ([#199](https://github.com/doublewordai/control-layer/issues/199)) ([a1861a8](https://github.com/doublewordai/control-layer/commit/a1861a8f683e3b39b235d907565c8663cf4d66c4))
+* **dwctl + dashboard:** users pagination ([#207](https://github.com/doublewordai/control-layer/issues/207)) ([57fdb5c](https://github.com/doublewordai/control-layer/commit/57fdb5c30148f6b14d63eab2b4d7556153a46939))
+
+
+### Bug Fixes
+
+* better batch status transitions ([6a78562](https://github.com/doublewordai/control-layer/commit/6a7856286be4beaa04282914ab5b33766e10c36c))
+* jwt only stores used id, rest of data fetched from db ([187e922](https://github.com/doublewordai/control-layer/commit/187e9226d0c079e92562dc4ae065f60141dc1c0a))
+* use database NOW() for updated_at timestamps to prevent clock skew ([#212](https://github.com/doublewordai/control-layer/issues/212)) ([bfced03](https://github.com/doublewordai/control-layer/commit/bfced038e7294034293ef1435c9e400dbd6fa789))
+
 ## [0.8.1](https://github.com/doublewordai/control-layer/compare/v0.8.0...v0.8.1) (2025-11-24)
 
 

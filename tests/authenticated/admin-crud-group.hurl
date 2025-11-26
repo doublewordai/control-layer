@@ -47,8 +47,8 @@ GET http://localhost:3001/admin/api/v1/groups
 dwctl_session: {{admin_jwt}}
 HTTP 200
 [Asserts]
-jsonpath "$" isCollection
-jsonpath "$[?(@.name == '{{group_name}}')]" count == 1
+jsonpath "$.data" isCollection
+jsonpath "$.data[?(@.name == '{{group_name}}')]" count == 1
 
 # Delete the group
 DELETE http://localhost:3001/admin/api/v1/groups/{{group_id}}

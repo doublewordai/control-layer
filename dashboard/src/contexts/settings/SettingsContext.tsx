@@ -11,7 +11,6 @@ const DEFAULT_SETTINGS: AppSettings = {
   features: {
     demo: false,
   },
-  paymentProviderUrl: undefined,
 };
 
 /**
@@ -64,10 +63,6 @@ function loadSettings(): AppSettings {
         DEFAULT_SETTINGS.features.demo,
     },
     demoConfig: localSettings.demoConfig,
-    paymentProviderUrl:
-      import.meta.env.VITE_PAYMENT_PROVIDER_URL ||
-      localSettings.paymentProviderUrl ||
-      DEFAULT_SETTINGS.paymentProviderUrl,
   };
 }
 

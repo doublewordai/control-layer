@@ -48,7 +48,7 @@ export const AccessManagementModal: React.FC<AccessManagementModalProps> = ({
 
   // Check if group has access to the model using the groups data
   const groupHasAccessToModel = (groupId: string): boolean => {
-    const group = groupsData?.find((g) => g.id === groupId);
+    const group = groupsData?.data.find((g) => g.id === groupId);
     const result = group?.models?.some((m) => m.id === model.id) || false;
     return result;
   };
@@ -121,7 +121,7 @@ export const AccessManagementModal: React.FC<AccessManagementModalProps> = ({
                 </p>
               </div>
 
-              {!groupsData || groupsData.length === 0 ? (
+              {!groupsData || groupsData.data.length === 0 ? (
                 <div className="text-center py-8">
                   <Users className="w-12 h-12 text-gray-400 mx-auto mb-3" />
                   <p className="text-gray-500">No groups available</p>
@@ -140,13 +140,13 @@ export const AccessManagementModal: React.FC<AccessManagementModalProps> = ({
                   </button>
                 </div>
               ) : (
-                groupsData.map((group: BackendGroup) => (
+                groupsData.data.map((group: BackendGroup) => (
                   <div
                     key={group.id}
                     className="flex items-center justify-between p-4 border border-gray-200 rounded-lg hover:bg-gray-50 transition-colors"
                   >
                     <div className="flex items-center gap-3 flex-1 min-w-0 pr-10">
-                      <div className="w-10 h-10 bg-blue-500 rounded-lg flex items-center justify-center flex-shrink-0">
+                      <div className="w-10 h-10 bg-blue-500 rounded-lg flex items-center justify-center shrink-0">
                         <Users className="w-5 h-5 text-white" />
                       </div>
                       <div className="min-w-0 flex-1">
@@ -164,7 +164,7 @@ export const AccessManagementModal: React.FC<AccessManagementModalProps> = ({
                       </div>
                     </div>
 
-                    <div className="flex items-center gap-2 flex-shrink-0">
+                    <div className="flex items-center gap-2 shrink-0">
                       {groupHasAccessToModel(group.id) ? (
                         <>
                           <span className="text-xs px-2 py-1 bg-green-100 text-green-700 rounded-full">

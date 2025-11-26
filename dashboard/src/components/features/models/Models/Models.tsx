@@ -20,11 +20,10 @@ const Models: React.FC = () => {
   const canManageGroups = hasPermission("manage-groups");
   const canViewAnalytics = hasPermission("analytics");
   const showPricing = true;
+
   const [filterProvider, setFilterProvider] = useState("all");
-  const [currentPage, setCurrentPage] = useState(1);
-  const [itemsPerPage] = useState(12);
   const [searchQuery, setSearchQuery] = useState("");
-  const [debouncedSearchQuery, setDebouncedSearchQuery] = useState("");
+  const [currentPage, setCurrentPage] = useState(1);
   const [showAccessibleOnly, setShowAccessibleOnly] = useState(false);
 
   const { data: endpointsData } = useEndpoints();
@@ -32,26 +31,34 @@ const Models: React.FC = () => {
     ...new Set(["all", ...(endpointsData || []).map((e) => e.name).sort()]),
   ];
 
-  // Debounce search query to avoid excessive API calls
+  // load search query and page from URL params (to preserve history)
   useEffect(() => {
-    const timer = setTimeout(() => {
-      setDebouncedSearchQuery(searchQuery);
-    }, 300);
-    return () => clearTimeout(timer);
-  }, [searchQuery]);
+    const search = searchParams.get("search");
+    const page = searchParams.get("page");
 
-  // Reset to page 1 when filter or search changes
+    if (search) setSearchQuery(search);
+    if (page) setCurrentPage(Number(page));
+  }, [searchParams]);
+
+  // sync search query to URL params
+  useEffect(() => {
+    const params = new URLSearchParams();
+    if (searchQuery) params.set("search", searchQuery);
+    if (currentPage) params.set("page", String(currentPage));
+
+    setSearchParams(params, { replace: true });
+  }, [searchQuery, currentPage, setSearchParams]);
+
+  // reset pagination when search query changes
   useEffect(() => {
     setCurrentPage(1);
-  }, [filterProvider, debouncedSearchQuery]);
+  }, [searchQuery]);
 
-  // Read view mode from URL params (defaults to "grid")
   const viewMode = searchParams.get("view") || "grid";
   const isStatusMode = viewMode === "status";
 
-  // Handle tab change
   const handleTabChange = (value: string) => {
-    setSearchParams({ view: value });
+    setSearchParams({ view: value }, { replace: true });
   };
 
   const handleClearFilters = () => {
@@ -150,13 +157,11 @@ const Models: React.FC = () => {
 
         {/* Content - isolated to prevent header re-renders */}
         <ModelsContent
-          debouncedSearchQuery={debouncedSearchQuery}
+          currentPage={currentPage}
+          setCurrentPage={setCurrentPage}
           searchQuery={searchQuery}
           filterProvider={filterProvider}
           showAccessibleOnly={showAccessibleOnly}
-          currentPage={currentPage}
-          setCurrentPage={setCurrentPage}
-          itemsPerPage={itemsPerPage}
           isStatusMode={isStatusMode}
           canManageGroups={canManageGroups}
           canViewAnalytics={canViewAnalytics}

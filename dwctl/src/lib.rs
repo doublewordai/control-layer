@@ -143,6 +143,7 @@ pub mod errors;
 mod leader_election;
 mod metrics;
 mod openapi;
+mod payment_providers;
 mod probes;
 mod request_logging;
 mod static_assets;
@@ -168,7 +169,7 @@ use auth::middleware::admin_ai_proxy_middleware;
 use axum::extract::DefaultBodyLimit;
 use axum::http::HeaderValue;
 use axum::{
-    Router, ServiceExt,
+    Router, ServiceExt, http,
     middleware::from_fn_with_state,
     routing::{delete, get, patch, post},
 };
@@ -558,7 +559,8 @@ fn create_cors_layer(config: &Config) -> anyhow::Result<CorsLayer> {
 
     let mut cors = CorsLayer::new()
         .allow_origin(origins)
-        .allow_credentials(config.auth.security.cors.allow_credentials);
+        .allow_credentials(config.auth.security.cors.allow_credentials)
+        .expose_headers(vec![http::header::LOCATION]);
 
     if let Some(max_age) = config.auth.security.cors.max_age {
         cors = cors.max_age(std::time::Duration::from_secs(max_age));
@@ -673,6 +675,9 @@ pub async fn build_router(state: &mut AppState, onwards_router: Router) -> anyho
         .route("/transactions", post(api::handlers::transactions::create_transaction))
         .route("/transactions/{transaction_id}", get(api::handlers::transactions::get_transaction))
         .route("/transactions", get(api::handlers::transactions::list_transactions))
+        // Payment processing
+        .route("/payments", post(api::handlers::payments::create_payment))
+        .route("/payments/{id}", patch(api::handlers::payments::process_payment))
         // Inference endpoints management (admin only for write operations)
         .route("/endpoints", get(api::handlers::inference_endpoints::list_inference_endpoints))
         .route("/endpoints", post(api::handlers::inference_endpoints::create_inference_endpoint))
@@ -798,6 +803,9 @@ pub async fn build_router(state: &mut AppState, onwards_router: Router) -> anyho
                 (axum::http::StatusCode::OK, [("content-type", "application/yaml")], OPENAPI_SPEC)
             }),
         )
+        // Webhook routes (external services, not part of client API docs)
+        .route("/webhooks/payments", post(api::handlers::payments::webhook_handler))
+        .with_state(state.clone())
         .merge(auth_routes)
         .nest("/ai/v1", ai_router)
         .nest("/admin/api/v1", api_routes_with_state)

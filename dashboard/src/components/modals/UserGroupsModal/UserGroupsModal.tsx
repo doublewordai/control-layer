@@ -1,4 +1,4 @@
-import React, { useEffect, useState } from "react";
+import React, { useEffect, useMemo, useState } from "react";
 import { Users, Plus, Trash2 } from "lucide-react";
 import {
   Dialog,
@@ -33,12 +33,17 @@ export const UserGroupsModal: React.FC<UserGroupsModalProps> = ({
 
   // Fetch all groups data (includes users for membership checking)
   // Only fetch when modal is open to avoid 403 errors for users without permission
-  const { data: groupsData, isLoading: loading } = useGroups({
+  const { data: groupsResponse, isLoading: loading } = useGroups({
     include: "users",
     enabled: isOpen,
   });
   const addUserToGroupMutation = useAddUserToGroup();
   const removeUserFromGroupMutation = useRemoveUserFromGroup();
+
+  const groupsData = useMemo(
+    () => groupsResponse?.data || [],
+    [groupsResponse],
+  );
 
   // Clear error when modal opens
   useEffect(() => {
@@ -51,7 +56,7 @@ export const UserGroupsModal: React.FC<UserGroupsModalProps> = ({
   // changes when memberships changes) and not the passed in 'user` prop, since
   // that's static & its groups won't change.
   const isUserInGroup = (groupId: string): boolean => {
-    const group = groupsData?.find((g) => g.id === groupId);
+    const group = groupsData.find((g) => g.id === groupId);
     const result = group?.users?.some((u) => u.id === user.id) || false;
     return result;
   };

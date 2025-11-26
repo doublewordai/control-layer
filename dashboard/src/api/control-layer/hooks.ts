@@ -24,6 +24,8 @@ import type {
   FileUploadRequest,
   AddFundsRequest,
   DaemonsQuery,
+  Model,
+  Endpoint,
 } from "./types";
 
 // Config hooks
@@ -49,6 +51,7 @@ export function useUser(id: string, options?: { include?: string }) {
   return useQuery({
     queryKey: queryKeys.users.byId(id, options?.include),
     queryFn: () => dwctlApi.users.get(id, options),
+    staleTime: 30 * 1000, // 30 seconds - matches useTransactions to keep balance in sync
   });
 }
 
@@ -111,16 +114,36 @@ export function useDeleteUser() {
 
 // Models hooks
 export function useModels(options?: ModelsQuery) {
+  const queryClient = useQueryClient();
+
   return useQuery({
     queryKey: queryKeys.models.query(options),
     queryFn: () => dwctlApi.models.list(options),
+    // Populate individual model caches when list is fetched
+    select: (data) => {
+      // Seed the cache with individual models
+      data.data.forEach((model) => {
+        queryClient.setQueryData(queryKeys.models.byId(model.id), model);
+      });
+      return data;
+    },
   });
 }
 
-export function useModel(id: string) {
+export function useModel(id: string, options?: { include?: string }) {
+  const queryClient = useQueryClient();
+
   return useQuery({
-    queryKey: queryKeys.models.byId(id),
-    queryFn: () => dwctlApi.models.get(id),
+    queryKey: queryKeys.models.byId(id, options?.include),
+    queryFn: () => dwctlApi.models.get(id, options),
+    // Use cached list data as placeholder while fetching complete data
+    placeholderData: () => {
+      // Check if this exact model is cached
+      const cached: Model | undefined = queryClient.getQueryData(
+        queryKeys.models.byId(id),
+      );
+      if (cached) return cached;
+    },
   });
 }
 
@@ -253,18 +276,43 @@ export function useRemoveModelFromGroup() {
 
 // Endpoints hooks
 export function useEndpoints(options?: { enabled?: boolean }) {
+  const queryClient = useQueryClient();
   const { enabled = true } = options || {};
+
   return useQuery({
     queryKey: queryKeys.endpoints.all,
     queryFn: () => dwctlApi.endpoints.list(),
     enabled,
+    // Populate individual endpoint caches when list is fetched
+    select: (data) => {
+      // Seed the cache with individual endpoints
+      data.forEach((endpoint) => {
+        queryClient.setQueryData(
+          queryKeys.endpoints.byId(endpoint.id),
+          endpoint,
+        );
+      });
+      return data;
+    },
   });
 }
 
-export function useEndpoint(id: string) {
+export function useEndpoint(id: string, options?: { enabled?: boolean }) {
+  const queryClient = useQueryClient();
+  const { enabled = true } = options || {};
+
   return useQuery({
     queryKey: queryKeys.endpoints.byId(id),
     queryFn: () => dwctlApi.endpoints.get(id),
+    enabled,
+    // Use cached list data as placeholder while fetching complete data
+    placeholderData: () => {
+      // Check if this exact endpoint is cached
+      const cached: Endpoint | undefined = queryClient.getQueryData(
+        queryKeys.endpoints.byId(id),
+      );
+      if (cached) return cached;
+    },
   });
 }
 
@@ -853,8 +901,51 @@ export function useAddFunds() {
         queryClient.refetchQueries({
           queryKey: queryKeys.users.byId(variables.user_id, "billing"),
         }),
-        queryClient.refetchQueries({ queryKey: ["cost", "transactions"] }),
+        queryClient.invalidateQueries({
+          queryKey: ["cost", "transactions"],
+          exact: false,
+        }),
       ]);
+    },
+  });
+}
+
+// Payment hooks
+
+export function useCreatePayment() {
+  return useMutation({
+    mutationKey: queryKeys.payments.create(),
+    mutationFn: () => dwctlApi.payments.create(),
+  });
+}
+
+export function useProcessPayment(options?: {
+  onSuccess?: () => void;
+  onError?: (error: Error) => void;
+}) {
+  const queryClient = useQueryClient();
+
+  return useMutation({
+    mutationKey: ["payments", "process"],
+    mutationFn: async (sessionId: string) => {
+      await dwctlApi.payments.process(sessionId)
+    },
+    onSuccess: () => {
+      // Refetch user data to update balance after successful payment
+      queryClient.invalidateQueries({
+        queryKey: queryKeys.users.all,
+      });
+      queryClient.invalidateQueries({
+        queryKey: ["cost", "transactions"],
+        exact: false,
+      });
+      // Call the component's callback if provided
+      options?.onSuccess?.();
+    },
+    onError: (error) => {
+      console.error('[useProcessPayment] onError callback triggered:', error);
+      // Call the component's error callback if provided
+      options?.onError?.(error as Error);
     },
   });
 }

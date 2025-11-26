@@ -64,10 +64,11 @@ describe("User Hooks", () => {
       });
 
       expect(result.current.data).toBeDefined();
-      expect(Array.isArray(result.current.data)).toBe(true);
-      expect(result.current.data!.length).toBeGreaterThan(0);
-      expect(result.current.data![0]).toHaveProperty("id");
-      expect(result.current.data![0]).toHaveProperty("username");
+      expect(result.current.data).toHaveProperty("data");
+      expect(Array.isArray(result.current.data!.data)).toBe(true);
+      expect(result.current.data!.data.length).toBeGreaterThan(0);
+      expect(result.current.data!.data[0]).toHaveProperty("id");
+      expect(result.current.data!.data[0]).toHaveProperty("username");
     });
 
     it("should fetch users with include parameter", async () => {
@@ -79,8 +80,8 @@ describe("User Hooks", () => {
         expect(result.current.isSuccess).toBe(true);
       });
 
-      expect(result.current.data![0]).toHaveProperty("groups");
-      expect(Array.isArray(result.current.data![0].groups)).toBe(true);
+      expect(result.current.data!.data[0]).toHaveProperty("groups");
+      expect(Array.isArray(result.current.data!.data[0].groups)).toBe(true);
     });
 
     it("should handle errors", async () => {
@@ -280,18 +281,25 @@ describe("User Hooks", () => {
       expect(usersWithGroupsResult.current.data).toBeDefined();
 
       // Users without groups should not have groups property
-      expect(usersResult.current.data![0]).not.toHaveProperty("groups");
+      expect(usersResult.current.data!.data[0]).not.toHaveProperty("groups");
 
       // Users with groups should have groups property
-      expect(usersWithGroupsResult.current.data![0]).toHaveProperty("groups");
-      expect(Array.isArray(usersWithGroupsResult.current.data![0].groups)).toBe(
-        true,
+      expect(usersWithGroupsResult.current.data!.data[0]).toHaveProperty(
+        "groups",
       );
+      expect(
+        Array.isArray(usersWithGroupsResult.current.data!.data[0].groups),
+      ).toBe(true);
     });
 
     it("should invalidate all user queries when creating a user", async () => {
       const queryClient = new QueryClient({
-        defaultOptions: { queries: { retry: false } },
+        defaultOptions: {
+          queries: {
+            retry: false,
+            staleTime: 0, // Override any staleTime set in hooks
+          },
+        },
       });
 
       const wrapper = ({ children }: { children: ReactNode }) => (
@@ -317,11 +325,8 @@ describe("User Hooks", () => {
         expect(userResult.current.isSuccess).toBe(true);
       });
 
-      // Mark queries as stale to test invalidation
-      const queries = queryClient.getQueryCache().getAll();
-      queries.forEach((query) => {
-        query.state.dataUpdatedAt = Date.now() - 10000; // 10 seconds ago
-      });
+      // Spy on invalidateQueries to verify it's called correctly
+      const invalidateQueriesSpy = vi.spyOn(queryClient, "invalidateQueries");
 
       // Create a new user
       const { result: createResult } = renderHook(() => useCreateUser(), {
@@ -339,15 +344,12 @@ describe("User Hooks", () => {
         expect(createResult.current.isSuccess).toBe(true);
       });
 
-      // All user queries should be marked as stale/invalid
-      const updatedQueries = queryClient.getQueryCache().getAll();
-      const userQueries = updatedQueries.filter(
-        (q) => q.queryKey[0] === "users",
-      );
-
-      // Check that queries are marked as stale due to invalidation
-      userQueries.forEach((query) => {
-        expect(query.isStale()).toBe(true);
+      // Verify that invalidateQueries was called with the correct keys
+      expect(invalidateQueriesSpy).toHaveBeenCalledWith({
+        queryKey: ["users"],
+      });
+      expect(invalidateQueriesSpy).toHaveBeenCalledWith({
+        queryKey: ["groups"],
       });
     });
 
@@ -385,8 +387,8 @@ describe("User Hooks", () => {
       expect(users1.current.data).not.toBe(usersWithGroups.current.data);
 
       // Verify the data shapes are correct
-      expect(users1.current.data![0]).not.toHaveProperty("groups");
-      expect(usersWithGroups.current.data![0]).toHaveProperty("groups");
+      expect(users1.current.data!.data[0]).not.toHaveProperty("groups");
+      expect(usersWithGroups.current.data!.data[0]).toHaveProperty("groups");
     });
   });
 
@@ -548,7 +550,7 @@ describe("Billing Hooks", () => {
 
       const fundsData = {
         user_id: "550e8400-e29b-41d4-a716-446655440001",
-        source_id: "550e8400-e29b-41d4-a716-446655440001",
+        source_id: `550e8400-e29b-41d4-a716-446655440001_${Date.now()}`,
         amount: 100.0,
         description: "Test funds addition",
       };
@@ -572,7 +574,7 @@ describe("Billing Hooks", () => {
       });
 
       const fundsData = {
-        source_id: "550e8400-e29b-41d4-a716-446655440001",
+        source_id: `550e8400-e29b-41d4-a716-446655440001_${Date.now()}`,
         user_id: "550e8400-e29b-41d4-a716-446655440002",
         amount: 50.0,
       };
@@ -604,7 +606,7 @@ describe("Billing Hooks", () => {
       });
 
       result.current.mutate({
-        source_id: "550e8400-e29b-41d4-a716-446655440001",
+        source_id: `550e8400-e29b-41d4-a716-446655440001_${Date.now()}`,
         user_id: "non-existent-user",
         amount: 100,
       });
@@ -633,7 +635,7 @@ describe("Billing Hooks", () => {
 
       const userId = "550e8400-e29b-41d4-a716-446655440001";
       result.current.mutate({
-        source_id: "550e8400-e29b-41d4-a716-446655440001",
+        source_id: `550e8400-e29b-41d4-a716-446655440001_${Date.now()}`,
         user_id: userId,
         amount: 100,
         description: "Test invalidation",
