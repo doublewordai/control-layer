@@ -10,6 +10,7 @@ import {
   DialogTitle,
 } from "../../ui/dialog";
 import { Button } from "../../ui/button";
+import { AlertBox } from "@/components/ui/alert-box";
 
 interface DeleteUserModalProps {
   isOpen: boolean;
@@ -48,17 +49,14 @@ export const DeleteUserModal: React.FC<DeleteUserModalProps> = ({
 
   return (
     <Dialog open={isOpen} onOpenChange={onClose}>
-      <DialogContent
-        className="sm:max-w-md"
-        aria-labelledby="delete-user-title"
-      >
+      <DialogContent className="sm:max-w-md">
         <DialogHeader>
           <div className="flex items-center gap-3">
             <div className="w-10 h-10 bg-red-100 rounded-full flex items-center justify-center">
               <AlertTriangle className="w-5 h-5 text-red-600" />
             </div>
             <div>
-              <DialogTitle id="delete-user-title">Delete User</DialogTitle>
+              <DialogTitle>Delete User</DialogTitle>
               <DialogDescription>
                 This action cannot be undone
               </DialogDescription>
@@ -67,11 +65,9 @@ export const DeleteUserModal: React.FC<DeleteUserModalProps> = ({
         </DialogHeader>
 
         <div className="space-y-4">
-          {error && (
-            <div className="p-3 bg-red-50 border border-red-200 rounded-lg">
-              <p className="text-sm text-red-600">{error}</p>
-            </div>
-          )}
+          <AlertBox variant="error" className="mb-4">
+            {error}
+          </AlertBox>
 
           <p className="text-gray-700">
             Are you sure you want to delete the user <strong>{userName}</strong>

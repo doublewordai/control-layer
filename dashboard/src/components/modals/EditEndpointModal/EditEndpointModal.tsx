@@ -21,6 +21,7 @@ import {
   DialogHeader,
   DialogTitle,
   DialogFooter,
+  DialogDescription,
 } from "../../ui/dialog";
 import {
   Form,
@@ -659,6 +660,7 @@ export const EditEndpointModal: React.FC<EditEndpointModalProps> = ({
               </div>
             </div>
           </div>
+          <DialogDescription>Adjust endpoint settings</DialogDescription>
         </DialogHeader>
 
         <Form {...form}>
@@ -1072,7 +1074,7 @@ export const EditEndpointModal: React.FC<EditEndpointModalProps> = ({
                   "endpoint_name_conflict" && (
                   <div className="p-3 bg-red-50 border border-red-200 rounded-md">
                     <div className="flex items-center space-x-2">
-                      <AlertCircle className="w-4 h-4 text-red-500 flex-shrink-0" />
+                      <AlertCircle className="w-4 h-4 text-red-500 shrink-0" />
                       <p className="text-sm text-red-700">
                         <strong>Endpoint name conflict:</strong> Please choose a
                         different display name above.
@@ -1084,7 +1086,7 @@ export const EditEndpointModal: React.FC<EditEndpointModalProps> = ({
                 {localConflicts.length > 0 && (
                   <div className="p-3 bg-orange-50 border border-orange-200 rounded-md">
                     <div className="flex items-center space-x-2">
-                      <AlertCircle className="w-4 h-4 text-orange-500 flex-shrink-0" />
+                      <AlertCircle className="w-4 h-4 text-orange-500 shrink-0" />
                       <p className="text-sm text-orange-700">
                         <strong>Duplicate aliases detected:</strong>{" "}
                         {localConflicts.join(", ")}. Please ensure all aliases
@@ -1097,7 +1099,7 @@ export const EditEndpointModal: React.FC<EditEndpointModalProps> = ({
                 {backendConflicts.size > 0 && (
                   <div className="p-3 bg-red-50 border border-red-200 rounded-md">
                     <div className="flex items-center space-x-2">
-                      <AlertCircle className="w-4 h-4 text-red-500 flex-shrink-0" />
+                      <AlertCircle className="w-4 h-4 text-red-500 shrink-0" />
                       <p className="text-sm text-red-700">
                         <strong>Model alias conflict:</strong> Please edit the
                         highlighted aliases above.

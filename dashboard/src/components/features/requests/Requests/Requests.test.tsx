@@ -1,5 +1,5 @@
 import { render, screen, waitFor } from "@testing-library/react";
-import { BrowserRouter } from "react-router-dom";
+import { MemoryRouter } from "react-router-dom";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { setupServer } from "msw/node";
 import { http, HttpResponse } from "msw";
@@ -115,9 +115,11 @@ afterEach(() => {
   server.resetHandlers();
   // Reset authorization mock to default state
   vi.mocked(useAuthorization).mockReturnValue({
+    isLoading: false,
     userRoles: ["PlatformManager"], // Default to full permissions
     hasPermission: vi.fn(() => true),
     canAccessRoute: vi.fn(() => true),
+    getFirstAccessibleRoute: vi.fn(() => "/models"),
   });
 });
 afterAll(() => server.close());
@@ -134,9 +136,9 @@ function createWrapper() {
 
   return ({ children }: { children: ReactNode }) => (
     <QueryClientProvider client={queryClient}>
-      <BrowserRouter>
+      <MemoryRouter>
         <SettingsProvider>{children}</SettingsProvider>
-      </BrowserRouter>
+      </MemoryRouter>
     </QueryClientProvider>
   );
 }

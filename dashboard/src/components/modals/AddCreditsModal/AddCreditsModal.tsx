@@ -2,6 +2,7 @@ import { useState } from "react";
 import {
   Dialog,
   DialogContent,
+  DialogDescription,
   DialogHeader,
   DialogTitle,
 } from "../../ui/dialog";
@@ -11,6 +12,7 @@ import { Textarea } from "../../ui/textarea";
 import { useAddFunds, useUser } from "../../../api/control-layer/hooks";
 import { toast } from "sonner";
 import type { DisplayUser } from "../../../types/display";
+import { AlertBox } from "@/components/ui/alert-box";
 
 interface AddFundsModalProps {
   isOpen: boolean;
@@ -29,19 +31,20 @@ export function AddFundsModal({
   const [description, setDescription] = useState<string>("");
   const addFundsMutation = useAddFunds();
   const { data: currentUser } = useUser("current");
+  const [error, setError] = useState<string | null>(null);
 
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
 
     // Guard: Ensure currentUser is loaded
     if (!currentUser?.id) {
-      toast.error("Unable to add funds. Please try refreshing the page.");
+      setError("Unable to add funds. Please try refreshing the page.");
       return;
     }
 
     const amountNum = parseFloat(amount);
     if (isNaN(amountNum) || amountNum <= 0) {
-      toast.error("Please enter a valid amount");
+      setError("Please enter a valid amount");
       return;
     }
 
@@ -65,7 +68,7 @@ export function AddFundsModal({
       setAmount("10.00");
       setDescription("");
     } catch (error) {
-      toast.error("Failed to add funds. Please try again.");
+      setError("Failed to add funds. Please try again.");
       console.error("Failed to add funds:", error);
     }
   };
@@ -76,6 +79,10 @@ export function AddFundsModal({
         <DialogHeader>
           <DialogTitle className="text-2xl">Add to Credit Balance</DialogTitle>
         </DialogHeader>
+
+        <AlertBox variant="error" className="mb-4">
+          {error}
+        </AlertBox>
 
         <form onSubmit={handleSubmit} className="space-y-4 mt-4">
           <div>

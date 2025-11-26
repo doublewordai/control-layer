@@ -26,6 +26,7 @@ import {
   DialogHeader,
   DialogTitle,
   DialogFooter,
+  DialogDescription,
 } from "../../ui/dialog";
 import {
   Form,
@@ -913,6 +914,9 @@ export const CreateEndpointModal: React.FC<CreateEndpointModalProps> = ({
               </div>
             </div>
           </div>
+          <DialogDescription>
+            Add an endpoint to access and configure the provided models.
+          </DialogDescription>
         </DialogHeader>
 
         <Form {...form}>
@@ -1109,7 +1113,7 @@ export const CreateEndpointModal: React.FC<CreateEndpointModalProps> = ({
                                           <img
                                             src={endpoint.icon}
                                             alt={`${endpoint.name} logo`}
-                                            className="w-5 h-5 flex-shrink-0"
+                                            className="w-5 h-5 shrink-0"
                                           />
                                         )}
                                         <div className="flex-1 min-w-0">
@@ -1535,7 +1539,7 @@ export const CreateEndpointModal: React.FC<CreateEndpointModalProps> = ({
               validationError?.includes("endpoint name")) && (
               <div className="p-3 bg-red-50 border border-red-200 rounded-md">
                 <div className="flex items-center space-x-2">
-                  <AlertCircle className="w-4 h-4 text-red-500 flex-shrink-0" />
+                  <AlertCircle className="w-4 h-4 text-red-500 shrink-0" />
                   <p className="text-sm text-red-700">
                     <strong>Endpoint name conflict:</strong> Please choose a
                     different display name above.
@@ -1547,7 +1551,7 @@ export const CreateEndpointModal: React.FC<CreateEndpointModalProps> = ({
             {localConflicts.length > 0 && (
               <div className="p-3 bg-orange-50 border border-orange-200 rounded-md">
                 <div className="flex items-center space-x-2">
-                  <AlertCircle className="w-4 h-4 text-orange-500 flex-shrink-0" />
+                  <AlertCircle className="w-4 h-4 text-orange-500 shrink-0" />
                   <p className="text-sm text-orange-700">
                     <strong>Duplicate aliases detected:</strong>{" "}
                     {localConflicts.join(", ")}. Please ensure all aliases are
@@ -1560,7 +1564,7 @@ export const CreateEndpointModal: React.FC<CreateEndpointModalProps> = ({
             {backendConflicts.size > 0 && (
               <div className="p-3 bg-red-50 border border-red-200 rounded-md">
                 <div className="flex items-center space-x-2">
-                  <AlertCircle className="w-4 h-4 text-red-500 flex-shrink-0" />
+                  <AlertCircle className="w-4 h-4 text-red-500 shrink-0" />
                   <p className="text-sm text-red-700">
                     <strong>Model alias conflict:</strong> Please edit the
                     highlighted aliases above.

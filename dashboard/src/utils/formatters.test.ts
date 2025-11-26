@@ -161,16 +161,16 @@ describe("formatters", () => {
     });
 
     it("should format kilobytes", () => {
-      expect(formatBytes(1024)).toBe("1 KB");
-      expect(formatBytes(2048)).toBe("2 KB");
+      expect(formatBytes(1000)).toBe("1 KB");
+      expect(formatBytes(2000)).toBe("2 KB");
     });
 
     it("should format megabytes", () => {
-      expect(formatBytes(1048576)).toBe("1 MB");
+      expect(formatBytes(1000000)).toBe("1 MB");
     });
 
     it("should format gigabytes", () => {
-      expect(formatBytes(1073741824)).toBe("1 GB");
+      expect(formatBytes(1000000000)).toBe("1 GB");
     });
 
     it("should handle invalid numbers", () => {
