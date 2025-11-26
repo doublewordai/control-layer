@@ -38,7 +38,6 @@ export function CostManagement() {
   const processPaymentMutation = useProcessPayment({
     onSuccess: () => {
       setTimeout(() => {
-        console.log('Closing modal now');
         setShowSuccessModal(false);
         // Refetch user data to get latest balance
         refetchCurrentUser();
