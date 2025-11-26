@@ -57,7 +57,9 @@ pub async fn error_enrichment_middleware(State(pool): State<PgPool>, request: Re
         if let Some(key) = api_key {
             debug!("Intercepted 403 response on AI proxy path, attempting enrichment");
             if let Ok(balance) = get_balance_of_api_key(pool, &key).await {
-                if balance <= Decimal::ZERO {
+                // Only enrich if balance is negative (user is in debt)
+                // If balance is exactly 0, the 403 might be due to model access rather than credits
+                if balance < Decimal::ZERO {
                     return Error::InsufficientCredits {
                         current_balance: balance,
                         message: "Account balance too low. Please add credits to continue.".to_string(),
@@ -198,7 +200,7 @@ mod tests {
         assert_eq!(response.status_code().as_u16(), 402);
         let body = response.text();
         println!("Enriched response body: {}", body);
-        assert!(body.contains("insufficient credits"));
+        assert!(body.contains("balance too low"));
     }
 
     /// Integration test: Error enrichment middleware only affects /ai/ paths
