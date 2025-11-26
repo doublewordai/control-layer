@@ -5,16 +5,19 @@
 //! model endpoints to maintain consistency.
 
 use crate::{
-    api::models::deployments::{DeployedModelResponse, ModelMetrics, ModelProbeStatus},
+    api::models::{
+        deployments::{DeployedModelResponse, ModelMetrics, ModelProbeStatus},
+        inference_endpoints::InferenceEndpointResponse,
+    },
     db::{
-        handlers::{Groups, Repository, analytics::get_model_metrics},
+        handlers::{Groups, InferenceEndpoints, Repository, analytics::get_model_metrics},
         models::{deployments::ModelPricing, groups::GroupDBResponse},
     },
     errors::{Error, Result},
-    types::{DeploymentId, GroupId},
+    types::{DeploymentId, GroupId, InferenceEndpointId},
 };
 use chrono::{DateTime, Utc};
-use sqlx::{Acquire, PgPool};
+use sqlx::PgPool;
 use std::collections::HashMap;
 use uuid::Uuid;
 
@@ -30,6 +33,8 @@ pub struct DeployedModelEnricher<'a> {
     pub include_status: bool,
     /// Whether to include pricing information
     pub include_pricing: bool,
+    /// Whether to include endpoint information
+    pub include_endpoints: bool,
     /// Whether the user can read full pricing details
     pub can_read_pricing: bool,
     /// Whether the user can read rate limiting information
@@ -61,16 +66,13 @@ impl<'a> DeployedModelEnricher<'a> {
         let model_ids: Vec<DeploymentId> = models.iter().map(|(m, _)| m.id).collect();
         let model_aliases: Vec<String> = models.iter().map(|(m, _)| m.alias.clone()).collect();
 
-        // Start a transaction for atomic reads
-        let mut tx = self.db.begin().await.map_err(|e| Error::Database(e.into()))?;
-
         // Fetch all includes in parallel for maximum performance
-        let (groups_result, status_map, metrics_map) = tokio::join!(
+        let (groups_result, status_map, metrics_map, endpoints_map) = tokio::join!(
             // Groups query
             async {
                 if self.include_groups {
-                    let groups_conn = tx.acquire().await.map_err(|e| Error::Database(e.into())).ok()?;
-                    let mut groups_repo = Groups::new(&mut *groups_conn);
+                    let mut groups_conn = self.db.acquire().await.map_err(|e| Error::Database(e.into())).ok()?;
+                    let mut groups_repo = Groups::new(&mut groups_conn);
 
                     let model_groups_map = groups_repo.get_deployments_groups_bulk(&model_ids).await.ok()?;
 
@@ -112,6 +114,31 @@ impl<'a> DeployedModelEnricher<'a> {
                 } else {
                     None
                 }
+            },
+            // Endpoints query
+            async {
+                if self.include_endpoints {
+                    let mut endpoints_conn = self.db.acquire().await.map_err(|e| Error::Database(e.into())).ok()?;
+                    let mut endpoints_repo = InferenceEndpoints::new(&mut endpoints_conn);
+
+                    // Collect all unique endpoint IDs
+                    let endpoint_ids: Vec<InferenceEndpointId> = models
+                        .iter()
+                        .map(|(m, _)| m.hosted_on)
+                        .collect::<std::collections::HashSet<_>>()
+                        .into_iter()
+                        .collect();
+
+                    let endpoints_db = endpoints_repo.get_bulk(endpoint_ids).await.ok()?;
+
+                    // Convert DB responses to API responses
+                    let endpoints_map: HashMap<InferenceEndpointId, InferenceEndpointResponse> =
+                        endpoints_db.into_iter().map(|(id, endpoint)| (id, endpoint.into())).collect();
+
+                    Some(endpoints_map)
+                } else {
+                    None
+                }
             }
         );
 
@@ -144,6 +171,11 @@ impl<'a> DeployedModelEnricher<'a> {
                 model_response = Self::apply_pricing(model_response, model_pricing, self.can_read_pricing);
             }
 
+            // Add endpoint if requested and available
+            if self.include_endpoints {
+                model_response = Self::apply_endpoint(model_response, &endpoints_map);
+            }
+
             // Mask rate limiting info for users without ModelRateLimits permission
             if !self.can_read_rate_limits {
                 model_response = model_response.mask_rate_limiting();
@@ -151,9 +183,6 @@ impl<'a> DeployedModelEnricher<'a> {
 
             enriched_models.push(model_response);
         }
-
-        // Commit the transaction to ensure all reads were atomic
-        tx.commit().await.map_err(|e| Error::Database(e.into()))?;
 
         Ok(enriched_models)
     }
@@ -257,6 +286,19 @@ impl<'a> DeployedModelEnricher<'a> {
         }
         model
     }
+
+    /// Apply endpoint to a model response
+    fn apply_endpoint(
+        mut model: DeployedModelResponse,
+        endpoints_map: &Option<HashMap<InferenceEndpointId, InferenceEndpointResponse>>,
+    ) -> DeployedModelResponse {
+        if let Some(endpoints_map) = endpoints_map {
+            if let Some(endpoint) = endpoints_map.get(&model.hosted_on) {
+                model = model.with_endpoint(endpoint.clone());
+            }
+        }
+        model
+    }
 }
 
 #[cfg(test)]
@@ -295,6 +337,7 @@ mod tests {
             status: None,
             pricing: None,
             downstream_pricing: None,
+            endpoint: None,
         }
     }
 
@@ -495,5 +538,57 @@ mod tests {
         assert_eq!(masked.burst_size, None);
         // Capacity is not a rate limit, should remain
         assert_eq!(masked.capacity, Some(50));
+    }
+
+    #[test]
+    fn test_apply_endpoint_with_data() {
+        let model = create_test_model();
+        let endpoint_id = model.hosted_on;
+
+        let mut endpoints_map = HashMap::new();
+        endpoints_map.insert(
+            endpoint_id,
+            InferenceEndpointResponse {
+                id: endpoint_id,
+                name: "Test Endpoint".to_string(),
+                description: Some("Test endpoint description".to_string()),
+                url: "https://api.example.com".to_string(),
+                model_filter: None,
+                requires_api_key: true,
+                auth_header_name: "Authorization".to_string(),
+                auth_header_prefix: "Bearer ".to_string(),
+                created_by: Uuid::new_v4().into(),
+                created_at: Utc::now(),
+                updated_at: Utc::now(),
+            },
+        );
+
+        let result = DeployedModelEnricher::apply_endpoint(model, &Some(endpoints_map));
+
+        assert!(result.endpoint.is_some());
+        let endpoint = result.endpoint.unwrap();
+        assert_eq!(endpoint.name, "Test Endpoint");
+        assert_eq!(endpoint.url, "https://api.example.com");
+    }
+
+    #[test]
+    fn test_apply_endpoint_no_data() {
+        let model = create_test_model();
+        let endpoints_map = HashMap::new();
+
+        let result = DeployedModelEnricher::apply_endpoint(model, &Some(endpoints_map));
+
+        // No endpoint found for this model, should remain None
+        assert!(result.endpoint.is_none());
+    }
+
+    #[test]
+    fn test_apply_endpoint_not_requested() {
+        let model = create_test_model();
+
+        let result = DeployedModelEnricher::apply_endpoint(model, &None);
+
+        // Endpoints not requested, should remain None
+        assert!(result.endpoint.is_none());
     }
 }

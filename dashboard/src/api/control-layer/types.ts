@@ -76,6 +76,7 @@ export interface Model {
   metrics?: ModelMetrics; // only present when include=metrics
   status?: ModelProbeStatus; // only present when include=status
   pricing?: TokenPricing; // only present when include=pricing
+  endpoint?: Endpoint; // only present when include=endpoints
 }
 
 export interface Endpoint {
@@ -158,17 +159,33 @@ export type ModelsInclude =
   | "metrics"
   | "status"
   | "pricing"
+  | "endpoints"
   | "groups,metrics"
   | "groups,status"
   | "groups,pricing"
+  | "groups,endpoints"
   | "metrics,status"
   | "metrics,pricing"
+  | "metrics,endpoints"
   | "status,pricing"
+  | "status,endpoints"
+  | "pricing,endpoints"
   | "groups,metrics,status"
   | "groups,metrics,pricing"
+  | "groups,metrics,endpoints"
   | "groups,status,pricing"
+  | "groups,status,endpoints"
+  | "groups,pricing,endpoints"
   | "metrics,status,pricing"
-  | "groups,metrics,status,pricing";
+  | "metrics,status,endpoints"
+  | "metrics,pricing,endpoints"
+  | "status,pricing,endpoints"
+  | "groups,metrics,status,pricing"
+  | "groups,metrics,status,endpoints"
+  | "groups,metrics,pricing,endpoints"
+  | "groups,status,pricing,endpoints"
+  | "metrics,status,pricing,endpoints"
+  | "groups,metrics,status,pricing,endpoints";
 export type GroupsInclude = "users" | "models" | "users,models";
 export type UsersInclude = "groups";
 
