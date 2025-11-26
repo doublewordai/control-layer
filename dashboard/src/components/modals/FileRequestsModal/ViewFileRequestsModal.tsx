@@ -4,6 +4,7 @@ import { useQuery } from "@tanstack/react-query";
 import {
   Dialog,
   DialogContent,
+  DialogDescription,
   DialogHeader,
   DialogTitle,
 } from "../../ui/dialog";
@@ -101,6 +102,9 @@ export function ViewFileRequestsModal({
             <FileText className="w-5 h-5" />
             File Requests: {file?.filename || ""}
           </DialogTitle>
+          <DialogDescription>
+            View and manage file requests for this file.
+          </DialogDescription>
         </DialogHeader>
 
         {file && (

@@ -262,7 +262,7 @@ TAGS=v1.0.0 PLATFORMS=linux/amd64,linux/arm64 docker buildx bake --push
 ## Testing Philosophy
 
 - **Backend**: `cargo test` provides comprehensive API integration tests using `axum-test` to spin up the full API server and make ~real HTTP requests
-- **Frontend**: `npm test` in `dashboard/` runs Vitest unit tests for React components and utilities
+- **Frontend**: `npm test` in `dashboard/` runs Vitest unit tests for React components and utilities. Always scope queries using `within(container)` instead of `screen` to avoid querying multiple test instances in the DOM (see TypeScript/React Testing section for details)
 - Hurl and Playwright E2E tests exist but are currently minimal (not the main test suite)
 - All Rust tests require a running PostgreSQL database due to SQLx integration
 - Test cleanup scripts in `scripts/` (drop-test-users.sh, drop-test-groups.sh) for Hurl tests
@@ -322,6 +322,15 @@ prevent name clashes.
 - Focus on testing utility functions, context behavior, and complex component logic
 - Prefer testing user-facing behavior over implementation details
 - To select components, always use aria labels or roles rather than class names or tag names, to both improve accessibility and reduce brittleness
+- **Query Scoping Pattern**: When tests run in parallel, multiple component instances may exist in the DOM. Always scope queries to avoid "Found multiple elements" errors:
+  - Use `const { container } = render(...)` to get the component's container
+  - Use `within(container).getByRole(...)` instead of `screen.getByRole(...)`
+  - Import `within` from `@testing-library/react` when using this pattern
+  - **Exception - Portal-rendered elements**: For elements that render outside the component container (modals, dialogs, dropdown menus, popovers), use `screen` instead of `within(container)`:
+    - Modals and dialogs: `screen.getByRole("dialog")`
+    - Dropdown menus: `screen.getByRole("menu")` and `screen.getByRole("menuitem")`
+    - Popover content: `screen.getByPlaceholderText(...)` for inputs inside popovers
+    - These elements use portals and render at the document root, so they won't be found within the component container
 
 **Component Structure:**
 

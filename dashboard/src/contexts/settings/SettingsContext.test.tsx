@@ -1,4 +1,4 @@
-import { render, screen, act, cleanup } from "@testing-library/react";
+import { render, screen, act, cleanup, within } from "@testing-library/react";
 import { SettingsProvider } from "./SettingsContext";
 import { useSettings } from "./hooks";
 
@@ -35,17 +35,21 @@ describe("SettingsContext", () => {
   });
 
   it("provides default settings when no localStorage or URL params", () => {
-    render(
+    const { container } = render(
       <SettingsProvider>
         <TestComponent />
       </SettingsProvider>,
     );
 
-    expect(screen.getByTestId("api-base-url")).toHaveTextContent(
+    expect(within(container).getByTestId("api-base-url")).toHaveTextContent(
       "/admin/api/v1",
     );
-    expect(screen.getByTestId("demo-enabled")).toHaveTextContent("false");
-    expect(screen.getByTestId("demo-feature-check")).toHaveTextContent("false");
+    expect(within(container).getByTestId("demo-enabled")).toHaveTextContent(
+      "false",
+    );
+    expect(
+      within(container).getByTestId("demo-feature-check"),
+    ).toHaveTextContent("false");
   });
 
   it("loads settings from localStorage", () => {
@@ -58,14 +62,18 @@ describe("SettingsContext", () => {
 
     localStorage.setItem("app-settings", JSON.stringify(storedSettings));
 
-    render(
+    const { container } = render(
       <SettingsProvider>
         <TestComponent />
       </SettingsProvider>,
     );
 
-    expect(screen.getByTestId("api-base-url")).toHaveTextContent("/custom/api");
-    expect(screen.getByTestId("demo-enabled")).toHaveTextContent("true");
+    expect(within(container).getByTestId("api-base-url")).toHaveTextContent(
+      "/custom/api",
+    );
+    expect(within(container).getByTestId("demo-enabled")).toHaveTextContent(
+      "true",
+    );
   });
 
   it("URL params completely override localStorage settings", () => {
@@ -87,7 +95,7 @@ describe("SettingsContext", () => {
       }),
     }));
 
-    render(
+    const { container } = render(
       <SettingsProvider>
         <TestComponent />
       </SettingsProvider>,
@@ -97,9 +105,13 @@ describe("SettingsContext", () => {
     global.URLSearchParams = originalURLSearchParams;
 
     // URL flags should override localStorage (only demo enabled)
-    expect(screen.getByTestId("demo-enabled")).toHaveTextContent("true");
+    expect(within(container).getByTestId("demo-enabled")).toHaveTextContent(
+      "true",
+    );
     // apiBaseUrl should still come from localStorage since URL doesn't set it
-    expect(screen.getByTestId("api-base-url")).toHaveTextContent("/stored/api");
+    expect(within(container).getByTestId("api-base-url")).toHaveTextContent(
+      "/stored/api",
+    );
   });
 
   it("toggles feature flags and saves to localStorage", async () => {
@@ -110,14 +122,16 @@ describe("SettingsContext", () => {
       writable: true,
     });
 
-    render(
+    const { container } = render(
       <SettingsProvider>
         <TestComponent />
       </SettingsProvider>,
     );
 
     // Check initial state based on clean localStorage (should be false)
-    expect(screen.getByTestId("demo-enabled")).toHaveTextContent("false");
+    expect(within(container).getByTestId("demo-enabled")).toHaveTextContent(
+      "false",
+    );
 
     // Toggle demo feature
     await act(async () => {
@@ -125,8 +139,12 @@ describe("SettingsContext", () => {
     });
 
     // Should update state
-    expect(screen.getByTestId("demo-enabled")).toHaveTextContent("true");
-    expect(screen.getByTestId("demo-feature-check")).toHaveTextContent("true");
+    expect(within(container).getByTestId("demo-enabled")).toHaveTextContent(
+      "true",
+    );
+    expect(
+      within(container).getByTestId("demo-feature-check"),
+    ).toHaveTextContent("true");
   });
 
   it("demo mode toggle triggers automatic reload", async () => {
@@ -156,14 +174,16 @@ describe("SettingsContext", () => {
       writable: true,
     });
 
-    render(
+    const { container } = render(
       <SettingsProvider>
         <TestComponent />
       </SettingsProvider>,
     );
 
     // Initially demo should be false (default)
-    expect(screen.getByTestId("demo-enabled")).toHaveTextContent("false");
+    expect(within(container).getByTestId("demo-enabled")).toHaveTextContent(
+      "false",
+    );
     expect(window.location.reload).not.toHaveBeenCalled();
 
     // Toggle demo feature to true
@@ -200,13 +220,15 @@ describe("SettingsContext", () => {
     localStorage.setItem("app-settings", "invalid json");
 
     // Should not throw and use defaults
-    render(
+    const { container } = render(
       <SettingsProvider>
         <TestComponent />
       </SettingsProvider>,
     );
 
-    expect(screen.getByTestId("demo-enabled")).toHaveTextContent("false");
+    expect(within(container).getByTestId("demo-enabled")).toHaveTextContent(
+      "false",
+    );
   });
 
   it("throws error when useSettings is used outside provider", () => {

@@ -86,7 +86,7 @@ describe("dwctlApi.users", () => {
         username: "newuser",
         email: "newuser@example.com",
         display_name: "New User",
-        roles: ["User"],
+        roles: ["StandardUser"],
       };
 
       const createdUser = await dwctlApi.users.create(userData);
@@ -104,7 +104,7 @@ describe("dwctlApi.users", () => {
       const userData: UserCreateRequest = {
         username: "testuser",
         email: "test@example.com",
-        roles: ["Admin", "User"],
+        roles: ["PlatformManager", "StandardUser"],
         display_name: "Test User",
         avatar_url: "https://example.com/avatar.jpg",
       };
@@ -125,7 +125,7 @@ describe("dwctlApi.users", () => {
       const userId = "550e8400-e29b-41d4-a716-446655440001";
       const updateData: UserUpdateRequest = {
         display_name: "Updated Name",
-        roles: ["Admin"],
+        roles: ["PlatformManager"],
       };
 
       const updatedUser = await dwctlApi.users.update(userId, updateData);
@@ -205,6 +205,7 @@ describe("dwctlApi.users", () => {
         const keyData: ApiKeyCreateRequest = {
           name: "Test Key",
           description: "Test description",
+          purpose: "inference",
         };
 
         const createdKey = await dwctlApi.users.apiKeys.create(keyData);
@@ -220,6 +221,7 @@ describe("dwctlApi.users", () => {
         const userId = "550e8400-e29b-41d4-a716-446655440001";
         const keyData: ApiKeyCreateRequest = {
           name: "User Key",
+          purpose: "inference",
         };
 
         const createdKey = await dwctlApi.users.apiKeys.create(keyData, userId);
@@ -270,7 +272,9 @@ describe("dwctlApi.models", () => {
       const response = await dwctlApi.models.list({ endpoint: "2" });
 
       expect(response).toHaveProperty("data");
-      expect(response.data.every((model) => model.hosted_on === 2)).toBe(true);
+      expect(response.data.every((model) => model.hosted_on === "2")).toBe(
+        true,
+      );
     });
 
     it("should include groups when requested", async () => {
@@ -575,7 +579,7 @@ describe("URL Construction", () => {
     const modelsFiltered = await dwctlApi.models.list({ endpoint: "2" });
 
     expect(usersWithGroups.data[0]).toHaveProperty("groups");
-    expect(modelsFiltered.data.every((model) => model.hosted_on === 2)).toBe(
+    expect(modelsFiltered.data.every((model) => model.hosted_on === "2")).toBe(
       true,
     );
   });

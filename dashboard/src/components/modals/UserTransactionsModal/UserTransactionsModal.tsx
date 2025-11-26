@@ -3,6 +3,7 @@ import { X, Plus } from "lucide-react";
 import {
   Dialog,
   DialogContent,
+  DialogDescription,
   DialogHeader,
   DialogTitle,
 } from "../../ui/dialog";
@@ -31,7 +32,7 @@ export function UserTransactionsModal({
   return (
     <>
       <Dialog open={isOpen} onOpenChange={onClose}>
-        <DialogContent className="!max-w-[50vw] max-h-[80vh] overflow-y-auto">
+        <DialogContent className="max-w-[50vw]! max-h-[80vh] overflow-y-auto">
           <DialogHeader>
             <div className="flex items-center justify-between">
               <div className="flex-1">
@@ -61,6 +62,12 @@ export function UserTransactionsModal({
                 </button>
               </div>
             </div>
+            <DialogDescription>
+              <p className="text-sm text-doubleword-neutral-600 mt-1">
+                Viewing transactions for <strong>{user.name}</strong> (
+                {user.email})
+              </p>
+            </DialogDescription>
           </DialogHeader>
 
           <div className="mt-4">

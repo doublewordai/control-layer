@@ -23,6 +23,7 @@ import { createColumns } from "./columns";
 import {
   Dialog,
   DialogContent,
+  DialogDescription,
   DialogHeader,
   DialogTitle,
   DialogFooter,
@@ -310,6 +311,9 @@ export const ApiKeys: React.FC = () => {
                 ? "API Key Created Successfully"
                 : "Create New API Key"}
             </DialogTitle>
+            <DialogDescription>
+              Create a new API key to access the platform programmatically.
+            </DialogDescription>
           </DialogHeader>
 
           {newKeyResponse ? (
@@ -633,9 +637,9 @@ export const ApiKeys: React.FC = () => {
               </div>
               <div>
                 <DialogTitle>Delete API Key</DialogTitle>
-                <p className="text-sm text-gray-600">
+                <DialogDescription>
                   This action cannot be undone
-                </p>
+                </DialogDescription>
               </div>
             </div>
           </DialogHeader>
@@ -682,9 +686,9 @@ export const ApiKeys: React.FC = () => {
               </div>
               <div>
                 <DialogTitle>Delete API Keys</DialogTitle>
-                <p className="text-sm text-gray-600">
+                <DialogDescription>
                   This action cannot be undone
-                </p>
+                </DialogDescription>
               </div>
             </div>
           </DialogHeader>

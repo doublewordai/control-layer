@@ -70,7 +70,7 @@ describe("EditEndpointModal", () => {
       />,
       { wrapper: createWrapper() },
     );
-
+    // assert modal on screen as it renders outside of container
     expect(screen.queryByText("Edit Endpoint")).not.toBeInTheDocument();
   });
 
@@ -345,7 +345,9 @@ describe("EditEndpointModal", () => {
         ),
       ).toBeInTheDocument();
       expect(
-        screen.getByRole("button", { name: /Select All|Deselect All/i }),
+        screen.getByRole("button", {
+          name: /Select All|Deselect All/i,
+        }),
       ).toBeInTheDocument();
     });
   });

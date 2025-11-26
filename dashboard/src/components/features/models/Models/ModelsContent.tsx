@@ -49,7 +49,6 @@ import {
   formatRelativeTime,
 } from "../../../../utils/formatters";
 import { StatusRow } from "./StatusRow";
-import { useDebounce } from "@/hooks/useDebounce";
 
 export interface ModelsContentProps {
   currentPage: number;
@@ -82,7 +81,6 @@ export const ModelsContent: React.FC<ModelsContentProps> = ({
   const [showApiExamples, setShowApiExamples] = useState(false);
   const [apiExamplesModel, setApiExamplesModel] = useState<Model | null>(null);
   const [itemsPerPage] = useState(12);
-  const debouncedSearch = useDebounce(searchQuery, 300);
 
   const includeParam = useMemo(() => {
     const parts: string[] = ["status"];
@@ -101,7 +99,7 @@ export const ModelsContent: React.FC<ModelsContentProps> = ({
     limit: itemsPerPage,
     include: includeParam as ModelsInclude,
     accessible: isStatusMode ? true : !canManageGroups || showAccessibleOnly,
-    search: debouncedSearch || undefined, // ← API debounce only
+    search: searchQuery || undefined,
   });
 
   const {

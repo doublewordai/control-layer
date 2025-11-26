@@ -438,38 +438,38 @@ export function Batches({
       onDragOver={handleDrag}
       onDrop={handleDrop}
     >
-      {/* Header with Tabs and Actions */}
-      <div className="mb-6 flex flex-col lg:flex-row lg:items-center lg:justify-between gap-4">
-        {/* Left: Title */}
-        <div className="flex-shrink-0">
-          <h1 className="text-3xl font-bold text-doubleword-neutral-900">
-            Batch Processing
-          </h1>
-          <p className="text-doubleword-neutral-600 mt-1">
-            Upload files and create batches to process requests at scale
-          </p>
-        </div>
+      <Tabs
+        value={activeTab}
+        onValueChange={(v) => updateURL(v as "files" | "batches", null)}
+        className="space-y-4"
+      >
+        {/* Header with Tabs and Actions */}
+        <div className="mb-6 flex flex-col lg:flex-row lg:items-center lg:justify-between gap-4">
+          {/* Left: Title */}
+          <div className="shrink-0">
+            <h1 className="text-3xl font-bold text-doubleword-neutral-900">
+              Batch Processing
+            </h1>
+            <p className="text-doubleword-neutral-600 mt-1">
+              Upload files and create batches to process requests at scale
+            </p>
+          </div>
 
-        {/* Right: Buttons + Tabs */}
-        <div className="flex flex-col sm:flex-row items-stretch sm:items-center gap-3 lg:flex-shrink-0">
-          {/* Action Button */}
-          <Button
-            onClick={() => onOpenUploadModal()}
-            variant="outline"
-            className={`flex-1 sm:flex-none transition-all duration-200 ${
-              dragActive ? "border-blue-500 bg-blue-50 text-blue-700" : ""
-            }`}
-          >
-            <Upload className="w-4 h-4 mr-2" />
-            Upload File
-          </Button>
+          {/* Right: Buttons + Tabs */}
+          <div className="flex flex-col sm:flex-row items-stretch sm:items-center gap-3 lg:shrink-0">
+            {/* Action Button */}
+            <Button
+              onClick={() => onOpenUploadModal()}
+              variant="outline"
+              className={`flex-1 sm:flex-none transition-all duration-200 ${
+                dragActive ? "border-blue-500 bg-blue-50 text-blue-700" : ""
+              }`}
+            >
+              <Upload className="w-4 h-4 mr-2" />
+              Upload File
+            </Button>
 
-          {/* Tabs Selector */}
-          <Tabs
-            value={activeTab}
-            onValueChange={(v) => updateURL(v as "files" | "batches", null)}
-            className="w-full sm:w-auto"
-          >
+            {/* Tabs Selector */}
             <TabsList className="w-full sm:w-auto">
               <TabsTrigger
                 value="files"
@@ -486,16 +486,10 @@ export function Batches({
                 Batches ({batches.length})
               </TabsTrigger>
             </TabsList>
-          </Tabs>
+          </div>
         </div>
-      </div>
 
-      {/* Content */}
-      <Tabs
-        value={activeTab}
-        onValueChange={(v) => updateURL(v as "files" | "batches", null)}
-        className="space-y-4"
-      >
+        {/* Content */}
         <TabsContent value="files" className="space-y-4">
           {files.length === 0 ? (
             <div className="text-center py-12">
@@ -588,7 +582,7 @@ export function Batches({
                         handleFilesPageSizeChange(Number(value))
                       }
                     >
-                      <SelectTrigger className="w-[80px] h-9">
+                      <SelectTrigger className="w-20 h-9">
                         <SelectValue />
                       </SelectTrigger>
                       <SelectContent>
@@ -717,7 +711,7 @@ export function Batches({
                         handleBatchesPageSizeChange(Number(value))
                       }
                     >
-                      <SelectTrigger className="w-[80px] h-9">
+                      <SelectTrigger className="w-20p h-9">
                         <SelectValue />
                       </SelectTrigger>
                       <SelectContent>
