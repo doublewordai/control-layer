@@ -6,6 +6,7 @@ import {
   DollarSign,
   ChevronLeft,
   ChevronRight,
+  ChevronDown,
   Search,
   RefreshCw,
 } from "lucide-react";
@@ -28,25 +29,40 @@ import {
   TableHeader,
   TableRow,
 } from "../../../ui/table.tsx";
+import {
+  DropdownMenu,
+  DropdownMenuContent,
+  DropdownMenuItem,
+  DropdownMenuTrigger,
+} from "@/components/ui/dropdown-menu";
 import type { Transaction } from "@/api/control-layer";
-import { useUserBalance, useTransactions } from "@/api/control-layer";
+import { useUserBalance, useTransactions, useUser } from "@/api/control-layer";
 import { useSettings } from "@/contexts";
+
+export type AddFundsConfig =
+  | { type: 'direct'; onAddFunds: () => void }
+  | { type: 'redirect'; onAddFunds: () => void }
+  | { type: 'split'; onPrimaryAction: () => void; onDirectAction: () => void }
+  | undefined;
 
 export interface TransactionHistoryProps {
   userId: string;
   showCard?: boolean;
-  onAddFunds?: () => void;
-  isAddingFunds?: boolean;
+  addFundsConfig?: AddFundsConfig;
+  filterUserId?: string;
 }
 
 export function TransactionHistory({
   userId,
   showCard = true,
-  onAddFunds,
-  isAddingFunds = false,
+  addFundsConfig,
+  filterUserId,
 }: TransactionHistoryProps) {
   const { isFeatureEnabled } = useSettings();
   const isDemoMode = isFeatureEnabled("demo");
+
+  // Fetch user info for display
+  const { data: displayUser } = useUser(filterUserId || userId);
 
   // Fetch balance and transactions
   const {
@@ -86,7 +102,7 @@ export function TransactionHistory({
 
   // Pagination state
   const [currentPage, setCurrentPage] = useState(1);
-  const itemsPerPage = 6;
+  const itemsPerPage = 10;
 
   // Helper functions
   const formatDate = (isoString: string) => {
@@ -110,6 +126,11 @@ export function TransactionHistory({
   // Apply filters
   const filteredTransactions = useMemo(() => {
     let filtered = [...transactions];
+
+    // Filter by specific user if provided
+    if (filterUserId) {
+      filtered = filtered.filter((t) => t.user_id === filterUserId);
+    }
 
     // Filter by search term
     if (searchTerm) {
@@ -152,7 +173,7 @@ export function TransactionHistory({
     }
 
     return filtered;
-  }, [transactions, transactionType, dateRange, searchTerm]);
+  }, [transactions, transactionType, dateRange, searchTerm, filterUserId]);
 
   // Paginate filtered transactions
   const paginatedTransactions = useMemo(() => {
@@ -205,9 +226,9 @@ export function TransactionHistory({
 
   const content = (
     <>
-      {/* Transaction History Card */}
-      <Card className="p-4">
-        <div className="flex items-center justify-between mb-2">
+      {/* Header with Title and Balance */}
+      <div className="flex items-center justify-between mb-6">
+        <div>
           <div className="flex items-center gap-3">
             <h2 className="text-2xl font-semibold text-doubleword-neutral-900">
               Transaction History
@@ -225,27 +246,67 @@ export function TransactionHistory({
               />
             </Button>
           </div>
-          <div className="flex items-stretch border border-blue-200 rounded-lg overflow-hidden bg-gradient-to-br from-blue-50 to-indigo-50">
-            <div className="flex items-center gap-3 px-4 py-2">
-              <span className="text-sm font-medium text-blue-700">Balance</span>
-              <span className="text-2xl font-bold text-blue-900">
-                {formatDollars(currentBalance)}
-              </span>
-            </div>
-            {onAddFunds && (
-              <button
-                onClick={onAddFunds}
-                disabled={isAddingFunds}
-                className="flex items-center px-4 py-2 bg-blue-600 hover:bg-blue-700 text-white border-l border-blue-500 disabled:opacity-50 disabled:cursor-not-allowed transition-colors"
-              >
-                <Plus className="w-5 h-5 mr-2" />
-                <span className="font-medium">
-                  {isAddingFunds ? "Adding..." : "Add Funds"}
-                </span>
-              </button>
-            )}
-          </div>
+          {displayUser && (
+            <p className={`text-sm mt-1 ${filterUserId && filterUserId !== userId ? 'text-red-600 font-semibold' : 'text-gray-600'}`}>
+              Showing transactions for user <span className="font-medium">{displayUser.email}</span>
+            </p>
+          )}
         </div>
+        <div className="flex items-center gap-3">
+          <div className="flex items-center gap-2 text-sm">
+            <span className="text-gray-600">Balance:</span>
+            <span className="font-semibold text-gray-900">
+              {formatDollars(currentBalance)}
+            </span>
+          </div>
+          {addFundsConfig && (
+            <>
+              {(addFundsConfig.type === 'direct' || addFundsConfig.type === 'redirect') && (
+                <Button
+                  variant="outline"
+                  size="sm"
+                  onClick={addFundsConfig.onAddFunds}
+                >
+                  <Plus className="w-4 h-4 mr-2" />
+                  Add to Credit Balance
+                </Button>
+              )}
+              {addFundsConfig.type === 'split' && (
+                <div className="flex">
+                  <Button
+                    variant="outline"
+                    size="sm"
+                    onClick={addFundsConfig.onPrimaryAction}
+                    className="rounded-r-none"
+                  >
+                    <Plus className="w-4 h-4 mr-2" />
+                    Add to Credit Balance
+                  </Button>
+                  <DropdownMenu>
+                    <DropdownMenuTrigger asChild>
+                      <Button
+                        variant="outline"
+                        size="sm"
+                        className="rounded-l-none border-l-0 px-2"
+                      >
+                        <ChevronDown className="w-4 h-4" />
+                      </Button>
+                    </DropdownMenuTrigger>
+                    <DropdownMenuContent align="end">
+                      <DropdownMenuItem onClick={addFundsConfig.onDirectAction}>
+                        Grant as admin
+                      </DropdownMenuItem>
+                    </DropdownMenuContent>
+                  </DropdownMenu>
+                </div>
+              )}
+            </>
+          )}
+        </div>
+      </div>
+
+      {/* Transaction History Card */}
+      <Card className="p-4">
 
         {/* Search and Filters */}
         <div className="space-y-2">
@@ -304,7 +365,7 @@ export function TransactionHistory({
           )}
         </div>
 
-        <div className="mb-0">
+        <div className="-mt-2 mb-0">
           <Table>
             <TableHeader>
               <TableRow>

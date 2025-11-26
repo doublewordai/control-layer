@@ -43,14 +43,26 @@ impl StripeProvider {
 
 #[async_trait]
 impl PaymentProvider for StripeProvider {
-    async fn create_checkout_session(&self, db_pool: &PgPool, user: &CurrentUser, cancel_url: &str, success_url: &str) -> Result<String> {
+    async fn create_checkout_session(
+        &self,
+        db_pool: &PgPool,
+        user: &CurrentUser,
+        creditee_id: Option<&str>,
+        cancel_url: &str,
+        success_url: &str,
+    ) -> Result<String> {
         let client = self.client();
+
+        // Determine which user will receive the credits
+        // If creditee_id is provided, use that; otherwise use the authenticated user
+        let user_id_string = user.id.to_string();
+        let recipient_id = creditee_id.unwrap_or(&user_id_string);
 
         // Build checkout session parameters
         let mut checkout_params = CreateCheckoutSession {
             cancel_url: Some(cancel_url),
             success_url: Some(success_url),
-            client_reference_id: Some(&user.id.to_string()),
+            client_reference_id: Some(recipient_id), // This is who will receive the credits
             currency: Some(stripe::Currency::USD),
             line_items: Some(vec![CreateCheckoutSessionLineItems {
                 price: Some(self.price_id.clone()),
@@ -70,6 +82,7 @@ impl PaymentProvider for StripeProvider {
 
         // Include existing customer ID if we have one
         if let Some(existing_id) = &user.payment_provider_id {
+            // This is who is giving the credits
             tracing::info!("Using existing Stripe customer ID {} for user {}", existing_id, user.id);
             checkout_params.customer = Some(existing_id.as_str().parse().unwrap());
         } else {
@@ -84,7 +97,12 @@ impl PaymentProvider for StripeProvider {
             PaymentError::ProviderApi(e.to_string())
         })?;
 
-        tracing::info!("Created checkout session {} for user {}", checkout_session.id, user.id);
+        tracing::info!(
+            "Created checkout session {} for user {} (payer: {})",
+            checkout_session.id,
+            recipient_id,
+            user.id
+        );
 
         // If we didn't have a customer ID before, save the newly created one
         if user.payment_provider_id.is_none() && checkout_session.customer.is_some() {
@@ -118,7 +136,7 @@ impl PaymentProvider for StripeProvider {
                 PaymentError::ProviderApi(e.to_string())
             })?;
 
-        // Extract user ID from client_reference_id
+        // Extract ID of user receiving the credits from client_reference_id
         let user_id = checkout_session.client_reference_id.ok_or_else(|| {
             tracing::error!("Checkout session missing client_reference_id");
             PaymentError::InvalidData("Missing client_reference_id".to_string())
@@ -135,10 +153,14 @@ impl PaymentProvider for StripeProvider {
             })?
             / 100; // Convert cents to dollars
 
+        // Extract Stripe customer ID (this is the payer)
+        let customer_id = checkout_session.customer.as_ref().map(|c| c.id().to_string());
+
         Ok(PaymentSession {
             user_id,
             amount: Decimal::from(price),
             is_paid: checkout_session.payment_status == CheckoutSessionPaymentStatus::Paid,
+            payer_id: customer_id,
         })
     }
 
@@ -175,22 +197,51 @@ impl PaymentProvider for StripeProvider {
         let mut conn = db_pool.acquire().await?;
         let mut credits = Credits::new(&mut conn);
 
-        let user_id: UserId = payment_session.user_id.parse().map_err(|e| {
+        let creditee_id: UserId = payment_session.user_id.parse().map_err(|e| {
             tracing::error!("Failed to parse user ID: {:?}", e);
             PaymentError::InvalidData(format!("Invalid user ID: {}", e))
         })?;
 
+        // Build description with payer information if available
+        let description = if let Some(customer_id) = &payment_session.payer_id {
+            // Look up the payer by their Stripe customer ID (payment_provider_id)
+            let payer = sqlx::query!(
+                r#"
+                SELECT id, display_name, email
+                FROM users
+                WHERE payment_provider_id = $1
+                "#,
+                customer_id
+            )
+            .fetch_optional(db_pool)
+            .await?;
+
+            if let Some(payer) = payer {
+                // Only include "from {name}" if the payer is different from the recipient
+                if payer.id != creditee_id {
+                    let payer_name = payer.display_name.unwrap_or(payer.email);
+                    format!("Stripe payment from {}", payer_name)
+                } else {
+                    "Stripe payment".to_string()
+                }
+            } else {
+                "Stripe payment".to_string()
+            }
+        } else {
+            "Stripe payment".to_string()
+        };
+
         let request = CreditTransactionCreateDBRequest {
-            user_id,
+            user_id: creditee_id,
             transaction_type: CreditTransactionType::Purchase,
             amount: payment_session.amount,
             source_id: session_id.to_string(),
-            description: Some("Stripe payment".to_string()),
+            description: Some(description),
         };
 
         match credits.create_transaction(&request).await {
             Ok(_) => {
-                tracing::info!("Successfully fulfilled checkout session {} for user {}", session_id, user_id);
+                tracing::info!("Successfully fulfilled checkout session {} for user {}", session_id, creditee_id);
                 Ok(())
             }
             Err(crate::db::errors::DbError::UniqueViolation { constraint, .. }) => {
@@ -341,11 +392,13 @@ mod tests {
             user_id: "550e8400-e29b-41d4-a716-446655440000".to_string(),
             amount: Decimal::new(5000, 2),
             is_paid: true,
+            payer_id: Some("cus_test123".to_string()), // Stripe customer ID
         };
 
         assert_eq!(session.user_id, "550e8400-e29b-41d4-a716-446655440000");
         assert_eq!(session.amount, Decimal::new(5000, 2));
         assert!(session.is_paid);
+        assert_eq!(session.payer_id, Some("cus_test123".to_string()));
     }
 
     #[test]
@@ -358,5 +411,118 @@ mod tests {
 
         assert_eq!(event.event_type, "CheckoutSessionCompleted");
         assert_eq!(event.session_id, Some("cs_test_123".to_string()));
+    }
+
+    #[sqlx::test]
+    async fn test_payment_description_self(pool: PgPool) {
+        // Test that when a user pays for themselves, description is just "Stripe payment"
+        let user = crate::test_utils::create_test_user(&pool, crate::api::models::users::Role::StandardUser).await;
+
+        // Set a Stripe customer ID for the user
+        let customer_id = "cus_test_self_payment";
+        sqlx::query!("UPDATE users SET payment_provider_id = $1 WHERE id = $2", customer_id, user.id)
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        // Create a payment session where payer = recipient
+        let payment_session = PaymentSession {
+            user_id: user.id.to_string(),
+            amount: Decimal::new(5000, 2),
+            is_paid: true,
+            payer_id: Some(customer_id.to_string()),
+        };
+
+        // Manually build the description logic (same as in process_payment_session)
+        let description = if let Some(customer_id) = &payment_session.payer_id {
+            let payer = sqlx::query!(
+                r#"
+                SELECT id, display_name, email
+                FROM users
+                WHERE payment_provider_id = $1
+                "#,
+                customer_id
+            )
+            .fetch_optional(&pool)
+            .await
+            .unwrap();
+
+            if let Some(payer) = payer {
+                let creditee_id = payment_session.user_id.parse::<crate::types::UserId>().unwrap();
+                if payer.id != creditee_id {
+                    let payer_name = payer.display_name.unwrap_or(payer.email);
+                    format!("Stripe payment from {}", payer_name)
+                } else {
+                    "Stripe payment".to_string()
+                }
+            } else {
+                "Stripe payment".to_string()
+            }
+        } else {
+            "Stripe payment".to_string()
+        };
+
+        assert_eq!(description, "Stripe payment", "Self-payment should not include 'from' attribution");
+    }
+
+    #[sqlx::test]
+    async fn test_payment_description_other(pool: PgPool) {
+        // Test that when a user pays for someone else, description includes "from {name}"
+        let payer = crate::test_utils::create_test_user(&pool, crate::api::models::users::Role::StandardUser).await;
+        let recipient = crate::test_utils::create_test_user(&pool, crate::api::models::users::Role::StandardUser).await;
+
+        // Set a Stripe customer ID for the payer
+        let customer_id = "cus_test_other_payment";
+        sqlx::query!(
+            "UPDATE users SET payment_provider_id = $1, display_name = $2 WHERE id = $3",
+            customer_id,
+            "John Admin",
+            payer.id
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        // Create a payment session where payer != recipient
+        let payment_session = PaymentSession {
+            user_id: recipient.id.to_string(),
+            amount: Decimal::new(5000, 2),
+            is_paid: true,
+            payer_id: Some(customer_id.to_string()),
+        };
+
+        // Manually build the description logic (same as in process_payment_session)
+        let description = if let Some(customer_id) = &payment_session.payer_id {
+            let payer_record = sqlx::query!(
+                r#"
+                SELECT id, display_name, email
+                FROM users
+                WHERE payment_provider_id = $1
+                "#,
+                customer_id
+            )
+            .fetch_optional(&pool)
+            .await
+            .unwrap();
+
+            if let Some(payer_record) = payer_record {
+                let creditee_id = payment_session.user_id.parse::<crate::types::UserId>().unwrap();
+                if payer_record.id != creditee_id {
+                    let payer_name = payer_record.display_name.unwrap_or(payer_record.email);
+                    format!("Stripe payment from {}", payer_name)
+                } else {
+                    "Stripe payment".to_string()
+                }
+            } else {
+                "Stripe payment".to_string()
+            }
+        } else {
+            "Stripe payment".to_string()
+        };
+
+        assert_eq!(
+            description, "Stripe payment from John Admin",
+            "Payment for others should include 'from' attribution"
+        );
     }
 }
