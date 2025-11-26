@@ -1,5 +1,6 @@
 //! Test utilities for integration testing (available with `test-utils` feature).
 
+use crate::auth::password;
 use crate::config::{
     BatchConfig, DaemonConfig, DaemonEnabled, FilesConfig, LeaderElectionConfig, NativeAuthConfig, OnwardsSyncConfig, PasswordConfig,
     PoolSettings, ProbeSchedulerConfig, ProxyHeaderAuthConfig, SecurityConfig,
@@ -125,6 +126,17 @@ pub fn create_test_config() -> crate::config::Config {
             leader_election: LeaderElectionConfig { enabled: false },
             ..Default::default()
         },
+    }
+}
+
+/// Returns ultra-weak Argon2 parameters for fast testing.
+/// Uses 128 KiB memory, 1 iteration, and 1 parallelism.
+/// DO NOT USE IN PRODUCTION - these parameters are intentionally weak.
+pub fn test_argon2_params() -> password::Argon2Params {
+    password::Argon2Params {
+        memory_kib: 128,
+        iterations: 1,
+        parallelism: 1,
     }
 }
 

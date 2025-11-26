@@ -528,7 +528,7 @@ fn create_session_cookie(token: &str, config: &crate::config::Config) -> String 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{db::models::credits::CreditTransactionType, test_utils::create_test_config};
+    use crate::{db::models::credits::CreditTransactionType, test_utils::{create_test_config, test_argon2_params}};
     use axum_test::TestServer;
     use sqlx::PgPool;
 
@@ -839,11 +839,7 @@ mod tests {
 
         // Create a user using the repository
         // Use weak params for fast testing
-        let test_params = password::Argon2Params {
-            memory_kib: 128,
-            iterations: 1,
-            parallelism: 1,
-        };
+        let test_params = test_argon2_params();
         let password_hash = password::hash_string_with_params("testpassword", Some(test_params)).unwrap();
         let mut conn = pool.acquire().await.unwrap();
         let mut user_repo = Users::new(&mut conn);
@@ -947,11 +943,7 @@ mod tests {
         // Create a user using the repository
         let password_hash = password::hash_string_with_params(
             "correctpassword",
-            Some(password::Argon2Params {
-                memory_kib: 128,
-                iterations: 1,
-                parallelism: 1,
-            }),
+            Some(test_argon2_params()),
         )
         .unwrap();
         let mut conn = pool.acquire().await.unwrap();
@@ -1088,11 +1080,7 @@ mod tests {
             password_hash: Some(
                 password::hash_string_with_params(
                     "password",
-                    Some(password::Argon2Params {
-                        memory_kib: 128,
-                        iterations: 1,
-                        parallelism: 1,
-                    }),
+                    Some(test_argon2_params()),
                 )
                 .unwrap(),
             ),
@@ -1400,7 +1388,7 @@ mod tests {
 
     #[sqlx::test]
     async fn test_password_reset_full_flow(pool: PgPool) {
-        use crate::test_utils::create_test_config;
+        use crate::test_utils::{create_test_config, test_argon2_params};
 
         // Create a custom config with native auth enabled
         let mut config = create_test_config();
@@ -1422,11 +1410,7 @@ mod tests {
         // Create a user with a password
         let old_password_hash = password::hash_string_with_params(
             "oldpassword123",
-            Some(password::Argon2Params {
-                memory_kib: 128,
-                iterations: 1,
-                parallelism: 1,
-            }),
+            Some(test_argon2_params()),
         )
         .unwrap();
         let mut conn = pool.acquire().await.unwrap();
@@ -1559,7 +1543,7 @@ mod tests {
 
     #[sqlx::test]
     async fn test_change_password_success_full(pool: PgPool) {
-        use crate::test_utils::create_test_config;
+        use crate::test_utils::{create_test_config, test_argon2_params};
 
         // Create a custom config with native auth enabled
         let mut config = create_test_config();
@@ -1574,11 +1558,7 @@ mod tests {
         // Create a user with a password
         let old_password_hash = password::hash_string_with_params(
             "oldpassword123",
-            Some(password::Argon2Params {
-                memory_kib: 128,
-                iterations: 1,
-                parallelism: 1,
-            }),
+            Some(test_argon2_params()),
         )
         .unwrap();
         let mut conn = pool.acquire().await.unwrap();
@@ -1641,7 +1621,7 @@ mod tests {
 
     #[sqlx::test]
     async fn test_change_password_wrong_current(pool: PgPool) {
-        use crate::test_utils::create_test_config;
+        use crate::test_utils::{create_test_config, test_argon2_params};
 
         let mut config = create_test_config();
         config.auth.native.enabled = true;
@@ -1655,11 +1635,7 @@ mod tests {
         // Create a user with a password
         let password_hash = password::hash_string_with_params(
             "correctpassword",
-            Some(password::Argon2Params {
-                memory_kib: 128,
-                iterations: 1,
-                parallelism: 1,
-            }),
+            Some(test_argon2_params()),
         )
         .unwrap();
         let mut conn = pool.acquire().await.unwrap();
@@ -1752,7 +1728,7 @@ mod tests {
 
     #[sqlx::test]
     async fn test_change_password_too_short(pool: PgPool) {
-        use crate::test_utils::create_test_config;
+        use crate::test_utils::{create_test_config, test_argon2_params};
 
         let mut config = create_test_config();
         config.auth.native.enabled = true;
@@ -1767,11 +1743,7 @@ mod tests {
         // Create a user with a password
         let password_hash = password::hash_string_with_params(
             "oldpassword123",
-            Some(password::Argon2Params {
-                memory_kib: 128,
-                iterations: 1,
-                parallelism: 1,
-            }),
+            Some(test_argon2_params()),
         )
         .unwrap();
         let mut conn = pool.acquire().await.unwrap();
@@ -1813,7 +1785,7 @@ mod tests {
 
     #[sqlx::test]
     async fn test_change_password_too_long(pool: PgPool) {
-        use crate::test_utils::create_test_config;
+        use crate::test_utils::{create_test_config, test_argon2_params};
 
         let mut config = create_test_config();
         config.auth.native.enabled = true;
@@ -1828,11 +1800,7 @@ mod tests {
         // Create a user with a password
         let password_hash = password::hash_string_with_params(
             "oldpassword",
-            Some(password::Argon2Params {
-                memory_kib: 128,
-                iterations: 1,
-                parallelism: 1,
-            }),
+            Some(test_argon2_params()),
         )
         .unwrap();
         let mut conn = pool.acquire().await.unwrap();
@@ -1874,7 +1842,7 @@ mod tests {
 
     #[sqlx::test]
     async fn test_change_password_when_disabled(pool: PgPool) {
-        use crate::test_utils::create_test_config;
+        use crate::test_utils::{create_test_config, test_argon2_params};
 
         let mut config = create_test_config();
         config.auth.native.enabled = false; // Disabled!
@@ -1888,11 +1856,7 @@ mod tests {
         // Create a user with a password
         let password_hash = password::hash_string_with_params(
             "oldpassword",
-            Some(password::Argon2Params {
-                memory_kib: 128,
-                iterations: 1,
-                parallelism: 1,
-            }),
+            Some(test_argon2_params()),
         )
         .unwrap();
         let mut conn = pool.acquire().await.unwrap();

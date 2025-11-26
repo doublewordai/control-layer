@@ -1733,11 +1733,7 @@ mod test {
         let user_id = create_initial_admin_user(
             test_email,
             None,
-            password::Argon2Params {
-                memory_kib: 128,
-                iterations: 1,
-                parallelism: 1,
-            },
+            test_argon2_params(),
             &pool,
         )
         .await
@@ -1776,11 +1772,7 @@ mod test {
         let returned_user_id = create_initial_admin_user(
             test_email,
             None,
-            password::Argon2Params {
-                memory_kib: 128,
-                iterations: 1,
-                parallelism: 1,
-            },
+            test_argon2_params(),
             &pool,
         )
         .await
