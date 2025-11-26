@@ -1,4 +1,4 @@
-import { render, screen, waitFor } from "@testing-library/react";
+import { render, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { setupServer } from "msw/node";
@@ -103,24 +103,33 @@ function createWrapper() {
 
 describe("ModelCombobox", () => {
   it("renders with default placeholder", async () => {
-    render(<ModelCombobox />, { wrapper: createWrapper() });
+    const { container } = render(<ModelCombobox />, {
+      wrapper: createWrapper(),
+    });
 
-    const combobox = screen.getByRole("combobox", { name: /select model/i });
+    const combobox = within(container).getByRole("combobox", {
+      name: /select model/i,
+    });
     expect(combobox).toBeInTheDocument();
     expect(combobox).toHaveTextContent("Select a model...");
   });
 
   it("renders with custom placeholder", async () => {
-    render(<ModelCombobox placeholder="Choose your model" />, {
-      wrapper: createWrapper(),
-    });
+    const { container } = render(
+      <ModelCombobox placeholder="Choose your model" />,
+      {
+        wrapper: createWrapper(),
+      },
+    );
 
-    const combobox = screen.getByRole("combobox", { name: /select model/i });
+    const combobox = within(container).getByRole("combobox", {
+      name: /select model/i,
+    });
     expect(combobox).toHaveTextContent("Choose your model");
   });
 
   it("renders with React node as placeholder", async () => {
-    render(
+    const { container } = render(
       <ModelCombobox
         placeholder={
           <div className="flex items-center">
@@ -131,24 +140,34 @@ describe("ModelCombobox", () => {
       { wrapper: createWrapper() },
     );
 
-    const combobox = screen.getByRole("combobox", { name: /select model/i });
+    const combobox = within(container).getByRole("combobox", {
+      name: /select model/i,
+    });
     expect(combobox).toHaveTextContent("Custom Icon Select");
   });
 
   it("displays selected model alias when value is provided", async () => {
-    render(<ModelCombobox value="gpt-4o" />, { wrapper: createWrapper() });
+    const { container } = render(<ModelCombobox value="gpt-4o" />, {
+      wrapper: createWrapper(),
+    });
 
     await waitFor(() => {
-      const combobox = screen.getByRole("combobox", { name: /select model/i });
+      const combobox = within(container).getByRole("combobox", {
+        name: /select model/i,
+      });
       expect(combobox).toHaveTextContent("gpt-4o");
     });
   });
 
   it("opens popover when clicked", async () => {
     const user = userEvent.setup();
-    render(<ModelCombobox />, { wrapper: createWrapper() });
+    const { container } = render(<ModelCombobox />, {
+      wrapper: createWrapper(),
+    });
 
-    const combobox = screen.getByRole("combobox", { name: /select model/i });
+    const combobox = within(container).getByRole("combobox", {
+      name: /select model/i,
+    });
     await user.click(combobox);
 
     // Popover should be open
@@ -157,48 +176,61 @@ describe("ModelCombobox", () => {
     // Search input should be visible
     await waitFor(() => {
       expect(
-        screen.getByPlaceholderText("Search models..."),
+        within(container).getByPlaceholderText("Search models..."),
       ).toBeInTheDocument();
     });
   });
 
   it("displays all models when opened", async () => {
     const user = userEvent.setup();
-    render(<ModelCombobox />, { wrapper: createWrapper() });
+    const { container } = render(<ModelCombobox />, {
+      wrapper: createWrapper(),
+    });
 
-    const combobox = screen.getByRole("combobox", { name: /select model/i });
+    const combobox = within(container).getByRole("combobox", {
+      name: /select model/i,
+    });
     await user.click(combobox);
 
     // Wait for models to load and display
     await waitFor(() => {
-      expect(screen.getByText("gpt-4o")).toBeInTheDocument();
-      expect(screen.getByText("gpt-4o-mini")).toBeInTheDocument();
-      expect(screen.getByText("text-embedding-3-large")).toBeInTheDocument();
-      expect(screen.getByText("claude-3-opus")).toBeInTheDocument();
+      expect(within(container).getByText("gpt-4o")).toBeInTheDocument();
+      expect(within(container).getByText("gpt-4o-mini")).toBeInTheDocument();
+      expect(
+        within(container).getByText("text-embedding-3-large"),
+      ).toBeInTheDocument();
+      expect(within(container).getByText("claude-3-opus")).toBeInTheDocument();
     });
   });
 
   it("filters models based on search query", async () => {
     const user = userEvent.setup();
-    render(<ModelCombobox />, { wrapper: createWrapper() });
+    const { container } = render(<ModelCombobox />, {
+      wrapper: createWrapper(),
+    });
 
-    const combobox = screen.getByRole("combobox", { name: /select model/i });
+    const combobox = within(container).getByRole("combobox", {
+      name: /select model/i,
+    });
     await user.click(combobox);
 
     // Wait for models to load
     await waitFor(() => {
-      expect(screen.getByText("gpt-4o")).toBeInTheDocument();
+      expect(within(container).getByText("gpt-4o")).toBeInTheDocument();
     });
 
     // Type search query
-    const searchInput = screen.getByPlaceholderText("Search models...");
+    const searchInput =
+      within(container).getByPlaceholderText("Search models...");
     await user.type(searchInput, "claude");
 
     // Should show filtered results (debounced)
     await waitFor(
       () => {
-        expect(screen.getByText("claude-3-opus")).toBeInTheDocument();
-        expect(screen.queryByText("gpt-4o")).not.toBeInTheDocument();
+        expect(
+          within(container).getByText("claude-3-opus"),
+        ).toBeInTheDocument();
+        expect(within(container).queryByText("gpt-4o")).not.toBeInTheDocument();
       },
       { timeout: 1000 },
     );
@@ -208,20 +240,25 @@ describe("ModelCombobox", () => {
     const user = userEvent.setup();
     const handleChange = vi.fn();
 
-    render(<ModelCombobox onValueChange={handleChange} />, {
-      wrapper: createWrapper(),
-    });
+    const { container } = render(
+      <ModelCombobox onValueChange={handleChange} />,
+      {
+        wrapper: createWrapper(),
+      },
+    );
 
-    const combobox = screen.getByRole("combobox", { name: /select model/i });
+    const combobox = within(container).getByRole("combobox", {
+      name: /select model/i,
+    });
     await user.click(combobox);
 
     // Wait for models to load
     await waitFor(() => {
-      expect(screen.getByText("gpt-4o")).toBeInTheDocument();
+      expect(within(container).getByText("gpt-4o")).toBeInTheDocument();
     });
 
     // Click on a model
-    await user.click(screen.getByText("gpt-4o"));
+    await user.click(within(container).getByText("gpt-4o"));
 
     // Should call onValueChange with the model alias
     expect(handleChange).toHaveBeenCalledWith("gpt-4o");
@@ -230,18 +267,22 @@ describe("ModelCombobox", () => {
 
   it("closes popover after model selection", async () => {
     const user = userEvent.setup();
-    render(<ModelCombobox />, { wrapper: createWrapper() });
+    const { container } = render(<ModelCombobox />, {
+      wrapper: createWrapper(),
+    });
 
-    const combobox = screen.getByRole("combobox", { name: /select model/i });
+    const combobox = within(container).getByRole("combobox", {
+      name: /select model/i,
+    });
     await user.click(combobox);
 
     // Wait for models to load
     await waitFor(() => {
-      expect(screen.getByText("gpt-4o")).toBeInTheDocument();
+      expect(within(container).getByText("gpt-4o")).toBeInTheDocument();
     });
 
     // Click on a model
-    await user.click(screen.getByText("gpt-4o"));
+    await user.click(within(container).getByText("gpt-4o"));
 
     // Popover should close
     await waitFor(() => {
@@ -253,69 +294,82 @@ describe("ModelCombobox", () => {
     const user = userEvent.setup();
     const chatOnlyFilter = (model: Model) => model.model_type === "CHAT";
 
-    render(<ModelCombobox filterFn={chatOnlyFilter} />, {
+    const { container } = render(<ModelCombobox filterFn={chatOnlyFilter} />, {
       wrapper: createWrapper(),
     });
 
-    const combobox = screen.getByRole("combobox", { name: /select model/i });
+    const combobox = within(container).getByRole("combobox", {
+      name: /select model/i,
+    });
     await user.click(combobox);
 
     // Wait for models to load
     await waitFor(() => {
-      expect(screen.getByText("gpt-4o")).toBeInTheDocument();
+      expect(within(container).getByText("gpt-4o")).toBeInTheDocument();
     });
 
     // Should show only chat models
-    expect(screen.getByText("gpt-4o")).toBeInTheDocument();
-    expect(screen.getByText("gpt-4o-mini")).toBeInTheDocument();
-    expect(screen.getByText("claude-3-opus")).toBeInTheDocument();
+    expect(within(container).getByText("gpt-4o")).toBeInTheDocument();
+    expect(within(container).getByText("gpt-4o-mini")).toBeInTheDocument();
+    expect(within(container).getByText("claude-3-opus")).toBeInTheDocument();
 
     // Should not show embeddings model
     expect(
-      screen.queryByText("text-embedding-3-large"),
+      within(container).queryByText("text-embedding-3-large"),
     ).not.toBeInTheDocument();
   });
 
   it("uses custom search placeholder", async () => {
     const user = userEvent.setup();
-    render(<ModelCombobox searchPlaceholder="Find a model..." />, {
-      wrapper: createWrapper(),
-    });
+    const { container } = render(
+      <ModelCombobox searchPlaceholder="Find a model..." />,
+      {
+        wrapper: createWrapper(),
+      },
+    );
 
-    const combobox = screen.getByRole("combobox", { name: /select model/i });
+    const combobox = within(container).getByRole("combobox", {
+      name: /select model/i,
+    });
     await user.click(combobox);
 
     // Should show custom search placeholder
     await waitFor(() => {
       expect(
-        screen.getByPlaceholderText("Find a model..."),
+        within(container).getByPlaceholderText("Find a model..."),
       ).toBeInTheDocument();
     });
   });
 
   it("shows empty message when no models match search", async () => {
     const user = userEvent.setup();
-    render(<ModelCombobox emptyMessage="No matching models found" />, {
-      wrapper: createWrapper(),
-    });
+    const { container } = render(
+      <ModelCombobox emptyMessage="No matching models found" />,
+      {
+        wrapper: createWrapper(),
+      },
+    );
 
-    const combobox = screen.getByRole("combobox", { name: /select model/i });
+    const combobox = within(container).getByRole("combobox", {
+      name: /select model/i,
+    });
     await user.click(combobox);
 
     // Wait for models to load
     await waitFor(() => {
-      expect(screen.getByText("gpt-4o")).toBeInTheDocument();
+      expect(within(container).getByText("gpt-4o")).toBeInTheDocument();
     });
 
     // Type search query that matches no models
-    const searchInput = screen.getByPlaceholderText("Search models...");
+    const searchInput =
+      within(container).getByPlaceholderText("Search models...");
     await user.type(searchInput, "nonexistent-model-xyz");
 
     // Should show custom empty message (debounced)
     await waitFor(
       () => {
         expect(
-          screen.getByText("No matching models found"),
+          within(container).getByText("No matching models found"),
         ).toBeInTheDocument();
       },
       { timeout: 1000 },
@@ -323,38 +377,47 @@ describe("ModelCombobox", () => {
   });
 
   it("applies custom className", async () => {
-    render(<ModelCombobox className="custom-width" />, {
+    const { container } = render(<ModelCombobox className="custom-width" />, {
       wrapper: createWrapper(),
     });
 
-    const combobox = screen.getByRole("combobox", { name: /select model/i });
+    const combobox = within(container).getByRole("combobox", {
+      name: /select model/i,
+    });
     expect(combobox).toHaveClass("custom-width");
   });
 
   it("debounces search input", async () => {
     const user = userEvent.setup();
-    render(<ModelCombobox />, { wrapper: createWrapper() });
+    const { container } = render(<ModelCombobox />, {
+      wrapper: createWrapper(),
+    });
 
-    const combobox = screen.getByRole("combobox", { name: /select model/i });
+    const combobox = within(container).getByRole("combobox", {
+      name: /select model/i,
+    });
     await user.click(combobox);
 
     // Wait for initial models to load
     await waitFor(() => {
-      expect(screen.getByText("gpt-4o")).toBeInTheDocument();
+      expect(within(container).getByText("gpt-4o")).toBeInTheDocument();
     });
 
-    const searchInput = screen.getByPlaceholderText("Search models...");
+    const searchInput =
+      within(container).getByPlaceholderText("Search models...");
 
     // Type quickly (should debounce)
     await user.type(searchInput, "gp");
 
     // Should still show all models immediately (debounced)
-    expect(screen.getByText("claude-3-opus")).toBeInTheDocument();
+    expect(within(container).getByText("claude-3-opus")).toBeInTheDocument();
 
     // After debounce delay, should filter
     await waitFor(
       () => {
-        expect(screen.queryByText("claude-3-opus")).not.toBeInTheDocument();
+        expect(
+          within(container).queryByText("claude-3-opus"),
+        ).not.toBeInTheDocument();
       },
       { timeout: 500 },
     );
@@ -366,16 +429,21 @@ describe("ModelCombobox", () => {
     // The component should work with query options
     // We can't directly test the query options being passed,
     // but we can verify the component renders correctly with them
-    render(<ModelCombobox queryOptions={{ accessible: true }} />, {
-      wrapper: createWrapper(),
-    });
+    const { container } = render(
+      <ModelCombobox queryOptions={{ accessible: true }} />,
+      {
+        wrapper: createWrapper(),
+      },
+    );
 
-    const combobox = screen.getByRole("combobox", { name: /select model/i });
+    const combobox = within(container).getByRole("combobox", {
+      name: /select model/i,
+    });
     await user.click(combobox);
 
     // Should still load and display models
     await waitFor(() => {
-      expect(screen.getByText("gpt-4o")).toBeInTheDocument();
+      expect(within(container).getByText("gpt-4o")).toBeInTheDocument();
     });
   });
 });

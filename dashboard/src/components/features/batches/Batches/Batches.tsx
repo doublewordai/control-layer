@@ -446,7 +446,7 @@ export function Batches({
         {/* Header with Tabs and Actions */}
         <div className="mb-6 flex flex-col lg:flex-row lg:items-center lg:justify-between gap-4">
           {/* Left: Title */}
-          <div className="flex-shrink-0">
+          <div className="shrink-0">
             <h1 className="text-3xl font-bold text-doubleword-neutral-900">
               Batch Processing
             </h1>
@@ -456,7 +456,7 @@ export function Batches({
           </div>
 
           {/* Right: Buttons + Tabs */}
-          <div className="flex flex-col sm:flex-row items-stretch sm:items-center gap-3 lg:flex-shrink-0">
+          <div className="flex flex-col sm:flex-row items-stretch sm:items-center gap-3 lg:shrink-0">
             {/* Action Button */}
             <Button
               onClick={() => onOpenUploadModal()}
@@ -582,7 +582,7 @@ export function Batches({
                         handleFilesPageSizeChange(Number(value))
                       }
                     >
-                      <SelectTrigger className="w-[80px] h-9">
+                      <SelectTrigger className="w-20 h-9">
                         <SelectValue />
                       </SelectTrigger>
                       <SelectContent>
@@ -711,7 +711,7 @@ export function Batches({
                         handleBatchesPageSizeChange(Number(value))
                       }
                     >
-                      <SelectTrigger className="w-[80px] h-9">
+                      <SelectTrigger className="w-20p h-9">
                         <SelectValue />
                       </SelectTrigger>
                       <SelectContent>
