@@ -264,20 +264,20 @@ pub async fn create_user(
     _: RequiresPermission<resource::Users, operation::CreateAll>,
     Json(user_data): Json<UserCreate>,
 ) -> Result<(StatusCode, Json<UserResponse>)> {
-    // Check admin role
+    let mut tx = state.db.begin().await.map_err(|e| Error::Database(e.into()))?;
 
-    let mut conn = state.db.acquire().await.expect("Failed to acquire database connection");
-    let mut repo = Users::new(&mut conn);
+    let mut repo = Users::new(&mut tx);
     let db_request = UserCreateDBRequest::from(user_data);
 
     let user = repo.create(&db_request).await?;
 
     // Pre-create hidden API key for inference to avoid race condition with onwards sync
-    let mut api_keys_repo = ApiKeys::new(&mut conn);
+    let mut api_keys_repo = ApiKeys::new(&mut tx);
     api_keys_repo
         .get_or_create_hidden_key(user.id, ApiKeyPurpose::Inference)
         .await?;
 
+    tx.commit().await.map_err(|e| Error::Database(e.into()))?;
     Ok((StatusCode::CREATED, Json(UserResponse::from(user))))
 }
 
