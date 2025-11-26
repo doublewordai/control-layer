@@ -1,6 +1,6 @@
 import { render, screen, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
-import { BrowserRouter } from "react-router-dom";
+import { MemoryRouter } from "react-router-dom";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { setupServer } from "msw/node";
 import type { ReactNode } from "react";
@@ -63,7 +63,7 @@ function createWrapper() {
 
   return ({ children }: { children: ReactNode }) => (
     <QueryClientProvider client={queryClient}>
-      <BrowserRouter>{children}</BrowserRouter>
+      <MemoryRouter>{children}</MemoryRouter>
     </QueryClientProvider>
   );
 }
