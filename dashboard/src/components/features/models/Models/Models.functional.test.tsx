@@ -1,6 +1,6 @@
 import { render, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
-import { BrowserRouter } from "react-router-dom";
+import { MemoryRouter } from "react-router-dom";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { setupServer } from "msw/node";
 import { ReactNode } from "react";
@@ -59,7 +59,7 @@ function createWrapper() {
   return ({ children }: { children: ReactNode }) => (
     <SettingsProvider>
       <QueryClientProvider client={queryClient}>
-        <BrowserRouter>{children}</BrowserRouter>
+        <MemoryRouter>{children}</MemoryRouter>
       </QueryClientProvider>
     </SettingsProvider>
   );
@@ -202,7 +202,7 @@ describe("Models Component - Functional Tests", () => {
             screen.getByRole("heading", { name: /api examples/i }),
           ).toBeInTheDocument();
         },
-        { timeout: 5000, interval: 50 }
+        { timeout: 5000, interval: 50 },
       );
     });
   });
@@ -346,7 +346,7 @@ describe("Models Component - Functional Tests", () => {
           () => {
             expect(screen.getByRole("dialog")).toBeInTheDocument();
           },
-          { timeout: 5000, interval: 50 }
+          { timeout: 5000, interval: 50 },
         );
       } else {
         // If no "Add groups" button is visible, all models have groups
@@ -380,7 +380,7 @@ describe("Models Component - Functional Tests", () => {
           () => {
             expect(screen.getByRole("dialog")).toBeInTheDocument();
           },
-          { timeout: 5000, interval: 50 }
+          { timeout: 5000, interval: 50 },
         );
       } else {
         // Look for regular group badges that might be clickable
