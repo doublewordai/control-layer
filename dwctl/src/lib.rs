@@ -150,13 +150,13 @@ mod static_assets;
 mod sync;
 pub mod telemetry;
 mod types;
+use crate::api::models::users::Role;
 use crate::config::CorsOrigin;
 
 #[cfg(any(test, feature = "test-utils"))]
 pub mod test_utils;
 
 use crate::{
-    api::models::users::Role,
     auth::password,
     db::handlers::{Repository, Users},
     db::models::users::UserCreateDBRequest,
@@ -258,10 +258,12 @@ pub fn migrator() -> sqlx::migrate::Migrator {
 /// ```no_run
 /// # use dwctl::create_initial_admin_user;
 /// # use sqlx::PgPool;
+/// # use dwctl::auth::password::Argon2Params;
 /// # async fn example(pool: PgPool) -> Result<(), sqlx::Error> {
 /// let user_id = create_initial_admin_user(
 ///     "admin@example.com",
 ///     Some("secure_password"),
+///     Argon2Params::default(),
 ///     &pool
 /// ).await?;
 /// # Ok(())

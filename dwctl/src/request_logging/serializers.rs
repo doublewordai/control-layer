@@ -17,7 +17,6 @@ use super::utils;
 /// Access source types for analytics tracking
 #[derive(Clone, Debug)]
 pub enum AccessSource {
-    Playground,
     ApiKey,
     UnknownApiKey,
     Unauthenticated,
@@ -26,7 +25,6 @@ pub enum AccessSource {
 impl fmt::Display for AccessSource {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            AccessSource::Playground => write!(f, "playground"),
             AccessSource::ApiKey => write!(f, "api_key"),
             AccessSource::UnknownApiKey => write!(f, "unknown_api_key"),
             AccessSource::Unauthenticated => write!(f, "unauthenticated"),
@@ -37,8 +35,6 @@ impl fmt::Display for AccessSource {
 /// Authentication information extracted from request headers
 #[derive(Clone)]
 pub enum Auth {
-    /// Playground access via SSO proxy (X-Doubleword-User header)
-    Playground { user_email: String },
     /// API key access (Authorization: Bearer <key>)
     ApiKey { bearer_token: String },
     /// No authentication found
@@ -48,7 +44,6 @@ pub enum Auth {
 impl fmt::Debug for Auth {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Auth::Playground { user_email } => f.debug_struct("Playground").field("user_email", user_email).finish(),
             Auth::ApiKey { .. } => f.debug_struct("ApiKey").field("bearer_token", &"<redacted>").finish(),
             Auth::None => write!(f, "None"),
         }
@@ -253,13 +248,7 @@ impl UsageMetrics {
 
 impl Auth {
     /// Extract authentication from request headers
-    pub fn from_request(request_data: &RequestData, config: &Config) -> Self {
-        // Check for proxy header (Playground/SSO access)
-        let proxy_header_name = &config.auth.proxy_header.header_name;
-        if let Some(email) = Self::get_header_value(request_data, proxy_header_name) {
-            return Auth::Playground { user_email: email };
-        }
-
+    pub fn from_request(request_data: &RequestData, _config: &Config) -> Self {
         // Check for API key in Authorization header
         if let Some(auth_header) = Self::get_header_value(request_data, "authorization")
             && let Some(bearer_token) = auth_header.strip_prefix("Bearer ")
@@ -328,19 +317,6 @@ fn map_url_to_otel_provider(url: &str) -> Option<&'static str> {
 pub async fn store_analytics_record(pool: &PgPool, metrics: &UsageMetrics, auth: &Auth) -> Result<HttpAnalyticsRow, sqlx::Error> {
     // Extract user information based on auth type
     let (user_id, user_email, access_source) = match auth {
-        Auth::Playground { user_email } => {
-            // Try to get user ID from email
-            match sqlx::query_scalar!("SELECT id FROM users WHERE email = $1", user_email)
-                .fetch_optional(pool)
-                .await?
-            {
-                Some(user_id) => (Some(user_id), Some(user_email.clone()), AccessSource::Playground),
-                None => {
-                    warn!("User not found for email: {}", user_email);
-                    (None, Some(user_email.clone()), AccessSource::Playground)
-                }
-            }
-        }
         Auth::ApiKey { bearer_token } => {
             // Try to get user ID and email from API key
             match sqlx::query!(
@@ -1850,73 +1826,6 @@ mod tests {
                 Decimal::from_str("10.00").unwrap(),
                 "Balance should not change without model"
             );
-        }
-
-        #[sqlx::test]
-        #[test_log::test]
-        async fn test_playground_users_are_charged(pool: sqlx::PgPool) {
-            // Setup: User with balance (accessed via Playground/SSO)
-            let initial_balance = Decimal::from_str("10.00").unwrap();
-            let user = create_test_user(&pool, Role::StandardUser).await;
-            let user_id = user.id;
-
-            // Grant initial balance
-            let mut conn = pool.acquire().await.expect("Failed to acquire connection");
-            let mut credits = Credits::new(&mut conn);
-            credits
-                .create_transaction(&CreditTransactionCreateDBRequest {
-                    user_id,
-                    transaction_type: CreditTransactionType::AdminGrant,
-                    amount: initial_balance,
-                    source_id: "test_setup".to_string(),
-                    description: Some("Initial test balance".to_string()),
-                })
-                .await
-                .expect("Failed to create initial balance");
-
-            // Create Playground auth (SSO via X-Doubleword-User header)
-            let auth = Auth::Playground {
-                user_email: user.email.clone(),
-            };
-
-            // Create metrics with pricing and tokens (would normally cost money)
-            let input_price = Decimal::from_str("0.00001").unwrap();
-            let output_price = Decimal::from_str("0.00003").unwrap();
-            let metrics = create_test_usage_metrics(Some(input_price), Some(output_price), 1000, 500);
-
-            // Execute
-            let result = store_analytics_record(&pool, &metrics, &auth).await;
-            assert!(result.is_ok(), "Analytics record should be created");
-
-            // Verify: Balance SHOULD change (Playground users ARE charged)
-            let mut conn = pool.acquire().await.unwrap();
-            let mut credits = Credits::new(&mut conn);
-            let final_balance = credits.get_user_balance(user_id).await.unwrap();
-
-            // Expected cost with full precision
-            let expected_cost = Decimal::from_str("0.025").unwrap();
-            let expected_balance = initial_balance - expected_cost;
-            assert_eq!(
-                final_balance, expected_balance,
-                "Balance should be deducted correctly for Playground users"
-            );
-
-            // Verify: Transaction was created
-            let transactions = credits.list_user_transactions(user_id, 0, 10).await.unwrap();
-            let usage_tx = transactions.iter().find(|tx| tx.transaction_type == CreditTransactionType::Usage);
-            assert!(usage_tx.is_some(), "Usage transaction should be created");
-
-            let usage_tx = usage_tx.unwrap();
-            assert_eq!(usage_tx.amount, expected_cost, "Transaction amount should preserve full precision");
-            assert_eq!(usage_tx.balance_after, expected_balance, "Balance after should match");
-
-            // Verify: Analytics record WAS created (tracking, just not billing)
-            let analytics_count = sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM http_analytics WHERE user_id = $1")
-                .bind(user_id)
-                .fetch_one(&pool)
-                .await
-                .unwrap();
-            assert_eq!(analytics_count, 1, "Analytics record should be created for tracking");
         }
 
         #[sqlx::test]
