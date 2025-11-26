@@ -49,8 +49,10 @@ Object.assign(navigator, {
 });
 
 // Test wrapper with QueryClient and Router
+let queryClient: QueryClient;
+
 function createWrapper() {
-  const queryClient = new QueryClient({
+  queryClient = new QueryClient({
     defaultOptions: {
       queries: {
         retry: false,
@@ -67,6 +69,13 @@ function createWrapper() {
 }
 
 describe("API Keys Component - Functional Tests", () => {
+  afterEach(() => {
+    // Clean up QueryClient to prevent state pollution between tests
+    if (queryClient) {
+      queryClient.clear();
+      queryClient.cancelQueries();
+    }
+  });
   describe("API Keys List Journey", () => {
     it("displays existing API keys and allows creating new ones", async () => {
       const user = userEvent.setup();
