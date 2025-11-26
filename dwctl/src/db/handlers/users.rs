@@ -538,7 +538,7 @@ impl<'c> Users<'c> {
         // Pre-create hidden API key for inference to avoid race condition with onwards sync
         // This ensures the key exists before the user makes their first AI request
         let mut api_keys_repo = ApiKeys::new(&mut *self.db);
-        let _ = api_keys_repo
+        api_keys_repo
             .get_or_create_hidden_key(user.id, ApiKeyPurpose::Inference)
             .await?;
 
