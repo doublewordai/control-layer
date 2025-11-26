@@ -24,6 +24,7 @@ pub struct PasswordResetTokenCreateRequest {
     pub user_id: UserId,
     pub raw_token: String,
     pub expires_at: DateTime<Utc>,
+    pub argon2_params: crate::auth::password::Argon2Params,
 }
 
 /// Request for updating a password reset token (mark as used)

@@ -1,7 +1,7 @@
 //! Password hashing and verification.
 
 use argon2::{
-    Argon2,
+    Algorithm, Argon2, Params, Version,
     password_hash::{PasswordHash, PasswordHasher, PasswordVerifier, SaltString},
 };
 use base64::{Engine as _, engine::general_purpose};
@@ -9,10 +9,46 @@ use rand::{Rng, rngs::OsRng, thread_rng};
 
 use crate::errors::Error;
 
-/// Hash a string using Argon2 (used for passwords and tokens)
-pub fn hash_string(input: &str) -> Result<String, Error> {
+/// Argon2 hashing parameters.
+#[derive(Debug, Clone, Copy)]
+pub struct Argon2Params {
+    pub memory_kib: u32,
+    pub iterations: u32,
+    pub parallelism: u32,
+}
+
+impl Argon2Params {
+    /// Create Argon2 instance with these parameters.
+    fn to_argon2(self) -> Result<Argon2<'static>, Error> {
+        let params = Params::new(self.memory_kib, self.iterations, self.parallelism, None).map_err(|e| Error::Internal {
+            operation: format!("create argon2 params: {e}"),
+        })?;
+
+        Ok(Argon2::new(Algorithm::Argon2id, Version::V0x13, params))
+    }
+}
+
+impl Default for Argon2Params {
+    /// Secure defaults for production (Argon2id RFC recommendations)
+    fn default() -> Self {
+        Self {
+            memory_kib: 19456, // 19 MB
+            iterations: 2,
+            parallelism: 1,
+        }
+    }
+}
+
+/// Hash a string using Argon2 (used for passwords and tokens).
+///
+/// Uses the provided parameters or secure defaults if None.
+pub fn hash_string_with_params(input: &str, params: Option<Argon2Params>) -> Result<String, Error> {
     let salt = SaltString::generate(&mut OsRng);
-    let argon2 = Argon2::default();
+    let argon2 = if let Some(p) = params {
+        p.to_argon2()?
+    } else {
+        Argon2Params::default().to_argon2()?
+    };
 
     let hash = argon2.hash_password(input.as_bytes(), &salt).map_err(|e| Error::Internal {
         operation: format!("hash string: {e}"),
@@ -21,12 +57,20 @@ pub fn hash_string(input: &str) -> Result<String, Error> {
     Ok(hash.to_string())
 }
 
-/// Verify a string against a hash
+/// Hash a string using Argon2 with default secure parameters.
+pub fn hash_string(input: &str) -> Result<String, Error> {
+    hash_string_with_params(input, None)
+}
+
+/// Verify a string against a hash.
+///
+/// Note: Verification uses the parameters embedded in the hash itself.
 pub fn verify_string(input: &str, hash: &str) -> Result<bool, Error> {
     let parsed_hash = PasswordHash::new(hash).map_err(|e| Error::Internal {
         operation: format!("parse hash: {e}"),
     })?;
 
+    // Verification always uses params from the hash
     let argon2 = Argon2::default();
     Ok(argon2.verify_password(input.as_bytes(), &parsed_hash).is_ok())
 }
