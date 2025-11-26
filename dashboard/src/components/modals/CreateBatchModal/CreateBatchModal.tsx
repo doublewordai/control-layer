@@ -6,6 +6,7 @@ import {
   DialogHeader,
   DialogTitle,
   DialogFooter,
+  DialogDescription,
 } from "../../ui/dialog";
 import { Button } from "../../ui/button";
 import { Label } from "../../ui/label";
@@ -13,6 +14,7 @@ import { Input } from "../../ui/input";
 import { useCreateBatch } from "../../../api/control-layer/hooks";
 import { toast } from "sonner";
 import type { FileObject } from "../../features/batches/types";
+import { AlertBox } from "@/components/ui/alert-box";
 
 interface CreateBatchModalProps {
   isOpen: boolean;
@@ -29,12 +31,13 @@ export function CreateBatchModal({
 }: CreateBatchModalProps) {
   const [endpoint, setEndpoint] = useState<string>("/v1/chat/completions");
   const [description, setDescription] = useState<string>("");
+  const [error, setError] = useState<string | null>(null);
 
   const createBatchMutation = useCreateBatch();
 
   const handleSubmit = async () => {
     if (!preselectedFile) {
-      toast.error("No file selected");
+      setError("No file selected");
       return;
     }
 
@@ -61,11 +64,7 @@ export function CreateBatchModal({
       onClose();
     } catch (error) {
       console.error("Failed to create batch:", error);
-      toast.error(
-        error instanceof Error
-          ? error.message
-          : "Failed to create batch. Please try again.",
-      );
+      setError("Failed to create batch. Please try again.");
     }
   };
 
@@ -80,7 +79,14 @@ export function CreateBatchModal({
       <DialogContent className="sm:max-w-lg">
         <DialogHeader>
           <DialogTitle>Create New Batch</DialogTitle>
+          <DialogDescription>
+            Enter a description for the batch.
+          </DialogDescription>
         </DialogHeader>
+
+        <AlertBox variant="error" className="mb-4">
+          {error}
+        </AlertBox>
 
         <div className="space-y-6">
           {/* File Info */}
@@ -121,7 +127,7 @@ export function CreateBatchModal({
           {/* Info Box */}
           <div className="bg-blue-50 border border-blue-200 rounded-lg p-3">
             <div className="flex gap-2">
-              <AlertCircle className="w-4 h-4 text-blue-600 mt-0.5 flex-shrink-0" />
+              <AlertCircle className="w-4 h-4 text-blue-600 mt-0.5 shrink-0" />
               <div className="text-sm text-blue-800">
                 <p className="font-medium mb-1">Batch Processing</p>
                 <p className="text-blue-700">
@@ -156,7 +162,7 @@ export function CreateBatchModal({
               </>
             ) : (
               <>
-                <Play className="w-4 h-4 mr-2 transition-transform group-hover:translate-x-[1px]" />
+                <Play className="w-4 h-4 mr-2 transition-transform group-hover:translate-x-px" />
                 Create Batch
               </>
             )}

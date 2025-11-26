@@ -1,5 +1,5 @@
-import { render, screen, waitFor } from "@testing-library/react";
-import { BrowserRouter } from "react-router-dom";
+import { render, waitFor, within } from "@testing-library/react";
+import { MemoryRouter } from "react-router-dom";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { setupServer } from "msw/node";
 import { http, HttpResponse } from "msw";
@@ -46,7 +46,7 @@ function createWrapper() {
   return ({ children }: { children: ReactNode }) => (
     <SettingsProvider>
       <QueryClientProvider client={queryClient}>
-        <BrowserRouter>{children}</BrowserRouter>
+        <MemoryRouter>{children}</MemoryRouter>
       </QueryClientProvider>
     </SettingsProvider>
   );
@@ -54,25 +54,31 @@ function createWrapper() {
 
 describe("Models Component", () => {
   it("renders without crashing", async () => {
-    render(<Models />, { wrapper: createWrapper() });
+    const { container } = render(<Models />, { wrapper: createWrapper() });
 
     // Should show loading state initially
-    expect(screen.getByText("Loading model usage data...")).toBeInTheDocument();
+    expect(
+      within(container).getByText("Loading model usage data..."),
+    ).toBeInTheDocument();
 
     // Should render the component after loading
     await waitFor(() => {
-      expect(screen.getByText("Models")).toBeInTheDocument();
+      expect(
+        within(container).getByRole("heading", { name: /models/i }),
+      ).toBeInTheDocument();
     });
   });
 
   it("renders models data when loaded", async () => {
-    render(<Models />, { wrapper: createWrapper() });
+    const { container } = render(<Models />, { wrapper: createWrapper() });
 
     await waitFor(() => {
       // Check that the page header is displayed
-      expect(screen.getByText("Models")).toBeInTheDocument();
       expect(
-        screen.getByText(/View and monitor your deployed models/),
+        within(container).getByRole("heading", { name: /models/i }),
+      ).toBeInTheDocument();
+      expect(
+        within(container).getByText(/View and monitor your deployed models/),
       ).toBeInTheDocument();
     });
   });
@@ -87,10 +93,10 @@ describe("Models Component", () => {
       }),
     );
 
-    render(<Models />, { wrapper: createWrapper() });
+    const { container } = render(<Models />, { wrapper: createWrapper() });
 
     await waitFor(() => {
-      expect(screen.getByText(/Error:/)).toBeInTheDocument();
+      expect(within(container).getByText(/Error:/)).toBeInTheDocument();
     });
   });
 
@@ -104,13 +110,15 @@ describe("Models Component", () => {
       }),
     );
 
-    render(<Models />, { wrapper: createWrapper() });
+    const { container } = render(<Models />, { wrapper: createWrapper() });
 
     await waitFor(() => {
-      expect(screen.getByText("Models")).toBeInTheDocument();
+      expect(
+        within(container).getByRole("heading", { name: /models/i }),
+      ).toBeInTheDocument();
       // Should still render the page structure even with no models
       expect(
-        screen.getByText(/View and monitor your deployed models/),
+        within(container).getByText(/View and monitor your deployed models/),
       ).toBeInTheDocument();
     });
   });

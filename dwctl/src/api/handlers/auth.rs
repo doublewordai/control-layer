@@ -98,7 +98,12 @@ pub async fn register(State(state): State<AppState>, Json(request): Json<Registe
 
     // Hash the password on a blocking thread to avoid blocking async runtime
     let password = request.password.clone();
-    let password_hash = tokio::task::spawn_blocking(move || password::hash_string(&password))
+    let argon2_params = password::Argon2Params {
+        memory_kib: password_config.argon2_memory_kib,
+        iterations: password_config.argon2_iterations,
+        parallelism: password_config.argon2_parallelism,
+    };
+    let password_hash = tokio::task::spawn_blocking(move || password::hash_string_with_params(&password, Some(argon2_params)))
         .await
         .map_err(|e| Error::Internal {
             operation: format!("spawn password hashing task: {e}"),
@@ -353,7 +358,12 @@ pub async fn confirm_password_reset(
     // Hash new password
     let new_password_hash = tokio::task::spawn_blocking({
         let password = request.new_password.clone();
-        move || password::hash_string(&password)
+        let argon2_params = password::Argon2Params {
+            memory_kib: password_config.argon2_memory_kib,
+            iterations: password_config.argon2_iterations,
+            parallelism: password_config.argon2_parallelism,
+        };
+        move || password::hash_string_with_params(&password, Some(argon2_params))
     })
     .await
     .map_err(|e| Error::Internal {
@@ -477,7 +487,12 @@ pub async fn change_password(
     // Hash new password
     let new_password_hash = tokio::task::spawn_blocking({
         let password = request.new_password.clone();
-        move || password::hash_string(&password)
+        let argon2_params = password::Argon2Params {
+            memory_kib: password_config.argon2_memory_kib,
+            iterations: password_config.argon2_iterations,
+            parallelism: password_config.argon2_parallelism,
+        };
+        move || password::hash_string_with_params(&password, Some(argon2_params))
     })
     .await
     .map_err(|e| Error::Internal {
@@ -823,7 +838,13 @@ mod tests {
             .build();
 
         // Create a user using the repository
-        let password_hash = password::hash_string("testpassword").unwrap();
+        // Use weak params for fast testing
+        let test_params = password::Argon2Params {
+            memory_kib: 128,
+            iterations: 1,
+            parallelism: 1,
+        };
+        let password_hash = password::hash_string_with_params("testpassword", Some(test_params)).unwrap();
         let mut conn = pool.acquire().await.unwrap();
         let mut user_repo = Users::new(&mut conn);
 
@@ -924,7 +945,15 @@ mod tests {
             .build();
 
         // Create a user using the repository
-        let password_hash = password::hash_string("correctpassword").unwrap();
+        let password_hash = password::hash_string_with_params(
+            "correctpassword",
+            Some(password::Argon2Params {
+                memory_kib: 128,
+                iterations: 1,
+                parallelism: 1,
+            }),
+        )
+        .unwrap();
         let mut conn = pool.acquire().await.unwrap();
         let mut user_repo = Users::new(&mut conn);
 
@@ -1056,7 +1085,17 @@ mod tests {
             is_admin: false,
             roles: vec![Role::StandardUser],
             auth_source: "native".to_string(),
-            password_hash: Some(password::hash_string("password").unwrap()),
+            password_hash: Some(
+                password::hash_string_with_params(
+                    "password",
+                    Some(password::Argon2Params {
+                        memory_kib: 128,
+                        iterations: 1,
+                        parallelism: 1,
+                    }),
+                )
+                .unwrap(),
+            ),
             external_user_id: None,
         };
 
@@ -1381,7 +1420,15 @@ mod tests {
         let (app, _bg_services) = app.into_test_server();
 
         // Create a user with a password
-        let old_password_hash = password::hash_string("oldpassword123").unwrap();
+        let old_password_hash = password::hash_string_with_params(
+            "oldpassword123",
+            Some(password::Argon2Params {
+                memory_kib: 128,
+                iterations: 1,
+                parallelism: 1,
+            }),
+        )
+        .unwrap();
         let mut conn = pool.acquire().await.unwrap();
         let mut user_repo = Users::new(&mut conn);
 
@@ -1525,7 +1572,15 @@ mod tests {
         let (app, _bg_services) = app.into_test_server();
 
         // Create a user with a password
-        let old_password_hash = password::hash_string("oldpassword123").unwrap();
+        let old_password_hash = password::hash_string_with_params(
+            "oldpassword123",
+            Some(password::Argon2Params {
+                memory_kib: 128,
+                iterations: 1,
+                parallelism: 1,
+            }),
+        )
+        .unwrap();
         let mut conn = pool.acquire().await.unwrap();
         let mut user_repo = Users::new(&mut conn);
 
@@ -1598,7 +1653,15 @@ mod tests {
         let (app, _bg_services) = app.into_test_server();
 
         // Create a user with a password
-        let password_hash = password::hash_string("correctpassword").unwrap();
+        let password_hash = password::hash_string_with_params(
+            "correctpassword",
+            Some(password::Argon2Params {
+                memory_kib: 128,
+                iterations: 1,
+                parallelism: 1,
+            }),
+        )
+        .unwrap();
         let mut conn = pool.acquire().await.unwrap();
         let mut user_repo = Users::new(&mut conn);
 
@@ -1702,7 +1765,15 @@ mod tests {
         let (app, _bg_services) = app.into_test_server();
 
         // Create a user with a password
-        let password_hash = password::hash_string("oldpassword123").unwrap();
+        let password_hash = password::hash_string_with_params(
+            "oldpassword123",
+            Some(password::Argon2Params {
+                memory_kib: 128,
+                iterations: 1,
+                parallelism: 1,
+            }),
+        )
+        .unwrap();
         let mut conn = pool.acquire().await.unwrap();
         let mut user_repo = Users::new(&mut conn);
 
@@ -1755,7 +1826,15 @@ mod tests {
         let (app, _bg_services) = app.into_test_server();
 
         // Create a user with a password
-        let password_hash = password::hash_string("oldpassword").unwrap();
+        let password_hash = password::hash_string_with_params(
+            "oldpassword",
+            Some(password::Argon2Params {
+                memory_kib: 128,
+                iterations: 1,
+                parallelism: 1,
+            }),
+        )
+        .unwrap();
         let mut conn = pool.acquire().await.unwrap();
         let mut user_repo = Users::new(&mut conn);
 
@@ -1807,7 +1886,15 @@ mod tests {
         let (app, _bg_services) = app.into_test_server();
 
         // Create a user with a password
-        let password_hash = password::hash_string("oldpassword").unwrap();
+        let password_hash = password::hash_string_with_params(
+            "oldpassword",
+            Some(password::Argon2Params {
+                memory_kib: 128,
+                iterations: 1,
+                parallelism: 1,
+            }),
+        )
+        .unwrap();
         let mut conn = pool.acquire().await.unwrap();
         let mut user_repo = Users::new(&mut conn);
 

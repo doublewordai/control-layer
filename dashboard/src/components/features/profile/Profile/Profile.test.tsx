@@ -1,5 +1,5 @@
-import { render, screen, waitFor } from "@testing-library/react";
-import { BrowserRouter } from "react-router-dom";
+import { render, within, waitFor } from "@testing-library/react";
+import { MemoryRouter } from "react-router-dom";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { setupServer } from "msw/node";
 import { ReactNode } from "react";
@@ -27,14 +27,14 @@ function createWrapper() {
 
   return ({ children }: { children: ReactNode }) => (
     <QueryClientProvider client={queryClient}>
-      <BrowserRouter>{children}</BrowserRouter>
+      <MemoryRouter>{children}</MemoryRouter>
     </QueryClientProvider>
   );
 }
 
 describe("Profile Component", () => {
   it("renders without crashing", async () => {
-    render(<Profile />, { wrapper: createWrapper() });
+    const { container } = render(<Profile />, { wrapper: createWrapper() });
 
     // Should show loading skeleton initially
     expect(document.querySelector(".animate-pulse")).toBeInTheDocument();
@@ -42,59 +42,63 @@ describe("Profile Component", () => {
     // Should render the component after loading
     await waitFor(() => {
       expect(
-        screen.getByRole("heading", { name: "Profile Settings" }),
+        within(container).getByRole("heading", { name: "Profile Settings" }),
       ).toBeInTheDocument();
     });
   });
 
   it("renders profile data when loaded", async () => {
-    render(<Profile />, { wrapper: createWrapper() });
+    const { container } = render(<Profile />, { wrapper: createWrapper() });
 
     await waitFor(() => {
       // Check that the page header is displayed
       expect(
-        screen.getByRole("heading", { name: "Profile Settings" }),
+        within(container).getByRole("heading", { name: "Profile Settings" }),
       ).toBeInTheDocument();
       expect(
-        screen.getByText(/Manage your account information and preferences/),
+        within(container).getByText(
+          /Manage your account information and preferences/,
+        ),
       ).toBeInTheDocument();
     });
 
     // Check that user data from mock is displayed
-    expect(screen.getByText("Sarah Chen")).toBeInTheDocument();
+    expect(within(container).getByText("Sarah Chen")).toBeInTheDocument();
     expect(
-      screen.getAllByText("sarah.chen@doubleword.ai")[0],
+      within(container).getAllByText("sarah.chen@doubleword.ai")[0],
     ).toBeInTheDocument();
 
     // Check form fields are accessible via roles
     expect(
-      screen.getByRole("textbox", { name: "Display Name" }),
+      within(container).getByRole("textbox", { name: "Display Name" }),
     ).toBeInTheDocument();
     expect(
-      screen.getByRole("textbox", { name: "Avatar URL" }),
+      within(container).getByRole("textbox", { name: "Avatar URL" }),
     ).toBeInTheDocument();
 
     // Check buttons are accessible
     expect(
-      screen.getByRole("button", { name: /save changes/i }),
+      within(container).getByRole("button", { name: /save changes/i }),
     ).toBeInTheDocument();
   });
 
   it("allows editing display name and avatar url", async () => {
     const user = userEvent.setup();
-    render(<Profile />, { wrapper: createWrapper() });
+    const { container } = render(<Profile />, { wrapper: createWrapper() });
 
     await waitFor(() => {
       expect(
-        screen.getByRole("heading", { name: "Profile Settings" }),
+        within(container).getByRole("heading", { name: "Profile Settings" }),
       ).toBeInTheDocument();
     });
 
     // Find form fields by their roles and accessible names
-    const displayNameInput = screen.getByRole("textbox", {
+    const displayNameInput = within(container).getByRole("textbox", {
       name: "Display Name",
     });
-    const avatarUrlInput = screen.getByRole("textbox", { name: "Avatar URL" });
+    const avatarUrlInput = within(container).getByRole("textbox", {
+      name: "Avatar URL",
+    });
 
     // Verify initial values (from mock data)
     expect(displayNameInput).toHaveValue("Sarah Chen");
@@ -113,7 +117,9 @@ describe("Profile Component", () => {
     expect(avatarUrlInput).toHaveValue("https://example.com/new-avatar.jpg");
 
     // Find and click save button by role, not by text
-    const saveButton = screen.getByRole("button", { name: /save changes/i });
+    const saveButton = within(container).getByRole("button", {
+      name: /save changes/i,
+    });
     expect(saveButton).not.toBeDisabled();
 
     await user.click(saveButton);
@@ -121,7 +127,7 @@ describe("Profile Component", () => {
     // Verify success state appears
     await waitFor(() => {
       expect(
-        screen.getByText(/Profile updated successfully/i),
+        within(container).getByText(/Profile updated successfully/i),
       ).toBeInTheDocument();
     });
   });

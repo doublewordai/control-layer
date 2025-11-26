@@ -392,7 +392,7 @@ test target="" *args="":
                     echo "  cargo binstall cargo-llvm-cov"
                     exit 1
                 fi
-                cargo llvm-cov --fail-under-lines 60 --lcov --output-path lcov.info -- --test-threads=4
+                cargo llvm-cov --fail-under-lines 60 --lcov --output-path lcov.info
             else
                 cargo test {{args}}
             fi
@@ -804,7 +804,7 @@ db-start:
           -e POSTGRES_PASSWORD=password \
           -e POSTGRES_HOST_AUTH_METHOD=trust \
           -p 5432:5432 \
-          -v test-postgres-data:/var/lib/postgresql/data \
+          -v test-postgres-data:/var/lib/postgresql/ \
           -d postgres:latest \
           postgres -c fsync=off \
           -c full_page_writes=off \

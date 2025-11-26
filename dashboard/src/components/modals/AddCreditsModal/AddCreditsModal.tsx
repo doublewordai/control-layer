@@ -3,6 +3,7 @@ import { X } from "lucide-react";
 import {
   Dialog,
   DialogContent,
+  DialogDescription,
   DialogHeader,
   DialogTitle,
 } from "../../ui/dialog";
@@ -10,6 +11,7 @@ import { Button } from "../../ui/button";
 import { useAddFunds, useUser } from "../../../api/control-layer/hooks";
 import { toast } from "sonner";
 import type { DisplayUser } from "../../../types/display";
+import { AlertBox } from "@/components/ui/alert-box";
 
 interface AddFundsModalProps {
   isOpen: boolean;
@@ -28,19 +30,20 @@ export function AddFundsModal({
   const [description, setDescription] = useState<string>("");
   const addFundsMutation = useAddFunds();
   const { data: currentUser } = useUser("current");
+  const [error, setError] = useState<string | null>(null);
 
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
 
     // Guard: Ensure currentUser is loaded
     if (!currentUser?.id) {
-      toast.error("Unable to add funds. Please try refreshing the page.");
+      setError("Unable to add funds. Please try refreshing the page.");
       return;
     }
 
     const amountNum = parseFloat(amount);
     if (isNaN(amountNum) || amountNum <= 0) {
-      toast.error("Please enter a valid amount");
+      setError("Please enter a valid amount");
       return;
     }
 
@@ -64,7 +67,7 @@ export function AddFundsModal({
       setAmount("10.00");
       setDescription("");
     } catch (error) {
-      toast.error("Failed to add funds. Please try again.");
+      setError("Failed to add funds. Please try again.");
       console.error("Failed to add funds:", error);
     }
   };
@@ -83,16 +86,17 @@ export function AddFundsModal({
               <X className="w-5 h-5" />
             </button>
           </div>
+          <DialogDescription>
+            You are about to add funds to <strong>{targetUser.name}</strong> (
+            {targetUser.email})
+          </DialogDescription>
         </DialogHeader>
 
-        <form onSubmit={handleSubmit} className="space-y-4 mt-4">
-          <div>
-            <p className="text-sm text-doubleword-neutral-600 mb-4">
-              You are about to add funds to <strong>{targetUser.name}</strong> (
-              {targetUser.email})
-            </p>
-          </div>
+        <AlertBox variant="error" className="mb-4">
+          {error}
+        </AlertBox>
 
+        <form onSubmit={handleSubmit} className="space-y-4 mt-4">
           <div>
             <label
               htmlFor="amount"

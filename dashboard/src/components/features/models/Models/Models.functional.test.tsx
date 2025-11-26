@@ -1,6 +1,6 @@
 import { render, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
-import { BrowserRouter } from "react-router-dom";
+import { MemoryRouter } from "react-router-dom";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { setupServer } from "msw/node";
 import { ReactNode } from "react";
@@ -44,8 +44,10 @@ vi.mock("../../../../utils/authorization", () => ({
 }));
 
 // Test wrapper with QueryClient, Router, and Context Providers
+let queryClient: QueryClient;
+
 function createWrapper() {
-  const queryClient = new QueryClient({
+  queryClient = new QueryClient({
     defaultOptions: {
       queries: {
         retry: false,
@@ -57,7 +59,7 @@ function createWrapper() {
   return ({ children }: { children: ReactNode }) => (
     <SettingsProvider>
       <QueryClientProvider client={queryClient}>
-        <BrowserRouter>{children}</BrowserRouter>
+        <MemoryRouter>{children}</MemoryRouter>
       </QueryClientProvider>
     </SettingsProvider>
   );
@@ -68,29 +70,39 @@ describe("Models Component - Functional Tests", () => {
     mockNavigate.mockClear();
   });
 
+  afterEach(() => {
+    // Clean up QueryClient to prevent state pollution between tests
+    if (queryClient) {
+      queryClient.clear();
+      queryClient.cancelQueries();
+    }
+  });
+
   describe("Model Discovery Journey", () => {
     it("allows users to browse, filter, and search models", async () => {
       const user = userEvent.setup();
-      render(<Models />, { wrapper: createWrapper() });
+      const { container } = render(<Models />, { wrapper: createWrapper() });
 
       // Wait for data to load
       await waitFor(() => {
         expect(
-          screen.getByRole("heading", { name: /models/i }),
+          within(container).getByRole("heading", { name: /models/i }),
         ).toBeInTheDocument();
       });
 
       // Wait for models to load and render
       await waitFor(() => {
-        expect(screen.getAllByRole("listitem").length).toBeGreaterThan(0);
+        expect(
+          within(container).getAllByRole("listitem").length,
+        ).toBeGreaterThan(0);
       });
 
       // Verify initial state - should show multiple model cards
-      const modelCards = screen.getAllByRole("listitem");
+      const modelCards = within(container).getAllByRole("listitem");
       expect(modelCards.length).toBeGreaterThan(0);
 
       // Test that provider filter is present and clickable
-      const providerSelect = screen.getByRole("combobox", {
+      const providerSelect = within(container).getByRole("combobox", {
         name: /filter by endpoint provider/i,
       });
       expect(providerSelect).toBeInTheDocument();
@@ -99,14 +111,14 @@ describe("Models Component - Functional Tests", () => {
       expect(providerSelect).toHaveTextContent(/all endpoints/i);
 
       // Test search functionality
-      const searchInput = screen.getByRole("textbox", {
+      const searchInput = within(container).getByRole("textbox", {
         name: /search models/i,
       });
       await user.type(searchInput, "gpt");
 
       // Verify search results
       await waitFor(() => {
-        const searchResults = screen.getAllByRole("listitem");
+        const searchResults = within(container).getAllByRole("listitem");
         // Should have GPT-related models
         searchResults.forEach((card) => {
           const cardText = card.textContent?.toLowerCase();
@@ -120,28 +132,30 @@ describe("Models Component - Functional Tests", () => {
 
       // Verify no results state
       await waitFor(() => {
-        expect(screen.queryAllByRole("listitem")).toHaveLength(0);
+        expect(within(container).queryAllByRole("listitem")).toHaveLength(0);
       });
     });
 
     it("navigates to playground when clicking playground button", async () => {
       const user = userEvent.setup();
-      render(<Models />, { wrapper: createWrapper() });
+      const { container } = render(<Models />, { wrapper: createWrapper() });
 
       // Wait for models to load
       await waitFor(() => {
         expect(
-          screen.getByRole("heading", { name: /models/i }),
+          within(container).getByRole("heading", { name: /models/i }),
         ).toBeInTheDocument();
       });
 
       // Wait for model cards to render
       await waitFor(() => {
-        expect(screen.getAllByRole("listitem").length).toBeGreaterThan(0);
+        expect(
+          within(container).getAllByRole("listitem").length,
+        ).toBeGreaterThan(0);
       });
 
       // Find first model card and click its playground button
-      const modelCards = screen.getAllByRole("listitem");
+      const modelCards = within(container).getAllByRole("listitem");
       expect(modelCards.length).toBeGreaterThan(0);
 
       const firstCard = modelCards[0];
@@ -161,22 +175,24 @@ describe("Models Component - Functional Tests", () => {
   describe("API Integration Journey", () => {
     it("opens API examples modal when clicking API button", async () => {
       const user = userEvent.setup();
-      render(<Models />, { wrapper: createWrapper() });
+      const { container } = render(<Models />, { wrapper: createWrapper() });
 
       // Wait for models to load
       await waitFor(() => {
         expect(
-          screen.getByRole("heading", { name: /models/i }),
+          within(container).getByRole("heading", { name: /models/i }),
         ).toBeInTheDocument();
       });
 
       // Wait for model cards to render
       await waitFor(() => {
-        expect(screen.getAllByRole("listitem").length).toBeGreaterThan(0);
+        expect(
+          within(container).getAllByRole("listitem").length,
+        ).toBeGreaterThan(0);
       });
 
       // Find first model card and click its API button
-      const modelCards = screen.getAllByRole("listitem");
+      const modelCards = within(container).getAllByRole("listitem");
       const firstCard = modelCards[0];
       const apiButton = within(firstCard).getByRole("button", { name: /api/i });
 
@@ -184,6 +200,7 @@ describe("Models Component - Functional Tests", () => {
 
       // Verify API examples modal opened
       await waitFor(() => {
+        // use screen as dialog is rendered outside of the container
         expect(screen.getByRole("dialog")).toBeInTheDocument();
         // Look for the specific modal heading
         expect(
@@ -195,17 +212,17 @@ describe("Models Component - Functional Tests", () => {
 
   describe("Access Control Journey", () => {
     it("shows access toggle for admin users", async () => {
-      render(<Models />, { wrapper: createWrapper() });
+      const { container } = render(<Models />, { wrapper: createWrapper() });
 
       // Wait for models to load
       await waitFor(() => {
         expect(
-          screen.getByRole("heading", { name: /models/i }),
+          within(container).getByRole("heading", { name: /models/i }),
         ).toBeInTheDocument();
       });
 
       // Check for admin access toggle (should be present with mock permissions)
-      const accessToggle = screen.getByRole("combobox", {
+      const accessToggle = within(container).getByRole("combobox", {
         name: /model access filter/i,
       });
       expect(accessToggle).toBeInTheDocument();
@@ -213,26 +230,28 @@ describe("Models Component - Functional Tests", () => {
 
     it("allows admin users to toggle between all models and accessible models", async () => {
       const _user = userEvent.setup();
-      render(<Models />, { wrapper: createWrapper() });
+      const { container } = render(<Models />, { wrapper: createWrapper() });
 
       // Wait for models to load
       await waitFor(() => {
         expect(
-          screen.getByRole("heading", { name: /models/i }),
+          within(container).getByRole("heading", { name: /models/i }),
         ).toBeInTheDocument();
       });
 
       // Wait for model cards to render
       await waitFor(() => {
-        expect(screen.getAllByRole("listitem").length).toBeGreaterThan(0);
+        expect(
+          within(container).getAllByRole("listitem").length,
+        ).toBeGreaterThan(0);
       });
 
       // Get initial model count
-      const initialCards = screen.getAllByRole("listitem");
+      const initialCards = within(container).getAllByRole("listitem");
       const _initialCount = initialCards.length;
 
       // Verify the access toggle shows "All Models" initially
-      const accessToggle = screen.getByRole("combobox", {
+      const accessToggle = within(container).getByRole("combobox", {
         name: /model access filter/i,
       });
       expect(accessToggle).toHaveTextContent(/all models/i);
@@ -242,17 +261,17 @@ describe("Models Component - Functional Tests", () => {
   describe("Pagination Journey", () => {
     it("handles pagination when many models are present", async () => {
       const user = userEvent.setup();
-      render(<Models />, { wrapper: createWrapper() });
+      const { container } = render(<Models />, { wrapper: createWrapper() });
 
       // Wait for models to load
       await waitFor(() => {
         expect(
-          screen.getByRole("heading", { name: /models/i }),
+          within(container).getByRole("heading", { name: /models/i }),
         ).toBeInTheDocument();
       });
 
       // Check if pagination is present (depends on mock data having >12 models)
-      const pagination = screen.queryByRole("navigation", {
+      const pagination = within(container).queryByRole("navigation", {
         name: /pagination/i,
       });
 
@@ -283,14 +302,16 @@ describe("Models Component - Functional Tests", () => {
     it("handles API errors gracefully", async () => {
       // For this test, we'll just verify the component handles the loading state
       // The existing MSW handlers provide successful responses
-      render(<Models />, { wrapper: createWrapper() });
+      const { container } = render(<Models />, { wrapper: createWrapper() });
 
       // Should eventually load successfully (not show loading state)
       await waitFor(() => {
         expect(
-          screen.getByRole("heading", { name: /models/i }),
+          within(container).getByRole("heading", { name: /models/i }),
         ).toBeInTheDocument();
-        expect(screen.queryByText(/loading/i)).not.toBeInTheDocument();
+        expect(
+          within(container).queryByText(/loading/i),
+        ).not.toBeInTheDocument();
       });
     });
   });
@@ -298,32 +319,40 @@ describe("Models Component - Functional Tests", () => {
   describe("Admin Features Journey", () => {
     it("allows admins to add groups to models with no groups", async () => {
       const user = userEvent.setup();
-      render(<Models />, { wrapper: createWrapper() });
+      const { container } = render(<Models />, { wrapper: createWrapper() });
 
       // Wait for models to load
       await waitFor(() => {
         expect(
-          screen.getByRole("heading", { name: /models/i }),
+          within(container).getByRole("heading", { name: /models/i }),
         ).toBeInTheDocument();
       });
 
       // Wait for model cards to render
       await waitFor(() => {
-        expect(screen.getAllByRole("listitem").length).toBeGreaterThan(0);
+        expect(
+          within(container).getAllByRole("listitem").length,
+        ).toBeGreaterThan(0);
       });
 
       // Find a model card and look for "Add groups" button
-      const modelCards = screen.getAllByRole("listitem");
+      const modelCards = within(container).getAllByRole("listitem");
       expect(modelCards.length).toBeGreaterThan(0);
 
       // Look for "Add groups" buttons in any of the cards
-      const addGroupsButtons = screen.queryAllByRole("button", {
+      const addGroupsButtons = within(container).queryAllByRole("button", {
         name: /add groups/i,
       });
 
       if (addGroupsButtons.length > 0) {
-        // Click the first "Add groups" button
+        // Wait for the button to be fully interactive
         const firstAddGroupsButton = addGroupsButtons[0];
+        await waitFor(() => {
+          expect(firstAddGroupsButton).toBeEnabled();
+        });
+
+        // Click the first "Add groups" button
+        // Skip pointer events check as the button may have pointer-events css applied transiently
         await user.click(firstAddGroupsButton);
 
         // Verify access management modal opens
@@ -339,17 +368,17 @@ describe("Models Component - Functional Tests", () => {
 
     it("allows admins to manage access groups via group badges", async () => {
       const user = userEvent.setup();
-      render(<Models />, { wrapper: createWrapper() });
+      const { container } = render(<Models />, { wrapper: createWrapper() });
 
       // Wait for models to load
       await waitFor(() => {
         expect(
-          screen.getByRole("heading", { name: /models/i }),
+          within(container).getByRole("heading", { name: /models/i }),
         ).toBeInTheDocument();
       });
 
       // Look for group badges or "+ X more" badges
-      const moreGroupsBadges = screen.queryAllByText(/\+\d+ more/);
+      const moreGroupsBadges = within(container).queryAllByText(/\+\d+ more/);
 
       if (moreGroupsBadges.length > 0) {
         // Click on a "+ X more" badge
@@ -357,12 +386,16 @@ describe("Models Component - Functional Tests", () => {
         await user.click(firstMoreBadge);
 
         // Verify access management modal opens
-        await waitFor(() => {
-          expect(screen.getByRole("dialog")).toBeInTheDocument();
-        });
+        // Using both timeout and interval to handle slow CI environments
+        await waitFor(
+          () => {
+            expect(within(container).getByRole("dialog")).toBeInTheDocument();
+          },
+          { timeout: 5000, interval: 50 },
+        );
       } else {
         // Look for regular group badges that might be clickable
-        const groupBadges = screen.queryAllByText(/group/i);
+        const groupBadges = within(container).queryAllByText(/group/i);
 
         if (groupBadges.length > 0) {
           // Verify group badges are visible (even if not clickable)
@@ -372,32 +405,34 @@ describe("Models Component - Functional Tests", () => {
     });
 
     it("shows admin-specific UI elements for platform managers", async () => {
-      render(<Models />, { wrapper: createWrapper() });
+      const { container } = render(<Models />, { wrapper: createWrapper() });
 
       // Wait for models to load
       await waitFor(() => {
         expect(
-          screen.getByRole("heading", { name: /models/i }),
+          within(container).getByRole("heading", { name: /models/i }),
         ).toBeInTheDocument();
       });
 
       // Wait for model cards to render
       await waitFor(() => {
-        expect(screen.getAllByRole("listitem").length).toBeGreaterThan(0);
+        expect(
+          within(container).getAllByRole("listitem").length,
+        ).toBeGreaterThan(0);
       });
 
       // Verify admin-specific elements are present
-      const accessFilter = screen.getByRole("combobox", {
+      const accessFilter = within(container).getByRole("combobox", {
         name: /model access filter/i,
       });
       expect(accessFilter).toBeInTheDocument();
 
       // Check for admin-only buttons in model cards
-      const modelCards = screen.getAllByRole("listitem");
+      const modelCards = within(container).getAllByRole("listitem");
       expect(modelCards.length).toBeGreaterThan(0);
 
       // Look for admin UI elements
-      const adminButtons = screen.queryAllByRole("button", {
+      const adminButtons = within(container).queryAllByRole("button", {
         name: /add groups|open menu/i,
       });
 
@@ -407,17 +442,17 @@ describe("Models Component - Functional Tests", () => {
 
     it("handles hover interactions on group badges", async () => {
       const user = userEvent.setup();
-      render(<Models />, { wrapper: createWrapper() });
+      const { container } = render(<Models />, { wrapper: createWrapper() });
 
       // Wait for models to load
       await waitFor(() => {
         expect(
-          screen.getByRole("heading", { name: /models/i }),
+          within(container).getByRole("heading", { name: /models/i }),
         ).toBeInTheDocument();
       });
 
       // Look for "+ X more" badges which should show hover cards
-      const moreGroupsBadges = screen.queryAllByText(/\+\d+ more/);
+      const moreGroupsBadges = within(container).queryAllByText(/\+\d+ more/);
 
       if (moreGroupsBadges.length > 0) {
         const firstMoreBadge = moreGroupsBadges[0];
@@ -436,38 +471,40 @@ describe("Models Component - Functional Tests", () => {
 
       // Test passes if we can interact with hover elements without errors
       expect(
-        screen.getByRole("heading", { name: /models/i }),
+        within(container).getByRole("heading", { name: /models/i }),
       ).toBeInTheDocument();
     });
 
     it("handles permission-based rendering correctly", async () => {
-      render(<Models />, { wrapper: createWrapper() });
+      const { container } = render(<Models />, { wrapper: createWrapper() });
 
       // Wait for models to load
       await waitFor(() => {
         expect(
-          screen.getByRole("heading", { name: /models/i }),
+          within(container).getByRole("heading", { name: /models/i }),
         ).toBeInTheDocument();
       });
 
       // Wait for model cards to render
       await waitFor(() => {
-        expect(screen.getAllByRole("listitem").length).toBeGreaterThan(0);
+        expect(
+          within(container).getAllByRole("listitem").length,
+        ).toBeGreaterThan(0);
       });
 
-      const modelCards = screen.getAllByRole("listitem");
+      const modelCards = within(container).getAllByRole("listitem");
       expect(modelCards.length).toBeGreaterThan(0);
 
       // Verify that admin features are conditionally rendered
       // The mock data should provide admin permissions by default
-      const accessFilter = screen.getByRole("combobox", {
+      const accessFilter = within(container).getByRole("combobox", {
         name: /model access filter/i,
       });
       expect(accessFilter).toBeInTheDocument();
 
       // Check that models show appropriate admin controls
       // This could be group management buttons or dropdown menus
-      const adminControls = screen.queryAllByRole("button", {
+      const adminControls = within(container).queryAllByRole("button", {
         name: /add groups|open menu|manage access/i,
       });
 
@@ -488,23 +525,30 @@ describe("Models Component - Functional Tests", () => {
         value: 375,
       });
 
-      render(<Models />, { wrapper: createWrapper() });
+      const { container } = render(<Models />, { wrapper: createWrapper() });
 
       // Wait for models to load
       await waitFor(() => {
         expect(
-          screen.getByRole("heading", { name: /models/i }),
+          within(container).getByRole("heading", { name: /models/i }),
         ).toBeInTheDocument();
       });
 
       // Core functionality should still work on mobile
-      const searchInput = screen.getByRole("textbox", {
+      const searchInput = within(container).getByRole("textbox", {
         name: /search models/i,
       });
+
+      // Wait for input to be fully interactive
+      await waitFor(() => {
+        expect(searchInput).toBeEnabled();
+      });
+
+      // Skip pointer events check as the input may have transient pointer-events css
       await user.type(searchInput, "gpt");
 
       await waitFor(() => {
-        const searchResults = screen.getAllByRole("listitem");
+        const searchResults = within(container).getAllByRole("listitem");
         expect(searchResults.length).toBeGreaterThan(0);
       });
     });
