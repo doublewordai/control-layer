@@ -273,9 +273,7 @@ pub async fn create_user(
 
     // Pre-create hidden API key for inference to avoid race condition with onwards sync
     let mut api_keys_repo = ApiKeys::new(&mut tx);
-    api_keys_repo
-        .get_or_create_hidden_key(user.id, ApiKeyPurpose::Inference)
-        .await?;
+    api_keys_repo.get_or_create_hidden_key(user.id, ApiKeyPurpose::Inference).await?;
 
     tx.commit().await.map_err(|e| Error::Database(e.into()))?;
     Ok((StatusCode::CREATED, Json(UserResponse::from(user))))
