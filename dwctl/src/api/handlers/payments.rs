@@ -136,10 +136,24 @@ pub async fn create_payment(
         "/cost-management".to_string()
     };
 
-    let success_url = format!("{}{}payment=success&session_id={{CHECKOUT_SESSION_ID}}", origin,
-        if query.creditee_id.is_some() { format!("{}&", base_path) } else { format!("{}?", base_path) });
-    let cancel_url = format!("{}{}payment=cancelled&session_id={{CHECKOUT_SESSION_ID}}", origin,
-        if query.creditee_id.is_some() { format!("{}&", base_path) } else { format!("{}?", base_path) });
+    let success_url = format!(
+        "{}{}payment=success&session_id={{CHECKOUT_SESSION_ID}}",
+        origin,
+        if query.creditee_id.is_some() {
+            format!("{}&", base_path)
+        } else {
+            format!("{}?", base_path)
+        }
+    );
+    let cancel_url = format!(
+        "{}{}payment=cancelled&session_id={{CHECKOUT_SESSION_ID}}",
+        origin,
+        if query.creditee_id.is_some() {
+            format!("{}&", base_path)
+        } else {
+            format!("{}?", base_path)
+        }
+    );
 
     let provider = payment_providers::create_provider(payment_config);
 
@@ -517,9 +531,15 @@ mod tests {
         assert!(checkout_url.contains(&format!("dummy_session_{}", recipient.id)));
 
         // Verify URL contains the user query parameter to return to filtered view
-        assert!(checkout_url.contains(&format!("user={}", recipient.id)),
-            "Redirect URL should preserve user filter: {}", checkout_url);
-        assert!(checkout_url.contains("payment=success"),
-            "Redirect URL should contain payment status: {}", checkout_url);
+        assert!(
+            checkout_url.contains(&format!("user={}", recipient.id)),
+            "Redirect URL should preserve user filter: {}",
+            checkout_url
+        );
+        assert!(
+            checkout_url.contains("payment=success"),
+            "Redirect URL should contain payment status: {}",
+            checkout_url
+        );
     }
 }

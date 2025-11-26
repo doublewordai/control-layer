@@ -60,7 +60,7 @@ export function AddFundsModal({
 
       const sentAmount = Number(result.amount).toFixed(2);
 
-      toast.success(`Successfully added $${sentAmount} to ${targetUser.name}`);
+      toast.success(`Successfully added $${sentAmount} to ${targetUser.display_name || targetUser.email}`);
       onSuccess?.();
       onClose();
 
@@ -78,6 +78,10 @@ export function AddFundsModal({
       <DialogContent className="sm:max-w-md">
         <DialogHeader>
           <DialogTitle className="text-2xl">Add to Credit Balance</DialogTitle>
+          <DialogDescription>
+            You are about to add funds to <strong>{targetUser.display_name || targetUser.email}</strong>
+            {targetUser.display_name && ` (${targetUser.email})`}
+          </DialogDescription>
         </DialogHeader>
 
         <AlertBox variant="error" className="mb-4">
@@ -85,12 +89,6 @@ export function AddFundsModal({
         </AlertBox>
 
         <form onSubmit={handleSubmit} className="space-y-4 mt-4">
-          <div>
-            <p className="text-sm text-doubleword-neutral-600 mb-4">
-              You are about to add funds to <strong>{targetUser.name}</strong> (
-              {targetUser.email})
-            </p>
-          </div>
 
           <div>
             <label

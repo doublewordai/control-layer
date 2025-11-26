@@ -43,7 +43,14 @@ impl StripeProvider {
 
 #[async_trait]
 impl PaymentProvider for StripeProvider {
-    async fn create_checkout_session(&self, db_pool: &PgPool, user: &CurrentUser, creditee_id: Option<&str>, cancel_url: &str, success_url: &str) -> Result<String> {
+    async fn create_checkout_session(
+        &self,
+        db_pool: &PgPool,
+        user: &CurrentUser,
+        creditee_id: Option<&str>,
+        cancel_url: &str,
+        success_url: &str,
+    ) -> Result<String> {
         let client = self.client();
 
         // Determine which user will receive the credits
@@ -74,7 +81,8 @@ impl PaymentProvider for StripeProvider {
         };
 
         // Include existing customer ID if we have one
-        if let Some(existing_id) = &user.payment_provider_id { // This is who is giving the credits
+        if let Some(existing_id) = &user.payment_provider_id {
+            // This is who is giving the credits
             tracing::info!("Using existing Stripe customer ID {} for user {}", existing_id, user.id);
             checkout_params.customer = Some(existing_id.as_str().parse().unwrap());
         } else {
@@ -89,7 +97,12 @@ impl PaymentProvider for StripeProvider {
             PaymentError::ProviderApi(e.to_string())
         })?;
 
-        tracing::info!("Created checkout session {} for user {} (payer: {})", checkout_session.id, recipient_id, user.id);
+        tracing::info!(
+            "Created checkout session {} for user {} (payer: {})",
+            checkout_session.id,
+            recipient_id,
+            user.id
+        );
 
         // If we didn't have a customer ID before, save the newly created one
         if user.payment_provider_id.is_none() && checkout_session.customer.is_some() {
@@ -407,14 +420,10 @@ mod tests {
 
         // Set a Stripe customer ID for the user
         let customer_id = "cus_test_self_payment";
-        sqlx::query!(
-            "UPDATE users SET payment_provider_id = $1 WHERE id = $2",
-            customer_id,
-            user.id
-        )
-        .execute(&pool)
-        .await
-        .unwrap();
+        sqlx::query!("UPDATE users SET payment_provider_id = $1 WHERE id = $2", customer_id, user.id)
+            .execute(&pool)
+            .await
+            .unwrap();
 
         // Create a payment session where payer = recipient
         let payment_session = PaymentSession {
@@ -511,6 +520,9 @@ mod tests {
             "Stripe payment".to_string()
         };
 
-        assert_eq!(description, "Stripe payment from John Admin", "Payment for others should include 'from' attribution");
+        assert_eq!(
+            description, "Stripe payment from John Admin",
+            "Payment for others should include 'from' attribution"
+        );
     }
 }

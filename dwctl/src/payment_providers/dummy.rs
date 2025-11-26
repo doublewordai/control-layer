@@ -30,7 +30,14 @@ impl DummyProvider {
 
 #[async_trait]
 impl PaymentProvider for DummyProvider {
-    async fn create_checkout_session(&self, _db_pool: &PgPool, user: &CurrentUser, creditee_id: Option<&str>, _cancel_url: &str, success_url: &str) -> Result<String> {
+    async fn create_checkout_session(
+        &self,
+        _db_pool: &PgPool,
+        user: &CurrentUser,
+        creditee_id: Option<&str>,
+        _cancel_url: &str,
+        success_url: &str,
+    ) -> Result<String> {
         // Determine which user will receive the credits
         // If creditee_id is provided, use that; otherwise use the authenticated user
         let user_id_string = user.id.to_string();
@@ -43,7 +50,12 @@ impl PaymentProvider for DummyProvider {
         // Build success URL with session ID
         let redirect_url = success_url.replace("{CHECKOUT_SESSION_ID}", &session_id);
 
-        tracing::info!("Dummy provider created checkout session {} for user {} (payer: {})", session_id, recipient_id, user.id);
+        tracing::info!(
+            "Dummy provider created checkout session {} for user {} (payer: {})",
+            session_id,
+            recipient_id,
+            user.id
+        );
 
         // Return the success URL - payment is instantly "complete" for dummy provider
         Ok(redirect_url)

@@ -105,7 +105,14 @@ pub trait PaymentProvider: Send + Sync {
     /// * `creditee_id` - Optional user ID to credit (for admin granting credits to another user)
     /// * `cancel_url` - URL to redirect to if payment is cancelled
     /// * `success_url` - URL to redirect to if payment succeeds
-    async fn create_checkout_session(&self, db_pool: &PgPool, user: &CurrentUser, creditee_id: Option<&str>, cancel_url: &str, success_url: &str) -> Result<String>;
+    async fn create_checkout_session(
+        &self,
+        db_pool: &PgPool,
+        user: &CurrentUser,
+        creditee_id: Option<&str>,
+        cancel_url: &str,
+        success_url: &str,
+    ) -> Result<String>;
 
     /// Retrieve and validate a payment session
     ///
