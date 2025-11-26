@@ -79,7 +79,7 @@ pub struct PaymentSession {
 }
 
 /// Represents a webhook event from a payment provider
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WebhookEvent {
     /// Type of event (e.g., "checkout.session.completed")
     pub event_type: String,

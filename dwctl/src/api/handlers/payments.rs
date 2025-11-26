@@ -1,9 +1,73 @@
 //! HTTP handlers for payment processing endpoints.
+//!
+//! # Payment Flow
+//!
+//! The payment system supports multiple payment providers (Stripe, PayPal, etc.) through
+//! a unified abstraction layer. The flow works as follows:
+//!
+//! ## 1. Checkout Session Creation
+//!
+//! **Endpoint**: `POST /admin/api/v1/payments`
+//!
+//! - User initiates payment from the frontend
+//! - Backend creates a checkout session with the configured payment provider
+//! - Returns a checkout URL for the frontend to redirect the user to
+//! - Requires configured `host_url` in payment config for building redirect URLs
+//!
+//! ## 2. User Completes Payment
+//!
+//! - User is redirected to payment provider (e.g., Stripe Checkout)
+//! - User completes payment on provider's secure page
+//! - Provider redirects user back to success or cancel URL
+//!
+//! ## 3. Payment Confirmation
+//!
+//! ### Path A: Webhook (Primary, Automatic)
+//!
+//! **Endpoint**: `POST /admin/api/v1/webhooks/payments`
+//!
+//! - Payment provider sends webhook event when payment completes
+//! - Backend validates webhook signature
+//! - Processes payment and credits user account
+//! - Returns 200 OK (even on processing errors to prevent retries)
+//!
+//! ### Path B: Manual Processing (Fallback)
+//!
+//! **Endpoint**: `PATCH /admin/api/v1/payments/{session_id}`
+//!
+//! - Frontend can trigger payment processing manually using session ID
+//! - Useful when webhooks fail or for immediate confirmation
+//! - Idempotent - safe to call multiple times
+//! - Returns 402 if payment not yet completed by provider
+//!
+//! ## Idempotency
+//!
+//! Payment processing is idempotent - processing the same session multiple times
+//! (via webhooks or manual triggers) will not create duplicate transactions.
+//!
+//! ## Frontend Integration
+//!
+//! The frontend payment flow:
+//!
+//! 1. **Initiate Payment**: Call `POST /admin/api/v1/payments` to get checkout URL
+//! 2. **Redirect**: Navigate user to the returned checkout URL (payment provider page)
+//! 3. **Handle Return**: Payment provider redirects back with query parameters:
+//!    - Success: `?payment=success&session_id={SESSION_ID}`
+//!    - Cancelled: `?payment=cancelled&session_id={SESSION_ID}`
+//! 4. **Process Payment**: On success, call `PATCH /admin/api/v1/payments/{session_id}`
+//!    to confirm and apply payment to account
+//! 5. **Show Feedback**: Display appropriate UI based on result:
+//!    - Success: "Payment processed successfully"
+//!    - Error: "Payment captured but not yet applied. Will update automatically."
+//! 6. **Clean URL**: Remove query parameters from URL after processing
+//!
+//! The frontend should handle errors gracefully - if manual processing fails,
+//! the webhook will eventually process the payment automatically.
 
 use axum::{
     Json,
     extract::State,
-    http::{StatusCode, header},
+    http::StatusCode,
     response::{IntoResponse, Response},
 };
 use serde_json::json;
@@ -27,59 +91,33 @@ use crate::{AppState, api::models::users::CurrentUser, payment_providers};
     )
 )]
 #[tracing::instrument(skip_all)]
-pub async fn create_payment(
-    State(state): State<AppState>,
-    headers: axum::http::HeaderMap,
-    user: CurrentUser,
-) -> Result<Response, StatusCode> {
+pub async fn create_payment(State(state): State<AppState>, user: CurrentUser) -> Result<Response, StatusCode> {
     // Get payment provider from config (generic - works for any provider)
     let payment_config = match state.config.payment.clone() {
         Some(config) => config,
         None => {
             tracing::warn!("Checkout requested but no payment provider is configured");
             let error_response = Json(json!({
-                "error": "No payment provider configured",
-                "message": "Sorry, there's no payment provider setup. Please contact support."
+                "message": "Payment processing is currently unavailable. Please contact support."
             }));
-            return Ok((StatusCode::NOT_IMPLEMENTED, error_response).into_response());
+            return Ok((StatusCode::SERVICE_UNAVAILABLE, error_response).into_response());
         }
     };
 
-    // Build redirect URLs from configured host URL (preferred) or fallback to request headers
-    let origin = if let Some(configured_host) = payment_config.host_url() {
-        // Use configured host URL - this is the reliable, recommended approach
-        tracing::info!("Using configured host URL for checkout redirect: {}", configured_host);
-        configured_host.to_string()
-    } else {
-        // Fallback to reading from request headers (less reliable)
-        tracing::warn!("No host_url configured in payment config, falling back to request headers (unreliable)");
-        headers
-            .get(header::ORIGIN)
-            .or_else(|| headers.get(header::REFERER))
-            .and_then(|h| h.to_str().ok())
-            .and_then(|s| {
-                // If it's a referer, extract just the origin part
-                if let Ok(url) = url::Url::parse(s) {
-                    url.origin().ascii_serialization().into()
-                } else {
-                    Some(s.to_string())
-                }
-            })
-            .unwrap_or_else(|| {
-                // Fallback to constructing from Host header
-                let host = headers.get(header::HOST).and_then(|h| h.to_str().ok()).unwrap_or("localhost:3001");
-
-                // Determine protocol - check X-Forwarded-Proto for proxied requests
-                let proto = headers.get("x-forwarded-proto").and_then(|h| h.to_str().ok()).unwrap_or("http");
-
-                format!("{}://{}", proto, host)
-            })
+    // Build redirect URLs from configured host URL
+    let origin = match payment_config.host_url() {
+        Some(configured_host) => configured_host.to_string(),
+        None => {
+            tracing::error!("No host_url configured in payment config - this is required for payment processing");
+            let error_response = Json(json!({
+                "message": "Payment processing is currently unavailable. Please contact support."
+            }));
+            return Ok((StatusCode::SERVICE_UNAVAILABLE, error_response).into_response());
+        }
     };
 
     let success_url = format!("{}/cost-management?payment=success&session_id={{CHECKOUT_SESSION_ID}}", origin);
     let cancel_url = format!("{}/cost-management?payment=cancelled&session_id={{CHECKOUT_SESSION_ID}}", origin);
-
-    tracing::info!("Building checkout URLs with origin: {}", origin);
 
     let provider = payment_providers::create_provider(payment_config);
 
@@ -132,10 +170,9 @@ pub async fn process_payment(
         None => {
             tracing::warn!("Payment processing requested but no payment provider is configured");
             return Ok((
-                StatusCode::NOT_IMPLEMENTED,
+                StatusCode::SERVICE_UNAVAILABLE,
                 Json(json!({
-                    "error": "No payment provider configured",
-                    "message": "Payment provider is not configured"
+                    "message": "Payment processing is currently unavailable. Please contact support."
                 })),
             )
                 .into_response());
@@ -145,23 +182,27 @@ pub async fn process_payment(
     // Process the payment session using the provider trait
     match provider.process_payment_session(&state.db, &id).await {
         Ok(()) => Ok(Json(json!({
-            "success": true,
             "message": "Payment processed successfully"
         }))
         .into_response()),
         Err(e) => {
-            let status = StatusCode::from(e);
-            if status == StatusCode::PAYMENT_REQUIRED {
+            tracing::error!("Failed to process payment session: {:?}", e);
+            if matches!(e, payment_providers::PaymentError::PaymentNotCompleted) {
                 Ok((
                     StatusCode::PAYMENT_REQUIRED,
                     Json(json!({
-                        "error": "Payment not completed",
-                        "message": "The payment has not been completed yet"
+                        "message": "Payment is still processing. Please check back in a moment."
                     })),
                 )
                     .into_response())
             } else {
-                Err(status)
+                Ok((
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(json!({
+                        "message": "Unable to process payment. Please contact support."
+                    })),
+                )
+                    .into_response())
             }
         }
     }
@@ -207,12 +248,12 @@ pub async fn webhook_handler(State(state): State<AppState>, headers: axum::http:
         }
     };
 
-    tracing::info!("Received webhook event: {}", event.event_type);
+    tracing::trace!("Received webhook event: {}", event.event_type);
 
     // Process the webhook event
     match provider.process_webhook_event(&state.db, &event).await {
         Ok(()) => {
-            tracing::info!("Successfully processed webhook event: {}", event.event_type);
+            tracing::trace!("Successfully processed webhook event: {}", event.event_type);
             StatusCode::OK
         }
         Err(e) => {
@@ -220,5 +261,194 @@ pub async fn webhook_handler(State(state): State<AppState>, headers: axum::http:
             // Always return 200 to prevent provider retries for events we've already seen
             StatusCode::OK
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::DummyConfig;
+    use crate::{config::PaymentConfig, test_utils::create_test_config};
+    use axum::Router;
+    use axum::routing::{patch, post};
+    use axum_test::TestServer;
+    use rust_decimal::Decimal;
+    use sqlx::PgPool;
+
+    #[sqlx::test]
+    async fn test_dummy_payment_flow(pool: PgPool) {
+        // Setup config with dummy payment provider
+        let mut config = create_test_config();
+        config.payment = Some(PaymentConfig::Dummy(DummyConfig {
+            host_url: Some("http://localhost:3001".to_string()),
+            amount: Some(Decimal::new(100, 0)), // $100
+        }));
+
+        let request_manager = std::sync::Arc::new(fusillade::PostgresRequestManager::new(pool.clone()));
+        let state = AppState::builder()
+            .db(pool.clone())
+            .config(config)
+            .request_manager(request_manager)
+            .build();
+
+        // Create a test user
+        let user = crate::test_utils::create_test_user(&pool, crate::api::models::users::Role::StandardUser).await;
+        let auth_headers = crate::test_utils::add_auth_headers(&user);
+
+        let app = Router::new()
+            .route("/payments", post(create_payment))
+            .route("/payments/{id}", patch(process_payment))
+            .with_state(state);
+
+        let server = TestServer::new(app).unwrap();
+
+        // Step 1: Create checkout session
+        let mut request = server.post("/payments");
+        for (key, value) in &auth_headers {
+            request = request.add_header(key.as_str(), value.as_str());
+        }
+        let response = request.await;
+
+        response.assert_status(StatusCode::OK);
+        let checkout_response: serde_json::Value = response.json();
+        let checkout_url = checkout_response["url"].as_str().unwrap();
+
+        // Verify URL contains session_id
+        assert!(checkout_url.contains("session_id="));
+        assert!(checkout_url.contains("payment=success"));
+
+        // Extract session_id from URL
+        let url = url::Url::parse(checkout_url).unwrap();
+        let query_pairs: std::collections::HashMap<_, _> = url.query_pairs().collect();
+        let session_id = query_pairs.get("session_id").unwrap();
+
+        // Step 2: Verify NO transaction was created yet (matches real payment flow)
+        let count_before = sqlx::query!(
+            r#"
+            SELECT COUNT(*) as count
+            FROM credits_transactions
+            WHERE source_id = $1
+            "#,
+            session_id.to_string()
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(count_before.count.unwrap(), 0, "Transaction should not exist before processing");
+
+        // Step 3: Process payment to create transaction
+        let mut request = server.patch(&format!("/payments/{}", session_id));
+        for (key, value) in &auth_headers {
+            request = request.add_header(key.as_str(), value.as_str());
+        }
+        let response = request.await;
+
+        response.assert_status(StatusCode::OK);
+        let process_response: serde_json::Value = response.json();
+        assert_eq!(process_response["message"], "Payment processed successfully");
+
+        // Step 4: Verify transaction was created
+        let transaction = sqlx::query!(
+            r#"
+            SELECT amount, user_id, source_id
+            FROM credits_transactions
+            WHERE source_id = $1
+            "#,
+            session_id.to_string()
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+
+        assert_eq!(transaction.amount, Decimal::new(100, 0));
+        assert_eq!(transaction.user_id, user.id);
+
+        // Step 5: Process again to verify idempotency
+        let mut request = server.patch(&format!("/payments/{}", session_id));
+        for (key, value) in &auth_headers {
+            request = request.add_header(key.as_str(), value.as_str());
+        }
+        let response = request.await;
+
+        response.assert_status(StatusCode::OK);
+
+        // Step 6: Verify no duplicate transactions
+        let count = sqlx::query!(
+            r#"
+            SELECT COUNT(*) as count
+            FROM credits_transactions
+            WHERE source_id = $1
+            "#,
+            session_id.to_string()
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+
+        assert_eq!(count.count.unwrap(), 1, "Should only have one transaction (idempotent)");
+    }
+
+    #[sqlx::test]
+    async fn test_payment_no_provider_configured(pool: PgPool) {
+        // Setup config WITHOUT payment provider
+        let config = create_test_config();
+
+        let request_manager = std::sync::Arc::new(fusillade::PostgresRequestManager::new(pool.clone()));
+        let state = AppState::builder()
+            .db(pool.clone())
+            .config(config)
+            .request_manager(request_manager)
+            .build();
+
+        let user = crate::test_utils::create_test_user(&pool, crate::api::models::users::Role::StandardUser).await;
+        let auth_headers = crate::test_utils::add_auth_headers(&user);
+
+        let app = Router::new().route("/payments", post(create_payment)).with_state(state);
+
+        let server = TestServer::new(app).unwrap();
+
+        let mut request = server.post("/payments");
+        for (key, value) in &auth_headers {
+            request = request.add_header(key.as_str(), value.as_str());
+        }
+        let response = request.await;
+
+        response.assert_status(StatusCode::SERVICE_UNAVAILABLE);
+        let error_response: serde_json::Value = response.json();
+        assert!(error_response["message"].as_str().unwrap().contains("unavailable"));
+    }
+
+    #[sqlx::test]
+    async fn test_payment_no_host_url(pool: PgPool) {
+        // Setup config with dummy provider but NO host_url
+        let mut config = create_test_config();
+        config.payment = Some(PaymentConfig::Dummy(DummyConfig {
+            host_url: None,
+            amount: Some(Decimal::new(50, 0)),
+        }));
+
+        let request_manager = std::sync::Arc::new(fusillade::PostgresRequestManager::new(pool.clone()));
+        let state = AppState::builder()
+            .db(pool.clone())
+            .config(config)
+            .request_manager(request_manager)
+            .build();
+
+        let user = crate::test_utils::create_test_user(&pool, crate::api::models::users::Role::StandardUser).await;
+        let auth_headers = crate::test_utils::add_auth_headers(&user);
+
+        let app = Router::new().route("/payments", post(create_payment)).with_state(state);
+
+        let server = TestServer::new(app).unwrap();
+
+        let mut request = server.post("/payments");
+        for (key, value) in &auth_headers {
+            request = request.add_header(key.as_str(), value.as_str());
+        }
+        let response = request.await;
+
+        response.assert_status(StatusCode::SERVICE_UNAVAILABLE);
+        let error_response: serde_json::Value = response.json();
+        assert!(error_response["message"].as_str().unwrap().contains("unavailable"));
     }
 }
