@@ -20,7 +20,8 @@ export const queryKeys = {
       accessible?: boolean;
       search?: string;
     }) => ["models", "query", options] as const,
-    byId: (id: string) => ["models", "byId", id] as const,
+    byId: (id: string, include?: string) =>
+      ["models", "byId", id, include] as const,
   },
 
   // Groups
