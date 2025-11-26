@@ -239,7 +239,7 @@ export function Batches({
   // File actions
   const handleViewFileRequests = (file: FileObject) => {
     if ((file as any)._isEmpty) return;
-    navigate(`/batches/files/${file.id}/content`);
+    navigate(`/batches/files/${file.id}/content?returnTab=${activeTab}`);
   };
 
   const handleDeleteFile = (file: FileObject) => {

@@ -1,8 +1,8 @@
 //! Test utilities for integration testing (available with `test-utils` feature).
 
 use crate::config::{
-    BatchConfig, DaemonConfig, DaemonEnabled, FilesConfig, LeaderElectionConfig, NativeAuthConfig, OnwardsSyncConfig, PoolSettings,
-    ProbeSchedulerConfig, ProxyHeaderAuthConfig, SecurityConfig,
+    BatchConfig, DaemonConfig, DaemonEnabled, FilesConfig, LeaderElectionConfig, NativeAuthConfig, OnwardsSyncConfig, PasswordConfig,
+    PoolSettings, ProbeSchedulerConfig, ProxyHeaderAuthConfig, SecurityConfig,
 };
 use crate::db::handlers::inference_endpoints::{InferenceEndpointFilter, InferenceEndpoints};
 use crate::db::handlers::repository::Repository;
@@ -86,6 +86,14 @@ pub fn create_test_config() -> crate::config::Config {
                         path: temp_dir.to_string_lossy().to_string(),
                     },
                     ..Default::default()
+                },
+                password: PasswordConfig {
+                    min_length: 8,
+                    max_length: 64,
+                    // Ultra-weak params for fast testing (DO NOT USE IN PRODUCTION)
+                    argon2_memory_kib: 128, // 128 KB (vs 19 MB production)
+                    argon2_iterations: 1,   // 1 iteration (vs 2 production)
+                    argon2_parallelism: 1,  // 1 thread
                 },
                 ..Default::default()
             },
