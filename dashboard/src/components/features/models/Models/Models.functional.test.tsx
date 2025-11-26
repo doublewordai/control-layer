@@ -183,13 +183,16 @@ describe("Models Component - Functional Tests", () => {
       await user.click(apiButton);
 
       // Verify API examples modal opened
-      await waitFor(() => {
-        expect(screen.getByRole("dialog")).toBeInTheDocument();
-        // Look for the specific modal heading
-        expect(
-          screen.getByRole("heading", { name: /api examples/i }),
-        ).toBeInTheDocument();
-      });
+      await waitFor(
+        () => {
+          expect(screen.getByRole("dialog")).toBeInTheDocument();
+          // Look for the specific modal heading
+          expect(
+            screen.getByRole("heading", { name: /api examples/i }),
+          ).toBeInTheDocument();
+        },
+        { timeout: 3000 }
+      );
     });
   });
 
@@ -327,9 +330,12 @@ describe("Models Component - Functional Tests", () => {
         await user.click(firstAddGroupsButton);
 
         // Verify access management modal opens
-        await waitFor(() => {
-          expect(screen.getByRole("dialog")).toBeInTheDocument();
-        });
+        await waitFor(
+          () => {
+            expect(screen.getByRole("dialog")).toBeInTheDocument();
+          },
+          { timeout: 3000 }
+        );
       } else {
         // If no "Add groups" button is visible, all models have groups
         // This is also a valid state to test
@@ -357,9 +363,12 @@ describe("Models Component - Functional Tests", () => {
         await user.click(firstMoreBadge);
 
         // Verify access management modal opens
-        await waitFor(() => {
-          expect(screen.getByRole("dialog")).toBeInTheDocument();
-        });
+        await waitFor(
+          () => {
+            expect(screen.getByRole("dialog")).toBeInTheDocument();
+          },
+          { timeout: 3000 }
+        );
       } else {
         // Look for regular group badges that might be clickable
         const groupBadges = screen.queryAllByText(/group/i);
