@@ -117,6 +117,16 @@ export function CreateBatchModal({
               placeholder="e.g., Daily evaluation batch"
               value={description}
               onChange={(e) => setDescription(e.target.value)}
+              onKeyDown={(e) => {
+                if (
+                  e.key === "Enter" &&
+                  !createBatchMutation.isPending &&
+                  preselectedFile
+                ) {
+                  e.preventDefault();
+                  handleSubmit();
+                }
+              }}
               maxLength={512}
             />
             <p className="text-xs text-gray-500">
