@@ -330,150 +330,153 @@ export function ExpandableBatchFilesTable({
                           key={batch.id}
                           className={`bg-blue-50/30 border-b ${index === fileBatches.length - 1 ? "border-b-2" : ""}`}
                         >
-                          {/*<td className="px-2 py-3"></td>*/}
-                          <td colSpan={5} className="px-4 py-3">
-                            <div className="pl-6">
-                              <div className="grid grid-cols-12 gap-4 items-center text-sm">
-                                {/* Status */}
-                                <div className="col-span-2">
-                                  <div className="flex items-center gap-2">
-                                    {getStatusIcon(batch.status)}
-                                    <span
-                                      className={`inline-flex items-center px-2.5 py-0.5 rounded-full text-xs font-medium ${getStatusColor(batch.status)}`}
-                                    >
-                                      {batch.status.replace("_", " ")}
-                                    </span>
-                                  </div>
-                                </div>
+                          {/* Empty cell for chevron column */}
+                          <td className="px-2 py-3"></td>
 
-                                {/* Progress */}
-                                <div className="col-span-3">
-                                  <div className="space-y-1">
-                                    <div className="flex justify-between text-xs text-gray-600">
-                                      <span>
-                                        {completed + failed + canceled} /{" "}
-                                        {total}
-                                      </span>
-                                      <span>
-                                        {Math.round(
-                                          completedPercent +
-                                            failedPercent +
-                                            canceledPercent,
-                                        )}
-                                        %
-                                      </span>
-                                    </div>
-                                    <div className="relative h-2 w-full bg-gray-200 rounded-full overflow-hidden">
-                                      <div
-                                        className="absolute left-0 top-0 h-full bg-emerald-400 transition-all"
-                                        style={{
-                                          width: `${completedPercent}%`,
-                                        }}
-                                      />
-                                      <div
-                                        className="absolute top-0 h-full bg-rose-400 transition-all"
-                                        style={{
-                                          left: `${completedPercent}%`,
-                                          width: `${failedPercent}%`,
-                                        }}
-                                      />
-                                      {canceled > 0 && (
-                                        <div
-                                          className="absolute top-0 h-full bg-gray-400 transition-all"
-                                          style={{
-                                            left: `${completedPercent + failedPercent}%`,
-                                            width: `${canceledPercent}%`,
-                                          }}
-                                        />
-                                      )}
-                                    </div>
-                                  </div>
-                                </div>
+                          {/* Status column (aligned with Created) */}
+                          <td className="px-4 py-3">
+                            <div className="flex items-center gap-2">
+                              {getStatusIcon(batch.status)}
+                              <span
+                                className={`inline-flex items-center px-2.5 py-0.5 rounded-full text-xs font-medium ${getStatusColor(batch.status)}`}
+                              >
+                                {batch.status.replace("_", " ")}
+                              </span>
+                            </div>
+                          </td>
 
-                                {/* Duration */}
-                                <div className="col-span-2">
-                                  {duration ? (
-                                    <div className="flex items-center gap-1 text-sm text-gray-700">
-                                      <Clock className="w-3 h-3" />
-                                      {formatLongDuration(duration)}
-                                    </div>
-                                  ) : (
-                                    <span className="text-gray-400">-</span>
+                          {/* Progress bar (aligned with Filename) */}
+                          <td className="px-4 py-3">
+                            <div className="space-y-1">
+                              <div className="flex justify-between text-xs text-gray-600">
+                                <span>
+                                  {completed + failed + canceled} / {total}
+                                </span>
+                                <span>
+                                  {Math.round(
+                                    completedPercent +
+                                      failedPercent +
+                                      canceledPercent,
                                   )}
-                                </div>
-
-                                {/* Actions */}
-                                <div className="col-span-3 flex items-center gap-2 justify-end">
-                                  {outputFile && (
-                                    <Tooltip delayDuration={500}>
-                                      <TooltipTrigger asChild>
-                                        <Button
-                                          variant="ghost"
-                                          size="sm"
-                                          className="h-7 w-7 p-0 text-gray-600 hover:bg-gray-100 hover:text-gray-900 relative group/output"
-                                          onClick={(e) => {
-                                            e.stopPropagation();
-                                            onViewFileRequests(outputFile);
-                                          }}
-                                        >
-                                          <FileCheck className="h-5 w-5" />
-                                          <span className="absolute top-[5%] left-[55%] text-gray-600 group-hover/output:text-gray-900 text-[8px] font-bold leading-none border border-gray-400 group-hover/output:border-gray-900 rounded-full min-w-[12px] h-3 flex items-center justify-center bg-white px-0.5 transition-colors">
-                                            {formatNumber(outputCount)}
-                                          </span>
-                                        </Button>
-                                      </TooltipTrigger>
-                                      <TooltipContent>
-                                        View output file (
-                                        {formatNumber(outputCount)} requests)
-                                      </TooltipContent>
-                                    </Tooltip>
-                                  )}
-                                  {errorFile && (
-                                    <Tooltip delayDuration={500}>
-                                      <TooltipTrigger asChild>
-                                        <Button
-                                          variant="ghost"
-                                          size="sm"
-                                          className="h-7 w-7 p-0 text-gray-600 hover:bg-red-50 hover:text-red-600 relative group/error"
-                                          onClick={(e) => {
-                                            e.stopPropagation();
-                                            onViewFileRequests(errorFile);
-                                          }}
-                                        >
-                                          <AlertCircle className="h-5 w-5" />
-                                          <span className="absolute top-[5%] left-[55%] text-gray-600 group-hover/error:text-red-600 text-[8px] font-bold leading-none border border-gray-400 group-hover/error:border-red-600 rounded-full min-w-[12px] h-3 flex items-center justify-center bg-white px-0.5 transition-colors">
-                                            {formatNumber(errorCount)}
-                                          </span>
-                                        </Button>
-                                      </TooltipTrigger>
-                                      <TooltipContent>
-                                        View error file (
-                                        {formatNumber(errorCount)} requests)
-                                      </TooltipContent>
-                                    </Tooltip>
-                                  )}
-                                  {canCancel && (
-                                    <Tooltip delayDuration={500}>
-                                      <TooltipTrigger asChild>
-                                        <Button
-                                          variant="ghost"
-                                          size="sm"
-                                          className="h-7 w-7 p-0 text-red-600 hover:bg-red-50 hover:text-red-700"
-                                          onClick={(e) => {
-                                            e.stopPropagation();
-                                            onCancelBatch(batch);
-                                          }}
-                                        >
-                                          <XCircle className="h-4 w-4" />
-                                        </Button>
-                                      </TooltipTrigger>
-                                      <TooltipContent>
-                                        Cancel batch
-                                      </TooltipContent>
-                                    </Tooltip>
-                                  )}
-                                </div>
+                                  %
+                                </span>
                               </div>
+                              <div className="relative h-2 w-full bg-gray-200 rounded-full overflow-hidden">
+                                <div
+                                  className="absolute left-0 top-0 h-full bg-emerald-400 transition-all"
+                                  style={{
+                                    width: `${completedPercent}%`,
+                                  }}
+                                />
+                                <div
+                                  className="absolute top-0 h-full bg-rose-400 transition-all"
+                                  style={{
+                                    left: `${completedPercent}%`,
+                                    width: `${failedPercent}%`,
+                                  }}
+                                />
+                                {canceled > 0 && (
+                                  <div
+                                    className="absolute top-0 h-full bg-gray-400 transition-all"
+                                    style={{
+                                      left: `${completedPercent + failedPercent}%`,
+                                      width: `${canceledPercent}%`,
+                                    }}
+                                  />
+                                )}
+                              </div>
+                            </div>
+                          </td>
+
+                          {/* View results */}
+                          <td className="px-4 py-3 text-sm">
+                            <div className="flex items-center gap-2 justify-end">
+                              {outputFile && (
+                                <Tooltip delayDuration={500}>
+                                  <TooltipTrigger asChild>
+                                    <Button
+                                      variant="ghost"
+                                      size="sm"
+                                      className="h-7 w-7 p-0 text-gray-600 hover:bg-gray-100 hover:text-gray-900 relative group/output"
+                                      onClick={(e) => {
+                                        e.stopPropagation();
+                                        onViewFileRequests(outputFile);
+                                      }}
+                                    >
+                                      <FileCheck className="h-5 w-5" />
+                                      <span className="absolute top-[5%] left-[55%] text-gray-600 group-hover/output:text-gray-900 text-[8px] font-bold leading-none border border-gray-400 group-hover/output:border-gray-900 rounded-full min-w-[12px] h-3 flex items-center justify-center bg-white px-0.5 transition-colors">
+                                        {formatNumber(outputCount)}
+                                      </span>
+                                    </Button>
+                                  </TooltipTrigger>
+                                  <TooltipContent>
+                                    View output file (
+                                    {formatNumber(outputCount)} requests)
+                                  </TooltipContent>
+                                </Tooltip>
+                              )}
+                              {errorFile && (
+                                <Tooltip delayDuration={500}>
+                                  <TooltipTrigger asChild>
+                                    <Button
+                                      variant="ghost"
+                                      size="sm"
+                                      className="h-7 w-7 p-0 text-gray-600 hover:bg-red-50 hover:text-red-600 relative group/error"
+                                      onClick={(e) => {
+                                        e.stopPropagation();
+                                        onViewFileRequests(errorFile);
+                                      }}
+                                    >
+                                      <AlertCircle className="h-5 w-5" />
+                                      <span className="absolute top-[5%] left-[55%] text-gray-600 group-hover/error:text-red-600 text-[8px] font-bold leading-none border border-gray-400 group-hover/error:border-red-600 rounded-full min-w-[12px] h-3 flex items-center justify-center bg-white px-0.5 transition-colors">
+                                        {formatNumber(errorCount)}
+                                      </span>
+                                    </Button>
+                                  </TooltipTrigger>
+                                  <TooltipContent>
+                                    View error file ({formatNumber(errorCount)}{" "}
+                                    requests)
+                                  </TooltipContent>
+                                </Tooltip>
+                              )}
+                            </div>
+                          </td>
+
+                          {/* Batch ID (aligned with File ID) */}
+                          <td className="px-4 py-3 text-sm font-mono text-gray-600">
+                            {/*Batch ID: <br />*/}
+                            {batch.id}
+                          </td>
+
+                          {/* Duration and cancel controls */}
+                          <td className="px-4 py-3">
+                            <div className="flex items-center gap-2 justify-end">
+                              {duration ? (
+                                <div className="flex items-center gap-1 text-gray-700">
+                                  <Clock className="w-3 h-3" />
+                                  {formatLongDuration(duration)}
+                                </div>
+                              ) : (
+                                <span className="text-gray-400">-</span>
+                              )}
+                              {canCancel && (
+                                <Tooltip delayDuration={500}>
+                                  <TooltipTrigger asChild>
+                                    <Button
+                                      variant="ghost"
+                                      size="sm"
+                                      className="h-7 w-7 p-0 text-red-600 hover:bg-red-50 hover:text-red-700"
+                                      onClick={(e) => {
+                                        e.stopPropagation();
+                                        onCancelBatch(batch);
+                                      }}
+                                    >
+                                      <XCircle className="h-4 w-4" />
+                                    </Button>
+                                  </TooltipTrigger>
+                                  <TooltipContent>Cancel batch</TooltipContent>
+                                </Tooltip>
+                              )}
                             </div>
                           </td>
                         </tr>
