@@ -1,4 +1,4 @@
-import { useState, useCallback, useRef } from "react";
+import { useState } from "react";
 import { Batches } from "./Batches";
 import { UploadFileModal } from "../../../modals/CreateFileModal";
 import { CreateBatchModal } from "../../../modals/CreateBatchModal";
@@ -48,17 +48,9 @@ export function BatchesContainer() {
   // Drag and drop state
   const [droppedFile, setDroppedFile] = useState<File | undefined>();
 
-  // Ref to store batch created callback from Batches component
-  const batchCreatedCallbackRef = useRef<(() => void) | undefined>(undefined);
-
   // Mutations
   const deleteMutation = useDeleteFile();
   const cancelMutation = useCancelBatch();
-
-  // Function for Batches to register its callback
-  const registerBatchCreatedCallback = useCallback((callback: () => void) => {
-    batchCreatedCallbackRef.current = callback;
-  }, []);
 
   // Modal handlers to pass down to Batches component
   const handleOpenUploadModal = (file?: File) => {
@@ -133,7 +125,6 @@ export function BatchesContainer() {
         onOpenDownloadModal={handleOpenDownloadModal}
         onOpenDeleteDialog={handleOpenDeleteDialog}
         onOpenCancelDialog={handleOpenCancelDialog}
-        onBatchCreatedCallback={registerBatchCreatedCallback}
       />
 
       {/* All modals rendered at container level */}
@@ -159,10 +150,6 @@ export function BatchesContainer() {
         onSuccess={() => {
           setCreateBatchModalOpen(false);
           setPreselectedFile(undefined);
-          // Call the registered callback from Batches component
-          if (batchCreatedCallbackRef.current) {
-            batchCreatedCallbackRef.current();
-          }
         }}
         preselectedFile={preselectedFile}
       />
