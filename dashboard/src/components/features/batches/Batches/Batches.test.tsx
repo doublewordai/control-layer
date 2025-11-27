@@ -248,6 +248,123 @@ describe("Batches", () => {
         within(container).getByRole("tab", { name: /batches \(2\)/i }),
       ).toBeInTheDocument();
     });
+
+    it("should populate both file and batch counts on initial render", () => {
+      const useFilesSpy = vi.mocked(hooks.useFiles);
+      const useBatchesSpy = vi.mocked(hooks.useBatches);
+
+      const { container } = render(<Batches {...defaultProps} />, {
+        wrapper: createWrapper(),
+      });
+
+      // Verify both queries were called (not disabled)
+      expect(useFilesSpy).toHaveBeenCalled();
+      expect(useBatchesSpy).toHaveBeenCalled();
+
+      // Verify counts are displayed correctly in tabs
+      expect(
+        within(container).getByRole("tab", { name: /files \(2\)/i }),
+      ).toBeInTheDocument();
+      expect(
+        within(container).getByRole("tab", { name: /batches \(2\)/i }),
+      ).toBeInTheDocument();
+    });
+
+    it("should show correct counts even when starting on files tab", () => {
+      const { container } = render(<Batches {...defaultProps} />, {
+        wrapper: createWrapper(["/?tab=files"]),
+      });
+
+      // Even though we're on the files tab, batches count should be populated
+      const filesTab = within(container).getByRole("tab", {
+        name: /files \(2\)/i,
+      });
+      const batchesTab = within(container).getByRole("tab", {
+        name: /batches \(2\)/i,
+      });
+
+      expect(filesTab).toBeInTheDocument();
+      expect(batchesTab).toBeInTheDocument();
+
+      // Verify files tab is active
+      expect(filesTab).toHaveAttribute("data-state", "active");
+      expect(batchesTab).toHaveAttribute("data-state", "inactive");
+    });
+
+    it("should show '10+' when there are more than 10 files", () => {
+      // Create 11 files (10 per page + 1 to indicate more)
+      const manyFiles = Array.from({ length: 11 }, (_, i) => ({
+        id: `file-${i}`,
+        object: "file" as const,
+        bytes: 100000,
+        created_at: 1730995200,
+        expires_at: 1765065600,
+        filename: `file_${i}.jsonl`,
+        purpose: "batch" as const,
+      }));
+
+      vi.mocked(hooks.useFiles).mockReturnValue({
+        data: { data: manyFiles },
+        isLoading: false,
+        error: null,
+        refetch: vi.fn(),
+      } as any);
+
+      const { container } = render(<Batches {...defaultProps} />, {
+        wrapper: createWrapper(),
+      });
+
+      // Should show "10+" instead of "11"
+      expect(
+        within(container).getByRole("tab", { name: /files \(10\+\)/i }),
+      ).toBeInTheDocument();
+    });
+
+    it("should show '10+' when there are more than 10 batches", () => {
+      // Create 11 batches (10 per page + 1 to indicate more)
+      const manyBatches = Array.from({ length: 11 }, (_, i) => ({
+        id: `batch-${i}`,
+        object: "batch" as const,
+        endpoint: "/v1/chat/completions",
+        errors: null,
+        input_file_id: `file-${i}`,
+        completion_window: "24h",
+        status: "completed" as const,
+        output_file_id: `file-output-${i}`,
+        error_file_id: null,
+        created_at: 1730822400,
+        in_progress_at: 1730824200,
+        expires_at: 1731427200,
+        finalizing_at: 1730865600,
+        completed_at: 1730869200,
+        failed_at: null,
+        expired_at: null,
+        cancelling_at: null,
+        cancelled_at: null,
+        request_counts: {
+          total: 100,
+          completed: 98,
+          failed: 2,
+        },
+        metadata: {},
+      }));
+
+      vi.mocked(hooks.useBatches).mockReturnValue({
+        data: { data: manyBatches },
+        isLoading: false,
+        error: null,
+        refetch: vi.fn(),
+      } as any);
+
+      const { container } = render(<Batches {...defaultProps} />, {
+        wrapper: createWrapper(),
+      });
+
+      // Should show "10+" instead of "11"
+      expect(
+        within(container).getByRole("tab", { name: /batches \(10\+\)/i }),
+      ).toBeInTheDocument();
+    });
   });
 
   describe("Loading State", () => {
