@@ -114,7 +114,7 @@ pub async fn register(State(state): State<AppState>, Json(request): Json<Registe
         display_name: request.display_name,
         avatar_url: None,
         is_admin: false,
-        roles: vec![Role::StandardUser],
+        roles: state.config.auth.default_user_roles.clone(),
         auth_source: "native".to_string(),
         password_hash: Some(password_hash),
         external_user_id: None,
@@ -1930,5 +1930,85 @@ mod tests {
             .await;
 
         response.assert_status(axum::http::StatusCode::BAD_REQUEST);
+    }
+
+    #[sqlx::test]
+    async fn test_register_with_configured_default_roles(pool: PgPool) {
+        let mut config = create_test_config();
+        config.auth.native.enabled = true;
+        config.auth.native.allow_registration = true;
+        // Configure default roles to include RequestViewer in addition to StandardUser
+        config.auth.default_user_roles = vec![Role::StandardUser, Role::RequestViewer];
+
+        let request_manager = std::sync::Arc::new(fusillade::PostgresRequestManager::new(pool.clone()));
+        let state = AppState::builder()
+            .db(pool.clone())
+            .config(config)
+            .request_manager(request_manager)
+            .build();
+
+        let app = axum::Router::new()
+            .route("/auth/register", axum::routing::post(register))
+            .with_state(state);
+
+        let server = TestServer::new(app).unwrap();
+
+        let request = RegisterRequest {
+            username: "testuser".to_string(),
+            email: "test@example.com".to_string(),
+            password: "password123".to_string(),
+            display_name: Some("Test User".to_string()),
+        };
+
+        let response = server.post("/auth/register").json(&request).await;
+
+        response.assert_status(axum::http::StatusCode::CREATED);
+
+        let body: AuthResponse = response.json();
+        assert_eq!(body.user.email, "test@example.com");
+
+        // Verify the user has both StandardUser and RequestViewer roles
+        assert_eq!(body.user.roles.len(), 2);
+        assert!(body.user.roles.contains(&Role::StandardUser));
+        assert!(body.user.roles.contains(&Role::RequestViewer));
+    }
+
+    #[sqlx::test]
+    async fn test_register_standard_user_role_always_present(pool: PgPool) {
+        let mut config = create_test_config();
+        config.auth.native.enabled = true;
+        config.auth.native.allow_registration = true;
+        // Configure default roles without StandardUser - it should still be added
+        config.auth.default_user_roles = vec![Role::RequestViewer];
+
+        let request_manager = std::sync::Arc::new(fusillade::PostgresRequestManager::new(pool.clone()));
+        let state = AppState::builder()
+            .db(pool.clone())
+            .config(config)
+            .request_manager(request_manager)
+            .build();
+
+        let app = axum::Router::new()
+            .route("/auth/register", axum::routing::post(register))
+            .with_state(state);
+
+        let server = TestServer::new(app).unwrap();
+
+        let request = RegisterRequest {
+            username: "testuser2".to_string(),
+            email: "test2@example.com".to_string(),
+            password: "password123".to_string(),
+            display_name: Some("Test User 2".to_string()),
+        };
+
+        let response = server.post("/auth/register").json(&request).await;
+
+        response.assert_status(axum::http::StatusCode::CREATED);
+
+        let body: AuthResponse = response.json();
+
+        // Verify StandardUser was automatically added even though not in config
+        assert!(body.user.roles.contains(&Role::StandardUser));
+        assert!(body.user.roles.contains(&Role::RequestViewer));
     }
 }

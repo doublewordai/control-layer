@@ -729,15 +729,17 @@ mod tests {
 
     #[sqlx::test]
     #[test_log::test]
-    async fn test_request_viewer_cannot_manage_api_keys(pool: PgPool) {
+    async fn test_request_viewer_api_key_permissions(pool: PgPool) {
         let (app, _bg_services) = create_test_app(pool.clone(), false).await;
+        // Note: create_test_user automatically adds StandardUser role
+        // So request_viewer actually has [RequestViewer, StandardUser] roles
         let request_viewer = create_test_user(&pool, Role::RequestViewer).await;
-        let standard_user = create_test_user(&pool, Role::StandardUser).await;
+        let other_user = create_test_user(&pool, Role::StandardUser).await;
 
-        // RequestViewer should not be able to create API keys for themselves
+        // RequestViewer (with StandardUser) CAN create API keys for themselves
         let api_key_data = json!({
             "name": "RequestViewer Key",
-            "description": "Should not work",
+            "description": "Should work - StandardUser can manage own keys",
             "purpose": "inference"
         });
 
@@ -748,20 +750,20 @@ mod tests {
             .json(&api_key_data)
             .await;
 
-        response.assert_status_forbidden();
+        response.assert_status(axum::http::StatusCode::CREATED);
 
-        // RequestViewer should not be able to list their own API keys
+        // RequestViewer (with StandardUser) CAN list their own API keys
         let response = app
             .get("/admin/api/v1/users/current/api-keys")
             .add_header(&add_auth_headers(&request_viewer)[0].0, &add_auth_headers(&request_viewer)[0].1)
             .add_header(&add_auth_headers(&request_viewer)[1].0, &add_auth_headers(&request_viewer)[1].1)
             .await;
 
-        response.assert_status_forbidden();
+        response.assert_status_ok();
 
-        // RequestViewer should not be able to list other users' API keys
+        // RequestViewer should NOT be able to list other users' API keys (no PlatformManager role)
         let response = app
-            .get(&format!("/admin/api/v1/users/{}/api-keys", standard_user.id))
+            .get(&format!("/admin/api/v1/users/{}/api-keys", other_user.id))
             .add_header(&add_auth_headers(&request_viewer)[0].0, &add_auth_headers(&request_viewer)[0].1)
             .add_header(&add_auth_headers(&request_viewer)[1].0, &add_auth_headers(&request_viewer)[1].1)
             .await;
