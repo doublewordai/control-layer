@@ -13,22 +13,24 @@ use utoipa::ToSchema;
 /// Token-based pricing structure
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, ToSchema, Default)]
 pub struct TokenPricing {
-    #[schema(value_type = Option<f64>)]
+    /// Input price per token (sent/returned as string to preserve precision)
+    #[schema(value_type = Option<String>)]
     pub input_price_per_token: Option<Decimal>,
-    #[schema(value_type = Option<f64>)]
+    /// Output price per token (sent/returned as string to preserve precision)
+    #[schema(value_type = Option<String>)]
     pub output_price_per_token: Option<Decimal>,
 }
 
 /// Token pricing update structure for partial updates
 #[derive(Debug, Clone, Default, Serialize, Deserialize, ToSchema)]
 pub struct TokenPricingUpdate {
-    /// Update input pricing: None = no change, Some(None) = clear, Some(price) = set
+    /// Update input pricing: None = no change, Some(None) = clear, Some(price) = set (sent as string to preserve precision)
     #[serde(default, skip_serializing_if = "Option::is_none", with = "double_option")]
-    #[schema(value_type = Option<Option<f64>>)]
+    #[schema(value_type = Option<Option<String>>)]
     pub input_price_per_token: Option<Option<Decimal>>,
-    /// Update output pricing: None = no change, Some(None) = clear, Some(price) = set
+    /// Update output pricing: None = no change, Some(None) = clear, Some(price) = set (sent as string to preserve precision)
     #[serde(default, skip_serializing_if = "Option::is_none", with = "double_option")]
-    #[schema(value_type = Option<Option<f64>>)]
+    #[schema(value_type = Option<Option<String>>)]
     pub output_price_per_token: Option<Option<Decimal>>,
 }
 
@@ -37,15 +39,19 @@ pub struct TokenPricingUpdate {
 #[serde(tag = "mode", rename_all = "snake_case")]
 pub enum ProviderPricing {
     PerToken {
-        #[schema(value_type = Option<f64>)]
+        /// Input price per token (sent/returned as string to preserve precision)
+        #[schema(value_type = Option<String>)]
         input_price_per_token: Option<Decimal>,
-        #[schema(value_type = Option<f64>)]
+        /// Output price per token (sent/returned as string to preserve precision)
+        #[schema(value_type = Option<String>)]
         output_price_per_token: Option<Decimal>,
     },
     Hourly {
-        #[schema(value_type = f64)]
+        /// Hourly rate (sent/returned as string to preserve precision)
+        #[schema(value_type = String)]
         rate: Decimal,
-        #[schema(value_type = Option<f64>)]
+        /// Input token cost ratio (sent/returned as string to preserve precision)
+        #[schema(value_type = String)]
         input_token_cost_ratio: Decimal,
     },
 }
@@ -59,24 +65,24 @@ pub enum ProviderPricingUpdate {
     NoChange,
     /// Update per-token pricing fields
     PerToken {
-        /// Update input pricing: None = no change, Some(None) = clear, Some(price) = set
+        /// Update input pricing: None = no change, Some(None) = clear, Some(price) = set (sent as string to preserve precision)
         #[serde(default, skip_serializing_if = "Option::is_none", with = "double_option")]
-        #[schema(value_type = Option<Option<f64>>)]
+        #[schema(value_type = Option<Option<String>>)]
         input_price_per_token: Option<Option<Decimal>>,
-        /// Update output pricing: None = no change, Some(None) = clear, Some(price) = set
+        /// Update output pricing: None = no change, Some(None) = clear, Some(price) = set (sent as string to preserve precision)
         #[serde(default, skip_serializing_if = "Option::is_none", with = "double_option")]
-        #[schema(value_type = Option<Option<f64>>)]
+        #[schema(value_type = Option<Option<String>>)]
         output_price_per_token: Option<Option<Decimal>>,
     },
     /// Update hourly pricing fields
     Hourly {
-        /// Update hourly rate: None = no change, Some(rate) = set
+        /// Update hourly rate: None = no change, Some(rate) = set (sent as string to preserve precision)
         #[serde(default, skip_serializing_if = "Option::is_none")]
-        #[schema(value_type = Option<f64>)]
+        #[schema(value_type = Option<String>)]
         rate: Option<Decimal>,
-        /// Update input token cost ratio: None = no change, Some(ratio) = set
+        /// Update input token cost ratio: None = no change, Some(ratio) = set (sent as string to preserve precision)
         #[serde(default, skip_serializing_if = "Option::is_none")]
-        #[schema(value_type = Option<f64>)]
+        #[schema(value_type = Option<String>)]
         input_token_cost_ratio: Option<Decimal>,
     },
 }
