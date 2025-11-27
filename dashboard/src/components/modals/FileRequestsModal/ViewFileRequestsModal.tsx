@@ -76,9 +76,9 @@ export function ViewFileRequestsModal({
   const { data, isLoading } = useQuery({
     queryKey: ["file-content", file?.id, page],
     queryFn: () =>
-      dwctlApi.files.getContent(file?.id || "", {
+      dwctlApi.files.getFileContent(file?.id || "", {
         limit: pageSize,
-        offset: page * pageSize,
+        skip: page * pageSize,
       }),
     enabled: !!file?.id && isOpen,
   });

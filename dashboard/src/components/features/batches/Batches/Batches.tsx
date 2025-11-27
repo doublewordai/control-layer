@@ -20,6 +20,7 @@ import {
   SelectValue,
 } from "../../../ui/select";
 import { DataTable } from "../../../ui/data-table";
+import { CursorPagination } from "../../../ui/cursor-pagination";
 import { createFileColumns } from "../FilesTable/columns";
 import { createBatchColumns } from "../BatchesTable/columns";
 import { useFiles, useBatches } from "../../../../api/control-layer/hooks";
@@ -597,48 +598,21 @@ export function Batches({
                   </div>
                 }
               />
-              {/* Server-side pagination controls */}
-              <div className="flex items-center justify-between px-2 py-0">
-                <div className="text-sm text-gray-700">
-                  Showing {filesPage * filesPageSize + 1} -{" "}
-                  {filesPage * filesPageSize + files.length}
-                  {filesHasMore && " of many"}
-                </div>
-                <div className="flex items-center gap-2">
-                  {filesPage > 1 && (
-                    <Button
-                      variant="outline"
-                      size="sm"
-                      onClick={() => {
-                        setFilesAfterCursor(undefined);
-                        filesCursorHistory.current = []; // Clear history when jumping to first page
-                        updateFilesPagination(0, filesPageSize);
-                      }}
-                    >
-                      First
-                    </Button>
-                  )}
-                  <Button
-                    variant="outline"
-                    size="sm"
-                    onClick={handleFilesPrevPage}
-                    disabled={filesPage === 0}
-                  >
-                    Previous
-                  </Button>
-                  <span className="text-sm text-gray-700">
-                    Page {filesPage + 1}
-                  </span>
-                  <Button
-                    variant="outline"
-                    size="sm"
-                    onClick={handleFilesNextPage}
-                    disabled={!filesHasMore}
-                  >
-                    Next
-                  </Button>
-                </div>
-              </div>
+              <CursorPagination
+                currentPage={filesPage + 1}
+                itemsPerPage={filesPageSize}
+                onNextPage={handleFilesNextPage}
+                onPrevPage={handleFilesPrevPage}
+                onFirstPage={() => {
+                  setFilesAfterCursor(undefined);
+                  filesCursorHistory.current = [];
+                  updateFilesPagination(0, filesPageSize);
+                }}
+                hasNextPage={filesHasMore}
+                hasPrevPage={filesPage > 0}
+                currentPageItemCount={files.length}
+                itemName="files"
+              />
             </>
           )}
         </TabsContent>
@@ -726,48 +700,21 @@ export function Batches({
                   </div>
                 }
               />
-              {/* Server-side pagination controls */}
-              <div className="flex items-center justify-between px-2 py-0">
-                <div className="text-sm text-gray-700">
-                  Showing {batchesPage * batchesPageSize + 1} -{" "}
-                  {batchesPage * batchesPageSize + filteredBatches.length}
-                  {batchesHasMore && " of many"}
-                </div>
-                <div className="flex items-center gap-2">
-                  {batchesPage > 1 && (
-                    <Button
-                      variant="outline"
-                      size="sm"
-                      onClick={() => {
-                        setBatchesAfterCursor(undefined);
-                        batchesCursorHistory.current = []; // Clear history when jumping to first page
-                        updateBatchesPagination(0, batchesPageSize);
-                      }}
-                    >
-                      First
-                    </Button>
-                  )}
-                  <Button
-                    variant="outline"
-                    size="sm"
-                    onClick={handleBatchesPrevPage}
-                    disabled={batchesPage === 0}
-                  >
-                    Previous
-                  </Button>
-                  <span className="text-sm text-gray-700">
-                    Page {batchesPage + 1}
-                  </span>
-                  <Button
-                    variant="outline"
-                    size="sm"
-                    onClick={handleBatchesNextPage}
-                    disabled={!batchesHasMore}
-                  >
-                    Next
-                  </Button>
-                </div>
-              </div>
+              <CursorPagination
+                currentPage={batchesPage + 1}
+                itemsPerPage={batchesPageSize}
+                onNextPage={handleBatchesNextPage}
+                onPrevPage={handleBatchesPrevPage}
+                onFirstPage={() => {
+                  setBatchesAfterCursor(undefined);
+                  batchesCursorHistory.current = [];
+                  updateBatchesPagination(0, batchesPageSize);
+                }}
+                hasNextPage={batchesHasMore}
+                hasPrevPage={batchesPage > 0}
+                currentPageItemCount={filteredBatches.length}
+                itemName="batches"
+              />
             </>
           )}
         </TabsContent>
