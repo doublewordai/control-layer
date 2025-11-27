@@ -6,7 +6,6 @@ import {
   List,
   Download,
   Play,
-  Layers,
   XCircle,
   Clock,
   CheckCircle2,
@@ -121,7 +120,7 @@ export function ExpandableBatchFilesTable({
                 Size
               </th>
               <th className="px-4 py-3 text-left text-sm font-medium text-gray-700">
-                File ID
+                ID
               </th>
               <th className="px-4 py-3 text-right text-sm font-medium text-gray-700">
                 Actions
@@ -140,23 +139,22 @@ export function ExpandableBatchFilesTable({
                   {/* File Row */}
                   <tr
                     key={file.id}
-                    className="border-b hover:bg-gray-50 transition-colors"
+                    className={`border-b transition-colors ${hasBatches ? "cursor-pointer hover:bg-gray-50" : ""}`}
+                    onClick={() => {
+                      if (hasBatches) {
+                        toggleRow(file.id);
+                      }
+                    }}
                   >
                     <td className="px-2 py-3">
                       {hasBatches ? (
-                        <button
-                          className="text-gray-500 hover:text-gray-700 p-1 rounded hover:bg-gray-100 transition-colors"
-                          onClick={(e) => {
-                            e.stopPropagation();
-                            toggleRow(file.id);
-                          }}
-                        >
+                        <div className="text-gray-500 p-1">
                           {isExpanded ? (
                             <ChevronDown className="w-4 h-4" />
                           ) : (
                             <ChevronRight className="w-4 h-4" />
                           )}
-                        </button>
+                        </div>
                       ) : null}
                     </td>
                     <td className="px-4 py-3 text-sm text-gray-700">
@@ -232,27 +230,6 @@ export function ExpandableBatchFilesTable({
                             </TooltipTrigger>
                             <TooltipContent>
                               Create batch from file
-                            </TooltipContent>
-                          </Tooltip>
-                        )}
-
-                        {hasBatches && (
-                          <Tooltip delayDuration={500}>
-                            <TooltipTrigger asChild>
-                              <Button
-                                variant="ghost"
-                                size="sm"
-                                className="h-7 w-7 p-0 text-gray-700 hover:bg-gray-100 hover:text-gray-900"
-                                onClick={(e) => {
-                                  e.stopPropagation();
-                                  toggleRow(file.id);
-                                }}
-                              >
-                                <Layers className="h-4 w-4" />
-                              </Button>
-                            </TooltipTrigger>
-                            <TooltipContent>
-                              {isExpanded ? "Hide" : "Show"} batches
                             </TooltipContent>
                           </Tooltip>
                         )}
