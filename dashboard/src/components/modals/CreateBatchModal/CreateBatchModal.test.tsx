@@ -8,6 +8,8 @@ import * as hooks from "../../../api/control-layer/hooks";
 // Mock the hooks
 vi.mock("../../../api/control-layer/hooks", () => ({
   useCreateBatch: vi.fn(),
+  useUploadFile: vi.fn(),
+  useFiles: vi.fn(),
 }));
 
 // Mock sonner toast
@@ -43,6 +45,34 @@ const createWrapper = () => {
 describe("CreateBatchModal", () => {
   beforeEach(() => {
     vi.clearAllMocks();
+
+    // Default mock for useUploadFile
+    vi.mocked(hooks.useUploadFile).mockReturnValue({
+      mutateAsync: vi.fn(),
+      isPending: false,
+      isError: false,
+      error: null,
+      isSuccess: false,
+      data: undefined,
+      mutate: vi.fn(),
+      reset: vi.fn(),
+      status: "idle",
+      context: undefined,
+      failureCount: 0,
+      failureReason: null,
+      isIdle: true,
+      isPaused: false,
+      submittedAt: 0,
+      variables: undefined,
+    } as any);
+
+    // Default mock for useFiles
+    vi.mocked(hooks.useFiles).mockReturnValue({
+      data: { data: [] },
+      isLoading: false,
+      error: null,
+      refetch: vi.fn(),
+    } as any);
   });
 
   describe("Basic interactions", () => {
