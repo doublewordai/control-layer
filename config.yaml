@@ -112,6 +112,18 @@ auth:
     # auto_create_users: Automatically create users on first login
     auto_create_users: true
 
+  # Default roles assigned to newly created non-admin users
+  # Applies to both native user registration and proxy header auto-creation
+  # StandardUser role is always guaranteed to be present even if not specified
+  # Available roles:
+  #   - StandardUser: Required base role for all users (cannot be removed)
+  #   - RequestViewer: Read-only access to request logs and analytics
+  #   - BillingManager: Full access to credit system and user billing
+  #   - BatchAPIUser: Can manage files and batches for batch processing
+  # Example: To give all new users request viewing capabilities:
+  #   default_user_roles: ["StandardUser", "RequestViewer"]
+  default_user_roles: ["StandardUser"]
+
   # Security settings
   security:
     enable_csrf: true

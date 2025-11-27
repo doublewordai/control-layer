@@ -108,8 +108,14 @@ impl<'c> Repository for Users<'c> {
         .fetch_one(&mut *tx)
         .await?;
 
-        // Insert roles
-        for role in &request.roles {
+        // Ensure StandardUser role is always present
+        let mut roles_to_insert = request.roles.clone();
+        if !roles_to_insert.contains(&Role::StandardUser) {
+            roles_to_insert.push(Role::StandardUser);
+        }
+
+        // Insert roles (with StandardUser guaranteed to be included)
+        for role in &roles_to_insert {
             sqlx::query!("INSERT INTO user_roles (user_id, role) VALUES ($1, $2)", user_id, role as &Role)
                 .execute(&mut *tx)
                 .await?;
@@ -117,7 +123,7 @@ impl<'c> Repository for Users<'c> {
 
         tx.commit().await?;
 
-        Ok(UserDBResponse::from((request.roles.clone(), user)))
+        Ok(UserDBResponse::from((roles_to_insert, user)))
     }
 
     #[instrument(skip(self), fields(user_id = %abbrev_uuid(&id)), err)]
@@ -423,12 +429,13 @@ impl<'c> Users<'c> {
     /// 3. If not found, create new user
     ///
     /// Email is required for user creation. Groups are synced if provided (along with provider).
-    #[instrument(skip(self, external_user_id, email, groups_and_provider), err)]
+    #[instrument(skip(self, external_user_id, email, groups_and_provider, default_roles), err)]
     pub async fn get_or_create_proxy_header_user(
         &mut self,
         external_user_id: &str,
         email: &str,
         groups_and_provider: Option<(Vec<String>, &str)>,
+        default_roles: &[Role],
     ) -> Result<UserDBResponse> {
         tracing::trace!(
             "Starting get_or_create_proxy_header_user for external_user_id: {}",
@@ -513,7 +520,7 @@ impl<'c> Users<'c> {
                 display_name: None,
                 avatar_url: None,
                 is_admin: false,
-                roles: vec![Role::StandardUser],
+                roles: default_roles.to_vec(),
                 auth_source: "proxy-header".to_string(),
                 password_hash: None,
                 external_user_id: Some(external_user_id.to_string()),

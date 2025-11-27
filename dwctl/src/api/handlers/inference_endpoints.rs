@@ -1362,18 +1362,20 @@ mod tests {
     #[test_log::test]
     async fn test_request_viewer_can_read_endpoints_only(pool: PgPool) {
         let (app, _bg_services) = create_test_app(pool.clone(), false).await;
+        // Note: create_test_user automatically adds StandardUser role
+        // So request_viewer actually has [RequestViewer, StandardUser] roles
         let request_viewer = create_test_user(&pool, Role::RequestViewer).await;
 
-        // RequestViewer should NOT be able to list endpoints (no Endpoints permissions)
+        // RequestViewer (with StandardUser) CAN list endpoints
         let response = app
             .get("/admin/api/v1/endpoints")
             .add_header(&add_auth_headers(&request_viewer)[0].0, &add_auth_headers(&request_viewer)[0].1)
             .add_header(&add_auth_headers(&request_viewer)[1].0, &add_auth_headers(&request_viewer)[1].1)
             .await;
 
-        response.assert_status_forbidden();
+        response.assert_status_ok();
 
-        // RequestViewer should NOT be able to get specific endpoint
+        // RequestViewer (with StandardUser) CAN get specific endpoint
         let admin_user = create_test_admin_user(&pool, Role::PlatformManager).await;
         let test_endpoint_id = get_test_endpoint_id(&app, &admin_user).await;
 
@@ -1383,7 +1385,7 @@ mod tests {
             .add_header(&add_auth_headers(&request_viewer)[1].0, &add_auth_headers(&request_viewer)[1].1)
             .await;
 
-        response.assert_status_forbidden();
+        response.assert_status_ok();
 
         // RequestViewer should NOT be able to create endpoints
         let create_request = json!({
@@ -1799,17 +1801,19 @@ mod tests {
     #[test_log::test]
     async fn test_request_viewer_endpoint_access(pool: PgPool) {
         let (app, _bg_services) = create_test_app(pool.clone(), false).await;
+        // Note: create_test_user automatically adds StandardUser role
+        // So request_viewer actually has [RequestViewer, StandardUser] roles
         let request_viewer = create_test_user(&pool, Role::RequestViewer).await;
 
-        // Request viewer should NOT be able to read endpoints
+        // RequestViewer (with StandardUser) CAN read endpoints
         let response = app
             .get("/admin/api/v1/endpoints")
             .add_header(&add_auth_headers(&request_viewer)[0].0, &add_auth_headers(&request_viewer)[0].1)
             .add_header(&add_auth_headers(&request_viewer)[1].0, &add_auth_headers(&request_viewer)[1].1)
             .await;
-        response.assert_status_forbidden();
+        response.assert_status_ok();
 
-        // Request viewer should NOT be able to create endpoints
+        // RequestViewer should NOT be able to create endpoints (requires PlatformManager)
         let create_request = json!({
             "name": "Test Create Permission",
             "url": "https://api.test.com/v1"
