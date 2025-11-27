@@ -16,6 +16,12 @@ import {
 import { Button } from "../../../ui/button";
 import { Tooltip, TooltipContent, TooltipTrigger } from "../../../ui/tooltip";
 import {
+  DropdownMenu,
+  DropdownMenuCheckboxItem,
+  DropdownMenuContent,
+  DropdownMenuTrigger,
+} from "../../../ui/dropdown-menu";
+import {
   formatBytes,
   formatTimestamp,
   formatLongDuration,
@@ -34,6 +40,8 @@ interface ExpandableBatchFilesTableProps {
   getBatchFiles: (batch: Batch) => any[];
   isFileInProgress: (file: FileObject) => boolean;
 }
+
+type ColumnId = "created" | "id" | "filename" | "size";
 
 const getStatusIcon = (status: BatchStatus) => {
   switch (status) {
@@ -87,6 +95,14 @@ export function ExpandableBatchFilesTable({
   isFileInProgress,
 }: ExpandableBatchFilesTableProps) {
   const [expandedRows, setExpandedRows] = useState<Set<string>>(new Set());
+  const [columnVisibility, setColumnVisibility] = useState<
+    Record<ColumnId, boolean>
+  >({
+    created: true,
+    id: false, // ID column hidden by default
+    filename: true,
+    size: true,
+  });
 
   const toggleRow = (fileId: string) => {
     const newExpanded = new Set(expandedRows);
@@ -98,122 +114,148 @@ export function ExpandableBatchFilesTable({
     setExpandedRows(newExpanded);
   };
 
+  const toggleColumn = (columnId: ColumnId) => {
+    setColumnVisibility((prev) => ({
+      ...prev,
+      [columnId]: !prev[columnId],
+    }));
+  };
+
   // Get batches for a specific file
   const getBatchesForFile = (fileId: string) => {
     return batches.filter((batch) => batch.input_file_id === fileId);
   };
 
   return (
-    <div className="border rounded-lg overflow-hidden bg-white">
-      <div className="overflow-x-auto">
-        <table className="w-full">
-          <thead className="bg-gray-50 border-b">
-            <tr>
-              <th className="w-10 px-2"></th>
-              <th className="px-4 py-3 text-left text-sm font-medium text-gray-700">
-                Created
-              </th>
-              <th className="px-4 py-3 text-left text-sm font-medium text-gray-700">
-                Filename
-              </th>
-              <th className="px-4 py-3 text-left text-sm font-medium text-gray-700">
-                Size
-              </th>
-              <th className="px-4 py-3 text-left text-sm font-medium text-gray-700">
-                ID
-              </th>
-              <th className="px-4 py-3 text-right text-sm font-medium text-gray-700">
-                Actions
-              </th>
-            </tr>
-          </thead>
-          <tbody>
-            {files.map((file) => {
-              const fileBatches = getBatchesForFile(file.id);
-              const isExpanded = expandedRows.has(file.id);
-              const hasBatches = fileBatches.length > 0;
-              const isInProgress = isFileInProgress(file);
+    <div className="space-y-4">
+      {/* Column visibility controls */}
+      <div className="flex justify-end">
+        <DropdownMenu>
+          <DropdownMenuTrigger asChild>
+            <Button variant="outline" size="sm">
+              Columns
+            </Button>
+          </DropdownMenuTrigger>
+          <DropdownMenuContent align="end" className="w-[150px]">
+            <DropdownMenuCheckboxItem
+              checked={columnVisibility.created}
+              onCheckedChange={() => toggleColumn("created")}
+            >
+              Created
+            </DropdownMenuCheckboxItem>
+            <DropdownMenuCheckboxItem
+              checked={columnVisibility.id}
+              onCheckedChange={() => toggleColumn("id")}
+            >
+              ID
+            </DropdownMenuCheckboxItem>
+            <DropdownMenuCheckboxItem
+              checked={columnVisibility.filename}
+              onCheckedChange={() => toggleColumn("filename")}
+            >
+              Filename
+            </DropdownMenuCheckboxItem>
+            <DropdownMenuCheckboxItem
+              checked={columnVisibility.size}
+              onCheckedChange={() => toggleColumn("size")}
+            >
+              Size
+            </DropdownMenuCheckboxItem>
+          </DropdownMenuContent>
+        </DropdownMenu>
+      </div>
 
-              return (
-                <>
-                  {/* File Row */}
-                  <tr
-                    key={file.id}
-                    className={`border-b transition-colors ${hasBatches ? "cursor-pointer hover:bg-gray-50" : ""}`}
-                    onClick={() => {
-                      if (hasBatches) {
-                        toggleRow(file.id);
-                      }
-                    }}
-                  >
-                    <td className="px-2 py-3">
-                      {hasBatches ? (
-                        <div className="text-gray-500 p-1">
-                          {isExpanded ? (
-                            <ChevronDown className="w-4 h-4" />
-                          ) : (
-                            <ChevronRight className="w-4 h-4" />
+      <div className="border rounded-lg overflow-hidden bg-white">
+        <div className="overflow-x-auto">
+          <table className="w-full">
+            <thead className="bg-gray-50 border-b">
+              <tr>
+                <th className="w-10 px-2"></th>
+                {columnVisibility.created && (
+                  <th className="px-4 py-3 text-left text-sm font-medium text-gray-700">
+                    Created
+                  </th>
+                )}
+                {columnVisibility.id && (
+                  <th className="px-4 py-3 text-left text-sm font-medium text-gray-700">
+                    ID
+                  </th>
+                )}
+                {columnVisibility.filename && (
+                  <th className="px-4 py-3 text-left text-sm font-medium text-gray-700">
+                    Filename
+                  </th>
+                )}
+                {columnVisibility.size && (
+                  <th className="px-4 py-3 text-left text-sm font-medium text-gray-700">
+                    Size
+                  </th>
+                )}
+                <th className="px-4 py-3 text-right text-sm font-medium text-gray-700">
+                  Actions
+                </th>
+              </tr>
+            </thead>
+            <tbody>
+              {files.map((file) => {
+                const fileBatches = getBatchesForFile(file.id);
+                const isExpanded = expandedRows.has(file.id);
+                const hasBatches = fileBatches.length > 0;
+                const isInProgress = isFileInProgress(file);
+
+                return (
+                  <>
+                    {/* File Row */}
+                    <tr
+                      key={file.id}
+                      className={`border-b transition-colors ${hasBatches ? "cursor-pointer hover:bg-gray-50" : ""}`}
+                      onClick={() => {
+                        if (hasBatches) {
+                          toggleRow(file.id);
+                        }
+                      }}
+                    >
+                      <td className="px-2 py-3">
+                        {hasBatches ? (
+                          <div className="text-gray-500 p-1">
+                            {isExpanded ? (
+                              <ChevronDown className="w-4 h-4" />
+                            ) : (
+                              <ChevronRight className="w-4 h-4" />
+                            )}
+                          </div>
+                        ) : null}
+                      </td>
+                      {columnVisibility.created && (
+                        <td className="px-4 py-3 text-sm text-gray-700">
+                          {formatTimestamp(
+                            new Date(file.created_at * 1000).toISOString(),
                           )}
-                        </div>
-                      ) : null}
-                    </td>
-                    <td className="px-4 py-3 text-sm text-gray-700">
-                      {formatTimestamp(
-                        new Date(file.created_at * 1000).toISOString(),
+                        </td>
                       )}
-                    </td>
-                    <td className="px-4 py-3 text-sm text-gray-900 font-medium">
-                      {file.filename}
-                      {hasBatches && (
-                        <span className="ml-2 text-xs text-gray-500">
-                          ({fileBatches.length}{" "}
-                          {fileBatches.length === 1 ? "batch" : "batches"})
-                        </span>
+                      {columnVisibility.id && (
+                        <td className="px-4 py-3 text-sm font-mono text-gray-600">
+                          {file.id}
+                        </td>
                       )}
-                    </td>
-                    <td className="px-4 py-3 text-sm text-gray-700">
-                      {formatBytes(file.bytes)}
-                    </td>
-                    <td className="px-4 py-3 text-sm font-mono text-gray-600">
-                      {file.id}
-                    </td>
-                    <td className="px-4 py-3">
-                      <div className="flex items-center gap-2 justify-end -mr-2">
-                        <Tooltip delayDuration={500}>
-                          <TooltipTrigger asChild>
-                            <Button
-                              variant="ghost"
-                              size="sm"
-                              className="h-7 w-7 p-0 text-gray-700 hover:bg-gray-100 hover:text-gray-900"
-                              onClick={(e) => {
-                                e.stopPropagation();
-                                onViewFileRequests(file);
-                              }}
-                            >
-                              <List className="h-4 w-4" />
-                            </Button>
-                          </TooltipTrigger>
-                          <TooltipContent>View file contents</TooltipContent>
-                        </Tooltip>
-
-                        <Tooltip delayDuration={500}>
-                          <TooltipTrigger asChild>
-                            <Button
-                              variant="ghost"
-                              size="sm"
-                              className="h-7 w-7 p-0 text-gray-700 hover:bg-gray-100 hover:text-gray-900"
-                              onClick={(e) => {
-                                e.stopPropagation();
-                                onDownloadFileCode(file);
-                              }}
-                            >
-                              <Download className="h-4 w-4" />
-                            </Button>
-                          </TooltipTrigger>
-                          <TooltipContent>Download file</TooltipContent>
-                        </Tooltip>
-
-                        {file.purpose === "batch" && (
+                      {columnVisibility.filename && (
+                        <td className="px-4 py-3 text-sm text-gray-900 font-medium">
+                          {file.filename}
+                          {hasBatches && (
+                            <span className="ml-2 text-xs text-gray-500">
+                              ({fileBatches.length}{" "}
+                              {fileBatches.length === 1 ? "batch" : "batches"})
+                            </span>
+                          )}
+                        </td>
+                      )}
+                      {columnVisibility.size && (
+                        <td className="px-4 py-3 text-sm text-gray-700">
+                          {formatBytes(file.bytes)}
+                        </td>
+                      )}
+                      <td className="px-4 py-3">
+                        <div className="flex items-center gap-2 justify-end -mr-2">
                           <Tooltip delayDuration={500}>
                             <TooltipTrigger asChild>
                               <Button
@@ -222,248 +264,296 @@ export function ExpandableBatchFilesTable({
                                 className="h-7 w-7 p-0 text-gray-700 hover:bg-gray-100 hover:text-gray-900"
                                 onClick={(e) => {
                                   e.stopPropagation();
-                                  onTriggerBatch(file);
+                                  onViewFileRequests(file);
                                 }}
                               >
-                                <Play className="h-4 w-4" />
+                                <List className="h-4 w-4" />
+                              </Button>
+                            </TooltipTrigger>
+                            <TooltipContent>View file contents</TooltipContent>
+                          </Tooltip>
+
+                          <Tooltip delayDuration={500}>
+                            <TooltipTrigger asChild>
+                              <Button
+                                variant="ghost"
+                                size="sm"
+                                className="h-7 w-7 p-0 text-gray-700 hover:bg-gray-100 hover:text-gray-900"
+                                onClick={(e) => {
+                                  e.stopPropagation();
+                                  onDownloadFileCode(file);
+                                }}
+                              >
+                                <Download className="h-4 w-4" />
+                              </Button>
+                            </TooltipTrigger>
+                            <TooltipContent>Download file</TooltipContent>
+                          </Tooltip>
+
+                          {file.purpose === "batch" && (
+                            <Tooltip delayDuration={500}>
+                              <TooltipTrigger asChild>
+                                <Button
+                                  variant="ghost"
+                                  size="sm"
+                                  className="h-7 w-7 p-0 text-gray-700 hover:bg-gray-100 hover:text-gray-900"
+                                  onClick={(e) => {
+                                    e.stopPropagation();
+                                    onTriggerBatch(file);
+                                  }}
+                                >
+                                  <Play className="h-4 w-4" />
+                                </Button>
+                              </TooltipTrigger>
+                              <TooltipContent>
+                                Create batch from file
+                              </TooltipContent>
+                            </Tooltip>
+                          )}
+
+                          <Tooltip delayDuration={500}>
+                            <TooltipTrigger asChild>
+                              <Button
+                                variant="ghost"
+                                size="sm"
+                                className="h-8 w-8 p-0 text-gray-700 hover:bg-red-50 hover:text-red-600"
+                                onClick={(e) => {
+                                  e.stopPropagation();
+                                  onDeleteFile(file);
+                                }}
+                                disabled={isInProgress}
+                              >
+                                <Trash2 className="h-4 w-4" />
                               </Button>
                             </TooltipTrigger>
                             <TooltipContent>
-                              Create batch from file
+                              {isInProgress
+                                ? "Cannot delete - batch in progress"
+                                : "Delete file"}
                             </TooltipContent>
                           </Tooltip>
-                        )}
+                        </div>
+                      </td>
+                    </tr>
 
-                        <Tooltip delayDuration={500}>
-                          <TooltipTrigger asChild>
-                            <Button
-                              variant="ghost"
-                              size="sm"
-                              className="h-8 w-8 p-0 text-gray-700 hover:bg-red-50 hover:text-red-600"
-                              onClick={(e) => {
-                                e.stopPropagation();
-                                onDeleteFile(file);
-                              }}
-                              disabled={isInProgress}
-                            >
-                              <Trash2 className="h-4 w-4" />
-                            </Button>
-                          </TooltipTrigger>
-                          <TooltipContent>
-                            {isInProgress
-                              ? "Cannot delete - batch in progress"
-                              : "Delete file"}
-                          </TooltipContent>
-                        </Tooltip>
-                      </div>
-                    </td>
-                  </tr>
+                    {/* Expanded Batch Rows */}
+                    {isExpanded &&
+                      fileBatches.map((batch, index) => {
+                        const batchFiles = getBatchFiles(batch);
+                        const outputFile = batchFiles.find(
+                          (f: any) => f.purpose === "batch_output",
+                        );
+                        const errorFile = batchFiles.find(
+                          (f: any) => f.purpose === "batch_error",
+                        );
+                        const canCancel = [
+                          "validating",
+                          "in_progress",
+                          "finalizing",
+                        ].includes(batch.status);
 
-                  {/* Expanded Batch Rows */}
-                  {isExpanded &&
-                    fileBatches.map((batch, index) => {
-                      const batchFiles = getBatchFiles(batch);
-                      const outputFile = batchFiles.find(
-                        (f: any) => f.purpose === "batch_output",
-                      );
-                      const errorFile = batchFiles.find(
-                        (f: any) => f.purpose === "batch_error",
-                      );
-                      const canCancel = [
-                        "validating",
-                        "in_progress",
-                        "finalizing",
-                      ].includes(batch.status);
+                        const outputCount = batch.request_counts.completed;
+                        const errorCount = batch.request_counts.failed;
 
-                      const outputCount = batch.request_counts.completed;
-                      const errorCount = batch.request_counts.failed;
+                        const { total, completed, failed } =
+                          batch.request_counts;
+                        const canceled =
+                          batch.status === "cancelled"
+                            ? Math.max(0, total - completed - failed)
+                            : 0;
+                        const completedPercent =
+                          total > 0 ? (completed / total) * 100 : 0;
+                        const failedPercent =
+                          total > 0 ? (failed / total) * 100 : 0;
+                        const canceledPercent =
+                          total > 0 ? (canceled / total) * 100 : 0;
 
-                      const { total, completed, failed } = batch.request_counts;
-                      const canceled =
-                        batch.status === "cancelled"
-                          ? Math.max(0, total - completed - failed)
-                          : 0;
-                      const completedPercent =
-                        total > 0 ? (completed / total) * 100 : 0;
-                      const failedPercent =
-                        total > 0 ? (failed / total) * 100 : 0;
-                      const canceledPercent =
-                        total > 0 ? (canceled / total) * 100 : 0;
+                        const startTime = batch.in_progress_at
+                          ? batch.in_progress_at * 1000
+                          : null;
+                        const endTime = batch.completed_at
+                          ? batch.completed_at * 1000
+                          : batch.failed_at
+                            ? batch.failed_at * 1000
+                            : batch.cancelled_at
+                              ? batch.cancelled_at * 1000
+                              : Date.now();
+                        const duration = startTime ? endTime - startTime : null;
 
-                      const startTime = batch.in_progress_at
-                        ? batch.in_progress_at * 1000
-                        : null;
-                      const endTime = batch.completed_at
-                        ? batch.completed_at * 1000
-                        : batch.failed_at
-                          ? batch.failed_at * 1000
-                          : batch.cancelled_at
-                            ? batch.cancelled_at * 1000
-                            : Date.now();
-                      const duration = startTime ? endTime - startTime : null;
+                        return (
+                          <tr
+                            key={batch.id}
+                            className={`bg-blue-50/30 border-b ${index === fileBatches.length - 1 ? "border-b-2" : ""}`}
+                          >
+                            {/* Empty cell for chevron column */}
+                            <td className="px-2 py-3"></td>
 
-                      return (
-                        <tr
-                          key={batch.id}
-                          className={`bg-blue-50/30 border-b ${index === fileBatches.length - 1 ? "border-b-2" : ""}`}
-                        >
-                          {/* Empty cell for chevron column */}
-                          <td className="px-2 py-3"></td>
+                            {/* Status column (aligned with Created) */}
+                            {columnVisibility.created && (
+                              <td className="px-4 py-3">
+                                <div className="flex items-center gap-2">
+                                  {getStatusIcon(batch.status)}
+                                  <span
+                                    className={`inline-flex items-center px-2.5 py-0.5 rounded-full text-xs font-medium ${getStatusColor(batch.status)}`}
+                                  >
+                                    {batch.status.replace("_", " ")}
+                                  </span>
+                                </div>
+                              </td>
+                            )}
 
-                          {/* Status column (aligned with Created) */}
-                          <td className="px-4 py-3">
-                            <div className="flex items-center gap-2">
-                              {getStatusIcon(batch.status)}
-                              <span
-                                className={`inline-flex items-center px-2.5 py-0.5 rounded-full text-xs font-medium ${getStatusColor(batch.status)}`}
-                              >
-                                {batch.status.replace("_", " ")}
-                              </span>
-                            </div>
-                          </td>
+                            {/* Batch ID (aligned with ID column) */}
+                            {columnVisibility.id && (
+                              <td className="px-4 py-3 text-sm font-mono text-gray-600">
+                                {batch.id}
+                              </td>
+                            )}
 
-                          {/* Progress bar (aligned with Filename) */}
-                          <td className="px-4 py-3">
-                            <div className="space-y-1">
-                              <div className="flex justify-between text-xs text-gray-600">
-                                <span>
-                                  {completed + failed + canceled} / {total}
-                                </span>
-                                <span>
-                                  {Math.round(
-                                    completedPercent +
-                                      failedPercent +
-                                      canceledPercent,
+                            {/* Progress bar (aligned with Filename) */}
+                            {columnVisibility.filename && (
+                              <td className="px-4 py-3">
+                                <div className="space-y-1">
+                                  <div className="flex justify-between text-xs text-gray-600">
+                                    <span>
+                                      {completed + failed + canceled} / {total}
+                                    </span>
+                                    <span>
+                                      {Math.round(
+                                        completedPercent +
+                                          failedPercent +
+                                          canceledPercent,
+                                      )}
+                                      %
+                                    </span>
+                                  </div>
+                                  <div className="relative h-2 w-full bg-gray-200 rounded-full overflow-hidden">
+                                    <div
+                                      className="absolute left-0 top-0 h-full bg-emerald-400 transition-all"
+                                      style={{
+                                        width: `${completedPercent}%`,
+                                      }}
+                                    />
+                                    <div
+                                      className="absolute top-0 h-full bg-rose-400 transition-all"
+                                      style={{
+                                        left: `${completedPercent}%`,
+                                        width: `${failedPercent}%`,
+                                      }}
+                                    />
+                                    {canceled > 0 && (
+                                      <div
+                                        className="absolute top-0 h-full bg-gray-400 transition-all"
+                                        style={{
+                                          left: `${completedPercent + failedPercent}%`,
+                                          width: `${canceledPercent}%`,
+                                        }}
+                                      />
+                                    )}
+                                  </div>
+                                </div>
+                              </td>
+                            )}
+
+                            {/* View results (aligned with Size) */}
+                            {columnVisibility.size && (
+                              <td className="px-4 py-3 text-sm">
+                                <div className="flex items-center gap-2 justify-start">
+                                  {duration ? (
+                                    <div className="flex items-center gap-1 text-sm text-gray-700">
+                                      <Clock className="w-3 h-3" />
+                                      {formatLongDuration(duration)}
+                                    </div>
+                                  ) : (
+                                    <span className="text-sm text-gray-400">
+                                      -
+                                    </span>
                                   )}
-                                  %
-                                </span>
-                              </div>
-                              <div className="relative h-2 w-full bg-gray-200 rounded-full overflow-hidden">
-                                <div
-                                  className="absolute left-0 top-0 h-full bg-emerald-400 transition-all"
-                                  style={{
-                                    width: `${completedPercent}%`,
-                                  }}
-                                />
-                                <div
-                                  className="absolute top-0 h-full bg-rose-400 transition-all"
-                                  style={{
-                                    left: `${completedPercent}%`,
-                                    width: `${failedPercent}%`,
-                                  }}
-                                />
-                                {canceled > 0 && (
-                                  <div
-                                    className="absolute top-0 h-full bg-gray-400 transition-all"
-                                    style={{
-                                      left: `${completedPercent + failedPercent}%`,
-                                      width: `${canceledPercent}%`,
-                                    }}
-                                  />
+                                </div>
+                              </td>
+                            )}
+
+                            {/* Actions (aligned with Actions column) */}
+                            <td className="px-4 py-3">
+                              <div className="flex items-center gap-2 justify-end -mr-2">
+                                {outputFile && (
+                                  <Tooltip delayDuration={500}>
+                                    <TooltipTrigger asChild>
+                                      <Button
+                                        variant="ghost"
+                                        size="sm"
+                                        className="h-7 w-7 p-0 text-gray-600 hover:bg-gray-100 hover:text-gray-900 relative group/output"
+                                        onClick={(e) => {
+                                          e.stopPropagation();
+                                          onViewFileRequests(outputFile);
+                                        }}
+                                      >
+                                        <FileCheck className="h-5 w-5" />
+                                        <span className="absolute top-[5%] left-[55%] text-gray-600 group-hover/output:text-gray-900 text-[8px] font-bold leading-none border border-gray-400 group-hover/output:border-gray-900 rounded-full min-w-[12px] h-3 flex items-center justify-center bg-white px-0.5 transition-colors">
+                                          {formatNumber(outputCount)}
+                                        </span>
+                                      </Button>
+                                    </TooltipTrigger>
+                                    <TooltipContent>
+                                      View output file (
+                                      {formatNumber(outputCount)} requests)
+                                    </TooltipContent>
+                                  </Tooltip>
+                                )}
+                                {errorFile && (
+                                  <Tooltip delayDuration={500}>
+                                    <TooltipTrigger asChild>
+                                      <Button
+                                        variant="ghost"
+                                        size="sm"
+                                        className="h-7 w-7 p-0 text-gray-600 hover:bg-red-50 hover:text-red-600 relative group/error"
+                                        onClick={(e) => {
+                                          e.stopPropagation();
+                                          onViewFileRequests(errorFile);
+                                        }}
+                                      >
+                                        <AlertCircle className="h-5 w-5" />
+                                        <span className="absolute top-[5%] left-[55%] text-gray-600 group-hover/error:text-red-600 text-[8px] font-bold leading-none border border-gray-400 group-hover/error:border-red-600 rounded-full min-w-[12px] h-3 flex items-center justify-center bg-white px-0.5 transition-colors">
+                                          {formatNumber(errorCount)}
+                                        </span>
+                                      </Button>
+                                    </TooltipTrigger>
+                                    <TooltipContent>
+                                      View error file (
+                                      {formatNumber(errorCount)} requests)
+                                    </TooltipContent>
+                                  </Tooltip>
+                                )}
+                                {canCancel && (
+                                  <Tooltip delayDuration={500}>
+                                    <TooltipTrigger asChild>
+                                      <Button
+                                        variant="ghost"
+                                        size="sm"
+                                        className="h-7 w-7 p-0 text-red-600 hover:bg-red-50 hover:text-red-700"
+                                        onClick={(e) => {
+                                          e.stopPropagation();
+                                          onCancelBatch(batch);
+                                        }}
+                                      >
+                                        <XCircle className="h-4 w-4" />
+                                      </Button>
+                                    </TooltipTrigger>
+                                    <TooltipContent>
+                                      Cancel batch
+                                    </TooltipContent>
+                                  </Tooltip>
                                 )}
                               </div>
-                            </div>
-                          </td>
-
-                          {/* View results */}
-                          <td className="px-4 py-3 text-sm">
-                            <div className="flex items-center gap-2 justify-end">
-                              {outputFile && (
-                                <Tooltip delayDuration={500}>
-                                  <TooltipTrigger asChild>
-                                    <Button
-                                      variant="ghost"
-                                      size="sm"
-                                      className="h-7 w-7 p-0 text-gray-600 hover:bg-gray-100 hover:text-gray-900 relative group/output"
-                                      onClick={(e) => {
-                                        e.stopPropagation();
-                                        onViewFileRequests(outputFile);
-                                      }}
-                                    >
-                                      <FileCheck className="h-5 w-5" />
-                                      <span className="absolute top-[5%] left-[55%] text-gray-600 group-hover/output:text-gray-900 text-[8px] font-bold leading-none border border-gray-400 group-hover/output:border-gray-900 rounded-full min-w-[12px] h-3 flex items-center justify-center bg-white px-0.5 transition-colors">
-                                        {formatNumber(outputCount)}
-                                      </span>
-                                    </Button>
-                                  </TooltipTrigger>
-                                  <TooltipContent>
-                                    View output file (
-                                    {formatNumber(outputCount)} requests)
-                                  </TooltipContent>
-                                </Tooltip>
-                              )}
-                              {errorFile && (
-                                <Tooltip delayDuration={500}>
-                                  <TooltipTrigger asChild>
-                                    <Button
-                                      variant="ghost"
-                                      size="sm"
-                                      className="h-7 w-7 p-0 text-gray-600 hover:bg-red-50 hover:text-red-600 relative group/error"
-                                      onClick={(e) => {
-                                        e.stopPropagation();
-                                        onViewFileRequests(errorFile);
-                                      }}
-                                    >
-                                      <AlertCircle className="h-5 w-5" />
-                                      <span className="absolute top-[5%] left-[55%] text-gray-600 group-hover/error:text-red-600 text-[8px] font-bold leading-none border border-gray-400 group-hover/error:border-red-600 rounded-full min-w-[12px] h-3 flex items-center justify-center bg-white px-0.5 transition-colors">
-                                        {formatNumber(errorCount)}
-                                      </span>
-                                    </Button>
-                                  </TooltipTrigger>
-                                  <TooltipContent>
-                                    View error file ({formatNumber(errorCount)}{" "}
-                                    requests)
-                                  </TooltipContent>
-                                </Tooltip>
-                              )}
-                            </div>
-                          </td>
-
-                          {/* Batch ID (aligned with File ID) */}
-                          <td className="px-4 py-3 text-sm font-mono text-gray-600">
-                            {/*Batch ID: <br />*/}
-                            {batch.id}
-                          </td>
-
-                          {/* Duration and cancel controls */}
-                          <td className="px-4 py-3">
-                            <div className="flex items-center gap-2 justify-end">
-                              {duration ? (
-                                <div className="flex items-center gap-1 text-gray-700">
-                                  <Clock className="w-3 h-3" />
-                                  {formatLongDuration(duration)}
-                                </div>
-                              ) : (
-                                <span className="text-gray-400">-</span>
-                              )}
-                              {canCancel && (
-                                <Tooltip delayDuration={500}>
-                                  <TooltipTrigger asChild>
-                                    <Button
-                                      variant="ghost"
-                                      size="sm"
-                                      className="h-7 w-7 p-0 text-red-600 hover:bg-red-50 hover:text-red-700"
-                                      onClick={(e) => {
-                                        e.stopPropagation();
-                                        onCancelBatch(batch);
-                                      }}
-                                    >
-                                      <XCircle className="h-4 w-4" />
-                                    </Button>
-                                  </TooltipTrigger>
-                                  <TooltipContent>Cancel batch</TooltipContent>
-                                </Tooltip>
-                              )}
-                            </div>
-                          </td>
-                        </tr>
-                      );
-                    })}
-                </>
-              );
-            })}
-          </tbody>
-        </table>
+                            </td>
+                          </tr>
+                        );
+                      })}
+                  </>
+                );
+              })}
+            </tbody>
+          </table>
+        </div>
       </div>
     </div>
   );
