@@ -185,18 +185,24 @@ describe("Batches - Pagination", () => {
         ).toBeInTheDocument();
       });
 
-      // Verify we're on page 1
-      expect(within(container).getByText(/Page 1/i)).toBeInTheDocument();
+      // Verify we're on page 1 - look for the active pagination link
+      const activePage = within(container).getByRole("link", {
+        current: "page",
+      });
+      expect(activePage).toHaveTextContent("1");
 
-      // Click Next button
-      const nextButton = within(container).getByRole("button", {
-        name: /Next/i,
+      // Click Next button - uses aria-label "Go to next page"
+      const nextButton = within(container).getByRole("link", {
+        name: /go to next page/i,
       });
       await user.click(nextButton);
 
       // Verify page 2 is shown
       await waitFor(() => {
-        expect(within(container).getByText(/Page 2/i)).toBeInTheDocument();
+        const activePage2 = within(container).getByRole("link", {
+          current: "page",
+        });
+        expect(activePage2).toHaveTextContent("2");
       });
 
       // Verify the correct cursor was used (last item from page 1)
@@ -280,28 +286,34 @@ describe("Batches - Pagination", () => {
       });
 
       // Navigate to page 2
-      const nextButton = within(container).getByRole("button", {
-        name: /Next/i,
+      const nextButton = within(container).getByRole("link", {
+        name: /go to next page/i,
       });
       await user.click(nextButton);
 
       await waitFor(() => {
-        expect(within(container).getByText(/Page 2/i)).toBeInTheDocument();
+        const activePage2 = within(container).getByRole("link", {
+          current: "page",
+        });
+        expect(activePage2).toHaveTextContent("2");
       });
 
       // Now click Previous - should go back to page 1 using cursor history
-      const prevButton = within(container).getByRole("button", {
-        name: /Previous/i,
+      const prevButton = within(container).getByRole("link", {
+        name: /go to previous page/i,
       });
       await user.click(prevButton);
 
       // Should be back on page 1
       await waitFor(() => {
-        expect(within(container).getByText(/Page 1/i)).toBeInTheDocument();
+        const activePage1 = within(container).getByRole("link", {
+          current: "page",
+        });
+        expect(activePage1).toHaveTextContent("1");
       });
 
-      // The previous button should now be disabled (we're on page 0)
-      expect(prevButton).toBeDisabled();
+      // The previous button should have pointer-events-none class (disabled)
+      expect(prevButton).toHaveClass("pointer-events-none");
     });
 
     it("should show First button only when on page 2 or higher", async () => {
@@ -385,37 +397,43 @@ describe("Batches - Pagination", () => {
 
       // Page 1: No First button
       expect(
-        within(container).queryByRole("button", { name: /First/i }),
+        within(container).queryByRole("link", { name: /First/i }),
       ).not.toBeInTheDocument();
 
       // Navigate to page 2
-      const nextButton = within(container).getByRole("button", {
-        name: /Next/i,
+      const nextButton = within(container).getByRole("link", {
+        name: /go to next page/i,
       });
       await user.click(nextButton);
 
       await waitFor(() => {
-        expect(within(container).getByText(/Page 2/i)).toBeInTheDocument();
+        const activePage2 = within(container).getByRole("link", {
+          current: "page",
+        });
+        expect(activePage2).toHaveTextContent("2");
       });
 
-      // Page 2: Still no First button (only shows on page 3+)
+      // Page 2: First button should now appear (currentPage > 1)
       expect(
-        within(container).queryByRole("button", { name: /First/i }),
-      ).not.toBeInTheDocument();
+        within(container).getByRole("link", { name: /First/i }),
+      ).toBeInTheDocument();
 
       // Navigate to page 3
-      const nextButton2 = within(container).getByRole("button", {
-        name: /Next/i,
+      const nextButton2 = within(container).getByRole("link", {
+        name: /go to next page/i,
       });
       await user.click(nextButton2);
 
       await waitFor(() => {
-        expect(within(container).getByText(/Page 3/i)).toBeInTheDocument();
+        const activePage3 = within(container).getByRole("link", {
+          current: "page",
+        });
+        expect(activePage3).toHaveTextContent("3");
       });
 
-      // Page 3: First button should appear
+      // Page 3: First button should still appear
       expect(
-        within(container).getByRole("button", { name: /First/i }),
+        within(container).getByRole("link", { name: /First/i }),
       ).toBeInTheDocument();
     });
 
@@ -512,36 +530,45 @@ describe("Batches - Pagination", () => {
       });
 
       // Navigate to page 2, then page 3
-      const nextButton = within(container).getByRole("button", {
-        name: /Next/i,
+      const nextButton = within(container).getByRole("link", {
+        name: /go to next page/i,
       });
       await user.click(nextButton);
       await waitFor(() => {
-        expect(within(container).getByText(/Page 2/i)).toBeInTheDocument();
+        const activePage2 = within(container).getByRole("link", {
+          current: "page",
+        });
+        expect(activePage2).toHaveTextContent("2");
       });
 
-      const nextButton2 = within(container).getByRole("button", {
-        name: /Next/i,
+      const nextButton2 = within(container).getByRole("link", {
+        name: /go to next page/i,
       });
       await user.click(nextButton2);
       await waitFor(() => {
-        expect(within(container).getByText(/Page 3/i)).toBeInTheDocument();
+        const activePage3 = within(container).getByRole("link", {
+          current: "page",
+        });
+        expect(activePage3).toHaveTextContent("3");
       });
 
       // Click First button
-      const firstButton = within(container).getByRole("button", {
+      const firstButton = within(container).getByRole("link", {
         name: /First/i,
       });
       await user.click(firstButton);
 
       // Should be back on page 1
       await waitFor(() => {
-        expect(within(container).getByText(/Page 1/i)).toBeInTheDocument();
+        const activePage1 = within(container).getByRole("link", {
+          current: "page",
+        });
+        expect(activePage1).toHaveTextContent("1");
       });
 
       // First button should no longer be visible
       expect(
-        within(container).queryByRole("button", { name: /First/i }),
+        within(container).queryByRole("link", { name: /First/i }),
       ).not.toBeInTheDocument();
     });
 
@@ -616,13 +643,16 @@ describe("Batches - Pagination", () => {
       });
 
       // Navigate to page 2
-      const nextButton = within(container).getByRole("button", {
-        name: /Next/i,
+      const nextButton = within(container).getByRole("link", {
+        name: /go to next page/i,
       });
       await user.click(nextButton);
 
       await waitFor(() => {
-        expect(within(container).getByText(/Page 2/i)).toBeInTheDocument();
+        const activePage2 = within(container).getByRole("link", {
+          current: "page",
+        });
+        expect(activePage2).toHaveTextContent("2");
       });
 
       // Change page size by clicking the combobox trigger
@@ -643,13 +673,17 @@ describe("Batches - Pagination", () => {
 
       // Should reset to page 1 after changing page size
       await waitFor(() => {
-        expect(within(container).getByText(/Page 1/i)).toBeInTheDocument();
+        const activePage1 = within(container).getByRole("link", {
+          current: "page",
+        });
+        expect(activePage1).toHaveTextContent("1");
       });
 
-      // Previous button should be disabled (back at page 1)
-      expect(
-        within(container).getByRole("button", { name: /Previous/i }),
-      ).toBeDisabled();
+      // Previous button should have pointer-events-none class (disabled)
+      const prevButton = within(container).getByRole("link", {
+        name: /go to previous page/i,
+      });
+      expect(prevButton).toHaveClass("pointer-events-none");
     });
   });
 
@@ -714,17 +748,23 @@ describe("Batches - Pagination", () => {
       );
 
       await waitFor(() => {
-        expect(within(container).getByText(/Page 1/i)).toBeInTheDocument();
+        const activePage = within(container).getByRole("link", {
+          current: "page",
+        });
+        expect(activePage).toHaveTextContent("1");
       });
 
       // Navigate to page 2
-      const nextButton = within(container).getByRole("button", {
-        name: /Next/i,
+      const nextButton = within(container).getByRole("link", {
+        name: /go to next page/i,
       });
       await user.click(nextButton);
 
       await waitFor(() => {
-        expect(within(container).getByText(/Page 2/i)).toBeInTheDocument();
+        const activePage2 = within(container).getByRole("link", {
+          current: "page",
+        });
+        expect(activePage2).toHaveTextContent("2");
       });
     });
 
@@ -788,31 +828,40 @@ describe("Batches - Pagination", () => {
       );
 
       await waitFor(() => {
-        expect(within(container).getByText(/Page 1/i)).toBeInTheDocument();
+        const activePage = within(container).getByRole("link", {
+          current: "page",
+        });
+        expect(activePage).toHaveTextContent("1");
       });
 
       // Navigate to page 2
-      const nextButton = within(container).getByRole("button", {
-        name: /Next/i,
+      const nextButton = within(container).getByRole("link", {
+        name: /go to next page/i,
       });
       await user.click(nextButton);
 
       await waitFor(() => {
-        expect(within(container).getByText(/Page 2/i)).toBeInTheDocument();
+        const activePage2 = within(container).getByRole("link", {
+          current: "page",
+        });
+        expect(activePage2).toHaveTextContent("2");
       });
 
       // Navigate back to page 1
-      const prevButton = within(container).getByRole("button", {
-        name: /Previous/i,
+      const prevButton = within(container).getByRole("link", {
+        name: /go to previous page/i,
       });
       await user.click(prevButton);
 
       await waitFor(() => {
-        expect(within(container).getByText(/Page 1/i)).toBeInTheDocument();
+        const activePage1 = within(container).getByRole("link", {
+          current: "page",
+        });
+        expect(activePage1).toHaveTextContent("1");
       });
 
-      // Previous button should be disabled on page 1
-      expect(prevButton).toBeDisabled();
+      // Previous button should have pointer-events-none class (disabled) on page 1
+      expect(prevButton).toHaveClass("pointer-events-none");
     });
   });
 });

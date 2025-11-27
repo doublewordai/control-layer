@@ -796,7 +796,9 @@ const paymentsApi = {
 
     if (!response.ok) {
       const errorData = await response.json().catch(() => ({}));
-      throw new Error(errorData.message || `Failed to create payment: ${response.status}`);
+      throw new Error(
+        errorData.message || `Failed to create payment: ${response.status}`,
+      );
     }
 
     return response.json();
@@ -1046,13 +1048,13 @@ const filesApi = {
 
   // Get file content as JSONL (supports limit/offset query params)
   // Returns content, whether there are more results, and the last line number
-  async getContent(
+  async getFileContent(
     id: string,
-    options?: { limit?: number; offset?: number },
+    options?: { limit?: number; skip?: number },
   ): Promise<{ content: string; incomplete: boolean; lastLine: number }> {
     const params = new URLSearchParams();
     if (options?.limit) params.set("limit", options.limit.toString());
-    if (options?.offset) params.set("offset", options.offset.toString());
+    if (options?.skip) params.set("skip", options.skip.toString());
 
     const url = `/ai/v1/files/${id}/content${params.toString() ? "?" + params.toString() : ""}`;
     const response = await fetch(url);

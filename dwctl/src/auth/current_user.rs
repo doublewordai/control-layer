@@ -152,7 +152,7 @@ async fn try_proxy_header_auth(
     // Get or create user with group sync (only if auto_create is enabled)
     let user_result = if config.auth.proxy_header.auto_create_users {
         match user_repo
-            .get_or_create_proxy_header_user(external_user_id, user_email, groups_and_provider)
+            .get_or_create_proxy_header_user(external_user_id, user_email, groups_and_provider, &config.auth.default_user_roles)
             .await
         {
             Ok(user) => Some(CurrentUser {

@@ -75,6 +75,7 @@ use std::path::PathBuf;
 use std::time::Duration;
 use url::Url;
 
+use crate::api::models::users::Role;
 use crate::errors::Error;
 
 // DB sync channel name
@@ -384,7 +385,6 @@ pub struct ModelSource {
 /// Authentication configuration for all supported auth methods.
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(default)]
-#[derive(Default)]
 pub struct AuthConfig {
     /// Native username/password authentication
     pub native: NativeAuthConfig,
@@ -392,6 +392,21 @@ pub struct AuthConfig {
     pub proxy_header: ProxyHeaderAuthConfig,
     /// Security settings (JWT, CORS, etc.)
     pub security: SecurityConfig,
+    /// Default roles assigned to newly created non-admin users
+    /// Applies to user registration and proxy header auth auto-creation
+    /// StandardUser role is always guaranteed to be present even if not specified
+    pub default_user_roles: Vec<Role>,
+}
+
+impl Default for AuthConfig {
+    fn default() -> Self {
+        Self {
+            native: NativeAuthConfig::default(),
+            proxy_header: ProxyHeaderAuthConfig::default(),
+            security: SecurityConfig::default(),
+            default_user_roles: vec![Role::StandardUser],
+        }
+    }
 }
 
 /// Native username/password authentication configuration.

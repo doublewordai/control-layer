@@ -102,6 +102,7 @@ pub fn create_test_config() -> crate::config::Config {
                 ..Default::default()
             },
             security: SecurityConfig::default(),
+            default_user_roles: vec![crate::api::models::users::Role::StandardUser],
         },
         enable_metrics: false,
         enable_request_logging: false,

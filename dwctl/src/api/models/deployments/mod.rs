@@ -25,7 +25,7 @@ pub struct ListModelsQuery {
     #[param(value_type = Option<String>, format = "uuid")]
     #[schema(value_type = Option<String>, format = "uuid")]
     pub endpoint: Option<InferenceEndpointId>,
-    /// Include related data (comma-separated: "groups", "metrics")
+    /// Include related data (comma-separated: "groups", "metrics", "status", "pricing", "endpoints")
     pub include: Option<String>,
     /// Show deleted models when true, non-deleted when false, all when not specified (admin only for deleted=true)
     pub deleted: Option<bool>,
@@ -44,7 +44,7 @@ pub struct GetModelQuery {
     pub deleted: Option<bool>,
     /// Show inactive model when true, 404 when false/unspecified if model is inactive
     pub inactive: Option<bool>,
-    /// Include related data (comma-separated: "groups", "metrics")
+    /// Include related data (comma-separated: "groups", "metrics", "status", "pricing", "endpoints")
     pub include: Option<String>,
 }
 
@@ -195,6 +195,9 @@ pub struct DeployedModelResponse {
     /// Provider/downstream pricing details (only included if requested and user has Pricing::ReadAll)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub downstream_pricing: Option<ProviderPricing>,
+    /// Inference endpoint information (only included if requested)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub endpoint: Option<super::inference_endpoints::InferenceEndpointResponse>,
 }
 
 impl From<DeploymentDBResponse> for DeployedModelResponse {
@@ -219,6 +222,7 @@ impl From<DeploymentDBResponse> for DeployedModelResponse {
             status: None,             // By default, probe status is not included
             pricing: None,            // By default, pricing is not included (opt-in via include)
             downstream_pricing: None, // By default, downstream pricing is not included
+            endpoint: None,           // By default, endpoint is not included
         }
     }
 }
@@ -258,6 +262,12 @@ impl DeployedModelResponse {
     pub fn mask_rate_limiting(mut self) -> Self {
         self.requests_per_second = None;
         self.burst_size = None;
+        self
+    }
+
+    /// Create a response with endpoint information included
+    pub fn with_endpoint(mut self, endpoint: super::inference_endpoints::InferenceEndpointResponse) -> Self {
+        self.endpoint = Some(endpoint);
         self
     }
 }
