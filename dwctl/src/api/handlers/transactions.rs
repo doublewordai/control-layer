@@ -1008,4 +1008,116 @@ mod tests {
 
         response.assert_status_forbidden();
     }
+
+    // Regression test: Ensure high-precision decimals can be serialized to JSON without panic
+    // Previously, DECIMAL(64,32) values caused "CapacityError: insufficient capacity" panic
+    // during rust_decimal string conversion in JSON serialization
+    #[sqlx::test]
+    #[test_log::test]
+    async fn test_high_precision_decimal_serialization(pool: PgPool) {
+        let (app, _bg_services) = create_test_app(pool.clone(), false).await;
+        let user = create_test_user(&pool, Role::StandardUser).await;
+
+        // Create transaction with maximum precision (15 decimal places)
+        let transaction_id = create_initial_credit_transaction(&pool, user.id, "123.456789012345678").await;
+
+        // Test GET single transaction - this triggers JSON serialization
+        let response = app
+            .get(&format!("/admin/api/v1/transactions/{}", transaction_id))
+            .add_header(&add_auth_headers(&user)[0].0, &add_auth_headers(&user)[0].1)
+            .add_header(&add_auth_headers(&user)[1].0, &add_auth_headers(&user)[1].1)
+            .await;
+
+        // Should not panic and return 200
+        response.assert_status_ok();
+        let transaction: CreditTransactionResponse = response.json();
+
+        // Verify the high-precision value was serialized correctly
+        assert_eq!(transaction.id, transaction_id);
+        assert_eq!(transaction.user_id, user.id);
+        // Note: JSON serialization converts Decimal to f64, so exact comparison may not match
+        // but the important part is that it didn't panic
+
+        // Test GET list transactions - this also triggers JSON serialization of Vec<CreditTransactionResponse>
+        let response = app
+            .get("/admin/api/v1/transactions")
+            .add_header(&add_auth_headers(&user)[0].0, &add_auth_headers(&user)[0].1)
+            .add_header(&add_auth_headers(&user)[1].0, &add_auth_headers(&user)[1].1)
+            .await;
+
+        response.assert_status_ok();
+        let transactions: Vec<CreditTransactionResponse> = response.json();
+
+        // Should have at least our transaction
+        assert!(!transactions.is_empty());
+        assert!(transactions.iter().any(|t| t.id == transaction_id));
+    }
+
+    // Test: Verify that Decimal serialization preserves arbitrary precision
+    #[sqlx::test]
+    #[test_log::test]
+    async fn test_decimal_precision_preserved_in_json(pool: PgPool) {
+        let (app, _bg_services) = create_test_app(pool.clone(), false).await;
+        let user = create_test_user(&pool, Role::StandardUser).await;
+
+        // Create transaction with high precision that would be lost if serialized as f64
+        // f64 has ~15-17 decimal digits of precision total
+        let precise_amount = "0.123456789012345"; // 15 decimal places
+        let transaction_id = create_initial_credit_transaction(&pool, user.id, precise_amount).await;
+
+        // Get the transaction via API
+        let response = app
+            .get(&format!("/admin/api/v1/transactions/{}", transaction_id))
+            .add_header(&add_auth_headers(&user)[0].0, &add_auth_headers(&user)[0].1)
+            .add_header(&add_auth_headers(&user)[1].0, &add_auth_headers(&user)[1].1)
+            .await;
+
+        response.assert_status_ok();
+
+        // Get the raw JSON text to inspect how Decimal is serialized
+        let json_text = response.text();
+
+        // Check if amount is serialized as a string (preserves precision) or number (loses precision)
+        // rust_decimal's default Serialize implementation uses strings for arbitrary precision
+        let json_value: serde_json::Value = serde_json::from_str(&json_text).expect("Failed to parse JSON");
+
+        // Print for debugging
+        println!("JSON amount field: {:?}", json_value["amount"]);
+        println!("JSON balance_after field: {:?}", json_value["balance_after"]);
+
+        // Check what type the amount field is
+        match &json_value["amount"] {
+            serde_json::Value::String(s) => {
+                println!("✓ Amount serialized as string (arbitrary precision): {}", s);
+                assert_eq!(s, precise_amount, "String representation should match exactly");
+            }
+            serde_json::Value::Number(n) => {
+                println!("✗ Amount serialized as number (may lose precision): {}", n);
+                // If it's a number, precision might be lost
+                // f64 representation would be something like 0.12345678901234501
+            }
+            other => {
+                panic!("Unexpected JSON type for amount: {:?}", other);
+            }
+        }
+
+        // Also check balance_after
+        match &json_value["balance_after"] {
+            serde_json::Value::String(s) => {
+                println!("✓ Balance serialized as string (arbitrary precision): {}", s);
+                assert_eq!(s, precise_amount, "String representation should match exactly");
+            }
+            serde_json::Value::Number(n) => {
+                println!("✗ Balance serialized as number (may lose precision): {}", n);
+            }
+            other => {
+                panic!("Unexpected JSON type for balance_after: {:?}", other);
+            }
+        }
+
+        // Test round-trip: deserialize and verify precision is preserved
+        let transaction: CreditTransactionResponse = serde_json::from_str(&json_text).expect("Failed to deserialize");
+        assert_eq!(transaction.amount.to_string(), precise_amount);
+        assert_eq!(transaction.balance_after.to_string(), precise_amount);
+    }
 }

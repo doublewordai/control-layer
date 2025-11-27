@@ -36,8 +36,8 @@ pub struct CreditTransactionCreate {
     pub user_id: UserId,
     /// Type of transaction (only admin_grant and admin_removal allowed for admin API)
     pub transaction_type: TransactionType,
-    /// Amount of credits (absolute value)
-    #[schema(value_type = f64)]
+    /// Amount of credits (absolute value, sent as string to preserve precision)
+    #[schema(value_type = String)]
     pub amount: Decimal,
     /// Source ID for the transaction (user UUID, or UUID-suffix for grants)
     pub source_id: String,
@@ -56,11 +56,11 @@ pub struct CreditTransactionResponse {
     pub user_id: UserId,
     /// Transaction type
     pub transaction_type: CreditTransactionType,
-    /// Amount of credits
-    #[schema(value_type = f64)]
+    /// Amount of credits (returned as string to preserve precision)
+    #[schema(value_type = String)]
     pub amount: Decimal,
-    /// Balance after this transaction
-    #[schema(value_type = f64)]
+    /// Balance after this transaction (returned as string to preserve precision)
+    #[schema(value_type = String)]
     pub balance_after: Decimal,
     /// Previous transaction ID
     #[schema(value_type = Option<String>, format = "uuid")]

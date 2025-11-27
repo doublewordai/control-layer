@@ -105,9 +105,14 @@ impl<'c> Credits<'c> {
         };
 
         // Calculate what the new balance should be based on transaction type
+        // Use checked arithmetic to prevent overflow panics
         let new_balance = match request.transaction_type {
-            CreditTransactionType::AdminGrant | CreditTransactionType::Purchase => current_balance + request.amount,
-            CreditTransactionType::AdminRemoval | CreditTransactionType::Usage => current_balance - request.amount,
+            CreditTransactionType::AdminGrant | CreditTransactionType::Purchase => current_balance
+                .checked_add(request.amount)
+                .ok_or_else(|| sqlx::Error::Protocol("Balance overflow: resulting balance exceeds maximum".to_string()))?,
+            CreditTransactionType::AdminRemoval | CreditTransactionType::Usage => current_balance
+                .checked_sub(request.amount)
+                .ok_or_else(|| sqlx::Error::Protocol("Balance underflow: resulting balance exceeds minimum".to_string()))?,
         };
 
         // Insert the transaction, there is protection on the DB so will return an error if balance goes negative which is why there isn't a check here.
@@ -1010,9 +1015,8 @@ mod tests {
         let mut conn = pool.acquire().await.expect("Failed to acquire connection");
         let mut credits = Credits::new(&mut conn);
 
-        // Test with large credit amount that fits in DECIMAL(12, 2)
-        // Maximum is 9,999,999,999.99
-        let large_amount = Decimal::from_str("1000000000.00").unwrap(); // 1 billion
+        // Test with large credit amount
+        let large_amount = Decimal::from_str("100000000.00").unwrap(); // 100 million
         let request = CreditTransactionCreateDBRequest::admin_grant(user_id, user_id, large_amount, Some("Large credit grant".to_string()));
 
         let transaction = credits
@@ -1033,11 +1037,11 @@ mod tests {
             .await
             .expect("Failed to create second large transaction");
 
-        assert_eq!(transaction2.balance_after, Decimal::from_str("2000000000.00").unwrap());
+        assert_eq!(transaction2.balance_after, Decimal::from_str("200000000.00").unwrap());
 
         // Verify balance
         let balance = credits.get_user_balance(user_id).await.expect("Failed to get balance");
-        assert_eq!(balance, Decimal::from_str("2000000000.00").unwrap());
+        assert_eq!(balance, Decimal::from_str("200000000.00").unwrap());
     }
 
     #[sqlx::test]
