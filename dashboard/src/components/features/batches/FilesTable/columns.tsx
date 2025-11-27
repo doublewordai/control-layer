@@ -150,13 +150,14 @@ export const createFileColumns = (
   },
   {
     id: "actions",
+    header: "Actions",
     cell: ({ row }) => {
       const file = row.original;
       const isExpired =
         file.expires_at && new Date(file.expires_at * 1000) < new Date();
 
       return (
-        <div className="flex items-center justify-end gap-1">
+        <div className="flex items-center gap-1">
           {!isExpired && file.purpose === "batch" && (
             <Tooltip delayDuration={500}>
               <TooltipTrigger asChild>

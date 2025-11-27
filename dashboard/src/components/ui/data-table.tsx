@@ -47,6 +47,7 @@ interface DataTableProps<TData, TValue> {
   actionBar?: React.ReactNode;
   headerActions?: React.ReactNode;
   initialColumnVisibility?: VisibilityState;
+  onRowClick?: (row: TData) => void;
 }
 
 export function DataTable<TData, TValue>({
@@ -63,6 +64,7 @@ export function DataTable<TData, TValue>({
   actionBar,
   headerActions,
   initialColumnVisibility = {},
+  onRowClick,
 }: DataTableProps<TData, TValue>) {
   const [sorting, setSorting] = React.useState<SortingState>([]);
   const [columnFilters, setColumnFilters] = React.useState<ColumnFiltersState>(
@@ -184,7 +186,7 @@ export function DataTable<TData, TValue>({
           )}
         </div>
       </div>
-      <div className="rounded-md border overflow-x-auto">
+      <div className="rounded-md border">
         <Table>
           <TableHeader>
             {table.getHeaderGroups().map((headerGroup) => (
@@ -245,10 +247,11 @@ export function DataTable<TData, TValue>({
                     <TableRow
                       key={row.id}
                       data-state={row.getIsSelected() && "selected"}
-                      className="group"
+                      className={onRowClick ? "group cursor-pointer" : "group"}
                       style={{ height: rowHeight }}
+                      onClick={() => onRowClick?.(row.original)}
                     >
-                      {row.getVisibleCells().map((cell) => (
+                      {row.getVisibleCells().map((cell, index, cells) => (
                         <TableCell
                           key={cell.id}
                           className={
@@ -256,8 +259,8 @@ export function DataTable<TData, TValue>({
                               ? "pl-6 w-[50px]"
                               : cell.column.getIndex() === 0
                                 ? "pl-6"
-                                : cell.column.id === "actions"
-                                  ? "pr-6"
+                                : index === cells.length - 1
+                                  ? "pr-0"
                                   : ""
                           }
                         >

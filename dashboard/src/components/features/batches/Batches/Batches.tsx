@@ -94,8 +94,9 @@ export function Batches({
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [onBatchCreatedCallback]);
 
-  // Read state from URL
-  const activeTab = (searchParams.get("tab") as "files" | "batches") || "files";
+  // Read state from URL - default to batches tab
+  const activeTab =
+    (searchParams.get("tab") as "files" | "batches") || "batches";
   const batchFileFilter = searchParams.get("fileFilter");
   const fileTypeFilter =
     (searchParams.get("fileType") as "input" | "output" | "error") || "input";
@@ -407,11 +408,17 @@ export function Batches({
     isFileInProgress,
   });
 
+  const handleBatchClick = (batch: Batch) => {
+    if ((batch as any)._isEmpty) return;
+    navigate(`/batches/${batch.id}?from=/batches`);
+  };
+
   const batchColumns = createBatchColumns({
     onCancel: handleCancelBatch,
     getBatchFiles,
     onViewFile: handleViewFileRequests,
     getInputFile,
+    onRowClick: handleBatchClick,
   });
 
   // Loading state
@@ -464,40 +471,156 @@ export function Batches({
 
           {/* Right: Buttons + Tabs */}
           <div className="flex flex-col sm:flex-row items-stretch sm:items-center gap-3 lg:shrink-0">
-            {/* Action Button */}
-            <Button
-              onClick={() => onOpenUploadModal()}
-              variant="outline"
-              className={`flex-1 sm:flex-none transition-all duration-200 ${
-                dragActive ? "border-blue-500 bg-blue-50 text-blue-700" : ""
-              }`}
-            >
-              <Upload className="w-4 h-4 mr-2" />
-              Upload File
-            </Button>
+            {/* Action Button - changes based on active tab */}
+            {activeTab === "batches" ? (
+              <Button
+                onClick={() => onOpenCreateBatchModal()}
+                variant="outline"
+                className="flex-1 sm:flex-none"
+              >
+                <Play className="w-4 h-4 mr-2" />
+                Create Batch
+              </Button>
+            ) : (
+              <Button
+                onClick={() => onOpenUploadModal()}
+                variant="outline"
+                className={`flex-1 sm:flex-none transition-all duration-200 ${
+                  dragActive ? "border-blue-500 bg-blue-50 text-blue-700" : ""
+                }`}
+              >
+                <Upload className="w-4 h-4 mr-2" />
+                Upload File
+              </Button>
+            )}
 
             {/* Tabs Selector */}
             <TabsList className="w-full sm:w-auto">
-              <TabsTrigger
-                value="files"
-                className="flex items-center gap-2 flex-1 sm:flex-none"
-              >
-                <FileInput className="w-4 h-4" />
-                Files ({filesHasMore ? `${filesPageSize}+` : files.length})
-              </TabsTrigger>
               <TabsTrigger
                 value="batches"
                 className="flex items-center gap-2 flex-1 sm:flex-none"
               >
                 <Box className="w-4 h-4" />
-                Batches (
-                {batchesHasMore ? `${batchesPageSize}+` : batches.length})
+                Batches
+              </TabsTrigger>
+              <TabsTrigger
+                value="files"
+                className="flex items-center gap-2 flex-1 sm:flex-none"
+              >
+                <FileInput className="w-4 h-4" />
+                Files
               </TabsTrigger>
             </TabsList>
           </div>
         </div>
 
         {/* Content */}
+        <TabsContent value="batches" className="space-y-4">
+          {/* Show filter indicator if active */}
+          {batchFileFilter && (
+            <div className="flex items-center gap-2 bg-blue-50 border border-blue-200 rounded-lg p-3">
+              <FileInput className="w-4 h-4 text-blue-600" />
+              <span className="text-sm text-blue-900">
+                Showing batches for file:{" "}
+                <span className="font-mono">
+                  {files.find((f) => f.id === batchFileFilter)?.filename ||
+                    batchFileFilter}
+                </span>
+              </span>
+              <Button
+                variant="ghost"
+                size="sm"
+                onClick={() => updateURL("batches", null)}
+                className="ml-auto h-auto py-1 px-2 text-blue-600 hover:text-blue-800 hover:bg-blue-100"
+              >
+                Clear filter
+              </Button>
+            </div>
+          )}
+          {filteredBatches.length === 0 ? (
+            <div className="text-center py-12">
+              <div className="p-4 bg-doubleword-neutral-100 rounded-full w-16 h-16 mx-auto mb-4 flex items-center justify-center">
+                <Box className="w-8 h-8 text-doubleword-neutral-600" />
+              </div>
+              <h3 className="text-lg font-medium text-doubleword-neutral-900 mb-2">
+                No batches created
+              </h3>
+              <p className="text-doubleword-neutral-600 mb-4">
+                Create a batch from an uploaded file to start processing
+                requests
+              </p>
+              <Button
+                onClick={() => {
+                  // Find the file object if we have a filter
+                  const file = batchFileFilter
+                    ? files.find((f) => f.id === batchFileFilter)
+                    : undefined;
+                  onOpenCreateBatchModal(file);
+                }}
+              >
+                <Play className="w-4 h-4 mr-2" />
+                {batchFileFilter ? "Create Batch" : "Create First Batch"}
+              </Button>
+            </div>
+          ) : (
+            <>
+              <DataTable
+                columns={batchColumns}
+                data={filteredBatches}
+                searchPlaceholder="Search batches..."
+                showPagination={false}
+                showColumnToggle={true}
+                pageSize={batchesPageSize}
+                minRows={batchesPageSize}
+                rowHeight="40px"
+                initialColumnVisibility={{ id: false }}
+                onRowClick={handleBatchClick}
+                headerActions={
+                  <div className="flex items-center gap-2">
+                    <span className="text-sm text-gray-600">Rows:</span>
+                    <Select
+                      value={batchesPageSize.toString()}
+                      onValueChange={(value) =>
+                        handleBatchesPageSizeChange(Number(value))
+                      }
+                    >
+                      <SelectTrigger className="w-20p h-9">
+                        <SelectValue />
+                      </SelectTrigger>
+                      <SelectContent>
+                        <SelectItem value="10">10</SelectItem>
+                        <SelectItem value="25">25</SelectItem>
+                        <SelectItem value="50">50</SelectItem>
+                        <SelectItem value="100">100</SelectItem>
+                        <SelectItem value="200">200</SelectItem>
+                        <SelectItem value="500">500</SelectItem>
+                      </SelectContent>
+                    </Select>
+                  </div>
+                }
+              />
+              <CursorPagination
+                currentPage={batchesPage}
+                itemsPerPage={batchesPageSize}
+                onNextPage={handleBatchesNextPage}
+                onPrevPage={handleBatchesPrevPage}
+                onFirstPage={() => {
+                  batchesCursorHistory.current = [];
+                  const params = new URLSearchParams(searchParams);
+                  params.set("batchesPage", "1");
+                  params.set("batchesPageSize", batchesPageSize.toString());
+                  params.delete("batchesAfter");
+                  setSearchParams(params, { replace: true });
+                }}
+                hasNextPage={batchesHasMore}
+                hasPrevPage={batchesPage > 1}
+                currentPageItemCount={filteredBatches.length}
+                itemName="batches"
+              />
+            </>
+          )}
+        </TabsContent>
+
         <TabsContent value="files" className="space-y-4">
           {files.length === 0 ? (
             <div className="text-center py-12">
@@ -622,111 +745,6 @@ export function Batches({
                 hasPrevPage={filesPage > 1}
                 currentPageItemCount={files.length}
                 itemName="files"
-              />
-            </>
-          )}
-        </TabsContent>
-
-        <TabsContent value="batches" className="space-y-4">
-          {/* Show filter indicator if active */}
-          {batchFileFilter && (
-            <div className="flex items-center gap-2 bg-blue-50 border border-blue-200 rounded-lg p-3">
-              <FileInput className="w-4 h-4 text-blue-600" />
-              <span className="text-sm text-blue-900">
-                Showing batches for file:{" "}
-                <span className="font-mono">
-                  {files.find((f) => f.id === batchFileFilter)?.filename ||
-                    batchFileFilter}
-                </span>
-              </span>
-              <Button
-                variant="ghost"
-                size="sm"
-                onClick={() => updateURL("batches", null)}
-                className="ml-auto h-auto py-1 px-2 text-blue-600 hover:text-blue-800 hover:bg-blue-100"
-              >
-                Clear filter
-              </Button>
-            </div>
-          )}
-          {filteredBatches.length === 0 ? (
-            <div className="text-center py-12">
-              <div className="p-4 bg-doubleword-neutral-100 rounded-full w-16 h-16 mx-auto mb-4 flex items-center justify-center">
-                <Box className="w-8 h-8 text-doubleword-neutral-600" />
-              </div>
-              <h3 className="text-lg font-medium text-doubleword-neutral-900 mb-2">
-                No batches created
-              </h3>
-              <p className="text-doubleword-neutral-600 mb-4">
-                Create a batch from an uploaded file to start processing
-                requests
-              </p>
-              <Button
-                onClick={() => {
-                  // Find the file object if we have a filter
-                  const file = batchFileFilter
-                    ? files.find((f) => f.id === batchFileFilter)
-                    : undefined;
-                  onOpenCreateBatchModal(file);
-                }}
-              >
-                <Play className="w-4 h-4 mr-2" />
-                {batchFileFilter ? "Create Batch" : "Create First Batch"}
-              </Button>
-            </div>
-          ) : (
-            <>
-              <DataTable
-                columns={batchColumns}
-                data={filteredBatches}
-                searchPlaceholder="Search batches..."
-                showPagination={false}
-                showColumnToggle={true}
-                pageSize={batchesPageSize}
-                minRows={batchesPageSize}
-                rowHeight="40px"
-                initialColumnVisibility={{ id: false }}
-                headerActions={
-                  <div className="flex items-center gap-2">
-                    <span className="text-sm text-gray-600">Rows:</span>
-                    <Select
-                      value={batchesPageSize.toString()}
-                      onValueChange={(value) =>
-                        handleBatchesPageSizeChange(Number(value))
-                      }
-                    >
-                      <SelectTrigger className="w-20p h-9">
-                        <SelectValue />
-                      </SelectTrigger>
-                      <SelectContent>
-                        <SelectItem value="10">10</SelectItem>
-                        <SelectItem value="25">25</SelectItem>
-                        <SelectItem value="50">50</SelectItem>
-                        <SelectItem value="100">100</SelectItem>
-                        <SelectItem value="200">200</SelectItem>
-                        <SelectItem value="500">500</SelectItem>
-                      </SelectContent>
-                    </Select>
-                  </div>
-                }
-              />
-              <CursorPagination
-                currentPage={batchesPage}
-                itemsPerPage={batchesPageSize}
-                onNextPage={handleBatchesNextPage}
-                onPrevPage={handleBatchesPrevPage}
-                onFirstPage={() => {
-                  batchesCursorHistory.current = [];
-                  const params = new URLSearchParams(searchParams);
-                  params.set("batchesPage", "1");
-                  params.set("batchesPageSize", batchesPageSize.toString());
-                  params.delete("batchesAfter");
-                  setSearchParams(params, { replace: true });
-                }}
-                hasNextPage={batchesHasMore}
-                hasPrevPage={batchesPage > 1}
-                currentPageItemCount={filteredBatches.length}
-                itemName="batches"
               />
             </>
           )}
