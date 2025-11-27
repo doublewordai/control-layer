@@ -12,10 +12,17 @@ import {
   SelectValue,
 } from "../../../ui/select";
 import { CursorPagination } from "../../../ui/cursor-pagination";
+import type { ColumnId } from "../ExpandableBatchFilesTable/ExpandableBatchFilesTable";
 import { ExpandableBatchFilesTable } from "../ExpandableBatchFilesTable/ExpandableBatchFilesTable";
 import { useFiles, useBatches } from "../../../../api/control-layer/hooks";
 import { dwctlApi } from "../../../../api/control-layer/client";
 import type { FileObject, Batch } from "../types";
+import {
+  DropdownMenu,
+  DropdownMenuCheckboxItem,
+  DropdownMenuContent,
+  DropdownMenuTrigger,
+} from "../../../ui/dropdown-menu";
 
 /**
  * Props for the Batches component.
@@ -97,6 +104,23 @@ export function Batches({
   const files = filesForDisplay;
 
   const isFilesLoading = filesLoading;
+
+  // column selectors
+  const [columnVisibility, setColumnVisibility] = useState<
+    Record<ColumnId, boolean>
+  >({
+    created: true,
+    id: false, // ID column hidden by default
+    filename: true,
+    size: true,
+  });
+
+  const toggleColumn = (columnId: ColumnId) => {
+    setColumnVisibility((prev) => ({
+      ...prev,
+      [columnId]: !prev[columnId],
+    }));
+  };
 
   // Prefetch next page for files - only if user has already started paginating
   useEffect(() => {
@@ -323,6 +347,44 @@ export function Batches({
                   <SelectItem value="500">500</SelectItem>
                 </SelectContent>
               </Select>
+
+              <div className="flex justify-end">
+                <DropdownMenu>
+                  <DropdownMenuTrigger asChild>
+                    <Button variant="outline" size="sm">
+                      Columns
+                    </Button>
+                  </DropdownMenuTrigger>
+                  <DropdownMenuContent align="end" className="w-[150px]">
+                    <DropdownMenuCheckboxItem
+                      key={"created"}
+                      className="capitalize"
+                      checked={columnVisibility.created}
+                      onCheckedChange={() => toggleColumn("created")}
+                    >
+                      Created
+                    </DropdownMenuCheckboxItem>
+                    <DropdownMenuCheckboxItem
+                      checked={columnVisibility.id}
+                      onCheckedChange={() => toggleColumn("id")}
+                    >
+                      ID
+                    </DropdownMenuCheckboxItem>
+                    <DropdownMenuCheckboxItem
+                      checked={columnVisibility.filename}
+                      onCheckedChange={() => toggleColumn("filename")}
+                    >
+                      Filename
+                    </DropdownMenuCheckboxItem>
+                    <DropdownMenuCheckboxItem
+                      checked={columnVisibility.size}
+                      onCheckedChange={() => toggleColumn("size")}
+                    >
+                      Size
+                    </DropdownMenuCheckboxItem>
+                  </DropdownMenuContent>
+                </DropdownMenu>
+              </div>
             </div>
           </div>
 
@@ -391,6 +453,7 @@ export function Batches({
               ];
               return activeStatuses.includes(batch.status);
             }}
+            columnVisibility={columnVisibility}
           />
 
           {/* Pagination */}
