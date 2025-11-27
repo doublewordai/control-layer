@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.10.1](https://github.com/doublewordai/control-layer/compare/v0.10.0...v0.10.1) (2025-11-27)
+
+
+### Bug Fixes
+
+* decimal precision bug ([#246](https://github.com/doublewordai/control-layer/issues/246)) ([8e3062f](https://github.com/doublewordai/control-layer/commit/8e3062f571a4cbcc60f7387641307194fc2f0802))
+
 ## [0.10.0](https://github.com/doublewordai/control-layer/compare/v0.9.0...v0.10.0) (2025-11-26)
 
 
