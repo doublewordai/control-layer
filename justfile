@@ -748,13 +748,8 @@ release:
         fi
     }
 
-    # Publish fusillade
-    echo "Step 1/2: Publishing fusillade..."
-    publish_package "fusillade" || exit 1
-    echo ""
-
     # Build frontend for dwctl
-    echo "Step 2/2: Building frontend and publishing dwctl..."
+    echo "Building frontend and publishing dwctl..."
     echo "Building frontend..."
     cd dashboard
     npm ci
