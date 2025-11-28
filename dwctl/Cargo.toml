@@ -46,7 +46,7 @@ opentelemetry-otlp = { version = "0.27", features = [
   "http-proto",
   "reqwest-client",
 ] }
-tracing-opentelemetry = "0.28"
+tracing-opentelemetry = "0.32"
 tower = "0.5"
 tower-http = { version = "0.6", features = ["cors", "fs", "trace"] }
 async-trait = "0.1"
