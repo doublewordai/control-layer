@@ -1,5 +1,5 @@
 # Backend build stage
-FROM rust:1.90.0-slim AS backend-builder
+FROM rust:1.91.1-slim AS backend-builder
 
 # Install build dependencies including Node.js
 RUN apt-get update && apt-get install -y \
