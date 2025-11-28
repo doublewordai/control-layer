@@ -99,7 +99,7 @@ rust-embed = { version = "8.5", features = ["debug-embed"] }
 mime_guess = "2.0"
 futures = "0.3.31"
 # axum-test is optional and only used for tests and benchmarks
-axum-test = { version = "17.3", optional = true }
+axum-test = { version = "18.0", optional = true }
 dashmap = { version = "6.1.0", features = ["serde"] }
 moka = { version = "0.12", features = ["future"] }
 # Stripe payment processing
@@ -112,7 +112,7 @@ async-stripe = { version = "0.41.0", default-features = false, features = [
 ] }
 
 [dev-dependencies]
-axum-test = { version = "17.3" }
+axum-test = { version = "18.0" }
 sqlx = { version = "0.8", features = [
   "postgres",
   "runtime-tokio-rustls",
