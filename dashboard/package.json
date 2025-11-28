@@ -79,7 +79,7 @@
     "eslint-plugin-react-hooks": "^5.2.0",
     "eslint-plugin-react-refresh": "^0.4.20",
     "globals": "^16.4.0",
-    "jsdom": "^26.1.0",
+    "jsdom": "^27.0.0",
     "msw": "^2.10.5",
     "rollup-plugin-visualizer": "^6.0.5",
     "tailwindcss": "^4.1.12",
