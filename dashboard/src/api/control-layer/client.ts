@@ -244,7 +244,7 @@ const modelApi = {
 };
 
 const endpointApi = {
-  async list(options: EndpointsQuery): Promise<Endpoint[]> {
+  async list(options?: EndpointsQuery): Promise<Endpoint[]> {
     const params = new URLSearchParams();
     if (options?.skip !== undefined)
       params.set("skip", options.skip.toString());
