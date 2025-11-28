@@ -5,6 +5,7 @@ use crate::{
     AppState,
     api::models::{
         api_keys::{ApiKeyCreate, ApiKeyInfoResponse, ApiKeyResponse},
+        pagination::PaginatedResponse,
         users::CurrentUser,
     },
     auth::permissions::{
@@ -115,7 +116,7 @@ pub async fn create_user_api_key(
         ListApiKeysQuery
     ),
     responses(
-        (status = 200, description = "List of API keys", body = [ApiKeyInfoResponse]),
+        (status = 200, description = "Paginated list of API keys", body = PaginatedResponse<ApiKeyInfoResponse>),
         (status = 401, description = "Unauthorized"),
         (status = 403, description = "Forbidden - can only view own API keys unless admin"),
         (status = 500, description = "Internal server error"),
@@ -133,7 +134,7 @@ pub async fn list_user_api_keys(
     Query(query): Query<ListApiKeysQuery>,
     // Can't use RequiresPermission here because we need conditional logic for own vs other users
     current_user: CurrentUser,
-) -> Result<Json<Vec<ApiKeyInfoResponse>>> {
+) -> Result<Json<PaginatedResponse<ApiKeyInfoResponse>>> {
     let target_user_id = match user_id {
         UserIdOrCurrent::Current(_) => {
             // Even for /current, verify they have permission to read their own API keys
@@ -178,8 +179,13 @@ pub async fn list_user_api_keys(
         user_id: Some(target_user_id),
     };
 
+    // Get total count and list of items
+    let total_count = repo.count(&filter).await?;
     let api_keys = repo.list(&filter).await?;
-    Ok(Json(api_keys.into_iter().map(ApiKeyInfoResponse::from).collect()))
+
+    let data: Vec<ApiKeyInfoResponse> = api_keys.into_iter().map(ApiKeyInfoResponse::from).collect();
+
+    Ok(Json(PaginatedResponse::new(data, total_count, skip, limit)))
 }
 
 /// Get a specific API key for the current user or a specified user.
@@ -344,6 +350,7 @@ pub async fn delete_user_api_key(
 #[cfg(test)]
 mod tests {
     use crate::api::models::api_keys::{ApiKeyInfoResponse, ApiKeyResponse};
+    use crate::api::models::pagination::PaginatedResponse;
     use crate::api::models::users::Role;
     use crate::test_utils::*;
     use serde_json::json;
@@ -444,9 +451,10 @@ mod tests {
             .await;
 
         response.assert_status_ok();
-        let api_keys: Vec<ApiKeyInfoResponse> = response.json();
-        assert_eq!(api_keys.len(), 1);
-        assert_eq!(api_keys[0].name, "Test API Key");
+        let paginated: PaginatedResponse<ApiKeyInfoResponse> = response.json();
+        assert_eq!(paginated.data.len(), 1);
+        assert_eq!(paginated.total_count, 1);
+        assert_eq!(paginated.data[0].name, "Test API Key");
     }
 
     // Add new pagination test for the handler
@@ -482,8 +490,11 @@ mod tests {
             .await;
 
         response.assert_status_ok();
-        let api_keys: Vec<ApiKeyInfoResponse> = response.json();
-        assert_eq!(api_keys.len(), 2, "Should return exactly 2 items with limit=2");
+        let paginated: PaginatedResponse<ApiKeyInfoResponse> = response.json();
+        assert_eq!(paginated.data.len(), 2, "Should return exactly 2 items with limit=2");
+        assert_eq!(paginated.total_count, 5, "Total count should be 5");
+        assert_eq!(paginated.skip, 1);
+        assert_eq!(paginated.limit, 2);
 
         // Test with no pagination parameters (should use defaults)
         let response = app
@@ -493,8 +504,9 @@ mod tests {
             .await;
 
         response.assert_status_ok();
-        let api_keys: Vec<ApiKeyInfoResponse> = response.json();
-        assert_eq!(api_keys.len(), 5, "Should return all items with default pagination");
+        let paginated: PaginatedResponse<ApiKeyInfoResponse> = response.json();
+        assert_eq!(paginated.data.len(), 5, "Should return all items with default pagination");
+        assert_eq!(paginated.total_count, 5);
 
         // Test with large limit (should be capped)
         let response = app
@@ -504,8 +516,9 @@ mod tests {
             .await;
 
         response.assert_status_ok();
-        let api_keys: Vec<ApiKeyInfoResponse> = response.json();
-        assert_eq!(api_keys.len(), 5, "Should return all items even with large limit");
+        let paginated: PaginatedResponse<ApiKeyInfoResponse> = response.json();
+        assert_eq!(paginated.data.len(), 5, "Should return all items even with large limit");
+        assert_eq!(paginated.total_count, 5);
     }
 
     #[sqlx::test]
@@ -533,8 +546,9 @@ mod tests {
             .await;
 
         list_response.assert_status_ok();
-        let api_keys: Vec<ApiKeyInfoResponse> = list_response.json();
-        assert_eq!(api_keys.len(), 0);
+        let paginated: PaginatedResponse<ApiKeyInfoResponse> = list_response.json();
+        assert_eq!(paginated.data.len(), 0);
+        assert_eq!(paginated.total_count, 0);
     }
 
     #[sqlx::test]
@@ -563,8 +577,9 @@ mod tests {
             .await;
 
         list_response.assert_status_ok();
-        let api_keys: Vec<ApiKeyInfoResponse> = list_response.json();
-        assert_eq!(api_keys.len(), 0);
+        let paginated: PaginatedResponse<ApiKeyInfoResponse> = list_response.json();
+        assert_eq!(paginated.data.len(), 0);
+        assert_eq!(paginated.total_count, 0);
     }
 
     #[sqlx::test]
@@ -593,8 +608,9 @@ mod tests {
             .await;
 
         list_response.assert_status_ok();
-        let api_keys: Vec<ApiKeyInfoResponse> = list_response.json();
-        assert_eq!(api_keys.len(), 1);
+        let paginated: PaginatedResponse<ApiKeyInfoResponse> = list_response.json();
+        assert_eq!(paginated.data.len(), 1);
+        assert_eq!(paginated.total_count, 1);
     }
 
     #[sqlx::test]
@@ -658,11 +674,12 @@ mod tests {
             .await;
 
         response.assert_status_ok();
-        let api_keys: Vec<ApiKeyInfoResponse> = response.json();
-        assert_eq!(api_keys.len(), 2);
+        let paginated: PaginatedResponse<ApiKeyInfoResponse> = response.json();
+        assert_eq!(paginated.data.len(), 2);
+        assert_eq!(paginated.total_count, 2);
 
         // Verify we got the correct API keys
-        let returned_ids: Vec<_> = api_keys.iter().map(|k| k.id).collect();
+        let returned_ids: Vec<_> = paginated.data.iter().map(|k| k.id).collect();
         assert!(returned_ids.contains(&api_key1.id));
         assert!(returned_ids.contains(&api_key2.id));
     }
@@ -805,12 +822,13 @@ mod tests {
             .await;
 
         response.assert_status_ok();
-        let api_keys: Vec<ApiKeyInfoResponse> = response.json();
-        assert_eq!(api_keys.len(), 1);
-        assert_eq!(api_keys[0].name, "Multi Role Key");
+        let paginated: PaginatedResponse<ApiKeyInfoResponse> = response.json();
+        assert_eq!(paginated.data.len(), 1);
+        assert_eq!(paginated.total_count, 1);
+        assert_eq!(paginated.data[0].name, "Multi Role Key");
 
         // Should be able to get specific API key
-        let api_key_id = api_keys[0].id;
+        let api_key_id = paginated.data[0].id;
         let response = app
             .get(&format!("/admin/api/v1/users/current/api-keys/{api_key_id}"))
             .add_header(&add_auth_headers(&multi_role_user)[0].0, &add_auth_headers(&multi_role_user)[0].1)
@@ -862,11 +880,12 @@ mod tests {
             .await;
 
         response.assert_status_ok();
-        let api_keys: Vec<ApiKeyInfoResponse> = response.json();
-        assert_eq!(api_keys.len(), 1);
+        let paginated: PaginatedResponse<ApiKeyInfoResponse> = response.json();
+        assert_eq!(paginated.data.len(), 1);
+        assert_eq!(paginated.total_count, 1);
 
         // Platform manager should be able to get specific API keys for other users
-        let api_key_id = api_keys[0].id;
+        let api_key_id = paginated.data[0].id;
         let response = app
             .get(&format!("/admin/api/v1/users/{}/api-keys/{}", standard_user.id, api_key_id))
             .add_header(&add_auth_headers(&platform_manager)[0].0, &add_auth_headers(&platform_manager)[0].1)
@@ -907,9 +926,10 @@ mod tests {
             .await;
 
         response.assert_status_ok();
-        let user1_keys: Vec<ApiKeyInfoResponse> = response.json();
-        assert_eq!(user1_keys.len(), 1);
-        assert_eq!(user1_keys[0].id, api_key1.id);
+        let user1_paginated: PaginatedResponse<ApiKeyInfoResponse> = response.json();
+        assert_eq!(user1_paginated.data.len(), 1);
+        assert_eq!(user1_paginated.total_count, 1);
+        assert_eq!(user1_paginated.data[0].id, api_key1.id);
 
         // User2 should only see their own API keys
         let response = app
@@ -919,9 +939,10 @@ mod tests {
             .await;
 
         response.assert_status_ok();
-        let user2_keys: Vec<ApiKeyInfoResponse> = response.json();
-        assert_eq!(user2_keys.len(), 1);
-        assert_eq!(user2_keys[0].id, api_key2.id);
+        let user2_paginated: PaginatedResponse<ApiKeyInfoResponse> = response.json();
+        assert_eq!(user2_paginated.data.len(), 1);
+        assert_eq!(user2_paginated.total_count, 1);
+        assert_eq!(user2_paginated.data[0].id, api_key2.id);
 
         // User1 should not be able to access user2's specific API key
         let response = app
@@ -1016,8 +1037,9 @@ mod tests {
             .await;
 
         list_response.assert_status_ok();
-        let listed_keys: Vec<ApiKeyInfoResponse> = list_response.json();
-        assert_eq!(listed_keys.len(), 1);
+        let paginated: PaginatedResponse<ApiKeyInfoResponse> = list_response.json();
+        assert_eq!(paginated.data.len(), 1);
+        assert_eq!(paginated.total_count, 1);
 
         // ApiKeyInfoResponse doesn't have a key field - this is the security feature
 

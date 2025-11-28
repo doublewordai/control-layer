@@ -49,8 +49,9 @@ import {
 import { StatusRow } from "./StatusRow";
 
 export interface ModelsContentProps {
-  currentPage: number;
-  setCurrentPage: (page: number) => void;
+  pagination: ReturnType<
+    typeof import("../../../../hooks/useServerPagination").useServerPagination
+  >;
   searchQuery: string;
   filterProvider: string;
   showAccessibleOnly: boolean;
@@ -62,8 +63,7 @@ export interface ModelsContentProps {
 }
 
 export const ModelsContent: React.FC<ModelsContentProps> = ({
-  currentPage,
-  setCurrentPage,
+  pagination,
   searchQuery,
   filterProvider,
   showAccessibleOnly,
@@ -78,7 +78,6 @@ export const ModelsContent: React.FC<ModelsContentProps> = ({
   const [accessModel, setAccessModel] = useState<Model | null>(null);
   const [showApiExamples, setShowApiExamples] = useState(false);
   const [apiExamplesModel, setApiExamplesModel] = useState<Model | null>(null);
-  const [itemsPerPage] = useState(12);
 
   const includeParam = useMemo(() => {
     const parts: string[] = ["status", "endpoints"];
@@ -93,8 +92,8 @@ export const ModelsContent: React.FC<ModelsContentProps> = ({
     isLoading: modelsLoading,
     error: modelsError,
   } = useModels({
-    skip: (currentPage - 1) * itemsPerPage,
-    limit: itemsPerPage,
+    skip: pagination.queryParams.skip,
+    limit: pagination.queryParams.limit,
     include: includeParam as ModelsInclude,
     accessible: isStatusMode ? true : !canManageGroups || showAccessibleOnly,
     search: searchQuery || undefined,
@@ -120,7 +119,7 @@ export const ModelsContent: React.FC<ModelsContentProps> = ({
   });
 
   const hasNoModels =
-    (rawModelsData?.total_count || 0) === 0 && currentPage === 1;
+    (rawModelsData?.total_count || 0) === 0 && pagination.page === 1;
   const hasNoFilteredResults = !hasNoModels && filteredModels.length === 0;
 
   if (loading) {
@@ -758,9 +757,9 @@ export const ModelsContent: React.FC<ModelsContentProps> = ({
 
           <TablePagination
             itemName="models"
-            itemsPerPage={itemsPerPage}
-            currentPage={currentPage}
-            onPageChange={setCurrentPage}
+            itemsPerPage={pagination.pageSize}
+            currentPage={pagination.page}
+            onPageChange={pagination.handlePageChange}
             totalItems={rawModelsData?.total_count || 0}
           />
         </>

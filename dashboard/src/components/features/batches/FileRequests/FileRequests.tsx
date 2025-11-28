@@ -36,11 +36,12 @@ import {
 } from "../../../ui/dialog";
 import { CodeBlock } from "../../../ui/code-block";
 import type { FileRequest } from "../../../../api/control-layer/types";
+import { useServerPagination } from "../../../../hooks/useServerPagination";
 
 export function FileRequests() {
   const { fileId } = useParams<{ fileId: string }>();
   const navigate = useNavigate();
-  const [searchParams, setSearchParams] = useSearchParams();
+  const [searchParams] = useSearchParams();
   const [downloadModalOpen, setDownloadModalOpen] = useState(false);
 
   // Get the tab to return to (default to "files")
@@ -51,22 +52,8 @@ export function FileRequests() {
     useState<FileRequestOrResponse | null>(null);
   const [requestBodyModalOpen, setRequestBodyModalOpen] = useState(false);
 
-  // Pagination state (1-based page number)
-  const currentPage = Number(searchParams.get("page")) || 1;
-  const pageSize = Number(searchParams.get("pageSize")) || 10;
-
-  // Calculate 0-based offset for API
-  const offset = (currentPage - 1) * pageSize;
-
-  // Update pagination in URL
-  const updatePagination = (page: number, size: number) => {
-    const params = new URLSearchParams(searchParams);
-    params.set("page", String(page));
-    params.set("pageSize", String(size));
-    // Preserve returnTab
-    if (returnTab) params.set("returnTab", returnTab);
-    setSearchParams(params, { replace: true });
-  };
+  // Use pagination hook for URL-based pagination state
+  const pagination = useServerPagination({ defaultPageSize: 10 });
 
   // Get file details - works for input, output, or error files
   const { data: file } = useFile(fileId || "");
@@ -86,10 +73,10 @@ export function FileRequests() {
     );
 
   // Fetch file content with pagination using custom hook
-  const { data, isLoading } = useFileContent(fileId || "", {
-    limit: pageSize,
-    skip: offset,
-  });
+  const { data, isLoading } = useFileContent(
+    fileId || "",
+    pagination.queryParams,
+  );
 
   // Parse JSONL into requests (could be templates or responses)
   const requests: FileRequestOrResponse[] = data?.content
@@ -189,18 +176,17 @@ export function FileRequests() {
             columns={columns}
             data={requests}
             searchPlaceholder="Search by custom ID..."
-            showPagination={false}
             showColumnToggle={true}
-            pageSize={pageSize}
-            minRows={pageSize}
+            pageSize={pagination.pageSize}
+            minRows={pagination.pageSize}
             rowHeight="40px"
             headerActions={
               <div className="flex items-center gap-2">
                 <span className="text-sm text-gray-600">Rows:</span>
                 <Select
-                  value={pageSize.toString()}
+                  value={pagination.pageSize.toString()}
                   onValueChange={(value) => {
-                    updatePagination(1, Number(value)); // Reset to first page when changing page size
+                    pagination.handlePageSizeChange(Number(value));
                   }}
                 >
                   <SelectTrigger className="w-20 h-8">
@@ -219,15 +205,15 @@ export function FileRequests() {
             }
           />
           <CursorPagination
-            currentPage={currentPage}
-            itemsPerPage={pageSize}
-            onNextPage={() => updatePagination(currentPage + 1, pageSize)}
+            currentPage={pagination.page}
+            itemsPerPage={pagination.pageSize}
+            onNextPage={() => pagination.handlePageChange(pagination.page + 1)}
             onPrevPage={() =>
-              updatePagination(Math.max(1, currentPage - 1), pageSize)
+              pagination.handlePageChange(Math.max(1, pagination.page - 1))
             }
-            onFirstPage={() => updatePagination(1, pageSize)}
+            onFirstPage={() => pagination.handlePageChange(1)}
             hasNextPage={hasMore}
-            hasPrevPage={currentPage > 1}
+            hasPrevPage={pagination.page > 1}
             currentPageItemCount={requests.length}
             itemName="requests"
           />
