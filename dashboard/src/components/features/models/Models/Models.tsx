@@ -14,6 +14,7 @@ import { Input } from "../../../ui/input";
 import { ModelsContent } from "./ModelsContent";
 import { useEndpoints } from "@/api/control-layer/hooks";
 import { useDebounce } from "@/hooks/useDebounce";
+import { useServerPagination } from "@/hooks/useServerPagination";
 
 const Models: React.FC = () => {
   const [searchParams, setSearchParams] = useSearchParams();
@@ -27,26 +28,17 @@ const Models: React.FC = () => {
     searchParams.get("search") || "",
   );
   const debouncedSearch = useDebounce(searchQuery, 300);
-  const [currentPage, setCurrentPage] = useState(
-    Number(searchParams.get("page")) || 1,
-  );
   const [showAccessibleOnly, setShowAccessibleOnly] = useState(false);
+
+  // Use pagination hook for URL-based pagination state
+  const pagination = useServerPagination({ defaultPageSize: 12 });
 
   const { data: endpointsData } = useEndpoints();
   const providers = [
     ...new Set(["all", ...(endpointsData || []).map((e) => e.name).sort()]),
   ];
 
-  // load search query and page from URL params (to preserve history)
-  useEffect(() => {
-    const search = searchParams.get("search");
-    const page = searchParams.get("page");
-
-    if (search) setSearchQuery(search);
-    if (page) setCurrentPage(Number(page));
-  }, [searchParams]);
-
-  // sync search query to URL params
+  // Sync search query to URL params
   useEffect(() => {
     setSearchParams(
       (prev) => {
@@ -56,20 +48,16 @@ const Models: React.FC = () => {
         } else {
           params.delete("search");
         }
-        if (currentPage > 1) {
-          params.set("page", String(currentPage));
-        } else {
-          params.delete("page");
-        }
         return params;
       },
       { replace: true },
     );
-  }, [searchQuery, currentPage, setSearchParams]);
+  }, [searchQuery, setSearchParams]);
 
-  // reset pagination when search query changes
+  // Reset pagination when search query changes
   useEffect(() => {
-    setCurrentPage(1);
+    pagination.handleReset();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [debouncedSearch]);
 
   const viewMode = searchParams.get("view") || "grid";
@@ -175,8 +163,7 @@ const Models: React.FC = () => {
 
         {/* Content - isolated to prevent header re-renders */}
         <ModelsContent
-          currentPage={currentPage}
-          setCurrentPage={setCurrentPage}
+          pagination={pagination}
           searchQuery={debouncedSearch}
           filterProvider={filterProvider}
           showAccessibleOnly={showAccessibleOnly}

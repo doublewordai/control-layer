@@ -31,7 +31,40 @@ import {
   DropdownMenuContent,
   DropdownMenuTrigger,
 } from "./dropdown-menu";
+import {
+  Select,
+  SelectContent,
+  SelectItem,
+  SelectTrigger,
+  SelectValue,
+} from "./select";
 import { TablePagination } from "./table-pagination";
+import { CursorPagination } from "./cursor-pagination";
+
+/**
+ * Server-side pagination configuration for offset-based pagination
+ */
+interface ServerPagination {
+  page: number;
+  pageSize: number;
+  totalItems?: number;
+  onPageChange: (page: number) => void;
+  onPageSizeChange?: (pageSize: number) => void;
+}
+
+/**
+ * Server-side pagination configuration for cursor-based pagination
+ */
+interface ServerCursorPagination {
+  page: number;
+  pageSize: number;
+  onNextPage: (lastItemId: string) => void;
+  onPrevPage: () => void;
+  onFirstPage?: () => void;
+  onPageSizeChange?: (pageSize: number) => void;
+  hasNextPage: boolean;
+  hasPrevPage: boolean;
+}
 
 interface DataTableProps<TData, TValue> {
   columns: ColumnDef<TData, TValue>[];
@@ -39,8 +72,9 @@ interface DataTableProps<TData, TValue> {
   searchPlaceholder?: string;
   searchColumn?: string;
   showColumnToggle?: boolean;
-  showPagination?: boolean;
+  showPagination?: boolean; // Optional: Override automatic pagination visibility
   pageSize?: number;
+  totalItems?: number;
   minRows?: number; // Optional: Minimum number of rows to display (pads with empty rows)
   rowHeight?: string; // Optional: Height for each row (e.g., "65px", "49px")
   onSelectionChange?: (selectedRows: TData[]) => void;
@@ -48,6 +82,45 @@ interface DataTableProps<TData, TValue> {
   headerActions?: React.ReactNode;
   initialColumnVisibility?: VisibilityState;
   onRowClick?: (row: TData) => void;
+
+  // NEW: Server-side pagination support
+  /**
+   * Pagination mode
+   * - 'client': All data loaded at once, pagination handled in-memory (default)
+   * - 'server-offset': Server-side pagination using skip/limit
+   * - 'server-cursor': Server-side pagination using cursors
+   */
+  paginationMode?: "client" | "server-offset" | "server-cursor";
+
+  /**
+   * Server pagination configuration (required when paginationMode is 'server-offset' or 'server-cursor')
+   */
+  serverPagination?: ServerPagination | ServerCursorPagination;
+
+  /**
+   * External search control (for server-side search)
+   * When provided, search input becomes a controlled component
+   */
+  externalSearch?: {
+    value: string;
+    onChange: (value: string) => void;
+  };
+
+  /**
+   * Loading state (shows skeleton rows)
+   */
+  isLoading?: boolean;
+
+  /**
+   * Show page size selector
+   */
+  showPageSizeSelector?: boolean;
+
+  /**
+   * Page size options for the selector
+   * @default [10, 25, 50, 100]
+   */
+  pageSizeOptions?: number[];
 }
 
 export function DataTable<TData, TValue>({
@@ -56,8 +129,9 @@ export function DataTable<TData, TValue>({
   searchPlaceholder = "Search...",
   searchColumn,
   showColumnToggle = true,
-  showPagination = true,
+  showPagination: showPaginationProp,
   pageSize = 10,
+  totalItems,
   minRows,
   rowHeight = "53px", // Default row height
   onSelectionChange,
@@ -65,6 +139,12 @@ export function DataTable<TData, TValue>({
   headerActions,
   initialColumnVisibility = {},
   onRowClick,
+  paginationMode = "client",
+  serverPagination,
+  externalSearch,
+  isLoading = false,
+  showPageSizeSelector = false,
+  pageSizeOptions = [10, 25, 50, 100],
 }: DataTableProps<TData, TValue>) {
   const [sorting, setSorting] = React.useState<SortingState>([]);
   const [columnFilters, setColumnFilters] = React.useState<ColumnFiltersState>(
@@ -75,6 +155,12 @@ export function DataTable<TData, TValue>({
   const [rowSelection, setRowSelection] = React.useState({});
   const [globalFilter, setGlobalFilter] = React.useState("");
 
+  // Determine if we're in server-side mode
+  const isServerMode = paginationMode !== "client";
+
+  // Use server pagination page size if available, otherwise use prop
+  const currentPageSize = serverPagination?.pageSize ?? pageSize;
+
   const table = useReactTable({
     data,
     columns,
@@ -82,11 +168,14 @@ export function DataTable<TData, TValue>({
     onColumnFiltersChange: setColumnFilters,
     onGlobalFilterChange: setGlobalFilter,
     getCoreRowModel: getCoreRowModel(),
-    getPaginationRowModel: getPaginationRowModel(),
-    getSortedRowModel: getSortedRowModel(),
-    getFilteredRowModel: getFilteredRowModel(),
+    getPaginationRowModel: isServerMode ? undefined : getPaginationRowModel(),
+    getSortedRowModel: isServerMode ? undefined : getSortedRowModel(),
+    getFilteredRowModel: isServerMode ? undefined : getFilteredRowModel(),
     onColumnVisibilityChange: setColumnVisibility,
     onRowSelectionChange: setRowSelection,
+    manualPagination: isServerMode,
+    manualSorting: isServerMode,
+    manualFiltering: isServerMode,
     state: {
       sorting,
       columnFilters,
@@ -96,7 +185,7 @@ export function DataTable<TData, TValue>({
     },
     initialState: {
       pagination: {
-        pageSize,
+        pageSize: currentPageSize,
       },
     },
   });
@@ -119,6 +208,25 @@ export function DataTable<TData, TValue>({
     ? Math.max(0, minRows - currentPageRows.length)
     : 0;
 
+  // Determine if pagination should be shown
+  const showPagination = (() => {
+    if (paginationMode === "server-offset") {
+      const offsetPagination = serverPagination as ServerPagination | undefined;
+      return (
+        !!offsetPagination?.totalItems &&
+        offsetPagination.totalItems > offsetPagination.pageSize
+      );
+    }
+    if (paginationMode === "server-cursor") {
+      const cursorPagination = serverPagination as
+        | ServerCursorPagination
+        | undefined;
+      return !!(cursorPagination?.hasNextPage || cursorPagination?.hasPrevPage);
+    }
+    // Client mode: show if there are more items than page size
+    return data.length > currentPageSize;
+  })();
+
   return (
     <div className="space-y-4">
       {actionBar && selectedRows.length > 0 && actionBar}
@@ -130,21 +238,26 @@ export function DataTable<TData, TValue>({
               placeholder={searchPlaceholder}
               aria-label={searchPlaceholder || "Search table"}
               value={
-                searchColumn
-                  ? ((table
-                      .getColumn(searchColumn)
-                      ?.getFilterValue() as string) ?? "")
-                  : globalFilter
+                externalSearch
+                  ? externalSearch.value
+                  : searchColumn
+                    ? ((table
+                        .getColumn(searchColumn)
+                        ?.getFilterValue() as string) ?? "")
+                    : globalFilter
               }
               onChange={(event) => {
                 const value = event.target.value;
-                if (searchColumn) {
+                if (externalSearch) {
+                  externalSearch.onChange(value);
+                } else if (searchColumn) {
                   table.getColumn(searchColumn)?.setFilterValue(value);
                 } else {
                   setGlobalFilter(value);
                 }
               }}
               className="pl-8 w-full sm:w-[300px]"
+              disabled={isLoading}
             />
           </div>
           {selectedRows.length > 0 && (
@@ -155,6 +268,28 @@ export function DataTable<TData, TValue>({
           )}
         </div>
         <div className="flex items-center gap-2 w-full sm:w-auto justify-end">
+          {showPageSizeSelector && serverPagination?.onPageSizeChange && (
+            <div className="flex items-center gap-2">
+              <span className="text-sm text-muted-foreground">Show</span>
+              <Select
+                value={String(currentPageSize)}
+                onValueChange={(value) =>
+                  serverPagination.onPageSizeChange?.(Number(value))
+                }
+              >
+                <SelectTrigger className="w-[70px]">
+                  <SelectValue />
+                </SelectTrigger>
+                <SelectContent>
+                  {pageSizeOptions.map((size) => (
+                    <SelectItem key={size} value={String(size)}>
+                      {size}
+                    </SelectItem>
+                  ))}
+                </SelectContent>
+              </Select>
+            </div>
+          )}
           {headerActions}
           {showColumnToggle && (
             <DropdownMenu>
@@ -216,7 +351,27 @@ export function DataTable<TData, TValue>({
             ))}
           </TableHeader>
           <TableBody>
-            {table.getRowModel().rows?.length ? (
+            {isLoading ? (
+              // Show skeleton rows while loading
+              Array.from({ length: minRows || currentPageSize }).map(
+                (_, index) => (
+                  <TableRow
+                    key={`skeleton-${index}`}
+                    className="hover:bg-transparent"
+                    style={{ height: rowHeight }}
+                  >
+                    {columns.map((_, cellIndex) => (
+                      <TableCell
+                        key={`skeleton-${index}-${cellIndex}`}
+                        className={cellIndex === 0 ? "pl-6" : ""}
+                      >
+                        <div className="h-4 bg-muted animate-pulse rounded" />
+                      </TableCell>
+                    ))}
+                  </TableRow>
+                ),
+              )
+            ) : table.getRowModel().rows?.length ? (
               <>
                 {table.getRowModel().rows.map((row) => {
                   // Check if this is an expansion row
@@ -307,13 +462,48 @@ export function DataTable<TData, TValue>({
         </Table>
       </div>
       {showPagination && (
-        <TablePagination
-          currentPage={table.getState().pagination.pageIndex + 1}
-          itemsPerPage={table.getState().pagination.pageSize}
-          onPageChange={(page) => table.setPageIndex(page - 1)}
-          totalItems={table.getFilteredRowModel().rows.length}
-          itemName="results"
-        />
+        <>
+          {paginationMode === "server-cursor" &&
+          serverPagination &&
+          "hasNextPage" in serverPagination ? (
+            <CursorPagination
+              currentPage={serverPagination.page}
+              itemsPerPage={serverPagination.pageSize}
+              onNextPage={() => {
+                if (data.length > 0) {
+                  const lastItem = data[data.length - 1] as any;
+                  const lastItemId =
+                    lastItem.id || lastItem._id || lastItem.key;
+                  serverPagination.onNextPage(lastItemId);
+                }
+              }}
+              onPrevPage={serverPagination.onPrevPage}
+              onFirstPage={serverPagination.onFirstPage}
+              hasNextPage={serverPagination.hasNextPage}
+              hasPrevPage={serverPagination.hasPrevPage}
+              currentPageItemCount={data.length}
+              itemName="results"
+            />
+          ) : paginationMode === "server-offset" &&
+            serverPagination &&
+            "onPageChange" in serverPagination ? (
+            <TablePagination
+              currentPage={serverPagination.page}
+              itemsPerPage={serverPagination.pageSize}
+              onPageChange={serverPagination.onPageChange}
+              totalItems={serverPagination.totalItems ?? 0}
+              itemName="results"
+            />
+          ) : (
+            <TablePagination
+              currentPage={table.getState().pagination.pageIndex + 1}
+              itemsPerPage={table.getState().pagination.pageSize}
+              onPageChange={(page) => table.setPageIndex(page - 1)}
+              totalItems={totalItems ?? data.length}
+              itemName="results"
+            />
+          )}
+        </>
       )}
     </div>
   );
