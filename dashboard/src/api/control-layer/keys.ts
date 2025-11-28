@@ -43,7 +43,10 @@ export const queryKeys = {
   // API Keys
   apiKeys: {
     all: ["apiKeys"] as const,
-    query: (userId?: string) => ["apiKeys", "query", userId] as const,
+    query: (
+      userId: string = "current",
+      options?: { skip?: number; limit?: number },
+    ) => ["apiKeys", "query", userId, options] as const,
     byId: (id: string, userId?: string) =>
       ["apiKeys", "byId", id, userId] as const,
   },
