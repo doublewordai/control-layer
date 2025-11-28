@@ -228,15 +228,11 @@ fn create_file_stream(
                                     let error_start = valid_up_to.saturating_sub(20);
                                     let error_end = (valid_up_to + error_len + 20).min(combined_bytes.len());
                                     let problem_bytes = &combined_bytes[error_start..error_end];
-                                    tracing::error!(
-                                        "Bytes around error (offset {}-{}): {:02x?}",
-                                        error_start,
-                                        error_end,
-                                        problem_bytes
-                                    );
+                                    tracing::error!("Bytes around error (offset {}-{}): {:02x?}", error_start, error_end, problem_bytes);
 
                                     // Try to show ASCII representation
-                                    let ascii_repr: String = problem_bytes.iter()
+                                    let ascii_repr: String = problem_bytes
+                                        .iter()
                                         .map(|&b| if b.is_ascii_graphic() || b == b' ' { b as char } else { '.' })
                                         .collect();
                                     tracing::error!("ASCII representation: '{}'", ascii_repr);
@@ -255,16 +251,14 @@ fn create_file_stream(
                                         total_size - chunk_size + valid_up_to as i64,
                                         e
                                     );
-                                    let _ = tx
-                                        .send(fusillade::FileStreamItem::Error(error_msg))
-                                        .await;
+                                    let _ = tx.send(fusillade::FileStreamItem::Error(error_msg)).await;
                                     return;
                                 }
 
                                 // Otherwise, this is an incomplete UTF-8 sequence at the end of the chunk
                                 // Save the incomplete bytes for the next chunk
-                                let valid_str = std::str::from_utf8(&combined_bytes[..valid_up_to])
-                                    .expect("valid_up_to should point to valid UTF-8");
+                                let valid_str =
+                                    std::str::from_utf8(&combined_bytes[..valid_up_to]).expect("valid_up_to should point to valid UTF-8");
                                 let remaining = combined_bytes[valid_up_to..].to_vec();
 
                                 tracing::debug!(
