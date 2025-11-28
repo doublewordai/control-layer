@@ -33,7 +33,6 @@ import {
   DialogFooter,
 } from "../../../ui/dialog";
 import type { DisplayUser, DisplayGroup } from "../../../../types/display";
-import { TablePagination } from "@/components/ui/table-pagination";
 import { useServerPagination } from "@/hooks/useServerPagination";
 
 // Predefined color classes that Tailwind will include
@@ -536,13 +535,6 @@ const UsersGroups: React.FC = () => {
                 </div>
               );
             })}
-            <TablePagination
-              itemName="group"
-              itemsPerPage={groupsPagination.pageSize}
-              currentPage={groupsPagination.page}
-              onPageChange={groupsPagination.handlePageChange}
-              totalItems={groupsData?.total_count || 0}
-            />
           </div>
         )}
       </div>
