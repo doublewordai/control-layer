@@ -67,7 +67,7 @@ const Batches = lazy(() =>
   })),
 );
 const BatchInfo = lazy(() =>
-  import("./components/features/batches/BatchInfo").then((m) => ({
+  import("./components/features/batches").then((m) => ({
     default: m.BatchInfo,
   })),
 );
