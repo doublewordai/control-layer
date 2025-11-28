@@ -308,7 +308,6 @@ export function Requests() {
                 columns={columns}
                 data={requests}
                 searchPlaceholder="Search requests and responses..."
-                showPagination={requests.length > 10}
                 showColumnToggle={true}
                 pageSize={10}
                 rowHeight="40px"

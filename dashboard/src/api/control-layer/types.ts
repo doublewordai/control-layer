@@ -202,6 +202,7 @@ export interface ModelsQuery {
 export interface EndpointsQuery {
   skip?: number;
   limit?: number;
+  enabled?: boolean;
 }
 
 export interface GroupsQuery {
@@ -237,6 +238,11 @@ export interface ApiKeyCreateRequest {
   purpose: ApiKeyPurpose; // Required: purpose of the key
   requests_per_second?: number | null;
   burst_size?: number | null;
+}
+
+export interface ApiKeysQuery {
+  skip?: number;
+  limit?: number;
 }
 
 // Update endpoint bodies

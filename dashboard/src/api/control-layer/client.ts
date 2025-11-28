@@ -54,6 +54,7 @@ import type {
   AddFundsResponse,
   DaemonsListResponse,
   DaemonsQuery,
+  EndpointsQuery,
 } from "./types";
 import { ApiError } from "./errors";
 
@@ -127,8 +128,19 @@ const userApi = {
 
   // Nested API keys under users
   apiKeys: {
-    async getAll(userId: string = "current"): Promise<ApiKey[]> {
-      const response = await fetch(`/admin/api/v1/users/${userId}/api-keys`);
+    async getAll(
+      userId: string = "current",
+      options: { skip?: number; limit?: number } = {},
+    ): Promise<PaginatedResponse<ApiKey>> {
+      const params = new URLSearchParams();
+      if (options.skip !== undefined) params.set("skip", String(options.skip));
+      if (options.limit !== undefined)
+        params.set("limit", String(options.limit));
+
+      const queryString = params.toString();
+      const url = `/admin/api/v1/users/${userId}/api-keys${queryString ? `?${queryString}` : ""}`;
+
+      const response = await fetch(url);
       if (!response.ok) {
         throw new Error(`Failed to fetch API keys: ${response.status}`);
       }
@@ -232,8 +244,16 @@ const modelApi = {
 };
 
 const endpointApi = {
-  async list(): Promise<Endpoint[]> {
-    const response = await fetch("/admin/api/v1/endpoints");
+  async list(options?: EndpointsQuery): Promise<Endpoint[]> {
+    const params = new URLSearchParams();
+    if (options?.skip !== undefined)
+      params.set("skip", options.skip.toString());
+    if (options?.limit !== undefined)
+      params.set("limit", options.limit.toString());
+    if (options?.enabled) params.set("enabled", options.enabled.toString());
+
+    const url = `/admin/api/v1/endpoints${params.toString() ? "?" + params.toString() : ""}`;
+    const response = await fetch(url);
     if (!response.ok) {
       throw new Error(`Failed to fetch endpoints: ${response.status}`);
     }

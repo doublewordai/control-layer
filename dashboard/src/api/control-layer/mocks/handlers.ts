@@ -399,8 +399,19 @@ export const handlers = [
   }),
 
   // API Keys under users
-  http.get("/admin/api/v1/users/:userId/api-keys", () => {
-    return HttpResponse.json(apiKeysData);
+  http.get("/admin/api/v1/users/:userId/api-keys", ({ request }) => {
+    const url = new URL(request.url);
+    const skip = parseInt(url.searchParams.get("skip") || "0", 10);
+    const limit = parseInt(url.searchParams.get("limit") || "10", 10);
+
+    const paginatedData = apiKeysData.slice(skip, skip + limit);
+
+    return HttpResponse.json({
+      data: paginatedData,
+      total_count: apiKeysData.length,
+      skip,
+      limit,
+    });
   }),
 
   http.get("/admin/api/v1/users/:userId/api-keys/:id", ({ params }) => {

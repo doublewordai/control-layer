@@ -34,6 +34,7 @@ import {
 } from "../../../ui/dialog";
 import type { DisplayUser, DisplayGroup } from "../../../../types/display";
 import { TablePagination } from "@/components/ui/table-pagination";
+import { useServerPagination } from "@/hooks/useServerPagination";
 
 // Predefined color classes that Tailwind will include
 const GROUP_COLOR_CLASSES = [
@@ -58,9 +59,17 @@ const getGroupColor = (_groupId: string, index: number): string => {
 const UsersGroups: React.FC = () => {
   const [searchParams] = useSearchParams();
   const navigate = useNavigate();
-  const [userPage, setUserPage] = useState<number>(1);
-  const [groupPage, setGroupPage] = useState<number>(1);
-  const [itemsPerPage] = useState(12);
+
+  // Use pagination hooks with prefixes for multi-table support
+  const usersPagination = useServerPagination({
+    paramPrefix: "users",
+    defaultPageSize: 10,
+  });
+
+  const groupsPagination = useServerPagination({
+    paramPrefix: "groups",
+    defaultPageSize: 10,
+  });
 
   // Get tab from URL or default to "users"
   const tabFromUrl = searchParams.get("tab");
@@ -91,8 +100,7 @@ const UsersGroups: React.FC = () => {
     error: usersError,
   } = useUsers({
     include: "groups",
-    skip: (userPage - 1) * itemsPerPage,
-    limit: itemsPerPage,
+    ...usersPagination.queryParams,
   });
 
   const {
@@ -101,8 +109,7 @@ const UsersGroups: React.FC = () => {
     error: groupsError,
   } = useGroups({
     include: "users",
-    skip: (groupPage - 1) * itemsPerPage,
-    limit: itemsPerPage,
+    ...groupsPagination.queryParams,
   });
 
   const loading = usersLoading || groupsLoading;
@@ -306,7 +313,7 @@ const UsersGroups: React.FC = () => {
                 : "border-transparent text-doubleword-neutral-500 hover:text-doubleword-neutral-700"
             }`}
           >
-            Users ({users.length})
+            Users {usersData ? `(${usersData.total_count})` : ""}
           </button>
           <button
             id="groups-tab"
@@ -321,7 +328,7 @@ const UsersGroups: React.FC = () => {
                 : "border-transparent text-doubleword-neutral-500 hover:text-doubleword-neutral-700"
             }`}
           >
-            Groups ({groups.length})
+            Groups {groupsData ? `(${groupsData.total_count})` : ""}
           </button>
         </nav>
       </div>
@@ -402,7 +409,15 @@ const UsersGroups: React.FC = () => {
             data={users}
             searchPlaceholder="Search users..."
             searchColumn="name"
-            showPagination={users.length > 10}
+            paginationMode="server"
+            serverPagination={{
+              page: usersPagination.page,
+              pageSize: usersPagination.pageSize,
+              totalItems: usersData?.total_count || 0,
+              onPageChange: usersPagination.handlePageChange,
+              onPageSizeChange: usersPagination.handlePageSizeChange,
+            }}
+            showPageSizeSelector={true}
             onSelectionChange={setSelectedUsers}
             headerActions={
               <Button onClick={() => setShowCreateUserModal(true)} size="sm">
@@ -431,13 +446,6 @@ const UsersGroups: React.FC = () => {
             }
           />
         )}
-        <TablePagination
-          itemName="users"
-          itemsPerPage={itemsPerPage}
-          currentPage={userPage}
-          onPageChange={setUserPage}
-          totalItems={usersData?.total_count || 0}
-        />
       </div>
       <div
         role="tabpanel"
@@ -530,9 +538,9 @@ const UsersGroups: React.FC = () => {
             })}
             <TablePagination
               itemName="group"
-              itemsPerPage={itemsPerPage}
-              currentPage={groupPage}
-              onPageChange={setGroupPage}
+              itemsPerPage={groupsPagination.pageSize}
+              currentPage={groupsPagination.page}
+              onPageChange={groupsPagination.handlePageChange}
               totalItems={groupsData?.total_count || 0}
             />
           </div>
