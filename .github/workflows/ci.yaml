@@ -15,12 +15,12 @@ jobs:
 
     steps:
       - name: Checkout code
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
 
       - name: Setup Node.js
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@v6
         with:
-          node-version: "20"
+          node-version: "24"
           cache: "npm"
           cache-dependency-path: dashboard/package-lock.json
 
@@ -29,7 +29,7 @@ jobs:
         run: npm ci
 
       - name: Install just
-        uses: extractions/setup-just@v2
+        uses: extractions/setup-just@v3
 
       - name: Run frontend CI pipeline
         id: ci-step
@@ -115,7 +115,7 @@ jobs:
 
     steps:
       - name: Checkout code
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
@@ -126,7 +126,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2
 
       - name: Install just
-        uses: extractions/setup-just@v2
+        uses: extractions/setup-just@v3
 
       - name: Install sqlx-cli and cargo-llvm-cov
         run: |
@@ -192,7 +192,7 @@ jobs:
 
     steps:
       - name: Checkout code
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
 
       - name: Log in to GitHub Container Registry
         uses: docker/login-action@v3
@@ -258,7 +258,7 @@ jobs:
 
     steps:
       - name: Checkout code
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
 
       - name: Log in to GitHub Container Registry
         uses: docker/login-action@v3
@@ -331,15 +331,15 @@ jobs:
 
     steps:
       - name: Checkout code
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
 
       - name: Install just
-        uses: extractions/setup-just@v2
+        uses: extractions/setup-just@v3
 
       - name: Setup Node.js
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@v6
         with:
-          node-version: "20"
+          node-version: "24"
           cache: "npm"
           cache-dependency-path: dashboard/package-lock.json
 
@@ -389,12 +389,12 @@ jobs:
 
     steps:
       - name: Checkout code
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
 
       - name: Setup Node.js
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@v6
         with:
-          node-version: "20"
+          node-version: "24"
           cache: "npm"
           cache-dependency-path: dashboard/package-lock.json
 
@@ -404,7 +404,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2
 
       - name: Install just
-        uses: extractions/setup-just@v2
+        uses: extractions/setup-just@v3
 
       - name: Publish to crates.io
         run: just release

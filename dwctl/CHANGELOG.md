@@ -1,5 +1,25 @@
 # Changelog
 
+## [0.11.1](https://github.com/doublewordai/control-layer/compare/v0.11.0...v0.11.1) (2025-11-28)
+
+
+### Bug Fixes
+
+* a bug in file upload where you could get incomplete utf-8 spread across chunks ([#262](https://github.com/doublewordai/control-layer/issues/262)) ([82b1238](https://github.com/doublewordai/control-layer/commit/82b1238115ad662f8c3517ad874d3093656daac4))
+
+## [0.11.0](https://github.com/doublewordai/control-layer/compare/v0.10.1...v0.11.0) (2025-11-28)
+
+
+### Features
+
+* **deps:** bump fusillade to 0.4.0 ([#279](https://github.com/doublewordai/control-layer/issues/279)) ([b47410a](https://github.com/doublewordai/control-layer/commit/b47410afb7df7bc865a74a9638d9283151b605cb))
+* make default user roles configurable via auth.default_user_roles ([#253](https://github.com/doublewordai/control-layer/issues/253)) ([f290c44](https://github.com/doublewordai/control-layer/commit/f290c44e193b155a71e440f5c83b21156a3856ed))
+
+
+### Bug Fixes
+
+* **deps:** update rust crate prometheus to 0.14 ([#273](https://github.com/doublewordai/control-layer/issues/273)) ([7dc6fb0](https://github.com/doublewordai/control-layer/commit/7dc6fb00c4a73193f8a0c57034bf1a737b9bcd83))
+
 ## [0.10.1](https://github.com/doublewordai/control-layer/compare/v0.10.0...v0.10.1) (2025-11-27)
 
 
