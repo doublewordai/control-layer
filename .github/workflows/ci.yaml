@@ -29,7 +29,7 @@ jobs:
         run: npm ci
 
       - name: Install just
-        uses: extractions/setup-just@v2
+        uses: extractions/setup-just@v3
 
       - name: Run frontend CI pipeline
         id: ci-step
@@ -126,7 +126,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2
 
       - name: Install just
-        uses: extractions/setup-just@v2
+        uses: extractions/setup-just@v3
 
       - name: Install sqlx-cli and cargo-llvm-cov
         run: |
@@ -334,7 +334,7 @@ jobs:
         uses: actions/checkout@v6
 
       - name: Install just
-        uses: extractions/setup-just@v2
+        uses: extractions/setup-just@v3
 
       - name: Setup Node.js
         uses: actions/setup-node@v6
@@ -404,7 +404,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2
 
       - name: Install just
-        uses: extractions/setup-just@v2
+        uses: extractions/setup-just@v3
 
       - name: Publish to crates.io
         run: just release
