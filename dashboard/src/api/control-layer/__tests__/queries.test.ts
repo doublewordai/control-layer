@@ -165,20 +165,26 @@ describe("dwctlApi.users", () => {
   describe("apiKeys", () => {
     describe("getAll", () => {
       it("should fetch all API keys for current user", async () => {
-        const apiKeys = await dwctlApi.users.apiKeys.getAll();
+        const response = await dwctlApi.users.apiKeys.getAll();
 
-        expect(apiKeys).toBeInstanceOf(Array);
-        expect(apiKeys.length).toBeGreaterThan(0);
-        expect(apiKeys[0]).toHaveProperty("id");
-        expect(apiKeys[0]).toHaveProperty("name");
-        expect(apiKeys[0]).toHaveProperty("created_at");
+        expect(response).toHaveProperty("data");
+        expect(response).toHaveProperty("total_count");
+        expect(response).toHaveProperty("skip");
+        expect(response).toHaveProperty("limit");
+        expect(response.data).toBeInstanceOf(Array);
+        expect(response.data.length).toBeGreaterThan(0);
+        expect(response.data[0]).toHaveProperty("id");
+        expect(response.data[0]).toHaveProperty("name");
+        expect(response.data[0]).toHaveProperty("created_at");
       });
 
       it("should fetch API keys for specific user", async () => {
         const userId = "550e8400-e29b-41d4-a716-446655440001";
-        const apiKeys = await dwctlApi.users.apiKeys.getAll(userId);
+        const response = await dwctlApi.users.apiKeys.getAll(userId);
 
-        expect(apiKeys).toBeInstanceOf(Array);
+        expect(response).toHaveProperty("data");
+        expect(response).toHaveProperty("total_count");
+        expect(response.data).toBeInstanceOf(Array);
       });
     });
 

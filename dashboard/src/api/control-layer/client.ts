@@ -132,9 +132,15 @@ const userApi = {
       userId: string = "current",
       options: { skip?: number; limit?: number } = {},
     ): Promise<PaginatedResponse<ApiKey>> {
-      const response = await fetch(
-        `/admin/api/v1/users/${userId}/api-keys?skip=${options.skip}&limit=${options.limit}`,
-      );
+      const params = new URLSearchParams();
+      if (options.skip !== undefined) params.set("skip", String(options.skip));
+      if (options.limit !== undefined)
+        params.set("limit", String(options.limit));
+
+      const queryString = params.toString();
+      const url = `/admin/api/v1/users/${userId}/api-keys${queryString ? `?${queryString}` : ""}`;
+
+      const response = await fetch(url);
       if (!response.ok) {
         throw new Error(`Failed to fetch API keys: ${response.status}`);
       }
