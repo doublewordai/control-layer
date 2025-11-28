@@ -35,6 +35,8 @@ export const queryKeys = {
   // Endpoints
   endpoints: {
     all: ["endpoints"] as const,
+    query: (options?: { enabled?: boolean; skip?: number; limit?: number }) =>
+      ["endpoints", "query", options] as const,
     byId: (id: string) => ["endpoints", "byId", id] as const,
   },
 

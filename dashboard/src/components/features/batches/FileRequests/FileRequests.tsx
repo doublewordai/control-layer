@@ -176,7 +176,6 @@ export function FileRequests() {
             columns={columns}
             data={requests}
             searchPlaceholder="Search by custom ID..."
-            showPagination={false}
             showColumnToggle={true}
             pageSize={pagination.pageSize}
             minRows={pagination.pageSize}

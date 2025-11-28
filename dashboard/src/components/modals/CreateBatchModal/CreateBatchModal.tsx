@@ -26,6 +26,7 @@ interface CreateBatchModalProps {
   onClose: () => void;
   onSuccess?: () => void;
   preselectedFile?: FileObject;
+  preselectedFileToUpload?: File;
 }
 
 export function CreateBatchModal({
@@ -33,11 +34,14 @@ export function CreateBatchModal({
   onClose,
   onSuccess,
   preselectedFile,
+  preselectedFileToUpload,
 }: CreateBatchModalProps) {
   const [selectedFileId, setSelectedFileId] = useState<string | null>(
     preselectedFile?.id || null,
   );
-  const [fileToUpload, setFileToUpload] = useState<File | null>(null);
+  const [fileToUpload, setFileToUpload] = useState<File | null>(
+    preselectedFileToUpload || null,
+  );
   const [expirationSeconds, setExpirationSeconds] = useState<number>(2592000); // 30 days default
   const [endpoint, setEndpoint] = useState<string>("/v1/chat/completions");
   const [description, setDescription] = useState<string>("");
@@ -63,6 +67,14 @@ export function CreateBatchModal({
       setFileToUpload(null); // Clear any file to upload
     }
   }, [preselectedFile]);
+
+  // Update selected file when preselected file to upload changes
+  useEffect(() => {
+    if (preselectedFileToUpload) {
+      setFileToUpload(preselectedFileToUpload);
+      setSelectedFileId(null);
+    }
+  }, [preselectedFileToUpload]);
 
   const handleDrag = (e: React.DragEvent) => {
     e.preventDefault();

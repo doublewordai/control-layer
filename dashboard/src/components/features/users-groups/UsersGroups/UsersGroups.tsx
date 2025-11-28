@@ -409,7 +409,7 @@ const UsersGroups: React.FC = () => {
             data={users}
             searchPlaceholder="Search users..."
             searchColumn="name"
-            paginationMode="server-offset"
+            paginationMode="server"
             serverPagination={{
               page: usersPagination.page,
               pageSize: usersPagination.pageSize,

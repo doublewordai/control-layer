@@ -17,7 +17,10 @@ interface UserUsageTableProps {
   showPricing?: boolean;
 }
 
-const UserUsageTable: React.FC<UserUsageTableProps> = ({ modelAlias, showPricing = true }) => {
+const UserUsageTable: React.FC<UserUsageTableProps> = ({
+  modelAlias,
+  showPricing = true,
+}) => {
   const [dateRange, setDateRange] = useState<{ from: Date; to: Date }>({
     from: new Date(new Date().getTime() - 24 * 60 * 60 * 1000), // 24 hours ago
     to: new Date(), // now
@@ -162,29 +165,33 @@ const UserUsageTable: React.FC<UserUsageTableProps> = ({ modelAlias, showPricing
           );
         },
       },
-      ...(showPricing ? [{
-        accessorKey: "total_cost" as const,
-        header: ({ column }: { column: any }) => {
-          return (
-            <Button
-              variant="ghost"
-              size="sm"
-              className="-ml-3 h-8"
-              onClick={() =>
-                column.toggleSorting(column.getIsSorted() === "asc")
-              }
-            >
-              Cost
-              <ArrowUpDown className="ml-2 h-4 w-4" />
-            </Button>
-          );
-        },
-        cell: ({ row }: { row: any }) => (
-          <span className="font-medium text-green-700">
-            {formatCost(row.getValue("total_cost"))}
-          </span>
-        ),
-      }] as ColumnDef<UserUsage>[] : []),
+      ...(showPricing
+        ? ([
+            {
+              accessorKey: "total_cost" as const,
+              header: ({ column }: { column: any }) => {
+                return (
+                  <Button
+                    variant="ghost"
+                    size="sm"
+                    className="-ml-3 h-8"
+                    onClick={() =>
+                      column.toggleSorting(column.getIsSorted() === "asc")
+                    }
+                  >
+                    Cost
+                    <ArrowUpDown className="ml-2 h-4 w-4" />
+                  </Button>
+                );
+              },
+              cell: ({ row }: { row: any }) => (
+                <span className="font-medium text-green-700">
+                  {formatCost(row.getValue("total_cost"))}
+                </span>
+              ),
+            },
+          ] as ColumnDef<UserUsage>[])
+        : []),
       {
         accessorKey: "last_active_at",
         header: "Last Active",
@@ -329,7 +336,6 @@ const UserUsageTable: React.FC<UserUsageTableProps> = ({ modelAlias, showPricing
           columns={columns}
           data={data.users}
           searchPlaceholder="Search users..."
-          showPagination={data.users.length > 10}
           pageSize={10}
           headerActions={
             <Button variant="outline" size="sm" onClick={downloadCSV}>

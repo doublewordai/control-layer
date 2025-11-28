@@ -20,7 +20,6 @@ import {
   SelectValue,
 } from "../../../ui/select";
 import { DataTable } from "../../../ui/data-table";
-import { CursorPagination } from "../../../ui/cursor-pagination";
 import { createFileColumns } from "../FilesTable/columns";
 import { createBatchColumns } from "../BatchesTable/columns";
 import { useFiles, useBatches } from "../../../../api/control-layer/hooks";
@@ -35,7 +34,7 @@ import { useServerCursorPagination } from "../../../../hooks/useServerCursorPagi
  */
 interface BatchesProps {
   onOpenUploadModal: (file?: File) => void;
-  onOpenCreateBatchModal: (file?: FileObject) => void;
+  onOpenCreateBatchModal: (file?: File | FileObject) => void;
   onOpenDownloadModal: (resource: {
     type: "file" | "batch-results";
     id: string;
@@ -292,7 +291,11 @@ export function Batches({
     if (e.dataTransfer.files && e.dataTransfer.files[0]) {
       const file = e.dataTransfer.files[0];
       if (file.name.endsWith(".jsonl")) {
-        onOpenUploadModal(file);
+        if (activeTab === "batches") {
+          onOpenCreateBatchModal(file);
+        } else if (activeTab === "files") {
+          onOpenUploadModal(file);
+        }
       }
     }
   };
@@ -498,7 +501,6 @@ export function Batches({
                 columns={batchColumns}
                 data={filteredBatches}
                 searchPlaceholder="Search batches..."
-                showPagination={false}
                 showColumnToggle={true}
                 pageSize={batchesPagination.pageSize}
                 minRows={batchesPagination.pageSize}
@@ -528,22 +530,21 @@ export function Batches({
                     </Select>
                   </div>
                 }
-              />
-              <CursorPagination
-                currentPage={batchesPagination.page}
-                itemsPerPage={batchesPagination.pageSize}
-                onNextPage={() => {
-                  const lastBatch = batches[batches.length - 1];
-                  if (lastBatch) {
-                    batchesPagination.handleNextPage(lastBatch.id);
-                  }
+                paginationMode="server-cursor"
+                serverPagination={{
+                  page: batchesPagination.page,
+                  pageSize: batchesPagination.pageSize,
+                  onNextPage: () => {
+                    const lastBatch = batches[batches.length - 1];
+                    if (lastBatch) {
+                      batchesPagination.handleNextPage(lastBatch.id);
+                    }
+                  },
+                  onPrevPage: batchesPagination.handlePrevPage,
+                  onFirstPage: batchesPagination.handleFirstPage,
+                  hasNextPage: batchesHasMore,
+                  hasPrevPage: batchesPagination.hasPrevPage,
                 }}
-                onPrevPage={batchesPagination.handlePrevPage}
-                onFirstPage={batchesPagination.handleFirstPage}
-                hasNextPage={batchesHasMore}
-                hasPrevPage={batchesPagination.hasPrevPage}
-                currentPageItemCount={filteredBatches.length}
-                itemName="batches"
               />
             </>
           )}
@@ -572,7 +573,6 @@ export function Batches({
                 columns={fileColumns}
                 data={files}
                 searchPlaceholder="Search files..."
-                showPagination={false}
                 showColumnToggle={true}
                 pageSize={filesPagination.pageSize}
                 minRows={filesPagination.pageSize}
@@ -648,22 +648,21 @@ export function Batches({
                     </Select>
                   </div>
                 }
-              />
-              <CursorPagination
-                currentPage={filesPagination.page}
-                itemsPerPage={filesPagination.pageSize}
-                onNextPage={() => {
-                  const lastFile = files[files.length - 1];
-                  if (lastFile) {
-                    filesPagination.handleNextPage(lastFile.id);
-                  }
+                paginationMode="server-cursor"
+                serverPagination={{
+                  page: filesPagination.page,
+                  pageSize: filesPagination.pageSize,
+                  onNextPage: () => {
+                    const lastFile = files[files.length - 1];
+                    if (lastFile) {
+                      filesPagination.handleNextPage(lastFile.id);
+                    }
+                  },
+                  onPrevPage: filesPagination.handlePrevPage,
+                  onFirstPage: filesPagination.handleFirstPage,
+                  hasNextPage: filesHasMore,
+                  hasPrevPage: filesPagination.hasPrevPage,
                 }}
-                onPrevPage={filesPagination.handlePrevPage}
-                onFirstPage={filesPagination.handleFirstPage}
-                hasNextPage={filesHasMore}
-                hasPrevPage={filesPagination.hasPrevPage}
-                currentPageItemCount={files.length}
-                itemName="files"
               />
             </>
           )}

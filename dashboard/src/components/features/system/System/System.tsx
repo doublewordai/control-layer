@@ -323,7 +323,6 @@ export function System() {
                   columns={daemonColumns}
                   data={daemons}
                   searchPlaceholder="Search daemons..."
-                  showPagination={true}
                   showColumnToggle={true}
                   initialColumnVisibility={{ id: false }}
                 />

@@ -24,6 +24,7 @@ import {
   EditEndpointModal,
 } from "../../../modals";
 import type { Endpoint } from "../../../../api/control-layer/types";
+import { useServerPagination } from "@/hooks/useServerPagination";
 
 export function Endpoints() {
   const location = useLocation();
@@ -35,7 +36,15 @@ export function Endpoints() {
   const [selectedEndpoints, setSelectedEndpoints] = useState<Endpoint[]>([]);
   const [showBulkDeleteModal, setShowBulkDeleteModal] = useState(false);
 
-  const { data: endpoints, isLoading, error, refetch } = useEndpoints();
+  const endpointsPagination = useServerPagination();
+  const {
+    data: endpoints,
+    isLoading,
+    error,
+    refetch,
+  } = useEndpoints({
+    ...endpointsPagination.queryParams,
+  });
   const synchronizeEndpointMutation = useSynchronizeEndpoint();
   const updateEndpointMutation = useUpdateEndpoint();
   const deleteEndpointMutation = useDeleteEndpoint();
@@ -178,7 +187,6 @@ export function Endpoints() {
           data={endpoints}
           searchPlaceholder="Search endpoints..."
           searchColumn="name"
-          showPagination={endpoints.length > 10}
           onSelectionChange={setSelectedEndpoints}
           actionBar={
             <div className="bg-blue-50 border border-blue-200 rounded-lg p-3 mb-4 flex items-center justify-between">

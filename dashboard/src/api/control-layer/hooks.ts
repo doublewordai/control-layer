@@ -8,9 +8,11 @@ import type {
   GroupUpdateRequest,
   ModelUpdateRequest,
   ApiKeyCreateRequest,
+  ApiKeysQuery,
   EndpointCreateRequest,
   EndpointUpdateRequest,
   EndpointValidateRequest,
+  EndpointsQuery,
   UsersQuery,
   ModelsQuery,
   GroupsQuery,
@@ -275,13 +277,13 @@ export function useRemoveModelFromGroup() {
 }
 
 // Endpoints hooks
-export function useEndpoints(options?: { enabled?: boolean }) {
+export function useEndpoints(options?: EndpointsQuery) {
   const queryClient = useQueryClient();
-  const { enabled = true } = options || {};
+  const { enabled = true, ...queryOptions } = options || {};
 
   return useQuery({
-    queryKey: queryKeys.endpoints.all,
-    queryFn: () => dwctlApi.endpoints.list(),
+    queryKey: queryKeys.endpoints.query(queryOptions),
+    queryFn: () => dwctlApi.endpoints.list(queryOptions),
     enabled,
     // Populate individual endpoint caches when list is fetched
     select: (data) => {
@@ -384,10 +386,10 @@ export function useSynchronizeEndpoint() {
 }
 
 // API Keys hooks
-export function useApiKeys(userId = "current") {
+export function useApiKeys(userId = "current", options: ApiKeysQuery) {
   return useQuery({
-    queryKey: queryKeys.apiKeys.query(userId),
-    queryFn: () => dwctlApi.users.apiKeys.getAll(userId),
+    queryKey: queryKeys.apiKeys.query(userId, options),
+    queryFn: () => dwctlApi.users.apiKeys.getAll(userId, options),
   });
 }
 

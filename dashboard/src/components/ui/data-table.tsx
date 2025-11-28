@@ -72,7 +72,6 @@ interface DataTableProps<TData, TValue> {
   searchPlaceholder?: string;
   searchColumn?: string;
   showColumnToggle?: boolean;
-  showPagination?: boolean; // Optional: Override automatic pagination visibility
   pageSize?: number;
   totalItems?: number;
   minRows?: number; // Optional: Minimum number of rows to display (pads with empty rows)
@@ -87,10 +86,10 @@ interface DataTableProps<TData, TValue> {
   /**
    * Pagination mode
    * - 'client': All data loaded at once, pagination handled in-memory (default)
-   * - 'server-offset': Server-side pagination using skip/limit
-   * - 'server-cursor': Server-side pagination using cursors
+   * - 'server': Server-side pagination using skip/limit
+   * - 'server-cursor': Server-side pagination using after(cursor)/limit
    */
-  paginationMode?: "client" | "server-offset" | "server-cursor";
+  paginationMode?: "client" | "server" | "server-cursor";
 
   /**
    * Server pagination configuration (required when paginationMode is 'server-offset' or 'server-cursor')
@@ -129,7 +128,6 @@ export function DataTable<TData, TValue>({
   searchPlaceholder = "Search...",
   searchColumn,
   showColumnToggle = true,
-  showPagination: showPaginationProp,
   pageSize = 10,
   totalItems,
   minRows,
@@ -209,29 +207,23 @@ export function DataTable<TData, TValue>({
     : 0;
 
   // Determine if pagination should be shown
-  const showPagination =
-    showPaginationProp ??
-    (() => {
-      if (paginationMode === "server-offset") {
-        const offsetPagination = serverPagination as
-          | ServerPagination
-          | undefined;
-        return (
-          !!offsetPagination?.totalItems &&
-          offsetPagination.totalItems > offsetPagination.pageSize
-        );
-      }
-      if (paginationMode === "server-cursor") {
-        const cursorPagination = serverPagination as
-          | ServerCursorPagination
-          | undefined;
-        return !!(
-          cursorPagination?.hasNextPage || cursorPagination?.hasPrevPage
-        );
-      }
-      // Client mode: show if there are more items than page size
-      return data.length > currentPageSize;
-    })();
+  const showPagination = (() => {
+    if (paginationMode === "server") {
+      const offsetPagination = serverPagination as ServerPagination | undefined;
+      return (
+        !!offsetPagination?.totalItems &&
+        offsetPagination.totalItems > offsetPagination.pageSize
+      );
+    }
+    if (paginationMode === "server-cursor") {
+      const cursorPagination = serverPagination as
+        | ServerCursorPagination
+        | undefined;
+      return !!(cursorPagination?.hasNextPage || cursorPagination?.hasPrevPage);
+    }
+    // Client mode: show if there are more items than page size
+    return data.length > currentPageSize;
+  })();
 
   return (
     <div className="space-y-4">
@@ -490,7 +482,7 @@ export function DataTable<TData, TValue>({
               currentPageItemCount={data.length}
               itemName="results"
             />
-          ) : paginationMode === "server-offset" &&
+          ) : paginationMode === "server" &&
             serverPagination &&
             "onPageChange" in serverPagination ? (
             <TablePagination
