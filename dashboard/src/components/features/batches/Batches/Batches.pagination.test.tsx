@@ -178,6 +178,9 @@ describe("Batches - Pagination", () => {
         wrapper: createWrapper(),
       });
 
+      // Switch to files tab first
+      await user.click(within(container).getByRole("tab", { name: /files/i }));
+
       // Wait for initial render
       await waitFor(() => {
         expect(
@@ -277,6 +280,9 @@ describe("Batches - Pagination", () => {
       const { container } = render(<Batches {...defaultProps} />, {
         wrapper: createWrapper(),
       });
+
+      // Switch to files tab first
+      await user.click(within(container).getByRole("tab", { name: /files/i }));
 
       // Wait for page 1
       await waitFor(() => {
@@ -388,6 +394,9 @@ describe("Batches - Pagination", () => {
       const { container } = render(<Batches {...defaultProps} />, {
         wrapper: createWrapper(),
       });
+
+      // Switch to files tab first
+      await user.click(within(container).getByRole("tab", { name: /files/i }));
 
       await waitFor(() => {
         expect(
@@ -523,6 +532,9 @@ describe("Batches - Pagination", () => {
         wrapper: createWrapper(),
       });
 
+      // Switch to files tab first
+      await user.click(within(container).getByRole("tab", { name: /files/i }));
+
       await waitFor(() => {
         expect(
           within(container).getByText("file_page1_0.jsonl"),
@@ -635,6 +647,9 @@ describe("Batches - Pagination", () => {
       const { container } = render(<Batches {...defaultProps} />, {
         wrapper: createWrapper(),
       });
+
+      // Switch to files tab first
+      await user.click(within(container).getByRole("tab", { name: /files/i }));
 
       await waitFor(() => {
         expect(

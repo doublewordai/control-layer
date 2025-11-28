@@ -94,47 +94,28 @@ export function Batches({
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [onBatchCreatedCallback]);
 
-  // Read state from URL
-  const activeTab = (searchParams.get("tab") as "files" | "batches") || "files";
+  // Read state from URL - default to batches tab
+  const activeTab =
+    (searchParams.get("tab") as "files" | "batches") || "batches";
   const batchFileFilter = searchParams.get("fileFilter");
   const fileTypeFilter =
     (searchParams.get("fileType") as "input" | "output" | "error") || "input";
 
   // Pagination state from URL
-  const filesPage = parseInt(searchParams.get("filesPage") || "0", 10);
+  const filesPage = parseInt(searchParams.get("filesPage") || "1", 10);
   const filesPageSize = parseInt(searchParams.get("filesPageSize") || "10", 10);
-  const [filesAfterCursor, setFilesAfterCursor] = useState<string | undefined>(
-    undefined,
-  );
+  const filesAfterCursor = searchParams.get("filesAfter") || undefined;
 
-  const batchesPage = parseInt(searchParams.get("batchesPage") || "0", 10);
+  const batchesPage = parseInt(searchParams.get("batchesPage") || "1", 10);
   const batchesPageSize = parseInt(
     searchParams.get("batchesPageSize") || "10",
     10,
   );
-  const [batchesAfterCursor, setBatchesAfterCursor] = useState<
-    string | undefined
-  >(undefined);
+  const batchesAfterCursor = searchParams.get("batchesAfter") || undefined;
 
   // Cursor history for backwards pagination
   const filesCursorHistory = React.useRef<(string | undefined)[]>([]);
   const batchesCursorHistory = React.useRef<(string | undefined)[]>([]);
-
-  // Update files pagination in URL
-  const updateFilesPagination = (newPage: number, newPageSize: number) => {
-    const params = new URLSearchParams(searchParams);
-    params.set("filesPage", newPage.toString());
-    params.set("filesPageSize", newPageSize.toString());
-    setSearchParams(params, { replace: true });
-  };
-
-  // Update batches pagination in URL
-  const updateBatchesPagination = (newPage: number, newPageSize: number) => {
-    const params = new URLSearchParams(searchParams);
-    params.set("batchesPage", newPage.toString());
-    params.set("batchesPageSize", newPageSize.toString());
-    setSearchParams(params, { replace: true });
-  };
 
   // API queries
   // Paginated files query for display in Files tab
@@ -150,14 +131,14 @@ export function Batches({
     purpose: filePurpose,
     limit: filesPageSize + 1, // Fetch one extra to detect if there are more
     after: filesAfterCursor,
-    enabled: activeTab === "files", // Only fetch when on files tab
+    // Always fetch to populate tab counts, but refetch interval is lower when not active
   });
 
   // Paginated batches query
   const { data: batchesResponse, isLoading: batchesLoading } = useBatches({
     limit: batchesPageSize + 1, // Fetch one extra to detect if there are more
     after: batchesAfterCursor,
-    enabled: activeTab === "batches", // Only fetch when on batches tab
+    // Always fetch to populate tab counts, but refetch interval is lower when not active
   });
 
   // Process batches response - remove extra item used for hasMore detection
@@ -320,8 +301,11 @@ export function Batches({
     if (lastFile && filesHasMore) {
       // Save current cursor to history before moving forward
       filesCursorHistory.current[filesPage] = filesAfterCursor;
-      setFilesAfterCursor(lastFile.id);
-      updateFilesPagination(filesPage + 1, filesPageSize);
+      const params = new URLSearchParams(searchParams);
+      params.set("filesPage", (filesPage + 1).toString());
+      params.set("filesPageSize", filesPageSize.toString());
+      params.set("filesAfter", lastFile.id);
+      setSearchParams(params, { replace: true });
     }
   };
 
@@ -329,15 +313,25 @@ export function Batches({
     if (filesPage > 0) {
       // Use cursor history to go back one page
       const previousCursor = filesCursorHistory.current[filesPage - 1];
-      setFilesAfterCursor(previousCursor);
-      updateFilesPagination(filesPage - 1, filesPageSize);
+      const params = new URLSearchParams(searchParams);
+      params.set("filesPage", (filesPage - 1).toString());
+      params.set("filesPageSize", filesPageSize.toString());
+      if (previousCursor) {
+        params.set("filesAfter", previousCursor);
+      } else {
+        params.delete("filesAfter");
+      }
+      setSearchParams(params, { replace: true });
     }
   };
 
   const handleFilesPageSizeChange = (newSize: number) => {
-    setFilesAfterCursor(undefined);
     filesCursorHistory.current = []; // Clear history when changing page size
-    updateFilesPagination(0, newSize);
+    const params = new URLSearchParams(searchParams);
+    params.set("filesPage", "1");
+    params.set("filesPageSize", newSize.toString());
+    params.delete("filesAfter");
+    setSearchParams(params, { replace: true });
   };
 
   const handleBatchesNextPage = () => {
@@ -345,8 +339,11 @@ export function Batches({
     if (lastBatch && batchesHasMore) {
       // Save current cursor to history before moving forward
       batchesCursorHistory.current[batchesPage] = batchesAfterCursor;
-      setBatchesAfterCursor(lastBatch.id);
-      updateBatchesPagination(batchesPage + 1, batchesPageSize);
+      const params = new URLSearchParams(searchParams);
+      params.set("batchesPage", (batchesPage + 1).toString());
+      params.set("batchesPageSize", batchesPageSize.toString());
+      params.set("batchesAfter", lastBatch.id);
+      setSearchParams(params, { replace: true });
     }
   };
 
@@ -354,15 +351,25 @@ export function Batches({
     if (batchesPage > 0) {
       // Use cursor history to go back one page
       const previousCursor = batchesCursorHistory.current[batchesPage - 1];
-      setBatchesAfterCursor(previousCursor);
-      updateBatchesPagination(batchesPage - 1, batchesPageSize);
+      const params = new URLSearchParams(searchParams);
+      params.set("batchesPage", (batchesPage - 1).toString());
+      params.set("batchesPageSize", batchesPageSize.toString());
+      if (previousCursor) {
+        params.set("batchesAfter", previousCursor);
+      } else {
+        params.delete("batchesAfter");
+      }
+      setSearchParams(params, { replace: true });
     }
   };
 
   const handleBatchesPageSizeChange = (newSize: number) => {
-    setBatchesAfterCursor(undefined);
     batchesCursorHistory.current = []; // Clear history when changing page size
-    updateBatchesPagination(0, newSize);
+    const params = new URLSearchParams(searchParams);
+    params.set("batchesPage", "1");
+    params.set("batchesPageSize", newSize.toString());
+    params.delete("batchesAfter");
+    setSearchParams(params, { replace: true });
   };
 
   // Check if a file's associated batch is still in progress
@@ -401,11 +408,17 @@ export function Batches({
     isFileInProgress,
   });
 
+  const handleBatchClick = (batch: Batch) => {
+    if ((batch as any)._isEmpty) return;
+    navigate(`/batches/${batch.id}?from=/batches`);
+  };
+
   const batchColumns = createBatchColumns({
     onCancel: handleCancelBatch,
     getBatchFiles,
     onViewFile: handleViewFileRequests,
     getInputFile,
+    onRowClick: handleBatchClick,
   });
 
   // Loading state
@@ -458,39 +471,156 @@ export function Batches({
 
           {/* Right: Buttons + Tabs */}
           <div className="flex flex-col sm:flex-row items-stretch sm:items-center gap-3 lg:shrink-0">
-            {/* Action Button */}
-            <Button
-              onClick={() => onOpenUploadModal()}
-              variant="outline"
-              className={`flex-1 sm:flex-none transition-all duration-200 ${
-                dragActive ? "border-blue-500 bg-blue-50 text-blue-700" : ""
-              }`}
-            >
-              <Upload className="w-4 h-4 mr-2" />
-              Upload File
-            </Button>
+            {/* Action Button - changes based on active tab */}
+            {activeTab === "batches" ? (
+              <Button
+                onClick={() => onOpenCreateBatchModal()}
+                variant="outline"
+                className="flex-1 sm:flex-none"
+              >
+                <Play className="w-4 h-4 mr-2" />
+                Create Batch
+              </Button>
+            ) : (
+              <Button
+                onClick={() => onOpenUploadModal()}
+                variant="outline"
+                className={`flex-1 sm:flex-none transition-all duration-200 ${
+                  dragActive ? "border-blue-500 bg-blue-50 text-blue-700" : ""
+                }`}
+              >
+                <Upload className="w-4 h-4 mr-2" />
+                Upload File
+              </Button>
+            )}
 
             {/* Tabs Selector */}
             <TabsList className="w-full sm:w-auto">
-              <TabsTrigger
-                value="files"
-                className="flex items-center gap-2 flex-1 sm:flex-none"
-              >
-                <FileInput className="w-4 h-4" />
-                Files ({files.length})
-              </TabsTrigger>
               <TabsTrigger
                 value="batches"
                 className="flex items-center gap-2 flex-1 sm:flex-none"
               >
                 <Box className="w-4 h-4" />
-                Batches ({batches.length})
+                Batches
+              </TabsTrigger>
+              <TabsTrigger
+                value="files"
+                className="flex items-center gap-2 flex-1 sm:flex-none"
+              >
+                <FileInput className="w-4 h-4" />
+                Files
               </TabsTrigger>
             </TabsList>
           </div>
         </div>
 
         {/* Content */}
+        <TabsContent value="batches" className="space-y-4">
+          {/* Show filter indicator if active */}
+          {batchFileFilter && (
+            <div className="flex items-center gap-2 bg-blue-50 border border-blue-200 rounded-lg p-3">
+              <FileInput className="w-4 h-4 text-blue-600" />
+              <span className="text-sm text-blue-900">
+                Showing batches for file:{" "}
+                <span className="font-mono">
+                  {files.find((f) => f.id === batchFileFilter)?.filename ||
+                    batchFileFilter}
+                </span>
+              </span>
+              <Button
+                variant="ghost"
+                size="sm"
+                onClick={() => updateURL("batches", null)}
+                className="ml-auto h-auto py-1 px-2 text-blue-600 hover:text-blue-800 hover:bg-blue-100"
+              >
+                Clear filter
+              </Button>
+            </div>
+          )}
+          {filteredBatches.length === 0 ? (
+            <div className="text-center py-12">
+              <div className="p-4 bg-doubleword-neutral-100 rounded-full w-16 h-16 mx-auto mb-4 flex items-center justify-center">
+                <Box className="w-8 h-8 text-doubleword-neutral-600" />
+              </div>
+              <h3 className="text-lg font-medium text-doubleword-neutral-900 mb-2">
+                No batches created
+              </h3>
+              <p className="text-doubleword-neutral-600 mb-4">
+                Create a batch from an uploaded file to start processing
+                requests
+              </p>
+              <Button
+                onClick={() => {
+                  // Find the file object if we have a filter
+                  const file = batchFileFilter
+                    ? files.find((f) => f.id === batchFileFilter)
+                    : undefined;
+                  onOpenCreateBatchModal(file);
+                }}
+              >
+                <Play className="w-4 h-4 mr-2" />
+                {batchFileFilter ? "Create Batch" : "Create First Batch"}
+              </Button>
+            </div>
+          ) : (
+            <>
+              <DataTable
+                columns={batchColumns}
+                data={filteredBatches}
+                searchPlaceholder="Search batches..."
+                showPagination={false}
+                showColumnToggle={true}
+                pageSize={batchesPageSize}
+                minRows={batchesPageSize}
+                rowHeight="40px"
+                initialColumnVisibility={{ id: false }}
+                onRowClick={handleBatchClick}
+                headerActions={
+                  <div className="flex items-center gap-2">
+                    <span className="text-sm text-gray-600">Rows:</span>
+                    <Select
+                      value={batchesPageSize.toString()}
+                      onValueChange={(value) =>
+                        handleBatchesPageSizeChange(Number(value))
+                      }
+                    >
+                      <SelectTrigger className="w-20p h-9">
+                        <SelectValue />
+                      </SelectTrigger>
+                      <SelectContent>
+                        <SelectItem value="10">10</SelectItem>
+                        <SelectItem value="25">25</SelectItem>
+                        <SelectItem value="50">50</SelectItem>
+                        <SelectItem value="100">100</SelectItem>
+                        <SelectItem value="200">200</SelectItem>
+                        <SelectItem value="500">500</SelectItem>
+                      </SelectContent>
+                    </Select>
+                  </div>
+                }
+              />
+              <CursorPagination
+                currentPage={batchesPage}
+                itemsPerPage={batchesPageSize}
+                onNextPage={handleBatchesNextPage}
+                onPrevPage={handleBatchesPrevPage}
+                onFirstPage={() => {
+                  batchesCursorHistory.current = [];
+                  const params = new URLSearchParams(searchParams);
+                  params.set("batchesPage", "1");
+                  params.set("batchesPageSize", batchesPageSize.toString());
+                  params.delete("batchesAfter");
+                  setSearchParams(params, { replace: true });
+                }}
+                hasNextPage={batchesHasMore}
+                hasPrevPage={batchesPage > 1}
+                currentPageItemCount={filteredBatches.length}
+                itemName="batches"
+              />
+            </>
+          )}
+        </TabsContent>
+
         <TabsContent value="files" className="space-y-4">
           {files.length === 0 ? (
             <div className="text-center py-12">
@@ -555,14 +685,14 @@ export function Batches({
                                 params.delete("fileType");
                               }
                               // Reset pagination
-                              params.set("filesPage", "0");
+                              params.set("filesPage", "1");
                               params.set(
                                 "filesPageSize",
                                 filesPageSize.toString(),
                               );
+                              params.delete("filesAfter");
                               setSearchParams(params, { replace: false });
-                              // Reset cursor and history
-                              setFilesAfterCursor(undefined);
+                              // Reset cursor history
                               filesCursorHistory.current = [];
                             }}
                             className={`inline-flex items-center justify-center whitespace-nowrap rounded-sm px-3 py-1 text-sm font-medium ring-offset-background transition-all focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 ${
@@ -599,121 +729,22 @@ export function Batches({
                 }
               />
               <CursorPagination
-                currentPage={filesPage + 1}
+                currentPage={filesPage}
                 itemsPerPage={filesPageSize}
                 onNextPage={handleFilesNextPage}
                 onPrevPage={handleFilesPrevPage}
                 onFirstPage={() => {
-                  setFilesAfterCursor(undefined);
                   filesCursorHistory.current = [];
-                  updateFilesPagination(0, filesPageSize);
+                  const params = new URLSearchParams(searchParams);
+                  params.set("filesPage", "1");
+                  params.set("filesPageSize", filesPageSize.toString());
+                  params.delete("filesAfter");
+                  setSearchParams(params, { replace: true });
                 }}
                 hasNextPage={filesHasMore}
-                hasPrevPage={filesPage > 0}
+                hasPrevPage={filesPage > 1}
                 currentPageItemCount={files.length}
                 itemName="files"
-              />
-            </>
-          )}
-        </TabsContent>
-
-        <TabsContent value="batches" className="space-y-4">
-          {/* Show filter indicator if active */}
-          {batchFileFilter && (
-            <div className="flex items-center gap-2 bg-blue-50 border border-blue-200 rounded-lg p-3">
-              <FileInput className="w-4 h-4 text-blue-600" />
-              <span className="text-sm text-blue-900">
-                Showing batches for file:{" "}
-                <span className="font-mono">
-                  {files.find((f) => f.id === batchFileFilter)?.filename ||
-                    batchFileFilter}
-                </span>
-              </span>
-              <Button
-                variant="ghost"
-                size="sm"
-                onClick={() => updateURL("batches", null)}
-                className="ml-auto h-auto py-1 px-2 text-blue-600 hover:text-blue-800 hover:bg-blue-100"
-              >
-                Clear filter
-              </Button>
-            </div>
-          )}
-          {filteredBatches.length === 0 ? (
-            <div className="text-center py-12">
-              <div className="p-4 bg-doubleword-neutral-100 rounded-full w-16 h-16 mx-auto mb-4 flex items-center justify-center">
-                <Box className="w-8 h-8 text-doubleword-neutral-600" />
-              </div>
-              <h3 className="text-lg font-medium text-doubleword-neutral-900 mb-2">
-                No batches created
-              </h3>
-              <p className="text-doubleword-neutral-600 mb-4">
-                Create a batch from an uploaded file to start processing
-                requests
-              </p>
-              <Button
-                onClick={() => {
-                  // Find the file object if we have a filter
-                  const file = batchFileFilter
-                    ? files.find((f) => f.id === batchFileFilter)
-                    : undefined;
-                  onOpenCreateBatchModal(file);
-                }}
-              >
-                <Play className="w-4 h-4 mr-2" />
-                {batchFileFilter ? "Create Batch" : "Create First Batch"}
-              </Button>
-            </div>
-          ) : (
-            <>
-              <DataTable
-                columns={batchColumns}
-                data={filteredBatches}
-                searchPlaceholder="Search batches..."
-                showPagination={false}
-                showColumnToggle={true}
-                pageSize={batchesPageSize}
-                minRows={batchesPageSize}
-                rowHeight="40px"
-                initialColumnVisibility={{ id: false }}
-                headerActions={
-                  <div className="flex items-center gap-2">
-                    <span className="text-sm text-gray-600">Rows:</span>
-                    <Select
-                      value={batchesPageSize.toString()}
-                      onValueChange={(value) =>
-                        handleBatchesPageSizeChange(Number(value))
-                      }
-                    >
-                      <SelectTrigger className="w-20p h-9">
-                        <SelectValue />
-                      </SelectTrigger>
-                      <SelectContent>
-                        <SelectItem value="10">10</SelectItem>
-                        <SelectItem value="25">25</SelectItem>
-                        <SelectItem value="50">50</SelectItem>
-                        <SelectItem value="100">100</SelectItem>
-                        <SelectItem value="200">200</SelectItem>
-                        <SelectItem value="500">500</SelectItem>
-                      </SelectContent>
-                    </Select>
-                  </div>
-                }
-              />
-              <CursorPagination
-                currentPage={batchesPage + 1}
-                itemsPerPage={batchesPageSize}
-                onNextPage={handleBatchesNextPage}
-                onPrevPage={handleBatchesPrevPage}
-                onFirstPage={() => {
-                  setBatchesAfterCursor(undefined);
-                  batchesCursorHistory.current = [];
-                  updateBatchesPagination(0, batchesPageSize);
-                }}
-                hasNextPage={batchesHasMore}
-                hasPrevPage={batchesPage > 0}
-                currentPageItemCount={filteredBatches.length}
-                itemName="batches"
               />
             </>
           )}
