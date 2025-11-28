@@ -209,23 +209,29 @@ export function DataTable<TData, TValue>({
     : 0;
 
   // Determine if pagination should be shown
-  const showPagination = (() => {
-    if (paginationMode === "server-offset") {
-      const offsetPagination = serverPagination as ServerPagination | undefined;
-      return (
-        !!offsetPagination?.totalItems &&
-        offsetPagination.totalItems > offsetPagination.pageSize
-      );
-    }
-    if (paginationMode === "server-cursor") {
-      const cursorPagination = serverPagination as
-        | ServerCursorPagination
-        | undefined;
-      return !!(cursorPagination?.hasNextPage || cursorPagination?.hasPrevPage);
-    }
-    // Client mode: show if there are more items than page size
-    return data.length > currentPageSize;
-  })();
+  const showPagination =
+    showPaginationProp ??
+    (() => {
+      if (paginationMode === "server-offset") {
+        const offsetPagination = serverPagination as
+          | ServerPagination
+          | undefined;
+        return (
+          !!offsetPagination?.totalItems &&
+          offsetPagination.totalItems > offsetPagination.pageSize
+        );
+      }
+      if (paginationMode === "server-cursor") {
+        const cursorPagination = serverPagination as
+          | ServerCursorPagination
+          | undefined;
+        return !!(
+          cursorPagination?.hasNextPage || cursorPagination?.hasPrevPage
+        );
+      }
+      // Client mode: show if there are more items than page size
+      return data.length > currentPageSize;
+    })();
 
   return (
     <div className="space-y-4">
