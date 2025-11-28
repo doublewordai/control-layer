@@ -66,6 +66,11 @@ const Batches = lazy(() =>
     default: m.Batches,
   })),
 );
+const BatchInfo = lazy(() =>
+  import("./components/features/batches/BatchInfo").then((m) => ({
+    default: m.BatchInfo,
+  })),
+);
 const FileRequests = lazy(() =>
   import("./components/features/batches/FileRequests").then((m) => ({
     default: m.FileRequests,
@@ -121,7 +126,11 @@ const queryClient = new QueryClient({
     mutations: {
       onError: (error) => {
         // Handle 401s globally for mutations
-        if (error instanceof Error && "status" in error && error.status === 401) {
+        if (
+          error instanceof Error &&
+          "status" in error &&
+          error.status === 401
+        ) {
           // Clear all queries and redirect to login
           queryClient.clear();
           window.location.href = "/login";
@@ -274,6 +283,18 @@ function AppRoutes() {
               <ProtectedRoute path="/batches">
                 <Suspense fallback={<RouteLoader />}>
                   <Batches />
+                </Suspense>
+              </ProtectedRoute>
+            </AppLayout>
+          }
+        />
+        <Route
+          path="/batches/:batchId"
+          element={
+            <AppLayout>
+              <ProtectedRoute path="/batches/:batchId">
+                <Suspense fallback={<RouteLoader />}>
+                  <BatchInfo />
                 </Suspense>
               </ProtectedRoute>
             </AppLayout>

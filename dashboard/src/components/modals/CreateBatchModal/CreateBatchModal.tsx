@@ -1,5 +1,5 @@
-import { useState } from "react";
-import { Play, AlertCircle } from "lucide-react";
+import { useState, useEffect } from "react";
+import { Play, AlertCircle, X, Upload } from "lucide-react";
 import {
   Dialog,
   DialogContent,
@@ -11,7 +11,12 @@ import {
 import { Button } from "../../ui/button";
 import { Label } from "../../ui/label";
 import { Input } from "../../ui/input";
-import { useCreateBatch } from "../../../api/control-layer/hooks";
+import { Combobox } from "../../ui/combobox";
+import {
+  useCreateBatch,
+  useFiles,
+  useUploadFile,
+} from "../../../api/control-layer/hooks";
 import { toast } from "sonner";
 import type { FileObject } from "../../features/batches/types";
 import { AlertBox } from "@/components/ui/alert-box";
@@ -29,15 +34,114 @@ export function CreateBatchModal({
   onSuccess,
   preselectedFile,
 }: CreateBatchModalProps) {
+  const [selectedFileId, setSelectedFileId] = useState<string | null>(
+    preselectedFile?.id || null,
+  );
+  const [fileToUpload, setFileToUpload] = useState<File | null>(null);
+  const [expirationSeconds, setExpirationSeconds] = useState<number>(2592000); // 30 days default
   const [endpoint, setEndpoint] = useState<string>("/v1/chat/completions");
   const [description, setDescription] = useState<string>("");
   const [error, setError] = useState<string | null>(null);
+  const [dragActive, setDragActive] = useState(false);
+  const [isUploading, setIsUploading] = useState(false);
 
   const createBatchMutation = useCreateBatch();
+  const uploadMutation = useUploadFile();
+
+  // Fetch available files for combobox (only input files with purpose "batch")
+  const { data: filesResponse } = useFiles({
+    purpose: "batch",
+    limit: 1000, // Fetch plenty for the dropdown
+  });
+
+  const availableFiles = filesResponse?.data || [];
+
+  // Update selected file when preselected file changes
+  useEffect(() => {
+    if (preselectedFile) {
+      setSelectedFileId(preselectedFile.id);
+      setFileToUpload(null); // Clear any file to upload
+    }
+  }, [preselectedFile]);
+
+  const handleDrag = (e: React.DragEvent) => {
+    e.preventDefault();
+    e.stopPropagation();
+    if (e.type === "dragenter" || e.type === "dragover") {
+      setDragActive(true);
+    } else if (e.type === "dragleave") {
+      setDragActive(false);
+    }
+  };
+
+  const handleDrop = (e: React.DragEvent) => {
+    e.preventDefault();
+    e.stopPropagation();
+    setDragActive(false);
+
+    if (e.dataTransfer.files && e.dataTransfer.files[0]) {
+      const droppedFile = e.dataTransfer.files[0];
+      if (droppedFile.name.endsWith(".jsonl")) {
+        setFileToUpload(droppedFile);
+        setSelectedFileId(null); // Clear combobox selection
+        setError(null);
+      } else {
+        setError("Please upload a .jsonl file");
+      }
+    }
+  };
+
+  const handleFileChange = (e: React.ChangeEvent<HTMLInputElement>) => {
+    if (e.target.files && e.target.files[0]) {
+      const file = e.target.files[0];
+      if (file.name.endsWith(".jsonl")) {
+        setFileToUpload(file);
+        setSelectedFileId(null); // Clear combobox selection
+        setError(null);
+      } else {
+        setError("Please upload a .jsonl file");
+      }
+    }
+  };
+
+  const handleRemoveFile = () => {
+    setFileToUpload(null);
+    setSelectedFileId(null);
+  };
 
   const handleSubmit = async () => {
-    if (!preselectedFile) {
-      setError("No file selected");
+    let finalFileId = selectedFileId;
+
+    // If a file needs to be uploaded, upload it first
+    if (fileToUpload) {
+      setIsUploading(true);
+      try {
+        const uploadedFile = await uploadMutation.mutateAsync({
+          file: fileToUpload,
+          purpose: "batch",
+          expires_after: {
+            anchor: "created_at",
+            seconds: expirationSeconds,
+          },
+        });
+        finalFileId = uploadedFile.id;
+        toast.success(`File "${fileToUpload.name}" uploaded successfully`);
+      } catch (error) {
+        console.error("Failed to upload file:", error);
+        setError(
+          error instanceof Error
+            ? error.message
+            : "Failed to upload file. Please try again.",
+        );
+        setIsUploading(false);
+        return;
+      } finally {
+        setIsUploading(false);
+      }
+    }
+
+    if (!finalFileId) {
+      setError("Please select or upload a file");
       return;
     }
 
@@ -48,18 +152,25 @@ export function CreateBatchModal({
       }
 
       await createBatchMutation.mutateAsync({
-        input_file_id: preselectedFile.id,
+        input_file_id: finalFileId,
         endpoint,
         completion_window: "24h",
         metadata: Object.keys(metadata).length > 0 ? metadata : undefined,
       });
 
-      toast.success(
-        `Batch created successfully from "${preselectedFile.filename}"`,
-      );
+      const fileName =
+        fileToUpload?.name ||
+        availableFiles.find((f) => f.id === finalFileId)?.filename ||
+        "file";
+      toast.success(`Batch created successfully from "${fileName}"`);
 
+      // Reset form
+      setSelectedFileId(null);
+      setFileToUpload(null);
       setEndpoint("/v1/chat/completions");
       setDescription("");
+      setExpirationSeconds(2592000);
+      setError(null);
       onSuccess?.();
       onClose();
     } catch (error) {
@@ -69,10 +180,25 @@ export function CreateBatchModal({
   };
 
   const handleClose = () => {
+    setSelectedFileId(preselectedFile?.id || null);
+    setFileToUpload(null);
     setEndpoint("/v1/chat/completions");
     setDescription("");
+    setExpirationSeconds(2592000);
+    setError(null);
     onClose();
   };
+
+  const selectedFile = selectedFileId
+    ? availableFiles.find((f) => f.id === selectedFileId)
+    : null;
+
+  const fileOptions = availableFiles.map((file) => ({
+    value: file.id,
+    label: file.filename,
+  }));
+
+  const isPending = createBatchMutation.isPending || isUploading;
 
   return (
     <Dialog open={isOpen} onOpenChange={handleClose}>
@@ -80,7 +206,7 @@ export function CreateBatchModal({
         <DialogHeader>
           <DialogTitle>Create New Batch</DialogTitle>
           <DialogDescription>
-            Enter a description for the batch.
+            Select an existing file or upload a new one to create a batch.
           </DialogDescription>
         </DialogHeader>
 
@@ -89,23 +215,124 @@ export function CreateBatchModal({
         </AlertBox>
 
         <div className="space-y-6">
-          {/* File Info */}
-          {preselectedFile && (
-            <div className="space-y-2">
-              <Label>Selected File</Label>
-              <div className="bg-gray-50 rounded-lg p-3 space-y-1">
-                <p className="text-sm font-medium text-gray-900">
-                  {preselectedFile.filename}
-                </p>
-                <div className="flex gap-4 text-xs text-gray-600">
-                  <span>
-                    Size: {(preselectedFile.bytes / 1024).toFixed(1)} KB
-                  </span>
-                  <span>ID: {preselectedFile.id}</span>
+          {/* File Selection/Upload */}
+          <div className="space-y-2">
+            <Label>File Selection</Label>
+
+            {/* Show selected file or file to upload */}
+            {selectedFile || fileToUpload ? (
+              <div className="bg-gray-50 rounded-lg p-3 space-y-1 relative">
+                <div className="flex items-start justify-between gap-2">
+                  <div className="flex-1 min-w-0">
+                    <p className="text-sm font-medium text-gray-900 truncate">
+                      {fileToUpload?.name || selectedFile?.filename}
+                    </p>
+                    <div className="flex gap-4 text-xs text-gray-600">
+                      {fileToUpload ? (
+                        <>
+                          <span>
+                            Size: {(fileToUpload.size / 1024).toFixed(1)} KB
+                          </span>
+                          <span className="text-blue-600">Ready to upload</span>
+                        </>
+                      ) : (
+                        selectedFile && (
+                          <>
+                            <span>
+                              Size: {(selectedFile.bytes / 1024).toFixed(1)} KB
+                            </span>
+                            <span>ID: {selectedFile.id}</span>
+                          </>
+                        )
+                      )}
+                    </div>
+                  </div>
+                  <Button
+                    type="button"
+                    variant="ghost"
+                    size="sm"
+                    onClick={handleRemoveFile}
+                    className="h-8 w-8 p-0 text-gray-500 hover:text-red-600 hover:bg-red-50 shrink-0"
+                    disabled={isPending}
+                  >
+                    <X className="w-4 h-4" />
+                  </Button>
                 </div>
               </div>
-            </div>
-          )}
+            ) : (
+              <>
+                {/* Combobox for selecting existing file */}
+                {availableFiles.length > 0 && (
+                  <div className="space-y-2">
+                    <Combobox
+                      options={fileOptions}
+                      value={selectedFileId || ""}
+                      onValueChange={(value) => {
+                        setSelectedFileId(value);
+                        setFileToUpload(null); // Clear file to upload
+                        setError(null);
+                      }}
+                      placeholder="Select an existing file..."
+                      searchPlaceholder="Search files..."
+                      emptyMessage="No files found."
+                      className="w-full"
+                    />
+                    <p className="text-xs text-gray-500">
+                      Choose from your uploaded batch files
+                    </p>
+                  </div>
+                )}
+
+                {/* Separator */}
+                {availableFiles.length > 0 && (
+                  <div className="relative py-2">
+                    <div className="absolute inset-0 flex items-center">
+                      <span className="w-full border-t" />
+                    </div>
+                    <div className="relative flex justify-center text-xs uppercase">
+                      <span className="bg-white px-2 text-muted-foreground">
+                        Or
+                      </span>
+                    </div>
+                  </div>
+                )}
+
+                {/* Drop zone for new file */}
+                <div
+                  className={`relative border-2 border-dashed rounded-lg p-6 text-center transition-colors ${
+                    dragActive
+                      ? "border-blue-500 bg-blue-50"
+                      : "border-gray-300 hover:border-gray-400"
+                  }`}
+                  onDragEnter={handleDrag}
+                  onDragLeave={handleDrag}
+                  onDragOver={handleDrag}
+                  onDrop={handleDrop}
+                >
+                  <input
+                    type="file"
+                    id="file-upload-batch"
+                    accept=".jsonl"
+                    onChange={handleFileChange}
+                    className="absolute inset-0 w-full h-full opacity-0 cursor-pointer"
+                    disabled={isPending}
+                  />
+
+                  <div className="space-y-2 pointer-events-none">
+                    <Upload className="w-10 h-10 mx-auto text-gray-400" />
+                    <div>
+                      <p className="font-medium text-gray-700 text-sm">
+                        Drop a .jsonl file here
+                      </p>
+                      <p className="text-xs text-gray-500">
+                        or click to browse
+                      </p>
+                    </div>
+                  </div>
+                </div>
+              </>
+            )}
+          </div>
 
           {/* Description (Optional) */}
           <div className="space-y-2">
@@ -117,7 +344,18 @@ export function CreateBatchModal({
               placeholder="e.g., Daily evaluation batch"
               value={description}
               onChange={(e) => setDescription(e.target.value)}
+              onKeyDown={(e) => {
+                if (
+                  e.key === "Enter" &&
+                  !isPending &&
+                  (selectedFileId || fileToUpload)
+                ) {
+                  e.preventDefault();
+                  handleSubmit();
+                }
+              }}
               maxLength={512}
+              disabled={isPending}
             />
             <p className="text-xs text-gray-500">
               Add a description to help identify this batch later
@@ -131,8 +369,10 @@ export function CreateBatchModal({
               <div className="text-sm text-blue-800">
                 <p className="font-medium mb-1">Batch Processing</p>
                 <p className="text-blue-700">
-                  The batch will process all requests in the selected file. You
-                  can track progress and download results once completed.
+                  {fileToUpload
+                    ? "The file will be uploaded and the batch will process all requests. "
+                    : "The batch will process all requests in the selected file. "}
+                  You can track progress and download results once completed.
                 </p>
               </div>
             </div>
@@ -144,7 +384,7 @@ export function CreateBatchModal({
             type="button"
             variant="outline"
             onClick={handleClose}
-            disabled={createBatchMutation.isPending}
+            disabled={isPending}
           >
             Cancel
           </Button>
@@ -152,13 +392,13 @@ export function CreateBatchModal({
             type="button"
             variant="outline"
             onClick={handleSubmit}
-            disabled={!preselectedFile || createBatchMutation.isPending}
+            disabled={(!selectedFileId && !fileToUpload) || isPending}
             className="group"
           >
-            {createBatchMutation.isPending ? (
+            {isPending ? (
               <>
                 <div className="animate-spin rounded-full h-4 w-4 border-b-2 border-white mr-2"></div>
-                Creating...
+                {isUploading ? "Uploading..." : "Creating..."}
               </>
             ) : (
               <>
