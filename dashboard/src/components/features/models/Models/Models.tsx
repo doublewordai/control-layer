@@ -48,11 +48,23 @@ const Models: React.FC = () => {
 
   // sync search query to URL params
   useEffect(() => {
-    const params = new URLSearchParams();
-    if (searchQuery) params.set("search", searchQuery);
-    if (currentPage) params.set("page", String(currentPage));
-
-    setSearchParams(params, { replace: true });
+    setSearchParams(
+      (prev) => {
+        const params = new URLSearchParams(prev);
+        if (searchQuery) {
+          params.set("search", searchQuery);
+        } else {
+          params.delete("search");
+        }
+        if (currentPage > 1) {
+          params.set("page", String(currentPage));
+        } else {
+          params.delete("page");
+        }
+        return params;
+      },
+      { replace: true },
+    );
   }, [searchQuery, currentPage, setSearchParams]);
 
   // reset pagination when search query changes
