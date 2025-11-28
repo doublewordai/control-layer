@@ -129,6 +129,7 @@ fn create_file_stream(
         let mut total_size = 0i64;
         let mut line_count = 0u64;
         let mut incomplete_line = String::new();
+        let mut incomplete_utf8_bytes = Vec::new(); // Buffer for incomplete UTF-8 sequences at chunk boundaries
         let mut metadata = fusillade::FileMetadata {
             uploaded_by,
             ..Default::default()
@@ -191,16 +192,86 @@ fn create_file_stream(
                             return;
                         }
 
-                        // Convert chunk to UTF-8
-                        let chunk_str = match std::str::from_utf8(&chunk) {
-                            Ok(s) => s,
-                            Err(_) => {
-                                let _ = tx
-                                    .send(fusillade::FileStreamItem::Error("File contains invalid UTF-8".to_string()))
-                                    .await;
-                                return;
+                        // Combine incomplete UTF-8 bytes from previous chunk with current chunk
+                        let combined_bytes = if incomplete_utf8_bytes.is_empty() {
+                            chunk.to_vec()
+                        } else {
+                            let mut combined = incomplete_utf8_bytes.clone();
+                            combined.extend_from_slice(&chunk);
+                            combined
+                        };
+
+                        // Try to convert to UTF-8, handling incomplete sequences at the end
+                        let (chunk_str, remaining_bytes) = match std::str::from_utf8(&combined_bytes) {
+                            Ok(s) => {
+                                // All bytes are valid UTF-8
+                                incomplete_utf8_bytes.clear();
+                                (s.to_string(), Vec::new())
+                            }
+                            Err(e) => {
+                                // Check if the error is due to an incomplete sequence at the end
+                                let valid_up_to = e.valid_up_to();
+
+                                // If there's an error length, it means we have invalid UTF-8, not just incomplete
+                                if let Some(error_len) = e.error_len() {
+                                    // This is actual invalid UTF-8, not just an incomplete sequence
+                                    tracing::error!(
+                                        "UTF-8 parsing error on/near line {}, byte offset {} in combined buffer, total file offset ~{}, combined buffer size: {} bytes, error: {:?}",
+                                        line_count + 1,
+                                        valid_up_to,
+                                        total_size - chunk_size + valid_up_to as i64,
+                                        combined_bytes.len(),
+                                        e
+                                    );
+
+                                    // Show a hex dump of the problematic area
+                                    let error_start = valid_up_to.saturating_sub(20);
+                                    let error_end = (valid_up_to + error_len + 20).min(combined_bytes.len());
+                                    let problem_bytes = &combined_bytes[error_start..error_end];
+                                    tracing::error!("Bytes around error (offset {}-{}): {:02x?}", error_start, error_end, problem_bytes);
+
+                                    // Try to show ASCII representation
+                                    let ascii_repr: String = problem_bytes
+                                        .iter()
+                                        .map(|&b| if b.is_ascii_graphic() || b == b' ' { b as char } else { '.' })
+                                        .collect();
+                                    tracing::error!("ASCII representation: '{}'", ascii_repr);
+
+                                    // Also show the incomplete_line if any
+                                    if !incomplete_line.is_empty() {
+                                        tracing::error!(
+                                            "Incomplete line from previous chunk (may be part of the problem): '{}'",
+                                            incomplete_line.chars().take(200).collect::<String>()
+                                        );
+                                    }
+
+                                    let error_msg = format!(
+                                        "File contains invalid UTF-8 on/near line {} at byte offset {}. Error: {}",
+                                        line_count + 1,
+                                        total_size - chunk_size + valid_up_to as i64,
+                                        e
+                                    );
+                                    let _ = tx.send(fusillade::FileStreamItem::Error(error_msg)).await;
+                                    return;
+                                }
+
+                                // Otherwise, this is an incomplete UTF-8 sequence at the end of the chunk
+                                // Save the incomplete bytes for the next chunk
+                                let valid_str =
+                                    std::str::from_utf8(&combined_bytes[..valid_up_to]).expect("valid_up_to should point to valid UTF-8");
+                                let remaining = combined_bytes[valid_up_to..].to_vec();
+
+                                tracing::debug!(
+                                    "Incomplete UTF-8 sequence at chunk boundary, buffering {} bytes for next chunk",
+                                    remaining.len()
+                                );
+
+                                (valid_str.to_string(), remaining)
                             }
                         };
+
+                        // Update the incomplete UTF-8 buffer for next iteration
+                        incomplete_utf8_bytes = remaining_bytes;
 
                         // Combine with incomplete line from previous chunk
                         let text_to_process = if incomplete_line.is_empty() {
