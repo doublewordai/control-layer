@@ -68,7 +68,7 @@ const UsersGroups: React.FC = () => {
 
   const groupsPagination = useServerPagination({
     paramPrefix: "groups",
-    defaultPageSize: 10,
+    defaultPageSize: 9,
   });
 
   // Get tab from URL or default to "users"
@@ -536,15 +536,15 @@ const UsersGroups: React.FC = () => {
                 </div>
               );
             })}
-            <TablePagination
-              itemName="group"
-              itemsPerPage={groupsPagination.pageSize}
-              currentPage={groupsPagination.page}
-              onPageChange={groupsPagination.handlePageChange}
-              totalItems={groupsData?.total_count || 0}
-            />
           </div>
         )}
+        <TablePagination
+          itemName="group"
+          itemsPerPage={groupsPagination.pageSize}
+          currentPage={groupsPagination.page}
+          onPageChange={groupsPagination.handlePageChange}
+          totalItems={groupsData?.total_count || 0}
+        />
       </div>
 
       {/* Modals */}
