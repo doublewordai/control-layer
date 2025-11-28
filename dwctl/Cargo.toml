@@ -63,7 +63,7 @@ utoipa = { version = "5.0", features = [
 ] }
 utoipa-rapidoc = { version = "6.0", features = ["axum"] }
 figment = { version = "0.10", features = ["yaml", "env", "test"] }
-rand = "0.8"
+rand = "0.9"
 # Authentication
 jsonwebtoken = "9.0"
 argon2 = "0.5"
