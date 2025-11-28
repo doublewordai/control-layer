@@ -89,7 +89,7 @@ rust_decimal = { version = "1.38.0", features = ["serde"] }
 bon = "3.3"
 once_cell = "1.20"
 # Prometheus for GenAI metrics (via axum-prometheus)
-prometheus = "0.13"
+prometheus = "0.14"
 # Embedded database support
 postgresql_embedded = { version = "0.20", optional = true, features = [
   "bundled",
