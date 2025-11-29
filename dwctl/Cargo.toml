@@ -65,7 +65,7 @@ utoipa-rapidoc = { version = "6.0", features = ["axum"] }
 figment = { version = "0.10", features = ["yaml", "env", "test"] }
 rand = "0.8"
 # Authentication
-jsonwebtoken = "9.0"
+jsonwebtoken = "10.0"
 argon2 = "0.5"
 base64 = "0.22"
 bytes = "1.5"
