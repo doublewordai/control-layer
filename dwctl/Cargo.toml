@@ -123,7 +123,7 @@ sqlx = { version = "0.8", features = [
 tokio-test = "0.4"
 serial_test = "3.0"
 test-log = { version = "0.2", features = ["trace"] }
-criterion = { version = "0.7", features = ["async_tokio"] }
+criterion = { version = "0.8", features = ["async_tokio"] }
 tempfile = "3.0"
 wiremock = "0.6"
 serde_urlencoded = "0.7"
