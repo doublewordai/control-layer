@@ -1245,4 +1245,301 @@ mod tests {
         let claude3 = models.iter().find(|m| m.model == "claude-3").unwrap();
         assert_eq!(claude3.percentage, 30.0);
     }
+
+    // Helper function to insert analytics data with fusillade_request_id
+    async fn insert_test_analytics_with_request_id(
+        pool: &PgPool,
+        fusillade_request_id: Uuid,
+        timestamp: DateTime<Utc>,
+        model: &str,
+        status_code: i32,
+        duration_ms: f64,
+        duration_to_first_byte_ms: Option<f64>,
+        prompt_tokens: i64,
+        completion_tokens: i64,
+        input_price_per_token: Option<f64>,
+        output_price_per_token: Option<f64>,
+    ) {
+        use rust_decimal::Decimal;
+        use uuid::Uuid;
+
+        sqlx::query!(
+            r#"
+            INSERT INTO http_analytics (
+                instance_id, correlation_id, timestamp, uri, method, status_code,
+                duration_ms, duration_to_first_byte_ms, model, prompt_tokens,
+                completion_tokens, total_tokens, fusillade_request_id,
+                input_price_per_token, output_price_per_token
+            ) VALUES ($1, $2, $3, '/ai/chat/completions', 'POST', $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
+            "#,
+            Uuid::new_v4(),
+            1i64,
+            timestamp,
+            status_code,
+            duration_ms as i64,
+            duration_to_first_byte_ms.map(|d| d as i64),
+            model,
+            prompt_tokens,
+            completion_tokens,
+            prompt_tokens + completion_tokens,
+            fusillade_request_id,
+            input_price_per_token.map(Decimal::from_f64_retain).flatten(),
+            output_price_per_token.map(Decimal::from_f64_retain).flatten(),
+        )
+        .execute(pool)
+        .await
+        .expect("Failed to insert test analytics data with request ID");
+    }
+
+    #[sqlx::test]
+    async fn test_get_batch_analytics_empty_request_ids(pool: PgPool) {
+        let result = get_batch_analytics(&pool, &[]).await.unwrap();
+
+        assert_eq!(result.total_requests, 0);
+        assert_eq!(result.total_prompt_tokens, 0);
+        assert_eq!(result.total_completion_tokens, 0);
+        assert_eq!(result.total_tokens, 0);
+        assert_eq!(result.avg_duration_ms, None);
+        assert_eq!(result.avg_ttfb_ms, None);
+        assert_eq!(result.total_cost, None);
+    }
+
+    #[sqlx::test]
+    async fn test_get_batch_analytics_single_request(pool: PgPool) {
+        let request_id = Uuid::new_v4();
+        let now = Utc::now();
+
+        // Insert a single analytics record
+        insert_test_analytics_with_request_id(
+            &pool,
+            request_id,
+            now,
+            "gpt-4",
+            200,
+            150.0,
+            Some(50.0),
+            100,
+            50,
+            Some(0.00001), // $0.00001 per token
+            Some(0.00003), // $0.00003 per token
+        )
+        .await;
+
+        let result = get_batch_analytics(&pool, &[request_id]).await.unwrap();
+
+        assert_eq!(result.total_requests, 1);
+        assert_eq!(result.total_prompt_tokens, 100);
+        assert_eq!(result.total_completion_tokens, 50);
+        assert_eq!(result.total_tokens, 150);
+        assert_eq!(result.avg_duration_ms, Some(150.0));
+        assert_eq!(result.avg_ttfb_ms, Some(50.0));
+
+        // Cost = (100 * 0.00001) + (50 * 0.00003) = 0.001 + 0.0015 = 0.0025
+        let cost = result.total_cost.unwrap();
+        let cost_f64: f64 = cost.parse().unwrap();
+        assert!((cost_f64 - 0.0025).abs() < 0.00001);
+    }
+
+    #[sqlx::test]
+    async fn test_get_batch_analytics_multiple_requests(pool: PgPool) {
+        let request_id_1 = Uuid::new_v4();
+        let request_id_2 = Uuid::new_v4();
+        let request_id_3 = Uuid::new_v4();
+        let now = Utc::now();
+
+        // Insert multiple analytics records
+        insert_test_analytics_with_request_id(
+            &pool,
+            request_id_1,
+            now,
+            "gpt-4",
+            200,
+            100.0,
+            Some(30.0),
+            50,
+            25,
+            Some(0.00001),
+            Some(0.00003),
+        )
+        .await;
+
+        insert_test_analytics_with_request_id(
+            &pool,
+            request_id_2,
+            now,
+            "gpt-4",
+            200,
+            200.0,
+            Some(70.0),
+            100,
+            50,
+            Some(0.00001),
+            Some(0.00003),
+        )
+        .await;
+
+        insert_test_analytics_with_request_id(
+            &pool,
+            request_id_3,
+            now,
+            "claude-3",
+            200,
+            150.0,
+            Some(40.0),
+            75,
+            35,
+            Some(0.00002),
+            Some(0.00004),
+        )
+        .await;
+
+        let result = get_batch_analytics(&pool, &[request_id_1, request_id_2, request_id_3])
+            .await
+            .unwrap();
+
+        assert_eq!(result.total_requests, 3);
+        assert_eq!(result.total_prompt_tokens, 225); // 50 + 100 + 75
+        assert_eq!(result.total_completion_tokens, 110); // 25 + 50 + 35
+        assert_eq!(result.total_tokens, 335); // 75 + 150 + 110
+
+        // Average duration: (100 + 200 + 150) / 3 = 150.0
+        assert_eq!(result.avg_duration_ms, Some(150.0));
+
+        // Average TTFB: (30 + 70 + 40) / 3 = 46.666...
+        let avg_ttfb = result.avg_ttfb_ms.unwrap();
+        assert!((avg_ttfb - 46.666666666666664).abs() < 0.0001);
+
+        // Total cost calculation:
+        // req1: (50 * 0.00001) + (25 * 0.00003) = 0.0005 + 0.00075 = 0.00125
+        // req2: (100 * 0.00001) + (50 * 0.00003) = 0.001 + 0.0015 = 0.0025
+        // req3: (75 * 0.00002) + (35 * 0.00004) = 0.0015 + 0.0014 = 0.0029
+        // Total: 0.00125 + 0.0025 + 0.0029 = 0.00665
+        let cost = result.total_cost.unwrap();
+        let cost_f64: f64 = cost.parse().unwrap();
+        assert!((cost_f64 - 0.00665).abs() < 0.00001);
+    }
+
+    #[sqlx::test]
+    async fn test_get_batch_analytics_nonexistent_request_ids(pool: PgPool) {
+        let nonexistent_id_1 = Uuid::new_v4();
+        let nonexistent_id_2 = Uuid::new_v4();
+
+        let result = get_batch_analytics(&pool, &[nonexistent_id_1, nonexistent_id_2]).await.unwrap();
+
+        assert_eq!(result.total_requests, 0);
+        assert_eq!(result.total_prompt_tokens, 0);
+        assert_eq!(result.total_completion_tokens, 0);
+        assert_eq!(result.total_tokens, 0);
+        assert_eq!(result.avg_duration_ms, None);
+        assert_eq!(result.avg_ttfb_ms, None);
+        assert_eq!(result.total_cost, None);
+    }
+
+    #[sqlx::test]
+    async fn test_get_batch_analytics_partial_match(pool: PgPool) {
+        let existing_id = Uuid::new_v4();
+        let nonexistent_id = Uuid::new_v4();
+        let now = Utc::now();
+
+        // Insert only one record
+        insert_test_analytics_with_request_id(
+            &pool,
+            existing_id,
+            now,
+            "gpt-4",
+            200,
+            100.0,
+            Some(30.0),
+            50,
+            25,
+            Some(0.00001),
+            Some(0.00003),
+        )
+        .await;
+
+        // Query with both existing and non-existing IDs
+        let result = get_batch_analytics(&pool, &[existing_id, nonexistent_id]).await.unwrap();
+
+        // Should only return data for the existing ID
+        assert_eq!(result.total_requests, 1);
+        assert_eq!(result.total_prompt_tokens, 50);
+        assert_eq!(result.total_completion_tokens, 25);
+        assert_eq!(result.total_tokens, 75);
+    }
+
+    #[sqlx::test]
+    async fn test_get_batch_analytics_missing_optional_fields(pool: PgPool) {
+        let request_id = Uuid::new_v4();
+        let now = Utc::now();
+
+        // Insert record without TTFB and pricing data
+        insert_test_analytics_with_request_id(
+            &pool, request_id, now, "gpt-4", 200, 100.0, None, // No TTFB
+            50, 25, None, // No input price
+            None, // No output price
+        )
+        .await;
+
+        let result = get_batch_analytics(&pool, &[request_id]).await.unwrap();
+
+        assert_eq!(result.total_requests, 1);
+        assert_eq!(result.total_prompt_tokens, 50);
+        assert_eq!(result.total_completion_tokens, 25);
+        assert_eq!(result.total_tokens, 75);
+        assert_eq!(result.avg_duration_ms, Some(100.0));
+        assert_eq!(result.avg_ttfb_ms, None); // Should be None when no TTFB data
+
+        // Cost should be 0 when no pricing data
+        let cost = result.total_cost.unwrap();
+        let cost_f64: f64 = cost.parse().unwrap();
+        assert_eq!(cost_f64, 0.0);
+    }
+
+    #[sqlx::test]
+    async fn test_get_batch_analytics_filters_by_request_id(pool: PgPool) {
+        let batch_request_id = Uuid::new_v4();
+        let other_request_id = Uuid::new_v4();
+        let now = Utc::now();
+
+        // Insert records for the batch
+        insert_test_analytics_with_request_id(
+            &pool,
+            batch_request_id,
+            now,
+            "gpt-4",
+            200,
+            100.0,
+            Some(30.0),
+            50,
+            25,
+            Some(0.00001),
+            Some(0.00003),
+        )
+        .await;
+
+        // Insert record for a different request (should not be included)
+        insert_test_analytics_with_request_id(
+            &pool,
+            other_request_id,
+            now,
+            "gpt-4",
+            200,
+            200.0,
+            Some(40.0),
+            100,
+            50,
+            Some(0.00001),
+            Some(0.00003),
+        )
+        .await;
+
+        // Query only for the batch request
+        let result = get_batch_analytics(&pool, &[batch_request_id]).await.unwrap();
+
+        // Should only include the batch request, not the other one
+        assert_eq!(result.total_requests, 1);
+        assert_eq!(result.total_prompt_tokens, 50);
+        assert_eq!(result.total_completion_tokens, 25);
+        assert_eq!(result.avg_duration_ms, Some(100.0));
+    }
 }
