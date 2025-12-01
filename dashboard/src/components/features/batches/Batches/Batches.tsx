@@ -599,22 +599,28 @@ export function Batches({
                             onClick={(e) => {
                               e.preventDefault();
                               e.stopPropagation();
-                              // Combine URL updates into single setSearchParams call
-                              const params = new URLSearchParams(searchParams);
-                              params.set("tab", activeTab);
-                              if (batchFileFilter) {
-                                params.set("fileFilter", batchFileFilter);
-                              } else {
-                                params.delete("fileFilter");
-                              }
-                              if (type !== "input") {
-                                params.set("fileType", type);
-                              } else {
-                                params.delete("fileType");
-                              }
-                              setSearchParams(params, { replace: false });
-                              // Reset pagination to first page
-                              filesPagination.handleFirstPage();
+                              // Reset pagination and update file type in a single setSearchParams call
+                              setSearchParams(
+                                (prev) => {
+                                  const params = new URLSearchParams(prev);
+                                  params.set("tab", activeTab);
+                                  if (batchFileFilter) {
+                                    params.set("fileFilter", batchFileFilter);
+                                  } else {
+                                    params.delete("fileFilter");
+                                  }
+                                  if (type !== "input") {
+                                    params.set("fileType", type);
+                                  } else {
+                                    params.delete("fileType");
+                                  }
+                                  // Reset pagination
+                                  params.set("filesPage", "1");
+                                  params.delete("filesAfter");
+                                  return params;
+                                },
+                                { replace: false },
+                              );
                             }}
                             className={`inline-flex items-center justify-center whitespace-nowrap rounded-sm px-3 py-1 text-sm font-medium ring-offset-background transition-all focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 ${
                               fileTypeFilter === type
