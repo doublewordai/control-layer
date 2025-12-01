@@ -1558,6 +1558,113 @@ mod tests {
         assert_eq!(super::map_url_to_otel_provider("HTTPS://API.ANTHROPIC.COM/"), Some("anthropic"));
     }
 
+    // ===== Fusillade Request ID Tests =====
+    // Tests for extracting and serializing the X-Fusillade-Request-Id header
+
+    #[test]
+    fn test_extract_fusillade_request_id_valid_header() {
+        use bytes::Bytes;
+        use std::collections::HashMap;
+
+        let request_id = Uuid::new_v4();
+        let mut headers = HashMap::new();
+        headers.insert("x-fusillade-request-id".to_string(), vec![Bytes::from(request_id.to_string())]);
+
+        let request_data = RequestData {
+            correlation_id: 1,
+            timestamp: std::time::SystemTime::now(),
+            method: axum::http::Method::POST,
+            uri: "/v1/chat/completions".parse().unwrap(),
+            headers,
+            body: None,
+        };
+
+        let extracted = super::extract_fusillade_request_id(&request_data);
+        assert_eq!(extracted, Some(request_id));
+    }
+
+    #[test]
+    fn test_extract_fusillade_request_id_missing_header() {
+        use std::collections::HashMap;
+
+        let request_data = RequestData {
+            correlation_id: 1,
+            timestamp: std::time::SystemTime::now(),
+            method: axum::http::Method::POST,
+            uri: "/v1/chat/completions".parse().unwrap(),
+            headers: HashMap::new(),
+            body: None,
+        };
+
+        let extracted = super::extract_fusillade_request_id(&request_data);
+        assert_eq!(extracted, None);
+    }
+
+    #[test]
+    fn test_extract_fusillade_request_id_invalid_uuid() {
+        use bytes::Bytes;
+        use std::collections::HashMap;
+
+        let mut headers = HashMap::new();
+        headers.insert("x-fusillade-request-id".to_string(), vec![Bytes::from("not-a-valid-uuid")]);
+
+        let request_data = RequestData {
+            correlation_id: 1,
+            timestamp: std::time::SystemTime::now(),
+            method: axum::http::Method::POST,
+            uri: "/v1/chat/completions".parse().unwrap(),
+            headers,
+            body: None,
+        };
+
+        let extracted = super::extract_fusillade_request_id(&request_data);
+        assert_eq!(extracted, None);
+    }
+
+    #[test]
+    fn test_extract_fusillade_request_id_empty_value() {
+        use std::collections::HashMap;
+
+        let mut headers = HashMap::new();
+        headers.insert("x-fusillade-request-id".to_string(), vec![]);
+
+        let request_data = RequestData {
+            correlation_id: 1,
+            timestamp: std::time::SystemTime::now(),
+            method: axum::http::Method::POST,
+            uri: "/v1/chat/completions".parse().unwrap(),
+            headers,
+            body: None,
+        };
+
+        let extracted = super::extract_fusillade_request_id(&request_data);
+        assert_eq!(extracted, None);
+    }
+
+    #[test]
+    fn test_extract_fusillade_request_id_case_sensitive() {
+        use bytes::Bytes;
+        use std::collections::HashMap;
+
+        let request_id = Uuid::new_v4();
+        let mut headers = HashMap::new();
+        // Header name should be lowercase to match
+        headers.insert("X-Fusillade-Request-Id".to_string(), vec![Bytes::from(request_id.to_string())]);
+
+        let request_data = RequestData {
+            correlation_id: 1,
+            timestamp: std::time::SystemTime::now(),
+            method: axum::http::Method::POST,
+            uri: "/v1/chat/completions".parse().unwrap(),
+            headers,
+            body: None,
+        };
+
+        // Should not match because header lookup is case-sensitive in our implementation
+        let extracted = super::extract_fusillade_request_id(&request_data);
+        assert_eq!(extracted, None);
+    }
+
     // ===== Credit Deduction Tests =====
     // Tests for the credit deduction functionality in store_analytics_record
 
@@ -1630,13 +1737,24 @@ mod tests {
 
         /// Helper: Create dummy RequestData for tests
         fn create_test_request_data() -> RequestData {
+            create_test_request_data_with_headers(None)
+        }
+
+        fn create_test_request_data_with_headers(fusillade_request_id: Option<Uuid>) -> RequestData {
+            use bytes::Bytes;
             use std::collections::HashMap;
+            let mut headers = HashMap::new();
+
+            if let Some(request_id) = fusillade_request_id {
+                headers.insert("x-fusillade-request-id".to_string(), vec![Bytes::from(request_id.to_string())]);
+            }
+
             RequestData {
                 correlation_id: 12345,
                 timestamp: std::time::SystemTime::now(),
                 method: axum::http::Method::POST,
                 uri: "/v1/chat/completions".parse().unwrap(),
-                headers: HashMap::new(),
+                headers,
                 body: None,
             }
         }
@@ -2112,6 +2230,84 @@ mod tests {
                 .await
                 .unwrap();
             assert_eq!(analytics_count, 1, "Analytics record should still be created");
+        }
+
+        #[sqlx::test]
+        #[test_log::test]
+        async fn test_fusillade_request_id_stored_correctly(pool: sqlx::PgPool) {
+            // Setup: User with balance
+            let initial_balance = Decimal::from_str("10.00").unwrap();
+            let user_id = setup_user_with_balance(&pool, initial_balance).await;
+            let auth = create_test_auth_for_user(&pool, user_id).await;
+
+            let input_price = Decimal::from_str("0.00001").unwrap();
+            let output_price = Decimal::from_str("0.00003").unwrap();
+            let metrics = create_test_usage_metrics(Some(input_price), Some(output_price), 100, 50);
+
+            // Create request with fusillade request ID
+            let fusillade_request_id = Uuid::new_v4();
+            let request_data = create_test_request_data_with_headers(Some(fusillade_request_id));
+
+            // Execute
+            let result = store_analytics_record(&pool, &metrics, &auth, &request_data).await;
+            assert!(result.is_ok(), "store_analytics_record should succeed");
+
+            // Verify: fusillade_request_id is stored in the analytics record
+            let stored_record = sqlx::query!(
+                r#"
+                SELECT fusillade_request_id
+                FROM http_analytics
+                WHERE correlation_id = $1
+                "#,
+                request_data.correlation_id as i64
+            )
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+
+            assert_eq!(
+                stored_record.fusillade_request_id,
+                Some(fusillade_request_id),
+                "Fusillade request ID should be stored in analytics record"
+            );
+        }
+
+        #[sqlx::test]
+        #[test_log::test]
+        async fn test_fusillade_request_id_null_when_missing(pool: sqlx::PgPool) {
+            // Setup: User with balance
+            let initial_balance = Decimal::from_str("10.00").unwrap();
+            let user_id = setup_user_with_balance(&pool, initial_balance).await;
+            let auth = create_test_auth_for_user(&pool, user_id).await;
+
+            let input_price = Decimal::from_str("0.00001").unwrap();
+            let output_price = Decimal::from_str("0.00003").unwrap();
+            let metrics = create_test_usage_metrics(Some(input_price), Some(output_price), 100, 50);
+
+            // Create request without fusillade request ID
+            let request_data = create_test_request_data_with_headers(None);
+
+            // Execute
+            let result = store_analytics_record(&pool, &metrics, &auth, &request_data).await;
+            assert!(result.is_ok(), "store_analytics_record should succeed");
+
+            // Verify: fusillade_request_id is NULL in the analytics record
+            let stored_record = sqlx::query!(
+                r#"
+                SELECT fusillade_request_id
+                FROM http_analytics
+                WHERE correlation_id = $1
+                "#,
+                request_data.correlation_id as i64
+            )
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+
+            assert_eq!(
+                stored_record.fusillade_request_id, None,
+                "Fusillade request ID should be NULL when header is not present"
+            );
         }
     }
 }
