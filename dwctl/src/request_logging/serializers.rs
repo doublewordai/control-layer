@@ -346,10 +346,8 @@ pub async fn store_analytics_record(
     auth: &Auth,
     request_data: &RequestData,
 ) -> Result<HttpAnalyticsRow, sqlx::Error> {
-    error!("request_data {:?}", request_data);
     // Extract fusillade request ID if present
     let fusillade_request_id = extract_fusillade_request_id(request_data);
-    error!("request_id {:?}", fusillade_request_id);
     // Extract user information based on auth type
     let (user_id, user_email, access_source) = match auth {
         Auth::ApiKey { bearer_token } => {

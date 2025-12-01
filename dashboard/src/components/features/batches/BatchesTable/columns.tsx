@@ -10,6 +10,7 @@ import {
   Loader2,
   FileCheck,
   FileText,
+  DollarSign,
 } from "lucide-react";
 import { Button } from "../../../ui/button";
 import { Tooltip, TooltipContent, TooltipTrigger } from "../../../ui/tooltip";
@@ -19,6 +20,7 @@ import {
   formatNumber,
 } from "../../../../utils";
 import type { Batch, BatchStatus } from "../types";
+import { useBatchAnalytics } from "../../../../api/control-layer/hooks";
 
 interface ColumnActions {
   onCancel: (batch: Batch) => void;
@@ -66,6 +68,34 @@ const getStatusColor = (status: BatchStatus) => {
     default:
       return "bg-gray-100 text-gray-800";
   }
+};
+
+// Component to fetch and display batch cost
+const BatchCostCell = ({ batchId }: { batchId: string }) => {
+  // TODO: this currently fetches per batch. We should do a bulk fetch on the batch list page to improve performance
+  const { data: analytics, isLoading } = useBatchAnalytics(batchId);
+
+  if (isLoading) {
+    return (
+      <div className="flex items-center gap-1 text-sm text-gray-400">
+        <Loader2 className="w-3 h-3 animate-spin" />
+        <span>...</span>
+      </div>
+    );
+  }
+
+  if (!analytics?.total_cost || parseFloat(analytics.total_cost) === 0) {
+    return <span className="text-gray-400 text-sm">-</span>;
+  }
+
+  const cost = parseFloat(analytics.total_cost);
+
+  return (
+    <div className="flex items-center gap-1 text-sm text-gray-700">
+      <DollarSign className="w-3 h-3 text-green-600" />
+      <span className="font-medium">{cost.toFixed(4)}</span>
+    </div>
+  );
 };
 
 export const createBatchColumns = (
@@ -235,6 +265,16 @@ export const createBatchColumns = (
         </div>
       );
     },
+  },
+  {
+    id: "cost",
+    header: "Cost",
+    cell: ({ row }) => {
+      const batch = row.original as Batch;
+      return <BatchCostCell batchId={batch.id} />;
+    },
+    // Disable sorting for cost column since data is fetched asynchronously
+    enableSorting: false,
   },
   {
     id: "files",
