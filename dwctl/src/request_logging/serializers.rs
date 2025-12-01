@@ -75,6 +75,7 @@ pub struct HttpAnalyticsRow {
     pub server_address: String,
     pub server_port: u16,
     pub provider_name: Option<String>,
+    pub fusillade_request_id: Option<Uuid>,
 }
 
 /// Usage metrics extracted from AI responses (subset of HttpAnalyticsRow)
@@ -140,7 +141,7 @@ pub fn parse_ai_request(request_data: &RequestData) -> Result<AiRequest, Seriali
 /// Parses HTTP response body data into structured AI response types.
 ///
 /// # Arguments
-/// * `request_data` - The original HTTP request data (used to determine response parsing strategy)  
+/// * `request_data` - The original HTTP request data (used to determine response parsing strategy)
 /// * `response_data` - The HTTP response data containing body, headers, and metadata
 ///
 /// # Returns
@@ -312,9 +313,26 @@ fn map_url_to_otel_provider(url: &str) -> Option<&'static str> {
     }
 }
 
+/// Extract fusillade request ID from request headers
+fn extract_fusillade_request_id(request_data: &RequestData) -> Option<Uuid> {
+    request_data
+        .headers
+        .get("x-fusillade-request-id")
+        .and_then(|values| values.first())
+        .and_then(|bytes| str::from_utf8(bytes).ok())
+        .and_then(|s| Uuid::parse_str(s).ok())
+}
+
 /// Store analytics record with user and pricing enrichment, returns the complete row
-#[instrument(skip(pool))]
-pub async fn store_analytics_record(pool: &PgPool, metrics: &UsageMetrics, auth: &Auth) -> Result<HttpAnalyticsRow, sqlx::Error> {
+#[instrument(skip(pool, request_data))]
+pub async fn store_analytics_record(
+    pool: &PgPool,
+    metrics: &UsageMetrics,
+    auth: &Auth,
+    request_data: &RequestData,
+) -> Result<HttpAnalyticsRow, sqlx::Error> {
+    // Extract fusillade request ID if present
+    let fusillade_request_id = extract_fusillade_request_id(request_data);
     // Extract user information based on auth type
     let (user_id, user_email, access_source) = match auth {
         Auth::ApiKey { bearer_token } => {
@@ -391,6 +409,7 @@ pub async fn store_analytics_record(pool: &PgPool, metrics: &UsageMetrics, auth:
         server_address: metrics.server_address.clone(),
         server_port: metrics.server_port,
         provider_name,
+        fusillade_request_id,
     };
 
     // Insert the analytics record and get the ID
@@ -400,9 +419,9 @@ pub async fn store_analytics_record(pool: &PgPool, metrics: &UsageMetrics, auth:
             instance_id, correlation_id, timestamp, method, uri, model,
             status_code, duration_ms, duration_to_first_byte_ms, prompt_tokens, completion_tokens,
             total_tokens, response_type, user_id, user_email, access_source,
-            input_price_per_token, output_price_per_token
+            input_price_per_token, output_price_per_token, fusillade_request_id
         )
-        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18)
+        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19)
         ON CONFLICT (instance_id, correlation_id)
         DO UPDATE SET
             status_code = EXCLUDED.status_code,
@@ -416,7 +435,8 @@ pub async fn store_analytics_record(pool: &PgPool, metrics: &UsageMetrics, auth:
             user_email = EXCLUDED.user_email,
             access_source = EXCLUDED.access_source,
             input_price_per_token = EXCLUDED.input_price_per_token,
-            output_price_per_token = EXCLUDED.output_price_per_token
+            output_price_per_token = EXCLUDED.output_price_per_token,
+            fusillade_request_id = EXCLUDED.fusillade_request_id
         RETURNING id
         "#,
         row.instance_id,
@@ -436,7 +456,8 @@ pub async fn store_analytics_record(pool: &PgPool, metrics: &UsageMetrics, auth:
         row.user_email,
         row.access_source,
         row.input_price_per_token,
-        row.output_price_per_token
+        row.output_price_per_token,
+        row.fusillade_request_id
     )
     .fetch_one(pool)
     .await?;
@@ -750,11 +771,12 @@ where
             // Clone data for async processing
             let pool_clone = self.pool.clone();
             let metrics_recorder_clone = self.metrics_recorder.clone();
+            let request_data_clone = request_data.clone();
 
             // The write to the analytics table and metrics recording
             tokio::spawn(async move {
                 // Store to database - this enriches with user/pricing data and returns complete row
-                match store_analytics_record(&pool_clone, &metrics, &auth).await {
+                match store_analytics_record(&pool_clone, &metrics, &auth, &request_data_clone).await {
                     Ok(complete_row) => {
                         // Record metrics using the complete row (called AFTER database write)
                         if let Some(ref recorder) = metrics_recorder_clone {
@@ -1606,6 +1628,19 @@ mod tests {
             }
         }
 
+        /// Helper: Create dummy RequestData for tests
+        fn create_test_request_data() -> RequestData {
+            use std::collections::HashMap;
+            RequestData {
+                correlation_id: 12345,
+                timestamp: std::time::SystemTime::now(),
+                method: axum::http::Method::POST,
+                uri: "/v1/chat/completions".parse().unwrap(),
+                headers: HashMap::new(),
+                body: None,
+            }
+        }
+
         /// Helper: Create test Auth for API key with valid user
         async fn create_test_auth_for_user(pool: &sqlx::PgPool, user_id: Uuid) -> Auth {
             // Create an API key for this user
@@ -1643,7 +1678,8 @@ mod tests {
             let metrics = create_test_usage_metrics(Some(input_price), Some(output_price), 1000, 500);
 
             // Execute
-            let result = store_analytics_record(&pool, &metrics, &auth).await;
+            let request_data = create_test_request_data();
+            let result = store_analytics_record(&pool, &metrics, &auth, &request_data).await;
             assert!(result.is_ok(), "store_analytics_record should succeed");
 
             // Verify: Balance should be deducted
@@ -1679,7 +1715,8 @@ mod tests {
             );
 
             // Execute
-            let result = store_analytics_record(&pool, &metrics, &auth).await;
+            let request_data = create_test_request_data();
+            let result = store_analytics_record(&pool, &metrics, &auth, &request_data).await;
             assert!(result.is_ok(), "Should succeed even without user_id");
 
             // Verify: No transactions should be created
@@ -1700,7 +1737,8 @@ mod tests {
             );
 
             // Execute
-            let result = store_analytics_record(&pool, &metrics, &auth).await;
+            let request_data = create_test_request_data();
+            let result = store_analytics_record(&pool, &metrics, &auth, &request_data).await;
             assert!(result.is_ok(), "Should succeed with zero cost");
 
             // Verify: Balance should not change (no Usage transaction)
@@ -1728,7 +1766,8 @@ mod tests {
             let metrics = create_test_usage_metrics(Some(input_price), Some(output_price), 1000, 500);
 
             // Execute
-            let result = store_analytics_record(&pool, &metrics, &auth).await;
+            let request_data = create_test_request_data();
+            let result = store_analytics_record(&pool, &metrics, &auth, &request_data).await;
             // Analytics record should still be created successfully
             assert!(result.is_ok(), "Analytics record should be created even if credit deduction fails");
 
@@ -1779,7 +1818,8 @@ mod tests {
                     credits.get_user_balance(user_id).await.unwrap()
                 };
 
-                let result = store_analytics_record(&pool, &metrics, &auth).await;
+                let request_data = create_test_request_data();
+                let result = store_analytics_record(&pool, &metrics, &auth, &request_data).await;
                 assert!(result.is_ok(), "store_analytics_record should succeed");
 
                 let balance_after = {
@@ -1814,7 +1854,8 @@ mod tests {
             metrics.request_model = None; // Remove model
 
             // Execute
-            let result = store_analytics_record(&pool, &metrics, &auth).await;
+            let request_data = create_test_request_data();
+            let result = store_analytics_record(&pool, &metrics, &auth, &request_data).await;
             assert!(result.is_ok(), "Should succeed even without model");
 
             // Verify: Balance should not change
@@ -1858,7 +1899,8 @@ mod tests {
             let metrics = create_test_usage_metrics(Some(input_price), Some(output_price), 1000, 500);
 
             // Execute
-            let result = store_analytics_record(&pool, &metrics, &auth).await;
+            let request_data = create_test_request_data();
+            let result = store_analytics_record(&pool, &metrics, &auth, &request_data).await;
             assert!(result.is_ok(), "Analytics record should be created");
 
             // Verify: Balance should NOT change (Playground users aren't charged)
@@ -1910,7 +1952,8 @@ mod tests {
 
                 let handle = tokio::task::spawn(async move {
                     let metrics = create_test_usage_metrics(Some(input_price), Some(output_price), 100, 0);
-                    store_analytics_record(&pool_clone, &metrics, &auth_clone).await
+                    let request_data = create_test_request_data();
+                    store_analytics_record(&pool_clone, &metrics, &auth_clone, &request_data).await
                 });
 
                 handles.push(handle);
@@ -1973,7 +2016,8 @@ mod tests {
             let input_price = Decimal::from_str("0.00001").unwrap();
             let metrics = create_test_usage_metrics(Some(input_price), None, 1000, 500);
 
-            let result = store_analytics_record(&pool, &metrics, &auth).await;
+            let request_data = create_test_request_data();
+            let result = store_analytics_record(&pool, &metrics, &auth, &request_data).await;
             assert!(result.is_ok(), "store_analytics_record should succeed");
 
             // Verify credit deduction
@@ -2008,7 +2052,8 @@ mod tests {
             let output_price = Decimal::from_str("0.00003").unwrap();
             let metrics = create_test_usage_metrics(None, Some(output_price), 1000, 500);
 
-            let result = store_analytics_record(&pool, &metrics, &auth).await;
+            let request_data = create_test_request_data();
+            let result = store_analytics_record(&pool, &metrics, &auth, &request_data).await;
             assert!(result.is_ok(), "store_analytics_record should succeed");
 
             // Verify credit deduction
@@ -2043,7 +2088,8 @@ mod tests {
             // Both prices are None
             let metrics = create_test_usage_metrics(None, None, 1000, 500);
 
-            let result = store_analytics_record(&pool, &metrics, &auth).await;
+            let request_data = create_test_request_data();
+            let result = store_analytics_record(&pool, &metrics, &auth, &request_data).await;
             assert!(result.is_ok(), "store_analytics_record should succeed");
 
             // Verify NO credit deduction occurred

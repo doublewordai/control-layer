@@ -6,7 +6,8 @@
 
 use crate::AppState;
 use crate::api::models::batches::{
-    BatchErrors, BatchListResponse, BatchObjectType, BatchResponse, CreateBatchRequest, ListBatchesQuery, ListObjectType, RequestCounts,
+    BatchAnalytics, BatchErrors, BatchListResponse, BatchObjectType, BatchResponse, CreateBatchRequest, ListBatchesQuery, ListObjectType,
+    RequestCounts,
 };
 use crate::auth::permissions::{RequiresPermission, can_read_all_resources, has_permission, operation, resource};
 use crate::errors::{Error, Result};
@@ -20,8 +21,42 @@ use fusillade::Storage;
 use std::collections::HashMap;
 use uuid::Uuid;
 
+/// Fetch aggregated analytics metrics for a batch from the http_analytics table
+async fn fetch_batch_analytics(pool: &sqlx::PgPool, batch_id: Uuid) -> sqlx::Result<BatchAnalytics> {
+    let metrics = sqlx::query!(
+        r#"
+        SELECT
+            COUNT(*) as "total_requests!",
+            COALESCE(SUM(prompt_tokens), 0) as "total_prompt_tokens!",
+            COALESCE(SUM(completion_tokens), 0) as "total_completion_tokens!",
+            COALESCE(SUM(total_tokens), 0) as "total_tokens!",
+            AVG(duration_ms) as "avg_duration_ms",
+            AVG(duration_to_first_byte_ms) as "avg_ttfb_ms",
+            SUM((prompt_tokens * COALESCE(input_price_per_token, 0)) +
+                (completion_tokens * COALESCE(output_price_per_token, 0))) as "total_cost"
+        FROM http_analytics
+        WHERE fusillade_request_id IN (
+            SELECT id FROM fusillade.requests WHERE batch_id = $1
+        )
+        "#,
+        batch_id
+    )
+    .fetch_one(pool)
+    .await?;
+
+    Ok(BatchAnalytics {
+        total_requests: metrics.total_requests,
+        total_prompt_tokens: metrics.total_prompt_tokens,
+        total_completion_tokens: metrics.total_completion_tokens,
+        total_tokens: metrics.total_tokens,
+        avg_duration_ms: metrics.avg_duration_ms,
+        avg_ttfb_ms: metrics.avg_ttfb_ms,
+        total_cost: metrics.total_cost,
+    })
+}
+
 /// Helper function to convert fusillade Batch to OpenAI BatchResponse
-fn to_batch_response(batch: fusillade::Batch) -> BatchResponse {
+fn to_batch_response(batch: fusillade::Batch, analytics: Option<BatchAnalytics>) -> BatchResponse {
     // Convert metadata from serde_json::Value to HashMap<String, String>
     let metadata: Option<HashMap<String, String>> = batch.metadata.and_then(|m| {
         m.as_object().map(|obj| {
@@ -107,6 +142,7 @@ fn to_batch_response(batch: fusillade::Batch) -> BatchResponse {
             failed: batch.failed_requests,
         },
         metadata,
+        analytics,
     }
 }
 
@@ -199,7 +235,7 @@ pub async fn create_batch(
 
     tracing::info!("Batch {} created successfully", batch.id);
 
-    Ok((StatusCode::CREATED, Json(to_batch_response(batch))))
+    Ok((StatusCode::CREATED, Json(to_batch_response(batch, None))))
 }
 
 #[utoipa::path(
@@ -249,7 +285,10 @@ pub async fn get_batch(
         }
     }
 
-    Ok(Json(to_batch_response(batch)))
+    // Fetch aggregated analytics metrics for this batch
+    let analytics = fetch_batch_analytics(&state.db, batch_id).await.ok();
+
+    Ok(Json(to_batch_response(batch, analytics)))
 }
 
 #[utoipa::path(
@@ -320,7 +359,7 @@ pub async fn cancel_batch(
 
     tracing::info!("Batch {} cancelled", batch_id);
 
-    Ok(Json(to_batch_response(batch)))
+    Ok(Json(to_batch_response(batch, None)))
 }
 
 #[utoipa::path(
@@ -374,7 +413,7 @@ pub async fn list_batches(
     let last_id = batches.last().map(|b| b.id.0.to_string());
 
     // Convert batches to responses (status is embedded in batch)
-    let data: Vec<_> = batches.into_iter().map(to_batch_response).collect();
+    let data: Vec<_> = batches.into_iter().map(|b| to_batch_response(b, None)).collect();
 
     Ok(Json(BatchListResponse {
         object_type: ListObjectType::List,

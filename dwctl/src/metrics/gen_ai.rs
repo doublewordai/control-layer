@@ -272,6 +272,7 @@ mod tests {
             server_address: "api.openai.com".to_string(),
             server_port: 443,
             provider_name: Some("openai".to_string()),
+            fusillade_request_id: None,
         };
 
         // Call the function under test
@@ -381,6 +382,7 @@ mod tests {
             server_address: "api.anthropic.com".to_string(),
             server_port: 443,
             provider_name: Some("anthropic".to_string()),
+            fusillade_request_id: None,
         };
 
         metrics.record_from_analytics(&row).await;
@@ -438,6 +440,7 @@ mod tests {
             server_address: "api.openai.com".to_string(),
             server_port: 443,
             provider_name: Some("openai".to_string()),
+            fusillade_request_id: None,
         };
 
         metrics.record_from_analytics(&row).await;
@@ -506,6 +509,7 @@ mod tests {
             server_address: "api.openai.com".to_string(),
             server_port: 443,
             provider_name: Some("openai".to_string()),
+            fusillade_request_id: None,
         };
 
         metrics.record_from_analytics(&row).await;
@@ -617,6 +621,7 @@ mod tests {
             server_address: "api.openai.com".to_string(),
             server_port: 443,
             provider_name: Some("openai".to_string()),
+            fusillade_request_id: None,
         };
 
         metrics.record_from_analytics(&row).await;
@@ -767,6 +772,7 @@ mod tests {
             server_address: "api.openai.com".to_string(),
             server_port: 443,
             provider_name: Some("openai".to_string()),
+            fusillade_request_id: None,
         };
 
         metrics.record_from_analytics(&row).await;
