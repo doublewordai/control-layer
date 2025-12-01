@@ -49,6 +49,7 @@ import type {
   BatchCreateRequest,
   BatchListResponse,
   BatchesListQuery,
+  BatchAnalytics,
   Transaction,
   AddFundsRequest,
   AddFundsResponse,
@@ -1136,6 +1137,14 @@ const batchesApi = {
     });
     if (!response.ok) {
       throw new Error(`Failed to cancel batch: ${response.status}`);
+    }
+    return response.json();
+  },
+
+  async getAnalytics(id: string): Promise<BatchAnalytics> {
+    const response = await fetch(`/ai/v1/batches/${id}/analytics`);
+    if (!response.ok) {
+      throw new Error(`Failed to fetch batch analytics: ${response.status}`);
     }
     return response.json();
   },

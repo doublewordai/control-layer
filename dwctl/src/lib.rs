@@ -178,7 +178,7 @@ use bon::Builder;
 pub use config::Config;
 use outlet::{RequestLoggerConfig, RequestLoggerLayer};
 use outlet_postgres::PostgresHandler;
-use request_logging::{AiRequest, AiResponse};
+use request_logging::{AiResponse, ParsedAIRequest};
 use sqlx::{Executor, PgPool};
 use std::sync::Arc;
 use tokio::net::TcpListener;
@@ -627,7 +627,7 @@ pub async fn build_router(state: &mut AppState, onwards_router: Router) -> anyho
             state.metrics_recorder.clone(),
         );
 
-        let postgres_handler = PostgresHandler::<AiRequest, AiResponse>::from_pool(outlet_pool.clone())
+        let postgres_handler = PostgresHandler::<ParsedAIRequest, AiResponse>::from_pool(outlet_pool.clone())
             .await
             .expect("Failed to create PostgresHandler for request logging")
             .with_request_serializer(parse_ai_request)

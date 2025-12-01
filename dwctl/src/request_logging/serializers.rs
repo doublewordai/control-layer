@@ -1,7 +1,8 @@
 use crate::config::{Config, ONWARDS_INPUT_TOKEN_PRICE_HEADER, ONWARDS_OUTPUT_TOKEN_PRICE_HEADER};
 use crate::db::handlers::Credits;
 use crate::db::models::credits::{CreditTransactionCreateDBRequest, CreditTransactionType};
-use crate::request_logging::models::{AiRequest, AiResponse, ChatCompletionChunk};
+use crate::request_logging::models::{AiRequest, AiResponse, ChatCompletionChunk, ParsedAIRequest};
+use crate::request_logging::utils::extract_fusillade_request_id;
 use outlet::{RequestData, ResponseData};
 use outlet_postgres::SerializationError;
 use rust_decimal::{Decimal, prelude::ToPrimitive};
@@ -113,20 +114,38 @@ pub struct UsageMetrics {
 /// # Behavior
 /// - Returns `AiRequest::Other(Value::Null)` for missing or empty bodies
 /// - On parse failure, returns error with base64-encoded body for safe PostgreSQL storage
-pub fn parse_ai_request(request_data: &RequestData) -> Result<AiRequest, SerializationError> {
+pub fn parse_ai_request(request_data: &RequestData) -> Result<ParsedAIRequest, SerializationError> {
+    let headers = request_data
+        .headers
+        .iter()
+        .map(|(k, v)| (k.clone(), v.iter().map(|b| String::from_utf8_lossy(b).to_string()).collect()))
+        .collect();
+
     let bytes = match &request_data.body {
         Some(body) => body.as_ref(),
-        None => return Ok(AiRequest::Other(Value::Null)),
+        None => {
+            return Ok({
+                ParsedAIRequest {
+                    headers,
+                    request: AiRequest::Other(Value::Null),
+                }
+            });
+        }
     };
 
     let body_str = String::from_utf8_lossy(bytes);
 
     if body_str.trim().is_empty() {
-        return Ok(AiRequest::Other(Value::Null));
+        return Ok({
+            ParsedAIRequest {
+                headers,
+                request: AiRequest::Other(Value::Null),
+            }
+        });
     }
 
     match serde_json::from_str(&body_str) {
-        Ok(request) => Ok(request),
+        Ok(request) => Ok(ParsedAIRequest { headers, request }),
         Err(e) => {
             // Always base64 encode unparseable content to avoid PostgreSQL issues
             let base64_encoded = base64::Engine::encode(&base64::engine::general_purpose::STANDARD, bytes);
@@ -172,8 +191,11 @@ pub fn parse_ai_response(request_data: &RequestData, response_data: &ResponseDat
 
     // Parse response based on request type
     let result = match parse_ai_request(request_data) {
-        Ok(AiRequest::ChatCompletions(chat_req)) if chat_req.stream.unwrap_or(false) => utils::parse_streaming_response(&body_str),
-        Ok(AiRequest::Completions(completion_req)) if completion_req.stream.unwrap_or(false) => utils::parse_streaming_response(&body_str),
+        Ok(parsed_request) => match parsed_request.request {
+            AiRequest::ChatCompletions(chat_req) if chat_req.stream.unwrap_or(false) => utils::parse_streaming_response(&body_str),
+            AiRequest::Completions(completion_req) if completion_req.stream.unwrap_or(false) => utils::parse_streaming_response(&body_str),
+            _ => utils::parse_non_streaming_response(&body_str),
+        },
         _ => utils::parse_non_streaming_response(&body_str),
     };
 
@@ -207,9 +229,12 @@ impl UsageMetrics {
     ) -> Self {
         // Extract model from request
         let request_model = match parse_ai_request(request_data) {
-            Ok(AiRequest::ChatCompletions(req)) => Some(req.model),
-            Ok(AiRequest::Completions(req)) => Some(req.model),
-            Ok(AiRequest::Embeddings(req)) => Some(req.model),
+            Ok(parsed_request) => match parsed_request.request {
+                AiRequest::ChatCompletions(req) => Some(req.model),
+                AiRequest::Completions(req) => Some(req.model),
+                AiRequest::Embeddings(req) => Some(req.model),
+                _ => None,
+            },
             _ => None,
         };
 
@@ -313,16 +338,6 @@ fn map_url_to_otel_provider(url: &str) -> Option<&'static str> {
     }
 }
 
-/// Extract fusillade request ID from request headers
-fn extract_fusillade_request_id(request_data: &RequestData) -> Option<Uuid> {
-    request_data
-        .headers
-        .get("x-fusillade-request-id")
-        .and_then(|values| values.first())
-        .and_then(|bytes| str::from_utf8(bytes).ok())
-        .and_then(|s| Uuid::parse_str(s).ok())
-}
-
 /// Store analytics record with user and pricing enrichment, returns the complete row
 #[instrument(skip(pool, request_data))]
 pub async fn store_analytics_record(
@@ -331,8 +346,10 @@ pub async fn store_analytics_record(
     auth: &Auth,
     request_data: &RequestData,
 ) -> Result<HttpAnalyticsRow, sqlx::Error> {
+    error!("request_data {:?}", request_data);
     // Extract fusillade request ID if present
     let fusillade_request_id = extract_fusillade_request_id(request_data);
+    error!("request_id {:?}", fusillade_request_id);
     // Extract user information based on auth type
     let (user_id, user_email, access_source) = match auth {
         Auth::ApiKey { bearer_token } => {
@@ -828,7 +845,7 @@ mod tests {
 
         let result = parse_ai_request(&request_data).unwrap();
 
-        match result {
+        match result.request {
             AiRequest::Other(value) => assert!(value.is_null()),
             _ => panic!("Expected AiRequest::Other(null)"),
         }
@@ -847,7 +864,7 @@ mod tests {
 
         let result = parse_ai_request(&request_data).unwrap();
 
-        match result {
+        match result.request {
             AiRequest::Other(value) => assert!(value.is_null()),
             _ => panic!("Expected AiRequest::Other(null)"),
         }
@@ -885,7 +902,7 @@ mod tests {
 
         let result = parse_ai_request(&request_data).unwrap();
 
-        match result {
+        match result.request {
             AiRequest::ChatCompletions(req) => {
                 assert_eq!(req.model, "gpt-4");
                 assert_eq!(req.messages.len(), 1);
@@ -908,7 +925,7 @@ mod tests {
 
         let result = parse_ai_request(&request_data).unwrap();
 
-        match result {
+        match result.request {
             AiRequest::Completions(req) => {
                 assert_eq!(req.model, "gpt-3.5-turbo-instruct");
             }
@@ -930,7 +947,7 @@ mod tests {
 
         let result = parse_ai_request(&request_data).unwrap();
 
-        match result {
+        match result.request {
             AiRequest::Embeddings(req) => {
                 assert_eq!(req.model, "text-embedding-ada-002");
             }
@@ -1560,110 +1577,7 @@ mod tests {
 
     // ===== Fusillade Request ID Tests =====
     // Tests for extracting and serializing the X-Fusillade-Request-Id header
-
-    #[test]
-    fn test_extract_fusillade_request_id_valid_header() {
-        use bytes::Bytes;
-        use std::collections::HashMap;
-
-        let request_id = Uuid::new_v4();
-        let mut headers = HashMap::new();
-        headers.insert("x-fusillade-request-id".to_string(), vec![Bytes::from(request_id.to_string())]);
-
-        let request_data = RequestData {
-            correlation_id: 1,
-            timestamp: std::time::SystemTime::now(),
-            method: axum::http::Method::POST,
-            uri: "/v1/chat/completions".parse().unwrap(),
-            headers,
-            body: None,
-        };
-
-        let extracted = super::extract_fusillade_request_id(&request_data);
-        assert_eq!(extracted, Some(request_id));
-    }
-
-    #[test]
-    fn test_extract_fusillade_request_id_missing_header() {
-        use std::collections::HashMap;
-
-        let request_data = RequestData {
-            correlation_id: 1,
-            timestamp: std::time::SystemTime::now(),
-            method: axum::http::Method::POST,
-            uri: "/v1/chat/completions".parse().unwrap(),
-            headers: HashMap::new(),
-            body: None,
-        };
-
-        let extracted = super::extract_fusillade_request_id(&request_data);
-        assert_eq!(extracted, None);
-    }
-
-    #[test]
-    fn test_extract_fusillade_request_id_invalid_uuid() {
-        use bytes::Bytes;
-        use std::collections::HashMap;
-
-        let mut headers = HashMap::new();
-        headers.insert("x-fusillade-request-id".to_string(), vec![Bytes::from("not-a-valid-uuid")]);
-
-        let request_data = RequestData {
-            correlation_id: 1,
-            timestamp: std::time::SystemTime::now(),
-            method: axum::http::Method::POST,
-            uri: "/v1/chat/completions".parse().unwrap(),
-            headers,
-            body: None,
-        };
-
-        let extracted = super::extract_fusillade_request_id(&request_data);
-        assert_eq!(extracted, None);
-    }
-
-    #[test]
-    fn test_extract_fusillade_request_id_empty_value() {
-        use std::collections::HashMap;
-
-        let mut headers = HashMap::new();
-        headers.insert("x-fusillade-request-id".to_string(), vec![]);
-
-        let request_data = RequestData {
-            correlation_id: 1,
-            timestamp: std::time::SystemTime::now(),
-            method: axum::http::Method::POST,
-            uri: "/v1/chat/completions".parse().unwrap(),
-            headers,
-            body: None,
-        };
-
-        let extracted = super::extract_fusillade_request_id(&request_data);
-        assert_eq!(extracted, None);
-    }
-
-    #[test]
-    fn test_extract_fusillade_request_id_case_sensitive() {
-        use bytes::Bytes;
-        use std::collections::HashMap;
-
-        let request_id = Uuid::new_v4();
-        let mut headers = HashMap::new();
-        // Header name should be lowercase to match
-        headers.insert("X-Fusillade-Request-Id".to_string(), vec![Bytes::from(request_id.to_string())]);
-
-        let request_data = RequestData {
-            correlation_id: 1,
-            timestamp: std::time::SystemTime::now(),
-            method: axum::http::Method::POST,
-            uri: "/v1/chat/completions".parse().unwrap(),
-            headers,
-            body: None,
-        };
-
-        // Should not match because header lookup is case-sensitive in our implementation
-        let extracted = super::extract_fusillade_request_id(&request_data);
-        assert_eq!(extracted, None);
-    }
+    // Note: Unit tests for extract_fusillade_request_id are in utils.rs
 
     // ===== Credit Deduction Tests =====
     // Tests for the credit deduction functionality in store_analytics_record

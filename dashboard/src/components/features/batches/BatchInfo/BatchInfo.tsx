@@ -12,10 +12,14 @@ import {
   Ban,
   Loader2,
 } from "lucide-react";
-import { useBatch } from "../../../../api/control-layer/hooks";
+import {
+  useBatch,
+  useBatchAnalytics,
+} from "../../../../api/control-layer/hooks";
 import { Card, CardContent, CardHeader, CardTitle } from "../../../ui/card";
 import { Badge } from "../../../ui/badge";
 import { Button } from "../../../ui/button";
+import { Skeleton } from "../../../ui/skeleton";
 import type { BatchStatus } from "../../../../api/control-layer/types";
 
 const BatchInfo: React.FC = () => {
@@ -26,6 +30,9 @@ const BatchInfo: React.FC = () => {
   const fromUrl = searchParams.get("from");
 
   const { data: batch, isLoading, error } = useBatch(batchId!);
+  const { data: analytics, isLoading: analyticsLoading } = useBatchAnalytics(
+    batchId!,
+  );
 
   if (isLoading) {
     return (
@@ -262,6 +269,123 @@ const BatchInfo: React.FC = () => {
                 </CardContent>
               </Card>
             )}
+
+          {/* Analytics Card */}
+          {analytics && (
+            <Card className="p-0 gap-0 rounded-lg">
+              <CardHeader className="px-6 pt-5 pb-4">
+                <CardTitle>Analytics</CardTitle>
+              </CardHeader>
+              <CardContent className="px-6 pb-6 pt-0">
+                {analyticsLoading ? (
+                  <div className="space-y-4">
+                    <Skeleton className="h-20 w-full" />
+                    <Skeleton className="h-20 w-full" />
+                  </div>
+                ) : analytics.total_requests > 0 ? (
+                  <div className="space-y-6">
+                    {/* Token Usage */}
+                    <div>
+                      <h4 className="text-sm font-medium text-gray-900 mb-3">
+                        Token Usage
+                      </h4>
+                      <div className="grid grid-cols-3 gap-4">
+                        <div className="text-center p-3 bg-blue-50 rounded-lg">
+                          <p className="text-2xl font-bold text-blue-700">
+                            {analytics.total_prompt_tokens.toLocaleString()}
+                          </p>
+                          <p className="text-xs text-gray-600 mt-1">
+                            Prompt Tokens
+                          </p>
+                        </div>
+                        <div className="text-center p-3 bg-purple-50 rounded-lg">
+                          <p className="text-2xl font-bold text-purple-700">
+                            {analytics.total_completion_tokens.toLocaleString()}
+                          </p>
+                          <p className="text-xs text-gray-600 mt-1">
+                            Completion Tokens
+                          </p>
+                        </div>
+                        <div className="text-center p-3 bg-gray-50 rounded-lg">
+                          <p className="text-2xl font-bold text-gray-900">
+                            {analytics.total_tokens.toLocaleString()}
+                          </p>
+                          <p className="text-xs text-gray-600 mt-1">
+                            Total Tokens
+                          </p>
+                        </div>
+                      </div>
+                    </div>
+
+                    {/* Performance Metrics */}
+                    {(analytics.avg_duration_ms || analytics.avg_ttfb_ms) && (
+                      <div className="border-t pt-6">
+                        <h4 className="text-sm font-medium text-gray-900 mb-3">
+                          Performance
+                        </h4>
+                        <div className="grid grid-cols-2 gap-4">
+                          {analytics.avg_duration_ms && (
+                            <div className="p-3 bg-gray-50 rounded-lg">
+                              <p className="text-sm text-gray-600 mb-1">
+                                Avg Duration
+                              </p>
+                              <p className="text-xl font-bold text-gray-900">
+                                {analytics.avg_duration_ms.toFixed(0)}ms
+                              </p>
+                            </div>
+                          )}
+                          {analytics.avg_ttfb_ms && (
+                            <div className="p-3 bg-gray-50 rounded-lg">
+                              <p className="text-sm text-gray-600 mb-1">
+                                Avg TTFB
+                              </p>
+                              <p className="text-xl font-bold text-gray-900">
+                                {analytics.avg_ttfb_ms.toFixed(0)}ms
+                              </p>
+                            </div>
+                          )}
+                        </div>
+                      </div>
+                    )}
+
+                    {/* Cost */}
+                    {analytics.total_cost &&
+                      parseFloat(analytics.total_cost) > 0 && (
+                        <div className="border-t pt-6">
+                          <h4 className="text-sm font-medium text-gray-900 mb-3">
+                            Cost
+                          </h4>
+                          <div className="p-4 bg-green-50 rounded-lg text-center">
+                            <p className="text-3xl font-bold text-green-700">
+                              ${parseFloat(analytics.total_cost).toFixed(4)}
+                            </p>
+                            <p className="text-xs text-gray-600 mt-1">
+                              Total Cost
+                            </p>
+                          </div>
+                        </div>
+                      )}
+
+                    {/* Analytics Summary */}
+                    <div className="border-t pt-6">
+                      <p className="text-xs text-gray-500">
+                        Analytics based on {analytics.total_requests} of{" "}
+                        {batch.request_counts.total} requests with recorded
+                        metrics
+                      </p>
+                    </div>
+                  </div>
+                ) : (
+                  <div className="text-center py-8 text-gray-500">
+                    <p className="text-sm">No analytics data available yet.</p>
+                    <p className="text-xs mt-1">
+                      Analytics will appear as requests complete.
+                    </p>
+                  </div>
+                )}
+              </CardContent>
+            </Card>
+          )}
 
           {/* Batch Details */}
           <Card className="p-0 gap-0 rounded-lg">

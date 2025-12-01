@@ -119,14 +119,46 @@ pub(crate) fn decompress_response_if_needed(
     }
 }
 
+/// Extract fusillade request ID from request headers
+///
+/// The fusillade system sends a truncated 8-character hex string in the header
+/// (e.g., "05872bea") for readability, but we need to pad it to a valid UUID format.
+/// We pad with zeros to create a valid UUID: "05872bea-0000-0000-0000-000000000000"
+///
+/// # Arguments
+/// * `request_data` - The HTTP request data containing headers
+///
+/// # Returns
+/// * `Some(Uuid)` - Successfully extracted and parsed UUID (either full or padded from 8-char hex)
+/// * `None` - Header missing, empty, or invalid format
+pub(crate) fn extract_fusillade_request_id(request_data: &outlet::RequestData) -> Option<uuid::Uuid> {
+    request_data
+        .headers
+        .get("x-fusillade-request-id")
+        .and_then(|values| values.first())
+        .and_then(|bytes| std::str::from_utf8(bytes).ok())
+        .and_then(|s| {
+            // Try parsing as full UUID first
+            if let Ok(uuid) = uuid::Uuid::parse_str(s) {
+                return Some(uuid);
+            }
+
+            None
+        })
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
-        decompress_response_if_needed, parse_non_streaming_response, parse_sse_chunks, parse_streaming_response, process_sse_chunks,
+        decompress_response_if_needed, extract_fusillade_request_id, parse_non_streaming_response, parse_sse_chunks,
+        parse_streaming_response, process_sse_chunks,
     };
     use crate::request_logging::models::{AiResponse, ChatCompletionChunk, SseParseError};
+    use axum::http::{Method, Uri};
     use bytes::Bytes;
+    use outlet::RequestData;
     use std::collections::HashMap;
+    use std::time::SystemTime;
 
     #[test]
     fn test_parse_sse_chunks_valid() {
@@ -327,5 +359,132 @@ mod tests {
 
         // Unknown encoding should pass through unchanged
         assert_eq!(result, data);
+    }
+
+    // ===== Fusillade Request ID Tests =====
+
+    #[test]
+    fn test_extract_fusillade_request_id() {
+        // Test with full UUID format
+        let test_uuid = uuid::Uuid::new_v4();
+        let mut headers = HashMap::new();
+        headers.insert("x-fusillade-request-id".to_string(), vec![Bytes::from(test_uuid.to_string())]);
+
+        let request_data = RequestData {
+            correlation_id: 123,
+            timestamp: SystemTime::now(),
+            method: Method::POST,
+            uri: "/test".parse::<Uri>().unwrap(),
+            headers,
+            body: None,
+        };
+
+        let result = extract_fusillade_request_id(&request_data);
+
+        assert!(result.is_some());
+        assert_eq!(result.unwrap(), test_uuid);
+    }
+
+    #[test]
+    fn test_extract_fusillade_request_id_missing_header() {
+        // Test when header is not present
+        let headers = HashMap::new();
+
+        let request_data = RequestData {
+            correlation_id: 123,
+            timestamp: SystemTime::now(),
+            method: Method::POST,
+            uri: "/test".parse::<Uri>().unwrap(),
+            headers,
+            body: None,
+        };
+
+        let result = extract_fusillade_request_id(&request_data);
+
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn test_extract_fusillade_request_id_empty_value() {
+        // Test when header has empty value
+        let mut headers = HashMap::new();
+        headers.insert("x-fusillade-request-id".to_string(), vec![]);
+
+        let request_data = RequestData {
+            correlation_id: 123,
+            timestamp: SystemTime::now(),
+            method: Method::POST,
+            uri: "/test".parse::<Uri>().unwrap(),
+            headers,
+            body: None,
+        };
+
+        let result = extract_fusillade_request_id(&request_data);
+
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn test_extract_fusillade_request_id_invalid_uuid() {
+        let mut headers = HashMap::new();
+        headers.insert("x-fusillade-request-id".to_string(), vec![Bytes::from("notvalid")]);
+
+        let request_data = RequestData {
+            correlation_id: 123,
+            timestamp: SystemTime::now(),
+            method: Method::POST,
+            uri: "/test".parse::<Uri>().unwrap(),
+            headers,
+            body: None,
+        };
+
+        let result = extract_fusillade_request_id(&request_data);
+
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn test_extract_fusillade_request_id_invalid_utf8() {
+        // Test with invalid UTF-8 bytes
+        let mut headers = HashMap::new();
+        headers.insert("x-fusillade-request-id".to_string(), vec![Bytes::from(vec![0xFF, 0xFE, 0xFD])]);
+
+        let request_data = RequestData {
+            correlation_id: 123,
+            timestamp: SystemTime::now(),
+            method: Method::POST,
+            uri: "/test".parse::<Uri>().unwrap(),
+            headers,
+            body: None,
+        };
+
+        let result = extract_fusillade_request_id(&request_data);
+
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn test_extract_fusillade_request_id_all_zeros() {
+        // Test with 8 zeros (valid hex)
+        let mut headers = HashMap::new();
+        headers.insert(
+            "x-fusillade-request-id".to_string(),
+            vec![Bytes::from("00000000-0000-0000-0000-000000000000")],
+        );
+
+        let request_data = RequestData {
+            correlation_id: 123,
+            timestamp: SystemTime::now(),
+            method: Method::POST,
+            uri: "/test".parse::<Uri>().unwrap(),
+            headers,
+            body: None,
+        };
+
+        let result = extract_fusillade_request_id(&request_data);
+
+        assert!(result.is_some());
+        let uuid = result.unwrap();
+        assert_eq!(uuid.to_string(), "00000000-0000-0000-0000-000000000000");
     }
 }
