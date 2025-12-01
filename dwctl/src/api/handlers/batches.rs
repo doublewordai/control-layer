@@ -6,7 +6,8 @@
 
 use crate::AppState;
 use crate::api::models::batches::{
-    BatchErrors, BatchListResponse, BatchObjectType, BatchResponse, CreateBatchRequest, ListBatchesQuery, ListObjectType, RequestCounts,
+    BatchAnalytics, BatchErrors, BatchListResponse, BatchObjectType, BatchResponse, CreateBatchRequest, ListBatchesQuery, ListObjectType,
+    RequestCounts,
 };
 use crate::auth::permissions::{RequiresPermission, can_read_all_resources, has_permission, operation, resource};
 use crate::errors::{Error, Result};
@@ -19,6 +20,27 @@ use axum::{
 use fusillade::Storage;
 use std::collections::HashMap;
 use uuid::Uuid;
+
+/// Fetch aggregated analytics metrics for a batch
+async fn fetch_batch_analytics(pool: &sqlx::PgPool, request_manager: &impl fusillade::Storage, batch_id: Uuid) -> Result<BatchAnalytics> {
+    // Get all request IDs for this batch from fusillade
+    let requests = request_manager
+        .get_batch_requests(fusillade::BatchId(batch_id))
+        .await
+        .map_err(|e| Error::Internal {
+            operation: format!("get batch requests: {}", e),
+        })?;
+
+    // Extract request IDs
+    let request_ids: Vec<Uuid> = requests.iter().map(|r| r.id().0).collect();
+
+    // Query analytics using the db handler
+    crate::db::handlers::analytics::get_batch_analytics(pool, &request_ids)
+        .await
+        .map_err(|e| Error::Internal {
+            operation: format!("fetch batch analytics: {}", e),
+        })
+}
 
 /// Helper function to convert fusillade Batch to OpenAI BatchResponse
 fn to_batch_response(batch: fusillade::Batch) -> BatchResponse {
@@ -250,6 +272,59 @@ pub async fn get_batch(
     }
 
     Ok(Json(to_batch_response(batch)))
+}
+
+#[utoipa::path(
+    get,
+    path = "/batches/{batch_id}/analytics",
+    tag = "batches",
+    summary = "Get batch analytics",
+    description = "Retrieves aggregated analytics metrics for a batch, including token usage, costs, and performance metrics",
+    responses(
+        (status = 200, description = "Batch analytics retrieved successfully", body = BatchAnalytics),
+        (status = 404, description = "Batch not found or no analytics available"),
+        (status = 500, description = "Internal server error")
+    ),
+    params(
+        ("batch_id" = String, Path, description = "The ID of the batch to retrieve analytics for")
+    )
+)]
+#[tracing::instrument(skip(state, current_user), fields(user_id = %current_user.id, batch_id = %batch_id_str))]
+pub async fn get_batch_analytics(
+    State(state): State<AppState>,
+    Path(batch_id_str): Path<String>,
+    current_user: RequiresPermission<resource::Batches, operation::ReadOwn>,
+) -> Result<Json<BatchAnalytics>> {
+    let batch_id = Uuid::parse_str(&batch_id_str).map_err(|_| Error::BadRequest {
+        message: "Invalid batch ID format".to_string(),
+    })?;
+
+    // Get batch first to verify it exists and check permissions
+    let batch = state
+        .request_manager
+        .get_batch(fusillade::BatchId(batch_id))
+        .await
+        .map_err(|_| Error::NotFound {
+            resource: "Batch".to_string(),
+            id: batch_id_str.clone(),
+        })?;
+
+    // Check ownership: users without ReadAll permission can only see their own batches
+    let can_read_all = can_read_all_resources(&current_user, Resource::Batches);
+    if !can_read_all {
+        let user_id = current_user.id.to_string();
+        if batch.created_by.as_deref() != Some(user_id.as_str()) {
+            return Err(Error::NotFound {
+                resource: "Batch".to_string(),
+                id: batch_id_str.clone(),
+            });
+        }
+    }
+
+    // Fetch aggregated analytics metrics for this batch
+    let analytics = fetch_batch_analytics(&state.db, &*state.request_manager, batch_id).await?;
+
+    Ok(Json(analytics))
 }
 
 #[utoipa::path(

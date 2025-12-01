@@ -44,7 +44,9 @@ export function FileRequests() {
   const [searchParams] = useSearchParams();
   const [downloadModalOpen, setDownloadModalOpen] = useState(false);
 
-  // Get the tab to return to (default to "files")
+  // Get the URL to return to - could be batch details page or batches list
+  const fromUrl = searchParams.get("from");
+  // Legacy support for returnTab parameter
   const returnTab = searchParams.get("returnTab") || "files";
 
   // Modal state for viewing request bodies - lifted to component level
@@ -109,9 +111,9 @@ export function FileRequests() {
       {/* Compact Header with Back Button */}
       <div className="mb-6 flex items-center gap-4">
         <button
-          onClick={() => navigate(`/batches?tab=${returnTab}`)}
+          onClick={() => navigate(fromUrl || `/batches?tab=${returnTab}`)}
           className="p-2 text-gray-500 hover:bg-gray-100 rounded-lg transition-colors shrink-0"
-          aria-label="Back to Batches"
+          aria-label={fromUrl ? "Go Back" : "Back to Batches"}
           title="Back to Batches"
         >
           <ArrowLeft className="w-5 h-5" />

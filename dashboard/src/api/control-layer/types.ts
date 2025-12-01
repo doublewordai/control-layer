@@ -937,6 +937,17 @@ export interface FileRequestsListQuery {
   skip?: number;
 }
 
+// Batch Analytics (Custom endpoint beyond OpenAI spec)
+export interface BatchAnalytics {
+  total_requests: number;
+  total_prompt_tokens: number;
+  total_completion_tokens: number;
+  total_tokens: number;
+  avg_duration_ms?: number | null;
+  avg_ttfb_ms?: number | null;
+  total_cost?: string | null;
+}
+
 // ===== DAEMON MONITORING TYPES =====
 
 export type DaemonStatus = "initializing" | "running" | "dead";
