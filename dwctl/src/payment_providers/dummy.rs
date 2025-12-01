@@ -18,13 +18,12 @@ use crate::{
 
 /// Dummy payment provider that adds $50 credits automatically
 pub struct DummyProvider {
-    amount: Decimal,
+    config: crate::config::DummyConfig,
 }
 
-impl DummyProvider {
-    /// Create a new Dummy provider
-    pub fn new(amount: Decimal) -> Self {
-        Self { amount }
+impl From<crate::config::DummyConfig> for DummyProvider {
+    fn from(config: crate::config::DummyConfig) -> Self {
+        Self { config }
     }
 }
 
@@ -79,7 +78,7 @@ impl PaymentProvider for DummyProvider {
 
         Ok(PaymentSession {
             user_id: recipient_id.to_string(),
-            amount: self.amount,
+            amount: self.config.amount.unwrap_or(Decimal::new(50, 0)),
             is_paid: true, // Dummy sessions are always "paid"
             payer_id: Some(payer_id.to_string()),
         })
@@ -222,14 +221,32 @@ mod tests {
     }
 
     #[test]
-    fn test_dummy_provider_creation() {
-        let provider = DummyProvider::new(Decimal::new(100, 0));
-        assert_eq!(provider.amount, Decimal::new(100, 0));
+    fn test_dummy_provider_from_config() {
+        let config = crate::config::DummyConfig {
+            amount: Some(Decimal::new(100, 0)),
+            host_url: None,
+        };
+        let provider = DummyProvider::from(config);
+        assert_eq!(provider.config.amount, Some(Decimal::new(100, 0)));
+    }
+
+    #[test]
+    fn test_dummy_provider_default_amount() {
+        let config = crate::config::DummyConfig {
+            amount: None,
+            host_url: None,
+        };
+        let provider = DummyProvider::from(config);
+        assert_eq!(provider.config.amount, None);
     }
 
     #[sqlx::test]
     async fn test_dummy_full_payment_flow(pool: PgPool) {
-        let provider = DummyProvider::new(Decimal::new(5000, 2)); // $50.00
+        let config = crate::config::DummyConfig {
+            amount: Some(Decimal::new(5000, 2)),
+            host_url: None,
+        };
+        let provider = DummyProvider::from(config); // $50.00
         let user = create_test_user(&pool).await;
 
         let cancel_url = "http://localhost:3001/cost-management?payment=cancelled&session_id={CHECKOUT_SESSION_ID}";
@@ -288,7 +305,11 @@ mod tests {
 
     #[sqlx::test]
     async fn test_dummy_idempotency(pool: PgPool) {
-        let provider = DummyProvider::new(Decimal::new(100, 0));
+        let config = crate::config::DummyConfig {
+            amount: Some(Decimal::new(100, 0)),
+            host_url: None,
+        };
+        let provider = DummyProvider::from(config);
         let user = create_test_user(&pool).await;
 
         let cancel_url = "http://localhost:3001/cost-management?payment=cancelled&session_id={CHECKOUT_SESSION_ID}";
@@ -332,7 +353,11 @@ mod tests {
 
     #[test]
     fn test_dummy_webhook_not_supported() {
-        let provider = DummyProvider::new(Decimal::new(100, 0));
+        let config = crate::config::DummyConfig {
+            amount: Some(Decimal::new(100, 0)),
+            host_url: None,
+        };
+        let provider = DummyProvider::from(config);
 
         // Dummy provider doesn't support webhooks
         let headers = axum::http::HeaderMap::new();

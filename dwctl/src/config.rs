@@ -342,6 +342,9 @@ pub struct StripeConfig {
     /// Base URL for redirect URLs (e.g., "https://app.example.com")
     /// This is used to construct success/cancel URLs for checkout sessions
     pub host_url: Option<String>,
+    /// Whether to allow promotion codes at checkout (default: false)
+    #[serde(default)]
+    pub allow_promotion_codes: bool,
 }
 
 /// Dummy payment configuration for testing.
