@@ -12,6 +12,10 @@ vi.mock("../../../../api/control-layer/hooks", () => ({
   useBatches: vi.fn(),
   useDeleteFile: vi.fn(),
   useCancelBatch: vi.fn(),
+  useBatchAnalytics: vi.fn(() => ({
+    data: null,
+    isLoading: false,
+  })),
 }));
 
 // Mock the modals

@@ -1,0 +1,17 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n                UPDATE batches\n                SET finalizing_at = COALESCE(finalizing_at, $2),\n                    completed_at = COALESCE(completed_at, $3),\n                    failed_at = COALESCE(failed_at, $4)\n                WHERE id = $1\n                ",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Timestamptz",
+        "Timestamptz",
+        "Timestamptz"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "f95f2eae7bd6407c8e5bf669b1f53126c5af6459e33c5bb73f26b65dfa8d6161"
+}
