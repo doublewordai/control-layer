@@ -234,7 +234,7 @@ const BatchInfo: React.FC = () => {
                         <span className="text-gray-600">Overall Progress</span>
                         <span className="font-medium">{progress}%</span>
                       </div>
-                      <div className="w-full bg-gray-200 rounded-full h-2.5">
+                      <div className="w-full rounded-full h-2.5">
                         <div
                           className="bg-blue-600 h-2.5 rounded-full transition-all duration-300"
                           style={{ width: `${progress}%` }}
@@ -244,7 +244,7 @@ const BatchInfo: React.FC = () => {
 
                     {/* Request Counts */}
                     <div className="grid grid-cols-3 gap-4 pt-4">
-                      <div className="text-center p-3 bg-gray-50 rounded-lg">
+                      <div className="text-center p-3 rounded-lg">
                         <p className="text-2xl font-bold text-gray-900">
                           {batch.request_counts.total}
                         </p>
@@ -252,13 +252,13 @@ const BatchInfo: React.FC = () => {
                           Total Requests
                         </p>
                       </div>
-                      <div className="text-center p-3 bg-green-50 rounded-lg">
+                      <div className="text-center p-3 rounded-lg">
                         <p className="text-2xl font-bold text-green-700">
                           {batch.request_counts.completed}
                         </p>
                         <p className="text-xs text-gray-600 mt-1">Completed</p>
                       </div>
-                      <div className="text-center p-3 bg-red-50 rounded-lg">
+                      <div className="text-center p-3 rounded-lg">
                         <p className="text-2xl font-bold text-red-700">
                           {batch.request_counts.failed}
                         </p>
@@ -274,7 +274,7 @@ const BatchInfo: React.FC = () => {
           {analytics && (
             <Card className="p-0 gap-0 rounded-lg">
               <CardHeader className="px-6 pt-5 pb-4">
-                <CardTitle>Analytics</CardTitle>
+                <CardTitle>Metrics</CardTitle>
               </CardHeader>
               <CardContent className="px-6 pb-6 pt-0">
                 {analyticsLoading ? (
@@ -290,23 +290,23 @@ const BatchInfo: React.FC = () => {
                         Token Usage
                       </h4>
                       <div className="grid grid-cols-3 gap-4">
-                        <div className="text-center p-3 bg-blue-50 rounded-lg">
-                          <p className="text-2xl font-bold text-blue-700">
+                        <div className="text-center p-3 rounded-lg">
+                          <p className="text-2xl font-bold">
                             {analytics.total_prompt_tokens.toLocaleString()}
                           </p>
                           <p className="text-xs text-gray-600 mt-1">
                             Prompt Tokens
                           </p>
                         </div>
-                        <div className="text-center p-3 bg-purple-50 rounded-lg">
-                          <p className="text-2xl font-bold text-purple-700">
+                        <div className="text-center p-3 rounded-lg">
+                          <p className="text-2xl font-bold">
                             {analytics.total_completion_tokens.toLocaleString()}
                           </p>
                           <p className="text-xs text-gray-600 mt-1">
                             Completion Tokens
                           </p>
                         </div>
-                        <div className="text-center p-3 bg-gray-50 rounded-lg">
+                        <div className="text-center p-3 rounded-lg">
                           <p className="text-2xl font-bold text-gray-900">
                             {analytics.total_tokens.toLocaleString()}
                           </p>
@@ -317,37 +317,6 @@ const BatchInfo: React.FC = () => {
                       </div>
                     </div>
 
-                    {/* Performance Metrics */}
-                    {(analytics.avg_duration_ms || analytics.avg_ttfb_ms) && (
-                      <div className="border-t pt-6">
-                        <h4 className="text-sm font-medium text-gray-900 mb-3">
-                          Performance
-                        </h4>
-                        <div className="grid grid-cols-2 gap-4">
-                          {analytics.avg_duration_ms && (
-                            <div className="p-3 bg-gray-50 rounded-lg">
-                              <p className="text-sm text-gray-600 mb-1">
-                                Avg Duration
-                              </p>
-                              <p className="text-xl font-bold text-gray-900">
-                                {analytics.avg_duration_ms.toFixed(0)}ms
-                              </p>
-                            </div>
-                          )}
-                          {analytics.avg_ttfb_ms && (
-                            <div className="p-3 bg-gray-50 rounded-lg">
-                              <p className="text-sm text-gray-600 mb-1">
-                                Avg TTFB
-                              </p>
-                              <p className="text-xl font-bold text-gray-900">
-                                {analytics.avg_ttfb_ms.toFixed(0)}ms
-                              </p>
-                            </div>
-                          )}
-                        </div>
-                      </div>
-                    )}
-
                     {/* Cost */}
                     {analytics.total_cost &&
                       parseFloat(analytics.total_cost) > 0 && (
@@ -355,7 +324,7 @@ const BatchInfo: React.FC = () => {
                           <h4 className="text-sm font-medium text-gray-900 mb-3">
                             Cost
                           </h4>
-                          <div className="p-4 bg-green-50 rounded-lg text-center">
+                          <div className="p-4 rounded-lg text-center">
                             <p className="text-3xl font-bold text-green-700">
                               ${parseFloat(analytics.total_cost).toFixed(4)}
                             </p>
@@ -365,15 +334,6 @@ const BatchInfo: React.FC = () => {
                           </div>
                         </div>
                       )}
-
-                    {/* Analytics Summary */}
-                    <div className="border-t pt-6">
-                      <p className="text-xs text-gray-500">
-                        Analytics based on {analytics.total_requests} of{" "}
-                        {batch.request_counts.total} requests with recorded
-                        metrics
-                      </p>
-                    </div>
                   </div>
                 ) : (
                   <div className="text-center py-8 text-gray-500">
@@ -623,6 +583,24 @@ const BatchInfo: React.FC = () => {
                     <p className="text-sm text-gray-600 mb-1">Duration</p>
                     <p className="text-sm font-medium">
                       {formatDuration(batch.in_progress_at, batch.completed_at)}
+                    </p>
+                  </div>
+                )}
+
+                {analytics && analytics.avg_ttfb_ms && (
+                  <div>
+                    <p className="text-sm text-gray-600 mb-1">Avg TTFB</p>
+                    <p className="text-sm font-medium">
+                      {analytics.avg_ttfb_ms.toFixed(0)}ms
+                    </p>
+                  </div>
+                )}
+
+                {analytics && analytics.avg_duration_ms && (
+                  <div>
+                    <p className="text-sm text-gray-600 mb-1">Avg Duration</p>
+                    <p className="text-sm font-medium">
+                      {analytics.avg_duration_ms.toFixed(0)}ms
                     </p>
                   </div>
                 )}
