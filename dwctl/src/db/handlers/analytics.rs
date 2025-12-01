@@ -9,11 +9,14 @@ use tracing::instrument;
 
 use crate::{
     api::models::{
+        batches::BatchAnalytics,
         deployments::{ModelMetrics, ModelTimeSeriesPoint},
         requests::{ModelUsage, ModelUserUsageResponse, RequestsAggregateResponse, StatusCodeBreakdown, TimeSeriesPoint, UserUsage},
     },
     db::errors::Result,
 };
+use rust_decimal::prelude::ToPrimitive;
+use uuid::Uuid;
 
 /// Global cache for model metrics (60 second TTL)
 static METRICS_CACHE: Lazy<Cache<String, HashMap<String, ModelMetrics>>> = Lazy::new(|| {
@@ -773,6 +776,53 @@ pub async fn get_model_user_usage(
     })
 }
 
+/// Get aggregated analytics metrics for a batch given a list of request IDs
+#[instrument(skip(pool))]
+pub async fn get_batch_analytics(pool: &PgPool, request_ids: &[Uuid]) -> Result<BatchAnalytics> {
+    // If no requests, return zero metrics
+    if request_ids.is_empty() {
+        return Ok(BatchAnalytics {
+            total_requests: 0,
+            total_prompt_tokens: 0,
+            total_completion_tokens: 0,
+            total_tokens: 0,
+            avg_duration_ms: None,
+            avg_ttfb_ms: None,
+            total_cost: None,
+        });
+    }
+
+    // Query analytics for these specific request IDs
+    let metrics = sqlx::query!(
+        r#"
+        SELECT
+            COUNT(*) as "total_requests!",
+            COALESCE(SUM(prompt_tokens), 0) as "total_prompt_tokens!",
+            COALESCE(SUM(completion_tokens), 0) as "total_completion_tokens!",
+            COALESCE(SUM(total_tokens), 0) as "total_tokens!",
+            AVG(duration_ms) as "avg_duration_ms",
+            AVG(duration_to_first_byte_ms) as "avg_ttfb_ms",
+            SUM((prompt_tokens * COALESCE(input_price_per_token, 0)) +
+                (completion_tokens * COALESCE(output_price_per_token, 0))) as "total_cost"
+        FROM http_analytics
+        WHERE fusillade_request_id = ANY($1)
+        "#,
+        request_ids
+    )
+    .fetch_one(pool)
+    .await?;
+
+    Ok(BatchAnalytics {
+        total_requests: metrics.total_requests,
+        total_prompt_tokens: metrics.total_prompt_tokens.to_i64().unwrap_or(0),
+        total_completion_tokens: metrics.total_completion_tokens.to_i64().unwrap_or(0),
+        total_tokens: metrics.total_tokens.to_i64().unwrap_or(0),
+        avg_duration_ms: metrics.avg_duration_ms.and_then(|d| d.to_f64()),
+        avg_ttfb_ms: metrics.avg_ttfb_ms.and_then(|d| d.to_f64()),
+        total_cost: metrics.total_cost.map(|d| d.to_string()),
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -941,7 +991,7 @@ mod tests {
         sqlx::query!(
             r#"
             INSERT INTO http_analytics (
-                instance_id, correlation_id, timestamp, uri, method, status_code, duration_ms, 
+                instance_id, correlation_id, timestamp, uri, method, status_code, duration_ms,
                 model, prompt_tokens, completion_tokens, total_tokens
             ) VALUES ($1, $2, $3, '/ai/chat/completions', 'POST', $4, $5, $6, $7, $8, $9)
             "#,
