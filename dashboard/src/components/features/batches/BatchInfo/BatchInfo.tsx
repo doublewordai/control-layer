@@ -178,7 +178,9 @@ const BatchInfo: React.FC = () => {
   const progress =
     batch.request_counts.total > 0
       ? Math.round(
-          (batch.request_counts.completed / batch.request_counts.total) * 100,
+          ((batch.request_counts.completed + batch.request_counts.failed) /
+            batch.request_counts.total) *
+            100,
         )
       : 0;
 
@@ -234,10 +236,19 @@ const BatchInfo: React.FC = () => {
                         <span className="text-gray-600">Overall Progress</span>
                         <span className="font-medium">{progress}%</span>
                       </div>
-                      <div className="w-full rounded-full h-2.5">
+                      <div className="relative w-full rounded-full h-2.5 bg-gray-200 overflow-hidden">
                         <div
-                          className="bg-blue-600 h-2.5 rounded-full transition-all duration-300"
-                          style={{ width: `${progress}%` }}
+                          className="absolute left-0 top-0 h-full bg-emerald-400 transition-all duration-300"
+                          style={{
+                            width: `${batch.request_counts.total > 0 ? (batch.request_counts.completed / batch.request_counts.total) * 100 : 0}%`,
+                          }}
+                        ></div>
+                        <div
+                          className="absolute top-0 h-full bg-rose-400 transition-all duration-300"
+                          style={{
+                            left: `${batch.request_counts.total > 0 ? (batch.request_counts.completed / batch.request_counts.total) * 100 : 0}%`,
+                            width: `${batch.request_counts.total > 0 ? (batch.request_counts.failed / batch.request_counts.total) * 100 : 0}%`,
+                          }}
                         ></div>
                       </div>
                     </div>
@@ -252,18 +263,46 @@ const BatchInfo: React.FC = () => {
                           Total Requests
                         </p>
                       </div>
-                      <div className="text-center p-3 rounded-lg">
+                      <button
+                        className="text-center p-3 rounded-lg hover:bg-green-50 transition-colors cursor-pointer disabled:cursor-default disabled:hover:bg-transparent"
+                        onClick={() =>
+                          batch.output_file_id &&
+                          navigate(
+                            `/batches/files/${batch.output_file_id}/content?from=/batches/${batchId}`,
+                          )
+                        }
+                        disabled={!batch.output_file_id}
+                        title={
+                          batch.output_file_id
+                            ? "Click to view output file"
+                            : "No output file available"
+                        }
+                      >
                         <p className="text-2xl font-bold text-green-700">
                           {batch.request_counts.completed}
                         </p>
                         <p className="text-xs text-gray-600 mt-1">Completed</p>
-                      </div>
-                      <div className="text-center p-3 rounded-lg">
+                      </button>
+                      <button
+                        className="text-center p-3 rounded-lg hover:bg-red-50 transition-colors cursor-pointer disabled:cursor-default disabled:hover:bg-transparent"
+                        onClick={() =>
+                          batch.error_file_id &&
+                          navigate(
+                            `/batches/files/${batch.error_file_id}/content?from=/batches/${batchId}`,
+                          )
+                        }
+                        disabled={!batch.error_file_id}
+                        title={
+                          batch.error_file_id
+                            ? "Click to view error file"
+                            : "No error file available"
+                        }
+                      >
                         <p className="text-2xl font-bold text-red-700">
                           {batch.request_counts.failed}
                         </p>
                         <p className="text-xs text-gray-600 mt-1">Failed</p>
-                      </div>
+                      </button>
                     </div>
                   </div>
                 </CardContent>
@@ -397,7 +436,7 @@ const BatchInfo: React.FC = () => {
                         size="sm"
                         onClick={() =>
                           navigate(
-                            `/batches/files/${batch.input_file_id}/content`,
+                            `/batches/files/${batch.input_file_id}/content?from=/batches/${batchId}`,
                           )
                         }
                         className="shrink-0"
@@ -422,7 +461,7 @@ const BatchInfo: React.FC = () => {
                           size="sm"
                           onClick={() =>
                             navigate(
-                              `/batches/files/${batch.output_file_id}/content`,
+                              `/batches/files/${batch.output_file_id}/content?from=/batches/${batchId}`,
                             )
                           }
                           className="shrink-0"
@@ -448,7 +487,7 @@ const BatchInfo: React.FC = () => {
                           size="sm"
                           onClick={() =>
                             navigate(
-                              `/batches/files/${batch.error_file_id}/content`,
+                              `/batches/files/${batch.error_file_id}/content?from=/batches/${batchId}`,
                             )
                           }
                           className="shrink-0"

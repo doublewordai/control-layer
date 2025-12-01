@@ -11,6 +11,7 @@ import {
   FileCheck,
   FileText,
   DollarSign,
+  List,
 } from "lucide-react";
 import { Button } from "../../../ui/button";
 import { Tooltip, TooltipContent, TooltipTrigger } from "../../../ui/tooltip";
@@ -362,6 +363,22 @@ export const createBatchColumns = (
               <TooltipContent>Cancel batch</TooltipContent>
             </Tooltip>
           )}
+          <Tooltip delayDuration={500}>
+            <TooltipTrigger asChild>
+              <Button
+                variant="ghost"
+                size="sm"
+                className="h-7 w-7 p-0 text-gray-600 hover:bg-gray-100 hover:text-gray-900"
+                onClick={(e) => {
+                  e.stopPropagation();
+                  actions.onRowClick?.(batch);
+                }}
+              >
+                <List className="h-4 w-4" />
+              </Button>
+            </TooltipTrigger>
+            <TooltipContent>View batch details</TooltipContent>
+          </Tooltip>
         </div>
       );
     },
