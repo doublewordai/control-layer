@@ -5,10 +5,18 @@ import type {
   BatchRequest,
   FileRequest,
   BatchStatus,
+  BatchAnalytics,
 } from "../../../api/control-layer/types";
 
 // Re-export API types for convenience
-export type { FileObject, Batch, BatchRequest, FileRequest, BatchStatus };
+export type {
+  FileObject,
+  Batch,
+  BatchRequest,
+  FileRequest,
+  BatchStatus,
+  BatchAnalytics,
+};
 
 // UI-specific types
 export interface BatchWithProgress extends Batch {
