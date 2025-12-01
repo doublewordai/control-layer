@@ -71,7 +71,7 @@ const getStatusColor = (status: BatchStatus) => {
 };
 
 // Component to fetch and display batch cost
-const BatchCostCell = ({ batchId }: { batchId: string }) => {
+export const BatchCostCell = ({ batchId }: { batchId: string }) => {
   // TODO: this currently fetches per batch. We should do a bulk fetch on the batch list page to improve performance
   const { data: analytics, isLoading } = useBatchAnalytics(batchId);
 
