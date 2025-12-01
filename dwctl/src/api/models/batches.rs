@@ -103,10 +103,6 @@ pub struct BatchResponse {
 
     #[serde(skip_serializing_if = "Option::is_none")]
     pub metadata: Option<HashMap<String, String>>,
-
-    /// Aggregated analytics metrics for this batch (extension to OpenAI API)
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub analytics: Option<BatchAnalytics>,
 }
 
 /// Aggregated analytics metrics for batch requests
@@ -134,7 +130,7 @@ pub struct BatchAnalytics {
 
     /// Total cost in credits (if pricing is available)
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub total_cost: Option<rust_decimal::Decimal>,
+    pub total_cost: Option<String>,
 }
 
 /// Object type - always "batch"

@@ -22,7 +22,32 @@ use std::collections::HashMap;
 use uuid::Uuid;
 
 /// Fetch aggregated analytics metrics for a batch from the http_analytics table
-async fn fetch_batch_analytics(pool: &sqlx::PgPool, batch_id: Uuid) -> sqlx::Result<BatchAnalytics> {
+async fn fetch_batch_analytics(pool: &sqlx::PgPool, request_manager: &impl fusillade::Storage, batch_id: Uuid) -> Result<BatchAnalytics> {
+    // Get all request IDs for this batch from fusillade
+    let requests = request_manager
+        .get_batch_requests(fusillade::BatchId(batch_id))
+        .await
+        .map_err(|e| Error::Internal {
+            operation: format!("get batch requests: {}", e),
+        })?;
+
+    // Extract request IDs
+    let request_ids: Vec<Uuid> = requests.iter().map(|r| r.id().0).collect();
+
+    // If no requests, return zero metrics
+    if request_ids.is_empty() {
+        return Ok(BatchAnalytics {
+            total_requests: 0,
+            total_prompt_tokens: 0,
+            total_completion_tokens: 0,
+            total_tokens: 0,
+            avg_duration_ms: None,
+            avg_ttfb_ms: None,
+            total_cost: None,
+        });
+    }
+
+    // Query analytics for these specific request IDs
     let metrics = sqlx::query!(
         r#"
         SELECT
@@ -35,28 +60,29 @@ async fn fetch_batch_analytics(pool: &sqlx::PgPool, batch_id: Uuid) -> sqlx::Res
             SUM((prompt_tokens * COALESCE(input_price_per_token, 0)) +
                 (completion_tokens * COALESCE(output_price_per_token, 0))) as "total_cost"
         FROM http_analytics
-        WHERE fusillade_request_id IN (
-            SELECT id FROM fusillade.requests WHERE batch_id = $1
-        )
+        WHERE fusillade_request_id = ANY($1)
         "#,
-        batch_id
+        &request_ids
     )
     .fetch_one(pool)
-    .await?;
+    .await
+    .map_err(|e| Error::Internal {
+        operation: format!("fetch analytics: {}", e),
+    })?;
 
     Ok(BatchAnalytics {
         total_requests: metrics.total_requests,
-        total_prompt_tokens: metrics.total_prompt_tokens,
-        total_completion_tokens: metrics.total_completion_tokens,
-        total_tokens: metrics.total_tokens,
-        avg_duration_ms: metrics.avg_duration_ms,
-        avg_ttfb_ms: metrics.avg_ttfb_ms,
-        total_cost: metrics.total_cost,
+        total_prompt_tokens: metrics.total_prompt_tokens.to_i64().unwrap_or(0),
+        total_completion_tokens: metrics.total_completion_tokens.to_i64().unwrap_or(0),
+        total_tokens: metrics.total_tokens.to_i64().unwrap_or(0),
+        avg_duration_ms: metrics.avg_duration_ms.and_then(|d| d.to_f64()),
+        avg_ttfb_ms: metrics.avg_ttfb_ms.and_then(|d| d.to_f64()),
+        total_cost: metrics.total_cost.map(|d| d.to_string()),
     })
 }
 
 /// Helper function to convert fusillade Batch to OpenAI BatchResponse
-fn to_batch_response(batch: fusillade::Batch, analytics: Option<BatchAnalytics>) -> BatchResponse {
+fn to_batch_response(batch: fusillade::Batch) -> BatchResponse {
     // Convert metadata from serde_json::Value to HashMap<String, String>
     let metadata: Option<HashMap<String, String>> = batch.metadata.and_then(|m| {
         m.as_object().map(|obj| {
@@ -142,7 +168,6 @@ fn to_batch_response(batch: fusillade::Batch, analytics: Option<BatchAnalytics>)
             failed: batch.failed_requests,
         },
         metadata,
-        analytics,
     }
 }
 
@@ -235,7 +260,7 @@ pub async fn create_batch(
 
     tracing::info!("Batch {} created successfully", batch.id);
 
-    Ok((StatusCode::CREATED, Json(to_batch_response(batch, None))))
+    Ok((StatusCode::CREATED, Json(to_batch_response(batch))))
 }
 
 #[utoipa::path(
@@ -285,10 +310,60 @@ pub async fn get_batch(
         }
     }
 
-    // Fetch aggregated analytics metrics for this batch
-    let analytics = fetch_batch_analytics(&state.db, batch_id).await.ok();
+    Ok(Json(to_batch_response(batch)))
+}
 
-    Ok(Json(to_batch_response(batch, analytics)))
+#[utoipa::path(
+    get,
+    path = "/batches/{batch_id}/analytics",
+    tag = "batches",
+    summary = "Get batch analytics",
+    description = "Retrieves aggregated analytics metrics for a batch, including token usage, costs, and performance metrics",
+    responses(
+        (status = 200, description = "Batch analytics retrieved successfully", body = BatchAnalytics),
+        (status = 404, description = "Batch not found or no analytics available"),
+        (status = 500, description = "Internal server error")
+    ),
+    params(
+        ("batch_id" = String, Path, description = "The ID of the batch to retrieve analytics for")
+    )
+)]
+#[tracing::instrument(skip(state, current_user), fields(user_id = %current_user.id, batch_id = %batch_id_str))]
+pub async fn get_batch_analytics(
+    State(state): State<AppState>,
+    Path(batch_id_str): Path<String>,
+    current_user: RequiresPermission<resource::Batches, operation::ReadOwn>,
+) -> Result<Json<BatchAnalytics>> {
+    let batch_id = Uuid::parse_str(&batch_id_str).map_err(|_| Error::BadRequest {
+        message: "Invalid batch ID format".to_string(),
+    })?;
+
+    // Get batch first to verify it exists and check permissions
+    let batch = state
+        .request_manager
+        .get_batch(fusillade::BatchId(batch_id))
+        .await
+        .map_err(|_| Error::NotFound {
+            resource: "Batch".to_string(),
+            id: batch_id_str.clone(),
+        })?;
+
+    // Check ownership: users without ReadAll permission can only see their own batches
+    let can_read_all = can_read_all_resources(&current_user, Resource::Batches);
+    if !can_read_all {
+        let user_id = current_user.id.to_string();
+        if batch.created_by.as_deref() != Some(user_id.as_str()) {
+            return Err(Error::NotFound {
+                resource: "Batch".to_string(),
+                id: batch_id_str.clone(),
+            });
+        }
+    }
+
+    // Fetch aggregated analytics metrics for this batch
+    let analytics = fetch_batch_analytics(&state.db, &*state.request_manager, batch_id).await?;
+
+    Ok(Json(analytics))
 }
 
 #[utoipa::path(
@@ -359,7 +434,7 @@ pub async fn cancel_batch(
 
     tracing::info!("Batch {} cancelled", batch_id);
 
-    Ok(Json(to_batch_response(batch, None)))
+    Ok(Json(to_batch_response(batch)))
 }
 
 #[utoipa::path(
@@ -413,7 +488,7 @@ pub async fn list_batches(
     let last_id = batches.last().map(|b| b.id.0.to_string());
 
     // Convert batches to responses (status is embedded in batch)
-    let data: Vec<_> = batches.into_iter().map(|b| to_batch_response(b, None)).collect();
+    let data: Vec<_> = batches.into_iter().map(to_batch_response).collect();
 
     Ok(Json(BatchListResponse {
         object_type: ListObjectType::List,
