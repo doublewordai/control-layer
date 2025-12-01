@@ -72,11 +72,7 @@ impl PaymentProvider for StripeProvider {
             ui_mode: Some(CheckoutSessionUiMode::Hosted),
             customer_creation: Some(CheckoutSessionCustomerCreation::Always),
             expand: &["line_items"],
-            allow_promotion_codes: if self.config.allow_promotion_codes {
-                Some(true)
-            } else {
-                None
-            },
+            allow_promotion_codes: if self.config.allow_promotion_codes { Some(true) } else { None },
             ..Default::default()
         };
 
