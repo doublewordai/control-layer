@@ -21,18 +21,13 @@ use crate::{
 /// Stripe payment provider
 pub struct StripeProvider {
     config: crate::config::StripeConfig,
-}
-
-impl StripeProvider {
-    /// Get a Stripe client
-    fn client(&self) -> Client {
-        Client::new(&self.config.api_key)
-    }
+    client: Client,
 }
 
 impl From<crate::config::StripeConfig> for StripeProvider {
     fn from(config: crate::config::StripeConfig) -> Self {
-        Self { config }
+        let client = Client::new(&config.api_key);
+        Self { config, client }
     }
 }
 
@@ -46,8 +41,6 @@ impl PaymentProvider for StripeProvider {
         cancel_url: &str,
         success_url: &str,
     ) -> Result<String> {
-        let client = self.client();
-
         // Determine which user will receive the credits
         // If creditee_id is provided, use that; otherwise use the authenticated user
         let user_id_string = user.id.to_string();
@@ -88,7 +81,7 @@ impl PaymentProvider for StripeProvider {
         }
 
         // Create checkout session
-        let checkout_session = CheckoutSession::create(&client, checkout_params).await.map_err(|e| {
+        let checkout_session = CheckoutSession::create(&self.client, checkout_params).await.map_err(|e| {
             tracing::error!("Failed to create Stripe checkout session: {:?}", e);
             PaymentError::ProviderApi(e.to_string())
         })?;
@@ -118,14 +111,12 @@ impl PaymentProvider for StripeProvider {
     }
 
     async fn get_payment_session(&self, session_id: &str) -> Result<PaymentSession> {
-        let client = self.client();
-
         let session_id: stripe::CheckoutSessionId = session_id
             .parse()
             .map_err(|_| PaymentError::InvalidData("Invalid Stripe session ID".to_string()))?;
 
         // Retrieve full checkout session with line items
-        let checkout_session = CheckoutSession::retrieve(&client, &session_id, &["line_items"])
+        let checkout_session = CheckoutSession::retrieve(&self.client, &session_id, &["line_items"])
             .await
             .map_err(|e| {
                 tracing::error!("Failed to retrieve Stripe checkout session: {:?}", e);
