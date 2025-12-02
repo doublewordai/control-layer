@@ -1,10 +1,9 @@
 //! Dummy payment provider implementation
 //!
-//! This provider automatically adds $50 of credits without requiring any external payment.
+//! This provider automatically adds credits without requiring any external payment.
 //! Useful for testing and development purposes.
 
 use async_trait::async_trait;
-use rust_decimal::Decimal;
 use sqlx::PgPool;
 
 use crate::{
@@ -16,15 +15,14 @@ use crate::{
     payment_providers::{PaymentError, PaymentProvider, PaymentSession, Result, WebhookEvent},
 };
 
-/// Dummy payment provider that adds $50 credits automatically
+/// Dummy payment provider that adds credits automatically
 pub struct DummyProvider {
-    amount: Decimal,
+    config: crate::config::DummyConfig,
 }
 
-impl DummyProvider {
-    /// Create a new Dummy provider
-    pub fn new(amount: Decimal) -> Self {
-        Self { amount }
+impl From<crate::config::DummyConfig> for DummyProvider {
+    fn from(config: crate::config::DummyConfig) -> Self {
+        Self { config }
     }
 }
 
@@ -79,7 +77,7 @@ impl PaymentProvider for DummyProvider {
 
         Ok(PaymentSession {
             user_id: recipient_id.to_string(),
-            amount: self.amount,
+            amount: self.config.amount,
             is_paid: true, // Dummy sessions are always "paid"
             payer_id: Some(payer_id.to_string()),
         })
@@ -222,14 +220,22 @@ mod tests {
     }
 
     #[test]
-    fn test_dummy_provider_creation() {
-        let provider = DummyProvider::new(Decimal::new(100, 0));
-        assert_eq!(provider.amount, Decimal::new(100, 0));
+    fn test_dummy_provider_from_config() {
+        let config = crate::config::DummyConfig {
+            amount: Decimal::new(100, 0),
+            host_url: None,
+        };
+        let provider = DummyProvider::from(config);
+        assert_eq!(provider.config.amount, Decimal::new(100, 0));
     }
 
     #[sqlx::test]
     async fn test_dummy_full_payment_flow(pool: PgPool) {
-        let provider = DummyProvider::new(Decimal::new(5000, 2)); // $50.00
+        let config = crate::config::DummyConfig {
+            amount: Decimal::new(5000, 2), // $50.00
+            host_url: None,
+        };
+        let provider = DummyProvider::from(config);
         let user = create_test_user(&pool).await;
 
         let cancel_url = "http://localhost:3001/cost-management?payment=cancelled&session_id={CHECKOUT_SESSION_ID}";
@@ -288,7 +294,11 @@ mod tests {
 
     #[sqlx::test]
     async fn test_dummy_idempotency(pool: PgPool) {
-        let provider = DummyProvider::new(Decimal::new(100, 0));
+        let config = crate::config::DummyConfig {
+            amount: Decimal::new(100, 0),
+            host_url: None,
+        };
+        let provider = DummyProvider::from(config);
         let user = create_test_user(&pool).await;
 
         let cancel_url = "http://localhost:3001/cost-management?payment=cancelled&session_id={CHECKOUT_SESSION_ID}";
@@ -332,7 +342,11 @@ mod tests {
 
     #[test]
     fn test_dummy_webhook_not_supported() {
-        let provider = DummyProvider::new(Decimal::new(100, 0));
+        let config = crate::config::DummyConfig {
+            amount: Decimal::new(100, 0),
+            host_url: None,
+        };
+        let provider = DummyProvider::from(config);
 
         // Dummy provider doesn't support webhooks
         let headers = axum::http::HeaderMap::new();

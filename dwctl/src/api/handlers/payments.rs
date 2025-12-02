@@ -317,7 +317,7 @@ mod tests {
         let mut config = create_test_config();
         config.payment = Some(PaymentConfig::Dummy(DummyConfig {
             host_url: Some("http://localhost:3001".to_string()),
-            amount: Some(Decimal::new(100, 0)), // $100
+            amount: Decimal::new(100, 0), // $100
         }));
 
         let request_manager = std::sync::Arc::new(fusillade::PostgresRequestManager::new(pool.clone()));
@@ -460,7 +460,7 @@ mod tests {
         let mut config = create_test_config();
         config.payment = Some(PaymentConfig::Dummy(DummyConfig {
             host_url: None,
-            amount: Some(Decimal::new(50, 0)),
+            amount: Decimal::new(50, 0),
         }));
 
         let request_manager = std::sync::Arc::new(fusillade::PostgresRequestManager::new(pool.clone()));
@@ -494,7 +494,7 @@ mod tests {
         let mut config = create_test_config();
         config.payment = Some(PaymentConfig::Dummy(DummyConfig {
             host_url: Some("http://localhost:3001".to_string()),
-            amount: Some(Decimal::new(100, 0)),
+            amount: Decimal::new(100, 0),
         }));
 
         let request_manager = std::sync::Arc::new(fusillade::PostgresRequestManager::new(pool.clone()));
