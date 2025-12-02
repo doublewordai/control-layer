@@ -1,5 +1,19 @@
 # Changelog
 
+## [0.12.0](https://github.com/doublewordai/control-layer/compare/v0.11.1...v0.12.0) (2025-11-28)
+
+
+### Features
+
+* Paginate api keys ([#289](https://github.com/doublewordai/control-layer/issues/289)) ([772bcc1](https://github.com/doublewordai/control-layer/commit/772bcc15c835b0daa3ad9e6884aeda67db1b3d02))
+
+## [0.11.1](https://github.com/doublewordai/control-layer/compare/v0.11.0...v0.11.1) (2025-11-28)
+
+
+### Bug Fixes
+
+* a bug in file upload where you could get incomplete utf-8 spread across chunks ([#262](https://github.com/doublewordai/control-layer/issues/262)) ([82b1238](https://github.com/doublewordai/control-layer/commit/82b1238115ad662f8c3517ad874d3093656daac4))
+
 ## [0.11.0](https://github.com/doublewordai/control-layer/compare/v0.10.1...v0.11.0) (2025-11-28)
 
 

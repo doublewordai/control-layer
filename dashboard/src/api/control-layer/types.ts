@@ -202,6 +202,7 @@ export interface ModelsQuery {
 export interface EndpointsQuery {
   skip?: number;
   limit?: number;
+  enabled?: boolean;
 }
 
 export interface GroupsQuery {
@@ -237,6 +238,11 @@ export interface ApiKeyCreateRequest {
   purpose: ApiKeyPurpose; // Required: purpose of the key
   requests_per_second?: number | null;
   burst_size?: number | null;
+}
+
+export interface ApiKeysQuery {
+  skip?: number;
+  limit?: number;
 }
 
 // Update endpoint bodies
@@ -929,6 +935,17 @@ export interface FileRequestsListResponse {
 export interface FileRequestsListQuery {
   limit?: number;
   skip?: number;
+}
+
+// Batch Analytics (Custom endpoint beyond OpenAI spec)
+export interface BatchAnalytics {
+  total_requests: number;
+  total_prompt_tokens: number;
+  total_completion_tokens: number;
+  total_tokens: number;
+  avg_duration_ms?: number | null;
+  avg_ttfb_ms?: number | null;
+  total_cost?: string | null;
 }
 
 // ===== DAEMON MONITORING TYPES =====

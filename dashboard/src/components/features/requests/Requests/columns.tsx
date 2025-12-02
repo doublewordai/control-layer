@@ -65,10 +65,10 @@ export const createRequestColumns = (): ColumnDef<RequestsEntry>[] => [
     cell: ({ row }) => {
       const request = row.original;
       return (
-        <div className="max-w-[240px]">
+        <div className="max-w-60">
           <HoverCard>
             <HoverCardTrigger asChild>
-              <div className="text-sm text-doubleword-neutral-900 line-clamp-1 break-words hover:bg-gray-50 rounded cursor-pointer px-1 truncate">
+              <div className="text-sm text-doubleword-neutral-900 line-clamp-1 wrap-break-words hover:bg-gray-50 rounded cursor-pointer px-1 truncate">
                 <ReactMarkdown
                   remarkPlugins={[remarkGfm]}
                   components={{
@@ -122,7 +122,7 @@ export const createRequestColumns = (): ColumnDef<RequestsEntry>[] => [
             </HoverCardTrigger>
             <HoverCardContent
               side="top"
-              className="w-[32rem] max-h-64 overflow-y-auto"
+              className="w-lg max-h-64 overflow-y-auto"
             >
               <div className="text-sm prose prose-sm max-w-none">
                 <ReactMarkdown
@@ -162,10 +162,10 @@ export const createRequestColumns = (): ColumnDef<RequestsEntry>[] => [
     cell: ({ row }) => {
       const request = row.original;
       return (
-        <div className="max-w-[240px]">
+        <div className="max-w-60">
           <HoverCard>
             <HoverCardTrigger asChild>
-              <div className="text-sm text-gray-700 line-clamp-1 break-words hover:bg-gray-50 rounded cursor-pointer px-1 truncate">
+              <div className="text-sm text-gray-700 line-clamp-1 wrap-break-words hover:bg-gray-50 rounded cursor-pointer px-1 truncate">
                 <ReactMarkdown
                   remarkPlugins={[remarkGfm]}
                   components={{
@@ -235,7 +235,7 @@ export const createRequestColumns = (): ColumnDef<RequestsEntry>[] => [
             </HoverCardTrigger>
             <HoverCardContent
               side="top"
-              className="w-[32rem] max-h-64 overflow-y-auto"
+              className="w-lg max-h-64 overflow-y-auto"
             >
               <div className="text-sm prose prose-sm max-w-none">
                 <ReactMarkdown

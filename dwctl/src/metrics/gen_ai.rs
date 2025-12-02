@@ -239,7 +239,7 @@ mod tests {
 
     /// Helper to find a label value in a Prometheus metric
     fn find_label(labels: &[prometheus::proto::LabelPair], name: &str) -> Option<String> {
-        labels.iter().find(|l| l.get_name() == name).map(|l| l.get_value().to_string())
+        labels.iter().find(|l| l.name() == name).map(|l| l.value().to_string())
     }
 
     #[tokio::test]
@@ -272,6 +272,7 @@ mod tests {
             server_address: "api.openai.com".to_string(),
             server_port: 443,
             provider_name: Some("openai".to_string()),
+            fusillade_request_id: None,
         };
 
         // Call the function under test
@@ -283,7 +284,7 @@ mod tests {
         // Verify request duration metric
         let duration_metric = metric_families
             .iter()
-            .find(|m| m.get_name() == "gen_ai_server_request_duration_seconds")
+            .find(|m| m.name() == "gen_ai_server_request_duration_seconds")
             .expect("Should have request duration metric");
 
         let duration_histogram = duration_metric.get_metric().first().unwrap().get_histogram();
@@ -302,7 +303,7 @@ mod tests {
         // Verify time to first token metric (only for streaming)
         let ttft_metric = metric_families
             .iter()
-            .find(|m| m.get_name() == "gen_ai_server_time_to_first_token_seconds")
+            .find(|m| m.name() == "gen_ai_server_time_to_first_token_seconds")
             .expect("Should have time to first token metric");
 
         let ttft_histogram = ttft_metric.get_metric().first().unwrap().get_histogram();
@@ -312,7 +313,7 @@ mod tests {
         // Verify time per output token metric
         let tpot_metric = metric_families
             .iter()
-            .find(|m| m.get_name() == "gen_ai_server_time_per_output_token_seconds")
+            .find(|m| m.name() == "gen_ai_server_time_per_output_token_seconds")
             .expect("Should have time per output token metric");
 
         let tpot_histogram = tpot_metric.get_metric().first().unwrap().get_histogram();
@@ -327,7 +328,7 @@ mod tests {
         // Verify token usage metrics (should have 2: input and output)
         let token_metric = metric_families
             .iter()
-            .find(|m| m.get_name() == "gen_ai_client_token_usage")
+            .find(|m| m.name() == "gen_ai_client_token_usage")
             .expect("Should have token usage metric");
 
         assert_eq!(token_metric.get_metric().len(), 2, "Should have 2 token metrics (input + output)");
@@ -381,6 +382,7 @@ mod tests {
             server_address: "api.anthropic.com".to_string(),
             server_port: 443,
             provider_name: Some("anthropic".to_string()),
+            fusillade_request_id: None,
         };
 
         metrics.record_from_analytics(&row).await;
@@ -389,14 +391,14 @@ mod tests {
         // Should have request duration
         let duration_metric = metric_families
             .iter()
-            .find(|m| m.get_name() == "gen_ai_server_request_duration_seconds")
+            .find(|m| m.name() == "gen_ai_server_request_duration_seconds")
             .expect("Should have request duration metric");
         assert_eq!(duration_metric.get_metric().first().unwrap().get_histogram().get_sample_count(), 1);
 
         // Should NOT have time to first token (not streaming)
         let ttft_metric = metric_families
             .iter()
-            .find(|m| m.get_name() == "gen_ai_server_time_to_first_token_seconds");
+            .find(|m| m.name() == "gen_ai_server_time_to_first_token_seconds");
         assert!(
             ttft_metric.is_none() || ttft_metric.unwrap().get_metric().is_empty(),
             "Non-streaming should not record TTFT"
@@ -405,7 +407,7 @@ mod tests {
         // Should have time per output token (has completion tokens)
         let tpot_metric = metric_families
             .iter()
-            .find(|m| m.get_name() == "gen_ai_server_time_per_output_token_seconds")
+            .find(|m| m.name() == "gen_ai_server_time_per_output_token_seconds")
             .expect("Should have TPOT metric");
         assert_eq!(tpot_metric.get_metric().first().unwrap().get_histogram().get_sample_count(), 1);
     }
@@ -438,6 +440,7 @@ mod tests {
             server_address: "api.openai.com".to_string(),
             server_port: 443,
             provider_name: Some("openai".to_string()),
+            fusillade_request_id: None,
         };
 
         metrics.record_from_analytics(&row).await;
@@ -446,7 +449,7 @@ mod tests {
         // Verify operation name is "embeddings"
         let duration_metric = metric_families
             .iter()
-            .find(|m| m.get_name() == "gen_ai_server_request_duration_seconds")
+            .find(|m| m.name() == "gen_ai_server_request_duration_seconds")
             .expect("Should have request duration metric");
 
         let duration_labels = duration_metric.get_metric().first().unwrap().get_label();
@@ -459,7 +462,7 @@ mod tests {
         // Should only have input tokens, not output
         let token_metric = metric_families
             .iter()
-            .find(|m| m.get_name() == "gen_ai_client_token_usage")
+            .find(|m| m.name() == "gen_ai_client_token_usage")
             .expect("Should have token usage metric");
 
         assert_eq!(token_metric.get_metric().len(), 1, "Should only have 1 token metric (input only)");
@@ -471,7 +474,7 @@ mod tests {
         // Should NOT have time per output token (no completion tokens)
         let tpot_metric = metric_families
             .iter()
-            .find(|m| m.get_name() == "gen_ai_server_time_per_output_token_seconds");
+            .find(|m| m.name() == "gen_ai_server_time_per_output_token_seconds");
         assert!(
             tpot_metric.is_none() || tpot_metric.unwrap().get_metric().is_empty(),
             "Embeddings should not record TPOT"
@@ -506,6 +509,7 @@ mod tests {
             server_address: "api.openai.com".to_string(),
             server_port: 443,
             provider_name: Some("openai".to_string()),
+            fusillade_request_id: None,
         };
 
         metrics.record_from_analytics(&row).await;
@@ -514,7 +518,7 @@ mod tests {
         // Should record request duration with error_type
         let duration_metric = metric_families
             .iter()
-            .find(|m| m.get_name() == "gen_ai_server_request_duration_seconds")
+            .find(|m| m.name() == "gen_ai_server_request_duration_seconds")
             .expect("Should have request duration metric");
 
         let duration_labels = duration_metric.get_metric().first().unwrap().get_label();
@@ -525,7 +529,7 @@ mod tests {
         );
 
         // Should NOT record token usage (no tokens)
-        let token_metric = metric_families.iter().find(|m| m.get_name() == "gen_ai_client_token_usage");
+        let token_metric = metric_families.iter().find(|m| m.name() == "gen_ai_client_token_usage");
         assert!(
             token_metric.is_none() || token_metric.unwrap().get_metric().is_empty(),
             "Should not record tokens on error"
@@ -560,6 +564,7 @@ mod tests {
             server_address: "localhost".to_string(),
             server_port: 8080,
             provider_name: None, // Missing provider
+            fusillade_request_id: None,
         };
 
         metrics.record_from_analytics(&row).await;
@@ -568,7 +573,7 @@ mod tests {
         // Should still record metrics with empty strings for missing fields
         let duration_metric = metric_families
             .iter()
-            .find(|m| m.get_name() == "gen_ai_server_request_duration_seconds")
+            .find(|m| m.name() == "gen_ai_server_request_duration_seconds")
             .expect("Should have request duration metric");
 
         let duration_labels = duration_metric.get_metric().first().unwrap().get_label();
@@ -582,7 +587,7 @@ mod tests {
         // Should NOT record TPOT without duration_to_first_byte_ms
         let tpot_metric = metric_families
             .iter()
-            .find(|m| m.get_name() == "gen_ai_server_time_per_output_token_seconds");
+            .find(|m| m.name() == "gen_ai_server_time_per_output_token_seconds");
         assert!(
             tpot_metric.is_none() || tpot_metric.unwrap().get_metric().is_empty(),
             "Should not record TPOT without TTFB"
@@ -617,6 +622,7 @@ mod tests {
             server_address: "api.openai.com".to_string(),
             server_port: 443,
             provider_name: Some("openai".to_string()),
+            fusillade_request_id: None,
         };
 
         metrics.record_from_analytics(&row).await;
@@ -625,7 +631,7 @@ mod tests {
         // Should only record input tokens
         let token_metric = metric_families
             .iter()
-            .find(|m| m.get_name() == "gen_ai_client_token_usage")
+            .find(|m| m.name() == "gen_ai_client_token_usage")
             .expect("Should have token usage metric");
 
         assert_eq!(token_metric.get_metric().len(), 1, "Should only have input tokens");
@@ -636,7 +642,7 @@ mod tests {
         // Should NOT record TPOT with zero completion tokens
         let tpot_metric = metric_families
             .iter()
-            .find(|m| m.get_name() == "gen_ai_server_time_per_output_token_seconds");
+            .find(|m| m.name() == "gen_ai_server_time_per_output_token_seconds");
         assert!(
             tpot_metric.is_none() || tpot_metric.unwrap().get_metric().is_empty(),
             "Should not record TPOT with zero completion tokens"
@@ -671,6 +677,7 @@ mod tests {
             server_address: "api.example.com".to_string(),
             server_port: 443,
             provider_name: Some("custom".to_string()),
+            fusillade_request_id: None,
         };
 
         metrics.record_from_analytics(&row).await;
@@ -679,7 +686,7 @@ mod tests {
         // Should record with empty operation name
         let duration_metric = metric_families
             .iter()
-            .find(|m| m.get_name() == "gen_ai_server_request_duration_seconds")
+            .find(|m| m.name() == "gen_ai_server_request_duration_seconds")
             .expect("Should have request duration metric");
 
         let duration_labels = duration_metric.get_metric().first().unwrap().get_label();
@@ -720,6 +727,7 @@ mod tests {
                 server_address: "api.openai.com".to_string(),
                 server_port: 443,
                 provider_name: Some("openai".to_string()),
+                fusillade_request_id: None,
             };
 
             metrics.record_from_analytics(&row).await;
@@ -728,7 +736,7 @@ mod tests {
         let metric_families = registry.gather();
         let duration_metric = metric_families
             .iter()
-            .find(|m| m.get_name() == "gen_ai_server_request_duration_seconds")
+            .find(|m| m.name() == "gen_ai_server_request_duration_seconds")
             .expect("Should have request duration metric");
 
         // Should have recorded 4 different error types
@@ -767,6 +775,7 @@ mod tests {
             server_address: "api.openai.com".to_string(),
             server_port: 443,
             provider_name: Some("openai".to_string()),
+            fusillade_request_id: None,
         };
 
         metrics.record_from_analytics(&row).await;
@@ -775,7 +784,7 @@ mod tests {
         // Verify operation name is "embeddings" for base64_embeddings
         let duration_metric = metric_families
             .iter()
-            .find(|m| m.get_name() == "gen_ai_server_request_duration_seconds")
+            .find(|m| m.name() == "gen_ai_server_request_duration_seconds")
             .expect("Should have request duration metric");
 
         let duration_labels = duration_metric.get_metric().first().unwrap().get_label();

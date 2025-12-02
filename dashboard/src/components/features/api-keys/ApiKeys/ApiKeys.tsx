@@ -49,6 +49,7 @@ import {
   HoverCardContent,
   HoverCardTrigger,
 } from "../../../ui/hover-card";
+import { useServerPagination } from "@/hooks/useServerPagination";
 
 export const ApiKeys: React.FC = () => {
   const { data: user } = useUser("current");
@@ -74,12 +75,17 @@ export const ApiKeys: React.FC = () => {
 
   // Check if user is a platform manager
   const isPlatformManager = user?.roles?.includes("PlatformManager") || false;
-
+  const pagination = useServerPagination();
   const {
-    data: apiKeys = [],
+    data: apiKeysData,
     isLoading,
     error,
-  } = useApiKeys(user?.id || "current");
+  } = useApiKeys(user?.id || "current", {
+    ...pagination.queryParams,
+  });
+
+  const apiKeys = apiKeysData?.data || [];
+
   const createApiKeyMutation = useCreateApiKey();
   const deleteApiKeyMutation = useDeleteApiKey();
 
@@ -233,7 +239,6 @@ export const ApiKeys: React.FC = () => {
           data={apiKeys}
           searchPlaceholder="Search API keys..."
           searchColumn="name"
-          showPagination={apiKeys.length > 10}
           onSelectionChange={setSelectedKeys}
           actionBar={
             <div className="bg-blue-50 border border-blue-200 rounded-lg p-3 mb-4 flex items-center justify-between">
@@ -255,6 +260,15 @@ export const ApiKeys: React.FC = () => {
               </div>
             </div>
           }
+          paginationMode="server"
+          serverPagination={{
+            page: pagination.page,
+            pageSize: pagination.pageSize,
+            totalItems: apiKeysData?.total_count || 0,
+            onPageChange: (page: number) => pagination.handlePageChange(page),
+            onPageSizeChange: (pageSize: number) =>
+              pagination.handlePageSizeChange(pageSize),
+          }}
         />
       ) : (
         <div

@@ -8,9 +8,11 @@ import type {
   GroupUpdateRequest,
   ModelUpdateRequest,
   ApiKeyCreateRequest,
+  ApiKeysQuery,
   EndpointCreateRequest,
   EndpointUpdateRequest,
   EndpointValidateRequest,
+  EndpointsQuery,
   UsersQuery,
   ModelsQuery,
   GroupsQuery,
@@ -275,13 +277,13 @@ export function useRemoveModelFromGroup() {
 }
 
 // Endpoints hooks
-export function useEndpoints(options?: { enabled?: boolean }) {
+export function useEndpoints(options?: EndpointsQuery) {
   const queryClient = useQueryClient();
-  const { enabled = true } = options || {};
+  const { enabled = true, ...queryOptions } = options || {};
 
   return useQuery({
-    queryKey: queryKeys.endpoints.all,
-    queryFn: () => dwctlApi.endpoints.list(),
+    queryKey: queryKeys.endpoints.query(queryOptions),
+    queryFn: () => dwctlApi.endpoints.list(queryOptions),
     enabled,
     // Populate individual endpoint caches when list is fetched
     select: (data) => {
@@ -384,10 +386,10 @@ export function useSynchronizeEndpoint() {
 }
 
 // API Keys hooks
-export function useApiKeys(userId = "current") {
+export function useApiKeys(userId = "current", options: ApiKeysQuery) {
   return useQuery({
-    queryKey: queryKeys.apiKeys.query(userId),
-    queryFn: () => dwctlApi.users.apiKeys.getAll(userId),
+    queryKey: queryKeys.apiKeys.query(userId, options),
+    queryFn: () => dwctlApi.users.apiKeys.getAll(userId, options),
   });
 }
 
@@ -812,6 +814,24 @@ export function useBatch(id: string) {
         )
       ) {
         return 2000;
+      }
+      return false;
+    },
+  });
+}
+
+export function useBatchAnalytics(id: string) {
+  return useQuery({
+    queryKey: queryKeys.batches.analytics(id),
+    queryFn: () => dwctlApi.batches.getAnalytics(id),
+    enabled: !!id,
+    // Only fetch analytics for completed batches, or refetch periodically for in-progress batches
+    refetchInterval: (query) => {
+      // We need to get the batch status - we can use the batch query cache
+      const batchQueryState = query.state.dataUpdatedAt;
+      if (batchQueryState) {
+        // Refetch every 5 seconds to get updated analytics
+        return 5000;
       }
       return false;
     },
