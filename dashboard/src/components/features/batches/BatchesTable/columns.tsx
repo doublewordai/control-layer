@@ -239,6 +239,38 @@ export const createBatchColumns = (
       );
     },
   },
+  // KILLED BC QUERY IS DIABOLICAL AND NUKES SERVER MEMORY
+  // {
+  //   id: "cost",
+  //   header: "Cost",
+  //   cell: ({ row }) => {
+  //     const batch = row.original as Batch;
+  //     const analytics = actions.batchAnalytics?.get(batch.id);
+  //     if (!analytics) {
+  //       return (
+  //         <div className="flex items-center gap-1 text-sm text-gray-400">
+  //           <Loader2 className="w-3 h-3 animate-spin" />
+  //           <span>...</span>
+  //         </div>
+  //       );
+  //     }
+
+  //     if (!analytics.total_cost || parseFloat(analytics.total_cost) === 0) {
+  //       return <span className="text-gray-400 text-sm">-</span>;
+  //     }
+
+  //     const cost = parseFloat(analytics.total_cost);
+
+  //     return (
+  //       <div className="flex items-center gap-1 text-sm text-gray-700">
+  //         <DollarSign className="w-3 h-3 text-green-600" />
+  //         <span className="font-medium">{cost.toFixed(4)}</span>
+  //       </div>
+  //     );
+  //   },
+  //   // Disable sorting for cost column since data is fetched asynchronously
+  //   enableSorting: false,
+  // },
   {
     id: "cost",
     header: "Cost",
