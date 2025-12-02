@@ -1,10 +1,7 @@
 import { useState, useEffect } from "react";
 import * as React from "react";
 import { useNavigate, useSearchParams } from "react-router-dom";
-import {
-  useQueryClient,
-  // useQueries
-} from "@tanstack/react-query";
+import { useQueryClient, useQueries } from "@tanstack/react-query";
 import {
   Upload,
   Play,
@@ -28,7 +25,7 @@ import { createBatchColumns } from "../BatchesTable/columns";
 import { useFiles, useBatches } from "../../../../api/control-layer/hooks";
 import { dwctlApi } from "../../../../api/control-layer/client";
 import type { FileObject, Batch } from "../types";
-// import type { BatchAnalytics } from "../../../../api/control-layer/types";
+import type { BatchAnalytics } from "../../../../api/control-layer/types";
 import { useServerCursorPagination } from "../../../../hooks/useServerCursorPagination";
 
 /**
@@ -163,28 +160,28 @@ export function Batches({
     return batches.filter((b) => b.input_file_id === batchFileFilter);
   }, [batches, batchFileFilter]);
 
-  // // Fetch analytics for all batches in parallel
-  // const analyticsQueries = useQueries({
-  //   queries: batches.map((batch) => ({
-  //     queryKey: ["batches", "analytics", batch.id],
-  //     queryFn: () => dwctlApi.batches.getAnalytics(batch.id),
-  //     staleTime: 5000, // 5 seconds
-  //     refetchInterval: 5000, // Refetch every 5 seconds for in-progress batches
-  //   })),
-  // });
+  // Fetch analytics for all batches in parallel
+  const analyticsQueries = useQueries({
+    queries: batches.map((batch) => ({
+      queryKey: ["batches", "analytics", batch.id],
+      queryFn: () => dwctlApi.batches.getAnalytics(batch.id),
+      staleTime: 5000, // 5 seconds
+      refetchInterval: 5000, // Refetch every 5 seconds for in-progress batches
+    })),
+  });
 
-  // // Create a map of batch ID to analytics for easy lookup
-  // // TODO: optimise this into a bulk request rather than one per batch
-  // const batchAnalyticsMap = React.useMemo(() => {
-  //   const map = new Map<string, BatchAnalytics>();
-  //   batches.forEach((batch, index) => {
-  //     const analytics = analyticsQueries[index]?.data;
-  //     if (analytics) {
-  //       map.set(batch.id, analytics);
-  //     }
-  //   });
-  //   return map;
-  // }, [batches, analyticsQueries]);
+  // Create a map of batch ID to analytics for easy lookup
+  // TODO: optimise this into a bulk request rather than one per batch
+  const batchAnalyticsMap = React.useMemo(() => {
+    const map = new Map<string, BatchAnalytics>();
+    batches.forEach((batch, index) => {
+      const analytics = analyticsQueries[index]?.data;
+      if (analytics) {
+        map.set(batch.id, analytics);
+      }
+    });
+    return map;
+  }, [batches, analyticsQueries]);
 
   // Prefetch next page for files - only if user has already started paginating
   useEffect(() => {
@@ -379,7 +376,7 @@ export function Batches({
     onViewFile: handleViewFileRequests,
     getInputFile,
     onRowClick: handleBatchClick,
-    // batchAnalytics: batchAnalyticsMap,
+    batchAnalytics: batchAnalyticsMap,
   });
 
   // Loading state

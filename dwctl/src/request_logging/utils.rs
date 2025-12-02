@@ -477,7 +477,7 @@ mod tests {
             body: None,
         };
 
-        let result = extract_fusillade_request_id(&request_data);
+        let result = extract_header_value_as_string(&request_data, "x-fusillade-request-id");
 
         assert!(result.is_some());
         let uuid = result.unwrap();
