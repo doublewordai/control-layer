@@ -348,11 +348,10 @@ pub struct StripeConfig {
 }
 
 /// Dummy payment configuration for testing.
-#[derive(Debug, Clone, Deserialize, Serialize, Default)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct DummyConfig {
-    /// Amount to add in dollars (defaults to $50)
-    #[serde(default)]
-    pub amount: Option<rust_decimal::Decimal>,
+    /// Amount to add in dollars (required)
+    pub amount: rust_decimal::Decimal,
     /// Base URL for redirect URLs (e.g., "https://app.example.com")
     /// This is used to construct success/cancel URLs for checkout sessions
     #[serde(default)]
