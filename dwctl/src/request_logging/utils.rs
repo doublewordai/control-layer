@@ -119,11 +119,7 @@ pub(crate) fn decompress_response_if_needed(
     }
 }
 
-/// Extract fusillade request ID from request headers
-///
-/// The fusillade system sends a truncated 8-character hex string in the header
-/// (e.g., "05872bea") for readability, but we need to pad it to a valid UUID format.
-/// We pad with zeros to create a valid UUID: "05872bea-0000-0000-0000-000000000000"
+/// Extract value from request headers
 ///
 /// # Arguments
 /// * `request_data` - The HTTP request data containing headers
@@ -131,10 +127,10 @@ pub(crate) fn decompress_response_if_needed(
 /// # Returns
 /// * `Some(Uuid)` - Successfully extracted and parsed UUID (either full or padded from 8-char hex)
 /// * `None` - Header missing, empty, or invalid format
-pub(crate) fn extract_fusillade_request_id(request_data: &outlet::RequestData) -> Option<uuid::Uuid> {
+pub(crate) fn extract_header_value_as_string(request_data: &outlet::RequestData, header_name: &str) -> Option<uuid::Uuid> {
     request_data
         .headers
-        .get("x-fusillade-request-id")
+        .get(header_name)
         .and_then(|values| values.first())
         .and_then(|bytes| std::str::from_utf8(bytes).ok())
         .and_then(|s| {
@@ -150,7 +146,7 @@ pub(crate) fn extract_fusillade_request_id(request_data: &outlet::RequestData) -
 #[cfg(test)]
 mod tests {
     use super::{
-        decompress_response_if_needed, extract_fusillade_request_id, parse_non_streaming_response, parse_sse_chunks,
+        decompress_response_if_needed, extract_header_value_as_string, parse_non_streaming_response, parse_sse_chunks,
         parse_streaming_response, process_sse_chunks,
     };
     use crate::request_logging::models::{AiResponse, ChatCompletionChunk, SseParseError};
@@ -379,7 +375,7 @@ mod tests {
             body: None,
         };
 
-        let result = extract_fusillade_request_id(&request_data);
+        let result = extract_header_value_as_string(&request_data, "x-fusillade-request-id");
 
         assert!(result.is_some());
         assert_eq!(result.unwrap(), test_uuid);
@@ -399,7 +395,7 @@ mod tests {
             body: None,
         };
 
-        let result = extract_fusillade_request_id(&request_data);
+        let result = extract_header_value_as_string(&request_data, "x-fusillade-request-id");
 
         assert!(result.is_none());
     }
@@ -419,7 +415,7 @@ mod tests {
             body: None,
         };
 
-        let result = extract_fusillade_request_id(&request_data);
+        let result = extract_header_value_as_string(&request_data, "x-fusillade-request-id");
 
         assert!(result.is_none());
     }
@@ -438,7 +434,7 @@ mod tests {
             body: None,
         };
 
-        let result = extract_fusillade_request_id(&request_data);
+        let result = extract_header_value_as_string(&request_data, "x-fusillade-request-id");
 
         assert!(result.is_none());
     }
@@ -458,7 +454,7 @@ mod tests {
             body: None,
         };
 
-        let result = extract_fusillade_request_id(&request_data);
+        let result = extract_header_value_as_string(&request_data, "x-fusillade-request-id");
 
         assert!(result.is_none());
     }
@@ -481,7 +477,7 @@ mod tests {
             body: None,
         };
 
-        let result = extract_fusillade_request_id(&request_data);
+        let result = extract_header_value_as_string(&request_data, "x-fusillade-request-id");
 
         assert!(result.is_some());
         let uuid = result.unwrap();

@@ -272,6 +272,7 @@ mod tests {
             server_address: "api.openai.com".to_string(),
             server_port: 443,
             provider_name: Some("openai".to_string()),
+            fusillade_batch_id: None,
             fusillade_request_id: None,
         };
 
@@ -382,6 +383,7 @@ mod tests {
             server_address: "api.anthropic.com".to_string(),
             server_port: 443,
             provider_name: Some("anthropic".to_string()),
+            fusillade_batch_id: None,
             fusillade_request_id: None,
         };
 
@@ -440,6 +442,7 @@ mod tests {
             server_address: "api.openai.com".to_string(),
             server_port: 443,
             provider_name: Some("openai".to_string()),
+            fusillade_batch_id: None,
             fusillade_request_id: None,
         };
 
@@ -509,6 +512,7 @@ mod tests {
             server_address: "api.openai.com".to_string(),
             server_port: 443,
             provider_name: Some("openai".to_string()),
+            fusillade_batch_id: None,
             fusillade_request_id: None,
         };
 
@@ -564,6 +568,7 @@ mod tests {
             server_address: "localhost".to_string(),
             server_port: 8080,
             provider_name: None, // Missing provider
+            fusillade_batch_id: None,
             fusillade_request_id: None,
         };
 
@@ -622,6 +627,7 @@ mod tests {
             server_address: "api.openai.com".to_string(),
             server_port: 443,
             provider_name: Some("openai".to_string()),
+            fusillade_batch_id: None,
             fusillade_request_id: None,
         };
 
@@ -677,6 +683,7 @@ mod tests {
             server_address: "api.example.com".to_string(),
             server_port: 443,
             provider_name: Some("custom".to_string()),
+            fusillade_batch_id: None,
             fusillade_request_id: None,
         };
 
@@ -727,6 +734,7 @@ mod tests {
                 server_address: "api.openai.com".to_string(),
                 server_port: 443,
                 provider_name: Some("openai".to_string()),
+                fusillade_batch_id: None,
                 fusillade_request_id: None,
             };
 
@@ -775,6 +783,7 @@ mod tests {
             server_address: "api.openai.com".to_string(),
             server_port: 443,
             provider_name: Some("openai".to_string()),
+            fusillade_batch_id: None,
             fusillade_request_id: None,
         };
 
