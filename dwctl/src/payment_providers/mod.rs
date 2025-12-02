@@ -19,18 +19,12 @@ pub mod stripe;
 /// Adding a new provider requires adding a match arm here.
 pub fn create_provider(config: PaymentConfig) -> Box<dyn PaymentProvider> {
     match config {
-        PaymentConfig::Stripe(stripe_config) => Box::new(stripe::StripeProvider::new(
-            stripe_config.api_key,
-            stripe_config.price_id,
-            stripe_config.webhook_secret,
-        )),
-        PaymentConfig::Dummy(dummy_config) => {
-            let amount = dummy_config.amount.unwrap_or(Decimal::new(50, 0));
-            Box::new(dummy::DummyProvider::new(amount))
-        } // Future providers:
-          // PaymentConfig::PayPal(paypal_config) => {
-          //     Box::new(paypal::PayPalProvider::new(...))
-          // }
+        PaymentConfig::Stripe(stripe_config) => Box::new(stripe::StripeProvider::from(stripe_config)),
+        PaymentConfig::Dummy(dummy_config) => Box::new(dummy::DummyProvider::from(dummy_config)),
+        // Future providers:
+        // PaymentConfig::PayPal(paypal_config) => {
+        //     Box::new(paypal::PayPalProvider::from(paypal_config))
+        // }
     }
 }
 
