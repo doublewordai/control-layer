@@ -907,7 +907,10 @@ pub struct BackgroundServices {
     onwards_targets: onwards::target::Targets,
     #[cfg_attr(not(test), allow(dead_code))]
     onwards_sender: Option<tokio::sync::watch::Sender<onwards::target::Targets>>,
-    background_tasks: Vec<(&'static str, tokio::task::JoinHandle<anyhow::Result<()>>)>,
+    // JoinSet is cancel-safe - can be polled in select! without losing tasks
+    background_tasks: tokio::task::JoinSet<anyhow::Result<()>>,
+    // Map task IDs to names for logging
+    task_names: std::collections::HashMap<tokio::task::Id, &'static str>,
     shutdown_token: tokio_util::sync::CancellationToken,
     // Pub so that we can disarm it if we want to
     pub drop_guard: Option<tokio_util::sync::DropGuard>,
@@ -915,43 +918,28 @@ pub struct BackgroundServices {
 
 impl BackgroundServices {
     /// Wait for any background task to complete (indicating a failure)
-    /// Mutates the task list to contain only the remaining pending tasks
+    /// This method is cancel-safe - can be used in tokio::select! without losing tasks
     /// Returns an error with details about which task failed
     pub async fn wait_for_failure(&mut self) -> anyhow::Result<std::convert::Infallible> {
-        let tasks = std::mem::take(&mut self.background_tasks);
-
-        if tasks.is_empty() {
-            // No background tasks - wait forever
-            futures::future::pending::<()>().await;
-            unreachable!()
-        }
-
-        // Extract names and handles separately
-        let (names, handles): (Vec<_>, Vec<_>) = tasks.into_iter().unzip();
-
-        let (result, index, remaining) = futures::future::select_all(handles).await;
-
-        let task_name = names.get(index).copied().unwrap_or("unknown");
-
-        // Put remaining tasks back - zip names (minus the completed one) with remaining handles
-        let remaining_names: Vec<_> = names
-            .into_iter()
-            .enumerate()
-            .filter_map(|(i, name)| if i != index { Some(name) } else { None })
-            .collect();
-
-        self.background_tasks = remaining_names.into_iter().zip(remaining.into_iter()).collect();
-
-        match result {
-            Ok(Ok(())) => {
+        match self.background_tasks.join_next_with_id().await {
+            None => {
+                // No background tasks - wait forever
+                futures::future::pending::<()>().await;
+                unreachable!()
+            }
+            Some(Ok((task_id, Ok(())))) => {
+                let task_name = self.task_names.get(&task_id).copied().unwrap_or("unknown");
                 tracing::warn!(task = task_name, "Background task completed unexpectedly");
                 anyhow::bail!("Background task '{}' completed early", task_name)
             }
-            Ok(Err(e)) => {
+            Some(Ok((task_id, Err(e)))) => {
+                let task_name = self.task_names.get(&task_id).copied().unwrap_or("unknown");
                 tracing::error!(task = task_name, error = %e, "Background task failed");
                 anyhow::bail!("Background task '{}' failed: {}", task_name, e)
             }
-            Err(e) => {
+            Some(Err(e)) => {
+                let task_id = e.id();
+                let task_name = self.task_names.get(&task_id).copied().unwrap_or("unknown");
                 tracing::error!(task = task_name, error = %e, "Background task panicked");
                 anyhow::bail!("Background task '{}' panicked: {}", task_name, e)
             }
@@ -959,21 +947,25 @@ impl BackgroundServices {
     }
 
     /// Gracefully shutdown all background tasks
-    pub async fn shutdown(self) {
+    pub async fn shutdown(mut self) {
         // Signal all background tasks to shutdown
         self.shutdown_token.cancel();
 
         // Wait for all background tasks to complete and check for errors
-        for (name, handle) in self.background_tasks.into_iter() {
-            match handle.await {
-                Ok(Ok(())) => {
-                    tracing::debug!(task = name, "Background task completed successfully");
+        while let Some(result) = self.background_tasks.join_next_with_id().await {
+            match result {
+                Ok((task_id, Ok(()))) => {
+                    let task_name = self.task_names.get(&task_id).copied().unwrap_or("unknown");
+                    tracing::debug!(task = task_name, "Background task completed successfully");
                 }
-                Ok(Err(e)) => {
-                    tracing::error!(task = name, error = %e, "Background task failed");
+                Ok((task_id, Err(e))) => {
+                    let task_name = self.task_names.get(&task_id).copied().unwrap_or("unknown");
+                    tracing::error!(task = task_name, error = %e, "Background task failed");
                 }
                 Err(e) => {
-                    tracing::error!(task = name, error = %e, "Background task panicked");
+                    let task_id = e.id();
+                    let task_name = self.task_names.get(&task_id).copied().unwrap_or("unknown");
+                    tracing::error!(task = task_name, error = %e, "Background task panicked");
                 }
             }
         }
@@ -1001,6 +993,38 @@ impl BackgroundServices {
     }
 }
 
+/// Helper for spawning named background tasks during setup
+struct BackgroundTaskBuilder {
+    tasks: tokio::task::JoinSet<anyhow::Result<()>>,
+    names: std::collections::HashMap<tokio::task::Id, &'static str>,
+}
+
+impl BackgroundTaskBuilder {
+    fn new() -> Self {
+        Self {
+            tasks: tokio::task::JoinSet::new(),
+            names: std::collections::HashMap::new(),
+        }
+    }
+
+    fn spawn<F>(&mut self, name: &'static str, future: F)
+    where
+        F: std::future::Future<Output = anyhow::Result<()>> + Send + 'static,
+    {
+        let abort_handle = self.tasks.spawn(future);
+        self.names.insert(abort_handle.id(), name);
+    }
+
+    fn into_parts(
+        self,
+    ) -> (
+        tokio::task::JoinSet<anyhow::Result<()>>,
+        std::collections::HashMap<tokio::task::Id, &'static str>,
+    ) {
+        (self.tasks, self.names)
+    }
+}
+
 /// Setup background services (probe scheduler, batch daemon, leader election, onwards integration)
 async fn setup_background_services(
     pool: PgPool,
@@ -1010,7 +1034,7 @@ async fn setup_background_services(
 ) -> anyhow::Result<BackgroundServices> {
     let drop_guard = shutdown_token.clone().drop_guard();
     // Track all background task handles for graceful shutdown
-    let mut background_tasks = Vec::new();
+    let mut background_tasks = BackgroundTaskBuilder::new();
 
     // Create shared model capacity limits map for daemon coordination
     // This is populated by onwards config sync and read by fusillade daemon
@@ -1034,14 +1058,13 @@ async fn setup_background_services(
 
         // Start the onwards configuration listener
         let onwards_shutdown = shutdown_token.clone();
-        let handle = tokio::spawn(async move {
+        background_tasks.spawn("onwards-config-sync", async move {
             info!("Starting onwards configuration listener");
             onwards_config_sync
                 .start(Default::default(), onwards_shutdown)
                 .await
                 .context("Onwards configuration listener failed")
         });
-        background_tasks.push(("onwards-config-sync", handle));
 
         (initial_targets, Some(sender))
     } else {
@@ -1084,14 +1107,13 @@ async fn setup_background_services(
             // Start the scheduler daemon in the background
             let daemon_scheduler = probe_scheduler.clone();
             let daemon_shutdown = shutdown_token.clone();
-            let handle = tokio::spawn(async move {
+            background_tasks.spawn("probe-scheduler", async move {
                 // Use LISTEN/NOTIFY in production, but disable in tests to avoid hangs
                 let use_listen_notify = !cfg!(test);
                 daemon_scheduler.run_daemon(daemon_shutdown, use_listen_notify, 300).await;
                 // Probe scheduler runs until cancelled, then exits normally
                 Ok(())
             });
-            background_tasks.push(("probe-scheduler", handle));
         } else {
             info!("Probe scheduler disabled by configuration");
         }
@@ -1103,7 +1125,7 @@ async fn setup_background_services(
             DaemonEnabled::Always | DaemonEnabled::Leader => {
                 let daemon_handle = request_manager.clone().run(shutdown_token.clone())?;
                 // Spawn task that propagates daemon errors
-                let handle = tokio::spawn(async move {
+                background_tasks.spawn("fusillade-daemon", async move {
                     match daemon_handle.await {
                         Ok(Ok(())) => {
                             tracing::info!("Fusillade daemon exited normally");
@@ -1119,7 +1141,6 @@ async fn setup_background_services(
                     }
                     Ok(())
                 });
-                background_tasks.push(("fusillade-daemon", handle));
                 info!("Skipping leader election - running as leader with probe scheduler and fusillade daemon");
             }
             DaemonEnabled::Never => {
@@ -1137,7 +1158,7 @@ async fn setup_background_services(
             use fusillade::DaemonExecutor;
             let daemon_handle = request_manager.clone().run(shutdown_token.clone())?;
             // Spawn task that propagates daemon errors
-            let handle = tokio::spawn(async move {
+            background_tasks.spawn("fusillade-daemon", async move {
                 match daemon_handle.await {
                     Ok(Ok(())) => {
                         tracing::info!("Fusillade daemon exited normally");
@@ -1153,7 +1174,6 @@ async fn setup_background_services(
                 }
                 Ok(())
             });
-            background_tasks.push(("fusillade-daemon", handle));
             info!("Fusillade batch daemon started (configured to always run)");
         }
 
@@ -1180,7 +1200,7 @@ async fn setup_background_services(
         let leadership_shutdown_lose = leadership_shutdown.clone();
 
         let leader_election_shutdown = shutdown_token.clone();
-        let handle = tokio::spawn(async move {
+        background_tasks.spawn("leader-election", async move {
             leader_election::leader_election_task(
                 leader_election_pool,
                 leader_election_config,
@@ -1277,8 +1297,9 @@ async fn setup_background_services(
             // Leader election runs until cancelled, then exits normally
             Ok(())
         });
-        background_tasks.push(("leader-election", handle));
     }
+
+    let (background_tasks, task_names) = background_tasks.into_parts();
 
     Ok(BackgroundServices {
         request_manager,
@@ -1286,6 +1307,7 @@ async fn setup_background_services(
         onwards_targets: initial_targets,
         onwards_sender,
         background_tasks,
+        task_names,
         shutdown_token,
         drop_guard: Some(drop_guard),
     })
