@@ -778,20 +778,7 @@ pub async fn get_model_user_usage(
 
 /// Get aggregated analytics metrics for a batch given a list of request IDs
 #[instrument(skip(pool))]
-pub async fn get_batch_analytics(pool: &PgPool, request_ids: &[Uuid]) -> Result<BatchAnalytics> {
-    // If no requests, return zero metrics
-    if request_ids.is_empty() {
-        return Ok(BatchAnalytics {
-            total_requests: 0,
-            total_prompt_tokens: 0,
-            total_completion_tokens: 0,
-            total_tokens: 0,
-            avg_duration_ms: None,
-            avg_ttfb_ms: None,
-            total_cost: None,
-        });
-    }
-
+pub async fn get_batch_analytics(pool: &PgPool, batch_id: &Uuid) -> Result<BatchAnalytics> {
     // Query analytics for these specific request IDs
     let metrics = sqlx::query!(
         r#"
@@ -805,9 +792,9 @@ pub async fn get_batch_analytics(pool: &PgPool, request_ids: &[Uuid]) -> Result<
             SUM((prompt_tokens * COALESCE(input_price_per_token, 0)) +
                 (completion_tokens * COALESCE(output_price_per_token, 0))) as "total_cost"
         FROM http_analytics
-        WHERE fusillade_request_id = ANY($1)
+        WHERE fusillade_batch_id = $1
         "#,
-        request_ids
+        batch_id
     )
     .fetch_one(pool)
     .await?;
@@ -1247,9 +1234,10 @@ mod tests {
     }
 
     // Helper function to insert analytics data with fusillade_request_id
-    async fn insert_test_analytics_with_request_id(
+    async fn insert_test_analytics_with_batch_id(
         pool: &PgPool,
-        fusillade_request_id: Uuid,
+        fusillade_batch_id: Uuid,
+        fusillade_request_id: Option<Uuid>,
         timestamp: DateTime<Utc>,
         model: &str,
         status_code: i32,
@@ -1268,9 +1256,9 @@ mod tests {
             INSERT INTO http_analytics (
                 instance_id, correlation_id, timestamp, uri, method, status_code,
                 duration_ms, duration_to_first_byte_ms, model, prompt_tokens,
-                completion_tokens, total_tokens, fusillade_request_id,
+                completion_tokens, total_tokens, fusillade_batch_id, fusillade_request_id,
                 input_price_per_token, output_price_per_token
-            ) VALUES ($1, $2, $3, '/ai/chat/completions', 'POST', $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
+            ) VALUES ($1, $2, $3, '/ai/chat/completions', 'POST', $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)
             "#,
             Uuid::new_v4(),
             1i64,
@@ -1282,37 +1270,26 @@ mod tests {
             prompt_tokens,
             completion_tokens,
             prompt_tokens + completion_tokens,
+            fusillade_batch_id,
             fusillade_request_id,
             input_price_per_token.map(Decimal::from_f64_retain).flatten(),
             output_price_per_token.map(Decimal::from_f64_retain).flatten(),
         )
         .execute(pool)
         .await
-        .expect("Failed to insert test analytics data with request ID");
-    }
-
-    #[sqlx::test]
-    async fn test_get_batch_analytics_empty_request_ids(pool: PgPool) {
-        let result = get_batch_analytics(&pool, &[]).await.unwrap();
-
-        assert_eq!(result.total_requests, 0);
-        assert_eq!(result.total_prompt_tokens, 0);
-        assert_eq!(result.total_completion_tokens, 0);
-        assert_eq!(result.total_tokens, 0);
-        assert_eq!(result.avg_duration_ms, None);
-        assert_eq!(result.avg_ttfb_ms, None);
-        assert_eq!(result.total_cost, None);
+        .expect("Failed to insert test analytics data with batch ID");
     }
 
     #[sqlx::test]
     async fn test_get_batch_analytics_single_request(pool: PgPool) {
-        let request_id = Uuid::new_v4();
+        let batch_id = Uuid::new_v4();
         let now = Utc::now();
 
         // Insert a single analytics record
-        insert_test_analytics_with_request_id(
+        insert_test_analytics_with_batch_id(
             &pool,
-            request_id,
+            batch_id,
+            Some(Uuid::new_v4()),
             now,
             "gpt-4",
             200,
@@ -1325,7 +1302,7 @@ mod tests {
         )
         .await;
 
-        let result = get_batch_analytics(&pool, &[request_id]).await.unwrap();
+        let result = get_batch_analytics(&pool, &batch_id).await.unwrap();
 
         assert_eq!(result.total_requests, 1);
         assert_eq!(result.total_prompt_tokens, 100);
@@ -1342,15 +1319,14 @@ mod tests {
 
     #[sqlx::test]
     async fn test_get_batch_analytics_multiple_requests(pool: PgPool) {
-        let request_id_1 = Uuid::new_v4();
-        let request_id_2 = Uuid::new_v4();
-        let request_id_3 = Uuid::new_v4();
+        let batch_id = Uuid::new_v4();
         let now = Utc::now();
 
-        // Insert multiple analytics records
-        insert_test_analytics_with_request_id(
+        // Insert multiple analytics records for the same batch
+        insert_test_analytics_with_batch_id(
             &pool,
-            request_id_1,
+            batch_id,
+            Some(Uuid::new_v4()),
             now,
             "gpt-4",
             200,
@@ -1363,9 +1339,10 @@ mod tests {
         )
         .await;
 
-        insert_test_analytics_with_request_id(
+        insert_test_analytics_with_batch_id(
             &pool,
-            request_id_2,
+            batch_id,
+            Some(Uuid::new_v4()),
             now,
             "gpt-4",
             200,
@@ -1378,9 +1355,10 @@ mod tests {
         )
         .await;
 
-        insert_test_analytics_with_request_id(
+        insert_test_analytics_with_batch_id(
             &pool,
-            request_id_3,
+            batch_id,
+            Some(Uuid::new_v4()),
             now,
             "claude-3",
             200,
@@ -1393,9 +1371,7 @@ mod tests {
         )
         .await;
 
-        let result = get_batch_analytics(&pool, &[request_id_1, request_id_2, request_id_3])
-            .await
-            .unwrap();
+        let result = get_batch_analytics(&pool, &batch_id).await.unwrap();
 
         assert_eq!(result.total_requests, 3);
         assert_eq!(result.total_prompt_tokens, 225); // 50 + 100 + 75
@@ -1420,11 +1396,10 @@ mod tests {
     }
 
     #[sqlx::test]
-    async fn test_get_batch_analytics_nonexistent_request_ids(pool: PgPool) {
-        let nonexistent_id_1 = Uuid::new_v4();
-        let nonexistent_id_2 = Uuid::new_v4();
+    async fn test_get_batch_analytics_nonexistent_batch_id(pool: PgPool) {
+        let nonexistent_batch_id = Uuid::new_v4();
 
-        let result = get_batch_analytics(&pool, &[nonexistent_id_1, nonexistent_id_2]).await.unwrap();
+        let result = get_batch_analytics(&pool, &nonexistent_batch_id).await.unwrap();
 
         assert_eq!(result.total_requests, 0);
         assert_eq!(result.total_prompt_tokens, 0);
@@ -1436,15 +1411,16 @@ mod tests {
     }
 
     #[sqlx::test]
-    async fn test_get_batch_analytics_partial_match(pool: PgPool) {
-        let existing_id = Uuid::new_v4();
-        let nonexistent_id = Uuid::new_v4();
+    async fn test_get_batch_analytics_filters_by_batch_id(pool: PgPool) {
+        let batch_id_1 = Uuid::new_v4();
+        let batch_id_2 = Uuid::new_v4();
         let now = Utc::now();
 
-        // Insert only one record
-        insert_test_analytics_with_request_id(
+        // Insert records for batch 1
+        insert_test_analytics_with_batch_id(
             &pool,
-            existing_id,
+            batch_id_1,
+            Some(Uuid::new_v4()),
             now,
             "gpt-4",
             200,
@@ -1457,30 +1433,57 @@ mod tests {
         )
         .await;
 
-        // Query with both existing and non-existing IDs
-        let result = get_batch_analytics(&pool, &[existing_id, nonexistent_id]).await.unwrap();
+        // Insert records for batch 2 (should not be included)
+        insert_test_analytics_with_batch_id(
+            &pool,
+            batch_id_2,
+            Some(Uuid::new_v4()),
+            now,
+            "gpt-4",
+            200,
+            200.0,
+            Some(40.0),
+            100,
+            50,
+            Some(0.00001),
+            Some(0.00003),
+        )
+        .await;
 
-        // Should only return data for the existing ID
+        // Query only for batch 1
+        let result = get_batch_analytics(&pool, &batch_id_1).await.unwrap();
+
+        // Should only return data for batch 1
         assert_eq!(result.total_requests, 1);
         assert_eq!(result.total_prompt_tokens, 50);
         assert_eq!(result.total_completion_tokens, 25);
         assert_eq!(result.total_tokens, 75);
+        assert_eq!(result.avg_duration_ms, Some(100.0));
     }
 
     #[sqlx::test]
     async fn test_get_batch_analytics_missing_optional_fields(pool: PgPool) {
-        let request_id = Uuid::new_v4();
+        let batch_id = Uuid::new_v4();
         let now = Utc::now();
 
         // Insert record without TTFB and pricing data
-        insert_test_analytics_with_request_id(
-            &pool, request_id, now, "gpt-4", 200, 100.0, None, // No TTFB
-            50, 25, None, // No input price
+        insert_test_analytics_with_batch_id(
+            &pool,
+            batch_id,
+            Some(Uuid::new_v4()),
+            now,
+            "gpt-4",
+            200,
+            100.0,
+            None, // No TTFB
+            50,
+            25,
+            None, // No input price
             None, // No output price
         )
         .await;
 
-        let result = get_batch_analytics(&pool, &[request_id]).await.unwrap();
+        let result = get_batch_analytics(&pool, &batch_id).await.unwrap();
 
         assert_eq!(result.total_requests, 1);
         assert_eq!(result.total_prompt_tokens, 50);
@@ -1496,15 +1499,16 @@ mod tests {
     }
 
     #[sqlx::test]
-    async fn test_get_batch_analytics_filters_by_request_id(pool: PgPool) {
-        let batch_request_id = Uuid::new_v4();
-        let other_request_id = Uuid::new_v4();
+    async fn test_get_batch_analytics_multiple_requests_same_batch(pool: PgPool) {
+        let batch_id = Uuid::new_v4();
+        let other_batch_id = Uuid::new_v4();
         let now = Utc::now();
 
-        // Insert records for the batch
-        insert_test_analytics_with_request_id(
+        // Insert multiple records for the same batch with different request IDs
+        insert_test_analytics_with_batch_id(
             &pool,
-            batch_request_id,
+            batch_id,
+            Some(Uuid::new_v4()),
             now,
             "gpt-4",
             200,
@@ -1517,10 +1521,27 @@ mod tests {
         )
         .await;
 
-        // Insert record for a different request (should not be included)
-        insert_test_analytics_with_request_id(
+        insert_test_analytics_with_batch_id(
             &pool,
-            other_request_id,
+            batch_id,
+            Some(Uuid::new_v4()),
+            now,
+            "gpt-4",
+            200,
+            150.0,
+            Some(45.0),
+            75,
+            30,
+            Some(0.00001),
+            Some(0.00003),
+        )
+        .await;
+
+        // Insert record for a different batch (should not be included)
+        insert_test_analytics_with_batch_id(
+            &pool,
+            other_batch_id,
+            Some(Uuid::new_v4()),
             now,
             "gpt-4",
             200,
@@ -1533,13 +1554,13 @@ mod tests {
         )
         .await;
 
-        // Query only for the batch request
-        let result = get_batch_analytics(&pool, &[batch_request_id]).await.unwrap();
+        // Query only for the first batch
+        let result = get_batch_analytics(&pool, &batch_id).await.unwrap();
 
-        // Should only include the batch request, not the other one
-        assert_eq!(result.total_requests, 1);
-        assert_eq!(result.total_prompt_tokens, 50);
-        assert_eq!(result.total_completion_tokens, 25);
-        assert_eq!(result.avg_duration_ms, Some(100.0));
+        // Should only include the two requests from the first batch, not the other batch
+        assert_eq!(result.total_requests, 2);
+        assert_eq!(result.total_prompt_tokens, 125); // 50 + 75
+        assert_eq!(result.total_completion_tokens, 55); // 25 + 30
+        assert_eq!(result.avg_duration_ms, Some(125.0)); // (100 + 150) / 2
     }
 }

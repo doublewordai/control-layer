@@ -21,27 +21,6 @@ use fusillade::Storage;
 use std::collections::HashMap;
 use uuid::Uuid;
 
-/// Fetch aggregated analytics metrics for a batch
-async fn fetch_batch_analytics(pool: &sqlx::PgPool, request_manager: &impl fusillade::Storage, batch_id: Uuid) -> Result<BatchAnalytics> {
-    // Get all request IDs for this batch from fusillade
-    let requests = request_manager
-        .get_batch_requests(fusillade::BatchId(batch_id))
-        .await
-        .map_err(|e| Error::Internal {
-            operation: format!("get batch requests: {}", e),
-        })?;
-
-    // Extract request IDs
-    let request_ids: Vec<Uuid> = requests.iter().map(|r| r.id().0).collect();
-
-    // Query analytics using the db handler
-    crate::db::handlers::analytics::get_batch_analytics(pool, &request_ids)
-        .await
-        .map_err(|e| Error::Internal {
-            operation: format!("fetch batch analytics: {}", e),
-        })
-}
-
 /// Helper function to convert fusillade Batch to OpenAI BatchResponse
 fn to_batch_response(batch: fusillade::Batch) -> BatchResponse {
     // Convert metadata from serde_json::Value to HashMap<String, String>
@@ -322,7 +301,11 @@ pub async fn get_batch_analytics(
     }
 
     // Fetch aggregated analytics metrics for this batch
-    let analytics = fetch_batch_analytics(&state.db, &*state.request_manager, batch_id).await?;
+    let analytics = crate::db::handlers::analytics::get_batch_analytics(&state.db, &batch_id)
+        .await
+        .map_err(|e| Error::Internal {
+            operation: format!("fetch batch analytics: {}", e),
+        })?;
 
     Ok(Json(analytics))
 }

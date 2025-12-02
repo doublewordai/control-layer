@@ -2,7 +2,7 @@ use crate::config::{Config, ONWARDS_INPUT_TOKEN_PRICE_HEADER, ONWARDS_OUTPUT_TOK
 use crate::db::handlers::Credits;
 use crate::db::models::credits::{CreditTransactionCreateDBRequest, CreditTransactionType};
 use crate::request_logging::models::{AiRequest, AiResponse, ChatCompletionChunk, ParsedAIRequest};
-use crate::request_logging::utils::extract_fusillade_request_id;
+use crate::request_logging::utils::extract_header_value_as_string;
 use outlet::{RequestData, ResponseData};
 use outlet_postgres::SerializationError;
 use rust_decimal::{Decimal, prelude::ToPrimitive};
@@ -76,6 +76,7 @@ pub struct HttpAnalyticsRow {
     pub server_address: String,
     pub server_port: u16,
     pub provider_name: Option<String>,
+    pub fusillade_batch_id: Option<Uuid>,
     pub fusillade_request_id: Option<Uuid>,
 }
 
@@ -347,7 +348,9 @@ pub async fn store_analytics_record(
     request_data: &RequestData,
 ) -> Result<HttpAnalyticsRow, sqlx::Error> {
     // Extract fusillade request ID if present
-    let fusillade_request_id = extract_fusillade_request_id(request_data);
+    let fusillade_batch_id = extract_header_value_as_string(request_data, "x-fusillade-batch-id");
+    let fusillade_request_id = extract_header_value_as_string(request_data, "x-fusillade-request-id");
+
     // Extract user information based on auth type
     let (user_id, user_email, access_source) = match auth {
         Auth::ApiKey { bearer_token } => {
@@ -424,6 +427,7 @@ pub async fn store_analytics_record(
         server_address: metrics.server_address.clone(),
         server_port: metrics.server_port,
         provider_name,
+        fusillade_batch_id,
         fusillade_request_id,
     };
 
@@ -434,9 +438,9 @@ pub async fn store_analytics_record(
             instance_id, correlation_id, timestamp, method, uri, model,
             status_code, duration_ms, duration_to_first_byte_ms, prompt_tokens, completion_tokens,
             total_tokens, response_type, user_id, user_email, access_source,
-            input_price_per_token, output_price_per_token, fusillade_request_id
+            input_price_per_token, output_price_per_token, fusillade_batch_id, fusillade_request_id
         )
-        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19)
+        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20)
         ON CONFLICT (instance_id, correlation_id)
         DO UPDATE SET
             status_code = EXCLUDED.status_code,
@@ -451,6 +455,7 @@ pub async fn store_analytics_record(
             access_source = EXCLUDED.access_source,
             input_price_per_token = EXCLUDED.input_price_per_token,
             output_price_per_token = EXCLUDED.output_price_per_token,
+            fusillade_batch_id = EXCLUDED.fusillade_batch_id,
             fusillade_request_id = EXCLUDED.fusillade_request_id
         RETURNING id
         "#,
@@ -472,6 +477,7 @@ pub async fn store_analytics_record(
         row.access_source,
         row.input_price_per_token,
         row.output_price_per_token,
+        row.fusillade_batch_id,
         row.fusillade_request_id
     )
     .fetch_one(pool)

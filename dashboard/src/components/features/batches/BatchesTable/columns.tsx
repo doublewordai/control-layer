@@ -10,7 +10,7 @@ import {
   Loader2,
   FileCheck,
   FileText,
-  // DollarSign,
+  DollarSign,
   Eye,
 } from "lucide-react";
 import { Button } from "../../../ui/button";
@@ -20,11 +20,7 @@ import {
   formatLongDuration,
   formatNumber,
 } from "../../../../utils";
-import type {
-  Batch,
-  BatchStatus,
-  // BatchAnalytics
-} from "../types";
+import type { Batch, BatchStatus, BatchAnalytics } from "../types";
 
 interface ColumnActions {
   onCancel: (batch: Batch) => void;
@@ -32,7 +28,7 @@ interface ColumnActions {
   onViewFile: (file: any) => void;
   getInputFile: (batch: Batch) => any | undefined;
   onRowClick?: (batch: Batch) => void;
-  // batchAnalytics?: Map<string, BatchAnalytics>;
+  batchAnalytics?: Map<string, BatchAnalytics>;
 }
 
 const getStatusIcon = (status: BatchStatus) => {
@@ -243,38 +239,35 @@ export const createBatchColumns = (
       );
     },
   },
-  // KILLED BC QUERY IS DIABOLICAL AND NUKES SERVER MEMORY
-  // {
-  //   id: "cost",
-  //   header: "Cost",
-  //   cell: ({ row }) => {
-  //     const batch = row.original as Batch;
-  //     const analytics = actions.batchAnalytics?.get(batch.id);
-  //     if (!analytics) {
-  //       return (
-  //         <div className="flex items-center gap-1 text-sm text-gray-400">
-  //           <Loader2 className="w-3 h-3 animate-spin" />
-  //           <span>...</span>
-  //         </div>
-  //       );
-  //     }
+  {
+    id: "cost",
+    header: "Cost",
+    cell: ({ row }) => {
+      const batch = row.original as Batch;
+      const analytics = actions.batchAnalytics?.get(batch.id);
+      if (!analytics) {
+        return (
+          <div className="flex items-center gap-1 text-sm text-gray-400">
+            <Loader2 className="w-3 h-3 animate-spin" />
+            <span>...</span>
+          </div>
+        );
+      }
 
-  //     if (!analytics.total_cost || parseFloat(analytics.total_cost) === 0) {
-  //       return <span className="text-gray-400 text-sm">-</span>;
-  //     }
+      if (!analytics.total_cost || parseFloat(analytics.total_cost) === 0) {
+        return <span className="text-gray-400 text-sm">-</span>;
+      }
 
-  //     const cost = parseFloat(analytics.total_cost);
+      const cost = parseFloat(analytics.total_cost);
 
-  //     return (
-  //       <div className="flex items-center gap-1 text-sm text-gray-700">
-  //         <DollarSign className="w-3 h-3 text-green-600" />
-  //         <span className="font-medium">{cost.toFixed(4)}</span>
-  //       </div>
-  //     );
-  //   },
-  //   // Disable sorting for cost column since data is fetched asynchronously
-  //   enableSorting: false,
-  // },
+      return (
+        <div className="flex items-center gap-1 text-sm text-gray-700">
+          <DollarSign className="w-3 h-3 text-green-600" />
+          <span className="font-medium">{cost.toFixed(4)}</span>
+        </div>
+      );
+    },
+  },
   {
     id: "files",
     header: "Results",
