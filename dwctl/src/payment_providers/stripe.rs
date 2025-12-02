@@ -63,7 +63,6 @@ impl PaymentProvider for StripeProvider {
             }),
             mode: Some(CheckoutSessionMode::Payment),
             ui_mode: Some(CheckoutSessionUiMode::Hosted),
-            customer_creation: Some(CheckoutSessionCustomerCreation::Always),
             expand: &["line_items"],
             allow_promotion_codes: if self.config.allow_promotion_codes { Some(true) } else { None },
             ..Default::default()
@@ -78,6 +77,7 @@ impl PaymentProvider for StripeProvider {
             tracing::info!("No customer ID found for user {}, Stripe will create one", user.id);
             // Provide customer email for the new customer
             checkout_params.customer_email = Some(&user.email);
+            checkout_params.customer_creation = Some(CheckoutSessionCustomerCreation::Always);
         }
 
         // Create checkout session
