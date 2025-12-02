@@ -14,12 +14,12 @@ import {
 } from "lucide-react";
 import {
   useBatch,
-  useBatchAnalytics,
+  // useBatchAnalytics,
 } from "../../../../api/control-layer/hooks";
 import { Card, CardContent, CardHeader, CardTitle } from "../../../ui/card";
 import { Badge } from "../../../ui/badge";
 import { Button } from "../../../ui/button";
-import { Skeleton } from "../../../ui/skeleton";
+// import { Skeleton } from "../../../ui/skeleton";
 import type { BatchStatus } from "../../../../api/control-layer/types";
 
 const BatchInfo: React.FC = () => {
@@ -30,9 +30,9 @@ const BatchInfo: React.FC = () => {
   const fromUrl = searchParams.get("from");
 
   const { data: batch, isLoading, error } = useBatch(batchId!);
-  const { data: analytics, isLoading: analyticsLoading } = useBatchAnalytics(
-    batchId!,
-  );
+  // const { data: analytics, isLoading: analyticsLoading } = useBatchAnalytics(
+  //   batchId!,
+  // );
 
   if (isLoading) {
     return (
@@ -309,7 +309,7 @@ const BatchInfo: React.FC = () => {
               </Card>
             )}
 
-          {/* Analytics Card */}
+          {/* Analytics Card
           {analytics && (
             <Card className="p-0 gap-0 rounded-lg">
               <CardHeader className="px-6 pt-5 pb-4">
@@ -323,7 +323,7 @@ const BatchInfo: React.FC = () => {
                   </div>
                 ) : analytics.total_requests > 0 ? (
                   <div className="space-y-6">
-                    {/* Token Usage */}
+                    {/* Token Usage
                     <div>
                       <h4 className="text-sm font-medium text-gray-900 mb-3">
                         Token Usage
@@ -356,7 +356,7 @@ const BatchInfo: React.FC = () => {
                       </div>
                     </div>
 
-                    {/* Cost */}
+                    {/* Cost
                     {analytics.total_cost &&
                       parseFloat(analytics.total_cost) > 0 && (
                         <div className="border-t pt-6">
@@ -384,7 +384,8 @@ const BatchInfo: React.FC = () => {
                 )}
               </CardContent>
             </Card>
-          )}
+          )
+          */}
 
           {/* Batch Details */}
           <Card className="p-0 gap-0 rounded-lg">
@@ -625,7 +626,7 @@ const BatchInfo: React.FC = () => {
                     </p>
                   </div>
                 )}
-
+                {/*
                 {analytics && analytics.avg_ttfb_ms && (
                   <div>
                     <p className="text-sm text-gray-600 mb-1">Avg TTFB</p>
@@ -643,6 +644,7 @@ const BatchInfo: React.FC = () => {
                     </p>
                   </div>
                 )}
+                */}
               </div>
             </CardContent>
           </Card>
