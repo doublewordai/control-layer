@@ -20,7 +20,11 @@ import {
   formatLongDuration,
   formatNumber,
 } from "../../../../utils";
-import type { Batch, BatchStatus, BatchAnalytics } from "../types";
+import type {
+  Batch,
+  BatchStatus,
+  // BatchAnalytics
+} from "../types";
 
 interface ColumnActions {
   onCancel: (batch: Batch) => void;
@@ -28,7 +32,7 @@ interface ColumnActions {
   onViewFile: (file: any) => void;
   getInputFile: (batch: Batch) => any | undefined;
   onRowClick?: (batch: Batch) => void;
-  batchAnalytics?: Map<string, BatchAnalytics>;
+  // batchAnalytics?: Map<string, BatchAnalytics>;
 }
 
 const getStatusIcon = (status: BatchStatus) => {
