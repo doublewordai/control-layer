@@ -40,6 +40,9 @@ export function BatchesContainer() {
   const [preselectedFile, setPreselectedFile] = useState<
     FileObject | undefined
   >();
+  const [preselectedFileToUpload, setPreselectedFileToUpload] = useState<
+    File | undefined
+  >();
 
   // Delete/cancel confirmation
   const [fileToDelete, setFileToDelete] = useState<FileObject | null>(null);
@@ -66,8 +69,15 @@ export function BatchesContainer() {
     setUploadModalOpen(true);
   };
 
-  const handleOpenCreateBatchModal = (file?: FileObject) => {
-    setPreselectedFile(file);
+  const handleOpenCreateBatchModal = (file?: File | FileObject) => {
+    if (file) {
+      if (file instanceof File) {
+        // first start upload file
+        setPreselectedFileToUpload(file);
+      } else {
+        setPreselectedFile(file);
+      }
+    }
     setCreateBatchModalOpen(true);
   };
 
@@ -165,6 +175,7 @@ export function BatchesContainer() {
           }
         }}
         preselectedFile={preselectedFile}
+        preselectedFileToUpload={preselectedFileToUpload}
       />
 
       <DownloadFileModal

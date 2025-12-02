@@ -1,5 +1,7 @@
 //! Request logging data models.
 
+use std::collections::HashMap;
+
 use async_openai::types::{
     CreateBase64EmbeddingResponse, CreateChatCompletionRequest, CreateChatCompletionResponse, CreateChatCompletionStreamResponse,
     CreateCompletionRequest, CreateCompletionResponse, CreateEmbeddingRequest, CreateEmbeddingResponse,
@@ -28,6 +30,12 @@ pub enum AiRequest {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ParsedAIRequest {
+    pub headers: HashMap<String, String>,
+    pub request: AiRequest,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(untagged)]
 pub enum ChatCompletionChunk {
     Normal(CreateChatCompletionStreamResponse),
@@ -46,3 +54,9 @@ pub enum AiResponse {
     Base64Embeddings(CreateBase64EmbeddingResponse),
     Other(Value),
 }
+
+// There is currently no need for capturing response headers
+// struct ParsedAIResponse {
+//     headers: HashMap<String, String>,
+//     response: AiResponse,
+// }

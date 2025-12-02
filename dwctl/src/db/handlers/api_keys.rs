@@ -240,6 +240,22 @@ impl<'c> ApiKeys<'c> {
         Self { db }
     }
 
+    /// Count total API keys matching the filter
+    #[instrument(skip(self, filter), err)]
+    pub async fn count(&mut self, filter: &ApiKeyFilter) -> Result<i64> {
+        let count = if let Some(user_id) = filter.user_id {
+            sqlx::query_scalar!("SELECT COUNT(*) FROM api_keys WHERE user_id = $1 AND hidden = false", user_id)
+                .fetch_one(&mut *self.db)
+                .await?
+        } else {
+            sqlx::query_scalar!("SELECT COUNT(*) FROM api_keys WHERE hidden = false")
+                .fetch_one(&mut *self.db)
+                .await?
+        };
+
+        Ok(count.unwrap_or(0))
+    }
+
     /// Get the user ID associated with an API key secret
     ///
     /// Joins with users table to verify the key exists and user is valid.

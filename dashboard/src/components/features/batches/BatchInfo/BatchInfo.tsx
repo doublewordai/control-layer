@@ -12,10 +12,14 @@ import {
   Ban,
   Loader2,
 } from "lucide-react";
-import { useBatch } from "../../../../api/control-layer/hooks";
+import {
+  useBatch,
+  useBatchAnalytics,
+} from "../../../../api/control-layer/hooks";
 import { Card, CardContent, CardHeader, CardTitle } from "../../../ui/card";
 import { Badge } from "../../../ui/badge";
 import { Button } from "../../../ui/button";
+import { Skeleton } from "../../../ui/skeleton";
 import type { BatchStatus } from "../../../../api/control-layer/types";
 
 const BatchInfo: React.FC = () => {
@@ -26,6 +30,9 @@ const BatchInfo: React.FC = () => {
   const fromUrl = searchParams.get("from");
 
   const { data: batch, isLoading, error } = useBatch(batchId!);
+  const { data: analytics, isLoading: analyticsLoading } = useBatchAnalytics(
+    batchId!,
+  );
 
   if (isLoading) {
     return (
@@ -171,7 +178,9 @@ const BatchInfo: React.FC = () => {
   const progress =
     batch.request_counts.total > 0
       ? Math.round(
-          (batch.request_counts.completed / batch.request_counts.total) * 100,
+          ((batch.request_counts.completed + batch.request_counts.failed) /
+            batch.request_counts.total) *
+            100,
         )
       : 0;
 
@@ -227,17 +236,26 @@ const BatchInfo: React.FC = () => {
                         <span className="text-gray-600">Overall Progress</span>
                         <span className="font-medium">{progress}%</span>
                       </div>
-                      <div className="w-full bg-gray-200 rounded-full h-2.5">
+                      <div className="relative w-full rounded-full h-2.5 bg-gray-200 overflow-hidden">
                         <div
-                          className="bg-blue-600 h-2.5 rounded-full transition-all duration-300"
-                          style={{ width: `${progress}%` }}
+                          className="absolute left-0 top-0 h-full bg-emerald-400 transition-all duration-300"
+                          style={{
+                            width: `${batch.request_counts.total > 0 ? (batch.request_counts.completed / batch.request_counts.total) * 100 : 0}%`,
+                          }}
+                        ></div>
+                        <div
+                          className="absolute top-0 h-full bg-rose-400 transition-all duration-300"
+                          style={{
+                            left: `${batch.request_counts.total > 0 ? (batch.request_counts.completed / batch.request_counts.total) * 100 : 0}%`,
+                            width: `${batch.request_counts.total > 0 ? (batch.request_counts.failed / batch.request_counts.total) * 100 : 0}%`,
+                          }}
                         ></div>
                       </div>
                     </div>
 
                     {/* Request Counts */}
                     <div className="grid grid-cols-3 gap-4 pt-4">
-                      <div className="text-center p-3 bg-gray-50 rounded-lg">
+                      <div className="text-center p-3 rounded-lg">
                         <p className="text-2xl font-bold text-gray-900">
                           {batch.request_counts.total}
                         </p>
@@ -245,23 +263,128 @@ const BatchInfo: React.FC = () => {
                           Total Requests
                         </p>
                       </div>
-                      <div className="text-center p-3 bg-green-50 rounded-lg">
+                      <button
+                        className="text-center p-3 rounded-lg hover:bg-green-50 transition-colors cursor-pointer disabled:cursor-default disabled:hover:bg-transparent"
+                        onClick={() =>
+                          batch.output_file_id &&
+                          navigate(
+                            `/batches/files/${batch.output_file_id}/content?from=/batches/${batchId}`,
+                          )
+                        }
+                        disabled={!batch.output_file_id}
+                        title={
+                          batch.output_file_id
+                            ? "Click to view output file"
+                            : "No output file available"
+                        }
+                      >
                         <p className="text-2xl font-bold text-green-700">
                           {batch.request_counts.completed}
                         </p>
                         <p className="text-xs text-gray-600 mt-1">Completed</p>
-                      </div>
-                      <div className="text-center p-3 bg-red-50 rounded-lg">
+                      </button>
+                      <button
+                        className="text-center p-3 rounded-lg hover:bg-red-50 transition-colors cursor-pointer disabled:cursor-default disabled:hover:bg-transparent"
+                        onClick={() =>
+                          batch.error_file_id &&
+                          navigate(
+                            `/batches/files/${batch.error_file_id}/content?from=/batches/${batchId}`,
+                          )
+                        }
+                        disabled={!batch.error_file_id}
+                        title={
+                          batch.error_file_id
+                            ? "Click to view error file"
+                            : "No error file available"
+                        }
+                      >
                         <p className="text-2xl font-bold text-red-700">
                           {batch.request_counts.failed}
                         </p>
                         <p className="text-xs text-gray-600 mt-1">Failed</p>
-                      </div>
+                      </button>
                     </div>
                   </div>
                 </CardContent>
               </Card>
             )}
+
+          {/* Analytics Card */}
+          {analytics && (
+            <Card className="p-0 gap-0 rounded-lg">
+              <CardHeader className="px-6 pt-5 pb-4">
+                <CardTitle>Metrics</CardTitle>
+              </CardHeader>
+              <CardContent className="px-6 pb-6 pt-0">
+                {analyticsLoading ? (
+                  <div className="space-y-4">
+                    <Skeleton className="h-20 w-full" />
+                    <Skeleton className="h-20 w-full" />
+                  </div>
+                ) : analytics.total_requests > 0 ? (
+                  <div className="space-y-6">
+                    {/* Token Usage */}
+                    <div>
+                      <h4 className="text-sm font-medium text-gray-900 mb-3">
+                        Token Usage
+                      </h4>
+                      <div className="grid grid-cols-3 gap-4">
+                        <div className="text-center p-3 rounded-lg">
+                          <p className="text-2xl font-bold">
+                            {analytics.total_prompt_tokens.toLocaleString()}
+                          </p>
+                          <p className="text-xs text-gray-600 mt-1">
+                            Prompt Tokens
+                          </p>
+                        </div>
+                        <div className="text-center p-3 rounded-lg">
+                          <p className="text-2xl font-bold">
+                            {analytics.total_completion_tokens.toLocaleString()}
+                          </p>
+                          <p className="text-xs text-gray-600 mt-1">
+                            Completion Tokens
+                          </p>
+                        </div>
+                        <div className="text-center p-3 rounded-lg">
+                          <p className="text-2xl font-bold text-gray-900">
+                            {analytics.total_tokens.toLocaleString()}
+                          </p>
+                          <p className="text-xs text-gray-600 mt-1">
+                            Total Tokens
+                          </p>
+                        </div>
+                      </div>
+                    </div>
+
+                    {/* Cost */}
+                    {analytics.total_cost &&
+                      parseFloat(analytics.total_cost) > 0 && (
+                        <div className="border-t pt-6">
+                          <h4 className="text-sm font-medium text-gray-900 mb-3">
+                            Cost
+                          </h4>
+                          <div className="p-4 rounded-lg text-center">
+                            <p className="text-3xl font-bold text-green-700">
+                              ${parseFloat(analytics.total_cost).toFixed(4)}
+                            </p>
+                            <p className="text-xs text-gray-600 mt-1">
+                              Total Cost
+                            </p>
+                          </div>
+                        </div>
+                      )}
+                  </div>
+                ) : (
+                  <div className="text-center py-8 text-gray-500">
+                    <p className="text-sm">No analytics data available yet.</p>
+                    <p className="text-xs mt-1">
+                      Analytics will appear as requests complete.
+                    </p>
+                  </div>
+                )}
+              </CardContent>
+            </Card>
+          )}
 
           {/* Batch Details */}
           <Card className="p-0 gap-0 rounded-lg">
@@ -313,7 +436,7 @@ const BatchInfo: React.FC = () => {
                         size="sm"
                         onClick={() =>
                           navigate(
-                            `/batches/files/${batch.input_file_id}/content`,
+                            `/batches/files/${batch.input_file_id}/content?from=/batches/${batchId}`,
                           )
                         }
                         className="shrink-0"
@@ -338,7 +461,7 @@ const BatchInfo: React.FC = () => {
                           size="sm"
                           onClick={() =>
                             navigate(
-                              `/batches/files/${batch.output_file_id}/content`,
+                              `/batches/files/${batch.output_file_id}/content?from=/batches/${batchId}`,
                             )
                           }
                           className="shrink-0"
@@ -364,7 +487,7 @@ const BatchInfo: React.FC = () => {
                           size="sm"
                           onClick={() =>
                             navigate(
-                              `/batches/files/${batch.error_file_id}/content`,
+                              `/batches/files/${batch.error_file_id}/content?from=/batches/${batchId}`,
                             )
                           }
                           className="shrink-0"
@@ -499,6 +622,24 @@ const BatchInfo: React.FC = () => {
                     <p className="text-sm text-gray-600 mb-1">Duration</p>
                     <p className="text-sm font-medium">
                       {formatDuration(batch.in_progress_at, batch.completed_at)}
+                    </p>
+                  </div>
+                )}
+
+                {analytics && analytics.avg_ttfb_ms && (
+                  <div>
+                    <p className="text-sm text-gray-600 mb-1">Avg TTFB</p>
+                    <p className="text-sm font-medium">
+                      {analytics.avg_ttfb_ms.toFixed(0)}ms
+                    </p>
+                  </div>
+                )}
+
+                {analytics && analytics.avg_duration_ms && (
+                  <div>
+                    <p className="text-sm text-gray-600 mb-1">Avg Duration</p>
+                    <p className="text-sm font-medium">
+                      {analytics.avg_duration_ms.toFixed(0)}ms
                     </p>
                   </div>
                 )}

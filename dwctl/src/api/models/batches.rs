@@ -105,6 +105,34 @@ pub struct BatchResponse {
     pub metadata: Option<HashMap<String, String>>,
 }
 
+/// Aggregated analytics metrics for batch requests
+#[derive(Debug, Serialize, Deserialize, ToSchema)]
+pub struct BatchAnalytics {
+    /// Total number of requests with analytics data
+    pub total_requests: i64,
+
+    /// Total prompt tokens across all requests
+    pub total_prompt_tokens: i64,
+
+    /// Total completion tokens across all requests
+    pub total_completion_tokens: i64,
+
+    /// Total tokens (prompt + completion) across all requests
+    pub total_tokens: i64,
+
+    /// Average request duration in milliseconds
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub avg_duration_ms: Option<f64>,
+
+    /// Average time to first byte in milliseconds
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub avg_ttfb_ms: Option<f64>,
+
+    /// Total cost in credits (if pricing is available)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub total_cost: Option<String>,
+}
+
 /// Object type - always "batch"
 #[derive(Debug, Serialize, Deserialize, ToSchema)]
 #[serde(rename_all = "lowercase")]
