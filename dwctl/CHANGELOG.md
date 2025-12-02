@@ -1,5 +1,18 @@
 # Changelog
 
+## [0.13.0](https://github.com/doublewordai/control-layer/compare/v0.12.0...v0.13.0) (2025-12-02)
+
+
+### Features
+
+* Add batch analytics endpoint with request-level metrics tracking ([#304](https://github.com/doublewordai/control-layer/issues/304)) ([e43d423](https://github.com/doublewordai/control-layer/commit/e43d423317c952927ee62a67f7519df2c1351dbe))
+
+
+### Bug Fixes
+
+* **deps:** update rust crate brotli to v8 ([#297](https://github.com/doublewordai/control-layer/issues/297)) ([2f93022](https://github.com/doublewordai/control-layer/commit/2f930226418b921c775969b43ac100165208ef05))
+* filetype params ([#305](https://github.com/doublewordai/control-layer/issues/305)) ([87db326](https://github.com/doublewordai/control-layer/commit/87db32679e6416ff362a1948b9e661bc8c58c672))
+
 ## [0.12.0](https://github.com/doublewordai/control-layer/compare/v0.11.1...v0.12.0) (2025-11-28)
 
 
