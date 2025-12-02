@@ -20,24 +20,14 @@ use crate::{
 
 /// Stripe payment provider
 pub struct StripeProvider {
-    api_key: String,
-    price_id: String,
-    webhook_secret: String,
+    config: crate::config::StripeConfig,
+    client: Client,
 }
 
-impl StripeProvider {
-    /// Create a new Stripe provider
-    pub fn new(api_key: String, price_id: String, webhook_secret: String) -> Self {
-        Self {
-            api_key,
-            price_id,
-            webhook_secret,
-        }
-    }
-
-    /// Get a Stripe client
-    fn client(&self) -> Client {
-        Client::new(&self.api_key)
+impl From<crate::config::StripeConfig> for StripeProvider {
+    fn from(config: crate::config::StripeConfig) -> Self {
+        let client = Client::new(&config.api_key);
+        Self { config, client }
     }
 }
 
@@ -51,8 +41,6 @@ impl PaymentProvider for StripeProvider {
         cancel_url: &str,
         success_url: &str,
     ) -> Result<String> {
-        let client = self.client();
-
         // Determine which user will receive the credits
         // If creditee_id is provided, use that; otherwise use the authenticated user
         let user_id_string = user.id.to_string();
@@ -65,7 +53,7 @@ impl PaymentProvider for StripeProvider {
             client_reference_id: Some(recipient_id), // This is who will receive the credits
             currency: Some(stripe::Currency::USD),
             line_items: Some(vec![CreateCheckoutSessionLineItems {
-                price: Some(self.price_id.clone()),
+                price: Some(self.config.price_id.clone()),
                 quantity: Some(1),
                 ..Default::default()
             }]),
@@ -77,6 +65,7 @@ impl PaymentProvider for StripeProvider {
             ui_mode: Some(CheckoutSessionUiMode::Hosted),
             customer_creation: Some(CheckoutSessionCustomerCreation::Always),
             expand: &["line_items"],
+            allow_promotion_codes: if self.config.allow_promotion_codes { Some(true) } else { None },
             ..Default::default()
         };
 
@@ -92,7 +81,7 @@ impl PaymentProvider for StripeProvider {
         }
 
         // Create checkout session
-        let checkout_session = CheckoutSession::create(&client, checkout_params).await.map_err(|e| {
+        let checkout_session = CheckoutSession::create(&self.client, checkout_params).await.map_err(|e| {
             tracing::error!("Failed to create Stripe checkout session: {:?}", e);
             PaymentError::ProviderApi(e.to_string())
         })?;
@@ -122,14 +111,12 @@ impl PaymentProvider for StripeProvider {
     }
 
     async fn get_payment_session(&self, session_id: &str) -> Result<PaymentSession> {
-        let client = self.client();
-
         let session_id: stripe::CheckoutSessionId = session_id
             .parse()
             .map_err(|_| PaymentError::InvalidData("Invalid Stripe session ID".to_string()))?;
 
         // Retrieve full checkout session with line items
-        let checkout_session = CheckoutSession::retrieve(&client, &session_id, &["line_items"])
+        let checkout_session = CheckoutSession::retrieve(&self.client, &session_id, &["line_items"])
             .await
             .map_err(|e| {
                 tracing::error!("Failed to retrieve Stripe checkout session: {:?}", e);
@@ -280,7 +267,7 @@ impl PaymentProvider for StripeProvider {
             })?;
 
         // Validate the webhook signature and construct the event
-        let event = stripe::Webhook::construct_event(body, signature, &self.webhook_secret).map_err(|e| {
+        let event = stripe::Webhook::construct_event(body, signature, &self.config.webhook_secret).map_err(|e| {
             tracing::error!("Failed to construct webhook event: {:?}", e);
             PaymentError::InvalidData(format!("Webhook validation failed: {}", e))
         })?;
@@ -335,12 +322,34 @@ mod tests {
     }
 
     #[test]
-    fn test_stripe_provider_creation() {
-        let provider = StripeProvider::new("sk_test_fake".to_string(), "price_fake".to_string(), "whsec_fake".to_string());
+    fn test_stripe_provider_from_config() {
+        let config = crate::config::StripeConfig {
+            api_key: "sk_test_fake".to_string(),
+            price_id: "price_fake".to_string(),
+            webhook_secret: "whsec_fake".to_string(),
+            host_url: None,
+            allow_promotion_codes: false,
+        };
+        let provider = StripeProvider::from(config);
 
-        assert_eq!(provider.api_key, "sk_test_fake");
-        assert_eq!(provider.price_id, "price_fake");
-        assert_eq!(provider.webhook_secret, "whsec_fake");
+        assert_eq!(provider.config.api_key, "sk_test_fake");
+        assert_eq!(provider.config.price_id, "price_fake");
+        assert_eq!(provider.config.webhook_secret, "whsec_fake");
+        assert!(!provider.config.allow_promotion_codes);
+    }
+
+    #[test]
+    fn test_stripe_provider_with_promotion_codes() {
+        let config = crate::config::StripeConfig {
+            api_key: "sk_test_fake".to_string(),
+            price_id: "price_fake".to_string(),
+            webhook_secret: "whsec_fake".to_string(),
+            host_url: None,
+            allow_promotion_codes: true,
+        };
+        let provider = StripeProvider::from(config);
+
+        assert!(provider.config.allow_promotion_codes);
     }
 
     #[sqlx::test]
@@ -363,7 +372,14 @@ mod tests {
 
         credits.create_transaction(&request).await.unwrap();
 
-        let provider = StripeProvider::new("sk_test_fake".to_string(), "price_fake".to_string(), "whsec_fake".to_string());
+        let config = crate::config::StripeConfig {
+            api_key: "sk_test_fake".to_string(),
+            price_id: "price_fake".to_string(),
+            webhook_secret: "whsec_fake".to_string(),
+            host_url: None,
+            allow_promotion_codes: false,
+        };
+        let provider = StripeProvider::from(config);
 
         // Process the same session - should hit fast path and succeed
         let result = provider.process_payment_session(&pool, session_id).await;
