@@ -264,9 +264,27 @@ export const ModelsContent: React.FC<ModelsContentProps> = ({
                       {/* ROW 1: Alias on left, groups/chevron on right */}
                       <div className="flex items-center justify-between gap-4">
                         <div className="flex items-center gap-2">
-                          <CardTitle className="text-lg truncate break-all">
-                            {model.alias}
-                          </CardTitle>
+                          {model.alias.length > 30 ? (
+                            <HoverCard openDelay={200} closeDelay={100}>
+                              <HoverCardTrigger asChild>
+                                <CardTitle className="text-lg truncate max-w-[300px] break-all hover:opacity-70 transition-opacity cursor-default">
+                                  {model.alias}
+                                </CardTitle>
+                              </HoverCardTrigger>
+                              <HoverCardContent
+                                className="w-auto max-w-sm"
+                                sideOffset={5}
+                              >
+                                <p className="text-sm break-all">
+                                  {model.alias}
+                                </p>
+                              </HoverCardContent>
+                            </HoverCard>
+                          ) : (
+                            <CardTitle className="text-lg truncate max-w-[300px] break-all">
+                              {model.alias}
+                            </CardTitle>
+                          )}
 
                           {model.status?.probe_id && (
                             <HoverCard openDelay={200} closeDelay={100}>
