@@ -1,5 +1,19 @@
 # Changelog
 
+## [0.14.0](https://github.com/doublewordai/control-layer/compare/v0.13.0...v0.14.0) (2025-12-03)
+
+
+### Features
+
+* fusillade 0.6.0 ([#320](https://github.com/doublewordai/control-layer/issues/320)) ([623d3ce](https://github.com/doublewordai/control-layer/commit/623d3ce267c766ba2e77275d2255c963da0439c4))
+
+
+### Bug Fixes
+
+* cancel safety in background services ([#308](https://github.com/doublewordai/control-layer/issues/308)) ([5b0ec02](https://github.com/doublewordai/control-layer/commit/5b0ec021917b2762a1453e0ba6fcd909804ba650))
+* remove batch analytics ([#316](https://github.com/doublewordai/control-layer/issues/316)) ([27d7032](https://github.com/doublewordai/control-layer/commit/27d703276924a019bc80afa75c3ef1f337a463f2))
+* slow mega-query ([#310](https://github.com/doublewordai/control-layer/issues/310)) ([250652b](https://github.com/doublewordai/control-layer/commit/250652b92af5b37cf552b2c8cdc8d2fb00216e73))
+
 ## [0.13.0](https://github.com/doublewordai/control-layer/compare/v0.12.0...v0.13.0) (2025-12-02)
 
 
