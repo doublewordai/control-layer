@@ -12,7 +12,6 @@ import {
   BarChart3,
   ArrowUpDown,
   Info,
-  ChevronRight,
   DollarSign,
   ArrowDown,
   ArrowUp,
@@ -267,7 +266,7 @@ export const ModelsContent: React.FC<ModelsContentProps> = ({
                           {model.alias.length > 30 ? (
                             <HoverCard openDelay={200} closeDelay={100}>
                               <HoverCardTrigger asChild>
-                                <CardTitle className="text-lg truncate max-w-[460px] md:max-w-[460px] lg:max-w-[260px] xl:max-w-[360px] 2xl:max-w-[250px] break-all hover:opacity-70 transition-opacity cursor-default">
+                                <CardTitle className="text-lg truncate max-w-[460px] md:max-w-[420px] lg:max-w-[260px] xl:max-w-[300px] 2xl:max-w-[230px] 3xl:max-w-[340px] break-all hover:opacity-70 transition-opacity cursor-default">
                                   {model.alias}
                                 </CardTitle>
                               </HoverCardTrigger>
@@ -281,7 +280,7 @@ export const ModelsContent: React.FC<ModelsContentProps> = ({
                               </HoverCardContent>
                             </HoverCard>
                           ) : (
-                            <CardTitle className="text-lg truncate max-w-[460px] md:max-w-[460px] lg:max-w-[260px] xl:max-w-[360px] 2xl:max-w-[250px] break-all">
+                            <CardTitle className="text-lg truncate max-w-[460px] md:max-w-[420px] lg:max-w-[260px] xl:max-w-[300px] 2xl:max-w-[230px] 3xl:max-w-[340px] break-all">
                               {model.alias}
                             </CardTitle>
                           )}
@@ -566,7 +565,7 @@ export const ModelsContent: React.FC<ModelsContentProps> = ({
                           {model.model_name.length > 30 ? (
                             <HoverCard openDelay={200} closeDelay={100}>
                               <HoverCardTrigger asChild>
-                                <span className="truncate max-w-[330px] md:max-w-[330px] lg:max-w-[180px] xl:max-w-[230px] 2xl:max-w-[150px] hover:opacity-70 transition-opacity">
+                                <span className="truncate max-w-[330px] md:max-w-[330px] lg:max-w-[180px] xl:max-w-[200px] 2xl:max-w-[150px] 3xl:max-w-[200px] hover:opacity-70 transition-opacity">
                                   {model.model_name}
                                 </span>
                               </HoverCardTrigger>
@@ -580,7 +579,7 @@ export const ModelsContent: React.FC<ModelsContentProps> = ({
                               </HoverCardContent>
                             </HoverCard>
                           ) : (
-                            <span className="truncate max-w-[330px] md:max-w-[330px] lg:max-w-[180px] xl:max-w-[230px] 2xl:max-w-[150px]">
+                            <span className="truncate max-w-[330px] md:max-w-[330px] lg:max-w-[180px] xl:max-w-[200px] 2xl:max-w-[150px] 3xl:max-w-[200px]">
                               {model.model_name}
                             </span>
                           )}
@@ -591,7 +590,7 @@ export const ModelsContent: React.FC<ModelsContentProps> = ({
                             return endpointName.length > 25 ? (
                               <HoverCard openDelay={200} closeDelay={100}>
                                 <HoverCardTrigger asChild>
-                                  <span className="truncate max-w-[300px] md:max-w-[300px] lg:max-w-[150px] xl:max-w-[200px] 2xl:max-w-[150px] hover:opacity-70 transition-opacity">
+                                  <span className="truncate max-w-[300px] md:max-w-[300px] lg:max-w-[150px] xl:max-w-40 2xl:max-w-[150px] 3xl:max-w-[180px] hover:opacity-70 transition-opacity">
                                     {endpointName}
                                   </span>
                                 </HoverCardTrigger>
@@ -603,7 +602,7 @@ export const ModelsContent: React.FC<ModelsContentProps> = ({
                                 </HoverCardContent>
                               </HoverCard>
                             ) : (
-                              <span className="truncate max-w-[300px] md:max-w-[300px] lg:max-w-[150px] xl:max-w-[200px] 2xl:max-w-[150px]">
+                              <span className="truncate max-w-[300px] md:max-w-[300px] lg:max-w-[150px] xl:max-w-40 2xl:max-w-[150px] 3xl:max-w-[180px]">
                                 {endpointName}
                               </span>
                             );
