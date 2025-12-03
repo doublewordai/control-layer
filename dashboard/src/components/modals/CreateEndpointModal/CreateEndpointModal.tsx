@@ -798,19 +798,45 @@ export const CreateEndpointModal: React.FC<CreateEndpointModalProps> = ({
           ) : (
             <div className="flex items-center justify-between flex-1">
               <div className="flex items-center space-x-2 flex-1 min-w-0">
-                <span
-                  className={`text-sm truncate ${
-                    hasBackendConflict
-                      ? "text-red-700"
-                      : hasLocalConflict
-                        ? "text-orange-600"
-                        : alias !== model.id
-                          ? "text-blue-600"
-                          : "text-gray-700"
-                  }`}
-                >
-                  {alias}
-                </span>
+                {alias.length > 35 ? (
+                  <HoverCard openDelay={200} closeDelay={100}>
+                    <HoverCardTrigger asChild>
+                      <span
+                        className={`text-sm truncate max-w-[250px] hover:opacity-70 transition-opacity cursor-default ${
+                          hasBackendConflict
+                            ? "text-red-700"
+                            : hasLocalConflict
+                              ? "text-orange-600"
+                              : alias !== model.id
+                                ? "text-blue-600"
+                                : "text-gray-700"
+                        }`}
+                      >
+                        {alias}
+                      </span>
+                    </HoverCardTrigger>
+                    <HoverCardContent
+                      className="w-auto max-w-sm"
+                      sideOffset={5}
+                    >
+                      <p className="text-sm break-all">{alias}</p>
+                    </HoverCardContent>
+                  </HoverCard>
+                ) : (
+                  <span
+                    className={`text-sm truncate max-w-[250px] ${
+                      hasBackendConflict
+                        ? "text-red-700"
+                        : hasLocalConflict
+                          ? "text-orange-600"
+                          : alias !== model.id
+                            ? "text-blue-600"
+                            : "text-gray-700"
+                    }`}
+                  >
+                    {alias}
+                  </span>
+                )}
                 {alias !== model.id && !hasConflict && (
                   <span className="text-xs text-gray-400">(custom)</span>
                 )}
@@ -857,7 +883,7 @@ export const CreateEndpointModal: React.FC<CreateEndpointModalProps> = ({
 
   return (
     <Dialog open={isOpen} onOpenChange={onClose}>
-      <DialogContent className="sm:max-w-2xl max-h-[90vh] overflow-y-auto [&>button]:hidden">
+      <DialogContent className="sm:max-w-2xl max-h-[90vh] flex flex-col [&>button]:hidden">
         <DialogHeader>
           <div className="flex items-center justify-between">
             <DialogTitle>Add Endpoint</DialogTitle>
@@ -920,105 +946,88 @@ export const CreateEndpointModal: React.FC<CreateEndpointModalProps> = ({
         </DialogHeader>
 
         <Form {...form}>
-          <form onSubmit={form.handleSubmit(onSubmit)} className="space-y-6">
-            {/* Step 1: Connection Details */}
-            {currentStep === 1 && (
-              <div className="space-y-6">
-                <FormField
-                  control={form.control}
-                  name="url"
-                  render={({ field }) => {
-                    const currentUrl = form.watch("url");
-                    // Match endpoints - use domain property if available, otherwise exact URL match
-                    const matchedEndpoint = POPULAR_ENDPOINTS.find((ep) => {
-                      if (!currentUrl) return false;
-                      // For endpoints with a domain property (like Snowflake), match by domain
-                      if (ep.domain) {
-                        return currentUrl.includes(ep.domain);
-                      }
-                      // For static URLs, match exactly
-                      return currentUrl.trim() === ep.url;
-                    });
+          <form
+            onSubmit={form.handleSubmit(onSubmit)}
+            className="flex flex-col flex-1 min-h-0"
+          >
+            <div className="space-y-6 overflow-y-auto flex-1 pr-1">
+              {/* Step 1: Connection Details */}
+              {currentStep === 1 && (
+                <div className="space-y-6">
+                  <FormField
+                    control={form.control}
+                    name="url"
+                    render={({ field }) => {
+                      const currentUrl = form.watch("url");
+                      // Match endpoints - use domain property if available, otherwise exact URL match
+                      const matchedEndpoint = POPULAR_ENDPOINTS.find((ep) => {
+                        if (!currentUrl) return false;
+                        // For endpoints with a domain property (like Snowflake), match by domain
+                        if (ep.domain) {
+                          return currentUrl.includes(ep.domain);
+                        }
+                        // For static URLs, match exactly
+                        return currentUrl.trim() === ep.url;
+                      });
 
-                    return (
-                      <FormItem>
-                        <div className="flex items-center gap-1.5">
-                          <FormLabel>Base URL *</FormLabel>
-                          <HoverCard openDelay={200} closeDelay={100}>
-                            <HoverCardTrigger asChild>
-                              <button
-                                type="button"
-                                className="text-gray-500 hover:text-gray-700 transition-colors"
-                                onFocus={(e) => e.preventDefault()}
-                                tabIndex={-1}
-                              >
-                                <Info className="h-4 w-4" />
-                                <span className="sr-only">
-                                  Endpoint URL information
-                                </span>
-                              </button>
-                            </HoverCardTrigger>
-                            <HoverCardContent className="w-80" sideOffset={5}>
-                              <p className="text-sm text-muted-foreground">
-                                The base URL is the url that you provide when
-                                using the OpenAI client libraries. It might
-                                include a version specifier after the root
-                                domain: for example, https://api.openai.com/v1
-                              </p>
-                            </HoverCardContent>
-                          </HoverCard>
-                        </div>
-                        <FormControl>
-                          <div className="relative">
-                            <Input
-                              placeholder="https://api.example.com"
-                              {...field}
-                              className="pr-10"
-                              onChange={(e) => {
-                                field.onChange(e);
+                      return (
+                        <FormItem>
+                          <div className="flex items-center gap-1.5">
+                            <FormLabel>Base URL *</FormLabel>
+                            <HoverCard openDelay={200} closeDelay={100}>
+                              <HoverCardTrigger asChild>
+                                <button
+                                  type="button"
+                                  className="text-gray-500 hover:text-gray-700 transition-colors"
+                                  onFocus={(e) => e.preventDefault()}
+                                  tabIndex={-1}
+                                >
+                                  <Info className="h-4 w-4" />
+                                  <span className="sr-only">
+                                    Endpoint URL information
+                                  </span>
+                                </button>
+                              </HoverCardTrigger>
+                              <HoverCardContent className="w-80" sideOffset={5}>
+                                <p className="text-sm text-muted-foreground">
+                                  The base URL is the url that you provide when
+                                  using the OpenAI client libraries. It might
+                                  include a version specifier after the root
+                                  domain: for example, https://api.openai.com/v1
+                                </p>
+                              </HoverCardContent>
+                            </HoverCard>
+                          </div>
+                          <FormControl>
+                            <div className="relative">
+                              <Input
+                                placeholder="https://api.example.com"
+                                {...field}
+                                className="pr-10"
+                                onChange={(e) => {
+                                  field.onChange(e);
 
-                                // Check if URL matches a known endpoint and update auto-discover
-                                const url = e.target.value;
-                                const matchedEndpoint = POPULAR_ENDPOINTS.find(
-                                  (ep) => {
-                                    if (!url) return false;
-                                    if (ep.domain) {
-                                      return url.includes(ep.domain);
-                                    }
-                                    return url.trim() === ep.url;
-                                  },
-                                );
+                                  // Check if URL matches a known endpoint and update auto-discover
+                                  const url = e.target.value;
+                                  const matchedEndpoint =
+                                    POPULAR_ENDPOINTS.find((ep) => {
+                                      if (!url) return false;
+                                      if (ep.domain) {
+                                        return url.includes(ep.domain);
+                                      }
+                                      return url.trim() === ep.url;
+                                    });
 
-                                if (matchedEndpoint) {
-                                  setAutoDiscoverModels(
-                                    !matchedEndpoint.skipValidation,
-                                  );
-                                } else {
-                                  // Default to true for unknown endpoints
-                                  setAutoDiscoverModels(true);
-                                }
+                                  if (matchedEndpoint) {
+                                    setAutoDiscoverModels(
+                                      !matchedEndpoint.skipValidation,
+                                    );
+                                  } else {
+                                    // Default to true for unknown endpoints
+                                    setAutoDiscoverModels(true);
+                                  }
 
-                                // Reset validation state when URL changes
-                                if (validationState === "success") {
-                                  setValidationState("idle");
-                                  setAvailableModels([]);
-                                  form.setValue("selectedModels", []);
-                                  setBackendConflicts(new Set());
-                                  setLocalConflicts([]);
-                                }
-                                if (validationError) {
-                                  setValidationError(null);
-                                  setValidationState("idle");
-                                }
-                              }}
-                            />
-                            {field.value ? (
-                              <button
-                                type="button"
-                                className="absolute right-0 top-0 h-full px-3 text-gray-500 hover:text-gray-700 transition-colors border-l"
-                                onClick={() => {
-                                  form.setValue("url", "");
-                                  // Reset validation state
+                                  // Reset validation state when URL changes
                                   if (validationState === "success") {
                                     setValidationState("idle");
                                     setAvailableModels([]);
@@ -1031,547 +1040,576 @@ export const CreateEndpointModal: React.FC<CreateEndpointModalProps> = ({
                                     setValidationState("idle");
                                   }
                                 }}
-                              >
-                                <X className="h-4 w-4" />
-                                <span className="sr-only">Clear URL</span>
-                              </button>
-                            ) : (
-                              <Popover
-                                open={urlPopoverOpen}
-                                onOpenChange={setUrlPopoverOpen}
-                              >
-                                <PopoverTrigger asChild>
-                                  <button
-                                    type="button"
-                                    className="absolute right-0 top-0 h-full px-3 text-gray-500 hover:text-gray-700 transition-colors border-l"
-                                  >
-                                    <ChevronDown className="h-4 w-4" />
-                                    <span className="sr-only">
-                                      Select popular endpoint
-                                    </span>
-                                  </button>
-                                </PopoverTrigger>
-                                <PopoverContent
-                                  className="w-96 p-2"
-                                  align="end"
-                                >
-                                  <div className="space-y-1">
-                                    <p className="text-xs font-medium text-gray-600 px-2 py-1">
-                                      Popular Endpoints
-                                    </p>
-                                    {POPULAR_ENDPOINTS.map((endpoint) => (
-                                      <button
-                                        key={endpoint.url}
-                                        type="button"
-                                        className="w-full text-left px-2 py-2 text-sm hover:bg-gray-100 rounded transition-colors cursor-pointer flex items-center gap-3"
-                                        onClick={() => {
-                                          form.setValue("url", endpoint.url);
-                                          setUrlPopoverOpen(false);
-
-                                          // Set auto-discover based on endpoint capabilities
-                                          // Disable for endpoints that don't support model discovery (skipValidation = true)
-                                          setAutoDiscoverModels(
-                                            !endpoint.skipValidation,
-                                          );
-
-                                          // Set Snowflake-specific settings if this is Snowflake SPCS Endpoint
-                                          if (
-                                            endpoint.name ===
-                                            "Snowflake SPCS Endpoint"
-                                          ) {
-                                            form.setValue(
-                                              "authHeaderPrefix",
-                                              endpoint.authHeaderPrefix || "",
-                                            );
-                                            setQuoteApiKey(
-                                              endpoint.quoteApiKey || false,
-                                            );
-                                          } else {
-                                            // Clear these for other endpoints
-                                            form.setValue(
-                                              "authHeaderPrefix",
-                                              "",
-                                            );
-                                            setQuoteApiKey(false);
-                                          }
-
-                                          // Reset validation state when changing URL
-                                          if (validationState === "success") {
-                                            setValidationState("idle");
-                                            setAvailableModels([]);
-                                            form.setValue("selectedModels", []);
-                                            setBackendConflicts(new Set());
-                                            setLocalConflicts([]);
-                                          }
-                                          if (validationError) {
-                                            setValidationError(null);
-                                            setValidationState("idle");
-                                          }
-                                        }}
-                                      >
-                                        {endpoint.icon && (
-                                          <img
-                                            src={endpoint.icon}
-                                            alt={`${endpoint.name} logo`}
-                                            className="w-5 h-5 shrink-0"
-                                          />
-                                        )}
-                                        <div className="flex-1 min-w-0">
-                                          <div className="font-medium text-gray-900">
-                                            {endpoint.name}
-                                          </div>
-                                          <div className="text-xs text-gray-500 font-mono truncate">
-                                            {endpoint.url}
-                                          </div>
-                                        </div>
-                                      </button>
-                                    ))}
-                                  </div>
-                                </PopoverContent>
-                              </Popover>
-                            )}
-                          </div>
-                        </FormControl>
-                        <FormDescription>
-                          {matchedEndpoint?.endpointInstructions
-                            ? matchedEndpoint.endpointInstructions()
-                            : "The base URL of your OpenAI-compatible inference endpoint."}
-                        </FormDescription>
-                        <FormMessage />
-                      </FormItem>
-                    );
-                  }}
-                />
-
-                <FormField
-                  control={form.control}
-                  name="apiKey"
-                  render={({ field }) => {
-                    const currentUrl = form.watch("url");
-                    // Match endpoints - use domain property if available, otherwise exact URL match
-                    const matchedEndpoint = POPULAR_ENDPOINTS.find((ep) => {
-                      if (!currentUrl) return false;
-                      // For endpoints with a domain property (like Snowflake), match by domain
-                      if (ep.domain) {
-                        return currentUrl.includes(ep.domain);
-                      }
-                      // For static URLs, match exactly
-                      return currentUrl.trim() === ep.url;
-                    });
-
-                    return (
-                      <FormItem>
-                        <FormLabel>
-                          API Key{" "}
-                          {matchedEndpoint?.requiresApiKey ? "*" : "(optional)"}
-                        </FormLabel>
-                        <FormControl>
-                          <div className="relative">
-                            <Input
-                              type={showApiKey ? "text" : "password"}
-                              placeholder="sk-..."
-                              {...field}
-                              className="pr-10"
-                            />
-                            <button
-                              type="button"
-                              className="absolute right-0 top-0 h-full px-3 text-gray-500 hover:text-gray-700 transition-colors"
-                              onClick={() => setShowApiKey(!showApiKey)}
-                            >
-                              {showApiKey ? (
-                                <EyeOff className="h-4 w-4" />
-                              ) : (
-                                <Eye className="h-4 w-4" />
-                              )}
-                              <span className="sr-only">
-                                {showApiKey ? "Hide API key" : "Show API key"}
-                              </span>
-                            </button>
-                          </div>
-                        </FormControl>
-                        <FormDescription>
-                          {matchedEndpoint?.apiKeyInstructions
-                            ? matchedEndpoint.apiKeyInstructions()
-                            : "Add an API key if the endpoint requires authentication"}
-                        </FormDescription>
-                      </FormItem>
-                    );
-                  }}
-                />
-
-                {/* Advanced Configuration and Auto-discover */}
-                <div className="flex items-center justify-between">
-                  <Popover
-                    open={advancedPopoverOpen}
-                    onOpenChange={setAdvancedPopoverOpen}
-                  >
-                    <PopoverTrigger asChild>
-                      <button
-                        type="button"
-                        className="flex items-center gap-2 text-sm font-medium text-gray-700 hover:text-gray-900 transition-colors group"
-                      >
-                        Advanced Configuration
-                        <ChevronDown
-                          className={`w-4 h-4 transition-transform group-hover:translate-y-px ${advancedPopoverOpen ? "rotate-180" : ""}`}
-                        />
-                      </button>
-                    </PopoverTrigger>
-                    <PopoverContent className="w-96 p-4" align="start">
-                      <div className="space-y-4">
-                        <FormField
-                          control={form.control}
-                          name="authHeaderName"
-                          render={({ field }) => (
-                            <FormItem>
-                              <FormLabel>Authorization Header Name</FormLabel>
-                              <FormControl>
-                                <Input
-                                  placeholder='"Authorization"'
-                                  {...field}
-                                />
-                              </FormControl>
-                              <FormDescription>
-                                The HTTP header name provided with upstream
-                                requests to this endpoint.
-                              </FormDescription>
-                            </FormItem>
-                          )}
-                        />
-
-                        <FormField
-                          control={form.control}
-                          name="authHeaderPrefix"
-                          render={({ field }) => (
-                            <FormItem>
-                              <FormLabel>Authorization Header Prefix</FormLabel>
-                              <FormControl>
-                                <Input placeholder='"Bearer "' {...field} />
-                              </FormControl>
-                              <FormDescription>
-                                The prefix before the API key header value.
-                                Default is "Bearer " (with trailing space).
-                              </FormDescription>
-                            </FormItem>
-                          )}
-                        />
-
-                        <div className="flex items-center space-x-2 pt-2 border-t">
-                          <Checkbox
-                            id="quote-api-key"
-                            checked={quoteApiKey}
-                            onCheckedChange={(checked) =>
-                              setQuoteApiKey(checked === true)
-                            }
-                          />
-                          <label
-                            htmlFor="quote-api-key"
-                            className="text-sm font-medium leading-none peer-disabled:cursor-not-allowed peer-disabled:opacity-70 cursor-pointer"
-                          >
-                            Quote API key in header
-                          </label>
-                        </div>
-                        <FormDescription className="-mt-2">
-                          Wrap the API key in double quotes. Useful for
-                          endpoints like Snowflake that require quoted tokens.
-                        </FormDescription>
-                      </div>
-                    </PopoverContent>
-                  </Popover>
-
-                  {/* Auto-discover models checkbox */}
-                  <div className="flex items-center space-x-2">
-                    <Checkbox
-                      id="auto-discover"
-                      checked={autoDiscoverModels}
-                      onCheckedChange={(checked) =>
-                        setAutoDiscoverModels(checked === true)
-                      }
-                    />
-                    <label
-                      htmlFor="auto-discover"
-                      className="text-sm font-medium leading-none peer-disabled:cursor-not-allowed peer-disabled:opacity-70 cursor-pointer"
-                    >
-                      Auto-discover models
-                    </label>
-                    <HoverCard openDelay={200} closeDelay={100}>
-                      <HoverCardTrigger asChild>
-                        <button
-                          type="button"
-                          className="text-gray-500 hover:text-gray-700 transition-colors"
-                          onFocus={(e) => e.preventDefault()}
-                          tabIndex={-1}
-                        >
-                          <Info className="h-4 w-4" />
-                          <span className="sr-only">
-                            Auto-discover information
-                          </span>
-                        </button>
-                      </HoverCardTrigger>
-                      <HoverCardContent className="w-80" sideOffset={5}>
-                        <p className="text-sm text-muted-foreground">
-                          When enabled, the endpoint will be queried for
-                          available models via the <code>/v1/models</code> API.
-                          If disabled, you can manually specify the model names.
-                        </p>
-                      </HoverCardContent>
-                    </HoverCard>
-                  </div>
-                </div>
-
-                {/* Validation Error Banner */}
-                {validationState === "error" && (
-                  <div className="p-4 bg-red-50 border border-red-200 rounded-lg">
-                    <div className="flex items-center space-x-2">
-                      <AlertCircle className="w-5 h-5 text-red-600" />
-                      <p className="text-red-800 font-medium">
-                        Connection Failed
-                      </p>
-                    </div>
-                    <p className="text-red-700 text-sm mt-1">
-                      {validationError}
-                    </p>
-                  </div>
-                )}
-              </div>
-            )}
-
-            {/* Step 2: Configure Models */}
-            {currentStep === 2 && (
-              <div className="space-y-6">
-                {/* Endpoint Name - Required in Step 2 */}
-                <FormField
-                  control={form.control}
-                  name="name"
-                  render={({ field, fieldState }) => (
-                    <FormItem>
-                      <FormLabel>Display Name *</FormLabel>
-                      <FormControl>
-                        <Input
-                          placeholder="My API Endpoint"
-                          {...field}
-                          onChange={(e) => {
-                            field.onChange(e);
-                            // Clear name error when user types
-                            if (form.formState.errors.name) {
-                              form.clearErrors("name");
-                            }
-                          }}
-                          className={
-                            fieldState.error
-                              ? "border-red-500 focus:border-red-500"
-                              : ""
-                          }
-                        />
-                      </FormControl>
-                      {fieldState.error?.message !==
-                        "endpoint_name_conflict" && <FormMessage />}
-                    </FormItem>
-                  )}
-                />
-
-                <FormField
-                  control={form.control}
-                  name="description"
-                  render={({ field }) => (
-                    <FormItem>
-                      <FormLabel>Description (optional)</FormLabel>
-                      <FormControl>
-                        <Textarea
-                          placeholder="Description of this endpoint..."
-                          className="resize-none"
-                          rows={3}
-                          {...field}
-                        />
-                      </FormControl>
-                    </FormItem>
-                  )}
-                />
-
-                {/* Success Banner */}
-                {validationState === "success" &&
-                  availableModels.length > 0 && (
-                    <div className="p-2 bg-green-50 border border-green-200 rounded-lg">
-                      <div className="flex items-center space-x-2">
-                        <Check className="w-4 h-4 text-green-600" />
-                        <p className="text-sm text-green-800">
-                          {manualMode
-                            ? `${availableModels.length} model${availableModels.length === 1 ? "" : "s"} configured`
-                            : `Connected successfully • ${availableModels.length} model${availableModels.length === 1 ? "" : "s"} found`}
-                        </p>
-                      </div>
-                    </div>
-                  )}
-
-                {/* Manual Model Entry */}
-                {manualMode && validationState !== "success" && (
-                  <div className="space-y-3">
-                    <div>
-                      <label className="text-sm font-medium">
-                        Model Names (one per line)
-                      </label>
-                      <p className="text-xs text-gray-500 mt-1">
-                        Enter the model names available on this endpoint
-                      </p>
-                    </div>
-                    <Textarea
-                      placeholder="gpt-4&#10;gpt-3.5-turbo&#10;my-custom-model"
-                      value={manualModelInput}
-                      onChange={(e) => setManualModelInput(e.target.value)}
-                      rows={8}
-                      className="font-mono text-sm"
-                    />
-                    <Button
-                      type="button"
-                      onClick={handleApplyManualModels}
-                      disabled={!manualModelInput.trim()}
-                      className="w-full"
-                    >
-                      Configure Models
-                    </Button>
-                  </div>
-                )}
-
-                {/* Model Selection */}
-                {validationState === "success" &&
-                  availableModels.length > 0 && (
-                    <FormField
-                      control={form.control}
-                      name="selectedModels"
-                      render={({ field }) => (
-                        <FormItem>
-                          <div className="flex items-center justify-between">
-                            <div>
-                              <FormLabel>
-                                Select Models & Configure Aliases
-                              </FormLabel>
-                              <FormDescription className="text-xs">
-                                {field.value?.length || 0} of{" "}
-                                {availableModels.length} selected • Aliases
-                                default to model names but can be customized
-                              </FormDescription>
-                            </div>
-                            <Button
-                              type="button"
-                              variant="link"
-                              onClick={handleSelectAll}
-                              className="h-auto p-0 text-xs"
-                            >
-                              {field.value?.length === availableModels.length
-                                ? "Deselect All"
-                                : "Select All"}
-                            </Button>
-                          </div>
-
-                          <div className="max-h-60 overflow-y-auto border rounded-lg mt-2">
-                            <div className="sticky top-0 bg-gray-50 border-b px-3 py-2 text-xs font-medium text-gray-600">
-                              <div className="grid grid-cols-12 gap-3">
-                                <div className="col-span-1"></div>{" "}
-                                {/* Checkbox column */}
-                                <div className="col-span-5">Model Name</div>
-                                <div className="col-span-6">
-                                  Alias (used for routing)
-                                </div>
-                              </div>
-                            </div>
-
-                            {availableModels.map((model) => (
-                              <ModelRowWithAlias
-                                key={model.id}
-                                model={model}
-                                isSelected={
-                                  field.value?.includes(model.id) || false
-                                }
-                                alias={modelAliases[model.id] || model.id}
-                                onSelectionChange={(checked) => {
-                                  const current = field.value || [];
-                                  if (checked) {
-                                    field.onChange([...current, model.id]);
-                                    // Initialize alias if not set
-                                    if (!modelAliases[model.id]) {
-                                      setModelAliases((prev) => ({
-                                        ...prev,
-                                        [model.id]: model.id,
-                                      }));
-                                    }
-                                  } else {
-                                    field.onChange(
-                                      current.filter((id) => id !== model.id),
-                                    );
-                                  }
-                                }}
-                                onAliasChange={(newAlias) => {
-                                  const trimmedAlias = newAlias.trim();
-                                  const updatedAliases = {
-                                    ...modelAliases,
-                                    [model.id]: trimmedAlias,
-                                  };
-                                  setModelAliases(updatedAliases);
-
-                                  // Immediately check for local conflicts with the updated aliases
-                                  const conflicts =
-                                    checkLocalAliasConflicts(updatedAliases);
-                                  setLocalConflicts(conflicts);
-                                }}
-                                onConflictClear={(oldAlias) => {
-                                  setBackendConflicts((prev) => {
-                                    const updated = new Set(prev);
-                                    updated.delete(oldAlias);
-                                    return updated;
-                                  });
-                                }}
-                                conflictInfo={checkAliasConflict(
-                                  model.id,
-                                  modelAliases[model.id] || model.id,
-                                )}
                               />
-                            ))}
-                          </div>
+                              {field.value ? (
+                                <button
+                                  type="button"
+                                  className="absolute right-0 top-0 h-full px-3 text-gray-500 hover:text-gray-700 transition-colors border-l"
+                                  onClick={() => {
+                                    form.setValue("url", "");
+                                    // Reset validation state
+                                    if (validationState === "success") {
+                                      setValidationState("idle");
+                                      setAvailableModels([]);
+                                      form.setValue("selectedModels", []);
+                                      setBackendConflicts(new Set());
+                                      setLocalConflicts([]);
+                                    }
+                                    if (validationError) {
+                                      setValidationError(null);
+                                      setValidationState("idle");
+                                    }
+                                  }}
+                                >
+                                  <X className="h-4 w-4" />
+                                  <span className="sr-only">Clear URL</span>
+                                </button>
+                              ) : (
+                                <Popover
+                                  open={urlPopoverOpen}
+                                  onOpenChange={setUrlPopoverOpen}
+                                >
+                                  <PopoverTrigger asChild>
+                                    <button
+                                      type="button"
+                                      className="absolute right-0 top-0 h-full px-3 text-gray-500 hover:text-gray-700 transition-colors border-l"
+                                    >
+                                      <ChevronDown className="h-4 w-4" />
+                                      <span className="sr-only">
+                                        Select popular endpoint
+                                      </span>
+                                    </button>
+                                  </PopoverTrigger>
+                                  <PopoverContent
+                                    className="w-96 p-2"
+                                    align="end"
+                                  >
+                                    <div className="space-y-1">
+                                      <p className="text-xs font-medium text-gray-600 px-2 py-1">
+                                        Popular Endpoints
+                                      </p>
+                                      {POPULAR_ENDPOINTS.map((endpoint) => (
+                                        <button
+                                          key={endpoint.url}
+                                          type="button"
+                                          className="w-full text-left px-2 py-2 text-sm hover:bg-gray-100 rounded transition-colors cursor-pointer flex items-center gap-3"
+                                          onClick={() => {
+                                            form.setValue("url", endpoint.url);
+                                            setUrlPopoverOpen(false);
+
+                                            // Set auto-discover based on endpoint capabilities
+                                            // Disable for endpoints that don't support model discovery (skipValidation = true)
+                                            setAutoDiscoverModels(
+                                              !endpoint.skipValidation,
+                                            );
+
+                                            // Set Snowflake-specific settings if this is Snowflake SPCS Endpoint
+                                            if (
+                                              endpoint.name ===
+                                              "Snowflake SPCS Endpoint"
+                                            ) {
+                                              form.setValue(
+                                                "authHeaderPrefix",
+                                                endpoint.authHeaderPrefix || "",
+                                              );
+                                              setQuoteApiKey(
+                                                endpoint.quoteApiKey || false,
+                                              );
+                                            } else {
+                                              // Clear these for other endpoints
+                                              form.setValue(
+                                                "authHeaderPrefix",
+                                                "",
+                                              );
+                                              setQuoteApiKey(false);
+                                            }
+
+                                            // Reset validation state when changing URL
+                                            if (validationState === "success") {
+                                              setValidationState("idle");
+                                              setAvailableModels([]);
+                                              form.setValue(
+                                                "selectedModels",
+                                                [],
+                                              );
+                                              setBackendConflicts(new Set());
+                                              setLocalConflicts([]);
+                                            }
+                                            if (validationError) {
+                                              setValidationError(null);
+                                              setValidationState("idle");
+                                            }
+                                          }}
+                                        >
+                                          {endpoint.icon && (
+                                            <img
+                                              src={endpoint.icon}
+                                              alt={`${endpoint.name} logo`}
+                                              className="w-5 h-5 shrink-0"
+                                            />
+                                          )}
+                                          <div className="flex-1 min-w-0">
+                                            <div className="font-medium text-gray-900">
+                                              {endpoint.name}
+                                            </div>
+                                            <div className="text-xs text-gray-500 font-mono truncate">
+                                              {endpoint.url}
+                                            </div>
+                                          </div>
+                                        </button>
+                                      ))}
+                                    </div>
+                                  </PopoverContent>
+                                </Popover>
+                              )}
+                            </div>
+                          </FormControl>
+                          <FormDescription>
+                            {matchedEndpoint?.endpointInstructions
+                              ? matchedEndpoint.endpointInstructions()
+                              : "The base URL of your OpenAI-compatible inference endpoint."}
+                          </FormDescription>
                           <FormMessage />
                         </FormItem>
-                      )}
-                    />
+                      );
+                    }}
+                  />
+
+                  <FormField
+                    control={form.control}
+                    name="apiKey"
+                    render={({ field }) => {
+                      const currentUrl = form.watch("url");
+                      // Match endpoints - use domain property if available, otherwise exact URL match
+                      const matchedEndpoint = POPULAR_ENDPOINTS.find((ep) => {
+                        if (!currentUrl) return false;
+                        // For endpoints with a domain property (like Snowflake), match by domain
+                        if (ep.domain) {
+                          return currentUrl.includes(ep.domain);
+                        }
+                        // For static URLs, match exactly
+                        return currentUrl.trim() === ep.url;
+                      });
+
+                      return (
+                        <FormItem>
+                          <FormLabel>
+                            API Key{" "}
+                            {matchedEndpoint?.requiresApiKey
+                              ? "*"
+                              : "(optional)"}
+                          </FormLabel>
+                          <FormControl>
+                            <div className="relative">
+                              <Input
+                                type={showApiKey ? "text" : "password"}
+                                placeholder="sk-..."
+                                {...field}
+                                className="pr-10"
+                              />
+                              <button
+                                type="button"
+                                className="absolute right-0 top-0 h-full px-3 text-gray-500 hover:text-gray-700 transition-colors"
+                                onClick={() => setShowApiKey(!showApiKey)}
+                              >
+                                {showApiKey ? (
+                                  <EyeOff className="h-4 w-4" />
+                                ) : (
+                                  <Eye className="h-4 w-4" />
+                                )}
+                                <span className="sr-only">
+                                  {showApiKey ? "Hide API key" : "Show API key"}
+                                </span>
+                              </button>
+                            </div>
+                          </FormControl>
+                          <FormDescription>
+                            {matchedEndpoint?.apiKeyInstructions
+                              ? matchedEndpoint.apiKeyInstructions()
+                              : "Add an API key if the endpoint requires authentication"}
+                          </FormDescription>
+                        </FormItem>
+                      );
+                    }}
+                  />
+
+                  {/* Advanced Configuration and Auto-discover */}
+                  <div className="flex items-center justify-between">
+                    <Popover
+                      open={advancedPopoverOpen}
+                      onOpenChange={setAdvancedPopoverOpen}
+                    >
+                      <PopoverTrigger asChild>
+                        <button
+                          type="button"
+                          className="flex items-center gap-2 text-sm font-medium text-gray-700 hover:text-gray-900 transition-colors group"
+                        >
+                          Advanced Configuration
+                          <ChevronDown
+                            className={`w-4 h-4 transition-transform group-hover:translate-y-px ${advancedPopoverOpen ? "rotate-180" : ""}`}
+                          />
+                        </button>
+                      </PopoverTrigger>
+                      <PopoverContent className="w-96 p-4" align="start">
+                        <div className="space-y-4">
+                          <FormField
+                            control={form.control}
+                            name="authHeaderName"
+                            render={({ field }) => (
+                              <FormItem>
+                                <FormLabel>Authorization Header Name</FormLabel>
+                                <FormControl>
+                                  <Input
+                                    placeholder='"Authorization"'
+                                    {...field}
+                                  />
+                                </FormControl>
+                                <FormDescription>
+                                  The HTTP header name provided with upstream
+                                  requests to this endpoint.
+                                </FormDescription>
+                              </FormItem>
+                            )}
+                          />
+
+                          <FormField
+                            control={form.control}
+                            name="authHeaderPrefix"
+                            render={({ field }) => (
+                              <FormItem>
+                                <FormLabel>
+                                  Authorization Header Prefix
+                                </FormLabel>
+                                <FormControl>
+                                  <Input placeholder='"Bearer "' {...field} />
+                                </FormControl>
+                                <FormDescription>
+                                  The prefix before the API key header value.
+                                  Default is "Bearer " (with trailing space).
+                                </FormDescription>
+                              </FormItem>
+                            )}
+                          />
+
+                          <div className="flex items-center space-x-2 pt-2 border-t">
+                            <Checkbox
+                              id="quote-api-key"
+                              checked={quoteApiKey}
+                              onCheckedChange={(checked) =>
+                                setQuoteApiKey(checked === true)
+                              }
+                            />
+                            <label
+                              htmlFor="quote-api-key"
+                              className="text-sm font-medium leading-none peer-disabled:cursor-not-allowed peer-disabled:opacity-70 cursor-pointer"
+                            >
+                              Quote API key in header
+                            </label>
+                          </div>
+                          <FormDescription className="-mt-2">
+                            Wrap the API key in double quotes. Useful for
+                            endpoints like Snowflake that require quoted tokens.
+                          </FormDescription>
+                        </div>
+                      </PopoverContent>
+                    </Popover>
+
+                    {/* Auto-discover models checkbox */}
+                    <div className="flex items-center space-x-2">
+                      <Checkbox
+                        id="auto-discover"
+                        checked={autoDiscoverModels}
+                        onCheckedChange={(checked) =>
+                          setAutoDiscoverModels(checked === true)
+                        }
+                      />
+                      <label
+                        htmlFor="auto-discover"
+                        className="text-sm font-medium leading-none peer-disabled:cursor-not-allowed peer-disabled:opacity-70 cursor-pointer"
+                      >
+                        Auto-discover models
+                      </label>
+                      <HoverCard openDelay={200} closeDelay={100}>
+                        <HoverCardTrigger asChild>
+                          <button
+                            type="button"
+                            className="text-gray-500 hover:text-gray-700 transition-colors"
+                            onFocus={(e) => e.preventDefault()}
+                            tabIndex={-1}
+                          >
+                            <Info className="h-4 w-4" />
+                            <span className="sr-only">
+                              Auto-discover information
+                            </span>
+                          </button>
+                        </HoverCardTrigger>
+                        <HoverCardContent className="w-80" sideOffset={5}>
+                          <p className="text-sm text-muted-foreground">
+                            When enabled, the endpoint will be queried for
+                            available models via the <code>/v1/models</code>{" "}
+                            API. If disabled, you can manually specify the model
+                            names.
+                          </p>
+                        </HoverCardContent>
+                      </HoverCard>
+                    </div>
+                  </div>
+
+                  {/* Validation Error Banner */}
+                  {validationState === "error" && (
+                    <div className="p-4 bg-red-50 border border-red-200 rounded-lg">
+                      <div className="flex items-center space-x-2">
+                        <AlertCircle className="w-5 h-5 text-red-600" />
+                        <p className="text-red-800 font-medium">
+                          Connection Failed
+                        </p>
+                      </div>
+                      <p className="text-red-700 text-sm mt-1">
+                        {validationError}
+                      </p>
+                    </div>
                   )}
-              </div>
-            )}
-
-            {(form.formState.errors.name?.message ===
-              "endpoint_name_conflict" ||
-              validationError?.includes("endpoint name")) && (
-              <div className="p-3 bg-red-50 border border-red-200 rounded-md">
-                <div className="flex items-center space-x-2">
-                  <AlertCircle className="w-4 h-4 text-red-500 shrink-0" />
-                  <p className="text-sm text-red-700">
-                    <strong>Endpoint name conflict:</strong> Please choose a
-                    different display name above.
-                  </p>
                 </div>
-              </div>
-            )}
+              )}
 
-            {localConflicts.length > 0 && (
-              <div className="p-3 bg-orange-50 border border-orange-200 rounded-md">
-                <div className="flex items-center space-x-2">
-                  <AlertCircle className="w-4 h-4 text-orange-500 shrink-0" />
-                  <p className="text-sm text-orange-700">
-                    <strong>Duplicate aliases detected:</strong>{" "}
-                    {localConflicts.join(", ")}. Please ensure all aliases are
-                    unique.
-                  </p>
-                </div>
-              </div>
-            )}
+              {/* Step 2: Configure Models */}
+              {currentStep === 2 && (
+                <div className="space-y-6">
+                  {/* Endpoint Name - Required in Step 2 */}
+                  <FormField
+                    control={form.control}
+                    name="name"
+                    render={({ field, fieldState }) => (
+                      <FormItem>
+                        <FormLabel>Display Name *</FormLabel>
+                        <FormControl>
+                          <Input
+                            placeholder="My API Endpoint"
+                            {...field}
+                            onChange={(e) => {
+                              field.onChange(e);
+                              // Clear name error when user types
+                              if (form.formState.errors.name) {
+                                form.clearErrors("name");
+                              }
+                            }}
+                            className={
+                              fieldState.error
+                                ? "border-red-500 focus:border-red-500"
+                                : ""
+                            }
+                          />
+                        </FormControl>
+                        {fieldState.error?.message !==
+                          "endpoint_name_conflict" && <FormMessage />}
+                      </FormItem>
+                    )}
+                  />
 
-            {backendConflicts.size > 0 && (
-              <div className="p-3 bg-red-50 border border-red-200 rounded-md">
-                <div className="flex items-center space-x-2">
-                  <AlertCircle className="w-4 h-4 text-red-500 shrink-0" />
-                  <p className="text-sm text-red-700">
-                    <strong>Model alias conflict:</strong> Please edit the
-                    highlighted aliases above.
-                  </p>
+                  <FormField
+                    control={form.control}
+                    name="description"
+                    render={({ field }) => (
+                      <FormItem>
+                        <FormLabel>Description (optional)</FormLabel>
+                        <FormControl>
+                          <Textarea
+                            placeholder="Description of this endpoint..."
+                            className="resize-none"
+                            rows={3}
+                            {...field}
+                          />
+                        </FormControl>
+                      </FormItem>
+                    )}
+                  />
+
+                  {/* Success Banner */}
+                  {validationState === "success" &&
+                    availableModels.length > 0 && (
+                      <div className="p-2 bg-green-50 border border-green-200 rounded-lg">
+                        <div className="flex items-center space-x-2">
+                          <Check className="w-4 h-4 text-green-600" />
+                          <p className="text-sm text-green-800">
+                            {manualMode
+                              ? `${availableModels.length} model${availableModels.length === 1 ? "" : "s"} configured`
+                              : `Connected successfully • ${availableModels.length} model${availableModels.length === 1 ? "" : "s"} found`}
+                          </p>
+                        </div>
+                      </div>
+                    )}
+
+                  {/* Manual Model Entry */}
+                  {manualMode && validationState !== "success" && (
+                    <div className="space-y-3">
+                      <div>
+                        <label className="text-sm font-medium">
+                          Model Names (one per line)
+                        </label>
+                        <p className="text-xs text-gray-500 mt-1">
+                          Enter the model names available on this endpoint
+                        </p>
+                      </div>
+                      <Textarea
+                        placeholder="gpt-4&#10;gpt-3.5-turbo&#10;my-custom-model"
+                        value={manualModelInput}
+                        onChange={(e) => setManualModelInput(e.target.value)}
+                        rows={8}
+                        className="font-mono text-sm"
+                      />
+                      <Button
+                        type="button"
+                        onClick={handleApplyManualModels}
+                        disabled={!manualModelInput.trim()}
+                        className="w-full"
+                      >
+                        Configure Models
+                      </Button>
+                    </div>
+                  )}
+
+                  {/* Model Selection */}
+                  {validationState === "success" &&
+                    availableModels.length > 0 && (
+                      <FormField
+                        control={form.control}
+                        name="selectedModels"
+                        render={({ field }) => (
+                          <FormItem>
+                            <div className="flex items-center justify-between">
+                              <div>
+                                <FormLabel>
+                                  Select Models & Configure Aliases
+                                </FormLabel>
+                                <FormDescription className="text-xs">
+                                  {field.value?.length || 0} of{" "}
+                                  {availableModels.length} selected • Aliases
+                                  default to model names but can be customized
+                                </FormDescription>
+                              </div>
+                              <Button
+                                type="button"
+                                variant="link"
+                                onClick={handleSelectAll}
+                                className="h-auto p-0 text-xs"
+                              >
+                                {field.value?.length === availableModels.length
+                                  ? "Deselect All"
+                                  : "Select All"}
+                              </Button>
+                            </div>
+
+                            <div className="max-h-60 overflow-y-auto overflow-x-hidden border rounded-lg mt-2">
+                              <div className="sticky top-0 bg-gray-50 border-b px-3 py-2 text-xs font-medium text-gray-600">
+                                <div className="grid grid-cols-12 gap-3">
+                                  <div className="col-span-1"></div>{" "}
+                                  {/* Checkbox column */}
+                                  <div className="col-span-5">Model Name</div>
+                                  <div className="col-span-6">
+                                    Alias (used for routing)
+                                  </div>
+                                </div>
+                              </div>
+
+                              {availableModels.map((model) => (
+                                <ModelRowWithAlias
+                                  key={model.id}
+                                  model={model}
+                                  isSelected={
+                                    field.value?.includes(model.id) || false
+                                  }
+                                  alias={modelAliases[model.id] || model.id}
+                                  onSelectionChange={(checked) => {
+                                    const current = field.value || [];
+                                    if (checked) {
+                                      field.onChange([...current, model.id]);
+                                      // Initialize alias if not set
+                                      if (!modelAliases[model.id]) {
+                                        setModelAliases((prev) => ({
+                                          ...prev,
+                                          [model.id]: model.id,
+                                        }));
+                                      }
+                                    } else {
+                                      field.onChange(
+                                        current.filter((id) => id !== model.id),
+                                      );
+                                    }
+                                  }}
+                                  onAliasChange={(newAlias) => {
+                                    const trimmedAlias = newAlias.trim();
+                                    const updatedAliases = {
+                                      ...modelAliases,
+                                      [model.id]: trimmedAlias,
+                                    };
+                                    setModelAliases(updatedAliases);
+
+                                    // Immediately check for local conflicts with the updated aliases
+                                    const conflicts =
+                                      checkLocalAliasConflicts(updatedAliases);
+                                    setLocalConflicts(conflicts);
+                                  }}
+                                  onConflictClear={(oldAlias) => {
+                                    setBackendConflicts((prev) => {
+                                      const updated = new Set(prev);
+                                      updated.delete(oldAlias);
+                                      return updated;
+                                    });
+                                  }}
+                                  conflictInfo={checkAliasConflict(
+                                    model.id,
+                                    modelAliases[model.id] || model.id,
+                                  )}
+                                />
+                              ))}
+                            </div>
+                            <FormMessage />
+                          </FormItem>
+                        )}
+                      />
+                    )}
                 </div>
-              </div>
-            )}
+              )}
+
+              {(form.formState.errors.name?.message ===
+                "endpoint_name_conflict" ||
+                validationError?.includes("endpoint name")) && (
+                <div className="p-3 bg-red-50 border border-red-200 rounded-md">
+                  <div className="flex items-center space-x-2">
+                    <AlertCircle className="w-4 h-4 text-red-500 shrink-0" />
+                    <p className="text-sm text-red-700">
+                      <strong>Endpoint name conflict:</strong> Please choose a
+                      different display name above.
+                    </p>
+                  </div>
+                </div>
+              )}
+
+              {localConflicts.length > 0 && (
+                <div className="p-3 bg-orange-50 border border-orange-200 rounded-md">
+                  <div className="flex items-center space-x-2">
+                    <AlertCircle className="w-4 h-4 text-orange-500 shrink-0" />
+                    <p className="text-sm text-orange-700">
+                      <strong>Duplicate aliases detected:</strong>{" "}
+                      {localConflicts.join(", ")}. Please ensure all aliases are
+                      unique.
+                    </p>
+                  </div>
+                </div>
+              )}
+
+              {backendConflicts.size > 0 && (
+                <div className="p-3 bg-red-50 border border-red-200 rounded-md">
+                  <div className="flex items-center space-x-2">
+                    <AlertCircle className="w-4 h-4 text-red-500 shrink-0" />
+                    <p className="text-sm text-red-700">
+                      <strong>Model alias conflict:</strong> Please edit the
+                      highlighted aliases above.
+                    </p>
+                  </div>
+                </div>
+              )}
+            </div>
           </form>
         </Form>
 

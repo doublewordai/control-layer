@@ -188,6 +188,10 @@ export function Endpoints() {
           searchPlaceholder="Search endpoints..."
           searchColumn="name"
           onSelectionChange={setSelectedEndpoints}
+          initialColumnVisibility={{
+            description: false,
+            updated_at: false,
+          }}
           actionBar={
             <div className="bg-blue-50 border border-blue-200 rounded-lg p-3 mb-4 flex items-center justify-between">
               <div className="flex items-center gap-2">
