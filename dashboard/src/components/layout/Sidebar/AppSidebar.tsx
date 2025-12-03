@@ -14,7 +14,12 @@ import {
   ChevronUp,
   DollarSign,
 } from "lucide-react";
-import { useUser, useConfig } from "../../../api/control-layer/hooks";
+import {
+  useUser,
+  useConfig,
+  useUserBalance,
+  useTransactions,
+} from "../../../api/control-layer/hooks";
 import { UserAvatar } from "../../ui";
 import { useAuthorization } from "../../../utils";
 import { useAuth } from "../../../contexts/auth";
@@ -42,6 +47,9 @@ import {
   DropdownMenuItem,
   DropdownMenuTrigger,
 } from "@/components/ui/dropdown-menu";
+import type { Transaction } from "@/api/control-layer/types";
+import { useMemo } from "react";
+import { formatDollars } from "@/utils/money";
 
 interface NavItem {
   path: string;
@@ -189,7 +197,27 @@ export function AppSidebar() {
 }
 
 export function AppLayout({ children }: { children: React.ReactNode }) {
+  const { user } = useAuth();
   const { data: config, isLoading: configLoading } = useConfig();
+  const { isFeatureEnabled } = useSettings();
+  const isDemoMode = isFeatureEnabled("demo");
+
+  // Fetch balance and transactions
+  const { data: balance = 0 } = useUserBalance(user?.id || "");
+  const { data: transactionsData } = useTransactions({
+    userId: user?.id || "",
+  });
+  // Get transactions - use fetched data in both demo and API mode
+  // In demo mode, MSW returns data from transactions.json
+  const transactions = useMemo<Transaction[]>(() => {
+    return transactionsData || [];
+  }, [transactionsData]);
+
+  // Calculate current balance (in demo mode, use latest transaction balance)
+  const currentBalance =
+    isDemoMode && transactions.length > 0
+      ? transactions[0]?.balance_after || balance
+      : balance;
 
   return (
     <SidebarProvider>
@@ -214,6 +242,13 @@ export function AppLayout({ children }: { children: React.ReactNode }) {
                     </span>
                     <span className="font-medium text-foreground">
                       {config.organization}
+                    </span>
+                  </div>
+                  <div className="hidden lg:block w-px h-4 bg-border"></div>
+                  <div className="flex items-center gap-2 text-sm">
+                    <span className="text-gray-600">Balance:</span>
+                    <span className="font-semibold text-gray-900">
+                      {formatDollars(currentBalance)}
                     </span>
                   </div>
                   <div className="hidden md:block w-px h-4 bg-border"></div>

@@ -38,11 +38,12 @@ import {
 import type { Transaction } from "@/api/control-layer";
 import { useUserBalance, useTransactions, useUser } from "@/api/control-layer";
 import { useSettings } from "@/contexts";
+import { formatDollars } from "@/utils/money.ts";
 
 export type AddFundsConfig =
-  | { type: 'direct'; onAddFunds: () => void }
-  | { type: 'redirect'; onAddFunds: () => void }
-  | { type: 'split'; onPrimaryAction: () => void; onDirectAction: () => void }
+  | { type: "direct"; onAddFunds: () => void }
+  | { type: "redirect"; onAddFunds: () => void }
+  | { type: "split"; onPrimaryAction: () => void; onDirectAction: () => void }
   | undefined;
 
 export interface TransactionHistoryProps {
@@ -65,11 +66,7 @@ export function TransactionHistory({
   const { data: displayUser } = useUser(filterUserId || userId);
 
   // Fetch balance and transactions
-  const {
-    data: balance = 0,
-    isLoading: isLoadingBalance,
-    refetch: refetchBalance,
-  } = useUserBalance(userId);
+  const { refetch: refetchBalance } = useUserBalance(userId);
 
   // Always pass userId to filter transactions by the specific user
   // Backend enforces permissions: non-admins can only see their own transactions
@@ -85,13 +82,7 @@ export function TransactionHistory({
     return transactionsData || [];
   }, [transactionsData]);
 
-  // Calculate current balance (in demo mode, use latest transaction balance)
-  const currentBalance =
-    isDemoMode && transactions.length > 0
-      ? transactions[0]?.balance_after || balance
-      : balance;
-
-  const isLoading = !isDemoMode && (isLoadingBalance || isLoadingTransactions);
+  const isLoading = !isDemoMode && isLoadingTransactions;
 
   // Filter states
   const [transactionType, setTransactionType] = useState<string>("all");
@@ -114,13 +105,6 @@ export function TransactionHistory({
       hour: "2-digit",
       minute: "2-digit",
     }).format(date);
-  };
-
-  const formatDollars = (amount: number) => {
-    return new Intl.NumberFormat("en-US", {
-      style: "currency",
-      currency: "USD",
-    }).format(amount);
   };
 
   // Apply filters
@@ -247,21 +231,19 @@ export function TransactionHistory({
             </Button>
           </div>
           {displayUser && (
-            <p className={`text-sm mt-1 ${filterUserId && filterUserId !== userId ? 'text-red-600 font-semibold' : 'text-gray-600'}`}>
-              Showing transactions for user <span className="font-medium">{displayUser.email}</span>
+            <p
+              className={`text-sm mt-1 ${filterUserId && filterUserId !== userId ? "text-red-600 font-semibold" : "text-gray-600"}`}
+            >
+              Showing transactions for user{" "}
+              <span className="font-medium">{displayUser.email}</span>
             </p>
           )}
         </div>
         <div className="flex items-center gap-3">
-          <div className="flex items-center gap-2 text-sm">
-            <span className="text-gray-600">Balance:</span>
-            <span className="font-semibold text-gray-900">
-              {formatDollars(currentBalance)}
-            </span>
-          </div>
           {addFundsConfig && (
             <>
-              {(addFundsConfig.type === 'direct' || addFundsConfig.type === 'redirect') && (
+              {(addFundsConfig.type === "direct" ||
+                addFundsConfig.type === "redirect") && (
                 <Button
                   variant="outline"
                   size="sm"
@@ -271,7 +253,7 @@ export function TransactionHistory({
                   Add to Credit Balance
                 </Button>
               )}
-              {addFundsConfig.type === 'split' && (
+              {addFundsConfig.type === "split" && (
                 <div className="flex">
                   <Button
                     variant="outline"
@@ -307,7 +289,6 @@ export function TransactionHistory({
 
       {/* Transaction History Card */}
       <Card className="p-4">
-
         {/* Search and Filters */}
         <div className="space-y-2">
           <div className="flex flex-wrap items-center gap-2">
