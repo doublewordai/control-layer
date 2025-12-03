@@ -1,4 +1,13 @@
+import {
+  useTransactions,
+  useUser,
+  useUserBalance,
+} from "@/api/control-layer/hooks";
+import type { Transaction } from "@/api/control-layer/types";
+import { useSettings } from "@/contexts/settings/hooks";
+import { formatDollars } from "@/utils/money";
 import { ArrowLeft, ExternalLink } from "lucide-react";
+import { useMemo } from "react";
 import { useLocation, useNavigate } from "react-router-dom";
 
 export function Header() {
@@ -6,6 +15,26 @@ export function Header() {
   const navigate = useNavigate();
 
   const isComparisonPage = location.pathname.startsWith("/compare/");
+  const { data: currentUser } = useUser("current");
+  const { isFeatureEnabled } = useSettings();
+  const isDemoMode = isFeatureEnabled("demo");
+
+  // Fetch balance and transactions
+  const { data: balance = 0 } = useUserBalance(currentUser?.id || "");
+  const { data: transactionsData } = useTransactions({
+    userId: currentUser?.id || "",
+  });
+  // Get transactions - use fetched data in both demo and API mode
+  // In demo mode, MSW returns data from transactions.json
+  const transactions = useMemo<Transaction[]>(() => {
+    return transactionsData || [];
+  }, [transactionsData]);
+
+  // Calculate current balance (in demo mode, use latest transaction balance)
+  const currentBalance =
+    isDemoMode && transactions.length > 0
+      ? transactions[0]?.balance_after || balance
+      : balance;
 
   return (
     <div className="h-16 bg-white border-b border-doubleword-border fixed top-0 right-0 left-64 z-10">
@@ -27,9 +56,11 @@ export function Header() {
             <span className="font-medium">UK South</span>
           </div>
           <div className="w-px h-4 bg-doubleword-neutral-200"></div>
-          <div className="flex items-center gap-2">
-            <span className="text-doubleword-neutral-400">Organization:</span>
-            <span className="font-medium">ACME Corp</span>
+          <div className="flex items-center gap-2 text-sm">
+            <span className="text-gray-600">Balance:</span>
+            <span className="font-semibold text-gray-900">
+              {formatDollars(currentBalance)}
+            </span>
           </div>
           <div className="w-px h-4 bg-doubleword-neutral-200"></div>
           <a
