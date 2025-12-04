@@ -19,7 +19,24 @@ pub async fn serve_embedded_asset(uri: Uri) -> impl IntoResponse {
         path = "index.html";
     }
 
-    // Try to serve the requested file
+    // Check filesystem first for specific volume-mounted files only
+    // This avoids unnecessary filesystem checks for most static assets
+    const FILESYSTEM_OVERRIDE_PATHS: &[&str] = &["bootstrap.js"];
+
+    if FILESYSTEM_OVERRIDE_PATHS.contains(&path) {
+        let fs_path = format!("/app/static/{}", path);
+        if let Ok(content) = tokio::fs::read(&fs_path).await {
+            let mime = mime_guess::from_path(path).first_or_octet_stream();
+
+            return Response::builder()
+                .header(axum::http::header::CONTENT_TYPE, mime.as_ref())
+                .header(axum::http::header::CACHE_CONTROL, "public, max-age=86400") // 24 hours
+                .body(Body::from(content))
+                .unwrap();
+        }
+    }
+
+    // Fall back to embedded static assets
     if let Some(content) = static_assets::Assets::get(path) {
         let mime = mime_guess::from_path(path).first_or_octet_stream();
 
