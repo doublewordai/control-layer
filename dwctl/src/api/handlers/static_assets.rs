@@ -5,7 +5,8 @@ use axum::{
     http::{Response, StatusCode, Uri},
     response::{Html, IntoResponse},
 };
-use tracing::{debug, instrument};
+use base64::Engine;
+use tracing::{debug, error, instrument};
 
 use crate::static_assets;
 
@@ -19,20 +20,24 @@ pub async fn serve_embedded_asset(uri: Uri) -> impl IntoResponse {
         path = "index.html";
     }
 
-    // Check filesystem first for specific volume-mounted files only
-    // This avoids unnecessary filesystem checks for most static assets
-    const FILESYSTEM_OVERRIDE_PATHS: &[&str] = &["bootstrap.js"];
-
-    if FILESYSTEM_OVERRIDE_PATHS.contains(&path) {
-        let fs_path = format!("/app/static/{}", path);
-        if let Ok(content) = tokio::fs::read(&fs_path).await {
-            let mime = mime_guess::from_path(path).first_or_octet_stream();
-
-            return Response::builder()
-                .header(axum::http::header::CONTENT_TYPE, mime.as_ref())
-                .header(axum::http::header::CACHE_CONTROL, "public, max-age=86400") // 24 hours
-                .body(Body::from(content))
-                .unwrap();
+    // Check for bootstrap.js override via environment variable (base64 encoded)
+    // This allows injecting custom bootstrap code without volume mounts
+    if path == "bootstrap.js" {
+        if let Ok(encoded) = std::env::var("DASHBOARD_BOOTSTRAP_JS") {
+            match base64::prelude::BASE64_STANDARD.decode(encoded.trim()) {
+                Ok(content) => {
+                    debug!("Serving bootstrap.js from DASHBOARD_BOOTSTRAP_JS environment variable");
+                    return Response::builder()
+                        .header(axum::http::header::CONTENT_TYPE, "application/javascript")
+                        .header(axum::http::header::CACHE_CONTROL, "no-cache")
+                        .body(Body::from(content))
+                        .unwrap();
+                }
+                Err(e) => {
+                    error!("Failed to decode DASHBOARD_BOOTSTRAP_JS (expected base64): {}", e);
+                    // Fall through to embedded assets
+                }
+            }
         }
     }
 
