@@ -29,7 +29,7 @@ pub async fn serve_embedded_asset(uri: Uri) -> impl IntoResponse {
             Ok(content) => {
                 debug!("Serving bootstrap.js from DASHBOARD_BOOTSTRAP_JS environment variable");
                 return Response::builder()
-                    .header(axum::http::header::CONTENT_TYPE, "application/javascript")
+                    .header(axum::http::header::CONTENT_TYPE, "text/javascript")
                     .header(axum::http::header::CACHE_CONTROL, "no-cache")
                     .body(Body::from(content))
                     .unwrap();
