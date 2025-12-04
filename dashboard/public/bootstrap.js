@@ -1,2 +1,2 @@
-// Insert scripts for analytics etc here
-console.log("Bootstrap completed.");
+// insert custom scripts for analytics etc here
+console.log("Bootstrap setup completed.");

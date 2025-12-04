@@ -5,7 +5,8 @@ use axum::{
     http::{Response, StatusCode, Uri},
     response::{Html, IntoResponse},
 };
-use tracing::{debug, instrument};
+use base64::Engine;
+use tracing::{debug, error, instrument};
 
 use crate::static_assets;
 
@@ -19,7 +20,28 @@ pub async fn serve_embedded_asset(uri: Uri) -> impl IntoResponse {
         path = "index.html";
     }
 
-    // Try to serve the requested file
+    // Check for bootstrap.js override via environment variable (base64 encoded)
+    // This allows injecting custom bootstrap code without volume mounts
+    if path == "bootstrap.js"
+        && let Ok(encoded) = std::env::var("DASHBOARD_BOOTSTRAP_JS")
+    {
+        match base64::prelude::BASE64_STANDARD.decode(encoded.trim()) {
+            Ok(content) => {
+                debug!("Serving bootstrap.js from DASHBOARD_BOOTSTRAP_JS environment variable");
+                return Response::builder()
+                    .header(axum::http::header::CONTENT_TYPE, "text/javascript")
+                    .header(axum::http::header::CACHE_CONTROL, "no-cache")
+                    .body(Body::from(content))
+                    .unwrap();
+            }
+            Err(e) => {
+                error!("Failed to decode DASHBOARD_BOOTSTRAP_JS (expected base64): {}", e);
+                // Fall through to embedded assets
+            }
+        }
+    }
+
+    // Fall back to embedded static assets
     if let Some(content) = static_assets::Assets::get(path) {
         let mime = mime_guess::from_path(path).first_or_octet_stream();
 
