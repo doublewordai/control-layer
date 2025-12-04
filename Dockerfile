@@ -3,12 +3,12 @@ FROM rust:1.91.1-slim AS backend-builder
 
 # Install build dependencies including Node.js
 RUN apt-get update && apt-get install -y \
-  pkg-config \
-  libssl-dev \
-  curl \
-  && curl -fsSL https://deb.nodesource.com/setup_20.x | bash - \
-  && apt-get install -y nodejs \
-  && rm -rf /var/lib/apt/lists/*
+    pkg-config \
+    libssl-dev \
+    curl \
+    && curl -fsSL https://deb.nodesource.com/setup_20.x | bash - \
+    && apt-get install -y nodejs \
+    && rm -rf /var/lib/apt/lists/*
 
 # Create app directory
 WORKDIR /app
@@ -46,11 +46,11 @@ FROM ubuntu:24.04
 
 # Install runtime dependencies
 RUN apt-get update && apt-get install -y \
-  ca-certificates \
-  curl \
-  libxml2 \
-  tzdata \
-  && rm -rf /var/lib/apt/lists/*
+    ca-certificates \
+    curl \
+    libxml2 \
+    tzdata \
+    && rm -rf /var/lib/apt/lists/*
 
 # Set working directory
 WORKDIR /app
