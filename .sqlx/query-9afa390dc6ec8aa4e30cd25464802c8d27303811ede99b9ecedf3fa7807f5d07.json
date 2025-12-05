@@ -1,0 +1,110 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n        WITH latest_balances AS (\n            SELECT DISTINCT ON (user_id)\n                user_id,\n                balance_after\n            FROM credits_transactions\n            ORDER BY user_id, created_at DESC, id DESC\n        )\n        SELECT\n            -- Deployment fields (only what we need)\n            dm.id as deployment_id,\n            dm.model_name,\n            dm.alias,\n            dm.hosted_on,\n            dm.requests_per_second as deployment_requests_per_second,\n            dm.burst_size as deployment_burst_size,\n            dm.capacity,\n            -- Endpoint fields (only what we need)\n            ie.id as endpoint_id,\n            ie.url as \"endpoint_url!\",\n            ie.api_key as endpoint_api_key,\n            ie.auth_header_name,\n            ie.auth_header_prefix,\n            -- API key fields (nullable due to LEFT JOIN)\n            ak.id as \"api_key_id?\",\n            ak.secret as \"api_key_secret?\",\n            ak.requests_per_second as api_key_requests_per_second,\n            ak.burst_size as api_key_burst_size\n        FROM deployed_models dm\n        INNER JOIN inference_endpoints ie ON dm.hosted_on = ie.id\n        LEFT JOIN LATERAL (\n            -- Get all API keys that have access to this deployment\n            SELECT DISTINCT\n                ak.id,\n                ak.secret,\n                ak.requests_per_second,\n                ak.burst_size\n            FROM api_keys ak\n            WHERE (\n                -- System user always has access\n                ak.user_id = '00000000-0000-0000-0000-000000000000'\n\n                -- OR user is in a group assigned to this deployment\n                OR EXISTS (\n                    SELECT 1 FROM user_groups ug\n                    INNER JOIN deployment_groups dg ON ug.group_id = dg.group_id\n                    WHERE dg.deployment_id = dm.id\n                      AND ug.user_id = ak.user_id\n                )\n\n                -- OR deployment is in public group (nil UUID)\n                OR EXISTS (\n                    SELECT 1 FROM deployment_groups dg\n                    WHERE dg.deployment_id = dm.id\n                      AND dg.group_id = '00000000-0000-0000-0000-000000000000'\n                )\n            )\n            -- Access control: require credit OR free model (except system user always passes)\n            AND (\n                ak.user_id = '00000000-0000-0000-0000-000000000000'\n                OR EXISTS (\n                    SELECT 1 FROM latest_balances lb\n                    WHERE lb.user_id = ak.user_id AND lb.balance_after > 0\n                )\n                OR (\n                    -- Free model check: no active tariffs with pricing\n                    NOT EXISTS (\n                        SELECT 1 FROM model_tariffs mt\n                        WHERE mt.deployed_model_id = dm.id\n                          AND mt.valid_until IS NULL\n                          AND (mt.input_price_per_token > 0 OR mt.output_price_per_token > 0)\n                    )\n                )\n            )\n        ) ak ON true\n        WHERE dm.deleted = FALSE\n        ORDER BY dm.id, ak.id\n        ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "deployment_id",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 1,
+        "name": "model_name",
+        "type_info": "Varchar"
+      },
+      {
+        "ordinal": 2,
+        "name": "alias",
+        "type_info": "Varchar"
+      },
+      {
+        "ordinal": 3,
+        "name": "hosted_on",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 4,
+        "name": "deployment_requests_per_second",
+        "type_info": "Float4"
+      },
+      {
+        "ordinal": 5,
+        "name": "deployment_burst_size",
+        "type_info": "Int4"
+      },
+      {
+        "ordinal": 6,
+        "name": "capacity",
+        "type_info": "Int4"
+      },
+      {
+        "ordinal": 7,
+        "name": "endpoint_id",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 8,
+        "name": "endpoint_url!",
+        "type_info": "Varchar"
+      },
+      {
+        "ordinal": 9,
+        "name": "endpoint_api_key",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 10,
+        "name": "auth_header_name",
+        "type_info": "Varchar"
+      },
+      {
+        "ordinal": 11,
+        "name": "auth_header_prefix",
+        "type_info": "Varchar"
+      },
+      {
+        "ordinal": 12,
+        "name": "api_key_id?",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 13,
+        "name": "api_key_secret?",
+        "type_info": "Varchar"
+      },
+      {
+        "ordinal": 14,
+        "name": "api_key_requests_per_second",
+        "type_info": "Float4"
+      },
+      {
+        "ordinal": 15,
+        "name": "api_key_burst_size",
+        "type_info": "Int4"
+      }
+    ],
+    "parameters": {
+      "Left": []
+    },
+    "nullable": [
+      false,
+      false,
+      false,
+      false,
+      true,
+      true,
+      true,
+      false,
+      false,
+      true,
+      false,
+      false,
+      false,
+      false,
+      true,
+      true
+    ]
+  },
+  "hash": "9afa390dc6ec8aa4e30cd25464802c8d27303811ede99b9ecedf3fa7807f5d07"
+}

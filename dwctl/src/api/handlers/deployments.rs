@@ -13,7 +13,7 @@ use crate::{
     auth::permissions::{RequiresPermission, can_read_all_resources, has_permission, operation, resource},
     db::{
         handlers::{Deployments, InferenceEndpoints, Repository, deployments::DeploymentFilter},
-        models::deployments::{DeploymentCreateDBRequest, DeploymentUpdateDBRequest, ModelPricing, ModelStatus},
+        models::deployments::{DeploymentCreateDBRequest, DeploymentUpdateDBRequest, ModelStatus},
     },
     errors::{Error, Result},
     types::{DeploymentId, Resource},
@@ -33,7 +33,7 @@ use sqlx::Acquire;
     params(
         ("endpoint" = Option<i32>, Query, description = "Filter by inference endpoint ID"),
         ("accessible" = Option<bool>, Query, description = "Filter to only models the current user can access (defaults to false for admins, true for users)"),
-        ("include" = Option<String>, Query, description = "Include additional data (comma-separated: 'groups', 'metrics', 'status', 'pricing', 'endpoints'). Only platform managers can include groups. Status shows probe monitoring information. Pricing shows simple customer rates for regular users, full pricing structure for users with Pricing::ReadAll permission. Endpoints includes full inference endpoint details."),
+        ("include" = Option<String>, Query, description = "Include additional data (comma-separated: 'groups', 'metrics', 'status', 'pricing', 'endpoints'). Only platform managers can include groups. Status shows probe monitoring information. Pricing shows simple customer rates for regular users, full pricing structure including current active tariffs for users with Pricing::ReadAll permission. Endpoints includes full inference endpoint details."),
         ("deleted" = Option<bool>, Query, description = "Show deleted models when true (admin only), non-deleted models when false, and all models when not specified"),
         ("inactive" = Option<bool>, Query, description = "Show inactive models when true (admin only)"),
         ("limit" = Option<i64>, Query, description = "Maximum number of items to return (default: 10, max: 100)"),
@@ -171,12 +171,12 @@ pub async fn list_deployed_models(
     let total_count = repo.count(&filter).await?;
     let filtered_models = repo.list(&filter).await?;
 
-    // Prepare models with their pricing for enrichment
-    let models_with_pricing: Vec<(DeployedModelResponse, Option<ModelPricing>)> = filtered_models
+    // Convert to API responses and add provider_pricing based on permissions and includes
+    let models: Vec<DeployedModelResponse> = filtered_models
         .into_iter()
         .map(|model| {
-            let pricing = model.pricing.clone();
-            (model.into(), pricing)
+            let provider_pricing = if can_read_pricing { model.provider_pricing.clone() } else { None };
+            DeployedModelResponse::from(model).with_provider_pricing(provider_pricing)
         })
         .collect();
 
@@ -199,7 +199,7 @@ pub async fn list_deployed_models(
         can_read_rate_limits,
     };
 
-    let response = enricher.enrich_many(models_with_pricing).await?;
+    let response = enricher.enrich_many(models).await?;
 
     Ok(Json(PaginatedResponse::new(response, total_count, skip, limit)))
 }
@@ -253,8 +253,15 @@ pub async fn create_deployed_model(
 
     // Create the deployment - let database constraints handle uniqueness
     let mut repo = Deployments::new(tx.acquire().await.map_err(|e| Error::Database(e.into()))?);
+    let tariffs = create.tariffs.clone();
     let db_request = DeploymentCreateDBRequest::from_api_create(current_user.id, create);
     let model = repo.create(&db_request).await?;
+
+    // Create tariffs if provided
+    if let Some(tariff_defs) = tariffs {
+        repo.create_tariffs(model.id, tariff_defs).await?;
+    }
+
     tx.commit().await.map_err(|e| Error::Database(e.into()))?;
 
     Ok(Json(DeployedModelResponse::from(model)))
@@ -291,8 +298,8 @@ pub async fn update_deployed_model(
 ) -> Result<Json<DeployedModelResponse>> {
     let has_system_access = has_permission(&current_user, resource::Models.into(), operation::SystemAccess.into());
 
-    let mut pool_conn = state.db.acquire().await.map_err(|e| Error::Database(e.into()))?;
-    let mut repo = Deployments::new(&mut pool_conn);
+    let mut tx = state.db.begin().await.map_err(|e| Error::Database(e.into()))?;
+    let mut repo = Deployments::new(tx.acquire().await.map_err(|e| Error::Database(e.into()))?);
 
     // Verify deployment exists and check access based on permissions
     match repo.get_by_id(deployment_id).await {
@@ -314,8 +321,17 @@ pub async fn update_deployed_model(
         Err(e) => return Err(e.into()),
     }
 
+    let tariffs = update.tariffs.clone();
     let db_request = DeploymentUpdateDBRequest::from(update);
     let model = repo.update(deployment_id, &db_request).await?;
+
+    // Handle tariff replacement if provided
+    if let Some(tariff_defs) = tariffs {
+        repo.replace_tariffs(deployment_id, tariff_defs).await?;
+    }
+
+    tx.commit().await.map_err(|e| Error::Database(e.into()))?;
+
     Ok(Json(DeployedModelResponse::from(model)))
 }
 
@@ -400,9 +416,13 @@ pub async fn get_deployed_model(
     let include_pricing = include_params.contains("pricing");
     let include_endpoints = include_params.contains("endpoints");
 
-    // Build base response
-    let pricing = model.pricing.clone();
-    let mut response = DeployedModelResponse::from(model);
+    // Build base response with provider_pricing based on permissions and includes
+    let provider_pricing = if include_pricing && can_read_pricing {
+        model.provider_pricing.clone()
+    } else {
+        None
+    };
+    let mut response = DeployedModelResponse::from(model).with_provider_pricing(provider_pricing);
 
     // Use ModelEnricher to add related data
     let enricher = DeployedModelEnricher {
@@ -416,7 +436,7 @@ pub async fn get_deployed_model(
         can_read_rate_limits,
     };
 
-    response = enricher.enrich_one(response, pricing).await?;
+    response = enricher.enrich_one(response).await?;
 
     Ok(Json(response))
 }
