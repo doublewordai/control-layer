@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.14.1](https://github.com/doublewordai/control-layer/compare/v0.14.0...v0.14.1) (2025-12-05)
+
+
+### Bug Fixes
+
+* DASHBOARD_BOOTSTRAP_JS env var ([#328](https://github.com/doublewordai/control-layer/issues/328)) ([40a995a](https://github.com/doublewordai/control-layer/commit/40a995a6d5d798afe9197165e9a41861c7f0808c))
+
 ## [0.14.0](https://github.com/doublewordai/control-layer/compare/v0.13.0...v0.14.0) (2025-12-03)
 
 
