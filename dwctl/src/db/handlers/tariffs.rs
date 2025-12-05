@@ -3,14 +3,13 @@
 use crate::{
     db::{
         errors::Result,
-        handlers::Repository,
         models::tariffs::{ModelTariff, TariffCreateDBRequest, TariffDBResponse, TariffUpdateDBRequest},
     },
     types::DeploymentId,
 };
 use chrono::{DateTime, Utc};
 use rust_decimal::Decimal;
-use sqlx::PgConnection;
+use sqlx::{PgConnection, PgPool};
 use tracing::instrument;
 use uuid::Uuid;
 
@@ -18,10 +17,9 @@ pub struct Tariffs<'c> {
     db: &'c mut PgConnection,
 }
 
-impl<'c> Repository for Tariffs<'c> {
-    type Connection = PgConnection;
-
-    fn new(db: &'c mut Self::Connection) -> Self {
+impl<'c> Tariffs<'c> {
+    /// Create a new Tariffs repository instance
+    pub fn new(db: &'c mut PgConnection) -> Self {
         Self { db }
     }
 }
@@ -115,6 +113,11 @@ impl<'c> Tariffs<'c> {
 
     /// Get the pricing for a specific tariff that was valid at a given timestamp
     /// This is used for historical chargeback calculations
+    ///
+    /// Uses an optimized two-step lookup:
+    /// 1. First checks the current (active) tariff (WHERE valid_until IS NULL)
+    /// 2. If the timestamp is >= current tariff's valid_from, uses it (fast path)
+    /// 3. Otherwise, does a full historical lookup with temporal constraints
     #[instrument(skip(self), err)]
     pub async fn get_pricing_at_timestamp(
         &mut self,
@@ -122,6 +125,32 @@ impl<'c> Tariffs<'c> {
         tariff_name: &str,
         timestamp: DateTime<Utc>,
     ) -> Result<Option<(Decimal, Decimal)>> {
+        // Step 1: Check current (active) tariff - this is the fast path for recent requests
+        let current_tariff = sqlx::query!(
+            r#"
+            SELECT input_price_per_token, output_price_per_token, valid_from
+            FROM model_tariffs
+            WHERE deployed_model_id = $1
+              AND name = $2
+              AND valid_until IS NULL
+            LIMIT 1
+            "#,
+            deployed_model_id,
+            tariff_name
+        )
+        .fetch_optional(&mut *self.db)
+        .await?;
+
+        // Step 2: If current tariff exists and request is after its valid_from, use it
+        if let Some(current) = current_tariff {
+            if timestamp >= current.valid_from {
+                // Fast path - use current pricing
+                return Ok(Some((current.input_price_per_token, current.output_price_per_token)));
+            }
+        }
+
+        // Step 3: Either no current tariff exists, or request is older than current tariff
+        // Do full historical lookup
         let result = sqlx::query!(
             r#"
             SELECT input_price_per_token, output_price_per_token

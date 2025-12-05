@@ -372,14 +372,13 @@ pub async fn store_analytics_record(
         Auth::None => (None, None, AccessSource::Unauthenticated),
     };
 
-    // Get model pricing and provider name if we have a model
+    // Get model ID, tariff pricing, and provider name
     // Use request_model for lookup since that's what the user specified
-    let provider_name = if let Some(model_name) = &metrics.request_model {
-        sqlx::query!(
+    let (model_id, tariff_pricing, provider_name) = if let Some(model_name) = &metrics.request_model {
+        let model_info = sqlx::query!(
             r#"
             SELECT
-                dm.upstream_input_price_per_token,
-                dm.upstream_output_price_per_token,
+                dm.id as model_id,
                 ie.name as "provider_name?",
                 ie.url as "provider_url?"
             FROM deployed_models dm
@@ -390,18 +389,50 @@ pub async fn store_analytics_record(
             model_name
         )
         .fetch_optional(pool)
-        .await?
-        .map(|row| {
-            row.provider_url
+        .await?;
+
+        if let Some(model_info) = model_info {
+            // Use the tariff repository to get pricing at timestamp
+            use crate::db::handlers::Tariffs;
+            let mut conn = pool.acquire().await?;
+            let mut tariffs_repo = Tariffs::new(&mut conn);
+            let tariff_pricing = tariffs_repo.get_pricing_at_timestamp(
+                model_info.model_id,
+                "batch",
+                metrics.timestamp
+            ).await.map_err(|e| match e {
+                crate::db::errors::DbError::NotFound => sqlx::Error::RowNotFound,
+                crate::db::errors::DbError::Other(anyhow_err) => {
+                    // Try to downcast to sqlx::Error
+                    match anyhow_err.downcast::<sqlx::Error>() {
+                        Ok(sqlx_err) => sqlx_err,
+                        Err(other_err) => sqlx::Error::Configuration(other_err.to_string().into()),
+                    }
+                }
+                _ => sqlx::Error::Configuration(e.to_string().into()),
+            })?;
+
+            let provider_name = model_info.provider_url
                 .as_ref()
                 .and_then(|url| map_url_to_otel_provider(url))
                 .map(|s| s.to_string())
-                .or(row.provider_name)
-        })
+                .or(model_info.provider_name);
+
+            (Some(model_info.model_id), tariff_pricing, provider_name)
+        } else {
+            (None, None, None)
+        }
     } else {
-        None
-    }
-    .flatten();
+        (None, None, None)
+    };
+
+    // Use tariff pricing if available, otherwise fall back to header pricing (for backwards compatibility)
+    let (input_price, output_price) = if let Some((input, output)) = tariff_pricing {
+        (Some(input), Some(output))
+    } else {
+        // Fall back to header pricing from onwards (legacy)
+        (metrics.input_price_per_token, metrics.output_price_per_token)
+    };
 
     // Construct the complete row
     let row = HttpAnalyticsRow {
@@ -422,8 +453,8 @@ pub async fn store_analytics_record(
         user_id,
         user_email: user_email.clone(),
         access_source: access_source.to_string(),
-        input_price_per_token: metrics.input_price_per_token,
-        output_price_per_token: metrics.output_price_per_token,
+        input_price_per_token: input_price,
+        output_price_per_token: output_price,
         server_address: metrics.server_address.clone(),
         server_port: metrics.server_port,
         provider_name,

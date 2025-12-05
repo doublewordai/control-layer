@@ -434,9 +434,13 @@ impl<'c> ApiKeys<'c> {
                 )
                 OR (
                     -- Free models are accessible to all users (zero balance OK)
-                    -- A model is free if pricing is NULL OR both prices are 0
-                    (dm.upstream_input_price_per_token IS NULL OR dm.upstream_input_price_per_token = 0)
-                    AND (dm.upstream_output_price_per_token IS NULL OR dm.upstream_output_price_per_token = 0)
+                    -- A model is free if it has no active tariffs or all active tariffs are zero-priced
+                    NOT EXISTS (
+                        SELECT 1 FROM model_tariffs mt
+                        WHERE mt.deployed_model_id = dm.id
+                        AND mt.valid_until IS NULL
+                        AND (mt.input_price_per_token > 0 OR mt.output_price_per_token > 0)
+                    )
                 )
             )
 
@@ -475,9 +479,13 @@ impl<'c> ApiKeys<'c> {
                 )
                 OR (
                     -- Free models are accessible to all users (zero balance OK)
-                    -- A model is free if pricing is NULL OR both prices are 0
-                    (dm.upstream_input_price_per_token IS NULL OR dm.upstream_input_price_per_token = 0)
-                    AND (dm.upstream_output_price_per_token IS NULL OR dm.upstream_output_price_per_token = 0)
+                    -- A model is free if it has no active tariffs or all active tariffs are zero-priced
+                    NOT EXISTS (
+                        SELECT 1 FROM model_tariffs mt
+                        WHERE mt.deployed_model_id = dm.id
+                        AND mt.valid_until IS NULL
+                        AND (mt.input_price_per_token > 0 OR mt.output_price_per_token > 0)
+                    )
                 )
             )
             "#,

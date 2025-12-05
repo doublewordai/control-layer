@@ -1,6 +1,5 @@
 //! HTTP handlers for model deployment endpoints.
 
-use yansi::paint::Paint;
 use crate::{
     AppState,
     api::models::{
@@ -335,6 +334,10 @@ pub async fn update_deployed_model(
         Err(e) => return Err(e.into()),
     }
 
+    let db_request = DeploymentUpdateDBRequest::from(update);
+    let model = repo.update(deployment_id, &db_request).await?;
+
+
     // Handle tariff replacement if provided
     if let Some(tariff_defs) = &update.tariffs {
         use crate::db::{handlers::Tariffs, models::tariffs::TariffCreateDBRequest};
@@ -350,9 +353,9 @@ pub async fn update_deployed_model(
             "#,
             deployment_id
         )
-        .execute(&mut *tx)
-        .await
-        .map_err(|e| Error::Database(e.into()))?;
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| Error::Database(e.into()))?;
 
         // Create new tariffs
         for tariff_def in tariff_defs {
@@ -367,9 +370,6 @@ pub async fn update_deployed_model(
             tariffs_repo.create(&tariff_request).await?;
         }
     }
-
-    let db_request = DeploymentUpdateDBRequest::from(update);
-    let model = repo.update(deployment_id, &db_request).await?;
 
     tx.commit().await.map_err(|e| Error::Database(e.into()))?;
 
