@@ -143,7 +143,7 @@ impl<'a> DeployedModelEnricher<'a> {
             // Tariffs query (only if pricing is requested and user can read pricing)
             async {
                 if self.include_pricing && self.can_read_pricing {
-                    use crate::{db::handlers::Tariffs, api::models::tariffs::TariffResponse};
+                    use crate::{api::models::tariffs::TariffResponse, db::handlers::Tariffs};
 
                     let mut tariffs_map: HashMap<DeploymentId, Vec<TariffResponse>> = HashMap::new();
 
@@ -152,10 +152,7 @@ impl<'a> DeployedModelEnricher<'a> {
                         let mut tariffs_repo = Tariffs::new(&mut tariffs_conn);
 
                         if let Ok(tariffs) = tariffs_repo.list_current_by_model(*model_id).await {
-                            tariffs_map.insert(
-                                *model_id,
-                                tariffs.into_iter().map(TariffResponse::from).collect()
-                            );
+                            tariffs_map.insert(*model_id, tariffs.into_iter().map(TariffResponse::from).collect());
                         }
                     }
 
@@ -326,10 +323,7 @@ impl<'a> DeployedModelEnricher<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{
-        api::models::deployments::ModelMetrics,
-        db::models::groups::GroupDBResponse,
-    };
+    use crate::{api::models::deployments::ModelMetrics, db::models::groups::GroupDBResponse};
     use chrono::Utc;
     use std::collections::HashMap;
     use uuid::Uuid;

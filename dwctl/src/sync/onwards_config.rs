@@ -571,10 +571,7 @@ async fn update_daemon_capacity_limits(db: &PgPool, limits: &Arc<dashmap::DashMa
 mod tests {
     use std::{str::FromStr, time::Duration};
 
-    use tokio::{
-        sync::mpsc,
-        time::timeout,
-    };
+    use tokio::{sync::mpsc, time::timeout};
     use tokio_util::sync::CancellationToken;
     use uuid::Uuid;
 
@@ -639,15 +636,13 @@ mod tests {
     #[sqlx::test]
     /// Test that tariff changes trigger onwards config reload via Postgres NOTIFY
     async fn test_onwards_config_reloads_on_tariff_change(pool: sqlx::PgPool) {
+        use crate::Role;
         use crate::db::handlers::{Deployments, InferenceEndpoints, Repository, Tariffs};
         use crate::db::models::{
-            deployments::DeploymentCreateDBRequest,
-            inference_endpoints::InferenceEndpointCreateDBRequest,
-            tariffs::TariffCreateDBRequest,
+            deployments::DeploymentCreateDBRequest, inference_endpoints::InferenceEndpointCreateDBRequest, tariffs::TariffCreateDBRequest,
         };
         use rust_decimal::Decimal;
         use sqlx::postgres::PgListener;
-        use crate::Role;
 
         // Create test user
         let test_user = crate::test_utils::create_test_user(&pool, Role::StandardUser).await;

@@ -4,9 +4,7 @@ pub mod enrichment;
 
 use super::pagination::Pagination;
 use crate::api::models::groups::GroupResponse;
-use crate::db::models::deployments::{
-    DeploymentDBResponse, ModelType, ProviderPricing, ProviderPricingUpdate,
-};
+use crate::db::models::deployments::{DeploymentDBResponse, ModelType, ProviderPricing, ProviderPricingUpdate};
 use crate::types::{DeploymentId, InferenceEndpointId, UserId};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
@@ -233,12 +231,12 @@ impl From<DeploymentDBResponse> for DeployedModelResponse {
             burst_size: db.burst_size,
             capacity: db.capacity,
             batch_capacity: db.batch_capacity,
-            groups: None,             // By default, relationships are not included
-            metrics: None,            // By default, metrics are not included
-            status: None,             // By default, probe status is not included
-            provider_pricing: None,   // By default, provider pricing is not included
-            endpoint: None,           // By default, endpoint is not included
-            tariffs: None,            // By default, tariffs are not included
+            groups: None,           // By default, relationships are not included
+            metrics: None,          // By default, metrics are not included
+            status: None,           // By default, probe status is not included
+            provider_pricing: None, // By default, provider pricing is not included
+            endpoint: None,         // By default, endpoint is not included
+            tariffs: None,          // By default, tariffs are not included
         }
     }
 }

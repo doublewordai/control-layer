@@ -176,10 +176,17 @@ impl<'c> Repository for Deployments<'c> {
         });
 
         // Extract provider pricing fields
-        let (downstream_pricing_mode, downstream_input_price_per_token, downstream_output_price_per_token, downstream_hourly_rate, downstream_input_token_cost_ratio) =
-            request.provider_pricing.as_ref()
-                .map(|p| p.to_flat_fields())
-                .unwrap_or((None, None, None, None, None));
+        let (
+            downstream_pricing_mode,
+            downstream_input_price_per_token,
+            downstream_output_price_per_token,
+            downstream_hourly_rate,
+            downstream_input_token_cost_ratio,
+        ) = request
+            .provider_pricing
+            .as_ref()
+            .map(|p| p.to_flat_fields())
+            .unwrap_or((None, None, None, None, None));
 
         let model = sqlx::query_as!(
             DeployedModel,
@@ -312,11 +319,7 @@ impl<'c> Repository for Deployments<'c> {
         let capabilities_slice: Option<&[String]> = request.capabilities.as_ref().and_then(|inner| inner.as_ref().map(|v| v.as_slice()));
 
         // Extract provider pricing update information
-        let pricing_params = request
-            .provider_pricing
-            .as_ref()
-            .map(|p| p.to_update_params())
-            .unwrap_or_default();
+        let pricing_params = request.provider_pricing.as_ref().map(|p| p.to_update_params()).unwrap_or_default();
 
         // Info logging for rate limiting
         tracing::info!(

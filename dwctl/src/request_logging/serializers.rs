@@ -372,9 +372,9 @@ pub async fn store_analytics_record(
         Auth::None => (None, None, AccessSource::Unauthenticated),
     };
 
-    // Get model ID, tariff pricing, and provider name
+    // Get tariff pricing and provider name
     // Use request_model for lookup since that's what the user specified
-    let (model_id, tariff_pricing, provider_name) = if let Some(model_name) = &metrics.request_model {
+    let (tariff_pricing, provider_name) = if let Some(model_name) = &metrics.request_model {
         let model_info = sqlx::query!(
             r#"
             SELECT
@@ -396,34 +396,34 @@ pub async fn store_analytics_record(
             use crate::db::handlers::Tariffs;
             let mut conn = pool.acquire().await?;
             let mut tariffs_repo = Tariffs::new(&mut conn);
-            let tariff_pricing = tariffs_repo.get_pricing_at_timestamp(
-                model_info.model_id,
-                "batch",
-                metrics.timestamp
-            ).await.map_err(|e| match e {
-                crate::db::errors::DbError::NotFound => sqlx::Error::RowNotFound,
-                crate::db::errors::DbError::Other(anyhow_err) => {
-                    // Try to downcast to sqlx::Error
-                    match anyhow_err.downcast::<sqlx::Error>() {
-                        Ok(sqlx_err) => sqlx_err,
-                        Err(other_err) => sqlx::Error::Configuration(other_err.to_string().into()),
+            let tariff_pricing = tariffs_repo
+                .get_pricing_at_timestamp(model_info.model_id, "batch", metrics.timestamp)
+                .await
+                .map_err(|e| match e {
+                    crate::db::errors::DbError::NotFound => sqlx::Error::RowNotFound,
+                    crate::db::errors::DbError::Other(anyhow_err) => {
+                        // Try to downcast to sqlx::Error
+                        match anyhow_err.downcast::<sqlx::Error>() {
+                            Ok(sqlx_err) => sqlx_err,
+                            Err(other_err) => sqlx::Error::Configuration(other_err.to_string().into()),
+                        }
                     }
-                }
-                _ => sqlx::Error::Configuration(e.to_string().into()),
-            })?;
+                    _ => sqlx::Error::Configuration(e.to_string().into()),
+                })?;
 
-            let provider_name = model_info.provider_url
+            let provider_name = model_info
+                .provider_url
                 .as_ref()
                 .and_then(|url| map_url_to_otel_provider(url))
                 .map(|s| s.to_string())
                 .or(model_info.provider_name);
 
-            (Some(model_info.model_id), tariff_pricing, provider_name)
+            (tariff_pricing, provider_name)
         } else {
-            (None, None, None)
+            (None, None)
         }
     } else {
-        (None, None, None)
+        (None, None)
     };
 
     // Use tariff pricing if available, otherwise fall back to header pricing (for backwards compatibility)

@@ -2499,14 +2499,17 @@ mod tests {
             use crate::db::handlers::Tariffs;
             use crate::db::models::tariffs::TariffCreateDBRequest;
             let mut tariffs_repo = Tariffs::new(deployment_tx.acquire().await.unwrap());
-            tariffs_repo.create(&TariffCreateDBRequest {
-                deployed_model_id: deployment.id,
-                name: "default".to_string(),
-                input_price_per_token: Decimal::new(1, 6),  // $0.000001 per token
-                output_price_per_token: Decimal::new(2, 6), // $0.000002 per token
-                is_default: true,
-                valid_from: None,
-            }).await.unwrap();
+            tariffs_repo
+                .create(&TariffCreateDBRequest {
+                    deployed_model_id: deployment.id,
+                    name: "default".to_string(),
+                    input_price_per_token: Decimal::new(1, 6),  // $0.000001 per token
+                    output_price_per_token: Decimal::new(2, 6), // $0.000002 per token
+                    is_default: true,
+                    valid_from: None,
+                })
+                .await
+                .unwrap();
 
             deployment_tx.commit().await.unwrap();
         }
@@ -2607,14 +2610,17 @@ mod tests {
             use crate::db::handlers::Tariffs;
             use crate::db::models::tariffs::TariffCreateDBRequest;
             let mut tariffs_repo = Tariffs::new(deployment_tx.acquire().await.unwrap());
-            tariffs_repo.create(&TariffCreateDBRequest {
-                deployed_model_id: deployment.id,
-                name: "default".to_string(),
-                input_price_per_token: Decimal::new(1, 6),  // $0.000001 per token
-                output_price_per_token: Decimal::new(2, 6), // $0.000002 per token
-                is_default: true,
-                valid_from: None,
-            }).await.unwrap();
+            tariffs_repo
+                .create(&TariffCreateDBRequest {
+                    deployed_model_id: deployment.id,
+                    name: "default".to_string(),
+                    input_price_per_token: Decimal::new(1, 6),  // $0.000001 per token
+                    output_price_per_token: Decimal::new(2, 6), // $0.000002 per token
+                    is_default: true,
+                    valid_from: None,
+                })
+                .await
+                .unwrap();
 
             deployment_tx.commit().await.unwrap();
         }
@@ -3253,14 +3259,17 @@ mod tests {
             use crate::db::handlers::Tariffs;
             use crate::db::models::tariffs::TariffCreateDBRequest;
             let mut tariffs_repo = Tariffs::new(deployment_tx.acquire().await.unwrap());
-            tariffs_repo.create(&TariffCreateDBRequest {
-                deployed_model_id: deployment.id,
-                name: "default".to_string(),
-                input_price_per_token: Decimal::new(1, 6),  // $0.000001 per token
-                output_price_per_token: Decimal::new(2, 6), // $0.000002 per token
-                is_default: true,
-                valid_from: None,
-            }).await.unwrap();
+            tariffs_repo
+                .create(&TariffCreateDBRequest {
+                    deployed_model_id: deployment.id,
+                    name: "default".to_string(),
+                    input_price_per_token: Decimal::new(1, 6),  // $0.000001 per token
+                    output_price_per_token: Decimal::new(2, 6), // $0.000002 per token
+                    is_default: true,
+                    valid_from: None,
+                })
+                .await
+                .unwrap();
 
             deployment_tx.commit().await.unwrap();
         }
@@ -3385,14 +3394,17 @@ mod tests {
             use crate::db::handlers::Tariffs;
             use crate::db::models::tariffs::TariffCreateDBRequest;
             let mut tariffs_repo = Tariffs::new(deployment_tx.acquire().await.unwrap());
-            tariffs_repo.create(&TariffCreateDBRequest {
-                deployed_model_id: deployment.id,
-                name: "free".to_string(),
-                input_price_per_token: Decimal::ZERO,
-                output_price_per_token: Decimal::ZERO,
-                is_default: true,
-                valid_from: None,
-            }).await.unwrap();
+            tariffs_repo
+                .create(&TariffCreateDBRequest {
+                    deployed_model_id: deployment.id,
+                    name: "free".to_string(),
+                    input_price_per_token: Decimal::ZERO,
+                    output_price_per_token: Decimal::ZERO,
+                    is_default: true,
+                    valid_from: None,
+                })
+                .await
+                .unwrap();
 
             deployment_tx.commit().await.unwrap();
         }

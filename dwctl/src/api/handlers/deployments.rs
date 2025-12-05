@@ -175,11 +175,7 @@ pub async fn list_deployed_models(
     let models: Vec<DeployedModelResponse> = filtered_models
         .into_iter()
         .map(|model| {
-            let provider_pricing = if can_read_pricing {
-                model.provider_pricing.clone()
-            } else {
-                None
-            };
+            let provider_pricing = if can_read_pricing { model.provider_pricing.clone() } else { None };
             DeployedModelResponse::from(model).with_provider_pricing(provider_pricing)
         })
         .collect();
@@ -328,7 +324,6 @@ pub async fn update_deployed_model(
     let tariffs = update.tariffs.clone();
     let db_request = DeploymentUpdateDBRequest::from(update);
     let model = repo.update(deployment_id, &db_request).await?;
-
 
     // Handle tariff replacement if provided
     if let Some(tariff_defs) = tariffs {

@@ -46,14 +46,13 @@ impl ProviderPricing {
         input_token_cost_ratio: Option<Decimal>,
     ) -> Option<Self> {
         match mode.as_deref() {
-            Some(MODE_HOURLY) => {
-                match (hourly_rate, input_token_cost_ratio) {
-                    (Some(rate), Some(input_token_cost_ratio)) => {
-                        Some(ProviderPricing::Hourly { rate, input_token_cost_ratio })
-                    }
-                    _ => None,
-                }
-            }
+            Some(MODE_HOURLY) => match (hourly_rate, input_token_cost_ratio) {
+                (Some(rate), Some(input_token_cost_ratio)) => Some(ProviderPricing::Hourly {
+                    rate,
+                    input_token_cost_ratio,
+                }),
+                _ => None,
+            },
             Some(MODE_PER_TOKEN) => Some(ProviderPricing::PerToken {
                 input_price_per_token,
                 output_price_per_token,
@@ -63,15 +62,7 @@ impl ProviderPricing {
     }
 
     /// Convert structured provider pricing to flat database fields
-    pub fn to_flat_fields(
-        &self,
-    ) -> (
-        Option<String>,
-        Option<Decimal>,
-        Option<Decimal>,
-        Option<Decimal>,
-        Option<Decimal>,
-    ) {
+    pub fn to_flat_fields(&self) -> (Option<String>, Option<Decimal>, Option<Decimal>, Option<Decimal>, Option<Decimal>) {
         match self {
             ProviderPricing::PerToken {
                 input_price_per_token,
