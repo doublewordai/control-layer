@@ -5,6 +5,7 @@ use crate::db::{
     handlers::repository::Repository,
     models::deployments::{
         DeploymentCreateDBRequest, DeploymentDBResponse, DeploymentUpdateDBRequest, ModelStatus, ModelType, ProviderPricing,
+        ProviderPricingFields,
     },
 };
 use crate::types::{DeploymentId, InferenceEndpointId, UserId, abbrev_uuid};
@@ -116,13 +117,13 @@ pub struct Deployments<'c> {
 
 impl From<(Option<ModelType>, DeployedModel)> for DeploymentDBResponse {
     fn from((model_type, m): (Option<ModelType>, DeployedModel)) -> Self {
-        let provider_pricing = ProviderPricing::from_flat_fields(
-            m.downstream_pricing_mode,
-            m.downstream_input_price_per_token,
-            m.downstream_output_price_per_token,
-            m.downstream_hourly_rate,
-            m.downstream_input_token_cost_ratio,
-        );
+        let provider_pricing = ProviderPricing::from_flat_fields(ProviderPricingFields {
+            mode: m.downstream_pricing_mode,
+            input_price_per_token: m.downstream_input_price_per_token,
+            output_price_per_token: m.downstream_output_price_per_token,
+            hourly_rate: m.downstream_hourly_rate,
+            input_token_cost_ratio: m.downstream_input_token_cost_ratio,
+        });
 
         Self {
             id: m.id,
@@ -176,17 +177,7 @@ impl<'c> Repository for Deployments<'c> {
         });
 
         // Extract provider pricing fields
-        let (
-            downstream_pricing_mode,
-            downstream_input_price_per_token,
-            downstream_output_price_per_token,
-            downstream_hourly_rate,
-            downstream_input_token_cost_ratio,
-        ) = request
-            .provider_pricing
-            .as_ref()
-            .map(|p| p.to_flat_fields())
-            .unwrap_or((None, None, None, None, None));
+        let pricing_fields = request.provider_pricing.as_ref().map(|p| p.to_flat_fields()).unwrap_or_default();
 
         let model = sqlx::query_as!(
             DeployedModel,
@@ -213,11 +204,11 @@ impl<'c> Repository for Deployments<'c> {
             request.burst_size,
             request.capacity,
             request.batch_capacity,
-            downstream_pricing_mode,
-            downstream_input_price_per_token,
-            downstream_output_price_per_token,
-            downstream_hourly_rate,
-            downstream_input_token_cost_ratio
+            pricing_fields.mode,
+            pricing_fields.input_price_per_token,
+            pricing_fields.output_price_per_token,
+            pricing_fields.hourly_rate,
+            pricing_fields.input_token_cost_ratio
         )
         .fetch_one(&mut *self.db)
         .await?;

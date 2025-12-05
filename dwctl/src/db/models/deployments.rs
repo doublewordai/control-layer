@@ -36,17 +36,21 @@ pub enum ProviderPricing {
     },
 }
 
+/// Flat database fields for provider pricing
+#[derive(Debug, Clone, Default)]
+pub struct ProviderPricingFields {
+    pub mode: Option<String>,
+    pub input_price_per_token: Option<Decimal>,
+    pub output_price_per_token: Option<Decimal>,
+    pub hourly_rate: Option<Decimal>,
+    pub input_token_cost_ratio: Option<Decimal>,
+}
+
 impl ProviderPricing {
     /// Convert flat database fields to structured provider pricing
-    pub fn from_flat_fields(
-        mode: Option<String>,
-        input_price_per_token: Option<Decimal>,
-        output_price_per_token: Option<Decimal>,
-        hourly_rate: Option<Decimal>,
-        input_token_cost_ratio: Option<Decimal>,
-    ) -> Option<Self> {
-        match mode.as_deref() {
-            Some(MODE_HOURLY) => match (hourly_rate, input_token_cost_ratio) {
+    pub fn from_flat_fields(fields: ProviderPricingFields) -> Option<Self> {
+        match fields.mode.as_deref() {
+            Some(MODE_HOURLY) => match (fields.hourly_rate, fields.input_token_cost_ratio) {
                 (Some(rate), Some(input_token_cost_ratio)) => Some(ProviderPricing::Hourly {
                     rate,
                     input_token_cost_ratio,
@@ -54,36 +58,36 @@ impl ProviderPricing {
                 _ => None,
             },
             Some(MODE_PER_TOKEN) => Some(ProviderPricing::PerToken {
-                input_price_per_token,
-                output_price_per_token,
+                input_price_per_token: fields.input_price_per_token,
+                output_price_per_token: fields.output_price_per_token,
             }),
             _ => None,
         }
     }
 
     /// Convert structured provider pricing to flat database fields
-    pub fn to_flat_fields(&self) -> (Option<String>, Option<Decimal>, Option<Decimal>, Option<Decimal>, Option<Decimal>) {
+    pub fn to_flat_fields(&self) -> ProviderPricingFields {
         match self {
             ProviderPricing::PerToken {
                 input_price_per_token,
                 output_price_per_token,
-            } => (
-                Some(MODE_PER_TOKEN.to_string()),
-                *input_price_per_token,
-                *output_price_per_token,
-                None,
-                None,
-            ),
+            } => ProviderPricingFields {
+                mode: Some(MODE_PER_TOKEN.to_string()),
+                input_price_per_token: *input_price_per_token,
+                output_price_per_token: *output_price_per_token,
+                hourly_rate: None,
+                input_token_cost_ratio: None,
+            },
             ProviderPricing::Hourly {
                 rate,
                 input_token_cost_ratio,
-            } => (
-                Some(MODE_HOURLY.to_string()),
-                None,
-                None,
-                Some(*rate),
-                Some(*input_token_cost_ratio),
-            ),
+            } => ProviderPricingFields {
+                mode: Some(MODE_HOURLY.to_string()),
+                input_price_per_token: None,
+                output_price_per_token: None,
+                hourly_rate: Some(*rate),
+                input_token_cost_ratio: Some(*input_token_cost_ratio),
+            },
         }
     }
 }

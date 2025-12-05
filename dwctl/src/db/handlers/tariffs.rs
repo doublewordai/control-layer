@@ -142,11 +142,11 @@ impl<'c> Tariffs<'c> {
         .await?;
 
         // Step 2: If current tariff exists and request is after its valid_from, use it
-        if let Some(current) = current_tariff {
-            if timestamp >= current.valid_from {
-                // Fast path - use current pricing
-                return Ok(Some((current.input_price_per_token, current.output_price_per_token)));
-            }
+        if let Some(current) = current_tariff
+            && timestamp >= current.valid_from
+        {
+            // Fast path - use current pricing
+            return Ok(Some((current.input_price_per_token, current.output_price_per_token)));
         }
 
         // Step 3: Either no current tariff exists, or request is older than current tariff
