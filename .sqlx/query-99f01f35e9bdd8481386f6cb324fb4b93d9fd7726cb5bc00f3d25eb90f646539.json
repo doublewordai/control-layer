@@ -1,0 +1,79 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n            UPDATE model_tariffs\n            SET input_price_per_token = COALESCE($2, input_price_per_token),\n                output_price_per_token = COALESCE($3, output_price_per_token),\n                is_default = COALESCE($4, is_default),\n                updated_at = NOW()\n            WHERE id = $1\n            RETURNING id, deployed_model_id, name, input_price_per_token, output_price_per_token,\n                      is_default, valid_from, valid_until, created_at, updated_at\n            ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "id",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 1,
+        "name": "deployed_model_id",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 2,
+        "name": "name",
+        "type_info": "Varchar"
+      },
+      {
+        "ordinal": 3,
+        "name": "input_price_per_token",
+        "type_info": "Numeric"
+      },
+      {
+        "ordinal": 4,
+        "name": "output_price_per_token",
+        "type_info": "Numeric"
+      },
+      {
+        "ordinal": 5,
+        "name": "is_default",
+        "type_info": "Bool"
+      },
+      {
+        "ordinal": 6,
+        "name": "valid_from",
+        "type_info": "Timestamptz"
+      },
+      {
+        "ordinal": 7,
+        "name": "valid_until",
+        "type_info": "Timestamptz"
+      },
+      {
+        "ordinal": 8,
+        "name": "created_at",
+        "type_info": "Timestamptz"
+      },
+      {
+        "ordinal": 9,
+        "name": "updated_at",
+        "type_info": "Timestamptz"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Numeric",
+        "Numeric",
+        "Bool"
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      true,
+      false,
+      false
+    ]
+  },
+  "hash": "99f01f35e9bdd8481386f6cb324fb4b93d9fd7726cb5bc00f3d25eb90f646539"
+}
