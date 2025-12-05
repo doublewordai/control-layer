@@ -155,7 +155,7 @@ describe("Requests Component", () => {
     });
 
     // Should show Analytics tab by default (due to user permissions)
-    expect(screen.getByRole("tab", { name: /analytics/i })).toHaveAttribute(
+    expect(screen.getByRole("tab", { name: /dashboard/i })).toHaveAttribute(
       "aria-selected",
       "true",
     );
