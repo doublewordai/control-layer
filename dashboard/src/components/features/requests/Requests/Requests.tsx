@@ -32,10 +32,13 @@ export function Requests() {
     { from: Date; to: Date } | undefined
   >(getDefaultDateRange());
 
-  // Server-side pagination
+  // Server-side pagination with hasMore detection
   const pagination = useServerPagination({
-    defaultPageSize: 50,
+    defaultPageSize: 25,
   });
+
+  // Query for limit + 1 to detect if there are more items
+  const queryLimit = pagination.pageSize + 1;
 
   // Check user permissions
   const hasAnalyticsPermission = userRoles.some(
@@ -88,6 +91,7 @@ export function Requests() {
 
   // Fetch requests data only if user has requests permission AND requests tab is active
   // MSW will intercept these calls in demo mode
+  // Query for limit + 1 to detect if there are more pages
   const {
     data: requestsResponse,
     isLoading: requestsLoading,
@@ -95,7 +99,7 @@ export function Requests() {
   } = useRequests(
     {
       skip: pagination.queryParams.skip,
-      limit: pagination.queryParams.limit,
+      limit: queryLimit,
       order_desc: true,
     },
     { enabled: hasRequestsPermission && activeTab === "requests" },
@@ -111,17 +115,26 @@ export function Requests() {
   const error = requestsError;
 
   // Transform backend data to frontend format
-  const allRequests = requestsResponse
-    ? transformRequestResponsePairs(requestsResponse.data)
+  const allRequestsRaw = requestsResponse
+    ? transformRequestResponsePairs(requestsResponse.requests)
     : [];
+
+  // Check if there are more items (we queried for limit + 1)
+  const hasMore = allRequestsRaw.length > pagination.pageSize;
+
+  // Remove the extra item if we got it
+  const allRequests = hasMore
+    ? allRequestsRaw.slice(0, pagination.pageSize)
+    : allRequestsRaw;
 
   // Filter requests by selected model
   const requests = selectedModel
     ? allRequests.filter((request) => request.model === selectedModel)
     : allRequests;
 
-  // Use total count from API response
-  const totalItems = requestsResponse?.total_count || 0;
+  // Calculate pagination state
+  const hasPrevPage = pagination.page > 1;
+  const hasNextPage = hasMore;
 
   const columns = createRequestColumns();
 
@@ -316,16 +329,21 @@ export function Requests() {
                 showColumnToggle={true}
                 rowHeight="40px"
                 initialColumnVisibility={{ timestamp: false }}
-                paginationMode="server"
+                paginationMode="server-cursor"
                 serverPagination={{
                   page: pagination.page,
                   pageSize: pagination.pageSize,
-                  totalItems: requestsResponse?.requests.length || 0,
-                  onPageChange: pagination.handlePageChange,
+                  onNextPage: () =>
+                    pagination.handlePageChange(pagination.page + 1),
+                  onPrevPage: () =>
+                    pagination.handlePageChange(pagination.page - 1),
+                  onFirstPage: () => pagination.handlePageChange(1),
                   onPageSizeChange: pagination.handlePageSizeChange,
+                  hasNextPage: hasNextPage,
+                  hasPrevPage: hasPrevPage,
                 }}
                 showPageSizeSelector={true}
-                pageSizeOptions={[10, 25, 50, 100, 200, 500]}
+                pageSizeOptions={[10, 25, 50]}
                 isLoading={requestsLoading}
               />
             )}
