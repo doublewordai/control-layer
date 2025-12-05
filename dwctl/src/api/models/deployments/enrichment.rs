@@ -561,19 +561,17 @@ mod tests {
         let mut tariffs_map = HashMap::new();
         tariffs_map.insert(
             model_id,
-            vec![
-                TariffResponse {
-                    id: Uuid::new_v4(),
-                    deployed_model_id: model_id,
-                    name: "Standard Tariff".to_string(),
-                    input_price_per_token: Decimal::from_str("0.001").unwrap(),
-                    output_price_per_token: Decimal::from_str("0.002").unwrap(),
-                    is_default: true,
-                    valid_from: Utc::now(),
-                    valid_until: None,
-                    is_active: true,
-                },
-            ],
+            vec![TariffResponse {
+                id: Uuid::new_v4(),
+                deployed_model_id: model_id,
+                name: "Standard Tariff".to_string(),
+                input_price_per_token: Decimal::from_str("0.001").unwrap(),
+                output_price_per_token: Decimal::from_str("0.002").unwrap(),
+                is_default: true,
+                valid_from: Utc::now(),
+                valid_until: None,
+                is_active: true,
+            }],
         );
 
         let result = DeployedModelEnricher::apply_tariffs(model, &Some(tariffs_map));
