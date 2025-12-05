@@ -640,8 +640,7 @@ impl<'c> Deployments<'c> {
         sqlx::query!(
             r#"
             UPDATE model_tariffs
-            SET valid_until = NOW(),
-                updated_at = NOW()
+            SET valid_until = NOW()
             WHERE deployed_model_id = $1 AND valid_until IS NULL
             "#,
             deployment_id

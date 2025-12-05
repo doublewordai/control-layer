@@ -12,8 +12,6 @@ CREATE TABLE model_tariffs (
     is_default BOOLEAN NOT NULL DEFAULT false,
     valid_from TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     valid_until TIMESTAMPTZ,
-    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
 
     -- Ensure tariff names are unique per model
     CONSTRAINT model_tariffs_model_name_unique UNIQUE (deployed_model_id, name)
@@ -45,12 +43,6 @@ SELECT
 FROM deployed_models
 WHERE upstream_input_price_per_token IS NOT NULL
    OR upstream_output_price_per_token IS NOT NULL;
-
--- Add trigger to update updated_at timestamp
-CREATE TRIGGER update_model_tariffs_updated_at
-    BEFORE UPDATE ON model_tariffs
-    FOR EACH ROW
-    EXECUTE FUNCTION update_updated_at_column();
 
 -- Notify onwards config when tariffs change
 CREATE OR REPLACE FUNCTION notify_onwards_config_on_tariff_change()

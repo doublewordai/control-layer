@@ -17,8 +17,6 @@ pub struct ModelTariff {
     pub is_default: bool,
     pub valid_from: DateTime<Utc>,
     pub valid_until: Option<DateTime<Utc>>,
-    pub created_at: DateTime<Utc>,
-    pub updated_at: DateTime<Utc>,
 }
 
 /// Request to create a new tariff

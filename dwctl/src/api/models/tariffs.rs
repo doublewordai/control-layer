@@ -24,8 +24,6 @@ pub struct TariffResponse {
     pub is_default: bool,
     pub valid_from: DateTime<Utc>,
     pub valid_until: Option<DateTime<Utc>>,
-    pub created_at: DateTime<Utc>,
-    pub updated_at: DateTime<Utc>,
     /// Indicates if this tariff is currently active (valid_until IS NULL)
     #[serde(default)]
     pub is_active: bool,
@@ -42,8 +40,6 @@ impl From<ModelTariff> for TariffResponse {
             is_default: tariff.is_default,
             valid_from: tariff.valid_from,
             valid_until: tariff.valid_until,
-            created_at: tariff.created_at,
-            updated_at: tariff.updated_at,
             is_active: tariff.valid_until.is_none(),
         }
     }

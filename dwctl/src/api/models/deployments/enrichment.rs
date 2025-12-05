@@ -548,4 +548,64 @@ mod tests {
         // Endpoints not requested, should remain None
         assert!(result.endpoint.is_none());
     }
+
+    #[test]
+    fn test_apply_tariffs_with_data() {
+        use crate::api::models::tariffs::TariffResponse;
+        use rust_decimal::Decimal;
+        use std::str::FromStr;
+
+        let model = create_test_model();
+        let model_id = model.id;
+
+        let mut tariffs_map = HashMap::new();
+        tariffs_map.insert(
+            model_id,
+            vec![
+                TariffResponse {
+                    id: Uuid::new_v4(),
+                    deployed_model_id: model_id,
+                    name: "Standard Tariff".to_string(),
+                    input_price_per_token: Decimal::from_str("0.001").unwrap(),
+                    output_price_per_token: Decimal::from_str("0.002").unwrap(),
+                    is_default: true,
+                    valid_from: Utc::now(),
+                    valid_until: None,
+                    is_active: true,
+                },
+            ],
+        );
+
+        let result = DeployedModelEnricher::apply_tariffs(model, &Some(tariffs_map));
+
+        // Tariffs should be applied
+        assert!(result.tariffs.is_some());
+        let tariffs = result.tariffs.unwrap();
+        assert_eq!(tariffs.len(), 1);
+        assert_eq!(tariffs[0].name, "Standard Tariff");
+        assert_eq!(tariffs[0].input_price_per_token, Decimal::from_str("0.001").unwrap());
+        assert_eq!(tariffs[0].output_price_per_token, Decimal::from_str("0.002").unwrap());
+        assert_eq!(tariffs[0].is_default, true);
+    }
+
+    #[test]
+    fn test_apply_tariffs_no_data() {
+        let model = create_test_model();
+        let tariffs_map = HashMap::new();
+
+        let result = DeployedModelEnricher::apply_tariffs(model, &Some(tariffs_map));
+
+        // No tariffs for this model, should remain None
+        assert!(result.tariffs.is_none());
+    }
+
+    #[test]
+    fn test_apply_tariffs_not_requested() {
+        let model = create_test_model();
+
+        let result = DeployedModelEnricher::apply_tariffs(model, &None);
+
+        // Tariffs not requested, should remain None
+        assert!(result.tariffs.is_none());
+    }
 }
