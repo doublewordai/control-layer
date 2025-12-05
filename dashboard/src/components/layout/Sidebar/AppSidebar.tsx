@@ -245,12 +245,15 @@ export function AppLayout({ children }: { children: React.ReactNode }) {
                     </span>
                   </div>
                   <div className="hidden lg:block w-px h-4 bg-border"></div>
-                  <div className="flex items-center gap-2 text-sm">
+                  <Link
+                    to="/cost-management"
+                    className="flex items-center gap-2 text-sm hover:text-primary transition-colors"
+                  >
                     <span className="text-gray-600">Balance:</span>
                     <span className="font-semibold text-gray-900">
                       {formatDollars(currentBalance)}
                     </span>
-                  </div>
+                  </Link>
                   <div className="hidden md:block w-px h-4 bg-border"></div>
                 </>
               )}
