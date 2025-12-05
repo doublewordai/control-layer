@@ -87,9 +87,24 @@ export function UploadFileModal({
       const selectedFile = e.target.files[0];
       if (selectedFile.name.endsWith(".jsonl")) {
         setFile(selectedFile);
+        setError(null);
       } else {
         setError("Please upload a .jsonl file");
       }
+    }
+  };
+
+  const handleRemoveFile = (e: React.MouseEvent) => {
+    e.preventDefault();
+    e.stopPropagation();
+    setFile(null);
+    setError(null);
+    // Reset the file input element
+    const fileInput = document.getElementById(
+      "file-upload",
+    ) as HTMLInputElement;
+    if (fileInput) {
+      fileInput.value = "";
     }
   };
 
@@ -159,13 +174,15 @@ export function UploadFileModal({
             onDragOver={handleDrag}
             onDrop={handleDrop}
           >
-            <input
-              type="file"
-              id="file-upload"
-              accept=".jsonl"
-              onChange={handleFileChange}
-              className="absolute inset-0 w-full h-full opacity-0 cursor-pointer"
-            />
+            {!file && (
+              <input
+                type="file"
+                id="file-upload"
+                accept=".jsonl"
+                onChange={handleFileChange}
+                className="absolute inset-0 w-full h-full opacity-0 cursor-pointer"
+              />
+            )}
 
             {file ? (
               <div className="space-y-2">
@@ -180,10 +197,7 @@ export function UploadFileModal({
                   type="button"
                   variant="ghost"
                   size="sm"
-                  onClick={(e) => {
-                    e.stopPropagation();
-                    setFile(null);
-                  }}
+                  onClick={handleRemoveFile}
                   className="text-red-600 hover:text-red-700 hover:bg-red-50"
                 >
                   <X className="w-4 h-4 mr-1" />

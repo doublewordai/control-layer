@@ -396,7 +396,7 @@ export function TransactionHistory({
                         }`}
                       >
                         {isCredit ? "+" : "-"}
-                        {formatDollars(transaction.amount)}
+                        {formatDollars(transaction.amount, 9)}
                       </p>
                     </TableCell>
                     <TableCell className="text-right">

@@ -10,6 +10,8 @@ import {
   DialogFooter,
 } from "../../ui/dialog";
 import { Button } from "../../ui/button";
+import { TablePagination } from "../../ui/table-pagination";
+import { useServerPagination } from "../../../hooks/useServerPagination";
 import {
   useUsers,
   useAddUserToGroup,
@@ -32,11 +34,18 @@ export const GroupManagementModal: React.FC<GroupManagementModalProps> = ({
 }) => {
   const [error, setError] = useState<string | null>(null);
 
+  // Pagination hook
+  const pagination = useServerPagination({
+    paramPrefix: "groupModal",
+    defaultPageSize: 20,
+  });
+
   // Fetch all users data
   // Only fetch when modal is open to avoid 403 errors for users without permission
   const { data: usersResponse, isLoading: loading } = useUsers({
     include: "groups",
     enabled: isOpen,
+    ...pagination.queryParams,
   });
 
   const users = useMemo(() => usersResponse?.data || [], [usersResponse]);
@@ -50,6 +59,13 @@ export const GroupManagementModal: React.FC<GroupManagementModalProps> = ({
       setError(null);
     }
   }, [isOpen, group.name, users]);
+
+  // Clean up pagination URL parameters when modal closes
+  const handleClose = () => {
+    // Clear pagination params from URL
+    pagination.handleClear();
+    onClose();
+  };
 
   // Check if user is in this group (use current users data, not static group prop)
   const isUserInGroup = (userId: string): boolean => {
@@ -95,7 +111,7 @@ export const GroupManagementModal: React.FC<GroupManagementModalProps> = ({
   };
 
   return (
-    <Dialog open={isOpen} onOpenChange={onClose}>
+    <Dialog open={isOpen} onOpenChange={handleClose}>
       <DialogContent className="sm:max-w-2xl max-h-[80vh] overflow-hidden">
         <DialogHeader>
           <DialogTitle>Manage Group Members</DialogTitle>
@@ -186,10 +202,21 @@ export const GroupManagementModal: React.FC<GroupManagementModalProps> = ({
               )}
             </div>
           )}
+
+          {/* Pagination */}
+          {usersResponse && usersResponse.total_count > 0 && (
+            <TablePagination
+              itemName="user"
+              itemsPerPage={pagination.pageSize}
+              currentPage={pagination.page}
+              onPageChange={pagination.handlePageChange}
+              totalItems={usersResponse.total_count}
+            />
+          )}
         </div>
 
         <DialogFooter>
-          <Button onClick={onClose} variant="outline">
+          <Button onClick={handleClose} variant="outline">
             Done
           </Button>
         </DialogFooter>
