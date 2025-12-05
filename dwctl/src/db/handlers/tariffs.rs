@@ -9,7 +9,7 @@ use crate::{
 };
 use chrono::{DateTime, Utc};
 use rust_decimal::Decimal;
-use sqlx::{PgConnection, PgPool};
+use sqlx::PgConnection;
 use tracing::instrument;
 use uuid::Uuid;
 

@@ -20,7 +20,7 @@ pub enum SyncStatus {
 }
 
 use crate::{
-    config::{ONWARDS_CONFIG_CHANGED_CHANNEL, ONWARDS_INPUT_TOKEN_PRICE_HEADER, ONWARDS_OUTPUT_TOKEN_PRICE_HEADER},
+    config::ONWARDS_CONFIG_CHANGED_CHANNEL,
     types::{ApiKeyId, DeploymentId},
 };
 
@@ -34,8 +34,6 @@ struct OnwardsTarget {
     requests_per_second: Option<f32>,
     burst_size: Option<i32>,
     capacity: Option<i32>,
-    upstream_input_price_per_token: Option<rust_decimal::Decimal>,
-    upstream_output_price_per_token: Option<rust_decimal::Decimal>,
 
     // Endpoint info
     endpoint_url: url::Url,
@@ -259,8 +257,6 @@ pub async fn load_targets_from_db(db: &PgPool) -> Result<Targets, anyhow::Error>
             dm.requests_per_second as deployment_requests_per_second,
             dm.burst_size as deployment_burst_size,
             dm.capacity,
-            dm.upstream_input_price_per_token,
-            dm.upstream_output_price_per_token,
             -- Endpoint fields (only what we need)
             ie.id as endpoint_id,
             ie.url as "endpoint_url!",
@@ -309,9 +305,13 @@ pub async fn load_targets_from_db(db: &PgPool) -> Result<Targets, anyhow::Error>
                     WHERE lb.user_id = ak.user_id AND lb.balance_after > 0
                 )
                 OR (
-                    -- Free model check
-                    (dm.upstream_input_price_per_token IS NULL OR dm.upstream_input_price_per_token = 0)
-                    AND (dm.upstream_output_price_per_token IS NULL OR dm.upstream_output_price_per_token = 0)
+                    -- Free model check: no active tariffs with pricing
+                    NOT EXISTS (
+                        SELECT 1 FROM model_tariffs mt
+                        WHERE mt.deployed_model_id = dm.id
+                          AND mt.valid_until IS NULL
+                          AND (mt.input_price_per_token > 0 OR mt.output_price_per_token > 0)
+                    )
                 )
             )
         ) ak ON true
@@ -352,8 +352,6 @@ pub async fn load_targets_from_db(db: &PgPool) -> Result<Targets, anyhow::Error>
             requests_per_second: row.deployment_requests_per_second,
             burst_size: row.deployment_burst_size,
             capacity: row.capacity,
-            upstream_input_price_per_token: row.upstream_input_price_per_token,
-            upstream_output_price_per_token: row.upstream_output_price_per_token,
             endpoint_url: url::Url::parse(&row.endpoint_url).expect("Invalid URL in database"),
             endpoint_api_key: row.endpoint_api_key.clone(),
             auth_header_name: row.auth_header_name.clone(),
@@ -501,20 +499,7 @@ fn convert_to_config_file(targets: Vec<OnwardsTarget>) -> ConfigFile {
                 }
             });
 
-            // Convert pricing to response headers
-            let response_headers = if target.upstream_input_price_per_token.is_some() || target.upstream_output_price_per_token.is_some() {
-                let mut headers = HashMap::new();
-                if let Some(price) = target.upstream_input_price_per_token {
-                    headers.insert(ONWARDS_INPUT_TOKEN_PRICE_HEADER.to_string(), price.to_string());
-                }
-                if let Some(price) = target.upstream_output_price_per_token {
-                    headers.insert(ONWARDS_OUTPUT_TOKEN_PRICE_HEADER.to_string(), price.to_string());
-                }
-                Some(headers)
-            } else {
-                None
-            };
-
+            // Note: Pricing is now handled via tariffs, not response headers
             let target_spec = TargetSpec {
                 url: target.endpoint_url.clone(),
                 keys,
@@ -524,7 +509,7 @@ fn convert_to_config_file(targets: Vec<OnwardsTarget>) -> ConfigFile {
                 concurrency_limit,
                 upstream_auth_header_name,
                 upstream_auth_header_prefix,
-                response_headers,
+                response_headers: None,
             };
 
             (target.alias, target_spec)
@@ -587,7 +572,7 @@ mod tests {
     use std::{str::FromStr, time::Duration};
 
     use tokio::{
-        sync::{mpsc, watch},
+        sync::mpsc,
         time::timeout,
     };
     use tokio_util::sync::CancellationToken;
@@ -604,8 +589,6 @@ mod tests {
             requests_per_second: None,
             burst_size: None,
             capacity: None,
-            upstream_input_price_per_token: None,
-            upstream_output_price_per_token: None,
             endpoint_url: url::Url::parse(endpoint_url).unwrap(),
             endpoint_api_key: None,
             auth_header_name: "Authorization".to_string(),
@@ -654,156 +637,97 @@ mod tests {
     }
 
     #[sqlx::test]
-    #[test_log::test]
-    async fn test_pricing_update_triggers_notification_and_config_reload(pool: sqlx::PgPool) {
-        // Setup: Create user and endpoint
-        let user = crate::test_utils::create_test_user(&pool, crate::api::models::users::Role::StandardUser).await;
-
-        let endpoint_result = sqlx::query!(
-            r#"
-            INSERT INTO inference_endpoints (name, description, url, created_by)
-            VALUES ($1, $2, $3, $4)
-            RETURNING id
-            "#,
-            "test-endpoint",
-            "Test endpoint",
-            "http://localhost:8000",
-            user.id
-        )
-        .fetch_one(&pool)
-        .await
-        .expect("Failed to create endpoint");
-
-        // Create deployed_model with initial pricing
-        let original_input_price = rust_decimal::Decimal::from_str("0.00001").unwrap();
-        let original_output_price = rust_decimal::Decimal::from_str("0.00003").unwrap();
-
-        let model_result = sqlx::query!(
-            r#"
-            INSERT INTO deployed_models (
-                alias, model_name, created_by, hosted_on, status,
-                upstream_input_price_per_token, upstream_output_price_per_token
-            )
-            VALUES ($1, $2, $3, $4, 'active', $5, $6)
-            RETURNING id
-            "#,
-            "test-gpt-4",
-            "gpt-4",
-            user.id,
-            endpoint_result.id,
-            original_input_price,
-            original_output_price
-        )
-        .fetch_one(&pool)
-        .await
-        .expect("Failed to create deployed model");
-
-        // Create the OnwardsConfigSync with a custom watch channel to monitor changes
-        let initial_targets = super::load_targets_from_db(&pool).await.expect("Failed to load initial targets");
-        let (sender, mut receiver) = watch::channel(initial_targets.clone());
-
-        let shutdown_token = CancellationToken::new();
-        let _drop_guard = shutdown_token.clone().drop_guard();
-
-        let sync = super::OnwardsConfigSync {
-            db: pool.clone(),
-            sender,
-            daemon_capacity_limits: None,
+    /// Test that tariff changes trigger onwards config reload via Postgres NOTIFY
+    async fn test_onwards_config_reloads_on_tariff_change(pool: sqlx::PgPool) {
+        use crate::db::handlers::{Deployments, InferenceEndpoints, Repository, Tariffs};
+        use crate::db::models::{
+            deployments::DeploymentCreateDBRequest,
+            inference_endpoints::InferenceEndpointCreateDBRequest,
+            tariffs::TariffCreateDBRequest,
         };
+        use rust_decimal::Decimal;
+        use sqlx::postgres::PgListener;
+        use crate::Role;
 
-        // Verify initial pricing
-        let initial_target = initial_targets
-            .targets
-            .get("test-gpt-4")
-            .expect("Model should be in initial targets");
-        let initial_headers = initial_target
-            .response_headers
-            .as_ref()
-            .expect("Response headers should be present");
-        let initial_input_price = initial_headers
-            .get(crate::config::ONWARDS_INPUT_TOKEN_PRICE_HEADER)
-            .expect("Initial input price should be present");
+        // Create test user
+        let test_user = crate::test_utils::create_test_user(&pool, Role::StandardUser).await;
+
+        // Set up a listener to verify notifications are sent
+        let mut listener = PgListener::connect_with(&pool).await.unwrap();
+        listener.listen("auth_config_changed").await.unwrap();
+
+        // Create test endpoint
+        let mut endpoint_tx = pool.begin().await.unwrap();
+        let mut endpoints_repo = InferenceEndpoints::new(&mut endpoint_tx);
+        let endpoint = endpoints_repo
+            .create(&InferenceEndpointCreateDBRequest {
+                created_by: test_user.id,
+                name: "test-endpoint".to_string(),
+                description: None,
+                url: url::Url::from_str("https://api.test.com").unwrap(),
+                api_key: None,
+                model_filter: None,
+                auth_header_name: Some("Authorization".to_string()),
+                auth_header_prefix: Some("Bearer ".to_string()),
+            })
+            .await
+            .unwrap();
+        endpoint_tx.commit().await.unwrap();
+
+        // Create test deployment
+        let mut deployment_tx = pool.begin().await.unwrap();
+        let mut deployments_repo = Deployments::new(&mut deployment_tx);
+        let deployment = deployments_repo
+            .create(&DeploymentCreateDBRequest {
+                created_by: test_user.id,
+                model_name: "test-model".to_string(),
+                alias: "test-alias".to_string(),
+                description: None,
+                model_type: None,
+                capabilities: None,
+                hosted_on: endpoint.id,
+                requests_per_second: None,
+                burst_size: None,
+                capacity: None,
+                batch_capacity: None,
+                provider_pricing: None,
+            })
+            .await
+            .unwrap();
+        deployment_tx.commit().await.unwrap();
+
+        // Drain any pending notifications from setup
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        while timeout(Duration::from_millis(10), listener.try_recv()).await.is_ok() {
+            // Drain
+        }
+
+        // Now create a tariff - this should trigger a notification
+        let mut tariff_tx = pool.begin().await.unwrap();
+        let mut tariffs_repo = Tariffs::new(&mut tariff_tx);
+        tariffs_repo
+            .create(&TariffCreateDBRequest {
+                deployed_model_id: deployment.id,
+                name: "default".to_string(),
+                input_price_per_token: Decimal::new(1, 6),  // $0.000001
+                output_price_per_token: Decimal::new(2, 6), // $0.000002
+                is_default: true,
+                valid_from: None,
+            })
+            .await
+            .unwrap();
+        tariff_tx.commit().await.unwrap();
+
+        // Wait for notification
+        let notification = timeout(Duration::from_secs(2), listener.recv())
+            .await
+            .expect("Timeout waiting for tariff change notification")
+            .expect("Failed to receive notification");
+
+        // Verify notification contains tariff table reference
         assert!(
-            initial_input_price.starts_with("0.00001"),
-            "Initial config should have original input price, got: {}",
-            initial_input_price
-        );
-
-        // Start the sync task in the background
-        let (status_tx, _status_rx) = mpsc::channel(10);
-        let config = SyncConfig {
-            status_tx: Some(status_tx),
-        };
-        tokio::spawn(async move {
-            if let Err(e) = sync.start(config, shutdown_token).await {
-                eprintln!("Sync task failed: {}", e);
-            }
-        });
-
-        // Give the listener time to connect and start listening
-        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-
-        // Update the model's pricing
-        let new_input_price = rust_decimal::Decimal::from_str("0.00002").unwrap();
-        let new_output_price = rust_decimal::Decimal::from_str("0.00006").unwrap();
-
-        sqlx::query!(
-            r#"
-            UPDATE deployed_models
-            SET upstream_input_price_per_token = $1,
-                upstream_output_price_per_token = $2
-            WHERE id = $3
-            "#,
-            new_input_price,
-            new_output_price,
-            model_result.id
-        )
-        .execute(&pool)
-        .await
-        .expect("Failed to update model pricing");
-
-        // Wait for the receiver to detect a change
-        // The receiver will be notified when the notification triggers a config reload
-        let update_result = tokio::time::timeout(std::time::Duration::from_secs(5), receiver.changed()).await;
-
-        assert!(
-            update_result.is_ok(),
-            "Timeout waiting for config update - notification may not have triggered"
-        );
-        update_result
-            .expect("Failed to receive update notification")
-            .expect("Receiver error");
-
-        // Get the updated targets from the receiver
-        let updated_targets = receiver.borrow().clone();
-
-        // Verify the updated pricing in the new config
-        let updated_target = updated_targets
-            .targets
-            .get("test-gpt-4")
-            .expect("Model should be in updated targets");
-        let updated_headers = updated_target
-            .response_headers
-            .as_ref()
-            .expect("Response headers should be present");
-
-        let input_price_header = updated_headers
-            .get(crate::config::ONWARDS_INPUT_TOKEN_PRICE_HEADER)
-            .expect("Input price header should be present");
-        let output_price_header = updated_headers
-            .get(crate::config::ONWARDS_OUTPUT_TOKEN_PRICE_HEADER)
-            .expect("Output price header should be present");
-
-        // Verify the pricing was updated
-        assert!(
-            input_price_header.starts_with("0.00002"),
-            "Config should have updated input price, got: {}",
-            input_price_header
-        );
-        assert!(
-            output_price_header.starts_with("0.00006"),
-            "Config should have updated output price, got: {}",
-            output_price_header
+            notification.payload().contains("model_tariffs"),
+            "Notification should reference model_tariffs table"
         );
     }
 

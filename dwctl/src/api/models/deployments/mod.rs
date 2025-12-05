@@ -5,7 +5,7 @@ pub mod enrichment;
 use super::pagination::Pagination;
 use crate::api::models::groups::GroupResponse;
 use crate::db::models::deployments::{
-    DeploymentDBResponse, ModelType, ProviderPricing, ProviderPricingUpdate, TokenPricing, TokenPricingUpdate,
+    DeploymentDBResponse, ModelType, ProviderPricing, ProviderPricingUpdate,
 };
 use crate::types::{DeploymentId, InferenceEndpointId, UserId};
 use chrono::{DateTime, Utc};
@@ -112,10 +112,8 @@ pub struct DeployedModelCreate {
     pub capacity: Option<i32>,
     /// Maximum number of concurrent batch requests allowed for this model (null = defaults to capacity or no limit)
     pub batch_capacity: Option<i32>,
-    /// Customer-facing pricing rates (DEPRECATED: use tariffs instead)
-    pub pricing: Option<TokenPricing>,
     /// Provider/downstream pricing details (admin only)
-    pub downstream_pricing: Option<ProviderPricing>,
+    pub provider_pricing: Option<ProviderPricing>,
     /// Tariffs for this model - if provided, these will be created as active tariffs
     pub tariffs: Option<Vec<TariffDefinition>>,
 }
@@ -139,12 +137,9 @@ pub struct DeployedModelUpdate {
     /// Maximum concurrent batch requests (null = no change, Some(None) = remove limit, Some(Some(n)) = set limit)
     #[serde(default, skip_serializing_if = "Option::is_none", with = "double_option")]
     pub batch_capacity: Option<Option<i32>>,
-    /// Customer-facing pricing rates partial updates (DEPRECATED: use tariffs instead)
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub pricing: Option<TokenPricingUpdate>,
     /// Provider/downstream pricing details partial updates (null = no change, Some(pricing_update) = partial update)
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub downstream_pricing: Option<ProviderPricingUpdate>,
+    pub provider_pricing: Option<ProviderPricingUpdate>,
     /// Tariffs for this model - if provided, closes all existing active tariffs and creates these as new active tariffs
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tariffs: Option<Vec<TariffDefinition>>,
@@ -210,12 +205,9 @@ pub struct DeployedModelResponse {
     /// Probe status (only included if requested)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub status: Option<ModelProbeStatus>,
-    /// Customer-facing pricing rates (only included if requested)
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub pricing: Option<TokenPricing>,
     /// Provider/downstream pricing details (only included if requested and user has Pricing::ReadAll)
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub downstream_pricing: Option<ProviderPricing>,
+    pub provider_pricing: Option<ProviderPricing>,
     /// Inference endpoint information (only included if requested)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub endpoint: Option<super::inference_endpoints::InferenceEndpointResponse>,
@@ -244,8 +236,7 @@ impl From<DeploymentDBResponse> for DeployedModelResponse {
             groups: None,             // By default, relationships are not included
             metrics: None,            // By default, metrics are not included
             status: None,             // By default, probe status is not included
-            pricing: None,            // By default, pricing is not included (opt-in via include)
-            downstream_pricing: None, // By default, downstream pricing is not included
+            provider_pricing: None,   // By default, provider pricing is not included
             endpoint: None,           // By default, endpoint is not included
             tariffs: None,            // By default, tariffs are not included
         }
@@ -271,15 +262,9 @@ impl DeployedModelResponse {
         self
     }
 
-    /// Create a response with customer pricing included
-    pub fn with_pricing(mut self, pricing: Option<TokenPricing>) -> Self {
-        self.pricing = pricing;
-        self
-    }
-
-    /// Create a response with downstream pricing included (admin only)
-    pub fn with_downstream_pricing(mut self, downstream_pricing: Option<ProviderPricing>) -> Self {
-        self.downstream_pricing = downstream_pricing;
+    /// Create a response with provider pricing included (admin only)
+    pub fn with_provider_pricing(mut self, provider_pricing: Option<ProviderPricing>) -> Self {
+        self.provider_pricing = provider_pricing;
         self
     }
 

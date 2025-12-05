@@ -4,7 +4,6 @@ use crate::types::DeploymentId;
 use chrono::{DateTime, Utc};
 use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
-use utoipa::ToSchema;
 use uuid::Uuid;
 
 /// Database representation of a model tariff

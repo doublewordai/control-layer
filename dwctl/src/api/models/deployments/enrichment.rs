@@ -11,7 +11,7 @@ use crate::{
     },
     db::{
         handlers::{Groups, InferenceEndpoints, Repository, analytics::get_model_metrics},
-        models::{deployments::ModelPricing, groups::GroupDBResponse},
+        models::groups::GroupDBResponse,
     },
     errors::{Error, Result},
     types::{DeploymentId, GroupId, InferenceEndpointId},
@@ -50,21 +50,21 @@ impl<'a> DeployedModelEnricher<'a> {
     /// - Groups: Fetches model-to-group associations and group details
     /// - Metrics: Fetches usage statistics and analytics
     /// - Status: Fetches probe health check information
-    /// - Pricing: Applies pricing based on user permissions
+    /// - Pricing: Fetches tariffs from database (provider_pricing is added directly by handlers)
     ///
     /// # Arguments
-    /// * `models` - Vector of models to enrich (with their pricing info)
+    /// * `models` - Vector of models to enrich
     ///
     /// # Returns
     /// Vector of enriched model responses with requested data included
     #[tracing::instrument(skip(self, models), fields(count = models.len()))]
-    pub async fn enrich_many(&self, models: Vec<(DeployedModelResponse, Option<ModelPricing>)>) -> Result<Vec<DeployedModelResponse>> {
+    pub async fn enrich_many(&self, models: Vec<DeployedModelResponse>) -> Result<Vec<DeployedModelResponse>> {
         if models.is_empty() {
             return Ok(vec![]);
         }
 
-        let model_ids: Vec<DeploymentId> = models.iter().map(|(m, _)| m.id).collect();
-        let model_aliases: Vec<String> = models.iter().map(|(m, _)| m.alias.clone()).collect();
+        let model_ids: Vec<DeploymentId> = models.iter().map(|m| m.id).collect();
+        let model_aliases: Vec<String> = models.iter().map(|m| m.alias.clone()).collect();
 
         // Fetch all includes in parallel for maximum performance
         let (groups_result, status_map, metrics_map, endpoints_map, pricing_tariffs_map) = tokio::join!(
@@ -124,7 +124,7 @@ impl<'a> DeployedModelEnricher<'a> {
                     // Collect all unique endpoint IDs
                     let endpoint_ids: Vec<InferenceEndpointId> = models
                         .iter()
-                        .map(|(m, _)| m.hosted_on)
+                        .map(|m| m.hosted_on)
                         .collect::<std::collections::HashSet<_>>()
                         .into_iter()
                         .collect();
@@ -174,7 +174,7 @@ impl<'a> DeployedModelEnricher<'a> {
         // Build enriched responses
         let mut enriched_models = Vec::with_capacity(models.len());
 
-        for (mut model_response, model_pricing) in models {
+        for mut model_response in models {
             // Add groups if requested and available
             if self.include_groups {
                 model_response = Self::apply_groups(model_response, &model_groups_map, &groups_map);
@@ -188,11 +188,6 @@ impl<'a> DeployedModelEnricher<'a> {
             // Add probe status if requested and available
             if self.include_status {
                 model_response = Self::apply_status(model_response, &status_map);
-            }
-
-            // Add pricing if requested (filtered by user role)
-            if self.include_pricing {
-                model_response = Self::apply_pricing(model_response, model_pricing, self.can_read_pricing);
             }
 
             // Add endpoint if requested and available
@@ -223,13 +218,12 @@ impl<'a> DeployedModelEnricher<'a> {
     ///
     /// # Arguments
     /// * `model` - The model to enrich
-    /// * `pricing` - Optional pricing information for the model
     ///
     /// # Returns
     /// Enriched model response with requested data included
     #[tracing::instrument(skip(self, model))]
-    pub async fn enrich_one(&self, model: DeployedModelResponse, pricing: Option<ModelPricing>) -> Result<DeployedModelResponse> {
-        let enriched = self.enrich_many(vec![(model, pricing)]).await?;
+    pub async fn enrich_one(&self, model: DeployedModelResponse) -> Result<DeployedModelResponse> {
+        let enriched = self.enrich_many(vec![model]).await?;
         enriched.into_iter().next().ok_or_else(|| Error::BadRequest {
             message: "No model returned from enrichment".to_string(),
         })
@@ -302,20 +296,6 @@ impl<'a> DeployedModelEnricher<'a> {
         model
     }
 
-    /// Apply pricing to a model response based on user permissions
-    fn apply_pricing(mut model: DeployedModelResponse, pricing: Option<ModelPricing>, can_read_pricing: bool) -> DeployedModelResponse {
-        if let Some(pricing) = pricing {
-            // All users get customer-facing pricing
-            model = model.with_pricing(pricing.to_customer_pricing());
-
-            // Only privileged users get downstream pricing
-            if can_read_pricing {
-                model = model.with_downstream_pricing(pricing.downstream);
-            }
-        }
-        model
-    }
-
     /// Apply endpoint to a model response
     fn apply_endpoint(
         mut model: DeployedModelResponse,
@@ -348,14 +328,10 @@ mod tests {
     use super::*;
     use crate::{
         api::models::deployments::ModelMetrics,
-        db::models::{
-            deployments::{ModelPricing, ProviderPricing, TokenPricing},
-            groups::GroupDBResponse,
-        },
+        db::models::groups::GroupDBResponse,
     };
     use chrono::Utc;
-    use rust_decimal::Decimal;
-    use std::{collections::HashMap, str::FromStr};
+    use std::collections::HashMap;
     use uuid::Uuid;
 
     fn create_test_model() -> DeployedModelResponse {
@@ -377,22 +353,9 @@ mod tests {
             groups: None,
             metrics: None,
             status: None,
-            pricing: None,
-            downstream_pricing: None,
+            provider_pricing: None,
             endpoint: None,
-        }
-    }
-
-    fn create_test_pricing() -> ModelPricing {
-        ModelPricing {
-            upstream: Some(TokenPricing {
-                input_price_per_token: Some(Decimal::from_str("0.001").unwrap()),
-                output_price_per_token: Some(Decimal::from_str("0.002").unwrap()),
-            }),
-            downstream: Some(ProviderPricing::PerToken {
-                input_price_per_token: Some(Decimal::from_str("0.0005").unwrap()),
-                output_price_per_token: Some(Decimal::from_str("0.001").unwrap()),
-            }),
+            tariffs: None,
         }
     }
 
@@ -522,48 +485,6 @@ mod tests {
         assert_eq!(status.probe_id, None);
         assert_eq!(status.active, false);
         assert_eq!(status.interval_seconds, None);
-    }
-
-    #[test]
-    fn test_apply_pricing_with_full_permissions() {
-        let model = create_test_model();
-        let pricing = create_test_pricing();
-
-        let result = DeployedModelEnricher::apply_pricing(model, Some(pricing.clone()), true);
-
-        // User has full pricing permissions
-        assert!(result.pricing.is_some());
-        assert!(result.downstream_pricing.is_some());
-
-        let upstream_pricing = result.pricing.unwrap();
-        assert_eq!(upstream_pricing.input_price_per_token, Some(Decimal::from_str("0.001").unwrap()));
-        assert_eq!(upstream_pricing.output_price_per_token, Some(Decimal::from_str("0.002").unwrap()));
-    }
-
-    #[test]
-    fn test_apply_pricing_without_full_permissions() {
-        let model = create_test_model();
-        let pricing = create_test_pricing();
-
-        let result = DeployedModelEnricher::apply_pricing(model, Some(pricing.clone()), false);
-
-        // User only sees customer-facing pricing
-        assert!(result.pricing.is_some());
-        assert!(result.downstream_pricing.is_none());
-
-        let upstream_pricing = result.pricing.unwrap();
-        assert_eq!(upstream_pricing.input_price_per_token, Some(Decimal::from_str("0.001").unwrap()));
-    }
-
-    #[test]
-    fn test_apply_pricing_no_pricing() {
-        let model = create_test_model();
-
-        let result = DeployedModelEnricher::apply_pricing(model, None, true);
-
-        // No pricing available
-        assert!(result.pricing.is_none());
-        assert!(result.downstream_pricing.is_none());
     }
 
     #[test]

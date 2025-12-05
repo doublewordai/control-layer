@@ -10,29 +10,9 @@ use serde::{Deserialize, Serialize};
 use serde_with::rust::double_option;
 use utoipa::ToSchema;
 
-/// Token-based pricing structure
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, ToSchema, Default)]
-pub struct TokenPricing {
-    /// Input price per token (sent/returned as string to preserve precision)
-    #[schema(value_type = Option<String>)]
-    pub input_price_per_token: Option<Decimal>,
-    /// Output price per token (sent/returned as string to preserve precision)
-    #[schema(value_type = Option<String>)]
-    pub output_price_per_token: Option<Decimal>,
-}
-
-/// Token pricing update structure for partial updates
-#[derive(Debug, Clone, Default, Serialize, Deserialize, ToSchema)]
-pub struct TokenPricingUpdate {
-    /// Update input pricing: None = no change, Some(None) = clear, Some(price) = set (sent as string to preserve precision)
-    #[serde(default, skip_serializing_if = "Option::is_none", with = "double_option")]
-    #[schema(value_type = Option<Option<String>>)]
-    pub input_price_per_token: Option<Option<Decimal>>,
-    /// Update output pricing: None = no change, Some(None) = clear, Some(price) = set (sent as string to preserve precision)
-    #[serde(default, skip_serializing_if = "Option::is_none", with = "double_option")]
-    #[schema(value_type = Option<Option<String>>)]
-    pub output_price_per_token: Option<Option<Decimal>>,
-}
+// Mode constants for provider pricing
+const MODE_PER_TOKEN: &str = "per_token";
+const MODE_HOURLY: &str = "hourly";
 
 /// Provider pricing options (enum for type safety)
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, ToSchema)]
@@ -54,6 +34,67 @@ pub enum ProviderPricing {
         #[schema(value_type = String)]
         input_token_cost_ratio: Decimal,
     },
+}
+
+impl ProviderPricing {
+    /// Convert flat database fields to structured provider pricing
+    pub fn from_flat_fields(
+        mode: Option<String>,
+        input_price_per_token: Option<Decimal>,
+        output_price_per_token: Option<Decimal>,
+        hourly_rate: Option<Decimal>,
+        input_token_cost_ratio: Option<Decimal>,
+    ) -> Option<Self> {
+        match mode.as_deref() {
+            Some(MODE_HOURLY) => {
+                match (hourly_rate, input_token_cost_ratio) {
+                    (Some(rate), Some(input_token_cost_ratio)) => {
+                        Some(ProviderPricing::Hourly { rate, input_token_cost_ratio })
+                    }
+                    _ => None,
+                }
+            }
+            Some(MODE_PER_TOKEN) => Some(ProviderPricing::PerToken {
+                input_price_per_token,
+                output_price_per_token,
+            }),
+            _ => None,
+        }
+    }
+
+    /// Convert structured provider pricing to flat database fields
+    pub fn to_flat_fields(
+        &self,
+    ) -> (
+        Option<String>,
+        Option<Decimal>,
+        Option<Decimal>,
+        Option<Decimal>,
+        Option<Decimal>,
+    ) {
+        match self {
+            ProviderPricing::PerToken {
+                input_price_per_token,
+                output_price_per_token,
+            } => (
+                Some(MODE_PER_TOKEN.to_string()),
+                *input_price_per_token,
+                *output_price_per_token,
+                None,
+                None,
+            ),
+            ProviderPricing::Hourly {
+                rate,
+                input_token_cost_ratio,
+            } => (
+                Some(MODE_HOURLY.to_string()),
+                None,
+                None,
+                Some(*rate),
+                Some(*input_token_cost_ratio),
+            ),
+        }
+    }
 }
 
 /// Provider pricing update structure for partial updates
@@ -87,199 +128,50 @@ pub enum ProviderPricingUpdate {
     },
 }
 
-/// Complete model pricing structure (internal storage)
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, ToSchema, Default)]
-pub struct ModelPricing {
-    /// User-facing pricing (always per-token)
-    pub upstream: Option<TokenPricing>,
-    /// Provider pricing (flexible mode)
-    pub downstream: Option<ProviderPricing>,
-}
-
-/// Model pricing update structure for partial updates
+/// Parameters for provider pricing database updates
 #[derive(Debug, Clone, Default)]
-pub struct ModelPricingUpdate {
-    /// Customer pricing partial update
-    pub upstream: Option<TokenPricingUpdate>,
-    /// Provider pricing partial update
-    pub downstream: Option<ProviderPricingUpdate>,
+pub struct ProviderPricingUpdateParams {
+    pub should_update_mode: bool,
+    pub mode: Option<String>,
+    pub should_update_input: bool,
+    pub input: Option<Decimal>,
+    pub should_update_output: bool,
+    pub output: Option<Decimal>,
+    pub should_update_hourly: bool,
+    pub hourly: Option<Decimal>,
+    pub should_update_ratio: bool,
+    pub ratio: Option<Decimal>,
 }
 
-/// Clean intermediate struct for pricing update parameters
-#[derive(Debug, Clone, Default)]
-pub struct PricingUpdateParams {
-    // Customer pricing fields
-    pub should_update_customer_input: bool,
-    pub customer_input: Option<Decimal>,
-    pub should_update_customer_output: bool,
-    pub customer_output: Option<Decimal>,
-
-    // Downstream pricing fields
-    pub should_update_downstream_mode: bool,
-    pub downstream_mode: Option<String>,
-    pub should_update_downstream_input: bool,
-    pub downstream_input: Option<Decimal>,
-    pub should_update_downstream_output: bool,
-    pub downstream_output: Option<Decimal>,
-    pub should_update_downstream_hourly: bool,
-    pub downstream_hourly: Option<Decimal>,
-    pub should_update_downstream_ratio: bool,
-    pub downstream_ratio: Option<Decimal>,
-}
-
-impl ModelPricingUpdate {
-    /// Convert to clean parameter structure for database updates
-    pub fn to_update_params(&self) -> PricingUpdateParams {
-        let mut params = PricingUpdateParams::default();
-
-        // Extract customer pricing field flags and values
-        if let Some(upstream) = &self.upstream {
-            params.should_update_customer_input = upstream.input_price_per_token.is_some();
-            params.customer_input = upstream.input_price_per_token.flatten();
-
-            params.should_update_customer_output = upstream.output_price_per_token.is_some();
-            params.customer_output = upstream.output_price_per_token.flatten();
-        }
-
-        // Extract downstream pricing fields with individual flags
-        if let Some(downstream) = &self.downstream {
-            match downstream {
-                ProviderPricingUpdate::NoChange => {
-                    // All downstream flags remain false
-                }
-                ProviderPricingUpdate::PerToken {
-                    input_price_per_token,
-                    output_price_per_token,
-                } => {
-                    // Always update mode when switching to per_token
-                    params.should_update_downstream_mode = true;
-                    params.downstream_mode = Some("per_token".to_string());
-
-                    // Update individual per-token fields
-                    params.should_update_downstream_input = input_price_per_token.is_some();
-                    params.downstream_input = input_price_per_token.flatten();
-
-                    params.should_update_downstream_output = output_price_per_token.is_some();
-                    params.downstream_output = output_price_per_token.flatten();
-                }
-                ProviderPricingUpdate::Hourly {
-                    rate,
-                    input_token_cost_ratio,
-                } => {
-                    // Always update mode when switching to hourly
-                    params.should_update_downstream_mode = true;
-                    params.downstream_mode = Some("hourly".to_string());
-
-                    // Update individual hourly fields
-                    params.should_update_downstream_hourly = rate.is_some();
-                    params.downstream_hourly = *rate;
-
-                    params.should_update_downstream_ratio = input_token_cost_ratio.is_some();
-                    params.downstream_ratio = *input_token_cost_ratio;
-                }
-            }
-        }
-
-        params
-    }
-}
-
-/// Flat pricing fields for database storage
-#[derive(Debug, Clone, Default)]
-pub struct FlatPricingFields {
-    pub upstream_input_price_per_token: Option<Decimal>,
-    pub upstream_output_price_per_token: Option<Decimal>,
-    pub downstream_pricing_mode: Option<String>,
-    pub downstream_input_price_per_token: Option<Decimal>,
-    pub downstream_output_price_per_token: Option<Decimal>,
-    pub downstream_hourly_rate: Option<Decimal>,
-    pub downstream_input_token_cost_ratio: Option<Decimal>,
-}
-
-impl ModelPricing {
-    /// Convert structured pricing to flat database fields
-    pub fn to_flat_fields(&self) -> FlatPricingFields {
-        let upstream_input_price_per_token = self.upstream.as_ref().and_then(|u| u.input_price_per_token);
-        let upstream_output_price_per_token = self.upstream.as_ref().and_then(|u| u.output_price_per_token);
-
-        let (
-            downstream_pricing_mode,
-            downstream_input_price_per_token,
-            downstream_output_price_per_token,
-            downstream_hourly_rate,
-            downstream_input_token_cost_ratio,
-        ) = match &self.downstream {
-            Some(ProviderPricing::PerToken {
+impl ProviderPricingUpdate {
+    /// Convert to parameters for database update query
+    pub fn to_update_params(&self) -> ProviderPricingUpdateParams {
+        match self {
+            ProviderPricingUpdate::NoChange => ProviderPricingUpdateParams::default(),
+            ProviderPricingUpdate::PerToken {
                 input_price_per_token,
                 output_price_per_token,
-            }) => (
-                Some("per_token".to_string()),
-                *input_price_per_token,
-                *output_price_per_token,
-                None,
-                None,
-            ),
-            Some(ProviderPricing::Hourly {
+            } => ProviderPricingUpdateParams {
+                should_update_mode: true,
+                mode: Some(MODE_PER_TOKEN.to_string()),
+                should_update_input: input_price_per_token.is_some(),
+                input: input_price_per_token.flatten(),
+                should_update_output: output_price_per_token.is_some(),
+                output: output_price_per_token.flatten(),
+                ..Default::default()
+            },
+            ProviderPricingUpdate::Hourly {
                 rate,
                 input_token_cost_ratio,
-            }) => (Some("hourly".to_string()), None, None, Some(*rate), Some(*input_token_cost_ratio)),
-            None => (None, None, None, None, None),
-        };
-
-        FlatPricingFields {
-            upstream_input_price_per_token,
-            upstream_output_price_per_token,
-            downstream_pricing_mode,
-            downstream_input_price_per_token,
-            downstream_output_price_per_token,
-            downstream_hourly_rate,
-            downstream_input_token_cost_ratio,
-        }
-    }
-
-    /// Convert flat database fields to structured pricing
-    pub fn from_flat_fields(fields: FlatPricingFields) -> Option<Self> {
-        let upstream = match (fields.upstream_input_price_per_token, fields.upstream_output_price_per_token) {
-            (None, None) => None,
-            (input, output) => Some(TokenPricing {
-                input_price_per_token: input,
-                output_price_per_token: output,
-            }),
-        };
-
-        let downstream = match fields.downstream_pricing_mode.as_deref() {
-            Some("hourly") => fields
-                .downstream_hourly_rate
-                .and_then(|rate| fields.downstream_input_token_cost_ratio.map(|ratio| (rate, ratio)))
-                .map(|(rate, input_token_cost_ratio)| ProviderPricing::Hourly {
-                    rate,
-                    input_token_cost_ratio,
-                }),
-            _ if fields.downstream_input_price_per_token.is_some() || fields.downstream_output_price_per_token.is_some() => {
-                Some(ProviderPricing::PerToken {
-                    input_price_per_token: fields.downstream_input_price_per_token,
-                    output_price_per_token: fields.downstream_output_price_per_token,
-                })
-            }
-            _ => None,
-        };
-
-        match (upstream.as_ref(), downstream.as_ref()) {
-            (None, None) => None,
-            _ => Some(Self { upstream, downstream }),
-        }
-    }
-
-    /// Convert to customer-facing pricing (simple format)
-    pub fn to_customer_pricing(&self) -> Option<TokenPricing> {
-        self.upstream.clone()
-    }
-
-    /// Create ModelPricing from separate API pricing fields
-    pub fn from_api_pricing(pricing: Option<TokenPricing>, downstream_pricing: Option<ProviderPricing>) -> Option<Self> {
-        match (pricing, downstream_pricing) {
-            (None, None) => None,
-            (upstream, downstream) => Some(Self { upstream, downstream }),
+            } => ProviderPricingUpdateParams {
+                should_update_mode: true,
+                mode: Some(MODE_HOURLY.to_string()),
+                should_update_hourly: rate.is_some(),
+                hourly: *rate,
+                should_update_ratio: input_token_cost_ratio.is_some(),
+                ratio: *input_token_cost_ratio,
+                ..Default::default()
+            },
         }
     }
 }
@@ -374,15 +266,13 @@ pub struct DeploymentCreateDBRequest {
     pub burst_size: Option<i32>,
     pub capacity: Option<i32>,
     pub batch_capacity: Option<i32>,
-    // Clean structured pricing
-    pub pricing: Option<ModelPricing>,
+    // Provider/downstream pricing
+    pub provider_pricing: Option<ProviderPricing>,
 }
 
 impl DeploymentCreateDBRequest {
     /// Creates a deployment request from API model creation data
     pub fn from_api_create(created_by: UserId, create: DeployedModelCreate) -> Self {
-        let combined_pricing = ModelPricing::from_api_pricing(create.pricing, create.downstream_pricing);
-
         Self::builder()
             .created_by(created_by)
             .model_name(create.model_name.clone())
@@ -395,7 +285,7 @@ impl DeploymentCreateDBRequest {
             .maybe_burst_size(create.burst_size)
             .maybe_capacity(create.capacity)
             .maybe_batch_capacity(create.batch_capacity)
-            .maybe_pricing(combined_pricing)
+            .maybe_provider_pricing(create.provider_pricing)
             .build()
     }
 }
@@ -415,21 +305,12 @@ pub struct DeploymentUpdateDBRequest {
     pub burst_size: Option<Option<i32>>,
     pub capacity: Option<Option<i32>>,
     pub batch_capacity: Option<Option<i32>>,
-    // Pricing updates using double-option pattern
-    pub pricing: Option<ModelPricingUpdate>,
+    // Provider pricing updates
+    pub provider_pricing: Option<ProviderPricingUpdate>,
 }
 
 impl From<DeployedModelUpdate> for DeploymentUpdateDBRequest {
     fn from(update: DeployedModelUpdate) -> Self {
-        let pricing_update = if update.pricing.is_some() || update.downstream_pricing.is_some() {
-            Some(ModelPricingUpdate {
-                upstream: update.pricing,
-                downstream: update.downstream_pricing,
-            })
-        } else {
-            None
-        };
-
         Self::builder()
             .maybe_alias(update.alias)
             .maybe_description(update.description)
@@ -439,7 +320,7 @@ impl From<DeployedModelUpdate> for DeploymentUpdateDBRequest {
             .maybe_burst_size(update.burst_size)
             .maybe_capacity(update.capacity)
             .maybe_batch_capacity(update.batch_capacity)
-            .maybe_pricing(pricing_update)
+            .maybe_provider_pricing(update.provider_pricing)
             .build()
     }
 }
@@ -482,6 +363,6 @@ pub struct DeploymentDBResponse {
     pub burst_size: Option<i32>,
     pub capacity: Option<i32>,
     pub batch_capacity: Option<i32>,
-    // Clean structured pricing
-    pub pricing: Option<ModelPricing>,
+    // Provider/downstream pricing
+    pub provider_pricing: Option<ProviderPricing>,
 }

@@ -2484,28 +2484,30 @@ mod tests {
         // Create deployment with pricing (paid model by default for credit tests)
         let deployment;
         {
-            use crate::db::models::deployments::{ModelPricing, TokenPricing};
-
             let mut deployment_tx = tx.begin().await.unwrap();
             let mut deployment_repo = Deployments::new(deployment_tx.acquire().await.unwrap());
-
-            // Default to a paid model for credit filtering tests
-            let pricing = ModelPricing {
-                upstream: Some(TokenPricing {
-                    input_price_per_token: Some(Decimal::new(1, 6)),  // $0.000001 per token
-                    output_price_per_token: Some(Decimal::new(2, 6)), // $0.000002 per token
-                }),
-                downstream: None,
-            };
 
             let mut deployment_create = DeploymentCreateDBRequest::builder()
                 .created_by(admin_user.id)
                 .model_name(format!("test-model-{}", uuid::Uuid::new_v4()))
                 .alias(format!("test-alias-{}", uuid::Uuid::new_v4()))
-                .pricing(pricing)
                 .build();
             deployment_create.hosted_on = test_endpoint_id;
             deployment = deployment_repo.create(&deployment_create).await.unwrap();
+
+            // Create a tariff with pricing to make this a paid model
+            use crate::db::handlers::Tariffs;
+            use crate::db::models::tariffs::TariffCreateDBRequest;
+            let mut tariffs_repo = Tariffs::new(deployment_tx.acquire().await.unwrap());
+            tariffs_repo.create(&TariffCreateDBRequest {
+                deployed_model_id: deployment.id,
+                name: "default".to_string(),
+                input_price_per_token: Decimal::new(1, 6),  // $0.000001 per token
+                output_price_per_token: Decimal::new(2, 6), // $0.000002 per token
+                is_default: true,
+                valid_from: None,
+            }).await.unwrap();
+
             deployment_tx.commit().await.unwrap();
         }
 
@@ -2587,30 +2589,33 @@ mod tests {
         crate::seed_database(&config.model_sources, &pool).await.unwrap();
         let test_endpoint_id = get_test_endpoint_id(&pool).await;
 
-        // Create deployment with pricing (paid model)
+        // Create deployment (paid model via tariffs)
         let deployment;
         {
-            use crate::db::models::deployments::{ModelPricing, TokenPricing};
-
             let mut deployment_tx = tx.begin().await.unwrap();
             let mut deployment_repo = Deployments::new(deployment_tx.acquire().await.unwrap());
-
-            let pricing = ModelPricing {
-                upstream: Some(TokenPricing {
-                    input_price_per_token: Some(Decimal::new(1, 6)),  // $0.000001 per token
-                    output_price_per_token: Some(Decimal::new(2, 6)), // $0.000002 per token
-                }),
-                downstream: None,
-            };
 
             let mut deployment_create = DeploymentCreateDBRequest::builder()
                 .created_by(admin_user.id)
                 .model_name("test-model".to_string())
                 .alias("test-alias".to_string())
-                .pricing(pricing)
                 .build();
             deployment_create.hosted_on = test_endpoint_id;
             deployment = deployment_repo.create(&deployment_create).await.unwrap();
+
+            // Create a tariff with pricing to make this a paid model
+            use crate::db::handlers::Tariffs;
+            use crate::db::models::tariffs::TariffCreateDBRequest;
+            let mut tariffs_repo = Tariffs::new(deployment_tx.acquire().await.unwrap());
+            tariffs_repo.create(&TariffCreateDBRequest {
+                deployed_model_id: deployment.id,
+                name: "default".to_string(),
+                input_price_per_token: Decimal::new(1, 6),  // $0.000001 per token
+                output_price_per_token: Decimal::new(2, 6), // $0.000002 per token
+                is_default: true,
+                valid_from: None,
+            }).await.unwrap();
+
             deployment_tx.commit().await.unwrap();
         }
 
@@ -3230,29 +3235,33 @@ mod tests {
         crate::seed_database(&config.model_sources, &pool).await.unwrap();
         let test_endpoint_id = get_test_endpoint_id(&pool).await;
 
-        // Create deployment WITH pricing (paid model)
+        // Create deployment (paid model via tariffs)
         let deployment;
         {
             let mut deployment_tx = tx.begin().await.unwrap();
             let mut deployment_repo = Deployments::new(deployment_tx.acquire().await.unwrap());
 
-            use crate::db::models::deployments::{ModelPricing, TokenPricing};
-            let pricing = ModelPricing {
-                upstream: Some(TokenPricing {
-                    input_price_per_token: Some(Decimal::new(1, 6)),  // $0.000001 per token
-                    output_price_per_token: Some(Decimal::new(2, 6)), // $0.000002 per token
-                }),
-                downstream: None,
-            };
-
             let mut deployment_create = DeploymentCreateDBRequest::builder()
                 .created_by(admin_user.id)
                 .model_name("paid-model".to_string())
                 .alias("paid-alias".to_string())
-                .pricing(pricing) // Paid model - has pricing
                 .build();
             deployment_create.hosted_on = test_endpoint_id;
             deployment = deployment_repo.create(&deployment_create).await.unwrap();
+
+            // Create a tariff with pricing to make this a paid model
+            use crate::db::handlers::Tariffs;
+            use crate::db::models::tariffs::TariffCreateDBRequest;
+            let mut tariffs_repo = Tariffs::new(deployment_tx.acquire().await.unwrap());
+            tariffs_repo.create(&TariffCreateDBRequest {
+                deployed_model_id: deployment.id,
+                name: "default".to_string(),
+                input_price_per_token: Decimal::new(1, 6),  // $0.000001 per token
+                output_price_per_token: Decimal::new(2, 6), // $0.000002 per token
+                is_default: true,
+                valid_from: None,
+            }).await.unwrap();
+
             deployment_tx.commit().await.unwrap();
         }
 
@@ -3364,23 +3373,27 @@ mod tests {
             let mut deployment_tx = tx.begin().await.unwrap();
             let mut deployment_repo = Deployments::new(deployment_tx.acquire().await.unwrap());
 
-            use crate::db::models::deployments::{ModelPricing, TokenPricing};
-            let pricing = ModelPricing {
-                upstream: Some(TokenPricing {
-                    input_price_per_token: Some(Decimal::ZERO),  // Explicit $0.00
-                    output_price_per_token: Some(Decimal::ZERO), // Explicit $0.00
-                }),
-                downstream: None,
-            };
-
             let mut deployment_create = DeploymentCreateDBRequest::builder()
                 .created_by(admin_user.id)
                 .model_name("zero-price-model".to_string())
                 .alias("zero-price-alias".to_string())
-                .pricing(pricing) // Free model with explicit zero pricing
                 .build();
             deployment_create.hosted_on = test_endpoint_id;
             deployment = deployment_repo.create(&deployment_create).await.unwrap();
+
+            // Create a tariff with zero pricing to make this a free model
+            use crate::db::handlers::Tariffs;
+            use crate::db::models::tariffs::TariffCreateDBRequest;
+            let mut tariffs_repo = Tariffs::new(deployment_tx.acquire().await.unwrap());
+            tariffs_repo.create(&TariffCreateDBRequest {
+                deployed_model_id: deployment.id,
+                name: "free".to_string(),
+                input_price_per_token: Decimal::ZERO,
+                output_price_per_token: Decimal::ZERO,
+                is_default: true,
+                valid_from: None,
+            }).await.unwrap();
+
             deployment_tx.commit().await.unwrap();
         }
 
