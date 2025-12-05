@@ -253,6 +253,7 @@ test target="" *args="":
         echo "Cleaning up any leftover test data from previous runs..."
         ./scripts/drop-test-users.sh > /dev/null 2>&1 || echo "  (no previous test users to clean up)"
         ./scripts/drop-test-groups.sh > /dev/null 2>&1 || echo "  (no previous test groups to clean up)"
+        ./scripts/drop-permtest-resources.sh 2>&1 || echo "  ⚠️  Failed to cleanup permtest resources"
 
         echo "Generating test cookies..."
         # Get admin credentials from config.yaml
@@ -322,7 +323,7 @@ test target="" *args="":
 
         if [ "$RUN_API_TESTS" = true ]; then
             echo "Running: hurl --variables-file test.env --test --jobs 1 tests/"
-            hurl --variables-file test.env --test --jobs 1 tests/
+            hurl --variables-file test.env --test --jobs 1 --file-root tests/files/ tests/
         fi
 
         # if [ "$RUN_E2E_TESTS" = true ]; then
@@ -336,6 +337,7 @@ test target="" *args="":
         echo "Cleaning up test users and groups..."
         ./scripts/drop-test-users.sh
         ADMIN_PASSWORD=$ADMIN_PASSWORD ./scripts/drop-test-groups.sh
+        ./scripts/drop-permtest-resources.sh
         exit 0
     fi
 
