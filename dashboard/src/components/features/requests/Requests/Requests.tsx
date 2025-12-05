@@ -1,4 +1,4 @@
-import { Activity, X, BarChart3, List, ArrowLeft } from "lucide-react";
+import { Activity, X, List, ArrowLeft, LayoutGrid } from "lucide-react";
 import { useState, useEffect } from "react";
 import { useSearchParams, useNavigate } from "react-router-dom";
 import {
@@ -240,7 +240,7 @@ export function Requests() {
             )}
             <div>
               <h1 className="text-3xl font-bold text-doubleword-neutral-900">
-                Analytics
+                {`${activeTab.slice(0, 1).toUpperCase()}${activeTab.slice(1)}`}
               </h1>
             </div>
           </div>
@@ -288,8 +288,8 @@ export function Requests() {
                   value="analytics"
                   className="flex items-center gap-2 flex-1 sm:flex-initial"
                 >
-                  <BarChart3 className="h-4 w-4" />
-                  Analytics
+                  <LayoutGrid className="h-4 w-4" />
+                  Dashboard
                 </TabsTrigger>
               )}
               {hasRequestsPermission && (
