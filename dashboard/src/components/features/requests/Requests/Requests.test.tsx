@@ -150,7 +150,7 @@ describe("Requests Component", () => {
     // Should render the main component
     await waitFor(() => {
       expect(
-        screen.getByRole("heading", { name: "Traffic" }),
+        screen.getByRole("heading", { name: "Analytics" }),
       ).toBeInTheDocument();
     });
 
