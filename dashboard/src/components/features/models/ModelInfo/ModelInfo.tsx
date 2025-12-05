@@ -1427,32 +1427,23 @@ const ModelInfo: React.FC = () => {
                     <Play className="mr-2 h-4 w-4" />
                     Try in Playground
                   </Button>
-                  <Button
-                    variant="outline"
-                    className="w-full justify-start"
-                    onClick={() => {
-                      const currentUrl = `/models/${model.id}${fromUrl ? `?from=${encodeURIComponent(fromUrl)}` : ""}`;
-                      navigate(
-                        `/analytics?model=${encodeURIComponent(model.alias)}&from=${encodeURIComponent(currentUrl)}`,
-                      );
-                    }}
-                  >
-                    <BarChart3 className="mr-2 h-4 w-4" />
-                    View Analytics
-                  </Button>
-                  <Button
-                    variant="outline"
-                    className="w-full justify-start"
-                    onClick={() => {
-                      const currentUrl = `/models/${model.id}${fromUrl ? `?from=${encodeURIComponent(fromUrl)}` : ""}`;
-                      navigate(
-                        `/analytics?model=${encodeURIComponent(model.alias)}&tab=requests&from=${encodeURIComponent(currentUrl)}`,
-                      );
-                    }}
-                  >
-                    <Activity className="mr-2 h-4 w-4" />
-                    View Traffic
-                  </Button>
+                  {canViewAnalytics && (
+                    <>
+                      <Button
+                        variant="outline"
+                        className="w-full justify-start"
+                        onClick={() => {
+                          const currentUrl = `/models/${model.id}${fromUrl ? `?from=${encodeURIComponent(fromUrl)}` : ""}`;
+                          navigate(
+                            `/analytics?model=${encodeURIComponent(model.alias)}&from=${encodeURIComponent(currentUrl)}`,
+                          );
+                        }}
+                      >
+                        <BarChart3 className="mr-2 h-4 w-4" />
+                        View Analytics
+                      </Button>
+                    </>
+                  )}
                   <Button
                     variant="outline"
                     className="w-full justify-start"

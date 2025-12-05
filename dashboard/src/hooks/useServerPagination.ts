@@ -128,6 +128,19 @@ export function useServerPagination(options: UseServerPaginationOptions = {}) {
     });
   }, [pageParam, setSearchParams]);
 
+  /**
+   * Clear pagination parameters from URL
+   * Useful when closing modals or unmounting components
+   */
+  const handleClear = useCallback(() => {
+    setSearchParams((prev) => {
+      const next = new URLSearchParams(prev);
+      next.delete(pageParam);
+      next.delete(pageSizeParam);
+      return next;
+    });
+  }, [pageParam, pageSizeParam, setSearchParams]);
+
   // Calculate skip value for API queries
   const skip = (page - 1) * pageSize;
 
@@ -140,6 +153,7 @@ export function useServerPagination(options: UseServerPaginationOptions = {}) {
     handlePageChange,
     handlePageSizeChange,
     handleReset,
+    handleClear,
 
     // Query parameters ready for API calls
     queryParams: {

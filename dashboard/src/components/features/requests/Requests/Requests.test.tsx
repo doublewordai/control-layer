@@ -150,12 +150,12 @@ describe("Requests Component", () => {
     // Should render the main component
     await waitFor(() => {
       expect(
-        screen.getByRole("heading", { name: "Traffic" }),
+        screen.getByRole("heading", { name: "Analytics" }),
       ).toBeInTheDocument();
     });
 
     // Should show Analytics tab by default (due to user permissions)
-    expect(screen.getByRole("tab", { name: /analytics/i })).toHaveAttribute(
+    expect(screen.getByRole("tab", { name: /dashboard/i })).toHaveAttribute(
       "aria-selected",
       "true",
     );
