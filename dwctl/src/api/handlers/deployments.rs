@@ -1,5 +1,6 @@
 //! HTTP handlers for model deployment endpoints.
 
+use yansi::paint::Paint;
 use crate::{
     AppState,
     api::models::{
@@ -33,7 +34,7 @@ use sqlx::Acquire;
     params(
         ("endpoint" = Option<i32>, Query, description = "Filter by inference endpoint ID"),
         ("accessible" = Option<bool>, Query, description = "Filter to only models the current user can access (defaults to false for admins, true for users)"),
-        ("include" = Option<String>, Query, description = "Include additional data (comma-separated: 'groups', 'metrics', 'status', 'pricing', 'endpoints'). Only platform managers can include groups. Status shows probe monitoring information. Pricing shows simple customer rates for regular users, full pricing structure for users with Pricing::ReadAll permission. Endpoints includes full inference endpoint details."),
+        ("include" = Option<String>, Query, description = "Include additional data (comma-separated: 'groups', 'metrics', 'status', 'pricing', 'endpoints'). Only platform managers can include groups. Status shows probe monitoring information. Pricing shows simple customer rates for regular users, full pricing structure including current active tariffs for users with Pricing::ReadAll permission. Endpoints includes full inference endpoint details."),
         ("deleted" = Option<bool>, Query, description = "Show deleted models when true (admin only), non-deleted models when false, and all models when not specified"),
         ("inactive" = Option<bool>, Query, description = "Show inactive models when true (admin only)"),
         ("limit" = Option<i64>, Query, description = "Maximum number of items to return (default: 10, max: 100)"),
@@ -253,8 +254,28 @@ pub async fn create_deployed_model(
 
     // Create the deployment - let database constraints handle uniqueness
     let mut repo = Deployments::new(tx.acquire().await.map_err(|e| Error::Database(e.into()))?);
+    let tariffs = create.tariffs.clone();
     let db_request = DeploymentCreateDBRequest::from_api_create(current_user.id, create);
     let model = repo.create(&db_request).await?;
+
+    // Create tariffs if provided
+    if let Some(tariff_defs) = tariffs {
+        use crate::db::{handlers::Tariffs, models::tariffs::TariffCreateDBRequest};
+        let mut tariffs_repo = Tariffs::new(tx.acquire().await.map_err(|e| Error::Database(e.into()))?);
+
+        for tariff_def in tariff_defs {
+            let tariff_request = TariffCreateDBRequest {
+                deployed_model_id: model.id,
+                name: tariff_def.name,
+                input_price_per_token: tariff_def.input_price_per_token,
+                output_price_per_token: tariff_def.output_price_per_token,
+                is_default: tariff_def.is_default,
+                valid_from: None, // Use NOW()
+            };
+            tariffs_repo.create(&tariff_request).await?;
+        }
+    }
+
     tx.commit().await.map_err(|e| Error::Database(e.into()))?;
 
     Ok(Json(DeployedModelResponse::from(model)))
@@ -291,8 +312,8 @@ pub async fn update_deployed_model(
 ) -> Result<Json<DeployedModelResponse>> {
     let has_system_access = has_permission(&current_user, resource::Models.into(), operation::SystemAccess.into());
 
-    let mut pool_conn = state.db.acquire().await.map_err(|e| Error::Database(e.into()))?;
-    let mut repo = Deployments::new(&mut pool_conn);
+    let mut tx = state.db.begin().await.map_err(|e| Error::Database(e.into()))?;
+    let mut repo = Deployments::new(tx.acquire().await.map_err(|e| Error::Database(e.into()))?);
 
     // Verify deployment exists and check access based on permissions
     match repo.get_by_id(deployment_id).await {
@@ -314,8 +335,44 @@ pub async fn update_deployed_model(
         Err(e) => return Err(e.into()),
     }
 
+    // Handle tariff replacement if provided
+    if let Some(tariff_defs) = &update.tariffs {
+        use crate::db::{handlers::Tariffs, models::tariffs::TariffCreateDBRequest};
+        let mut tariffs_repo = Tariffs::new(tx.acquire().await.map_err(|e| Error::Database(e.into()))?);
+
+        // Close all current active tariffs for this model
+        sqlx::query!(
+            r#"
+            UPDATE model_tariffs
+            SET valid_until = NOW(),
+                updated_at = NOW()
+            WHERE deployed_model_id = $1 AND valid_until IS NULL
+            "#,
+            deployment_id
+        )
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| Error::Database(e.into()))?;
+
+        // Create new tariffs
+        for tariff_def in tariff_defs {
+            let tariff_request = TariffCreateDBRequest {
+                deployed_model_id: deployment_id,
+                name: tariff_def.name.clone(),
+                input_price_per_token: tariff_def.input_price_per_token,
+                output_price_per_token: tariff_def.output_price_per_token,
+                is_default: tariff_def.is_default,
+                valid_from: None, // Use NOW()
+            };
+            tariffs_repo.create(&tariff_request).await?;
+        }
+    }
+
     let db_request = DeploymentUpdateDBRequest::from(update);
     let model = repo.update(deployment_id, &db_request).await?;
+
+    tx.commit().await.map_err(|e| Error::Database(e.into()))?;
+
     Ok(Json(DeployedModelResponse::from(model)))
 }
 

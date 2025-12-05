@@ -31,7 +31,7 @@ pub struct DeployedModelEnricher<'a> {
     pub include_metrics: bool,
     /// Whether to include probe status information
     pub include_status: bool,
-    /// Whether to include pricing information
+    /// Whether to include pricing information (includes tariffs)
     pub include_pricing: bool,
     /// Whether to include endpoint information
     pub include_endpoints: bool,
@@ -67,7 +67,7 @@ impl<'a> DeployedModelEnricher<'a> {
         let model_aliases: Vec<String> = models.iter().map(|(m, _)| m.alias.clone()).collect();
 
         // Fetch all includes in parallel for maximum performance
-        let (groups_result, status_map, metrics_map, endpoints_map) = tokio::join!(
+        let (groups_result, status_map, metrics_map, endpoints_map, pricing_tariffs_map) = tokio::join!(
             // Groups query
             async {
                 if self.include_groups {
@@ -139,6 +139,30 @@ impl<'a> DeployedModelEnricher<'a> {
                 } else {
                     None
                 }
+            },
+            // Tariffs query (only if pricing is requested and user can read pricing)
+            async {
+                if self.include_pricing && self.can_read_pricing {
+                    use crate::{db::handlers::Tariffs, api::models::tariffs::TariffResponse};
+
+                    let mut tariffs_map: HashMap<DeploymentId, Vec<TariffResponse>> = HashMap::new();
+
+                    for model_id in &model_ids {
+                        let mut tariffs_conn = self.db.acquire().await.map_err(|e| Error::Database(e.into())).ok()?;
+                        let mut tariffs_repo = Tariffs::new(&mut tariffs_conn);
+
+                        if let Ok(tariffs) = tariffs_repo.list_current_by_model(*model_id).await {
+                            tariffs_map.insert(
+                                *model_id,
+                                tariffs.into_iter().map(TariffResponse::from).collect()
+                            );
+                        }
+                    }
+
+                    Some(tariffs_map)
+                } else {
+                    None
+                }
             }
         );
 
@@ -174,6 +198,11 @@ impl<'a> DeployedModelEnricher<'a> {
             // Add endpoint if requested and available
             if self.include_endpoints {
                 model_response = Self::apply_endpoint(model_response, &endpoints_map);
+            }
+
+            // Add tariffs if pricing is requested and available
+            if self.include_pricing && self.can_read_pricing {
+                model_response = Self::apply_tariffs(model_response, &pricing_tariffs_map);
             }
 
             // Mask rate limiting info for users without ModelRateLimits permission
@@ -296,6 +325,19 @@ impl<'a> DeployedModelEnricher<'a> {
             && let Some(endpoint) = endpoints_map.get(&model.hosted_on)
         {
             model = model.with_endpoint(endpoint.clone());
+        }
+        model
+    }
+
+    /// Apply tariffs to a model response
+    fn apply_tariffs(
+        mut model: DeployedModelResponse,
+        tariffs_map: &Option<HashMap<DeploymentId, Vec<crate::api::models::tariffs::TariffResponse>>>,
+    ) -> DeployedModelResponse {
+        if let Some(tariffs_map) = tariffs_map
+            && let Some(tariffs) = tariffs_map.get(&model.id)
+        {
+            model = model.with_tariffs(tariffs.clone());
         }
         model
     }

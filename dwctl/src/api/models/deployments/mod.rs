@@ -72,6 +72,22 @@ pub struct ModelMetrics {
     pub time_series: Option<Vec<ModelTimeSeriesPoint>>,
 }
 
+/// Tariff definition for model creation/update
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct TariffDefinition {
+    /// Tariff name (e.g., "batch", "realtime", "premium")
+    pub name: String,
+    /// Input price per token (sent/returned as string to preserve precision)
+    #[schema(value_type = String)]
+    pub input_price_per_token: rust_decimal::Decimal,
+    /// Output price per token (sent/returned as string to preserve precision)
+    #[schema(value_type = String)]
+    pub output_price_per_token: rust_decimal::Decimal,
+    /// Whether this is the default tariff for the model
+    #[serde(default)]
+    pub is_default: bool,
+}
+
 /// The data required to create a new model.
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct DeployedModelCreate {
@@ -96,10 +112,12 @@ pub struct DeployedModelCreate {
     pub capacity: Option<i32>,
     /// Maximum number of concurrent batch requests allowed for this model (null = defaults to capacity or no limit)
     pub batch_capacity: Option<i32>,
-    /// Customer-facing pricing rates
+    /// Customer-facing pricing rates (DEPRECATED: use tariffs instead)
     pub pricing: Option<TokenPricing>,
     /// Provider/downstream pricing details (admin only)
     pub downstream_pricing: Option<ProviderPricing>,
+    /// Tariffs for this model - if provided, these will be created as active tariffs
+    pub tariffs: Option<Vec<TariffDefinition>>,
 }
 
 /// The data required to update a specific model.
@@ -121,12 +139,15 @@ pub struct DeployedModelUpdate {
     /// Maximum concurrent batch requests (null = no change, Some(None) = remove limit, Some(Some(n)) = set limit)
     #[serde(default, skip_serializing_if = "Option::is_none", with = "double_option")]
     pub batch_capacity: Option<Option<i32>>,
-    /// Customer-facing pricing rates partial updates (null = no change, Some(pricing_update) = partial update)
+    /// Customer-facing pricing rates partial updates (DEPRECATED: use tariffs instead)
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pricing: Option<TokenPricingUpdate>,
     /// Provider/downstream pricing details partial updates (null = no change, Some(pricing_update) = partial update)
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub downstream_pricing: Option<ProviderPricingUpdate>,
+    /// Tariffs for this model - if provided, closes all existing active tariffs and creates these as new active tariffs
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tariffs: Option<Vec<TariffDefinition>>,
 }
 
 /// A request to update a specific model (i.e. bundle a `DeployedModelUpdate` with a model id).
@@ -198,6 +219,9 @@ pub struct DeployedModelResponse {
     /// Inference endpoint information (only included if requested)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub endpoint: Option<super::inference_endpoints::InferenceEndpointResponse>,
+    /// Tariffs for this model (only included if requested)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tariffs: Option<Vec<super::tariffs::TariffResponse>>,
 }
 
 impl From<DeploymentDBResponse> for DeployedModelResponse {
@@ -223,6 +247,7 @@ impl From<DeploymentDBResponse> for DeployedModelResponse {
             pricing: None,            // By default, pricing is not included (opt-in via include)
             downstream_pricing: None, // By default, downstream pricing is not included
             endpoint: None,           // By default, endpoint is not included
+            tariffs: None,            // By default, tariffs are not included
         }
     }
 }
@@ -268,6 +293,12 @@ impl DeployedModelResponse {
     /// Create a response with endpoint information included
     pub fn with_endpoint(mut self, endpoint: super::inference_endpoints::InferenceEndpointResponse) -> Self {
         self.endpoint = Some(endpoint);
+        self
+    }
+
+    /// Create a response with tariffs included
+    pub fn with_tariffs(mut self, tariffs: Vec<super::tariffs::TariffResponse>) -> Self {
+        self.tariffs = Some(tariffs);
         self
     }
 }
