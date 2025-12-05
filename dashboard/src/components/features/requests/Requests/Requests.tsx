@@ -7,17 +7,11 @@ import {
 } from "../../../../api/control-layer";
 import { transformRequestResponsePairs } from "../../../../utils";
 import { useAuthorization } from "../../../../utils/authorization";
+import { useServerPagination } from "../../../../hooks/useServerPagination";
 import { DataTable } from "../../../ui/data-table";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "../../../ui/tabs";
 import { Combobox } from "../../../ui/combobox";
 import { DateTimeRangeSelector } from "../../../ui/date-time-range-selector";
-import {
-  Select,
-  SelectContent,
-  SelectItem,
-  SelectTrigger,
-  SelectValue,
-} from "../../../ui/select";
 import { RequestsAnalytics } from "../RequestsAnalytics";
 import { createRequestColumns } from "./columns";
 
@@ -37,7 +31,11 @@ export function Requests() {
   const [dateRange, setDateRange] = useState<
     { from: Date; to: Date } | undefined
   >(getDefaultDateRange());
-  const [recordLimit, setRecordLimit] = useState<number>(50);
+
+  // Server-side pagination
+  const pagination = useServerPagination({
+    defaultPageSize: 50,
+  });
 
   // Check user permissions
   const hasAnalyticsPermission = userRoles.some(
@@ -95,7 +93,11 @@ export function Requests() {
     isLoading: requestsLoading,
     error: requestsError,
   } = useRequests(
-    { limit: recordLimit, order_desc: true },
+    {
+      skip: pagination.queryParams.skip,
+      limit: pagination.queryParams.limit,
+      order_desc: true,
+    },
     { enabled: hasRequestsPermission && activeTab === "requests" },
     dateRange,
   );
@@ -110,13 +112,16 @@ export function Requests() {
 
   // Transform backend data to frontend format
   const allRequests = requestsResponse
-    ? transformRequestResponsePairs(requestsResponse.requests)
+    ? transformRequestResponsePairs(requestsResponse.data)
     : [];
 
   // Filter requests by selected model
   const requests = selectedModel
     ? allRequests.filter((request) => request.model === selectedModel)
     : allRequests;
+
+  // Use total count from API response
+  const totalItems = requestsResponse?.total_count || 0;
 
   const columns = createRequestColumns();
 
@@ -309,29 +314,19 @@ export function Requests() {
                 data={requests}
                 searchPlaceholder="Search requests and responses..."
                 showColumnToggle={true}
-                pageSize={10}
                 rowHeight="40px"
                 initialColumnVisibility={{ timestamp: false }}
-                headerActions={
-                  <Select
-                    value={recordLimit.toString()}
-                    onValueChange={(value) =>
-                      setRecordLimit(parseInt(value, 10))
-                    }
-                  >
-                    <SelectTrigger className="w-[130px] h-9">
-                      <SelectValue placeholder="Records" />
-                    </SelectTrigger>
-                    <SelectContent>
-                      <SelectItem value="10">10 records</SelectItem>
-                      <SelectItem value="25">25 records</SelectItem>
-                      <SelectItem value="50">50 records</SelectItem>
-                      <SelectItem value="100">100 records</SelectItem>
-                      <SelectItem value="200">200 records</SelectItem>
-                      <SelectItem value="500">500 records</SelectItem>
-                    </SelectContent>
-                  </Select>
-                }
+                paginationMode="server"
+                serverPagination={{
+                  page: pagination.page,
+                  pageSize: pagination.pageSize,
+                  totalItems: requestsResponse?.requests.length || 0,
+                  onPageChange: pagination.handlePageChange,
+                  onPageSizeChange: pagination.handlePageSizeChange,
+                }}
+                showPageSizeSelector={true}
+                pageSizeOptions={[10, 25, 50, 100, 200, 500]}
+                isLoading={requestsLoading}
               />
             )}
           </TabsContent>
