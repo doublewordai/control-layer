@@ -1,7 +1,6 @@
 import { NavLink, Link, useNavigate } from "react-router-dom";
 import {
   Settings,
-  Activity,
   Box,
   Layers,
   Users,
