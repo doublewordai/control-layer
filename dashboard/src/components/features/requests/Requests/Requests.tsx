@@ -31,7 +31,7 @@ export function Requests() {
   // Initialize with last 24 hours as default
   const getDefaultDateRange = () => {
     const now = new Date();
-    const from = new Date(now.getTime() - 24 * 60 * 60 * 1000);
+    const from = new Date(now.getTime() - 31 * 24 * 60 * 60 * 1000);
     return { from, to: now };
   };
   const [dateRange, setDateRange] = useState<
@@ -126,10 +126,10 @@ export function Requests() {
       <div className="py-4 px-6">
         <div className="mb-4">
           <h1 className="text-3xl font-bold text-doubleword-neutral-900">
-            Traffic
+            Analytics
           </h1>
           <p className="text-doubleword-neutral-600 mt-2">
-            Loading traffic data...
+            Loading analytics data...
           </p>
         </div>
         <div className="flex items-center justify-center h-64">
@@ -152,7 +152,7 @@ export function Requests() {
       <div className="py-4 px-6">
         <div className="mb-4">
           <h1 className="text-3xl font-bold text-doubleword-neutral-900">
-            Traffic
+            Analytics
           </h1>
         </div>
         <div className="flex items-center justify-center h-64">
@@ -180,7 +180,7 @@ export function Requests() {
       <div className="py-4 px-6">
         <div className="mb-4">
           <h1 className="text-3xl font-bold text-doubleword-neutral-900">
-            Traffic
+            Analytics
           </h1>
         </div>
         <div className="flex items-center justify-center h-64">
@@ -192,7 +192,7 @@ export function Requests() {
               Access Denied
             </h3>
             <p className="text-red-600">
-              You don't have permission to view traffic data.
+              You don't have permission to view analytics data.
             </p>
           </div>
         </div>
@@ -222,7 +222,7 @@ export function Requests() {
             )}
             <div>
               <h1 className="text-3xl font-bold text-doubleword-neutral-900">
-                Traffic
+                Analytics
               </h1>
             </div>
           </div>

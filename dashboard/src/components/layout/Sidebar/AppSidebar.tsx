@@ -13,6 +13,7 @@ import {
   LogOut,
   ChevronUp,
   DollarSign,
+  BarChart3,
 } from "lucide-react";
 import {
   useUser,
@@ -71,7 +72,7 @@ export function AppSidebar() {
     { path: "/endpoints", icon: Server, label: "Endpoints" },
     { path: "/playground", icon: Play, label: "Playground" },
     { path: "/batches", icon: Box, label: "Batches", demoOnly: false },
-    { path: "/analytics", icon: Activity, label: "Traffic" },
+    { path: "/analytics", icon: BarChart3, label: "Analytics" },
     { path: "/users-groups", icon: Users, label: "Users & Groups" },
     { path: "/api-keys", icon: Key, label: "API Keys" },
     { path: "/system", icon: Settings, label: "System" },
