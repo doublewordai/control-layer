@@ -37,7 +37,7 @@ impl<'c> Tariffs<'c> {
             )
             VALUES ($1, $2, $3, $4, $5, COALESCE($6, NOW()))
             RETURNING id, deployed_model_id, name, input_price_per_token, output_price_per_token,
-                      is_default, valid_from, valid_until, created_at, updated_at
+                      is_default, valid_from, valid_until
             "#,
             request.deployed_model_id,
             request.name,
@@ -59,7 +59,7 @@ impl<'c> Tariffs<'c> {
             ModelTariff,
             r#"
             SELECT id, deployed_model_id, name, input_price_per_token, output_price_per_token,
-                   is_default, valid_from, valid_until, created_at, updated_at
+                   is_default, valid_from, valid_until
             FROM model_tariffs
             WHERE id = $1
             "#,
@@ -78,7 +78,7 @@ impl<'c> Tariffs<'c> {
             ModelTariff,
             r#"
             SELECT id, deployed_model_id, name, input_price_per_token, output_price_per_token,
-                   is_default, valid_from, valid_until, created_at, updated_at
+                   is_default, valid_from, valid_until
             FROM model_tariffs
             WHERE deployed_model_id = $1 AND valid_until IS NULL
             ORDER BY is_default DESC, name ASC
@@ -98,7 +98,7 @@ impl<'c> Tariffs<'c> {
             ModelTariff,
             r#"
             SELECT id, deployed_model_id, name, input_price_per_token, output_price_per_token,
-                   is_default, valid_from, valid_until, created_at, updated_at
+                   is_default, valid_from, valid_until
             FROM model_tariffs
             WHERE deployed_model_id = $1
             ORDER BY valid_from DESC, name ASC
@@ -183,11 +183,10 @@ impl<'c> Tariffs<'c> {
             UPDATE model_tariffs
             SET input_price_per_token = COALESCE($2, input_price_per_token),
                 output_price_per_token = COALESCE($3, output_price_per_token),
-                is_default = COALESCE($4, is_default),
-                updated_at = NOW()
+                is_default = COALESCE($4, is_default)
             WHERE id = $1
             RETURNING id, deployed_model_id, name, input_price_per_token, output_price_per_token,
-                      is_default, valid_from, valid_until, created_at, updated_at
+                      is_default, valid_from, valid_until
             "#,
             id,
             request.input_price_per_token,
@@ -208,11 +207,10 @@ impl<'c> Tariffs<'c> {
             ModelTariff,
             r#"
             UPDATE model_tariffs
-            SET valid_until = NOW(),
-                updated_at = NOW()
+            SET valid_until = NOW()
             WHERE id = $1 AND valid_until IS NULL
             RETURNING id, deployed_model_id, name, input_price_per_token, output_price_per_token,
-                      is_default, valid_from, valid_until, created_at, updated_at
+                      is_default, valid_from, valid_until
             "#,
             id
         )
@@ -237,8 +235,7 @@ impl<'c> Tariffs<'c> {
         sqlx::query!(
             r#"
             UPDATE model_tariffs
-            SET valid_until = NOW(),
-                updated_at = NOW()
+            SET valid_until = NOW()
             WHERE deployed_model_id = $1 AND name = $2 AND valid_until IS NULL
             "#,
             deployed_model_id,
@@ -257,7 +254,7 @@ impl<'c> Tariffs<'c> {
             )
             VALUES ($1, $2, $3, $4, $5, NOW())
             RETURNING id, deployed_model_id, name, input_price_per_token, output_price_per_token,
-                      is_default, valid_from, valid_until, created_at, updated_at
+                      is_default, valid_from, valid_until
             "#,
             deployed_model_id,
             name,
