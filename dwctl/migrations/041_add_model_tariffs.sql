@@ -11,10 +11,7 @@ CREATE TABLE model_tariffs (
     output_price_per_token DECIMAL(12, 8) NOT NULL DEFAULT 0,
     is_default BOOLEAN NOT NULL DEFAULT false,
     valid_from TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-    valid_until TIMESTAMPTZ,
-
-    -- Ensure tariff names are unique per model
-    CONSTRAINT model_tariffs_model_name_unique UNIQUE (deployed_model_id, name)
+    valid_until TIMESTAMPTZ
 );
 
 -- Unique partial index ensures only one active tariff with each name per model

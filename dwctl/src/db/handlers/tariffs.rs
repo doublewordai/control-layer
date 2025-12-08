@@ -22,9 +22,7 @@ impl<'c> Tariffs<'c> {
     pub fn new(db: &'c mut PgConnection) -> Self {
         Self { db }
     }
-}
 
-impl<'c> Tariffs<'c> {
     /// Create a new tariff for a deployed model
     #[instrument(skip(self, request), fields(deployed_model_id = %request.deployed_model_id, name = %request.name), err)]
     pub async fn create(&mut self, request: &TariffCreateDBRequest) -> Result<TariffDBResponse> {
