@@ -575,6 +575,269 @@ HTTP 200
 [Asserts]
 jsonpath "$.id" == "{{user2_batch_id}}"
 
+# =============================================================================
+# GET /files/{file_id} - Batch Output/Error File Permissions
+# =============================================================================
+# When batches complete, they create output_file_id and error_file_id
+# Users should only be able to access these files for their own batches
+# Platform managers can access all batch output/error files
+
+# -----------------------------------------------------------------------------
+# Capture output/error file IDs from user1's batch
+# -----------------------------------------------------------------------------
+
+GET http://localhost:3001/ai/v1/batches/{{user1_batch_id}}
+[Cookies]
+dwctl_session: {{user_jwt}}
+HTTP 200
+[Captures]
+user1_batch_output_file_id: jsonpath "$.output_file_id"
+user1_batch_error_file_id: jsonpath "$.error_file_id"
+
+# -----------------------------------------------------------------------------
+# Capture output/error file IDs from user2's batch
+# -----------------------------------------------------------------------------
+
+GET http://localhost:3001/ai/v1/batches/{{user2_batch_id}}
+[Cookies]
+dwctl_session: {{user2_jwt}}
+HTTP 200
+[Captures]
+user2_batch_output_file_id: jsonpath "$.output_file_id"
+user2_batch_error_file_id: jsonpath "$.error_file_id"
+
+# -----------------------------------------------------------------------------
+# User1 CAN read their own batch output file metadata
+# -----------------------------------------------------------------------------
+
+GET http://localhost:3001/ai/v1/files/{{user1_batch_output_file_id}}
+[Cookies]
+dwctl_session: {{user_jwt}}
+HTTP 200
+[Asserts]
+jsonpath "$.id" == "{{user1_batch_output_file_id}}"
+
+# -----------------------------------------------------------------------------
+# User1 CAN read their own batch output file content
+# -----------------------------------------------------------------------------
+
+GET http://localhost:3001/ai/v1/files/{{user1_batch_output_file_id}}/content
+[Cookies]
+dwctl_session: {{user_jwt}}
+HTTP 200
+
+# -----------------------------------------------------------------------------
+# User1 CAN read their own batch error file metadata
+# -----------------------------------------------------------------------------
+
+GET http://localhost:3001/ai/v1/files/{{user1_batch_error_file_id}}
+[Cookies]
+dwctl_session: {{user_jwt}}
+HTTP 200
+[Asserts]
+jsonpath "$.id" == "{{user1_batch_error_file_id}}"
+
+# -----------------------------------------------------------------------------
+# User1 CAN read their own batch error file content
+# -----------------------------------------------------------------------------
+
+GET http://localhost:3001/ai/v1/files/{{user1_batch_error_file_id}}/content
+[Cookies]
+dwctl_session: {{user_jwt}}
+HTTP 200
+
+# -----------------------------------------------------------------------------
+# User1 CANNOT read user2's batch output file metadata
+# -----------------------------------------------------------------------------
+
+GET http://localhost:3001/ai/v1/files/{{user2_batch_output_file_id}}
+[Cookies]
+dwctl_session: {{user_jwt}}
+HTTP 404
+
+# -----------------------------------------------------------------------------
+# User1 CANNOT read user2's batch output file content
+# -----------------------------------------------------------------------------
+
+GET http://localhost:3001/ai/v1/files/{{user2_batch_output_file_id}}/content
+[Cookies]
+dwctl_session: {{user_jwt}}
+HTTP 404
+
+# -----------------------------------------------------------------------------
+# User1 CANNOT read user2's batch error file metadata
+# -----------------------------------------------------------------------------
+
+GET http://localhost:3001/ai/v1/files/{{user2_batch_error_file_id}}
+[Cookies]
+dwctl_session: {{user_jwt}}
+HTTP 404
+
+# -----------------------------------------------------------------------------
+# User1 CANNOT read user2's batch error file content
+# -----------------------------------------------------------------------------
+
+GET http://localhost:3001/ai/v1/files/{{user2_batch_error_file_id}}/content
+[Cookies]
+dwctl_session: {{user_jwt}}
+HTTP 404
+
+# -----------------------------------------------------------------------------
+# User2 CAN read their own batch output file metadata
+# -----------------------------------------------------------------------------
+
+GET http://localhost:3001/ai/v1/files/{{user2_batch_output_file_id}}
+[Cookies]
+dwctl_session: {{user2_jwt}}
+HTTP 200
+[Asserts]
+jsonpath "$.id" == "{{user2_batch_output_file_id}}"
+
+# -----------------------------------------------------------------------------
+# User2 CAN read their own batch output file content
+# -----------------------------------------------------------------------------
+
+GET http://localhost:3001/ai/v1/files/{{user2_batch_output_file_id}}/content
+[Cookies]
+dwctl_session: {{user2_jwt}}
+HTTP 200
+
+# -----------------------------------------------------------------------------
+# User2 CAN read their own batch error file metadata
+# -----------------------------------------------------------------------------
+
+GET http://localhost:3001/ai/v1/files/{{user2_batch_error_file_id}}
+[Cookies]
+dwctl_session: {{user2_jwt}}
+HTTP 200
+[Asserts]
+jsonpath "$.id" == "{{user2_batch_error_file_id}}"
+
+# -----------------------------------------------------------------------------
+# User2 CAN read their own batch error file content
+# -----------------------------------------------------------------------------
+
+GET http://localhost:3001/ai/v1/files/{{user2_batch_error_file_id}}/content
+[Cookies]
+dwctl_session: {{user2_jwt}}
+HTTP 200
+
+# -----------------------------------------------------------------------------
+# User2 CANNOT read user1's batch output file metadata
+# -----------------------------------------------------------------------------
+
+GET http://localhost:3001/ai/v1/files/{{user1_batch_output_file_id}}
+[Cookies]
+dwctl_session: {{user2_jwt}}
+HTTP 404
+
+# -----------------------------------------------------------------------------
+# User2 CANNOT read user1's batch output file content
+# -----------------------------------------------------------------------------
+
+GET http://localhost:3001/ai/v1/files/{{user1_batch_output_file_id}}/content
+[Cookies]
+dwctl_session: {{user2_jwt}}
+HTTP 404
+
+# -----------------------------------------------------------------------------
+# User2 CANNOT read user1's batch error file metadata
+# -----------------------------------------------------------------------------
+
+GET http://localhost:3001/ai/v1/files/{{user1_batch_error_file_id}}
+[Cookies]
+dwctl_session: {{user2_jwt}}
+HTTP 404
+
+# -----------------------------------------------------------------------------
+# User2 CANNOT read user1's batch error file content
+# -----------------------------------------------------------------------------
+
+GET http://localhost:3001/ai/v1/files/{{user1_batch_error_file_id}}/content
+[Cookies]
+dwctl_session: {{user2_jwt}}
+HTTP 404
+
+# -----------------------------------------------------------------------------
+# Admin CAN read user1's batch output file metadata
+# -----------------------------------------------------------------------------
+
+GET http://localhost:3001/ai/v1/files/{{user1_batch_output_file_id}}
+[Cookies]
+dwctl_session: {{admin_jwt}}
+HTTP 200
+[Asserts]
+jsonpath "$.id" == "{{user1_batch_output_file_id}}"
+
+# -----------------------------------------------------------------------------
+# Admin CAN read user1's batch output file content
+# -----------------------------------------------------------------------------
+
+GET http://localhost:3001/ai/v1/files/{{user1_batch_output_file_id}}/content
+[Cookies]
+dwctl_session: {{admin_jwt}}
+HTTP 200
+
+# -----------------------------------------------------------------------------
+# Admin CAN read user1's batch error file metadata
+# -----------------------------------------------------------------------------
+
+GET http://localhost:3001/ai/v1/files/{{user1_batch_error_file_id}}
+[Cookies]
+dwctl_session: {{admin_jwt}}
+HTTP 200
+[Asserts]
+jsonpath "$.id" == "{{user1_batch_error_file_id}}"
+
+# -----------------------------------------------------------------------------
+# Admin CAN read user1's batch error file content
+# -----------------------------------------------------------------------------
+
+GET http://localhost:3001/ai/v1/files/{{user1_batch_error_file_id}}/content
+[Cookies]
+dwctl_session: {{admin_jwt}}
+HTTP 200
+
+# -----------------------------------------------------------------------------
+# Admin CAN read user2's batch output file metadata
+# -----------------------------------------------------------------------------
+
+GET http://localhost:3001/ai/v1/files/{{user2_batch_output_file_id}}
+[Cookies]
+dwctl_session: {{admin_jwt}}
+HTTP 200
+[Asserts]
+jsonpath "$.id" == "{{user2_batch_output_file_id}}"
+
+# -----------------------------------------------------------------------------
+# Admin CAN read user2's batch output file content
+# -----------------------------------------------------------------------------
+
+GET http://localhost:3001/ai/v1/files/{{user2_batch_output_file_id}}/content
+[Cookies]
+dwctl_session: {{admin_jwt}}
+HTTP 200
+
+# -----------------------------------------------------------------------------
+# Admin CAN read user2's batch error file metadata
+# -----------------------------------------------------------------------------
+
+GET http://localhost:3001/ai/v1/files/{{user2_batch_error_file_id}}
+[Cookies]
+dwctl_session: {{admin_jwt}}
+HTTP 200
+[Asserts]
+jsonpath "$.id" == "{{user2_batch_error_file_id}}"
+
+# -----------------------------------------------------------------------------
+# Admin CAN read user2's batch error file content
+# -----------------------------------------------------------------------------
+
+GET http://localhost:3001/ai/v1/files/{{user2_batch_error_file_id}}/content
+[Cookies]
+dwctl_session: {{admin_jwt}}
+HTTP 200
+
 # -----------------------------------------------------------------------------
 # GET /batches/{batch_id}/analytics - Get Batch Analytics Permissions
 # -----------------------------------------------------------------------------
