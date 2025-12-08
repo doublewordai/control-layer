@@ -3,6 +3,7 @@ import { Hash, Trash2 } from "lucide-react";
 import type { Model } from "../../../../api/control-layer/types";
 import { Textarea } from "../../../ui/textarea";
 import { Button } from "../../../ui/button";
+import { AlertBox } from "@/components/ui/alert-box";
 
 interface SimilarityResult {
   score: number;
@@ -133,12 +134,7 @@ const EmbeddingPlayground: React.FC<EmbeddingPlaygroundProps> = ({
           </div>
         </div>
       )}
-      {error && (
-        <div className="bg-red-50 border border-red-200 text-red-700 rounded-lg p-4 mt-4">
-          <p className="font-medium text-sm">Error</p>
-          <p className="text-sm">{error}</p>
-        </div>
-      )}
+      <AlertBox variant="error">{error}</AlertBox>
 
       {/* Input Area for Embeddings */}
       <div className="mt-8">
