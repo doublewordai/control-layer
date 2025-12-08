@@ -14,13 +14,16 @@
 //!
 //! ## Error Cases Enriched
 //!
-//! 1. **403 Forbidden - Insufficient Credits**: User's balance ≤ 0 for paid models
+//! 1. **403 Forbidden - Insufficient Credits**: User's balance < 0 for paid models
 //!    - Shows current balance
+//! 2. **403 Forbidden - Model Access Denied**: User is not a member of a group with access to the requested model
+//!    - Shows which model was requested
 
 use crate::{
     db::errors::DbError,
     db::handlers::{Credits, api_keys::ApiKeys},
     errors::Error,
+    types::UserId,
 };
 use axum::{
     body::Body,
@@ -30,13 +33,21 @@ use axum::{
     response::IntoResponse,
 };
 use rust_decimal::Decimal;
+use serde::Deserialize;
 use sqlx::PgPool;
 use tracing::{debug, instrument};
+
+/// Request body structure for extracting model name
+#[derive(Debug, Deserialize)]
+struct ChatRequest {
+    model: String,
+}
 
 /// Middleware that enriches error responses from the AI proxy with helpful context
 ///
 /// Currently handles:
 /// - 403 Forbidden errors (likely insufficient credits) → enriched with balance
+/// - 403 Forbidden errors (likely model access denied) → enriched with model name
 #[instrument(skip_all, fields(path = %request.uri().path(), method = %request.method()))]
 pub async fn error_enrichment_middleware(State(pool): State<PgPool>, request: Request<Body>, next: Next) -> Response<Body> {
     // Extract API key from request headers before passing to onwards
@@ -47,8 +58,24 @@ pub async fn error_enrichment_middleware(State(pool): State<PgPool>, request: Re
         .and_then(|auth| auth.strip_prefix("Bearer ").or_else(|| auth.strip_prefix("bearer ")))
         .map(|token| token.trim().to_string());
 
+    // Extract request body to get model name for potential error enrichment
+    let (parts, body) = request.into_parts();
+    let bytes = match axum::body::to_bytes(body, usize::MAX).await {
+        Ok(b) => b,
+        Err(_) => {
+            // If we can't read the body, just pass through
+            let reconstructed = Request::from_parts(parts, Body::empty());
+            return next.run(reconstructed).await;
+        }
+    };
+
+    let model_name = serde_json::from_slice::<ChatRequest>(&bytes).ok().map(|req| req.model);
+
+    // Reconstruct the request with the body
+    let reconstructed = Request::from_parts(parts, Body::from(bytes));
+
     // Let the request proceed through onwards
-    let response = next.run(request).await;
+    let response = next.run(reconstructed).await;
 
     // Only enrich 403 errors when we have an API key
     // Note: This middleware is applied only to the onwards router (AI proxy paths),
@@ -57,9 +84,9 @@ pub async fn error_enrichment_middleware(State(pool): State<PgPool>, request: Re
         && let Some(key) = api_key
     {
         debug!("Intercepted 403 response on AI proxy path, attempting enrichment");
-        if let Ok(balance) = get_balance_of_api_key(pool, &key).await {
-            // Only enrich if balance is negative (user is in debt)
-            // If balance is exactly 0, the 403 might be due to model access rather than credits
+
+        // Check balance first - if negative, it's a credits issue
+        if let Ok(balance) = get_balance_of_api_key(pool.clone(), &key).await {
             if balance < Decimal::ZERO {
                 return Error::InsufficientCredits {
                     current_balance: balance,
@@ -68,26 +95,80 @@ pub async fn error_enrichment_middleware(State(pool): State<PgPool>, request: Re
                 .into_response();
             }
         }
+
+        // If balance is OK but we have a 403, check if it's a model access issue
+        if let Some(model) = model_name {
+            if let Ok(user_id) = get_user_id_of_api_key(pool.clone(), &key).await {
+                if let Ok(has_access) = check_user_has_model_access(pool, user_id, &model).await {
+                    if !has_access {
+                        return Error::ModelAccessDenied {
+                            model_name: model.clone(),
+                            message: format!(
+                                "You do not have access to '{}'. Please contact your administrator to request access.",
+                                model
+                            ),
+                        }
+                        .into_response();
+                    }
+                }
+            }
+        }
     }
 
     response
 }
 
 #[instrument(skip_all)]
-pub async fn get_balance_of_api_key(pool: PgPool, api_key: &str) -> Result<Decimal, DbError> {
-    // Look up user_id from API key
+pub async fn get_user_id_of_api_key(pool: PgPool, api_key: &str) -> Result<UserId, DbError> {
     let mut conn = pool.acquire().await?;
     let mut api_keys_repo = ApiKeys::new(&mut conn);
-    let user_id = api_keys_repo
+    api_keys_repo
         .get_user_id_by_secret(api_key)
         .await?
-        .ok_or_else(|| anyhow::anyhow!("API key not found or associated user doesn't exist"))?;
+        .ok_or_else(|| anyhow::anyhow!("API key not found or associated user doesn't exist").into())
+}
+
+#[instrument(skip_all)]
+pub async fn get_balance_of_api_key(pool: PgPool, api_key: &str) -> Result<Decimal, DbError> {
+    // Look up user_id from API key
+    let user_id = get_user_id_of_api_key(pool.clone(), api_key).await?;
 
     debug!("Found user_id for API key: {}", user_id);
 
     // Query user's current balance
+    let mut conn = pool.acquire().await?;
     let mut credits_repo = Credits::new(&mut conn);
     credits_repo.get_user_balance(user_id).await
+}
+
+#[instrument(skip_all)]
+pub async fn check_user_has_model_access(pool: PgPool, user_id: UserId, model_alias: &str) -> Result<bool, DbError> {
+    let mut conn = pool.acquire().await?;
+
+    // Query to check if user has access to this deployment through group membership
+    let result = sqlx::query_scalar!(
+        r#"
+        SELECT EXISTS(
+            SELECT 1
+            FROM deployed_models d
+            JOIN deployment_groups dg ON dg.deployment_id = d.id
+            WHERE d.alias = $1
+              AND d.deleted = false
+              AND dg.group_id IN (
+                  SELECT ug.group_id FROM user_groups ug WHERE ug.user_id = $2
+                  UNION
+                  SELECT '00000000-0000-0000-0000-000000000000'::uuid
+                  WHERE $2 != '00000000-0000-0000-0000-000000000000'
+              )
+        ) as "has_access!"
+        "#,
+        model_alias,
+        user_id
+    )
+    .fetch_one(&mut *conn)
+    .await?;
+
+    Ok(result)
 }
 
 #[cfg(test)]

@@ -562,10 +562,10 @@ export const ModelsContent: React.FC<ModelsContentProps> = ({
                           </>
                         )}
                         <span className="flex items-center gap-1.5 min-w-0">
-                          {model.model_name.length > 30 ? (
+                          {/*{model.model_name.length > 30 ? (
                             <HoverCard openDelay={200} closeDelay={100}>
                               <HoverCardTrigger asChild>
-                                <span className="truncate max-w-[330px] md:max-w-[330px] lg:max-w-[150px] xl:max-w-[180px] 2xl:max-w-[140px] 3xl:max-w-[200px] 4xl:max-w-60 hover:opacity-70 transition-opacity">
+                                <span className="truncate max-w-[330px] md:max-w-[330px] lg:max-w-[150px] xl:max-w-[180px] 2xl:max-w-[140px] 3xl:max-w-[170px] 4xl:max-w-[190px] hover:opacity-70 transition-opacity">
                                   {model.model_name}
                                 </span>
                               </HoverCardTrigger>
@@ -579,18 +579,18 @@ export const ModelsContent: React.FC<ModelsContentProps> = ({
                               </HoverCardContent>
                             </HoverCard>
                           ) : (
-                            <span className="truncate max-w-[330px] md:max-w-[330px] lg:max-w-[150px] xl:max-w-[180px] 2xl:max-w-[140px] 3xl:max-w-[200px] 4xl:max-w-60 ">
+                            <span className="truncate max-w-[330px] md:max-w-[330px] lg:max-w-[150px] xl:max-w-[180px] 2xl:max-w-[140px] 3xl:max-w-[170px] 4xl:max-w-[190px] ">
                               {model.model_name}
                             </span>
                           )}
-                          <span>•</span>
+                          <span>•</span>*/}
                           {(() => {
                             const endpointName =
                               model.endpoint?.name || "Unknown endpoint";
                             return endpointName.length > 25 ? (
                               <HoverCard openDelay={200} closeDelay={100}>
                                 <HoverCardTrigger asChild>
-                                  <span className="truncate max-w-[300px] md:max-w-[300px] lg:max-w-[150px] xl:max-w-40 2xl:max-w-[150px] 3xl:max-w-[180px] 4xl:max-w-60 hover:opacity-70 transition-opacity">
+                                  <span className="truncate max-w-[300px] 2xl:max-w-[200px] 3xl:max-w-[300px] hover:opacity-70 transition-opacity">
                                     {endpointName}
                                   </span>
                                 </HoverCardTrigger>
@@ -602,7 +602,7 @@ export const ModelsContent: React.FC<ModelsContentProps> = ({
                                 </HoverCardContent>
                               </HoverCard>
                             ) : (
-                              <span className="truncate max-w-[300px] md:max-w-[300px] lg:max-w-[150px] xl:max-w-40 2xl:max-w-[150px] 3xl:max-w-[180px] 4xl:max-w-60">
+                              <span className="truncate max-w-[300px] 2xl:max-w-[200px] 3xl:max-w-[300px]">
                                 {endpointName}
                               </span>
                             );

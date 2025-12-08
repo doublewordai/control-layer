@@ -13,6 +13,7 @@ import {
   DialogTitle,
   DialogFooter,
 } from "../../../ui/dialog";
+import { AlertBox } from "@/components/ui/alert-box";
 
 interface RerankPlaygroundProps {
   selectedModel: Model;
@@ -74,17 +75,12 @@ const RerankPlayground: React.FC<RerankPlaygroundProps> = ({
           </p>
         </div>
 
-        {error && (
-          <div className="bg-red-50 border border-red-200 text-red-700 rounded-lg p-3 mb-4">
-            <p className="font-medium text-sm">Error</p>
-            <p className="text-sm">{error}</p>
-          </div>
-        )}
+        <AlertBox variant="error">{error}</AlertBox>
 
         {/* Input Area - Flex Layout */}
         <div className="flex-1 min-h-0 flex flex-col lg:flex-row gap-8">
           {/* Query Section */}
-          <div className="flex-shrink-0 lg:w-80 space-y-4">
+          <div className="shrink-0 lg:w-80 space-y-4">
             <div className="flex-1">
               <label className="block text-sm font-medium text-gray-700 mb-2">
                 Query
@@ -145,7 +141,7 @@ const RerankPlayground: React.FC<RerankPlaygroundProps> = ({
               {documents.map((doc, index) => (
                 <div key={index} className="relative">
                   <div className="flex items-start gap-2">
-                    <div className="flex-shrink-0 mt-2">
+                    <div className="shrink-0 mt-2">
                       <div className="w-6 h-6 bg-gray-100 text-gray-600 rounded-full flex items-center justify-center text-xs font-medium">
                         {index + 1}
                       </div>
@@ -171,7 +167,7 @@ const RerankPlayground: React.FC<RerankPlaygroundProps> = ({
                         onClick={() => onRemoveDocument(index)}
                         size="sm"
                         variant="outline"
-                        className="flex-shrink-0 text-gray-400 hover:text-red-500 border-none mt-1"
+                        className="shrink-0 text-gray-400 hover:text-red-500 border-none mt-1"
                         disabled={isStreaming}
                       >
                         <X className="w-4 h-4" />
@@ -191,7 +187,7 @@ const RerankPlayground: React.FC<RerankPlaygroundProps> = ({
         onOpenChange={(open) => !open && onClearResult()}
       >
         <DialogContent className="sm:max-w-5xl max-h-[85vh] overflow-hidden flex flex-col">
-          <DialogHeader className="flex-shrink-0">
+          <DialogHeader className="shrink-0">
             <DialogTitle className="text-lg">Reranking Results</DialogTitle>
           </DialogHeader>
 
@@ -275,7 +271,7 @@ const RerankPlayground: React.FC<RerankPlaygroundProps> = ({
             </div>
           )}
 
-          <DialogFooter className="flex-shrink-0 mt-4">
+          <DialogFooter className="shrink-0 mt-4">
             <Button
               onClick={onClearResult}
               variant="outline"
