@@ -5,8 +5,9 @@
 @custom-variant dark (&:is(.dark *));
 
 @theme {
+    --breakpoint-2xl: 101rem;
     --breakpoint-3xl: 112.5rem;
-    --breakpoint-4xl: 130rem;
+    --breakpoint-4xl: 136rem;
 
     --color-doubleword-primary: #fe6767;
     --color-doubleword-concrete: #e2e0d3;
