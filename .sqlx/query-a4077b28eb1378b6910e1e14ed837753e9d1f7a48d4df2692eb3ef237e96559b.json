@@ -1,0 +1,15 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n            UPDATE model_tariffs\n            SET valid_until = NOW()\n            WHERE deployed_model_id = $1 AND name = $2 AND valid_until IS NULL\n            ",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Text"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "a4077b28eb1378b6910e1e14ed837753e9d1f7a48d4df2692eb3ef237e96559b"
+}

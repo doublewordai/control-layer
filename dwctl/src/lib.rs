@@ -1574,7 +1574,7 @@ mod test {
         assert_eq!(endpoint_response.status_code(), 201, "Failed to create endpoint");
         let endpoint: crate::api::models::inference_endpoints::InferenceEndpointResponse = endpoint_response.json();
 
-        // Step 6: Admin creates deployment via API (with pricing for credit deduction)
+        // Step 6: Admin creates deployment via API (with tariffs for credit deduction)
         let deployment_response = server
             .post("/admin/api/v1/models")
             .add_header(&admin_headers[0].0, &admin_headers[0].1)
@@ -1584,10 +1584,12 @@ mod test {
                 "alias": "test-model",
                 "description": "Test model deployment",
                 "hosted_on": endpoint.id,
-                "pricing": {
+                "tariffs": [{
+                    "name": "batch",
                     "input_price_per_token": "0.001",
-                    "output_price_per_token": "0.003"
-                }
+                    "output_price_per_token": "0.003",
+                    "is_default": true
+                }]
             }))
             .await;
         assert_eq!(deployment_response.status_code(), 200, "Failed to create deployment");
@@ -1728,10 +1730,7 @@ mod test {
         assert_eq!(usage["completion_tokens"], 12, "Should have 12 completion tokens from mock");
         assert_eq!(usage["total_tokens"], 21, "Should match mocked token count");
 
-        // Verify pricing headers were set by onwards
-        let headers = &logged_entry["response"]["headers"];
-        assert_eq!(headers["onwards-input-price-per-token"], "0.00100000");
-        assert_eq!(headers["onwards-output-price-per-token"], "0.00300000");
+        // Note: Pricing is now fetched from tariffs table, not from response headers
 
         // Test 2: Proxy header auth also works (SSO-style authentication)
         let regular_user_external_id = regular_user.external_user_id.as_ref().unwrap_or(&regular_user.username);

@@ -1,0 +1,68 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n            INSERT INTO model_tariffs (\n                deployed_model_id, name, input_price_per_token, output_price_per_token,\n                is_default, valid_from\n            )\n            VALUES ($1, $2, $3, $4, $5, NOW())\n            RETURNING id, deployed_model_id, name, input_price_per_token, output_price_per_token,\n                      is_default, valid_from, valid_until\n            ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "id",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 1,
+        "name": "deployed_model_id",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 2,
+        "name": "name",
+        "type_info": "Varchar"
+      },
+      {
+        "ordinal": 3,
+        "name": "input_price_per_token",
+        "type_info": "Numeric"
+      },
+      {
+        "ordinal": 4,
+        "name": "output_price_per_token",
+        "type_info": "Numeric"
+      },
+      {
+        "ordinal": 5,
+        "name": "is_default",
+        "type_info": "Bool"
+      },
+      {
+        "ordinal": 6,
+        "name": "valid_from",
+        "type_info": "Timestamptz"
+      },
+      {
+        "ordinal": 7,
+        "name": "valid_until",
+        "type_info": "Timestamptz"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Varchar",
+        "Numeric",
+        "Numeric",
+        "Bool"
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      true
+    ]
+  },
+  "hash": "c562d96210ecf12dbd8bb75f5a66ee1dd30d8d9f64f0904458edad11f3dac1c1"
+}
