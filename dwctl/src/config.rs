@@ -81,7 +81,6 @@ use crate::errors::Error;
 // DB sync channel name
 pub static ONWARDS_CONFIG_CHANGED_CHANNEL: &str = "auth_config_changed";
 
-
 /// Simple CLI args - just for specifying config file
 #[derive(Parser, Debug)]
 #[command(author, version, about, long_about = None)]

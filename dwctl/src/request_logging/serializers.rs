@@ -399,7 +399,10 @@ pub async fn store_analytics_record(
                     }
                     _ => sqlx::Error::Configuration(e.to_string().into()),
                 })?
-                .expect(&format!("No tariff pricing found for model '{}' - tariffs must be configured for all models", model_name));
+                .expect(&format!(
+                    "No tariff pricing found for model '{}' - tariffs must be configured for all models",
+                    model_name
+                ));
 
             let provider_name = model_info
                 .provider_url
@@ -410,8 +413,13 @@ pub async fn store_analytics_record(
 
             (Some(tariff_pricing), provider_name)
         } else {
-            // Model exists in request but not found in deployed_models - still panic
-            panic!("Model '{}' not found in deployed_models table", model_name);
+            // Model exists in request but not found in deployed_models
+            // Log analytics without pricing to preserve request data
+            warn!(
+                "Model '{}' not found in deployed_models table - logging analytics without pricing",
+                model_name
+            );
+            (None, None)
         }
     } else {
         (None, None)
@@ -1624,10 +1632,7 @@ mod tests {
         /// Returns the model's deployment ID
         async fn create_test_model(pool: &sqlx::PgPool, model_name: &str) -> DeploymentId {
             use crate::db::handlers::{Deployments, InferenceEndpoints};
-            use crate::db::models::{
-                deployments::DeploymentCreateDBRequest,
-                inference_endpoints::InferenceEndpointCreateDBRequest,
-            };
+            use crate::db::models::{deployments::DeploymentCreateDBRequest, inference_endpoints::InferenceEndpointCreateDBRequest};
 
             let user = create_test_user(pool, Role::StandardUser).await;
 
@@ -1686,13 +1691,7 @@ mod tests {
             let mut conn = pool.acquire().await.unwrap();
             let mut tariffs_repo = Tariffs::new(&mut conn);
             tariffs_repo
-                .replace_tariff(
-                    deployed_model_id,
-                    tariff_name,
-                    input_price_per_token,
-                    output_price_per_token,
-                    true,
-                )
+                .replace_tariff(deployed_model_id, tariff_name, input_price_per_token, output_price_per_token, true)
                 .await
                 .unwrap();
         }
@@ -1723,10 +1722,7 @@ mod tests {
         }
 
         /// Helper: Create test UsageMetrics for testing
-        fn create_test_usage_metrics(
-            prompt_tokens: i64,
-            completion_tokens: i64,
-        ) -> UsageMetrics {
+        fn create_test_usage_metrics(prompt_tokens: i64, completion_tokens: i64) -> UsageMetrics {
             UsageMetrics {
                 instance_id: Uuid::new_v4(),
                 correlation_id: 12345,
@@ -1839,14 +1835,18 @@ mod tests {
         async fn test_skip_deduction_when_user_id_none(pool: sqlx::PgPool) {
             // Setup: Model with tariff pricing
             let model_id = create_test_model(&pool, "gpt-4").await;
-            setup_tariff(&pool, model_id, "batch", Decimal::from_str("0.00001").unwrap(), Decimal::from_str("0.00003").unwrap()).await;
+            setup_tariff(
+                &pool,
+                model_id,
+                "batch",
+                Decimal::from_str("0.00001").unwrap(),
+                Decimal::from_str("0.00003").unwrap(),
+            )
+            .await;
 
             // Setup: Auth::None (no user)
             let auth = Auth::None;
-            let metrics = create_test_usage_metrics(
-                1000,
-                500,
-            );
+            let metrics = create_test_usage_metrics(1000, 500);
 
             // Execute
             let request_data = create_test_request_data();
@@ -1862,7 +1862,14 @@ mod tests {
         async fn test_skip_deduction_when_cost_zero(pool: sqlx::PgPool) {
             // Setup: Model with tariff pricing
             let model_id = create_test_model(&pool, "gpt-4").await;
-            setup_tariff(&pool, model_id, "batch", Decimal::from_str("0.00001").unwrap(), Decimal::from_str("0.00003").unwrap()).await;
+            setup_tariff(
+                &pool,
+                model_id,
+                "batch",
+                Decimal::from_str("0.00001").unwrap(),
+                Decimal::from_str("0.00003").unwrap(),
+            )
+            .await;
 
             // Setup: User with balance, but zero tokens
             let user_id = setup_user_with_balance(&pool, Decimal::from_str("10.00").unwrap()).await;
@@ -1991,10 +1998,7 @@ mod tests {
             let auth = create_test_auth_for_user(&pool, user_id).await;
 
             // Create metrics with pricing but no model
-            let mut metrics = create_test_usage_metrics(
-                1000,
-                500,
-            );
+            let mut metrics = create_test_usage_metrics(1000, 500);
             metrics.request_model = None; // Remove model
 
             // Execute
