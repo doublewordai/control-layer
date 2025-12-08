@@ -20,7 +20,7 @@ test-utils = ["dep:axum-test"]
 
 [dependencies]
 axum = { version = "0.8", features = ["multipart"] }
-fusillade = { version = "0.6.0" }
+fusillade = { path = "../../fusillade" }
 tokio = { version = "1.0", features = ["full"] }
 tokio-stream = { version = "0.1", features = ["sync"] }
 tokio-util = "0.7"
