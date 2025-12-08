@@ -45,7 +45,7 @@ DELETED_FILES=0
 # Check if response has .data field (paginated response)
 if echo "$FILES_RESPONSE" | jq -e '.data' >/dev/null 2>&1; then
   # Files that match our test JSONL filenames
-  FILES=$(echo "$FILES_RESPONSE" | jq -r '.data[]? | select(.filename | test("^(gpt4-batch|restricted-batch|mixed-batch)\\.jsonl$")) | .id')
+  FILES=$(echo "$FILES_RESPONSE" | jq -r '.data[]? | select(.filename | test("^(gpt-4-batches|restricted-batches|mixed-batches|gemini-batches|gpt-4-files|restricted-files|mixed-files|gemini-files)\\.jsonl$")) | .id')
   if [ -n "$FILES" ]; then
     while read -r file_id; do
       echo "  Deleting file: $file_id" >&2
