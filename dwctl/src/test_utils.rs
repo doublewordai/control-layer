@@ -26,6 +26,7 @@ use crate::{
 use axum_test::TestServer;
 use sqlx::{PgConnection, PgPool};
 use uuid::Uuid;
+use crate::db::models::api_keys::ApiKeyPurpose;
 
 pub async fn create_test_app(pool: PgPool, _enable_sync: bool) -> (TestServer, crate::BackgroundServices) {
     let config = create_test_config();
@@ -286,7 +287,7 @@ pub async fn create_test_api_key_for_user(pool: &PgPool, user_id: UserId) -> Api
         ApiKeyCreate {
             name: "Test API Key".to_string(),
             description: Some("Test description".to_string()),
-            purpose: crate::db::models::api_keys::ApiKeyPurpose::Inference,
+            purpose: ApiKeyPurpose::Realtime,
             requests_per_second: None,
             burst_size: None,
         },

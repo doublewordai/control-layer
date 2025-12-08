@@ -57,10 +57,14 @@ impl From<(Vec<DeploymentId>, ApiKey)> for ApiKeyDBResponse {
             .and_then(|v| serde_json::from_value::<ApiKeyPurpose>(v).ok())
             .or(match api_key.purpose.as_str() {
                 "platform" => Some(ApiKeyPurpose::Platform),
-                "inference" => Some(ApiKeyPurpose::Inference),
+                "realtime" => Some(ApiKeyPurpose::Realtime),
+                "batch" => Some(ApiKeyPurpose::Batch),
+                "playground" => Some(ApiKeyPurpose::Playground),
+                // Legacy: map old "inference" to "realtime" for backwards compatibility
+                "inference" => Some(ApiKeyPurpose::Realtime),
                 _ => None,
             })
-            .unwrap_or(ApiKeyPurpose::Inference);
+            .unwrap_or(ApiKeyPurpose::Realtime);
 
         Self {
             id: api_key.id,
@@ -98,7 +102,9 @@ impl<'c> Repository for ApiKeys<'c> {
         // Convert purpose enum to string for database
         let purpose_str = match request.purpose {
             ApiKeyPurpose::Platform => "platform",
-            ApiKeyPurpose::Inference => "inference",
+            ApiKeyPurpose::Realtime => "realtime",
+            ApiKeyPurpose::Batch => "batch",
+            ApiKeyPurpose::Playground => "playground",
         };
 
         let api_key = sqlx::query_as!(
@@ -289,7 +295,7 @@ impl<'c> ApiKeys<'c> {
     ///
     /// # Arguments
     /// * `user_id` - The user ID to get or create a hidden key for
-    /// * `purpose` - The purpose of the key (should be ApiKeyPurpose::Inference for proxy use)
+    /// * `purpose` - The purpose of the key
     ///
     /// # Returns
     /// Returns the secret of the hidden API key
@@ -298,7 +304,9 @@ impl<'c> ApiKeys<'c> {
         // Convert purpose enum to string for database
         let purpose_str = match purpose {
             ApiKeyPurpose::Platform => "platform",
-            ApiKeyPurpose::Inference => "inference",
+            ApiKeyPurpose::Realtime => "realtime",
+            ApiKeyPurpose::Batch => "batch",
+            ApiKeyPurpose::Playground => "playground",
         };
 
         // Try to get existing hidden key for this user and purpose
@@ -597,7 +605,7 @@ mod tests {
                     user_id: userid,
                     name: "Test API Key".to_string(),
                     description: Some("Test description".to_string()),
-                    purpose: ApiKeyPurpose::Inference,
+                    purpose: ApiKeyPurpose::Realtime,
                     requests_per_second: None,
                     burst_size: None,
                 };
@@ -637,7 +645,7 @@ mod tests {
                 user_id: user.id,
                 name: "Key 1".to_string(),
                 description: None,
-                purpose: ApiKeyPurpose::Inference,
+                purpose: ApiKeyPurpose::Realtime,
                 requests_per_second: None,
                 burst_size: None,
             };
@@ -645,7 +653,7 @@ mod tests {
                 user_id: user.id,
                 name: "Key 2".to_string(),
                 description: Some("Key 2 description".to_string()),
-                purpose: ApiKeyPurpose::Inference,
+                purpose: ApiKeyPurpose::Realtime,
                 requests_per_second: None,
                 burst_size: None,
             };
@@ -699,7 +707,7 @@ mod tests {
                 user_id: user.id,
                 name: "Delete Me".to_string(),
                 description: None,
-                purpose: ApiKeyPurpose::Inference,
+                purpose: ApiKeyPurpose::Realtime,
                 requests_per_second: None,
                 burst_size: None,
             };
@@ -742,7 +750,7 @@ mod tests {
                 user_id: user.id,
                 name: "Trait Test Key".to_string(),
                 description: Some("Test trait description".to_string()),
-                purpose: ApiKeyPurpose::Inference,
+                purpose: ApiKeyPurpose::Realtime,
                 requests_per_second: None,
                 burst_size: None,
             };
@@ -866,7 +874,7 @@ mod tests {
                 user_id: user.id,
                 name: "Test API Key".to_string(),
                 description: Some("API key for testing group access".to_string()),
-                purpose: ApiKeyPurpose::Inference,
+                purpose: ApiKeyPurpose::Realtime,
                 requests_per_second: None,
                 burst_size: None,
             };
@@ -994,7 +1002,7 @@ mod tests {
                 user_id: user.id,
                 name: "Test API Key".to_string(),
                 description: Some("API key for testing access removal".to_string()),
-                purpose: ApiKeyPurpose::Inference,
+                purpose: ApiKeyPurpose::Realtime,
                 requests_per_second: None,
                 burst_size: None,
             };
@@ -1136,7 +1144,7 @@ mod tests {
                 user_id: user.id,
                 name: "Test API Key".to_string(),
                 description: Some("API key for testing deployment removal".to_string()),
-                purpose: ApiKeyPurpose::Inference,
+                purpose: ApiKeyPurpose::Realtime,
                 requests_per_second: None,
                 burst_size: None,
             };
@@ -1304,7 +1312,7 @@ mod tests {
                 user_id: user1.id,
                 name: "User 1 Key".to_string(),
                 description: Some("API key for user 1".to_string()),
-                purpose: ApiKeyPurpose::Inference,
+                purpose: ApiKeyPurpose::Realtime,
                 requests_per_second: None,
                 burst_size: None,
             };
@@ -1314,7 +1322,7 @@ mod tests {
                 user_id: user2.id,
                 name: "User 2 Key".to_string(),
                 description: Some("API key for user 2".to_string()),
-                purpose: ApiKeyPurpose::Inference,
+                purpose: ApiKeyPurpose::Realtime,
                 requests_per_second: None,
                 burst_size: None,
             };
@@ -1480,7 +1488,7 @@ mod tests {
                 user_id: user.id,
                 name: "Multi Access Key".to_string(),
                 description: Some("API key for multiple deployments".to_string()),
-                purpose: ApiKeyPurpose::Inference,
+                purpose: ApiKeyPurpose::Realtime,
                 requests_per_second: None,
                 burst_size: None,
             };
@@ -1620,7 +1628,7 @@ mod tests {
                 user_id: user.id,
                 name: "Dynamic Access Key".to_string(),
                 description: Some("API key for testing dynamic access".to_string()),
-                purpose: ApiKeyPurpose::Inference,
+                purpose: ApiKeyPurpose::Realtime,
                 requests_per_second: None,
                 burst_size: None,
             };
@@ -1807,7 +1815,7 @@ mod tests {
                 user_id: user.id,
                 name: "Test API Key".to_string(),
                 description: Some("API key for testing Everyone group access".to_string()),
-                purpose: ApiKeyPurpose::Inference,
+                purpose: ApiKeyPurpose::Realtime,
                 requests_per_second: None,
                 burst_size: None,
             };
@@ -1889,7 +1897,7 @@ mod tests {
                     user_id: user.id,
                     name: format!("Pagination Key {i}"),
                     description: Some(format!("Key {i} for pagination testing")),
-                    purpose: ApiKeyPurpose::Inference,
+                    purpose: ApiKeyPurpose::Realtime,
                     requests_per_second: None,
                     burst_size: None,
                 };
@@ -2016,7 +2024,7 @@ mod tests {
                 user_id: user1.id,
                 name: "User1 Key".to_string(),
                 description: None,
-                purpose: ApiKeyPurpose::Inference,
+                purpose: ApiKeyPurpose::Realtime,
                 requests_per_second: None,
                 burst_size: None,
             };
@@ -2024,7 +2032,7 @@ mod tests {
                 user_id: user2.id,
                 name: "User2 Key".to_string(),
                 description: None,
-                purpose: ApiKeyPurpose::Inference,
+                purpose: ApiKeyPurpose::Realtime,
                 requests_per_second: None,
                 burst_size: None,
             };
@@ -2087,7 +2095,7 @@ mod tests {
             user_id: user.id,
             name: "Bulk Key 1".to_string(),
             description: Some("First bulk key".to_string()),
-            purpose: ApiKeyPurpose::Inference,
+            purpose: ApiKeyPurpose::Realtime,
             requests_per_second: None,
             burst_size: None,
         };
@@ -2095,7 +2103,7 @@ mod tests {
             user_id: user.id,
             name: "Bulk Key 2".to_string(),
             description: Some("Second bulk key".to_string()),
-            purpose: ApiKeyPurpose::Inference,
+            purpose: ApiKeyPurpose::Realtime,
             requests_per_second: None,
             burst_size: None,
         };
@@ -2103,7 +2111,7 @@ mod tests {
             user_id: user.id,
             name: "Bulk Key 3".to_string(),
             description: None,
-            purpose: ApiKeyPurpose::Inference,
+            purpose: ApiKeyPurpose::Realtime,
             requests_per_second: None,
             burst_size: None,
         };
@@ -2160,7 +2168,7 @@ mod tests {
             user_id: user.id,
             name: "Valid Key".to_string(),
             description: Some("Only valid key".to_string()),
-            purpose: ApiKeyPurpose::Inference,
+            purpose: ApiKeyPurpose::Realtime,
             requests_per_second: None,
             burst_size: None,
         };
@@ -2239,7 +2247,7 @@ mod tests {
             user_id: user.id,
             name: "Duplicate Test Key".to_string(),
             description: Some("Key for testing duplicates".to_string()),
-            purpose: ApiKeyPurpose::Inference,
+            purpose: ApiKeyPurpose::Realtime,
             requests_per_second: None,
             burst_size: None,
         };
@@ -2327,7 +2335,7 @@ mod tests {
             user_id: user.id,
             name: "Bulk Access Key 1".to_string(),
             description: Some("First key with model access".to_string()),
-            purpose: ApiKeyPurpose::Inference,
+            purpose: ApiKeyPurpose::Realtime,
             requests_per_second: None,
             burst_size: None,
         };
@@ -2335,7 +2343,7 @@ mod tests {
             user_id: user.id,
             name: "Bulk Access Key 2".to_string(),
             description: Some("Second key with model access".to_string()),
-            purpose: ApiKeyPurpose::Inference,
+            purpose: ApiKeyPurpose::Realtime,
             requests_per_second: None,
             burst_size: None,
         };
@@ -2395,7 +2403,7 @@ mod tests {
             user_id: user1.id,
             name: "User1 Bulk Key".to_string(),
             description: Some("Key for user 1".to_string()),
-            purpose: ApiKeyPurpose::Inference,
+            purpose: ApiKeyPurpose::Realtime,
             requests_per_second: None,
             burst_size: None,
         };
@@ -2403,7 +2411,7 @@ mod tests {
             user_id: user2.id,
             name: "User2 Bulk Key".to_string(),
             description: Some("Key for user 2".to_string()),
-            purpose: ApiKeyPurpose::Inference,
+            purpose: ApiKeyPurpose::Realtime,
             requests_per_second: None,
             burst_size: None,
         };
@@ -2647,7 +2655,7 @@ mod tests {
                 user_id: user_with_credits.id,
                 requests_per_second: None,
                 burst_size: None,
-                purpose: ApiKeyPurpose::Inference,
+                purpose: ApiKeyPurpose::Realtime,
             })
             .await
             .unwrap();
@@ -2659,7 +2667,7 @@ mod tests {
                 user_id: user_without_credits.id,
                 requests_per_second: None,
                 burst_size: None,
-                purpose: ApiKeyPurpose::Inference,
+                purpose: ApiKeyPurpose::Realtime,
             })
             .await
             .unwrap();
@@ -2781,7 +2789,7 @@ mod tests {
                     description: None,
                     requests_per_second: None,
                     burst_size: None,
-                    purpose: ApiKeyPurpose::Inference,
+                    purpose: ApiKeyPurpose::Realtime,
                 })
                 .await
                 .unwrap();
@@ -2872,7 +2880,7 @@ mod tests {
                     description: None,
                     requests_per_second: None,
                     burst_size: None,
-                    purpose: ApiKeyPurpose::Inference,
+                    purpose: ApiKeyPurpose::Realtime,
                 })
                 .await
                 .unwrap();
@@ -2934,7 +2942,7 @@ mod tests {
                     description: None,
                     requests_per_second: None,
                     burst_size: None,
-                    purpose: ApiKeyPurpose::Inference,
+                    purpose: ApiKeyPurpose::Realtime,
                 })
                 .await
                 .unwrap();
@@ -3021,7 +3029,7 @@ mod tests {
                     description: None,
                     requests_per_second: None,
                     burst_size: None,
-                    purpose: ApiKeyPurpose::Inference,
+                    purpose: ApiKeyPurpose::Realtime,
                 })
                 .await
                 .unwrap();
@@ -3160,7 +3168,7 @@ mod tests {
                 user_id: user_no_credits.id,
                 requests_per_second: None,
                 burst_size: None,
-                purpose: ApiKeyPurpose::Inference,
+                purpose: ApiKeyPurpose::Realtime,
             })
             .await
             .unwrap();
@@ -3295,7 +3303,7 @@ mod tests {
                 user_id: user_no_credits.id,
                 requests_per_second: None,
                 burst_size: None,
-                purpose: ApiKeyPurpose::Inference,
+                purpose: ApiKeyPurpose::Realtime,
             })
             .await
             .unwrap();
@@ -3430,7 +3438,7 @@ mod tests {
                 user_id: user_no_credits.id,
                 requests_per_second: None,
                 burst_size: None,
-                purpose: ApiKeyPurpose::Inference,
+                purpose: ApiKeyPurpose::Realtime,
             })
             .await
             .unwrap();
@@ -3488,7 +3496,7 @@ mod tests {
                 user_id: user.id,
                 name: "Test Secret Key".to_string(),
                 description: Some("Key for testing secret lookup".to_string()),
-                purpose: ApiKeyPurpose::Inference,
+                purpose: ApiKeyPurpose::Realtime,
                 requests_per_second: None,
                 burst_size: None,
             };

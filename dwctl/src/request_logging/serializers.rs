@@ -1777,7 +1777,7 @@ mod tests {
                     user_id,
                     name: "Test API key".to_string(),
                     description: None,
-                    purpose: ApiKeyPurpose::Inference,
+                    purpose: ApiKeyPurpose::Realtime,
                     requests_per_second: None,
                     burst_size: None,
                 })

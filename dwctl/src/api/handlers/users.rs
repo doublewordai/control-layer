@@ -9,9 +9,8 @@ use crate::{
     },
     auth::permissions::{self as permissions, RequiresPermission, can_read_all_resources, can_read_own_resource, operation, resource},
     db::{
-        handlers::{Credits, Groups, Repository, Users, api_keys::ApiKeys, users::UserFilter},
+        handlers::{Credits, Groups, Repository, Users, users::UserFilter},
         models::{
-            api_keys::ApiKeyPurpose,
             users::{UserCreateDBRequest, UserUpdateDBRequest},
         },
     },
@@ -271,9 +270,9 @@ pub async fn create_user(
 
     let user = repo.create(&db_request).await?;
 
-    // Pre-create hidden API key for inference to avoid race condition with onwards sync
-    let mut api_keys_repo = ApiKeys::new(&mut tx);
-    api_keys_repo.get_or_create_hidden_key(user.id, ApiKeyPurpose::Inference).await?;
+    // Note: Batch and playground hidden API keys are pre-created by the repository's
+    // get_or_create_proxy_header_user method to avoid race conditions with onwards sync.
+    // Realtime keys are created by users explicitly via API and can tolerate activation delay.
 
     tx.commit().await.map_err(|e| Error::Database(e.into()))?;
     Ok((StatusCode::CREATED, Json(UserResponse::from(user))))
