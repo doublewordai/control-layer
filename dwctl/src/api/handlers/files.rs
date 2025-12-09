@@ -16,7 +16,7 @@ use crate::db::{
     handlers::deployments::{DeploymentFilter, Deployments},
     handlers::repository::Repository,
     models::api_keys::ApiKeyPurpose,
-    models::deployments::{ModelStatus, ModelType},
+    models::deployments::ModelStatus,
 };
 use crate::errors::{Error, Result};
 use crate::types::Resource;
@@ -897,7 +897,6 @@ pub async fn get_file_cost_estimate(
     Path(file_id_str): Path<String>,
     current_user: RequiresPermission<resource::Files, operation::ReadOwn>,
 ) -> Result<Json<crate::api::models::files::FileCostEstimate>> {
-    use futures::StreamExt;
     use rust_decimal::Decimal;
     use std::collections::HashMap;
 
@@ -937,8 +936,15 @@ pub async fn get_file_cost_estimate(
         .with_deleted(false);
     let all_deployments = deployments_repo.list(&filter).await.map_err(Error::Database)?;
 
-    // Build a lookup map of model alias -> (deployment, avg_output_tokens)
-    let mut model_info: HashMap<String, (crate::db::models::deployments::DeploymentDBResponse, Option<i64>)> = HashMap::new();
+    // Build a lookup map of model alias -> (deployment, avg_output_tokens, model_type)
+    let mut model_info: HashMap<
+        String,
+        (
+            crate::db::models::deployments::DeploymentDBResponse,
+            Option<i64>,
+            Option<crate::db::models::deployments::ModelType>,
+        ),
+    > = HashMap::new();
 
     for deployment in all_deployments {
         // Query http_analytics for last 100 responses to get average output token count
@@ -962,32 +968,28 @@ pub async fn get_file_cost_estimate(
         .map_err(|e| Error::Database(e.into()))?
         .flatten();
 
-        model_info.insert(deployment.alias.clone(), (deployment, avg_output_tokens));
+        model_info.insert(
+            deployment.alias.clone(),
+            (deployment.clone(), avg_output_tokens, deployment.model_type.clone()),
+        );
     }
 
-    // Stream all templates from the file and group by model
-    let content_stream = state.request_manager.get_file_content_stream(fusillade::FileId(file_id), 0);
-
-    // Collect all templates and group by model
-    let mut model_stats: HashMap<String, (i64, i64)> = HashMap::new(); // (request_count, input_tokens)
-
-    let mut content_stream = Box::pin(content_stream);
-    while let Some(item_result) = content_stream.next().await {
-        let item = item_result.map_err(|e| Error::Internal {
-            operation: format!("read file content: {}", e),
+    // Get aggregated template statistics (optimized single query)
+    let template_stats = state
+        .request_manager
+        .get_file_template_stats(fusillade::FileId(file_id))
+        .await
+        .map_err(|e| Error::Internal {
+            operation: format!("get file template stats: {}", e),
         })?;
 
-        // Only process templates (input requests), not outputs or errors
-        if let fusillade::FileContentItem::Template(template) = item {
-            // Estimate input tokens: body size in bytes / 4
-            let body_bytes = template.body.len() as i64;
-            let estimated_input_tokens = body_bytes / 4;
+    // Convert to the format needed for cost calculation
+    let mut model_stats: HashMap<String, (i64, i64)> = HashMap::new(); // (request_count, input_tokens)
 
-            // Update stats for this model
-            let stats = model_stats.entry(template.model.clone()).or_insert((0, 0));
-            stats.0 += 1; // request_count
-            stats.1 += estimated_input_tokens;
-        }
+    for stat in template_stats {
+        // Estimate input tokens: body size in bytes / 4
+        let estimated_input_tokens = stat.total_body_bytes / 4;
+        model_stats.insert(stat.model, (stat.request_count, estimated_input_tokens));
     }
 
     let mut total_cost = Decimal::ZERO;
@@ -995,21 +997,14 @@ pub async fn get_file_cost_estimate(
 
     for (model_alias, (request_count, input_tokens)) in model_stats {
         // Look up the deployment and historical average
-        let (deployment_opt, avg_output_tokens) = model_info
+        let (deployment_opt, avg_output_tokens, model_type) = model_info
             .get(&model_alias)
-            .map(|(d, avg)| (Some(d.clone()), *avg))
-            .unwrap_or((None, None));
+            .map(|(d, avg, mt)| (Some(d.clone()), *avg, mt.clone()))
+            .unwrap_or((None, None, None));
 
-        // Check if this is an embeddings model from deployment type
-        let is_embeddings = deployment_opt
-            .as_ref()
-            .and_then(|d| d.model_type.as_ref())
-            .map(|t| matches!(t, ModelType::Embeddings))
-            .unwrap_or(false);
-
-        // Calculate estimated output tokens using model type, historical average, or fallback heuristics
-        let estimated_output_tokens = if is_embeddings {
-            // Embeddings models return 1 token per request
+        // Calculate estimated output tokens using historical average or fallback heuristics
+        let estimated_output_tokens = if matches!(model_type, Some(crate::db::models::deployments::ModelType::Embeddings)) {
+            // Embedding models have minimal output
             request_count
         } else if let Some(avg) = avg_output_tokens {
             // Use historical average multiplied by request count
