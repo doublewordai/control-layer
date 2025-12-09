@@ -97,21 +97,19 @@ pub async fn error_enrichment_middleware(State(pool): State<PgPool>, request: Re
         }
 
         // If balance is OK but we have a 403, check if it's a model access issue
-        if let Some(model) = model_name {
-            if let Ok(user_id) = get_user_id_of_api_key(pool.clone(), &key).await {
-                if let Ok(has_access) = check_user_has_model_access(pool, user_id, &model).await {
-                    if !has_access {
-                        return Error::ModelAccessDenied {
-                            model_name: model.clone(),
-                            message: format!(
-                                "You do not have access to '{}'. Please contact your administrator to request access.",
-                                model
-                            ),
-                        }
-                        .into_response();
-                    }
-                }
+        if let Some(model) = model_name
+            && let Ok(user_id) = get_user_id_of_api_key(pool.clone(), &key).await
+            && let Ok(has_access) = check_user_has_model_access(pool, user_id, &model).await
+            && !has_access
+        {
+            return Error::ModelAccessDenied {
+                model_name: model.clone(),
+                message: format!(
+                    "You do not have access to '{}'. Please contact your administrator to request access.",
+                    model
+                ),
             }
+            .into_response();
         }
     }
 
