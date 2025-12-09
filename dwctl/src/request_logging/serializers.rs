@@ -411,6 +411,11 @@ pub async fn store_analytics_record(
                 .map(|s| s.to_string())
                 .or(model_info.provider_name);
 
+            warn!(
+                "Tariff pricing for model '{}' with tariff '{}': {:?}",
+                model_name, tariff_name, tariff_pricing
+            );
+
             (Some(tariff_pricing), provider_name)
         } else {
             // Model exists in request but not found in deployed_models
@@ -1691,6 +1696,19 @@ mod tests {
 
             let mut conn = pool.acquire().await.unwrap();
             let mut tariffs_repo = Tariffs::new(&mut conn);
+
+            // Close existing tariffs for this model to avoid duplicates
+            let current_tariffs = tariffs_repo.list_current_by_model(deployed_model_id).await.unwrap();
+            let tariff_ids: Vec<_> = current_tariffs
+                .into_iter()
+                .filter(|t| t.name == tariff_name)
+                .map(|t| t.id)
+                .collect();
+
+            if !tariff_ids.is_empty() {
+                tariffs_repo.close_tariffs_batch(&tariff_ids).await.unwrap();
+            }
+
             let tariff = TariffCreateDBRequest {
                 deployed_model_id,
                 name: tariff_name.to_string(),
