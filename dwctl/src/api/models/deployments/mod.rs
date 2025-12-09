@@ -73,7 +73,7 @@ pub struct ModelMetrics {
 /// Tariff definition for model creation/update
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct TariffDefinition {
-    /// Tariff name (e.g., "batch", "realtime", "premium")
+    /// Tariff name (e.g., "Standard Pricing", "Premium Tier")
     pub name: String,
     /// Input price per token (sent/returned as string to preserve precision)
     #[schema(value_type = String)]
@@ -81,9 +81,8 @@ pub struct TariffDefinition {
     /// Output price per token (sent/returned as string to preserve precision)
     #[schema(value_type = String)]
     pub output_price_per_token: rust_decimal::Decimal,
-    /// Whether this is the default tariff for the model
-    #[serde(default)]
-    pub is_default: bool,
+    /// Optional API key purpose this tariff applies to (realtime, batch, playground)
+    pub api_key_purpose: Option<crate::db::models::api_keys::ApiKeyPurpose>,
 }
 
 /// The data required to create a new model.

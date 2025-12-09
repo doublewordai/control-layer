@@ -12,7 +12,7 @@ use crate::{
     },
     auth::permissions::{RequiresPermission, can_read_all_resources, has_permission, operation, resource},
     db::{
-        handlers::{Deployments, InferenceEndpoints, Repository, deployments::DeploymentFilter},
+        handlers::{Deployments, InferenceEndpoints, Repository, Tariffs, deployments::DeploymentFilter},
         models::deployments::{DeploymentCreateDBRequest, DeploymentUpdateDBRequest, ModelStatus},
     },
     errors::{Error, Result},
@@ -259,7 +259,8 @@ pub async fn create_deployed_model(
 
     // Create tariffs if provided
     if let Some(tariff_defs) = tariffs {
-        repo.create_tariffs(model.id, tariff_defs).await?;
+        let mut tariffs_repo = Tariffs::new(tx.acquire().await.map_err(|e| Error::Database(e.into()))?);
+        tariffs_repo.create_tariffs(model.id, tariff_defs).await?;
     }
 
     tx.commit().await.map_err(|e| Error::Database(e.into()))?;
@@ -327,7 +328,8 @@ pub async fn update_deployed_model(
 
     // Handle tariff replacement if provided
     if let Some(tariff_defs) = tariffs {
-        repo.replace_tariffs(deployment_id, tariff_defs).await?;
+        let mut tariffs_repo = Tariffs::new(tx.acquire().await.map_err(|e| Error::Database(e.into()))?);
+        tariffs_repo.replace_tariffs(deployment_id, tariff_defs).await?;
     }
 
     tx.commit().await.map_err(|e| Error::Database(e.into()))?;

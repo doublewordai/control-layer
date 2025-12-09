@@ -626,69 +626,6 @@ impl<'c> Deployments<'c> {
         Ok(count.0)
     }
 
-    /// Replace all active tariffs for a model with new ones
-    /// Closes all current active tariffs and creates new ones
-    #[instrument(skip(self, tariffs), fields(deployment_id = %deployment_id, count = tariffs.len()), err)]
-    pub async fn replace_tariffs(
-        &mut self,
-        deployment_id: DeploymentId,
-        tariffs: Vec<crate::api::models::deployments::TariffDefinition>,
-    ) -> Result<()> {
-        use crate::db::{handlers::Tariffs, models::tariffs::TariffCreateDBRequest};
-
-        // Close all current active tariffs for this model
-        sqlx::query!(
-            r#"
-            UPDATE model_tariffs
-            SET valid_until = NOW()
-            WHERE deployed_model_id = $1 AND valid_until IS NULL
-            "#,
-            deployment_id
-        )
-        .execute(&mut *self.db)
-        .await?;
-
-        // Create new tariffs
-        let mut tariffs_repo = Tariffs::new(&mut *self.db);
-        for tariff_def in tariffs {
-            let tariff_request = TariffCreateDBRequest {
-                deployed_model_id: deployment_id,
-                name: tariff_def.name,
-                input_price_per_token: tariff_def.input_price_per_token,
-                output_price_per_token: tariff_def.output_price_per_token,
-                is_default: tariff_def.is_default,
-                valid_from: None, // Use NOW()
-            };
-            tariffs_repo.create(&tariff_request).await?;
-        }
-
-        Ok(())
-    }
-
-    /// Create initial tariffs for a new model
-    #[instrument(skip(self, tariffs), fields(deployment_id = %deployment_id, count = tariffs.len()), err)]
-    pub async fn create_tariffs(
-        &mut self,
-        deployment_id: DeploymentId,
-        tariffs: Vec<crate::api::models::deployments::TariffDefinition>,
-    ) -> Result<()> {
-        use crate::db::{handlers::Tariffs, models::tariffs::TariffCreateDBRequest};
-
-        let mut tariffs_repo = Tariffs::new(&mut *self.db);
-        for tariff_def in tariffs {
-            let tariff_request = TariffCreateDBRequest {
-                deployed_model_id: deployment_id,
-                name: tariff_def.name,
-                input_price_per_token: tariff_def.input_price_per_token,
-                output_price_per_token: tariff_def.output_price_per_token,
-                is_default: tariff_def.is_default,
-                valid_from: None, // Use NOW()
-            };
-            tariffs_repo.create(&tariff_request).await?;
-        }
-
-        Ok(())
-    }
 }
 
 #[cfg(test)]

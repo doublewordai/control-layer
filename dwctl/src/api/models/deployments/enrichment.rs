@@ -567,7 +567,7 @@ mod tests {
                 name: "Standard Tariff".to_string(),
                 input_price_per_token: Decimal::from_str("0.001").unwrap(),
                 output_price_per_token: Decimal::from_str("0.002").unwrap(),
-                is_default: true,
+                api_key_purpose: None,
                 valid_from: Utc::now(),
                 valid_until: None,
                 is_active: true,
@@ -583,7 +583,6 @@ mod tests {
         assert_eq!(tariffs[0].name, "Standard Tariff");
         assert_eq!(tariffs[0].input_price_per_token, Decimal::from_str("0.001").unwrap());
         assert_eq!(tariffs[0].output_price_per_token, Decimal::from_str("0.002").unwrap());
-        assert_eq!(tariffs[0].is_default, true);
     }
 
     #[test]

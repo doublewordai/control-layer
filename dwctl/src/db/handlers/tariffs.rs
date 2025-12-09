@@ -26,22 +26,30 @@ impl<'c> Tariffs<'c> {
     /// Create a new tariff for a deployed model
     #[instrument(skip(self, request), fields(deployed_model_id = %request.deployed_model_id, name = %request.name), err)]
     pub async fn create(&mut self, request: &TariffCreateDBRequest) -> Result<TariffDBResponse> {
+        // Convert ApiKeyPurpose enum to string for database
+        let purpose_str = request.api_key_purpose.as_ref().map(|p| match p {
+            crate::db::models::api_keys::ApiKeyPurpose::Realtime => "realtime",
+            crate::db::models::api_keys::ApiKeyPurpose::Batch => "batch",
+            crate::db::models::api_keys::ApiKeyPurpose::Playground => "playground",
+            crate::db::models::api_keys::ApiKeyPurpose::Platform => "platform",
+        });
+
         let tariff = sqlx::query_as!(
             ModelTariff,
             r#"
             INSERT INTO model_tariffs (
                 deployed_model_id, name, input_price_per_token, output_price_per_token,
-                is_default, valid_from
+                api_key_purpose, valid_from
             )
             VALUES ($1, $2, $3, $4, $5, COALESCE($6, NOW()))
             RETURNING id, deployed_model_id, name, input_price_per_token, output_price_per_token,
-                      is_default, valid_from, valid_until
+                      valid_from, valid_until, api_key_purpose as "api_key_purpose: _"
             "#,
             request.deployed_model_id,
             request.name,
             request.input_price_per_token,
             request.output_price_per_token,
-            request.is_default,
+            purpose_str,
             request.valid_from,
         )
         .fetch_one(&mut *self.db)
@@ -57,7 +65,7 @@ impl<'c> Tariffs<'c> {
             ModelTariff,
             r#"
             SELECT id, deployed_model_id, name, input_price_per_token, output_price_per_token,
-                   is_default, valid_from, valid_until
+                   valid_from, valid_until, api_key_purpose as "api_key_purpose: _"
             FROM model_tariffs
             WHERE id = $1
             "#,
@@ -76,10 +84,10 @@ impl<'c> Tariffs<'c> {
             ModelTariff,
             r#"
             SELECT id, deployed_model_id, name, input_price_per_token, output_price_per_token,
-                   is_default, valid_from, valid_until
+                   valid_from, valid_until, api_key_purpose as "api_key_purpose: _"
             FROM model_tariffs
             WHERE deployed_model_id = $1 AND valid_until IS NULL
-            ORDER BY is_default DESC, name ASC
+            ORDER BY api_key_purpose ASC NULLS LAST, name ASC
             "#,
             deployed_model_id
         )
@@ -96,10 +104,10 @@ impl<'c> Tariffs<'c> {
             ModelTariff,
             r#"
             SELECT id, deployed_model_id, name, input_price_per_token, output_price_per_token,
-                   is_default, valid_from, valid_until
+                   valid_from, valid_until, api_key_purpose as "api_key_purpose: _"
             FROM model_tariffs
             WHERE deployed_model_id = $1
-            ORDER BY valid_from DESC, name ASC
+            ORDER BY valid_from DESC, api_key_purpose ASC NULLS LAST, name ASC
             "#,
             deployed_model_id
         )
@@ -170,26 +178,36 @@ impl<'c> Tariffs<'c> {
         Ok(result.map(|r| (r.input_price_per_token, r.output_price_per_token)))
     }
 
-    /// Update a tariff (only updates pricing and is_default)
+    /// Update a tariff (only updates pricing and api_key_purpose)
     /// Note: To change pricing, you should typically close the current tariff and create a new one
     /// to maintain historical accuracy. This method is for minor corrections.
     #[instrument(skip(self, request), err)]
     pub async fn update(&mut self, id: Uuid, request: &TariffUpdateDBRequest) -> Result<Option<TariffDBResponse>> {
+        // Convert optional api_key_purpose to string
+        let purpose_str = request.api_key_purpose.as_ref().and_then(|opt| {
+            opt.as_ref().map(|p| match p {
+                crate::db::models::api_keys::ApiKeyPurpose::Realtime => "realtime",
+                crate::db::models::api_keys::ApiKeyPurpose::Batch => "batch",
+                crate::db::models::api_keys::ApiKeyPurpose::Playground => "playground",
+                crate::db::models::api_keys::ApiKeyPurpose::Platform => "platform",
+            })
+        });
+
         let tariff = sqlx::query_as!(
             ModelTariff,
             r#"
             UPDATE model_tariffs
             SET input_price_per_token = COALESCE($2, input_price_per_token),
                 output_price_per_token = COALESCE($3, output_price_per_token),
-                is_default = COALESCE($4, is_default)
+                api_key_purpose = COALESCE($4, api_key_purpose)
             WHERE id = $1
             RETURNING id, deployed_model_id, name, input_price_per_token, output_price_per_token,
-                      is_default, valid_from, valid_until
+                      valid_from, valid_until, api_key_purpose as "api_key_purpose: _"
             "#,
             id,
             request.input_price_per_token,
             request.output_price_per_token,
-            request.is_default,
+            purpose_str,
         )
         .fetch_optional(&mut *self.db)
         .await?;
@@ -208,7 +226,7 @@ impl<'c> Tariffs<'c> {
             SET valid_until = NOW()
             WHERE id = $1 AND valid_until IS NULL
             RETURNING id, deployed_model_id, name, input_price_per_token, output_price_per_token,
-                      is_default, valid_from, valid_until
+                      valid_from, valid_until, api_key_purpose as "api_key_purpose: _"
             "#,
             id
         )
@@ -280,5 +298,63 @@ impl<'c> Tariffs<'c> {
         .await?;
 
         Ok(result.rows_affected() > 0)
+    }
+
+    /// Replace all active tariffs for a model with new ones
+    /// Closes all current active tariffs and creates new ones
+    #[instrument(skip(self, tariffs), fields(deployment_id = %deployment_id, count = tariffs.len()), err)]
+    pub async fn replace_tariffs(
+        &mut self,
+        deployment_id: DeploymentId,
+        tariffs: Vec<crate::api::models::deployments::TariffDefinition>,
+    ) -> Result<()> {
+        // Close all current active tariffs for this model
+        sqlx::query!(
+            r#"
+            UPDATE model_tariffs
+            SET valid_until = NOW()
+            WHERE deployed_model_id = $1 AND valid_until IS NULL
+            "#,
+            deployment_id
+        )
+        .execute(&mut *self.db)
+        .await?;
+
+        // Create new tariffs
+        for tariff_def in tariffs {
+            let tariff_request = TariffCreateDBRequest {
+                deployed_model_id: deployment_id,
+                name: tariff_def.name,
+                input_price_per_token: tariff_def.input_price_per_token,
+                output_price_per_token: tariff_def.output_price_per_token,
+                api_key_purpose: tariff_def.api_key_purpose,
+                valid_from: None, // Use NOW()
+            };
+            self.create(&tariff_request).await?;
+        }
+
+        Ok(())
+    }
+
+    /// Create initial tariffs for a new model
+    #[instrument(skip(self, tariffs), fields(deployment_id = %deployment_id, count = tariffs.len()), err)]
+    pub async fn create_tariffs(
+        &mut self,
+        deployment_id: DeploymentId,
+        tariffs: Vec<crate::api::models::deployments::TariffDefinition>,
+    ) -> Result<()> {
+        for tariff_def in tariffs {
+            let tariff_request = TariffCreateDBRequest {
+                deployed_model_id: deployment_id,
+                name: tariff_def.name,
+                input_price_per_token: tariff_def.input_price_per_token,
+                output_price_per_token: tariff_def.output_price_per_token,
+                api_key_purpose: tariff_def.api_key_purpose,
+                valid_from: None, // Use NOW()
+            };
+            self.create(&tariff_request).await?;
+        }
+
+        Ok(())
     }
 }

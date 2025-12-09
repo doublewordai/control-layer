@@ -1,6 +1,6 @@
 //! API response models for model tariffs (read-only).
 
-use crate::{db::models::tariffs::ModelTariff, types::DeploymentId};
+use crate::{db::models::{api_keys::ApiKeyPurpose, tariffs::ModelTariff}, types::DeploymentId};
 use chrono::{DateTime, Utc};
 use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
@@ -21,7 +21,9 @@ pub struct TariffResponse {
     /// Output price per token (sent/returned as string to preserve precision)
     #[schema(value_type = String)]
     pub output_price_per_token: Decimal,
-    pub is_default: bool,
+    /// Optional API key purpose this tariff applies to (realtime, batch, playground)
+    /// If null, tariff is not automatically applied
+    pub api_key_purpose: Option<ApiKeyPurpose>,
     pub valid_from: DateTime<Utc>,
     pub valid_until: Option<DateTime<Utc>>,
     /// Indicates if this tariff is currently active (valid_until IS NULL)
@@ -37,7 +39,7 @@ impl From<ModelTariff> for TariffResponse {
             name: tariff.name,
             input_price_per_token: tariff.input_price_per_token,
             output_price_per_token: tariff.output_price_per_token,
-            is_default: tariff.is_default,
+            api_key_purpose: tariff.api_key_purpose,
             valid_from: tariff.valid_from,
             valid_until: tariff.valid_until,
             is_active: tariff.valid_until.is_none(),

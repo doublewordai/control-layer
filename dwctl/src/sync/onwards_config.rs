@@ -706,8 +706,8 @@ mod tests {
                 name: "default".to_string(),
                 input_price_per_token: Decimal::new(1, 6),  // $0.000001
                 output_price_per_token: Decimal::new(2, 6), // $0.000002
-                is_default: true,
                 valid_from: None,
+                api_key_purpose: None,
             })
             .await
             .unwrap();

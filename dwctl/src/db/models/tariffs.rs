@@ -1,5 +1,6 @@
 //! Database models for model tariffs.
 
+use crate::db::models::api_keys::ApiKeyPurpose;
 use crate::types::DeploymentId;
 use chrono::{DateTime, Utc};
 use rust_decimal::Decimal;
@@ -14,9 +15,12 @@ pub struct ModelTariff {
     pub name: String,
     pub input_price_per_token: Decimal,
     pub output_price_per_token: Decimal,
-    pub is_default: bool,
     pub valid_from: DateTime<Utc>,
     pub valid_until: Option<DateTime<Utc>>,
+    /// Optional API key purpose this tariff applies to
+    /// If None, tariff is not automatically applied (legacy/manual pricing)
+    /// If Some(purpose), tariff applies when model is accessed via that purpose
+    pub api_key_purpose: Option<ApiKeyPurpose>,
 }
 
 /// Request to create a new tariff
@@ -26,7 +30,8 @@ pub struct TariffCreateDBRequest {
     pub name: String,
     pub input_price_per_token: Decimal,
     pub output_price_per_token: Decimal,
-    pub is_default: bool,
+    /// Optional API key purpose this tariff applies to
+    pub api_key_purpose: Option<ApiKeyPurpose>, //todo we should probably onyl be able to set realtime ones for thus
     /// Optional valid_from timestamp (defaults to NOW())
     pub valid_from: Option<DateTime<Utc>>,
 }
@@ -36,7 +41,9 @@ pub struct TariffCreateDBRequest {
 pub struct TariffUpdateDBRequest {
     pub input_price_per_token: Option<Decimal>,
     pub output_price_per_token: Option<Decimal>,
-    pub is_default: Option<bool>,
+    /// Update the API key purpose this tariff applies to
+    /// Database constraint will reject if another active tariff exists for the target purpose
+    pub api_key_purpose: Option<Option<ApiKeyPurpose>>,
 }
 
 /// Response from database after creating or updating a tariff
