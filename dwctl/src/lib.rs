@@ -1611,7 +1611,7 @@ mod test {
             .json(&serde_json::json!({
                 "name": "Test Inference Key",
                 "description": "API key for E2E test",
-                "purpose": "inference"
+                "purpose": "realtime"
             }))
             .await;
         assert_eq!(api_key_response.status_code(), 201, "Failed to create API key");
@@ -1804,7 +1804,7 @@ mod test {
             .add_header(&restricted_headers[1].0, &restricted_headers[1].1)
             .json(&serde_json::json!({
                 "name": "Restricted User Key",
-                "purpose": "inference"
+                "purpose": "realtime"
             }))
             .await;
         let restricted_key: crate::api::models::api_keys::ApiKeyResponse = restricted_key_response.json();
@@ -1901,7 +1901,7 @@ mod test {
             system_api_key_id,
             "System API Key",
             original_secret,
-            "inference",
+            "batch",
             system_api_key_id,
         )
         .execute(&pool)

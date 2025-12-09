@@ -49,7 +49,7 @@ struct ApiKey {
 
 impl From<(Vec<DeploymentId>, ApiKey)> for ApiKeyDBResponse {
     fn from((model_access, api_key): (Vec<DeploymentId>, ApiKey)) -> Self {
-        // Parse purpose string to enum - default to Inference for backwards compatibility
+        // Parse purpose string to enum - default to Realtime for backwards compatibility
         let purpose = api_key
             .purpose
             .parse::<serde_json::Value>()
