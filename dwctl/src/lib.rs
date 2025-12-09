@@ -777,6 +777,7 @@ pub async fn build_router(state: &mut AppState, onwards_router: Router) -> anyho
                 .route("/files", get(api::handlers::files::list_files))
                 .route("/files/{file_id}", get(api::handlers::files::get_file))
                 .route("/files/{file_id}/content", get(api::handlers::files::get_file_content))
+                .route("/files/{file_id}/cost-estimate", get(api::handlers::files::get_file_cost_estimate))
                 .route("/files/{file_id}", delete(api::handlers::files::delete_file))
                 // Batches management
                 .route("/batches", post(api::handlers::batches::create_batch))
