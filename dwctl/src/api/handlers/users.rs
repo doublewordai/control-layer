@@ -10,9 +10,7 @@ use crate::{
     auth::permissions::{self as permissions, RequiresPermission, can_read_all_resources, can_read_own_resource, operation, resource},
     db::{
         handlers::{Credits, Groups, Repository, Users, users::UserFilter},
-        models::{
-            users::{UserCreateDBRequest, UserUpdateDBRequest},
-        },
+        models::users::{UserCreateDBRequest, UserUpdateDBRequest},
     },
     errors::{Error, Result},
     types::{GroupId, Operation, Permission, Resource, UserId, UserIdOrCurrent},

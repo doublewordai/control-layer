@@ -1,5 +1,6 @@
 //! HTTP handlers for model deployment endpoints.
 
+use crate::db::models::tariffs::TariffCreateDBRequest;
 use crate::{
     AppState,
     api::models::{
@@ -23,7 +24,6 @@ use axum::{
     response::Json,
 };
 use sqlx::Acquire;
-use crate::db::models::tariffs::TariffCreateDBRequest;
 
 #[utoipa::path(
     get,
@@ -346,7 +346,8 @@ pub async fn update_deployed_model(
         let current_tariffs = tariffs_repo.list_current_by_model(deployment_id).await?;
 
         // Helper function to check if a tariff matches the definition
-        let tariff_matches = |existing: &crate::db::models::tariffs::ModelTariff, def: &crate::api::models::deployments::TariffDefinition| {
+        let tariff_matches = |existing: &crate::db::models::tariffs::ModelTariff,
+                              def: &crate::api::models::deployments::TariffDefinition| {
             existing.name == def.name
                 && existing.input_price_per_token == def.input_price_per_token
                 && existing.output_price_per_token == def.output_price_per_token

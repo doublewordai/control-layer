@@ -6,6 +6,7 @@ use crate::config::{
 };
 use crate::db::handlers::inference_endpoints::{InferenceEndpointFilter, InferenceEndpoints};
 use crate::db::handlers::repository::Repository;
+use crate::db::models::api_keys::ApiKeyPurpose;
 use crate::errors::Error;
 use crate::types::{GroupId, Operation, Permission, Resource, UserId};
 use crate::{
@@ -26,7 +27,6 @@ use crate::{
 use axum_test::TestServer;
 use sqlx::{PgConnection, PgPool};
 use uuid::Uuid;
-use crate::db::models::api_keys::ApiKeyPurpose;
 
 pub async fn create_test_app(pool: PgPool, _enable_sync: bool) -> (TestServer, crate::BackgroundServices) {
     let config = create_test_config();

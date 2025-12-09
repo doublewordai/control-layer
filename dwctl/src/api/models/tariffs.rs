@@ -1,6 +1,9 @@
 //! API response models for model tariffs (read-only).
 
-use crate::{db::models::{api_keys::ApiKeyPurpose, tariffs::ModelTariff}, types::DeploymentId};
+use crate::{
+    db::models::{api_keys::ApiKeyPurpose, tariffs::ModelTariff},
+    types::DeploymentId,
+};
 use chrono::{DateTime, Utc};
 use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};

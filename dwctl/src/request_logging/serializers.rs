@@ -1622,12 +1622,12 @@ mod tests {
         use crate::db::handlers::credits::Credits;
         use crate::db::models::api_keys::{ApiKeyCreateDBRequest, ApiKeyPurpose};
         use crate::db::models::credits::{CreditTransactionCreateDBRequest, CreditTransactionType};
+        use crate::db::models::tariffs::TariffCreateDBRequest;
         use crate::test_utils::create_test_user;
         use crate::types::DeploymentId;
         use rust_decimal::Decimal;
         use std::str::FromStr;
         use uuid::Uuid;
-        use crate::db::models::tariffs::TariffCreateDBRequest;
 
         /// Fixture: Create a test model with endpoint (no tariff)
         /// Returns the model's deployment ID

@@ -625,7 +625,6 @@ impl<'c> Deployments<'c> {
         let count: (i64,) = query.build_query_as().fetch_one(&mut *self.db).await?;
         Ok(count.0)
     }
-
 }
 
 #[cfg(test)]

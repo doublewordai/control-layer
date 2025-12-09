@@ -36,6 +36,5 @@ pub struct TariffCreateDBRequest {
     pub valid_from: Option<DateTime<Utc>>,
 }
 
-
 /// Response from database after creating or updating a tariff
 pub type TariffDBResponse = ModelTariff;

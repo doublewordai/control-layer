@@ -178,7 +178,6 @@ impl<'c> Tariffs<'c> {
         Ok(result.map(|r| (r.input_price_per_token, r.output_price_per_token)))
     }
 
-
     /// Close multiple tariffs by setting valid_until to the current time
     /// More efficient than calling close_tariff in a loop
     #[instrument(skip(self), fields(count = ids.len()), err)]
@@ -186,12 +185,9 @@ impl<'c> Tariffs<'c> {
         if ids.is_empty() {
             return Ok(0);
         }
-        let result = sqlx::query!(
-            "UPDATE model_tariffs SET valid_until = NOW() WHERE id = ANY($1)",
-            ids
-        )
-        .execute(&mut *self.db)
-        .await?;
+        let result = sqlx::query!("UPDATE model_tariffs SET valid_until = NOW() WHERE id = ANY($1)", ids)
+            .execute(&mut *self.db)
+            .await?;
         Ok(result.rows_affected())
     }
 
