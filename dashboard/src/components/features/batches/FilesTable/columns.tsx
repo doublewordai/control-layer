@@ -12,11 +12,80 @@ import {
   AlertCircle,
   Layers,
   Loader2,
+  DollarSign,
 } from "lucide-react";
 import { Button } from "../../../ui/button";
 import { Tooltip, TooltipContent, TooltipTrigger } from "../../../ui/tooltip";
 import { formatBytes, formatTimestamp } from "../../../../utils";
 import type { FileObject } from "../types";
+import { useFileCostEstimate } from "../../../../api/control-layer/hooks";
+
+// Component to display file cost estimate
+function FileCostEstimateCell({ fileId }: { fileId: string }) {
+  const { data: estimate, isLoading, error } = useFileCostEstimate(fileId);
+
+  if (isLoading) {
+    return <Loader2 className="h-4 w-4 animate-spin text-gray-400" />;
+  }
+
+  if (error || !estimate) {
+    return <span className="text-gray-400">—</span>;
+  }
+
+  const cost = parseFloat(estimate.total_estimated_cost);
+
+  // Format cost with appropriate precision
+  const formattedCost =
+    cost === 0
+      ? "$0.00"
+      : cost < 0.01
+        ? `$${cost.toFixed(4)}`
+        : `$${cost.toFixed(2)}`;
+
+  // Create tooltip content with per-model breakdown
+  const tooltipContent = (
+    <div className="space-y-1">
+      <div className="font-medium">Cost Estimate Breakdown</div>
+      <div className="text-xs space-y-0.5">
+        {estimate.models.map((model) => {
+          const modelCost = parseFloat(model.estimated_cost);
+          const formattedModelCost =
+            modelCost === 0
+              ? "$0.00"
+              : modelCost < 0.01
+                ? `$${modelCost.toFixed(4)}`
+                : `$${modelCost.toFixed(2)}`;
+
+          return (
+            <div key={model.model} className="flex justify-between gap-4">
+              <span>{model.model}:</span>
+              <span className="font-mono">{formattedModelCost}</span>
+            </div>
+          );
+        })}
+        <div className="pt-1 border-t border-gray-200 flex justify-between gap-4 font-medium">
+          <span>Total:</span>
+          <span className="font-mono">{formattedCost}</span>
+        </div>
+      </div>
+      <div className="text-xs text-gray-400 mt-2">
+        {estimate.total_requests} request
+        {estimate.total_requests !== 1 ? "s" : ""}
+      </div>
+    </div>
+  );
+
+  return (
+    <Tooltip delayDuration={300}>
+      <TooltipTrigger asChild>
+        <span className="text-gray-700 font-mono cursor-help">
+          {formattedCost}
+        </span>
+      </TooltipTrigger>
+      <TooltipContent>{tooltipContent}</TooltipContent>
+    </Tooltip>
+  );
+}
 
 interface ColumnActions {
   onView: (file: FileObject) => void;
@@ -120,6 +189,27 @@ export const createFileColumns = (
     cell: ({ row }) => {
       const bytes = row.getValue("bytes") as number;
       return <span className="text-gray-700">{formatBytes(bytes)}</span>;
+    },
+  },
+  {
+    id: "cost_estimate",
+    header: () => {
+      return (
+        <div className="flex items-center text-left font-medium">
+          <DollarSign className="mr-1 h-4 w-4 text-gray-500" />
+          Est. Cost
+        </div>
+      );
+    },
+    cell: ({ row }) => {
+      const file = row.original;
+
+      // Only show cost estimate for batch input files
+      if (file.purpose !== "batch") {
+        return <span className="text-gray-400">—</span>;
+      }
+
+      return <FileCostEstimateCell fileId={file.id} />;
     },
   },
   {
