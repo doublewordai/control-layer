@@ -16,7 +16,7 @@ use crate::db::{
     handlers::deployments::{DeploymentFilter, Deployments},
     handlers::repository::Repository,
     models::api_keys::ApiKeyPurpose,
-    models::deployments::ModelStatus,
+    models::deployments::{ModelStatus, ModelType},
 };
 use crate::errors::{Error, Result};
 use crate::types::Resource;
@@ -928,11 +928,48 @@ pub async fn get_file_cost_estimate(
         }
     }
 
+    // Fetch all deployments and their pricing information upfront
+    let mut conn = state.db.acquire().await.map_err(|e| Error::Database(e.into()))?;
+    let mut deployments_repo = Deployments::new(&mut conn);
+
+    let filter = DeploymentFilter::new(0, 1000)
+        .with_statuses(vec![ModelStatus::Active])
+        .with_deleted(false);
+    let all_deployments = deployments_repo.list(&filter).await.map_err(Error::Database)?;
+
+    // Build a lookup map of model alias -> (deployment, avg_output_tokens)
+    let mut model_info: HashMap<String, (crate::db::models::deployments::DeploymentDBResponse, Option<i64>)> = HashMap::new();
+
+    for deployment in all_deployments {
+        // Query http_analytics for last 100 responses to get average output token count
+        let avg_output_tokens: Option<i64> = sqlx::query_scalar(
+            r#"
+            SELECT AVG(completion_tokens)::BIGINT
+            FROM (
+                SELECT completion_tokens
+                FROM http_analytics
+                WHERE model = $1
+                  AND completion_tokens IS NOT NULL
+                  AND status_code = 200
+                ORDER BY timestamp DESC
+                LIMIT 100
+            ) recent_responses
+            "#,
+        )
+        .bind(&deployment.alias)
+        .fetch_optional(&mut *conn)
+        .await
+        .map_err(|e| Error::Database(e.into()))?
+        .flatten();
+
+        model_info.insert(deployment.alias.clone(), (deployment, avg_output_tokens));
+    }
+
     // Stream all templates from the file and group by model
     let content_stream = state.request_manager.get_file_content_stream(fusillade::FileId(file_id), 0);
 
     // Collect all templates and group by model
-    let mut model_stats: HashMap<String, (i64, i64, i64)> = HashMap::new(); // (request_count, input_tokens, output_tokens)
+    let mut model_stats: HashMap<String, (i64, i64)> = HashMap::new(); // (request_count, input_tokens)
 
     let mut content_stream = Box::pin(content_stream);
     while let Some(item_result) = content_stream.next().await {
@@ -946,31 +983,41 @@ pub async fn get_file_cost_estimate(
             let body_bytes = template.body.len() as i64;
             let estimated_input_tokens = body_bytes / 4;
 
-            // Estimate output tokens: 20% larger than input
-            let estimated_output_tokens = (estimated_input_tokens as f64 * 1.2) as i64;
-
             // Update stats for this model
-            let stats = model_stats.entry(template.model.clone()).or_insert((0, 0, 0));
+            let stats = model_stats.entry(template.model.clone()).or_insert((0, 0));
             stats.0 += 1; // request_count
             stats.1 += estimated_input_tokens;
-            stats.2 += estimated_output_tokens;
         }
     }
-
-    // Fetch pricing for all models
-    let mut conn = state.db.acquire().await.map_err(|e| Error::Database(e.into()))?;
-    let mut deployments_repo = Deployments::new(&mut conn);
 
     let mut total_cost = Decimal::ZERO;
     let mut model_breakdowns = Vec::new();
 
-    for (model_alias, (request_count, input_tokens, output_tokens)) in model_stats {
-        // Look up the deployment by alias using list with filter
-        let filter = DeploymentFilter::new(0, 1000)
-            .with_statuses(vec![ModelStatus::Active])
-            .with_deleted(false);
-        let deployments = deployments_repo.list(&filter).await.map_err(Error::Database)?;
-        let deployment_opt = deployments.into_iter().find(|d| d.alias == model_alias);
+    for (model_alias, (request_count, input_tokens)) in model_stats {
+        // Look up the deployment and historical average
+        let (deployment_opt, avg_output_tokens) = model_info
+            .get(&model_alias)
+            .map(|(d, avg)| (Some(d.clone()), *avg))
+            .unwrap_or((None, None));
+
+        // Check if this is an embeddings model from deployment type
+        let is_embeddings = deployment_opt
+            .as_ref()
+            .and_then(|d| d.model_type.as_ref())
+            .map(|t| matches!(t, ModelType::Embeddings))
+            .unwrap_or(false);
+
+        // Calculate estimated output tokens using model type, historical average, or fallback heuristics
+        let estimated_output_tokens = if is_embeddings {
+            // Embeddings models return 1 token per request
+            request_count
+        } else if let Some(avg) = avg_output_tokens {
+            // Use historical average multiplied by request count
+            avg * request_count
+        } else {
+            // Fallback: estimate 10% larger than input
+            ((input_tokens as f64) * 1.1) as i64
+        };
 
         let cost = if let Some(deployment) = deployment_opt {
             // Get pricing if available
@@ -980,7 +1027,7 @@ pub async fn get_file_cost_estimate(
                     let output_price = upstream.output_price_per_token.unwrap_or(Decimal::ZERO);
 
                     let input_cost = Decimal::from(input_tokens) * input_price;
-                    let output_cost = Decimal::from(output_tokens) * output_price;
+                    let output_cost = Decimal::from(estimated_output_tokens) * output_price;
                     input_cost + output_cost
                 } else {
                     Decimal::ZERO
@@ -999,7 +1046,7 @@ pub async fn get_file_cost_estimate(
             model: model_alias,
             request_count,
             estimated_input_tokens: input_tokens,
-            estimated_output_tokens: output_tokens,
+            estimated_output_tokens,
             estimated_cost: cost.to_string(),
         });
     }

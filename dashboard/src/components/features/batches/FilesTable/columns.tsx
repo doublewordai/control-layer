@@ -12,7 +12,6 @@ import {
   AlertCircle,
   Layers,
   Loader2,
-  DollarSign,
 } from "lucide-react";
 import { Button } from "../../../ui/button";
 import { Tooltip, TooltipContent, TooltipTrigger } from "../../../ui/tooltip";
@@ -174,45 +173,6 @@ export const createFileColumns = (
     },
   },
   {
-    accessorKey: "bytes",
-    header: ({ column }) => {
-      return (
-        <button
-          onClick={() => column.toggleSorting(column.getIsSorted() === "asc")}
-          className="flex items-center text-left font-medium group"
-        >
-          Size
-          <ArrowUpDown className="ml-2 h-4 w-4 text-gray-400 group-hover:text-gray-700 transition-colors" />
-        </button>
-      );
-    },
-    cell: ({ row }) => {
-      const bytes = row.getValue("bytes") as number;
-      return <span className="text-gray-700">{formatBytes(bytes)}</span>;
-    },
-  },
-  {
-    id: "cost_estimate",
-    header: () => {
-      return (
-        <div className="flex items-center text-left font-medium">
-          <DollarSign className="mr-1 h-4 w-4 text-gray-500" />
-          Est. Cost
-        </div>
-      );
-    },
-    cell: ({ row }) => {
-      const file = row.original;
-
-      // Only show cost estimate for batch input files
-      if (file.purpose !== "batch") {
-        return <span className="text-gray-400">—</span>;
-      }
-
-      return <FileCostEstimateCell fileId={file.id} />;
-    },
-  },
-  {
     accessorKey: "expires_at",
     header: "Expires",
     cell: ({ row }) => {
@@ -236,6 +196,42 @@ export const createFileColumns = (
           {formatTimestamp(expiresDate.toISOString())}
         </span>
       );
+    },
+  },
+  {
+    accessorKey: "bytes",
+    header: ({ column }) => {
+      return (
+        <button
+          onClick={() => column.toggleSorting(column.getIsSorted() === "asc")}
+          className="flex items-center text-left font-medium group"
+        >
+          Size
+          <ArrowUpDown className="ml-2 h-4 w-4 text-gray-400 group-hover:text-gray-700 transition-colors" />
+        </button>
+      );
+    },
+    cell: ({ row }) => {
+      const bytes = row.getValue("bytes") as number;
+      return <span className="text-gray-700">{formatBytes(bytes)}</span>;
+    },
+  },
+  {
+    id: "cost_estimate",
+    header: () => {
+      return (
+        <div className="flex items-center text-left font-medium">Est. Cost</div>
+      );
+    },
+    cell: ({ row }) => {
+      const file = row.original;
+
+      // Only show cost estimate for batch input files
+      if (file.purpose !== "batch") {
+        return <span className="text-gray-400">—</span>;
+      }
+
+      return <FileCostEstimateCell fileId={file.id} />;
     },
   },
   {
