@@ -36,15 +36,6 @@ pub struct TariffCreateDBRequest {
     pub valid_from: Option<DateTime<Utc>>,
 }
 
-/// Request to update an existing tariff
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
-pub struct TariffUpdateDBRequest {
-    pub input_price_per_token: Option<Decimal>,
-    pub output_price_per_token: Option<Decimal>,
-    /// Update the API key purpose this tariff applies to
-    /// Database constraint will reject if another active tariff exists for the target purpose
-    pub api_key_purpose: Option<Option<ApiKeyPurpose>>,
-}
 
 /// Response from database after creating or updating a tariff
 pub type TariffDBResponse = ModelTariff;

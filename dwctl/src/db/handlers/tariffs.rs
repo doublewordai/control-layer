@@ -3,7 +3,7 @@
 use crate::{
     db::{
         errors::Result,
-        models::tariffs::{ModelTariff, TariffCreateDBRequest, TariffDBResponse, TariffUpdateDBRequest},
+        models::tariffs::{ModelTariff, TariffCreateDBRequest, TariffDBResponse},
     },
     types::DeploymentId,
 };
@@ -177,43 +177,7 @@ impl<'c> Tariffs<'c> {
 
         Ok(result.map(|r| (r.input_price_per_token, r.output_price_per_token)))
     }
-
-    /// Update a tariff (only updates pricing and api_key_purpose)
-    /// Note: To change pricing, you should typically close the current tariff and create a new one
-    /// to maintain historical accuracy. This method is for minor corrections.
-    #[instrument(skip(self, request), err)]
-    pub async fn update(&mut self, id: Uuid, request: &TariffUpdateDBRequest) -> Result<Option<TariffDBResponse>> {
-        // Convert optional api_key_purpose to string
-        let purpose_str = request.api_key_purpose.as_ref().and_then(|opt| {
-            opt.as_ref().map(|p| match p {
-                crate::db::models::api_keys::ApiKeyPurpose::Realtime => "realtime",
-                crate::db::models::api_keys::ApiKeyPurpose::Batch => "batch",
-                crate::db::models::api_keys::ApiKeyPurpose::Playground => "playground",
-                crate::db::models::api_keys::ApiKeyPurpose::Platform => "platform",
-            })
-        });
-
-        let tariff = sqlx::query_as!(
-            ModelTariff,
-            r#"
-            UPDATE model_tariffs
-            SET input_price_per_token = COALESCE($2, input_price_per_token),
-                output_price_per_token = COALESCE($3, output_price_per_token),
-                api_key_purpose = COALESCE($4, api_key_purpose)
-            WHERE id = $1
-            RETURNING id, deployed_model_id, name, input_price_per_token, output_price_per_token,
-                      valid_from, valid_until, api_key_purpose as "api_key_purpose: _"
-            "#,
-            id,
-            request.input_price_per_token,
-            request.output_price_per_token,
-            purpose_str,
-        )
-        .fetch_optional(&mut *self.db)
-        .await?;
-
-        Ok(tariff)
-    }
+    
 
     /// Close out a tariff by setting valid_until to the current time
     /// This is the recommended way to "update" pricing - close the old tariff and create a new one
