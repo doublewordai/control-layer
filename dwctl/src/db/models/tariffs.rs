@@ -31,7 +31,7 @@ pub struct TariffCreateDBRequest {
     pub input_price_per_token: Decimal,
     pub output_price_per_token: Decimal,
     /// Optional API key purpose this tariff applies to
-    pub api_key_purpose: Option<ApiKeyPurpose>, //todo we should probably onyl be able to set realtime ones for thus
+    pub api_key_purpose: Option<ApiKeyPurpose>,
     /// Optional valid_from timestamp (defaults to NOW())
     pub valid_from: Option<DateTime<Utc>>,
 }

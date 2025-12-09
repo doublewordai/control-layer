@@ -1627,6 +1627,7 @@ mod tests {
         use rust_decimal::Decimal;
         use std::str::FromStr;
         use uuid::Uuid;
+        use crate::db::models::tariffs::TariffCreateDBRequest;
 
         /// Fixture: Create a test model with endpoint (no tariff)
         /// Returns the model's deployment ID
@@ -1690,10 +1691,15 @@ mod tests {
 
             let mut conn = pool.acquire().await.unwrap();
             let mut tariffs_repo = Tariffs::new(&mut conn);
-            tariffs_repo
-                .replace_tariff(deployed_model_id, tariff_name, input_price_per_token, output_price_per_token, true)
-                .await
-                .unwrap();
+            let tariff = TariffCreateDBRequest {
+                deployed_model_id,
+                name: tariff_name.to_string(),
+                input_price_per_token,
+                output_price_per_token,
+                api_key_purpose: None,
+                valid_from: None,
+            };
+            tariffs_repo.create(&tariff).await.unwrap();
         }
 
         /// Helper: Create a test user with an initial credit balance

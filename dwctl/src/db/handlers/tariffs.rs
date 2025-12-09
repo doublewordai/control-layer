@@ -218,22 +218,19 @@ impl<'c> Tariffs<'c> {
     /// Close out a tariff by setting valid_until to the current time
     /// This is the recommended way to "update" pricing - close the old tariff and create a new one
     #[instrument(skip(self), err)]
-    pub async fn close_tariff(&mut self, id: Uuid) -> Result<Option<TariffDBResponse>> {
-        let tariff = sqlx::query_as!(
-            ModelTariff,
-            r#"
-            UPDATE model_tariffs
-            SET valid_until = NOW()
-            WHERE id = $1 AND valid_until IS NULL
-            RETURNING id, deployed_model_id, name, input_price_per_token, output_price_per_token,
-                      valid_from, valid_until, api_key_purpose as "api_key_purpose: _"
-            "#,
-            id
-        )
-        .fetch_optional(&mut *self.db)
+    pub async fn close_tariffs(&mut self, id: Uuid) -> Result<bool> {
+    let result = sqlx::query!(
+        r#"
+        UPDATE model_tariffs
+        SET valid_until = NOW()
+        WHERE deployed_model_id = $1 AND valid_until IS NULL
+        "#,
+        id
+    )
+        .execute(&mut *self.db)
         .await?;
+    Ok(result.rows_affected() > 0)
 
-        Ok(tariff)
     }
 
     /// Delete a tariff (hard delete - only use for mistakes, prefer close_tariff for normal operations)
@@ -252,61 +249,4 @@ impl<'c> Tariffs<'c> {
         Ok(result.rows_affected() > 0)
     }
 
-    /// Replace all active tariffs for a model with new ones
-    /// Closes all current active tariffs and creates new ones
-    #[instrument(skip(self, tariffs), fields(deployment_id = %deployment_id, count = tariffs.len()), err)]
-    pub async fn replace_tariffs(
-        &mut self,
-        deployment_id: DeploymentId,
-        tariffs: Vec<crate::api::models::deployments::TariffDefinition>,
-    ) -> Result<()> {
-        // Close all current active tariffs for this model
-        sqlx::query!(
-            r#"
-            UPDATE model_tariffs
-            SET valid_until = NOW()
-            WHERE deployed_model_id = $1 AND valid_until IS NULL
-            "#,
-            deployment_id
-        )
-        .execute(&mut *self.db)
-        .await?;
-
-        // Create new tariffs
-        for tariff_def in tariffs {
-            let tariff_request = TariffCreateDBRequest {
-                deployed_model_id: deployment_id,
-                name: tariff_def.name,
-                input_price_per_token: tariff_def.input_price_per_token,
-                output_price_per_token: tariff_def.output_price_per_token,
-                api_key_purpose: tariff_def.api_key_purpose,
-                valid_from: None, // Use NOW()
-            };
-            self.create(&tariff_request).await?;
-        }
-
-        Ok(())
-    }
-
-    /// Create initial tariffs for a new model
-    #[instrument(skip(self, tariffs), fields(deployment_id = %deployment_id, count = tariffs.len()), err)]
-    pub async fn create_tariffs(
-        &mut self,
-        deployment_id: DeploymentId,
-        tariffs: Vec<crate::api::models::deployments::TariffDefinition>,
-    ) -> Result<()> {
-        for tariff_def in tariffs {
-            let tariff_request = TariffCreateDBRequest {
-                deployed_model_id: deployment_id,
-                name: tariff_def.name,
-                input_price_per_token: tariff_def.input_price_per_token,
-                output_price_per_token: tariff_def.output_price_per_token,
-                api_key_purpose: tariff_def.api_key_purpose,
-                valid_from: None, // Use NOW()
-            };
-            self.create(&tariff_request).await?;
-        }
-
-        Ok(())
-    }
 }

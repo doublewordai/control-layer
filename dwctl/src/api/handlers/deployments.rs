@@ -23,6 +23,7 @@ use axum::{
     response::Json,
 };
 use sqlx::Acquire;
+use crate::db::models::tariffs::TariffCreateDBRequest;
 
 #[utoipa::path(
     get,
@@ -260,7 +261,17 @@ pub async fn create_deployed_model(
     // Create tariffs if provided
     if let Some(tariff_defs) = tariffs {
         let mut tariffs_repo = Tariffs::new(tx.acquire().await.map_err(|e| Error::Database(e.into()))?);
-        tariffs_repo.create_tariffs(model.id, tariff_defs).await?;
+        for tariff_def in tariff_defs {
+            let tariff_request = TariffCreateDBRequest {
+                deployed_model_id: model.id,
+                name: tariff_def.name,
+                input_price_per_token: tariff_def.input_price_per_token,
+                output_price_per_token: tariff_def.output_price_per_token,
+                api_key_purpose: tariff_def.api_key_purpose,
+                valid_from: None, // Use NOW()
+            };
+            tariffs_repo.create(&tariff_request).await?;
+        }
     }
 
     tx.commit().await.map_err(|e| Error::Database(e.into()))?;
@@ -329,7 +340,20 @@ pub async fn update_deployed_model(
     // Handle tariff replacement if provided
     if let Some(tariff_defs) = tariffs {
         let mut tariffs_repo = Tariffs::new(tx.acquire().await.map_err(|e| Error::Database(e.into()))?);
-        tariffs_repo.replace_tariffs(deployment_id, tariff_defs).await?;
+
+        tariffs_repo.close_tariffs(deployment_id).await?;
+
+        for tariff_def in tariff_defs {
+            let tariff_request = TariffCreateDBRequest {
+                deployed_model_id: deployment_id,
+                name: tariff_def.name,
+                input_price_per_token: tariff_def.input_price_per_token,
+                output_price_per_token: tariff_def.output_price_per_token,
+                api_key_purpose: tariff_def.api_key_purpose,
+                valid_from: None, // Use NOW()
+            };
+            tariffs_repo.create(&tariff_request).await?;
+        }
     }
 
     tx.commit().await.map_err(|e| Error::Database(e.into()))?;
