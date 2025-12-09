@@ -48,6 +48,8 @@ services:
           path: ./dashboard/package.json
         - action: rebuild
           path: ./dashboard/Dockerfile
+  mock-llm-server:
+    image: zerob13/mock-openai-api:latest
 
 volumes:
   dwctl_target:
