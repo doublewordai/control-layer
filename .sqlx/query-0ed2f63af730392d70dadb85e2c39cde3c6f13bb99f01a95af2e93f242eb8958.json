@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "\n            INSERT INTO model_tariffs (\n                deployed_model_id, name, input_price_per_token, output_price_per_token,\n                is_default, valid_from\n            )\n            VALUES ($1, $2, $3, $4, $5, NOW())\n            RETURNING id, deployed_model_id, name, input_price_per_token, output_price_per_token,\n                      is_default, valid_from, valid_until\n            ",
+  "query": "\n            SELECT id, deployed_model_id, name, input_price_per_token, output_price_per_token,\n                   valid_from, valid_until, api_key_purpose as \"api_key_purpose: _\"\n            FROM model_tariffs\n            WHERE deployed_model_id = $1\n            ORDER BY valid_from DESC, api_key_purpose ASC NULLS LAST, name ASC\n            ",
   "describe": {
     "columns": [
       {
@@ -30,27 +30,23 @@
       },
       {
         "ordinal": 5,
-        "name": "is_default",
-        "type_info": "Bool"
-      },
-      {
-        "ordinal": 6,
         "name": "valid_from",
         "type_info": "Timestamptz"
       },
       {
-        "ordinal": 7,
+        "ordinal": 6,
         "name": "valid_until",
         "type_info": "Timestamptz"
+      },
+      {
+        "ordinal": 7,
+        "name": "api_key_purpose: _",
+        "type_info": "Varchar"
       }
     ],
     "parameters": {
       "Left": [
-        "Uuid",
-        "Varchar",
-        "Numeric",
-        "Numeric",
-        "Bool"
+        "Uuid"
       ]
     },
     "nullable": [
@@ -60,9 +56,9 @@
       false,
       false,
       false,
-      false,
+      true,
       true
     ]
   },
-  "hash": "c562d96210ecf12dbd8bb75f5a66ee1dd30d8d9f64f0904458edad11f3dac1c1"
+  "hash": "0ed2f63af730392d70dadb85e2c39cde3c6f13bb99f01a95af2e93f242eb8958"
 }

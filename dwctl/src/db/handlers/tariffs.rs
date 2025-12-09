@@ -236,54 +236,6 @@ impl<'c> Tariffs<'c> {
         Ok(tariff)
     }
 
-    /// Close out a tariff by name and model, then create a new one with updated pricing
-    /// This maintains historical accuracy while updating pricing
-    #[instrument(skip(self), err)]
-    pub async fn replace_tariff(
-        &mut self,
-        deployed_model_id: DeploymentId,
-        name: &str,
-        new_input_price: Decimal,
-        new_output_price: Decimal,
-        is_default: bool,
-    ) -> Result<TariffDBResponse> {
-        // Close out the current tariff
-        sqlx::query!(
-            r#"
-            UPDATE model_tariffs
-            SET valid_until = NOW()
-            WHERE deployed_model_id = $1 AND name = $2 AND valid_until IS NULL
-            "#,
-            deployed_model_id,
-            name
-        )
-        .execute(&mut *self.db)
-        .await?;
-
-        // Create the new tariff
-        let tariff = sqlx::query_as!(
-            ModelTariff,
-            r#"
-            INSERT INTO model_tariffs (
-                deployed_model_id, name, input_price_per_token, output_price_per_token,
-                is_default, valid_from
-            )
-            VALUES ($1, $2, $3, $4, $5, NOW())
-            RETURNING id, deployed_model_id, name, input_price_per_token, output_price_per_token,
-                      is_default, valid_from, valid_until
-            "#,
-            deployed_model_id,
-            name,
-            new_input_price,
-            new_output_price,
-            is_default
-        )
-        .fetch_one(&mut *self.db)
-        .await?;
-
-        Ok(tariff)
-    }
-
     /// Delete a tariff (hard delete - only use for mistakes, prefer close_tariff for normal operations)
     #[instrument(skip(self), err)]
     pub async fn delete(&mut self, id: Uuid) -> Result<bool> {

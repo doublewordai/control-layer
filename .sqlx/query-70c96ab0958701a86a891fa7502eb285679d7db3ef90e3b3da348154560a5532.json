@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "\n            SELECT id, deployed_model_id, name, input_price_per_token, output_price_per_token,\n                   is_default, valid_from, valid_until\n            FROM model_tariffs\n            WHERE deployed_model_id = $1\n            ORDER BY valid_from DESC, name ASC\n            ",
+  "query": "\n            SELECT id, deployed_model_id, name, input_price_per_token, output_price_per_token,\n                   valid_from, valid_until, api_key_purpose as \"api_key_purpose: _\"\n            FROM model_tariffs\n            WHERE deployed_model_id = $1 AND valid_until IS NULL\n            ORDER BY api_key_purpose ASC NULLS LAST, name ASC\n            ",
   "describe": {
     "columns": [
       {
@@ -30,18 +30,18 @@
       },
       {
         "ordinal": 5,
-        "name": "is_default",
-        "type_info": "Bool"
-      },
-      {
-        "ordinal": 6,
         "name": "valid_from",
         "type_info": "Timestamptz"
       },
       {
-        "ordinal": 7,
+        "ordinal": 6,
         "name": "valid_until",
         "type_info": "Timestamptz"
+      },
+      {
+        "ordinal": 7,
+        "name": "api_key_purpose: _",
+        "type_info": "Varchar"
       }
     ],
     "parameters": {
@@ -56,9 +56,9 @@
       false,
       false,
       false,
-      false,
+      true,
       true
     ]
   },
-  "hash": "b6e66922c02acb95b1aad194045ea5bb08c4db0101712583490465ec6feb47aa"
+  "hash": "70c96ab0958701a86a891fa7502eb285679d7db3ef90e3b3da348154560a5532"
 }

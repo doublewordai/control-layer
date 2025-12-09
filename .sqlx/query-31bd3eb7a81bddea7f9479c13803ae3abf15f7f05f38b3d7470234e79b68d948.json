@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "\n            UPDATE model_tariffs\n            SET input_price_per_token = COALESCE($2, input_price_per_token),\n                output_price_per_token = COALESCE($3, output_price_per_token),\n                is_default = COALESCE($4, is_default)\n            WHERE id = $1\n            RETURNING id, deployed_model_id, name, input_price_per_token, output_price_per_token,\n                      is_default, valid_from, valid_until\n            ",
+  "query": "\n            UPDATE model_tariffs\n            SET valid_until = NOW()\n            WHERE id = $1 AND valid_until IS NULL\n            RETURNING id, deployed_model_id, name, input_price_per_token, output_price_per_token,\n                      valid_from, valid_until, api_key_purpose as \"api_key_purpose: _\"\n            ",
   "describe": {
     "columns": [
       {
@@ -30,26 +30,23 @@
       },
       {
         "ordinal": 5,
-        "name": "is_default",
-        "type_info": "Bool"
-      },
-      {
-        "ordinal": 6,
         "name": "valid_from",
         "type_info": "Timestamptz"
       },
       {
-        "ordinal": 7,
+        "ordinal": 6,
         "name": "valid_until",
         "type_info": "Timestamptz"
+      },
+      {
+        "ordinal": 7,
+        "name": "api_key_purpose: _",
+        "type_info": "Varchar"
       }
     ],
     "parameters": {
       "Left": [
-        "Uuid",
-        "Numeric",
-        "Numeric",
-        "Bool"
+        "Uuid"
       ]
     },
     "nullable": [
@@ -59,9 +56,9 @@
       false,
       false,
       false,
-      false,
+      true,
       true
     ]
   },
-  "hash": "8fd842f02c8ac93f7454906aaa5679fff6971c176e0f6b53d55523900363c9b8"
+  "hash": "31bd3eb7a81bddea7f9479c13803ae3abf15f7f05f38b3d7470234e79b68d948"
 }
