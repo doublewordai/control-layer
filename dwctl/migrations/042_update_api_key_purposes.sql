@@ -1,10 +1,17 @@
 -- Update API key purposes to distinguish between different inference key types
 -- This migration:
--- 1. Renames user-created 'inference' keys to 'realtime'
--- 2. Renames hidden 'inference' keys to 'batch' (backwards compatible)
--- 3. Prepares for new 'playground' purpose (will be created on-demand)
+-- 1. Updates CHECK constraint to allow new purpose values
+-- 2. Renames user-created 'inference' keys to 'realtime'
+-- 3. Renames hidden 'inference' keys to 'batch' (backwards compatible)
+-- 4. Prepares for new 'playground' purpose (will be created on-demand)
 
--- Step 1: Update existing user-created 'inference' keys to 'realtime'
+-- Step 1: Drop old CHECK constraint and add new one with updated values
+ALTER TABLE api_keys DROP CONSTRAINT api_keys_purpose_check;
+ALTER TABLE api_keys
+ADD CONSTRAINT api_keys_purpose_check
+CHECK (purpose IN ('platform', 'inference', 'realtime', 'batch', 'playground'));
+
+-- Step 2: Update existing user-created 'inference' keys to 'realtime'
 UPDATE api_keys
 SET purpose = 'realtime'
 WHERE purpose = 'inference' AND hidden = false;
