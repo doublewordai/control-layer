@@ -339,11 +339,39 @@ pub async fn update_deployed_model(
 
     // Handle tariff replacement if provided
     if let Some(tariff_defs) = tariffs {
-        let mut tariffs_repo = Tariffs::new(tx.acquire().await.map_err(|e| Error::Database(e.into()))?);
+        let mut tariff_conn = tx.acquire().await.map_err(|e| Error::Database(e.into()))?;
+        let mut tariffs_repo = Tariffs::new(&mut tariff_conn);
 
-        tariffs_repo.close_tariffs(deployment_id).await?;
+        // Fetch current tariffs to compare
+        let current_tariffs = tariffs_repo.list_current_by_model(deployment_id).await?;
 
+        // Helper function to check if a tariff matches the definition
+        let tariff_matches = |existing: &crate::db::models::tariffs::ModelTariff, def: &crate::api::models::deployments::TariffDefinition| {
+            existing.name == def.name
+                && existing.input_price_per_token == def.input_price_per_token
+                && existing.output_price_per_token == def.output_price_per_token
+                && existing.api_key_purpose == def.api_key_purpose
+        };
+
+        // Collect IDs of tariffs to close (those not in the new set or have changed)
+        let tariffs_to_close: Vec<uuid::Uuid> = current_tariffs
+            .iter()
+            .filter(|existing| !tariff_defs.iter().any(|def| tariff_matches(existing, def)))
+            .map(|t| t.id)
+            .collect();
+
+        // Batch close tariffs in a single query
+        if !tariffs_to_close.is_empty() {
+            tariffs_repo.close_tariffs_batch(&tariffs_to_close).await?;
+        }
+
+        // Create new or changed tariffs (skip those that already exist unchanged)
         for tariff_def in tariff_defs {
+            // Skip if this tariff already exists with the same values
+            if current_tariffs.iter().any(|existing| tariff_matches(existing, &tariff_def)) {
+                continue;
+            }
+
             let tariff_request = TariffCreateDBRequest {
                 deployed_model_id: deployment_id,
                 name: tariff_def.name,

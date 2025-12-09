@@ -177,24 +177,22 @@ impl<'c> Tariffs<'c> {
 
         Ok(result.map(|r| (r.input_price_per_token, r.output_price_per_token)))
     }
-    
 
-    /// Close out a tariff by setting valid_until to the current time
-    /// This is the recommended way to "update" pricing - close the old tariff and create a new one
-    #[instrument(skip(self), err)]
-    pub async fn close_tariffs(&mut self, id: Uuid) -> Result<bool> {
-    let result = sqlx::query!(
-        r#"
-        UPDATE model_tariffs
-        SET valid_until = NOW()
-        WHERE deployed_model_id = $1 AND valid_until IS NULL
-        "#,
-        id
-    )
+
+    /// Close multiple tariffs by setting valid_until to the current time
+    /// More efficient than calling close_tariff in a loop
+    #[instrument(skip(self), fields(count = ids.len()), err)]
+    pub async fn close_tariffs_batch(&mut self, ids: &[Uuid]) -> Result<u64> {
+        if ids.is_empty() {
+            return Ok(0);
+        }
+        let result = sqlx::query!(
+            "UPDATE model_tariffs SET valid_until = NOW() WHERE id = ANY($1)",
+            ids
+        )
         .execute(&mut *self.db)
         .await?;
-    Ok(result.rows_affected() > 0)
-
+        Ok(result.rows_affected())
     }
 
     /// Delete a tariff (hard delete - only use for mistakes, prefer close_tariff for normal operations)
@@ -212,5 +210,4 @@ impl<'c> Tariffs<'c> {
 
         Ok(result.rows_affected() > 0)
     }
-
 }
