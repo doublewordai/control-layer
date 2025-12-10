@@ -775,6 +775,23 @@ export interface FilesListQuery {
   purpose?: string;
 }
 
+export interface ModelCostBreakdown {
+  model: string;
+  request_count: number;
+  estimated_input_tokens: number;
+  estimated_output_tokens: number;
+  estimated_cost: string;
+}
+
+export interface FileCostEstimate {
+  file_id: string;
+  total_requests: number;
+  total_estimated_input_tokens: number;
+  total_estimated_output_tokens: number;
+  total_estimated_cost: string;
+  models: ModelCostBreakdown[];
+}
+
 export interface BatchRequestCounts {
   total: number;
   completed: number;
