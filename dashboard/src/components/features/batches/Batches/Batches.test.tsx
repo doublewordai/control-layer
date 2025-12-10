@@ -16,6 +16,11 @@ vi.mock("../../../../api/control-layer/hooks", () => ({
     data: null,
     isLoading: false,
   })),
+  useFileCostEstimate: vi.fn(() => ({
+    data: null,
+    isLoading: false,
+    error: null,
+  })),
 }));
 
 // Mock the modals

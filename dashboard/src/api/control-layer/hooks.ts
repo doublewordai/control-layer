@@ -741,6 +741,15 @@ export function useDeleteFile() {
   });
 }
 
+export function useFileCostEstimate(id: string | undefined) {
+  return useQuery({
+    queryKey: ["files", id, "cost-estimate"],
+    queryFn: () => dwctlApi.files.getCostEstimate(id!),
+    enabled: !!id,
+    staleTime: 5 * 60 * 1000, // Cache for 5 minutes since estimates don't change
+  });
+}
+
 // ===== BATCHES HOOKS =====
 
 export function useBatches(options?: BatchesListQuery & { enabled?: boolean }) {

@@ -1,0 +1,22 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n            SELECT DISTINCT r.model\n            FROM requests r\n            JOIN batches b ON r.batch_id = b.id\n            WHERE r.state = 'pending'\n                AND (r.not_before IS NULL OR r.not_before <= $1)\n                AND b.cancelling_at IS NULL\n            ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "model",
+        "type_info": "Text"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Timestamptz"
+      ]
+    },
+    "nullable": [
+      false
+    ]
+  },
+  "hash": "7d5deb5f034c72562275fd0693fb01bf28078aa22bbd07bcf523b25143bd2060"
+}
