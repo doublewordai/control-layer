@@ -7,16 +7,17 @@ GET http://localhost:3001/admin/api/v1/users/current
 dwctl_session: {{user_jwt}}
 HTTP 200
 [Captures]
-test_user_id: jsonpath "$.id" 
+test_user_id: jsonpath "$.id"
 
-# Verify the user currently has User role
+# Verify the user currently has default roles (StandardUser and BatchAPIUser)
 GET http://localhost:3001/admin/api/v1/users/{{test_user_id}}
 [Cookies]
 dwctl_session: {{admin_jwt}}
 HTTP 200
 [Asserts]
-jsonpath "$.roles[0]" == "StandardUser"
-jsonpath "$.roles" count == 1
+jsonpath "$.roles" contains "StandardUser"
+jsonpath "$.roles" contains "BatchAPIUser"
+jsonpath "$.roles" count == 2
 
 # Test that regular users cannot access admin endpoints
 GET http://localhost:3001/admin/api/v1/users
