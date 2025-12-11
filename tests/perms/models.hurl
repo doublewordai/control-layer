@@ -153,7 +153,16 @@ dwctl_session: {{admin_jwt}}
   "alias": "user1-model-alias",
   "hosted_on": "{{models_test_endpoint_id}}",
   "requests_per_second": 100.0,
-  "burst_size": 200
+  "burst_size": 200,
+  "pricing": {
+    "input_price_per_token": "0.001",
+    "output_price_per_token": "0.002"
+  },
+  "downstream_pricing": {
+    "mode": "per_token",
+    "input_price_per_token": "0.0005",
+    "output_price_per_token": "0.001"
+  }
 }
 HTTP 200
 [Asserts]
@@ -178,7 +187,16 @@ dwctl_session: {{admin_jwt}}
   "alias": "user2-model-alias",
   "hosted_on": "{{models_test_endpoint_id}}",
   "requests_per_second": 100.0,
-  "burst_size": 200
+  "burst_size": 200,
+  "pricing": {
+    "input_price_per_token": "0.001",
+    "output_price_per_token": "0.002"
+  },
+  "downstream_pricing": {
+    "mode": "per_token",
+    "input_price_per_token": "0.0005",
+    "output_price_per_token": "0.001"
+  }
 }
 HTTP 200
 [Asserts]
@@ -201,7 +219,16 @@ dwctl_session: {{admin_jwt}}
   "alias": "public-model-alias",
   "hosted_on": "{{models_test_endpoint_id}}",
   "requests_per_second": 100.0,
-  "burst_size": 200
+  "burst_size": 200,
+  "pricing": {
+    "input_price_per_token": "0.001",
+    "output_price_per_token": "0.002"
+  },
+  "downstream_pricing": {
+    "mode": "per_token",
+    "input_price_per_token": "0.0005",
+    "output_price_per_token": "0.001"
+  }
 }
 HTTP 200
 [Asserts]
@@ -332,6 +359,18 @@ dwctl_session: {{user2_jwt}}
 }
 HTTP 403
 
+# User1 tries to update pricing on their accessible model - should be forbidden
+PATCH http://localhost:3001/admin/api/v1/models/{{user1_model_id}}
+[Cookies]
+dwctl_session: {{user_jwt}}
+{
+  "pricing": {
+    "prompt": "0.999",
+    "completion": "0.999"
+  }
+}
+HTTP 403
+
 # -----------------------------------------------------------------------------
 # PlatformManager CAN update models
 # -----------------------------------------------------------------------------
@@ -349,6 +388,37 @@ jsonpath "$.id" == "{{user1_model_id}}"
 jsonpath "$.alias" == "user1-model-updated"
 jsonpath "$.model_name" == "user1-model"
 
+# Admin updates pricing - should succeed
+PATCH http://localhost:3001/admin/api/v1/models/{{user1_model_id}}
+[Cookies]
+dwctl_session: {{admin_jwt}}
+{
+  "pricing": {
+    "input_price_per_token": "0.005",
+    "output_price_per_token": "0.010"
+  },
+  "downstream_pricing": {
+    "mode": "per_token",
+    "input_price_per_token": "0.0025",
+    "output_price_per_token": "0.005"
+  }
+}
+HTTP 200
+[Asserts]
+jsonpath "$.id" == "{{user1_model_id}}"
+
+# Verify pricing was updated
+GET http://localhost:3001/admin/api/v1/models/{{user1_model_id}}?include=pricing
+[Cookies]
+dwctl_session: {{admin_jwt}}
+HTTP 200
+[Asserts]
+jsonpath "$.id" == "{{user1_model_id}}"
+jsonpath "$.pricing.input_price_per_token" matches "^0\\.005"
+jsonpath "$.pricing.output_price_per_token" matches "^0\\.01"
+jsonpath "$.downstream_pricing.input_price_per_token" matches "^0\\.0025"
+jsonpath "$.downstream_pricing.output_price_per_token" matches "^0\\.005"
+
 # Admin updates rate limits - should succeed
 PATCH http://localhost:3001/admin/api/v1/models/{{user2_model_id}}
 [Cookies]
@@ -362,6 +432,116 @@ HTTP 200
 jsonpath "$.id" == "{{user2_model_id}}"
 jsonpath "$.requests_per_second" == 500.0
 jsonpath "$.burst_size" == 1000
+
+# =============================================================================
+# Capacity Fields Permission Tests
+# =============================================================================
+
+# -----------------------------------------------------------------------------
+# Create model with capacity limits
+# -----------------------------------------------------------------------------
+
+# Create model with capacity for testing
+POST http://localhost:3001/admin/api/v1/models
+[Cookies]
+dwctl_session: {{admin_jwt}}
+{
+  "model_name": "capacity-test-model",
+  "alias": "capacity-test-alias",
+  "hosted_on": "{{models_test_endpoint_id}}",
+  "capacity": 50,
+  "batch_capacity": 10
+}
+HTTP 200
+[Captures]
+capacity_model_id: jsonpath "$.id"
+[Asserts]
+jsonpath "$.capacity" == 50
+jsonpath "$.batch_capacity" == 10
+
+# Add to everyone group so users can access it
+POST http://localhost:3001/admin/api/v1/groups/{{everyone_group_id}}/models/{{capacity_model_id}}
+[Cookies]
+dwctl_session: {{admin_jwt}}
+HTTP 204
+
+# -----------------------------------------------------------------------------
+# StandardUser CANNOT see capacity fields (permission-gated like rate limits)
+# -----------------------------------------------------------------------------
+
+# User1 fetches model - should NOT see capacity fields
+GET http://localhost:3001/admin/api/v1/models/{{capacity_model_id}}
+[Cookies]
+dwctl_session: {{user_jwt}}
+HTTP 200
+[Asserts]
+jsonpath "$.id" == "{{capacity_model_id}}"
+jsonpath "$.capacity" not exists
+jsonpath "$.batch_capacity" not exists
+
+# User1 lists models - should NOT see capacity fields
+GET http://localhost:3001/admin/api/v1/models
+[Cookies]
+dwctl_session: {{user_jwt}}
+HTTP 200
+[Asserts]
+# Verify we can see the model in the list
+jsonpath "$.data[*].id" contains "{{capacity_model_id}}"
+# Verify that the capacity fields are completely absent (count == 0 means no objects have this field)
+jsonpath "$.data[*].capacity" count == 0
+jsonpath "$.data[*].batch_capacity" count == 0
+
+# -----------------------------------------------------------------------------
+# PlatformManager CAN see capacity fields
+# -----------------------------------------------------------------------------
+
+# Admin fetches model - should see capacity
+GET http://localhost:3001/admin/api/v1/models/{{capacity_model_id}}
+[Cookies]
+dwctl_session: {{admin_jwt}}
+HTTP 200
+[Asserts]
+jsonpath "$.capacity" == 50
+jsonpath "$.batch_capacity" == 10
+
+# Admin lists models - should see capacity
+GET http://localhost:3001/admin/api/v1/models
+[Cookies]
+dwctl_session: {{admin_jwt}}
+HTTP 200
+[Asserts]
+# Find the specific model and verify it has capacity fields
+jsonpath "$.data[?(@.id == '{{capacity_model_id}}')].capacity" nth 0 == 50
+jsonpath "$.data[?(@.id == '{{capacity_model_id}}')].batch_capacity" nth 0 == 10
+
+# Clean up capacity test model
+DELETE http://localhost:3001/admin/api/v1/models/{{capacity_model_id}}
+[Cookies]
+dwctl_session: {{admin_jwt}}
+HTTP 200
+
+# -----------------------------------------------------------------------------
+# hosted_on field is immutable (cannot be updated via PATCH)
+# -----------------------------------------------------------------------------
+
+# Create second endpoint for testing
+POST http://localhost:3001/admin/api/v1/endpoints
+[Cookies]
+dwctl_session: {{admin_jwt}}
+{
+  "name": "second-endpoint-{{newUuid}}",
+  "url": "http://second-llm:3000",
+  "sync": false
+}
+HTTP 201
+[Captures]
+second_endpoint_id: jsonpath "$.id"
+
+# Clean up second endpoint
+DELETE http://localhost:3001/admin/api/v1/endpoints/{{second_endpoint_id}}
+[Cookies]
+dwctl_session: {{admin_jwt}}
+HTTP 204
 
 # -----------------------------------------------------------------------------
 # PlatformManager CAN update deleted models (has system access)
@@ -405,6 +585,36 @@ HTTP 200
 [Asserts]
 jsonpath "$.id" == "{{public_model_id}}"
 
+# -----------------------------------------------------------------------------
+# created_by field visibility (should be hidden from StandardUser)
+# -----------------------------------------------------------------------------
+
+# User1 fetches their accessible model - should NOT see created_by
+GET http://localhost:3001/admin/api/v1/models/{{user1_model_id}}
+[Cookies]
+dwctl_session: {{user_jwt}}
+HTTP 200
+[Asserts]
+jsonpath "$.id" == "{{user1_model_id}}"
+jsonpath "$.created_by" not exists
+
+# User1 lists models - should NOT see created_by
+GET http://localhost:3001/admin/api/v1/models
+[Cookies]
+dwctl_session: {{user_jwt}}
+HTTP 200
+[Asserts]
+jsonpath "$.data[0].created_by" not exists
+
+# Admin CAN see created_by (has system access)
+GET http://localhost:3001/admin/api/v1/models/{{user1_model_id}}
+[Cookies]
+dwctl_session: {{admin_jwt}}
+HTTP 200
+[Asserts]
+jsonpath "$.created_by" exists
+jsonpath "$.created_by" == "{{admin_user_id}}"
+
 # User1 tries to fetch user2's model - should get 404
 GET http://localhost:3001/admin/api/v1/models/{{user2_model_id}}
 [Cookies]
@@ -422,6 +632,7 @@ GET http://localhost:3001/admin/api/v1/models/{{deleted_model_id}}
 [Cookies]
 dwctl_session: {{user_jwt}}
 HTTP 404
+
 
 # -----------------------------------------------------------------------------
 # StandardUser doesn't get enriched fields even when fetching by ID
@@ -565,8 +776,9 @@ GET http://localhost:3001/admin/api/v1/models?include=pricing
 dwctl_session: {{admin_jwt}}
 HTTP 200
 [Asserts]
-jsonpath "$.data[0].pricing" exists
-jsonpath "$.data[0].downstream_pricing" exists
+# Check that user1_model (which has pricing) shows both pricing fields
+jsonpath "$.data[?(@.id == '{{user1_model_id}}')].pricing" nth 0 exists
+jsonpath "$.data[?(@.id == '{{user1_model_id}}')].downstream_pricing" nth 0 exists
 
 # =============================================================================
 # Rate Limits Visibility Confirmation
@@ -840,7 +1052,7 @@ GET http://localhost:3001/admin/api/v1/models?deleted=true
 dwctl_session: {{admin_jwt}}
 HTTP 200
 [Asserts]
-jsonpath "$.data" count == 5
+jsonpath "$.data" count == 6
 jsonpath "$.data[*].id" contains "{{deleted_model_id}}"
 
 # Admin without deleted parameter should NOT see deleted (default behavior)
