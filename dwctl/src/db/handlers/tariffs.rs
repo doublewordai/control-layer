@@ -117,7 +117,40 @@ impl<'c> Tariffs<'c> {
         Ok(tariffs)
     }
 
-    /// Get the pricing for a specific tariff that was valid at a given timestamp
+    /// Get pricing with fallback support
+    ///
+    /// Tries to get pricing for the preferred API key purpose, falling back to the
+    /// fallback purpose if the preferred one is not found.
+    ///
+    /// # Arguments
+    /// * `deployed_model_id` - The model to get pricing for
+    /// * `preferred_purpose` - Optional preferred API key purpose
+    /// * `fallback_purpose` - Fallback API key purpose to use if preferred is not found
+    /// * `timestamp` - The timestamp to get pricing for (for historical accuracy)
+    ///
+    /// # Returns
+    /// * `Ok(Some((input_price, output_price)))` - Found pricing
+    /// * `Ok(None)` - Neither preferred nor fallback tariff found
+    #[instrument(skip(self), err)]
+    pub async fn get_pricing_at_timestamp_with_fallback(
+        &mut self,
+        deployed_model_id: DeploymentId,
+        preferred_purpose: Option<&str>,
+        fallback_purpose: &str,
+        timestamp: DateTime<Utc>,
+    ) -> Result<Option<(Decimal, Decimal)>> {
+        // Try preferred purpose first if specified
+        if let Some(preferred) = preferred_purpose {
+            if let Some(pricing) = self.get_pricing_at_timestamp(deployed_model_id, preferred, timestamp).await? {
+                return Ok(Some(pricing));
+            }
+        }
+
+        // Fall back to fallback purpose
+        self.get_pricing_at_timestamp(deployed_model_id, fallback_purpose, timestamp).await
+    }
+
+    /// Get the pricing for a specific API key purpose that was valid at a given timestamp
     /// This is used for historical chargeback calculations
     ///
     /// Uses an optimized two-step lookup:
@@ -128,7 +161,7 @@ impl<'c> Tariffs<'c> {
     pub async fn get_pricing_at_timestamp(
         &mut self,
         deployed_model_id: DeploymentId,
-        tariff_name: &str,
+        api_key_purpose: &str,
         timestamp: DateTime<Utc>,
     ) -> Result<Option<(Decimal, Decimal)>> {
         // Step 1: Check current (active) tariff - this is the fast path for recent requests
@@ -137,12 +170,12 @@ impl<'c> Tariffs<'c> {
             SELECT input_price_per_token, output_price_per_token, valid_from
             FROM model_tariffs
             WHERE deployed_model_id = $1
-              AND name = $2
+              AND api_key_purpose = $2
               AND valid_until IS NULL
             LIMIT 1
             "#,
             deployed_model_id,
-            tariff_name
+            api_key_purpose
         )
         .fetch_optional(&mut *self.db)
         .await?;
@@ -162,14 +195,14 @@ impl<'c> Tariffs<'c> {
             SELECT input_price_per_token, output_price_per_token
             FROM model_tariffs
             WHERE deployed_model_id = $1
-              AND name = $2
+              AND api_key_purpose = $2
               AND valid_from <= $3
               AND (valid_until IS NULL OR valid_until > $3)
             ORDER BY valid_from DESC
             LIMIT 1
             "#,
             deployed_model_id,
-            tariff_name,
+            api_key_purpose,
             timestamp
         )
         .fetch_optional(&mut *self.db)

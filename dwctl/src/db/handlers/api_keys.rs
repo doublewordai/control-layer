@@ -554,6 +554,60 @@ impl<'c> ApiKeys<'c> {
 
         Ok(results)
     }
+
+    /// Get user information (ID, email, purpose) by API key secret
+    ///
+    /// This method is used by the request logging system to enrich analytics records
+    /// with user information and determine tariff selection based on API key purpose.
+    ///
+    /// # Arguments
+    /// * `secret` - The API key secret to look up
+    ///
+    /// # Returns
+    /// Returns a tuple of (user_id, email, purpose) if found, or None if not found
+    #[instrument(skip(self, secret), err)]
+    pub async fn get_user_info_by_secret(&mut self, secret: &str) -> Result<Option<(UserId, String, ApiKeyPurpose)>> {
+        #[derive(Debug, FromRow)]
+        struct UserInfo {
+            user_id: UserId,
+            email: String,
+            purpose: String,
+        }
+
+        let info = sqlx::query_as!(
+            UserInfo,
+            r#"
+            SELECT u.id as user_id, u.email, ak.purpose
+            FROM api_keys ak
+            JOIN users u ON ak.user_id = u.id
+            WHERE ak.secret = $1
+            "#,
+            secret
+        )
+        .fetch_optional(&mut *self.db)
+        .await?;
+
+        Ok(info.map(|i| {
+            // Parse purpose string to enum - default to Realtime for backwards compatibility
+            let purpose = i
+                .purpose
+                .parse::<serde_json::Value>()
+                .ok()
+                .and_then(|v| serde_json::from_value::<ApiKeyPurpose>(v).ok())
+                .or(match i.purpose.as_str() {
+                    "platform" => Some(ApiKeyPurpose::Platform),
+                    "realtime" => Some(ApiKeyPurpose::Realtime),
+                    "batch" => Some(ApiKeyPurpose::Batch),
+                    "playground" => Some(ApiKeyPurpose::Playground),
+                    // Legacy: map old "inference" to "realtime" for backwards compatibility
+                    "inference" => Some(ApiKeyPurpose::Realtime),
+                    _ => None,
+                })
+                .unwrap_or(ApiKeyPurpose::Realtime);
+
+            (i.user_id, i.email, purpose)
+        }))
+    }
 }
 
 #[cfg(test)]
