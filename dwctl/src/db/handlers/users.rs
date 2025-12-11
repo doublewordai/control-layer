@@ -13,6 +13,7 @@ use crate::{
     },
 };
 use chrono::{DateTime, Utc};
+use rand::Rng;
 use serde::{Deserialize, Serialize};
 use sqlx::{Connection, FromRow, PgConnection};
 use tracing::instrument;
@@ -29,6 +30,54 @@ impl UserFilter {
     pub fn new(skip: i64, limit: i64) -> Self {
         Self { skip, limit }
     }
+}
+
+/// Generate a random inference-themed display name
+/// Format: "{adjective} {noun} {4-digit number}"
+/// Example: "Swift Inference 4729"
+fn generate_random_display_name() -> String {
+    const ADJECTIVES: &[&str] = &[
+        "Swift",
+        "Neural",
+        "Deep",
+        "Smart",
+        "Quantum",
+        "Adaptive",
+        "Dynamic",
+        "Logical",
+        "Efficient",
+        "Precise",
+        "Optimized",
+        "Parallel",
+        "Recursive",
+        "Semantic",
+        "Synthetic",
+    ];
+
+    const NOUNS: &[&str] = &[
+        "Inference",
+        "Network",
+        "Model",
+        "Agent",
+        "Processor",
+        "Analyzer",
+        "Engine",
+        "System",
+        "Predictor",
+        "Learner",
+        "Classifier",
+        "Transformer",
+        "Encoder",
+        "Decoder",
+        "Reasoning",
+    ];
+
+    let mut rng = rand::thread_rng();
+    let adjective = ADJECTIVES[rng.gen_range(0..ADJECTIVES.len())];
+    let noun = NOUNS[rng.gen_range(0..NOUNS.len())];
+    let number = rng.gen_range(1000..10000);
+
+    format!("{} {} {}", adjective, noun, number)
 }
 
 // Database entity model
@@ -545,10 +594,13 @@ impl<'c> Users<'c> {
                 external_user_id,
                 email
             );
+            let display_name = generate_random_display_name();
+            tracing::debug!("Generated display name: {}", display_name);
+
             let create_request = UserCreateDBRequest {
                 username: external_user_id.to_string(),
                 email: email.to_string(),
-                display_name: None,
+                display_name: Some(display_name),
                 avatar_url: None,
                 is_admin: false,
                 roles: default_roles.to_vec(),
