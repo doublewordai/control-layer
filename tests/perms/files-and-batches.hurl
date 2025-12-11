@@ -1138,8 +1138,7 @@ jsonpath "$.status" == "in_progress"
 
 GET http://localhost:3001/ai/v1/batches/{{user1_revoke_test_batch_id}}
 [Options]
-delay: 20000
-retry: 10
+delay: 10000
 [Cookies]
 dwctl_session: {{user_jwt}}
 HTTP 200

@@ -560,8 +560,8 @@ impl<'c> Deployments<'c> {
 
     /// Check if a user has access to a deployment through group membership
     /// Returns deployment info and system API key if access is granted
-    #[instrument(skip(self, user_email), fields(deployment_alias = %deployment_alias), err)]
-    pub async fn check_user_access(&mut self, deployment_alias: &str, user_email: &str) -> Result<Option<DeploymentAccessInfo>> {
+    #[instrument(skip(self), fields(deployment_alias = %deployment_alias, user_id = %abbrev_uuid(&user_id)), err)]
+    pub async fn check_user_access(&mut self, deployment_alias: &str, user_id: UserId) -> Result<Option<DeploymentAccessInfo>> {
         let result = sqlx::query_as!(
             DeploymentAccessInfo,
             r#"
@@ -569,22 +569,20 @@ impl<'c> Deployments<'c> {
                 d.id as deployment_id,
                 d.alias as deployment_alias,
                 ak.secret as system_api_key
-            FROM users u
-            JOIN deployment_groups dg ON (
-                dg.group_id IN (
-                    SELECT ug.group_id FROM user_groups ug WHERE ug.user_id = u.id
-                    UNION
-                    SELECT '00000000-0000-0000-0000-000000000000'::uuid
-                    WHERE u.id != '00000000-0000-0000-0000-000000000000'
-                )
-            )
-            JOIN deployed_models d ON dg.deployment_id = d.id
+            FROM deployed_models d
+            JOIN deployment_groups dg ON dg.deployment_id = d.id
             JOIN api_keys ak ON ak.id = '00000000-0000-0000-0000-000000000000'::uuid
-            WHERE u.email = $1 AND d.alias = $2
+            WHERE d.alias = $1
+            AND dg.group_id IN (
+                SELECT ug.group_id FROM user_groups ug WHERE ug.user_id = $2
+                UNION
+                SELECT '00000000-0000-0000-0000-000000000000'::uuid
+                WHERE $2 != '00000000-0000-0000-0000-000000000000'::uuid
+            )
             LIMIT 1
             "#,
-            user_email,
-            deployment_alias
+            deployment_alias,
+            user_id
         )
         .fetch_optional(&mut *self.db)
         .await?;
@@ -1653,7 +1651,7 @@ mod tests {
         let group = group_repo.create(&group_create).await.unwrap();
 
         // Test user access without group membership - should return None
-        let access_result = deployment_repo.check_user_access("access-test-alias", &user.email).await.unwrap();
+        let access_result = deployment_repo.check_user_access("access-test-alias", user.id).await.unwrap();
         assert!(access_result.is_none());
 
         // Add user to group
@@ -1663,7 +1661,7 @@ mod tests {
             .expect("Failed to add user to group");
 
         // Test user access without deployment in group - should still return None
-        let access_result = deployment_repo.check_user_access("access-test-alias", &user.email).await.unwrap();
+        let access_result = deployment_repo.check_user_access("access-test-alias", user.id).await.unwrap();
         assert!(access_result.is_none());
 
         // Add deployment to group
@@ -1673,7 +1671,7 @@ mod tests {
             .expect("Failed to add deployment to group");
 
         // Test user access with proper group membership - should return access info
-        let access_result = deployment_repo.check_user_access("access-test-alias", &user.email).await.unwrap();
+        let access_result = deployment_repo.check_user_access("access-test-alias", user.id).await.unwrap();
         assert!(access_result.is_some());
 
         let access_info = access_result.unwrap();
@@ -1682,14 +1680,15 @@ mod tests {
         assert_eq!(access_info.system_api_key, system_key_secret);
 
         // Test with non-existent user - should return None
+        let nonexistent_user_id = uuid::Uuid::new_v4().into();
         let access_result = deployment_repo
-            .check_user_access("access-test-alias", "nonexistent@example.com")
+            .check_user_access("access-test-alias", nonexistent_user_id)
             .await
             .unwrap();
         assert!(access_result.is_none());
 
         // Test with non-existent deployment - should return None
-        let access_result = deployment_repo.check_user_access("nonexistent-alias", &user.email).await.unwrap();
+        let access_result = deployment_repo.check_user_access("nonexistent-alias", user.id).await.unwrap();
         assert!(access_result.is_none());
 
         // Remove user from group and test access again - should return None
@@ -1698,7 +1697,7 @@ mod tests {
             .await
             .expect("Failed to remove user from group");
 
-        let access_result = deployment_repo.check_user_access("access-test-alias", &user.email).await.unwrap();
+        let access_result = deployment_repo.check_user_access("access-test-alias", user.id).await.unwrap();
         assert!(access_result.is_none());
     }
 

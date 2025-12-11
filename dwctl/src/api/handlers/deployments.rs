@@ -349,6 +349,7 @@ pub async fn get_deployed_model(
     current_user: CurrentUser,
 ) -> Result<Json<DeployedModelResponse>> {
     let has_system_access = has_permission(&current_user, resource::Models.into(), operation::SystemAccess.into());
+    let can_read_all_models = can_read_all_resources(&current_user, Resource::Models);
     let can_read_rate_limits = can_read_all_resources(&current_user, Resource::ModelRateLimits);
     let can_read_pricing = can_read_all_resources(&current_user, Resource::Pricing);
 
@@ -389,6 +390,18 @@ pub async fn get_deployed_model(
         // Active models (or other statuses): always visible if not deleted
         (false, _) => {
             // Model is visible, continue
+        }
+    }
+
+    // Check group-based access control for non-admin users
+    if !can_read_all_models {
+        let has_access = repo.check_user_access(&model.alias, current_user.id).await?;
+        
+        if has_access.is_none() {
+            return Err(Error::NotFound {
+                resource: "Deployment".to_string(),
+                id: deployment_id.to_string(),
+            });
         }
     }
 
@@ -675,6 +688,9 @@ mod tests {
         let deployment = create_test_deployment(&pool, admin_user.id, "test-model", "test-alias").await;
         let deployment_id = deployment.id;
 
+        let everyone_group_id = uuid::Uuid::nil();
+        add_deployment_to_group(&pool, deployment_id, everyone_group_id, admin_user.id).await;
+
         // Both users should initially see the model
         let response = app
             .get(&format!("/admin/api/v1/models/{deployment_id}"))
@@ -846,6 +862,10 @@ mod tests {
         // Create a deployment via API
         let deployment = create_test_deployment(&pool, admin_user.id, "preserve-test-model", "preserve-test-alias").await;
         let deployment_id = deployment.id;
+
+        // Add to Everyone group so regular users can access it
+        let everyone_group_id = uuid::Uuid::nil();
+        add_deployment_to_group(&pool, deployment_id, everyone_group_id, admin_user.id).await;
 
         // Verify both users can initially access the model
         let response = app

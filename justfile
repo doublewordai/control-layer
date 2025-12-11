@@ -422,7 +422,7 @@ test target="" *args="":
                 docker compose logs --tail=20  # Show fewer logs
                 echo "🧹 [$(date '+%H:%M:%S')] Cleaning up..."
                 # Fast teardown: kill containers immediately instead of graceful shutdown
-                # docker compose kill && docker compose rm -f && docker compose down --volumes --remove-orphans 2>/dev/null || true
+                docker compose kill && docker compose rm -f && docker compose down --volumes --remove-orphans 2>/dev/null || true
                 exit 1
             }
 
