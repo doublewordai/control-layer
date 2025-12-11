@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "SELECT * FROM users WHERE external_user_id = $1 AND id != '00000000-0000-0000-0000-000000000000'",
+  "query": "SELECT * FROM users WHERE email = $1 AND id != '00000000-0000-0000-0000-000000000000' AND is_deleted = false",
   "describe": {
     "columns": [
       {
@@ -67,6 +67,11 @@
         "ordinal": 12,
         "name": "payment_provider_id",
         "type_info": "Varchar"
+      },
+      {
+        "ordinal": 13,
+        "name": "is_deleted",
+        "type_info": "Bool"
       }
     ],
     "parameters": {
@@ -87,8 +92,9 @@
       false,
       true,
       true,
-      true
+      true,
+      false
     ]
   },
-  "hash": "dc24b06c4538619e59c36a784398488d6c43d0729450081b1d6fceafad7949f2"
+  "hash": "9e269479a91ac32016420a0bdfc34671853006e1efd5df4117434a4478df8696"
 }

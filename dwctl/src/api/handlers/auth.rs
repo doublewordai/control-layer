@@ -108,10 +108,17 @@ pub async fn register(State(state): State<AppState>, Json(request): Json<Registe
         .map_err(|e| Error::Internal {
             operation: format!("spawn password hashing task: {e}"),
         })??;
+    // Generate a random display name if not provided
+    let display_name = if request.display_name.is_none() {
+        Some(crate::auth::utils::generate_random_display_name())
+    } else {
+        request.display_name
+    };
+
     let create_request = UserCreateDBRequest {
         username: request.username,
         email: request.email,
-        display_name: request.display_name,
+        display_name,
         avatar_url: None,
         is_admin: false,
         roles: state.config.auth.default_user_roles.clone(),
@@ -714,6 +721,53 @@ mod tests {
             transactions.len(),
             0,
             "Should have no credit transactions when initial credits is zero"
+        );
+    }
+
+    #[sqlx::test]
+    async fn test_register_auto_generates_display_name(pool: PgPool) {
+        let mut config = create_test_config();
+        config.auth.native.enabled = true;
+        config.auth.native.allow_registration = true;
+
+        let request_manager = std::sync::Arc::new(fusillade::PostgresRequestManager::new(pool.clone()));
+        let state = AppState::builder()
+            .db(pool.clone())
+            .config(config)
+            .request_manager(request_manager)
+            .build();
+
+        let app = axum::Router::new()
+            .route("/auth/register", axum::routing::post(register))
+            .with_state(state);
+
+        let server = TestServer::new(app).unwrap();
+
+        // Register without providing a display name
+        let request = RegisterRequest {
+            username: "autogen_user".to_string(),
+            email: "autogen@example.com".to_string(),
+            password: "password123".to_string(),
+            display_name: None, // No display name provided
+        };
+
+        let response = server.post("/auth/register").json(&request).await;
+        response.assert_status(axum::http::StatusCode::CREATED);
+
+        let body: AuthResponse = response.json();
+        assert_eq!(body.user.email, "autogen@example.com");
+
+        // Verify display name was auto-generated
+        assert!(body.user.display_name.is_some(), "Display name should be auto-generated");
+        let display_name = body.user.display_name.unwrap();
+
+        // Verify format: "{adjective} {noun} {4-digit number}"
+        let parts: Vec<&str> = display_name.split_whitespace().collect();
+        assert_eq!(parts.len(), 3, "Display name should have 3 parts, got: {}", display_name);
+        assert!(
+            parts[2].len() == 4 && parts[2].parse::<u32>().is_ok(),
+            "Third part should be a 4-digit number, got: {}",
+            parts[2]
         );
     }
 

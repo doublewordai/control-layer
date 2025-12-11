@@ -476,12 +476,23 @@ mod tests {
         assert_eq!(current_user.email, new_email);
         assert_eq!(current_user.username, new_external_id); // Username is set to external_user_id for uniqueness
         assert!(current_user.roles.contains(&Role::StandardUser));
+        assert!(current_user.display_name.is_some(), "Display name should be auto-generated");
 
-        // Verify user was actually created in database
+        // Verify user was actually created in database with display name
         let created_user = users_repo.get_user_by_email(new_email).await.unwrap();
         assert!(created_user.is_some());
         let db_user = created_user.unwrap();
         assert_eq!(db_user.auth_source, "proxy-header");
+        assert!(db_user.display_name.is_some(), "Database user should have display name");
+
+        // Verify display name format (should match pattern: "{adjective} {noun} {4-digit number}")
+        let display_name = db_user.display_name.unwrap();
+        let parts: Vec<&str> = display_name.split_whitespace().collect();
+        assert_eq!(parts.len(), 3, "Display name should have 3 parts");
+        assert!(
+            parts[2].len() == 4 && parts[2].parse::<u32>().is_ok(),
+            "Third part should be a 4-digit number"
+        );
     }
 
     #[sqlx::test]
