@@ -364,12 +364,39 @@ pub async fn delete_user(
     Path(user_id): Path<UserId>,
     current_user: RequiresPermission<resource::Users, operation::DeleteAll>,
 ) -> Result<StatusCode> {
+    use fusillade::Storage;
+
     // Prevent self-deletion
     if user_id == current_user.id {
         return Err(Error::BadRequest {
             message: "You cannot delete your own account".to_string(),
         });
     }
+
+    // Cancel all active batches for this user before deletion
+    let user_id_str = user_id.to_string();
+    let batches = state
+        .request_manager
+        .list_batches(Some(user_id_str.clone()), None, i64::MAX)
+        .await
+        .map_err(|_| Error::NotFound {
+            resource: "Batch".to_string(),
+            id: user_id_str.clone(),
+        })?;
+
+    for batch in batches {
+        if batch.completed_at.is_none()
+            && let Err(e) = state.request_manager.cancel_batch(batch.id).await
+        {
+            tracing::warn!(
+                batch_id = %batch.id,
+                user_id = %user_id,
+                error = %e,
+                "Failed to cancel batch during user deletion"
+            );
+        }
+    }
+
     let mut conn = state.db.acquire().await.expect("Failed to acquire database connection");
     let mut repo = Users::new(&mut conn);
 

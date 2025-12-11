@@ -373,6 +373,7 @@ export const Profile: React.FC = () => {
                     <Input
                       id="avatarUrl"
                       type="url"
+                      autoComplete="off"
                       value={avatarUrl}
                       onChange={(e) => setAvatarUrl(e.target.value)}
                       placeholder="https://example.com/avatar.jpg"
@@ -408,6 +409,7 @@ export const Profile: React.FC = () => {
                           id="currentPassword"
                           type={showCurrentPassword ? "text" : "password"}
                           value={currentPassword}
+                          autoComplete="new-password"
                           onChange={(e) => setCurrentPassword(e.target.value)}
                           className="pl-10 pr-10"
                           placeholder="Enter your current password"
