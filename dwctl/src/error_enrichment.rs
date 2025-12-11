@@ -85,21 +85,10 @@ pub async fn error_enrichment_middleware(State(pool): State<PgPool>, request: Re
     {
         debug!("Intercepted 403 response on AI proxy path, attempting enrichment");
 
-        // Check balance first - if negative, it's a credits issue
-        if let Ok(balance) = get_balance_of_api_key(pool.clone(), &key).await
-            && balance <= Decimal::ZERO
-        {
-            return Error::InsufficientCredits {
-                current_balance: balance,
-                message: "Account balance too low. Please add credits to continue.".to_string(),
-            }
-            .into_response();
-        }
-
-        // If balance is OK but we have a 403, check if it's a model access issue
+        // First check if it's a model access issue
         if let Some(model) = model_name
             && let Ok(user_id) = get_user_id_of_api_key(pool.clone(), &key).await
-            && let Ok(has_access) = check_user_has_model_access(pool, user_id, &model).await
+            && let Ok(has_access) = check_user_has_model_access(pool.clone(), user_id, &model).await
             && !has_access
         {
             return Error::ModelAccessDenied {
@@ -108,6 +97,17 @@ pub async fn error_enrichment_middleware(State(pool): State<PgPool>, request: Re
                     "You do not have access to '{}'. Please contact your administrator to request access.",
                     model
                 ),
+            }
+            .into_response();
+        }
+
+        // If access is OK but we have a 403, check balance - if negative, it's a credits issue
+        if let Ok(balance) = get_balance_of_api_key(pool.clone(), &key).await
+            && balance <= Decimal::ZERO
+        {
+            return Error::InsufficientCredits {
+                current_balance: balance,
+                message: "Account balance too low. Please add credits to continue.".to_string(),
             }
             .into_response();
         }
@@ -186,6 +186,8 @@ mod tests {
     #[sqlx::test]
     #[test_log::test]
     async fn test_error_enrichment_middleware_enriches_403_with_balance(pool: PgPool) {
+        use crate::test_utils::{add_deployment_to_group, add_user_to_group, create_test_group};
+
         // Create test user with an API key
         let user = create_test_user(&pool, Role::StandardUser).await;
 
@@ -265,12 +267,22 @@ mod tests {
             .await
             .unwrap();
 
-        // Make request with API key in Authorization header
+        // We need to ensure user is part of a group with access to the deployment to avoid 403
+        let endpoint_id = crate::test_utils::create_test_endpoint(&pool, "test-endpoint", user.id).await;
+        let deployment_id =
+            crate::test_utils::create_test_model(&pool, "authorized-model-name", "authorized-model", endpoint_id, user.id).await;
+
+        let group = create_test_group(&pool).await;
+        add_user_to_group(&pool, user.id, group.id).await;
+        // Grant access to the group
+        add_deployment_to_group(&pool, deployment_id, group.id, user.id).await;
+
+        // Make request with API key in Authorization header, using the model the user has access to
         let response = server
             .post("/ai/v1/chat/completions")
             .add_header("authorization", &format!("Bearer {}", api_key.secret))
             .json(&serde_json::json!({
-                "model": "test-model",
+                "model": "authorized-model",
                 "messages": [{"role": "user", "content": "Hello"}]
             }))
             .await;
@@ -325,33 +337,9 @@ mod tests {
             .unwrap();
 
         // Create a deployment with 'authorized-model' alias and grant access to the group
-        // We need to manually insert both an endpoint and deployment since we don't have a seeded DB
-        let endpoint_id = uuid::Uuid::new_v4();
-        sqlx::query!(
-            r#"
-            INSERT INTO inference_endpoints (id, name, url, api_key, created_by)
-            VALUES ($1, 'test-endpoint', 'http://localhost:8080', NULL, $2)
-            "#,
-            endpoint_id,
-            user.id
-        )
-        .execute(&pool)
-        .await
-        .unwrap();
-
-        let deployment_id = uuid::Uuid::new_v4();
-        sqlx::query!(
-            r#"
-            INSERT INTO deployed_models (id, model_name, alias, hosted_on, created_by, deleted)
-            VALUES ($1, 'authorized-model-name', 'authorized-model', $2, $3, false)
-            "#,
-            deployment_id,
-            endpoint_id,
-            user.id
-        )
-        .execute(&pool)
-        .await
-        .unwrap();
+        let endpoint_id = crate::test_utils::create_test_endpoint(&pool, "test-endpoint", user.id).await;
+        let deployment_id =
+            crate::test_utils::create_test_model(&pool, "authorized-model-name", "authorized-model", endpoint_id, user.id).await;
 
         // Grant access to the group
         add_deployment_to_group(&pool, deployment_id, group.id, user.id).await;
