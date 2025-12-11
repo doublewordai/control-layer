@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "\n            SELECT\n                u.id,\n                u.username,\n                u.email,\n                u.display_name,\n                u.avatar_url,\n                u.auth_source,\n                u.created_at,\n                u.updated_at,\n                u.last_login,\n                u.is_admin,\n                u.password_hash,\n                u.external_user_id,\n                u.payment_provider_id,\n                ARRAY_AGG(ur.role) FILTER (WHERE ur.role IS NOT NULL) as \"roles: Vec<Role>\"\n            FROM users u\n            LEFT JOIN user_roles ur ON ur.user_id = u.id\n            WHERE u.id = ANY($1) AND u.id != '00000000-0000-0000-0000-000000000000'\n            GROUP BY u.id, u.username, u.email, u.display_name, u.avatar_url, u.auth_source, u.created_at, u.updated_at, u.last_login, u.is_admin, u.password_hash, u.external_user_id, u.payment_provider_id\n            ",
+  "query": "\n            SELECT\n                u.id,\n                u.username,\n                u.email,\n                u.display_name,\n                u.avatar_url,\n                u.auth_source,\n                u.created_at,\n                u.updated_at,\n                u.last_login,\n                u.is_admin,\n                u.password_hash,\n                u.external_user_id,\n                u.payment_provider_id,\n                u.is_deleted,\n                ARRAY_AGG(ur.role) FILTER (WHERE ur.role IS NOT NULL) as \"roles: Vec<Role>\"\n            FROM users u\n            LEFT JOIN user_roles ur ON ur.user_id = u.id\n            WHERE u.id = ANY($1) AND u.id != '00000000-0000-0000-0000-000000000000' AND u.is_deleted = false\n            GROUP BY u.id, u.username, u.email, u.display_name, u.avatar_url, u.auth_source, u.created_at, u.updated_at, u.last_login, u.is_admin, u.password_hash, u.external_user_id, u.payment_provider_id, u.is_deleted\n            ",
   "describe": {
     "columns": [
       {
@@ -70,6 +70,11 @@
       },
       {
         "ordinal": 13,
+        "name": "is_deleted",
+        "type_info": "Bool"
+      },
+      {
+        "ordinal": 14,
         "name": "roles: Vec<Role>",
         "type_info": {
           "Custom": {
@@ -113,8 +118,9 @@
       true,
       true,
       true,
+      false,
       null
     ]
   },
-  "hash": "0b4abfe0293a8bf40e1d4fcd2f1140f1deed171878e5bc2ceaf0a82538762ffd"
+  "hash": "0e9639f207eed5faa3cd3974166877b1d6b588830dc7263c14c3086075ec93bb"
 }
