@@ -67,6 +67,11 @@
         "ordinal": 12,
         "name": "payment_provider_id",
         "type_info": "Varchar"
+      },
+      {
+        "ordinal": 13,
+        "name": "is_deleted",
+        "type_info": "Bool"
       }
     ],
     "parameters": {
@@ -90,7 +95,8 @@
       false,
       true,
       true,
-      true
+      true,
+      false
     ]
   },
   "hash": "370386c627cf888c4aa7100163482dc4fe8be6df3d88e589447671f6c6d130d0"

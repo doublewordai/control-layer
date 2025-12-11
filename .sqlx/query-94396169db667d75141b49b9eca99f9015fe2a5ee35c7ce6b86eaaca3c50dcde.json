@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "\n            SELECT\n                u.id,\n                u.username,\n                u.email,\n                u.display_name,\n                u.avatar_url,\n                u.auth_source,\n                u.created_at,\n                u.updated_at,\n                u.last_login,\n                u.is_admin,\n                u.password_hash,\n                u.external_user_id,\n                u.payment_provider_id,\n                ARRAY_AGG(ur.role) FILTER (WHERE ur.role IS NOT NULL) as \"roles: Vec<Role>\"\n            FROM users u\n            LEFT JOIN user_roles ur ON ur.user_id = u.id\n            WHERE u.id = $1 AND u.id != '00000000-0000-0000-0000-000000000000'\n            GROUP BY u.id, u.username, u.email, u.display_name, u.avatar_url, u.auth_source, u.created_at, u.updated_at, u.last_login, u.is_admin, u.password_hash, u.external_user_id, u.payment_provider_id\n            ",
+  "query": "SELECT * FROM users WHERE id != '00000000-0000-0000-0000-000000000000' AND is_deleted = false ORDER BY created_at DESC LIMIT $1 OFFSET $2",
   "describe": {
     "columns": [
       {
@@ -70,33 +70,14 @@
       },
       {
         "ordinal": 13,
-        "name": "roles: Vec<Role>",
-        "type_info": {
-          "Custom": {
-            "name": "user_role[]",
-            "kind": {
-              "Array": {
-                "Custom": {
-                  "name": "user_role",
-                  "kind": {
-                    "Enum": [
-                      "PLATFORMMANAGER",
-                      "REQUESTVIEWER",
-                      "STANDARDUSER",
-                      "BILLINGMANAGER",
-                      "BATCHAPIUSER"
-                    ]
-                  }
-                }
-              }
-            }
-          }
-        }
+        "name": "is_deleted",
+        "type_info": "Bool"
       }
     ],
     "parameters": {
       "Left": [
-        "Uuid"
+        "Int8",
+        "Int8"
       ]
     },
     "nullable": [
@@ -113,8 +94,8 @@
       true,
       true,
       true,
-      null
+      false
     ]
   },
-  "hash": "b0dfdeab175dd8f651e0939e103751bb0f46cef30a7c9b8bdfa67fa829fc6d6d"
+  "hash": "94396169db667d75141b49b9eca99f9015fe2a5ee35c7ce6b86eaaca3c50dcde"
 }

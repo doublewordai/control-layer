@@ -279,13 +279,13 @@ pub async fn create_user(
     Ok((StatusCode::CREATED, Json(UserResponse::from(user))))
 }
 
-// PATCH /user/{user_id} - Update user (admin only)
+// PATCH /user/{user_id} - Update user (admin only) or own user (authenticated user)
 #[utoipa::path(
     patch,
     path = "/users/{user_id}",
     tag = "users",
     summary = "Update user",
-    description = "Update an existing user (admin only)",
+    description = "Update an existing user (admin can update any user, users can update their own profile)",
     params(
         ("user_id" = uuid::Uuid, Path, description = "User ID to update"),
     ),
@@ -293,7 +293,7 @@ pub async fn create_user(
         (status = 200, description = "User updated successfully", body = UserResponse),
         (status = 400, description = "Bad request - invalid user data"),
         (status = 401, description = "Unauthorized"),
-        (status = 403, description = "Forbidden - admin access required"),
+        (status = 403, description = "Forbidden - can only update own user data unless admin"),
         (status = 404, description = "User not found"),
         (status = 500, description = "Internal server error"),
     ),
@@ -307,10 +307,24 @@ pub async fn create_user(
 pub async fn update_user(
     State(state): State<AppState>,
     Path(user_id): Path<UserId>,
-    _: RequiresPermission<resource::Users, operation::UpdateAll>,
+    current_user: CurrentUser,
     Json(user_data): Json<UserUpdate>,
 ) -> Result<Json<UserResponse>> {
-    // Check admin role
+    // Check permissions: user can update all users OR update their own user
+    let can_update_all_users = permissions::can_update_all_resources(&current_user, Resource::Users);
+    let can_update_own_user = permissions::can_update_own_resource(&current_user, Resource::Users, user_id);
+
+    if !can_update_all_users && !can_update_own_user {
+        return Err(Error::InsufficientPermissions {
+            required: Permission::Any(vec![
+                Permission::Allow(Resource::Users, Operation::UpdateAll),
+                Permission::Allow(Resource::Users, Operation::UpdateOwn),
+            ]),
+            action: Operation::UpdateAll,
+            resource: format!("user data for user {user_id}"),
+        });
+    }
+
     let mut conn = state.db.acquire().await.expect("Failed to acquire database connection");
 
     let mut repo = Users::new(&mut conn);
@@ -885,6 +899,31 @@ mod tests {
         assert_eq!(updated_user.id, regular_user.id);
         assert_eq!(updated_user.display_name.as_deref(), Some("Updated Display Name"));
         assert_eq!(updated_user.avatar_url.as_deref(), Some("https://example.com/new-avatar.jpg"));
+    }
+
+    #[sqlx::test]
+    #[test_log::test]
+    async fn test_update_own_user_as_standard_user(pool: PgPool) {
+        let (app, _bg_services) = create_test_app(pool.clone(), false).await;
+        let user = create_test_user(&pool, Role::StandardUser).await;
+
+        let update_data = json!({
+            "display_name": "My New Display Name",
+            "avatar_url": "https://example.com/my-avatar.jpg"
+        });
+
+        let response = app
+            .patch(&format!("/admin/api/v1/users/{}", user.id))
+            .add_header(&add_auth_headers(&user)[0].0, &add_auth_headers(&user)[0].1)
+            .add_header(&add_auth_headers(&user)[1].0, &add_auth_headers(&user)[1].1)
+            .json(&update_data)
+            .await;
+
+        response.assert_status_ok();
+        let updated_user: UserResponse = response.json();
+        assert_eq!(updated_user.id, user.id);
+        assert_eq!(updated_user.display_name.as_deref(), Some("My New Display Name"));
+        assert_eq!(updated_user.avatar_url.as_deref(), Some("https://example.com/my-avatar.jpg"));
     }
 
     #[sqlx::test]

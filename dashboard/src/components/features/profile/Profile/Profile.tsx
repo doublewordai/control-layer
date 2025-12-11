@@ -1,6 +1,5 @@
 import React, { useState, useEffect } from "react";
 import {
-  User,
   Save,
   Loader2,
   Calendar,
@@ -10,6 +9,7 @@ import {
   Eye,
   EyeOff,
   Lock,
+  LockIcon,
 } from "lucide-react";
 import { useUser, useUpdateUser } from "../../../../api/control-layer/hooks";
 import {
@@ -270,7 +270,7 @@ export const Profile: React.FC = () => {
                     </TooltipContent>
                   </Tooltip>
                 </div>
-                <div className="flex items-center text-sm">
+                {/*<div className="flex items-center text-sm">
                   <User className="w-4 h-4 text-gray-400 mr-2 flex-shrink-0" />
                   <span className="text-gray-600 w-20 flex-shrink-0">
                     Username:
@@ -285,7 +285,7 @@ export const Profile: React.FC = () => {
                       <p>{currentUser?.username || ""}</p>
                     </TooltipContent>
                   </Tooltip>
-                </div>
+                </div>*/}
                 {currentUser?.created_at && (
                   <div className="flex items-center text-sm">
                     <Calendar className="w-4 h-4 text-gray-400 mr-2 flex-shrink-0" />
@@ -315,7 +315,7 @@ export const Profile: React.FC = () => {
                 </div>
                 {currentUser?.auth_source && (
                   <div className="flex items-center text-sm">
-                    <AtSign className="w-4 h-4 text-gray-400 mr-2 flex-shrink-0" />
+                    <LockIcon className="w-4 h-4 text-gray-400 mr-2 flex-shrink-0" />
                     <span className="text-gray-600 w-20 flex-shrink-0">
                       Auth:
                     </span>

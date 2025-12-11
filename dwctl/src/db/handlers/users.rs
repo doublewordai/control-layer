@@ -47,6 +47,7 @@ struct User {
     pub password_hash: Option<String>,
     pub external_user_id: Option<String>,
     pub payment_provider_id: Option<String>,
+    pub is_deleted: bool,
 }
 
 pub struct Users<'c> {
@@ -144,11 +145,12 @@ impl<'c> Repository for Users<'c> {
                 u.password_hash,
                 u.external_user_id,
                 u.payment_provider_id,
+                u.is_deleted,
                 ARRAY_AGG(ur.role) FILTER (WHERE ur.role IS NOT NULL) as "roles: Vec<Role>"
             FROM users u
             LEFT JOIN user_roles ur ON ur.user_id = u.id
-            WHERE u.id = $1 AND u.id != '00000000-0000-0000-0000-000000000000'
-            GROUP BY u.id, u.username, u.email, u.display_name, u.avatar_url, u.auth_source, u.created_at, u.updated_at, u.last_login, u.is_admin, u.password_hash, u.external_user_id, u.payment_provider_id
+            WHERE u.id = $1 AND u.id != '00000000-0000-0000-0000-000000000000' AND u.is_deleted = false
+            GROUP BY u.id, u.username, u.email, u.display_name, u.avatar_url, u.auth_source, u.created_at, u.updated_at, u.last_login, u.is_admin, u.password_hash, u.external_user_id, u.payment_provider_id, u.is_deleted
             "#,
             id
         )
@@ -170,6 +172,7 @@ impl<'c> Repository for Users<'c> {
                 password_hash: row.password_hash,
                 external_user_id: row.external_user_id,
                 payment_provider_id: row.payment_provider_id,
+                is_deleted: row.is_deleted,
             };
 
             let roles = row.roles.unwrap_or_default();
@@ -203,11 +206,12 @@ impl<'c> Repository for Users<'c> {
                 u.password_hash,
                 u.external_user_id,
                 u.payment_provider_id,
+                u.is_deleted,
                 ARRAY_AGG(ur.role) FILTER (WHERE ur.role IS NOT NULL) as "roles: Vec<Role>"
             FROM users u
             LEFT JOIN user_roles ur ON ur.user_id = u.id
-            WHERE u.id = ANY($1) AND u.id != '00000000-0000-0000-0000-000000000000'
-            GROUP BY u.id, u.username, u.email, u.display_name, u.avatar_url, u.auth_source, u.created_at, u.updated_at, u.last_login, u.is_admin, u.password_hash, u.external_user_id, u.payment_provider_id
+            WHERE u.id = ANY($1) AND u.id != '00000000-0000-0000-0000-000000000000' AND u.is_deleted = false
+            GROUP BY u.id, u.username, u.email, u.display_name, u.avatar_url, u.auth_source, u.created_at, u.updated_at, u.last_login, u.is_admin, u.password_hash, u.external_user_id, u.payment_provider_id, u.is_deleted
             "#,
             ids.as_slice()
         )
@@ -231,6 +235,7 @@ impl<'c> Repository for Users<'c> {
                 password_hash: row.password_hash,
                 external_user_id: row.external_user_id,
                 payment_provider_id: row.payment_provider_id,
+                is_deleted: row.is_deleted,
             };
 
             let roles = row.roles.unwrap_or_default();
@@ -244,7 +249,7 @@ impl<'c> Repository for Users<'c> {
     async fn list(&mut self, filter: &Self::Filter) -> Result<Vec<Self::Response>> {
         let users = sqlx::query_as!(
             User,
-            "SELECT * FROM users WHERE id != '00000000-0000-0000-0000-000000000000' ORDER BY created_at DESC LIMIT $1 OFFSET $2",
+            "SELECT * FROM users WHERE id != '00000000-0000-0000-0000-000000000000' AND is_deleted = false ORDER BY created_at DESC LIMIT $1 OFFSET $2",
             filter.limit,
             filter.skip
         )
@@ -270,7 +275,32 @@ impl<'c> Repository for Users<'c> {
 
     #[instrument(skip(self), fields(user_id = %abbrev_uuid(&id)), err)]
     async fn delete(&mut self, id: Self::Id) -> Result<bool> {
-        let result = sqlx::query!("DELETE FROM users WHERE id = $1", id).execute(&mut *self.db).await?;
+        // Soft delete with GDPR-compliant data scrubbing
+        // We scrub all personal information but keep the record for referential integrity
+        let scrubbed_email = format!("deleted-{}@deleted.local", id);
+        let scrubbed_username = format!("deleted-{}", id);
+
+        let result = sqlx::query!(
+            r#"
+            UPDATE users
+            SET
+                email = $1,
+                username = $2,
+                display_name = NULL,
+                avatar_url = NULL,
+                password_hash = NULL,
+                external_user_id = NULL,
+                payment_provider_id = NULL,
+                is_deleted = true,
+                updated_at = NOW()
+            WHERE id = $3 AND is_deleted = false
+            "#,
+            scrubbed_email,
+            scrubbed_username,
+            id
+        )
+        .execute(&mut *self.db)
+        .await?;
 
         Ok(result.rows_affected() > 0)
     }
@@ -346,11 +376,12 @@ impl<'c> Users<'c> {
 
     #[instrument(skip(self), err)]
     pub async fn count(&mut self) -> Result<i64> {
-        // Note: This query counts the number of users excluding the admin user.
+        // Note: This query counts the number of users excluding the admin user and deleted users.
         // It will likely need to filter by organization etc in future
-        let count = sqlx::query_scalar!("SELECT COUNT(*) FROM users WHERE id != '00000000-0000-0000-0000-000000000000'")
-            .fetch_one(&mut *self.db)
-            .await?;
+        let count =
+            sqlx::query_scalar!("SELECT COUNT(*) FROM users WHERE id != '00000000-0000-0000-0000-000000000000' AND is_deleted = false")
+                .fetch_one(&mut *self.db)
+                .await?;
 
         Ok(count.unwrap_or(0))
     }
@@ -359,7 +390,7 @@ impl<'c> Users<'c> {
     pub async fn get_user_by_email(&mut self, email: &str) -> Result<Option<UserDBResponse>> {
         let user = sqlx::query_as!(
             User,
-            "SELECT * FROM users WHERE email = $1 AND id != '00000000-0000-0000-0000-000000000000'",
+            "SELECT * FROM users WHERE email = $1 AND id != '00000000-0000-0000-0000-000000000000' AND is_deleted = false",
             email
         )
         .fetch_optional(&mut *self.db)
@@ -383,7 +414,7 @@ impl<'c> Users<'c> {
     pub async fn get_user_by_external_user_id(&mut self, external_user_id: &str) -> Result<Option<UserDBResponse>> {
         let user = sqlx::query_as!(
             User,
-            "SELECT * FROM users WHERE external_user_id = $1 AND id != '00000000-0000-0000-0000-000000000000'",
+            "SELECT * FROM users WHERE external_user_id = $1 AND id != '00000000-0000-0000-0000-000000000000' AND is_deleted = false",
             external_user_id
         )
         .fetch_optional(&mut *self.db)
