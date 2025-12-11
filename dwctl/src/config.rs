@@ -382,6 +382,16 @@ pub struct ModelSource {
     #[serde(default = "ModelSource::default_sync_interval")]
     #[serde(with = "humantime_serde")]
     pub sync_interval: Duration,
+    /// Groups to add the models to when syncing from this source
+    #[serde(default)]
+    pub default_models: Option<Vec<Models>>,
+}
+
+/// External model details.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct Models {
+    pub name: String,
+    pub add_to_everyone_group: bool,
 }
 
 /// Authentication configuration for all supported auth methods.
@@ -902,6 +912,7 @@ impl Default for ModelSource {
             url: Url::parse("http://localhost:8080").unwrap(),
             api_key: None,
             sync_interval: Duration::from_secs(10),
+            default_models: None,
         }
     }
 }
