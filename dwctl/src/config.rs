@@ -382,7 +382,7 @@ pub struct ModelSource {
     #[serde(default = "ModelSource::default_sync_interval")]
     #[serde(with = "humantime_serde")]
     pub sync_interval: Duration,
-    /// Groups to add the models to when syncing from this source
+    /// Models to seed during initial database setup from this source
     #[serde(default)]
     pub default_models: Option<Vec<DefaultModel>>,
 }
