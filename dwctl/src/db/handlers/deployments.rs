@@ -696,6 +696,7 @@ mod tests {
             url: base_url.clone(),
             api_key: None,
             sync_interval: std::time::Duration::from_secs(3600),
+            default_models: None,
         }];
         crate::seed_database(&sources, &pool).await.unwrap();
 
@@ -743,6 +744,7 @@ mod tests {
             url: base_url.clone(),
             api_key: None,
             sync_interval: std::time::Duration::from_secs(3600),
+            default_models: None,
         }];
         crate::seed_database(&sources, &pool).await.unwrap();
 
@@ -783,6 +785,7 @@ mod tests {
             url: base_url.clone(),
             api_key: None,
             sync_interval: std::time::Duration::from_secs(3600),
+            default_models: None,
         }];
         crate::seed_database(&sources, &pool).await.unwrap();
 
@@ -839,6 +842,7 @@ mod tests {
             url: base_url.clone(),
             api_key: None,
             sync_interval: std::time::Duration::from_secs(3600),
+            default_models: None,
         }];
         crate::seed_database(&sources, &pool).await.unwrap();
 
@@ -880,6 +884,7 @@ mod tests {
             url: base_url.clone(),
             api_key: None,
             sync_interval: std::time::Duration::from_secs(3600),
+            default_models: None,
         }];
         crate::seed_database(&sources, &pool).await.unwrap();
 
@@ -938,6 +943,7 @@ mod tests {
             url: base_url.clone(),
             api_key: None,
             sync_interval: std::time::Duration::from_secs(3600),
+            default_models: None,
         }];
         crate::seed_database(&sources, &pool).await.unwrap();
 
@@ -978,6 +984,7 @@ mod tests {
             url: base_url.clone(),
             api_key: None,
             sync_interval: std::time::Duration::from_secs(3600),
+            default_models: None,
         }];
         crate::seed_database(&sources, &pool).await.unwrap();
 
@@ -1022,6 +1029,7 @@ mod tests {
             url: base_url.clone(),
             api_key: None,
             sync_interval: std::time::Duration::from_secs(3600),
+            default_models: None,
         }];
         crate::seed_database(&sources, &pool).await.unwrap();
 
@@ -1057,6 +1065,7 @@ mod tests {
             url: base_url.clone(),
             api_key: None,
             sync_interval: std::time::Duration::from_secs(3600),
+            default_models: None,
         }];
         crate::seed_database(&sources, &pool).await.unwrap();
 
@@ -1096,6 +1105,7 @@ mod tests {
             url: base_url.clone(),
             api_key: None,
             sync_interval: std::time::Duration::from_secs(3600),
+            default_models: None,
         }];
         crate::seed_database(&sources, &pool).await.unwrap();
 
@@ -1141,6 +1151,7 @@ mod tests {
             url: base_url.clone(),
             api_key: None,
             sync_interval: std::time::Duration::from_secs(3600),
+            default_models: None,
         }];
         crate::seed_database(&sources, &pool).await.unwrap();
 
@@ -1214,6 +1225,7 @@ mod tests {
             url: base_url.clone(),
             api_key: None,
             sync_interval: std::time::Duration::from_secs(3600),
+            default_models: None,
         }];
         crate::seed_database(&sources, &pool).await.unwrap();
 
@@ -1270,6 +1282,7 @@ mod tests {
             url: base_url.clone(),
             api_key: None,
             sync_interval: std::time::Duration::from_secs(3600),
+            default_models: None,
         }];
         crate::seed_database(&sources, &pool).await.unwrap();
 
@@ -1315,6 +1328,7 @@ mod tests {
             url: base_url.clone(),
             api_key: None,
             sync_interval: std::time::Duration::from_secs(3600),
+            default_models: None,
         }];
         crate::seed_database(&sources, &pool).await.unwrap();
 
@@ -1352,6 +1366,7 @@ mod tests {
             url: base_url.clone(),
             api_key: None,
             sync_interval: std::time::Duration::from_secs(3600),
+            default_models: None,
         }];
         crate::seed_database(&sources, &pool).await.unwrap();
 
@@ -1387,6 +1402,7 @@ mod tests {
             url: base_url.clone(),
             api_key: None,
             sync_interval: std::time::Duration::from_secs(3600),
+            default_models: None,
         }];
         crate::seed_database(&sources, &pool).await.unwrap();
 
@@ -1449,6 +1465,7 @@ mod tests {
             url: base_url.clone(),
             api_key: None,
             sync_interval: std::time::Duration::from_secs(3600),
+            default_models: None,
         }];
         crate::seed_database(&sources, &pool).await.unwrap();
         let user = create_test_user(&pool).await;
@@ -1496,6 +1513,7 @@ mod tests {
             url: base_url.clone(),
             api_key: None,
             sync_interval: std::time::Duration::from_secs(3600),
+            default_models: None,
         }];
         crate::seed_database(&sources, &pool).await.unwrap();
         let user = create_test_user(&pool).await;
@@ -1535,6 +1553,7 @@ mod tests {
             url: base_url.clone(),
             api_key: None,
             sync_interval: std::time::Duration::from_secs(3600),
+            default_models: None,
         }];
         crate::seed_database(&sources, &pool).await.unwrap();
 
@@ -1577,6 +1596,7 @@ mod tests {
             url: base_url.clone(),
             api_key: None,
             sync_interval: std::time::Duration::from_secs(3600),
+            default_models: None,
         }];
         crate::seed_database(&sources, &pool).await.unwrap();
 
@@ -1597,6 +1617,7 @@ mod tests {
             url: base_url.clone(),
             api_key: None,
             sync_interval: std::time::Duration::from_secs(3600),
+            default_models: None,
         }];
         crate::seed_database(&sources, &pool).await.unwrap();
         let mut deploy_conn = pool.acquire().await.unwrap();
@@ -1711,6 +1732,7 @@ mod tests {
             url: base_url.clone(),
             api_key: None,
             sync_interval: std::time::Duration::from_secs(3600),
+            default_models: None,
         }];
         crate::seed_database(&sources, &pool).await.unwrap();
 
@@ -1852,6 +1874,7 @@ mod tests {
             url: base_url.clone(),
             api_key: None,
             sync_interval: std::time::Duration::from_secs(3600),
+            default_models: None,
         }];
         crate::seed_database(&sources, &pool).await.unwrap();
 
@@ -1997,6 +2020,7 @@ mod tests {
             url: base_url.clone(),
             api_key: None,
             sync_interval: std::time::Duration::from_secs(3600),
+            default_models: None,
         }];
         crate::seed_database(&sources, &pool).await.unwrap();
 
@@ -2154,6 +2178,7 @@ mod tests {
             url: base_url.clone(),
             api_key: None,
             sync_interval: std::time::Duration::from_secs(3600),
+            default_models: None,
         }];
         crate::seed_database(&sources, &pool).await.unwrap();
 
@@ -2223,6 +2248,7 @@ mod tests {
             url: base_url.clone(),
             api_key: None,
             sync_interval: std::time::Duration::from_secs(3600),
+            default_models: None,
         }];
         crate::seed_database(&sources, &pool).await.unwrap();
 
@@ -2367,6 +2393,7 @@ mod tests {
             url: base_url.clone(),
             api_key: None,
             sync_interval: std::time::Duration::from_secs(3600),
+            default_models: None,
         }];
         crate::seed_database(&sources, &pool).await.unwrap();
 
@@ -2411,6 +2438,7 @@ mod tests {
             url: base_url.clone(),
             api_key: None,
             sync_interval: std::time::Duration::from_secs(3600),
+            default_models: None,
         }];
         crate::seed_database(&sources, &pool).await.unwrap();
 

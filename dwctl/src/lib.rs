@@ -151,16 +151,16 @@ mod static_assets;
 mod sync;
 pub mod telemetry;
 mod types;
-use crate::api::models::users::Role;
-use crate::config::CorsOrigin;
 
 #[cfg(any(test, feature = "test-utils"))]
 pub mod test_utils;
 
 use crate::{
+    api::models::{deployments::DeployedModelCreate, users::Role},
     auth::password,
-    db::handlers::{Repository, Users},
-    db::models::users::UserCreateDBRequest,
+    config::CorsOrigin,
+    db::handlers::{Deployments, Groups, Repository, Users},
+    db::models::{deployments::DeploymentCreateDBRequest, users::UserCreateDBRequest},
     metrics::GenAiMetrics,
     openapi::ApiDoc,
     request_logging::serializers::{AnalyticsResponseSerializer, parse_ai_request},
@@ -372,17 +372,53 @@ pub async fn seed_database(sources: &[config::ModelSource], db: &PgPool) -> Resu
     let system_user_id = Uuid::nil();
     for source in sources {
         // Insert endpoint if it doesn't already exist (first-time seeding only)
-        sqlx::query!(
+        if let Some(endpoint_id) = sqlx::query_scalar!(
             "INSERT INTO inference_endpoints (name, description, url, created_by)
-             VALUES ($1, $2, $3, $4)
-             ON CONFLICT (name) DO NOTHING",
+            VALUES ($1, $2, $3, $4)
+            ON CONFLICT (name) DO NOTHING
+            RETURNING id",
             source.name,
             None::<String>, // System-created endpoints don't have descriptions
             source.url.as_str(),
             system_user_id,
         )
-        .execute(&mut *tx)
-        .await?;
+        .fetch_optional(&mut *tx)
+        .await?
+        {
+            for model in source.default_models.as_deref().unwrap_or(&[]) {
+                // Insert deployed model if it doesn't already exist
+                let mut model_repo = Deployments::new(&mut tx);
+                if let Ok(row) = model_repo
+                    .create(&DeploymentCreateDBRequest::from_api_create(
+                        Uuid::nil(),
+                        DeployedModelCreate {
+                            model_name: model.name.clone(),
+                            alias: Some(model.name.clone()),
+                            hosted_on: endpoint_id,
+                            description: None,
+                            model_type: None,
+                            capabilities: None,
+                            requests_per_second: None,
+                            burst_size: None,
+                            capacity: None,
+                            batch_capacity: None,
+                            pricing: None,
+                            downstream_pricing: None,
+                        },
+                    ))
+                    .await
+                    && model.add_to_everyone_group
+                {
+                    let mut groups_repo = Groups::new(&mut tx);
+                    if let Err(e) = groups_repo.add_deployment_to_group(row.id, Uuid::nil(), Uuid::nil()).await {
+                        debug!(
+                            "Failed to add deployed model {} to 'everyone' group during seeding: {}",
+                            model.name, e
+                        );
+                    }
+                }
+            }
+        }
     }
 
     // Update the system API key secret with a new secure value
@@ -1901,12 +1937,14 @@ mod test {
                 url: Url::parse("http://localhost:8001").unwrap(),
                 api_key: None,
                 sync_interval: std::time::Duration::from_secs(10),
+                default_models: None,
             },
             ModelSource {
                 name: "test-endpoint-2".to_string(),
                 url: Url::parse("http://localhost:8002").unwrap(),
                 api_key: None,
                 sync_interval: std::time::Duration::from_secs(10),
+                default_models: None,
             },
         ];
 
