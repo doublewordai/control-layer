@@ -262,16 +262,19 @@ async fn try_api_key_auth(parts: &axum::http::request::Parts, db: &PgPool) -> Op
     let path = parts.uri.path();
     let purpose_str = &api_key_data.purpose;
 
-    let expected_purpose = if path.starts_with("/admin/api/") {
-        "platform"
+    // Validate purpose for the endpoint
+    let is_valid = if path.starts_with("/admin/api/") {
+        // Platform endpoints require platform keys
+        purpose_str == "platform"
     } else if path.starts_with("/ai/") {
-        "inference"
+        // AI inference endpoints accept any inference-type key
+        matches!(purpose_str.as_str(), "realtime" | "batch" | "playground")
     } else {
         // For other paths, allow any purpose
-        purpose_str.as_str()
+        true
     };
 
-    if purpose_str != expected_purpose {
+    if !is_valid {
         return Some(Err(Error::InsufficientPermissions {
             required: crate::types::Permission::Granted,
             action: crate::types::Operation::ReadAll,

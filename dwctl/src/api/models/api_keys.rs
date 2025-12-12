@@ -12,7 +12,7 @@ use utoipa::{IntoParams, ToSchema};
 pub struct ApiKeyCreate {
     pub name: String,
     pub description: Option<String>,
-    /// Purpose of the API key: 'platform' for /admin/api/* access, 'inference' for /ai/* access
+    /// Purpose of the API key: 'platform' for /admin/api/* access, 'realtime'/'batch'/'playground' for /ai/* access
     pub purpose: ApiKeyPurpose,
     /// Per-API-key rate limit: requests per second (null = no limit)
     pub requests_per_second: Option<f32>,

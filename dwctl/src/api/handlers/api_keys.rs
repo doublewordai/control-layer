@@ -367,7 +367,7 @@ mod tests {
         let api_key_data = json!({
             "name": "Test API Key",
             "description": "A test API key",
-            "purpose": "inference"
+            "purpose": "realtime"
         });
 
         let response = app
@@ -396,7 +396,7 @@ mod tests {
         let api_key_data = json!({
             "name": "Admin Created Key",
             "description": "Created by admin for user",
-            "purpose": "inference"
+            "purpose": "realtime"
         });
 
         let response = app
@@ -422,7 +422,7 @@ mod tests {
         let api_key_data = json!({
             "name": "Forbidden Key",
             "description": "This should not work",
-            "purpose": "inference"
+            "purpose": "realtime"
         });
 
         let response = app
@@ -471,7 +471,7 @@ mod tests {
             let api_key_data = json!({
                 "name": format!("Test API Key {}", i),
                 "description": format!("Description for key {}", i),
-                "purpose": "inference"
+                "purpose": "realtime"
             });
 
             app.post("/admin/api/v1/users/current/api-keys")
@@ -757,7 +757,7 @@ mod tests {
         let api_key_data = json!({
             "name": "RequestViewer Key",
             "description": "Should work - StandardUser can manage own keys",
-            "purpose": "inference"
+            "purpose": "realtime"
         });
 
         let response = app
@@ -802,7 +802,7 @@ mod tests {
         let api_key_data = json!({
             "name": "Multi Role Key",
             "description": "Should work due to StandardUser role",
-            "purpose": "inference"
+            "purpose": "realtime"
         });
 
         let response = app
@@ -860,7 +860,7 @@ mod tests {
         let api_key_data = json!({
             "name": "Manager Created Key",
             "description": "Created by platform manager",
-            "purpose": "inference"
+            "purpose": "realtime"
         });
 
         let response = app
@@ -1012,7 +1012,7 @@ mod tests {
         let api_key_data = json!({
             "name": "Test Key for Security",
             "description": "Testing key exposure",
-            "purpose": "inference"
+            "purpose": "realtime"
         });
 
         let create_response = app

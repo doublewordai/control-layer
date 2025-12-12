@@ -1,0 +1,30 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n            SELECT input_price_per_token, output_price_per_token\n            FROM model_tariffs\n            WHERE deployed_model_id = $1\n              AND api_key_purpose = $2\n              AND valid_from <= $3\n              AND (valid_until IS NULL OR valid_until > $3)\n            ORDER BY valid_from DESC\n            LIMIT 1\n            ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "input_price_per_token",
+        "type_info": "Numeric"
+      },
+      {
+        "ordinal": 1,
+        "name": "output_price_per_token",
+        "type_info": "Numeric"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Text",
+        "Timestamptz"
+      ]
+    },
+    "nullable": [
+      false,
+      false
+    ]
+  },
+  "hash": "1ab9037d017a2a47420182b195b06bfcd5e07697a84f622fd063997e536304b2"
+}

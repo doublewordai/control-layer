@@ -52,13 +52,13 @@ pub(crate) async fn admin_ai_proxy(state: AppState, mut request: Request) -> Res
 
     debug!("Model name extracted from request: {}", model_name);
 
-    // Get or create user-specific hidden API key for this request
+    // Get or create user-specific hidden playground API key for this request
     let mut api_key_conn = state.db.acquire().await.unwrap();
     let mut api_keys_repo = ApiKeys::new(&mut api_key_conn);
     let user_api_key = api_keys_repo
-        .get_or_create_hidden_key(current_user.id, ApiKeyPurpose::Inference)
+        .get_or_create_hidden_key(current_user.id, ApiKeyPurpose::Playground)
         .await
-        .with_context(|| format!("Failed to get or create hidden API key for user {}", current_user.id))?;
+        .with_context(|| format!("Failed to get or create hidden playground API key for user {}", current_user.id))?;
 
     // Rewrite the path from /admin/api/v1/ai/* to /ai/*
     debug!("User has access to model: {}", model_name);

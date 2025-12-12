@@ -1,4 +1,5 @@
-use crate::config::{Config, ONWARDS_INPUT_TOKEN_PRICE_HEADER, ONWARDS_OUTPUT_TOKEN_PRICE_HEADER};
+use crate::config::Config;
+use crate::db::errors::Result as DbResult;
 use crate::db::handlers::Credits;
 use crate::db::models::credits::{CreditTransactionCreateDBRequest, CreditTransactionType};
 use crate::request_logging::models::{AiRequest, AiResponse, ChatCompletionChunk, ParsedAIRequest};
@@ -99,8 +100,6 @@ pub struct UsageMetrics {
     pub response_type: String,
     pub server_address: String,
     pub server_port: u16,
-    pub input_price_per_token: Option<rust_decimal::Decimal>,
-    pub output_price_per_token: Option<rust_decimal::Decimal>,
 }
 
 /// Parses HTTP request body data into structured AI request types.
@@ -259,16 +258,6 @@ impl UsageMetrics {
             response_type: response_metrics.response_type,
             server_address: config.host.clone(),
             server_port: config.port,
-            input_price_per_token: response_data.headers.get(ONWARDS_INPUT_TOKEN_PRICE_HEADER).and_then(|vals| {
-                vals.first()
-                    .and_then(|bytes| str::from_utf8(bytes).ok())
-                    .and_then(|s| s.parse::<rust_decimal::Decimal>().ok())
-            }),
-            output_price_per_token: response_data.headers.get(ONWARDS_OUTPUT_TOKEN_PRICE_HEADER).and_then(|vals| {
-                vals.first()
-                    .and_then(|bytes| str::from_utf8(bytes).ok())
-                    .and_then(|s| s.parse::<rust_decimal::Decimal>().ok())
-            }),
         }
     }
 }
@@ -346,40 +335,38 @@ pub async fn store_analytics_record(
     metrics: &UsageMetrics,
     auth: &Auth,
     request_data: &RequestData,
-) -> Result<HttpAnalyticsRow, sqlx::Error> {
+) -> DbResult<HttpAnalyticsRow> {
     // Extract fusillade request ID if present
     let fusillade_batch_id = extract_header_value_as_string(request_data, "x-fusillade-batch-id");
     let fusillade_request_id = extract_header_value_as_string(request_data, "x-fusillade-request-id");
 
-    // Extract user information based on auth type
-    let (user_id, user_email, access_source) = match auth {
+    // Extract user information and API key purpose based on auth type
+    let (user_id, user_email, access_source, api_key_purpose) = match auth {
         Auth::ApiKey { bearer_token } => {
-            // Try to get user ID and email from API key
-            match sqlx::query!(
-                "SELECT u.id, u.email FROM api_keys ak JOIN users u ON ak.user_id = u.id WHERE ak.secret = $1",
-                bearer_token
-            )
-            .fetch_optional(pool)
-            .await?
+            // Try to get user ID, email, and purpose from API key
+            use crate::db::handlers::api_keys::ApiKeys;
+            let mut conn = pool.acquire().await?;
             {
-                Some(row) => (Some(row.id), Some(row.email), AccessSource::ApiKey),
-                None => {
-                    warn!("Unknown API key used");
-                    (None, None, AccessSource::UnknownApiKey)
+                let mut repo = ApiKeys::new(&mut conn);
+                match repo.get_user_info_by_secret(bearer_token).await? {
+                    Some((user_id, email, purpose)) => (Some(user_id), Some(email), AccessSource::ApiKey, Some(purpose)),
+                    None => {
+                        warn!("Unknown API key used");
+                        (None, None, AccessSource::UnknownApiKey, None)
+                    }
                 }
             }
         }
-        Auth::None => (None, None, AccessSource::Unauthenticated),
+        Auth::None => (None, None, AccessSource::Unauthenticated, None),
     };
 
-    // Get model pricing and provider name if we have a model
+    // Get tariff pricing and provider name
     // Use request_model for lookup since that's what the user specified
-    let provider_name = if let Some(model_name) = &metrics.request_model {
-        sqlx::query!(
+    let (tariff_pricing, provider_name) = if let Some(model_name) = &metrics.request_model {
+        let model_info = sqlx::query!(
             r#"
             SELECT
-                dm.upstream_input_price_per_token,
-                dm.upstream_output_price_per_token,
+                dm.id as model_id,
                 ie.name as "provider_name?",
                 ie.url as "provider_url?"
             FROM deployed_models dm
@@ -390,18 +377,53 @@ pub async fn store_analytics_record(
             model_name
         )
         .fetch_optional(pool)
-        .await?
-        .map(|row| {
-            row.provider_url
+        .await?;
+
+        if let Some(model_info) = model_info {
+            // Use the tariff repository to get pricing at timestamp
+            use crate::db::handlers::Tariffs;
+            let mut conn = pool.acquire().await?;
+            let mut tariffs_repo = Tariffs::new(&mut conn);
+
+            let tariff_pricing = tariffs_repo
+                .get_pricing_at_timestamp_with_fallback(
+                    model_info.model_id,
+                    api_key_purpose.as_ref(),
+                    &crate::db::models::api_keys::ApiKeyPurpose::Realtime,
+                    metrics.timestamp,
+                )
+                .await?;
+
+            let provider_name = model_info
+                .provider_url
                 .as_ref()
                 .and_then(|url| map_url_to_otel_provider(url))
                 .map(|s| s.to_string())
-                .or(row.provider_name)
-        })
+                .or(model_info.provider_name);
+
+            warn!(
+                "Tariff pricing for model '{}' with purpose '{:?}': {:?}",
+                model_name, api_key_purpose, tariff_pricing
+            );
+
+            (tariff_pricing, provider_name)
+        } else {
+            // Model exists in request but not found in deployed_models
+            // Log analytics without pricing to preserve request data
+            warn!(
+                model_name = %model_name,
+                "Model not found in deployed_models table - logging analytics without pricing"
+            );
+            (None, None)
+        }
     } else {
-        None
-    }
-    .flatten();
+        (None, None)
+    };
+
+    // Use tariff pricing if available
+    let (input_price, output_price) = tariff_pricing
+        .map(|(input, output)| (Some(input), Some(output)))
+        .unwrap_or((None, None));
 
     // Construct the complete row
     let row = HttpAnalyticsRow {
@@ -422,8 +444,8 @@ pub async fn store_analytics_record(
         user_id,
         user_email: user_email.clone(),
         access_source: access_source.to_string(),
-        input_price_per_token: metrics.input_price_per_token,
-        output_price_per_token: metrics.output_price_per_token,
+        input_price_per_token: input_price,
+        output_price_per_token: output_price,
         server_address: metrics.server_address.clone(),
         server_port: metrics.server_port,
         provider_name,
@@ -797,6 +819,7 @@ where
             // The write to the analytics table and metrics recording
             tokio::spawn(async move {
                 // Store to database - this enriches with user/pricing data and returns complete row
+                // Use "batch" tariff by default - can be made configurable per request if needed
                 match store_analytics_record(&pool_clone, &metrics, &auth, &request_data_clone).await {
                     Ok(complete_row) => {
                         // Record metrics using the complete row (called AFTER database write)
@@ -1594,10 +1617,108 @@ mod tests {
         use crate::db::handlers::credits::Credits;
         use crate::db::models::api_keys::{ApiKeyCreateDBRequest, ApiKeyPurpose};
         use crate::db::models::credits::{CreditTransactionCreateDBRequest, CreditTransactionType};
+        use crate::db::models::tariffs::TariffCreateDBRequest;
         use crate::test_utils::create_test_user;
+        use crate::types::DeploymentId;
         use rust_decimal::Decimal;
         use std::str::FromStr;
         use uuid::Uuid;
+
+        /// Fixture: Create a test model with endpoint (no tariff)
+        /// Returns the model's deployment ID
+        async fn create_test_model(pool: &sqlx::PgPool, model_name: &str) -> DeploymentId {
+            use crate::db::handlers::{Deployments, InferenceEndpoints};
+            use crate::db::models::{deployments::DeploymentCreateDBRequest, inference_endpoints::InferenceEndpointCreateDBRequest};
+
+            let user = create_test_user(pool, Role::StandardUser).await;
+
+            // Create endpoint
+            let mut conn = pool.acquire().await.unwrap();
+            let mut endpoints_repo = InferenceEndpoints::new(&mut conn);
+            let endpoint = endpoints_repo
+                .create(&InferenceEndpointCreateDBRequest {
+                    created_by: user.id,
+                    name: format!("test-endpoint-{}", Uuid::new_v4()),
+                    description: None,
+                    url: url::Url::from_str("https://api.test.com").unwrap(),
+                    api_key: None,
+                    model_filter: None,
+                    auth_header_name: Some("Authorization".to_string()),
+                    auth_header_prefix: Some("Bearer ".to_string()),
+                })
+                .await
+                .unwrap();
+
+            // Create deployment
+            let mut conn = pool.acquire().await.unwrap();
+            let mut deployments_repo = Deployments::new(&mut conn);
+            let deployment = deployments_repo
+                .create(&DeploymentCreateDBRequest {
+                    created_by: user.id,
+                    model_name: model_name.to_string(),
+                    alias: model_name.to_string(),
+                    description: None,
+                    model_type: None,
+                    capabilities: None,
+                    hosted_on: endpoint.id,
+                    requests_per_second: None,
+                    burst_size: None,
+                    capacity: None,
+                    batch_capacity: None,
+                    provider_pricing: None,
+                })
+                .await
+                .unwrap();
+
+            deployment.id
+        }
+
+        /// Helper: Create or replace a tariff for a model
+        /// Takes model ID directly, no name lookups
+        ///
+        /// # Arguments
+        /// * `api_key_purpose` - Defaults to Realtime if not specified
+        /// * `valid_from` - Defaults to NOW if not specified
+        #[allow(clippy::too_many_arguments)]
+        async fn setup_tariff(
+            pool: &sqlx::PgPool,
+            deployed_model_id: DeploymentId,
+            tariff_name: &str,
+            input_price_per_token: Decimal,
+            output_price_per_token: Decimal,
+            api_key_purpose: Option<ApiKeyPurpose>,
+            valid_from: Option<chrono::DateTime<chrono::Utc>>,
+        ) {
+            use crate::db::handlers::Tariffs;
+
+            // Default to Realtime if not specified
+            let purpose = api_key_purpose.or(Some(ApiKeyPurpose::Realtime));
+
+            let mut conn = pool.acquire().await.unwrap();
+            let mut tariffs_repo = Tariffs::new(&mut conn);
+
+            // Close existing tariffs for this model to avoid duplicates
+            let current_tariffs = tariffs_repo.list_current_by_model(deployed_model_id).await.unwrap();
+            let tariff_ids: Vec<_> = current_tariffs
+                .into_iter()
+                .filter(|t| t.name == tariff_name && t.api_key_purpose == purpose)
+                .map(|t| t.id)
+                .collect();
+
+            if !tariff_ids.is_empty() {
+                tariffs_repo.close_tariffs_batch(&tariff_ids).await.unwrap();
+            }
+
+            let tariff = TariffCreateDBRequest {
+                deployed_model_id,
+                name: tariff_name.to_string(),
+                input_price_per_token,
+                output_price_per_token,
+                api_key_purpose: purpose,
+                valid_from,
+            };
+            tariffs_repo.create(&tariff).await.unwrap();
+        }
 
         /// Helper: Create a test user with an initial credit balance
         async fn setup_user_with_balance(pool: &sqlx::PgPool, balance: Decimal) -> Uuid {
@@ -1625,12 +1746,7 @@ mod tests {
         }
 
         /// Helper: Create test UsageMetrics for testing
-        fn create_test_usage_metrics(
-            input_price: Option<Decimal>,
-            output_price: Option<Decimal>,
-            prompt_tokens: i64,
-            completion_tokens: i64,
-        ) -> UsageMetrics {
+        fn create_test_usage_metrics(prompt_tokens: i64, completion_tokens: i64) -> UsageMetrics {
             UsageMetrics {
                 instance_id: Uuid::new_v4(),
                 correlation_id: 12345,
@@ -1648,8 +1764,6 @@ mod tests {
                 response_type: "chat_completion".to_string(),
                 server_address: "api.openai.com".to_string(),
                 server_port: 443,
-                input_price_per_token: input_price,
-                output_price_per_token: output_price,
             }
         }
 
@@ -1687,7 +1801,7 @@ mod tests {
                     user_id,
                     name: "Test API key".to_string(),
                     description: None,
-                    purpose: ApiKeyPurpose::Inference,
+                    purpose: ApiKeyPurpose::Realtime,
                     requests_per_second: None,
                     burst_size: None,
                 })
@@ -1700,18 +1814,20 @@ mod tests {
         #[sqlx::test]
         #[test_log::test]
         async fn test_credit_deduction_successful(pool: sqlx::PgPool) {
+            // Setup: Create test model and tariff
+            let model_id = create_test_model(&pool, "gpt-4").await;
+            let input_price = Decimal::from_str("0.00001").unwrap();
+            let output_price = Decimal::from_str("0.00003").unwrap();
+            setup_tariff(&pool, model_id, "batch", input_price, output_price, None, None).await;
+
             // Setup: User with $10.00 balance
             let initial_balance = Decimal::from_str("10.00").unwrap();
             let user_id = setup_user_with_balance(&pool, initial_balance).await;
             let auth = create_test_auth_for_user(&pool, user_id).await;
 
-            // Pricing: 0.0001 per 1K input tokens, 0.0003 per 1K output tokens
-            let input_price = Decimal::from_str("0.00001").unwrap();
-            let output_price = Decimal::from_str("0.00003").unwrap();
-
             // Usage: 1000 input tokens, 500 output tokens
             // Calculated cost: (1000 * 0.00001) + (500 * 0.00003) = 0.01 + 0.015 = 0.025
-            let metrics = create_test_usage_metrics(Some(input_price), Some(output_price), 1000, 500);
+            let metrics = create_test_usage_metrics(1000, 500);
 
             // Execute
             let request_data = create_test_request_data();
@@ -1741,14 +1857,22 @@ mod tests {
         #[sqlx::test]
         #[test_log::test]
         async fn test_skip_deduction_when_user_id_none(pool: sqlx::PgPool) {
+            // Setup: Model with tariff pricing
+            let model_id = create_test_model(&pool, "gpt-4").await;
+            setup_tariff(
+                &pool,
+                model_id,
+                "batch",
+                Decimal::from_str("0.00001").unwrap(),
+                Decimal::from_str("0.00003").unwrap(),
+                None,
+                None,
+            )
+            .await;
+
             // Setup: Auth::None (no user)
             let auth = Auth::None;
-            let metrics = create_test_usage_metrics(
-                Some(Decimal::from_str("0.00001").unwrap()),
-                Some(Decimal::from_str("0.00003").unwrap()),
-                1000,
-                500,
-            );
+            let metrics = create_test_usage_metrics(1000, 500);
 
             // Execute
             let request_data = create_test_request_data();
@@ -1762,12 +1886,23 @@ mod tests {
         #[sqlx::test]
         #[test_log::test]
         async fn test_skip_deduction_when_cost_zero(pool: sqlx::PgPool) {
+            // Setup: Model with tariff pricing
+            let model_id = create_test_model(&pool, "gpt-4").await;
+            setup_tariff(
+                &pool,
+                model_id,
+                "batch",
+                Decimal::from_str("0.00001").unwrap(),
+                Decimal::from_str("0.00003").unwrap(),
+                None,
+                None,
+            )
+            .await;
+
             // Setup: User with balance, but zero tokens
             let user_id = setup_user_with_balance(&pool, Decimal::from_str("10.00").unwrap()).await;
             let auth = create_test_auth_for_user(&pool, user_id).await;
             let metrics = create_test_usage_metrics(
-                Some(Decimal::from_str("0.00001").unwrap()),
-                Some(Decimal::from_str("0.00003").unwrap()),
                 0, // Zero tokens
                 0,
             );
@@ -1791,15 +1926,19 @@ mod tests {
         #[sqlx::test]
         #[test_log::test]
         async fn test_insufficient_balance_still_accrues_usage_transaction(pool: sqlx::PgPool) {
+            // Setup: Model with tariff pricing
+            let input_price = Decimal::from_str("0.00001").unwrap();
+            let output_price = Decimal::from_str("0.00003").unwrap();
+            let model_id = create_test_model(&pool, "gpt-4").await;
+            setup_tariff(&pool, model_id, "batch", input_price, output_price, None, None).await;
+
             // Setup: User with insufficient balance (0.01)
             let initial_balance = Decimal::from_str("0.01").unwrap();
             let user_id = setup_user_with_balance(&pool, initial_balance).await;
             let auth = create_test_auth_for_user(&pool, user_id).await;
 
             // Usage that costs more than balance (0.025 calculated)
-            let input_price = Decimal::from_str("0.00001").unwrap();
-            let output_price = Decimal::from_str("0.00003").unwrap();
-            let metrics = create_test_usage_metrics(Some(input_price), Some(output_price), 1000, 500);
+            let metrics = create_test_usage_metrics(1000, 500);
 
             // Execute
             let request_data = create_test_request_data();
@@ -1828,6 +1967,9 @@ mod tests {
         #[sqlx::test]
         #[test_log::test]
         async fn test_cost_calculation_precision(pool: sqlx::PgPool) {
+            // Setup: Model
+            let model_id = create_test_model(&pool, "gpt-4").await;
+
             // Setup: User with balance
             let user_id = setup_user_with_balance(&pool, Decimal::from_str("10.00").unwrap()).await;
             let auth = create_test_auth_for_user(&pool, user_id).await;
@@ -1842,11 +1984,14 @@ mod tests {
             ];
 
             for (input_tokens, output_tokens, input_price_str, output_price_str, expected_cost_str) in test_cases {
+                // Setup model with this specific pricing
                 let input_price = Decimal::from_str(input_price_str).unwrap();
                 let output_price = Decimal::from_str(output_price_str).unwrap();
+                setup_tariff(&pool, model_id, "batch", input_price, output_price, None, None).await;
+
                 let expected_cost = Decimal::from_str(expected_cost_str).unwrap();
 
-                let metrics = create_test_usage_metrics(Some(input_price), Some(output_price), input_tokens, output_tokens);
+                let metrics = create_test_usage_metrics(input_tokens, output_tokens);
 
                 let balance_before = {
                     let mut conn = pool.acquire().await.unwrap();
@@ -1881,12 +2026,7 @@ mod tests {
             let auth = create_test_auth_for_user(&pool, user_id).await;
 
             // Create metrics with pricing but no model
-            let mut metrics = create_test_usage_metrics(
-                Some(Decimal::from_str("0.00001").unwrap()),
-                Some(Decimal::from_str("0.00003").unwrap()),
-                1000,
-                500,
-            );
+            let mut metrics = create_test_usage_metrics(1000, 500);
             metrics.request_model = None; // Remove model
 
             // Execute
@@ -1908,6 +2048,12 @@ mod tests {
         #[sqlx::test]
         #[test_log::test]
         async fn test_system_user_are_not_charged(pool: sqlx::PgPool) {
+            // Setup: Model with tariff pricing
+            let model_id = create_test_model(&pool, "gpt-4").await;
+            let input_price = Decimal::from_str("0.00001").unwrap();
+            let output_price = Decimal::from_str("0.00003").unwrap();
+            setup_tariff(&pool, model_id, "batch", input_price, output_price, None, None).await;
+
             // Setup: User with balance (accessed via Playground/SSO)
             let initial_balance = Decimal::from_str("10.00").unwrap();
             let user_id = Uuid::nil();
@@ -1930,9 +2076,7 @@ mod tests {
             let auth = create_test_auth_for_user(&pool, user_id).await;
 
             // Create metrics with pricing and tokens (would normally cost money)
-            let input_price = Decimal::from_str("0.00001").unwrap();
-            let output_price = Decimal::from_str("0.00003").unwrap();
-            let metrics = create_test_usage_metrics(Some(input_price), Some(output_price), 1000, 500);
+            let metrics = create_test_usage_metrics(1000, 500);
 
             // Execute
             let request_data = create_test_request_data();
@@ -1965,30 +2109,42 @@ mod tests {
         #[sqlx::test]
         #[test_log::test]
         async fn test_concurrent_requests_with_consistent_pricing(pool: sqlx::PgPool) {
-            // Test that multiple concurrent requests are each charged according to their
-            // own captured pricing, even if pricing changes between requests
+            // Test that multiple concurrent requests are all processed successfully
+            // and charged at the same pricing (concurrent access with shared tariff)
 
+            let model_id = create_test_model(&pool, "gpt-4").await;
             let user_id = setup_user_with_balance(&pool, Decimal::from_str("100.00").unwrap()).await;
             let auth = create_test_auth_for_user(&pool, user_id).await;
 
-            // Spawn 10 concurrent requests with DIFFERENT pricing
-            // (simulating pricing changes between requests being processed)
+            // Setup a single tariff upfront (before spawning any tasks)
+            // Use an explicit valid_from in the past to avoid timing issues
+            let input_price = Decimal::from_str("0.0001").unwrap();
+            let output_price = Decimal::ZERO;
+
+            setup_tariff(
+                &pool,
+                model_id,
+                "batch",
+                input_price,
+                output_price,
+                Some(ApiKeyPurpose::Realtime),
+                Some(chrono::Utc::now() - chrono::Duration::seconds(5)),
+            )
+            .await;
+
+            // Spawn 10 concurrent requests all using the same tariff
             let mut handles = vec![];
 
             for i in 0..10 {
                 let pool_clone = pool.clone();
                 let auth_clone = auth.clone();
 
-                // Each request has different pricing that results in distinct costs
-                // Use prices that yield costs like: 0.01, 0.02, 0.03, ..., 0.10
-                // For 100 input tokens, we want total costs of 0.01, 0.02, etc.
-                let target_cost = (i + 1) as i64; // 1, 2, 3, ..., 10
-                let input_price = Decimal::new(target_cost, 4); // 0.0001, 0.0002, ..., 0.0010
-                let output_price = Decimal::ZERO; // Only charge for input to keep it simple
-
                 let handle = tokio::task::spawn(async move {
-                    let metrics = create_test_usage_metrics(Some(input_price), Some(output_price), 100, 0);
-                    let request_data = create_test_request_data();
+                    // Use unique correlation_id for each request to avoid conflicts
+                    let mut metrics = create_test_usage_metrics(100, 0);
+                    metrics.correlation_id = 12345 + i;
+                    let mut request_data = create_test_request_data();
+                    request_data.correlation_id = 12345 + (i as u64);
                     store_analytics_record(&pool_clone, &metrics, &auth_clone, &request_data).await
                 });
 
@@ -2012,32 +2168,34 @@ mod tests {
 
             assert_eq!(usage_transactions.len(), 10, "Should have 10 usage transactions, one per request");
 
-            // Verify: Each transaction has different amount (because pricing was different)
-            let mut amounts: Vec<_> = usage_transactions.iter().map(|tx| tx.amount).collect();
-            amounts.sort();
-            amounts.dedup();
+            // Verify: All transactions have the same amount (consistent pricing)
+            let amounts: Vec<_> = usage_transactions.iter().map(|tx| tx.amount).collect();
+            let expected_cost = Decimal::new(1, 2); // 100 tokens * 0.0001 = 0.01
+            for amount in &amounts {
+                assert_eq!(amount, &expected_cost, "All requests should be charged at the same rate");
+            }
 
-            assert_eq!(amounts.len(), 10, "Each request should have been charged at its own pricing");
+            // Debug: Print all transactions to see the chain
+            println!("\n=== All Transactions (most recent first) ===");
+            for tx in &transactions {
+                println!(
+                    "  {:?} | amount: {} | balance_after: {} | prev_id: {:?}",
+                    tx.transaction_type, tx.amount, tx.balance_after, tx.previous_transaction_id
+                );
+            }
 
-            // Verify: Final balance is correct (sum of all deductions)
+            // Verify: Final balance is correct (10 requests * 0.01 each = 0.10 total)
             let final_balance = credits.get_user_balance(user_id).await.unwrap();
-            let total_deducted = Decimal::from_str("100.00").unwrap() - final_balance;
+            let expected_final = Decimal::from_str("99.90").unwrap(); // 100.00 - 0.10
 
-            assert!(
-                final_balance < Decimal::from_str("100.00").unwrap(),
-                "Balance should have decreased"
-            );
-            assert!(total_deducted > Decimal::ZERO, "Some credits should have been deducted");
+            // Debug: Show what we got vs what we expected
+            println!("\nFinal balance: {} (expected: {})", final_balance, expected_final);
+            println!("Total transactions: {}", transactions.len());
+            println!("Usage transactions: {}", usage_transactions.len());
 
-            // With 10 requests at ~0.00010-0.00029 per token, 100 input + 50 output tokens each
-            // Rough calculation: avg price ~0.00015 input, ~0.00025 output
-            // Per request: (100 * 0.00015) + (50 * 0.00025) = 0.015 + 0.0125 = 0.0275
-            // Total for 10: ~0.275
-            // Allow reasonable range
-            assert!(
-                total_deducted < Decimal::from_str("1.0").unwrap(),
-                "Total deducted ({}) should be less than $1.00",
-                total_deducted
+            assert_eq!(
+                final_balance, expected_final,
+                "Balance should be 99.90 after 10 requests at 0.01 each"
             );
         }
 
@@ -2045,12 +2203,14 @@ mod tests {
         #[test_log::test]
         async fn test_credit_deduction_with_only_input_price(pool: sqlx::PgPool) {
             // Test that cost is calculated correctly when only input price is set
+            let model_id = create_test_model(&pool, "gpt-4").await;
+            let input_price = Decimal::from_str("0.00001").unwrap();
+            setup_tariff(&pool, model_id, "batch", input_price, Decimal::ZERO, None, None).await;
+
             let user_id = setup_user_with_balance(&pool, Decimal::from_str("10.00").unwrap()).await;
             let auth = create_test_auth_for_user(&pool, user_id).await;
 
-            // Set only input price, output price is None
-            let input_price = Decimal::from_str("0.00001").unwrap();
-            let metrics = create_test_usage_metrics(Some(input_price), None, 1000, 500);
+            let metrics = create_test_usage_metrics(1000, 500);
 
             let request_data = create_test_request_data();
             let result = store_analytics_record(&pool, &metrics, &auth, &request_data).await;
@@ -2081,12 +2241,14 @@ mod tests {
         #[test_log::test]
         async fn test_credit_deduction_with_only_output_price(pool: sqlx::PgPool) {
             // Test that cost is calculated correctly when only output price is set
+            let model_id = create_test_model(&pool, "gpt-4").await;
+            let output_price = Decimal::from_str("0.00003").unwrap();
+            setup_tariff(&pool, model_id, "batch", Decimal::ZERO, output_price, None, None).await;
+
             let user_id = setup_user_with_balance(&pool, Decimal::from_str("10.00").unwrap()).await;
             let auth = create_test_auth_for_user(&pool, user_id).await;
 
-            // Set only output price, input price is None
-            let output_price = Decimal::from_str("0.00003").unwrap();
-            let metrics = create_test_usage_metrics(None, Some(output_price), 1000, 500);
+            let metrics = create_test_usage_metrics(1000, 500);
 
             let request_data = create_test_request_data();
             let result = store_analytics_record(&pool, &metrics, &auth, &request_data).await;
@@ -2116,13 +2278,15 @@ mod tests {
         #[sqlx::test]
         #[test_log::test]
         async fn test_credit_deduction_with_no_pricing(pool: sqlx::PgPool) {
-            // Test that no deduction occurs when neither price is set
+            // Test that no deduction occurs when neither price is set (both zero)
+            let model_id = create_test_model(&pool, "gpt-4").await;
+            setup_tariff(&pool, model_id, "batch", Decimal::ZERO, Decimal::ZERO, None, None).await;
+
             let initial_balance = Decimal::from_str("10.00").unwrap();
             let user_id = setup_user_with_balance(&pool, initial_balance).await;
             let auth = create_test_auth_for_user(&pool, user_id).await;
 
-            // Both prices are None
-            let metrics = create_test_usage_metrics(None, None, 1000, 500);
+            let metrics = create_test_usage_metrics(1000, 500);
 
             let request_data = create_test_request_data();
             let result = store_analytics_record(&pool, &metrics, &auth, &request_data).await;
@@ -2153,14 +2317,18 @@ mod tests {
         #[sqlx::test]
         #[test_log::test]
         async fn test_fusillade_request_id_stored_correctly(pool: sqlx::PgPool) {
+            // Setup: Model with tariff pricing
+            let model_id = create_test_model(&pool, "gpt-4").await;
+            let input_price = Decimal::from_str("0.00001").unwrap();
+            let output_price = Decimal::from_str("0.00003").unwrap();
+            setup_tariff(&pool, model_id, "batch", input_price, output_price, None, None).await;
+
             // Setup: User with balance
             let initial_balance = Decimal::from_str("10.00").unwrap();
             let user_id = setup_user_with_balance(&pool, initial_balance).await;
             let auth = create_test_auth_for_user(&pool, user_id).await;
 
-            let input_price = Decimal::from_str("0.00001").unwrap();
-            let output_price = Decimal::from_str("0.00003").unwrap();
-            let metrics = create_test_usage_metrics(Some(input_price), Some(output_price), 100, 50);
+            let metrics = create_test_usage_metrics(100, 50);
 
             // Create request with fusillade request ID
             let fusillade_request_id = Uuid::new_v4();
@@ -2193,14 +2361,18 @@ mod tests {
         #[sqlx::test]
         #[test_log::test]
         async fn test_fusillade_request_id_null_when_missing(pool: sqlx::PgPool) {
+            // Setup: Model with tariff pricing
+            let model_id = create_test_model(&pool, "gpt-4").await;
+            let input_price = Decimal::from_str("0.00001").unwrap();
+            let output_price = Decimal::from_str("0.00003").unwrap();
+            setup_tariff(&pool, model_id, "batch", input_price, output_price, None, None).await;
+
             // Setup: User with balance
             let initial_balance = Decimal::from_str("10.00").unwrap();
             let user_id = setup_user_with_balance(&pool, initial_balance).await;
             let auth = create_test_auth_for_user(&pool, user_id).await;
 
-            let input_price = Decimal::from_str("0.00001").unwrap();
-            let output_price = Decimal::from_str("0.00003").unwrap();
-            let metrics = create_test_usage_metrics(Some(input_price), Some(output_price), 100, 50);
+            let metrics = create_test_usage_metrics(100, 50);
 
             // Create request without fusillade request ID
             let request_data = create_test_request_data_with_headers(None);
@@ -2225,6 +2397,467 @@ mod tests {
             assert_eq!(
                 stored_record.fusillade_request_id, None,
                 "Fusillade request ID should be NULL when header is not present"
+            );
+        }
+
+        /// Helper: Create test Auth for API key with specific purpose
+        async fn create_test_auth_for_user_with_purpose(pool: &sqlx::PgPool, user_id: Uuid, purpose: ApiKeyPurpose) -> Auth {
+            let mut conn = pool.acquire().await.expect("Failed to acquire connection");
+            let mut api_key_repo = ApiKeys::new(&mut conn);
+            let key = api_key_repo
+                .create(&ApiKeyCreateDBRequest {
+                    user_id,
+                    name: format!("Test API key - {:?}", purpose),
+                    description: None,
+                    purpose,
+                    requests_per_second: None,
+                    burst_size: None,
+                })
+                .await
+                .unwrap();
+
+            Auth::ApiKey { bearer_token: key.secret }
+        }
+
+        #[sqlx::test]
+        #[test_log::test]
+        async fn test_tariff_different_prices_for_batch_and_realtime(pool: sqlx::PgPool) {
+            // Test that a deployment can have different tariffs for batch and realtime,
+            // and requests are charged at the correct price based on API key purpose
+
+            // Setup: Create model
+            let model_id = create_test_model(&pool, "gpt-4-turbo").await;
+
+            // Setup: Create different tariffs for batch and realtime
+            let batch_input_price = Decimal::from_str("0.00005").unwrap(); // $0.00005 per token
+            let batch_output_price = Decimal::from_str("0.00010").unwrap(); // $0.00010 per token
+            setup_tariff(
+                &pool,
+                model_id,
+                "batch_pricing",
+                batch_input_price,
+                batch_output_price,
+                Some(ApiKeyPurpose::Batch),
+                None,
+            )
+            .await;
+
+            let realtime_input_price = Decimal::from_str("0.00010").unwrap(); // $0.00010 per token (2x batch)
+            let realtime_output_price = Decimal::from_str("0.00020").unwrap(); // $0.00020 per token (2x batch)
+            setup_tariff(
+                &pool,
+                model_id,
+                "realtime_pricing",
+                realtime_input_price,
+                realtime_output_price,
+                Some(ApiKeyPurpose::Realtime),
+                None,
+            )
+            .await;
+
+            // Setup: User with balance
+            let user_id = setup_user_with_balance(&pool, Decimal::from_str("100.00").unwrap()).await;
+
+            // Create API keys with different purposes
+            let batch_auth = create_test_auth_for_user_with_purpose(&pool, user_id, ApiKeyPurpose::Batch).await;
+            let realtime_auth = create_test_auth_for_user_with_purpose(&pool, user_id, ApiKeyPurpose::Realtime).await;
+
+            // Test batch request (1000 input tokens, 500 output tokens)
+            let mut batch_metrics = create_test_usage_metrics(1000, 500);
+            batch_metrics.request_model = Some("gpt-4-turbo".to_string());
+            batch_metrics.response_model = Some("gpt-4-turbo".to_string());
+            let batch_request_data = create_test_request_data();
+            let result = store_analytics_record(&pool, &batch_metrics, &batch_auth, &batch_request_data).await;
+            assert!(result.is_ok(), "Batch request should succeed");
+
+            // Expected batch cost: (1000 * 0.00005) + (500 * 0.00010) = 0.05 + 0.05 = 0.10
+            let expected_batch_cost = Decimal::from_str("0.10").unwrap();
+
+            // Test realtime request (1000 input tokens, 500 output tokens)
+            let mut realtime_metrics = create_test_usage_metrics(1000, 500);
+            realtime_metrics.correlation_id = 12346; // Different correlation ID
+            realtime_metrics.request_model = Some("gpt-4-turbo".to_string());
+            realtime_metrics.response_model = Some("gpt-4-turbo".to_string());
+            let mut realtime_request_data = create_test_request_data();
+            realtime_request_data.correlation_id = 12346;
+            let result = store_analytics_record(&pool, &realtime_metrics, &realtime_auth, &realtime_request_data).await;
+            assert!(result.is_ok(), "Realtime request should succeed");
+
+            // Expected realtime cost: (1000 * 0.00010) + (500 * 0.00020) = 0.10 + 0.10 = 0.20
+            let expected_realtime_cost = Decimal::from_str("0.20").unwrap();
+
+            // Verify: Check transactions
+            let mut conn = pool.acquire().await.unwrap();
+            let mut credits = Credits::new(&mut conn);
+            let transactions = credits.list_user_transactions(user_id, 0, 10).await.unwrap();
+
+            let usage_transactions: Vec<_> = transactions
+                .iter()
+                .filter(|tx| tx.transaction_type == CreditTransactionType::Usage)
+                .collect();
+
+            assert_eq!(usage_transactions.len(), 2, "Should have 2 usage transactions");
+
+            // Most recent transaction should be the realtime one (transactions are ordered newest first)
+            assert_eq!(
+                usage_transactions[0].amount, expected_realtime_cost,
+                "Realtime request should be charged at realtime price"
+            );
+            assert_eq!(
+                usage_transactions[1].amount, expected_batch_cost,
+                "Batch request should be charged at batch price"
+            );
+
+            // Verify: Final balance
+            let final_balance = credits.get_user_balance(user_id).await.unwrap();
+            let expected_balance = Decimal::from_str("100.00").unwrap() - expected_batch_cost - expected_realtime_cost;
+            assert_eq!(
+                final_balance, expected_balance,
+                "Balance should reflect both batch and realtime charges"
+            );
+
+            // Verify: Analytics records have correct pricing stored
+            let batch_analytics = sqlx::query!(
+                r#"
+                SELECT input_price_per_token, output_price_per_token
+                FROM http_analytics
+                WHERE correlation_id = $1
+                "#,
+                batch_request_data.correlation_id as i64
+            )
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+
+            assert_eq!(batch_analytics.input_price_per_token.unwrap(), batch_input_price);
+            assert_eq!(batch_analytics.output_price_per_token.unwrap(), batch_output_price);
+
+            let realtime_analytics = sqlx::query!(
+                r#"
+                SELECT input_price_per_token, output_price_per_token
+                FROM http_analytics
+                WHERE correlation_id = $1
+                "#,
+                realtime_request_data.correlation_id as i64
+            )
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+
+            assert_eq!(realtime_analytics.input_price_per_token.unwrap(), realtime_input_price);
+            assert_eq!(realtime_analytics.output_price_per_token.unwrap(), realtime_output_price);
+        }
+
+        #[sqlx::test]
+        #[test_log::test]
+        async fn test_tariff_update_new_requests_use_updated_pricing(pool: sqlx::PgPool) {
+            // Test that when tariffs are updated, new requests use the updated pricing
+
+            // Setup: Create model with initial tariff
+            let model_id = create_test_model(&pool, "claude-3-opus").await;
+            let initial_input_price = Decimal::from_str("0.00010").unwrap();
+            let initial_output_price = Decimal::from_str("0.00020").unwrap();
+            setup_tariff(
+                &pool,
+                model_id,
+                "standard_pricing",
+                initial_input_price,
+                initial_output_price,
+                Some(ApiKeyPurpose::Realtime),
+                None,
+            )
+            .await;
+
+            // Setup: User with balance
+            let user_id = setup_user_with_balance(&pool, Decimal::from_str("100.00").unwrap()).await;
+            let auth = create_test_auth_for_user(&pool, user_id).await;
+
+            // Request 1: Use initial pricing (1000 input, 500 output)
+            let mut metrics1 = create_test_usage_metrics(1000, 500);
+            metrics1.request_model = Some("claude-3-opus".to_string());
+            metrics1.response_model = Some("claude-3-opus".to_string());
+            let request_data1 = create_test_request_data();
+            let result = store_analytics_record(&pool, &metrics1, &auth, &request_data1).await;
+            assert!(result.is_ok(), "First request should succeed");
+
+            // Expected cost with initial pricing: (1000 * 0.00010) + (500 * 0.00020) = 0.10 + 0.10 = 0.20
+            let expected_cost1 = Decimal::from_str("0.20").unwrap();
+
+            // Update: Change tariff pricing (50% reduction)
+            let updated_input_price = Decimal::from_str("0.00005").unwrap();
+            let updated_output_price = Decimal::from_str("0.00010").unwrap();
+            setup_tariff(
+                &pool,
+                model_id,
+                "standard_pricing",
+                updated_input_price,
+                updated_output_price,
+                Some(ApiKeyPurpose::Realtime),
+                None,
+            )
+            .await;
+
+            // Request 2: Use updated pricing (1000 input, 500 output)
+            let mut metrics2 = create_test_usage_metrics(1000, 500);
+            metrics2.correlation_id = 12346;
+            metrics2.request_model = Some("claude-3-opus".to_string());
+            metrics2.response_model = Some("claude-3-opus".to_string());
+            let mut request_data2 = create_test_request_data();
+            request_data2.correlation_id = 12346;
+            let result = store_analytics_record(&pool, &metrics2, &auth, &request_data2).await;
+            assert!(result.is_ok(), "Second request should succeed");
+
+            // Expected cost with updated pricing: (1000 * 0.00005) + (500 * 0.00010) = 0.05 + 0.05 = 0.10
+            let expected_cost2 = Decimal::from_str("0.10").unwrap();
+
+            // Verify: Check transactions
+            let mut conn = pool.acquire().await.unwrap();
+            let mut credits = Credits::new(&mut conn);
+            let transactions = credits.list_user_transactions(user_id, 0, 10).await.unwrap();
+
+            let usage_transactions: Vec<_> = transactions
+                .iter()
+                .filter(|tx| tx.transaction_type == CreditTransactionType::Usage)
+                .collect();
+
+            assert_eq!(usage_transactions.len(), 2, "Should have 2 usage transactions");
+
+            // Most recent transaction (index 0) should use updated pricing
+            assert_eq!(
+                usage_transactions[0].amount, expected_cost2,
+                "Second request should use updated pricing (0.10)"
+            );
+            // Older transaction (index 1) should use original pricing
+            assert_eq!(
+                usage_transactions[1].amount, expected_cost1,
+                "First request should use original pricing (0.20)"
+            );
+
+            // Verify: Final balance reflects both charges
+            let final_balance = credits.get_user_balance(user_id).await.unwrap();
+            let expected_balance = Decimal::from_str("100.00").unwrap() - expected_cost1 - expected_cost2;
+            assert_eq!(
+                final_balance, expected_balance,
+                "Balance should reflect charges at both old and new pricing"
+            );
+
+            // Verify: Analytics records store the correct pricing
+            let analytics1 = sqlx::query!(
+                r#"
+                SELECT input_price_per_token, output_price_per_token
+                FROM http_analytics
+                WHERE correlation_id = $1
+                "#,
+                request_data1.correlation_id as i64
+            )
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+
+            assert_eq!(analytics1.input_price_per_token.unwrap(), initial_input_price);
+            assert_eq!(analytics1.output_price_per_token.unwrap(), initial_output_price);
+
+            let analytics2 = sqlx::query!(
+                r#"
+                SELECT input_price_per_token, output_price_per_token
+                FROM http_analytics
+                WHERE correlation_id = $1
+                "#,
+                request_data2.correlation_id as i64
+            )
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+
+            assert_eq!(analytics2.input_price_per_token.unwrap(), updated_input_price);
+            assert_eq!(analytics2.output_price_per_token.unwrap(), updated_output_price);
+        }
+
+        #[sqlx::test]
+        #[test_log::test]
+        async fn test_tariff_fallback_to_realtime_when_batch_tariff_missing(pool: sqlx::PgPool) {
+            // Test that batch requests fall back to realtime pricing when no batch tariff exists
+
+            // Setup: Create model with ONLY realtime tariff (no batch tariff)
+            let model_id = create_test_model(&pool, "gpt-4").await;
+            let realtime_input_price = Decimal::from_str("0.00015").unwrap();
+            let realtime_output_price = Decimal::from_str("0.00030").unwrap();
+            setup_tariff(
+                &pool,
+                model_id,
+                "realtime_pricing",
+                realtime_input_price,
+                realtime_output_price,
+                Some(ApiKeyPurpose::Realtime),
+                None,
+            )
+            .await;
+
+            // Setup: User with balance and batch API key
+            let user_id = setup_user_with_balance(&pool, Decimal::from_str("100.00").unwrap()).await;
+            let batch_auth = create_test_auth_for_user_with_purpose(&pool, user_id, ApiKeyPurpose::Batch).await;
+
+            // Test: Make a batch request (should fall back to realtime pricing)
+            let metrics = create_test_usage_metrics(1000, 500);
+            let request_data = create_test_request_data();
+            let result = store_analytics_record(&pool, &metrics, &batch_auth, &request_data).await;
+            assert!(result.is_ok(), "Batch request should succeed with fallback pricing");
+
+            // Expected cost using realtime pricing: (1000 * 0.00015) + (500 * 0.00030) = 0.15 + 0.15 = 0.30
+            let expected_cost = Decimal::from_str("0.30").unwrap();
+
+            // Verify: Transaction amount uses realtime pricing
+            let mut conn = pool.acquire().await.unwrap();
+            let mut credits = Credits::new(&mut conn);
+            let transactions = credits.list_user_transactions(user_id, 0, 10).await.unwrap();
+
+            let usage_tx = transactions
+                .iter()
+                .find(|tx| tx.transaction_type == CreditTransactionType::Usage)
+                .expect("Usage transaction should exist");
+
+            assert_eq!(usage_tx.amount, expected_cost, "Batch request should fall back to realtime pricing");
+
+            // Verify: Analytics record stores realtime pricing (not batch)
+            let analytics = sqlx::query!(
+                r#"
+                SELECT input_price_per_token, output_price_per_token
+                FROM http_analytics
+                WHERE correlation_id = $1
+                "#,
+                request_data.correlation_id as i64
+            )
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+
+            assert_eq!(
+                analytics.input_price_per_token.unwrap(),
+                realtime_input_price,
+                "Should store realtime input price"
+            );
+            assert_eq!(
+                analytics.output_price_per_token.unwrap(),
+                realtime_output_price,
+                "Should store realtime output price"
+            );
+        }
+
+        #[sqlx::test]
+        #[test_log::test]
+        async fn test_tariff_playground_has_separate_pricing(pool: sqlx::PgPool) {
+            // Test that playground requests use their own pricing (separate from realtime/batch)
+
+            // Setup: Create model with tariffs for all three purposes
+            let model_id = create_test_model(&pool, "gpt-3.5-turbo").await;
+
+            // Realtime: Standard pricing
+            setup_tariff(
+                &pool,
+                model_id,
+                "realtime_pricing",
+                Decimal::from_str("0.00100").unwrap(),
+                Decimal::from_str("0.00200").unwrap(),
+                Some(ApiKeyPurpose::Realtime),
+                None,
+            )
+            .await;
+
+            // Batch: Discounted pricing (50% off)
+            setup_tariff(
+                &pool,
+                model_id,
+                "batch_pricing",
+                Decimal::from_str("0.00050").unwrap(),
+                Decimal::from_str("0.00100").unwrap(),
+                Some(ApiKeyPurpose::Batch),
+                None,
+            )
+            .await;
+
+            // Playground: Free pricing (for testing/demos)
+            setup_tariff(
+                &pool,
+                model_id,
+                "playground_pricing",
+                Decimal::ZERO,
+                Decimal::ZERO,
+                Some(ApiKeyPurpose::Playground),
+                None,
+            )
+            .await;
+
+            // Setup: User with balance
+            let user_id = setup_user_with_balance(&pool, Decimal::from_str("100.00").unwrap()).await;
+
+            // Create API keys for each purpose
+            let realtime_auth = create_test_auth_for_user_with_purpose(&pool, user_id, ApiKeyPurpose::Realtime).await;
+            let batch_auth = create_test_auth_for_user_with_purpose(&pool, user_id, ApiKeyPurpose::Batch).await;
+            let playground_auth = create_test_auth_for_user_with_purpose(&pool, user_id, ApiKeyPurpose::Playground).await;
+
+            // Make requests with each API key type (100 input, 50 output)
+            let mut metrics1 = create_test_usage_metrics(100, 50);
+            metrics1.correlation_id = 11111;
+            metrics1.request_model = Some("gpt-3.5-turbo".to_string());
+            metrics1.response_model = Some("gpt-3.5-turbo".to_string());
+            let mut request_data1 = create_test_request_data();
+            request_data1.correlation_id = 11111;
+            store_analytics_record(&pool, &metrics1, &realtime_auth, &request_data1)
+                .await
+                .unwrap();
+
+            let mut metrics2 = create_test_usage_metrics(100, 50);
+            metrics2.correlation_id = 22222;
+            metrics2.request_model = Some("gpt-3.5-turbo".to_string());
+            metrics2.response_model = Some("gpt-3.5-turbo".to_string());
+            let mut request_data2 = create_test_request_data();
+            request_data2.correlation_id = 22222;
+            store_analytics_record(&pool, &metrics2, &batch_auth, &request_data2).await.unwrap();
+
+            let mut metrics3 = create_test_usage_metrics(100, 50);
+            metrics3.correlation_id = 33333;
+            metrics3.request_model = Some("gpt-3.5-turbo".to_string());
+            metrics3.response_model = Some("gpt-3.5-turbo".to_string());
+            let mut request_data3 = create_test_request_data();
+            request_data3.correlation_id = 33333;
+            store_analytics_record(&pool, &metrics3, &playground_auth, &request_data3)
+                .await
+                .unwrap();
+
+            // Verify: Check transaction amounts
+            let mut conn = pool.acquire().await.unwrap();
+            let mut credits = Credits::new(&mut conn);
+            let transactions = credits.list_user_transactions(user_id, 0, 10).await.unwrap();
+
+            let usage_transactions: Vec<_> = transactions
+                .iter()
+                .filter(|tx| tx.transaction_type == CreditTransactionType::Usage)
+                .collect();
+
+            // Only 2 usage transactions should exist (playground is free, so no transaction)
+            assert_eq!(
+                usage_transactions.len(),
+                2,
+                "Should have 2 usage transactions (realtime and batch only)"
+            );
+
+            // Expected costs:
+            // Realtime: (100 * 0.00100) + (50 * 0.00200) = 0.10 + 0.10 = 0.20
+            // Batch: (100 * 0.00050) + (50 * 0.00100) = 0.05 + 0.05 = 0.10
+            // Playground: 0 (free)
+            let expected_realtime_cost = Decimal::from_str("0.20").unwrap();
+            let expected_batch_cost = Decimal::from_str("0.10").unwrap();
+
+            // Transactions are ordered newest first, so: playground (no tx), batch, realtime
+            assert_eq!(usage_transactions[0].amount, expected_batch_cost);
+            assert_eq!(usage_transactions[1].amount, expected_realtime_cost);
+
+            // Verify: Final balance (should only deduct realtime + batch, not playground)
+            let final_balance = credits.get_user_balance(user_id).await.unwrap();
+            let expected_balance = Decimal::from_str("100.00").unwrap() - expected_realtime_cost - expected_batch_cost;
+            assert_eq!(
+                final_balance, expected_balance,
+                "Balance should only reflect realtime and batch charges"
             );
         }
     }
