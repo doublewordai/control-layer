@@ -210,4 +210,3 @@ background_services:
   # When disabled, all instances run as leader (useful for single-instance deployments)
   leader_election:
     enabled: true # Default: true
-

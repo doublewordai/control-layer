@@ -6,7 +6,7 @@
 //! files disaggregated in postgres.
 
 use crate::api::models::files::{
-    FileContentQuery, FileDeleteResponse, FileListResponse, FileResponse, ListFilesQuery, ListObject, ObjectType, Purpose,
+    FileContentQuery, FileCostEstimate, FileDeleteResponse, FileListResponse, FileResponse, ListFilesQuery, ListObject, ObjectType, Purpose,
 };
 use crate::auth::permissions::{RequiresPermission, can_read_all_resources, operation, resource};
 
@@ -876,10 +876,197 @@ pub async fn delete_file(
     }))
 }
 
+#[utoipa::path(
+    get,
+    path = "/files/{file_id}/cost-estimate",
+    tag = "files",
+    summary = "Get file cost estimate",
+    description = "Estimate the cost of processing a batch file based on file size and model pricing. Returns per-model breakdown and total cost.",
+    responses(
+        (status = 200, description = "Cost estimate", body = FileCostEstimate),
+        (status = 404, description = "File not found"),
+        (status = 500, description = "Internal server error")
+    ),
+    params(
+        ("file_id" = String, Path, description = "The ID of the file to estimate cost for")
+    )
+)]
+#[tracing::instrument(skip(state, current_user), fields(user_id = %current_user.id, file_id = %file_id_str))]
+pub async fn get_file_cost_estimate(
+    State(state): State<AppState>,
+    Path(file_id_str): Path<String>,
+    current_user: RequiresPermission<resource::Files, operation::ReadOwn>,
+) -> Result<Json<crate::api::models::files::FileCostEstimate>> {
+    use rust_decimal::Decimal;
+    use std::collections::HashMap;
+
+    let can_read_all_files = can_read_all_resources(&current_user, Resource::Files);
+
+    let file_id = Uuid::parse_str(&file_id_str).map_err(|_| Error::BadRequest {
+        message: "Invalid file ID format".to_string(),
+    })?;
+
+    // First, get the file to check ownership
+    let file = state
+        .request_manager
+        .get_file(fusillade::FileId(file_id))
+        .await
+        .map_err(|_e| Error::NotFound {
+            resource: "File".to_string(),
+            id: file_id_str.clone(),
+        })?;
+
+    // Check ownership: users without ReadAll permission can only see their own files
+    if !can_read_all_files {
+        let user_id = current_user.id.to_string();
+        if file.uploaded_by.as_deref() != Some(user_id.as_str()) {
+            return Err(Error::NotFound {
+                resource: "File".to_string(),
+                id: file_id_str,
+            });
+        }
+    }
+
+    // Fetch all deployments and their pricing information upfront
+    let mut conn = state.db.acquire().await.map_err(|e| Error::Database(e.into()))?;
+    let mut deployments_repo = Deployments::new(&mut conn);
+
+    let filter = DeploymentFilter::new(0, 1000)
+        .with_statuses(vec![ModelStatus::Active])
+        .with_deleted(false);
+    let all_deployments = deployments_repo.list(&filter).await.map_err(Error::Database)?;
+
+    // Build a lookup map of model alias -> (deployment, avg_output_tokens, model_type)
+    let mut model_info: HashMap<
+        String,
+        (
+            crate::db::models::deployments::DeploymentDBResponse,
+            Option<i64>,
+            Option<crate::db::models::deployments::ModelType>,
+        ),
+    > = HashMap::new();
+
+    for deployment in all_deployments {
+        // Query http_analytics for last 100 responses to get average output token count
+        let avg_output_tokens: Option<i64> = sqlx::query_scalar(
+            r#"
+            SELECT AVG(completion_tokens)::BIGINT
+            FROM (
+                SELECT completion_tokens
+                FROM http_analytics
+                WHERE model = $1
+                  AND completion_tokens IS NOT NULL
+                  AND status_code = 200
+                ORDER BY timestamp DESC
+                LIMIT 100
+            ) recent_responses
+            "#,
+        )
+        .bind(&deployment.alias)
+        .fetch_optional(&mut *conn)
+        .await
+        .map_err(|e| Error::Database(e.into()))?
+        .flatten();
+
+        model_info.insert(
+            deployment.alias.clone(),
+            (deployment.clone(), avg_output_tokens, deployment.model_type.clone()),
+        );
+    }
+
+    // Get aggregated template statistics (optimized single query)
+    let template_stats = state
+        .request_manager
+        .get_file_template_stats(fusillade::FileId(file_id))
+        .await
+        .map_err(|e| Error::Internal {
+            operation: format!("get file template stats: {}", e),
+        })?;
+
+    // Convert to the format needed for cost calculation
+    let mut model_stats: HashMap<String, (i64, i64)> = HashMap::new(); // (request_count, input_tokens)
+
+    for stat in template_stats {
+        // Estimate input tokens: body size in bytes / 4
+        let estimated_input_tokens = stat.total_body_bytes / 4;
+        model_stats.insert(stat.model, (stat.request_count, estimated_input_tokens));
+    }
+
+    let mut total_cost = Decimal::ZERO;
+    let mut model_breakdowns = Vec::new();
+
+    for (model_alias, (request_count, input_tokens)) in model_stats {
+        // Look up the deployment and historical average
+        let (deployment_opt, avg_output_tokens, model_type) = model_info
+            .get(&model_alias)
+            .map(|(d, avg, mt)| (Some(d.clone()), *avg, mt.clone()))
+            .unwrap_or((None, None, None));
+
+        // Calculate estimated output tokens using historical average or fallback heuristics
+        let estimated_output_tokens = if matches!(model_type, Some(crate::db::models::deployments::ModelType::Embeddings)) {
+            // Embedding models have minimal output
+            request_count
+        } else if let Some(avg) = avg_output_tokens {
+            // Use historical average multiplied by request count
+            avg * request_count
+        } else {
+            // Fallback: estimate 10% larger than input
+            ((input_tokens as f64) * 1.1) as i64
+        };
+
+        let cost = if let Some(deployment) = deployment_opt {
+            // Get pricing if available
+            if let Some(pricing) = deployment.pricing {
+                if let Some(upstream) = pricing.upstream {
+                    let input_price = upstream.input_price_per_token.unwrap_or(Decimal::ZERO);
+                    let output_price = upstream.output_price_per_token.unwrap_or(Decimal::ZERO);
+
+                    let input_cost = Decimal::from(input_tokens) * input_price;
+                    let output_cost = Decimal::from(estimated_output_tokens) * output_price;
+                    input_cost + output_cost
+                } else {
+                    Decimal::ZERO
+                }
+            } else {
+                Decimal::ZERO
+            }
+        } else {
+            // Model not found, cost is 0
+            Decimal::ZERO
+        };
+
+        total_cost += cost;
+
+        model_breakdowns.push(crate::api::models::files::ModelCostBreakdown {
+            model: model_alias,
+            request_count,
+            estimated_input_tokens: input_tokens,
+            estimated_output_tokens,
+            estimated_cost: cost.to_string(),
+        });
+    }
+
+    // Calculate totals
+    let total_requests: i64 = model_breakdowns.iter().map(|m| m.request_count).sum();
+    let total_input_tokens: i64 = model_breakdowns.iter().map(|m| m.estimated_input_tokens).sum();
+    let total_output_tokens: i64 = model_breakdowns.iter().map(|m| m.estimated_output_tokens).sum();
+
+    Ok(Json(crate::api::models::files::FileCostEstimate {
+        file_id: file_id_str,
+        total_requests,
+        total_estimated_input_tokens: total_input_tokens,
+        total_estimated_output_tokens: total_output_tokens,
+        total_estimated_cost: total_cost.to_string(),
+        models: model_breakdowns,
+    }))
+}
+
 #[cfg(test)]
 mod tests {
     use crate::api::models::files::FileResponse;
     use crate::api::models::users::Role;
+    use crate::db::handlers::deployments::Deployments;
+    use crate::db::handlers::repository::Repository;
     use crate::test_utils::*;
     use sqlx::PgPool;
 
@@ -1223,5 +1410,133 @@ mod tests {
             "Error message should mention file already exists: {}",
             error_body
         );
+    }
+
+    #[sqlx::test]
+    #[test_log::test]
+    async fn test_get_file_cost_estimate(pool: PgPool) {
+        use rust_decimal::Decimal;
+        use std::str::FromStr;
+
+        let (app, _bg_services) = create_test_app(pool.clone(), false).await;
+        let user = create_test_user_with_roles(&pool, vec![Role::StandardUser, Role::BatchAPIUser]).await;
+        let group = create_test_group(&pool).await;
+        add_user_to_group(&pool, user.id, group.id).await;
+
+        // Create two deployments with different pricing
+        let deployment1 = create_test_deployment(&pool, user.id, "gpt-4-model", "gpt-4").await;
+        add_deployment_to_group(&pool, deployment1.id, group.id, user.id).await;
+
+        let deployment2 = create_test_deployment(&pool, user.id, "gpt-3.5-model", "gpt-3.5").await;
+        add_deployment_to_group(&pool, deployment2.id, group.id, user.id).await;
+
+        // Set pricing for the models using the repository
+        let mut conn = pool.acquire().await.unwrap();
+        let mut deployment_repo = Deployments::new(&mut conn);
+
+        use crate::db::models::deployments::{DeploymentUpdateDBRequest, ModelPricingUpdate, TokenPricingUpdate};
+
+        // Update gpt-4 pricing
+        let pricing_update1 = DeploymentUpdateDBRequest::builder()
+            .maybe_pricing(Some(ModelPricingUpdate {
+                upstream: Some(TokenPricingUpdate {
+                    input_price_per_token: Some(Some(Decimal::from_str("0.00003").unwrap())), // $0.03 per 1K tokens
+                    output_price_per_token: Some(Some(Decimal::from_str("0.00006").unwrap())), // $0.06 per 1K tokens
+                }),
+                downstream: None,
+            }))
+            .build();
+        deployment_repo.update(deployment1.id, &pricing_update1).await.unwrap();
+
+        // Update gpt-3.5 pricing
+        let pricing_update2 = DeploymentUpdateDBRequest::builder()
+            .maybe_pricing(Some(ModelPricingUpdate {
+                upstream: Some(TokenPricingUpdate {
+                    input_price_per_token: Some(Some(Decimal::from_str("0.000001").unwrap())), // $0.001 per 1K tokens
+                    output_price_per_token: Some(Some(Decimal::from_str("0.000002").unwrap())), // $0.002 per 1K tokens
+                }),
+                downstream: None,
+            }))
+            .build();
+        deployment_repo.update(deployment2.id, &pricing_update2).await.unwrap();
+
+        drop(conn);
+
+        // Create test JSONL content with mixed models
+        // 2 requests for gpt-4, 1 request for gpt-3.5
+        let jsonl_content = r#"{"custom_id":"request-1","method":"POST","url":"/v1/chat/completions","body":{"model":"gpt-4","messages":[{"role":"user","content":"Hello 1"}]}}
+{"custom_id":"request-2","method":"POST","url":"/v1/chat/completions","body":{"model":"gpt-3.5","messages":[{"role":"user","content":"Hello 2"}]}}
+{"custom_id":"request-3","method":"POST","url":"/v1/chat/completions","body":{"model":"gpt-4","messages":[{"role":"user","content":"Hello 3"}]}}
+"#;
+
+        // Upload the file
+        let file_part = axum_test::multipart::Part::bytes(jsonl_content.as_bytes()).file_name("test-batch.jsonl");
+
+        let upload_response = app
+            .post("/ai/v1/files")
+            .add_header(&add_auth_headers(&user)[0].0, &add_auth_headers(&user)[0].1)
+            .add_header(&add_auth_headers(&user)[1].0, &add_auth_headers(&user)[1].1)
+            .multipart(
+                axum_test::multipart::MultipartForm::new()
+                    .add_text("purpose", "batch")
+                    .add_part("file", file_part),
+            )
+            .await;
+
+        upload_response.assert_status(axum::http::StatusCode::CREATED);
+        let file: FileResponse = upload_response.json();
+        let file_id = file.id;
+
+        // Get cost estimate
+        let estimate_response = app
+            .get(&format!("/ai/v1/files/{}/cost-estimate", file_id))
+            .add_header(&add_auth_headers(&user)[0].0, &add_auth_headers(&user)[0].1)
+            .add_header(&add_auth_headers(&user)[1].0, &add_auth_headers(&user)[1].1)
+            .await;
+
+        estimate_response.assert_status(axum::http::StatusCode::OK);
+        let estimate: crate::api::models::files::FileCostEstimate = estimate_response.json();
+
+        // Verify basic structure
+        assert_eq!(estimate.file_id, file_id);
+        assert_eq!(estimate.total_requests, 3);
+        assert_eq!(estimate.models.len(), 2); // Two different models
+
+        // Verify we have breakdowns for both models
+        let gpt4_breakdown = estimate
+            .models
+            .iter()
+            .find(|m| m.model == "gpt-4")
+            .expect("Should have gpt-4 breakdown");
+        let gpt35_breakdown = estimate
+            .models
+            .iter()
+            .find(|m| m.model == "gpt-3.5")
+            .expect("Should have gpt-3.5 breakdown");
+
+        assert_eq!(gpt4_breakdown.request_count, 2);
+        assert_eq!(gpt35_breakdown.request_count, 1);
+
+        // Verify token estimates are calculated (input = body_bytes / 4, output = input * 1.2)
+        assert!(gpt4_breakdown.estimated_input_tokens > 0);
+        assert!(gpt4_breakdown.estimated_output_tokens > 0);
+        assert!(gpt35_breakdown.estimated_input_tokens > 0);
+        assert!(gpt35_breakdown.estimated_output_tokens > 0);
+
+        // Verify costs are calculated (should be > 0 since we set pricing)
+        let gpt4_cost = Decimal::from_str(&gpt4_breakdown.estimated_cost).unwrap();
+        let gpt35_cost = Decimal::from_str(&gpt35_breakdown.estimated_cost).unwrap();
+        assert!(gpt4_cost > Decimal::ZERO, "GPT-4 cost should be greater than zero");
+        assert!(gpt35_cost > Decimal::ZERO, "GPT-3.5 cost should be greater than zero");
+
+        // Verify total cost is sum of model costs
+        let total_cost = Decimal::from_str(&estimate.total_estimated_cost).unwrap();
+        assert_eq!(total_cost, gpt4_cost + gpt35_cost);
+
+        // Verify totals match sum of breakdowns
+        let total_input: i64 = estimate.models.iter().map(|m| m.estimated_input_tokens).sum();
+        let total_output: i64 = estimate.models.iter().map(|m| m.estimated_output_tokens).sum();
+        assert_eq!(estimate.total_estimated_input_tokens, total_input);
+        assert_eq!(estimate.total_estimated_output_tokens, total_output);
     }
 }

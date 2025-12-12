@@ -119,6 +119,10 @@ pub enum Error {
     /// Insufficient credits to perform the requested operation
     #[error("Insufficient credits: {message}")]
     InsufficientCredits { current_balance: Decimal, message: String },
+
+    /// User does not have access to the requested model
+    #[error("Model access denied: {message}")]
+    ModelAccessDenied { model_name: String, message: String },
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -148,6 +152,7 @@ impl Error {
             Error::Conflict { .. } => StatusCode::CONFLICT,
             Error::PayloadTooLarge { .. } => StatusCode::PAYLOAD_TOO_LARGE,
             Error::InsufficientCredits { .. } => StatusCode::PAYMENT_REQUIRED,
+            Error::ModelAccessDenied { .. } => StatusCode::FORBIDDEN,
         }
     }
 
@@ -200,6 +205,7 @@ impl Error {
                 }
             }
             Error::InsufficientCredits { message, .. } => message.clone(),
+            Error::ModelAccessDenied { message, .. } => message.clone(),
         }
     }
 }
@@ -225,6 +231,9 @@ impl IntoResponse for Error {
             }
             Error::InsufficientCredits { .. } => {
                 tracing::info!("Insufficient credits error: {}", self);
+            }
+            Error::ModelAccessDenied { .. } => {
+                tracing::info!("Model access denied error: {}", self);
             }
         }
 

@@ -14,13 +14,16 @@
 //!
 //! ## Error Cases Enriched
 //!
-//! 1. **403 Forbidden - Insufficient Credits**: User's balance ≤ 0 for paid models
+//! 1. **403 Forbidden - Insufficient Credits**: User's balance < 0 for paid models
 //!    - Shows current balance
+//! 2. **403 Forbidden - Model Access Denied**: User is not a member of a group with access to the requested model
+//!    - Shows which model was requested
 
 use crate::{
     db::errors::DbError,
     db::handlers::{Credits, api_keys::ApiKeys},
     errors::Error,
+    types::UserId,
 };
 use axum::{
     body::Body,
@@ -30,13 +33,21 @@ use axum::{
     response::IntoResponse,
 };
 use rust_decimal::Decimal;
+use serde::Deserialize;
 use sqlx::PgPool;
 use tracing::{debug, instrument};
+
+/// Request body structure for extracting model name
+#[derive(Debug, Deserialize)]
+struct ChatRequest {
+    model: String,
+}
 
 /// Middleware that enriches error responses from the AI proxy with helpful context
 ///
 /// Currently handles:
 /// - 403 Forbidden errors (likely insufficient credits) → enriched with balance
+/// - 403 Forbidden errors (likely model access denied) → enriched with model name
 #[instrument(skip_all, fields(path = %request.uri().path(), method = %request.method()))]
 pub async fn error_enrichment_middleware(State(pool): State<PgPool>, request: Request<Body>, next: Next) -> Response<Body> {
     // Extract API key from request headers before passing to onwards
@@ -47,8 +58,24 @@ pub async fn error_enrichment_middleware(State(pool): State<PgPool>, request: Re
         .and_then(|auth| auth.strip_prefix("Bearer ").or_else(|| auth.strip_prefix("bearer ")))
         .map(|token| token.trim().to_string());
 
+    // Extract request body to get model name for potential error enrichment
+    let (parts, body) = request.into_parts();
+    let bytes = match axum::body::to_bytes(body, usize::MAX).await {
+        Ok(b) => b,
+        Err(_) => {
+            // If we can't read the body, just pass through
+            let reconstructed = Request::from_parts(parts, Body::empty());
+            return next.run(reconstructed).await;
+        }
+    };
+
+    let model_name = serde_json::from_slice::<ChatRequest>(&bytes).ok().map(|req| req.model);
+
+    // Reconstruct the request with the body
+    let reconstructed = Request::from_parts(parts, Body::from(bytes));
+
     // Let the request proceed through onwards
-    let response = next.run(request).await;
+    let response = next.run(reconstructed).await;
 
     // Only enrich 403 errors when we have an API key
     // Note: This middleware is applied only to the onwards router (AI proxy paths),
@@ -57,16 +84,32 @@ pub async fn error_enrichment_middleware(State(pool): State<PgPool>, request: Re
         && let Some(key) = api_key
     {
         debug!("Intercepted 403 response on AI proxy path, attempting enrichment");
-        if let Ok(balance) = get_balance_of_api_key(pool, &key).await {
-            // Only enrich if balance is negative (user is in debt)
-            // If balance is exactly 0, the 403 might be due to model access rather than credits
-            if balance < Decimal::ZERO {
-                return Error::InsufficientCredits {
-                    current_balance: balance,
-                    message: "Account balance too low. Please add credits to continue.".to_string(),
-                }
-                .into_response();
+
+        // First check if it's a model access issue
+        if let Some(model) = model_name
+            && let Ok(user_id) = get_user_id_of_api_key(pool.clone(), &key).await
+            && let Ok(has_access) = check_user_has_model_access(pool.clone(), user_id, &model).await
+            && !has_access
+        {
+            return Error::ModelAccessDenied {
+                model_name: model.clone(),
+                message: format!(
+                    "You do not have access to '{}'. Please contact your administrator to request access.",
+                    model
+                ),
             }
+            .into_response();
+        }
+
+        // If access is OK but we have a 403, check balance - if negative, it's a credits issue
+        if let Ok(balance) = get_balance_of_api_key(pool.clone(), &key).await
+            && balance <= Decimal::ZERO
+        {
+            return Error::InsufficientCredits {
+                current_balance: balance,
+                message: "Account balance too low. Please add credits to continue.".to_string(),
+            }
+            .into_response();
         }
     }
 
@@ -74,20 +117,56 @@ pub async fn error_enrichment_middleware(State(pool): State<PgPool>, request: Re
 }
 
 #[instrument(skip_all)]
-pub async fn get_balance_of_api_key(pool: PgPool, api_key: &str) -> Result<Decimal, DbError> {
-    // Look up user_id from API key
+pub async fn get_user_id_of_api_key(pool: PgPool, api_key: &str) -> Result<UserId, DbError> {
     let mut conn = pool.acquire().await?;
     let mut api_keys_repo = ApiKeys::new(&mut conn);
-    let user_id = api_keys_repo
+    api_keys_repo
         .get_user_id_by_secret(api_key)
         .await?
-        .ok_or_else(|| anyhow::anyhow!("API key not found or associated user doesn't exist"))?;
+        .ok_or_else(|| anyhow::anyhow!("API key not found or associated user doesn't exist").into())
+}
+
+#[instrument(skip_all)]
+pub async fn get_balance_of_api_key(pool: PgPool, api_key: &str) -> Result<Decimal, DbError> {
+    // Look up user_id from API key
+    let user_id = get_user_id_of_api_key(pool.clone(), api_key).await?;
 
     debug!("Found user_id for API key: {}", user_id);
 
     // Query user's current balance
+    let mut conn = pool.acquire().await?;
     let mut credits_repo = Credits::new(&mut conn);
     credits_repo.get_user_balance(user_id).await
+}
+
+#[instrument(skip_all)]
+pub async fn check_user_has_model_access(pool: PgPool, user_id: UserId, model_alias: &str) -> Result<bool, DbError> {
+    let mut conn = pool.acquire().await?;
+
+    // Query to check if user has access to this deployment through group membership
+    let result = sqlx::query_scalar!(
+        r#"
+        SELECT EXISTS(
+            SELECT 1
+            FROM deployed_models d
+            JOIN deployment_groups dg ON dg.deployment_id = d.id
+            WHERE d.alias = $1
+              AND d.deleted = false
+              AND dg.group_id IN (
+                  SELECT ug.group_id FROM user_groups ug WHERE ug.user_id = $2
+                  UNION
+                  SELECT '00000000-0000-0000-0000-000000000000'::uuid
+                  WHERE $2 != '00000000-0000-0000-0000-000000000000'
+              )
+        ) as "has_access!"
+        "#,
+        model_alias,
+        user_id
+    )
+    .fetch_one(&mut *conn)
+    .await?;
+
+    Ok(result)
 }
 
 #[cfg(test)]
@@ -107,6 +186,8 @@ mod tests {
     #[sqlx::test]
     #[test_log::test]
     async fn test_error_enrichment_middleware_enriches_403_with_balance(pool: PgPool) {
+        use crate::test_utils::{add_deployment_to_group, add_user_to_group, create_test_group};
+
         // Create test user with an API key
         let user = create_test_user(&pool, Role::StandardUser).await;
 
@@ -167,10 +248,10 @@ mod tests {
             }))
             .await;
 
-        // Test that response is 403 and not enriched
+        // Test that response is 403 and enriched with model access denied (user has positive balance but no model access)
         assert_eq!(response.status_code().as_u16(), 403);
         let body = response.text();
-        assert!(body.contains("Forbidden"));
+        assert!(body.contains("do not have access to 'test-model'"));
 
         // Now, deduct all credits to simulate insufficient balance
         let mut credits_conn = pool.acquire().await.unwrap();
@@ -186,12 +267,22 @@ mod tests {
             .await
             .unwrap();
 
-        // Make request with API key in Authorization header
+        // We need to ensure user is part of a group with access to the deployment to avoid 403
+        let endpoint_id = crate::test_utils::create_test_endpoint(&pool, "test-endpoint", user.id).await;
+        let deployment_id =
+            crate::test_utils::create_test_model(&pool, "authorized-model-name", "authorized-model", endpoint_id, user.id).await;
+
+        let group = create_test_group(&pool).await;
+        add_user_to_group(&pool, user.id, group.id).await;
+        // Grant access to the group
+        add_deployment_to_group(&pool, deployment_id, group.id, user.id).await;
+
+        // Make request with API key in Authorization header, using the model the user has access to
         let response = server
             .post("/ai/v1/chat/completions")
             .add_header("authorization", &format!("Bearer {}", api_key.secret))
             .json(&serde_json::json!({
-                "model": "test-model",
+                "model": "authorized-model",
                 "messages": [{"role": "user", "content": "Hello"}]
             }))
             .await;
@@ -201,6 +292,93 @@ mod tests {
         let body = response.text();
         println!("Enriched response body: {}", body);
         assert!(body.contains("balance too low"));
+    }
+
+    /// Integration test: Error enrichment middleware passes through 403 when user has access
+    #[sqlx::test]
+    #[test_log::test]
+    async fn test_error_enrichment_middleware_passes_through_legitimate_403(pool: PgPool) {
+        use crate::test_utils::{add_deployment_to_group, add_user_to_group, create_test_group};
+
+        // Create test user with positive balance and model access
+        let user = create_test_user(&pool, Role::StandardUser).await;
+
+        // Create a group and add the user to it
+        let group = create_test_group(&pool).await;
+        add_user_to_group(&pool, user.id, group.id).await;
+
+        // Create API key
+        let mut api_key_conn = pool.acquire().await.unwrap();
+        let mut api_keys_repo = ApiKeys::new(&mut api_key_conn);
+        let api_key = api_keys_repo
+            .create(&ApiKeyCreateDBRequest {
+                user_id: user.id,
+                name: "Test Key".to_string(),
+                description: None,
+                purpose: ApiKeyPurpose::Inference,
+                requests_per_second: None,
+                burst_size: None,
+            })
+            .await
+            .unwrap();
+
+        // Give user positive balance
+        let mut credits_conn = pool.acquire().await.unwrap();
+        let mut credits_repo = Credits::new(&mut credits_conn);
+        credits_repo
+            .create_transaction(&CreditTransactionCreateDBRequest {
+                user_id: user.id,
+                transaction_type: CreditTransactionType::AdminGrant,
+                amount: Decimal::new(5000, 2),
+                source_id: uuid::Uuid::new_v4().to_string(),
+                description: Some("Initial credits".to_string()),
+            })
+            .await
+            .unwrap();
+
+        // Create a deployment with 'authorized-model' alias and grant access to the group
+        let endpoint_id = crate::test_utils::create_test_endpoint(&pool, "test-endpoint", user.id).await;
+        let deployment_id =
+            crate::test_utils::create_test_model(&pool, "authorized-model-name", "authorized-model", endpoint_id, user.id).await;
+
+        // Grant access to the group
+        add_deployment_to_group(&pool, deployment_id, group.id, user.id).await;
+
+        // Create a test app with middleware that returns 403 for a different reason (e.g., rate limit)
+        let router = axum::Router::new()
+            .route(
+                "/ai/v1/chat/completions",
+                axum::routing::post(|| async {
+                    // Simulate a legitimate 403 error (not credits/access related)
+                    axum::response::Response::builder()
+                        .status(StatusCode::FORBIDDEN)
+                        .body(axum::body::Body::from("Rate limit exceeded"))
+                        .unwrap()
+                }),
+            )
+            .layer(axum::middleware::from_fn_with_state(
+                pool.clone(),
+                crate::error_enrichment::error_enrichment_middleware,
+            ));
+
+        let server = axum_test::TestServer::new(router).expect("Failed to create test server");
+
+        // Make request with API key and a model the user has access to
+        let response = server
+            .post("/ai/v1/chat/completions")
+            .add_header("authorization", &format!("Bearer {}", api_key.secret))
+            .json(&serde_json::json!({
+                "model": "authorized-model",
+                "messages": [{"role": "user", "content": "Hello"}]
+            }))
+            .await;
+
+        // Should pass through the original 403 without enrichment
+        assert_eq!(response.status_code().as_u16(), 403);
+        let body = response.text();
+        assert!(body.contains("Rate limit exceeded"));
+        assert!(!body.contains("balance"));
+        assert!(!body.contains("access"));
     }
 
     /// Integration test: Error enrichment middleware only affects /ai/ paths
