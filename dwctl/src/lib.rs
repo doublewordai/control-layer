@@ -410,8 +410,8 @@ pub async fn seed_database(sources: &[config::ModelSource], db: &PgPool) -> Resu
                 {
                     if model.add_to_everyone_group {
                         let mut groups_repo = Groups::new(&mut *tx);
-                        if let Err(_) = groups_repo.add_deployment_to_group(row.id, Uuid::nil(), Uuid::nil()).await {
-                            debug!("Failed to add deployed model {} to 'everyone' group during seeding", model.name);
+                        if let Err(e) = groups_repo.add_deployment_to_group(row.id, Uuid::nil(), Uuid::nil()).await {
+                            debug!("Failed to add deployed model {} to 'everyone' group during seeding: {}", model.name, e);
                         }
                     }
                 }
