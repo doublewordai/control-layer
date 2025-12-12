@@ -587,7 +587,8 @@ mod tests {
     #[test_log::test]
     async fn test_list_inference_endpoints(pool: PgPool) {
         let (app, _bg_services) = create_test_app(pool.clone(), false).await;
-        let user = create_test_user(&pool, Role::StandardUser).await;
+        // Use PlatformManager instead of StandardUser
+        let user = create_test_user(&pool, Role::PlatformManager).await;
 
         let response = app
             .get("/admin/api/v1/endpoints")
@@ -622,7 +623,8 @@ mod tests {
     #[test_log::test]
     async fn test_get_inference_endpoint(pool: PgPool) {
         let (app, _bg_services) = create_test_app(pool.clone(), false).await;
-        let user = create_test_user(&pool, Role::StandardUser).await;
+        // Use PlatformManager instead of StandardUser
+        let user = create_test_user(&pool, Role::PlatformManager).await;
         let test_endpoint_id = get_test_endpoint_id(&app, &user).await;
 
         let response = app
@@ -641,7 +643,8 @@ mod tests {
     #[test_log::test]
     async fn test_get_nonexistent_inference_endpoint(pool: PgPool) {
         let (app, _bg_services) = create_test_app(pool.clone(), false).await;
-        let user = create_test_user(&pool, Role::StandardUser).await;
+        // Use PlatformManager instead of StandardUser
+        let user = create_test_user(&pool, Role::PlatformManager).await;
         let non_existent_id = uuid::Uuid::new_v4();
 
         let response = app
@@ -682,7 +685,9 @@ mod tests {
     async fn test_update_inference_endpoint_as_non_admin_forbidden(pool: PgPool) {
         let (app, _bg_services) = create_test_app(pool.clone(), false).await;
         let user = create_test_user(&pool, Role::StandardUser).await;
-        let test_endpoint_id = get_test_endpoint_id(&app, &user).await;
+        // Use admin to get endpoint ID since StandardUser can't list endpoints
+        let admin_user = create_test_admin_user(&pool, Role::PlatformManager).await;
+        let test_endpoint_id = get_test_endpoint_id(&app, &admin_user).await;
 
         let update = json!({
             "name": "Should Not Work"
@@ -767,7 +772,8 @@ mod tests {
     #[test_log::test]
     async fn test_default_endpoint_exists(pool: PgPool) {
         let (app, _bg_services) = create_test_app(pool.clone(), false).await;
-        let user = create_test_user(&pool, Role::StandardUser).await;
+        // Use PlatformManager instead of StandardUser
+        let user = create_test_user(&pool, Role::PlatformManager).await;
 
         // First get the list to find the test endpoint
         let response = app
@@ -795,12 +801,12 @@ mod tests {
         assert_eq!(endpoint.id, test_endpoint_id);
         assert_eq!(endpoint.name, "test");
     }
-
     #[sqlx::test]
     #[test_log::test]
     async fn test_list_endpoints_with_pagination(pool: PgPool) {
         let (app, _bg_services) = create_test_app(pool.clone(), false).await;
-        let user = create_test_user(&pool, Role::StandardUser).await;
+        // Use PlatformManager instead of StandardUser
+        let user = create_test_user(&pool, Role::PlatformManager).await;
 
         // Test with limit
         let response = app
@@ -835,7 +841,6 @@ mod tests {
         let endpoints: Vec<InferenceEndpointResponse> = response.json();
         assert!(endpoints.is_empty());
     }
-
     #[sqlx::test]
     #[test_log::test]
     async fn test_validate_inference_endpoint_new_valid_url(pool: PgPool) {
@@ -1262,7 +1267,9 @@ mod tests {
     async fn test_synchronize_endpoint_as_non_admin_forbidden(pool: PgPool) {
         let (app, _bg_services) = create_test_app(pool.clone(), false).await;
         let user = create_test_user(&pool, Role::StandardUser).await;
-        let test_endpoint_id = get_test_endpoint_id(&app, &user).await;
+        // Use admin to get endpoint ID since StandardUser can't list endpoints
+        let admin_user = create_test_admin_user(&pool, Role::PlatformManager).await;
+        let test_endpoint_id = get_test_endpoint_id(&app, &admin_user).await;
 
         let response = app
             .post(&format!("/admin/api/v1/endpoints/{test_endpoint_id}/synchronize"))
@@ -1273,30 +1280,34 @@ mod tests {
         response.assert_status_forbidden();
     }
 
+    // Update permission test to correctly reflect that StandardUser CANNOT read endpoints
     #[sqlx::test]
     #[test_log::test]
     async fn test_standard_user_can_read_endpoints_only(pool: PgPool) {
         let (app, _bg_services) = create_test_app(pool.clone(), false).await;
         let standard_user = create_test_user(&pool, Role::StandardUser).await;
 
-        // StandardUser should be able to list endpoints (has ReadAll for Endpoints)
+        // StandardUser should NOT be able to list endpoints (no ReadAll for Endpoints)
         let response = app
             .get("/admin/api/v1/endpoints")
             .add_header(&add_auth_headers(&standard_user)[0].0, &add_auth_headers(&standard_user)[0].1)
             .add_header(&add_auth_headers(&standard_user)[1].0, &add_auth_headers(&standard_user)[1].1)
             .await;
 
-        response.assert_status_ok();
+        response.assert_status_forbidden();
 
-        // StandardUser should be able to get specific endpoint
-        let test_endpoint_id = get_test_endpoint_id(&app, &standard_user).await;
+        // Get test endpoint ID using admin
+        let admin_user = create_test_admin_user(&pool, Role::PlatformManager).await;
+        let test_endpoint_id = get_test_endpoint_id(&app, &admin_user).await;
+
+        // StandardUser should NOT be able to get specific endpoint
         let response = app
             .get(&format!("/admin/api/v1/endpoints/{test_endpoint_id}"))
             .add_header(&add_auth_headers(&standard_user)[0].0, &add_auth_headers(&standard_user)[0].1)
             .add_header(&add_auth_headers(&standard_user)[1].0, &add_auth_headers(&standard_user)[1].1)
             .await;
 
-        response.assert_status_ok();
+        response.assert_status_forbidden();
 
         // StandardUser should NOT be able to create endpoints
         let create_request = json!({
@@ -1358,6 +1369,7 @@ mod tests {
         response.assert_status_forbidden();
     }
 
+    // Update RequestViewer test - they also cannot read endpoints
     #[sqlx::test]
     #[test_log::test]
     async fn test_request_viewer_can_read_endpoints_only(pool: PgPool) {
@@ -1366,26 +1378,27 @@ mod tests {
         // So request_viewer actually has [RequestViewer, StandardUser] roles
         let request_viewer = create_test_user(&pool, Role::RequestViewer).await;
 
-        // RequestViewer (with StandardUser) CAN list endpoints
+        // RequestViewer (with StandardUser) CANNOT list endpoints (no Endpoints::ReadAll)
         let response = app
             .get("/admin/api/v1/endpoints")
             .add_header(&add_auth_headers(&request_viewer)[0].0, &add_auth_headers(&request_viewer)[0].1)
             .add_header(&add_auth_headers(&request_viewer)[1].0, &add_auth_headers(&request_viewer)[1].1)
             .await;
 
-        response.assert_status_ok();
+        response.assert_status_forbidden();
 
-        // RequestViewer (with StandardUser) CAN get specific endpoint
+        // Get test endpoint ID using admin
         let admin_user = create_test_admin_user(&pool, Role::PlatformManager).await;
         let test_endpoint_id = get_test_endpoint_id(&app, &admin_user).await;
 
+        // RequestViewer (with StandardUser) CANNOT get specific endpoint
         let response = app
             .get(&format!("/admin/api/v1/endpoints/{test_endpoint_id}"))
             .add_header(&add_auth_headers(&request_viewer)[0].0, &add_auth_headers(&request_viewer)[0].1)
             .add_header(&add_auth_headers(&request_viewer)[1].0, &add_auth_headers(&request_viewer)[1].1)
             .await;
 
-        response.assert_status_ok();
+        response.assert_status_forbidden();
 
         // RequestViewer should NOT be able to create endpoints
         let create_request = json!({
@@ -1418,6 +1431,7 @@ mod tests {
         response.assert_status_forbidden();
     }
 
+    // Update multi-role test
     #[sqlx::test]
     #[test_log::test]
     async fn test_multi_role_user_endpoint_permissions(pool: PgPool) {
@@ -1438,7 +1452,7 @@ mod tests {
 
         let (app, bg_services) = create_test_app(pool.clone(), false).await;
 
-        // User with StandardUser + RequestViewer should be able to read endpoints (from StandardUser)
+        // User with StandardUser + RequestViewer CANNOT read endpoints (neither role has Endpoints::ReadAll)
         let multi_role_user = create_test_user_with_roles(&pool, vec![Role::StandardUser, Role::RequestViewer]).await;
 
         let response = app
@@ -1447,9 +1461,9 @@ mod tests {
             .add_header(&add_auth_headers(&multi_role_user)[1].0, &add_auth_headers(&multi_role_user)[1].1)
             .await;
 
-        response.assert_status_ok();
+        response.assert_status_forbidden();
 
-        // But should NOT be able to modify endpoints (needs PlatformManager)
+        // And should NOT be able to modify endpoints (needs PlatformManager)
         let create_request = json!({
             "name": "Multi Role Endpoint",
             "url": format!("{}/v1", mock_server.uri())
@@ -1576,16 +1590,14 @@ mod tests {
 
         response.assert_status_ok();
 
-        // Standard User should only be able to read it
+        // Standard User should NOT be able to read it (no Endpoints::ReadAll permission)
         let response = app
             .get(&format!("/admin/api/v1/endpoints/{}", endpoint.id))
             .add_header(&add_auth_headers(&standard_user)[0].0, &add_auth_headers(&standard_user)[0].1)
             .add_header(&add_auth_headers(&standard_user)[1].0, &add_auth_headers(&standard_user)[1].1)
             .await;
 
-        response.assert_status_ok();
-        let read_endpoint: InferenceEndpointResponse = response.json();
-        assert_eq!(read_endpoint.name, "Updated by PM2");
+        response.assert_status_forbidden();
 
         // Standard User should NOT be able to delete it
         let response = app
@@ -1775,13 +1787,13 @@ mod tests {
         let (app, _bg_services) = create_test_app(pool.clone(), false).await;
         let standard_user = create_test_user(&pool, Role::StandardUser).await;
 
-        // Standard user should be able to read endpoints
+        // Standard user should NOT be able to read endpoints (no Endpoints::ReadAll)
         let response = app
             .get("/admin/api/v1/endpoints")
             .add_header(&add_auth_headers(&standard_user)[0].0, &add_auth_headers(&standard_user)[0].1)
             .add_header(&add_auth_headers(&standard_user)[1].0, &add_auth_headers(&standard_user)[1].1)
             .await;
-        response.assert_status_ok();
+        response.assert_status_forbidden();
 
         // Standard user should NOT be able to create endpoints
         let create_request = json!({
@@ -1805,13 +1817,13 @@ mod tests {
         // So request_viewer actually has [RequestViewer, StandardUser] roles
         let request_viewer = create_test_user(&pool, Role::RequestViewer).await;
 
-        // RequestViewer (with StandardUser) CAN read endpoints
+        // RequestViewer (with StandardUser) CANNOT read endpoints (no Endpoints::ReadAll)
         let response = app
             .get("/admin/api/v1/endpoints")
             .add_header(&add_auth_headers(&request_viewer)[0].0, &add_auth_headers(&request_viewer)[0].1)
             .add_header(&add_auth_headers(&request_viewer)[1].0, &add_auth_headers(&request_viewer)[1].1)
             .await;
-        response.assert_status_ok();
+        response.assert_status_forbidden();
 
         // RequestViewer should NOT be able to create endpoints (requires PlatformManager)
         let create_request = json!({
@@ -1833,13 +1845,13 @@ mod tests {
         let (app, _bg_services) = create_test_app(pool.clone(), false).await;
         let multi_role_user = create_test_user_with_roles(&pool, vec![Role::StandardUser, Role::RequestViewer]).await;
 
-        // Multi-role user should be able to read (StandardUser permission)
+        // Multi-role user CANNOT read (no PlatformManager role)
         let response = app
             .get("/admin/api/v1/endpoints")
             .add_header(&add_auth_headers(&multi_role_user)[0].0, &add_auth_headers(&multi_role_user)[0].1)
             .add_header(&add_auth_headers(&multi_role_user)[1].0, &add_auth_headers(&multi_role_user)[1].1)
             .await;
-        response.assert_status_ok();
+        response.assert_status_forbidden();
 
         // Multi-role user should NOT create (no PlatformManager role)
         let create_request = json!({

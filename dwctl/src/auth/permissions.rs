@@ -536,7 +536,6 @@ mod tests {
         // Should have both StandardUser permissions
         assert!(has_permission(&user, Resource::ApiKeys, Operation::CreateOwn));
         assert!(has_permission(&user, Resource::Models, Operation::ReadOwn));
-        assert!(has_permission(&user, Resource::Endpoints, Operation::ReadAll));
         assert!(has_permission(&user, Resource::Users, Operation::ReadOwn));
 
         // And BatchAPIUser permissions
