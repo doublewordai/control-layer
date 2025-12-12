@@ -1,5 +1,20 @@
 # Changelog
 
+## [0.15.0](https://github.com/doublewordai/control-layer/compare/v0.14.0...v0.15.0) (2025-12-12)
+
+
+### Features
+
+* File cost estimates ([#341](https://github.com/doublewordai/control-layer/issues/341)) ([fa65db0](https://github.com/doublewordai/control-layer/commit/fa65db01769332a2cf607c6f1d71514e579fa69e))
+* user soft delete + permissions fixes ([#346](https://github.com/doublewordai/control-layer/issues/346)) ([ee1c864](https://github.com/doublewordai/control-layer/commit/ee1c864739457fdc9d35ccba5851368043b69fbc))
+
+
+### Bug Fixes
+
+* DASHBOARD_BOOTSTRAP_JS env var ([#328](https://github.com/doublewordai/control-layer/issues/328)) ([40a995a](https://github.com/doublewordai/control-layer/commit/40a995a6d5d798afe9197165e9a41861c7f0808c))
+* playground access error and model name overflow ([#340](https://github.com/doublewordai/control-layer/issues/340)) ([b99eb9a](https://github.com/doublewordai/control-layer/commit/b99eb9ab516671093c0ea1ba083d4526fb0e7c55))
+* playground model selection & error enrichment ([#345](https://github.com/doublewordai/control-layer/issues/345)) ([c74296f](https://github.com/doublewordai/control-layer/commit/c74296f2441ca7fd07264f3204a257be64a35bca))
+
 ## [0.14.0](https://github.com/doublewordai/control-layer/compare/v0.13.0...v0.14.0) (2025-12-03)
 
 
