@@ -387,7 +387,7 @@ pub async fn seed_database(sources: &[config::ModelSource], db: &PgPool) -> Resu
         {
             for model in source.default_models.as_deref().unwrap_or(&[]) {
                 // Insert deployed model if it doesn't already exist
-                let mut model_repo = Deployments::new(&mut *tx);
+                let mut model_repo = Deployments::new(&mut tx);
                 if let Ok(row) = model_repo
                     .create(&DeploymentCreateDBRequest::from_api_create(
                         Uuid::nil(),
@@ -407,15 +407,14 @@ pub async fn seed_database(sources: &[config::ModelSource], db: &PgPool) -> Resu
                         },
                     ))
                     .await
+                    && model.add_to_everyone_group
                 {
-                    if model.add_to_everyone_group {
-                        let mut groups_repo = Groups::new(&mut *tx);
-                        if let Err(e) = groups_repo.add_deployment_to_group(row.id, Uuid::nil(), Uuid::nil()).await {
-                            debug!(
-                                "Failed to add deployed model {} to 'everyone' group during seeding: {}",
-                                model.name, e
-                            );
-                        }
+                    let mut groups_repo = Groups::new(&mut tx);
+                    if let Err(e) = groups_repo.add_deployment_to_group(row.id, Uuid::nil(), Uuid::nil()).await {
+                        debug!(
+                            "Failed to add deployed model {} to 'everyone' group during seeding: {}",
+                            model.name, e
+                        );
                     }
                 }
             }
