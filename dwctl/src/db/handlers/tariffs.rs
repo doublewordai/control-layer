@@ -135,8 +135,8 @@ impl<'c> Tariffs<'c> {
     pub async fn get_pricing_at_timestamp_with_fallback(
         &mut self,
         deployed_model_id: DeploymentId,
-        preferred_purpose: Option<&str>,
-        fallback_purpose: &str,
+        preferred_purpose: Option<&crate::db::models::api_keys::ApiKeyPurpose>,
+        fallback_purpose: &crate::db::models::api_keys::ApiKeyPurpose,
         timestamp: DateTime<Utc>,
     ) -> Result<Option<(Decimal, Decimal)>> {
         // Try preferred purpose first if specified
@@ -161,9 +161,17 @@ impl<'c> Tariffs<'c> {
     pub async fn get_pricing_at_timestamp(
         &mut self,
         deployed_model_id: DeploymentId,
-        api_key_purpose: &str,
+        api_key_purpose: &crate::db::models::api_keys::ApiKeyPurpose,
         timestamp: DateTime<Utc>,
     ) -> Result<Option<(Decimal, Decimal)>> {
+        // Convert enum to string for database query
+        let purpose_str = match api_key_purpose {
+            crate::db::models::api_keys::ApiKeyPurpose::Realtime => "realtime",
+            crate::db::models::api_keys::ApiKeyPurpose::Batch => "batch",
+            crate::db::models::api_keys::ApiKeyPurpose::Playground => "playground",
+            crate::db::models::api_keys::ApiKeyPurpose::Platform => "platform",
+        };
+
         // Step 1: Check current (active) tariff - this is the fast path for recent requests
         let current_tariff = sqlx::query!(
             r#"
@@ -175,7 +183,7 @@ impl<'c> Tariffs<'c> {
             LIMIT 1
             "#,
             deployed_model_id,
-            api_key_purpose
+            purpose_str
         )
         .fetch_optional(&mut *self.db)
         .await?;
@@ -202,7 +210,7 @@ impl<'c> Tariffs<'c> {
             LIMIT 1
             "#,
             deployed_model_id,
-            api_key_purpose,
+            purpose_str,
             timestamp
         )
         .fetch_optional(&mut *self.db)

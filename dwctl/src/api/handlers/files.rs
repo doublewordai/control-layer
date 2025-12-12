@@ -15,6 +15,7 @@ use crate::db::{
     handlers::api_keys::ApiKeys,
     handlers::deployments::{DeploymentFilter, Deployments},
     handlers::repository::Repository,
+    handlers::tariffs::Tariffs,
     models::api_keys::ApiKeyPurpose,
     models::deployments::ModelStatus,
 };
@@ -25,6 +26,7 @@ use axum::{
     extract::{Multipart, Path, Query, State},
     http::StatusCode,
 };
+use chrono::Utc;
 use fusillade::Storage;
 use futures::StreamExt;
 use futures::stream::Stream;
@@ -995,6 +997,10 @@ pub async fn get_file_cost_estimate(
     let mut total_cost = Decimal::ZERO;
     let mut model_breakdowns = Vec::new();
 
+    // Create tariffs repository once for all pricing lookups
+    let mut tariffs_repo = Tariffs::new(&mut conn);
+    let current_time = Utc::now();
+
     for (model_alias, (request_count, input_tokens)) in model_stats {
         // Look up the deployment and historical average
         let (deployment_opt, avg_output_tokens, model_type) = model_info
@@ -1015,18 +1021,16 @@ pub async fn get_file_cost_estimate(
         };
 
         let cost = if let Some(deployment) = deployment_opt {
-            // Get pricing if available
-            if let Some(pricing) = deployment.pricing {
-                if let Some(upstream) = pricing.upstream {
-                    let input_price = upstream.input_price_per_token.unwrap_or(Decimal::ZERO);
-                    let output_price = upstream.output_price_per_token.unwrap_or(Decimal::ZERO);
+            // Look up tariff pricing for Batch API key purpose, with fallback to realtime
+            let pricing_result = tariffs_repo
+                .get_pricing_at_timestamp_with_fallback(deployment.id, Some(&ApiKeyPurpose::Batch), &ApiKeyPurpose::Realtime, current_time)
+                .await
+                .map_err(Error::Database)?;
 
-                    let input_cost = Decimal::from(input_tokens) * input_price;
-                    let output_cost = Decimal::from(estimated_output_tokens) * output_price;
-                    input_cost + output_cost
-                } else {
-                    Decimal::ZERO
-                }
+            if let Some((input_price, output_price)) = pricing_result {
+                let input_cost = Decimal::from(input_tokens) * input_price;
+                let output_cost = Decimal::from(estimated_output_tokens) * output_price;
+                input_cost + output_cost
             } else {
                 Decimal::ZERO
             }
@@ -1065,8 +1069,7 @@ pub async fn get_file_cost_estimate(
 mod tests {
     use crate::api::models::files::FileResponse;
     use crate::api::models::users::Role;
-    use crate::db::handlers::deployments::Deployments;
-    use crate::db::handlers::repository::Repository;
+    use crate::db::models::api_keys::ApiKeyPurpose;
     use crate::test_utils::*;
     use sqlx::PgPool;
 
@@ -1430,35 +1433,38 @@ mod tests {
         let deployment2 = create_test_deployment(&pool, user.id, "gpt-3.5-model", "gpt-3.5").await;
         add_deployment_to_group(&pool, deployment2.id, group.id, user.id).await;
 
-        // Set pricing for the models using the repository
+        // Set pricing for the models using tariffs
+        use crate::db::handlers::Tariffs;
+        use crate::db::models::tariffs::TariffCreateDBRequest;
+
         let mut conn = pool.acquire().await.unwrap();
-        let mut deployment_repo = Deployments::new(&mut conn);
+        let mut tariffs_repo = Tariffs::new(&mut conn);
 
-        use crate::db::models::deployments::{DeploymentUpdateDBRequest, ModelPricingUpdate, TokenPricingUpdate};
+        // Create batch tariff for gpt-4
+        tariffs_repo
+            .create(&TariffCreateDBRequest {
+                deployed_model_id: deployment1.id,
+                name: "batch".to_string(),
+                input_price_per_token: Decimal::from_str("0.00003").unwrap(), // $0.03 per 1K tokens
+                output_price_per_token: Decimal::from_str("0.00006").unwrap(), // $0.06 per 1K tokens
+                api_key_purpose: Some(ApiKeyPurpose::Batch),
+                valid_from: None,
+            })
+            .await
+            .unwrap();
 
-        // Update gpt-4 pricing
-        let pricing_update1 = DeploymentUpdateDBRequest::builder()
-            .maybe_pricing(Some(ModelPricingUpdate {
-                upstream: Some(TokenPricingUpdate {
-                    input_price_per_token: Some(Some(Decimal::from_str("0.00003").unwrap())), // $0.03 per 1K tokens
-                    output_price_per_token: Some(Some(Decimal::from_str("0.00006").unwrap())), // $0.06 per 1K tokens
-                }),
-                downstream: None,
-            }))
-            .build();
-        deployment_repo.update(deployment1.id, &pricing_update1).await.unwrap();
-
-        // Update gpt-3.5 pricing
-        let pricing_update2 = DeploymentUpdateDBRequest::builder()
-            .maybe_pricing(Some(ModelPricingUpdate {
-                upstream: Some(TokenPricingUpdate {
-                    input_price_per_token: Some(Some(Decimal::from_str("0.000001").unwrap())), // $0.001 per 1K tokens
-                    output_price_per_token: Some(Some(Decimal::from_str("0.000002").unwrap())), // $0.002 per 1K tokens
-                }),
-                downstream: None,
-            }))
-            .build();
-        deployment_repo.update(deployment2.id, &pricing_update2).await.unwrap();
+        // Create batch tariff for gpt-3.5
+        tariffs_repo
+            .create(&TariffCreateDBRequest {
+                deployed_model_id: deployment2.id,
+                name: "batch".to_string(),
+                input_price_per_token: Decimal::from_str("0.000001").unwrap(), // $0.001 per 1K tokens
+                output_price_per_token: Decimal::from_str("0.000002").unwrap(), // $0.002 per 1K tokens
+                api_key_purpose: Some(ApiKeyPurpose::Batch),
+                valid_from: None,
+            })
+            .await
+            .unwrap();
 
         drop(conn);
 

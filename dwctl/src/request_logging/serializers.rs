@@ -385,16 +385,13 @@ pub async fn store_analytics_record(
             let mut conn = pool.acquire().await?;
             let mut tariffs_repo = Tariffs::new(&mut conn);
 
-            // Map api_key_purpose enum to string for tariff lookup
-            let preferred_purpose = api_key_purpose.as_ref().map(|purpose| match purpose {
-                crate::db::models::api_keys::ApiKeyPurpose::Realtime => "realtime",
-                crate::db::models::api_keys::ApiKeyPurpose::Batch => "batch",
-                crate::db::models::api_keys::ApiKeyPurpose::Playground => "playground",
-                crate::db::models::api_keys::ApiKeyPurpose::Platform => "platform",
-            });
-
             let tariff_pricing = tariffs_repo
-                .get_pricing_at_timestamp_with_fallback(model_info.model_id, preferred_purpose, "realtime", metrics.timestamp)
+                .get_pricing_at_timestamp_with_fallback(
+                    model_info.model_id,
+                    api_key_purpose.as_ref(),
+                    &crate::db::models::api_keys::ApiKeyPurpose::Realtime,
+                    metrics.timestamp,
+                )
                 .await?;
 
             let provider_name = model_info
@@ -406,7 +403,7 @@ pub async fn store_analytics_record(
 
             warn!(
                 "Tariff pricing for model '{}' with purpose '{:?}': {:?}",
-                model_name, preferred_purpose, tariff_pricing
+                model_name, api_key_purpose, tariff_pricing
             );
 
             (tariff_pricing, provider_name)
