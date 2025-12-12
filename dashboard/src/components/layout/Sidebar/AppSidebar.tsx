@@ -1,7 +1,6 @@
 import { NavLink, Link, useNavigate } from "react-router-dom";
 import {
   Settings,
-  Activity,
   Box,
   Layers,
   Users,
@@ -13,6 +12,7 @@ import {
   LogOut,
   ChevronUp,
   DollarSign,
+  BarChart3,
 } from "lucide-react";
 import {
   useUser,
@@ -71,7 +71,7 @@ export function AppSidebar() {
     { path: "/endpoints", icon: Server, label: "Endpoints" },
     { path: "/playground", icon: Play, label: "Playground" },
     { path: "/batches", icon: Box, label: "Batches", demoOnly: false },
-    { path: "/analytics", icon: Activity, label: "Traffic" },
+    { path: "/analytics", icon: BarChart3, label: "Analytics" },
     { path: "/users-groups", icon: Users, label: "Users & Groups" },
     { path: "/api-keys", icon: Key, label: "API Keys" },
     { path: "/system", icon: Settings, label: "System" },
@@ -151,10 +151,10 @@ export function AppSidebar() {
                     <UserAvatar user={currentUser} size="lg" />
                     <div className="flex-1 text-left min-w-0">
                       <p className="text-sm font-medium truncate">
-                        {currentUser.email}
+                        {currentUser.display_name || currentUser.username}
                       </p>
                       <p className="text-xs text-muted-foreground truncate">
-                        {currentUser.display_name || currentUser.username}
+                        {currentUser.email}
                       </p>
                     </div>
                     <ChevronUp className="w-4 h-4 text-muted-foreground" />
@@ -245,12 +245,15 @@ export function AppLayout({ children }: { children: React.ReactNode }) {
                     </span>
                   </div>
                   <div className="hidden lg:block w-px h-4 bg-border"></div>
-                  <div className="flex items-center gap-2 text-sm">
+                  <Link
+                    to="/cost-management"
+                    className="flex items-center gap-2 text-sm hover:text-primary transition-colors"
+                  >
                     <span className="text-gray-600">Balance:</span>
                     <span className="font-semibold text-gray-900">
                       {formatDollars(currentBalance)}
                     </span>
-                  </div>
+                  </Link>
                   <div className="hidden md:block w-px h-4 bg-border"></div>
                 </>
               )}

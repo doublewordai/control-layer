@@ -93,3 +93,27 @@ pub struct FileListResponse {
 pub enum ListObject {
     List,
 }
+
+/// Per-model cost breakdown
+#[derive(Debug, Serialize, Deserialize, ToSchema)]
+pub struct ModelCostBreakdown {
+    pub model: String,
+    pub request_count: i64,
+    pub estimated_input_tokens: i64,
+    pub estimated_output_tokens: i64,
+    /// Cost as string to preserve decimal precision
+    pub estimated_cost: String,
+}
+
+/// Response for file cost estimation
+#[derive(Debug, Serialize, Deserialize, ToSchema)]
+pub struct FileCostEstimate {
+    pub file_id: String,
+    pub total_requests: i64,
+    pub total_estimated_input_tokens: i64,
+    pub total_estimated_output_tokens: i64,
+    /// Total cost as string to preserve decimal precision
+    pub total_estimated_cost: String,
+    /// Per-model breakdown
+    pub models: Vec<ModelCostBreakdown>,
+}

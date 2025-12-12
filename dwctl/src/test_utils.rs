@@ -350,3 +350,39 @@ pub fn require_admin(user: CurrentUser) -> Result<CurrentUser, Error> {
         })
     }
 }
+
+pub async fn create_test_endpoint(pool: &PgPool, name: &str, created_by: UserId) -> uuid::Uuid {
+    let endpoint_id = uuid::Uuid::new_v4();
+    sqlx::query!(
+        r#"
+        INSERT INTO inference_endpoints (id, name, url, api_key, created_by)
+        VALUES ($1, $2, 'http://localhost:8080', NULL, $3)
+        "#,
+        endpoint_id,
+        name,
+        created_by
+    )
+    .execute(pool)
+    .await
+    .expect("Failed to create test endpoint");
+    endpoint_id
+}
+
+pub async fn create_test_model(pool: &PgPool, model_name: &str, alias: &str, endpoint_id: uuid::Uuid, created_by: UserId) -> uuid::Uuid {
+    let deployment_id = uuid::Uuid::new_v4();
+    sqlx::query!(
+        r#"
+        INSERT INTO deployed_models (id, model_name, alias, hosted_on, created_by, deleted)
+        VALUES ($1, $2, $3, $4, $5, false)
+        "#,
+        deployment_id,
+        model_name,
+        alias,
+        endpoint_id,
+        created_by
+    )
+    .execute(pool)
+    .await
+    .expect("Failed to create test model");
+    deployment_id
+}

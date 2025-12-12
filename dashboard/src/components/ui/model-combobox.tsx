@@ -16,8 +16,8 @@ import { Popover, PopoverContent, PopoverTrigger } from "./popover";
 import type { Model, ModelsQuery } from "../../api/control-layer/types";
 
 interface ModelComboboxProps {
-  value?: string; // model alias
-  onValueChange?: (value: string) => void;
+  value: Model | null;
+  onValueChange?: (value: Model) => void;
   placeholder?: React.ReactNode;
   searchPlaceholder?: string;
   emptyMessage?: string;
@@ -42,7 +42,7 @@ export function ModelCombobox({
 
   const { data: modelsData } = useModels({
     search: debouncedSearch || undefined,
-    limit: 50,
+    limit: 20,
     ...queryOptions,
   });
 
@@ -51,7 +51,7 @@ export function ModelCombobox({
     return filterFn ? allModels.filter(filterFn) : allModels;
   }, [modelsData, filterFn]);
 
-  const selectedModel = models.find((model) => model.alias === value);
+  const selectedModel = models.find((model) => model.id === value?.id);
 
   return (
     <Popover open={open} onOpenChange={setOpen}>
@@ -87,7 +87,7 @@ export function ModelCombobox({
                   key={model.id}
                   value={model.alias}
                   onSelect={() => {
-                    onValueChange?.(model.alias);
+                    onValueChange?.(model);
                     setOpen(false);
                   }}
                 >

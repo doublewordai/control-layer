@@ -1,4 +1,4 @@
-import { Activity, X, BarChart3, List, ArrowLeft } from "lucide-react";
+import { Activity, X, List, ArrowLeft, LayoutGrid } from "lucide-react";
 import { useState, useEffect } from "react";
 import { useSearchParams, useNavigate } from "react-router-dom";
 import {
@@ -7,17 +7,11 @@ import {
 } from "../../../../api/control-layer";
 import { transformRequestResponsePairs } from "../../../../utils";
 import { useAuthorization } from "../../../../utils/authorization";
+import { useServerPagination } from "../../../../hooks/useServerPagination";
 import { DataTable } from "../../../ui/data-table";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "../../../ui/tabs";
 import { Combobox } from "../../../ui/combobox";
 import { DateTimeRangeSelector } from "../../../ui/date-time-range-selector";
-import {
-  Select,
-  SelectContent,
-  SelectItem,
-  SelectTrigger,
-  SelectValue,
-} from "../../../ui/select";
 import { RequestsAnalytics } from "../RequestsAnalytics";
 import { createRequestColumns } from "./columns";
 
@@ -31,13 +25,20 @@ export function Requests() {
   // Initialize with last 24 hours as default
   const getDefaultDateRange = () => {
     const now = new Date();
-    const from = new Date(now.getTime() - 24 * 60 * 60 * 1000);
+    const from = new Date(now.getTime() - 31 * 24 * 60 * 60 * 1000);
     return { from, to: now };
   };
   const [dateRange, setDateRange] = useState<
     { from: Date; to: Date } | undefined
   >(getDefaultDateRange());
-  const [recordLimit, setRecordLimit] = useState<number>(50);
+
+  // Server-side pagination with hasMore detection
+  const pagination = useServerPagination({
+    defaultPageSize: 25,
+  });
+
+  // Query for limit + 1 to detect if there are more items
+  const queryLimit = pagination.pageSize + 1;
 
   // Check user permissions
   const hasAnalyticsPermission = userRoles.some(
@@ -90,12 +91,17 @@ export function Requests() {
 
   // Fetch requests data only if user has requests permission AND requests tab is active
   // MSW will intercept these calls in demo mode
+  // Query for limit + 1 to detect if there are more pages
   const {
     data: requestsResponse,
     isLoading: requestsLoading,
     error: requestsError,
   } = useRequests(
-    { limit: recordLimit, order_desc: true },
+    {
+      skip: pagination.queryParams.skip,
+      limit: queryLimit,
+      order_desc: true,
+    },
     { enabled: hasRequestsPermission && activeTab === "requests" },
     dateRange,
   );
@@ -109,14 +115,26 @@ export function Requests() {
   const error = requestsError;
 
   // Transform backend data to frontend format
-  const allRequests = requestsResponse
+  const allRequestsRaw = requestsResponse
     ? transformRequestResponsePairs(requestsResponse.requests)
     : [];
+
+  // Check if there are more items (we queried for limit + 1)
+  const hasMore = allRequestsRaw.length > pagination.pageSize;
+
+  // Remove the extra item if we got it
+  const allRequests = hasMore
+    ? allRequestsRaw.slice(0, pagination.pageSize)
+    : allRequestsRaw;
 
   // Filter requests by selected model
   const requests = selectedModel
     ? allRequests.filter((request) => request.model === selectedModel)
     : allRequests;
+
+  // Calculate pagination state
+  const hasPrevPage = pagination.page > 1;
+  const hasNextPage = hasMore;
 
   const columns = createRequestColumns();
 
@@ -126,10 +144,10 @@ export function Requests() {
       <div className="py-4 px-6">
         <div className="mb-4">
           <h1 className="text-3xl font-bold text-doubleword-neutral-900">
-            Traffic
+            Analytics
           </h1>
           <p className="text-doubleword-neutral-600 mt-2">
-            Loading traffic data...
+            Loading analytics data...
           </p>
         </div>
         <div className="flex items-center justify-center h-64">
@@ -152,7 +170,7 @@ export function Requests() {
       <div className="py-4 px-6">
         <div className="mb-4">
           <h1 className="text-3xl font-bold text-doubleword-neutral-900">
-            Traffic
+            Analytics
           </h1>
         </div>
         <div className="flex items-center justify-center h-64">
@@ -180,7 +198,7 @@ export function Requests() {
       <div className="py-4 px-6">
         <div className="mb-4">
           <h1 className="text-3xl font-bold text-doubleword-neutral-900">
-            Traffic
+            Analytics
           </h1>
         </div>
         <div className="flex items-center justify-center h-64">
@@ -192,7 +210,7 @@ export function Requests() {
               Access Denied
             </h3>
             <p className="text-red-600">
-              You don't have permission to view traffic data.
+              You don't have permission to view analytics data.
             </p>
           </div>
         </div>
@@ -222,7 +240,7 @@ export function Requests() {
             )}
             <div>
               <h1 className="text-3xl font-bold text-doubleword-neutral-900">
-                Traffic
+                {`${activeTab.slice(0, 1).toUpperCase()}${activeTab.slice(1)}`}
               </h1>
             </div>
           </div>
@@ -270,8 +288,8 @@ export function Requests() {
                   value="analytics"
                   className="flex items-center gap-2 flex-1 sm:flex-initial"
                 >
-                  <BarChart3 className="h-4 w-4" />
-                  Analytics
+                  <LayoutGrid className="h-4 w-4" />
+                  Dashboard
                 </TabsTrigger>
               )}
               {hasRequestsPermission && (
@@ -309,29 +327,24 @@ export function Requests() {
                 data={requests}
                 searchPlaceholder="Search requests and responses..."
                 showColumnToggle={true}
-                pageSize={10}
                 rowHeight="40px"
                 initialColumnVisibility={{ timestamp: false }}
-                headerActions={
-                  <Select
-                    value={recordLimit.toString()}
-                    onValueChange={(value) =>
-                      setRecordLimit(parseInt(value, 10))
-                    }
-                  >
-                    <SelectTrigger className="w-[130px] h-9">
-                      <SelectValue placeholder="Records" />
-                    </SelectTrigger>
-                    <SelectContent>
-                      <SelectItem value="10">10 records</SelectItem>
-                      <SelectItem value="25">25 records</SelectItem>
-                      <SelectItem value="50">50 records</SelectItem>
-                      <SelectItem value="100">100 records</SelectItem>
-                      <SelectItem value="200">200 records</SelectItem>
-                      <SelectItem value="500">500 records</SelectItem>
-                    </SelectContent>
-                  </Select>
-                }
+                paginationMode="server-cursor"
+                serverPagination={{
+                  page: pagination.page,
+                  pageSize: pagination.pageSize,
+                  onNextPage: () =>
+                    pagination.handlePageChange(pagination.page + 1),
+                  onPrevPage: () =>
+                    pagination.handlePageChange(pagination.page - 1),
+                  onFirstPage: () => pagination.handlePageChange(1),
+                  onPageSizeChange: pagination.handlePageSizeChange,
+                  hasNextPage: hasNextPage,
+                  hasPrevPage: hasPrevPage,
+                }}
+                showPageSizeSelector={true}
+                pageSizeOptions={[10, 25, 50]}
+                isLoading={requestsLoading}
               />
             )}
           </TabsContent>

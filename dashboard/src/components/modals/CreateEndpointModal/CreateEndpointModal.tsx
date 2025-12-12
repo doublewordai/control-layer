@@ -1004,6 +1004,8 @@ export const CreateEndpointModal: React.FC<CreateEndpointModalProps> = ({
                                 placeholder="https://api.example.com"
                                 {...field}
                                 className="pr-10"
+                                type="url"
+                                autoComplete="url"
                                 onChange={(e) => {
                                   field.onChange(e);
 
@@ -1203,6 +1205,7 @@ export const CreateEndpointModal: React.FC<CreateEndpointModalProps> = ({
                             <div className="relative">
                               <Input
                                 type={showApiKey ? "text" : "password"}
+                                autoComplete="new-password"
                                 placeholder="sk-..."
                                 {...field}
                                 className="pr-10"

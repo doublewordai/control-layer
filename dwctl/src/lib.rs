@@ -777,7 +777,7 @@ pub async fn build_router(state: &mut AppState, onwards_router: Router) -> anyho
                 .route("/files", get(api::handlers::files::list_files))
                 .route("/files/{file_id}", get(api::handlers::files::get_file))
                 .route("/files/{file_id}/content", get(api::handlers::files::get_file_content))
-                .route("/files/{file_id}", delete(api::handlers::files::delete_file))
+                .route("/files/{file_id}/cost-estimate", get(api::handlers::files::get_file_cost_estimate))
                 // Batches management
                 .route("/batches", post(api::handlers::batches::create_batch))
                 .route("/batches", get(api::handlers::batches::list_batches))
@@ -1864,6 +1864,15 @@ mod test {
             404,
             "Should return 404 for non-existent model"
         );
+
+        // Cleanup: Delete the group before test ends to avoid unique constraint violations
+        // when tests run multiple times (especially in CI with soft-deleted users)
+        let delete_group_response = server
+            .delete(&format!("/admin/api/v1/groups/{}", group.id))
+            .add_header(&admin_headers[0].0, &admin_headers[0].1)
+            .add_header(&admin_headers[1].0, &admin_headers[1].1)
+            .await;
+        assert_eq!(delete_group_response.status_code(), 204, "Should delete test group");
 
         // Gracefully shutdown background services to avoid slow test cleanup
         bg_services.shutdown().await;

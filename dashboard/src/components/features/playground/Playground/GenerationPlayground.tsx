@@ -30,6 +30,7 @@ import {
   TooltipProvider,
   TooltipTrigger,
 } from "../../../ui/tooltip";
+import { AlertBox } from "@/components/ui/alert-box";
 
 interface ImageContent {
   type: "image_url";
@@ -326,7 +327,15 @@ const GenerationPlayground: React.FC<GenerationPlaygroundProps> = ({
 
                             return className ? (
                               <div className="relative group my-4">
-                                <CodeBlock language={language as "python" | "javascript" | "bash" | "json"}>
+                                <CodeBlock
+                                  language={
+                                    language as
+                                      | "python"
+                                      | "javascript"
+                                      | "bash"
+                                      | "json"
+                                  }
+                                >
                                   {codeString}
                                 </CodeBlock>
                                 <button
@@ -577,7 +586,15 @@ const GenerationPlayground: React.FC<GenerationPlaygroundProps> = ({
 
                         return className ? (
                           <div className="relative group my-4">
-                            <CodeBlock language={language as "python" | "javascript" | "bash" | "json"}>
+                            <CodeBlock
+                              language={
+                                language as
+                                  | "python"
+                                  | "javascript"
+                                  | "bash"
+                                  | "json"
+                              }
+                            >
                               {codeString}
                             </CodeBlock>
                             <button
@@ -657,12 +674,7 @@ const GenerationPlayground: React.FC<GenerationPlaygroundProps> = ({
               </div>
             )}
 
-            {error && (
-              <div className="bg-red-50 border border-red-200 text-red-700 rounded-lg p-4 w-full">
-                <p className="font-medium text-sm">Error</p>
-                <p className="text-sm">{error}</p>
-              </div>
-            )}
+            <AlertBox variant="error">{error}</AlertBox>
           </div>
           <div ref={messagesEndReference} />
         </div>
@@ -883,7 +895,7 @@ const GenerationPlayground: React.FC<GenerationPlaygroundProps> = ({
       )}
 
       {/* Input Area */}
-      <div className="bg-white border-t border-gray-200 px-8 py-4 flex-shrink-0">
+      <div className="bg-white border-t border-gray-200 px-8 py-4 shrink-0">
         <div className="max-w-4xl mx-auto">
           {/* Image Preview */}
           {uploadedImages.length > 0 && (

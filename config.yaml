@@ -122,7 +122,7 @@ auth:
   #   - BatchAPIUser: Can manage files and batches for batch processing
   # Example: To give all new users request viewing capabilities:
   #   default_user_roles: ["StandardUser", "RequestViewer"]
-  default_user_roles: ["StandardUser"]
+  default_user_roles: ["StandardUser", "BatchAPIUser"]
 
   # Security settings
   security:
@@ -210,4 +210,3 @@ background_services:
   # When disabled, all instances run as leader (useful for single-instance deployments)
   leader_election:
     enabled: true # Default: true
-
