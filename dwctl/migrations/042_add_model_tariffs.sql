@@ -9,7 +9,7 @@ CREATE TABLE model_tariffs (
     name VARCHAR(255) NOT NULL,
     input_price_per_token DECIMAL(12, 8) NOT NULL DEFAULT 0,
     output_price_per_token DECIMAL(12, 8) NOT NULL DEFAULT 0,
-    valid_from TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    valid_from TIMESTAMPTZ NOT NULL DEFAULT clock_timestamp(),
     valid_until TIMESTAMPTZ,
     api_key_purpose VARCHAR(50)
 );
