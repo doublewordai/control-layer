@@ -325,6 +325,15 @@ pub async fn update_user(
         });
     }
 
+    // If user is updating their own account, they cannot change roles
+    if can_update_own_user && !can_update_all_users && user_data.roles.is_some() {
+        return Err(Error::InsufficientPermissions {
+            required: Permission::Allow(Resource::Users, Operation::UpdateAll),
+            action: Operation::UpdateAll,
+            resource: "user roles".to_string(),
+        });
+    }
+
     let mut conn = state.db.acquire().await.expect("Failed to acquire database connection");
 
     let mut repo = Users::new(&mut conn);

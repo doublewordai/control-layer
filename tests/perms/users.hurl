@@ -7,17 +7,18 @@
 # - StandardUser: Can only read their own user data
 #   - Cannot list users (no Users::ReadAll)
 #   - Can read own user with /users/{id} or /users/current (has Users::ReadOwn)
+#   - Can update own profile (display_name, avatar_url) but NOT roles (has Users::UpdateOwn)
 #   - Can see own credit balance with include=billing (has Credits::ReadOwn)
-#   - Cannot create, update, or delete users
+#   - Cannot create, update roles, or delete users
 # - PlatformManager: Full access to user management
 #   - Can list all users (has Users::ReadAll)
 #   - Can read any user (has Users::ReadAll)
 #   - Can see any user's credits with include=billing (has Credits::ReadAll)
-#   - Can create, update, and delete users
+#   - Can create, update (including roles), and delete users
 # =============================================================================
 
 # -----------------------------------------------------------------------------
-# Setup: Get user IDs and grant roles
+# Setup: Get user IDs and create test PlatformManager
 # -----------------------------------------------------------------------------
 
 # Get user IDs
@@ -42,14 +43,28 @@ HTTP 200
 [Captures]
 user2_id: jsonpath "$.id"
 
-# Temporarily grant user2 PlatformManager role for testing
-PATCH http://localhost:3001/admin/api/v1/users/{{user2_id}}
+# Create a dedicated PlatformManager for this test suite
+POST http://localhost:3001/admin/api/v1/users
 [Cookies]
 dwctl_session: {{admin_jwt}}
 {
+  "username": "test-platform-manager",
+  "email": "pm@test.example.com",
+  "display_name": "Test Platform Manager",
   "roles": ["PlatformManager"]
 }
+HTTP 201
+[Captures]
+pm_user_id: jsonpath "$.id"
+
+# Create JWT for the PlatformManager user
+POST http://localhost:3001/admin/api/v1/auth/admin-login
+{
+  "user_id": "{{pm_user_id}}"
+}
 HTTP 200
+[Captures]
+pm_jwt: cookie "dwctl_session"
 
 # Grant some credits to users for billing tests
 POST http://localhost:3001/admin/api/v1/transactions
@@ -68,10 +83,10 @@ POST http://localhost:3001/admin/api/v1/transactions
 [Cookies]
 dwctl_session: {{admin_jwt}}
 {
-  "user_id": "{{user2_id}}",
+  "user_id": "{{pm_user_id}}",
   "transaction_type": "admin_grant",
   "amount": "200.0",
-  "source_id": "test-grant-user2",
+  "source_id": "test-grant-pm",
   "description": "Credits for testing"
 }
 HTTP 201
@@ -118,50 +133,50 @@ HTTP 403
 # PlatformManager CAN list users (has Users::ReadAll)
 # -----------------------------------------------------------------------------
 
-# User2 (PlatformManager) lists users - should succeed
+# PlatformManager lists users - should succeed
 GET http://localhost:3001/admin/api/v1/users
 [Cookies]
-dwctl_session: {{user2_jwt}}
+dwctl_session: {{pm_jwt}}
 HTTP 200
 [Asserts]
 jsonpath "$.data" isCollection
 jsonpath "$.total_count" exists
 # Should see multiple users in the system
 jsonpath "$.data[*].id" contains "{{user1_id}}"
-jsonpath "$.data[*].id" contains "{{user2_id}}"
+jsonpath "$.data[*].id" contains "{{pm_user_id}}"
 
-# User2 lists users with pagination - should succeed
+# PlatformManager lists users with pagination - should succeed
 GET http://localhost:3001/admin/api/v1/users?skip=0&limit=5
 [Cookies]
-dwctl_session: {{user2_jwt}}
+dwctl_session: {{pm_jwt}}
 HTTP 200
 [Asserts]
 jsonpath "$.data" isCollection
 
-# User2 lists users with include=groups - should succeed
+# PlatformManager lists users with include=groups - should succeed
 GET http://localhost:3001/admin/api/v1/users?include=groups
 [Cookies]
-dwctl_session: {{user2_jwt}}
+dwctl_session: {{pm_jwt}}
 HTTP 200
 [Asserts]
 jsonpath "$.data" isCollection
 # Groups may or may not be present, but should not error
 
-# User2 lists users with include=billing - should succeed (has Credits::ReadAll)
+# PlatformManager lists users with include=billing - should succeed (has Credits::ReadAll)
 GET http://localhost:3001/admin/api/v1/users?include=billing
 [Cookies]
-dwctl_session: {{user2_jwt}}
+dwctl_session: {{pm_jwt}}
 HTTP 200
 [Asserts]
 jsonpath "$.data" isCollection
 # Should see credit_balance fields for users with credits
 jsonpath "$.data[?(@.id == '{{user1_id}}')].credit_balance" nth 0 exists
-jsonpath "$.data[?(@.id == '{{user2_id}}')].credit_balance" nth 0 exists
+jsonpath "$.data[?(@.id == '{{pm_user_id}}')].credit_balance" nth 0 exists
 
-# User2 lists users with multiple includes - should succeed
+# PlatformManager lists users with multiple includes - should succeed
 GET http://localhost:3001/admin/api/v1/users?include=groups,billing
 [Cookies]
-dwctl_session: {{user2_jwt}}
+dwctl_session: {{pm_jwt}}
 HTTP 200
 [Asserts]
 jsonpath "$.data" isCollection
@@ -229,34 +244,34 @@ jsonpath "$.credit_balance" exists
 # PlatformManager can read ANY user (has Users::ReadAll)
 # -----------------------------------------------------------------------------
 
-# User2 (PlatformManager) gets user1's data - should succeed
+# PlatformManager gets user1's data - should succeed
 GET http://localhost:3001/admin/api/v1/users/{{user1_id}}
 [Cookies]
-dwctl_session: {{user2_jwt}}
+dwctl_session: {{pm_jwt}}
 HTTP 200
 [Asserts]
 jsonpath "$.id" == "{{user1_id}}"
 
-# User2 gets their own data - should succeed
-GET http://localhost:3001/admin/api/v1/users/{{user2_id}}
+# PlatformManager gets their own data - should succeed
+GET http://localhost:3001/admin/api/v1/users/{{pm_user_id}}
 [Cookies]
-dwctl_session: {{user2_jwt}}
+dwctl_session: {{pm_jwt}}
 HTTP 200
 [Asserts]
-jsonpath "$.id" == "{{user2_id}}"
+jsonpath "$.id" == "{{pm_user_id}}"
 
-# User2 uses /users/current - should succeed
+# PlatformManager uses /users/current - should succeed
 GET http://localhost:3001/admin/api/v1/users/current
 [Cookies]
-dwctl_session: {{user2_jwt}}
+dwctl_session: {{pm_jwt}}
 HTTP 200
 [Asserts]
-jsonpath "$.id" == "{{user2_id}}"
+jsonpath "$.id" == "{{pm_user_id}}"
 
-# User2 gets admin's data - should succeed
+# PlatformManager gets admin's data - should succeed
 GET http://localhost:3001/admin/api/v1/users/{{admin_user_id}}
 [Cookies]
-dwctl_session: {{user2_jwt}}
+dwctl_session: {{pm_jwt}}
 HTTP 200
 [Asserts]
 jsonpath "$.id" == "{{admin_user_id}}"
@@ -265,29 +280,29 @@ jsonpath "$.id" == "{{admin_user_id}}"
 # PlatformManager can see ANY user's credits (has Credits::ReadAll)
 # -----------------------------------------------------------------------------
 
-# User2 gets user1's data with include=billing - should succeed
+# PlatformManager gets user1's data with include=billing - should succeed
 GET http://localhost:3001/admin/api/v1/users/{{user1_id}}?include=billing
 [Cookies]
-dwctl_session: {{user2_jwt}}
+dwctl_session: {{pm_jwt}}
 HTTP 200
 [Asserts]
 jsonpath "$.id" == "{{user1_id}}"
 jsonpath "$.credit_balance" exists
 jsonpath "$.credit_balance" == 100.0
 
-# User2 gets their own data with include=billing - should succeed
-GET http://localhost:3001/admin/api/v1/users/{{user2_id}}?include=billing
+# PlatformManager gets their own data with include=billing - should succeed
+GET http://localhost:3001/admin/api/v1/users/{{pm_user_id}}?include=billing
 [Cookies]
-dwctl_session: {{user2_jwt}}
+dwctl_session: {{pm_jwt}}
 HTTP 200
 [Asserts]
 jsonpath "$.credit_balance" exists
 jsonpath "$.credit_balance" == 200.0
 
-# User2 gets admin's data with include=billing - should succeed
+# PlatformManager gets admin's data with include=billing - should succeed
 GET http://localhost:3001/admin/api/v1/users/{{admin_user_id}}?include=billing
 [Cookies]
-dwctl_session: {{user2_jwt}}
+dwctl_session: {{pm_jwt}}
 HTTP 200
 [Asserts]
 jsonpath "$.id" == "{{admin_user_id}}"
@@ -327,10 +342,10 @@ HTTP 403
 # PlatformManager CAN create users (has Users::CreateAll)
 # -----------------------------------------------------------------------------
 
-# User2 (PlatformManager) creates a new standard user - should succeed
+# PlatformManager creates a new standard user - should succeed
 POST http://localhost:3001/admin/api/v1/users
 [Cookies]
-dwctl_session: {{user2_jwt}}
+dwctl_session: {{pm_jwt}}
 {
   "username": "created-user-1",
   "email": "createduser1@example.com",
@@ -346,10 +361,10 @@ jsonpath "$.roles" contains "StandardUser"
 [Captures]
 created_user1_id: jsonpath "$.id"
 
-# User2 creates another user with multiple roles - should succeed
+# PlatformManager creates another user with multiple roles - should succeed
 POST http://localhost:3001/admin/api/v1/users
 [Cookies]
-dwctl_session: {{user2_jwt}}
+dwctl_session: {{pm_jwt}}
 {
   "username": "created-user-2",
   "email": "createduser2@example.com",
@@ -364,30 +379,83 @@ jsonpath "$.roles" contains "BatchAPIUser"
 created_user2_id: jsonpath "$.id"
 
 # =============================================================================
-# User Update (PATCH /users/{user_id}) - Requires Users::UpdateAll
+# User Update (PATCH /users/{user_id})
 # =============================================================================
 
 # -----------------------------------------------------------------------------
-# StandardUser CANNOT update users (even themselves)
+# StandardUser CAN update their own profile (display_name, avatar_url)
 # -----------------------------------------------------------------------------
 
-# User1 tries to update themselves - should be forbidden
+# User1 updates their own display name - should succeed
 PATCH http://localhost:3001/admin/api/v1/users/{{user1_id}}
 [Cookies]
 dwctl_session: {{user_jwt}}
 {
-  "display_name": "User1 Updated"
+  "display_name": "User1 Updated Display Name"
+}
+HTTP 200
+[Asserts]
+jsonpath "$.display_name" == "User1 Updated Display Name"
+jsonpath "$.roles" contains "StandardUser"
+
+# User1 updates their avatar URL - should succeed
+PATCH http://localhost:3001/admin/api/v1/users/{{user1_id}}
+[Cookies]
+dwctl_session: {{user_jwt}}
+{
+  "avatar_url": "https://example.com/new-avatar.jpg"
+}
+HTTP 200
+[Asserts]
+jsonpath "$.avatar_url" == "https://example.com/new-avatar.jpg"
+
+# -----------------------------------------------------------------------------
+# SECURITY: StandardUser CANNOT escalate their own privileges
+# -----------------------------------------------------------------------------
+
+# User1 tries to give themselves PlatformManager role - should be forbidden
+PATCH http://localhost:3001/admin/api/v1/users/{{user1_id}}
+[Cookies]
+dwctl_session: {{user_jwt}}
+{
+  "roles": ["StandardUser", "PlatformManager"]
+}
+HTTP 403
+[Asserts]
+# Response should indicate insufficient permissions to modify roles
+body contains "roles"
+
+# Verify user1 still only has StandardUser role
+GET http://localhost:3001/admin/api/v1/users/{{user1_id}}
+[Cookies]
+dwctl_session: {{user_jwt}}
+HTTP 200
+[Asserts]
+jsonpath "$.roles" count == 1
+jsonpath "$.roles" contains "StandardUser"
+jsonpath "$.roles" not contains "PlatformManager"
+
+# User1 tries to remove their StandardUser role - should be forbidden
+PATCH http://localhost:3001/admin/api/v1/users/{{user1_id}}
+[Cookies]
+dwctl_session: {{user_jwt}}
+{
+  "roles": []
 }
 HTTP 403
 
-# User1 tries to update their roles - should be forbidden
+# User1 tries to add BatchAPIUser role - should be forbidden
 PATCH http://localhost:3001/admin/api/v1/users/{{user1_id}}
 [Cookies]
 dwctl_session: {{user_jwt}}
 {
-  "roles": ["PlatformManager"]
+  "roles": ["StandardUser", "BatchAPIUser"]
 }
 HTTP 403
+
+# -----------------------------------------------------------------------------
+# StandardUser CANNOT update other users
+# -----------------------------------------------------------------------------
 
 # User1 tries to update another user - should be forbidden
 PATCH http://localhost:3001/admin/api/v1/users/{{user2_id}}
@@ -402,10 +470,10 @@ HTTP 403
 # PlatformManager CAN update any user (has Users::UpdateAll)
 # -----------------------------------------------------------------------------
 
-# User2 (PlatformManager) updates created user1 - should succeed
+# PlatformManager updates created user1 - should succeed
 PATCH http://localhost:3001/admin/api/v1/users/{{created_user1_id}}
 [Cookies]
-dwctl_session: {{user2_jwt}}
+dwctl_session: {{pm_jwt}}
 {
   "display_name": "Updated Display Name"
 }
@@ -414,10 +482,10 @@ HTTP 200
 jsonpath "$.id" == "{{created_user1_id}}"
 jsonpath "$.display_name" == "Updated Display Name"
 
-# User2 updates user roles - should succeed
+# PlatformManager updates user roles - should succeed
 PATCH http://localhost:3001/admin/api/v1/users/{{created_user2_id}}
 [Cookies]
-dwctl_session: {{user2_jwt}}
+dwctl_session: {{pm_jwt}}
 {
   "roles": ["StandardUser", "RequestViewer"]
 }
@@ -426,16 +494,16 @@ HTTP 200
 jsonpath "$.roles" contains "StandardUser"
 jsonpath "$.roles" contains "RequestViewer"
 
-# User2 updates their own user - should succeed
-PATCH http://localhost:3001/admin/api/v1/users/{{user2_id}}
+# PlatformManager updates their own user - should succeed
+PATCH http://localhost:3001/admin/api/v1/users/{{pm_user_id}}
 [Cookies]
-dwctl_session: {{user2_jwt}}
+dwctl_session: {{pm_jwt}}
 {
   "display_name": "PM Updated Self"
 }
 HTTP 200
 [Asserts]
-jsonpath "$.id" == "{{user2_id}}"
+jsonpath "$.id" == "{{pm_user_id}}"
 jsonpath "$.display_name" == "PM Updated Self"
 
 # =============================================================================
@@ -468,46 +536,42 @@ HTTP 403
 # PlatformManager CAN delete users (has Users::DeleteAll)
 # -----------------------------------------------------------------------------
 
-# User2 (PlatformManager) deletes created user1 - should succeed
+# PlatformManager deletes created user1 - should succeed
 DELETE http://localhost:3001/admin/api/v1/users/{{created_user1_id}}
 [Cookies]
-dwctl_session: {{user2_jwt}}
+dwctl_session: {{pm_jwt}}
 HTTP 204
 
 # Verify user is deleted - should get 404
 GET http://localhost:3001/admin/api/v1/users/{{created_user1_id}}
 [Cookies]
-dwctl_session: {{user2_jwt}}
+dwctl_session: {{pm_jwt}}
 HTTP 404
 
-# User2 deletes created user2 - should succeed
+# PlatformManager deletes created user2 - should succeed
 DELETE http://localhost:3001/admin/api/v1/users/{{created_user2_id}}
 [Cookies]
-dwctl_session: {{user2_jwt}}
+dwctl_session: {{pm_jwt}}
 HTTP 204
 
 # -----------------------------------------------------------------------------
 # PlatformManager CANNOT delete themselves
 # -----------------------------------------------------------------------------
 
-# User2 tries to delete themselves - should get 400 (cannot self-delete)
-DELETE http://localhost:3001/admin/api/v1/users/{{user2_id}}
+# PlatformManager tries to delete themselves - should get 400 (cannot self-delete)
+DELETE http://localhost:3001/admin/api/v1/users/{{pm_user_id}}
 [Cookies]
-dwctl_session: {{user2_jwt}}
+dwctl_session: {{pm_jwt}}
 HTTP 400
 
 # =============================================================================
-# Cleanup: Restore user2 to original roles
+# Cleanup: Delete the test PlatformManager user
 # =============================================================================
 
-# Restore user2 to StandardUser + BatchAPIUser
-PATCH http://localhost:3001/admin/api/v1/users/{{user2_id}}
+DELETE http://localhost:3001/admin/api/v1/users/{{pm_user_id}}
 [Cookies]
 dwctl_session: {{admin_jwt}}
-{
-  "roles": ["StandardUser", "BatchAPIUser"]
-}
-HTTP 200
+HTTP 204
 
 # =============================================================================
 # Cleanup Complete
