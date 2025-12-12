@@ -45,3 +45,4 @@ playwright/.cache/
 data/
 dwctl/static/
 .dwctl_data/
+.neon
