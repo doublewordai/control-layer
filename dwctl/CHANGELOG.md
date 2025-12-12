@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.15.1](https://github.com/doublewordai/control-layer/compare/v0.15.0...v0.15.1) (2025-12-12)
+
+
+### Bug Fixes
+
+* ability to specify models to seed and option to add them to everyone group ([#347](https://github.com/doublewordai/control-layer/issues/347)) ([4e7c9fd](https://github.com/doublewordai/control-layer/commit/4e7c9fd65a966294efcb173cbbef934a43bad9fa))
+
 ## [0.15.0](https://github.com/doublewordai/control-layer/compare/v0.14.0...v0.15.0) (2025-12-12)
 
 
