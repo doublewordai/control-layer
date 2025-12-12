@@ -288,8 +288,6 @@ pub fn role_has_permission(role: &Role, resource: Resource, operation: Operation
             matches!(
                 (resource, operation),
                 (Resource::Models, Operation::ReadOwn)            // Can read accessible models (filtered by groups)
-                    | (Resource::Endpoints, Operation::ReadOwn)   // Can see own endpoints
-                    | (Resource::Endpoints, Operation::ReadAll)   // Can see all endpoints
                     | (Resource::ApiKeys, Operation::ReadOwn)     // Can read own API keys
                     | (Resource::ApiKeys, Operation::CreateOwn)   // Can create own API keys
                     | (Resource::ApiKeys, Operation::UpdateOwn)   // Can update own API keys

@@ -49,7 +49,8 @@ services:
         - action: rebuild
           path: ./dashboard/Dockerfile
   mock-llm-server:
-    image: zerob13/mock-openai-api:latest
+    # pinned image of zerob13/mock-openai-api
+    image: sha256:bebf39045b6b960c9987f379445127a6591e86f59dedf7693b312f6e34d7152c
 
 volumes:
   dwctl_target:

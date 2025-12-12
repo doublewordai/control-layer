@@ -82,7 +82,7 @@ impl FetchModels for MockFetchModels {
 pub async fn list_inference_endpoints(
     State(state): State<AppState>,
     Query(query): Query<ListEndpointsQuery>,
-    _: RequiresPermission<resource::Endpoints, operation::ReadAll>, // Need at least read-own, users with ReadAll can see more
+    _: RequiresPermission<resource::Endpoints, operation::ReadAll>,
 ) -> Result<Json<Vec<InferenceEndpointResponse>>> {
     let mut conn = state.db.acquire().await.map_err(|e| Error::Database(e.into()))?;
     let mut repo = InferenceEndpoints::new(&mut conn);
