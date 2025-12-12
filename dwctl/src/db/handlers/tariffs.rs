@@ -140,10 +140,10 @@ impl<'c> Tariffs<'c> {
         timestamp: DateTime<Utc>,
     ) -> Result<Option<(Decimal, Decimal)>> {
         // Try preferred purpose first if specified
-        if let Some(preferred) = preferred_purpose {
-            if let Some(pricing) = self.get_pricing_at_timestamp(deployed_model_id, preferred, timestamp).await? {
-                return Ok(Some(pricing));
-            }
+        if let Some(preferred) = preferred_purpose
+            && let Some(pricing) = self.get_pricing_at_timestamp(deployed_model_id, preferred, timestamp).await?
+        {
+            return Ok(Some(pricing));
         }
 
         // Fall back to fallback purpose

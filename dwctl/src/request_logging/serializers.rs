@@ -1,5 +1,5 @@
 use crate::config::Config;
-use crate::db::errors::{DbError, Result as DbResult};
+use crate::db::errors::Result as DbResult;
 use crate::db::handlers::Credits;
 use crate::db::models::credits::{CreditTransactionCreateDBRequest, CreditTransactionType};
 use crate::request_logging::models::{AiRequest, AiResponse, ChatCompletionChunk, ParsedAIRequest};

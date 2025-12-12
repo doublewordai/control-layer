@@ -339,8 +339,8 @@ pub async fn update_deployed_model(
 
     // Handle tariff replacement if provided
     if let Some(tariff_defs) = tariffs {
-        let mut tariff_conn = tx.acquire().await.map_err(|e| Error::Database(e.into()))?;
-        let mut tariffs_repo = Tariffs::new(&mut tariff_conn);
+        let tariff_conn = tx.acquire().await.map_err(|e| Error::Database(e.into()))?;
+        let mut tariffs_repo = Tariffs::new(tariff_conn);
 
         // Fetch current tariffs to compare
         let current_tariffs = tariffs_repo.list_current_by_model(deployment_id).await?;
