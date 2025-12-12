@@ -654,8 +654,24 @@ pub struct DaemonConfig {
     /// How long to sleep between claim iterations in milliseconds (default: 1000)
     pub claim_interval_ms: u64,
 
-    /// Maximum number of retry attempts before giving up (default: 5)
-    pub max_retries: u32,
+    /// Minimum number of retries to guarantee regardless of deadline (SLA-aware mode)
+    /// When set (along with stop_before_deadline_ms), uses deadline-aware retry logic.
+    /// Ignored if max_retries is set. (default: None)
+    #[serde(default)]
+    pub min_retries: Option<u32>,
+
+    /// Stop retrying this many milliseconds before batch deadline (SLA-aware mode)
+    /// When set (along with min_retries), uses deadline-aware retry logic.
+    /// Ignored if max_retries is set. (default: None)
+    #[serde(default)]
+    pub stop_before_deadline_ms: Option<u64>,
+
+    /// Maximum number of retry attempts before giving up (legacy fixed retry mode)
+    /// When set, uses fixed retry limit instead of deadline-aware retry logic.
+    /// Takes precedence over min_retries/stop_before_deadline_ms if specified.
+    /// When all retry fields are None, uses fusillade's default SLA-aware retry. (default: None)
+    #[serde(default)]
+    pub max_retries: Option<u32>,
 
     /// Base backoff duration in milliseconds (will be exponentially increased) (default: 1000)
     pub backoff_ms: u64,
@@ -689,7 +705,9 @@ impl Default for DaemonConfig {
             claim_batch_size: 100,
             default_model_concurrency: 10,
             claim_interval_ms: 1000,
-            max_retries: 5,
+            min_retries: None, // Set along with stop-before-deadline for SLA-aware retries
+            stop_before_deadline_ms: None,
+            max_retries: None, // Set to use max retries instead of SLA-aware retries (All none = SLA-aware default)
             backoff_ms: 1000,
             backoff_factor: 2,
             max_backoff_ms: 10000,
@@ -711,12 +729,27 @@ impl DaemonConfig {
         &self,
         model_capacity_limits: Option<std::sync::Arc<dashmap::DashMap<String, usize>>>,
     ) -> fusillade::daemon::DaemonConfig {
+        // Priority: max_retries > (min_retries + stop_before_deadline_ms) > default
+        let retry_limit = if let Some(max) = self.max_retries {
+            // Legacy fixed retry mode
+            fusillade::daemon::RetryLimit::FixedAttempts { max_retries: max }
+        } else if let (Some(min), Some(stop_before)) = (self.min_retries, self.stop_before_deadline_ms) {
+            // SLA-aware mode with custom parameters
+            fusillade::daemon::RetryLimit::UntilBatchDeadline {
+                min_retries: min,
+                stop_before_deadline_ms: stop_before,
+            }
+        } else {
+            // Use fusillade's default (SLA-aware with min_retries=3, 15-min buffer)
+            fusillade::daemon::RetryLimit::default()
+        };
+
         fusillade::daemon::DaemonConfig {
             claim_batch_size: self.claim_batch_size,
             default_model_concurrency: self.default_model_concurrency,
             model_concurrency_limits: model_capacity_limits.unwrap_or_else(|| std::sync::Arc::new(dashmap::DashMap::new())),
             claim_interval_ms: self.claim_interval_ms,
-            max_retries: self.max_retries,
+            retry_limit,
             backoff_ms: self.backoff_ms,
             backoff_factor: self.backoff_factor,
             max_backoff_ms: self.max_backoff_ms,

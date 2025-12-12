@@ -775,6 +775,23 @@ export interface FilesListQuery {
   purpose?: string;
 }
 
+export interface ModelCostBreakdown {
+  model: string;
+  request_count: number;
+  estimated_input_tokens: number;
+  estimated_output_tokens: number;
+  estimated_cost: string;
+}
+
+export interface FileCostEstimate {
+  file_id: string;
+  total_requests: number;
+  total_estimated_input_tokens: number;
+  total_estimated_output_tokens: number;
+  total_estimated_cost: string;
+  models: ModelCostBreakdown[];
+}
+
 export interface BatchRequestCounts {
   total: number;
   completed: number;
@@ -963,7 +980,9 @@ export interface DaemonConfig {
   default_model_concurrency: number;
   model_concurrency_limits: Record<string, number>;
   claim_interval_ms: number;
-  max_retries: number;
+  min_retries?: number | null;
+  stop_before_deadline_ms?: number | null;
+  max_retries?: number | null;
   backoff_ms: number;
   backoff_factor: number;
   max_backoff_ms: number;

@@ -242,8 +242,12 @@ batches:
     default_model_concurrency: 10 # Default concurrent requests per model
     claim_interval_ms: 1000 # Milliseconds to sleep between claim iterations
 
-    # Retry & Backoff Settings
-    max_retries: 5 # Maximum retry attempts before giving up
+    # Retry & Backoff Settings (choose one mode):
+    # SLA-aware mode (default if nothing specified: min_retries=3, stop_before_deadline_ms=3600000)
+    # min_retries: 3 # Minimum retries guaranteed regardless of deadline
+    # stop_before_deadline_ms: 3600000 # Stop retrying 1 hour before batch deadline
+    # OR legacy fixed retry mode:
+    # max_retries: 5 # Use fixed retry limit (takes precedence over SLA-aware settings)
     backoff_ms: 1000 # Initial backoff duration in milliseconds
     backoff_factor: 2 # Exponential backoff multiplier
     max_backoff_ms: 10000 # Maximum backoff duration in milliseconds

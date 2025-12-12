@@ -103,7 +103,7 @@ function createWrapper() {
 
 describe("ModelCombobox", () => {
   it("renders with default placeholder", async () => {
-    const { container } = render(<ModelCombobox />, {
+    const { container } = render(<ModelCombobox value={null} />, {
       wrapper: createWrapper(),
     });
 
@@ -116,7 +116,7 @@ describe("ModelCombobox", () => {
 
   it("renders with custom placeholder", async () => {
     const { container } = render(
-      <ModelCombobox placeholder="Choose your model" />,
+      <ModelCombobox value={null} placeholder="Choose your model" />,
       {
         wrapper: createWrapper(),
       },
@@ -131,6 +131,7 @@ describe("ModelCombobox", () => {
   it("renders with React node as placeholder", async () => {
     const { container } = render(
       <ModelCombobox
+        value={null}
         placeholder={
           <div className="flex items-center">
             <span>Custom Icon</span> Select
@@ -147,7 +148,7 @@ describe("ModelCombobox", () => {
   });
 
   it("displays selected model alias when value is provided", async () => {
-    const { container } = render(<ModelCombobox value="gpt-4o" />, {
+    const { container } = render(<ModelCombobox value={mockModels[0]} />, {
       wrapper: createWrapper(),
     });
 
@@ -161,7 +162,7 @@ describe("ModelCombobox", () => {
 
   it("opens popover when clicked", async () => {
     const user = userEvent.setup();
-    const { container } = render(<ModelCombobox />, {
+    const { container } = render(<ModelCombobox value={null} />, {
       wrapper: createWrapper(),
     });
 
@@ -184,7 +185,7 @@ describe("ModelCombobox", () => {
 
   it("displays all models when opened", async () => {
     const user = userEvent.setup();
-    const { container } = render(<ModelCombobox />, {
+    const { container } = render(<ModelCombobox value={null} />, {
       wrapper: createWrapper(),
     });
 
@@ -204,7 +205,7 @@ describe("ModelCombobox", () => {
 
   it("filters models based on search query", async () => {
     const user = userEvent.setup();
-    const { container } = render(<ModelCombobox />, {
+    const { container } = render(<ModelCombobox value={null} />, {
       wrapper: createWrapper(),
     });
 
@@ -237,7 +238,7 @@ describe("ModelCombobox", () => {
     const handleChange = vi.fn();
 
     const { container } = render(
-      <ModelCombobox onValueChange={handleChange} />,
+      <ModelCombobox value={null} onValueChange={handleChange} />,
       {
         wrapper: createWrapper(),
       },
@@ -256,14 +257,14 @@ describe("ModelCombobox", () => {
     // Click on a model
     await user.click(screen.getByText("gpt-4o"));
 
-    // Should call onValueChange with the model alias
-    expect(handleChange).toHaveBeenCalledWith("gpt-4o");
+    // Should call onValueChange with the model object
+    expect(handleChange).toHaveBeenCalledWith(mockModels[0]);
     expect(handleChange).toHaveBeenCalledTimes(1);
   });
 
   it("closes popover after model selection", async () => {
     const user = userEvent.setup();
-    const { container } = render(<ModelCombobox />, {
+    const { container } = render(<ModelCombobox value={null} />, {
       wrapper: createWrapper(),
     });
 
@@ -290,9 +291,12 @@ describe("ModelCombobox", () => {
     const user = userEvent.setup();
     const chatOnlyFilter = (model: Model) => model.model_type === "CHAT";
 
-    const { container } = render(<ModelCombobox filterFn={chatOnlyFilter} />, {
-      wrapper: createWrapper(),
-    });
+    const { container } = render(
+      <ModelCombobox value={null} filterFn={chatOnlyFilter} />,
+      {
+        wrapper: createWrapper(),
+      },
+    );
 
     const combobox = within(container).getByRole("combobox", {
       name: /select model/i,
@@ -318,7 +322,7 @@ describe("ModelCombobox", () => {
   it("uses custom search placeholder", async () => {
     const user = userEvent.setup();
     const { container } = render(
-      <ModelCombobox searchPlaceholder="Find a model..." />,
+      <ModelCombobox value={null} searchPlaceholder="Find a model..." />,
       {
         wrapper: createWrapper(),
       },
@@ -340,7 +344,7 @@ describe("ModelCombobox", () => {
   it("shows empty message when no models match search", async () => {
     const user = userEvent.setup();
     const { container } = render(
-      <ModelCombobox emptyMessage="No matching models found" />,
+      <ModelCombobox value={null} emptyMessage="No matching models found" />,
       {
         wrapper: createWrapper(),
       },
@@ -372,9 +376,12 @@ describe("ModelCombobox", () => {
   });
 
   it("applies custom className", async () => {
-    const { container } = render(<ModelCombobox className="custom-width" />, {
-      wrapper: createWrapper(),
-    });
+    const { container } = render(
+      <ModelCombobox value={null} className="custom-width" />,
+      {
+        wrapper: createWrapper(),
+      },
+    );
 
     const combobox = within(container).getByRole("combobox", {
       name: /select model/i,
@@ -384,7 +391,7 @@ describe("ModelCombobox", () => {
 
   it("debounces search input", async () => {
     const user = userEvent.setup();
-    const { container } = render(<ModelCombobox />, {
+    const { container } = render(<ModelCombobox value={null} />, {
       wrapper: createWrapper(),
     });
 
@@ -422,7 +429,7 @@ describe("ModelCombobox", () => {
     // We can't directly test the query options being passed,
     // but we can verify the component renders correctly with them
     const { container } = render(
-      <ModelCombobox queryOptions={{ accessible: true }} />,
+      <ModelCombobox value={null} queryOptions={{ accessible: true }} />,
       {
         wrapper: createWrapper(),
       },

@@ -45,6 +45,7 @@ import type {
   FileDeleteResponse,
   FileUploadRequest,
   FilesListQuery,
+  FileCostEstimate,
   Batch,
   BatchCreateRequest,
   BatchListResponse,
@@ -1088,6 +1089,14 @@ const filesApi = {
     const lastLine = parseInt(response.headers.get("X-Last-Line") || "0", 10);
 
     return { content, incomplete, lastLine };
+  },
+
+  async getCostEstimate(id: string): Promise<FileCostEstimate> {
+    const response = await fetch(`/ai/v1/files/${id}/cost-estimate`);
+    if (!response.ok) {
+      throw new Error(`Failed to fetch file cost estimate: ${response.status}`);
+    }
+    return response.json();
   },
 };
 

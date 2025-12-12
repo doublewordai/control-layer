@@ -5,13 +5,13 @@ import {
   FileInput,
   FileCheck,
   AlertCircle,
-  Activity,
   Clock,
   CheckCircle,
   XCircle,
   Ban,
   Loader2,
   RotateCcw,
+  Timer,
 } from "lucide-react";
 import {
   useBatch,
@@ -117,7 +117,7 @@ const BatchInfo: React.FC = () => {
       in_progress: {
         label: "In Progress",
         variant: "default",
-        icon: <Activity className="w-3 h-3" />,
+        icon: <Timer className="w-3 h-3" />,
       },
       finalizing: {
         label: "Finalizing",

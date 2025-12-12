@@ -48,7 +48,7 @@ interface Message {
 const Playground: React.FC = () => {
   const navigate = useNavigate();
   const [searchParams] = useSearchParams();
-  const selectedModelId = searchParams.get("model");
+  const selectedModelAlias = searchParams.get("model") || undefined;
   const fromUrl = searchParams.get("from");
 
   const [messages, setMessages] = useState<Message[]>([]);
@@ -68,39 +68,18 @@ const Playground: React.FC = () => {
     category: string;
   } | null>(null);
 
-  // Reranker state
-  const [query, setQuery] = useState("What is the capital of France?");
-  const [documents, setDocuments] = useState<string[]>([
-    "The capital of Brazil is Brasilia.",
-    "The capital of France is Paris.",
-    "Horses and cows are both animals",
-  ]);
-  const [rerankResult, setRerankResult] = useState<RerankResponse | null>(null);
-
-  const { data: modelsData, error: modelsError } = useModels({
-    limit: 50,
+  const { data: urlModelsData, error: modelsError } = useModels({
+    limit: 1,
+    search: selectedModelAlias,
   });
-  const models = useMemo(() => modelsData?.data ?? [], [modelsData]);
-
-  // Initialize OpenAI client pointing to our API
-  const baseURL = `${window.location.origin}/admin/api/v1/ai/v1`;
-
-  const openai = new OpenAI({
-    baseURL,
-    apiKey: "", // SDK requires this but we override the header below
-    dangerouslyAllowBrowser: true,
-    defaultHeaders: {
-      // Remove Authorization header so proxy can transform session cookies
-      Authorization: null as any,
-    },
-  });
+  const urlModels = useMemo(() => urlModelsData?.data ?? [], [urlModelsData]);
 
   // Convert models data to array and handle URL model selection
   useEffect(() => {
-    if (models && models.length > 0) {
+    if (urlModels && urlModels.length > 0) {
       // If a model ID is specified in URL, select it
-      if (selectedModelId) {
-        const model = models.find((m) => m.alias === selectedModelId);
+      if (selectedModelAlias) {
+        const model = urlModels.find((m) => m.alias === selectedModelAlias);
         if (model) {
           setSelectedModel(model);
           setModelType(
@@ -109,7 +88,7 @@ const Playground: React.FC = () => {
         }
       }
     }
-  }, [models, selectedModelId]);
+  }, [urlModels, selectedModelAlias]);
 
   // Handle models loading error
   useEffect(() => {
@@ -149,14 +128,34 @@ const Playground: React.FC = () => {
     }
   }, [selectedModel]);
 
-  const handleModelChange = (modelId: string) => {
-    const model = models.find((m) => m.alias === modelId);
+  const handleModelChange = (model: Model) => {
     if (model) {
       setSelectedModel(model);
       setModelType((model.model_type?.toLowerCase() as ModelType) || "chat");
-      navigate(`/playground?model=${encodeURIComponent(modelId)}`);
+      navigate(`/playground?model=${encodeURIComponent(model.alias)}`);
     }
   };
+
+  // Reranker state
+  const [query, setQuery] = useState("What is the capital of France?");
+  const [documents, setDocuments] = useState<string[]>([
+    "The capital of Brazil is Brasilia.",
+    "The capital of France is Paris.",
+    "Horses and cows are both animals",
+  ]);
+  const [rerankResult, setRerankResult] = useState<RerankResponse | null>(null);
+  // Initialize OpenAI client pointing to our API
+  const baseURL = `${window.location.origin}/admin/api/v1/ai/v1`;
+
+  const openai = new OpenAI({
+    baseURL,
+    apiKey: "", // SDK requires this but we override the header below
+    dangerouslyAllowBrowser: true,
+    defaultHeaders: {
+      // Remove Authorization header so proxy can transform session cookies
+      Authorization: null as any,
+    },
+  });
 
   // Calculate cosine similarity between two vectors
   const calculateCosineSimilarity = (
@@ -796,8 +795,7 @@ const Playground: React.FC = () => {
     }
   };
 
-  const handleComparisonModelSelect = (modelId: string) => {
-    const model = models.find((m) => m.alias === modelId);
+  const handleComparisonModelSelect = (model: Model) => {
     if (model) {
       setComparisonModel(model);
       setIsComparisonMode(true);
@@ -904,7 +902,7 @@ const Playground: React.FC = () => {
           <div className="flex items-center gap-2 md:gap-3 w-full md:w-auto">
             {/* Model Selector */}
             <ModelCombobox
-              value={selectedModel?.alias}
+              value={selectedModel}
               onValueChange={handleModelChange}
               placeholder="Search models..."
               className="w-full md:w-[200px]"
@@ -915,7 +913,7 @@ const Playground: React.FC = () => {
               <>
                 {!isComparisonMode ? (
                   <ModelCombobox
-                    value={undefined}
+                    value={null}
                     onValueChange={handleComparisonModelSelect}
                     placeholder={
                       <div className="text-sm flex items-center py-2">

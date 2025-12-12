@@ -75,13 +75,11 @@ fn to_batch_response(batch: fusillade::Batch) -> BatchResponse {
     let errors = batch.errors.and_then(|e| serde_json::from_value::<BatchErrors>(e).ok());
 
     // Check if batch has expired
-    let expired_at = batch.expires_at.and_then(|expires| {
-        if chrono::Utc::now() > expires {
-            Some(expires.timestamp())
-        } else {
-            None
-        }
-    });
+    let expired_at = if chrono::Utc::now() > batch.expires_at {
+        Some(batch.expires_at.timestamp())
+    } else {
+        None
+    };
 
     BatchResponse {
         id: batch.id.0.to_string(),
@@ -95,7 +93,7 @@ fn to_batch_response(batch: fusillade::Batch) -> BatchResponse {
         error_file_id: batch.error_file_id.map(|id| id.0.to_string()),
         created_at: batch.created_at.timestamp(),
         in_progress_at,
-        expires_at: batch.expires_at.map(|dt| dt.timestamp()),
+        expires_at: Some(batch.expires_at.timestamp()),
         finalizing_at,
         completed_at,
         failed_at,

@@ -1,0 +1,14 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n                UPDATE batches\n                SET finalizing_at = NULL,\n                    completed_at = NULL,\n                    failed_at = NULL\n                WHERE id = $1\n                ",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Uuid"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "669f6b0f57bf445ad8a496a4de3d7638deaa9a3d79a01a0365af09b2d1001e07"
+}
