@@ -76,6 +76,7 @@ pub fn create_test_config() -> crate::config::Config {
             url: "http://localhost:8081".parse().unwrap(),
             api_key: None,
             sync_interval: std::time::Duration::from_secs(60),
+            default_models: None,
         }],
         metadata: crate::config::Metadata::default(),
         payment: None,

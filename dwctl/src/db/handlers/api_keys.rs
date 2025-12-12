@@ -1817,6 +1817,7 @@ mod tests {
                 url: "http://localhost:8080".parse().unwrap(),
                 api_key: None,
                 sync_interval: std::time::Duration::from_secs(3600),
+                default_models: None,
             }],
             metadata: crate::config::Metadata {
                 region: "Test Region".to_string(),
