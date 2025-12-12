@@ -7,7 +7,7 @@
 use crate::AppState;
 use crate::api::models::batches::{
     BatchAnalytics, BatchErrors, BatchListResponse, BatchObjectType, BatchResponse, CreateBatchRequest, ListBatchesQuery, ListObjectType,
-    RequestCounts,
+    RequestCounts, RetryRequestsRequest,
 };
 use crate::auth::permissions::{RequiresPermission, can_read_all_resources, has_permission, operation, resource};
 use crate::errors::{Error, Result};
@@ -75,13 +75,11 @@ fn to_batch_response(batch: fusillade::Batch) -> BatchResponse {
     let errors = batch.errors.and_then(|e| serde_json::from_value::<BatchErrors>(e).ok());
 
     // Check if batch has expired
-    let expired_at = batch.expires_at.and_then(|expires| {
-        if chrono::Utc::now() > expires {
-            Some(expires.timestamp())
-        } else {
-            None
-        }
-    });
+    let expired_at = if chrono::Utc::now() > batch.expires_at {
+        Some(batch.expires_at.timestamp())
+    } else {
+        None
+    };
 
     BatchResponse {
         id: batch.id.0.to_string(),
@@ -95,7 +93,7 @@ fn to_batch_response(batch: fusillade::Batch) -> BatchResponse {
         error_file_id: batch.error_file_id.map(|id| id.0.to_string()),
         created_at: batch.created_at.timestamp(),
         in_progress_at,
-        expires_at: batch.expires_at.map(|dt| dt.timestamp()),
+        expires_at: Some(batch.expires_at.timestamp()),
         finalizing_at,
         completed_at,
         failed_at,
@@ -377,6 +375,242 @@ pub async fn cancel_batch(
         })?;
 
     tracing::info!("Batch {} cancelled", batch_id);
+
+    Ok(Json(to_batch_response(batch)))
+}
+
+#[utoipa::path(
+    post,
+    path = "/batches/{batch_id}/retry",
+    tag = "batches",
+    summary = "Retry failed requests",
+    description = "Retries all failed requests in a batch by resetting them to pending state",
+    responses(
+        (status = 200, description = "Failed requests retry initiated", body = BatchResponse),
+        (status = 404, description = "Batch not found"),
+        (status = 500, description = "Internal server error")
+    ),
+    params(
+        ("batch_id" = String, Path, description = "The ID of the batch to retry failed requests for")
+    )
+)]
+#[tracing::instrument(skip(state, current_user), fields(user_id = %current_user.id, batch_id = %batch_id_str))]
+pub async fn retry_failed_batch_requests(
+    State(state): State<AppState>,
+    Path(batch_id_str): Path<String>,
+    current_user: RequiresPermission<resource::Batches, operation::UpdateOwn>,
+) -> Result<Json<BatchResponse>> {
+    let batch_id = Uuid::parse_str(&batch_id_str).map_err(|_| Error::BadRequest {
+        message: "Invalid batch ID format".to_string(),
+    })?;
+
+    // Get batch first to verify it exists
+    let batch = state
+        .request_manager
+        .get_batch(fusillade::BatchId(batch_id))
+        .await
+        .map_err(|_| Error::NotFound {
+            resource: "Batch".to_string(),
+            id: batch_id_str.clone(),
+        })?;
+
+    // Check ownership: users without UpdateAll permission can only retry their own batches
+    let can_update_all = has_permission(&current_user, Resource::Batches, Operation::UpdateAll);
+    if !can_update_all {
+        let user_id = current_user.id.to_string();
+        if batch.created_by.as_deref() != Some(user_id.as_str()) {
+            return Err(Error::NotFound {
+                resource: "Batch".to_string(),
+                id: batch_id_str.clone(),
+            });
+        }
+    }
+
+    // Get all requests for the batch
+    let requests = state
+        .request_manager
+        .get_batch_requests(fusillade::BatchId(batch_id))
+        .await
+        .map_err(|e| Error::Internal {
+            operation: format!("get batch requests: {}", e),
+        })?;
+
+    // Collect IDs of failed requests
+    let failed_request_ids: Vec<fusillade::RequestId> = requests
+        .iter()
+        .filter_map(|req| {
+            if matches!(req, fusillade::request::AnyRequest::Failed(_)) {
+                Some(req.id())
+            } else {
+                None
+            }
+        })
+        .collect();
+
+    if failed_request_ids.is_empty() {
+        return Err(Error::BadRequest {
+            message: "No failed requests to retry in this batch".to_string(),
+        });
+    }
+
+    tracing::info!(
+        batch_id = %batch_id,
+        failed_count = failed_request_ids.len(),
+        "Retrying failed requests"
+    );
+
+    // Retry the failed requests
+    let results = state
+        .request_manager
+        .retry_failed_requests(failed_request_ids.clone())
+        .await
+        .map_err(|e| Error::Internal {
+            operation: format!("retry failed requests: {}", e),
+        })?;
+
+    // Check for any failures
+    let failed_retries: Vec<_> = results
+        .iter()
+        .enumerate()
+        .filter_map(|(i, r)| r.as_ref().err().map(|e| (i, e)))
+        .collect();
+
+    if !failed_retries.is_empty() {
+        tracing::warn!(
+            batch_id = %batch_id,
+            failed_retry_count = failed_retries.len(),
+            "Some requests failed to retry"
+        );
+    }
+
+    let successful_retries = results.iter().filter(|r| r.is_ok()).count();
+    tracing::info!(
+        batch_id = %batch_id,
+        retried_count = successful_retries,
+        "Successfully retried failed requests"
+    );
+
+    // Fetch updated batch to get latest status
+    let batch = state
+        .request_manager
+        .get_batch(fusillade::BatchId(batch_id))
+        .await
+        .map_err(|_| Error::NotFound {
+            resource: "Batch".to_string(),
+            id: batch_id_str.clone(),
+        })?;
+
+    Ok(Json(to_batch_response(batch)))
+}
+
+#[utoipa::path(
+    post,
+    path = "/batches/{batch_id}/retry-requests",
+    tag = "batches",
+    summary = "Retry specific requests",
+    description = "Retries specific failed requests in a batch by their IDs",
+    request_body = RetryRequestsRequest,
+    responses(
+        (status = 200, description = "Specific requests retry initiated", body = BatchResponse),
+        (status = 404, description = "Batch not found"),
+        (status = 500, description = "Internal server error")
+    ),
+    params(
+        ("batch_id" = String, Path, description = "The ID of the batch containing the requests to retry")
+    )
+)]
+#[tracing::instrument(skip(state, current_user, req), fields(user_id = %current_user.id, batch_id = %batch_id_str))]
+pub async fn retry_specific_requests(
+    State(state): State<AppState>,
+    Path(batch_id_str): Path<String>,
+    current_user: RequiresPermission<resource::Batches, operation::UpdateOwn>,
+    Json(req): Json<RetryRequestsRequest>,
+) -> Result<Json<BatchResponse>> {
+    let batch_id = Uuid::parse_str(&batch_id_str).map_err(|_| Error::BadRequest {
+        message: "Invalid batch ID format".to_string(),
+    })?;
+
+    // Get batch first to verify it exists
+    let batch = state
+        .request_manager
+        .get_batch(fusillade::BatchId(batch_id))
+        .await
+        .map_err(|_| Error::NotFound {
+            resource: "Batch".to_string(),
+            id: batch_id_str.clone(),
+        })?;
+
+    // Check ownership: users without UpdateAll permission can only retry their own batches
+    let can_update_all = has_permission(&current_user, Resource::Batches, Operation::UpdateAll);
+    if !can_update_all {
+        let user_id = current_user.id.to_string();
+        if batch.created_by.as_deref() != Some(user_id.as_str()) {
+            return Err(Error::NotFound {
+                resource: "Batch".to_string(),
+                id: batch_id_str.clone(),
+            });
+        }
+    }
+
+    // Parse request IDs
+    let request_ids: Vec<fusillade::RequestId> = req
+        .request_ids
+        .iter()
+        .filter_map(|id_str| Uuid::parse_str(id_str).ok().map(fusillade::RequestId))
+        .collect();
+
+    if request_ids.is_empty() {
+        return Err(Error::BadRequest {
+            message: "No valid request IDs provided".to_string(),
+        });
+    }
+
+    tracing::info!(
+        batch_id = %batch_id,
+        request_count = request_ids.len(),
+        "Retrying specific requests"
+    );
+
+    // Retry the specified requests
+    let results = state
+        .request_manager
+        .retry_failed_requests(request_ids.clone())
+        .await
+        .map_err(|e| Error::Internal {
+            operation: format!("retry failed requests: {}", e),
+        })?;
+
+    // Check for any failures
+    let failed_retries: Vec<_> = results
+        .iter()
+        .enumerate()
+        .filter_map(|(i, r)| r.as_ref().err().map(|e| (i, e)))
+        .collect();
+
+    if !failed_retries.is_empty() {
+        tracing::warn!(
+            batch_id = %batch_id,
+            failed_retry_count = failed_retries.len(),
+            "Some requests failed to retry"
+        );
+    }
+
+    let successful_retries = results.iter().filter(|r| r.is_ok()).count();
+    tracing::info!(
+        batch_id = %batch_id,
+        retried_count = successful_retries,
+        "Successfully retried specific requests"
+    );
+
+    // Fetch updated batch to get latest status
+    let batch = state
+        .request_manager
+        .get_batch(fusillade::BatchId(batch_id))
+        .await
+        .map_err(|_| Error::NotFound {
+            resource: "Batch".to_string(),
+            id: batch_id_str.clone(),
+        })?;
 
     Ok(Json(to_batch_response(batch)))
 }

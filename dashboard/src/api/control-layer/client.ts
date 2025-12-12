@@ -1150,6 +1150,28 @@ const batchesApi = {
     return response.json();
   },
 
+  async retry(id: string): Promise<Batch> {
+    const response = await fetch(`/ai/v1/batches/${id}/retry`, {
+      method: "POST",
+    });
+    if (!response.ok) {
+      throw new Error(`Failed to retry batch: ${response.status}`);
+    }
+    return response.json();
+  },
+
+  async retryRequests(id: string, requestIds: string[]): Promise<Batch> {
+    const response = await fetch(`/ai/v1/batches/${id}/retry-requests`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ request_ids: requestIds }),
+    });
+    if (!response.ok) {
+      throw new Error(`Failed to retry requests: ${response.status}`);
+    }
+    return response.json();
+  },
+
   async getAnalytics(id: string): Promise<BatchAnalytics> {
     const response = await fetch(`/ai/v1/batches/${id}/analytics`);
     if (!response.ok) {

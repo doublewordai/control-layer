@@ -1,0 +1,21 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n            UPDATE files\n            SET name = COALESCE($2, name), description = $3, size_bytes = $4, size_finalized = TRUE, status = $5, purpose = $6, expires_at = $7, uploaded_by = $8\n            WHERE id = $1\n            ",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Text",
+        "Text",
+        "Int8",
+        "Text",
+        "Text",
+        "Timestamptz",
+        "Text"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "95a1bdfb026741b4fd626a9b9b0506540c7e6c5b09dff23404eac62e52536290"
+}

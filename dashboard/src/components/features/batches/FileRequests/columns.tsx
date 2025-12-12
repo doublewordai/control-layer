@@ -2,6 +2,7 @@
 import { type ColumnDef } from "@tanstack/react-table";
 import { ArrowUpDown } from "lucide-react";
 import type { FileRequest } from "../../../../api/control-layer/types";
+import { Checkbox } from "../../../ui/checkbox";
 
 export type FileRequestOrResponse =
   | FileRequest
@@ -73,7 +74,34 @@ function RequestBodyButton({
 export const createFileRequestsColumns = (
   isOutput: boolean,
   onViewRequestBody: (request: FileRequestOrResponse) => void,
+  enableSelection = false,
 ): ColumnDef<FileRequestOrResponse>[] => [
+  // Checkbox column for selection (only shown if enableSelection is true)
+  ...(enableSelection
+    ? ([
+        {
+          id: "select",
+          header: ({ table }) => (
+            <Checkbox
+              checked={table.getIsAllPageRowsSelected()}
+              onCheckedChange={(value) =>
+                table.toggleAllPageRowsSelected(!!value)
+              }
+              aria-label="Select all"
+            />
+          ),
+          cell: ({ row }) => (
+            <Checkbox
+              checked={row.getIsSelected()}
+              onCheckedChange={(value) => row.toggleSelected(!!value)}
+              aria-label="Select row"
+            />
+          ),
+          enableSorting: false,
+          enableHiding: false,
+        },
+      ] as ColumnDef<FileRequestOrResponse>[])
+    : []),
   {
     accessorKey: "custom_id",
     header: ({ column }) => {
