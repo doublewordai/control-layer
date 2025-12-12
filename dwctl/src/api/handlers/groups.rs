@@ -521,7 +521,20 @@ pub async fn get_user_groups(
     let mut repo = Groups::new(&mut pool_conn);
 
     let groups = repo.get_user_groups(user_id).await?;
-    Ok(Json(groups.into_iter().map(GroupResponse::from).collect::<Vec<_>>()))
+    
+    // Mask created_by field if user doesn't have Users::ReadAll permission
+    let response_groups: Vec<GroupResponse> = groups
+        .into_iter()
+        .map(|group| {
+            let mut group_response = GroupResponse::from(group);
+            if !can_read_all_users {
+                group_response = group_response.mask_created_by();
+            }
+            group_response
+        })
+        .collect();
+    
+    Ok(Json(response_groups))
 }
 
 // Deployment-group management endpoints
@@ -1641,7 +1654,7 @@ mod tests {
 
         response.assert_status(StatusCode::NO_CONTENT);
 
-        // StandardUser should NOT be able to add deployment to group
+        // StandardUser should NOT be be able to add deployment to group
         let response = app
             .post(&format!("/admin/api/v1/groups/{}/models/{}", group.id, deployment.id))
             .add_header(&add_auth_headers(&standard_user)[0].0, &add_auth_headers(&standard_user)[0].1)
@@ -1650,7 +1663,7 @@ mod tests {
 
         response.assert_status_forbidden();
 
-        // RequestViewer should NOT be able to add deployment to group
+        // RequestViewer should NOT be be able to add deployment to group
         let response = app
             .post(&format!("/admin/api/v1/groups/{}/models/{}", group.id, deployment.id))
             .add_header(&add_auth_headers(&request_viewer)[0].0, &add_auth_headers(&request_viewer)[0].1)
