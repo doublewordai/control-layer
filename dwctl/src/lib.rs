@@ -385,7 +385,7 @@ pub async fn seed_database(sources: &[config::ModelSource], db: &PgPool) -> Resu
         .fetch_optional(&mut *tx)
         .await?
         {
-            for model in source.default_models.clone().unwrap_or(vec![]) {
+            for model in source.default_models.as_deref().unwrap_or(&[]) {
                 // Insert deployed model if it doesn't already exist
                 let mut model_repo = Deployments::new(&mut *tx);
                 if let Ok(row) = model_repo
