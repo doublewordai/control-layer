@@ -200,7 +200,7 @@ pub async fn list_deployed_models(
         include_endpoints,
         can_read_pricing,
         can_read_rate_limits,
-        can_read_users
+        can_read_users,
     };
 
     let response = enricher.enrich_many(models_with_pricing).await?;
@@ -403,7 +403,7 @@ pub async fn get_deployed_model(
     // Check group-based access control for non-admin users
     if !can_read_all_models {
         let has_access = repo.check_user_access(&model.alias, current_user.id).await?;
-        
+
         if has_access.is_none() {
             return Err(Error::NotFound {
                 resource: "Deployment".to_string(),
@@ -414,11 +414,7 @@ pub async fn get_deployed_model(
 
     // Parse include parameters and filter based on permissions (same logic as list)
     let include_params = query.include.as_deref().unwrap_or("");
-    let all_includes: Vec<&str> = include_params
-        .split(',')
-        .map(|s| s.trim())
-        .filter(|s| !s.is_empty())
-        .collect();
+    let all_includes: Vec<&str> = include_params.split(',').map(|s| s.trim()).filter(|s| !s.is_empty()).collect();
 
     // Filter includes based on permissions
     let mut include_groups = false;
@@ -475,7 +471,7 @@ pub async fn get_deployed_model(
         include_endpoints,
         can_read_pricing,
         can_read_rate_limits,
-        can_read_users
+        can_read_users,
     };
 
     response = enricher.enrich_one(response, pricing).await?;

@@ -272,7 +272,7 @@ impl DeployedModelResponse {
         self.batch_capacity = None;
         self
     }
-    
+
     /// Mask created_by field (sets to None for users without system access)
     pub fn mask_created_by(mut self) -> Self {
         self.created_by = None;
@@ -284,6 +284,4 @@ impl DeployedModelResponse {
         self.endpoint = Some(endpoint);
         self
     }
-
-    
 }

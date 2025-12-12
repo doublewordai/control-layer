@@ -521,7 +521,7 @@ pub async fn get_user_groups(
     let mut repo = Groups::new(&mut pool_conn);
 
     let groups = repo.get_user_groups(user_id).await?;
-    
+
     // Mask created_by field if user doesn't have Users::ReadAll permission
     let response_groups: Vec<GroupResponse> = groups
         .into_iter()
@@ -533,7 +533,7 @@ pub async fn get_user_groups(
             group_response
         })
         .collect();
-    
+
     Ok(Json(response_groups))
 }
 
