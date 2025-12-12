@@ -1675,34 +1675,24 @@ mod tests {
 
         /// Helper: Create or replace a tariff for a model
         /// Takes model ID directly, no name lookups
+        ///
+        /// # Arguments
+        /// * `api_key_purpose` - Defaults to Realtime if not specified
+        /// * `valid_from` - Defaults to NOW if not specified
+        #[allow(clippy::too_many_arguments)]
         async fn setup_tariff(
             pool: &sqlx::PgPool,
             deployed_model_id: DeploymentId,
             tariff_name: &str,
             input_price_per_token: Decimal,
             output_price_per_token: Decimal,
-        ) {
-            setup_tariff_with_purpose(
-                pool,
-                deployed_model_id,
-                tariff_name,
-                input_price_per_token,
-                output_price_per_token,
-                Some(ApiKeyPurpose::Realtime),
-            )
-            .await;
-        }
-
-        /// Helper: Create or replace a tariff for a model with specific purpose
-        async fn setup_tariff_with_purpose(
-            pool: &sqlx::PgPool,
-            deployed_model_id: DeploymentId,
-            tariff_name: &str,
-            input_price_per_token: Decimal,
-            output_price_per_token: Decimal,
             api_key_purpose: Option<ApiKeyPurpose>,
+            valid_from: Option<chrono::DateTime<chrono::Utc>>,
         ) {
             use crate::db::handlers::Tariffs;
+
+            // Default to Realtime if not specified
+            let purpose = api_key_purpose.or(Some(ApiKeyPurpose::Realtime));
 
             let mut conn = pool.acquire().await.unwrap();
             let mut tariffs_repo = Tariffs::new(&mut conn);
@@ -1711,7 +1701,7 @@ mod tests {
             let current_tariffs = tariffs_repo.list_current_by_model(deployed_model_id).await.unwrap();
             let tariff_ids: Vec<_> = current_tariffs
                 .into_iter()
-                .filter(|t| t.name == tariff_name && t.api_key_purpose == api_key_purpose)
+                .filter(|t| t.name == tariff_name && t.api_key_purpose == purpose)
                 .map(|t| t.id)
                 .collect();
 
@@ -1724,8 +1714,8 @@ mod tests {
                 name: tariff_name.to_string(),
                 input_price_per_token,
                 output_price_per_token,
-                api_key_purpose,
-                valid_from: None,
+                api_key_purpose: purpose,
+                valid_from,
             };
             tariffs_repo.create(&tariff).await.unwrap();
         }
@@ -1828,7 +1818,7 @@ mod tests {
             let model_id = create_test_model(&pool, "gpt-4").await;
             let input_price = Decimal::from_str("0.00001").unwrap();
             let output_price = Decimal::from_str("0.00003").unwrap();
-            setup_tariff(&pool, model_id, "batch", input_price, output_price).await;
+            setup_tariff(&pool, model_id, "batch", input_price, output_price, None, None).await;
 
             // Setup: User with $10.00 balance
             let initial_balance = Decimal::from_str("10.00").unwrap();
@@ -1936,7 +1926,7 @@ mod tests {
             let input_price = Decimal::from_str("0.00001").unwrap();
             let output_price = Decimal::from_str("0.00003").unwrap();
             let model_id = create_test_model(&pool, "gpt-4").await;
-            setup_tariff(&pool, model_id, "batch", input_price, output_price).await;
+            setup_tariff(&pool, model_id, "batch", input_price, output_price, None, None).await;
 
             // Setup: User with insufficient balance (0.01)
             let initial_balance = Decimal::from_str("0.01").unwrap();
@@ -1993,7 +1983,7 @@ mod tests {
                 // Setup model with this specific pricing
                 let input_price = Decimal::from_str(input_price_str).unwrap();
                 let output_price = Decimal::from_str(output_price_str).unwrap();
-                setup_tariff(&pool, model_id, "batch", input_price, output_price).await;
+                setup_tariff(&pool, model_id, "batch", input_price, output_price, None, None).await;
 
                 let expected_cost = Decimal::from_str(expected_cost_str).unwrap();
 
@@ -2058,7 +2048,7 @@ mod tests {
             let model_id = create_test_model(&pool, "gpt-4").await;
             let input_price = Decimal::from_str("0.00001").unwrap();
             let output_price = Decimal::from_str("0.00003").unwrap();
-            setup_tariff(&pool, model_id, "batch", input_price, output_price).await;
+            setup_tariff(&pool, model_id, "batch", input_price, output_price, None, None).await;
 
             // Setup: User with balance (accessed via Playground/SSO)
             let initial_balance = Decimal::from_str("10.00").unwrap();
@@ -2123,9 +2113,20 @@ mod tests {
             let auth = create_test_auth_for_user(&pool, user_id).await;
 
             // Setup a single tariff upfront (before spawning any tasks)
+            // Use an explicit valid_from in the past to avoid timing issues
             let input_price = Decimal::from_str("0.0001").unwrap();
             let output_price = Decimal::ZERO;
-            setup_tariff(&pool, model_id, "batch", input_price, output_price).await;
+
+            setup_tariff(
+                &pool,
+                model_id,
+                "batch",
+                input_price,
+                output_price,
+                Some(ApiKeyPurpose::Realtime),
+                Some(chrono::Utc::now() - chrono::Duration::seconds(5)),
+            )
+            .await;
 
             // Spawn 10 concurrent requests all using the same tariff
             let mut handles = vec![];
@@ -2200,7 +2201,7 @@ mod tests {
             // Test that cost is calculated correctly when only input price is set
             let model_id = create_test_model(&pool, "gpt-4").await;
             let input_price = Decimal::from_str("0.00001").unwrap();
-            setup_tariff(&pool, model_id, "batch", input_price, Decimal::ZERO).await;
+            setup_tariff(&pool, model_id, "batch", input_price, Decimal::ZERO, None, None).await;
 
             let user_id = setup_user_with_balance(&pool, Decimal::from_str("10.00").unwrap()).await;
             let auth = create_test_auth_for_user(&pool, user_id).await;
@@ -2238,7 +2239,7 @@ mod tests {
             // Test that cost is calculated correctly when only output price is set
             let model_id = create_test_model(&pool, "gpt-4").await;
             let output_price = Decimal::from_str("0.00003").unwrap();
-            setup_tariff(&pool, model_id, "batch", Decimal::ZERO, output_price).await;
+            setup_tariff(&pool, model_id, "batch", Decimal::ZERO, output_price, None, None).await;
 
             let user_id = setup_user_with_balance(&pool, Decimal::from_str("10.00").unwrap()).await;
             let auth = create_test_auth_for_user(&pool, user_id).await;
@@ -2275,7 +2276,7 @@ mod tests {
         async fn test_credit_deduction_with_no_pricing(pool: sqlx::PgPool) {
             // Test that no deduction occurs when neither price is set (both zero)
             let model_id = create_test_model(&pool, "gpt-4").await;
-            setup_tariff(&pool, model_id, "batch", Decimal::ZERO, Decimal::ZERO).await;
+            setup_tariff(&pool, model_id, "batch", Decimal::ZERO, Decimal::ZERO, None, None).await;
 
             let initial_balance = Decimal::from_str("10.00").unwrap();
             let user_id = setup_user_with_balance(&pool, initial_balance).await;
@@ -2316,7 +2317,7 @@ mod tests {
             let model_id = create_test_model(&pool, "gpt-4").await;
             let input_price = Decimal::from_str("0.00001").unwrap();
             let output_price = Decimal::from_str("0.00003").unwrap();
-            setup_tariff(&pool, model_id, "batch", input_price, output_price).await;
+            setup_tariff(&pool, model_id, "batch", input_price, output_price, None, None).await;
 
             // Setup: User with balance
             let initial_balance = Decimal::from_str("10.00").unwrap();
@@ -2360,7 +2361,7 @@ mod tests {
             let model_id = create_test_model(&pool, "gpt-4").await;
             let input_price = Decimal::from_str("0.00001").unwrap();
             let output_price = Decimal::from_str("0.00003").unwrap();
-            setup_tariff(&pool, model_id, "batch", input_price, output_price).await;
+            setup_tariff(&pool, model_id, "batch", input_price, output_price, None, None).await;
 
             // Setup: User with balance
             let initial_balance = Decimal::from_str("10.00").unwrap();
