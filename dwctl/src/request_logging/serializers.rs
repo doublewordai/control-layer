@@ -1865,6 +1865,8 @@ mod tests {
                 "batch",
                 Decimal::from_str("0.00001").unwrap(),
                 Decimal::from_str("0.00003").unwrap(),
+                None,
+                None,
             )
             .await;
 
@@ -1892,6 +1894,8 @@ mod tests {
                 "batch",
                 Decimal::from_str("0.00001").unwrap(),
                 Decimal::from_str("0.00003").unwrap(),
+                None,
+                None,
             )
             .await;
 
