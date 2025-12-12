@@ -2401,11 +2401,7 @@ mod tests {
         }
 
         /// Helper: Create test Auth for API key with specific purpose
-        async fn create_test_auth_for_user_with_purpose(
-            pool: &sqlx::PgPool,
-            user_id: Uuid,
-            purpose: ApiKeyPurpose,
-        ) -> Auth {
+        async fn create_test_auth_for_user_with_purpose(pool: &sqlx::PgPool, user_id: Uuid, purpose: ApiKeyPurpose) -> Auth {
             let mut conn = pool.acquire().await.expect("Failed to acquire connection");
             let mut api_key_repo = ApiKeys::new(&mut conn);
             let key = api_key_repo
@@ -2515,7 +2511,10 @@ mod tests {
             // Verify: Final balance
             let final_balance = credits.get_user_balance(user_id).await.unwrap();
             let expected_balance = Decimal::from_str("100.00").unwrap() - expected_batch_cost - expected_realtime_cost;
-            assert_eq!(final_balance, expected_balance, "Balance should reflect both batch and realtime charges");
+            assert_eq!(
+                final_balance, expected_balance,
+                "Balance should reflect both batch and realtime charges"
+            );
 
             // Verify: Analytics records have correct pricing stored
             let batch_analytics = sqlx::query!(
@@ -2717,10 +2716,7 @@ mod tests {
                 .find(|tx| tx.transaction_type == CreditTransactionType::Usage)
                 .expect("Usage transaction should exist");
 
-            assert_eq!(
-                usage_tx.amount, expected_cost,
-                "Batch request should fall back to realtime pricing"
-            );
+            assert_eq!(usage_tx.amount, expected_cost, "Batch request should fall back to realtime pricing");
 
             // Verify: Analytics record stores realtime pricing (not batch)
             let analytics = sqlx::query!(
@@ -2797,8 +2793,7 @@ mod tests {
             // Create API keys for each purpose
             let realtime_auth = create_test_auth_for_user_with_purpose(&pool, user_id, ApiKeyPurpose::Realtime).await;
             let batch_auth = create_test_auth_for_user_with_purpose(&pool, user_id, ApiKeyPurpose::Batch).await;
-            let playground_auth =
-                create_test_auth_for_user_with_purpose(&pool, user_id, ApiKeyPurpose::Playground).await;
+            let playground_auth = create_test_auth_for_user_with_purpose(&pool, user_id, ApiKeyPurpose::Playground).await;
 
             // Make requests with each API key type (100 input, 50 output)
             let mut metrics1 = create_test_usage_metrics(100, 50);
@@ -2817,9 +2812,7 @@ mod tests {
             metrics2.response_model = Some("gpt-3.5-turbo".to_string());
             let mut request_data2 = create_test_request_data();
             request_data2.correlation_id = 22222;
-            store_analytics_record(&pool, &metrics2, &batch_auth, &request_data2)
-                .await
-                .unwrap();
+            store_analytics_record(&pool, &metrics2, &batch_auth, &request_data2).await.unwrap();
 
             let mut metrics3 = create_test_usage_metrics(100, 50);
             metrics3.correlation_id = 33333;
@@ -2861,8 +2854,7 @@ mod tests {
 
             // Verify: Final balance (should only deduct realtime + batch, not playground)
             let final_balance = credits.get_user_balance(user_id).await.unwrap();
-            let expected_balance =
-                Decimal::from_str("100.00").unwrap() - expected_realtime_cost - expected_batch_cost;
+            let expected_balance = Decimal::from_str("100.00").unwrap() - expected_realtime_cost - expected_batch_cost;
             assert_eq!(
                 final_balance, expected_balance,
                 "Balance should only reflect realtime and batch charges"
