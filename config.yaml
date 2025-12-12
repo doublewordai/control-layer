@@ -193,16 +193,11 @@ background_services:
     claim_interval_ms: 1000 # Milliseconds to sleep between claim iterations
 
     # Retry & Backoff Settings
-    # By default, uses SLA-aware retry: retries until approaching the batch deadline
-    # with guaranteed minimum retries (min_retries=3, stop_before_deadline_ms=900000)
-    #
-    # To customize SLA-aware retry, uncomment both parameters:
-    # min_retries: 5 # Minimum retries guaranteed regardless of deadline
-    # stop_before_deadline_ms: 3600000 # Stop retrying 1 hour (3600000ms) before batch deadline
-    #
-    # To use legacy fixed retry limit instead, uncomment:
-    # max_retries: 5 # Use fixed retry limit (takes precedence over SLA-aware settings)
-    #
+    # All retry parameters are optional and default to fusillade's built-in defaults
+    # min_retries: 3 - Minimum retries guaranteed regardless of other limits
+    # max_retries: None - No cap on retries (only limited by deadline if set)
+    # stop_before_deadline_ms: 900000 - Stop 15 minutes before batch deadline
+
     backoff_ms: 1000 # Initial backoff duration in milliseconds
     backoff_factor: 2 # Exponential backoff multiplier
     max_backoff_ms: 10000 # Maximum backoff duration in milliseconds
