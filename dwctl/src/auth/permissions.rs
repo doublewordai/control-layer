@@ -288,8 +288,6 @@ pub fn role_has_permission(role: &Role, resource: Resource, operation: Operation
             matches!(
                 (resource, operation),
                 (Resource::Models, Operation::ReadOwn)            // Can read accessible models (filtered by groups)
-                    | (Resource::Endpoints, Operation::ReadOwn)   // Can see own endpoints
-                    | (Resource::Endpoints, Operation::ReadAll)   // Can see all endpoints
                     | (Resource::ApiKeys, Operation::ReadOwn)     // Can read own API keys
                     | (Resource::ApiKeys, Operation::CreateOwn)   // Can create own API keys
                     | (Resource::ApiKeys, Operation::UpdateOwn)   // Can update own API keys
@@ -538,7 +536,6 @@ mod tests {
         // Should have both StandardUser permissions
         assert!(has_permission(&user, Resource::ApiKeys, Operation::CreateOwn));
         assert!(has_permission(&user, Resource::Models, Operation::ReadOwn));
-        assert!(has_permission(&user, Resource::Endpoints, Operation::ReadAll));
         assert!(has_permission(&user, Resource::Users, Operation::ReadOwn));
 
         // And BatchAPIUser permissions

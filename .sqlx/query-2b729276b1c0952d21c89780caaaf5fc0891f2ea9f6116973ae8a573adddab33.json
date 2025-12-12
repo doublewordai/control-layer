@@ -1,0 +1,154 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n                    SELECT\n                        b.id, b.file_id, b.endpoint, b.completion_window, b.metadata,\n                        b.output_file_id, b.error_file_id, b.created_by, b.created_at,\n                        b.expires_at, b.cancelling_at, b.errors,\n                        b.total_requests,\n                        b.requests_started_at,\n                        b.finalizing_at,\n                        b.completed_at,\n                        b.failed_at,\n                        b.cancelled_at,\n                        COALESCE(counts.pending, 0)::BIGINT as \"pending_requests!\",\n                        COALESCE(counts.in_progress, 0)::BIGINT as \"in_progress_requests!\",\n                        COALESCE(counts.completed, 0)::BIGINT as \"completed_requests!\",\n                        COALESCE(counts.failed, 0)::BIGINT as \"failed_requests!\",\n                        COALESCE(counts.canceled, 0)::BIGINT as \"canceled_requests!\"\n                    FROM batches b\n                    LEFT JOIN LATERAL (\n                        SELECT\n                            COUNT(*) FILTER (WHERE state = 'pending') as pending,\n                            COUNT(*) FILTER (WHERE state IN ('claimed', 'processing')) as in_progress,\n                            COUNT(*) FILTER (WHERE state = 'completed') as completed,\n                            COUNT(*) FILTER (WHERE state = 'failed') as failed,\n                            COUNT(*) FILTER (WHERE state = 'canceled') as canceled\n                        FROM requests\n                        WHERE batch_id = b.id\n                    ) counts ON TRUE\n                    WHERE b.error_file_id = $1\n                    ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "id",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 1,
+        "name": "file_id",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 2,
+        "name": "endpoint",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 3,
+        "name": "completion_window",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 4,
+        "name": "metadata",
+        "type_info": "Jsonb"
+      },
+      {
+        "ordinal": 5,
+        "name": "output_file_id",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 6,
+        "name": "error_file_id",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 7,
+        "name": "created_by",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 8,
+        "name": "created_at",
+        "type_info": "Timestamptz"
+      },
+      {
+        "ordinal": 9,
+        "name": "expires_at",
+        "type_info": "Timestamptz"
+      },
+      {
+        "ordinal": 10,
+        "name": "cancelling_at",
+        "type_info": "Timestamptz"
+      },
+      {
+        "ordinal": 11,
+        "name": "errors",
+        "type_info": "Jsonb"
+      },
+      {
+        "ordinal": 12,
+        "name": "total_requests",
+        "type_info": "Int8"
+      },
+      {
+        "ordinal": 13,
+        "name": "requests_started_at",
+        "type_info": "Timestamptz"
+      },
+      {
+        "ordinal": 14,
+        "name": "finalizing_at",
+        "type_info": "Timestamptz"
+      },
+      {
+        "ordinal": 15,
+        "name": "completed_at",
+        "type_info": "Timestamptz"
+      },
+      {
+        "ordinal": 16,
+        "name": "failed_at",
+        "type_info": "Timestamptz"
+      },
+      {
+        "ordinal": 17,
+        "name": "cancelled_at",
+        "type_info": "Timestamptz"
+      },
+      {
+        "ordinal": 18,
+        "name": "pending_requests!",
+        "type_info": "Int8"
+      },
+      {
+        "ordinal": 19,
+        "name": "in_progress_requests!",
+        "type_info": "Int8"
+      },
+      {
+        "ordinal": 20,
+        "name": "completed_requests!",
+        "type_info": "Int8"
+      },
+      {
+        "ordinal": 21,
+        "name": "failed_requests!",
+        "type_info": "Int8"
+      },
+      {
+        "ordinal": 22,
+        "name": "canceled_requests!",
+        "type_info": "Int8"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid"
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      false,
+      false,
+      true,
+      true,
+      true,
+      true,
+      false,
+      true,
+      true,
+      true,
+      false,
+      true,
+      true,
+      true,
+      true,
+      true,
+      null,
+      null,
+      null,
+      null,
+      null
+    ]
+  },
+  "hash": "2b729276b1c0952d21c89780caaaf5fc0891f2ea9f6116973ae8a573adddab33"
+}

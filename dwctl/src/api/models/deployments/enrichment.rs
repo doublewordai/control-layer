@@ -39,6 +39,8 @@ pub struct DeployedModelEnricher<'a> {
     pub can_read_pricing: bool,
     /// Whether the user can read rate limiting information
     pub can_read_rate_limits: bool,
+    /// Whether the user can read who created models
+    pub can_read_users: bool,
 }
 
 type ProbeStatusTuple = (Option<Uuid>, bool, Option<i32>, Option<DateTime<Utc>>, Option<bool>, Option<f64>);
@@ -179,6 +181,11 @@ impl<'a> DeployedModelEnricher<'a> {
             // Mask rate limiting info for users without ModelRateLimits permission
             if !self.can_read_rate_limits {
                 model_response = model_response.mask_rate_limiting();
+                model_response = model_response.mask_capacity();
+            }
+
+            if !self.can_read_users {
+                model_response = model_response.mask_created_by();
             }
 
             enriched_models.push(model_response);

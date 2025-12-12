@@ -41,8 +41,9 @@ pub struct GroupResponse {
     pub id: GroupId,
     pub name: String,
     pub description: Option<String>,
-    #[schema(value_type = String, format = "uuid")]
-    pub created_by: UserId,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[schema(value_type = Option<String>, format = "uuid")]
+    pub created_by: Option<UserId>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
     /// Users in this group (only included if requested)
@@ -63,7 +64,7 @@ impl From<GroupDBResponse> for GroupResponse {
             id: db.id,
             name: db.name,
             description: db.description,
-            created_by: db.created_by,
+            created_by: Some(db.created_by),
             created_at: db.created_at,
             updated_at: db.updated_at,
             source: db.source,
@@ -82,6 +83,12 @@ impl GroupResponse {
         if let Some(models) = models {
             self.models = Some(models);
         }
+        self
+    }
+
+    /// Mask created_by field (sets to None for users without permission)
+    pub fn mask_created_by(mut self) -> Self {
+        self.created_by = None;
         self
     }
 }
