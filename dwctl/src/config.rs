@@ -384,12 +384,12 @@ pub struct ModelSource {
     pub sync_interval: Duration,
     /// Groups to add the models to when syncing from this source
     #[serde(default)]
-    pub default_models: Option<Vec<Models>>,
+    pub default_models: Option<Vec<DefaultModel>>,
 }
 
 /// External model details.
 #[derive(Debug, Clone, Deserialize, Serialize)]
-pub struct Models {
+pub struct DefaultModel {
     pub name: String,
     pub add_to_everyone_group: bool,
 }
