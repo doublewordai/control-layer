@@ -158,8 +158,10 @@ pub async fn list_deployed_models(
                 }
             }
             "endpoints" => {
-                // Endpoints are public information, allow for all users
-                includes.push(include);
+                // Model endpoints is priviliged information for admins
+                if can_read_all_models {
+                    includes.push(include);
+                }
             }
             _ => {
                 // Other includes (like pricing, status) are allowed for all users
@@ -440,8 +442,10 @@ pub async fn get_deployed_model(
                 }
             }
             "endpoints" => {
-                // Endpoints are public information, allow for all users
-                include_endpoints = true;
+                // Model endpoints is priviliged information for admins
+                if can_read_all_models {
+                    include_endpoints = true;
+                }
             }
             "status" => {
                 // Status is allowed for all users

@@ -649,8 +649,8 @@ jsonpath "$.groups" not exists
 jsonpath "$.metrics" not exists
 jsonpath "$.requests_per_second" not exists
 jsonpath "$.burst_size" not exists
-# Endpoints are public
-jsonpath "$.endpoint" exists
+# StandardUser CANNOT see endpoint details (contains privileged info)
+jsonpath "$.endpoint" not exists
 
 # -----------------------------------------------------------------------------
 # PlatformManager can fetch ANY model (even without group access)
@@ -845,7 +845,7 @@ jsonpath "$.data[*].id" not contains "{{admin_only_model_id}}"
 # StandardUser doesn't get enriched fields even if requested
 # -----------------------------------------------------------------------------
 
-# User1 requests all enriched fields - should get none (except endpoints)
+# User1 requests all enriched fields - should get no privileged information
 GET http://localhost:3001/admin/api/v1/models?include=groups,metrics,pricing,status,endpoints
 [Cookies]
 dwctl_session: {{user_jwt}}
@@ -856,7 +856,7 @@ jsonpath "$.data[0].metrics" not exists
 jsonpath "$.data[0].requests_per_second" not exists
 jsonpath "$.data[0].burst_size" not exists
 # Endpoints are public, user CAN see them
-jsonpath "$.data[0].endpoint" exists
+jsonpath "$.data[0].endpoint" not exists
 
 # -----------------------------------------------------------------------------
 # StandardUser cannot bypass with endpoint filter
@@ -991,7 +991,7 @@ jsonpath "$.data[?(@.alias == 'user1-model-alias')]" exists
 jsonpath "$.data[?(@.alias == 'public-model-alias')]" exists
 
 # -----------------------------------------------------------------------------
-# Endpoints are public info - StandardUser CAN see them
+# StandardUser CANNOT see endpoint details (privileged information)
 # -----------------------------------------------------------------------------
 
 GET http://localhost:3001/admin/api/v1/models?include=endpoints
@@ -999,9 +999,8 @@ GET http://localhost:3001/admin/api/v1/models?include=endpoints
 dwctl_session: {{user_jwt}}
 HTTP 200
 [Asserts]
-jsonpath "$.data[0].endpoint" exists
-jsonpath "$.data[0].endpoint.name" exists
-jsonpath "$.data[0].endpoint.url" exists
+# StandardUser should NOT see endpoint details even when requested
+jsonpath "$.data[0].endpoint" not exists
 
 # =============================================================================
 # PlatformManager Permissions Tests
@@ -1144,6 +1143,21 @@ HTTP 200
 [Asserts]
 jsonpath "$.data" count == 1
 jsonpath "$.data[0].id" == "{{deleted_model_id}}"
+
+# -----------------------------------------------------------------------------
+# PlatformManager CAN see endpoint details
+# -----------------------------------------------------------------------------
+
+# Admin with include=endpoints should see full endpoint information
+GET http://localhost:3001/admin/api/v1/models?include=endpoints
+[Cookies]
+dwctl_session: {{admin_jwt}}
+HTTP 200
+[Asserts]
+jsonpath "$.data[0].endpoint" exists
+jsonpath "$.data[0].endpoint.name" exists
+jsonpath "$.data[0].endpoint.url" exists
+jsonpath "$.data[0].endpoint.created_by" exists
 
 # =============================================================================
 # Model Deletion Permissions Tests (DELETE)
