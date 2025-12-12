@@ -369,7 +369,7 @@ macro_rules! generate_permission_helpers {
 // i.e can_read_own_resource, can_read_all_resources, etc.
 generate_permission_helpers!(read, Operation::ReadAll, Operation::ReadOwn);
 generate_permission_helpers!(create, Operation::CreateAll, Operation::CreateOwn);
-// generate_permission_helpers!(update, Operation::UpdateAll, Operation::UpdateOwn);
+generate_permission_helpers!(update, Operation::UpdateAll, Operation::UpdateOwn);
 generate_permission_helpers!(delete, Operation::DeleteAll, Operation::DeleteOwn);
 
 #[cfg(test)]
