@@ -1588,7 +1588,7 @@ mod test {
                     "name": "batch",
                     "input_price_per_token": "0.001",
                     "output_price_per_token": "0.003",
-                    "purpose": "realtime"
+                    "api_key_purpose": "realtime"
                 }]
             }))
             .await;
