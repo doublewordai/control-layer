@@ -9,11 +9,7 @@ HTTP 200
 [Captures]
 test_user_id: jsonpath "$.id"
 
-<<<<<<< HEAD
-# Verify the user currently has default roles (StandardUser + BatchAPIUser)
-=======
 # Verify the user currently has default roles (StandardUser and BatchAPIUser)
->>>>>>> main
 GET http://localhost:3001/admin/api/v1/users/{{test_user_id}}
 [Cookies]
 dwctl_session: {{admin_jwt}}
