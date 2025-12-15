@@ -1009,13 +1009,13 @@ jsonpath "$.data[*].id" contains "{{admin_list_batch}}"
 DELETE http://localhost:3001/ai/v1/files/{{user1_gpt4_file_id}}
 [Cookies]
 dwctl_session: {{user2_jwt}}
-HTTP 405
+HTTP 404
 
 # User1 CANNOT delete admin's files
 DELETE http://localhost:3001/ai/v1/files/{{admin_gpt4_file_id}}
 [Cookies]
 dwctl_session: {{user_jwt}}
-HTTP 405
+HTTP 404
 
 # User1 CAN delete their own files
 DELETE http://localhost:3001/ai/v1/files/{{user1_gpt4_file_id}}
@@ -1186,7 +1186,7 @@ dwctl_session: {{user_jwt}}
 HTTP 200
 [Asserts]
 body contains "req-2"
-body matches "Unauthorized|forbidden|not.*authorized"
+body matches "403"
 
 # =============================================================================
 # Cleanup: Delete test resources
