@@ -1,5 +1,6 @@
 //! HTTP handlers for model deployment endpoints.
 
+use crate::db::models::tariffs::TariffCreateDBRequest;
 use crate::{
     AppState,
     api::models::{
@@ -12,8 +13,8 @@ use crate::{
     },
     auth::permissions::{RequiresPermission, can_read_all_resources, has_permission, operation, resource},
     db::{
-        handlers::{Deployments, InferenceEndpoints, Repository, deployments::DeploymentFilter},
-        models::deployments::{DeploymentCreateDBRequest, DeploymentUpdateDBRequest, ModelPricing, ModelStatus},
+        handlers::{Deployments, InferenceEndpoints, Repository, Tariffs, deployments::DeploymentFilter},
+        models::deployments::{DeploymentCreateDBRequest, DeploymentUpdateDBRequest, ModelStatus},
     },
     errors::{Error, Result},
     types::{DeploymentId, Resource},
@@ -33,7 +34,7 @@ use sqlx::Acquire;
     params(
         ("endpoint" = Option<i32>, Query, description = "Filter by inference endpoint ID"),
         ("accessible" = Option<bool>, Query, description = "Filter to only models the current user can access (defaults to false for admins, true for users)"),
-        ("include" = Option<String>, Query, description = "Include additional data (comma-separated: 'groups', 'metrics', 'status', 'pricing', 'endpoints'). Only platform managers can include groups. Status shows probe monitoring information. Pricing shows simple customer rates for regular users, full pricing structure for users with Pricing::ReadAll permission. Endpoints includes full inference endpoint details."),
+        ("include" = Option<String>, Query, description = "Include additional data (comma-separated: 'groups', 'metrics', 'status', 'pricing', 'endpoints'). Only platform managers can include groups. Status shows probe monitoring information. Pricing shows simple customer rates for regular users, full pricing structure including current active tariffs for users with Pricing::ReadAll permission. Endpoints includes full inference endpoint details."),
         ("deleted" = Option<bool>, Query, description = "Show deleted models when true (admin only), non-deleted models when false, and all models when not specified"),
         ("inactive" = Option<bool>, Query, description = "Show inactive models when true (admin only)"),
         ("limit" = Option<i64>, Query, description = "Maximum number of items to return (default: 10, max: 100)"),
@@ -174,12 +175,12 @@ pub async fn list_deployed_models(
     let total_count = repo.count(&filter).await?;
     let filtered_models = repo.list(&filter).await?;
 
-    // Prepare models with their pricing for enrichment
-    let models_with_pricing: Vec<(DeployedModelResponse, Option<ModelPricing>)> = filtered_models
+    // Convert to API responses and add provider_pricing based on permissions and includes
+    let models: Vec<DeployedModelResponse> = filtered_models
         .into_iter()
         .map(|model| {
-            let pricing = model.pricing.clone();
-            (model.into(), pricing)
+            let provider_pricing = if can_read_pricing { model.provider_pricing.clone() } else { None };
+            DeployedModelResponse::from(model).with_provider_pricing(provider_pricing)
         })
         .collect();
 
@@ -203,7 +204,7 @@ pub async fn list_deployed_models(
         can_read_users,
     };
 
-    let response = enricher.enrich_many(models_with_pricing).await?;
+    let response = enricher.enrich_many(models).await?;
 
     Ok(Json(PaginatedResponse::new(response, total_count, skip, limit)))
 }
@@ -257,8 +258,26 @@ pub async fn create_deployed_model(
 
     // Create the deployment - let database constraints handle uniqueness
     let mut repo = Deployments::new(tx.acquire().await.map_err(|e| Error::Database(e.into()))?);
+    let tariffs = create.tariffs.clone();
     let db_request = DeploymentCreateDBRequest::from_api_create(current_user.id, create);
     let model = repo.create(&db_request).await?;
+
+    // Create tariffs if provided
+    if let Some(tariff_defs) = tariffs {
+        let mut tariffs_repo = Tariffs::new(tx.acquire().await.map_err(|e| Error::Database(e.into()))?);
+        for tariff_def in tariff_defs {
+            let tariff_request = TariffCreateDBRequest {
+                deployed_model_id: model.id,
+                name: tariff_def.name,
+                input_price_per_token: tariff_def.input_price_per_token,
+                output_price_per_token: tariff_def.output_price_per_token,
+                api_key_purpose: tariff_def.api_key_purpose,
+                valid_from: None, // Use NOW()
+            };
+            tariffs_repo.create(&tariff_request).await?;
+        }
+    }
+
     tx.commit().await.map_err(|e| Error::Database(e.into()))?;
 
     Ok(Json(DeployedModelResponse::from(model)))
@@ -295,8 +314,8 @@ pub async fn update_deployed_model(
 ) -> Result<Json<DeployedModelResponse>> {
     let has_system_access = has_permission(&current_user, resource::Models.into(), operation::SystemAccess.into());
 
-    let mut pool_conn = state.db.acquire().await.map_err(|e| Error::Database(e.into()))?;
-    let mut repo = Deployments::new(&mut pool_conn);
+    let mut tx = state.db.begin().await.map_err(|e| Error::Database(e.into()))?;
+    let mut repo = Deployments::new(tx.acquire().await.map_err(|e| Error::Database(e.into()))?);
 
     // Verify deployment exists and check access based on permissions
     match repo.get_by_id(deployment_id).await {
@@ -318,8 +337,60 @@ pub async fn update_deployed_model(
         Err(e) => return Err(e.into()),
     }
 
+    let tariffs = update.tariffs.clone();
     let db_request = DeploymentUpdateDBRequest::from(update);
     let model = repo.update(deployment_id, &db_request).await?;
+
+    // Handle tariff replacement if provided
+    if let Some(tariff_defs) = tariffs {
+        let tariff_conn = tx.acquire().await.map_err(|e| Error::Database(e.into()))?;
+        let mut tariffs_repo = Tariffs::new(tariff_conn);
+
+        // Fetch current tariffs to compare
+        let current_tariffs = tariffs_repo.list_current_by_model(deployment_id).await?;
+
+        // Helper function to check if a tariff matches the definition
+        let tariff_matches = |existing: &crate::db::models::tariffs::ModelTariff,
+                              def: &crate::api::models::deployments::TariffDefinition| {
+            existing.name == def.name
+                && existing.input_price_per_token == def.input_price_per_token
+                && existing.output_price_per_token == def.output_price_per_token
+                && existing.api_key_purpose == def.api_key_purpose
+        };
+
+        // Collect IDs of tariffs to close (those not in the new set or have changed)
+        let tariffs_to_close: Vec<uuid::Uuid> = current_tariffs
+            .iter()
+            .filter(|existing| !tariff_defs.iter().any(|def| tariff_matches(existing, def)))
+            .map(|t| t.id)
+            .collect();
+
+        // Batch close tariffs in a single query
+        if !tariffs_to_close.is_empty() {
+            tariffs_repo.close_tariffs_batch(&tariffs_to_close).await?;
+        }
+
+        // Create new or changed tariffs (skip those that already exist unchanged)
+        for tariff_def in tariff_defs {
+            // Skip if this tariff already exists with the same values
+            if current_tariffs.iter().any(|existing| tariff_matches(existing, &tariff_def)) {
+                continue;
+            }
+
+            let tariff_request = TariffCreateDBRequest {
+                deployed_model_id: deployment_id,
+                name: tariff_def.name,
+                input_price_per_token: tariff_def.input_price_per_token,
+                output_price_per_token: tariff_def.output_price_per_token,
+                api_key_purpose: tariff_def.api_key_purpose,
+                valid_from: None, // Use NOW()
+            };
+            tariffs_repo.create(&tariff_request).await?;
+        }
+    }
+
+    tx.commit().await.map_err(|e| Error::Database(e.into()))?;
+
     Ok(Json(DeployedModelResponse::from(model)))
 }
 
@@ -457,9 +528,13 @@ pub async fn get_deployed_model(
         }
     }
 
-    // Build base response
-    let pricing = model.pricing.clone();
-    let mut response = DeployedModelResponse::from(model);
+    // Build base response with provider_pricing based on permissions and includes
+    let provider_pricing = if include_pricing && can_read_pricing {
+        model.provider_pricing.clone()
+    } else {
+        None
+    };
+    let mut response = DeployedModelResponse::from(model).with_provider_pricing(provider_pricing);
 
     // Use ModelEnricher to add related data
     let enricher = DeployedModelEnricher {
@@ -474,7 +549,7 @@ pub async fn get_deployed_model(
         can_read_users,
     };
 
-    response = enricher.enrich_one(response, pricing).await?;
+    response = enricher.enrich_one(response).await?;
 
     Ok(Json(response))
 }

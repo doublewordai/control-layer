@@ -4,7 +4,8 @@ use crate::db::{
     errors::{DbError, Result},
     handlers::repository::Repository,
     models::deployments::{
-        DeploymentCreateDBRequest, DeploymentDBResponse, DeploymentUpdateDBRequest, FlatPricingFields, ModelPricing, ModelStatus, ModelType,
+        DeploymentCreateDBRequest, DeploymentDBResponse, DeploymentUpdateDBRequest, ModelStatus, ModelType, ProviderPricing,
+        ProviderPricingFields,
     },
 };
 use crate::types::{DeploymentId, InferenceEndpointId, UserId, abbrev_uuid};
@@ -102,9 +103,6 @@ struct DeployedModel {
     pub burst_size: Option<i32>,
     pub capacity: Option<i32>,
     pub batch_capacity: Option<i32>,
-    // User-facing pricing (always per-token)
-    pub upstream_input_price_per_token: Option<Decimal>,
-    pub upstream_output_price_per_token: Option<Decimal>,
     // Provider pricing (flexible)
     pub downstream_pricing_mode: Option<String>,
     pub downstream_input_price_per_token: Option<Decimal>,
@@ -119,15 +117,12 @@ pub struct Deployments<'c> {
 
 impl From<(Option<ModelType>, DeployedModel)> for DeploymentDBResponse {
     fn from((model_type, m): (Option<ModelType>, DeployedModel)) -> Self {
-        // Convert flat database fields to structured pricing
-        let pricing = ModelPricing::from_flat_fields(FlatPricingFields {
-            upstream_input_price_per_token: m.upstream_input_price_per_token,
-            upstream_output_price_per_token: m.upstream_output_price_per_token,
-            downstream_pricing_mode: m.downstream_pricing_mode,
-            downstream_input_price_per_token: m.downstream_input_price_per_token,
-            downstream_output_price_per_token: m.downstream_output_price_per_token,
-            downstream_hourly_rate: m.downstream_hourly_rate,
-            downstream_input_token_cost_ratio: m.downstream_input_token_cost_ratio,
+        let provider_pricing = ProviderPricing::from_flat_fields(ProviderPricingFields {
+            mode: m.downstream_pricing_mode,
+            input_price_per_token: m.downstream_input_price_per_token,
+            output_price_per_token: m.downstream_output_price_per_token,
+            hourly_rate: m.downstream_hourly_rate,
+            input_token_cost_ratio: m.downstream_input_token_cost_ratio,
         });
 
         Self {
@@ -148,7 +143,7 @@ impl From<(Option<ModelType>, DeployedModel)> for DeploymentDBResponse {
             burst_size: m.burst_size,
             capacity: m.capacity,
             batch_capacity: m.batch_capacity,
-            pricing,
+            provider_pricing,
         }
     }
 }
@@ -181,19 +176,19 @@ impl<'c> Repository for Deployments<'c> {
             ModelType::Reranker => "RERANKER",
         });
 
-        // Convert structured pricing to flat database fields
-        let flat_pricing = request.pricing.as_ref().map(|p| p.to_flat_fields()).unwrap_or_default();
+        // Extract provider pricing fields
+        let pricing_fields = request.provider_pricing.as_ref().map(|p| p.to_flat_fields()).unwrap_or_default();
 
         let model = sqlx::query_as!(
             DeployedModel,
             r#"
             INSERT INTO deployed_models (
                 model_name, alias, description, type, capabilities, created_by, hosted_on, created_at, updated_at,
-                requests_per_second, burst_size, capacity, batch_capacity, upstream_input_price_per_token, upstream_output_price_per_token,
+                requests_per_second, burst_size, capacity, batch_capacity,
                 downstream_pricing_mode, downstream_input_price_per_token, downstream_output_price_per_token,
                 downstream_hourly_rate, downstream_input_token_cost_ratio
             )
-            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18)
             RETURNING *
             "#,
             request.model_name.trim(),
@@ -209,13 +204,11 @@ impl<'c> Repository for Deployments<'c> {
             request.burst_size,
             request.capacity,
             request.batch_capacity,
-            flat_pricing.upstream_input_price_per_token,
-            flat_pricing.upstream_output_price_per_token,
-            flat_pricing.downstream_pricing_mode,
-            flat_pricing.downstream_input_price_per_token,
-            flat_pricing.downstream_output_price_per_token,
-            flat_pricing.downstream_hourly_rate,
-            flat_pricing.downstream_input_token_cost_ratio
+            pricing_fields.mode,
+            pricing_fields.input_price_per_token,
+            pricing_fields.output_price_per_token,
+            pricing_fields.hourly_rate,
+            pricing_fields.input_token_cost_ratio
         )
         .fetch_one(&mut *self.db)
         .await?;
@@ -234,7 +227,7 @@ impl<'c> Repository for Deployments<'c> {
     async fn get_by_id(&mut self, id: Self::Id) -> Result<Option<Self::Response>> {
         let model = sqlx::query_as!(
             DeployedModel,
-            "SELECT id, model_name, alias, description, type, capabilities, created_by, hosted_on, status, last_sync, deleted, created_at, updated_at, requests_per_second, burst_size, capacity, batch_capacity, upstream_input_price_per_token, upstream_output_price_per_token, downstream_pricing_mode, downstream_input_price_per_token, downstream_output_price_per_token, downstream_hourly_rate, downstream_input_token_cost_ratio FROM deployed_models WHERE id = $1",
+            "SELECT id, model_name, alias, description, type, capabilities, created_by, hosted_on, status, last_sync, deleted, created_at, updated_at, requests_per_second, burst_size, capacity, batch_capacity, downstream_pricing_mode, downstream_input_price_per_token, downstream_output_price_per_token, downstream_hourly_rate, downstream_input_token_cost_ratio FROM deployed_models WHERE id = $1",
             id
         )
             .fetch_optional(&mut *self.db)
@@ -259,7 +252,7 @@ impl<'c> Repository for Deployments<'c> {
 
         let deployments = sqlx::query_as!(
             DeployedModel,
-            "SELECT id, model_name, alias, description, type, capabilities, created_by, hosted_on, status, last_sync, deleted, created_at, updated_at, requests_per_second, burst_size, capacity, batch_capacity, upstream_input_price_per_token, upstream_output_price_per_token, downstream_pricing_mode, downstream_input_price_per_token, downstream_output_price_per_token, downstream_hourly_rate, downstream_input_token_cost_ratio FROM deployed_models WHERE id = ANY($1)",
+            "SELECT id, model_name, alias, description, type, capabilities, created_by, hosted_on, status, last_sync, deleted, created_at, updated_at, requests_per_second, burst_size, capacity, batch_capacity, downstream_pricing_mode, downstream_input_price_per_token, downstream_output_price_per_token, downstream_hourly_rate, downstream_input_token_cost_ratio FROM deployed_models WHERE id = ANY($1)",
             ids.as_slice()
         )
             .fetch_all(&mut *self.db)
@@ -316,12 +309,8 @@ impl<'c> Repository for Deployments<'c> {
         // Convert capabilities to slice if provided
         let capabilities_slice: Option<&[String]> = request.capabilities.as_ref().and_then(|inner| inner.as_ref().map(|v| v.as_slice()));
 
-        // Extract pricing update information using clean intermediate struct
-        let pricing_params = request
-            .pricing
-            .as_ref()
-            .map(|pricing_update| pricing_update.to_update_params())
-            .unwrap_or_default();
+        // Extract provider pricing update information
+        let pricing_params = request.provider_pricing.as_ref().map(|p| p.to_update_params()).unwrap_or_default();
 
         // Info logging for rate limiting
         tracing::info!(
@@ -381,35 +370,25 @@ impl<'c> Repository for Deployments<'c> {
                 ELSE batch_capacity
             END,
 
-            -- Individual field updates for customer/upstream pricing
-            upstream_input_price_per_token = CASE
-                WHEN $22 THEN $23
-                ELSE upstream_input_price_per_token
-            END,
-            upstream_output_price_per_token = CASE
-                WHEN $24 THEN $25
-                ELSE upstream_output_price_per_token
-            END,
-
-            -- Individual field updates for downstream pricing
+            -- Individual field updates for provider/downstream pricing
             downstream_pricing_mode = CASE
-                WHEN $26 THEN $27
+                WHEN $22 THEN $23
                 ELSE downstream_pricing_mode
             END,
             downstream_input_price_per_token = CASE
-                WHEN $28 THEN $29
+                WHEN $24 THEN $25
                 ELSE downstream_input_price_per_token
             END,
             downstream_output_price_per_token = CASE
-                WHEN $30 THEN $31
+                WHEN $26 THEN $27
                 ELSE downstream_output_price_per_token
             END,
             downstream_hourly_rate = CASE
-                WHEN $32 THEN $33
+                WHEN $28 THEN $29
                 ELSE downstream_hourly_rate
             END,
             downstream_input_token_cost_ratio = CASE
-                WHEN $34 THEN $35
+                WHEN $30 THEN $31
                 ELSE downstream_input_token_cost_ratio
             END,
 
@@ -444,22 +423,17 @@ impl<'c> Repository for Deployments<'c> {
             request.capacity.as_ref().and_then(|inner| inner.as_ref()),       // $19
             request.batch_capacity.is_some() as bool,                         // $20
             request.batch_capacity.as_ref().and_then(|inner| inner.as_ref()), // $21
-            // For individual customer/upstream pricing fields
-            pricing_params.should_update_customer_input,  // $22
-            pricing_params.customer_input,                // $23
-            pricing_params.should_update_customer_output, // $24
-            pricing_params.customer_output,               // $25
-            // For individual downstream pricing fields
-            pricing_params.should_update_downstream_mode,   // $26
-            pricing_params.downstream_mode,                 // $27
-            pricing_params.should_update_downstream_input,  // $28
-            pricing_params.downstream_input,                // $29
-            pricing_params.should_update_downstream_output, // $30
-            pricing_params.downstream_output,               // $31
-            pricing_params.should_update_downstream_hourly, // $32
-            pricing_params.downstream_hourly,               // $33
-            pricing_params.should_update_downstream_ratio,  // $34
-            pricing_params.downstream_ratio                 // $35
+            // For individual provider/downstream pricing fields
+            pricing_params.should_update_mode,   // $22
+            pricing_params.mode.as_deref(),      // $23
+            pricing_params.should_update_input,  // $24
+            pricing_params.input,                // $25
+            pricing_params.should_update_output, // $26
+            pricing_params.output,               // $27
+            pricing_params.should_update_hourly, // $28
+            pricing_params.hourly,               // $29
+            pricing_params.should_update_ratio,  // $30
+            pricing_params.ratio                 // $31
         )
         .fetch_one(&mut *self.db)
         .await?;
@@ -659,7 +633,7 @@ mod tests {
         db::{
             handlers::{Groups, Users, inference_endpoints::InferenceEndpoints},
             models::{
-                deployments::{ModelPricing, ModelPricingUpdate, ProviderPricing, ProviderPricingUpdate, TokenPricing, TokenPricingUpdate},
+                deployments::{ProviderPricing, ProviderPricingUpdate},
                 groups::GroupCreateDBRequest,
                 inference_endpoints::InferenceEndpointCreateDBRequest,
                 users::UserCreateDBRequest,
@@ -1724,148 +1698,6 @@ mod tests {
 
     #[sqlx::test]
     #[test_log::test]
-    async fn test_partial_customer_pricing_updates(pool: PgPool) {
-        let base_url = url::Url::parse("http://localhost:8080").unwrap();
-        let sources = vec![crate::config::ModelSource {
-            name: "test".to_string(),
-            url: base_url.clone(),
-            api_key: None,
-            sync_interval: std::time::Duration::from_secs(3600),
-            default_models: None,
-        }];
-        crate::seed_database(&sources, &pool).await.unwrap();
-
-        let user = create_test_user(&pool).await;
-        let test_endpoint_id = get_test_endpoint_id(&pool).await;
-
-        let created_model;
-        {
-            let mut tx = pool.begin().await.unwrap();
-            {
-                let mut repo = Deployments::new(tx.acquire().await.unwrap());
-
-                // Create model with initial pricing
-                let initial_pricing = ModelPricing {
-                    upstream: Some(TokenPricing {
-                        input_price_per_token: Some(Decimal::from_str("0.01").unwrap()),
-                        output_price_per_token: Some(Decimal::from_str("0.02").unwrap()),
-                    }),
-                    downstream: Some(ProviderPricing::PerToken {
-                        input_price_per_token: Some(Decimal::from_str("0.005").unwrap()),
-                        output_price_per_token: Some(Decimal::from_str("0.01").unwrap()),
-                    }),
-                };
-
-                let model_create = DeploymentCreateDBRequest::builder()
-                    .created_by(user.id)
-                    .model_name("pricing-test-model".to_string())
-                    .alias("pricing-test-deployment".to_string())
-                    .hosted_on(test_endpoint_id)
-                    .pricing(initial_pricing)
-                    .build();
-
-                created_model = repo.create(&model_create).await.unwrap();
-            }
-            tx.commit().await.unwrap();
-        }
-
-        // Verify initial pricing
-        assert!(created_model.pricing.is_some());
-        if let Some(pricing) = &created_model.pricing {
-            if let Some(upstream) = &pricing.upstream {
-                assert_eq!(upstream.input_price_per_token, Some(Decimal::from_str("0.01").unwrap()));
-                assert_eq!(upstream.output_price_per_token, Some(Decimal::from_str("0.02").unwrap()));
-            }
-        }
-
-        // Test 1: Update only customer input pricing, leave output unchanged
-        {
-            let mut conn = pool.acquire().await.unwrap();
-            let mut repo = Deployments::new(&mut conn);
-
-            let pricing_update = ModelPricingUpdate {
-                upstream: Some(TokenPricingUpdate {
-                    input_price_per_token: Some(Some(Decimal::from_str("0.015").unwrap())),
-                    output_price_per_token: None, // No change
-                }),
-                downstream: None, // No downstream changes
-            };
-
-            let update = DeploymentUpdateDBRequest::builder().pricing(pricing_update).build();
-
-            let updated_model = repo.update(created_model.id, &update).await.unwrap();
-
-            // Verify partial update worked
-            assert!(updated_model.pricing.is_some());
-            if let Some(pricing) = &updated_model.pricing {
-                if let Some(upstream) = &pricing.upstream {
-                    assert_eq!(upstream.input_price_per_token, Some(Decimal::from_str("0.015").unwrap()));
-                    assert_eq!(upstream.output_price_per_token, Some(Decimal::from_str("0.02").unwrap()));
-                    // Unchanged
-                }
-                // Downstream should remain unchanged
-                assert!(pricing.downstream.is_some());
-            }
-        }
-
-        // Test 2: Update only customer output pricing, leave input unchanged
-        {
-            let mut conn = pool.acquire().await.unwrap();
-            let mut repo = Deployments::new(&mut conn);
-
-            let pricing_update = ModelPricingUpdate {
-                upstream: Some(TokenPricingUpdate {
-                    input_price_per_token: None, // No change
-                    output_price_per_token: Some(Some(Decimal::from_str("0.025").unwrap())),
-                }),
-                downstream: None, // No downstream changes
-            };
-
-            let update = DeploymentUpdateDBRequest::builder().pricing(pricing_update).build();
-
-            let updated_model = repo.update(created_model.id, &update).await.unwrap();
-
-            // Verify partial update worked
-            assert!(updated_model.pricing.is_some());
-            if let Some(pricing) = &updated_model.pricing {
-                if let Some(upstream) = &pricing.upstream {
-                    assert_eq!(upstream.input_price_per_token, Some(Decimal::from_str("0.015").unwrap())); // From previous update
-                    assert_eq!(upstream.output_price_per_token, Some(Decimal::from_str("0.025").unwrap()));
-                    // New value
-                }
-            }
-        }
-
-        // Test 3: Clear customer input pricing (set to null)
-        {
-            let mut conn = pool.acquire().await.unwrap();
-            let mut repo = Deployments::new(&mut conn);
-
-            let pricing_update = ModelPricingUpdate {
-                upstream: Some(TokenPricingUpdate {
-                    input_price_per_token: Some(None), // Clear this field
-                    output_price_per_token: None,      // No change
-                }),
-                downstream: None,
-            };
-
-            let update = DeploymentUpdateDBRequest::builder().pricing(pricing_update).build();
-
-            let updated_model = repo.update(created_model.id, &update).await.unwrap();
-
-            // Verify clearing worked
-            if let Some(pricing) = &updated_model.pricing {
-                if let Some(upstream) = &pricing.upstream {
-                    assert_eq!(upstream.input_price_per_token, None); // Cleared
-                    assert_eq!(upstream.output_price_per_token, Some(Decimal::from_str("0.025").unwrap()));
-                    // Unchanged
-                }
-            }
-        }
-    }
-
-    #[sqlx::test]
-    #[test_log::test]
     async fn test_partial_downstream_per_token_pricing_updates(pool: PgPool) {
         let base_url = url::Url::parse("http://localhost:8080").unwrap();
         let sources = vec![crate::config::ModelSource {
@@ -1886,24 +1718,18 @@ mod tests {
             {
                 let mut repo = Deployments::new(tx.acquire().await.unwrap());
 
-                // Create model with initial downstream per-token pricing
-                let initial_pricing = ModelPricing {
-                    upstream: Some(TokenPricing {
-                        input_price_per_token: Some(Decimal::from_str("0.01").unwrap()),
-                        output_price_per_token: Some(Decimal::from_str("0.02").unwrap()),
-                    }),
-                    downstream: Some(ProviderPricing::PerToken {
-                        input_price_per_token: Some(Decimal::from_str("0.005").unwrap()),
-                        output_price_per_token: Some(Decimal::from_str("0.01").unwrap()),
-                    }),
+                // Create model with initial provider per-token pricing
+                let initial_provider_pricing = ProviderPricing::PerToken {
+                    input_price_per_token: Some(Decimal::from_str("0.005").unwrap()),
+                    output_price_per_token: Some(Decimal::from_str("0.01").unwrap()),
                 };
 
                 let model_create = DeploymentCreateDBRequest::builder()
                     .created_by(user.id)
-                    .model_name("downstream-per-token-test".to_string())
-                    .alias("downstream-per-token-alias".to_string())
+                    .model_name("provider-per-token-test".to_string())
+                    .alias("provider-per-token-alias".to_string())
                     .hosted_on(test_endpoint_id)
-                    .pricing(initial_pricing)
+                    .provider_pricing(initial_provider_pricing)
                     .build();
 
                 created_model = repo.create(&model_create).await.unwrap();
@@ -1911,108 +1737,85 @@ mod tests {
             tx.commit().await.unwrap();
         }
 
-        // Test 1: Update only downstream input pricing
+        // Test 1: Update only provider input pricing
         {
             let mut conn = pool.acquire().await.unwrap();
             let mut repo = Deployments::new(&mut conn);
 
-            let pricing_update = ModelPricingUpdate {
-                upstream: None, // No customer changes
-                downstream: Some(ProviderPricingUpdate::PerToken {
-                    input_price_per_token: Some(Some(Decimal::from_str("0.003").unwrap())),
-                    output_price_per_token: None, // No change
-                }),
+            let pricing_update = ProviderPricingUpdate::PerToken {
+                input_price_per_token: Some(Some(Decimal::from_str("0.003").unwrap())),
+                output_price_per_token: None, // No change
             };
 
-            let update = DeploymentUpdateDBRequest::builder().pricing(pricing_update).build();
+            let update = DeploymentUpdateDBRequest::builder().provider_pricing(pricing_update).build();
 
             let updated_model = repo.update(created_model.id, &update).await.unwrap();
 
-            // Verify partial downstream update
-            if let Some(pricing) = &updated_model.pricing {
-                if let Some(ProviderPricing::PerToken {
-                    input_price_per_token,
-                    output_price_per_token,
-                }) = &pricing.downstream
-                {
-                    assert_eq!(input_price_per_token, &Some(Decimal::from_str("0.003").unwrap()));
-                    assert_eq!(output_price_per_token, &Some(Decimal::from_str("0.01").unwrap()));
-                    // Unchanged
-                }
-                // Customer pricing should remain unchanged
-                if let Some(upstream) = &pricing.upstream {
-                    assert_eq!(upstream.input_price_per_token, Some(Decimal::from_str("0.01").unwrap()));
-                    assert_eq!(upstream.output_price_per_token, Some(Decimal::from_str("0.02").unwrap()));
-                }
+            // Verify partial provider update
+            if let Some(ProviderPricing::PerToken {
+                input_price_per_token,
+                output_price_per_token,
+            }) = &updated_model.provider_pricing
+            {
+                assert_eq!(input_price_per_token, &Some(Decimal::from_str("0.003").unwrap()));
+                assert_eq!(output_price_per_token, &Some(Decimal::from_str("0.01").unwrap())); // Unchanged
             }
         }
 
-        // Test 2: Update only downstream output pricing
+        // Test 2: Update only provider output pricing
         {
             let mut conn = pool.acquire().await.unwrap();
             let mut repo = Deployments::new(&mut conn);
 
-            let pricing_update = ModelPricingUpdate {
-                upstream: None,
-                downstream: Some(ProviderPricingUpdate::PerToken {
-                    input_price_per_token: None, // No change
-                    output_price_per_token: Some(Some(Decimal::from_str("0.008").unwrap())),
-                }),
+            let pricing_update = ProviderPricingUpdate::PerToken {
+                input_price_per_token: None, // No change
+                output_price_per_token: Some(Some(Decimal::from_str("0.008").unwrap())),
             };
 
-            let update = DeploymentUpdateDBRequest::builder().pricing(pricing_update).build();
+            let update = DeploymentUpdateDBRequest::builder().provider_pricing(pricing_update).build();
 
             let updated_model = repo.update(created_model.id, &update).await.unwrap();
 
-            // Verify partial downstream update
-            if let Some(pricing) = &updated_model.pricing {
-                if let Some(ProviderPricing::PerToken {
-                    input_price_per_token,
-                    output_price_per_token,
-                }) = &pricing.downstream
-                {
-                    assert_eq!(input_price_per_token, &Some(Decimal::from_str("0.003").unwrap())); // From previous update
-                    assert_eq!(output_price_per_token, &Some(Decimal::from_str("0.008").unwrap()));
-                    // New value
-                }
+            // Verify partial provider update
+            if let Some(ProviderPricing::PerToken {
+                input_price_per_token,
+                output_price_per_token,
+            }) = &updated_model.provider_pricing
+            {
+                assert_eq!(input_price_per_token, &Some(Decimal::from_str("0.003").unwrap())); // From previous update
+                assert_eq!(output_price_per_token, &Some(Decimal::from_str("0.008").unwrap()));
             }
         }
 
-        // Test 3: Clear downstream input pricing
+        // Test 3: Clear provider input pricing
         {
             let mut conn = pool.acquire().await.unwrap();
             let mut repo = Deployments::new(&mut conn);
 
-            let pricing_update = ModelPricingUpdate {
-                upstream: None,
-                downstream: Some(ProviderPricingUpdate::PerToken {
-                    input_price_per_token: Some(None), // Clear this field
-                    output_price_per_token: None,      // No change
-                }),
+            let pricing_update = ProviderPricingUpdate::PerToken {
+                input_price_per_token: Some(None), // Clear this field
+                output_price_per_token: None,      // No change
             };
 
-            let update = DeploymentUpdateDBRequest::builder().pricing(pricing_update).build();
+            let update = DeploymentUpdateDBRequest::builder().provider_pricing(pricing_update).build();
 
             let updated_model = repo.update(created_model.id, &update).await.unwrap();
 
             // Verify clearing worked
-            if let Some(pricing) = &updated_model.pricing {
-                if let Some(ProviderPricing::PerToken {
-                    input_price_per_token,
-                    output_price_per_token,
-                }) = &pricing.downstream
-                {
-                    assert_eq!(input_price_per_token, &None); // Cleared
-                    assert_eq!(output_price_per_token, &Some(Decimal::from_str("0.008").unwrap()));
-                    // Unchanged
-                }
+            if let Some(ProviderPricing::PerToken {
+                input_price_per_token,
+                output_price_per_token,
+            }) = &updated_model.provider_pricing
+            {
+                assert_eq!(input_price_per_token, &None); // Cleared
+                assert_eq!(output_price_per_token, &Some(Decimal::from_str("0.008").unwrap())); // Unchanged
             }
         }
     }
 
     #[sqlx::test]
     #[test_log::test]
-    async fn test_downstream_hourly_pricing_updates(pool: PgPool) {
+    async fn test_provider_hourly_pricing_updates(pool: PgPool) {
         let base_url = url::Url::parse("http://localhost:8080").unwrap();
         let sources = vec![crate::config::ModelSource {
             name: "test".to_string(),
@@ -2032,24 +1835,18 @@ mod tests {
             {
                 let mut repo = Deployments::new(tx.acquire().await.unwrap());
 
-                // Create model with initial hourly pricing
-                let initial_pricing = ModelPricing {
-                    upstream: Some(TokenPricing {
-                        input_price_per_token: Some(Decimal::from_str("0.01").unwrap()),
-                        output_price_per_token: Some(Decimal::from_str("0.02").unwrap()),
-                    }),
-                    downstream: Some(ProviderPricing::Hourly {
-                        rate: Decimal::from_str("5.00").unwrap(),
-                        input_token_cost_ratio: Decimal::from_str("0.8").unwrap(),
-                    }),
+                // Create model with initial provider hourly pricing
+                let initial_provider_pricing = ProviderPricing::Hourly {
+                    rate: Decimal::from_str("5.00").unwrap(),
+                    input_token_cost_ratio: Decimal::from_str("0.8").unwrap(),
                 };
 
                 let model_create = DeploymentCreateDBRequest::builder()
                     .created_by(user.id)
-                    .model_name("hourly-pricing-test".to_string())
-                    .alias("hourly-pricing-alias".to_string())
+                    .model_name("provider-hourly-test".to_string())
+                    .alias("provider-hourly-alias".to_string())
                     .hosted_on(test_endpoint_id)
-                    .pricing(initial_pricing)
+                    .provider_pricing(initial_provider_pricing)
                     .build();
 
                 created_model = repo.create(&model_create).await.unwrap();
@@ -2057,17 +1854,15 @@ mod tests {
             tx.commit().await.unwrap();
         }
 
-        // Verify initial hourly pricing
-        assert!(created_model.pricing.is_some());
-        if let Some(pricing) = &created_model.pricing {
-            if let Some(ProviderPricing::Hourly {
-                rate,
-                input_token_cost_ratio,
-            }) = &pricing.downstream
-            {
-                assert_eq!(rate, &Decimal::from_str("5.00").unwrap());
-                assert_eq!(input_token_cost_ratio, &Decimal::from_str("0.8").unwrap());
-            }
+        // Verify initial provider hourly pricing
+        assert!(created_model.provider_pricing.is_some());
+        if let Some(ProviderPricing::Hourly {
+            rate,
+            input_token_cost_ratio,
+        }) = &created_model.provider_pricing
+        {
+            assert_eq!(rate, &Decimal::from_str("5.00").unwrap());
+            assert_eq!(input_token_cost_ratio, &Decimal::from_str("0.8").unwrap());
         }
 
         // Test 1: Update hourly rate only
@@ -2075,34 +1870,23 @@ mod tests {
             let mut conn = pool.acquire().await.unwrap();
             let mut repo = Deployments::new(&mut conn);
 
-            let pricing_update = ModelPricingUpdate {
-                upstream: None, // No customer changes
-                downstream: Some(ProviderPricingUpdate::Hourly {
-                    rate: Some(Decimal::from_str("6.50").unwrap()),
-                    input_token_cost_ratio: None, // Keep existing value
-                }),
+            let pricing_update = ProviderPricingUpdate::Hourly {
+                rate: Some(Decimal::from_str("6.50").unwrap()),
+                input_token_cost_ratio: None, // Keep existing value
             };
 
-            let update = DeploymentUpdateDBRequest::builder().pricing(pricing_update).build();
+            let update = DeploymentUpdateDBRequest::builder().provider_pricing(pricing_update).build();
 
             let updated_model = repo.update(created_model.id, &update).await.unwrap();
 
             // Verify hourly rate update
-            if let Some(pricing) = &updated_model.pricing {
-                if let Some(ProviderPricing::Hourly {
-                    rate,
-                    input_token_cost_ratio,
-                }) = &pricing.downstream
-                {
-                    assert_eq!(rate, &Decimal::from_str("6.50").unwrap()); // Updated
-                    assert_eq!(input_token_cost_ratio, &Decimal::from_str("0.8").unwrap());
-                    // Should remain unchanged
-                }
-                // Customer pricing should remain unchanged
-                if let Some(upstream) = &pricing.upstream {
-                    assert_eq!(upstream.input_price_per_token, Some(Decimal::from_str("0.01").unwrap()));
-                    assert_eq!(upstream.output_price_per_token, Some(Decimal::from_str("0.02").unwrap()));
-                }
+            if let Some(ProviderPricing::Hourly {
+                rate,
+                input_token_cost_ratio,
+            }) = &updated_model.provider_pricing
+            {
+                assert_eq!(rate, &Decimal::from_str("6.50").unwrap()); // Updated
+                assert_eq!(input_token_cost_ratio, &Decimal::from_str("0.8").unwrap()); // Unchanged
             }
         }
 
@@ -2111,29 +1895,23 @@ mod tests {
             let mut conn = pool.acquire().await.unwrap();
             let mut repo = Deployments::new(&mut conn);
 
-            let pricing_update = ModelPricingUpdate {
-                upstream: None,
-                downstream: Some(ProviderPricingUpdate::Hourly {
-                    rate: None, // Keep existing value
-                    input_token_cost_ratio: Some(Decimal::from_str("0.9").unwrap()),
-                }),
+            let pricing_update = ProviderPricingUpdate::Hourly {
+                rate: None, // Keep existing value
+                input_token_cost_ratio: Some(Decimal::from_str("0.9").unwrap()),
             };
 
-            let update = DeploymentUpdateDBRequest::builder().pricing(pricing_update).build();
+            let update = DeploymentUpdateDBRequest::builder().provider_pricing(pricing_update).build();
 
             let updated_model = repo.update(created_model.id, &update).await.unwrap();
 
             // Verify input token cost ratio update
-            if let Some(pricing) = &updated_model.pricing {
-                if let Some(ProviderPricing::Hourly {
-                    rate,
-                    input_token_cost_ratio,
-                }) = &pricing.downstream
-                {
-                    assert_eq!(rate, &Decimal::from_str("6.50").unwrap()); // From previous update
-                    assert_eq!(input_token_cost_ratio, &Decimal::from_str("0.9").unwrap());
-                    // Updated
-                }
+            if let Some(ProviderPricing::Hourly {
+                rate,
+                input_token_cost_ratio,
+            }) = &updated_model.provider_pricing
+            {
+                assert_eq!(rate, &Decimal::from_str("6.50").unwrap()); // From previous update
+                assert_eq!(input_token_cost_ratio, &Decimal::from_str("0.9").unwrap()); // Updated
             }
         }
 
@@ -2142,28 +1920,23 @@ mod tests {
             let mut conn = pool.acquire().await.unwrap();
             let mut repo = Deployments::new(&mut conn);
 
-            let pricing_update = ModelPricingUpdate {
-                upstream: None,
-                downstream: Some(ProviderPricingUpdate::Hourly {
-                    rate: Some(Decimal::from_str("7.00").unwrap()),
-                    input_token_cost_ratio: Some(Decimal::from_str("0.75").unwrap()),
-                }),
+            let pricing_update = ProviderPricingUpdate::Hourly {
+                rate: Some(Decimal::from_str("7.00").unwrap()),
+                input_token_cost_ratio: Some(Decimal::from_str("0.75").unwrap()),
             };
 
-            let update = DeploymentUpdateDBRequest::builder().pricing(pricing_update).build();
+            let update = DeploymentUpdateDBRequest::builder().provider_pricing(pricing_update).build();
 
             let updated_model = repo.update(created_model.id, &update).await.unwrap();
 
             // Verify both fields updated
-            if let Some(pricing) = &updated_model.pricing {
-                if let Some(ProviderPricing::Hourly {
-                    rate,
-                    input_token_cost_ratio,
-                }) = &pricing.downstream
-                {
-                    assert_eq!(rate, &Decimal::from_str("7.00").unwrap());
-                    assert_eq!(input_token_cost_ratio, &Decimal::from_str("0.75").unwrap());
-                }
+            if let Some(ProviderPricing::Hourly {
+                rate,
+                input_token_cost_ratio,
+            }) = &updated_model.provider_pricing
+            {
+                assert_eq!(rate, &Decimal::from_str("7.00").unwrap());
+                assert_eq!(input_token_cost_ratio, &Decimal::from_str("0.75").unwrap());
             }
         }
     }

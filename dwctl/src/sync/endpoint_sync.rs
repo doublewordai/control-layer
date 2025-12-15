@@ -736,7 +736,7 @@ mod tests {
                 burst_size: None,
                 capacity: None,
                 batch_capacity: None,
-                pricing: None,
+                provider_pricing: None,
             }
         }
     }

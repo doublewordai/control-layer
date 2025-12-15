@@ -13,8 +13,12 @@ use utoipa::ToSchema;
 pub enum ApiKeyPurpose {
     /// Platform/management API access (/admin/api/*)
     Platform,
-    /// Inference API access (/ai/*)
-    Inference,
+    /// Real-time inference API access (/ai/*) - user-created keys
+    Realtime,
+    /// Batch inference access (/ai/*) - hidden keys for batch processing
+    Batch,
+    /// Playground inference access (/ai/*) - hidden keys for dashboard playground
+    Playground,
 }
 
 /// Database request for creating a new API key
