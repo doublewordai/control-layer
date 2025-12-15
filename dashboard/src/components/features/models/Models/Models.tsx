@@ -21,6 +21,7 @@ const Models: React.FC = () => {
   const { hasPermission } = useAuthorization();
   const canManageGroups = hasPermission("manage-groups");
   const canViewAnalytics = hasPermission("analytics");
+  const canViewEndpoints = hasPermission("endpoints");
   const showPricing = true;
 
   const [filterProvider, setFilterProvider] = useState("all");
@@ -170,6 +171,7 @@ const Models: React.FC = () => {
           isStatusMode={isStatusMode}
           canManageGroups={canManageGroups}
           canViewAnalytics={canViewAnalytics}
+          canViewEndpoints={canViewEndpoints}
           showPricing={showPricing}
           onClearFilters={handleClearFilters}
         />

@@ -57,6 +57,7 @@ export interface ModelsContentProps {
   isStatusMode: boolean;
   canManageGroups: boolean;
   canViewAnalytics: boolean;
+  canViewEndpoints: boolean;
   showPricing: boolean;
   onClearFilters: () => void;
 }
@@ -69,6 +70,7 @@ export const ModelsContent: React.FC<ModelsContentProps> = ({
   isStatusMode,
   canManageGroups,
   canViewAnalytics,
+  canViewEndpoints,
   showPricing,
   onClearFilters,
 }) => {
@@ -79,12 +81,13 @@ export const ModelsContent: React.FC<ModelsContentProps> = ({
   const [apiExamplesModel, setApiExamplesModel] = useState<Model | null>(null);
 
   const includeParam = useMemo(() => {
-    const parts: string[] = ["status", "endpoints"];
+    const parts: string[] = ["status"];
+    if (canViewEndpoints) parts.push("endpoints");
     if (canManageGroups) parts.push("groups");
     if (canViewAnalytics) parts.push("metrics");
     if (showPricing) parts.push("pricing");
     return parts.join(",");
-  }, [canManageGroups, canViewAnalytics, showPricing]);
+  }, [canViewEndpoints, canManageGroups, canViewAnalytics, showPricing]);
 
   const {
     data: rawModelsData,
@@ -259,14 +262,18 @@ export const ModelsContent: React.FC<ModelsContentProps> = ({
                   }}
                 >
                   <CardHeader className="px-6 pt-5 pb-0">
-                    <div className="space-y-2">
+                    <div
+                      className={canViewEndpoints ? "space-y-0" : "space-y-2"}
+                    >
                       {/* ROW 1: Alias on left, groups/chevron on right */}
                       <div className="flex items-center justify-between gap-1">
                         <div className="flex items-center gap-2">
                           {model.alias.length > 30 ? (
                             <HoverCard openDelay={200} closeDelay={100}>
                               <HoverCardTrigger asChild>
-                                <CardTitle className="text-lg truncate max-w-[460px] md:max-w-[420px] lg:max-w-[270px] xl:max-w-[360px] 2xl:max-w-[230px] 3xl:max-w-[300px] 4xl:max-w-[360px] 5xl:max-w-[420px] break-all hover:opacity-70 transition-opacity cursor-default">
+                                <CardTitle
+                                  className={`text-lg truncate ${canManageGroups ? "max-w-[460px] md:max-w-[420px] lg:max-w-[270px] xl:max-w-[360px] 2xl:max-w-[230px] 3xl:max-w-[300px] 4xl:max-w-[360px] 5xl:max-w-[420px]" : "max-w-[460px] md:max-w-[500px] lg:max-w-[320px] xl:max-w-[480px] 2xl:max-w-[360px] 3xl:max-w-[450px] 4xl:max-w-[520px] 5xl:max-w-[600px]"} break-all hover:opacity-70 transition-opacity cursor-default`}
+                                >
                                   {model.alias}
                                 </CardTitle>
                               </HoverCardTrigger>
@@ -280,7 +287,9 @@ export const ModelsContent: React.FC<ModelsContentProps> = ({
                               </HoverCardContent>
                             </HoverCard>
                           ) : (
-                            <CardTitle className="text-lg truncate max-w-[460px] md:max-w-[420px] lg:max-w-[270px] xl:max-w-[360px] 2xl:max-w-[230px] 3xl:max-w-[300px] 4xl:max-w-[360px] 5xl:max-w-[420px] break-all">
+                            <CardTitle
+                              className={`text-lg truncate ${canManageGroups ? "max-w-[460px] md:max-w-[420px] lg:max-w-[270px] xl:max-w-[360px] 2xl:max-w-[230px] 3xl:max-w-[300px] 4xl:max-w-[360px] 5xl:max-w-[420px]" : "max-w-[460px] md:max-w-[500px] lg:max-w-[320px] xl:max-w-[480px] 2xl:max-w-[360px] 3xl:max-w-[450px] 4xl:max-w-[520px] 5xl:max-w-[600px]"} break-all`}
+                            >
                               {model.alias}
                             </CardTitle>
                           )}
@@ -333,25 +342,6 @@ export const ModelsContent: React.FC<ModelsContentProps> = ({
                               </HoverCardContent>
                             </HoverCard>
                           )}
-
-                          <HoverCard openDelay={200} closeDelay={100}>
-                            <HoverCardTrigger asChild>
-                              <button
-                                className="text-gray-500 hover:text-gray-700 transition-colors p-1"
-                                onClick={(e) => e.stopPropagation()}
-                              >
-                                <Info className="h-4 w-4" />
-                                <span className="sr-only">
-                                  View model description
-                                </span>
-                              </button>
-                            </HoverCardTrigger>
-                            <HoverCardContent className="w-96" sideOffset={5}>
-                              <p className="text-sm text-muted-foreground">
-                                {model.description || "No description provided"}
-                              </p>
-                            </HoverCardContent>
-                          </HoverCard>
                         </div>
 
                         {/* Access Groups and Expand Icon */}
@@ -445,7 +435,18 @@ export const ModelsContent: React.FC<ModelsContentProps> = ({
                         </div>
                       </div>
 
-                      {/* ROW 2: Pricing, model name, endpoint */}
+                      {/* ROW 2: Endpoint (if user can edit endpoints) */}
+                      {canViewEndpoints && model.endpoint && (
+                        <CardDescription className="flex items-center gap-1.5 min-w-0 mb-2">
+                          <span className="text-gray-600 text-sm">
+                            <span className="font-medium">
+                              {model.endpoint.name}
+                            </span>
+                          </span>
+                        </CardDescription>
+                      )}
+
+                      {/* ROW 3: Batch & Realtime Pricing */}
                       <CardDescription className="flex items-center gap-1.5 min-w-0">
                         {/* Show pricing for all users */}
                         {showPricing && (
@@ -456,6 +457,7 @@ export const ModelsContent: React.FC<ModelsContentProps> = ({
                                   className="flex items-center gap-0.5 shrink-0 hover:opacity-70 transition-opacity"
                                   onClick={(e) => e.stopPropagation()}
                                 >
+                                  Batch:
                                   {!model.pricing?.input_price_per_token &&
                                   !model.pricing?.output_price_per_token ? (
                                     <span className="flex items-center gap-0.5 text-green-700">
@@ -509,6 +511,7 @@ export const ModelsContent: React.FC<ModelsContentProps> = ({
                                 </button>
                               </HoverCardTrigger>
                               <HoverCardContent className="w-48" sideOffset={5}>
+                                Batch:
                                 {!model.pricing?.input_price_per_token &&
                                 !model.pricing?.output_price_per_token ? (
                                   <div className="text-sm">
@@ -558,56 +561,8 @@ export const ModelsContent: React.FC<ModelsContentProps> = ({
                                 )}
                               </HoverCardContent>
                             </HoverCard>
-                            <span>•</span>
                           </>
                         )}
-                        <span className="flex items-center gap-1.5 min-w-0">
-                          {/*{model.model_name.length > 30 ? (
-                            <HoverCard openDelay={200} closeDelay={100}>
-                              <HoverCardTrigger asChild>
-                                <span className="truncate max-w-[330px] md:max-w-[330px] lg:max-w-[150px] xl:max-w-[180px] 2xl:max-w-[140px] 3xl:max-w-[170px] 4xl:max-w-[190px] hover:opacity-70 transition-opacity">
-                                  {model.model_name}
-                                </span>
-                              </HoverCardTrigger>
-                              <HoverCardContent
-                                className="w-auto max-w-sm"
-                                sideOffset={5}
-                              >
-                                <p className="text-sm break-all">
-                                  {model.model_name}
-                                </p>
-                              </HoverCardContent>
-                            </HoverCard>
-                          ) : (
-                            <span className="truncate max-w-[330px] md:max-w-[330px] lg:max-w-[150px] xl:max-w-[180px] 2xl:max-w-[140px] 3xl:max-w-[170px] 4xl:max-w-[190px] ">
-                              {model.model_name}
-                            </span>
-                          )}
-                          <span>•</span>*/}
-                          {(() => {
-                            const endpointName =
-                              model.endpoint?.name || "Unknown endpoint";
-                            return endpointName.length > 25 ? (
-                              <HoverCard openDelay={200} closeDelay={100}>
-                                <HoverCardTrigger asChild>
-                                  <span className="truncate max-w-[300px] 2xl:max-w-[200px] 3xl:max-w-[300px] hover:opacity-70 transition-opacity">
-                                    {endpointName}
-                                  </span>
-                                </HoverCardTrigger>
-                                <HoverCardContent
-                                  className="w-auto max-w-sm"
-                                  sideOffset={5}
-                                >
-                                  <p className="text-sm">{endpointName}</p>
-                                </HoverCardContent>
-                              </HoverCard>
-                            ) : (
-                              <span className="truncate max-w-[300px] 2xl:max-w-[200px] 3xl:max-w-[300px]">
-                                {endpointName}
-                              </span>
-                            );
-                          })()}
-                        </span>
                       </CardDescription>
                     </div>
                   </CardHeader>
