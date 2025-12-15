@@ -15,6 +15,7 @@ import {
   useUpdateModel,
 } from "../../../api/control-layer/hooks";
 import type { TariffDefinition } from "../../../api/control-layer/types";
+import { toast } from "sonner";
 
 interface UpdateModelPricingModalProps {
   isOpen: boolean;
@@ -68,8 +69,11 @@ export const UpdateModelPricingModal: React.FC<UpdateModelPricingModalProps> = (
       });
       onClose();
     } catch (error) {
-      console.error("Failed to update model tariffs:", error);
-      // You could add toast notification here
+      // Only log detailed errors in development to avoid leaking server info
+      if (import.meta.env.DEV) {
+        console.error("Failed to update model tariffs:", error);
+      }
+      toast.error("Failed to update pricing. Please try again.");
     }
   };
 
