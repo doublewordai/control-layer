@@ -78,12 +78,11 @@ impl<'c> Credits<'c> {
 
         // Use pg_advisory_xact_lock which is transaction-scoped (auto-releases on commit/rollback)
         // This will BLOCK until the lock is available, ensuring serialization
-        sqlx::query_scalar::<_, i32>("SELECT 1 FROM (SELECT pg_advisory_xact_lock($1)) AS _")
-            .bind(lock_key)
+        sqlx::query!("SELECT pg_advisory_xact_lock($1) as lock_result", lock_key)
             .fetch_one(&mut *tx)
             .await?;
 
-        trace!("Acquired lock for user_id {}", request.user_id);
+        trace!("Acquired advisory lock for user_id {}", request.user_id);
 
         // Now safely get the current balance - no race condition possible
         let (current_balance, last_transaction_id) = match sqlx::query!(

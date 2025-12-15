@@ -1,0 +1,1 @@
+export { ModelTariffTable } from "./ModelTariffTable";

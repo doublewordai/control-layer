@@ -122,6 +122,13 @@ impl<'c> Repository for Users<'c> {
                 .await?;
         }
 
+        // Pre-create hidden API keys for batch and playground to avoid race condition with onwards sync
+        // These keys must exist before the user's first request to ensure immediate access
+        // Realtime keys are NOT pre-created - users create them explicitly via API and can tolerate activation delay
+        let mut api_keys_repo = ApiKeys::new(&mut tx);
+        api_keys_repo.get_or_create_hidden_key(user_id, ApiKeyPurpose::Batch).await?;
+        api_keys_repo.get_or_create_hidden_key(user_id, ApiKeyPurpose::Playground).await?;
+
         tx.commit().await?;
 
         Ok(UserDBResponse::from((roles_to_insert, user)))
@@ -579,10 +586,8 @@ impl<'c> Users<'c> {
                 .await?;
         }
 
-        // Pre-create hidden API key for inference to avoid race condition with onwards sync
-        // This ensures the key exists before the user makes their first AI request
-        let mut api_keys_repo = ApiKeys::new(&mut *self.db);
-        api_keys_repo.get_or_create_hidden_key(user.id, ApiKeyPurpose::Inference).await?;
+        // Note: Hidden API keys for batch and playground are pre-created by the create() method
+        // to avoid race condition with onwards sync
 
         Ok((user, was_created))
     }

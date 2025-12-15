@@ -156,23 +156,31 @@ export function formatRelativeTime(dateString?: string): string {
 }
 
 /**
- * Format pricing information (input and output prices per token)
+ * Format a single tariff price (stored as price per token) for display as price per million tokens
+ * @param pricePerToken - Price per token as a decimal string (e.g., "0.000001")
+ * @returns Formatted price per million tokens (e.g., "$1.00")
  */
-export function formatPricing(pricing?: {
-  input_price_per_token?: number | null;
-  output_price_per_token?: number | null;
-}): string {
-  if (
-    !pricing ||
-    (!pricing.input_price_per_token && !pricing.output_price_per_token)
-  ) {
-    return "$0/$0";
+export function formatTariffPrice(pricePerToken: string | number | null | undefined): string {
+  if (!pricePerToken || pricePerToken === "0" || pricePerToken === 0) {
+    return "$0";
   }
-  const input = pricing.input_price_per_token
-    ? `$${Number(pricing.input_price_per_token).toFixed(4)}`
-    : "$0";
-  const output = pricing.output_price_per_token
-    ? `$${Number(pricing.output_price_per_token).toFixed(4)}`
-    : "$0";
-  return `${input} / ${output}`;
+
+  // Convert from per-token to per-million tokens for display
+  const pricePerMillion = parseFloat(String(pricePerToken)) * 1000000;
+
+  // Format with 2 decimal places
+  return `$${pricePerMillion.toFixed(2)}`;
+}
+
+/**
+ * Format tariff pricing with both input and output prices per million tokens
+ * @param inputPrice - Input price per token as a decimal string
+ * @param outputPrice - Output price per token as a decimal string
+ * @returns Formatted pricing string (e.g., "$1.50 / $2.00")
+ */
+export function formatTariffPricing(
+  inputPrice: string | number | null | undefined,
+  outputPrice: string | number | null | undefined
+): string {
+  return `${formatTariffPrice(inputPrice)} / ${formatTariffPrice(outputPrice)}`;
 }
