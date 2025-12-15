@@ -342,6 +342,28 @@ export const ModelsContent: React.FC<ModelsContentProps> = ({
                               </HoverCardContent>
                             </HoverCard>
                           )}
+
+                          {model.metrics && (
+                            <HoverCard openDelay={200} closeDelay={100}>
+                              <HoverCardTrigger asChild>
+                                <button
+                                  className="text-gray-500 hover:text-gray-700 transition-colors p-1"
+                                  onClick={(e) => e.stopPropagation()}
+                                >
+                                  <Info className="h-4 w-4" />
+                                  <span className="sr-only">
+                                    View model description
+                                  </span>
+                                </button>
+                              </HoverCardTrigger>
+                              <HoverCardContent className="w-96" sideOffset={5}>
+                                <p className="text-sm text-muted-foreground">
+                                  {model.description ||
+                                    "No description provided"}
+                                </p>
+                              </HoverCardContent>
+                            </HoverCard>
+                          )}
                         </div>
 
                         {/* Access Groups and Expand Icon */}
