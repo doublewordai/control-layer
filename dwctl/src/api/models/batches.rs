@@ -48,6 +48,13 @@ pub struct CreateBatchRequest {
     pub metadata: Option<HashMap<String, String>>,
 }
 
+/// Request body for retrying specific requests
+#[derive(Debug, Deserialize, ToSchema)]
+pub struct RetryRequestsRequest {
+    /// Array of request IDs to retry
+    pub request_ids: Vec<String>,
+}
+
 /// Batch object response (OpenAI-compatible)
 #[derive(Debug, Serialize, Deserialize, ToSchema)]
 pub struct BatchResponse {

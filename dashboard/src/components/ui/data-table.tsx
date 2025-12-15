@@ -82,7 +82,6 @@ interface DataTableProps<TData, TValue> {
   initialColumnVisibility?: VisibilityState;
   onRowClick?: (row: TData) => void;
 
-  // NEW: Server-side pagination support
   /**
    * Pagination mode
    * - 'client': All data loaded at once, pagination handled in-memory (default)
