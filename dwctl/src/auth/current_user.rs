@@ -155,16 +155,38 @@ async fn try_proxy_header_auth(
             .get_or_create_proxy_header_user(external_user_id, user_email, groups_and_provider, &config.auth.default_user_roles)
             .await
         {
-            Ok(user) => Some(CurrentUser {
-                id: user.id,
-                username: user.username,
-                email: user.email,
-                is_admin: user.is_admin,
-                roles: user.roles,
-                display_name: user.display_name,
-                avatar_url: user.avatar_url,
-                payment_provider_id: user.payment_provider_id,
-            }),
+            Ok((user, was_created)) => {
+                // Grant initial credits to newly created standard users if configured
+                if was_created {
+                    let initial_credits = config.credits.initial_credits_for_standard_users;
+                    if initial_credits > rust_decimal::Decimal::ZERO && user.roles.contains(&Role::StandardUser) {
+                        use crate::db::handlers::credits::Credits;
+                        use crate::db::models::credits::CreditTransactionCreateDBRequest;
+
+                        let mut credits_repo = Credits::new(&mut tx);
+                        let request = CreditTransactionCreateDBRequest::admin_grant(
+                            user.id,
+                            uuid::Uuid::nil(), // System ID for initial credits
+                            initial_credits,
+                            Some("Initial credits on account creation".to_string()),
+                        );
+                        if let Err(e) = credits_repo.create_transaction(&request).await {
+                            return Some(Err(Error::Database(e)));
+                        }
+                    }
+                }
+
+                Some(CurrentUser {
+                    id: user.id,
+                    username: user.username,
+                    email: user.email,
+                    is_admin: user.is_admin,
+                    roles: user.roles,
+                    display_name: user.display_name,
+                    avatar_url: user.avatar_url,
+                    payment_provider_id: user.payment_provider_id,
+                })
+            }
             Err(e) => return Some(Err(Error::Database(e))),
         }
     } else {
@@ -262,16 +284,19 @@ async fn try_api_key_auth(parts: &axum::http::request::Parts, db: &PgPool) -> Op
     let path = parts.uri.path();
     let purpose_str = &api_key_data.purpose;
 
-    let expected_purpose = if path.starts_with("/admin/api/") {
-        "platform"
+    // Validate purpose for the endpoint
+    let is_valid = if path.starts_with("/admin/api/") {
+        // Platform endpoints require platform keys
+        purpose_str == "platform"
     } else if path.starts_with("/ai/") {
-        "inference"
+        // AI inference endpoints accept any inference-type key
+        matches!(purpose_str.as_str(), "realtime" | "batch" | "playground")
     } else {
         // For other paths, allow any purpose
-        purpose_str.as_str()
+        true
     };
 
-    if purpose_str != expected_purpose {
+    if !is_valid {
         return Some(Err(Error::InsufficientPermissions {
             required: crate::types::Permission::Granted,
             action: crate::types::Operation::ReadAll,
@@ -1181,5 +1206,121 @@ mod tests {
         assert!(result.is_err());
         let error = result.unwrap_err();
         assert!(matches!(error, Error::Unauthenticated { .. }));
+    }
+
+    #[sqlx::test]
+    async fn test_proxy_header_user_receives_initial_credits(pool: PgPool) {
+        use crate::db::handlers::credits::Credits;
+        use crate::db::models::credits::CreditTransactionType;
+
+        let mut config = create_test_config();
+        config.auth.proxy_header.enabled = true;
+        config.auth.proxy_header.auto_create_users = true;
+        // Set initial credits for standard users
+        config.credits.initial_credits_for_standard_users = rust_decimal::Decimal::new(10000, 2); // 100.00 credits
+
+        let state = {
+            let request_manager = std::sync::Arc::new(fusillade::PostgresRequestManager::new(pool.clone()));
+            AppState::builder()
+                .db(pool.clone())
+                .config(config)
+                .request_manager(request_manager)
+                .build()
+        };
+
+        let new_email = "proxy-user@example.com";
+        let new_external_id = "auth0|proxyuser123";
+        let mut parts = create_test_parts_with_auth(new_external_id, new_email);
+
+        // Verify user doesn't exist initially
+        let mut pool_conn = pool.acquire().await.unwrap();
+        let mut users_repo = Users::new(&mut pool_conn);
+        let existing = users_repo.get_user_by_email(new_email).await.unwrap();
+        assert!(existing.is_none());
+        drop(users_repo);
+        drop(pool_conn);
+
+        // Extract should auto-create the user
+        let result = CurrentUser::from_request_parts(&mut parts, &state).await;
+        assert!(result.is_ok(), "Should successfully create user via proxy header");
+
+        let current_user = result.unwrap();
+        assert_eq!(current_user.email, new_email);
+        assert!(current_user.roles.contains(&Role::StandardUser));
+
+        // Verify the user got initial credits
+        let mut conn = pool.acquire().await.unwrap();
+        let mut credits_repo = Credits::new(&mut conn);
+
+        let balance = credits_repo.get_user_balance(current_user.id).await.unwrap();
+        assert_eq!(
+            balance,
+            rust_decimal::Decimal::new(10000, 2),
+            "User should have initial credits balance of 100.00"
+        );
+
+        // Verify the transaction exists with correct details
+        let transactions = credits_repo.list_user_transactions(current_user.id, 0, 10).await.unwrap();
+
+        assert_eq!(transactions.len(), 1, "Should have exactly one transaction");
+        assert_eq!(transactions[0].amount, rust_decimal::Decimal::new(10000, 2));
+        assert_eq!(transactions[0].balance_after, rust_decimal::Decimal::new(10000, 2));
+        assert_eq!(transactions[0].transaction_type, CreditTransactionType::AdminGrant);
+        assert!(transactions[0].description.as_ref().unwrap().contains("Initial credits"));
+    }
+
+    #[sqlx::test]
+    async fn test_proxy_header_existing_user_no_duplicate_credits(pool: PgPool) {
+        use crate::db::handlers::credits::Credits;
+
+        let mut config = create_test_config();
+        config.auth.proxy_header.enabled = true;
+        config.auth.proxy_header.auto_create_users = true;
+        config.credits.initial_credits_for_standard_users = rust_decimal::Decimal::new(10000, 2); // 100.00 credits
+
+        let state = {
+            let request_manager = std::sync::Arc::new(fusillade::PostgresRequestManager::new(pool.clone()));
+            AppState::builder()
+                .db(pool.clone())
+                .config(config)
+                .request_manager(request_manager)
+                .build()
+        };
+
+        let email = "existing-proxy@example.com";
+        let external_id = "auth0|existing123";
+
+        // First login - creates user and grants credits
+        let mut parts1 = create_test_parts_with_auth(external_id, email);
+        let result1 = CurrentUser::from_request_parts(&mut parts1, &state).await;
+        assert!(result1.is_ok());
+        let user = result1.unwrap();
+
+        // Verify initial credits were granted
+        let mut conn = pool.acquire().await.unwrap();
+        let mut credits_repo = Credits::new(&mut conn);
+        let balance = credits_repo.get_user_balance(user.id).await.unwrap();
+        assert_eq!(balance, rust_decimal::Decimal::new(10000, 2));
+        drop(credits_repo);
+        drop(conn);
+
+        // Second login with same user - should NOT grant credits again
+        let mut parts2 = create_test_parts_with_auth(external_id, email);
+        let result2 = CurrentUser::from_request_parts(&mut parts2, &state).await;
+        assert!(result2.is_ok());
+
+        // Verify balance is still the same (no duplicate credits)
+        let mut conn = pool.acquire().await.unwrap();
+        let mut credits_repo = Credits::new(&mut conn);
+        let balance_after = credits_repo.get_user_balance(user.id).await.unwrap();
+        assert_eq!(
+            balance_after,
+            rust_decimal::Decimal::new(10000, 2),
+            "Balance should remain the same on subsequent logins"
+        );
+
+        // Verify still only one transaction
+        let transactions = credits_repo.list_user_transactions(user.id, 0, 10).await.unwrap();
+        assert_eq!(transactions.len(), 1, "Should still have exactly one transaction");
     }
 }

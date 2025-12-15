@@ -122,6 +122,13 @@ impl<'c> Repository for Users<'c> {
                 .await?;
         }
 
+        // Pre-create hidden API keys for batch and playground to avoid race condition with onwards sync
+        // These keys must exist before the user's first request to ensure immediate access
+        // Realtime keys are NOT pre-created - users create them explicitly via API and can tolerate activation delay
+        let mut api_keys_repo = ApiKeys::new(&mut tx);
+        api_keys_repo.get_or_create_hidden_key(user_id, ApiKeyPurpose::Batch).await?;
+        api_keys_repo.get_or_create_hidden_key(user_id, ApiKeyPurpose::Playground).await?;
+
         tx.commit().await?;
 
         Ok(UserDBResponse::from((roles_to_insert, user)))
@@ -460,6 +467,8 @@ impl<'c> Users<'c> {
     /// 3. If not found, create new user
     ///
     /// Email is required for user creation. Groups are synced if provided (along with provider).
+    ///
+    /// Returns a tuple of (user, was_created) where was_created is true if a new user was created.
     #[instrument(skip(self, external_user_id, email, groups_and_provider, default_roles), err)]
     pub async fn get_or_create_proxy_header_user(
         &mut self,
@@ -467,7 +476,7 @@ impl<'c> Users<'c> {
         email: &str,
         groups_and_provider: Option<(Vec<String>, &str)>,
         default_roles: &[Role],
-    ) -> Result<UserDBResponse> {
+    ) -> Result<(UserDBResponse, bool)> {
         tracing::trace!(
             "Starting get_or_create_proxy_header_user for external_user_id: {}",
             external_user_id
@@ -481,7 +490,7 @@ impl<'c> Users<'c> {
             .await?;
         tracing::trace!("Acquired advisory lock for external_user_id");
 
-        let user = 'user_lookup: {
+        let (user, was_created) = 'user_lookup: {
             // Look up by external_user_id
             if let Some(mut user) = self.get_user_by_external_user_id(external_user_id).await? {
                 tracing::debug!("Found existing user by external_user_id");
@@ -494,7 +503,7 @@ impl<'c> Users<'c> {
                     user.email = email.to_string();
                 }
 
-                break 'user_lookup user;
+                break 'user_lookup (user, false);
             }
 
             // external user id not found (might be NULL). Lookup by email for single header mode
@@ -508,7 +517,7 @@ impl<'c> Users<'c> {
                     if existing_external_id == external_user_id {
                         tracing::debug!("External user ID matches for user {}, using existing user", abbrev_uuid(&user.id));
                         // Exact match - use this user
-                        break 'user_lookup user;
+                        break 'user_lookup (user, false);
                     }
                     tracing::debug!("External user ID mismatch for user {}, creating new user", abbrev_uuid(&user.id));
                     // External user ID mismatch - this is a different federated identity with the same email
@@ -525,7 +534,7 @@ impl<'c> Users<'c> {
                             abbrev_uuid(&user.id)
                         );
                         // Backwards compatibility mode - use this user but don't backfill yet
-                        break 'user_lookup user;
+                        break 'user_lookup (user, false);
                     }
                     tracing::debug!("Backfilling external_user_id for user {}", abbrev_uuid(&user.id));
                     tracing::trace!("Backfilling external_user_id to {}", external_user_id);
@@ -534,7 +543,7 @@ impl<'c> Users<'c> {
                     self.update_user_external_id(user.id, external_user_id).await?;
                     user.external_user_id = Some(external_user_id.to_string());
 
-                    break 'user_lookup user;
+                    break 'user_lookup (user, false);
                 }
             }
 
@@ -560,7 +569,8 @@ impl<'c> Users<'c> {
                 external_user_id: Some(external_user_id.to_string()),
             };
 
-            self.create(&create_request).await?
+            let created_user = self.create(&create_request).await?;
+            (created_user, true)
         };
 
         // Sync groups once at the end, regardless of which path we took
@@ -576,12 +586,10 @@ impl<'c> Users<'c> {
                 .await?;
         }
 
-        // Pre-create hidden API key for inference to avoid race condition with onwards sync
-        // This ensures the key exists before the user makes their first AI request
-        let mut api_keys_repo = ApiKeys::new(&mut *self.db);
-        api_keys_repo.get_or_create_hidden_key(user.id, ApiKeyPurpose::Inference).await?;
+        // Note: Hidden API keys for batch and playground are pre-created by the create() method
+        // to avoid race condition with onwards sync
 
-        Ok(user)
+        Ok((user, was_created))
     }
 }
 

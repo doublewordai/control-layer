@@ -49,7 +49,7 @@ struct ApiKey {
 
 impl From<(Vec<DeploymentId>, ApiKey)> for ApiKeyDBResponse {
     fn from((model_access, api_key): (Vec<DeploymentId>, ApiKey)) -> Self {
-        // Parse purpose string to enum - default to Inference for backwards compatibility
+        // Parse purpose string to enum - default to Realtime for backwards compatibility
         let purpose = api_key
             .purpose
             .parse::<serde_json::Value>()
@@ -57,10 +57,14 @@ impl From<(Vec<DeploymentId>, ApiKey)> for ApiKeyDBResponse {
             .and_then(|v| serde_json::from_value::<ApiKeyPurpose>(v).ok())
             .or(match api_key.purpose.as_str() {
                 "platform" => Some(ApiKeyPurpose::Platform),
-                "inference" => Some(ApiKeyPurpose::Inference),
+                "realtime" => Some(ApiKeyPurpose::Realtime),
+                "batch" => Some(ApiKeyPurpose::Batch),
+                "playground" => Some(ApiKeyPurpose::Playground),
+                // Legacy: map old "inference" to "realtime" for backwards compatibility
+                "inference" => Some(ApiKeyPurpose::Realtime),
                 _ => None,
             })
-            .unwrap_or(ApiKeyPurpose::Inference);
+            .unwrap_or(ApiKeyPurpose::Realtime);
 
         Self {
             id: api_key.id,
@@ -98,7 +102,9 @@ impl<'c> Repository for ApiKeys<'c> {
         // Convert purpose enum to string for database
         let purpose_str = match request.purpose {
             ApiKeyPurpose::Platform => "platform",
-            ApiKeyPurpose::Inference => "inference",
+            ApiKeyPurpose::Realtime => "realtime",
+            ApiKeyPurpose::Batch => "batch",
+            ApiKeyPurpose::Playground => "playground",
         };
 
         let api_key = sqlx::query_as!(
@@ -289,7 +295,7 @@ impl<'c> ApiKeys<'c> {
     ///
     /// # Arguments
     /// * `user_id` - The user ID to get or create a hidden key for
-    /// * `purpose` - The purpose of the key (should be ApiKeyPurpose::Inference for proxy use)
+    /// * `purpose` - The purpose of the key
     ///
     /// # Returns
     /// Returns the secret of the hidden API key
@@ -298,7 +304,9 @@ impl<'c> ApiKeys<'c> {
         // Convert purpose enum to string for database
         let purpose_str = match purpose {
             ApiKeyPurpose::Platform => "platform",
-            ApiKeyPurpose::Inference => "inference",
+            ApiKeyPurpose::Realtime => "realtime",
+            ApiKeyPurpose::Batch => "batch",
+            ApiKeyPurpose::Playground => "playground",
         };
 
         // Try to get existing hidden key for this user and purpose
@@ -434,9 +442,13 @@ impl<'c> ApiKeys<'c> {
                 )
                 OR (
                     -- Free models are accessible to all users (zero balance OK)
-                    -- A model is free if pricing is NULL OR both prices are 0
-                    (dm.upstream_input_price_per_token IS NULL OR dm.upstream_input_price_per_token = 0)
-                    AND (dm.upstream_output_price_per_token IS NULL OR dm.upstream_output_price_per_token = 0)
+                    -- A model is free if it has no active tariffs or all active tariffs are zero-priced
+                    NOT EXISTS (
+                        SELECT 1 FROM model_tariffs mt
+                        WHERE mt.deployed_model_id = dm.id
+                        AND mt.valid_until IS NULL
+                        AND (mt.input_price_per_token > 0 OR mt.output_price_per_token > 0)
+                    )
                 )
             )
 
@@ -475,9 +487,13 @@ impl<'c> ApiKeys<'c> {
                 )
                 OR (
                     -- Free models are accessible to all users (zero balance OK)
-                    -- A model is free if pricing is NULL OR both prices are 0
-                    (dm.upstream_input_price_per_token IS NULL OR dm.upstream_input_price_per_token = 0)
-                    AND (dm.upstream_output_price_per_token IS NULL OR dm.upstream_output_price_per_token = 0)
+                    -- A model is free if it has no active tariffs or all active tariffs are zero-priced
+                    NOT EXISTS (
+                        SELECT 1 FROM model_tariffs mt
+                        WHERE mt.deployed_model_id = dm.id
+                        AND mt.valid_until IS NULL
+                        AND (mt.input_price_per_token > 0 OR mt.output_price_per_token > 0)
+                    )
                 )
             )
             "#,
@@ -538,6 +554,60 @@ impl<'c> ApiKeys<'c> {
 
         Ok(results)
     }
+
+    /// Get user information (ID, email, purpose) by API key secret
+    ///
+    /// This method is used by the request logging system to enrich analytics records
+    /// with user information and determine tariff selection based on API key purpose.
+    ///
+    /// # Arguments
+    /// * `secret` - The API key secret to look up
+    ///
+    /// # Returns
+    /// Returns a tuple of (user_id, email, purpose) if found, or None if not found
+    #[instrument(skip(self, secret), err)]
+    pub async fn get_user_info_by_secret(&mut self, secret: &str) -> Result<Option<(UserId, String, ApiKeyPurpose)>> {
+        #[derive(Debug, FromRow)]
+        struct UserInfo {
+            user_id: UserId,
+            email: String,
+            purpose: String,
+        }
+
+        let info = sqlx::query_as!(
+            UserInfo,
+            r#"
+            SELECT u.id as user_id, u.email, ak.purpose
+            FROM api_keys ak
+            JOIN users u ON ak.user_id = u.id
+            WHERE ak.secret = $1
+            "#,
+            secret
+        )
+        .fetch_optional(&mut *self.db)
+        .await?;
+
+        Ok(info.map(|i| {
+            // Parse purpose string to enum - default to Realtime for backwards compatibility
+            let purpose = i
+                .purpose
+                .parse::<serde_json::Value>()
+                .ok()
+                .and_then(|v| serde_json::from_value::<ApiKeyPurpose>(v).ok())
+                .or(match i.purpose.as_str() {
+                    "platform" => Some(ApiKeyPurpose::Platform),
+                    "realtime" => Some(ApiKeyPurpose::Realtime),
+                    "batch" => Some(ApiKeyPurpose::Batch),
+                    "playground" => Some(ApiKeyPurpose::Playground),
+                    // Legacy: map old "inference" to "realtime" for backwards compatibility
+                    "inference" => Some(ApiKeyPurpose::Realtime),
+                    _ => None,
+                })
+                .unwrap_or(ApiKeyPurpose::Realtime);
+
+            (i.user_id, i.email, purpose)
+        }))
+    }
 }
 
 #[cfg(test)]
@@ -589,7 +659,7 @@ mod tests {
                     user_id: userid,
                     name: "Test API Key".to_string(),
                     description: Some("Test description".to_string()),
-                    purpose: ApiKeyPurpose::Inference,
+                    purpose: ApiKeyPurpose::Realtime,
                     requests_per_second: None,
                     burst_size: None,
                 };
@@ -629,7 +699,7 @@ mod tests {
                 user_id: user.id,
                 name: "Key 1".to_string(),
                 description: None,
-                purpose: ApiKeyPurpose::Inference,
+                purpose: ApiKeyPurpose::Realtime,
                 requests_per_second: None,
                 burst_size: None,
             };
@@ -637,7 +707,7 @@ mod tests {
                 user_id: user.id,
                 name: "Key 2".to_string(),
                 description: Some("Key 2 description".to_string()),
-                purpose: ApiKeyPurpose::Inference,
+                purpose: ApiKeyPurpose::Realtime,
                 requests_per_second: None,
                 burst_size: None,
             };
@@ -691,7 +761,7 @@ mod tests {
                 user_id: user.id,
                 name: "Delete Me".to_string(),
                 description: None,
-                purpose: ApiKeyPurpose::Inference,
+                purpose: ApiKeyPurpose::Realtime,
                 requests_per_second: None,
                 burst_size: None,
             };
@@ -734,7 +804,7 @@ mod tests {
                 user_id: user.id,
                 name: "Trait Test Key".to_string(),
                 description: Some("Test trait description".to_string()),
-                purpose: ApiKeyPurpose::Inference,
+                purpose: ApiKeyPurpose::Realtime,
                 requests_per_second: None,
                 burst_size: None,
             };
@@ -858,7 +928,7 @@ mod tests {
                 user_id: user.id,
                 name: "Test API Key".to_string(),
                 description: Some("API key for testing group access".to_string()),
-                purpose: ApiKeyPurpose::Inference,
+                purpose: ApiKeyPurpose::Realtime,
                 requests_per_second: None,
                 burst_size: None,
             };
@@ -986,7 +1056,7 @@ mod tests {
                 user_id: user.id,
                 name: "Test API Key".to_string(),
                 description: Some("API key for testing access removal".to_string()),
-                purpose: ApiKeyPurpose::Inference,
+                purpose: ApiKeyPurpose::Realtime,
                 requests_per_second: None,
                 burst_size: None,
             };
@@ -1128,7 +1198,7 @@ mod tests {
                 user_id: user.id,
                 name: "Test API Key".to_string(),
                 description: Some("API key for testing deployment removal".to_string()),
-                purpose: ApiKeyPurpose::Inference,
+                purpose: ApiKeyPurpose::Realtime,
                 requests_per_second: None,
                 burst_size: None,
             };
@@ -1296,7 +1366,7 @@ mod tests {
                 user_id: user1.id,
                 name: "User 1 Key".to_string(),
                 description: Some("API key for user 1".to_string()),
-                purpose: ApiKeyPurpose::Inference,
+                purpose: ApiKeyPurpose::Realtime,
                 requests_per_second: None,
                 burst_size: None,
             };
@@ -1306,7 +1376,7 @@ mod tests {
                 user_id: user2.id,
                 name: "User 2 Key".to_string(),
                 description: Some("API key for user 2".to_string()),
-                purpose: ApiKeyPurpose::Inference,
+                purpose: ApiKeyPurpose::Realtime,
                 requests_per_second: None,
                 burst_size: None,
             };
@@ -1350,9 +1420,12 @@ mod tests {
             .get_api_keys_for_deployment_with_sufficient_credit(deployment.id)
             .await
             .unwrap();
+
         assert!(keys_for_deployment.iter().any(|k| k.secret == api_key1.secret));
         assert!(keys_for_deployment.iter().any(|k| k.secret == api_key2.secret));
-        assert_eq!(keys_for_deployment.len(), 2 + 1); // + 1 for system user
+        // Each user gets 3 keys: 1 Realtime (explicit) + 1 Batch (auto) + 1 Playground (auto)
+        // Plus 1 system key
+        assert_eq!(keys_for_deployment.len(), (2 * 3) + 1); // 2 users * 3 keys each + 1 system = 7
 
         // Remove deployment from group 1
         let mut group_conn = pool.acquire().await.unwrap();
@@ -1366,7 +1439,8 @@ mod tests {
             .unwrap();
         assert!(!keys_for_deployment.iter().any(|k| k.secret == api_key1.secret));
         assert!(keys_for_deployment.iter().any(|k| k.secret == api_key2.secret));
-        assert_eq!(keys_for_deployment.len(), 1 + 1); // + 1 for system user
+        // User 2 gets 3 keys (Realtime + Batch + Playground) + 1 system key
+        assert_eq!(keys_for_deployment.len(), 3 + 1); // 3 keys for user2 + 1 system = 4
     }
 
     #[sqlx::test]
@@ -1472,7 +1546,7 @@ mod tests {
                 user_id: user.id,
                 name: "Multi Access Key".to_string(),
                 description: Some("API key for multiple deployments".to_string()),
-                purpose: ApiKeyPurpose::Inference,
+                purpose: ApiKeyPurpose::Realtime,
                 requests_per_second: None,
                 burst_size: None,
             };
@@ -1612,7 +1686,7 @@ mod tests {
                 user_id: user.id,
                 name: "Dynamic Access Key".to_string(),
                 description: Some("API key for testing dynamic access".to_string()),
-                purpose: ApiKeyPurpose::Inference,
+                purpose: ApiKeyPurpose::Realtime,
                 requests_per_second: None,
                 burst_size: None,
             };
@@ -1800,7 +1874,7 @@ mod tests {
                 user_id: user.id,
                 name: "Test API Key".to_string(),
                 description: Some("API key for testing Everyone group access".to_string()),
-                purpose: ApiKeyPurpose::Inference,
+                purpose: ApiKeyPurpose::Realtime,
                 requests_per_second: None,
                 burst_size: None,
             };
@@ -1882,7 +1956,7 @@ mod tests {
                     user_id: user.id,
                     name: format!("Pagination Key {i}"),
                     description: Some(format!("Key {i} for pagination testing")),
-                    purpose: ApiKeyPurpose::Inference,
+                    purpose: ApiKeyPurpose::Realtime,
                     requests_per_second: None,
                     burst_size: None,
                 };
@@ -2009,7 +2083,7 @@ mod tests {
                 user_id: user1.id,
                 name: "User1 Key".to_string(),
                 description: None,
-                purpose: ApiKeyPurpose::Inference,
+                purpose: ApiKeyPurpose::Realtime,
                 requests_per_second: None,
                 burst_size: None,
             };
@@ -2017,7 +2091,7 @@ mod tests {
                 user_id: user2.id,
                 name: "User2 Key".to_string(),
                 description: None,
-                purpose: ApiKeyPurpose::Inference,
+                purpose: ApiKeyPurpose::Realtime,
                 requests_per_second: None,
                 burst_size: None,
             };
@@ -2080,7 +2154,7 @@ mod tests {
             user_id: user.id,
             name: "Bulk Key 1".to_string(),
             description: Some("First bulk key".to_string()),
-            purpose: ApiKeyPurpose::Inference,
+            purpose: ApiKeyPurpose::Realtime,
             requests_per_second: None,
             burst_size: None,
         };
@@ -2088,7 +2162,7 @@ mod tests {
             user_id: user.id,
             name: "Bulk Key 2".to_string(),
             description: Some("Second bulk key".to_string()),
-            purpose: ApiKeyPurpose::Inference,
+            purpose: ApiKeyPurpose::Realtime,
             requests_per_second: None,
             burst_size: None,
         };
@@ -2096,7 +2170,7 @@ mod tests {
             user_id: user.id,
             name: "Bulk Key 3".to_string(),
             description: None,
-            purpose: ApiKeyPurpose::Inference,
+            purpose: ApiKeyPurpose::Realtime,
             requests_per_second: None,
             burst_size: None,
         };
@@ -2153,7 +2227,7 @@ mod tests {
             user_id: user.id,
             name: "Valid Key".to_string(),
             description: Some("Only valid key".to_string()),
-            purpose: ApiKeyPurpose::Inference,
+            purpose: ApiKeyPurpose::Realtime,
             requests_per_second: None,
             burst_size: None,
         };
@@ -2232,7 +2306,7 @@ mod tests {
             user_id: user.id,
             name: "Duplicate Test Key".to_string(),
             description: Some("Key for testing duplicates".to_string()),
-            purpose: ApiKeyPurpose::Inference,
+            purpose: ApiKeyPurpose::Realtime,
             requests_per_second: None,
             burst_size: None,
         };
@@ -2320,7 +2394,7 @@ mod tests {
             user_id: user.id,
             name: "Bulk Access Key 1".to_string(),
             description: Some("First key with model access".to_string()),
-            purpose: ApiKeyPurpose::Inference,
+            purpose: ApiKeyPurpose::Realtime,
             requests_per_second: None,
             burst_size: None,
         };
@@ -2328,7 +2402,7 @@ mod tests {
             user_id: user.id,
             name: "Bulk Access Key 2".to_string(),
             description: Some("Second key with model access".to_string()),
-            purpose: ApiKeyPurpose::Inference,
+            purpose: ApiKeyPurpose::Realtime,
             requests_per_second: None,
             burst_size: None,
         };
@@ -2388,7 +2462,7 @@ mod tests {
             user_id: user1.id,
             name: "User1 Bulk Key".to_string(),
             description: Some("Key for user 1".to_string()),
-            purpose: ApiKeyPurpose::Inference,
+            purpose: ApiKeyPurpose::Realtime,
             requests_per_second: None,
             burst_size: None,
         };
@@ -2396,7 +2470,7 @@ mod tests {
             user_id: user2.id,
             name: "User2 Bulk Key".to_string(),
             description: Some("Key for user 2".to_string()),
-            purpose: ApiKeyPurpose::Inference,
+            purpose: ApiKeyPurpose::Realtime,
             requests_per_second: None,
             burst_size: None,
         };
@@ -2477,28 +2551,33 @@ mod tests {
         // Create deployment with pricing (paid model by default for credit tests)
         let deployment;
         {
-            use crate::db::models::deployments::{ModelPricing, TokenPricing};
-
             let mut deployment_tx = tx.begin().await.unwrap();
             let mut deployment_repo = Deployments::new(deployment_tx.acquire().await.unwrap());
-
-            // Default to a paid model for credit filtering tests
-            let pricing = ModelPricing {
-                upstream: Some(TokenPricing {
-                    input_price_per_token: Some(Decimal::new(1, 6)),  // $0.000001 per token
-                    output_price_per_token: Some(Decimal::new(2, 6)), // $0.000002 per token
-                }),
-                downstream: None,
-            };
 
             let mut deployment_create = DeploymentCreateDBRequest::builder()
                 .created_by(admin_user.id)
                 .model_name(format!("test-model-{}", uuid::Uuid::new_v4()))
                 .alias(format!("test-alias-{}", uuid::Uuid::new_v4()))
-                .pricing(pricing)
                 .build();
             deployment_create.hosted_on = test_endpoint_id;
             deployment = deployment_repo.create(&deployment_create).await.unwrap();
+
+            // Create a tariff with pricing to make this a paid model
+            use crate::db::handlers::Tariffs;
+            use crate::db::models::tariffs::TariffCreateDBRequest;
+            let mut tariffs_repo = Tariffs::new(deployment_tx.acquire().await.unwrap());
+            tariffs_repo
+                .create(&TariffCreateDBRequest {
+                    deployed_model_id: deployment.id,
+                    name: "default".to_string(),
+                    input_price_per_token: Decimal::new(1, 6),  // $0.000001 per token
+                    output_price_per_token: Decimal::new(2, 6), // $0.000002 per token
+                    valid_from: None,
+                    api_key_purpose: None,
+                })
+                .await
+                .unwrap();
+
             deployment_tx.commit().await.unwrap();
         }
 
@@ -2580,30 +2659,36 @@ mod tests {
         crate::seed_database(&config.model_sources, &pool).await.unwrap();
         let test_endpoint_id = get_test_endpoint_id(&pool).await;
 
-        // Create deployment with pricing (paid model)
+        // Create deployment (paid model via tariffs)
         let deployment;
         {
-            use crate::db::models::deployments::{ModelPricing, TokenPricing};
-
             let mut deployment_tx = tx.begin().await.unwrap();
             let mut deployment_repo = Deployments::new(deployment_tx.acquire().await.unwrap());
-
-            let pricing = ModelPricing {
-                upstream: Some(TokenPricing {
-                    input_price_per_token: Some(Decimal::new(1, 6)),  // $0.000001 per token
-                    output_price_per_token: Some(Decimal::new(2, 6)), // $0.000002 per token
-                }),
-                downstream: None,
-            };
 
             let mut deployment_create = DeploymentCreateDBRequest::builder()
                 .created_by(admin_user.id)
                 .model_name("test-model".to_string())
                 .alias("test-alias".to_string())
-                .pricing(pricing)
                 .build();
             deployment_create.hosted_on = test_endpoint_id;
             deployment = deployment_repo.create(&deployment_create).await.unwrap();
+
+            // Create a tariff with pricing to make this a paid model
+            use crate::db::handlers::Tariffs;
+            use crate::db::models::tariffs::TariffCreateDBRequest;
+            let mut tariffs_repo = Tariffs::new(deployment_tx.acquire().await.unwrap());
+            tariffs_repo
+                .create(&TariffCreateDBRequest {
+                    deployed_model_id: deployment.id,
+                    name: "default".to_string(),
+                    input_price_per_token: Decimal::new(1, 6),  // $0.000001 per token
+                    output_price_per_token: Decimal::new(2, 6), // $0.000002 per token
+                    api_key_purpose: None,
+                    valid_from: None,
+                })
+                .await
+                .unwrap();
+
             deployment_tx.commit().await.unwrap();
         }
 
@@ -2629,7 +2714,7 @@ mod tests {
                 user_id: user_with_credits.id,
                 requests_per_second: None,
                 burst_size: None,
-                purpose: ApiKeyPurpose::Inference,
+                purpose: ApiKeyPurpose::Realtime,
             })
             .await
             .unwrap();
@@ -2641,7 +2726,7 @@ mod tests {
                 user_id: user_without_credits.id,
                 requests_per_second: None,
                 burst_size: None,
-                purpose: ApiKeyPurpose::Inference,
+                purpose: ApiKeyPurpose::Realtime,
             })
             .await
             .unwrap();
@@ -2763,7 +2848,7 @@ mod tests {
                     description: None,
                     requests_per_second: None,
                     burst_size: None,
-                    purpose: ApiKeyPurpose::Inference,
+                    purpose: ApiKeyPurpose::Realtime,
                 })
                 .await
                 .unwrap();
@@ -2854,7 +2939,7 @@ mod tests {
                     description: None,
                     requests_per_second: None,
                     burst_size: None,
-                    purpose: ApiKeyPurpose::Inference,
+                    purpose: ApiKeyPurpose::Realtime,
                 })
                 .await
                 .unwrap();
@@ -2916,7 +3001,7 @@ mod tests {
                     description: None,
                     requests_per_second: None,
                     burst_size: None,
-                    purpose: ApiKeyPurpose::Inference,
+                    purpose: ApiKeyPurpose::Realtime,
                 })
                 .await
                 .unwrap();
@@ -3003,7 +3088,7 @@ mod tests {
                     description: None,
                     requests_per_second: None,
                     burst_size: None,
-                    purpose: ApiKeyPurpose::Inference,
+                    purpose: ApiKeyPurpose::Realtime,
                 })
                 .await
                 .unwrap();
@@ -3142,7 +3227,7 @@ mod tests {
                 user_id: user_no_credits.id,
                 requests_per_second: None,
                 burst_size: None,
-                purpose: ApiKeyPurpose::Inference,
+                purpose: ApiKeyPurpose::Realtime,
             })
             .await
             .unwrap();
@@ -3223,29 +3308,36 @@ mod tests {
         crate::seed_database(&config.model_sources, &pool).await.unwrap();
         let test_endpoint_id = get_test_endpoint_id(&pool).await;
 
-        // Create deployment WITH pricing (paid model)
+        // Create deployment (paid model via tariffs)
         let deployment;
         {
             let mut deployment_tx = tx.begin().await.unwrap();
             let mut deployment_repo = Deployments::new(deployment_tx.acquire().await.unwrap());
 
-            use crate::db::models::deployments::{ModelPricing, TokenPricing};
-            let pricing = ModelPricing {
-                upstream: Some(TokenPricing {
-                    input_price_per_token: Some(Decimal::new(1, 6)),  // $0.000001 per token
-                    output_price_per_token: Some(Decimal::new(2, 6)), // $0.000002 per token
-                }),
-                downstream: None,
-            };
-
             let mut deployment_create = DeploymentCreateDBRequest::builder()
                 .created_by(admin_user.id)
                 .model_name("paid-model".to_string())
                 .alias("paid-alias".to_string())
-                .pricing(pricing) // Paid model - has pricing
                 .build();
             deployment_create.hosted_on = test_endpoint_id;
             deployment = deployment_repo.create(&deployment_create).await.unwrap();
+
+            // Create a tariff with pricing to make this a paid model
+            use crate::db::handlers::Tariffs;
+            use crate::db::models::tariffs::TariffCreateDBRequest;
+            let mut tariffs_repo = Tariffs::new(deployment_tx.acquire().await.unwrap());
+            tariffs_repo
+                .create(&TariffCreateDBRequest {
+                    deployed_model_id: deployment.id,
+                    name: "default".to_string(),
+                    input_price_per_token: Decimal::new(1, 6),  // $0.000001 per token
+                    output_price_per_token: Decimal::new(2, 6), // $0.000002 per token
+                    valid_from: None,
+                    api_key_purpose: None,
+                })
+                .await
+                .unwrap();
+
             deployment_tx.commit().await.unwrap();
         }
 
@@ -3270,7 +3362,7 @@ mod tests {
                 user_id: user_no_credits.id,
                 requests_per_second: None,
                 burst_size: None,
-                purpose: ApiKeyPurpose::Inference,
+                purpose: ApiKeyPurpose::Realtime,
             })
             .await
             .unwrap();
@@ -3357,23 +3449,30 @@ mod tests {
             let mut deployment_tx = tx.begin().await.unwrap();
             let mut deployment_repo = Deployments::new(deployment_tx.acquire().await.unwrap());
 
-            use crate::db::models::deployments::{ModelPricing, TokenPricing};
-            let pricing = ModelPricing {
-                upstream: Some(TokenPricing {
-                    input_price_per_token: Some(Decimal::ZERO),  // Explicit $0.00
-                    output_price_per_token: Some(Decimal::ZERO), // Explicit $0.00
-                }),
-                downstream: None,
-            };
-
             let mut deployment_create = DeploymentCreateDBRequest::builder()
                 .created_by(admin_user.id)
                 .model_name("zero-price-model".to_string())
                 .alias("zero-price-alias".to_string())
-                .pricing(pricing) // Free model with explicit zero pricing
                 .build();
             deployment_create.hosted_on = test_endpoint_id;
             deployment = deployment_repo.create(&deployment_create).await.unwrap();
+
+            // Create a tariff with zero pricing to make this a free model
+            use crate::db::handlers::Tariffs;
+            use crate::db::models::tariffs::TariffCreateDBRequest;
+            let mut tariffs_repo = Tariffs::new(deployment_tx.acquire().await.unwrap());
+            tariffs_repo
+                .create(&TariffCreateDBRequest {
+                    deployed_model_id: deployment.id,
+                    name: "free".to_string(),
+                    input_price_per_token: Decimal::ZERO,
+                    output_price_per_token: Decimal::ZERO,
+                    valid_from: None,
+                    api_key_purpose: None,
+                })
+                .await
+                .unwrap();
+
             deployment_tx.commit().await.unwrap();
         }
 
@@ -3398,7 +3497,7 @@ mod tests {
                 user_id: user_no_credits.id,
                 requests_per_second: None,
                 burst_size: None,
-                purpose: ApiKeyPurpose::Inference,
+                purpose: ApiKeyPurpose::Realtime,
             })
             .await
             .unwrap();
@@ -3456,7 +3555,7 @@ mod tests {
                 user_id: user.id,
                 name: "Test Secret Key".to_string(),
                 description: Some("Key for testing secret lookup".to_string()),
-                purpose: ApiKeyPurpose::Inference,
+                purpose: ApiKeyPurpose::Realtime,
                 requests_per_second: None,
                 burst_size: None,
             };

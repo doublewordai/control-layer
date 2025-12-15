@@ -13,6 +13,7 @@ pub mod inference_endpoints;
 pub mod pagination;
 pub mod probes;
 pub mod requests;
+pub mod tariffs;
 pub mod transactions;
 pub mod users;
 

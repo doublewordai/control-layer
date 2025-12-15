@@ -1,4 +1,4 @@
-import React, { useState, useEffect } from "react";
+import React, { useState, useEffect, useMemo } from "react";
 import { DollarSign } from "lucide-react";
 import { Button } from "../../ui/button";
 import {
@@ -9,180 +9,119 @@ import {
   DialogFooter,
   DialogDescription,
 } from "../../ui/dialog";
-import { Input } from "../../ui/input";
-import { Label } from "../../ui/label";
+import { ModelTariffTable } from "../../features/models/ModelTariffTable";
+import {
+  useModel,
+  useUpdateModel,
+} from "../../../api/control-layer/hooks";
+import type { TariffDefinition } from "../../../api/control-layer/types";
+import { toast } from "sonner";
 
 interface UpdateModelPricingModalProps {
   isOpen: boolean;
+  modelId: string;
   modelName: string;
-  currentPricing?: {
-    input_price_per_token?: number | null;
-    output_price_per_token?: number | null;
-  };
-  onSubmit: (pricing: {
-    input_price_per_token?: number;
-    output_price_per_token?: number;
-  }) => void;
   onClose: () => void;
-  isLoading?: boolean;
 }
 
-export const UpdateModelPricingModal: React.FC<
-  UpdateModelPricingModalProps
-> = ({
+export const UpdateModelPricingModal: React.FC<UpdateModelPricingModalProps> = ({
   isOpen,
+  modelId,
   modelName,
-  currentPricing,
-  onSubmit,
   onClose,
-  isLoading = false,
 }) => {
-  const [inputPrice, setInputPrice] = useState<string>("");
-  const [outputPrice, setOutputPrice] = useState<string>("");
-  const [errors, setErrors] = useState<{
-    input?: string;
-    output?: string;
-  }>({});
+  // Fetch model with tariffs included (via pricing parameter)
+  const { data: model, isLoading: isLoadingModel } = useModel(modelId, { include: "pricing" });
 
-  // Initialize with current pricing when modal opens (convert to per million)
+  // Mutation
+  const updateModel = useUpdateModel();
+
+  // Local state for tariff changes
+  const [pendingTariffs, setPendingTariffs] = useState<TariffDefinition[] | null>(null);
+
+  // Memoize tariffs to avoid creating new array reference on every render
+  const currentTariffs = useMemo(() => model?.tariffs || [], [model?.tariffs]);
+
+  // Reset pending changes when modal closes
   useEffect(() => {
-    if (isOpen && currentPricing) {
-      setInputPrice(
-        currentPricing.input_price_per_token
-          ? (currentPricing.input_price_per_token * 1000000).toString()
-          : ""
-      );
-      setOutputPrice(
-        currentPricing.output_price_per_token
-          ? (currentPricing.output_price_per_token * 1000000).toString()
-          : ""
-      );
-    } else if (isOpen && !currentPricing) {
-      setInputPrice("");
-      setOutputPrice("");
+    if (!isOpen) {
+      setPendingTariffs(null);
     }
-  }, [isOpen, currentPricing]);
+  }, [isOpen]);
 
-  const validatePricing = () => {
-    const newErrors: { input?: string; output?: string } = {};
-
-    if (inputPrice && (isNaN(Number(inputPrice)) || Number(inputPrice) < 0)) {
-      newErrors.input = "Must be a valid positive number";
-    }
-
-    if (
-      outputPrice &&
-      (isNaN(Number(outputPrice)) || Number(outputPrice) < 0)
-    ) {
-      newErrors.output = "Must be a valid positive number";
-    }
-
-    setErrors(newErrors);
-    return Object.keys(newErrors).length === 0;
+  const handleTariffsChange = (tariffs: TariffDefinition[]) => {
+    setPendingTariffs(tariffs);
   };
 
-  const handleSubmit = () => {
-    if (!validatePricing()) {
+  const handleSave = async () => {
+    if (pendingTariffs === null) {
+      // No changes, just close
+      onClose();
       return;
     }
 
-    const pricing: {
-      input_price_per_token?: number;
-      output_price_per_token?: number;
-    } = {};
-
-    // Only include fields that have values (convert from per million to per token)
-    if (inputPrice && inputPrice.trim() !== "") {
-      pricing.input_price_per_token = Number(inputPrice) / 1000000;
-    }
-
-    if (outputPrice && outputPrice.trim() !== "") {
-      pricing.output_price_per_token = Number(outputPrice) / 1000000;
-    }
-
-    onSubmit(pricing);
-  };
-
-  const handleClose = () => {
-    if (!isLoading) {
-      setInputPrice("");
-      setOutputPrice("");
-      setErrors({});
+    try {
+      await updateModel.mutateAsync({
+        id: modelId,
+        data: {
+          tariffs: pendingTariffs,
+        },
+      });
       onClose();
+    } catch (error) {
+      // Only log detailed errors in development to avoid leaking server info
+      if (import.meta.env.DEV) {
+        console.error("Failed to update model tariffs:", error);
+      }
+      toast.error("Failed to update pricing. Please try again.");
     }
   };
+
+  const hasChanges = pendingTariffs !== null;
 
   return (
-    <Dialog open={isOpen} onOpenChange={handleClose}>
-      <DialogContent className="sm:max-w-[500px]">
+    <Dialog open={isOpen} onOpenChange={onClose}>
+      <DialogContent className="sm:max-w-[900px] max-h-[80vh] overflow-y-auto">
         <DialogHeader>
           <DialogTitle className="flex items-center gap-2">
             <DollarSign className="h-5 w-5" />
-            Update Pricing for {modelName}
+            Manage Pricing Tariffs for {modelName}
           </DialogTitle>
           <DialogDescription>
-            Set the upstream price per million tokens for input and output
+            Configure pricing tiers for different API key purposes. You can set different
+            rates for realtime, batch, and playground usage.
           </DialogDescription>
         </DialogHeader>
 
-        <div className="grid gap-4 py-4">
-          <div className="grid gap-2">
-            <Label htmlFor="input-price">Input Price per Million Tokens</Label>
-            <Input
-              id="input-price"
-              type="text"
-              placeholder="e.g., 3.00"
-              value={inputPrice}
-              onChange={(e) => setInputPrice(e.target.value)}
-              className={errors.input ? "border-red-500" : ""}
-              disabled={isLoading}
+        <div className="py-4">
+          {isLoadingModel ? (
+            <div className="flex items-center justify-center py-8">
+              <div className="w-8 h-8 border-4 border-gray-300 border-t-blue-600 rounded-full animate-spin" />
+            </div>
+          ) : (
+            <ModelTariffTable
+              tariffs={currentTariffs}
+              onChange={handleTariffsChange}
+              isLoading={updateModel.isPending}
             />
-            {errors.input && (
-              <p className="text-sm text-red-500">{errors.input}</p>
-            )}
-            <p className="text-sm text-gray-500">
-              Price in dollars per million input tokens
-            </p>
-          </div>
-
-          <div className="grid gap-2">
-            <Label htmlFor="output-price">Output Price per Million Tokens</Label>
-            <Input
-              id="output-price"
-              type="text"
-              placeholder="e.g., 15.00"
-              value={outputPrice}
-              onChange={(e) => setOutputPrice(e.target.value)}
-              className={errors.output ? "border-red-500" : ""}
-              disabled={isLoading}
-            />
-            {errors.output && (
-              <p className="text-sm text-red-500">{errors.output}</p>
-            )}
-            <p className="text-sm text-gray-500">
-              Price in dollars per million output tokens
-            </p>
-          </div>
+          )}
         </div>
 
         <DialogFooter>
           <Button
             type="button"
             variant="outline"
-            onClick={handleClose}
-            disabled={isLoading}
+            onClick={onClose}
+            disabled={updateModel.isPending}
           >
             Cancel
           </Button>
-          <Button type="button" onClick={handleSubmit} disabled={isLoading}>
-            {isLoading ? (
-              <>
-                <div className="w-4 h-4 border-2 border-white border-t-transparent rounded-full animate-spin mr-2" />
-                Saving...
-              </>
-            ) : (
-              "Save Pricing"
-            )}
+          <Button
+            type="button"
+            onClick={handleSave}
+            disabled={updateModel.isPending || !hasChanges}
+          >
+            {updateModel.isPending ? "Saving..." : "Save Changes"}
           </Button>
         </DialogFooter>
       </DialogContent>
