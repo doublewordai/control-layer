@@ -9,7 +9,8 @@ import {
   formatBytes,
   formatLatency,
   formatRelativeTime,
-  formatPricing,
+  formatTariffPrice,
+  formatTariffPricing,
 } from "./formatters";
 
 describe("formatters", () => {
@@ -231,34 +232,52 @@ describe("formatters", () => {
     });
   });
 
-  describe("formatPricing", () => {
-    it("should return $0/$0 for undefined pricing", () => {
-      expect(formatPricing(undefined)).toBe("$0/$0");
+  describe("formatTariffPrice", () => {
+    it("should return $0 for null/undefined/zero", () => {
+      expect(formatTariffPrice(null)).toBe("$0");
+      expect(formatTariffPrice(undefined)).toBe("$0");
+      expect(formatTariffPrice(0)).toBe("$0");
+      expect(formatTariffPrice("0")).toBe("$0");
     });
 
-    it("should return $0/$0 when both prices are null", () => {
-      expect(formatPricing({ input_price_per_token: null, output_price_per_token: null })).toBe("$0/$0");
+    it("should convert per-token price to per-million and format", () => {
+      // $0.000001 per token = $1.00 per million tokens
+      expect(formatTariffPrice("0.000001")).toBe("$1.00");
+      expect(formatTariffPrice(0.000001)).toBe("$1.00");
+
+      // $0.000002 per token = $2.00 per million tokens
+      expect(formatTariffPrice("0.000002")).toBe("$2.00");
+
+      // $0.0000015 per token = $1.50 per million tokens
+      expect(formatTariffPrice("0.0000015")).toBe("$1.50");
     });
 
+    it("should handle typical pricing values", () => {
+      // Typical GPT-4 input pricing: $0.00001 per token = $10 per million
+      expect(formatTariffPrice("0.00001")).toBe("$10.00");
+
+      // Typical GPT-3.5 input pricing: $0.0000005 per token = $0.50 per million
+      expect(formatTariffPrice("0.0000005")).toBe("$0.50");
+    });
+  });
+
+  describe("formatTariffPricing", () => {
     it("should format both input and output prices", () => {
-      expect(formatPricing({
-        input_price_per_token: 0.0001,
-        output_price_per_token: 0.0002
-      })).toBe("$0.0001 / $0.0002");
+      expect(formatTariffPricing("0.000001", "0.000002")).toBe("$1.00 / $2.00");
     });
 
-    it("should handle missing input price", () => {
-      expect(formatPricing({
-        input_price_per_token: null,
-        output_price_per_token: 0.0002
-      })).toBe("$0 / $0.0002");
+    it("should handle null prices", () => {
+      expect(formatTariffPricing(null, null)).toBe("$0 / $0");
+      expect(formatTariffPricing("0.000001", null)).toBe("$1.00 / $0");
+      expect(formatTariffPricing(null, "0.000002")).toBe("$0 / $2.00");
     });
 
-    it("should handle missing output price", () => {
-      expect(formatPricing({
-        input_price_per_token: 0.0001,
-        output_price_per_token: null
-      })).toBe("$0.0001 / $0");
+    it("should handle typical model pricing", () => {
+      // GPT-4: $10 input / $30 output per million tokens
+      expect(formatTariffPricing("0.00001", "0.00003")).toBe("$10.00 / $30.00");
+
+      // GPT-3.5: $0.50 input / $1.50 output per million tokens
+      expect(formatTariffPricing("0.0000005", "0.0000015")).toBe("$0.50 / $1.50");
     });
   });
 });

@@ -402,8 +402,8 @@ pub async fn seed_database(sources: &[config::ModelSource], db: &PgPool) -> Resu
                             burst_size: None,
                             capacity: None,
                             batch_capacity: None,
-                            pricing: None,
-                            downstream_pricing: None,
+                            tariffs: None,
+                            provider_pricing: None,
                         },
                     ))
                     .await
@@ -1619,7 +1619,7 @@ mod test {
         assert_eq!(endpoint_response.status_code(), 201, "Failed to create endpoint");
         let endpoint: crate::api::models::inference_endpoints::InferenceEndpointResponse = endpoint_response.json();
 
-        // Step 6: Admin creates deployment via API (with pricing for credit deduction)
+        // Step 6: Admin creates deployment via API (with tariffs for credit deduction)
         let deployment_response = server
             .post("/admin/api/v1/models")
             .add_header(&admin_headers[0].0, &admin_headers[0].1)
@@ -1629,10 +1629,12 @@ mod test {
                 "alias": "test-model",
                 "description": "Test model deployment",
                 "hosted_on": endpoint.id,
-                "pricing": {
+                "tariffs": [{
+                    "name": "batch",
                     "input_price_per_token": "0.001",
-                    "output_price_per_token": "0.003"
-                }
+                    "output_price_per_token": "0.003",
+                    "api_key_purpose": "realtime"
+                }]
             }))
             .await;
         assert_eq!(deployment_response.status_code(), 200, "Failed to create deployment");
@@ -1654,7 +1656,7 @@ mod test {
             .json(&serde_json::json!({
                 "name": "Test Inference Key",
                 "description": "API key for E2E test",
-                "purpose": "inference"
+                "purpose": "realtime"
             }))
             .await;
         assert_eq!(api_key_response.status_code(), 201, "Failed to create API key");
@@ -1773,10 +1775,7 @@ mod test {
         assert_eq!(usage["completion_tokens"], 12, "Should have 12 completion tokens from mock");
         assert_eq!(usage["total_tokens"], 21, "Should match mocked token count");
 
-        // Verify pricing headers were set by onwards
-        let headers = &logged_entry["response"]["headers"];
-        assert_eq!(headers["onwards-input-price-per-token"], "0.00100000");
-        assert_eq!(headers["onwards-output-price-per-token"], "0.00300000");
+        // Note: Pricing is now fetched from tariffs table, not from response headers
 
         // Test 2: Proxy header auth also works (SSO-style authentication)
         let regular_user_external_id = regular_user.external_user_id.as_ref().unwrap_or(&regular_user.username);
@@ -1850,7 +1849,7 @@ mod test {
             .add_header(&restricted_headers[1].0, &restricted_headers[1].1)
             .json(&serde_json::json!({
                 "name": "Restricted User Key",
-                "purpose": "inference"
+                "purpose": "realtime"
             }))
             .await;
         let restricted_key: crate::api::models::api_keys::ApiKeyResponse = restricted_key_response.json();
@@ -1958,7 +1957,7 @@ mod test {
             system_api_key_id,
             "System API Key",
             original_secret,
-            "inference",
+            "batch",
             system_api_key_id,
         )
         .execute(&pool)

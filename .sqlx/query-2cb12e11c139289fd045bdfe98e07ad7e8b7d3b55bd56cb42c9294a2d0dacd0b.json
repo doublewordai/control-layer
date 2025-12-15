@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "SELECT id, model_name, alias, description, type, capabilities, created_by, hosted_on, status, last_sync, deleted, created_at, updated_at, requests_per_second, burst_size, capacity, batch_capacity, upstream_input_price_per_token, upstream_output_price_per_token, downstream_pricing_mode, downstream_input_price_per_token, downstream_output_price_per_token, downstream_hourly_rate, downstream_input_token_cost_ratio FROM deployed_models WHERE id = ANY($1)",
+  "query": "SELECT id, model_name, alias, description, type, capabilities, created_by, hosted_on, status, last_sync, deleted, created_at, updated_at, requests_per_second, burst_size, capacity, batch_capacity, downstream_pricing_mode, downstream_input_price_per_token, downstream_output_price_per_token, downstream_hourly_rate, downstream_input_token_cost_ratio FROM deployed_models WHERE id = $1",
   "describe": {
     "columns": [
       {
@@ -90,43 +90,33 @@
       },
       {
         "ordinal": 17,
-        "name": "upstream_input_price_per_token",
-        "type_info": "Numeric"
-      },
-      {
-        "ordinal": 18,
-        "name": "upstream_output_price_per_token",
-        "type_info": "Numeric"
-      },
-      {
-        "ordinal": 19,
         "name": "downstream_pricing_mode",
         "type_info": "Varchar"
       },
       {
-        "ordinal": 20,
+        "ordinal": 18,
         "name": "downstream_input_price_per_token",
         "type_info": "Numeric"
       },
       {
-        "ordinal": 21,
+        "ordinal": 19,
         "name": "downstream_output_price_per_token",
         "type_info": "Numeric"
       },
       {
-        "ordinal": 22,
+        "ordinal": 20,
         "name": "downstream_hourly_rate",
         "type_info": "Numeric"
       },
       {
-        "ordinal": 23,
+        "ordinal": 21,
         "name": "downstream_input_token_cost_ratio",
         "type_info": "Numeric"
       }
     ],
     "parameters": {
       "Left": [
-        "UuidArray"
+        "Uuid"
       ]
     },
     "nullable": [
@@ -151,10 +141,8 @@
       true,
       true,
       true,
-      true,
-      true,
       true
     ]
   },
-  "hash": "ff244878fe153f5d2eefc07d828b868e9bfc08ee327a4e17de46f42f5827217d"
+  "hash": "2cb12e11c139289fd045bdfe98e07ad7e8b7d3b55bd56cb42c9294a2d0dacd0b"
 }
