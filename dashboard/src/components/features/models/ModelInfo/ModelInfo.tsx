@@ -146,8 +146,6 @@ const ModelInfo: React.FC = () => {
     error: modelError,
   } = useModel(modelId!, { include: includeParam });
 
-  console.log(model);
-
   const {
     data: endpoint,
     isLoading: endpointLoading,

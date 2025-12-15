@@ -664,23 +664,14 @@ pub struct DaemonConfig {
     /// How long to sleep between claim iterations in milliseconds (default: 1000)
     pub claim_interval_ms: u64,
 
-    /// Minimum number of retries to guarantee regardless of deadline or max_retries
-    /// (default: None, uses fusillade default of 3)
-    #[serde(default)]
-    pub min_retries: Option<u32>,
-
     /// Maximum number of retry attempts before giving up
-    /// If None, only limited by deadline (if stop_before_deadline_ms is set)
-    /// (default: None, uses fusillade default of None/unlimited)
-    #[serde(default)]
+    /// If None, retries will run until stop_before_deadline_ms
     pub max_retries: Option<u32>,
 
     /// Stop retrying this many milliseconds before batch deadline
     /// Positive values stop before the deadline (safety buffer)
     /// Negative values allow retrying after the deadline
     /// If None, retries are not deadline-aware
-    /// (default: None, uses fusillade default of Some(900_000) = 15 min buffer)
-    #[serde(default)]
     pub stop_before_deadline_ms: Option<i64>,
 
     /// Base backoff duration in milliseconds (will be exponentially increased) (default: 1000)
@@ -715,13 +706,12 @@ impl Default for DaemonConfig {
             claim_batch_size: 100,
             default_model_concurrency: 10,
             claim_interval_ms: 1000,
-            min_retries: None,             // Use fusillade default (3)
-            max_retries: None,             // Use fusillade default (None/unlimited)
-            stop_before_deadline_ms: None, // Use fusillade default (900_000ms = 15 min)
+            max_retries: Some(1000),
+            stop_before_deadline_ms: Some(900_000),
             backoff_ms: 1000,
             backoff_factor: 2,
             max_backoff_ms: 10000,
-            timeout_ms: 600000,
+            timeout_ms: 6000,
             status_log_interval_ms: Some(2000),
             claim_timeout_ms: 60000,
             processing_timeout_ms: 600000,
@@ -739,20 +729,13 @@ impl DaemonConfig {
         &self,
         model_capacity_limits: Option<std::sync::Arc<dashmap::DashMap<String, usize>>>,
     ) -> fusillade::daemon::DaemonConfig {
-        // Build retry limits - use provided values or fall back to fusillade defaults
-        // We need to set either max_retries or stop_before_deadline_ms otherwise we risk retrying forever
-        let retry_limits = fusillade::daemon::RetryLimits {
-            min_retries: self.min_retries.unwrap_or(3),
-            max_retries: self.max_retries,
-            stop_before_deadline_ms: self.stop_before_deadline_ms.or(Some(900_000)),
-        };
-
         fusillade::daemon::DaemonConfig {
             claim_batch_size: self.claim_batch_size,
             default_model_concurrency: self.default_model_concurrency,
             model_concurrency_limits: model_capacity_limits.unwrap_or_else(|| std::sync::Arc::new(dashmap::DashMap::new())),
             claim_interval_ms: self.claim_interval_ms,
-            retry_limits,
+            max_retries: self.max_retries,
+            stop_before_deadline_ms: self.stop_before_deadline_ms,
             backoff_ms: self.backoff_ms,
             backoff_factor: self.backoff_factor,
             max_backoff_ms: self.max_backoff_ms,
