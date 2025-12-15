@@ -95,6 +95,16 @@ pub async fn create_user_api_key(
         }
     };
 
+    // Validate purpose: restrict batch/playground to system use only (purpose defaults to Realtime via serde)
+    match &data.purpose {
+        crate::db::models::api_keys::ApiKeyPurpose::Batch | crate::db::models::api_keys::ApiKeyPurpose::Playground => {
+            return Err(Error::BadRequest {
+                message: "Cannot manually create API keys with 'batch' or 'playground' purpose. These are reserved for internal system use.".to_string(),
+            });
+        }
+        _ => {}
+    }
+
     let mut pool_conn = state.db.acquire().await.map_err(|e| Error::Database(e.into()))?;
     let mut repo = ApiKeys::new(&mut pool_conn);
     let db_request = ApiKeyCreateDBRequest::new(target_user_id, data);

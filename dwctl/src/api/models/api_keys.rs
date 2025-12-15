@@ -7,12 +7,19 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use utoipa::{IntoParams, ToSchema};
 
+/// Default API key purpose when not specified
+fn default_api_key_purpose() -> ApiKeyPurpose {
+    ApiKeyPurpose::Realtime
+}
+
 // API Key request models.
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct ApiKeyCreate {
     pub name: String,
     pub description: Option<String>,
-    /// Purpose of the API key: 'platform' for /admin/api/* access, 'realtime'/'batch'/'playground' for /ai/* access
+    /// Purpose of the API key. Defaults to 'realtime' if not specified.
+    /// 'platform' keys require PlatformManager role. 'batch' and 'playground' are reserved for internal system use.
+    #[serde(default = "default_api_key_purpose")]
     pub purpose: ApiKeyPurpose,
     /// Per-API-key rate limit: requests per second (null = no limit)
     pub requests_per_second: Option<f32>,
