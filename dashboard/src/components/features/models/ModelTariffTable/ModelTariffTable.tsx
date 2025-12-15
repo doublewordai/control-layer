@@ -1,8 +1,9 @@
 import React, { useState, useEffect } from "react";
 import { Plus, Pencil, Trash2, Check, X } from "lucide-react";
-import { Button } from "../../../ui/button";
+import { Button } from "@/components";
 import { Input } from "../../../ui/input";
 import { Label } from "../../../ui/label";
+import { formatTariffPrice } from "@/utils";
 import {
   Select,
   SelectContent,
@@ -18,7 +19,7 @@ import {
   TableHeader,
   TableRow,
 } from "../../../ui/table";
-import type { ModelTariff, TariffDefinition, TariffApiKeyPurpose } from "../../../../api/control-layer/types";
+import type { ModelTariff, TariffDefinition, TariffApiKeyPurpose } from "@/api/control-layer";
 
 interface TariffFormData {
   name: string;
@@ -331,10 +332,10 @@ export const ModelTariffTable: React.FC<ModelTariffTableProps> = ({
         </TableCell>
         <TableCell>{tariff.name}</TableCell>
         <TableCell>
-          ${(parseFloat(tariff.input_price_per_token) * 1000000).toFixed(2)}
+          {formatTariffPrice(tariff.input_price_per_token)}
         </TableCell>
         <TableCell>
-          ${(parseFloat(tariff.output_price_per_token) * 1000000).toFixed(2)}
+          {formatTariffPrice(tariff.output_price_per_token)}
         </TableCell>
         <TableCell>
           {tariff.valid_from ? (

@@ -52,13 +52,6 @@ export interface ModelProbeStatus {
   uptime_percentage?: number; // Last 24h uptime
 }
 
-// Pricing types
-export type TokenPricing = {
-  input_price_per_token?: number | null;
-  output_price_per_token?: number | null;
-};
-
-export type TokenPricingUpdate = TokenPricing;
 
 // Tariff types (read-only from API)
 export interface ModelTariff {
@@ -97,7 +90,6 @@ export interface Model {
   groups?: Group[]; // array of group IDs - only present when include=groups
   metrics?: ModelMetrics; // only present when include=metrics
   status?: ModelProbeStatus; // only present when include=status
-  pricing?: TokenPricing; // only present when include=pricing (deprecated, use tariffs)
   tariffs?: ModelTariff[]; // only present when include=tariffs
   endpoint?: Endpoint; // only present when include=endpoints
 }
@@ -181,34 +173,34 @@ export type ModelsInclude =
   | "groups"
   | "metrics"
   | "status"
-  | "pricing"
   | "endpoints"
+  | "tariffs"
   | "groups,metrics"
   | "groups,status"
-  | "groups,pricing"
   | "groups,endpoints"
+  | "groups,tariffs"
   | "metrics,status"
-  | "metrics,pricing"
   | "metrics,endpoints"
-  | "status,pricing"
+  | "metrics,tariffs"
   | "status,endpoints"
-  | "pricing,endpoints"
+  | "status,tariffs"
+  | "endpoints,tariffs"
   | "groups,metrics,status"
-  | "groups,metrics,pricing"
   | "groups,metrics,endpoints"
-  | "groups,status,pricing"
+  | "groups,metrics,tariffs"
   | "groups,status,endpoints"
-  | "groups,pricing,endpoints"
-  | "metrics,status,pricing"
+  | "groups,status,tariffs"
+  | "groups,endpoints,tariffs"
   | "metrics,status,endpoints"
-  | "metrics,pricing,endpoints"
-  | "status,pricing,endpoints"
-  | "groups,metrics,status,pricing"
+  | "metrics,status,tariffs"
+  | "metrics,endpoints,tariffs"
+  | "status,endpoints,tariffs"
   | "groups,metrics,status,endpoints"
-  | "groups,metrics,pricing,endpoints"
-  | "groups,status,pricing,endpoints"
-  | "metrics,status,pricing,endpoints"
-  | "groups,metrics,status,pricing,endpoints";
+  | "groups,metrics,status,tariffs"
+  | "groups,metrics,endpoints,tariffs"
+  | "groups,status,endpoints,tariffs"
+  | "metrics,status,endpoints,tariffs"
+  | "groups,metrics,status,endpoints,tariffs"
 export type GroupsInclude = "users" | "models" | "users,models";
 export type UsersInclude = "groups";
 
@@ -289,7 +281,6 @@ export interface ModelUpdateRequest {
   burst_size?: number | null;
   capacity?: number | null;
   batch_capacity?: number | null;
-  pricing?: TokenPricingUpdate;
   tariffs?: TariffDefinition[];
 }
 

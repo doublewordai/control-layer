@@ -70,7 +70,6 @@ const ModelInfo: React.FC = () => {
   const { hasPermission } = useAuthorization();
   const canManageGroups = hasPermission("manage-groups");
   const canViewAnalytics = hasPermission("analytics");
-  const showPricing = true;
 
   const fromUrl = searchParams.get("from");
 
@@ -136,9 +135,8 @@ const ModelInfo: React.FC = () => {
     const parts: string[] = ["status"];
     if (canManageGroups) parts.push("groups");
     if (canViewAnalytics) parts.push("metrics");
-    if (showPricing) parts.push("pricing");
     return parts.join(",");
-  }, [canManageGroups, canViewAnalytics, showPricing]);
+  }, [canManageGroups, canViewAnalytics]);
 
   const {
     data: model,
@@ -1011,7 +1009,7 @@ const ModelInfo: React.FC = () => {
                         )}
 
                       {/* Pricing Display - visible to all users when billing is enabled */}
-                      {showPricing && (
+                      {(
                         <div className="border-t pt-6">
                           <div className="flex items-center justify-between mb-3">
                             <div className="flex items-center gap-1">
@@ -1467,7 +1465,6 @@ const ModelInfo: React.FC = () => {
           <TabsContent value="usage">
             <UserUsageTable
               modelAlias={model.alias}
-              showPricing={showPricing}
             />
           </TabsContent>
         )}
