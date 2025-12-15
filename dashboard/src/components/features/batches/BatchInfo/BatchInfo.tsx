@@ -5,16 +5,18 @@ import {
   FileInput,
   FileCheck,
   AlertCircle,
-  Activity,
   Clock,
   CheckCircle,
   XCircle,
   Ban,
   Loader2,
+  RotateCcw,
+  Timer,
 } from "lucide-react";
 import {
   useBatch,
   useBatchAnalytics,
+  useRetryBatch,
 } from "../../../../api/control-layer/hooks";
 import { Card, CardContent, CardHeader, CardTitle } from "../../../ui/card";
 import { Badge } from "../../../ui/badge";
@@ -33,6 +35,13 @@ const BatchInfo: React.FC = () => {
   const { data: analytics, isLoading: analyticsLoading } = useBatchAnalytics(
     batchId!,
   );
+  const retryMutation = useRetryBatch();
+
+  const handleRetry = () => {
+    if (batchId) {
+      retryMutation.mutate(batchId);
+    }
+  };
 
   if (isLoading) {
     return (
@@ -108,7 +117,7 @@ const BatchInfo: React.FC = () => {
       in_progress: {
         label: "In Progress",
         variant: "default",
-        icon: <Activity className="w-3 h-3" />,
+        icon: <Timer className="w-3 h-3" />,
       },
       finalizing: {
         label: "Finalizing",
@@ -304,6 +313,53 @@ const BatchInfo: React.FC = () => {
                         <p className="text-xs text-gray-600 mt-1">Failed</p>
                       </button>
                     </div>
+                  </div>
+                </CardContent>
+              </Card>
+            )}
+
+          {/* Retry Failed Requests */}
+          {batch &&
+            batch.request_counts.failed > 0 &&
+            (batch.status === "completed" ||
+              batch.status === "failed" ||
+              batch.status === "cancelled") && (
+              <Card className="p-0 gap-0 rounded-lg">
+                <CardHeader className="px-6 pt-5 pb-4">
+                  <CardTitle>Retry Failed Requests</CardTitle>
+                </CardHeader>
+                <CardContent className="px-6 pb-6 pt-0">
+                  <div className="flex items-center justify-between">
+                    <div>
+                      <p className="text-sm text-gray-700">
+                        This batch has{" "}
+                        <span className="font-semibold text-red-700">
+                          {batch.request_counts.failed} failed request
+                          {batch.request_counts.failed !== 1 ? "s" : ""}
+                        </span>
+                        .
+                      </p>
+                      <p className="text-xs text-gray-500 mt-1">
+                        Click to reset them to pending and retry processing.
+                      </p>
+                    </div>
+                    <Button
+                      onClick={handleRetry}
+                      disabled={retryMutation.isPending}
+                      className="ml-4"
+                    >
+                      {retryMutation.isPending ? (
+                        <>
+                          <Loader2 className="mr-2 h-4 w-4 animate-spin" />
+                          Retrying...
+                        </>
+                      ) : (
+                        <>
+                          <RotateCcw className="mr-2 h-4 w-4" />
+                          Retry Failed
+                        </>
+                      )}
+                    </Button>
                   </div>
                 </CardContent>
               </Card>

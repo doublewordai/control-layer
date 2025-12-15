@@ -980,7 +980,9 @@ export interface DaemonConfig {
   default_model_concurrency: number;
   model_concurrency_limits: Record<string, number>;
   claim_interval_ms: number;
-  max_retries: number;
+  min_retries?: number | null;
+  stop_before_deadline_ms?: number | null;
+  max_retries?: number | null;
   backoff_ms: number;
   backoff_factor: number;
   max_backoff_ms: number;
