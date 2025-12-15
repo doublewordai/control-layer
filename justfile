@@ -419,7 +419,7 @@ test target="" *args="":
                 echo "❌ [$(date '+%H:%M:%S')] Tests failed after $((FAIL_TIME - SERVICES_UP_TIME))s"
                 echo ""
                 echo "📋 Recent server logs:"
-                docker compose logs --tail=20  # Show fewer logs
+                docker compose -f docker-compose.yml -f docker-compose.test.yml logs --tail=20  # Show fewer logs
                 echo "🧹 [$(date '+%H:%M:%S')] Cleaning up..."
                 # Fast teardown: kill containers immediately instead of graceful shutdown
                 docker compose -f docker-compose.yml -f docker-compose.test.yml kill && docker compose -f docker-compose.yml -f docker-compose.test.yml rm -f && docker compose -f docker-compose.yml -f docker-compose.test.yml down --volumes --remove-orphans 2>/dev/null || true
