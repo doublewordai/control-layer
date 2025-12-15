@@ -389,7 +389,7 @@ test target="" *args="":
                 fi
             else
                 echo "🚀 [$(date '+%H:%M:%S')] Starting docker services..."
-                just up -d --wait
+                docker compose up -d --wait
                 
                 echo "⏳ Waiting for control-layer service to be ready..."
                 MAX_WAIT=60  # 1 minute max wait for pre-built images
