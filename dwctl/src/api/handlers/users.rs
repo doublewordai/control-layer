@@ -268,9 +268,9 @@ pub async fn create_user(
 
     let user = repo.create(&db_request).await?;
 
-    // Note: Batch and playground hidden API keys are pre-created by the repository's
-    // get_or_create_proxy_header_user method to avoid race conditions with onwards sync.
-    // Realtime keys are created by users explicitly via API and can tolerate activation delay.
+    // Note: Batch and playground hidden API keys are pre-created by the create() method
+    // to avoid race conditions with onwards sync. Realtime keys are created by users
+    // explicitly via API and can tolerate activation delay.
 
     tx.commit().await.map_err(|e| Error::Database(e.into()))?;
     Ok((StatusCode::CREATED, Json(UserResponse::from(user))))

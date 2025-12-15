@@ -1,5 +1,5 @@
 -- Add model_tariffs table to support multiple pricing tiers per deployed model
--- Migrate existing upstream pricing to 'batch' tariff
+-- Migrate existing upstream pricing to 'realtime' tariff so we always have a fallback
 -- Supports temporal validity to ensure accurate historical chargeback
 
 -- Create the model_tariffs table
