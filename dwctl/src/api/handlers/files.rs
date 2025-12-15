@@ -35,6 +35,7 @@ use std::collections::HashSet;
 use std::pin::Pin;
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
+use tracing::error;
 use uuid::Uuid;
 
 /// OpenAI Batch API request format
@@ -835,7 +836,9 @@ pub async fn delete_file(
     Path(file_id_str): Path<String>,
     current_user: RequiresPermission<resource::Files, operation::DeleteOwn>,
 ) -> Result<Json<FileDeleteResponse>> {
+    error!("here");
     let can_delete_all_files = can_read_all_resources(&current_user, Resource::Files);
+    error!("here 2");
 
     let file_id = Uuid::parse_str(&file_id_str).map_err(|_| Error::BadRequest {
         message: "Invalid file ID format".to_string(),

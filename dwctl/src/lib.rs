@@ -812,6 +812,7 @@ pub async fn build_router(state: &mut AppState, onwards_router: Router) -> anyho
                 .merge(file_router)
                 .route("/files", get(api::handlers::files::list_files))
                 .route("/files/{file_id}", get(api::handlers::files::get_file))
+                .route("/files/{file_id}", delete(api::handlers::files::delete_file))
                 .route("/files/{file_id}/content", get(api::handlers::files::get_file_content))
                 .route("/files/{file_id}/cost-estimate", get(api::handlers::files::get_file_cost_estimate))
                 // Batches management
@@ -820,6 +821,14 @@ pub async fn build_router(state: &mut AppState, onwards_router: Router) -> anyho
                 .route("/batches/{batch_id}", get(api::handlers::batches::get_batch))
                 .route("/batches/{batch_id}/analytics", get(api::handlers::batches::get_batch_analytics))
                 .route("/batches/{batch_id}/cancel", post(api::handlers::batches::cancel_batch))
+                .route(
+                    "/batches/{batch_id}/retry",
+                    post(api::handlers::batches::retry_failed_batch_requests),
+                )
+                .route(
+                    "/batches/{batch_id}/retry-requests",
+                    post(api::handlers::batches::retry_specific_requests),
+                )
                 // Daemon monitoring
                 .route("/daemons", get(api::handlers::daemons::list_daemons))
                 .with_state(state.clone()),

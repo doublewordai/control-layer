@@ -905,6 +905,40 @@ export function useCancelBatch() {
   });
 }
 
+export function useRetryBatch() {
+  const queryClient = useQueryClient();
+
+  return useMutation({
+    mutationFn: (id: string) => dwctlApi.batches.retry(id),
+    onSuccess: (data) => {
+      queryClient.invalidateQueries({
+        queryKey: queryKeys.batches.detail(data.id),
+      });
+      queryClient.invalidateQueries({ queryKey: queryKeys.batches.lists() });
+    },
+  });
+}
+
+export function useRetryBatchRequests() {
+  const queryClient = useQueryClient();
+
+  return useMutation({
+    mutationFn: ({
+      batchId,
+      requestIds,
+    }: {
+      batchId: string;
+      requestIds: string[];
+    }) => dwctlApi.batches.retryRequests(batchId, requestIds),
+    onSuccess: (data) => {
+      queryClient.invalidateQueries({
+        queryKey: queryKeys.batches.detail(data.id),
+      });
+      queryClient.invalidateQueries({ queryKey: queryKeys.batches.lists() });
+    },
+  });
+}
+
 export function useDownloadBatchResults() {
   return useMutation({
     mutationFn: async (id: string) => {

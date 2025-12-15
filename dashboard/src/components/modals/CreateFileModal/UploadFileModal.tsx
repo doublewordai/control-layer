@@ -142,6 +142,7 @@ export function UploadFileModal({
   const handleClose = () => {
     setFile(null);
     setExpirationSeconds(2592000);
+    setError(null);
     onClose();
   };
 

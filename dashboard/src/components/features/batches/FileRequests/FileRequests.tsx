@@ -140,16 +140,18 @@ export function FileRequests() {
             </div>
           )}
         </div>
-        {file && (
-          <Button
-            variant="outline"
-            onClick={() => setDownloadModalOpen(true)}
-            className="flex items-center gap-2"
-          >
-            <Download className="w-4 h-4" />
-            Download
-          </Button>
-        )}
+        <div className="flex items-center gap-2">
+          {file && (
+            <Button
+              variant="outline"
+              onClick={() => setDownloadModalOpen(true)}
+              className="flex items-center gap-2"
+            >
+              <Download className="w-4 h-4" />
+              Download
+            </Button>
+          )}
+        </div>
       </div>
 
       {/* Requests Table */}

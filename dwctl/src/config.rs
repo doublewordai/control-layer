@@ -661,8 +661,15 @@ pub struct DaemonConfig {
     /// How long to sleep between claim iterations in milliseconds (default: 1000)
     pub claim_interval_ms: u64,
 
-    /// Maximum number of retry attempts before giving up (default: 5)
-    pub max_retries: u32,
+    /// Maximum number of retry attempts before giving up
+    /// If None, retries will run until stop_before_deadline_ms
+    pub max_retries: Option<u32>,
+
+    /// Stop retrying this many milliseconds before batch deadline
+    /// Positive values stop before the deadline (safety buffer)
+    /// Negative values allow retrying after the deadline
+    /// If None, retries are not deadline-aware
+    pub stop_before_deadline_ms: Option<i64>,
 
     /// Base backoff duration in milliseconds (will be exponentially increased) (default: 1000)
     pub backoff_ms: u64,
@@ -696,7 +703,8 @@ impl Default for DaemonConfig {
             claim_batch_size: 100,
             default_model_concurrency: 10,
             claim_interval_ms: 1000,
-            max_retries: 5,
+            max_retries: Some(1000),
+            stop_before_deadline_ms: Some(900_000),
             backoff_ms: 1000,
             backoff_factor: 2,
             max_backoff_ms: 10000,
@@ -724,6 +732,7 @@ impl DaemonConfig {
             model_concurrency_limits: model_capacity_limits.unwrap_or_else(|| std::sync::Arc::new(dashmap::DashMap::new())),
             claim_interval_ms: self.claim_interval_ms,
             max_retries: self.max_retries,
+            stop_before_deadline_ms: self.stop_before_deadline_ms,
             backoff_ms: self.backoff_ms,
             backoff_factor: self.backoff_factor,
             max_backoff_ms: self.max_backoff_ms,
