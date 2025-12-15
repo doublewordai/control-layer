@@ -132,7 +132,7 @@ const ModelInfo: React.FC = () => {
 
   // Build include parameter based on permissions
   const includeParam = useMemo(() => {
-    const parts: string[] = ["status"];
+    const parts: string[] = ["status", "pricing"]; // Always include pricing to show tariffs
     if (canManageGroups) parts.push("groups");
     if (canViewAnalytics) parts.push("metrics");
     return parts.join(",");

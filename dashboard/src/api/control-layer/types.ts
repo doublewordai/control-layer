@@ -90,7 +90,7 @@ export interface Model {
   groups?: Group[]; // array of group IDs - only present when include=groups
   metrics?: ModelMetrics; // only present when include=metrics
   status?: ModelProbeStatus; // only present when include=status
-  tariffs?: ModelTariff[]; // only present when include=tariffs
+  tariffs?: ModelTariff[]; // only present when include=pricing
   endpoint?: Endpoint; // only present when include=endpoints
 }
 
