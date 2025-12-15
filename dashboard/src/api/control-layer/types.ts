@@ -17,6 +17,7 @@ export type Role =
   | "BillingManager"
   | "BatchAPIUser";
 export type ApiKeyPurpose = "platform" | "inference";
+export type TariffApiKeyPurpose = "realtime" | "batch" | "playground";
 
 // Config/Metadata types
 export interface ConfigResponse {
@@ -59,6 +60,27 @@ export type TokenPricing = {
 
 export type TokenPricingUpdate = TokenPricing;
 
+// Tariff types (read-only from API)
+export interface ModelTariff {
+  id: string;
+  deployed_model_id: string;
+  name: string;
+  input_price_per_token: string; // Decimal string to preserve precision
+  output_price_per_token: string; // Decimal string to preserve precision
+  valid_from: string; // ISO 8601 timestamp
+  valid_until?: string | null; // ISO 8601 timestamp, null means currently active
+  api_key_purpose?: TariffApiKeyPurpose | null;
+  is_active: boolean;
+}
+
+// Tariff definition for model create/update
+export interface TariffDefinition {
+  name: string;
+  input_price_per_token: string; // Decimal string to preserve precision
+  output_price_per_token: string; // Decimal string to preserve precision
+  api_key_purpose?: TariffApiKeyPurpose | null;
+}
+
 // Base model types
 export interface Model {
   id: string;
@@ -75,7 +97,8 @@ export interface Model {
   groups?: Group[]; // array of group IDs - only present when include=groups
   metrics?: ModelMetrics; // only present when include=metrics
   status?: ModelProbeStatus; // only present when include=status
-  pricing?: TokenPricing; // only present when include=pricing
+  pricing?: TokenPricing; // only present when include=pricing (deprecated, use tariffs)
+  tariffs?: ModelTariff[]; // only present when include=tariffs
   endpoint?: Endpoint; // only present when include=endpoints
 }
 
@@ -267,6 +290,7 @@ export interface ModelUpdateRequest {
   capacity?: number | null;
   batch_capacity?: number | null;
   pricing?: TokenPricingUpdate;
+  tariffs?: TariffDefinition[];
 }
 
 // Endpoint-specific types

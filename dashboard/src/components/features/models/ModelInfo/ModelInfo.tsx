@@ -1038,9 +1038,9 @@ const ModelInfo: React.FC = () => {
                       {/* Pricing Display - visible to all users when billing is enabled */}
                       {showPricing && (
                         <div className="border-t pt-6">
-                          <div className="flex items-center justify-between mb-1">
+                          <div className="flex items-center justify-between mb-3">
                             <div className="flex items-center gap-1">
-                              <p className="text-sm text-gray-600">Pricing</p>
+                              <p className="text-sm text-gray-600">Pricing Tariffs</p>
                               <HoverCard openDelay={100} closeDelay={50}>
                                 <HoverCardTrigger asChild>
                                   <Info className="h-3 w-3 text-gray-400 hover:text-gray-600" />
@@ -1050,9 +1050,9 @@ const ModelInfo: React.FC = () => {
                                   sideOffset={5}
                                 >
                                   <p className="text-sm text-muted-foreground">
-                                    Customer-facing pricing rates per token.
+                                    Pricing tiers for different API key purposes. Set different rates for realtime, batch, and playground usage.
                                     {canManageGroups &&
-                                      ` Click ${model.pricing ? "Edit" : "Set Pricing"} to update pricing.`}
+                                      ` Click "Manage Tariffs" to configure pricing.`}
                                   </p>
                                 </HoverCardContent>
                               </HoverCard>
@@ -1065,51 +1065,47 @@ const ModelInfo: React.FC = () => {
                                 className="h-8"
                               >
                                 <Edit className="h-3 w-3 mr-1" />
-                                {model.pricing ? "Edit" : "Set Pricing"}
+                                Manage Tariffs
                               </Button>
                             )}
                           </div>
-                          {model.pricing ? (
-                            <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
-                              <div>
-                                <p className="text-xs text-gray-500 mb-1">
-                                  Input Price per Million Tokens
-                                </p>
-                                <p className="font-medium">
-                                  {model.pricing.input_price_per_token
-                                    ? (() => {
-                                        const price =
-                                          Number(
-                                            model.pricing.input_price_per_token,
-                                          ) * 1000000;
-                                        return `$${price % 1 === 0 ? price.toFixed(0) : price.toFixed(2)}`;
-                                      })()
-                                    : "Not set"}
-                                </p>
-                              </div>
-                              <div>
-                                <p className="text-xs text-gray-500 mb-1">
-                                  Output Price per Million Tokens
-                                </p>
-                                <p className="font-medium">
-                                  {model.pricing.output_price_per_token
-                                    ? (() => {
-                                        const price =
-                                          Number(
-                                            model.pricing
-                                              .output_price_per_token,
-                                          ) * 1000000;
-                                        return `$${price % 1 === 0 ? price.toFixed(0) : price.toFixed(2)}`;
-                                      })()
-                                    : "Not set"}
-                                </p>
-                              </div>
+                          {model.tariffs && model.tariffs.length > 0 ? (
+                            <div className="space-y-3">
+                              {model.tariffs.map((tariff) => (
+                                <div key={tariff.id} className="bg-gray-50 rounded-lg p-3">
+                                  <div className="flex items-center gap-2 mb-2">
+                                    {tariff.api_key_purpose && (
+                                      <span className="text-xs bg-blue-100 text-blue-700 px-2 py-0.5 rounded">
+                                        {tariff.api_key_purpose.charAt(0).toUpperCase() + tariff.api_key_purpose.slice(1)}
+                                      </span>
+                                    )}
+                                    <p className="font-medium text-sm">{tariff.name}</p>
+                                    <span className="text-xs text-gray-500 ml-auto">
+                                      Valid from {new Date(tariff.valid_from).toLocaleString()}
+                                    </span>
+                                  </div>
+                                  <div className="grid grid-cols-2 gap-4 text-sm">
+                                    <div>
+                                      <p className="text-xs text-gray-500">Input (per 1M tokens)</p>
+                                      <p className="font-medium">
+                                        ${(parseFloat(tariff.input_price_per_token) * 1000000).toFixed(2)}
+                                      </p>
+                                    </div>
+                                    <div>
+                                      <p className="text-xs text-gray-500">Output (per 1M tokens)</p>
+                                      <p className="font-medium">
+                                        ${(parseFloat(tariff.output_price_per_token) * 1000000).toFixed(2)}
+                                      </p>
+                                    </div>
+                                  </div>
+                                </div>
+                              ))}
                             </div>
                           ) : (
                             <p className="text-sm text-gray-500 mt-2">
-                              No pricing configured.
+                              No tariffs configured.
                               {canManageGroups &&
-                                ' Click "Set Pricing" to add pricing information.'}
+                                ' Click "Manage Tariffs" to set up pricing.'}
                             </p>
                           )}
                         </div>
@@ -1525,11 +1521,9 @@ const ModelInfo: React.FC = () => {
       {/* Update Model Pricing Modal */}
       <UpdateModelPricingModal
         isOpen={showPricingModal}
+        modelId={model.id}
         modelName={model.alias}
-        currentPricing={model.pricing}
-        onSubmit={handlePricingSubmit}
         onClose={() => setShowPricingModal(false)}
-        isLoading={updateModelMutation.isPending}
       />
     </div>
   );
