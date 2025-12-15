@@ -248,6 +248,56 @@ impl<'c> Credits<'c> {
 
         Ok(transaction.map(CreditTransactionDBResponse::from))
     }
+
+    /// Get aggregated batch data for usage transactions with batch IDs
+    /// Returns (batched_transactions, batched_source_ids, request_counts)
+    #[instrument(skip(self, source_ids), fields(count = source_ids.len()), err)]
+    pub async fn get_aggregated_batches(&mut self, source_ids: &[String]) -> Result<(Vec<CreditTransactionDBResponse>, Vec<String>)> {
+        // Get batch aggregates - using ARRAY_AGG with ORDER BY to get first values
+        let rows = sqlx::query!(
+            r#"
+            SELECT
+                ha.fusillade_batch_id as "batch_id!",
+                COUNT(*) as "request_count!",
+                SUM(ct.amount) as "total_amount!",
+                MAX(ct.balance_after) as "max_balance_after!",
+                MAX(ct.created_at) as "max_created_at!",
+                (ARRAY_AGG(ct.id ORDER BY ct.created_at))[1] as "first_id!",
+                (ARRAY_AGG(ct.user_id ORDER BY ct.created_at))[1] as "first_user_id!",
+                (ARRAY_AGG(ct.source_id ORDER BY ct.created_at))[1] as "first_source_id!",
+                (ARRAY_AGG(ct.previous_transaction_id ORDER BY ct.created_at))[1] as "first_previous_transaction_id",
+                ARRAY_AGG(ct.source_id) as "batched_source_ids!"
+            FROM credits_transactions ct
+            INNER JOIN http_analytics ha ON ct.source_id = ha.id::text
+            WHERE ct.source_id = ANY($1) AND ha.fusillade_batch_id IS NOT NULL
+            GROUP BY ha.fusillade_batch_id
+            "#,
+            source_ids
+        )
+        .fetch_all(&mut *self.db)
+        .await?;
+
+        let mut batched_transactions = Vec::new();
+        let mut all_batched_source_ids = Vec::new();
+
+        for row in rows {
+            batched_transactions.push(CreditTransactionDBResponse {
+                id: row.first_id,
+                user_id: row.first_user_id,
+                transaction_type: CreditTransactionType::Usage,
+                amount: row.total_amount,
+                balance_after: row.max_balance_after,
+                previous_transaction_id: row.first_previous_transaction_id,
+                source_id: row.first_source_id.clone(),
+                description: Some(format!("Batch: {} requests", row.request_count)),
+                created_at: row.max_created_at,
+            });
+
+            all_batched_source_ids.extend(row.batched_source_ids);
+        }
+
+        Ok((batched_transactions, all_batched_source_ids))
+    }
 }
 
 #[cfg(test)]

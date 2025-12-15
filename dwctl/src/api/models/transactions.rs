@@ -56,6 +56,8 @@ pub struct CreditTransactionResponse {
     pub user_id: UserId,
     /// Transaction type
     pub transaction_type: CreditTransactionType,
+    /// Whether this is a grouped batch of multiple usage transactions
+    pub is_batch: bool,
     /// Amount of credits (returned as string to preserve precision)
     #[schema(value_type = String)]
     pub amount: Decimal,
@@ -84,6 +86,9 @@ pub struct ListTransactionsQuery {
     /// Return all transactions across all users (BillingManager only)
     pub all: Option<bool>,
 
+    /// Group transactions by fusillade_batch_id (merges batch requests into single entries)
+    pub group_batches: Option<bool>,
+
     /// Pagination parameters
     #[serde(flatten)]
     #[param(inline)]
@@ -91,12 +96,14 @@ pub struct ListTransactionsQuery {
 }
 
 // Conversions
-impl From<CreditTransactionDBResponse> for CreditTransactionResponse {
-    fn from(db: CreditTransactionDBResponse) -> Self {
+impl CreditTransactionResponse {
+    /// Convert from DB response with explicit is_batch flag
+    pub fn from_db(db: CreditTransactionDBResponse, is_batch: bool) -> Self {
         Self {
             id: db.id,
             user_id: db.user_id,
             transaction_type: db.transaction_type,
+            is_batch,
             amount: db.amount,
             balance_after: db.balance_after,
             previous_transaction_id: db.previous_transaction_id,
@@ -104,5 +111,11 @@ impl From<CreditTransactionDBResponse> for CreditTransactionResponse {
             description: db.description,
             created_at: db.created_at,
         }
+    }
+}
+
+impl From<CreditTransactionDBResponse> for CreditTransactionResponse {
+    fn from(db: CreditTransactionDBResponse) -> Self {
+        Self::from_db(db, false)
     }
 }
