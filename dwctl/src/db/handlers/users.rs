@@ -125,7 +125,7 @@ impl<'c> Repository for Users<'c> {
         // Pre-create hidden API keys for batch and playground to avoid race condition with onwards sync
         // These keys must exist before the user's first request to ensure immediate access
         // Realtime keys are NOT pre-created - users create them explicitly via API and can tolerate activation delay
-        let mut api_keys_repo = ApiKeys::new(&mut *tx);
+        let mut api_keys_repo = ApiKeys::new(&mut tx);
         api_keys_repo.get_or_create_hidden_key(user_id, ApiKeyPurpose::Batch).await?;
         api_keys_repo.get_or_create_hidden_key(user_id, ApiKeyPurpose::Playground).await?;
 
