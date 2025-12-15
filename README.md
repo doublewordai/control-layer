@@ -243,10 +243,9 @@ batches:
     claim_interval_ms: 1000 # Milliseconds to sleep between claim iterations
 
     # Retry & Backoff Settings
-    # All retry parameters are optional and default to fusillade's built-in defaults
-    min_retries: 3 # Minimum retries guaranteed regardless of other limits
-    max_retries: None # No cap on retries (only limited by deadline if set)
-    stop_before_deadline_ms: 900000 # Stop 15 minutes before batch deadline
+    # All retry parameters are optional - default behaviour is to retry indefinitely until deadline
+    # max_retries: 100 # stop retrying a request after 100 failed attempts
+    # stop_before_deadline_ms: 900000 # Stop 15 minutes before batch deadline
     
     backoff_ms: 1000 # Initial backoff duration in milliseconds
     backoff_factor: 2 # Exponential backoff multiplier
