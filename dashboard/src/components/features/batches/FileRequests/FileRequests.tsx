@@ -6,8 +6,6 @@ import {
   FileCheck,
   AlertCircle,
   Download,
-  RotateCcw,
-  Loader2,
 } from "lucide-react";
 import { Button } from "../../../ui/button";
 import { DataTable } from "../../../ui/data-table";
@@ -23,7 +21,6 @@ import {
   useFile,
   useBatches,
   useFileContent,
-  useRetryBatchRequests,
 } from "../../../../api/control-layer/hooks";
 import {
   createFileRequestsColumns,
@@ -40,14 +37,12 @@ import {
 import { CodeBlock } from "../../../ui/code-block";
 import type { FileRequest } from "../../../../api/control-layer/types";
 import { useServerPagination } from "../../../../hooks/useServerPagination";
-import type { RowSelectionState } from "@tanstack/react-table";
 
 export function FileRequests() {
   const { fileId } = useParams<{ fileId: string }>();
   const navigate = useNavigate();
   const [searchParams] = useSearchParams();
   const [downloadModalOpen, setDownloadModalOpen] = useState(false);
-  const [rowSelection, setRowSelection] = useState<RowSelectionState>({});
 
   // Get the URL to return to - could be batch details page or batches list
   const fromUrl = searchParams.get("from");
@@ -61,9 +56,6 @@ export function FileRequests() {
 
   // Use pagination hook for URL-based pagination state
   const pagination = useServerPagination({ defaultPageSize: 10 });
-
-  // Retry mutation
-  const retryMutation = useRetryBatchRequests();
 
   // Get file details - works for input, output, or error files
   const { data: file } = useFile(fileId || "");
@@ -109,53 +101,9 @@ export function FileRequests() {
     setRequestBodyModalOpen(true);
   };
 
-  // Find the batch ID for this file (needed for retry)
-  const batchForFile = batches.find(
-    (b) => b.output_file_id === file?.id || b.error_file_id === file?.id,
-  );
-
-  // Determine if we should enable selection (only for error files)
-  const isErrorFile = file?.purpose === "batch_error";
-  const enableSelection = isErrorFile && !!batchForFile;
-
-  // Handle retry of selected requests
-  const handleRetrySelected = () => {
-    if (!batchForFile) return;
-
-    // Get selected row indices
-    const selectedIndices = Object.keys(rowSelection)
-      .filter((key) => rowSelection[key])
-      .map((key) => parseInt(key));
-
-    // Get request IDs from selected rows
-    const selectedRequestIds = selectedIndices
-      .map((index) => {
-        const request = requests[index] as any;
-        return request.id; // Error files have an 'id' field with the request ID
-      })
-      .filter((id) => id); // Filter out any undefined
-
-    if (selectedRequestIds.length === 0) return;
-
-    retryMutation.mutate(
-      {
-        batchId: batchForFile.id,
-        requestIds: selectedRequestIds,
-      },
-      {
-        onSuccess: () => {
-          setRowSelection({}); // Clear selection after successful retry
-        },
-      },
-    );
-  };
-
-  const selectedCount = Object.values(rowSelection).filter(Boolean).length;
-
   const columns = createFileRequestsColumns(
     isOutputFile,
     handleViewRequestBody,
-    enableSelection,
   );
 
   return (
@@ -193,25 +141,6 @@ export function FileRequests() {
           )}
         </div>
         <div className="flex items-center gap-2">
-          {enableSelection && selectedCount > 0 && (
-            <Button
-              onClick={handleRetrySelected}
-              disabled={retryMutation.isPending}
-              className="flex items-center gap-2"
-            >
-              {retryMutation.isPending ? (
-                <>
-                  <Loader2 className="h-4 w-4 animate-spin" />
-                  Retrying...
-                </>
-              ) : (
-                <>
-                  <RotateCcw className="h-4 w-4" />
-                  Retry Selected ({selectedCount})
-                </>
-              )}
-            </Button>
-          )}
           {file && (
             <Button
               variant="outline"
@@ -255,9 +184,6 @@ export function FileRequests() {
             pageSize={pagination.pageSize}
             minRows={pagination.pageSize}
             rowHeight="40px"
-            enableRowSelection={enableSelection}
-            rowSelection={rowSelection}
-            onRowSelectionChange={setRowSelection}
             headerActions={
               <div className="flex items-center gap-2">
                 <span className="text-sm text-gray-600">Rows:</span>
