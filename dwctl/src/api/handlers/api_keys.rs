@@ -99,7 +99,9 @@ pub async fn create_user_api_key(
     match &data.purpose {
         crate::db::models::api_keys::ApiKeyPurpose::Batch | crate::db::models::api_keys::ApiKeyPurpose::Playground => {
             return Err(Error::BadRequest {
-                message: "Cannot manually create API keys with 'batch' or 'playground' purpose. These are reserved for internal system use.".to_string(),
+                message:
+                    "Cannot manually create API keys with 'batch' or 'playground' purpose. These are reserved for internal system use."
+                        .to_string(),
             });
         }
         _ => {}

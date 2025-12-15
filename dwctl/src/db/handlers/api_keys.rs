@@ -1420,9 +1420,12 @@ mod tests {
             .get_api_keys_for_deployment_with_sufficient_credit(deployment.id)
             .await
             .unwrap();
+
         assert!(keys_for_deployment.iter().any(|k| k.secret == api_key1.secret));
         assert!(keys_for_deployment.iter().any(|k| k.secret == api_key2.secret));
-        assert_eq!(keys_for_deployment.len(), 2 + 1); // + 1 for system user
+        // Each user gets 3 keys: 1 Realtime (explicit) + 1 Batch (auto) + 1 Playground (auto)
+        // Plus 1 system key
+        assert_eq!(keys_for_deployment.len(), (2 * 3) + 1); // 2 users * 3 keys each + 1 system = 7
 
         // Remove deployment from group 1
         let mut group_conn = pool.acquire().await.unwrap();
@@ -1436,7 +1439,8 @@ mod tests {
             .unwrap();
         assert!(!keys_for_deployment.iter().any(|k| k.secret == api_key1.secret));
         assert!(keys_for_deployment.iter().any(|k| k.secret == api_key2.secret));
-        assert_eq!(keys_for_deployment.len(), 1 + 1); // + 1 for system user
+        // User 2 gets 3 keys (Realtime + Batch + Playground) + 1 system key
+        assert_eq!(keys_for_deployment.len(), 3 + 1); // 3 keys for user2 + 1 system = 4
     }
 
     #[sqlx::test]
