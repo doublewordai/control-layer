@@ -52,6 +52,13 @@ export function AlertBox({
   const styles = variantStyles[variant];
   const IconComponent = styles.icon;
 
+  // strip out error if too long or containing HTML tags
+  const childString = children.toString();
+  const htmlTagRegex = /<\/?[a-zA-Z][^>]*>/;
+  if (htmlTagRegex.test(childString) && childString.length > 280) {
+    children = "An error occurred. Please try again later.";
+  }
+
   return (
     <div
       className={cn("p-3 border rounded-lg", styles.container, className)}
