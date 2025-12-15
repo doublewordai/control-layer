@@ -216,7 +216,7 @@ HTTP 200
 [Asserts]
 jsonpath "$" isCollection
 # Should only see user1's transactions
-jsonpath "$[*].user_id" includes "{{user1_id}}"
+jsonpath "$[*].user_id" contains "{{user1_id}}"
 # Should NOT see user2's transactions (verify no user2_id in results)
 jsonpath "$[?(@.user_id == '{{user2_id}}')]" count == 0
 
@@ -246,7 +246,7 @@ GET http://localhost:3001/admin/api/v1/transactions?user_id={{user1_id}}
 dwctl_session: {{user_jwt}}
 HTTP 200
 [Asserts]
-jsonpath "$[*].user_id" includes "{{user1_id}}"
+jsonpath "$[*].user_id" contains "{{user1_id}}"
 jsonpath "$[?(@.user_id == '{{user2_id}}')]" count == 0
 
 # -----------------------------------------------------------------------------
@@ -289,7 +289,7 @@ HTTP 200
 [Asserts]
 jsonpath "$" isCollection
 # Should only see user2's transactions by default
-jsonpath "$[*].user_id" includes "{{user2_id}}"
+jsonpath "$[*].user_id" contains "{{user2_id}}"
 # Should NOT see user1's transactions without explicit all=true
 jsonpath "$[?(@.user_id == '{{user1_id}}')]" count == 0
 
@@ -305,8 +305,8 @@ HTTP 200
 [Asserts]
 jsonpath "$" isCollection
 # Should see both user1's and user2's transactions
-jsonpath "$[*].user_id" includes "{{user1_id}}"
-jsonpath "$[*].user_id" includes "{{user2_id}}"
+jsonpath "$[*].user_id" contains "{{user1_id}}"
+jsonpath "$[*].user_id" contains "{{user2_id}}"
 
 # User2 uses all=true with pagination - should succeed
 GET http://localhost:3001/admin/api/v1/transactions?all=true&skip=0&limit=10
@@ -328,7 +328,7 @@ HTTP 200
 [Asserts]
 jsonpath "$" isCollection
 # Should only see user1's transactions
-jsonpath "$[*].user_id" includes "{{user1_id}}"
+jsonpath "$[*].user_id" contains "{{user1_id}}"
 # Should NOT see user2's transactions
 jsonpath "$[?(@.user_id == '{{user2_id}}')]" count == 0
 
@@ -338,7 +338,7 @@ GET http://localhost:3001/admin/api/v1/transactions?user_id={{user2_id}}
 dwctl_session: {{user2_jwt}}
 HTTP 200
 [Asserts]
-jsonpath "$[*].user_id" includes "{{user2_id}}"
+jsonpath "$[*].user_id" contains "{{user2_id}}"
 jsonpath "$[?(@.user_id == '{{user1_id}}')]" count == 0
 
 # User2 uses user_id with pagination - should succeed
@@ -361,8 +361,8 @@ HTTP 200
 [Asserts]
 jsonpath "$" isCollection
 # Should see BOTH users despite user_id filter (all=true takes precedence)
-jsonpath "$[*].user_id" includes "{{user1_id}}"
-jsonpath "$[*].user_id" includes "{{user2_id}}"
+jsonpath "$[*].user_id" contains "{{user1_id}}"
+jsonpath "$[*].user_id" contains "{{user2_id}}"
 
 # User2 uses all=true with user_id and pagination - should see everyone
 GET http://localhost:3001/admin/api/v1/transactions?all=true&user_id={{user2_id}}&skip=0&limit=10
@@ -394,7 +394,7 @@ HTTP 200
 jsonpath "$" isCollection
 jsonpath "$" count <= 1
 # All results should be for user1
-jsonpath "$[*].user_id" includes "{{user1_id}}"
+jsonpath "$[*].user_id" contains "{{user1_id}}"
 
 # =============================================================================
 # Cleanup: Restore user2 to original roles
