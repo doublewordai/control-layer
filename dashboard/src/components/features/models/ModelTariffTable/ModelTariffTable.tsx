@@ -87,7 +87,7 @@ export const ModelTariffTable: React.FC<ModelTariffTableProps> = ({
     setLocalTariffs(newTariffs);
     // Convert to TariffDefinition[] (remove _tempId and valid_from)
     onChange(
-      newTariffs.map(({ _tempId, valid_from, ...def }) => def)
+      newTariffs.map(({ _tempId, valid_from: _valid_from, ...def }) => def)
     );
   };
 

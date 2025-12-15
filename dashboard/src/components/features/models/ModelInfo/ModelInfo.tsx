@@ -264,31 +264,6 @@ const ModelInfo: React.FC = () => {
     setSettingsError(null);
   };
 
-  // Pricing modal handler
-  const handlePricingSubmit = async (pricing: {
-    input_price_per_token?: number;
-    output_price_per_token?: number;
-  }) => {
-    if (!model) return;
-    setSettingsError(null);
-
-    try {
-      await updateModelMutation.mutateAsync({
-        id: model.id,
-        data: {
-          pricing: {
-            input_price_per_token: pricing.input_price_per_token ?? null,
-            output_price_per_token: pricing.output_price_per_token ?? null,
-          },
-        },
-      });
-      setShowPricingModal(false);
-    } catch (error) {
-      setSettingsError(
-        error instanceof Error ? error.message : "Failed to update pricing",
-      );
-    }
-  };
 
   if (loading) {
     return (
