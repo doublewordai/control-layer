@@ -285,8 +285,8 @@ test target="" *args="":
         USER2_EMAIL="user2@example.org"
         USER2_PASSWORD="user2_password"
 
-        docker compose exec -T postgres psql -U control_layer -d control_layer -c "DELETE FROM users WHERE email = '$USER1_EMAIL';" > /dev/null 2>&1 || true
-        docker compose exec -T postgres psql -U control_layer -d control_layer -c "DELETE FROM users WHERE email = '$USER2_EMAIL';" > /dev/null 2>&1 || true
+        docker compose -f docker-compose.yml -f docker-compose.test.yml exec -T postgres psql -U control_layer -d control_layer -c "DELETE FROM users WHERE email = '$USER1_EMAIL';" > /dev/null 2>&1 || true
+        docker compose -f docker-compose.yml -f docker-compose.test.yml exec -T postgres psql -U control_layer -d control_layer -c "DELETE FROM users WHERE email = '$USER2_EMAIL';" > /dev/null 2>&1 || true
 
         echo "Creating test user 1: $USER1_EMAIL"
         curl -s -X POST http://localhost:3001/authentication/register \
@@ -360,10 +360,10 @@ test target="" *args="":
 
             if [ "$BUILD_LOCAL" = "true" ]; then
                 echo "🔨 [$(date '+%H:%M:%S')] Building local images..."
-                PULL_POLICY=never docker compose build
+                PULL_POLICY=never docker compose -f docker-compose.yml -f docker-compose.test.yml build
                 BUILD_TIME=$(date +%s)
                 echo "🚀 [$(date '+%H:%M:%S')] Starting docker services with local images... (build took: $((BUILD_TIME - START_TIME))s)"
-                PULL_POLICY=never docker compose up -d
+                PULL_POLICY=never docker compose -f docker-compose.yml -f docker-compose.test.yml up -d
                 
                 echo "⏳ Waiting for control-layer service to be ready..."
                 MAX_WAIT=300  # 5 minutes max wait
@@ -389,7 +389,7 @@ test target="" *args="":
                 fi
             else
                 echo "🚀 [$(date '+%H:%M:%S')] Starting docker services..."
-                docker compose up -d --wait
+                docker compose -f docker-compose.yml -f docker-compose.test.yml up -d --wait
                 
                 echo "⏳ Waiting for control-layer service to be ready..."
                 MAX_WAIT=60  # 1 minute max wait for pre-built images
@@ -407,7 +407,7 @@ test target="" *args="":
                     echo "❌ Service failed to become ready after ${MAX_WAIT}s"
                     echo ""
                     echo "📋 Control-layer logs:"
-                    docker compose logs control-layer --tail=50
+                    docker compose -f docker-compose.yml -f docker-compose.test.yml logs control-layer --tail=50
                     exit 1
                 fi
             fi
@@ -422,14 +422,14 @@ test target="" *args="":
                 docker compose logs --tail=20  # Show fewer logs
                 echo "🧹 [$(date '+%H:%M:%S')] Cleaning up..."
                 # Fast teardown: kill containers immediately instead of graceful shutdown
-                docker compose kill && docker compose rm -f && docker compose down --volumes --remove-orphans 2>/dev/null || true
+                docker compose -f docker-compose.yml -f docker-compose.test.yml kill && docker compose -f docker-compose.yml -f docker-compose.test.yml rm -f && docker compose -f docker-compose.yml -f docker-compose.test.yml down --volumes --remove-orphans 2>/dev/null || true
                 exit 1
             }
 
             TESTS_DONE_TIME=$(date +%s)
             echo "🧹 [$(date '+%H:%M:%S')] Stopping docker services... (tests took: $((TESTS_DONE_TIME - SERVICES_UP_TIME))s)"
             # Fast teardown: kill containers immediately instead of graceful shutdown
-            docker compose kill && docker compose rm -f && docker compose down --volumes --remove-orphans 2>/dev/null || true
+            docker compose -f docker-compose.yml -f docker-compose.test.yml kill && docker compose -f docker-compose.yml -f docker-compose.test.yml rm -f && docker compose -f docker-compose.yml -f docker-compose.test.yml down --volumes --remove-orphans 2>/dev/null || true
 
             END_TIME=$(date +%s)
             echo "✅ [$(date '+%H:%M:%S')] Docker tests completed successfully!"
