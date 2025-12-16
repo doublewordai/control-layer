@@ -154,11 +154,12 @@ dwctl_session: {{admin_jwt}}
   "hosted_on": "{{models_test_endpoint_id}}",
   "requests_per_second": 100.0,
   "burst_size": 200,
-  "pricing": {
+  "tariffs": [{
+    "name": "Standard Pricing",
     "input_price_per_token": "0.001",
     "output_price_per_token": "0.002"
-  },
-  "downstream_pricing": {
+  }],
+  "provider_pricing": {
     "mode": "per_token",
     "input_price_per_token": "0.0005",
     "output_price_per_token": "0.001"
@@ -188,11 +189,12 @@ dwctl_session: {{admin_jwt}}
   "hosted_on": "{{models_test_endpoint_id}}",
   "requests_per_second": 100.0,
   "burst_size": 200,
-  "pricing": {
+  "tariffs": [{
+    "name": "Standard Pricing",
     "input_price_per_token": "0.001",
     "output_price_per_token": "0.002"
-  },
-  "downstream_pricing": {
+  }],
+  "provider_pricing": {
     "mode": "per_token",
     "input_price_per_token": "0.0005",
     "output_price_per_token": "0.001"
@@ -220,11 +222,12 @@ dwctl_session: {{admin_jwt}}
   "hosted_on": "{{models_test_endpoint_id}}",
   "requests_per_second": 100.0,
   "burst_size": 200,
-  "pricing": {
+  "tariffs": [{
+    "name": "Standard Pricing",
     "input_price_per_token": "0.001",
     "output_price_per_token": "0.002"
-  },
-  "downstream_pricing": {
+  }],
+  "provider_pricing": {
     "mode": "per_token",
     "input_price_per_token": "0.0005",
     "output_price_per_token": "0.001"
@@ -364,10 +367,11 @@ PATCH http://localhost:3001/admin/api/v1/models/{{user1_model_id}}
 [Cookies]
 dwctl_session: {{user_jwt}}
 {
-  "pricing": {
-    "prompt": "0.999",
-    "completion": "0.999"
-  }
+  "tariffs": [{
+    "name": "Unauthorized Pricing",
+    "input_price_per_token": "0.999",
+    "output_price_per_token": "0.999"
+  }]
 }
 HTTP 403
 
@@ -393,11 +397,12 @@ PATCH http://localhost:3001/admin/api/v1/models/{{user1_model_id}}
 [Cookies]
 dwctl_session: {{admin_jwt}}
 {
-  "pricing": {
+  "tariffs": [{
+    "name": "Updated Pricing",
     "input_price_per_token": "0.005",
     "output_price_per_token": "0.010"
-  },
-  "downstream_pricing": {
+  }],
+  "provider_pricing": {
     "mode": "per_token",
     "input_price_per_token": "0.0025",
     "output_price_per_token": "0.005"
@@ -414,10 +419,11 @@ dwctl_session: {{admin_jwt}}
 HTTP 200
 [Asserts]
 jsonpath "$.id" == "{{user1_model_id}}"
-jsonpath "$.pricing.input_price_per_token" matches "^0\\.005"
-jsonpath "$.pricing.output_price_per_token" matches "^0\\.01"
-jsonpath "$.downstream_pricing.input_price_per_token" matches "^0\\.0025"
-jsonpath "$.downstream_pricing.output_price_per_token" matches "^0\\.005"
+jsonpath "$.tariffs" isCollection
+jsonpath "$.tariffs[0].input_price_per_token" matches "^0\\.005"
+jsonpath "$.tariffs[0].output_price_per_token" matches "^0\\.01"
+jsonpath "$.provider_pricing.input_price_per_token" matches "^0\\.0025"
+jsonpath "$.provider_pricing.output_price_per_token" matches "^0\\.005"
 
 # Admin updates rate limits - should succeed
 PATCH http://localhost:3001/admin/api/v1/models/{{user2_model_id}}
@@ -732,53 +738,56 @@ jsonpath "$.endpoint.url" exists
 # =============================================================================
 # Pricing Enrichment Permission Tests
 # =============================================================================
+# Tariffs (customer-facing pricing) - visible to ALL users when include=pricing
+# Provider pricing (downstream costs) - only visible to users with Pricing::ReadAll
+# =============================================================================
 
 # -----------------------------------------------------------------------------
-# StandardUser gets customer pricing only (no downstream pricing)
+# StandardUser gets tariffs but NOT provider pricing
 # -----------------------------------------------------------------------------
 
-# User1 fetches model with pricing - should get pricing but NOT downstream_pricing
+# User1 fetches model with pricing - should get tariffs but NOT provider_pricing
 GET http://localhost:3001/admin/api/v1/models/{{user1_model_id}}?include=pricing
 [Cookies]
 dwctl_session: {{user_jwt}}
 HTTP 200
 [Asserts]
 jsonpath "$.id" == "{{user1_model_id}}"
-jsonpath "$.pricing" exists
-jsonpath "$.downstream_pricing" not exists
+jsonpath "$.tariffs" exists
+jsonpath "$.provider_pricing" not exists
 
-# User1 lists models with pricing - should get pricing but NOT downstream_pricing
+# User1 lists models with pricing - should get tariffs but NOT provider_pricing
 GET http://localhost:3001/admin/api/v1/models?include=pricing
 [Cookies]
 dwctl_session: {{user_jwt}}
 HTTP 200
 [Asserts]
-jsonpath "$.data[0].pricing" exists
-jsonpath "$.data[0].downstream_pricing" not exists
+jsonpath "$.data[0].tariffs" exists
+jsonpath "$.data[0].provider_pricing" not exists
 
 # -----------------------------------------------------------------------------
 # PlatformManager gets BOTH customer and downstream pricing
 # -----------------------------------------------------------------------------
 
-# Admin fetches model with pricing - should get BOTH pricing fields
+# Admin fetches model with pricing - should get BOTH tariffs and provider_pricing
 GET http://localhost:3001/admin/api/v1/models/{{user1_model_id}}?include=pricing
 [Cookies]
 dwctl_session: {{admin_jwt}}
 HTTP 200
 [Asserts]
 jsonpath "$.id" == "{{user1_model_id}}"
-jsonpath "$.pricing" exists
-jsonpath "$.downstream_pricing" exists
+jsonpath "$.tariffs" exists
+jsonpath "$.provider_pricing" exists
 
-# Admin lists models with pricing - should get BOTH pricing fields
+# Admin lists models with pricing - should get BOTH tariffs and provider_pricing
 GET http://localhost:3001/admin/api/v1/models?include=pricing
 [Cookies]
 dwctl_session: {{admin_jwt}}
 HTTP 200
 [Asserts]
-# Check that user1_model (which has pricing) shows both pricing fields
-jsonpath "$.data[?(@.id == '{{user1_model_id}}')].pricing" nth 0 exists
-jsonpath "$.data[?(@.id == '{{user1_model_id}}')].downstream_pricing" nth 0 exists
+# Check that user1_model (which has pricing) shows both tariffs and provider_pricing
+jsonpath "$.data[?(@.id == '{{user1_model_id}}')].tariffs" nth 0 exists
+jsonpath "$.data[?(@.id == '{{user1_model_id}}')].provider_pricing" nth 0 exists
 
 # =============================================================================
 # Rate Limits Visibility Confirmation

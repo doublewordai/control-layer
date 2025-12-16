@@ -144,7 +144,7 @@ impl<'a> DeployedModelEnricher<'a> {
             },
             // Tariffs query (only if pricing is requested and user can read pricing)
             async {
-                if self.include_pricing && self.can_read_pricing {
+                if self.include_pricing {
                     use crate::{api::models::tariffs::TariffResponse, db::handlers::Tariffs};
 
                     let mut tariffs_map: HashMap<DeploymentId, Vec<TariffResponse>> = HashMap::new();
@@ -195,7 +195,7 @@ impl<'a> DeployedModelEnricher<'a> {
             }
 
             // Add tariffs if pricing is requested and available
-            if self.include_pricing && self.can_read_pricing {
+            if self.include_pricing {
                 model_response = Self::apply_tariffs(model_response, &pricing_tariffs_map);
             }
 

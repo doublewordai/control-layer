@@ -50,7 +50,7 @@ dwctl_session: {{user_jwt}}
 {
   "name": "User1 Self-Created Key",
   "description": "Created by user1 for themselves",
-  "purpose": "inference"
+  "purpose": "realtime"
 }
 HTTP 201
 [Captures]
@@ -67,7 +67,7 @@ dwctl_session: {{user2_jwt}}
 {
   "name": "User2 Self-Created Key",
   "description": "Created by user2 for themselves",
-  "purpose": "inference"
+  "purpose": "realtime"
 }
 HTTP 201
 [Captures]
@@ -87,7 +87,7 @@ dwctl_session: {{user_jwt}}
 {
   "name": "Should Fail",
   "description": "User1 trying to create key for User2",
-  "purpose": "inference"
+  "purpose": "realtime"
 }
 HTTP 403
 
@@ -97,7 +97,7 @@ dwctl_session: {{user2_jwt}}
 {
   "name": "Should Fail",
   "description": "User2 trying to create key for User1",
-  "purpose": "inference"
+  "purpose": "realtime"
 }
 HTTP 403
 
@@ -131,7 +131,7 @@ dwctl_session: {{admin_jwt}}
 {
   "name": "User1 Admin-Created Key",
   "description": "Created by admin for user1",
-  "purpose": "inference"
+  "purpose": "realtime"
 }
 HTTP 201
 [Captures]
@@ -147,7 +147,7 @@ dwctl_session: {{admin_jwt}}
 {
   "name": "User2 Admin-Created Key",
   "description": "Created by admin for user2",
-  "purpose": "inference"
+  "purpose": "realtime"
 }
 HTTP 201
 [Captures]
@@ -156,6 +156,130 @@ user2_admin_created_key_secret: jsonpath "$.key"
 [Asserts]
 jsonpath "$.name" == "User2 Admin-Created Key"
 jsonpath "$.user_id" == "{{user2_id}}"
+
+# =============================================================================
+# Purpose Validation Tests - Batch and Playground are system-only
+# =============================================================================
+
+# -----------------------------------------------------------------------------
+# Standard users CANNOT create batch or playground keys
+# -----------------------------------------------------------------------------
+
+# User1 tries to create a batch key - should be rejected
+POST http://localhost:3001/admin/api/v1/users/{{user1_id}}/api-keys
+[Cookies]
+dwctl_session: {{user_jwt}}
+{
+  "name": "Invalid Batch Key",
+  "description": "Should not be allowed",
+  "purpose": "batch"
+}
+HTTP 400
+[Asserts]
+body contains "batch"
+body contains "internal system use"
+
+# User1 tries to create a playground key - should be rejected
+POST http://localhost:3001/admin/api/v1/users/{{user1_id}}/api-keys
+[Cookies]
+dwctl_session: {{user_jwt}}
+{
+  "name": "Invalid Playground Key",
+  "description": "Should not be allowed",
+  "purpose": "playground"
+}
+HTTP 400
+[Asserts]
+body contains "playground"
+body contains "internal system use"
+
+# User2 tries to create a batch key - should be rejected
+POST http://localhost:3001/admin/api/v1/users/{{user2_id}}/api-keys
+[Cookies]
+dwctl_session: {{user2_jwt}}
+{
+  "name": "Invalid Batch Key User2",
+  "description": "Should not be allowed",
+  "purpose": "batch"
+}
+HTTP 400
+[Asserts]
+body contains "batch"
+body contains "internal system use"
+
+# User2 tries to create a playground key - should be rejected
+POST http://localhost:3001/admin/api/v1/users/{{user2_id}}/api-keys
+[Cookies]
+dwctl_session: {{user2_jwt}}
+{
+  "name": "Invalid Playground Key User2",
+  "description": "Should not be allowed",
+  "purpose": "playground"
+}
+HTTP 400
+[Asserts]
+body contains "playground"
+body contains "internal system use"
+
+# -----------------------------------------------------------------------------
+# Platform managers ALSO CANNOT create batch or playground keys via API
+# -----------------------------------------------------------------------------
+
+# Admin tries to create a batch key for themselves - should be rejected
+POST http://localhost:3001/admin/api/v1/users/{{admin_user_id}}/api-keys
+[Cookies]
+dwctl_session: {{admin_jwt}}
+{
+  "name": "Admin Invalid Batch Key",
+  "description": "Even admins can't create these",
+  "purpose": "batch"
+}
+HTTP 400
+[Asserts]
+body contains "batch"
+body contains "internal system use"
+
+# Admin tries to create a playground key for themselves - should be rejected
+POST http://localhost:3001/admin/api/v1/users/{{admin_user_id}}/api-keys
+[Cookies]
+dwctl_session: {{admin_jwt}}
+{
+  "name": "Admin Invalid Playground Key",
+  "description": "Even admins can't create these",
+  "purpose": "playground"
+}
+HTTP 400
+[Asserts]
+body contains "playground"
+body contains "internal system use"
+
+# Admin tries to create a batch key for another user - should be rejected
+POST http://localhost:3001/admin/api/v1/users/{{user1_id}}/api-keys
+[Cookies]
+dwctl_session: {{admin_jwt}}
+{
+  "name": "Admin Creating Batch Key for User1",
+  "description": "Should not be allowed even for admins",
+  "purpose": "batch"
+}
+HTTP 400
+[Asserts]
+body contains "batch"
+body contains "internal system use"
+
+# Admin tries to create a playground key for another user - should be rejected
+POST http://localhost:3001/admin/api/v1/users/{{user1_id}}/api-keys
+[Cookies]
+dwctl_session: {{admin_jwt}}
+{
+  "name": "Admin Creating Playground Key for User1",
+  "description": "Should not be allowed even for admins",
+  "purpose": "playground"
+}
+HTTP 400
+[Asserts]
+body contains "playground"
+body contains "internal system use"
 
 # =============================================================================
 # GET /users/{user_id}/api-keys - List API Keys
