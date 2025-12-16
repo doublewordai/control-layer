@@ -1,5 +1,20 @@
 # Changelog
 
+## [0.16.0](https://github.com/doublewordai/control-layer/compare/v0.15.1...v0.16.0) (2025-12-16)
+
+
+### Features
+
+* permissions audit ([036e77e](https://github.com/doublewordai/control-layer/commit/036e77e56bd845f3c28fdc5889a18d680e8d4bf6))
+* Retry failed batch requests ([#354](https://github.com/doublewordai/control-layer/issues/354)) ([b7ed485](https://github.com/doublewordai/control-layer/commit/b7ed485eb37d3d3924b35922323c9efbe2f0e808))
+* Support tariffs to set per-workload model costs ([#336](https://github.com/doublewordai/control-layer/issues/336)) ([0a16081](https://github.com/doublewordai/control-layer/commit/0a16081aa725620707060b7673a9b6b970c9550f))
+
+
+### Bug Fixes
+
+* grant credits to proxy header users ([#366](https://github.com/doublewordai/control-layer/issues/366)) ([0910efe](https://github.com/doublewordai/control-layer/commit/0910efeede12a4b56e9a46c2cbeeebe80b8a29a6))
+* timeout text ([#363](https://github.com/doublewordai/control-layer/issues/363)) ([7006a6b](https://github.com/doublewordai/control-layer/commit/7006a6bc04448d6a4daec6c2f83d0514455d9b61))
+
 ## [0.15.1](https://github.com/doublewordai/control-layer/compare/v0.15.0...v0.15.1) (2025-12-12)
 
 
