@@ -895,12 +895,52 @@ export const ModelsContent: React.FC<ModelsContentProps> = ({
                           style={{ minHeight: "90px" }}
                         >
                           {model.description ? (
-                            <Markdown
-                              className="text-sm text-gray-700 line-clamp-3"
-                              compact
-                            >
-                              {model.description}
-                            </Markdown>
+                            <div className="relative">
+                              <div
+                                className="text-sm text-gray-700"
+                                style={{
+                                  display: "-webkit-box",
+                                  WebkitLineClamp: 2,
+                                  WebkitBoxOrient: "vertical",
+                                  overflow: "hidden",
+                                  wordBreak: "break-word",
+                                }}
+                              >
+                                <Markdown className="inline" compact>
+                                  {(() => {
+                                    // Get first line only (split by newlines)
+                                    const firstLine =
+                                      model.description.split("\n")[0];
+                                    // Roughly estimate how many characters fit in 2 lines
+                                    const maxChars = 150;
+                                    if (firstLine.length <= maxChars) {
+                                      return firstLine;
+                                    }
+                                    // Find the last complete word before the limit
+                                    let truncated = firstLine.substring(
+                                      0,
+                                      maxChars,
+                                    );
+                                    const lastSpace =
+                                      truncated.lastIndexOf(" ");
+                                    if (lastSpace > 0) {
+                                      truncated = truncated.substring(
+                                        0,
+                                        lastSpace,
+                                      );
+                                    }
+                                    return truncated + "...";
+                                  })()}
+                                </Markdown>
+                              </div>
+                              {(model.description.split("\n")[0].length > 150 ||
+                                model.description.split("\n").length > 1 ||
+                                model.description.length > 150) && (
+                                <span className="text-xs text-blue-600 hover:text-blue-700 cursor-pointer">
+                                  read more
+                                </span>
+                              )}
+                            </div>
                           ) : (
                             <p className="text-sm text-gray-700">
                               No description provided
