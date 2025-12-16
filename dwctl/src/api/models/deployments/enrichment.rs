@@ -39,6 +39,8 @@ pub struct DeployedModelEnricher<'a> {
     pub can_read_pricing: bool,
     /// Whether the user can read rate limiting information
     pub can_read_rate_limits: bool,
+    /// Whether the user can read who created models
+    pub can_read_users: bool,
 }
 
 type ProbeStatusTuple = (Option<Uuid>, bool, Option<i32>, Option<DateTime<Utc>>, Option<bool>, Option<f64>);
@@ -142,7 +144,7 @@ impl<'a> DeployedModelEnricher<'a> {
             },
             // Tariffs query (only if pricing is requested and user can read pricing)
             async {
-                if self.include_pricing && self.can_read_pricing {
+                if self.include_pricing {
                     use crate::{api::models::tariffs::TariffResponse, db::handlers::Tariffs};
 
                     let mut tariffs_map: HashMap<DeploymentId, Vec<TariffResponse>> = HashMap::new();
@@ -193,13 +195,18 @@ impl<'a> DeployedModelEnricher<'a> {
             }
 
             // Add tariffs if pricing is requested and available
-            if self.include_pricing && self.can_read_pricing {
+            if self.include_pricing {
                 model_response = Self::apply_tariffs(model_response, &pricing_tariffs_map);
             }
 
             // Mask rate limiting info for users without ModelRateLimits permission
             if !self.can_read_rate_limits {
                 model_response = model_response.mask_rate_limiting();
+                model_response = model_response.mask_capacity();
+            }
+
+            if !self.can_read_users {
+                model_response = model_response.mask_created_by();
             }
 
             enriched_models.push(model_response);

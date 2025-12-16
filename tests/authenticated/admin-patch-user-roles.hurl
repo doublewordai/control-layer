@@ -61,7 +61,7 @@ HTTP 201
 [Captures]
 test_group_id: jsonpath "$.id"
 
-# Patch to RequestViewer
+# Patch to RequestViewer (StandardUser + BatchAPIUser should be auto-added)
 PATCH http://localhost:3001/admin/api/v1/users/{{test_user_id}}
 [Cookies]
 dwctl_session: {{admin_jwt}}
@@ -72,8 +72,9 @@ HTTP 200
 [Asserts]
 jsonpath "$.roles" contains "StandardUser"
 jsonpath "$.roles" contains "RequestViewer"
+jsonpath "$.roles" count == 2
 
-# Patch to empty roles
+# Patch to empty roles (should get default StandardUser + BatchAPIUser)
 PATCH http://localhost:3001/admin/api/v1/users/{{test_user_id}}
 [Cookies]
 dwctl_session: {{admin_jwt}}
@@ -82,13 +83,13 @@ dwctl_session: {{admin_jwt}}
 }
 HTTP 200
 [Asserts]
-jsonpath "$.roles[0]" == "StandardUser"
+jsonpath "$.roles" contains "StandardUser"
 jsonpath "$.roles" count == 1
 
 # REMOVED RE-LOGIN - not needed anymore!
 # Same JWT sees updated roles immediately
 
-# Test permissions are now restricted
+# Test permissions are now restricted (should not have admin access)
 GET http://localhost:3001/admin/api/v1/users
 [Cookies]
 dwctl_session: {{user_jwt}}
@@ -99,8 +100,22 @@ GET http://localhost:3001/admin/api/v1/groups
 dwctl_session: {{user_jwt}}
 HTTP 403
 
-# Cleanup
+# Cleanup - delete test group
 DELETE http://localhost:3001/admin/api/v1/groups/{{test_group_id}}
 [Cookies]
 dwctl_session: {{admin_jwt}}
 HTTP 204
+
+# Restore user to original default roles (StandardUser + BatchAPIUser)
+# This ensures subsequent tests that use user_jwt have the expected permissions
+PATCH http://localhost:3001/admin/api/v1/users/{{test_user_id}}
+[Cookies]
+dwctl_session: {{admin_jwt}}
+{
+  "roles": ["StandardUser", "BatchAPIUser"]
+}
+HTTP 200
+[Asserts]
+jsonpath "$.roles" contains "StandardUser"
+jsonpath "$.roles" contains "BatchAPIUser"
+jsonpath "$.roles" count == 2
