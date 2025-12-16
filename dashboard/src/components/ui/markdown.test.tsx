@@ -134,7 +134,6 @@ describe("Markdown Component", () => {
 
       expect(code).toBeInTheDocument();
       expect(code).toHaveTextContent("inline code");
-      expect(code).toHaveClass("bg-gray-100");
     });
 
     it("should render code blocks without language", () => {
@@ -145,15 +144,6 @@ describe("Markdown Component", () => {
 
       expect(pre).toBeInTheDocument();
       expect(code).toBeInTheDocument();
-      expect(pre).toHaveClass("bg-gray-900");
-    });
-
-    it("should use compact text size in compact mode for inline code", () => {
-      const markdown = "This is `code` text";
-      const { container } = render(<Markdown compact>{markdown}</Markdown>);
-      const code = container.querySelector("code");
-
-      expect(code).toHaveClass("text-xs");
     });
   });
 

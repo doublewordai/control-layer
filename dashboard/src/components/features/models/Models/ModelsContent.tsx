@@ -86,8 +86,6 @@ export const ModelsContent: React.FC<ModelsContentProps> = ({
   const [showPricingModal, setShowPricingModal] = useState(false);
   const [pricingModel, setPricingModel] = useState<Model | null>(null);
 
-  console.log("showPricing", showPricing);
-
   const includeParam = useMemo(() => {
     const parts: string[] = ["status"];
     if (canViewEndpoints) parts.push("endpoints");
@@ -256,7 +254,6 @@ export const ModelsContent: React.FC<ModelsContentProps> = ({
             className="grid grid-cols-1 lg:grid-cols-2 2xl:grid-cols-3 gap-6"
           >
             {filteredModels.map((model) => {
-              console.log(model);
               return (
                 <Card
                   key={model.id}
