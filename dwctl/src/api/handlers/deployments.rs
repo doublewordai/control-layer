@@ -63,6 +63,7 @@ pub async fn list_deployed_models(
     let has_system_access = has_permission(&current_user, resource::Models.into(), operation::SystemAccess.into());
     let can_read_all_models = can_read_all_resources(&current_user, Resource::Models);
     let can_read_groups = can_read_all_resources(&current_user, Resource::Groups);
+    let can_read_users = can_read_all_resources(&current_user, Resource::Users);
     let can_read_pricing = can_read_all_resources(&current_user, Resource::Pricing);
     let can_read_rate_limits = can_read_all_resources(&current_user, Resource::ModelRateLimits);
     let can_read_metrics = can_read_all_resources(&current_user, Resource::Analytics);
@@ -158,8 +159,10 @@ pub async fn list_deployed_models(
                 }
             }
             "endpoints" => {
-                // Endpoints are public information, allow for all users
-                includes.push(include);
+                // Model endpoints is priviliged information for admins
+                if can_read_all_models {
+                    includes.push(include);
+                }
             }
             _ => {
                 // Other includes (like pricing, status) are allowed for all users
@@ -198,6 +201,7 @@ pub async fn list_deployed_models(
         include_endpoints,
         can_read_pricing,
         can_read_rate_limits,
+        can_read_users,
     };
 
     let response = enricher.enrich_many(models).await?;
@@ -420,8 +424,12 @@ pub async fn get_deployed_model(
     current_user: CurrentUser,
 ) -> Result<Json<DeployedModelResponse>> {
     let has_system_access = has_permission(&current_user, resource::Models.into(), operation::SystemAccess.into());
+    let can_read_all_models = can_read_all_resources(&current_user, Resource::Models);
+    let can_read_groups = can_read_all_resources(&current_user, Resource::Groups);
+    let can_read_users = can_read_all_resources(&current_user, Resource::Users);
     let can_read_rate_limits = can_read_all_resources(&current_user, Resource::ModelRateLimits);
     let can_read_pricing = can_read_all_resources(&current_user, Resource::Pricing);
+    let can_read_metrics = can_read_all_resources(&current_user, Resource::Analytics);
 
     let mut pool_conn = state.db.acquire().await.map_err(|e| Error::Database(e.into()))?;
     let mut repo = Deployments::new(&mut pool_conn);
@@ -463,13 +471,62 @@ pub async fn get_deployed_model(
         }
     }
 
-    // Parse include parameters
+    // Check group-based access control for non-admin users
+    if !can_read_all_models {
+        let has_access = repo.check_user_access(&model.alias, current_user.id).await?;
+
+        if has_access.is_none() {
+            return Err(Error::NotFound {
+                resource: "Deployment".to_string(),
+                id: deployment_id.to_string(),
+            });
+        }
+    }
+
+    // Parse include parameters and filter based on permissions (same logic as list)
     let include_params = query.include.as_deref().unwrap_or("");
-    let include_groups = include_params.contains("groups");
-    let include_metrics = include_params.contains("metrics");
-    let include_status = include_params.contains("status");
-    let include_pricing = include_params.contains("pricing");
-    let include_endpoints = include_params.contains("endpoints");
+    let all_includes: Vec<&str> = include_params.split(',').map(|s| s.trim()).filter(|s| !s.is_empty()).collect();
+
+    // Filter includes based on permissions
+    let mut include_groups = false;
+    let mut include_metrics = false;
+    let mut include_status = false;
+    let mut include_pricing = false;
+    let mut include_endpoints = false;
+
+    for &include in &all_includes {
+        match include {
+            "groups" => {
+                // Only users with Groups::ReadAll can include groups
+                if can_read_groups {
+                    include_groups = true;
+                }
+            }
+            "metrics" => {
+                // Only users with Analytics::ReadAll can include metrics
+                if can_read_metrics {
+                    include_metrics = true;
+                }
+            }
+            "endpoints" => {
+                // Model endpoints is priviliged information for admins
+                if can_read_all_models {
+                    include_endpoints = true;
+                }
+            }
+            "status" => {
+                // Status is allowed for all users
+                include_status = true;
+            }
+            "pricing" => {
+                // Pricing is allowed for all users (enricher handles ReadAll permission)
+                include_pricing = true;
+            }
+            _ => {
+                // Unknown includes are ignored
+            }
+        }
+    }
 
     // Build base response with provider_pricing based on permissions and includes
     let provider_pricing = if include_pricing && can_read_pricing {
@@ -489,6 +546,7 @@ pub async fn get_deployed_model(
         include_endpoints,
         can_read_pricing,
         can_read_rate_limits,
+        can_read_users,
     };
 
     response = enricher.enrich_one(response).await?;
@@ -750,6 +808,9 @@ mod tests {
         let deployment = create_test_deployment(&pool, admin_user.id, "test-model", "test-alias").await;
         let deployment_id = deployment.id;
 
+        let everyone_group_id = uuid::Uuid::nil();
+        add_deployment_to_group(&pool, deployment_id, everyone_group_id, admin_user.id).await;
+
         // Both users should initially see the model
         let response = app
             .get(&format!("/admin/api/v1/models/{deployment_id}"))
@@ -922,6 +983,10 @@ mod tests {
         let deployment = create_test_deployment(&pool, admin_user.id, "preserve-test-model", "preserve-test-alias").await;
         let deployment_id = deployment.id;
 
+        // Add to Everyone group so regular users can access it
+        let everyone_group_id = uuid::Uuid::nil();
+        add_deployment_to_group(&pool, deployment_id, everyone_group_id, admin_user.id).await;
+
         // Verify both users can initially access the model
         let response = app
             .get(&format!("/admin/api/v1/models/{deployment_id}"))
@@ -1010,7 +1075,7 @@ mod tests {
         assert_eq!(created_model.alias, "Test New Model");
         assert_eq!(created_model.hosted_on, test_endpoint_id);
         assert_eq!(created_model.description, Some("A test model created via API".to_string()));
-        assert_eq!(created_model.created_by, admin_user.id);
+        assert_eq!(created_model.created_by, Some(admin_user.id));
     }
 
     #[sqlx::test]
@@ -1040,7 +1105,7 @@ mod tests {
         assert_eq!(created_model.alias, "simple-model"); // Should default to model_name
         assert_eq!(created_model.hosted_on, test_endpoint_id);
         assert_eq!(created_model.description, None);
-        assert_eq!(created_model.created_by, admin_user.id);
+        assert_eq!(created_model.created_by, Some(admin_user.id));
     }
 
     #[sqlx::test]

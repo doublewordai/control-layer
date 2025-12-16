@@ -48,7 +48,7 @@ services:
           path: ./dashboard/package.json
         - action: rebuild
           path: ./dashboard/Dockerfile
-
+          
 volumes:
   dwctl_target:
   control_layer_frontend_node_modules:

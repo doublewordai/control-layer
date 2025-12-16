@@ -172,8 +172,9 @@ pub struct DeployedModelResponse {
     pub description: Option<String>,
     pub model_type: Option<ModelType>,
     pub capabilities: Option<Vec<String>>,
-    #[schema(value_type = String, format = "uuid")]
-    pub created_by: UserId,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[schema(value_type = Option<String>, format = "uuid")]
+    pub created_by: Option<UserId>,
     #[schema(value_type = String, format = "uuid")]
     pub hosted_on: InferenceEndpointId,
     pub created_at: DateTime<Utc>,
@@ -222,7 +223,7 @@ impl From<DeploymentDBResponse> for DeployedModelResponse {
             description: db.description,
             model_type: db.model_type,
             capabilities: db.capabilities,
-            created_by: db.created_by,
+            created_by: Some(db.created_by),
             hosted_on: db.hosted_on,
             created_at: db.created_at,
             updated_at: db.updated_at,
@@ -269,6 +270,19 @@ impl DeployedModelResponse {
     pub fn mask_rate_limiting(mut self) -> Self {
         self.requests_per_second = None;
         self.burst_size = None;
+        self
+    }
+
+    /// Mask capacity information (sets to None for users without permission)
+    pub fn mask_capacity(mut self) -> Self {
+        self.capacity = None;
+        self.batch_capacity = None;
+        self
+    }
+
+    /// Mask created_by field (sets to None for users without system access)
+    pub fn mask_created_by(mut self) -> Self {
+        self.created_by = None;
         self
     }
 
