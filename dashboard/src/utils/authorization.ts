@@ -13,6 +13,7 @@ export type PagePermission =
   | "settings"
   | "profile"
   | "manage-groups"
+  | "manage-models"
   | "batches";
 
 // Define which roles can access which pages
@@ -28,6 +29,7 @@ const ROLE_PERMISSIONS: Record<Role, PagePermission[]> = {
     "settings",
     "profile",
     "manage-groups",
+    "manage-models",
     "batches",
   ],
   StandardUser: [

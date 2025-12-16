@@ -13,6 +13,8 @@ import {
   ArrowUpDown,
   Info,
   DollarSign,
+  ArrowDown,
+  ArrowUp,
 } from "lucide-react";
 import {
   useModels,
@@ -45,6 +47,7 @@ import {
   formatRelativeTime,
 } from "../../../../utils/formatters";
 import { StatusRow } from "./StatusRow";
+import { Markdown } from "../../../ui/markdown";
 
 export interface ModelsContentProps {
   pagination: ReturnType<
@@ -56,7 +59,9 @@ export interface ModelsContentProps {
   isStatusMode: boolean;
   canManageGroups: boolean;
   canViewAnalytics: boolean;
+  canViewEndpoints: boolean;
   showPricing: boolean;
+  canManageModels: boolean;
   onClearFilters: () => void;
 }
 
@@ -68,7 +73,9 @@ export const ModelsContent: React.FC<ModelsContentProps> = ({
   isStatusMode,
   canManageGroups,
   canViewAnalytics,
+  canViewEndpoints,
   showPricing,
+  canManageModels,
   onClearFilters,
 }) => {
   const navigate = useNavigate();
@@ -80,12 +87,13 @@ export const ModelsContent: React.FC<ModelsContentProps> = ({
   const [pricingModel, setPricingModel] = useState<Model | null>(null);
 
   const includeParam = useMemo(() => {
-    const parts: string[] = ["status", "endpoints"];
+    const parts: string[] = ["status"];
+    if (canViewEndpoints) parts.push("endpoints");
     if (canManageGroups) parts.push("groups");
     if (canViewAnalytics) parts.push("metrics");
-    if (showPricing) parts.push("tariffs");
+    if (showPricing) parts.push("pricing");
     return parts.join(",");
-  }, [canManageGroups, canViewAnalytics, showPricing]);
+  }, [canViewEndpoints, canManageGroups, canViewAnalytics, showPricing]);
 
   const {
     data: rawModelsData,
@@ -245,438 +253,692 @@ export const ModelsContent: React.FC<ModelsContentProps> = ({
             role="list"
             className="grid grid-cols-1 lg:grid-cols-2 2xl:grid-cols-3 gap-6"
           >
-            {filteredModels.map((model) => (
-              <Card
-                key={model.id}
-                role="listitem"
-                className="hover:shadow-md transition-shadow rounded-lg p-0 gap-0 overflow-hidden flex flex-col"
-              >
-                <div
-                  className="cursor-pointer hover:bg-gray-50 transition-colors group grow flex flex-col"
-                  onClick={() => {
-                    navigate(
-                      `/models/${model.id}?from=${encodeURIComponent("/models")}`,
-                    );
-                  }}
+            {filteredModels.map((model) => {
+              return (
+                <Card
+                  key={model.id}
+                  role="listitem"
+                  className="hover:shadow-md transition-shadow rounded-lg p-0 gap-0 overflow-hidden flex flex-col"
                 >
-                  <CardHeader className="px-6 pt-5 pb-0">
-                    <div className="space-y-2">
-                      {/* ROW 1: Alias on left, groups/chevron on right */}
-                      <div className="flex items-center justify-between gap-1">
-                        <div className="flex items-center gap-2">
-                          {model.alias.length > 30 ? (
-                            <HoverCard openDelay={200} closeDelay={100}>
-                              <HoverCardTrigger asChild>
-                                <CardTitle className="text-lg truncate max-w-[460px] md:max-w-[420px] lg:max-w-[270px] xl:max-w-[360px] 2xl:max-w-[230px] 3xl:max-w-[300px] 4xl:max-w-[360px] 5xl:max-w-[420px] break-all hover:opacity-70 transition-opacity cursor-default">
-                                  {model.alias}
-                                </CardTitle>
-                              </HoverCardTrigger>
-                              <HoverCardContent
-                                className="w-auto max-w-sm"
-                                sideOffset={5}
-                              >
-                                <p className="text-sm break-all">
-                                  {model.alias}
-                                </p>
-                              </HoverCardContent>
-                            </HoverCard>
-                          ) : (
-                            <CardTitle className="text-lg truncate max-w-[460px] md:max-w-[420px] lg:max-w-[270px] xl:max-w-[360px] 2xl:max-w-[230px] 3xl:max-w-[300px] 4xl:max-w-[360px] 5xl:max-w-[420px] break-all">
-                              {model.alias}
-                            </CardTitle>
-                          )}
-
-                          {model.status?.probe_id && (
-                            <HoverCard openDelay={200} closeDelay={100}>
-                              <HoverCardTrigger asChild>
-                                <div
-                                  className={`h-2 w-2 rounded-full ${
-                                    model.status.last_success === true
-                                      ? "bg-green-500 animate-pulse"
-                                      : model.status.last_success === false
-                                        ? "bg-red-500 animate-pulse"
-                                        : "bg-gray-400"
-                                  }`}
-                                  onClick={(e) => e.stopPropagation()}
-                                />
-                              </HoverCardTrigger>
-                              <HoverCardContent className="w-56" sideOffset={5}>
-                                <div className="space-y-2">
-                                  <div className="flex items-center gap-2">
-                                    <div
-                                      className={`h-2 w-2 rounded-full ${
-                                        model.status.last_success === true
-                                          ? "bg-green-500"
-                                          : model.status.last_success === false
-                                            ? "bg-red-500"
-                                            : "bg-gray-400"
-                                      }`}
-                                    />
-                                    <span className="font-medium text-sm">
-                                      {model.status.last_success === true
-                                        ? "Operational"
-                                        : model.status.last_success === false
-                                          ? "Down"
-                                          : "Unknown"}
-                                    </span>
-                                  </div>
-                                  {model.status.uptime_percentage !==
-                                    undefined &&
-                                    model.status.uptime_percentage !== null && (
-                                      <p className="text-xs text-muted-foreground">
-                                        {model.status.uptime_percentage.toFixed(
-                                          2,
-                                        )}
-                                        % uptime (24h)
-                                      </p>
-                                    )}
-                                </div>
-                              </HoverCardContent>
-                            </HoverCard>
-                          )}
-
-                          <HoverCard openDelay={200} closeDelay={100}>
-                            <HoverCardTrigger asChild>
-                              <button
-                                className="text-gray-500 hover:text-gray-700 transition-colors p-1"
-                                onClick={(e) => e.stopPropagation()}
-                              >
-                                <Info className="h-4 w-4" />
-                                <span className="sr-only">
-                                  View model description
-                                </span>
-                              </button>
-                            </HoverCardTrigger>
-                            <HoverCardContent className="w-96" sideOffset={5}>
-                              <p className="text-sm text-muted-foreground">
-                                {model.description || "No description provided"}
-                              </p>
-                            </HoverCardContent>
-                          </HoverCard>
-                        </div>
-
-                        {/* Access Groups and Expand Icon */}
-                        <div className="flex items-center gap-3">
-                          {canManageGroups && (
-                            <div
-                              className="flex items-center gap-1 max-w-[180px]"
-                              onClick={(e) => e.stopPropagation()}
-                            >
-                              {!model.groups || model.groups.length === 0 ? (
-                                <Button
-                                  variant="outline"
-                                  size="sm"
-                                  onClick={() => {
-                                    setAccessModel(model);
-                                    setShowAccessModal(true);
-                                  }}
-                                  className="h-6 px-2 text-xs"
-                                >
-                                  <Plus className="h-2.5 w-2.5" />
-                                  Add groups
-                                </Button>
-                              ) : (
-                                <>
-                                  {model.groups.slice(0, 1).map((group) => (
-                                    <Badge
-                                      key={group.id}
-                                      variant="secondary"
-                                      className="text-xs"
-                                      title={`Group: ${group.name}`}
-                                    >
-                                      <Users className="h-3 w-3" />
-                                      <span className="max-w-[60px] truncate break-all">
-                                        {group.name}
-                                      </span>
-                                    </Badge>
-                                  ))}
-                                  {model.groups.length > 1 ? (
-                                    <HoverCard openDelay={200} closeDelay={100}>
-                                      <HoverCardTrigger asChild>
-                                        <Badge
-                                          variant="outline"
-                                          className="text-xs hover:bg-gray-50 select-none"
-                                          onClick={() => {
-                                            setAccessModel(model);
-                                            setShowAccessModal(true);
-                                          }}
-                                        >
-                                          +{model.groups.length - 1} more
-                                        </Badge>
-                                      </HoverCardTrigger>
-                                      <HoverCardContent
-                                        className="w-60"
-                                        align="start"
-                                        sideOffset={5}
-                                      >
-                                        <div className="flex flex-wrap gap-1">
-                                          {model.groups.map((group) => (
-                                            <Badge
-                                              key={group.id}
-                                              variant="secondary"
-                                              className="text-xs max-w-[200px]"
-                                            >
-                                              <Users className="h-3 w-3 shrink-0" />
-                                              <span className="truncate break-all">
-                                                {group.name}
-                                              </span>
-                                            </Badge>
-                                          ))}
-                                        </div>
-                                      </HoverCardContent>
-                                    </HoverCard>
-                                  ) : (
-                                    <Button
-                                      variant="outline"
-                                      size="icon"
-                                      onClick={() => {
-                                        setAccessModel(model);
-                                        setShowAccessModal(true);
-                                      }}
-                                      className="h-6 w-6"
-                                      title="Manage access groups"
-                                    >
-                                      <Plus className="h-2.5 w-2.5" />
-                                    </Button>
-                                  )}
-                                </>
-                              )}
-                            </div>
-                          )}
-                        </div>
-                      </div>
-
-                      {/* ROW 2: Pricing, endpoint */}
-                      <CardDescription className="flex items-center gap-1.5 min-w-0">
-                        {/* Show pricing for users with pricing permissions */}
-                        {showPricing && (
-                          <>
-                            <button
-                              className="flex items-center gap-1 text-xs text-gray-600 hover:text-gray-900 transition-colors"
-                              onClick={(e) => {
-                                e.stopPropagation();
-                                setPricingModel(model);
-                                setShowPricingModal(true);
-                              }}
-                              title="Manage pricing tariffs"
-                            >
-                              <DollarSign className="h-3 w-3" />
-                              <span>
-                                {model.tariffs && model.tariffs.length > 0
-                                  ? `${model.tariffs.length} tariff${model.tariffs.length > 1 ? "s" : ""}`
-                                  : "Set pricing"}
-                              </span>
-                            </button>
-                            <span>•</span>
-                          </>
-                        )}
-                        <span className="flex items-center gap-1.5 min-w-0">
-                          {/*{model.model_name.length > 30 ? (
-                            <HoverCard openDelay={200} closeDelay={100}>
-                              <HoverCardTrigger asChild>
-                                <span className="truncate max-w-[330px] md:max-w-[330px] lg:max-w-[150px] xl:max-w-[180px] 2xl:max-w-[140px] 3xl:max-w-[170px] 4xl:max-w-[190px] hover:opacity-70 transition-opacity">
-                                  {model.model_name}
-                                </span>
-                              </HoverCardTrigger>
-                              <HoverCardContent
-                                className="w-auto max-w-sm"
-                                sideOffset={5}
-                              >
-                                <p className="text-sm break-all">
-                                  {model.model_name}
-                                </p>
-                              </HoverCardContent>
-                            </HoverCard>
-                          ) : (
-                            <span className="truncate max-w-[330px] md:max-w-[330px] lg:max-w-[150px] xl:max-w-[180px] 2xl:max-w-[140px] 3xl:max-w-[170px] 4xl:max-w-[190px] ">
-                              {model.model_name}
-                            </span>
-                          )}
-                          <span>•</span>*/}
-                          {(() => {
-                            const endpointName =
-                              model.endpoint?.name || "Unknown endpoint";
-                            return endpointName.length > 25 ? (
+                  <div
+                    className="cursor-pointer hover:bg-gray-50 transition-colors group grow flex flex-col"
+                    onClick={() => {
+                      navigate(
+                        `/models/${model.id}?from=${encodeURIComponent("/models")}`,
+                      );
+                    }}
+                  >
+                    <CardHeader className="px-6 pt-5 pb-0">
+                      <div
+                        className={canViewEndpoints ? "space-y-0" : "space-y-2"}
+                      >
+                        {/* ROW 1: Alias on left, groups/chevron on right */}
+                        <div className="flex items-center justify-between gap-1">
+                          <div className="flex items-center gap-2">
+                            {model.alias.length > 30 ? (
                               <HoverCard openDelay={200} closeDelay={100}>
                                 <HoverCardTrigger asChild>
-                                  <span className="truncate max-w-[300px] 2xl:max-w-[200px] 3xl:max-w-[300px] hover:opacity-70 transition-opacity">
-                                    {endpointName}
-                                  </span>
+                                  <CardTitle
+                                    className={`text-lg truncate ${canManageGroups ? "max-w-[460px] md:max-w-[420px] lg:max-w-[270px] xl:max-w-[360px] 2xl:max-w-[230px] 3xl:max-w-[300px] 4xl:max-w-[360px] 5xl:max-w-[420px]" : "max-w-[460px] md:max-w-[500px] lg:max-w-[320px] xl:max-w-[480px] 2xl:max-w-[360px] 3xl:max-w-[450px] 4xl:max-w-[520px] 5xl:max-w-[600px]"} break-all hover:opacity-70 transition-opacity cursor-default`}
+                                  >
+                                    {model.alias}
+                                  </CardTitle>
                                 </HoverCardTrigger>
                                 <HoverCardContent
                                   className="w-auto max-w-sm"
                                   sideOffset={5}
                                 >
-                                  <p className="text-sm">{endpointName}</p>
+                                  <p className="text-sm break-all">
+                                    {model.alias}
+                                  </p>
                                 </HoverCardContent>
                               </HoverCard>
                             ) : (
-                              <span className="truncate max-w-[300px] 2xl:max-w-[200px] 3xl:max-w-[300px]">
-                                {endpointName}
-                              </span>
-                            );
-                          })()}
-                        </span>
-                      </CardDescription>
-                    </div>
-                  </CardHeader>
+                              <CardTitle
+                                className={`text-lg truncate ${canManageGroups ? "max-w-[460px] md:max-w-[420px] lg:max-w-[270px] xl:max-w-[360px] 2xl:max-w-[230px] 3xl:max-w-[300px] 4xl:max-w-[360px] 5xl:max-w-[420px]" : "max-w-[460px] md:max-w-[500px] lg:max-w-[320px] xl:max-w-[480px] 2xl:max-w-[360px] 3xl:max-w-[450px] 4xl:max-w-[520px] 5xl:max-w-[600px]"} break-all`}
+                              >
+                                {model.alias}
+                              </CardTitle>
+                            )}
 
-                  <CardContent className="grow px-0 pt-0 pb-0 flex flex-col">
-                    {model.metrics ? (
-                      <div
-                        className="flex gap-6 items-center px-6 pb-4"
-                        style={{ minHeight: "90px" }}
-                      >
-                        <div className="flex-1">
-                          <div className="grid grid-cols-2 gap-2 text-xs">
-                            <div className="flex items-center gap-1.5">
+                            {model.status?.probe_id && (
                               <HoverCard openDelay={200} closeDelay={100}>
                                 <HoverCardTrigger asChild>
-                                  <BarChart3 className="h-3.5 w-3.5 text-gray-500 " />
+                                  <div
+                                    className={`h-2 w-2 rounded-full ${
+                                      model.status.last_success === true
+                                        ? "bg-green-500 animate-pulse"
+                                        : model.status.last_success === false
+                                          ? "bg-red-500 animate-pulse"
+                                          : "bg-gray-400"
+                                    }`}
+                                    onClick={(e) => e.stopPropagation()}
+                                  />
                                 </HoverCardTrigger>
                                 <HoverCardContent
-                                  className="w-40"
+                                  className="w-56"
                                   sideOffset={5}
                                 >
-                                  <p className="text-xs text-muted-foreground">
-                                    Total requests made to this model
-                                  </p>
-                                </HoverCardContent>
-                              </HoverCard>
-                              <span className="text-gray-600">
-                                {formatNumber(model.metrics.total_requests)}{" "}
-                                requests
-                              </span>
-                            </div>
-
-                            <div className="flex items-center gap-1.5">
-                              <HoverCard openDelay={200} closeDelay={100}>
-                                <HoverCardTrigger asChild>
-                                  <Activity className="h-3.5 w-3.5 text-gray-500 " />
-                                </HoverCardTrigger>
-                                <HoverCardContent
-                                  className="w-40"
-                                  sideOffset={5}
-                                >
-                                  <p className="text-xs text-muted-foreground">
-                                    Average response time across all requests
-                                  </p>
-                                </HoverCardContent>
-                              </HoverCard>
-                              <span className="text-gray-600">
-                                {formatLatency(model.metrics.avg_latency_ms)}{" "}
-                                avg
-                              </span>
-                            </div>
-
-                            <div className="flex items-center gap-1.5">
-                              <HoverCard openDelay={200} closeDelay={100}>
-                                <HoverCardTrigger asChild>
-                                  <ArrowUpDown className="h-3.5 w-3.5 text-gray-500 " />
-                                </HoverCardTrigger>
-                                <HoverCardContent
-                                  className="w-48"
-                                  sideOffset={5}
-                                >
-                                  <div className="text-xs text-muted-foreground">
-                                    <p>
-                                      Input:{" "}
-                                      {formatNumber(
-                                        model.metrics.total_input_tokens,
+                                  <div className="space-y-2">
+                                    <div className="flex items-center gap-2">
+                                      <div
+                                        className={`h-2 w-2 rounded-full ${
+                                          model.status.last_success === true
+                                            ? "bg-green-500"
+                                            : model.status.last_success ===
+                                                false
+                                              ? "bg-red-500"
+                                              : "bg-gray-400"
+                                        }`}
+                                      />
+                                      <span className="font-medium text-sm">
+                                        {model.status.last_success === true
+                                          ? "Operational"
+                                          : model.status.last_success === false
+                                            ? "Down"
+                                            : "Unknown"}
+                                      </span>
+                                    </div>
+                                    {model.status.uptime_percentage !==
+                                      undefined &&
+                                      model.status.uptime_percentage !==
+                                        null && (
+                                        <p className="text-xs text-muted-foreground">
+                                          {model.status.uptime_percentage.toFixed(
+                                            2,
+                                          )}
+                                          % uptime (24h)
+                                        </p>
                                       )}
-                                    </p>
-                                    <p>
-                                      Output:{" "}
-                                      {formatNumber(
-                                        model.metrics.total_output_tokens,
-                                      )}
-                                    </p>
-                                    <p className="mt-1 font-medium">
-                                      Total tokens processed
-                                    </p>
                                   </div>
                                 </HoverCardContent>
                               </HoverCard>
-                              <span className="text-gray-600">
-                                {formatNumber(
-                                  model.metrics.total_input_tokens +
-                                    model.metrics.total_output_tokens,
-                                )}{" "}
-                                tokens
-                              </span>
-                            </div>
+                            )}
 
-                            <div className="flex items-center gap-1.5">
+                            {model.metrics && (
                               <HoverCard openDelay={200} closeDelay={100}>
                                 <HoverCardTrigger asChild>
-                                  <Clock className="h-3.5 w-3.5 text-gray-500 " />
+                                  <button
+                                    className="text-gray-500 hover:text-gray-700 transition-colors p-1"
+                                    onClick={(e) => e.stopPropagation()}
+                                  >
+                                    <Info className="h-4 w-4" />
+                                    <span className="sr-only">
+                                      View model description
+                                    </span>
+                                  </button>
                                 </HoverCardTrigger>
                                 <HoverCardContent
-                                  className="w-36"
+                                  className="w-96"
                                   sideOffset={5}
                                 >
-                                  <p className="text-xs text-muted-foreground">
-                                    Last request received
-                                  </p>
+                                  {model.description ? (
+                                    <Markdown
+                                      className="text-sm text-muted-foreground"
+                                      compact
+                                    >
+                                      {model.description}
+                                    </Markdown>
+                                  ) : (
+                                    <p className="text-sm text-muted-foreground">
+                                      No description provided
+                                    </p>
+                                  )}
                                 </HoverCardContent>
                               </HoverCard>
-                              <span className="text-gray-600">
-                                {formatRelativeTime(
-                                  model.metrics.last_active_at,
+                            )}
+                          </div>
+                          {/* Access Groups and Expand Icon */}
+                          {canManageGroups && (
+                            <div className="flex items-center gap-3">
+                              <div
+                                className="flex items-center gap-1 max-w-[180px]"
+                                onClick={(e) => e.stopPropagation()}
+                              >
+                                {!model.groups || model.groups.length === 0 ? (
+                                  <Button
+                                    variant="outline"
+                                    size="sm"
+                                    onClick={() => {
+                                      setAccessModel(model);
+                                      setShowAccessModal(true);
+                                    }}
+                                    className="h-6 px-2 text-xs"
+                                  >
+                                    <Plus className="h-2.5 w-2.5" />
+                                    Add groups
+                                  </Button>
+                                ) : (
+                                  <>
+                                    {model.groups.slice(0, 1).map((group) => (
+                                      <Badge
+                                        key={group.id}
+                                        variant="secondary"
+                                        className="text-xs"
+                                        title={`Group: ${group.name}`}
+                                      >
+                                        <Users className="h-3 w-3" />
+                                        <span className="max-w-[60px] truncate break-all">
+                                          {group.name}
+                                        </span>
+                                      </Badge>
+                                    ))}
+                                    {model.groups.length > 1 ? (
+                                      <HoverCard
+                                        openDelay={200}
+                                        closeDelay={100}
+                                      >
+                                        <HoverCardTrigger asChild>
+                                          <Badge
+                                            variant="outline"
+                                            className="text-xs hover:bg-gray-50 select-none"
+                                            onClick={() => {
+                                              setAccessModel(model);
+                                              setShowAccessModal(true);
+                                            }}
+                                          >
+                                            +{model.groups.length - 1} more
+                                          </Badge>
+                                        </HoverCardTrigger>
+                                        <HoverCardContent
+                                          className="w-60"
+                                          align="start"
+                                          sideOffset={5}
+                                        >
+                                          <div className="flex flex-wrap gap-1">
+                                            {model.groups.map((group) => (
+                                              <Badge
+                                                key={group.id}
+                                                variant="secondary"
+                                                className="text-xs max-w-[200px]"
+                                              >
+                                                <Users className="h-3 w-3 shrink-0" />
+                                                <span className="truncate break-all">
+                                                  {group.name}
+                                                </span>
+                                              </Badge>
+                                            ))}
+                                          </div>
+                                        </HoverCardContent>
+                                      </HoverCard>
+                                    ) : (
+                                      <Button
+                                        variant="outline"
+                                        size="icon"
+                                        onClick={() => {
+                                          setAccessModel(model);
+                                          setShowAccessModal(true);
+                                        }}
+                                        className="h-6 w-6"
+                                        title="Manage access groups"
+                                      >
+                                        <Plus className="h-2.5 w-2.5" />
+                                      </Button>
+                                    )}
+                                  </>
                                 )}
+                              </div>
+                            </div>
+                          )}
+                        </div>
+
+                        {/* ROW 2: Endpoint (if user can edit endpoints) */}
+                        {canViewEndpoints && model.endpoint && (
+                          <CardDescription className="flex items-center gap-1.5 min-w-0 mb-2">
+                            <span className="text-gray-600 text-sm">
+                              <span className="font-medium">
+                                {model.endpoint.name}
                               </span>
+                            </span>
+                          </CardDescription>
+                        )}
+
+                        {/* ROW 3: Tariffs */}
+                        <CardDescription className="flex items-center gap-1.5 min-w-0">
+                          {/* Show pricing for users with pricing permissions */}
+                          {showPricing && (
+                            <>
+                              {(() => {
+                                const batchTariff = model.tariffs?.find(
+                                  (t) => t.api_key_purpose === "batch",
+                                );
+                                const realtimeTariff = model.tariffs?.find(
+                                  (t) => t.api_key_purpose === "realtime",
+                                );
+
+                                return (
+                                  <>
+                                    {batchTariff && (
+                                      <>
+                                        <HoverCard
+                                          openDelay={200}
+                                          closeDelay={100}
+                                        >
+                                          <HoverCardTrigger asChild>
+                                            <button
+                                              className="flex items-center gap-0.5 shrink-0 hover:opacity-70 transition-opacity"
+                                              onClick={(e) =>
+                                                e.stopPropagation()
+                                              }
+                                            >
+                                              Batch:
+                                              {!batchTariff.input_price_per_token &&
+                                              !batchTariff.output_price_per_token ? (
+                                                <span className="flex items-center gap-0.5 text-green-700">
+                                                  <div className="relative h-2.5 w-2.5">
+                                                    <DollarSign className="h-2.5 w-2.5" />
+                                                    <div className="absolute inset-0 flex items-center justify-center">
+                                                      <div className="w-5 h-px bg-green-700 rotate-[-50deg]" />
+                                                    </div>
+                                                  </div>
+                                                  <span>Free</span>
+                                                </span>
+                                              ) : (
+                                                <span className="flex items-center gap-0.5">
+                                                  <ArrowDown className="h-2.5 w-2.5 text-gray-500 shrink-0" />
+                                                  <span className="whitespace-nowrap tabular-nums">
+                                                    {batchTariff.input_price_per_token
+                                                      ? (() => {
+                                                          const price =
+                                                            Number(
+                                                              batchTariff.input_price_per_token,
+                                                            ) * 1000000;
+                                                          return `$${price % 1 === 0 ? price.toFixed(0) : price.toFixed(2)}`;
+                                                        })()
+                                                      : "$0"}
+                                                  </span>
+                                                  <span className="text-[8px] text-gray-400">
+                                                    /M
+                                                  </span>
+                                                  <ArrowUp className="h-2.5 w-2.5 text-gray-500 shrink-0 ml-0.5" />
+                                                  <span className="whitespace-nowrap tabular-nums">
+                                                    {batchTariff.output_price_per_token
+                                                      ? (() => {
+                                                          const price =
+                                                            Number(
+                                                              batchTariff.output_price_per_token,
+                                                            ) * 1000000;
+                                                          return `$${price % 1 === 0 ? price.toFixed(0) : price.toFixed(2)}`;
+                                                        })()
+                                                      : "$0"}
+                                                  </span>
+                                                  <span className="text-[8px] text-gray-400">
+                                                    /M
+                                                  </span>
+                                                </span>
+                                              )}
+                                              <span className="sr-only">
+                                                View batch pricing details
+                                              </span>
+                                            </button>
+                                          </HoverCardTrigger>
+                                          <HoverCardContent
+                                            className="w-48"
+                                            sideOffset={5}
+                                          >
+                                            Batch:
+                                            {!batchTariff.input_price_per_token &&
+                                            !batchTariff.output_price_per_token ? (
+                                              <div className="text-sm">
+                                                <p className="font-medium text-green-700">
+                                                  Free
+                                                </p>
+                                                <p className="text-xs text-muted-foreground mt-1">
+                                                  No charge for calls to this
+                                                  model
+                                                </p>
+                                              </div>
+                                            ) : (
+                                              <div className="space-y-1 text-xs">
+                                                <p className="text-muted-foreground">
+                                                  Pricing per million tokens:
+                                                </p>
+                                                <p>
+                                                  <span className="font-medium">
+                                                    Input:
+                                                  </span>{" "}
+                                                  {batchTariff.input_price_per_token
+                                                    ? (() => {
+                                                        const price =
+                                                          Number(
+                                                            batchTariff.input_price_per_token,
+                                                          ) * 1000000;
+                                                        return `$${price % 1 === 0 ? price.toFixed(0) : price.toFixed(2)}`;
+                                                      })()
+                                                    : "$0"}
+                                                </p>
+                                                <p>
+                                                  <span className="font-medium">
+                                                    Output:
+                                                  </span>{" "}
+                                                  {batchTariff.output_price_per_token
+                                                    ? (() => {
+                                                        const price =
+                                                          Number(
+                                                            batchTariff.output_price_per_token,
+                                                          ) * 1000000;
+                                                        return `$${price % 1 === 0 ? price.toFixed(0) : price.toFixed(2)}`;
+                                                      })()
+                                                    : "$0"}
+                                                </p>
+                                              </div>
+                                            )}
+                                          </HoverCardContent>
+                                        </HoverCard>
+                                        {realtimeTariff && <span>•</span>}
+                                      </>
+                                    )}
+
+                                    {realtimeTariff && (
+                                      <HoverCard
+                                        openDelay={200}
+                                        closeDelay={100}
+                                      >
+                                        <HoverCardTrigger asChild>
+                                          <button
+                                            className="flex items-center gap-0.5 shrink-0 hover:opacity-70 transition-opacity"
+                                            onClick={(e) => e.stopPropagation()}
+                                          >
+                                            Realtime:
+                                            {!realtimeTariff.input_price_per_token &&
+                                            !realtimeTariff.output_price_per_token ? (
+                                              <span className="flex items-center gap-0.5 text-green-700">
+                                                <div className="relative h-2.5 w-2.5">
+                                                  <DollarSign className="h-2.5 w-2.5" />
+                                                  <div className="absolute inset-0 flex items-center justify-center">
+                                                    <div className="w-5 h-px bg-green-700 rotate-[-50deg]" />
+                                                  </div>
+                                                </div>
+                                                <span>Free</span>
+                                              </span>
+                                            ) : (
+                                              <span className="flex items-center gap-0.5">
+                                                <ArrowDown className="h-2.5 w-2.5 text-gray-500 shrink-0" />
+                                                <span className="whitespace-nowrap tabular-nums">
+                                                  {realtimeTariff.input_price_per_token
+                                                    ? (() => {
+                                                        const price =
+                                                          Number(
+                                                            realtimeTariff.input_price_per_token,
+                                                          ) * 1000000;
+                                                        return `$${price % 1 === 0 ? price.toFixed(0) : price.toFixed(2)}`;
+                                                      })()
+                                                    : "$0"}
+                                                </span>
+                                                <span className="text-[8px] text-gray-400">
+                                                  /M
+                                                </span>
+                                                <ArrowUp className="h-2.5 w-2.5 text-gray-500 shrink-0 ml-0.5" />
+                                                <span className="whitespace-nowrap tabular-nums">
+                                                  {realtimeTariff.output_price_per_token
+                                                    ? (() => {
+                                                        const price =
+                                                          Number(
+                                                            realtimeTariff.output_price_per_token,
+                                                          ) * 1000000;
+                                                        return `$${price % 1 === 0 ? price.toFixed(0) : price.toFixed(2)}`;
+                                                      })()
+                                                    : "$0"}
+                                                </span>
+                                                <span className="text-[8px] text-gray-400">
+                                                  /M
+                                                </span>
+                                              </span>
+                                            )}
+                                            <span className="sr-only">
+                                              View realtime pricing details
+                                            </span>
+                                          </button>
+                                        </HoverCardTrigger>
+                                        <HoverCardContent
+                                          className="w-48"
+                                          sideOffset={5}
+                                        >
+                                          Realtime:
+                                          {!realtimeTariff.input_price_per_token &&
+                                          !realtimeTariff.output_price_per_token ? (
+                                            <div className="text-sm">
+                                              <p className="font-medium text-green-700">
+                                                Free
+                                              </p>
+                                              <p className="text-xs text-muted-foreground mt-1">
+                                                No charge for calls to this
+                                                model
+                                              </p>
+                                            </div>
+                                          ) : (
+                                            <div className="space-y-1 text-xs">
+                                              <p className="text-muted-foreground">
+                                                Pricing per million tokens:
+                                              </p>
+                                              <p>
+                                                <span className="font-medium">
+                                                  Input:
+                                                </span>{" "}
+                                                {realtimeTariff.input_price_per_token
+                                                  ? (() => {
+                                                      const price =
+                                                        Number(
+                                                          realtimeTariff.input_price_per_token,
+                                                        ) * 1000000;
+                                                      return `$${price % 1 === 0 ? price.toFixed(0) : price.toFixed(2)}`;
+                                                    })()
+                                                  : "$0"}
+                                              </p>
+                                              <p>
+                                                <span className="font-medium">
+                                                  Output:
+                                                </span>{" "}
+                                                {realtimeTariff.output_price_per_token
+                                                  ? (() => {
+                                                      const price =
+                                                        Number(
+                                                          realtimeTariff.output_price_per_token,
+                                                        ) * 1000000;
+                                                      return `$${price % 1 === 0 ? price.toFixed(0) : price.toFixed(2)}`;
+                                                    })()
+                                                  : "$0"}
+                                              </p>
+                                            </div>
+                                          )}
+                                        </HoverCardContent>
+                                      </HoverCard>
+                                    )}
+
+                                    {!batchTariff &&
+                                      !realtimeTariff &&
+                                      canManageModels && (
+                                        <button
+                                          className="flex items-center gap-1 text-xs text-gray-600 hover:text-gray-900 transition-colors"
+                                          onClick={(e) => {
+                                            e.stopPropagation();
+                                            setPricingModel(model);
+                                            setShowPricingModal(true);
+                                          }}
+                                          title="Set pricing tariffs"
+                                        >
+                                          <DollarSign className="h-3 w-3" />
+                                          <span>Set pricing</span>
+                                        </button>
+                                      )}
+                                  </>
+                                );
+                              })()}
+                            </>
+                          )}
+                        </CardDescription>
+                      </div>
+                    </CardHeader>
+
+                    <CardContent className="grow px-0 pt-0 pb-0 flex flex-col">
+                      {model.metrics ? (
+                        <div
+                          className="flex gap-6 items-center px-6 pb-4"
+                          style={{ minHeight: "90px" }}
+                        >
+                          <div className="flex-1">
+                            <div className="grid grid-cols-2 gap-2 text-xs">
+                              <div className="flex items-center gap-1.5">
+                                <HoverCard openDelay={200} closeDelay={100}>
+                                  <HoverCardTrigger asChild>
+                                    <BarChart3 className="h-3.5 w-3.5 text-gray-500 " />
+                                  </HoverCardTrigger>
+                                  <HoverCardContent
+                                    className="w-40"
+                                    sideOffset={5}
+                                  >
+                                    <p className="text-xs text-muted-foreground">
+                                      Total requests made to this model
+                                    </p>
+                                  </HoverCardContent>
+                                </HoverCard>
+                                <span className="text-gray-600">
+                                  {formatNumber(model.metrics.total_requests)}{" "}
+                                  requests
+                                </span>
+                              </div>
+
+                              <div className="flex items-center gap-1.5">
+                                <HoverCard openDelay={200} closeDelay={100}>
+                                  <HoverCardTrigger asChild>
+                                    <Activity className="h-3.5 w-3.5 text-gray-500 " />
+                                  </HoverCardTrigger>
+                                  <HoverCardContent
+                                    className="w-40"
+                                    sideOffset={5}
+                                  >
+                                    <p className="text-xs text-muted-foreground">
+                                      Average response time across all requests
+                                    </p>
+                                  </HoverCardContent>
+                                </HoverCard>
+                                <span className="text-gray-600">
+                                  {formatLatency(model.metrics.avg_latency_ms)}{" "}
+                                  avg
+                                </span>
+                              </div>
+
+                              <div className="flex items-center gap-1.5">
+                                <HoverCard openDelay={200} closeDelay={100}>
+                                  <HoverCardTrigger asChild>
+                                    <ArrowUpDown className="h-3.5 w-3.5 text-gray-500 " />
+                                  </HoverCardTrigger>
+                                  <HoverCardContent
+                                    className="w-48"
+                                    sideOffset={5}
+                                  >
+                                    <div className="text-xs text-muted-foreground">
+                                      <p>
+                                        Input:{" "}
+                                        {formatNumber(
+                                          model.metrics.total_input_tokens,
+                                        )}
+                                      </p>
+                                      <p>
+                                        Output:{" "}
+                                        {formatNumber(
+                                          model.metrics.total_output_tokens,
+                                        )}
+                                      </p>
+                                      <p className="mt-1 font-medium">
+                                        Total tokens processed
+                                      </p>
+                                    </div>
+                                  </HoverCardContent>
+                                </HoverCard>
+                                <span className="text-gray-600">
+                                  {formatNumber(
+                                    model.metrics.total_input_tokens +
+                                      model.metrics.total_output_tokens,
+                                  )}{" "}
+                                  tokens
+                                </span>
+                              </div>
+
+                              <div className="flex items-center gap-1.5">
+                                <HoverCard openDelay={200} closeDelay={100}>
+                                  <HoverCardTrigger asChild>
+                                    <Clock className="h-3.5 w-3.5 text-gray-500 " />
+                                  </HoverCardTrigger>
+                                  <HoverCardContent
+                                    className="w-36"
+                                    sideOffset={5}
+                                  >
+                                    <p className="text-xs text-muted-foreground">
+                                      Last request received
+                                    </p>
+                                  </HoverCardContent>
+                                </HoverCard>
+                                <span className="text-gray-600">
+                                  {formatRelativeTime(
+                                    model.metrics.last_active_at,
+                                  )}
+                                </span>
+                              </div>
+                            </div>
+                          </div>
+
+                          <div className="flex-1 flex items-center justify-center px-2">
+                            <div className="w-full max-w-[200px] min-w-[120px]">
+                              <Sparkline
+                                data={model.metrics.time_series || []}
+                                width={180}
+                                height={35}
+                                className="w-full h-auto"
+                              />
                             </div>
                           </div>
                         </div>
-
-                        <div className="flex-1 flex items-center justify-center px-2">
-                          <div className="w-full max-w-[200px] min-w-[120px]">
-                            <Sparkline
-                              data={model.metrics.time_series || []}
-                              width={180}
-                              height={35}
-                              className="w-full h-auto"
-                            />
-                          </div>
+                      ) : (
+                        <div
+                          className="px-6 pb-4"
+                          style={{ minHeight: "90px" }}
+                        >
+                          {model.description ? (
+                            <Markdown
+                              className="text-sm text-gray-700 line-clamp-3"
+                              compact
+                            >
+                              {model.description}
+                            </Markdown>
+                          ) : (
+                            <p className="text-sm text-gray-700">
+                              No description provided
+                            </p>
+                          )}
                         </div>
-                      </div>
-                    ) : (
-                      <div className="px-6 pb-4" style={{ minHeight: "90px" }}>
-                        <p className="text-sm text-gray-700 line-clamp-3">
-                          {model.description || "No description provided"}
-                        </p>
-                      </div>
-                    )}
-                  </CardContent>
-                </div>
-
-                <div className="border-t">
-                  <div className="grid grid-cols-2 divide-x">
-                    <button
-                      className="flex items-center justify-center gap-1.5 py-3.5 text-sm font-medium text-gray-600 hover:bg-gray-50 hover:text-gray-700 transition-colors rounded-bl-lg"
-                      onClick={() => {
-                        setApiExamplesModel(model);
-                        setShowApiExamples(true);
-                      }}
-                    >
-                      <Code className="h-4 w-4 text-blue-500" />
-                      <span>API</span>
-                    </button>
-                    <button
-                      className="flex items-center justify-center gap-1.5 py-3.5 text-sm font-medium text-gray-600 hover:bg-gray-50 hover:text-gray-700 transition-colors rounded-br-lg group"
-                      onClick={() => {
-                        navigate(
-                          `/playground?model=${encodeURIComponent(model.alias)}&from=${encodeURIComponent("/models")}`,
-                        );
-                      }}
-                    >
-                      <ArrowRight className="h-4 w-4 text-purple-500 group-hover:translate-x-0.5 transition-transform" />
-                      <span>Playground</span>
-                    </button>
+                      )}
+                    </CardContent>
                   </div>
-                </div>
-              </Card>
-            ))}
+
+                  <div className="border-t">
+                    <div className="grid grid-cols-2 divide-x">
+                      <button
+                        className="flex items-center justify-center gap-1.5 py-3.5 text-sm font-medium text-gray-600 hover:bg-gray-50 hover:text-gray-700 transition-colors rounded-bl-lg"
+                        onClick={() => {
+                          setApiExamplesModel(model);
+                          setShowApiExamples(true);
+                        }}
+                      >
+                        <Code className="h-4 w-4 text-blue-500" />
+                        <span>API</span>
+                      </button>
+                      <button
+                        className="flex items-center justify-center gap-1.5 py-3.5 text-sm font-medium text-gray-600 hover:bg-gray-50 hover:text-gray-700 transition-colors rounded-br-lg group"
+                        onClick={() => {
+                          navigate(
+                            `/playground?model=${encodeURIComponent(model.alias)}&from=${encodeURIComponent("/models")}`,
+                          );
+                        }}
+                      >
+                        <ArrowRight className="h-4 w-4 text-purple-500 group-hover:translate-x-0.5 transition-transform" />
+                        <span>Playground</span>
+                      </button>
+                    </div>
+                  </div>
+                </Card>
+              );
+            })}
           </div>
 
           <TablePagination

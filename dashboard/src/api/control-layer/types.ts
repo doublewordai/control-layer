@@ -52,7 +52,6 @@ export interface ModelProbeStatus {
   uptime_percentage?: number; // Last 24h uptime
 }
 
-
 // Tariff types (read-only from API)
 export interface ModelTariff {
   id: string;
@@ -174,33 +173,33 @@ export type ModelsInclude =
   | "metrics"
   | "status"
   | "endpoints"
-  | "tariffs"
+  | "pricing"
   | "groups,metrics"
   | "groups,status"
   | "groups,endpoints"
-  | "groups,tariffs"
+  | "groups,pricing"
   | "metrics,status"
   | "metrics,endpoints"
-  | "metrics,tariffs"
+  | "metrics,pricing"
   | "status,endpoints"
-  | "status,tariffs"
-  | "endpoints,tariffs"
+  | "status,pricing"
+  | "endpoints,pricing"
   | "groups,metrics,status"
   | "groups,metrics,endpoints"
-  | "groups,metrics,tariffs"
+  | "groups,metrics,pricing"
   | "groups,status,endpoints"
-  | "groups,status,tariffs"
-  | "groups,endpoints,tariffs"
+  | "groups,status,pricing"
+  | "groups,endpoints,pricing"
   | "metrics,status,endpoints"
-  | "metrics,status,tariffs"
-  | "metrics,endpoints,tariffs"
-  | "status,endpoints,tariffs"
+  | "metrics,status,pricing"
+  | "metrics,endpoints,pricing"
+  | "status,endpoints,pricing"
   | "groups,metrics,status,endpoints"
-  | "groups,metrics,status,tariffs"
-  | "groups,metrics,endpoints,tariffs"
-  | "groups,status,endpoints,tariffs"
-  | "metrics,status,endpoints,tariffs"
-  | "groups,metrics,status,endpoints,tariffs"
+  | "groups,metrics,status,pricing"
+  | "groups,metrics,endpoints,pricing"
+  | "groups,status,endpoints,pricing"
+  | "metrics,status,endpoints,pricing"
+  | "groups,metrics,status,endpoints,pricing";
 export type GroupsInclude = "users" | "models" | "users,models";
 export type UsersInclude = "groups";
 

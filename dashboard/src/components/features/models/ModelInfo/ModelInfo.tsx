@@ -54,6 +54,7 @@ import { useForm } from "react-hook-form";
 import { zodResolver } from "@hookform/resolvers/zod";
 import * as z from "zod";
 import { Sparkline } from "../../../ui/sparkline";
+import { Markdown } from "../../../ui/markdown";
 
 // Form schema for alias editing
 const aliasFormSchema = z.object({
@@ -70,6 +71,7 @@ const ModelInfo: React.FC = () => {
   const { hasPermission } = useAuthorization();
   const canManageGroups = hasPermission("manage-groups");
   const canViewAnalytics = hasPermission("analytics");
+  const canViewEndpoints = hasPermission("endpoints");
 
   const fromUrl = searchParams.get("from");
 
@@ -132,7 +134,7 @@ const ModelInfo: React.FC = () => {
 
   // Build include parameter based on permissions
   const includeParam = useMemo(() => {
-    const parts: string[] = ["status", "pricing"]; // Always include pricing to show tariffs
+    const parts: string[] = ["status", "pricing"];
     if (canManageGroups) parts.push("groups");
     if (canViewAnalytics) parts.push("metrics");
     return parts.join(",");
@@ -148,7 +150,9 @@ const ModelInfo: React.FC = () => {
     data: endpoint,
     isLoading: endpointLoading,
     error: endpointError,
-  } = useEndpoint(model?.hosted_on || "", { enabled: !!model?.hosted_on });
+  } = useEndpoint(model?.hosted_on || "", {
+    enabled: !!model?.hosted_on && canViewEndpoints,
+  });
 
   const loading = modelLoading || endpointLoading;
   const error = modelError
@@ -259,7 +263,6 @@ const ModelInfo: React.FC = () => {
     setIsEditingAlias(false);
     setSettingsError(null);
   };
-
 
   if (loading) {
     return (
@@ -396,7 +399,10 @@ const ModelInfo: React.FC = () => {
                     </h1>
                   )}
                   <p className="text-doubleword-neutral-600 mt-1">
-                    {model.model_name} • {endpoint?.name || "Unknown endpoint"}
+                    {model.model_name}
+                    {canViewEndpoints && (
+                      <> • {endpoint?.name || "Unknown endpoint"}</>
+                    )}
                   </p>
                 </div>
                 <div className="flex items-center justify-center sm:justify-start gap-3">
@@ -537,7 +543,7 @@ const ModelInfo: React.FC = () => {
                           }
                           placeholder="Enter model description..."
                           rows={3}
-                          className="resize-none"
+                          className="resize-y min-h-[72px]"
                         />
                       </div>
 
@@ -937,9 +943,15 @@ const ModelInfo: React.FC = () => {
                             </HoverCardContent>
                           </HoverCard>
                         </div>
-                        <p className="text-gray-700">
-                          {model.description || "No description provided"}
-                        </p>
+                        {model.description ? (
+                          <Markdown className="text-sm text-gray-700">
+                            {model.description}
+                          </Markdown>
+                        ) : (
+                          <p className="text-gray-700">
+                            No description provided
+                          </p>
+                        )}
                       </div>
 
                       {/* Capabilities Section - only show for CHAT models */}
@@ -1007,11 +1019,13 @@ const ModelInfo: React.FC = () => {
                         )}
 
                       {/* Pricing Display - visible to all users when billing is enabled */}
-                      {(
+                      {
                         <div className="border-t pt-6">
                           <div className="flex items-center justify-between mb-3">
                             <div className="flex items-center gap-1">
-                              <p className="text-sm text-gray-600">Pricing Tariffs</p>
+                              <p className="text-sm text-gray-600">
+                                Pricing Tariffs
+                              </p>
                               <HoverCard openDelay={100} closeDelay={50}>
                                 <HoverCardTrigger asChild>
                                   <Info className="h-3 w-3 text-gray-400 hover:text-gray-600" />
@@ -1021,7 +1035,9 @@ const ModelInfo: React.FC = () => {
                                   sideOffset={5}
                                 >
                                   <p className="text-sm text-muted-foreground">
-                                    Pricing tiers for different API key purposes. Set different rates for realtime, batch, and playground usage.
+                                    Pricing tiers for different API key
+                                    purposes. Set different rates for realtime,
+                                    batch, and playground usage.
                                     {canManageGroups &&
                                       ` Click "Manage Tariffs" to configure pricing.`}
                                   </p>
@@ -1043,29 +1059,54 @@ const ModelInfo: React.FC = () => {
                           {model.tariffs && model.tariffs.length > 0 ? (
                             <div className="space-y-3">
                               {model.tariffs.map((tariff) => (
-                                <div key={tariff.id} className="bg-gray-50 rounded-lg p-3">
+                                <div
+                                  key={tariff.id}
+                                  className="bg-gray-50 rounded-lg p-3"
+                                >
                                   <div className="flex items-center gap-2 mb-2">
                                     {tariff.api_key_purpose && (
                                       <span className="text-xs bg-blue-100 text-blue-700 px-2 py-0.5 rounded">
-                                        {tariff.api_key_purpose.charAt(0).toUpperCase() + tariff.api_key_purpose.slice(1)}
+                                        {tariff.api_key_purpose
+                                          .charAt(0)
+                                          .toUpperCase() +
+                                          tariff.api_key_purpose.slice(1)}
                                       </span>
                                     )}
-                                    <p className="font-medium text-sm">{tariff.name}</p>
+                                    <p className="font-medium text-sm">
+                                      {tariff.name}
+                                    </p>
                                     <span className="text-xs text-gray-500 ml-auto">
-                                      Valid from {new Date(tariff.valid_from).toLocaleString()}
+                                      Valid from{" "}
+                                      {new Date(
+                                        tariff.valid_from,
+                                      ).toLocaleString()}
                                     </span>
                                   </div>
                                   <div className="grid grid-cols-2 gap-4 text-sm">
                                     <div>
-                                      <p className="text-xs text-gray-500">Input (per 1M tokens)</p>
+                                      <p className="text-xs text-gray-500">
+                                        Input (per 1M tokens)
+                                      </p>
                                       <p className="font-medium">
-                                        ${(parseFloat(tariff.input_price_per_token) * 1000000).toFixed(2)}
+                                        $
+                                        {(
+                                          parseFloat(
+                                            tariff.input_price_per_token,
+                                          ) * 1000000
+                                        ).toFixed(2)}
                                       </p>
                                     </div>
                                     <div>
-                                      <p className="text-xs text-gray-500">Output (per 1M tokens)</p>
+                                      <p className="text-xs text-gray-500">
+                                        Output (per 1M tokens)
+                                      </p>
                                       <p className="font-medium">
-                                        ${(parseFloat(tariff.output_price_per_token) * 1000000).toFixed(2)}
+                                        $
+                                        {(
+                                          parseFloat(
+                                            tariff.output_price_per_token,
+                                          ) * 1000000
+                                        ).toFixed(2)}
                                       </p>
                                     </div>
                                   </div>
@@ -1080,7 +1121,7 @@ const ModelInfo: React.FC = () => {
                             </p>
                           )}
                         </div>
-                      )}
+                      }
 
                       {/* Rate Limiting & Capacity Display - only show for Platform Managers */}
                       {canManageGroups &&
@@ -1461,9 +1502,7 @@ const ModelInfo: React.FC = () => {
 
         {canManageGroups && (
           <TabsContent value="usage">
-            <UserUsageTable
-              modelAlias={model.alias}
-            />
+            <UserUsageTable modelAlias={model.alias} />
           </TabsContent>
         )}
 
