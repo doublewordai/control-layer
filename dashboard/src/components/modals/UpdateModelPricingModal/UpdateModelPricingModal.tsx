@@ -10,10 +10,7 @@ import {
   DialogDescription,
 } from "../../ui/dialog";
 import { ModelTariffTable } from "../../features/models/ModelTariffTable";
-import {
-  useModel,
-  useUpdateModel,
-} from "../../../api/control-layer/hooks";
+import { useModel, useUpdateModel } from "../../../api/control-layer/hooks";
 import type { TariffDefinition } from "../../../api/control-layer/types";
 import { toast } from "sonner";
 
@@ -24,20 +21,21 @@ interface UpdateModelPricingModalProps {
   onClose: () => void;
 }
 
-export const UpdateModelPricingModal: React.FC<UpdateModelPricingModalProps> = ({
-  isOpen,
-  modelId,
-  modelName,
-  onClose,
-}) => {
-  // Fetch model with tariffs included (via pricing parameter)
-  const { data: model, isLoading: isLoadingModel } = useModel(modelId, { include: "pricing" });
+export const UpdateModelPricingModal: React.FC<
+  UpdateModelPricingModalProps
+> = ({ isOpen, modelId, modelName, onClose }) => {
+  // Fetch model with tariffs included
+  const { data: model, isLoading: isLoadingModel } = useModel(modelId, {
+    include: "pricing",
+  });
 
   // Mutation
   const updateModel = useUpdateModel();
 
   // Local state for tariff changes
-  const [pendingTariffs, setPendingTariffs] = useState<TariffDefinition[] | null>(null);
+  const [pendingTariffs, setPendingTariffs] = useState<
+    TariffDefinition[] | null
+  >(null);
 
   // Memoize tariffs to avoid creating new array reference on every render
   const currentTariffs = useMemo(() => model?.tariffs || [], [model?.tariffs]);
@@ -88,8 +86,8 @@ export const UpdateModelPricingModal: React.FC<UpdateModelPricingModalProps> = (
             Manage Pricing Tariffs for {modelName}
           </DialogTitle>
           <DialogDescription>
-            Configure pricing tiers for different API key purposes. You can set different
-            rates for realtime, batch, and playground usage.
+            Configure pricing tiers for different API key purposes. You can set
+            different rates for realtime, batch, and playground usage.
           </DialogDescription>
         </DialogHeader>
 

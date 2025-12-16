@@ -54,6 +54,7 @@ import { useForm } from "react-hook-form";
 import { zodResolver } from "@hookform/resolvers/zod";
 import * as z from "zod";
 import { Sparkline } from "../../../ui/sparkline";
+import { Markdown } from "../../../ui/markdown";
 
 // Form schema for alias editing
 const aliasFormSchema = z.object({
@@ -536,7 +537,7 @@ const ModelInfo: React.FC = () => {
                           }
                           placeholder="Enter model description..."
                           rows={3}
-                          className="resize-none"
+                          className="resize-y min-h-[72px]"
                         />
                       </div>
 
@@ -936,9 +937,15 @@ const ModelInfo: React.FC = () => {
                             </HoverCardContent>
                           </HoverCard>
                         </div>
-                        <p className="text-gray-700">
-                          {model.description || "No description provided"}
-                        </p>
+                        {model.description ? (
+                          <Markdown className="text-sm text-gray-700">
+                            {model.description}
+                          </Markdown>
+                        ) : (
+                          <p className="text-gray-700">
+                            No description provided
+                          </p>
+                        )}
                       </div>
 
                       {/* Capabilities Section - only show for CHAT models */}

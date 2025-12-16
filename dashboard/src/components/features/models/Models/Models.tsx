@@ -23,6 +23,7 @@ const Models: React.FC = () => {
   const canViewAnalytics = hasPermission("analytics");
   const canViewEndpoints = hasPermission("endpoints");
   const showPricing = true;
+  const canManageModels = hasPermission("manage-models");
 
   const [filterProvider, setFilterProvider] = useState("all");
   const [searchQuery, setSearchQuery] = useState(
@@ -173,6 +174,7 @@ const Models: React.FC = () => {
           canViewAnalytics={canViewAnalytics}
           canViewEndpoints={canViewEndpoints}
           showPricing={showPricing}
+          canManageModels={canManageModels}
           onClearFilters={handleClearFilters}
         />
       </Tabs>
