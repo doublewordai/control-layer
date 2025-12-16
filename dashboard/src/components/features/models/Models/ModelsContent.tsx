@@ -480,7 +480,6 @@ export const ModelsContent: React.FC<ModelsContentProps> = ({
                               </div>
                             </div>
                           )}
-                          ;
                         </div>
 
                         {/* ROW 2: Endpoint (if user can edit endpoints) */}

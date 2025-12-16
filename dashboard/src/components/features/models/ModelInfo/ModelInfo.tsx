@@ -71,6 +71,7 @@ const ModelInfo: React.FC = () => {
   const { hasPermission } = useAuthorization();
   const canManageGroups = hasPermission("manage-groups");
   const canViewAnalytics = hasPermission("analytics");
+  const canViewEndpoints = hasPermission("endpoints");
 
   const fromUrl = searchParams.get("from");
 
@@ -149,7 +150,9 @@ const ModelInfo: React.FC = () => {
     data: endpoint,
     isLoading: endpointLoading,
     error: endpointError,
-  } = useEndpoint(model?.hosted_on || "", { enabled: !!model?.hosted_on });
+  } = useEndpoint(model?.hosted_on || "", {
+    enabled: !!model?.hosted_on && canViewEndpoints,
+  });
 
   const loading = modelLoading || endpointLoading;
   const error = modelError
@@ -396,7 +399,10 @@ const ModelInfo: React.FC = () => {
                     </h1>
                   )}
                   <p className="text-doubleword-neutral-600 mt-1">
-                    {model.model_name} • {endpoint?.name || "Unknown endpoint"}
+                    {model.model_name}
+                    {canViewEndpoints && (
+                      <> • {endpoint?.name || "Unknown endpoint"}</>
+                    )}
                   </p>
                 </div>
                 <div className="flex items-center justify-center sm:justify-start gap-3">
