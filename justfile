@@ -253,6 +253,7 @@ test target="" *args="":
         echo "Cleaning up any leftover test data from previous runs..."
         ./scripts/drop-test-users.sh > /dev/null 2>&1 || echo "  (no previous test users to clean up)"
         ./scripts/drop-test-groups.sh > /dev/null 2>&1 || echo "  (no previous test groups to clean up)"
+        ./scripts/drop-permtest-resources.sh 2>&1 || echo "  ⚠️  Failed to cleanup permtest resources"
 
         echo "Generating test cookies..."
         # Get admin credentials from config.yaml
@@ -279,27 +280,50 @@ test target="" *args="":
 
         # Delete and recreate test user to ensure clean state
         echo "Ensuring clean test user..."
-        docker compose exec -T postgres psql -U control_layer -d control_layer -c "DELETE FROM users WHERE email = 'user@example.org';" > /dev/null 2>&1 || true
+        USER1_EMAIL="user@example.org"
+        USER1_PASSWORD="user_password"
+        USER2_EMAIL="user2@example.org"
+        USER2_PASSWORD="user2_password"
+
+        docker compose -f docker-compose.yml -f docker-compose.test.yml exec -T postgres psql -U control_layer -d control_layer -c "DELETE FROM users WHERE email = '$USER1_EMAIL';" > /dev/null 2>&1 || true
+        docker compose -f docker-compose.yml -f docker-compose.test.yml exec -T postgres psql -U control_layer -d control_layer -c "DELETE FROM users WHERE email = '$USER2_EMAIL';" > /dev/null 2>&1 || true
+
+        echo "Creating test user 1: $USER1_EMAIL"
         curl -s -X POST http://localhost:3001/authentication/register \
             -H "Content-Type: application/json" \
-            -d '{"email":"user@example.org","username":"testuser","password":"user_password","display_name":"Test User"}' \
+            -d '{"email":"'"$USER1_EMAIL"'","username":"testuser1","password":"'"$USER1_PASSWORD"'","display_name":"Test User 1"}' \
             > /dev/null 2>&1
 
-        # Generate user JWT
-        echo "Generating user JWT..."
-        if USER_JWT=$(EMAIL=user@example.org PASSWORD=user_password ./scripts/login.sh); then
-            echo "user_jwt=$USER_JWT" >> test.env
-            echo "✅ User JWT generated successfully"
+        echo "Creating test user 2: $USER2_EMAIL"
+        curl -s -X POST http://localhost:3001/authentication/register \
+            -H "Content-Type: application/json" \
+            -d '{"email":"'"$USER2_EMAIL"'","username":"testuser2","password":"'"$USER2_PASSWORD"'","display_name":"Test User 2"}' \
+            > /dev/null 2>&1
+
+        # Generate user JWTs
+        echo "Generating user 1 JWT..."
+        if USER1_JWT=$(EMAIL=$USER1_EMAIL PASSWORD=$USER1_PASSWORD ./scripts/login.sh); then
+            echo "user_jwt=$USER1_JWT" >> test.env
+            echo "✅ User 1 JWT generated successfully"
         else
-            echo "❌ Failed to generate user JWT - see error above"
+            echo "❌ Failed to generate user 1 JWT - see error above"
             exit 1
         fi
+
+        echo "Generating user 2 JWT..."
+        if USER2_JWT=$(EMAIL=$USER2_EMAIL PASSWORD=$USER2_PASSWORD ./scripts/login.sh); then
+            echo "user2_jwt=$USER2_JWT" >> test.env
+            echo "✅ User 2 JWT generated successfully"
+        else
+            echo "❌ Failed to generate user 2 JWT - see error above"
+            exit 1
+        fi    
 
         echo "Test cookies written to test.env"
 
         if [ "$RUN_API_TESTS" = true ]; then
             echo "Running: hurl --variables-file test.env --test --jobs 1 tests/"
-            hurl --variables-file test.env --test --jobs 1 tests/
+            hurl --variables-file test.env --test --jobs 1 --file-root tests/files/ tests/
         fi
 
         # if [ "$RUN_E2E_TESTS" = true ]; then
@@ -313,6 +337,7 @@ test target="" *args="":
         echo "Cleaning up test users and groups..."
         ./scripts/drop-test-users.sh
         ADMIN_PASSWORD=$ADMIN_PASSWORD ./scripts/drop-test-groups.sh
+        ./scripts/drop-permtest-resources.sh
         exit 0
     fi
 
@@ -335,15 +360,56 @@ test target="" *args="":
 
             if [ "$BUILD_LOCAL" = "true" ]; then
                 echo "🔨 [$(date '+%H:%M:%S')] Building local images..."
-                PULL_POLICY=never docker compose build
+                PULL_POLICY=never docker compose -f docker-compose.yml -f docker-compose.test.yml build
                 BUILD_TIME=$(date +%s)
                 echo "🚀 [$(date '+%H:%M:%S')] Starting docker services with local images... (build took: $((BUILD_TIME - START_TIME))s)"
-                PULL_POLICY=never docker compose up -d
-                echo "⏳ Waiting for services to be ready..."
-                sleep 5
+                PULL_POLICY=never docker compose -f docker-compose.yml -f docker-compose.test.yml up -d
+                
+                echo "⏳ Waiting for control-layer service to be ready..."
+                MAX_WAIT=300  # 5 minutes max wait
+                WAITED=0
+                while [ $WAITED -lt $MAX_WAIT ]; do
+                    if curl -s -f http://localhost:3001/health > /dev/null 2>&1; then
+                        echo "✅ Control-layer service is ready (took ${WAITED}s)"
+                        break
+                    fi
+                    sleep 2
+                    WAITED=$((WAITED + 2))
+                    if [ $((WAITED % 10)) -eq 0 ]; then
+                        echo "   Still waiting... (${WAITED}s elapsed)"
+                    fi
+                done
+                
+                if [ $WAITED -ge $MAX_WAIT ]; then
+                    echo "❌ Service failed to become ready after ${MAX_WAIT}s"
+                    echo ""
+                    echo "📋 Control-layer logs:"
+                    docker compose logs control-layer --tail=50
+                    exit 1
+                fi
             else
                 echo "🚀 [$(date '+%H:%M:%S')] Starting docker services..."
-                just up -d --wait
+                docker compose -f docker-compose.yml -f docker-compose.test.yml up -d --wait
+                
+                echo "⏳ Waiting for control-layer service to be ready..."
+                MAX_WAIT=60  # 1 minute max wait for pre-built images
+                WAITED=0
+                while [ $WAITED -lt $MAX_WAIT ]; do
+                    if curl -s -f http://localhost:3001/health > /dev/null 2>&1; then
+                        echo "✅ Control-layer service is ready (took ${WAITED}s)"
+                        break
+                    fi
+                    sleep 1
+                    WAITED=$((WAITED + 1))
+                done
+                
+                if [ $WAITED -ge $MAX_WAIT ]; then
+                    echo "❌ Service failed to become ready after ${MAX_WAIT}s"
+                    echo ""
+                    echo "📋 Control-layer logs:"
+                    docker compose -f docker-compose.yml -f docker-compose.test.yml logs control-layer --tail=50
+                    exit 1
+                fi
             fi
 
             SERVICES_UP_TIME=$(date +%s)
@@ -353,17 +419,17 @@ test target="" *args="":
                 echo "❌ [$(date '+%H:%M:%S')] Tests failed after $((FAIL_TIME - SERVICES_UP_TIME))s"
                 echo ""
                 echo "📋 Recent server logs:"
-                docker compose logs --tail=20  # Show fewer logs
+                docker compose -f docker-compose.yml -f docker-compose.test.yml logs --tail=20  # Show fewer logs
                 echo "🧹 [$(date '+%H:%M:%S')] Cleaning up..."
                 # Fast teardown: kill containers immediately instead of graceful shutdown
-                # docker compose kill && docker compose rm -f && docker compose down --volumes --remove-orphans 2>/dev/null || true
+                docker compose -f docker-compose.yml -f docker-compose.test.yml kill && docker compose -f docker-compose.yml -f docker-compose.test.yml rm -f && docker compose -f docker-compose.yml -f docker-compose.test.yml down --volumes --remove-orphans 2>/dev/null || true
                 exit 1
             }
 
             TESTS_DONE_TIME=$(date +%s)
             echo "🧹 [$(date '+%H:%M:%S')] Stopping docker services... (tests took: $((TESTS_DONE_TIME - SERVICES_UP_TIME))s)"
             # Fast teardown: kill containers immediately instead of graceful shutdown
-            docker compose kill && docker compose rm -f && docker compose down --volumes --remove-orphans 2>/dev/null || true
+            docker compose -f docker-compose.yml -f docker-compose.test.yml kill && docker compose -f docker-compose.yml -f docker-compose.test.yml rm -f && docker compose -f docker-compose.yml -f docker-compose.test.yml down --volumes --remove-orphans 2>/dev/null || true
 
             END_TIME=$(date +%s)
             echo "✅ [$(date '+%H:%M:%S')] Docker tests completed successfully!"

@@ -1,0 +1,1 @@
+{"custom_id":"req-1","method":"POST","url":"/v1/chat/completions","body":{"model":"mock-gpt-markdown-permtest","messages":[{"role":"user","content":"Test request"}]}}
