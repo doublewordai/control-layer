@@ -1,0 +1,22 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT pg_advisory_xact_lock($1) as lock_result",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "lock_result",
+        "type_info": "Void"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Int8"
+      ]
+    },
+    "nullable": [
+      null
+    ]
+  },
+  "hash": "c6751af4faccc6de7e2d989728f7da31849e5864ba0100f32426c8410d2be447"
+}

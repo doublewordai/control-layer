@@ -80,9 +80,6 @@ use crate::errors::Error;
 
 // DB sync channel name
 pub static ONWARDS_CONFIG_CHANGED_CHANNEL: &str = "auth_config_changed";
-// Header names for onwards pricing information
-pub static ONWARDS_INPUT_TOKEN_PRICE_HEADER: &str = "onwards-input-price-per-token";
-pub static ONWARDS_OUTPUT_TOKEN_PRICE_HEADER: &str = "onwards-output-price-per-token";
 
 /// Simple CLI args - just for specifying config file
 #[derive(Parser, Debug)]

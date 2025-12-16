@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "\n            INSERT INTO deployed_models (\n                model_name, alias, description, type, capabilities, created_by, hosted_on, created_at, updated_at,\n                requests_per_second, burst_size, capacity, batch_capacity, upstream_input_price_per_token, upstream_output_price_per_token,\n                downstream_pricing_mode, downstream_input_price_per_token, downstream_output_price_per_token,\n                downstream_hourly_rate, downstream_input_token_cost_ratio\n            )\n            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20)\n            RETURNING *\n            ",
+  "query": "\n            INSERT INTO deployed_models (\n                model_name, alias, description, type, capabilities, created_by, hosted_on, created_at, updated_at,\n                requests_per_second, burst_size, capacity, batch_capacity,\n                downstream_pricing_mode, downstream_input_price_per_token, downstream_output_price_per_token,\n                downstream_hourly_rate, downstream_input_token_cost_ratio\n            )\n            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18)\n            RETURNING *\n            ",
   "describe": {
     "columns": [
       {
@@ -80,46 +80,36 @@
       },
       {
         "ordinal": 15,
-        "name": "upstream_input_price_per_token",
-        "type_info": "Numeric"
-      },
-      {
-        "ordinal": 16,
-        "name": "upstream_output_price_per_token",
-        "type_info": "Numeric"
-      },
-      {
-        "ordinal": 17,
         "name": "downstream_pricing_mode",
         "type_info": "Varchar"
       },
       {
-        "ordinal": 18,
+        "ordinal": 16,
         "name": "downstream_input_price_per_token",
         "type_info": "Numeric"
       },
       {
-        "ordinal": 19,
+        "ordinal": 17,
         "name": "downstream_output_price_per_token",
         "type_info": "Numeric"
       },
       {
-        "ordinal": 20,
+        "ordinal": 18,
         "name": "downstream_hourly_rate",
         "type_info": "Numeric"
       },
       {
-        "ordinal": 21,
+        "ordinal": 19,
         "name": "downstream_input_token_cost_ratio",
         "type_info": "Numeric"
       },
       {
-        "ordinal": 22,
+        "ordinal": 20,
         "name": "capacity",
         "type_info": "Int4"
       },
       {
-        "ordinal": 23,
+        "ordinal": 21,
         "name": "batch_capacity",
         "type_info": "Int4"
       }
@@ -139,8 +129,6 @@
         "Int4",
         "Int4",
         "Int4",
-        "Numeric",
-        "Numeric",
         "Varchar",
         "Numeric",
         "Numeric",
@@ -170,10 +158,8 @@
       true,
       true,
       true,
-      true,
-      true,
       true
     ]
   },
-  "hash": "36333b5a534b1df585f8516c9a92573b4f2626a2346cc1461d27f26dc3ed6507"
+  "hash": "ac4eb0715a3049140c0057e9e92d06f59e8d659bad502f5aedcf5fed56448128"
 }
