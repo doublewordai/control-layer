@@ -272,6 +272,7 @@ pub async fn create_deployed_model(
                 input_price_per_token: tariff_def.input_price_per_token,
                 output_price_per_token: tariff_def.output_price_per_token,
                 api_key_purpose: tariff_def.api_key_purpose,
+                completion_window: tariff_def.completion_window,
                 valid_from: None, // Use NOW()
             };
             tariffs_repo.create(&tariff_request).await?;
@@ -356,6 +357,7 @@ pub async fn update_deployed_model(
                 && existing.input_price_per_token == def.input_price_per_token
                 && existing.output_price_per_token == def.output_price_per_token
                 && existing.api_key_purpose == def.api_key_purpose
+                && existing.completion_window == def.completion_window
         };
 
         // Collect IDs of tariffs to close (those not in the new set or have changed)
@@ -383,6 +385,7 @@ pub async fn update_deployed_model(
                 input_price_per_token: tariff_def.input_price_per_token,
                 output_price_per_token: tariff_def.output_price_per_token,
                 api_key_purpose: tariff_def.api_key_purpose,
+                completion_window: tariff_def.completion_window,
                 valid_from: None, // Use NOW()
             };
             tariffs_repo.create(&tariff_request).await?;

@@ -39,17 +39,18 @@ impl<'c> Tariffs<'c> {
             r#"
             INSERT INTO model_tariffs (
                 deployed_model_id, name, input_price_per_token, output_price_per_token,
-                api_key_purpose, valid_from
+                api_key_purpose, completion_window, valid_from
             )
-            VALUES ($1, $2, $3, $4, $5, COALESCE($6, NOW()))
+            VALUES ($1, $2, $3, $4, $5, $6, COALESCE($7, NOW()))
             RETURNING id, deployed_model_id, name, input_price_per_token, output_price_per_token,
-                      valid_from, valid_until, api_key_purpose as "api_key_purpose: _"
+                      valid_from, valid_until, api_key_purpose as "api_key_purpose: _", completion_window
             "#,
             request.deployed_model_id,
             request.name,
             request.input_price_per_token,
             request.output_price_per_token,
             purpose_str,
+            request.completion_window,
             request.valid_from,
         )
         .fetch_one(&mut *self.db)
@@ -65,7 +66,7 @@ impl<'c> Tariffs<'c> {
             ModelTariff,
             r#"
             SELECT id, deployed_model_id, name, input_price_per_token, output_price_per_token,
-                   valid_from, valid_until, api_key_purpose as "api_key_purpose: _"
+                   valid_from, valid_until, api_key_purpose as "api_key_purpose: _", completion_window
             FROM model_tariffs
             WHERE id = $1
             "#,
@@ -84,10 +85,10 @@ impl<'c> Tariffs<'c> {
             ModelTariff,
             r#"
             SELECT id, deployed_model_id, name, input_price_per_token, output_price_per_token,
-                   valid_from, valid_until, api_key_purpose as "api_key_purpose: _"
+                   valid_from, valid_until, api_key_purpose as "api_key_purpose: _", completion_window
             FROM model_tariffs
             WHERE deployed_model_id = $1 AND valid_until IS NULL
-            ORDER BY api_key_purpose ASC NULLS LAST, name ASC
+            ORDER BY api_key_purpose ASC NULLS LAST, completion_window ASC NULLS LAST, name ASC
             "#,
             deployed_model_id
         )
@@ -104,10 +105,10 @@ impl<'c> Tariffs<'c> {
             ModelTariff,
             r#"
             SELECT id, deployed_model_id, name, input_price_per_token, output_price_per_token,
-                   valid_from, valid_until, api_key_purpose as "api_key_purpose: _"
+                   valid_from, valid_until, api_key_purpose as "api_key_purpose: _", completion_window
             FROM model_tariffs
             WHERE deployed_model_id = $1
-            ORDER BY valid_from DESC, api_key_purpose ASC NULLS LAST, name ASC
+            ORDER BY valid_from DESC, api_key_purpose ASC NULLS LAST, completion_window ASC NULLS LAST, name ASC
             "#,
             deployed_model_id
         )
@@ -246,5 +247,263 @@ impl<'c> Tariffs<'c> {
         .await?;
 
         Ok(result.rows_affected() > 0)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::db::models::api_keys::ApiKeyPurpose;
+    use crate::types::DeploymentId;
+    use rust_decimal::Decimal;
+    use std::str::FromStr;
+    use sqlx::PgPool;
+
+    #[sqlx::test]
+    async fn test_multiple_batch_tariffs_per_sla(pool: PgPool) {
+        // Seed the database with test infrastructure
+        let base_url = url::Url::parse("http://localhost:8080").unwrap();
+        let sources = vec![crate::config::ModelSource {
+            name: "test".to_string(),
+            url: base_url.clone(),
+            api_key: None,
+            sync_interval: std::time::Duration::from_secs(3600),
+            default_models: None,
+        }];
+        crate::seed_database(&sources, &pool).await.unwrap();
+
+        // Create a test user
+        let user = crate::test_utils::create_test_user(&pool, crate::api::models::users::Role::StandardUser).await;
+        let test_endpoint_id = crate::test_utils::get_test_endpoint_id(&pool).await;
+
+        // Create a test deployment
+        let deployment_id = DeploymentId::new_v4();
+        let mut tx = pool.begin().await.unwrap();
+        sqlx::query!(
+            "INSERT INTO deployed_models (id, model_name, alias, hosted_on, created_by) VALUES ($1, 'test-model', 'test-alias', $2, $3)",
+            deployment_id,
+            test_endpoint_id,
+            user.id
+        )
+        .execute(&mut *tx)
+        .await
+        .unwrap();
+
+        let mut tariffs = Tariffs::new(&mut tx);
+
+        // Create first batch tariff with 24h SLA
+        let tariff_24h = TariffCreateDBRequest {
+            deployed_model_id: deployment_id,
+            name: "Batch 24h".to_string(),
+            input_price_per_token: Decimal::from_str("0.001").unwrap(),
+            output_price_per_token: Decimal::from_str("0.002").unwrap(),
+            api_key_purpose: Some(ApiKeyPurpose::Batch),
+            completion_window: Some("24h".to_string()),
+            valid_from: None,
+        };
+        let created_24h = tariffs.create(&tariff_24h).await.unwrap();
+        assert_eq!(created_24h.completion_window, Some("24h".to_string()));
+
+        // Create second batch tariff with 1h SLA - should succeed (different completion_window)
+        let tariff_1h = TariffCreateDBRequest {
+            deployed_model_id: deployment_id,
+            name: "Batch 1h".to_string(),
+            input_price_per_token: Decimal::from_str("0.002").unwrap(),
+            output_price_per_token: Decimal::from_str("0.004").unwrap(),
+            api_key_purpose: Some(ApiKeyPurpose::Batch),
+            completion_window: Some("1h".to_string()),
+            valid_from: None,
+        };
+        let created_1h = tariffs.create(&tariff_1h).await.unwrap();
+        assert_eq!(created_1h.completion_window, Some("1h".to_string()));
+
+        // Verify both tariffs exist
+        let current_tariffs = tariffs.list_current_by_model(deployment_id).await.unwrap();
+        assert_eq!(current_tariffs.len(), 2);
+
+        // Verify we can find each tariff
+        let tariff_24h_found = current_tariffs
+            .iter()
+            .find(|t| t.completion_window == Some("24h".to_string()))
+            .unwrap();
+        assert_eq!(tariff_24h_found.name, "Batch 24h");
+
+        let tariff_1h_found = current_tariffs
+            .iter()
+            .find(|t| t.completion_window == Some("1h".to_string()))
+            .unwrap();
+        assert_eq!(tariff_1h_found.name, "Batch 1h");
+    }
+
+    #[sqlx::test]
+    async fn test_duplicate_batch_tariff_same_sla_rejected(pool: PgPool) {
+        // Seed the database with test infrastructure
+        let base_url = url::Url::parse("http://localhost:8080").unwrap();
+        let sources = vec![crate::config::ModelSource {
+            name: "test".to_string(),
+            url: base_url.clone(),
+            api_key: None,
+            sync_interval: std::time::Duration::from_secs(3600),
+            default_models: None,
+        }];
+        crate::seed_database(&sources, &pool).await.unwrap();
+
+        // Create a test user
+        let user = crate::test_utils::create_test_user(&pool, crate::api::models::users::Role::StandardUser).await;
+        let test_endpoint_id = crate::test_utils::get_test_endpoint_id(&pool).await;
+
+        // Create a test deployment
+        let deployment_id = DeploymentId::new_v4();
+        let mut tx = pool.begin().await.unwrap();
+        sqlx::query!(
+            "INSERT INTO deployed_models (id, model_name, alias, hosted_on, created_by) VALUES ($1, 'test-model', 'test-alias', $2, $3)",
+            deployment_id,
+            test_endpoint_id,
+            user.id
+        )
+        .execute(&mut *tx)
+        .await
+        .unwrap();
+
+        let mut tariffs = Tariffs::new(&mut tx);
+
+        // Create first batch tariff with 24h SLA
+        let tariff_24h = TariffCreateDBRequest {
+            deployed_model_id: deployment_id,
+            name: "Batch 24h".to_string(),
+            input_price_per_token: Decimal::from_str("0.001").unwrap(),
+            output_price_per_token: Decimal::from_str("0.002").unwrap(),
+            api_key_purpose: Some(ApiKeyPurpose::Batch),
+            completion_window: Some("24h".to_string()),
+            valid_from: None,
+        };
+        tariffs.create(&tariff_24h).await.unwrap();
+
+        // Try to create duplicate batch tariff with same 24h SLA - should fail
+        let duplicate_tariff = TariffCreateDBRequest {
+            deployed_model_id: deployment_id,
+            name: "Batch 24h Duplicate".to_string(),
+            input_price_per_token: Decimal::from_str("0.003").unwrap(),
+            output_price_per_token: Decimal::from_str("0.006").unwrap(),
+            api_key_purpose: Some(ApiKeyPurpose::Batch),
+            completion_window: Some("24h".to_string()),
+            valid_from: None,
+        };
+        let result = tariffs.create(&duplicate_tariff).await;
+        assert!(result.is_err(), "Should not allow duplicate batch tariff with same SLA");
+    }
+
+    #[sqlx::test]
+    async fn test_single_realtime_tariff_still_enforced(pool: PgPool) {
+        // Seed the database with test infrastructure
+        let base_url = url::Url::parse("http://localhost:8080").unwrap();
+        let sources = vec![crate::config::ModelSource {
+            name: "test".to_string(),
+            url: base_url.clone(),
+            api_key: None,
+            sync_interval: std::time::Duration::from_secs(3600),
+            default_models: None,
+        }];
+        crate::seed_database(&sources, &pool).await.unwrap();
+
+        // Create a test user
+        let user = crate::test_utils::create_test_user(&pool, crate::api::models::users::Role::StandardUser).await;
+        let test_endpoint_id = crate::test_utils::get_test_endpoint_id(&pool).await;
+
+        // Create a test deployment
+        let deployment_id = DeploymentId::new_v4();
+        let mut tx = pool.begin().await.unwrap();
+        sqlx::query!(
+            "INSERT INTO deployed_models (id, model_name, alias, hosted_on, created_by) VALUES ($1, 'test-model', 'test-alias', $2, $3)",
+            deployment_id,
+            test_endpoint_id,
+            user.id
+        )
+        .execute(&mut *tx)
+        .await
+        .unwrap();
+
+        let mut tariffs = Tariffs::new(&mut tx);
+
+        // Create realtime tariff
+        let realtime_tariff = TariffCreateDBRequest {
+            deployed_model_id: deployment_id,
+            name: "Realtime".to_string(),
+            input_price_per_token: Decimal::from_str("0.001").unwrap(),
+            output_price_per_token: Decimal::from_str("0.002").unwrap(),
+            api_key_purpose: Some(ApiKeyPurpose::Realtime),
+            completion_window: None,
+            valid_from: None,
+        };
+        tariffs.create(&realtime_tariff).await.unwrap();
+
+        // Try to create duplicate realtime tariff - should fail
+        let duplicate_realtime = TariffCreateDBRequest {
+            deployed_model_id: deployment_id,
+            name: "Realtime 2".to_string(),
+            input_price_per_token: Decimal::from_str("0.003").unwrap(),
+            output_price_per_token: Decimal::from_str("0.006").unwrap(),
+            api_key_purpose: Some(ApiKeyPurpose::Realtime),
+            completion_window: None,
+            valid_from: None,
+        };
+        let result = tariffs.create(&duplicate_realtime).await;
+        assert!(result.is_err(), "Should still enforce single realtime tariff per model");
+    }
+
+    #[sqlx::test]
+    async fn test_batch_tariff_without_completion_window_rejected(pool: PgPool) {
+        // Seed the database with test infrastructure
+        let base_url = url::Url::parse("http://localhost:8080").unwrap();
+        let sources = vec![crate::config::ModelSource {
+            name: "test".to_string(),
+            url: base_url.clone(),
+            api_key: None,
+            sync_interval: std::time::Duration::from_secs(3600),
+            default_models: None,
+        }];
+        crate::seed_database(&sources, &pool).await.unwrap();
+
+        // Create a test user
+        let user = crate::test_utils::create_test_user(&pool, crate::api::models::users::Role::StandardUser).await;
+        let test_endpoint_id = crate::test_utils::get_test_endpoint_id(&pool).await;
+
+        // Create a test deployment
+        let deployment_id = DeploymentId::new_v4();
+        let mut tx = pool.begin().await.unwrap();
+        sqlx::query!(
+            "INSERT INTO deployed_models (id, model_name, alias, hosted_on, created_by) VALUES ($1, 'test-model', 'test-alias', $2, $3)",
+            deployment_id,
+            test_endpoint_id,
+            user.id
+        )
+        .execute(&mut *tx)
+        .await
+        .unwrap();
+
+        let mut tariffs = Tariffs::new(&mut tx);
+
+        // Try to create batch tariff without completion_window - should fail
+        let batch_without_sla = TariffCreateDBRequest {
+            deployed_model_id: deployment_id,
+            name: "Batch No SLA".to_string(),
+            input_price_per_token: Decimal::from_str("0.001").unwrap(),
+            output_price_per_token: Decimal::from_str("0.002").unwrap(),
+            api_key_purpose: Some(ApiKeyPurpose::Batch),
+            completion_window: None,  // This should be rejected by CHECK constraint
+            valid_from: None,
+        };
+        let result = tariffs.create(&batch_without_sla).await;
+        assert!(result.is_err(), "Should not allow batch tariff without completion_window");
+
+        // Verify error is due to constraint violation
+        if let Err(e) = result {
+            let error_msg = format!("{:?}", e);
+            assert!(
+                error_msg.contains("batch_tariffs_must_have_completion_window") ||
+                error_msg.contains("constraint"),
+                "Error should be due to CHECK constraint violation, got: {}", error_msg
+            );
+        }
     }
 }

@@ -1715,6 +1715,7 @@ mod tests {
                 input_price_per_token,
                 output_price_per_token,
                 api_key_purpose: purpose,
+                completion_window: None,
                 valid_from,
             };
             tariffs_repo.create(&tariff).await.unwrap();

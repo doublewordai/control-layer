@@ -1451,6 +1451,7 @@ mod tests {
                 input_price_per_token: Decimal::from_str("0.00003").unwrap(), // $0.03 per 1K tokens
                 output_price_per_token: Decimal::from_str("0.00006").unwrap(), // $0.06 per 1K tokens
                 api_key_purpose: Some(ApiKeyPurpose::Batch),
+                completion_window: None,
                 valid_from: None,
             })
             .await
@@ -1464,6 +1465,7 @@ mod tests {
                 input_price_per_token: Decimal::from_str("0.000001").unwrap(), // $0.001 per 1K tokens
                 output_price_per_token: Decimal::from_str("0.000002").unwrap(), // $0.002 per 1K tokens
                 api_key_purpose: Some(ApiKeyPurpose::Batch),
+                completion_window: None,
                 valid_from: None,
             })
             .await
