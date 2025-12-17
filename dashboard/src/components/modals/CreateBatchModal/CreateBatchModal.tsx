@@ -13,9 +13,17 @@ import { Label } from "../../ui/label";
 import { Input } from "../../ui/input";
 import { Combobox } from "../../ui/combobox";
 import {
+  Select,
+  SelectContent,
+  SelectItem,
+  SelectTrigger,
+  SelectValue,
+} from "../../ui/select";
+import {
   useCreateBatch,
   useFiles,
   useUploadFile,
+  useConfig,
 } from "../../../api/control-layer/hooks";
 import { toast } from "sonner";
 import type { FileObject } from "../../features/batches/types";
@@ -44,6 +52,7 @@ export function CreateBatchModal({
   );
   const [expirationSeconds, setExpirationSeconds] = useState<number>(2592000); // 30 days default
   const [endpoint, setEndpoint] = useState<string>("/v1/chat/completions");
+  const [completionWindow, setCompletionWindow] = useState<string>("24h"); // Default SLA
   const [description, setDescription] = useState<string>("");
   const [error, setError] = useState<string | null>(null);
   const [dragActive, setDragActive] = useState(false);
@@ -52,6 +61,10 @@ export function CreateBatchModal({
   const createBatchMutation = useCreateBatch();
   const uploadMutation = useUploadFile();
 
+  // Fetch config to get available SLAs
+  const { data: config } = useConfig();
+  const availableSLAs = config?.batches?.allowed_completion_windows || ["24h"];
+
   // Fetch available files for combobox (only input files with purpose "batch")
   const { data: filesResponse } = useFiles({
     purpose: "batch",
@@ -59,6 +72,13 @@ export function CreateBatchModal({
   });
 
   const availableFiles = filesResponse?.data || [];
+
+  // Update default SLA when available SLAs change
+  useEffect(() => {
+    if (availableSLAs.length > 0 && !availableSLAs.includes(completionWindow)) {
+      setCompletionWindow(availableSLAs[0]);
+    }
+  }, [availableSLAs, completionWindow]);
 
   // Update selected file when preselected file changes
   useEffect(() => {
@@ -166,7 +186,7 @@ export function CreateBatchModal({
       await createBatchMutation.mutateAsync({
         input_file_id: finalFileId,
         endpoint,
-        completion_window: "24h",
+        completion_window: completionWindow,
         metadata: Object.keys(metadata).length > 0 ? metadata : undefined,
       });
 
@@ -180,6 +200,7 @@ export function CreateBatchModal({
       setSelectedFileId(null);
       setFileToUpload(null);
       setEndpoint("/v1/chat/completions");
+      setCompletionWindow(availableSLAs[0] || "24h");
       setDescription("");
       setExpirationSeconds(2592000);
       setError(null);
@@ -195,6 +216,7 @@ export function CreateBatchModal({
     setSelectedFileId(preselectedFile?.id || null);
     setFileToUpload(null);
     setEndpoint("/v1/chat/completions");
+    setCompletionWindow(availableSLAs[0] || "24h");
     setDescription("");
     setExpirationSeconds(2592000);
     setError(null);
@@ -371,6 +393,30 @@ export function CreateBatchModal({
             />
             <p className="text-xs text-gray-500">
               Add a description to help identify this batch later
+            </p>
+          </div>
+
+          {/* SLA Selection */}
+          <div className="space-y-2">
+            <Label htmlFor="completion-window">Completion Window (SLA)</Label>
+            <Select
+              value={completionWindow}
+              onValueChange={setCompletionWindow}
+              disabled={isPending}
+            >
+              <SelectTrigger id="completion-window">
+                <SelectValue />
+              </SelectTrigger>
+              <SelectContent>
+                {availableSLAs.map((sla) => (
+                  <SelectItem key={sla} value={sla}>
+                    {sla}
+                  </SelectItem>
+                ))}
+              </SelectContent>
+            </Select>
+            <p className="text-xs text-gray-500">
+              Select the maximum time allowed for batch completion
             </p>
           </div>
 
