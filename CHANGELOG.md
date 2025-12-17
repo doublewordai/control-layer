@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.17.1](https://github.com/doublewordai/control-layer/compare/v0.17.0...v0.17.1) (2025-12-17)
+
+
+### Bug Fixes
+
+* Api batch docs ([#389](https://github.com/doublewordai/control-layer/issues/389)) ([1b99045](https://github.com/doublewordai/control-layer/commit/1b990456f3a64e57cc28ad2b0afc48155a6a07b3))
+
 ## [0.17.0](https://github.com/doublewordai/control-layer/compare/v0.16.0...v0.17.0) (2025-12-17)
 
 
