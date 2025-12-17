@@ -1,5 +1,13 @@
 import React, { useState } from "react";
-import { Copy, Code, Plus, Loader2, Info, Download } from "lucide-react";
+import {
+  Copy,
+  Code,
+  Plus,
+  Loader2,
+  Info,
+  Download,
+  ExternalLink,
+} from "lucide-react";
 import { CodeBlock } from "../../ui/code-block";
 import { toast } from "sonner";
 import { useCreateApiKey } from "../../../api/control-layer";
@@ -118,10 +126,8 @@ const ApiExamplesModal: React.FC<ApiExamplesModalProps> = ({
 
   const getBaseUrl = () => `https://api.doubleword.ai/v1`;
 
-  const generateBatchApiCode = (language: Language, model: Model | null) => {
+  const generateBatchApiCode = (language: Language) => {
     const keyValue = apiKey || "your-api-key-here";
-    const modelAlias = model?.alias || "model-name";
-
     if (language === "python") {
       return `from openai import OpenAI
 
@@ -378,7 +384,7 @@ chatCompletion();`;
 
   const getCurrentCode = () => {
     if (exampleType === "batch") {
-      return generateBatchApiCode(selectedLanguage, model);
+      return generateBatchApiCode(selectedLanguage);
     }
 
     if (!model) return "";
@@ -436,12 +442,6 @@ chatCompletion();`;
     }
   };
 
-  const languageTabs = [
-    { id: "python" as Language, label: "Python" },
-    { id: "javascript" as Language, label: "JavaScript" },
-    { id: "curl" as Language, label: "cURL" },
-  ];
-
   if (!model) {
     return (
       <Dialog open={isOpen} onOpenChange={onClose}>
@@ -476,77 +476,82 @@ chatCompletion();`;
           </AlertBox>
 
           <div className="w-full overflow-hidden">
-            {/* Example Type Selection */}
-            <div className="mb-6">
-              <ToggleGroup
-                type="single"
-                value={exampleType}
-                onValueChange={(value) =>
-                  value && setExampleType(value as ExampleType)
-                }
-                className="inline-flex"
-                variant="outline"
-                size="sm"
-              >
-                <ToggleGroupItem
-                  value="batch"
-                  aria-label="Batch API"
-                  className="px-5 py-1.5"
+            {/* Example Type Selection - Only show for non-embeddings models */}
+            {model?.model_type?.toLowerCase() !== "embeddings" && (
+              <div className="mb-6">
+                <ToggleGroup
+                  type="single"
+                  value={exampleType}
+                  onValueChange={(value) =>
+                    value && setExampleType(value as ExampleType)
+                  }
+                  className="inline-flex"
+                  variant="outline"
+                  size="sm"
                 >
-                  Batch
-                </ToggleGroupItem>
-                <ToggleGroupItem
-                  value="realtime"
-                  aria-label="Realtime API usage"
-                  className="px-5 py-1.5"
-                >
-                  Realtime
-                </ToggleGroupItem>
-              </ToggleGroup>
-              {exampleType === "batch" && (
-                <div className="mt-4 space-y-3">
-                  <div className="bg-white border border-gray-200 rounded-lg overflow-hidden max-w-full">
-                    <div className="bg-gray-50 px-4 py-2 border-b border-gray-200 flex items-center justify-between">
-                      <div className="flex items-center gap-2">
-                        <Code className="w-4 h-4 text-gray-600" />
-                        <span className="text-sm font-medium text-gray-700">
-                          batch_requests.jsonl
-                        </span>
-                      </div>
-                      <div className="flex items-center gap-2">
-                        <button
-                          onClick={() =>
-                            copyToClipboard(getExampleJsonl(), "jsonl")
-                          }
-                          className="flex items-center gap-1 px-2 py-1 text-xs text-gray-500 hover:text-gray-700 hover:bg-gray-100 rounded transition-colors"
-                        >
-                          <Copy className="w-3 h-3" />
-                          {copiedCode === "jsonl" ? "Copied!" : "Copy"}
-                        </button>
-                        <button
-                          onClick={downloadJsonl}
-                          className="flex items-center gap-1 px-2 py-1 text-xs text-gray-500 hover:text-gray-700 hover:bg-gray-100 rounded transition-colors"
-                        >
-                          <Download className="w-3 h-3" />
-                          Download
-                        </button>
-                      </div>
-                    </div>
-                    <div className="overflow-x-auto max-w-full">
-                      <CodeBlock language="json">{getExampleJsonl()}</CodeBlock>
-                    </div>
-                  </div>
-                  <a
-                    href="https://docs.doubleword.ai"
-                    target="_blank"
-                    rel="noopener noreferrer"
-                    className="text-sm text-blue-600 hover:text-blue-700 hover:underline inline-block"
+                  <ToggleGroupItem
+                    value="batch"
+                    aria-label="Batch API"
+                    className="px-5 py-1.5"
                   >
-                    How to create a JSONL file →
-                  </a>
-                </div>
-              )}
-            </div>
+                    Batch
+                  </ToggleGroupItem>
+                  <ToggleGroupItem
+                    value="realtime"
+                    aria-label="Realtime API usage"
+                    className="px-5 py-1.5"
+                  >
+                    Realtime
+                  </ToggleGroupItem>
+                </ToggleGroup>
+                {exampleType === "batch" && (
+                  <div className="mt-4 space-y-3">
+                    <div className="bg-white border border-gray-200 rounded-lg overflow-hidden max-w-full">
+                      <div className="bg-gray-50 px-4 py-2 border-b border-gray-200 flex items-center justify-between">
+                        <div className="flex items-center gap-2">
+                          <Code className="w-4 h-4 text-gray-600" />
+                          <span className="text-sm font-medium text-gray-700">
+                            batch_requests.jsonl
+                          </span>
+                        </div>
+                        <div className="flex items-center gap-2">
+                          <button
+                            onClick={() =>
+                              copyToClipboard(getExampleJsonl(), "jsonl")
+                            }
+                            className="flex items-center gap-1 px-2 py-1 text-xs text-gray-500 hover:text-gray-700 hover:bg-gray-100 rounded transition-colors"
+                          >
+                            <Copy className="w-3 h-3" />
+                            {copiedCode === "jsonl" ? "Copied!" : "Copy"}
+                          </button>
+                          <button
+                            onClick={downloadJsonl}
+                            className="flex items-center gap-1 px-2 py-1 text-xs text-gray-500 hover:text-gray-700 hover:bg-gray-100 rounded transition-colors"
+                          >
+                            <Download className="w-3 h-3" />
+                            Download
+                          </button>
+                        </div>
+                      </div>
+                      <div className="overflow-x-auto max-w-full">
+                        <CodeBlock language="json">
+                          {getExampleJsonl()}
+                        </CodeBlock>
+                      </div>
+                    </div>
+                    <a
+                      href="https://docs.doubleword.ai"
+                      target="_blank"
+                      rel="noopener noreferrer"
+                      className="text-sm text-blue-600 hover:text-blue-700 hover:underline inline-flex items-center gap-1"
+                    >
+                      How to create a JSONL file
+                      <ExternalLink className="w-3 h-3" />
+                    </a>
+                  </div>
+                )}
+              </div>
+            )}
 
             {/* Code Example */}
             <div className="bg-white border border-gray-200 rounded-lg overflow-hidden max-w-full">
