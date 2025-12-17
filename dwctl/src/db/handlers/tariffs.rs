@@ -256,8 +256,8 @@ mod tests {
     use crate::db::models::api_keys::ApiKeyPurpose;
     use crate::types::DeploymentId;
     use rust_decimal::Decimal;
-    use std::str::FromStr;
     use sqlx::PgPool;
+    use std::str::FromStr;
 
     #[sqlx::test]
     async fn test_multiple_batch_tariffs_per_sla(pool: PgPool) {
@@ -490,7 +490,7 @@ mod tests {
             input_price_per_token: Decimal::from_str("0.001").unwrap(),
             output_price_per_token: Decimal::from_str("0.002").unwrap(),
             api_key_purpose: Some(ApiKeyPurpose::Batch),
-            completion_window: None,  // This should be rejected by CHECK constraint
+            completion_window: None, // This should be rejected by CHECK constraint
             valid_from: None,
         };
         let result = tariffs.create(&batch_without_sla).await;
@@ -500,9 +500,9 @@ mod tests {
         if let Err(e) = result {
             let error_msg = format!("{:?}", e);
             assert!(
-                error_msg.contains("batch_tariffs_must_have_completion_window") ||
-                error_msg.contains("constraint"),
-                "Error should be due to CHECK constraint violation, got: {}", error_msg
+                error_msg.contains("batch_tariffs_must_have_completion_window") || error_msg.contains("constraint"),
+                "Error should be due to CHECK constraint violation, got: {}",
+                error_msg
             );
         }
     }

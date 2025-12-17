@@ -130,12 +130,7 @@ pub async fn create_batch(
     Json(req): Json<CreateBatchRequest>,
 ) -> Result<(StatusCode, Json<BatchResponse>)> {
     // Validate completion_window against configured allowed values
-    if !state
-        .config
-        .batches
-        .allowed_completion_windows
-        .contains(&req.completion_window)
-    {
+    if !state.config.batches.allowed_completion_windows.contains(&req.completion_window) {
         return Err(Error::BadRequest {
             message: format!(
                 "Unsupported completion_window '{}'. Allowed: {}",
@@ -709,10 +704,9 @@ mod tests {
         // Upload a batch file first
         let jsonl_content = r#"{"custom_id":"request-1","method":"POST","url":"/v1/chat/completions","body":{"model":"gpt-4","messages":[{"role":"user","content":"Hello"}]}}"#;
         let file_part = axum_test::multipart::Part::bytes(jsonl_content.as_bytes()).file_name("test-batch.jsonl");
-        let multipart = axum_test::multipart::MultipartForm::new().add_part("file", file_part).add_part(
-            "purpose",
-            axum_test::multipart::Part::text("batch"),
-        );
+        let multipart = axum_test::multipart::MultipartForm::new()
+            .add_part("file", file_part)
+            .add_part("purpose", axum_test::multipart::Part::text("batch"));
         let upload_resp = app
             .post("/ai/v1/files")
             .multipart(multipart)
@@ -755,10 +749,9 @@ mod tests {
         // Upload a batch file first
         let jsonl_content = r#"{"custom_id":"request-1","method":"POST","url":"/v1/chat/completions","body":{"model":"gpt-4","messages":[{"role":"user","content":"Hello"}]}}"#;
         let file_part = axum_test::multipart::Part::bytes(jsonl_content.as_bytes()).file_name("test-batch.jsonl");
-        let multipart = axum_test::multipart::MultipartForm::new().add_part("file", file_part).add_part(
-            "purpose",
-            axum_test::multipart::Part::text("batch"),
-        );
+        let multipart = axum_test::multipart::MultipartForm::new()
+            .add_part("file", file_part)
+            .add_part("purpose", axum_test::multipart::Part::text("batch"));
         let upload_resp = app
             .post("/ai/v1/files")
             .multipart(multipart)
@@ -807,10 +800,9 @@ mod tests {
         // Upload a batch file first
         let jsonl_content = r#"{"custom_id":"request-1","method":"POST","url":"/v1/chat/completions","body":{"model":"gpt-4","messages":[{"role":"user","content":"Hello"}]}}"#;
         let file_part = axum_test::multipart::Part::bytes(jsonl_content.as_bytes()).file_name("test-batch.jsonl");
-        let multipart = axum_test::multipart::MultipartForm::new().add_part("file", file_part).add_part(
-            "purpose",
-            axum_test::multipart::Part::text("batch"),
-        );
+        let multipart = axum_test::multipart::MultipartForm::new()
+            .add_part("file", file_part)
+            .add_part("purpose", axum_test::multipart::Part::text("batch"));
         let upload_resp = app
             .post("/ai/v1/files")
             .multipart(multipart)
@@ -886,10 +878,9 @@ mod tests {
         // Upload a batch file first
         let jsonl_content = r#"{"custom_id":"request-1","method":"POST","url":"/v1/chat/completions","body":{"model":"gpt-4","messages":[{"role":"user","content":"Hello"}]}}"#;
         let file_part = axum_test::multipart::Part::bytes(jsonl_content.as_bytes()).file_name("test-batch.jsonl");
-        let multipart = axum_test::multipart::MultipartForm::new().add_part("file", file_part).add_part(
-            "purpose",
-            axum_test::multipart::Part::text("batch"),
-        );
+        let multipart = axum_test::multipart::MultipartForm::new()
+            .add_part("file", file_part)
+            .add_part("purpose", axum_test::multipart::Part::text("batch"));
         let upload_resp = app
             .post("/ai/v1/files")
             .multipart(multipart)
@@ -961,10 +952,9 @@ mod tests {
         // Upload a batch file first
         let jsonl_content = r#"{"custom_id":"request-1","method":"POST","url":"/v1/chat/completions","body":{"model":"gpt-4","messages":[{"role":"user","content":"Hello"}]}}"#;
         let file_part = axum_test::multipart::Part::bytes(jsonl_content.as_bytes()).file_name("test-batch.jsonl");
-        let multipart = axum_test::multipart::MultipartForm::new().add_part("file", file_part).add_part(
-            "purpose",
-            axum_test::multipart::Part::text("batch"),
-        );
+        let multipart = axum_test::multipart::MultipartForm::new()
+            .add_part("file", file_part)
+            .add_part("purpose", axum_test::multipart::Part::text("batch"));
         let upload_resp = app
             .post("/ai/v1/files")
             .multipart(multipart)
