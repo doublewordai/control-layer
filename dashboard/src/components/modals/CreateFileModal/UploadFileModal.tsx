@@ -1,5 +1,5 @@
 import { useState, useEffect } from "react";
-import { Upload, X, FileText, AlertCircle } from "lucide-react";
+import { Upload, X, FileText, AlertCircle, ExternalLink } from "lucide-react";
 import {
   Dialog,
   DialogContent,
@@ -152,7 +152,17 @@ export function UploadFileModal({
         <DialogHeader>
           <DialogTitle>Upload Batch File</DialogTitle>
           <DialogDescription>
-            Upload a batch file to process multiple requests asynchronously.
+            Upload a{" "}
+            <a
+              href="https://docs.doubleword.ai"
+              target="_blank"
+              rel="noopener noreferrer"
+              className="text-blue-600 hover:text-blue-700 hover:underline inline-flex items-center gap-1"
+            >
+              JSONL file
+              <ExternalLink className="w-3 h-3" />
+            </a>{" "}
+            to process multiple requests asynchronously.
           </DialogDescription>
         </DialogHeader>
 

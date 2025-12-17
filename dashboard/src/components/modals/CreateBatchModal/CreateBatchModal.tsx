@@ -1,5 +1,5 @@
 import { useState, useEffect } from "react";
-import { Play, AlertCircle, X, Upload } from "lucide-react";
+import { Play, AlertCircle, X, Upload, ExternalLink } from "lucide-react";
 import {
   Dialog,
   DialogContent,
@@ -218,7 +218,17 @@ export function CreateBatchModal({
         <DialogHeader>
           <DialogTitle>Create New Batch</DialogTitle>
           <DialogDescription>
-            Select an existing file or upload a new one to create a batch.
+            Select or upload a{" "}
+            <a
+              href="https://docs.doubleword.ai"
+              target="_blank"
+              rel="noopener noreferrer"
+              className="text-blue-600 hover:text-blue-700 hover:underline inline-flex items-center gap-1"
+            >
+              JSONL file
+              <ExternalLink className="w-3 h-3" />
+            </a>{" "}
+            to create a batch.
           </DialogDescription>
         </DialogHeader>
 

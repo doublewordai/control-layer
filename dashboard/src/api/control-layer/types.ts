@@ -16,7 +16,7 @@ export type Role =
   | "StandardUser"
   | "BillingManager"
   | "BatchAPIUser";
-export type ApiKeyPurpose = "platform" | "inference";
+export type ApiKeyPurpose = "platform" | "realtime" | "batch" | "playground";
 export type TariffApiKeyPurpose = "realtime" | "batch" | "playground";
 
 // Config/Metadata types
