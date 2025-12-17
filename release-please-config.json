@@ -1,21 +1,20 @@
 {
   "packages": {
-    "dwctl": {
-      "release-type": "rust",
-      "component": "dwctl"
-    },
-    "dashboard": {
-      "release-type": "node",
-      "component": "dashboard"
+    ".": {
+      "release-type": "simple",
+      "extra-files": [
+        {
+          "type": "toml",
+          "path": "dwctl/Cargo.toml",
+          "jsonpath": "$.package.version"
+        },
+        {
+          "type": "json",
+          "path": "dashboard/package.json",
+          "jsonpath": "$.version"
+        }
+      ]
     }
   },
-  "plugins": [
-    {
-      "type": "linked-versions",
-      "groupName": "control-layer",
-      "components": ["dwctl", "dashboard"]
-    }
-  ],
-  "include-component-in-tag": false,
-  "separate-pull-requests": false
+  "include-component-in-tag": false
 }
