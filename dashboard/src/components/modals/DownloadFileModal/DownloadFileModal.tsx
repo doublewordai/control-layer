@@ -330,12 +330,6 @@ curl -i -X GET "${getBaseUrl()}/files/${resourceId}/content" \\
     }
   };
 
-  const languageTabs = [
-    { id: "python" as Language, label: "Python" },
-    { id: "javascript" as Language, label: "JavaScript" },
-    { id: "curl" as Language, label: "cURL" },
-  ];
-
   return (
     <Dialog open={isOpen} onOpenChange={onClose}>
       <DialogContent className="sm:max-w-3xl max-h-[90vh] overflow-y-auto overflow-x-hidden">
