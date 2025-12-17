@@ -406,6 +406,12 @@ jobs:
       - name: Install just
         uses: extractions/setup-just@v3
 
+      - name: Copy SQLx metadata to dwctl package
+        run: |
+          echo "Copying .sqlx/ from workspace root to dwctl/"
+          cp -r .sqlx/ dwctl/.sqlx/
+          echo "SQLx metadata copied successfully"
+
       - name: Publish to crates.io
         run: just release
         env:
