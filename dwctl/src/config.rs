@@ -627,6 +627,10 @@ impl Default for FilesConfig {
 pub struct BatchConfig {
     /// Enable batches API endpoints (default: true)
     pub enabled: bool,
+    /// Allowed completion windows (SLAs) for batch processing.
+    /// These define the maximum time from batch creation to completion.
+    /// Default: vec!["24h".to_string()]
+    pub allowed_completion_windows: Vec<String>,
     /// Files configuration for batch file uploads/downloads
     pub files: FilesConfig,
 }
@@ -635,6 +639,7 @@ impl Default for BatchConfig {
     fn default() -> Self {
         Self {
             enabled: true,
+            allowed_completion_windows: vec!["24h".to_string()],
             files: FilesConfig::default(),
         }
     }
