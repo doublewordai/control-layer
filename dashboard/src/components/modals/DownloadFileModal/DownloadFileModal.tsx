@@ -8,12 +8,18 @@ import {
   DialogTitle,
   DialogDescription,
 } from "../../ui/dialog";
-import { ToggleGroup, ToggleGroupItem } from "../../ui/toggle-group";
 import { Button } from "../../ui/button";
 import { Input } from "../../ui/input";
 import { Textarea } from "../../ui/textarea";
 import { Label } from "../../ui/label";
 import { Popover, PopoverContent, PopoverTrigger } from "../../ui/popover";
+import {
+  Select,
+  SelectContent,
+  SelectItem,
+  SelectTrigger,
+  SelectValue,
+} from "../../ui/select";
 import { toast } from "sonner";
 import { useCreateApiKey } from "../../../api/control-layer/hooks";
 import { AlertBox } from "@/components/ui/alert-box";
@@ -40,7 +46,7 @@ export function DownloadFileModal({
   filename,
   isPartial,
 }: DownloadFileModalProps) {
-  const [selectedLanguage, setSelectedLanguage] = useState<Language>("curl");
+  const [selectedLanguage, setSelectedLanguage] = useState<Language>("python");
   const [copiedCode, setCopiedCode] = useState<string | null>(null);
   const [downloading, setDownloading] = useState(false);
   const [apiKey, setApiKey] = useState<string | null>(null);
@@ -62,7 +68,7 @@ export function DownloadFileModal({
         data: {
           name: newKeyName.trim(),
           description: newKeyDescription.trim() || undefined,
-          purpose: "inference",
+          purpose: "realtime",
         },
       });
 
@@ -93,7 +99,7 @@ export function DownloadFileModal({
     }
   };
 
-  const getBaseUrl = () => `${window.location.origin}/ai/v1`;
+  const getBaseUrl = () => `https://api.doubleword.ai/v1`;
 
   const handleDirectDownload = async () => {
     setDownloading(true);
@@ -324,12 +330,6 @@ curl -i -X GET "${getBaseUrl()}/files/${resourceId}/content" \\
     }
   };
 
-  const languageTabs = [
-    { id: "python" as Language, label: "Python" },
-    { id: "javascript" as Language, label: "JavaScript" },
-    { id: "curl" as Language, label: "cURL" },
-  ];
-
   return (
     <Dialog open={isOpen} onOpenChange={onClose}>
       <DialogContent className="sm:max-w-3xl max-h-[90vh] overflow-y-auto overflow-x-hidden">
@@ -402,42 +402,34 @@ curl -i -X GET "${getBaseUrl()}/files/${resourceId}/content" \\
               Option 2: Download via API
             </h3>
 
-            {/* Language Selection */}
-            <div className="mb-4">
-              <label className="block text-sm font-medium text-gray-700 mb-2">
-                Select Language
-              </label>
-              <ToggleGroup
-                type="single"
-                value={selectedLanguage}
-                onValueChange={(value) =>
-                  value && setSelectedLanguage(value as Language)
-                }
-                className="inline-flex"
-                variant="outline"
-                size="sm"
-              >
-                {languageTabs.map((tab) => (
-                  <ToggleGroupItem
-                    key={tab.id}
-                    value={tab.id}
-                    aria-label={`Select ${tab.label}`}
-                    className="px-5 py-1.5"
-                  >
-                    {tab.label}
-                  </ToggleGroupItem>
-                ))}
-              </ToggleGroup>
-            </div>
-
             {/* Code Example */}
-            <div className="bg-white border border-gray-200 rounded-lg overflow-hidden">
+            <div className="bg-white border border-gray-200 rounded-lg overflow-hidden max-w-full">
               <div className="bg-gray-50 px-4 py-3 border-b border-gray-200 flex items-center justify-between">
                 <div className="flex items-center gap-2">
                   <Code className="w-4 h-4 text-gray-600" />
-                  <span className="text-sm font-medium text-gray-700">
-                    Code Example
-                  </span>
+                  <Select
+                    value={selectedLanguage}
+                    onValueChange={(value) =>
+                      setSelectedLanguage(value as Language)
+                    }
+                  >
+                    <SelectTrigger
+                      size="sm"
+                      className="h-7 border-0 bg-transparent shadow-none hover:bg-gray-100 focus-visible:ring-0"
+                    >
+                      <SelectValue>
+                        <span className="text-sm font-medium text-gray-700">
+                          {selectedLanguage.charAt(0).toUpperCase() +
+                            selectedLanguage.slice(1)}
+                        </span>
+                      </SelectValue>
+                    </SelectTrigger>
+                    <SelectContent>
+                      <SelectItem value="python">Python</SelectItem>
+                      <SelectItem value="javascript">JavaScript</SelectItem>
+                      <SelectItem value="curl">cURL</SelectItem>
+                    </SelectContent>
+                  </Select>
                 </div>
                 <div className="flex items-center gap-2">
                   {!apiKey && (
@@ -537,7 +529,7 @@ curl -i -X GET "${getBaseUrl()}/files/${resourceId}/content" \\
                   </button>
                 </div>
               </div>
-              <div className="overflow-x-auto p-4">
+              <div className="overflow-x-auto max-w-full">
                 <CodeBlock
                   language={
                     getLanguageForHighlighting(selectedLanguage) as

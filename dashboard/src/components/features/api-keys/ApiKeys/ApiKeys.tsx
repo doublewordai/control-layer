@@ -56,8 +56,7 @@ export const ApiKeys: React.FC = () => {
   const [showCreateForm, setShowCreateForm] = useState(false);
   const [newKeyName, setNewKeyName] = useState("");
   const [newKeyDescription, setNewKeyDescription] = useState("");
-  const [newKeyPurpose, setNewKeyPurpose] =
-    useState<ApiKeyPurpose>("inference");
+  const [newKeyPurpose, setNewKeyPurpose] = useState<ApiKeyPurpose>("realtime");
   const [newKeyRequestsPerSecond, setNewKeyRequestsPerSecond] = useState<
     number | ""
   >("");
@@ -308,7 +307,7 @@ export const ApiKeys: React.FC = () => {
             setShowCreateForm(false);
             setNewKeyName("");
             setNewKeyDescription("");
-            setNewKeyPurpose("inference");
+            setNewKeyPurpose("realtime");
             setNewKeyRequestsPerSecond("");
             setNewKeyBurstSize("");
             setNewKeyResponse(null);
@@ -385,7 +384,7 @@ export const ApiKeys: React.FC = () => {
                     setShowCreateForm(false);
                     setNewKeyName("");
                     setNewKeyDescription("");
-                    setNewKeyPurpose("inference");
+                    setNewKeyPurpose("realtime");
                     setNewKeyRequestsPerSecond("");
                     setNewKeyBurstSize("");
                     setNewKeyResponse(null);
@@ -485,7 +484,7 @@ export const ApiKeys: React.FC = () => {
                         >
                           <SelectTrigger id="purpose" className="w-full">
                             <SelectValue placeholder="Select purpose">
-                              {newKeyPurpose === "inference"
+                              {newKeyPurpose === "realtime"
                                 ? "Inference"
                                 : "Platform"}
                             </SelectValue>
@@ -615,7 +614,7 @@ export const ApiKeys: React.FC = () => {
                     setShowCreateForm(false);
                     setNewKeyName("");
                     setNewKeyDescription("");
-                    setNewKeyPurpose("inference");
+                    setNewKeyPurpose("realtime");
                     setNewKeyRequestsPerSecond("");
                     setNewKeyBurstSize("");
                     setAdvancedOpen(false);
