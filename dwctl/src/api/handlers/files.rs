@@ -1026,7 +1026,7 @@ pub async fn get_file_cost_estimate(
         let cost = if let Some(deployment) = deployment_opt {
             // Look up tariff pricing for Batch API key purpose, with fallback to realtime
             let pricing_result = tariffs_repo
-                .get_pricing_at_timestamp_with_fallback(deployment.id, Some(&ApiKeyPurpose::Batch), &ApiKeyPurpose::Realtime, current_time)
+                .get_pricing_at_timestamp_with_fallback(deployment.id, Some(&ApiKeyPurpose::Batch), &ApiKeyPurpose::Realtime, current_time, None)
                 .await
                 .map_err(Error::Database)?;
 

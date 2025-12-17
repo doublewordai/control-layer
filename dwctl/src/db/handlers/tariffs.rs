@@ -139,20 +139,24 @@ impl<'c> Tariffs<'c> {
         preferred_purpose: Option<&crate::db::models::api_keys::ApiKeyPurpose>,
         fallback_purpose: &crate::db::models::api_keys::ApiKeyPurpose,
         timestamp: DateTime<Utc>,
+        completion_window: Option<&str>,
     ) -> Result<Option<(Decimal, Decimal)>> {
         // Try preferred purpose first if specified
         if let Some(preferred) = preferred_purpose
-            && let Some(pricing) = self.get_pricing_at_timestamp(deployed_model_id, preferred, timestamp).await?
+            && let Some(pricing) = self.get_pricing_at_timestamp(deployed_model_id, preferred, timestamp, completion_window).await?
         {
             return Ok(Some(pricing));
         }
 
-        // Fall back to fallback purpose
-        self.get_pricing_at_timestamp(deployed_model_id, fallback_purpose, timestamp).await
+        // Fall back to fallback purpose (completion_window not relevant for fallback)
+        self.get_pricing_at_timestamp(deployed_model_id, fallback_purpose, timestamp, None).await
     }
 
     /// Get the pricing for a specific API key purpose that was valid at a given timestamp
     /// This is used for historical chargeback calculations
+    ///
+    /// For batch tariffs, optionally filters by completion_window (SLA) to match the specific
+    /// batch pricing tier.
     ///
     /// Uses an optimized two-step lookup:
     /// 1. First checks the current (active) tariff (WHERE valid_until IS NULL)
@@ -164,6 +168,7 @@ impl<'c> Tariffs<'c> {
         deployed_model_id: DeploymentId,
         api_key_purpose: &crate::db::models::api_keys::ApiKeyPurpose,
         timestamp: DateTime<Utc>,
+        completion_window: Option<&str>,
     ) -> Result<Option<(Decimal, Decimal)>> {
         // Convert enum to string for database query
         let purpose_str = match api_key_purpose {
@@ -174,6 +179,7 @@ impl<'c> Tariffs<'c> {
         };
 
         // Step 1: Check current (active) tariff - this is the fast path for recent requests
+        // For batch tariffs with completion_window specified, filter by it
         let current_tariff = sqlx::query!(
             r#"
             SELECT input_price_per_token, output_price_per_token, valid_from
@@ -181,10 +187,12 @@ impl<'c> Tariffs<'c> {
             WHERE deployed_model_id = $1
               AND api_key_purpose = $2
               AND valid_until IS NULL
+              AND ($3::VARCHAR IS NULL OR completion_window = $3 OR api_key_purpose != 'batch')
             LIMIT 1
             "#,
             deployed_model_id,
-            purpose_str
+            purpose_str,
+            completion_window
         )
         .fetch_optional(&mut *self.db)
         .await?;
@@ -207,12 +215,14 @@ impl<'c> Tariffs<'c> {
               AND api_key_purpose = $2
               AND valid_from <= $3
               AND (valid_until IS NULL OR valid_until > $3)
+              AND ($4::VARCHAR IS NULL OR completion_window = $4 OR api_key_purpose != 'batch')
             ORDER BY valid_from DESC
             LIMIT 1
             "#,
             deployed_model_id,
             purpose_str,
-            timestamp
+            timestamp,
+            completion_window
         )
         .fetch_optional(&mut *self.db)
         .await?;
