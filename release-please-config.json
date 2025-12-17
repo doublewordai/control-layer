@@ -1,7 +1,8 @@
 {
   "packages": {
-    "dwctl": {
-      "release-type": "rust"
+    ".": {
+      "release-type": "rust",
+      "extra-files": ["dashboard/package.json"]
     }
   },
   "plugins": [
@@ -10,5 +11,5 @@
     }
   ],
   "include-component-in-tag": false,
-  "separate-pull-requests": true
+  "separate-pull-requests": false
 }
