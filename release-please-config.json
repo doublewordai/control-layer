@@ -1,13 +1,19 @@
 {
   "packages": {
-    ".": {
+    "dwctl": {
       "release-type": "rust",
-      "extra-files": ["dashboard/package.json"]
+      "component": "dwctl"
+    },
+    "dashboard": {
+      "release-type": "node",
+      "component": "dashboard"
     }
   },
   "plugins": [
     {
-      "type": "cargo-workspace"
+      "type": "linked-versions",
+      "groupName": "control-layer",
+      "components": ["dwctl", "dashboard"]
     }
   ],
   "include-component-in-tag": false,

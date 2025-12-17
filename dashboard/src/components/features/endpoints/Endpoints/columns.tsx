@@ -91,7 +91,7 @@ function EditableCell({
           <PopoverContent className="w-80" align="start">
             <div className="space-y-2">
               <h4 className="font-medium text-sm">
-                Edit{""}
+                Edit{" "}
                 {field === "name"
                   ? "Name"
                   : field === "description"
