@@ -352,6 +352,7 @@ export function Batches({
 
   // Get input file ID for a batch
   const getInputFile = (batch: Batch) => {
+    if (!batch.input_file_id) return undefined;
     return { id: batch.input_file_id, purpose: "batch" };
   };
 

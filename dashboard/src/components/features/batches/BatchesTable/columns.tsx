@@ -103,7 +103,7 @@ export const createBatchColumns = (
       const batch = row.original as Batch;
       const inputFile = actions.getInputFile(batch);
 
-      if (!inputFile) {
+      if (!inputFile || !inputFile.id) {
         return <span className="text-gray-400">-</span>;
       }
 

@@ -477,29 +477,31 @@ const BatchInfo: React.FC = () => {
                     Associated Files
                   </h4>
                   <div className="space-y-2">
-                    <div className="flex items-center gap-2 p-2 bg-gray-50 rounded">
-                      <FileInput className="w-4 h-4 text-gray-600" />
-                      <div className="flex-1 min-w-0">
-                        <p className="text-sm font-medium text-gray-700">
-                          Input File
-                        </p>
-                        <p className="text-xs text-gray-500 font-mono truncate">
-                          {batch.input_file_id}
-                        </p>
+                    {batch.input_file_id && (
+                      <div className="flex items-center gap-2 p-2 bg-gray-50 rounded">
+                        <FileInput className="w-4 h-4 text-gray-600" />
+                        <div className="flex-1 min-w-0">
+                          <p className="text-sm font-medium text-gray-700">
+                            Input File
+                          </p>
+                          <p className="text-xs text-gray-500 font-mono truncate">
+                            {batch.input_file_id}
+                          </p>
+                        </div>
+                        <Button
+                          variant="ghost"
+                          size="sm"
+                          onClick={() =>
+                            navigate(
+                              `/batches/files/${batch.input_file_id}/content?from=/batches/${batchId}`,
+                            )
+                          }
+                          className="shrink-0"
+                        >
+                          View
+                        </Button>
                       </div>
-                      <Button
-                        variant="ghost"
-                        size="sm"
-                        onClick={() =>
-                          navigate(
-                            `/batches/files/${batch.input_file_id}/content?from=/batches/${batchId}`,
-                          )
-                        }
-                        className="shrink-0"
-                      >
-                        View
-                      </Button>
-                    </div>
+                    )}
 
                     {batch.output_file_id && (
                       <div className="flex items-center gap-2 p-2 bg-green-50 rounded">

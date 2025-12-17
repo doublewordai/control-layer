@@ -86,7 +86,7 @@ fn to_batch_response(batch: fusillade::Batch) -> BatchResponse {
         object_type: BatchObjectType::Batch,
         endpoint: batch.endpoint.clone(),
         errors,
-        input_file_id: batch.file_id.0.to_string(),
+        input_file_id: batch.file_id.map(|id| id.0.to_string()).unwrap_or_default(),
         completion_window: batch.completion_window.clone(),
         status: openai_status.to_string(),
         output_file_id: batch.output_file_id.map(|id| id.0.to_string()),
