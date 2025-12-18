@@ -149,6 +149,7 @@ const defaultProps = {
   onOpenCreateBatchModal: vi.fn(),
   onOpenDownloadModal: vi.fn(),
   onOpenDeleteDialog: vi.fn(),
+  onOpenDeleteBatchDialog: vi.fn(),
   onOpenCancelDialog: vi.fn(),
   onBatchCreatedCallback: vi.fn(),
 };

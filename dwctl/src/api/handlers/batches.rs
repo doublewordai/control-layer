@@ -86,7 +86,7 @@ fn to_batch_response(batch: fusillade::Batch) -> BatchResponse {
         object_type: BatchObjectType::Batch,
         endpoint: batch.endpoint.clone(),
         errors,
-        input_file_id: batch.file_id.0.to_string(),
+        input_file_id: batch.file_id.map(|id| id.0.to_string()).unwrap_or_default(),
         completion_window: batch.completion_window.clone(),
         status: openai_status.to_string(),
         output_file_id: batch.output_file_id.map(|id| id.0.to_string()),
@@ -377,6 +377,74 @@ pub async fn cancel_batch(
     tracing::info!("Batch {} cancelled", batch_id);
 
     Ok(Json(to_batch_response(batch)))
+}
+
+#[utoipa::path(
+    delete,
+    path = "/batches/{batch_id}",
+    tag = "batches",
+    summary = "Delete a batch",
+    description = "Delete a batch and all its associated requests. This is a destructive operation that cannot be undone.",
+    responses(
+        (status = 204, description = "Batch deleted successfully"),
+        (status = 400, description = "Invalid batch ID format"),
+        (status = 403, description = "Forbidden - user does not have permission to delete this batch"),
+        (status = 404, description = "Batch not found"),
+        (status = 500, description = "Internal server error")
+    ),
+    params(
+        ("batch_id" = String, Path, description = "Batch ID")
+    ),
+    security(
+        ("BearerAuth" = []),
+        ("CookieAuth" = []),
+        ("X-Doubleword-User" = [])
+    )
+)]
+#[tracing::instrument(skip(state, current_user), fields(batch_id = %batch_id_str))]
+pub async fn delete_batch(
+    State(state): State<AppState>,
+    Path(batch_id_str): Path<String>,
+    current_user: RequiresPermission<resource::Batches, operation::DeleteOwn>,
+) -> Result<StatusCode> {
+    let batch_id = Uuid::parse_str(&batch_id_str).map_err(|_| Error::BadRequest {
+        message: "Invalid batch ID format".to_string(),
+    })?;
+
+    // Get batch first to verify it exists and check ownership
+    let batch = state
+        .request_manager
+        .get_batch(fusillade::BatchId(batch_id))
+        .await
+        .map_err(|_| Error::NotFound {
+            resource: "Batch".to_string(),
+            id: batch_id_str.clone(),
+        })?;
+
+    // Check ownership: users without DeleteAll permission can only delete their own batches
+    let can_delete_all = has_permission(&current_user, Resource::Batches, Operation::DeleteAll);
+    if !can_delete_all {
+        let user_id = current_user.id.to_string();
+        if batch.created_by.as_deref() != Some(user_id.as_str()) {
+            return Err(Error::NotFound {
+                resource: "Batch".to_string(),
+                id: batch_id_str.clone(),
+            });
+        }
+    }
+
+    // Delete the batch
+    state
+        .request_manager
+        .delete_batch(fusillade::BatchId(batch_id))
+        .await
+        .map_err(|e| Error::Internal {
+            operation: format!("delete batch: {}", e),
+        })?;
+
+    tracing::info!("Batch {} deleted", batch_id);
+
+    Ok(StatusCode::NO_CONTENT)
 }
 
 #[utoipa::path(

@@ -905,6 +905,17 @@ export function useCancelBatch() {
   });
 }
 
+export function useDeleteBatch() {
+  const queryClient = useQueryClient();
+
+  return useMutation({
+    mutationFn: (id: string) => dwctlApi.batches.delete(id),
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: queryKeys.batches.lists() });
+    },
+  });
+}
+
 export function useRetryBatch() {
   const queryClient = useQueryClient();
 

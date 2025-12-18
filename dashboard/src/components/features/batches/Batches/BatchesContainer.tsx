@@ -15,6 +15,7 @@ import { Trash2, Loader2 } from "lucide-react";
 import {
   useDeleteFile,
   useCancelBatch,
+  useDeleteBatch,
 } from "../../../../api/control-layer/hooks";
 import { toast } from "sonner";
 import type { FileObject, Batch } from "../types";
@@ -47,6 +48,7 @@ export function BatchesContainer() {
   // Delete/cancel confirmation
   const [fileToDelete, setFileToDelete] = useState<FileObject | null>(null);
   const [batchToCancel, setBatchToCancel] = useState<Batch | null>(null);
+  const [batchToDelete, setBatchToDelete] = useState<Batch | null>(null);
 
   // Drag and drop state
   const [droppedFile, setDroppedFile] = useState<File | undefined>();
@@ -57,6 +59,7 @@ export function BatchesContainer() {
   // Mutations
   const deleteMutation = useDeleteFile();
   const cancelMutation = useCancelBatch();
+  const deleteBatchMutation = useDeleteBatch();
 
   // Function for Batches to register its callback
   const registerBatchCreatedCallback = useCallback((callback: () => void) => {
@@ -99,6 +102,10 @@ export function BatchesContainer() {
     setBatchToCancel(batch);
   };
 
+  const handleOpenDeleteBatchDialog = (batch: Batch) => {
+    setBatchToDelete(batch);
+  };
+
   // Confirmation handlers
   const confirmDeleteFile = async () => {
     if (!fileToDelete) return;
@@ -134,6 +141,23 @@ export function BatchesContainer() {
     }
   };
 
+  const confirmDeleteBatch = async () => {
+    if (!batchToDelete) return;
+
+    try {
+      await deleteBatchMutation.mutateAsync(batchToDelete.id);
+      toast.success(`Batch "${batchToDelete.id}" deleted successfully`);
+      setBatchToDelete(null);
+    } catch (error) {
+      console.error("Failed to delete batch:", error);
+      toast.error(
+        error instanceof Error
+          ? error.message
+          : "Failed to delete batch. Please try again.",
+      );
+    }
+  };
+
   return (
     <>
       {/* Main Batches component - now purely presentational */}
@@ -142,6 +166,7 @@ export function BatchesContainer() {
         onOpenCreateBatchModal={handleOpenCreateBatchModal}
         onOpenDownloadModal={handleOpenDownloadModal}
         onOpenDeleteDialog={handleOpenDeleteDialog}
+        onOpenDeleteBatchDialog={handleOpenDeleteBatchDialog}
         onOpenCancelDialog={handleOpenCancelDialog}
         onBatchCreatedCallback={registerBatchCreatedCallback}
       />
@@ -292,6 +317,56 @@ export function BatchesContainer() {
                 <Loader2 className="w-4 h-4 mr-2 animate-spin" />
               )}
               Cancel Batch
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
+
+      {/* Delete Batch Confirmation */}
+      <Dialog
+        open={!!batchToDelete}
+        onOpenChange={() => setBatchToDelete(null)}
+      >
+        <DialogContent className="sm:max-w-md">
+          <DialogHeader>
+            <div className="flex items-center gap-3">
+              <div className="w-10 h-10 bg-red-100 rounded-full flex items-center justify-center">
+                <Trash2 className="w-5 h-5 text-red-600" />
+              </div>
+              <div>
+                <DialogTitle>Delete Batch</DialogTitle>
+                <p className="text-sm text-gray-600">
+                  This action cannot be undone
+                </p>
+              </div>
+            </div>
+          </DialogHeader>
+
+          <div className="py-4">
+            <p className="text-sm text-gray-700">
+              Are you sure you want to delete batch{" "}
+              <strong className="font-mono">"{batchToDelete?.id}"</strong>? This
+              will permanently delete the batch and all its associated requests.
+            </p>
+          </div>
+
+          <DialogFooter>
+            <Button
+              type="button"
+              variant="outline"
+              onClick={() => setBatchToDelete(null)}
+            >
+              Cancel
+            </Button>
+            <Button
+              onClick={confirmDeleteBatch}
+              disabled={deleteBatchMutation.isPending}
+              variant="destructive"
+            >
+              {deleteBatchMutation.isPending && (
+                <Loader2 className="w-4 h-4 mr-2 animate-spin" />
+              )}
+              Delete Batch
             </Button>
           </DialogFooter>
         </DialogContent>
