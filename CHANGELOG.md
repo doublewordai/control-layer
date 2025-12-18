@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.17.3](https://github.com/doublewordai/control-layer/compare/v0.17.2...v0.17.3) (2025-12-18)
+
+
+### Features
+
+* delete batches and fix file cascade ([#396](https://github.com/doublewordai/control-layer/issues/396)) ([86b64b2](https://github.com/doublewordai/control-layer/commit/86b64b2bc088be48fe340e0d2d07efc47a2c819e))
+
 ## [0.17.2](https://github.com/doublewordai/control-layer/compare/v0.17.1...v0.17.2) (2025-12-17)
 
 
