@@ -1150,6 +1150,15 @@ const batchesApi = {
     return response.json();
   },
 
+  async delete(id: string): Promise<void> {
+    const response = await fetch(`/ai/v1/batches/${id}`, {
+      method: "DELETE",
+    });
+    if (!response.ok) {
+      throw new Error(`Failed to delete batch: ${response.status}`);
+    }
+  },
+
   async retry(id: string): Promise<Batch> {
     const response = await fetch(`/ai/v1/batches/${id}/retry`, {
       method: "POST",

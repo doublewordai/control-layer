@@ -339,13 +339,19 @@ const BatchInfo: React.FC = () => {
                         </span>
                         .
                       </p>
-                      <p className="text-xs text-gray-500 mt-1">
-                        Click to reset them to pending and retry processing.
-                      </p>
+                      {!batch.input_file_id ? (
+                        <p className="text-xs text-red-600 mt-1">
+                          Source file has been deleted. Cannot retry.
+                        </p>
+                      ) : (
+                        <p className="text-xs text-gray-500 mt-1">
+                          Click to reset them to pending and retry processing.
+                        </p>
+                      )}
                     </div>
                     <Button
                       onClick={handleRetry}
-                      disabled={retryMutation.isPending}
+                      disabled={retryMutation.isPending || !batch.input_file_id}
                       className="ml-4"
                     >
                       {retryMutation.isPending ? (
@@ -477,29 +483,43 @@ const BatchInfo: React.FC = () => {
                     Associated Files
                   </h4>
                   <div className="space-y-2">
-                    <div className="flex items-center gap-2 p-2 bg-gray-50 rounded">
-                      <FileInput className="w-4 h-4 text-gray-600" />
-                      <div className="flex-1 min-w-0">
-                        <p className="text-sm font-medium text-gray-700">
-                          Input File
-                        </p>
-                        <p className="text-xs text-gray-500 font-mono truncate">
-                          {batch.input_file_id}
-                        </p>
+                    {batch.input_file_id ? (
+                      <div className="flex items-center gap-2 p-2 bg-gray-50 rounded">
+                        <FileInput className="w-4 h-4 text-gray-600" />
+                        <div className="flex-1 min-w-0">
+                          <p className="text-sm font-medium text-gray-700">
+                            Input File
+                          </p>
+                          <p className="text-xs text-gray-500 font-mono truncate">
+                            {batch.input_file_id}
+                          </p>
+                        </div>
+                        <Button
+                          variant="ghost"
+                          size="sm"
+                          onClick={() =>
+                            navigate(
+                              `/batches/files/${batch.input_file_id}/content?from=/batches/${batchId}`,
+                            )
+                          }
+                          className="shrink-0"
+                        >
+                          View
+                        </Button>
                       </div>
-                      <Button
-                        variant="ghost"
-                        size="sm"
-                        onClick={() =>
-                          navigate(
-                            `/batches/files/${batch.input_file_id}/content?from=/batches/${batchId}`,
-                          )
-                        }
-                        className="shrink-0"
-                      >
-                        View
-                      </Button>
-                    </div>
+                    ) : (
+                      <div className="flex items-center gap-2 p-2 bg-gray-100 rounded">
+                        <FileInput className="w-4 h-4 text-gray-400" />
+                        <div className="flex-1 min-w-0">
+                          <p className="text-sm font-medium text-gray-500">
+                            Input File
+                          </p>
+                          <p className="text-xs text-gray-400">
+                            Source file has been deleted
+                          </p>
+                        </div>
+                      </div>
+                    )}
 
                     {batch.output_file_id && (
                       <div className="flex items-center gap-2 p-2 bg-green-50 rounded">
