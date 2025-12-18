@@ -567,11 +567,16 @@ fn create_cors_layer(config: &Config) -> anyhow::Result<CorsLayer> {
     for origin in &config.auth.security.cors.allowed_origins {
         let header_value = match origin {
             CorsOrigin::Wildcard => "*".parse::<HeaderValue>()?,
-            CorsOrigin::Url(url) => url.as_str().parse::<HeaderValue>()?,
+            CorsOrigin::Url(url) => {
+                // Strip trailing slash that Url::parse adds during normalization
+                let url_str = url.as_str().trim_end_matches('/');
+                url_str.parse::<HeaderValue>()?
+            }
         };
         origins.push(header_value);
     }
 
+    info!("Configuring CORS with allowed origins: {:?}", origins);
     let mut cors = CorsLayer::new()
         .allow_origin(origins)
         .allow_methods([

@@ -131,6 +131,7 @@ auth:
     cors:
       allowed_origins:
         - "http://localhost:5173" # Development frontend (Vite)
+        - "http://localhost:3001" # Local control layer
         - "https://localhost" # Local HTTPS
       allow_credentials: true
       max_age: 3600 # Cache preflight requests for 1 hour
