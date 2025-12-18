@@ -12,6 +12,7 @@ import {
   FileText,
   DollarSign,
   Eye,
+  Trash2,
 } from "lucide-react";
 import { Button } from "../../../ui/button";
 import { Tooltip, TooltipContent, TooltipTrigger } from "../../../ui/tooltip";
@@ -24,6 +25,7 @@ import type { Batch, BatchStatus, BatchAnalytics } from "../types";
 
 interface ColumnActions {
   onCancel: (batch: Batch) => void;
+  onDelete: (batch: Batch) => void;
   getBatchFiles: (batch: Batch) => any[];
   onViewFile: (file: any) => void;
   getInputFile: (batch: Batch) => any | undefined;
@@ -369,6 +371,22 @@ export const createBatchColumns = (
               </Button>
             </TooltipTrigger>
             <TooltipContent>View batch details</TooltipContent>
+          </Tooltip>
+          <Tooltip delayDuration={500}>
+            <TooltipTrigger asChild>
+              <Button
+                variant="ghost"
+                size="sm"
+                className="h-7 w-7 p-0 text-red-600 hover:bg-red-50 hover:text-red-700"
+                onClick={(e) => {
+                  e.stopPropagation();
+                  actions.onDelete(batch);
+                }}
+              >
+                <Trash2 className="h-4 w-4" />
+              </Button>
+            </TooltipTrigger>
+            <TooltipContent>Delete batch</TooltipContent>
           </Tooltip>
         </div>
       );

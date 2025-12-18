@@ -46,6 +46,7 @@ interface BatchesProps {
     isPartial?: boolean;
   }) => void;
   onOpenDeleteDialog: (file: FileObject) => void;
+  onOpenDeleteBatchDialog: (batch: Batch) => void;
   onOpenCancelDialog: (batch: Batch) => void;
   onBatchCreatedCallback?: (callback: () => void) => void;
 }
@@ -55,6 +56,7 @@ export function Batches({
   onOpenCreateBatchModal,
   onOpenDownloadModal,
   onOpenDeleteDialog,
+  onOpenDeleteBatchDialog,
   onOpenCancelDialog,
   onBatchCreatedCallback,
 }: BatchesProps) {
@@ -322,6 +324,11 @@ export function Batches({
     onOpenCancelDialog(batch);
   };
 
+  const handleDeleteBatch = (batch: Batch) => {
+    if ((batch as any)._isEmpty) return;
+    onOpenDeleteBatchDialog(batch);
+  };
+
   // Drag and drop handlers
   const handleDrag = (e: React.DragEvent) => {
     e.preventDefault();
@@ -400,6 +407,7 @@ export function Batches({
 
   const batchColumns = createBatchColumns({
     onCancel: handleCancelBatch,
+    onDelete: handleDeleteBatch,
     getBatchFiles,
     onViewFile: handleViewFileRequests,
     getInputFile,
