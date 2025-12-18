@@ -574,6 +574,15 @@ fn create_cors_layer(config: &Config) -> anyhow::Result<CorsLayer> {
 
     let mut cors = CorsLayer::new()
         .allow_origin(origins)
+        .allow_methods([
+            http::Method::GET,
+            http::Method::POST,
+            http::Method::PUT,
+            http::Method::DELETE,
+            http::Method::PATCH,
+            http::Method::OPTIONS,
+        ])
+        .allow_headers([http::header::CONTENT_TYPE, http::header::AUTHORIZATION, http::header::ACCEPT])
         .allow_credentials(config.auth.security.cors.allow_credentials)
         .expose_headers(vec![http::header::LOCATION]);
 
