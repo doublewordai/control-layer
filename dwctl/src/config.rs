@@ -72,8 +72,8 @@ use figment::{
     providers::{Env, Format, Yaml},
 };
 use serde::{Deserialize, Serialize};
-use tracing::warn;
 use std::{collections::HashMap, path::PathBuf, sync::Arc, time::Duration};
+use tracing::warn;
 use url::Url;
 
 use crate::api::models::users::Role;
@@ -699,7 +699,7 @@ pub struct DaemonConfig {
     /// Per-model priority endpoint configurations for SLA escalation
     /// Parameters:
     ///     * endpoint: model endpoint name to route escalation to
-    ///     * api_key: optional env variable name for the original. Note different from fusillade config, we use an env var here 
+    ///     * api_key: optional env variable name for the original. Note different from fusillade config, we use an env var here
     /// for security so we can pass in api keys at runtime.
     ///     * path_overwrite: optional path to use instead of the original
     ///     * model_overwrite: optional model to use instead of the original
@@ -774,14 +774,12 @@ impl DaemonConfig {
         // For security we pass in api keys as env vars. Here we read them into config passed to fusillade.
         let mut priority_endpoints_map = self.priority_endpoints.clone();
         for (_, endpoint) in priority_endpoints_map.iter_mut() {
-            endpoint.api_key.as_mut().map(|env_var| {
-                match std::env::var(&env_var) {
-                    Err(_) => {warn!(
-                        "Priority endpoint configured with api_key env var '{}' which is not set",
-                        env_var
-                    ); None},
-                    Ok(value) => Some(value),
+            endpoint.api_key.as_mut().map(|env_var| match std::env::var(&env_var) {
+                Err(_) => {
+                    warn!("Priority endpoint configured with api_key env var '{}' which is not set", env_var);
+                    None
                 }
+                Ok(value) => Some(value),
             });
         }
         fusillade::daemon::DaemonConfig {
