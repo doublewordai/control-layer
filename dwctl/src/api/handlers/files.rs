@@ -47,6 +47,41 @@ struct OpenAIBatchRequest {
     body: serde_json::Value,
 }
 
+/// Allowed HTTP methods for batch requests
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AllowedHttpMethod {
+    Post,
+}
+
+impl std::str::FromStr for AllowedHttpMethod {
+    type Err = Error;
+
+    fn from_str(s: &str) -> Result<Self> {
+        match s.to_uppercase().as_str() {
+            "POST" => Ok(Self::Post),
+            _ => Err(Error::BadRequest {
+                message: format!("Unsupported HTTP method '{}'. Only POST is currently supported.", s),
+            }),
+        }
+    }
+}
+
+/// Allowed URL paths for batch requests
+const ALLOWED_URL_PATHS: &[&str] = &["/v1/chat/completions", "/v1/completions", "/v1/embeddings"];
+
+fn validate_url_path(url: &str) -> Result<()> {
+    if !ALLOWED_URL_PATHS.contains(&url) {
+        return Err(Error::BadRequest {
+            message: format!(
+                "Unsupported URL path '{}'. Allowed paths are: {}",
+                url,
+                ALLOWED_URL_PATHS.join(", ")
+            ),
+        });
+    }
+    Ok(())
+}
+
 impl OpenAIBatchRequest {
     /// Transform OpenAI format to internal format
     ///
@@ -56,6 +91,12 @@ impl OpenAIBatchRequest {
     /// * `accessible_models` - Set of model aliases the user can access
     #[tracing::instrument(skip(self, api_key, accessible_models), fields(custom_id = %self.custom_id, method = %self.method, url = %self.url))]
     fn to_internal(&self, endpoint: &str, api_key: String, accessible_models: &HashSet<String>) -> Result<fusillade::RequestTemplateInput> {
+        // Validate HTTP method
+        let _validated_method = self.method.parse::<AllowedHttpMethod>()?;
+
+        // Validate URL path
+        validate_url_path(&self.url)?;
+
         // Extract model from body if present
         let model = self
             .body
@@ -73,8 +114,20 @@ impl OpenAIBatchRequest {
             });
         }
 
-        // Serialize body back to string
-        let body = serde_json::to_string(&self.body).map_err(|e| Error::BadRequest {
+        // Strip 'priority' key from body if present (users shouldn't control priority)
+        let mut sanitized_body = self.body.clone();
+        if sanitized_body.is_object()
+            && let Some(obj) = sanitized_body.as_object_mut()
+            && obj.remove("priority").is_some()
+        {
+            tracing::debug!(
+                custom_id = %self.custom_id,
+                "Stripped 'priority' field from request body"
+            );
+        }
+
+        // Serialize sanitized body back to string
+        let body = serde_json::to_string(&sanitized_body).map_err(|e| Error::BadRequest {
             message: format!("Invalid JSON body: {}", e),
         })?;
 
@@ -1544,5 +1597,131 @@ mod tests {
         let total_output: i64 = estimate.models.iter().map(|m| m.estimated_output_tokens).sum();
         assert_eq!(estimate.total_estimated_input_tokens, total_input);
         assert_eq!(estimate.total_estimated_output_tokens, total_output);
+    }
+
+    #[sqlx::test]
+    #[test_log::test]
+    async fn test_upload_invalid_http_method(pool: PgPool) {
+        let (app, _bg_services) = create_test_app(pool.clone(), false).await;
+        let user = create_test_user_with_roles(&pool, vec![Role::StandardUser, Role::BatchAPIUser]).await;
+        let group = create_test_group(&pool).await;
+        add_user_to_group(&pool, user.id, group.id).await;
+
+        let deployment = create_test_deployment(&pool, user.id, "gpt-4-model", "gpt-4").await;
+        add_deployment_to_group(&pool, deployment.id, group.id, user.id).await;
+
+        // Use GET method instead of POST
+        let jsonl_content = r#"{"custom_id":"request-1","method":"GET","url":"/v1/chat/completions","body":{"model":"gpt-4","messages":[{"role":"user","content":"Hello"}]}}"#;
+
+        let file_part = axum_test::multipart::Part::bytes(jsonl_content.as_bytes()).file_name("test-batch.jsonl");
+
+        let upload_response = app
+            .post("/ai/v1/files")
+            .add_header(&add_auth_headers(&user)[0].0, &add_auth_headers(&user)[0].1)
+            .add_header(&add_auth_headers(&user)[1].0, &add_auth_headers(&user)[1].1)
+            .multipart(
+                axum_test::multipart::MultipartForm::new()
+                    .add_text("purpose", "batch")
+                    .add_part("file", file_part),
+            )
+            .await;
+
+        upload_response.assert_status(axum::http::StatusCode::BAD_REQUEST);
+        let error_body = upload_response.text();
+        assert!(error_body.contains("Unsupported HTTP method"));
+        assert!(error_body.contains("GET"));
+    }
+
+    #[sqlx::test]
+    #[test_log::test]
+    async fn test_upload_invalid_url_path(pool: PgPool) {
+        let (app, _bg_services) = create_test_app(pool.clone(), false).await;
+        let user = create_test_user_with_roles(&pool, vec![Role::StandardUser, Role::BatchAPIUser]).await;
+        let group = create_test_group(&pool).await;
+        add_user_to_group(&pool, user.id, group.id).await;
+
+        let deployment = create_test_deployment(&pool, user.id, "gpt-4-model", "gpt-4").await;
+        add_deployment_to_group(&pool, deployment.id, group.id, user.id).await;
+
+        // Use invalid URL path
+        let jsonl_content = r#"{"custom_id":"request-1","method":"POST","url":"/api/completions","body":{"model":"gpt-4","messages":[{"role":"user","content":"Hello"}]}}"#;
+
+        let file_part = axum_test::multipart::Part::bytes(jsonl_content.as_bytes()).file_name("test-batch.jsonl");
+
+        let upload_response = app
+            .post("/ai/v1/files")
+            .add_header(&add_auth_headers(&user)[0].0, &add_auth_headers(&user)[0].1)
+            .add_header(&add_auth_headers(&user)[1].0, &add_auth_headers(&user)[1].1)
+            .multipart(
+                axum_test::multipart::MultipartForm::new()
+                    .add_text("purpose", "batch")
+                    .add_part("file", file_part),
+            )
+            .await;
+
+        upload_response.assert_status(axum::http::StatusCode::BAD_REQUEST);
+        let error_body = upload_response.text();
+        assert!(error_body.contains("Unsupported URL path"));
+        assert!(error_body.contains("/api/completions"));
+        assert!(error_body.contains("/v1/chat/completions"));
+        assert!(error_body.contains("/v1/embeddings"));
+    }
+
+    #[sqlx::test]
+    #[test_log::test]
+    async fn test_upload_strips_priority_field(pool: PgPool) {
+        let (app, _bg_services) = create_test_app(pool.clone(), false).await;
+        let user = create_test_user_with_roles(&pool, vec![Role::StandardUser, Role::BatchAPIUser]).await;
+        let group = create_test_group(&pool).await;
+        add_user_to_group(&pool, user.id, group.id).await;
+
+        let deployment = create_test_deployment(&pool, user.id, "qwen-model", "Qwen/Qwen3-VL-30B-A3B-Instruct-FP8").await;
+        add_deployment_to_group(&pool, deployment.id, group.id, user.id).await;
+
+        // Upload file with priority field that user is trying to manipulate
+        let jsonl_content = r#"{"custom_id": "priority-hijack", "method": "POST", "url": "/v1/chat/completions", "body": {"model": "Qwen/Qwen3-VL-30B-A3B-Instruct-FP8", "messages": [{"role": "user", "content": "urgent"}], "priority": -999999}}"#;
+
+        let file_part = axum_test::multipart::Part::bytes(jsonl_content.as_bytes()).file_name("test-priority.jsonl");
+
+        let upload_response = app
+            .post("/ai/v1/files")
+            .add_header(&add_auth_headers(&user)[0].0, &add_auth_headers(&user)[0].1)
+            .add_header(&add_auth_headers(&user)[1].0, &add_auth_headers(&user)[1].1)
+            .multipart(
+                axum_test::multipart::MultipartForm::new()
+                    .add_text("purpose", "batch")
+                    .add_part("file", file_part),
+            )
+            .await;
+
+        // Upload should succeed
+        upload_response.assert_status(axum::http::StatusCode::CREATED);
+        let file: FileResponse = upload_response.json();
+        let file_id = file.id;
+
+        // Download the file content and verify priority was stripped
+        let download_response = app
+            .get(&format!("/ai/v1/files/{}/content", file_id))
+            .add_header(&add_auth_headers(&user)[0].0, &add_auth_headers(&user)[0].1)
+            .add_header(&add_auth_headers(&user)[1].0, &add_auth_headers(&user)[1].1)
+            .await;
+
+        download_response.assert_status(axum::http::StatusCode::OK);
+        let downloaded_content = download_response.text();
+
+        // Parse the downloaded line
+        let downloaded_json: serde_json::Value =
+            serde_json::from_str(downloaded_content.trim()).expect("Downloaded content should be valid JSON");
+
+        // Verify the body exists and doesn't contain priority
+        let body = downloaded_json.get("body").expect("Should have body field");
+        assert!(body.get("priority").is_none(), "Priority field should be stripped from body");
+
+        // Verify other fields are preserved
+        assert_eq!(
+            body.get("model").and_then(|v| v.as_str()).unwrap(),
+            "Qwen/Qwen3-VL-30B-A3B-Instruct-FP8"
+        );
+        assert!(body.get("messages").is_some(), "Messages field should be preserved");
     }
 }
