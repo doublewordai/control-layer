@@ -699,6 +699,24 @@ pub struct DaemonConfig {
     /// Maximum time a request can stay in "processing" state before being unclaimed
     /// and returned to pending (milliseconds). This handles daemon crashes during execution. (default: 600000 = 10 minutes)
     pub processing_timeout_ms: u64,
+
+    /// Batch table column names to include as request headers.
+    /// These values are sent as `x-fusillade-batch-{column}` headers with each request.
+    /// Example: ["id", "created_by", "endpoint"] produces headers like:
+    ///   - x-fusillade-batch-id
+    ///   - x-fusillade-batch-created-by
+    ///   - x-fusillade-batch-endpoint
+    #[serde(default = "default_batch_metadata_fields_dwctl")]
+    pub batch_metadata_fields: Vec<String>,
+}
+
+fn default_batch_metadata_fields_dwctl() -> Vec<String> {
+    vec![
+        "id".to_string(),
+        "endpoint".to_string(),
+        "created_at".to_string(),
+        "completion_window".to_string(),
+    ]
 }
 
 impl Default for DaemonConfig {
@@ -717,6 +735,7 @@ impl Default for DaemonConfig {
             status_log_interval_ms: Some(2000),
             claim_timeout_ms: 60000,
             processing_timeout_ms: 600000,
+            batch_metadata_fields: default_batch_metadata_fields_dwctl(),
         }
     }
 }
@@ -745,6 +764,7 @@ impl DaemonConfig {
             status_log_interval_ms: self.status_log_interval_ms,
             claim_timeout_ms: self.claim_timeout_ms,
             processing_timeout_ms: self.processing_timeout_ms,
+            batch_metadata_fields: self.batch_metadata_fields.clone(),
             ..Default::default()
         }
     }
