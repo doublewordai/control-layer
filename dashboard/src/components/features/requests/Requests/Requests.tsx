@@ -32,6 +32,8 @@ function transformAnalyticsEntry(entry: AnalyticsEntry): RequestsEntry {
     response_type: entry.response_type,
     user_email: entry.user_email,
     fusillade_batch_id: entry.fusillade_batch_id,
+    input_price_per_token: entry.input_price_per_token,
+    output_price_per_token: entry.output_price_per_token,
   };
 }
 
@@ -40,6 +42,9 @@ export function Requests() {
   const [searchParams] = useSearchParams();
   const navigate = useNavigate();
   const [selectedModel, setSelectedModel] = useState<string | undefined>(
+    undefined,
+  );
+  const [batchIdFilter, setBatchIdFilter] = useState<string | undefined>(
     undefined,
   );
   // Initialize with last 24 hours as default
@@ -68,11 +73,15 @@ export function Requests() {
     (role) => role === "RequestViewer",
   );
 
-  // Initialize selectedModel from URL parameter
+  // Initialize selectedModel and batchIdFilter from URL parameters
   useEffect(() => {
     const modelFromUrl = searchParams.get("model");
     if (modelFromUrl) {
       setSelectedModel(modelFromUrl);
+    }
+    const batchIdFromUrl = searchParams.get("fusillade_batch_id");
+    if (batchIdFromUrl) {
+      setBatchIdFilter(batchIdFromUrl);
     }
   }, [searchParams]);
 
@@ -112,7 +121,7 @@ export function Requests() {
   // Fetch requests data only if user has requests permission AND requests tab is active
   // MSW will intercept these calls in demo mode
   // Query for limit + 1 to detect if there are more pages
-  // Pass model filter to API for server-side filtering
+  // Pass model and batch_id filters to API for server-side filtering
   const {
     data: requestsResponse,
     isLoading: requestsLoading,
@@ -123,6 +132,7 @@ export function Requests() {
       limit: queryLimit,
       order_desc: true,
       model: selectedModel,
+      fusillade_batch_id: batchIdFilter,
     },
     { enabled: hasRequestsPermission && activeTab === "requests" },
     dateRange,
@@ -260,6 +270,32 @@ export function Requests() {
               <h1 className="text-3xl font-bold text-doubleword-neutral-900">
                 {`${activeTab.slice(0, 1).toUpperCase()}${activeTab.slice(1)}`}
               </h1>
+              {batchIdFilter && (
+                <div className="flex items-center gap-2 mt-1">
+                  <span className="text-sm text-doubleword-neutral-600">
+                    Filtered by batch:
+                  </span>
+                  <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded-full text-xs font-medium bg-blue-100 text-blue-800">
+                    <span className="font-mono">
+                      {batchIdFilter.slice(0, 8)}...
+                    </span>
+                    <button
+                      onClick={() => {
+                        setBatchIdFilter(undefined);
+                        const newParams = new URLSearchParams(searchParams);
+                        newParams.delete("fusillade_batch_id");
+                        navigate(`/analytics?${newParams.toString()}`, {
+                          replace: true,
+                        });
+                      }}
+                      className="ml-1 hover:text-blue-900"
+                      aria-label="Clear batch filter"
+                    >
+                      <X className="h-3 w-3" />
+                    </button>
+                  </span>
+                </div>
+              )}
             </div>
           </div>
 

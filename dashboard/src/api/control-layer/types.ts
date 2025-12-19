@@ -388,6 +388,8 @@ export interface AnalyticsEntry {
   response_type?: string;
   user_email?: string;
   fusillade_batch_id?: string;
+  input_price_per_token?: string;
+  output_price_per_token?: string;
 }
 
 export interface ListAnalyticsResponse {

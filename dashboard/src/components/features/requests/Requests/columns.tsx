@@ -1,11 +1,47 @@
 "use client";
 
 import { type ColumnDef } from "@tanstack/react-table";
-import { ArrowUpDown, Clock, ExternalLink } from "lucide-react";
+import { ArrowUpDown, Clock, ExternalLink, DollarSign } from "lucide-react";
 import { formatTimestamp, formatDuration } from "../../../../utils";
 import { Tooltip, TooltipContent, TooltipTrigger } from "../../../ui/tooltip";
 import type { RequestsEntry } from "../types";
 import { Link } from "react-router-dom";
+
+// Calculate estimated cost from tokens and price per token
+function calculateCost(entry: RequestsEntry): number | null {
+  const promptTokens = entry.prompt_tokens;
+  const completionTokens = entry.completion_tokens;
+  const inputPrice = entry.input_price_per_token
+    ? parseFloat(entry.input_price_per_token)
+    : null;
+  const outputPrice = entry.output_price_per_token
+    ? parseFloat(entry.output_price_per_token)
+    : null;
+
+  if (promptTokens === undefined || completionTokens === undefined) {
+    return null;
+  }
+
+  if (inputPrice === null && outputPrice === null) {
+    return null;
+  }
+
+  const inputCost = (promptTokens ?? 0) * (inputPrice ?? 0);
+  const outputCost = (completionTokens ?? 0) * (outputPrice ?? 0);
+
+  return inputCost + outputCost;
+}
+
+// Format cost with appropriate precision
+function formatCost(cost: number): string {
+  if (cost < 0.0001) {
+    return `$${cost.toFixed(6)}`;
+  } else if (cost < 0.01) {
+    return `$${cost.toFixed(4)}`;
+  } else {
+    return `$${cost.toFixed(2)}`;
+  }
+}
 
 const getStatusColor = (statusCode?: number) => {
   if (!statusCode) return "bg-gray-100 text-gray-800";
@@ -178,6 +214,57 @@ export const createRequestColumns = (): ColumnDef<RequestsEntry>[] => [
             <div className="text-xs">
               <div>Prompt: {promptTokens?.toLocaleString() ?? "-"}</div>
               <div>Completion: {completionTokens?.toLocaleString() ?? "-"}</div>
+            </div>
+          </TooltipContent>
+        </Tooltip>
+      );
+    },
+    size: 90,
+  },
+  {
+    id: "cost",
+    header: ({ column }) => {
+      return (
+        <button
+          onClick={() => column.toggleSorting(column.getIsSorted() === "asc")}
+          className="flex items-center text-left font-medium group"
+        >
+          Cost
+          <ArrowUpDown className="ml-2 h-4 w-4 text-gray-400 group-hover:text-gray-700 transition-colors" />
+        </button>
+      );
+    },
+    cell: ({ row }) => {
+      const request = row.original;
+      const cost = calculateCost(request);
+
+      if (cost === null) {
+        return <span className="text-gray-400">-</span>;
+      }
+
+      const inputCost =
+        (request.prompt_tokens ?? 0) *
+        (request.input_price_per_token
+          ? parseFloat(request.input_price_per_token)
+          : 0);
+      const outputCost =
+        (request.completion_tokens ?? 0) *
+        (request.output_price_per_token
+          ? parseFloat(request.output_price_per_token)
+          : 0);
+
+      return (
+        <Tooltip>
+          <TooltipTrigger asChild>
+            <span className="text-sm text-green-700 font-medium cursor-help flex items-center gap-1">
+              <DollarSign className="w-3 h-3" />
+              {formatCost(cost).slice(1)}
+            </span>
+          </TooltipTrigger>
+          <TooltipContent>
+            <div className="text-xs">
+              <div>Input: {formatCost(inputCost)}</div>
+              <div>Output: {formatCost(outputCost)}</div>
             </div>
           </TooltipContent>
         </Tooltip>

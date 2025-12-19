@@ -221,6 +221,12 @@ pub struct AnalyticsEntry {
     /// Fusillade batch ID (if part of a batch)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub fusillade_batch_id: Option<uuid::Uuid>,
+    /// Input/prompt price per token (for cost calculation)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub input_price_per_token: Option<String>,
+    /// Output/completion price per token (for cost calculation)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub output_price_per_token: Option<String>,
 }
 
 /// Response containing a list of analytics entries

@@ -18,6 +18,7 @@ use crate::{
     },
     db::errors::Result,
 };
+use rust_decimal::Decimal;
 use rust_decimal::prelude::ToPrimitive;
 use uuid::Uuid;
 
@@ -829,6 +830,8 @@ struct HttpAnalyticsRow {
     pub response_type: Option<String>,
     pub user_email: Option<String>,
     pub fusillade_batch_id: Option<Uuid>,
+    pub input_price_per_token: Option<Decimal>,
+    pub output_price_per_token: Option<Decimal>,
 }
 
 /// List HTTP analytics entries with filtering and pagination
@@ -856,7 +859,9 @@ pub async fn list_http_analytics(
             total_tokens,
             response_type,
             user_email,
-            fusillade_batch_id
+            fusillade_batch_id,
+            input_price_per_token,
+            output_price_per_token
         FROM http_analytics
         WHERE
             ($1::timestamptz IS NULL OR timestamp >= $1)
@@ -910,6 +915,8 @@ pub async fn list_http_analytics(
             response_type: row.response_type,
             user_email: row.user_email,
             fusillade_batch_id: row.fusillade_batch_id,
+            input_price_per_token: row.input_price_per_token.map(|p| p.to_string()),
+            output_price_per_token: row.output_price_per_token.map(|p| p.to_string()),
         })
         .collect();
 
