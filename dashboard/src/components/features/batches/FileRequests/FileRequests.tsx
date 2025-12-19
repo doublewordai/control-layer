@@ -184,6 +184,21 @@ export function FileRequests() {
         pageSize={pagination.pageSize}
         minRows={pagination.pageSize}
         rowHeight="40px"
+        emptyState={
+          <div className="text-center py-12">
+            <div className="p-4 bg-doubleword-neutral-100 rounded-full w-16 h-16 mx-auto mb-4 flex items-center justify-center">
+              <FileInput className="w-8 h-8 text-doubleword-neutral-600" />
+            </div>
+            <h3 className="text-lg font-medium text-doubleword-neutral-900 mb-2">
+              {debouncedSearch ? "No matching requests" : "File is empty"}
+            </h3>
+            <p className="text-doubleword-neutral-600">
+              {debouncedSearch
+                ? "No requests match your search. Try a different custom ID."
+                : "This file does not contain any data"}
+            </p>
+          </div>
+        }
         headerActions={
           <div className="flex items-center gap-2">
             <span className="text-sm text-gray-600">Rows:</span>

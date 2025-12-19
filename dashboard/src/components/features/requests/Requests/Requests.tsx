@@ -1,4 +1,4 @@
-import { X, List, ArrowLeft, LayoutGrid } from "lucide-react";
+import { Activity, X, List, ArrowLeft, LayoutGrid } from "lucide-react";
 import { useState, useEffect } from "react";
 import { useSearchParams, useNavigate } from "react-router-dom";
 import {
@@ -373,6 +373,21 @@ export function Requests() {
               showPageSizeSelector={true}
               pageSizeOptions={[10, 25, 50]}
               isLoading={requestsLoading}
+              emptyState={
+                <div className="text-center py-12">
+                  <div className="p-4 bg-doubleword-neutral-100 rounded-full w-16 h-16 mx-auto mb-4 flex items-center justify-center">
+                    <Activity className="w-8 h-8 text-doubleword-neutral-600" />
+                  </div>
+                  <h3 className="text-lg font-medium text-doubleword-neutral-900 mb-2">
+                    No requests found
+                  </h3>
+                  <p className="text-doubleword-neutral-600">
+                    {debouncedCustomIdSearch
+                      ? "No requests match your search. Try a different custom ID."
+                      : "No requests found for the selected time period. Try adjusting the date range or check back later once traffic starts flowing through the gateway."}
+                  </p>
+                </div>
+              }
             />
           </TabsContent>
         )}

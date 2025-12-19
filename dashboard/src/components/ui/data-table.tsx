@@ -110,6 +110,12 @@ interface DataTableProps<TData, TValue> {
   isLoading?: boolean;
 
   /**
+   * Custom empty state component to display when there are no results
+   * If not provided, shows default "No results." text
+   */
+  emptyState?: React.ReactNode;
+
+  /**
    * Show page size selector
    */
   showPageSizeSelector?: boolean;
@@ -140,6 +146,7 @@ export function DataTable<TData, TValue>({
   serverPagination,
   externalSearch,
   isLoading = false,
+  emptyState,
   showPageSizeSelector = false,
   pageSizeOptions = [10, 25, 50, 100],
 }: DataTableProps<TData, TValue>) {
@@ -472,9 +479,9 @@ export function DataTable<TData, TValue>({
               <TableRow>
                 <TableCell
                   colSpan={columns.length}
-                  className="h-24 text-center"
+                  className={emptyState ? "p-0" : "h-24 text-center"}
                 >
-                  No results.
+                  {emptyState || "No results."}
                 </TableCell>
               </TableRow>
             )}
