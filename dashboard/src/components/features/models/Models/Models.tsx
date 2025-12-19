@@ -40,6 +40,12 @@ const Models: React.FC = () => {
     ...new Set(["all", ...(endpointsData || []).map((e) => e.name).sort()]),
   ];
 
+  // Get endpoint ID from selected provider name for server-side filtering
+  const selectedEndpointId =
+    filterProvider !== "all"
+      ? endpointsData?.find((e) => e.name === filterProvider)?.id
+      : undefined;
+
   // Sync search query to URL params
   useEffect(() => {
     setSearchParams(
@@ -56,11 +62,11 @@ const Models: React.FC = () => {
     );
   }, [searchQuery, setSearchParams]);
 
-  // Reset pagination when search query changes
+  // Reset pagination when search query or endpoint filter changes
   useEffect(() => {
     pagination.handleReset();
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [debouncedSearch]);
+  }, [debouncedSearch, selectedEndpointId]);
 
   const viewMode = searchParams.get("view") || "grid";
   const isStatusMode = viewMode === "status";
@@ -168,6 +174,7 @@ const Models: React.FC = () => {
           pagination={pagination}
           searchQuery={debouncedSearch}
           filterProvider={filterProvider}
+          endpointId={selectedEndpointId}
           showAccessibleOnly={showAccessibleOnly}
           isStatusMode={isStatusMode}
           canManageGroups={canManageGroups}

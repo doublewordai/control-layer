@@ -71,8 +71,11 @@ pub struct ListUsersQuery {
     #[param(inline)]
     pub pagination: Pagination,
 
-    /// Include related data (comma-separated: "groups")
+    /// Include related data (comma-separated: "groups", "billing")
     pub include: Option<String>,
+
+    /// Search query to filter users by display_name, username, or email (case-insensitive substring match)
+    pub search: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]

@@ -17,11 +17,17 @@ use uuid::Uuid;
 pub struct GroupFilter {
     pub skip: i64,
     pub limit: i64,
+    pub search: Option<String>, // Case-insensitive substring search on name and description
 }
 
 impl GroupFilter {
     pub fn new(skip: i64, limit: i64) -> Self {
-        Self { skip, limit }
+        Self { skip, limit, search: None }
+    }
+
+    pub fn with_search(mut self, search: String) -> Self {
+        self.search = Some(search);
+        self
     }
 }
 
@@ -154,14 +160,34 @@ impl<'c> Repository for Groups<'c> {
 
     #[instrument(skip(self, filter), fields(limit = filter.limit, skip = filter.skip), err)]
     async fn list(&mut self, filter: &Self::Filter) -> Result<Vec<Self::Response>> {
-        let groups = sqlx::query_as!(
-            Group,
-            "SELECT * FROM groups ORDER BY name LIMIT $1 OFFSET $2",
-            filter.limit,
-            filter.skip
-        )
-        .fetch_all(&mut *self.db)
-        .await?;
+        use sqlx::QueryBuilder;
+
+        let mut query = QueryBuilder::new("SELECT * FROM groups WHERE 1=1");
+
+        // Add search filter if specified (case-insensitive substring match on name or description)
+        if let Some(ref search) = filter.search {
+            tracing::info!("Database layer: Building search query for '{}'", search);
+            let search_pattern = format!("%{}%", search.to_lowercase());
+            query.push(" AND (LOWER(name) LIKE ");
+            query.push_bind(search_pattern.clone());
+            query.push(" OR LOWER(COALESCE(description, '')) LIKE ");
+            query.push_bind(search_pattern);
+            query.push(")");
+        } else {
+            tracing::info!("Database layer: No search filter in GroupFilter");
+        }
+
+        query.push(" ORDER BY name LIMIT ");
+        query.push_bind(filter.limit);
+        query.push(" OFFSET ");
+        query.push_bind(filter.skip);
+
+        let sql = query.sql();
+        tracing::info!("Executing SQL: {}", sql);
+
+        let groups = query.build_query_as::<Group>().fetch_all(&mut *self.db).await?;
+
+        tracing::info!("Database layer: Retrieved {} groups", groups.len());
 
         Ok(groups.into_iter().map(GroupDBResponse::from).collect())
     }
@@ -191,11 +217,25 @@ impl<'c> Groups<'c> {
         Self { db }
     }
 
-    #[instrument(skip(self), err)]
-    pub async fn count(&mut self) -> Result<i64> {
-        let count = sqlx::query_scalar!("SELECT COUNT(*) FROM groups").fetch_one(&mut *self.db).await?;
+    #[instrument(skip(self, filter), err)]
+    pub async fn count(&mut self, filter: &GroupFilter) -> Result<i64> {
+        use sqlx::QueryBuilder;
 
-        Ok(count.unwrap_or(0))
+        let mut query = QueryBuilder::new("SELECT COUNT(*) FROM groups WHERE 1=1");
+
+        // Add search filter if specified
+        if let Some(ref search) = filter.search {
+            let search_pattern = format!("%{}%", search.to_lowercase());
+            query.push(" AND (LOWER(name) LIKE ");
+            query.push_bind(search_pattern.clone());
+            query.push(" OR LOWER(COALESCE(description, '')) LIKE ");
+            query.push_bind(search_pattern);
+            query.push(")");
+        }
+
+        let count: i64 = query.build_query_scalar().fetch_one(&mut *self.db).await?;
+
+        Ok(count)
     }
 
     #[instrument(skip(self), fields(user_id = %abbrev_uuid(&user_id), group_id = %abbrev_uuid(&group_id)), err)]
