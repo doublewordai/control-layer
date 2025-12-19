@@ -603,13 +603,27 @@ fn create_cors_layer(config: &Config) -> anyhow::Result<CorsLayer> {
     for origin in &config.auth.security.cors.allowed_origins {
         let header_value = match origin {
             CorsOrigin::Wildcard => "*".parse::<HeaderValue>()?,
-            CorsOrigin::Url(url) => url.as_str().parse::<HeaderValue>()?,
+            CorsOrigin::Url(url) => {
+                // Strip trailing slash that Url::parse adds during normalization
+                let url_str = url.as_str().trim_end_matches('/');
+                url_str.parse::<HeaderValue>()?
+            }
         };
         origins.push(header_value);
     }
 
+    info!("Configuring CORS with allowed origins: {:?}", origins);
     let mut cors = CorsLayer::new()
         .allow_origin(origins)
+        .allow_methods([
+            http::Method::GET,
+            http::Method::POST,
+            http::Method::PUT,
+            http::Method::DELETE,
+            http::Method::PATCH,
+            http::Method::OPTIONS,
+        ])
+        .allow_headers([http::header::CONTENT_TYPE, http::header::AUTHORIZATION, http::header::ACCEPT])
         .allow_credentials(config.auth.security.cors.allow_credentials)
         .expose_headers(vec![http::header::LOCATION]);
 
@@ -819,6 +833,7 @@ pub async fn build_router(state: &mut AppState, onwards_router: Router) -> anyho
                 .route("/batches", post(api::handlers::batches::create_batch))
                 .route("/batches", get(api::handlers::batches::list_batches))
                 .route("/batches/{batch_id}", get(api::handlers::batches::get_batch))
+                .route("/batches/{batch_id}", delete(api::handlers::batches::delete_batch))
                 .route("/batches/{batch_id}/analytics", get(api::handlers::batches::get_batch_analytics))
                 .route("/batches/{batch_id}/cancel", post(api::handlers::batches::cancel_batch))
                 .route(

@@ -211,7 +211,7 @@ describe("dwctlApi.users", () => {
         const keyData: ApiKeyCreateRequest = {
           name: "Test Key",
           description: "Test description",
-          purpose: "inference",
+          purpose: "realtime",
         };
 
         const createdKey = await dwctlApi.users.apiKeys.create(keyData);
@@ -227,7 +227,7 @@ describe("dwctlApi.users", () => {
         const userId = "550e8400-e29b-41d4-a716-446655440001";
         const keyData: ApiKeyCreateRequest = {
           name: "User Key",
-          purpose: "inference",
+          purpose: "realtime",
         };
 
         const createdKey = await dwctlApi.users.apiKeys.create(keyData, userId);

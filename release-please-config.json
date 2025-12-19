@@ -1,15 +1,20 @@
 {
   "packages": {
     ".": {
-      "release-type": "rust",
-      "extra-files": ["dashboard/package.json"]
+      "release-type": "simple",
+      "extra-files": [
+        {
+          "type": "toml",
+          "path": "dwctl/Cargo.toml",
+          "jsonpath": "$.package.version"
+        },
+        {
+          "type": "json",
+          "path": "dashboard/package.json",
+          "jsonpath": "$.version"
+        }
+      ]
     }
   },
-  "plugins": [
-    {
-      "type": "cargo-workspace"
-    }
-  ],
-  "include-component-in-tag": false,
-  "separate-pull-requests": false
+  "include-component-in-tag": false
 }

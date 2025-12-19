@@ -19,17 +19,24 @@ interface CodeBlockProps {
 
 export function CodeBlock({ language, children, className }: CodeBlockProps) {
   return (
-    <SyntaxHighlighter
-      language={language}
-      style={oneDark}
-      customStyle={{
-        margin: 0,
-        borderRadius: "0.375rem",
-        fontSize: "0.875rem",
-      }}
-      className={className}
-    >
-      {children}
-    </SyntaxHighlighter>
+    <div style={{ maxWidth: "100%", overflow: "auto" }}>
+      <SyntaxHighlighter
+        language={language}
+        style={oneDark}
+        customStyle={{
+          margin: 0,
+          borderRadius: 0,
+          fontSize: "0.875rem",
+          maxWidth: "100%",
+          overflowX: "auto",
+          padding: "1rem",
+        }}
+        className={className}
+        wrapLongLines={false}
+        PreTag="div"
+      >
+        {children}
+      </SyntaxHighlighter>
+    </div>
   );
 }
