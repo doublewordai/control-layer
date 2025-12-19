@@ -223,6 +223,7 @@ export interface GroupsQuery {
   skip?: number;
   limit?: number;
   include?: GroupsInclude;
+  search?: string;
 }
 
 export interface UsersQuery {

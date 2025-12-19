@@ -98,6 +98,10 @@ const UsersGroups: React.FC = () => {
   const [userSearchQuery, setUserSearchQuery] = useState("");
   const debouncedUserSearch = useDebounce(userSearchQuery, 300);
 
+  // Search state for groups (server-side) - must be declared before useGroups hook
+  const [groupSearchQuery, setGroupSearchQuery] = useState("");
+  const debouncedGroupSearch = useDebounce(groupSearchQuery, 300);
+
   // Data from the API: uses the tanstack query hooks to fetch both users and groups TODO: (this is a bit redundant right now, but we can optimize later)
   const {
     data: usersData,
@@ -115,6 +119,7 @@ const UsersGroups: React.FC = () => {
     error: groupsError,
   } = useGroups({
     include: "users",
+    search: debouncedGroupSearch || undefined,
     ...groupsPagination.queryParams,
   });
 
@@ -127,8 +132,11 @@ const UsersGroups: React.FC = () => {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [debouncedUserSearch]);
 
-  // Searching for groups (client-side)
-  const [searchQuery, setSearchQuery] = useState("");
+  // Reset pagination when group search changes
+  useEffect(() => {
+    groupsPagination.handleReset();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [debouncedGroupSearch]);
 
   // Selected users and groups for bulk operations
   const [selectedUsers, setSelectedUsers] = useState<DisplayUser[]>([]);
@@ -170,10 +178,10 @@ const UsersGroups: React.FC = () => {
   };
 
   const handleSelectAllGroups = () => {
-    if (selectedGroups.size === filteredGroups.length) {
+    if (selectedGroups.size === groups.length) {
       setSelectedGroups(new Set());
     } else {
-      setSelectedGroups(new Set(filteredGroups.map((g) => g.id)));
+      setSelectedGroups(new Set(groups.map((g) => g.id)));
     }
   };
 
@@ -232,12 +240,6 @@ const UsersGroups: React.FC = () => {
         memberIds: group.users ? group.users.map((user) => user.id) : [],
       }))
     : [];
-
-  const filteredGroups = groups.filter(
-    (group) =>
-      group.name.toLowerCase().includes(searchQuery.toLowerCase()) ||
-      group.description?.toLowerCase().includes(searchQuery.toLowerCase()),
-  );
 
   // Column configuration for users DataTable
   const userColumns = createUserColumns({
@@ -354,16 +356,15 @@ const UsersGroups: React.FC = () => {
               <Input
                 type="text"
                 placeholder="Search groups..."
-                value={searchQuery}
-                onChange={(e) => setSearchQuery(e.target.value)}
+                value={groupSearchQuery}
+                onChange={(e) => setGroupSearchQuery(e.target.value)}
                 className="pl-8"
                 aria-label="Search groups"
               />
             </div>
             {selectedGroups.size > 0 && (
               <div className="text-sm text-muted-foreground">
-                {selectedGroups.size} of {filteredGroups.length} group(s)
-                selected
+                {selectedGroups.size} of {groups.length} group(s) selected
               </div>
             )}
           </div>
@@ -372,13 +373,13 @@ const UsersGroups: React.FC = () => {
               <Users className="w-4 h-4" />
               Add Group
             </Button>
-            {filteredGroups.length > 0 && (
+            {groups.length > 0 && (
               <Button
                 variant="outline"
                 onClick={handleSelectAllGroups}
                 size="sm"
               >
-                {selectedGroups.size === filteredGroups.length
+                {selectedGroups.size === groups.length
                   ? "Deselect All"
                   : "Select All"}
               </Button>
@@ -473,7 +474,7 @@ const UsersGroups: React.FC = () => {
         {activeTab === "groups" && (
           /* Groups Grid */
           <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-6">
-            {filteredGroups.map((group, index) => {
+            {groups.map((group, index) => {
               const colorClass = getGroupColor(group.id, index);
               const isSelected = selectedGroups.has(group.id);
               return (
