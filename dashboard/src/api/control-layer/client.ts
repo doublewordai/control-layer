@@ -1012,6 +1012,7 @@ const filesApi = {
     if (options?.limit) params.set("limit", options.limit.toString());
     if (options?.order) params.set("order", options.order);
     if (options?.purpose) params.set("purpose", options.purpose);
+    if (options?.search) params.set("search", options.search);
 
     const url = `/ai/v1/files${params.toString() ? "?" + params.toString() : ""}`;
     const response = await fetch(url);
@@ -1105,6 +1106,7 @@ const batchesApi = {
     const params = new URLSearchParams();
     if (options?.after) params.set("after", options.after);
     if (options?.limit) params.set("limit", options.limit.toString());
+    if (options?.search) params.set("search", options.search);
 
     const url = `/ai/v1/batches${params.toString() ? "?" + params.toString() : ""}`;
     const response = await fetch(url);

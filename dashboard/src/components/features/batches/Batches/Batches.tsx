@@ -9,8 +9,10 @@ import {
   FileInput,
   FileCheck,
   AlertCircle,
+  Search,
 } from "lucide-react";
 import { Button } from "../../../ui/button";
+import { Input } from "../../../ui/input";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "../../../ui/tabs";
 import {
   Select,
@@ -30,6 +32,7 @@ import type {
   FileCostEstimate,
 } from "../../../../api/control-layer/types";
 import { useServerCursorPagination } from "../../../../hooks/useServerCursorPagination";
+import { useDebounce } from "../../../../hooks/useDebounce";
 
 /**
  * Props for the Batches component.
@@ -66,6 +69,12 @@ export function Batches({
 
   // Drag and drop state (kept locally as it's UI-only)
   const [dragActive, setDragActive] = useState(false);
+
+  // Search state for files and batches (server-side)
+  const [fileSearchQuery, setFileSearchQuery] = useState("");
+  const [batchSearchQuery, setBatchSearchQuery] = useState("");
+  const debouncedFileSearch = useDebounce(fileSearchQuery, 300);
+  const debouncedBatchSearch = useDebounce(batchSearchQuery, 300);
 
   // Sync URL with state changes
   const updateURL = (
@@ -118,6 +127,17 @@ export function Batches({
     defaultPageSize: 10,
   });
 
+  // Reset pagination when search changes
+  useEffect(() => {
+    filesPagination.handleFirstPage();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [debouncedFileSearch]);
+
+  useEffect(() => {
+    batchesPagination.handleFirstPage();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [debouncedBatchSearch]);
+
   // API queries
   // Paginated files query for display in Files tab
   // Map fileType to purpose filter
@@ -130,12 +150,13 @@ export function Batches({
 
   const { data: filesResponse, isLoading: filesLoading } = useFiles({
     purpose: filePurpose,
+    search: debouncedFileSearch.trim() || undefined,
     ...filesPagination.queryParams,
-    // Always fetch to populate tab counts, but refetch interval is lower when not active
   });
 
   // Paginated batches query
   const { data: batchesResponse, isLoading: batchesLoading } = useBatches({
+    search: debouncedBatchSearch.trim() || undefined,
     ...batchesPagination.queryParams,
     // Always fetch to populate tab counts, but refetch interval is lower when not active
   });
@@ -562,6 +583,10 @@ export function Batches({
                 columns={batchColumns}
                 data={filteredBatches}
                 searchPlaceholder="Search batches..."
+                externalSearch={{
+                  value: batchSearchQuery,
+                  onChange: setBatchSearchQuery,
+                }}
                 showColumnToggle={true}
                 pageSize={batchesPagination.pageSize}
                 minRows={batchesPagination.pageSize}
@@ -634,6 +659,10 @@ export function Batches({
                 columns={fileColumns}
                 data={files}
                 searchPlaceholder="Search files..."
+                externalSearch={{
+                  value: fileSearchQuery,
+                  onChange: setFileSearchQuery,
+                }}
                 showColumnToggle={true}
                 pageSize={filesPagination.pageSize}
                 minRows={filesPagination.pageSize}

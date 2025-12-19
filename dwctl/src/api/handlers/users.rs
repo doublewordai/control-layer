@@ -33,7 +33,8 @@ use tracing::error;
     params(
         ("skip" = Option<i64>, Query, description = "Number of users to skip"),
         ("limit" = Option<i64>, Query, description = "Maximum number of users to return"),
-        ("include" = Option<String>, Query, description = "Comma-separated list of related entities to include (e.g., 'groups')"),
+        ("include" = Option<String>, Query, description = "Comma-separated list of related entities to include (e.g., 'groups', 'billing')"),
+        ("search" = Option<String>, Query, description = "Search query to filter users by display_name, username, or email (case-insensitive substring match)"),
     ),
     responses(
         (status = 200, description = "List of users", body = [UserResponse]),
@@ -58,12 +59,20 @@ pub async fn list_users(
     let skip = query.pagination.skip();
     let limit = query.pagination.limit();
 
+    // Build filter with search if provided
+    let mut filter = UserFilter::new(skip, limit);
+    if let Some(search) = query.search.as_ref()
+        && !search.trim().is_empty()
+    {
+        filter = filter.with_search(search.trim().to_string());
+    }
+
     let users;
     let total_count;
     {
         let mut repo = Users::new(&mut tx);
-        users = repo.list(&UserFilter::new(skip, limit)).await?;
-        total_count = repo.count().await?;
+        users = repo.list(&filter).await?;
+        total_count = repo.count(&filter).await?;
     }
     // Parse include parameter
     let includes: Vec<&str> = query
@@ -383,7 +392,7 @@ pub async fn delete_user(
     let user_id_str = user_id.to_string();
     let batches = state
         .request_manager
-        .list_batches(Some(user_id_str.clone()), None, i64::MAX)
+        .list_batches(Some(user_id_str.clone()), None, None, i64::MAX)
         .await
         .map_err(|_| Error::NotFound {
             resource: "Batch".to_string(),

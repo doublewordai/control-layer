@@ -1,6 +1,7 @@
 import React, { useState, useRef, useEffect } from "react";
 import { useSearchParams, useNavigate } from "react-router-dom";
 import { Users, UserPlus, Search, X, Trash2 } from "lucide-react";
+import { useDebounce } from "@/hooks/useDebounce";
 import {
   useUsers,
   useGroups,
@@ -93,6 +94,10 @@ const UsersGroups: React.FC = () => {
     navigate(`/users-groups?${newParams.toString()}`, { replace: true });
   };
 
+  // Search state for users (server-side) - must be declared before useUsers hook
+  const [userSearchQuery, setUserSearchQuery] = useState("");
+  const debouncedUserSearch = useDebounce(userSearchQuery, 300);
+
   // Data from the API: uses the tanstack query hooks to fetch both users and groups TODO: (this is a bit redundant right now, but we can optimize later)
   const {
     data: usersData,
@@ -100,6 +105,7 @@ const UsersGroups: React.FC = () => {
     error: usersError,
   } = useUsers({
     include: "groups",
+    search: debouncedUserSearch || undefined,
     ...usersPagination.queryParams,
   });
 
@@ -115,7 +121,13 @@ const UsersGroups: React.FC = () => {
   const loading = usersLoading || groupsLoading;
   const error = usersError || groupsError;
 
-  // Searching for groups
+  // Reset pagination when user search changes
+  useEffect(() => {
+    usersPagination.handleReset();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [debouncedUserSearch]);
+
+  // Searching for groups (client-side)
   const [searchQuery, setSearchQuery] = useState("");
 
   // Selected users and groups for bulk operations
@@ -408,7 +420,10 @@ const UsersGroups: React.FC = () => {
             columns={userColumns}
             data={users}
             searchPlaceholder="Search users..."
-            searchColumn="name"
+            externalSearch={{
+              value: userSearchQuery,
+              onChange: setUserSearchQuery,
+            }}
             paginationMode="server"
             serverPagination={{
               page: usersPagination.page,
@@ -420,10 +435,12 @@ const UsersGroups: React.FC = () => {
             showPageSizeSelector={true}
             onSelectionChange={setSelectedUsers}
             headerActions={
-              <Button onClick={() => setShowCreateUserModal(true)} size="sm">
-                <UserPlus className="w-4 h-4" />
-                Add User
-              </Button>
+              <div className="flex items-center gap-2">
+                <Button onClick={() => setShowCreateUserModal(true)} size="sm">
+                  <UserPlus className="w-4 h-4" />
+                  Add User
+                </Button>
+              </div>
             }
             actionBar={
               <div className="bg-blue-50 border border-blue-200 rounded-lg p-3 mb-4 flex items-center justify-between">

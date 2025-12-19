@@ -20,6 +20,9 @@ pub struct ListFilesQuery {
 
     /// Only return files with the given purpose
     pub purpose: Option<String>,
+
+    /// Search query to filter files by filename (case-insensitive substring match)
+    pub search: Option<String>,
 }
 
 fn default_order() -> String {

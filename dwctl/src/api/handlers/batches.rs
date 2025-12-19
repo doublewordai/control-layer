@@ -716,10 +716,10 @@ pub async fn list_batches(
     let can_read_all = can_read_all_resources(&current_user, Resource::Batches);
     let created_by = if can_read_all { None } else { Some(current_user.id.to_string()) };
 
-    // Fetch batches with ownership filtering and cursor-based pagination
+    // Fetch batches with ownership filtering, search, and cursor-based pagination
     let batches = state
         .request_manager
-        .list_batches(created_by, after, limit + 1) // Fetch one extra to determine has_more
+        .list_batches(created_by, query.search.clone(), after, limit + 1) // Fetch one extra to determine has_more
         .await
         .map_err(|e| Error::Internal {
             operation: format!("list batches: {}", e),

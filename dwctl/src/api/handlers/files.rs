@@ -561,6 +561,7 @@ pub async fn list_files(
         // No status filtering
         status: None,
         purpose: query.purpose.clone(),
+        search: query.search.clone(),
         after,
         limit: Some((limit + 1) as usize), // Fetch one extra to check has_more
         ascending: query.order == "asc",
