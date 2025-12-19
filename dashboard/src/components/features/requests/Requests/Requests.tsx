@@ -1,4 +1,4 @@
-import { Activity, X, List, ArrowLeft, LayoutGrid } from "lucide-react";
+import { X, List, ArrowLeft, LayoutGrid } from "lucide-react";
 import { useState, useEffect } from "react";
 import { useSearchParams, useNavigate } from "react-router-dom";
 import {
@@ -51,6 +51,7 @@ export function Requests() {
   );
   const [customIdSearch, setCustomIdSearch] = useState<string>("");
   const debouncedCustomIdSearch = useDebounce(customIdSearch, 300);
+
   // Initialize with last 24 hours as default
   const getDefaultDateRange = () => {
     const now = new Date();
@@ -65,6 +66,11 @@ export function Requests() {
   const pagination = useServerPagination({
     defaultPageSize: 25,
   });
+
+  // Reset pagination when debounced search changes
+  useEffect(() => {
+    pagination.handlePageChange(1);
+  }, [debouncedCustomIdSearch]);
 
   // Query for limit + 1 to detect if there are more items
   const queryLimit = pagination.pageSize + 1;
@@ -170,32 +176,6 @@ export function Requests() {
   const hasNextPage = hasMore;
 
   const columns = createRequestColumns();
-
-  // Show loading state
-  if (loading) {
-    return (
-      <div className="py-4 px-6">
-        <div className="mb-4">
-          <h1 className="text-3xl font-bold text-doubleword-neutral-900">
-            Analytics
-          </h1>
-          <p className="text-doubleword-neutral-600 mt-2">
-            Loading analytics data...
-          </p>
-        </div>
-        <div className="flex items-center justify-center h-64">
-          <div className="text-center">
-            <div
-              className="animate-spin rounded-full h-12 w-12 border-b-2 border-doubleword-accent-blue mx-auto mb-4"
-              role="progressbar"
-              aria-label="Loading"
-            ></div>
-            <p className="text-doubleword-neutral-600">Loading...</p>
-          </div>
-        </div>
-      </div>
-    );
-  }
 
   // Show general error
   if (error) {
@@ -366,53 +346,34 @@ export function Requests() {
 
         {hasRequestsPermission && (
           <TabsContent value="requests" className="space-y-4">
-            {!requests || requests.length === 0 ? (
-              <div className="text-center py-12">
-                <div className="p-4 bg-doubleword-neutral-100 rounded-full w-16 h-16 mx-auto mb-4 flex items-center justify-center">
-                  <Activity className="w-8 h-8 text-doubleword-neutral-600" />
-                </div>
-                <h3 className="text-lg font-medium text-doubleword-neutral-900 mb-2">
-                  No requests found
-                </h3>
-                <p className="text-doubleword-neutral-600">
-                  No requests found for the selected time period. Try adjusting
-                  the date range or check back later once traffic starts flowing
-                  through the gateway.
-                </p>
-              </div>
-            ) : (
-              <DataTable
-                columns={columns}
-                data={requests}
-                searchPlaceholder="Search by custom ID..."
-                externalSearch={{
-                  value: customIdSearch,
-                  onChange: (value) => {
-                    setCustomIdSearch(value);
-                    pagination.handlePageChange(1);
-                  },
-                }}
-                showColumnToggle={true}
-                rowHeight="40px"
-                initialColumnVisibility={{ timestamp: false }}
-                paginationMode="server-cursor"
-                serverPagination={{
-                  page: pagination.page,
-                  pageSize: pagination.pageSize,
-                  onNextPage: () =>
-                    pagination.handlePageChange(pagination.page + 1),
-                  onPrevPage: () =>
-                    pagination.handlePageChange(pagination.page - 1),
-                  onFirstPage: () => pagination.handlePageChange(1),
-                  onPageSizeChange: pagination.handlePageSizeChange,
-                  hasNextPage: hasNextPage,
-                  hasPrevPage: hasPrevPage,
-                }}
-                showPageSizeSelector={true}
-                pageSizeOptions={[10, 25, 50]}
-                isLoading={requestsLoading}
-              />
-            )}
+            <DataTable
+              columns={columns}
+              data={requests}
+              searchPlaceholder="Search by custom ID..."
+              externalSearch={{
+                value: customIdSearch,
+                onChange: setCustomIdSearch,
+              }}
+              showColumnToggle={true}
+              rowHeight="40px"
+              initialColumnVisibility={{ timestamp: false }}
+              paginationMode="server-cursor"
+              serverPagination={{
+                page: pagination.page,
+                pageSize: pagination.pageSize,
+                onNextPage: () =>
+                  pagination.handlePageChange(pagination.page + 1),
+                onPrevPage: () =>
+                  pagination.handlePageChange(pagination.page - 1),
+                onFirstPage: () => pagination.handlePageChange(1),
+                onPageSizeChange: pagination.handlePageSizeChange,
+                hasNextPage: hasNextPage,
+                hasPrevPage: hasPrevPage,
+              }}
+              showPageSizeSelector={true}
+              pageSizeOptions={[10, 25, 50]}
+              isLoading={requestsLoading}
+            />
           </TabsContent>
         )}
 

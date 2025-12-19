@@ -1,4 +1,4 @@
-import { useState, useMemo } from "react";
+import { useState, useMemo, useEffect } from "react";
 import { useParams, useNavigate, useSearchParams } from "react-router-dom";
 import {
   ArrowLeft,
@@ -61,6 +61,11 @@ export function FileRequests() {
 
   // Use pagination hook for URL-based pagination state
   const pagination = useServerPagination({ defaultPageSize: 10 });
+
+  // Reset pagination when debounced search changes
+  useEffect(() => {
+    pagination.handleReset();
+  }, [debouncedSearch]);
 
   // Get file details - works for input, output, or error files
   const { data: file } = useFile(fileId || "");
@@ -166,81 +171,56 @@ export function FileRequests() {
       </div>
 
       {/* Requests Table */}
-      {isLoading ? (
-        <div className="flex items-center justify-center h-64">
-          <div className="text-center">
-            <div className="animate-spin rounded-full h-12 w-12 border-b-2 border-doubleword-accent-blue mx-auto"></div>
-            <p className="mt-4 text-gray-600">Loading requests...</p>
+      <DataTable
+        isLoading={isLoading}
+        columns={columns}
+        data={requests}
+        searchPlaceholder="Search by custom ID..."
+        externalSearch={{
+          value: searchInput,
+          onChange: setSearchInput,
+        }}
+        showColumnToggle={true}
+        pageSize={pagination.pageSize}
+        minRows={pagination.pageSize}
+        rowHeight="40px"
+        headerActions={
+          <div className="flex items-center gap-2">
+            <span className="text-sm text-gray-600">Rows:</span>
+            <Select
+              value={pagination.pageSize.toString()}
+              onValueChange={(value) => {
+                pagination.handlePageSizeChange(Number(value));
+              }}
+            >
+              <SelectTrigger className="w-20 h-8">
+                <SelectValue />
+              </SelectTrigger>
+              <SelectContent>
+                <SelectItem value="10">10</SelectItem>
+                <SelectItem value="25">25</SelectItem>
+                <SelectItem value="50">50</SelectItem>
+                <SelectItem value="100">100</SelectItem>
+                <SelectItem value="200">200</SelectItem>
+                <SelectItem value="500">500</SelectItem>
+              </SelectContent>
+            </Select>
           </div>
-        </div>
-      ) : requests.length === 0 ? (
-        <div className="text-center py-12">
-          <div className="p-4 bg-doubleword-neutral-100 rounded-full w-16 h-16 mx-auto mb-4 flex items-center justify-center">
-            <FileInput className="w-8 h-8 text-doubleword-neutral-600" />
-          </div>
-          <h3 className="text-lg font-medium text-doubleword-neutral-900 mb-2">
-            File is empty
-          </h3>
-          <p className="text-doubleword-neutral-600">
-            This file does not contain any data
-          </p>
-        </div>
-      ) : (
-        <>
-          <DataTable
-            columns={columns}
-            data={requests}
-            searchPlaceholder="Search by custom ID..."
-            externalSearch={{
-              value: searchInput,
-              onChange: (value) => {
-                setSearchInput(value);
-                pagination.handleReset();
-              },
-            }}
-            showColumnToggle={true}
-            pageSize={pagination.pageSize}
-            minRows={pagination.pageSize}
-            rowHeight="40px"
-            headerActions={
-              <div className="flex items-center gap-2">
-                <span className="text-sm text-gray-600">Rows:</span>
-                <Select
-                  value={pagination.pageSize.toString()}
-                  onValueChange={(value) => {
-                    pagination.handlePageSizeChange(Number(value));
-                  }}
-                >
-                  <SelectTrigger className="w-20 h-8">
-                    <SelectValue />
-                  </SelectTrigger>
-                  <SelectContent>
-                    <SelectItem value="10">10</SelectItem>
-                    <SelectItem value="25">25</SelectItem>
-                    <SelectItem value="50">50</SelectItem>
-                    <SelectItem value="100">100</SelectItem>
-                    <SelectItem value="200">200</SelectItem>
-                    <SelectItem value="500">500</SelectItem>
-                  </SelectContent>
-                </Select>
-              </div>
-            }
-          />
-          <CursorPagination
-            currentPage={pagination.page}
-            itemsPerPage={pagination.pageSize}
-            onNextPage={() => pagination.handlePageChange(pagination.page + 1)}
-            onPrevPage={() =>
-              pagination.handlePageChange(Math.max(1, pagination.page - 1))
-            }
-            onFirstPage={() => pagination.handlePageChange(1)}
-            hasNextPage={hasMore}
-            hasPrevPage={pagination.page > 1}
-            currentPageItemCount={requests.length}
-            itemName="requests"
-          />
-        </>
-      )}
+        }
+      />
+      <CursorPagination
+        currentPage={pagination.page}
+        itemsPerPage={pagination.pageSize}
+        onNextPage={() => pagination.handlePageChange(pagination.page + 1)}
+        onPrevPage={() =>
+          pagination.handlePageChange(Math.max(1, pagination.page - 1))
+        }
+        onFirstPage={() => pagination.handlePageChange(1)}
+        hasNextPage={hasMore}
+        hasPrevPage={pagination.page > 1}
+        currentPageItemCount={requests.length}
+        itemName="requests"
+      />
 
       {/* Download Modal */}
       {file && (
