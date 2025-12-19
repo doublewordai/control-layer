@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.17.4](https://github.com/doublewordai/control-layer/compare/v0.17.3...v0.17.4) (2025-12-18)
+
+
+### Bug Fixes
+
+* add more permissive cors ([#400](https://github.com/doublewordai/control-layer/issues/400)) ([29003fc](https://github.com/doublewordai/control-layer/commit/29003fcc9a9319f323d655bd03cdc7b846036443))
+
 ## [0.17.3](https://github.com/doublewordai/control-layer/compare/v0.17.2...v0.17.3) (2025-12-18)
 
 
