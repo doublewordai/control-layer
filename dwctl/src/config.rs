@@ -66,13 +66,13 @@
 //! ```
 
 use clap::Parser;
+use dashmap::DashMap;
 use figment::{
     Figment,
     providers::{Env, Format, Yaml},
 };
 use serde::{Deserialize, Serialize};
-use std::path::PathBuf;
-use std::time::Duration;
+use std::{collections::HashMap, path::PathBuf, sync::Arc, time::Duration};
 use url::Url;
 
 use crate::api::models::users::Role;
@@ -694,6 +694,41 @@ pub struct DaemonConfig {
     /// Maximum time a request can stay in "processing" state before being unclaimed
     /// and returned to pending (milliseconds). This handles daemon crashes during execution. (default: 600000 = 10 minutes)
     pub processing_timeout_ms: u64,
+
+    /// Per-model priority endpoint configurations for SLA escalation
+    pub priority_endpoints: HashMap<String, fusillade::PriorityEndpointConfig>,
+
+    /// How often to check for batches approaching SLA deadlines (seconds)
+    pub sla_check_interval_seconds: u64,
+
+    /// SLA threshold configurations.
+    /// Each threshold defines a time limit and action to take when batches approach expiration.
+    /// The daemon will query the database once per threshold to find at-risk batches.
+    ///
+    /// Example: Two thresholds (warning at 1 hour, critical at 15 minutes)
+    /// ```
+    /// use fusillade::daemon::{SlaThreshold, SlaAction, SlaLogLevel};
+    /// use fusillade::request::RequestStateFilter;
+    ///
+    /// vec![
+    ///     SlaThreshold {
+    ///         name: "warning".to_string(),
+    ///         threshold_seconds: 3600,
+    ///         action: SlaAction::Log { level: SlaLogLevel::Warn },
+    ///         allowed_states: vec![RequestStateFilter::Pending],
+    ///     },
+    ///     SlaThreshold {
+    ///         name: "critical".to_string(),
+    ///         threshold_seconds: 900,
+    ///         action: SlaAction::Log { level: SlaLogLevel::Error },
+    ///         // Act on both pending and claimed requests for critical threshold
+    ///         allowed_states: vec![RequestStateFilter::Pending, RequestStateFilter::Claimed],
+    ///     },
+    /// ]
+    /// # ;
+    /// ```
+    #[serde(default)]
+    pub sla_thresholds: Vec<fusillade::SlaThreshold>,
 }
 
 impl Default for DaemonConfig {
@@ -712,6 +747,9 @@ impl Default for DaemonConfig {
             status_log_interval_ms: Some(2000),
             claim_timeout_ms: 60000,
             processing_timeout_ms: 600000,
+            priority_endpoints: HashMap::new(),
+            sla_check_interval_seconds: 60,
+            sla_thresholds: vec![],
         }
     }
 }
@@ -740,6 +778,9 @@ impl DaemonConfig {
             status_log_interval_ms: self.status_log_interval_ms,
             claim_timeout_ms: self.claim_timeout_ms,
             processing_timeout_ms: self.processing_timeout_ms,
+            priority_endpoints: Arc::new(DashMap::from_iter(self.priority_endpoints.clone())),
+            sla_check_interval_seconds: self.sla_check_interval_seconds,
+            sla_thresholds: self.sla_thresholds.clone(),
             ..Default::default()
         }
     }
