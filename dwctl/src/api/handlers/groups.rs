@@ -33,6 +33,7 @@ use sqlx::Acquire;
     params(
         ("skip" = Option<i64>, Query, description = "Number of groups to skip"),
         ("limit" = Option<i64>, Query, description = "Maximum number of groups to return"),
+        ("search" = Option<String>, Query, description = "Search query to filter groups by name or description (case-insensitive substring match)"),
     ),
     security(
         ("BearerAuth" = []),
