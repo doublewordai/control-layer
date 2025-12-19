@@ -12,7 +12,6 @@ import {
   Loader2,
   RotateCcw,
   Timer,
-  Activity,
   ExternalLink,
 } from "lucide-react";
 import {
@@ -376,8 +375,19 @@ const BatchInfo: React.FC = () => {
           {/* Analytics Card */}
           {analytics && (
             <Card className="p-0 gap-0 rounded-lg">
-              <CardHeader className="px-6 pt-5 pb-4">
+              <CardHeader className="flex w-full justify-between px-6 pt-5 pb-4">
                 <CardTitle>Metrics</CardTitle>
+                <Button
+                  variant="outline"
+                  onClick={() =>
+                    navigate(
+                      `/analytics?tab=requests&fusillade_batch_id=${batchId}&from=/batches/${batchId}`,
+                    )
+                  }
+                >
+                  View Request Analytics
+                  <ExternalLink className="ml-2 h-4 w-4" />
+                </Button>
               </CardHeader>
               <CardContent className="px-6 pb-6 pt-0">
                 {analyticsLoading ? (
@@ -449,25 +459,6 @@ const BatchInfo: React.FC = () => {
               </CardContent>
             </Card>
           )}
-
-          {/* View Request Analytics Link */}
-          <Card className="p-0 gap-0 rounded-lg">
-            <CardContent className="px-6 py-4">
-              <Button
-                variant="outline"
-                className="w-full"
-                onClick={() =>
-                  navigate(
-                    `/analytics?tab=requests&fusillade_batch_id=${batchId}&from=/batches/${batchId}`,
-                  )
-                }
-              >
-                <Activity className="mr-2 h-4 w-4" />
-                View Request Analytics
-                <ExternalLink className="ml-2 h-4 w-4" />
-              </Button>
-            </CardContent>
-          </Card>
 
           {/* Batch Details */}
           <Card className="p-0 gap-0 rounded-lg">

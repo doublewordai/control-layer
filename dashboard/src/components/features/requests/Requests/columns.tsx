@@ -310,6 +310,29 @@ export const createRequestColumns = (): ColumnDef<RequestsEntry>[] => [
     size: 100,
   },
   {
+    accessorKey: "custom_id",
+    header: "Custom ID",
+    cell: ({ row }) => {
+      const customId = row.getValue("custom_id") as string | undefined;
+      if (!customId) {
+        return <span className="text-gray-400">-</span>;
+      }
+      return (
+        <Tooltip>
+          <TooltipTrigger asChild>
+            <span className="font-mono text-sm text-doubleword-neutral-700 truncate max-w-24 block cursor-help">
+              {customId}
+            </span>
+          </TooltipTrigger>
+          <TooltipContent>
+            <span className="font-mono text-xs">{customId}</span>
+          </TooltipContent>
+        </Tooltip>
+      );
+    },
+    size: 120,
+  },
+  {
     accessorKey: "response_type",
     header: "Type",
     cell: ({ row }) => {

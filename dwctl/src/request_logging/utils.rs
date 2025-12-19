@@ -127,7 +127,7 @@ pub(crate) fn decompress_response_if_needed(
 /// # Returns
 /// * `Some(Uuid)` - Successfully extracted and parsed UUID (either full or padded from 8-char hex)
 /// * `None` - Header missing, empty, or invalid format
-pub(crate) fn extract_header_value_as_string(request_data: &outlet::RequestData, header_name: &str) -> Option<uuid::Uuid> {
+pub(crate) fn extract_header_value_as_uuid(request_data: &outlet::RequestData, header_name: &str) -> Option<uuid::Uuid> {
     request_data
         .headers
         .get(header_name)
@@ -141,6 +141,25 @@ pub(crate) fn extract_header_value_as_string(request_data: &outlet::RequestData,
 
             None
         })
+}
+
+/// Extracts a header value as a raw string from request headers.
+///
+/// # Arguments
+/// * `request_data` - The HTTP request data containing headers
+/// * `header_name` - The name of the header to extract
+///
+/// # Returns
+/// * `Some(String)` - Successfully extracted string value
+/// * `None` - Header missing, empty, or invalid UTF-8
+pub(crate) fn extract_header_value_as_string(request_data: &outlet::RequestData, header_name: &str) -> Option<String> {
+    request_data
+        .headers
+        .get(header_name)
+        .and_then(|values| values.first())
+        .and_then(|bytes| std::str::from_utf8(bytes).ok())
+        .filter(|s| !s.is_empty())
+        .map(|s| s.to_string())
 }
 
 #[cfg(test)]

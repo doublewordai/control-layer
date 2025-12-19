@@ -58,6 +58,7 @@ pub async fn list_requests(
         timestamp_before: query.timestamp_before,
         model: query.model,
         fusillade_batch_id: query.fusillade_batch_id,
+        custom_id: query.custom_id,
     };
 
     // Query the http_analytics table

@@ -3,7 +3,7 @@ use crate::db::errors::Result as DbResult;
 use crate::db::handlers::Credits;
 use crate::db::models::credits::{CreditTransactionCreateDBRequest, CreditTransactionType};
 use crate::request_logging::models::{AiRequest, AiResponse, ChatCompletionChunk, ParsedAIRequest};
-use crate::request_logging::utils::extract_header_value_as_string;
+use crate::request_logging::utils::{extract_header_value_as_string, extract_header_value_as_uuid};
 use outlet::{RequestData, ResponseData};
 use outlet_postgres::SerializationError;
 use rust_decimal::{Decimal, prelude::ToPrimitive};
@@ -79,6 +79,7 @@ pub struct HttpAnalyticsRow {
     pub provider_name: Option<String>,
     pub fusillade_batch_id: Option<Uuid>,
     pub fusillade_request_id: Option<Uuid>,
+    pub custom_id: Option<String>,
 }
 
 /// Usage metrics extracted from AI responses (subset of HttpAnalyticsRow)
@@ -336,9 +337,10 @@ pub async fn store_analytics_record(
     auth: &Auth,
     request_data: &RequestData,
 ) -> DbResult<HttpAnalyticsRow> {
-    // Extract fusillade request ID if present
-    let fusillade_batch_id = extract_header_value_as_string(request_data, "x-fusillade-batch-id");
-    let fusillade_request_id = extract_header_value_as_string(request_data, "x-fusillade-request-id");
+    // Extract fusillade headers if present
+    let fusillade_batch_id = extract_header_value_as_uuid(request_data, "x-fusillade-batch-id");
+    let fusillade_request_id = extract_header_value_as_uuid(request_data, "x-fusillade-request-id");
+    let custom_id = extract_header_value_as_string(request_data, "x-fusillade-custom-id");
 
     // Extract user information and API key purpose based on auth type
     let (user_id, user_email, access_source, api_key_purpose) = match auth {
@@ -451,6 +453,7 @@ pub async fn store_analytics_record(
         provider_name,
         fusillade_batch_id,
         fusillade_request_id,
+        custom_id,
     };
 
     // Insert the analytics record and get the ID
@@ -460,9 +463,9 @@ pub async fn store_analytics_record(
             instance_id, correlation_id, timestamp, method, uri, model,
             status_code, duration_ms, duration_to_first_byte_ms, prompt_tokens, completion_tokens,
             total_tokens, response_type, user_id, user_email, access_source,
-            input_price_per_token, output_price_per_token, fusillade_batch_id, fusillade_request_id
+            input_price_per_token, output_price_per_token, fusillade_batch_id, fusillade_request_id, custom_id
         )
-        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20)
+        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21)
         ON CONFLICT (instance_id, correlation_id)
         DO UPDATE SET
             status_code = EXCLUDED.status_code,
@@ -478,7 +481,8 @@ pub async fn store_analytics_record(
             input_price_per_token = EXCLUDED.input_price_per_token,
             output_price_per_token = EXCLUDED.output_price_per_token,
             fusillade_batch_id = EXCLUDED.fusillade_batch_id,
-            fusillade_request_id = EXCLUDED.fusillade_request_id
+            fusillade_request_id = EXCLUDED.fusillade_request_id,
+            custom_id = EXCLUDED.custom_id
         RETURNING id
         "#,
         row.instance_id,
@@ -500,7 +504,8 @@ pub async fn store_analytics_record(
         row.input_price_per_token,
         row.output_price_per_token,
         row.fusillade_batch_id,
-        row.fusillade_request_id
+        row.fusillade_request_id,
+        row.custom_id
     )
     .fetch_one(pool)
     .await?;

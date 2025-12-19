@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useState, useMemo } from "react";
 import { useParams, useNavigate, useSearchParams } from "react-router-dom";
 import {
   ArrowLeft,
@@ -7,6 +7,7 @@ import {
   AlertCircle,
   Download,
 } from "lucide-react";
+import { useDebounce } from "../../../../hooks/useDebounce";
 import { Button } from "../../../ui/button";
 import { DataTable } from "../../../ui/data-table";
 import { CursorPagination } from "../../../ui/cursor-pagination";
@@ -54,6 +55,10 @@ export function FileRequests() {
     useState<FileRequestOrResponse | null>(null);
   const [requestBodyModalOpen, setRequestBodyModalOpen] = useState(false);
 
+  // Search state with debounce for server-side filtering
+  const [searchInput, setSearchInput] = useState("");
+  const debouncedSearch = useDebounce(searchInput, 300);
+
   // Use pagination hook for URL-based pagination state
   const pagination = useServerPagination({ defaultPageSize: 10 });
 
@@ -74,11 +79,17 @@ export function FileRequests() {
         ["validating", "in_progress", "finalizing"].includes(b.status),
     );
 
-  // Fetch file content with pagination using custom hook
-  const { data, isLoading } = useFileContent(
-    fileId || "",
-    pagination.queryParams,
+  // Build query params with search
+  const queryParams = useMemo(
+    () => ({
+      ...pagination.queryParams,
+      search: debouncedSearch || undefined,
+    }),
+    [pagination.queryParams, debouncedSearch],
   );
+
+  // Fetch file content with pagination and search using custom hook
+  const { data, isLoading } = useFileContent(fileId || "", queryParams);
 
   // Parse JSONL into requests (could be templates or responses)
   const requests: FileRequestOrResponse[] = data?.content
@@ -180,6 +191,13 @@ export function FileRequests() {
             columns={columns}
             data={requests}
             searchPlaceholder="Search by custom ID..."
+            externalSearch={{
+              value: searchInput,
+              onChange: (value) => {
+                setSearchInput(value);
+                pagination.handleReset();
+              },
+            }}
             showColumnToggle={true}
             pageSize={pagination.pageSize}
             minRows={pagination.pageSize}

@@ -15,6 +15,7 @@ import { DateTimeRangeSelector } from "../../../ui/date-time-range-selector";
 import { RequestsAnalytics } from "../RequestsAnalytics";
 import { createRequestColumns } from "./columns";
 import type { RequestsEntry } from "../types";
+import { useDebounce } from "../../../../hooks/useDebounce";
 
 // Transform API analytics entry to frontend display type
 function transformAnalyticsEntry(entry: AnalyticsEntry): RequestsEntry {
@@ -34,6 +35,7 @@ function transformAnalyticsEntry(entry: AnalyticsEntry): RequestsEntry {
     fusillade_batch_id: entry.fusillade_batch_id,
     input_price_per_token: entry.input_price_per_token,
     output_price_per_token: entry.output_price_per_token,
+    custom_id: entry.custom_id,
   };
 }
 
@@ -47,6 +49,8 @@ export function Requests() {
   const [batchIdFilter, setBatchIdFilter] = useState<string | undefined>(
     undefined,
   );
+  const [customIdSearch, setCustomIdSearch] = useState<string>("");
+  const debouncedCustomIdSearch = useDebounce(customIdSearch, 300);
   // Initialize with last 24 hours as default
   const getDefaultDateRange = () => {
     const now = new Date();
@@ -133,6 +137,7 @@ export function Requests() {
       order_desc: true,
       model: selectedModel,
       fusillade_batch_id: batchIdFilter,
+      custom_id: debouncedCustomIdSearch || undefined,
     },
     { enabled: hasRequestsPermission && activeTab === "requests" },
     dateRange,
@@ -379,7 +384,14 @@ export function Requests() {
               <DataTable
                 columns={columns}
                 data={requests}
-                searchPlaceholder="Search requests and responses..."
+                searchPlaceholder="Search by custom ID..."
+                externalSearch={{
+                  value: customIdSearch,
+                  onChange: (value) => {
+                    setCustomIdSearch(value);
+                    pagination.handlePageChange(1);
+                  },
+                }}
                 showColumnToggle={true}
                 rowHeight="40px"
                 initialColumnVisibility={{ timestamp: false }}

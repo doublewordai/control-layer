@@ -390,6 +390,7 @@ export interface AnalyticsEntry {
   fusillade_batch_id?: string;
   input_price_per_token?: string;
   output_price_per_token?: string;
+  custom_id?: string;
 }
 
 export interface ListAnalyticsResponse {
@@ -541,6 +542,7 @@ export interface ListRequestsQuery {
   order_desc?: boolean;
   model?: string;
   fusillade_batch_id?: string;
+  custom_id?: string;
 }
 
 // Validation schemas

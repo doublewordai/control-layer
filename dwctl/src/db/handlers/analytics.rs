@@ -832,6 +832,7 @@ struct HttpAnalyticsRow {
     pub fusillade_batch_id: Option<Uuid>,
     pub input_price_per_token: Option<Decimal>,
     pub output_price_per_token: Option<Decimal>,
+    pub custom_id: Option<String>,
 }
 
 /// List HTTP analytics entries with filtering and pagination
@@ -843,6 +844,9 @@ pub async fn list_http_analytics(
     order_desc: bool,
     filters: HttpAnalyticsFilter,
 ) -> Result<Vec<AnalyticsEntry>> {
+    // Wrap custom_id in wildcards for ILIKE substring matching
+    let custom_id_pattern = filters.custom_id.as_ref().map(|s| format!("%{}%", s));
+
     let rows = sqlx::query_as!(
         HttpAnalyticsRow,
         r#"
@@ -861,7 +865,8 @@ pub async fn list_http_analytics(
             user_email,
             fusillade_batch_id,
             input_price_per_token,
-            output_price_per_token
+            output_price_per_token,
+            custom_id
         FROM http_analytics
         WHERE
             ($1::timestamptz IS NULL OR timestamp >= $1)
@@ -875,9 +880,10 @@ pub async fn list_http_analytics(
             AND ($9::int IS NULL OR status_code <= $9)
             AND ($10::bigint IS NULL OR duration_ms >= $10)
             AND ($11::bigint IS NULL OR duration_ms <= $11)
+            AND ($12::text IS NULL OR custom_id ILIKE $12)
         ORDER BY timestamp DESC
-        LIMIT $12
-        OFFSET $13
+        LIMIT $13
+        OFFSET $14
         "#,
         filters.timestamp_after,
         filters.timestamp_before,
@@ -890,6 +896,7 @@ pub async fn list_http_analytics(
         filters.status_code_max,
         filters.min_duration_ms,
         filters.max_duration_ms,
+        custom_id_pattern,
         limit,
         skip,
     )
@@ -917,6 +924,7 @@ pub async fn list_http_analytics(
             fusillade_batch_id: row.fusillade_batch_id,
             input_price_per_token: row.input_price_per_token.map(|p| p.to_string()),
             output_price_per_token: row.output_price_per_token.map(|p| p.to_string()),
+            custom_id: row.custom_id,
         })
         .collect();
 

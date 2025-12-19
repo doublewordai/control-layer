@@ -698,7 +698,7 @@ export function useFile(id: string) {
 
 export function useFileContent(
   id: string,
-  options?: { limit?: number; skip?: number },
+  options?: { limit?: number; skip?: number; search?: string },
 ) {
   const queryClient = useQueryClient();
 

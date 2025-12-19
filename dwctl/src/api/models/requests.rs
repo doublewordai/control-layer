@@ -114,6 +114,9 @@ pub struct ListRequestsQuery {
 
     /// Filter by fusillade batch ID
     pub fusillade_batch_id: Option<uuid::Uuid>,
+
+    /// Filter by custom_id (case-insensitive search)
+    pub custom_id: Option<String>,
 }
 
 /// API-compatible HTTP request representation
@@ -181,6 +184,8 @@ pub struct HttpAnalyticsFilter {
     pub model: Option<String>,
     /// Filter by fusillade batch ID
     pub fusillade_batch_id: Option<uuid::Uuid>,
+    /// Filter by custom_id (case-insensitive search)
+    pub custom_id: Option<String>,
 }
 
 /// A single analytics entry from the http_analytics table
@@ -227,6 +232,9 @@ pub struct AnalyticsEntry {
     /// Output/completion price per token (for cost calculation)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub output_price_per_token: Option<String>,
+    /// Custom ID from fusillade batch request
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub custom_id: Option<String>,
 }
 
 /// Response containing a list of analytics entries
@@ -252,6 +260,7 @@ impl Default for ListRequestsQuery {
             order_desc: Some(true),
             model: None,
             fusillade_batch_id: None,
+            custom_id: None,
         }
     }
 }

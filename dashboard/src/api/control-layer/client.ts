@@ -585,6 +585,7 @@ const requestsApi = {
     if (options?.model) params.set("model", options.model);
     if (options?.fusillade_batch_id)
       params.set("fusillade_batch_id", options.fusillade_batch_id);
+    if (options?.custom_id) params.set("custom_id", options.custom_id);
 
     const url = `/admin/api/v1/requests${params.toString() ? "?" + params.toString() : ""}`;
     const response = await fetch(url);
@@ -1077,11 +1078,12 @@ const filesApi = {
   // Returns content, whether there are more results, and the last line number
   async getFileContent(
     id: string,
-    options?: { limit?: number; skip?: number },
+    options?: { limit?: number; skip?: number; search?: string },
   ): Promise<{ content: string; incomplete: boolean; lastLine: number }> {
     const params = new URLSearchParams();
     if (options?.limit) params.set("limit", options.limit.toString());
     if (options?.skip) params.set("skip", options.skip.toString());
+    if (options?.search) params.set("search", options.search);
 
     const url = `/ai/v1/files/${id}/content${params.toString() ? "?" + params.toString() : ""}`;
     const response = await fetch(url);
