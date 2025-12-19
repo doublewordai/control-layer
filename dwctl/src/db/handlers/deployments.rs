@@ -451,25 +451,27 @@ impl<'c> Repository for Deployments<'c> {
 
     #[instrument(skip(self, filter), fields(limit = filter.limit, skip = filter.skip), err)]
     async fn list(&mut self, filter: &Self::Filter) -> Result<Vec<Self::Response>> {
-        let mut query = QueryBuilder::new("SELECT * FROM deployed_models WHERE 1=1");
+        // Use LEFT JOIN with inference_endpoints to enable searching by endpoint name
+        let mut query =
+            QueryBuilder::new("SELECT dm.* FROM deployed_models dm LEFT JOIN inference_endpoints ie ON dm.hosted_on = ie.id WHERE 1=1");
 
         // Add endpoint filter if specified
         if let Some(endpoint_id) = filter.endpoint_id {
-            query.push(" AND hosted_on = ");
+            query.push(" AND dm.hosted_on = ");
             query.push_bind(endpoint_id);
         }
 
         // Add status filter if specified
         if let Some(ref statuses) = filter.statuses {
             let status_strings: Vec<String> = statuses.iter().map(|s| s.to_db_string().to_string()).collect();
-            query.push(" AND status = ANY(");
+            query.push(" AND dm.status = ANY(");
             query.push_bind(status_strings);
             query.push(")");
         }
 
         // Add deleted filter if specified
         if let Some(deleted) = filter.deleted {
-            query.push(" AND deleted = ");
+            query.push(" AND dm.deleted = ");
             query.push_bind(deleted);
         }
 
@@ -477,14 +479,14 @@ impl<'c> Repository for Deployments<'c> {
         if let Some(ref aliases) = filter.aliases
             && !aliases.is_empty()
         {
-            query.push(" AND alias = ANY(");
+            query.push(" AND dm.alias = ANY(");
             query.push_bind(aliases);
             query.push(")");
         }
 
         // Add accessibility filter if specified
         if let Some(user_id) = filter.accessible_to {
-            query.push(" AND id IN (");
+            query.push(" AND dm.id IN (");
             query.push("SELECT dg.deployment_id FROM deployment_groups dg WHERE dg.group_id IN (");
             query.push("SELECT ug.group_id FROM user_groups ug WHERE ug.user_id = ");
             query.push_bind(user_id);
@@ -494,12 +496,14 @@ impl<'c> Repository for Deployments<'c> {
             query.push("))");
         }
 
-        // Add search filter if specified (case-insensitive substring match on alias or model_name)
+        // Add search filter if specified (case-insensitive substring match on alias, model_name, or endpoint name)
         if let Some(ref search) = filter.search {
             let search_pattern = format!("%{}%", search.to_lowercase());
-            query.push(" AND (LOWER(alias) LIKE ");
+            query.push(" AND (LOWER(dm.alias) LIKE ");
             query.push_bind(search_pattern.clone());
-            query.push(" OR LOWER(model_name) LIKE ");
+            query.push(" OR LOWER(dm.model_name) LIKE ");
+            query.push_bind(search_pattern.clone());
+            query.push(" OR LOWER(ie.name) LIKE ");
             query.push_bind(search_pattern);
             query.push(")");
         }
@@ -567,25 +571,27 @@ impl<'c> Deployments<'c> {
     /// Count deployments matching the given filter (without pagination)
     #[instrument(skip(self, filter), err)]
     pub async fn count(&mut self, filter: &DeploymentFilter) -> Result<i64> {
-        let mut query = QueryBuilder::new("SELECT COUNT(*) FROM deployed_models WHERE 1=1");
+        // Use LEFT JOIN with inference_endpoints to enable searching by endpoint name
+        let mut query =
+            QueryBuilder::new("SELECT COUNT(*) FROM deployed_models dm LEFT JOIN inference_endpoints ie ON dm.hosted_on = ie.id WHERE 1=1");
 
         // Add endpoint filter if specified
         if let Some(endpoint_id) = filter.endpoint_id {
-            query.push(" AND hosted_on = ");
+            query.push(" AND dm.hosted_on = ");
             query.push_bind(endpoint_id);
         }
 
         // Add status filter if specified
         if let Some(ref statuses) = filter.statuses {
             let status_strings: Vec<String> = statuses.iter().map(|s| s.to_db_string().to_string()).collect();
-            query.push(" AND status = ANY(");
+            query.push(" AND dm.status = ANY(");
             query.push_bind(status_strings);
             query.push(")");
         }
 
         // Add deleted filter if specified
         if let Some(deleted) = filter.deleted {
-            query.push(" AND deleted = ");
+            query.push(" AND dm.deleted = ");
             query.push_bind(deleted);
         }
 
@@ -593,14 +599,14 @@ impl<'c> Deployments<'c> {
         if let Some(ref aliases) = filter.aliases
             && !aliases.is_empty()
         {
-            query.push(" AND alias = ANY(");
+            query.push(" AND dm.alias = ANY(");
             query.push_bind(aliases);
             query.push(")");
         }
 
         // Add accessibility filter if specified
         if let Some(user_id) = filter.accessible_to {
-            query.push(" AND id IN (");
+            query.push(" AND dm.id IN (");
             query.push("SELECT dg.deployment_id FROM deployment_groups dg WHERE dg.group_id IN (");
             query.push("SELECT ug.group_id FROM user_groups ug WHERE ug.user_id = ");
             query.push_bind(user_id);
@@ -610,12 +616,14 @@ impl<'c> Deployments<'c> {
             query.push("))");
         }
 
-        // Add search filter if specified (case-insensitive substring match on alias or model_name)
+        // Add search filter if specified (case-insensitive substring match on alias, model_name, or endpoint name)
         if let Some(ref search) = filter.search {
             let search_pattern = format!("%{}%", search.to_lowercase());
-            query.push(" AND (LOWER(alias) LIKE ");
+            query.push(" AND (LOWER(dm.alias) LIKE ");
             query.push_bind(search_pattern.clone());
-            query.push(" OR LOWER(model_name) LIKE ");
+            query.push(" OR LOWER(dm.model_name) LIKE ");
+            query.push_bind(search_pattern.clone());
+            query.push(" OR LOWER(ie.name) LIKE ");
             query.push_bind(search_pattern);
             query.push(")");
         }

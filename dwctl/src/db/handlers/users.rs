@@ -23,11 +23,17 @@ use uuid::Uuid;
 pub struct UserFilter {
     pub skip: i64,
     pub limit: i64,
+    pub search: Option<String>, // Case-insensitive substring search on display_name, username, and email
 }
 
 impl UserFilter {
     pub fn new(skip: i64, limit: i64) -> Self {
-        Self { skip, limit }
+        Self { skip, limit, search: None }
+    }
+
+    pub fn with_search(mut self, search: String) -> Self {
+        self.search = Some(search);
+        self
     }
 }
 
@@ -252,16 +258,30 @@ impl<'c> Repository for Users<'c> {
 
         Ok(result)
     }
-    #[instrument(skip(self, filter), fields(limit = filter.limit, skip = filter.skip), err)]
+    #[instrument(skip(self, filter), fields(limit = filter.limit, skip = filter.skip, search = filter.search), err)]
     async fn list(&mut self, filter: &Self::Filter) -> Result<Vec<Self::Response>> {
-        let users = sqlx::query_as!(
-            User,
-            "SELECT * FROM users WHERE id != '00000000-0000-0000-0000-000000000000' AND is_deleted = false ORDER BY created_at DESC LIMIT $1 OFFSET $2",
-            filter.limit,
-            filter.skip
-        )
-        .fetch_all(&mut *self.db)
-        .await?;
+        use sqlx::QueryBuilder;
+
+        let mut query = QueryBuilder::new("SELECT * FROM users WHERE id != '00000000-0000-0000-0000-000000000000' AND is_deleted = false");
+
+        // Add search filter if specified (case-insensitive substring match on display_name, username, or email)
+        if let Some(ref search) = filter.search {
+            let search_pattern = format!("%{}%", search.to_lowercase());
+            query.push(" AND (LOWER(COALESCE(display_name, '')) LIKE ");
+            query.push_bind(search_pattern.clone());
+            query.push(" OR LOWER(username) LIKE ");
+            query.push_bind(search_pattern.clone());
+            query.push(" OR LOWER(email) LIKE ");
+            query.push_bind(search_pattern);
+            query.push(")");
+        }
+
+        query.push(" ORDER BY created_at DESC LIMIT ");
+        query.push_bind(filter.limit);
+        query.push(" OFFSET ");
+        query.push_bind(filter.skip);
+
+        let users = query.build_query_as::<User>().fetch_all(&mut *self.db).await?;
 
         let mut tx = self.db.begin().await?;
 
@@ -381,16 +401,27 @@ impl<'c> Users<'c> {
         Self { db }
     }
 
-    #[instrument(skip(self), err)]
-    pub async fn count(&mut self) -> Result<i64> {
-        // Note: This query counts the number of users excluding the admin user and deleted users.
-        // It will likely need to filter by organization etc in future
-        let count =
-            sqlx::query_scalar!("SELECT COUNT(*) FROM users WHERE id != '00000000-0000-0000-0000-000000000000' AND is_deleted = false")
-                .fetch_one(&mut *self.db)
-                .await?;
+    #[instrument(skip(self, filter), fields(search = filter.search), err)]
+    pub async fn count(&mut self, filter: &UserFilter) -> Result<i64> {
+        use sqlx::QueryBuilder;
 
-        Ok(count.unwrap_or(0))
+        let mut query =
+            QueryBuilder::new("SELECT COUNT(*) FROM users WHERE id != '00000000-0000-0000-0000-000000000000' AND is_deleted = false");
+
+        // Add search filter if specified (case-insensitive substring match on display_name, username, or email)
+        if let Some(ref search) = filter.search {
+            let search_pattern = format!("%{}%", search.to_lowercase());
+            query.push(" AND (LOWER(COALESCE(display_name, '')) LIKE ");
+            query.push_bind(search_pattern.clone());
+            query.push(" OR LOWER(username) LIKE ");
+            query.push_bind(search_pattern.clone());
+            query.push(" OR LOWER(email) LIKE ");
+            query.push_bind(search_pattern);
+            query.push(")");
+        }
+
+        let count: (i64,) = query.build_query_as().fetch_one(&mut *self.db).await?;
+        Ok(count.0)
     }
 
     #[instrument(skip(self, email), err)]

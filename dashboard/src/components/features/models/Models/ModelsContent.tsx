@@ -55,6 +55,7 @@ export interface ModelsContentProps {
   >;
   searchQuery: string;
   filterProvider: string;
+  endpointId?: string;
   showAccessibleOnly: boolean;
   isStatusMode: boolean;
   canManageGroups: boolean;
@@ -69,6 +70,7 @@ export const ModelsContent: React.FC<ModelsContentProps> = ({
   pagination,
   searchQuery,
   filterProvider,
+  endpointId,
   showAccessibleOnly,
   isStatusMode,
   canManageGroups,
@@ -105,6 +107,7 @@ export const ModelsContent: React.FC<ModelsContentProps> = ({
     include: includeParam as ModelsInclude,
     accessible: isStatusMode ? true : !canManageGroups || showAccessibleOnly,
     search: searchQuery || undefined,
+    endpoint: endpointId,
   });
 
   const { data: probesData } = useProbes();
@@ -114,16 +117,12 @@ export const ModelsContent: React.FC<ModelsContentProps> = ({
   const loading = modelsLoading;
   const error = modelsError ? (modelsError as Error).message : null;
 
-  // TODO: filter providers on the server-side
+  // Filter models for status mode (only show models with probes)
   const filteredModels = models.filter((model) => {
     if (isStatusMode && !model.status?.probe_id) {
       return false;
     }
-
-    const matchesProvider =
-      filterProvider === "all" || model.endpoint?.name === filterProvider;
-
-    return matchesProvider;
+    return true;
   });
 
   const hasNoModels =
