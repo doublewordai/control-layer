@@ -53,7 +53,9 @@ enum AllowedHttpMethod {
     Post,
 }
 
-impl AllowedHttpMethod {
+impl std::str::FromStr for AllowedHttpMethod {
+    type Err = Error;
+
     fn from_str(s: &str) -> Result<Self> {
         match s.to_uppercase().as_str() {
             "POST" => Ok(Self::Post),
@@ -90,7 +92,7 @@ impl OpenAIBatchRequest {
     #[tracing::instrument(skip(self, api_key, accessible_models), fields(custom_id = %self.custom_id, method = %self.method, url = %self.url))]
     fn to_internal(&self, endpoint: &str, api_key: String, accessible_models: &HashSet<String>) -> Result<fusillade::RequestTemplateInput> {
         // Validate HTTP method
-        let _validated_method = AllowedHttpMethod::from_str(&self.method)?;
+        let _validated_method = self.method.parse::<AllowedHttpMethod>()?;
 
         // Validate URL path
         validate_url_path(&self.url)?;
