@@ -359,13 +359,13 @@ pub struct DummyConfig {
 /// Frontend metadata displayed in the UI.
 ///
 /// These values are exposed to the frontend and shown in the user interface.
-#[derive(Debug, Clone, Deserialize, Serialize)]
+#[derive(Debug, Clone, Deserialize, Serialize, Default)]
 #[serde(default)]
 pub struct Metadata {
     /// Region name displayed in the UI (e.g., "UK South", "US East")
-    pub region: String,
+    pub region: Option<String>,
     /// Organization name displayed in the UI
-    pub organization: String,
+    pub organization: Option<String>,
 }
 
 /// External model source configuration.
@@ -961,15 +961,6 @@ impl Default for Config {
     }
 }
 
-impl Default for Metadata {
-    fn default() -> Self {
-        Self {
-            region: "UK South".to_string(),
-            organization: "ACME Corp".to_string(),
-        }
-    }
-}
-
 impl Default for ModelSource {
     fn default() -> Self {
         Self {
@@ -1273,8 +1264,8 @@ metadata:
             assert_eq!(config.port, 8080);
 
             // YAML values should be preserved
-            assert_eq!(config.metadata.region, "US East");
-            assert_eq!(config.metadata.organization, "Test Corp");
+            assert_eq!(config.metadata.region, Some("US East".to_string()));
+            assert_eq!(config.metadata.organization, Some("Test Corp".to_string()));
 
             Ok(())
         });

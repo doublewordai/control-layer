@@ -51,11 +51,6 @@ export function Header() {
           <div></div>
         )}
         <div className="flex items-center gap-6 text-sm text-doubleword-neutral-600">
-          <div className="flex items-center gap-2">
-            <span className="text-doubleword-neutral-400">Region:</span>
-            <span className="font-medium">UK South</span>
-          </div>
-          <div className="w-px h-4 bg-doubleword-neutral-200"></div>
           <div className="flex items-center gap-2 text-sm">
             <span className="text-gray-600">Balance:</span>
             <span className="font-semibold text-gray-900">

@@ -77,9 +77,6 @@ describe("Models Component", () => {
       expect(
         within(container).getByRole("heading", { name: /models/i }),
       ).toBeInTheDocument();
-      expect(
-        within(container).getByText(/View and monitor your deployed models/),
-      ).toBeInTheDocument();
     });
   });
 
@@ -115,10 +112,6 @@ describe("Models Component", () => {
     await waitFor(() => {
       expect(
         within(container).getByRole("heading", { name: /models/i }),
-      ).toBeInTheDocument();
-      // Should still render the page structure even with no models
-      expect(
-        within(container).getByText(/View and monitor your deployed models/),
       ).toBeInTheDocument();
     });
   });

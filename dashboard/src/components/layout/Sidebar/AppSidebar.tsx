@@ -229,22 +229,30 @@ export function AppLayout({ children }: { children: React.ReactNode }) {
             <div className="flex items-center gap-3 md:gap-6 text-sm text-muted-foreground">
               {!configLoading && config && (
                 <>
-                  <div className="hidden lg:flex items-center gap-2">
-                    <span className="text-muted-foreground/70">Region:</span>
-                    <span className="font-medium text-foreground">
-                      {config.region}
-                    </span>
-                  </div>
-                  <div className="hidden lg:block w-px h-4 bg-border"></div>
-                  <div className="hidden md:flex items-center gap-2">
-                    <span className="text-muted-foreground/70">
-                      Organization:
-                    </span>
-                    <span className="font-medium text-foreground">
-                      {config.organization}
-                    </span>
-                  </div>
-                  <div className="hidden lg:block w-px h-4 bg-border"></div>
+                  {config.region && (
+                    <>
+                      <div className="hidden lg:flex items-center gap-2">
+                        <span className="text-muted-foreground/70">Region:</span>
+                        <span className="font-medium text-foreground">
+                          {config.region}
+                        </span>
+                      </div>
+                      <div className="hidden lg:block w-px h-4 bg-border"></div>
+                    </>
+                  )}
+                  {config.organization && (
+                    <>
+                      <div className="hidden md:flex items-center gap-2">
+                        <span className="text-muted-foreground/70">
+                          Organization:
+                        </span>
+                        <span className="font-medium text-foreground">
+                          {config.organization}
+                        </span>
+                      </div>
+                      <div className="hidden lg:block w-px h-4 bg-border"></div>
+                    </>
+                  )}
                   <Link
                     to="/cost-management"
                     className="flex items-center gap-2 text-sm hover:text-primary transition-colors"

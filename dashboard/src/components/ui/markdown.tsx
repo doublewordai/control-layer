@@ -22,11 +22,24 @@ export function Markdown({
       <ReactMarkdown
         remarkPlugins={[remarkGfm]}
         components={{
-          p: ({ children }) => (
-            <p className={compact ? "mb-1 last:mb-0" : "mb-2 last:mb-0"}>
-              {children}
-            </p>
-          ),
+          p: ({ children, node }) => {
+            // Check if this paragraph contains a code block
+            // Code blocks should not be wrapped in <p> tags (invalid HTML)
+            const hasCodeBlock = node?.children?.some(
+              (child: any) => child.type === "element" && child.tagName === "code" && !child.properties?.inline
+            );
+
+            // If it contains a code block, return children unwrapped
+            if (hasCodeBlock) {
+              return <>{children}</>;
+            }
+
+            return (
+              <p className={compact ? "mb-1 last:mb-0" : "mb-2 last:mb-0"}>
+                {children}
+              </p>
+            );
+          },
           ul: ({ children }) => (
             <ul
               className={`list-disc list-inside ${compact ? "mb-1 space-y-0.5" : "mb-2 space-y-1"}`}
