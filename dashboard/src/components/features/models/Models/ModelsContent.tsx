@@ -55,7 +55,7 @@ export interface ModelsContentProps {
   >;
   searchQuery: string;
   filterProvider: string;
-  endpointId?: number;
+  endpointId?: string;
   showAccessibleOnly: boolean;
   isStatusMode: boolean;
   canManageGroups: boolean;
@@ -107,7 +107,7 @@ export const ModelsContent: React.FC<ModelsContentProps> = ({
     include: includeParam as ModelsInclude,
     accessible: isStatusMode ? true : !canManageGroups || showAccessibleOnly,
     search: searchQuery || undefined,
-    endpoint: endpointId?.toString(),
+    endpoint: endpointId,
   });
 
   const { data: probesData } = useProbes();

@@ -166,12 +166,15 @@ impl<'c> Repository for Groups<'c> {
 
         // Add search filter if specified (case-insensitive substring match on name or description)
         if let Some(ref search) = filter.search {
+            tracing::info!("Database layer: Building search query for '{}'", search);
             let search_pattern = format!("%{}%", search.to_lowercase());
             query.push(" AND (LOWER(name) LIKE ");
             query.push_bind(search_pattern.clone());
             query.push(" OR LOWER(COALESCE(description, '')) LIKE ");
             query.push_bind(search_pattern);
             query.push(")");
+        } else {
+            tracing::info!("Database layer: No search filter in GroupFilter");
         }
 
         query.push(" ORDER BY name LIMIT ");
@@ -179,7 +182,12 @@ impl<'c> Repository for Groups<'c> {
         query.push(" OFFSET ");
         query.push_bind(filter.skip);
 
+        let sql = query.sql();
+        tracing::info!("Executing SQL: {}", sql);
+
         let groups = query.build_query_as::<Group>().fetch_all(&mut *self.db).await?;
+
+        tracing::info!("Database layer: Retrieved {} groups", groups.len());
 
         Ok(groups.into_iter().map(GroupDBResponse::from).collect())
     }
