@@ -143,13 +143,16 @@ impl<'c> Tariffs<'c> {
     ) -> Result<Option<(Decimal, Decimal)>> {
         // Try preferred purpose first if specified
         if let Some(preferred) = preferred_purpose
-            && let Some(pricing) = self.get_pricing_at_timestamp(deployed_model_id, preferred, timestamp, completion_window).await?
+            && let Some(pricing) = self
+                .get_pricing_at_timestamp(deployed_model_id, preferred, timestamp, completion_window)
+                .await?
         {
             return Ok(Some(pricing));
         }
 
         // Fall back to fallback purpose (completion_window not relevant for fallback)
-        self.get_pricing_at_timestamp(deployed_model_id, fallback_purpose, timestamp, None).await
+        self.get_pricing_at_timestamp(deployed_model_id, fallback_purpose, timestamp, None)
+            .await
     }
 
     /// Get the pricing for a specific API key purpose that was valid at a given timestamp
