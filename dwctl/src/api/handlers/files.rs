@@ -47,6 +47,39 @@ struct OpenAIBatchRequest {
     body: serde_json::Value,
 }
 
+/// Allowed HTTP methods for batch requests
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AllowedHttpMethod {
+    Post,
+}
+
+impl AllowedHttpMethod {
+    fn from_str(s: &str) -> Result<Self> {
+        match s.to_uppercase().as_str() {
+            "POST" => Ok(Self::Post),
+            _ => Err(Error::BadRequest {
+                message: format!("Unsupported HTTP method '{}'. Only POST is currently supported.", s),
+            }),
+        }
+    }
+}
+
+/// Allowed URL paths for batch requests
+const ALLOWED_URL_PATHS: &[&str] = &["/v1/chat/completions", "/v1/completions", "/v1/embeddings"];
+
+fn validate_url_path(url: &str) -> Result<()> {
+    if !ALLOWED_URL_PATHS.contains(&url) {
+        return Err(Error::BadRequest {
+            message: format!(
+                "Unsupported URL path '{}'. Allowed paths are: {}",
+                url,
+                ALLOWED_URL_PATHS.join(", ")
+            ),
+        });
+    }
+    Ok(())
+}
+
 impl OpenAIBatchRequest {
     /// Transform OpenAI format to internal format
     ///
@@ -56,6 +89,12 @@ impl OpenAIBatchRequest {
     /// * `accessible_models` - Set of model aliases the user can access
     #[tracing::instrument(skip(self, api_key, accessible_models), fields(custom_id = %self.custom_id, method = %self.method, url = %self.url))]
     fn to_internal(&self, endpoint: &str, api_key: String, accessible_models: &HashSet<String>) -> Result<fusillade::RequestTemplateInput> {
+        // Validate HTTP method
+        let _validated_method = AllowedHttpMethod::from_str(&self.method)?;
+
+        // Validate URL path
+        validate_url_path(&self.url)?;
+
         // Extract model from body if present
         let model = self
             .body
@@ -1544,5 +1583,73 @@ mod tests {
         let total_output: i64 = estimate.models.iter().map(|m| m.estimated_output_tokens).sum();
         assert_eq!(estimate.total_estimated_input_tokens, total_input);
         assert_eq!(estimate.total_estimated_output_tokens, total_output);
+    }
+
+    #[sqlx::test]
+    #[test_log::test]
+    async fn test_upload_invalid_http_method(pool: PgPool) {
+        let (app, _bg_services) = create_test_app(pool.clone(), false).await;
+        let user = create_test_user_with_roles(&pool, vec![Role::StandardUser, Role::BatchAPIUser]).await;
+        let group = create_test_group(&pool).await;
+        add_user_to_group(&pool, user.id, group.id).await;
+
+        let deployment = create_test_deployment(&pool, user.id, "gpt-4-model", "gpt-4").await;
+        add_deployment_to_group(&pool, deployment.id, group.id, user.id).await;
+
+        // Use GET method instead of POST
+        let jsonl_content = r#"{"custom_id":"request-1","method":"GET","url":"/v1/chat/completions","body":{"model":"gpt-4","messages":[{"role":"user","content":"Hello"}]}}"#;
+
+        let file_part = axum_test::multipart::Part::bytes(jsonl_content.as_bytes()).file_name("test-batch.jsonl");
+
+        let upload_response = app
+            .post("/ai/v1/files")
+            .add_header(&add_auth_headers(&user)[0].0, &add_auth_headers(&user)[0].1)
+            .add_header(&add_auth_headers(&user)[1].0, &add_auth_headers(&user)[1].1)
+            .multipart(
+                axum_test::multipart::MultipartForm::new()
+                    .add_text("purpose", "batch")
+                    .add_part("file", file_part),
+            )
+            .await;
+
+        upload_response.assert_status(axum::http::StatusCode::BAD_REQUEST);
+        let error_body = upload_response.text();
+        assert!(error_body.contains("Unsupported HTTP method"));
+        assert!(error_body.contains("GET"));
+    }
+
+    #[sqlx::test]
+    #[test_log::test]
+    async fn test_upload_invalid_url_path(pool: PgPool) {
+        let (app, _bg_services) = create_test_app(pool.clone(), false).await;
+        let user = create_test_user_with_roles(&pool, vec![Role::StandardUser, Role::BatchAPIUser]).await;
+        let group = create_test_group(&pool).await;
+        add_user_to_group(&pool, user.id, group.id).await;
+
+        let deployment = create_test_deployment(&pool, user.id, "gpt-4-model", "gpt-4").await;
+        add_deployment_to_group(&pool, deployment.id, group.id, user.id).await;
+
+        // Use invalid URL path
+        let jsonl_content = r#"{"custom_id":"request-1","method":"POST","url":"/api/completions","body":{"model":"gpt-4","messages":[{"role":"user","content":"Hello"}]}}"#;
+
+        let file_part = axum_test::multipart::Part::bytes(jsonl_content.as_bytes()).file_name("test-batch.jsonl");
+
+        let upload_response = app
+            .post("/ai/v1/files")
+            .add_header(&add_auth_headers(&user)[0].0, &add_auth_headers(&user)[0].1)
+            .add_header(&add_auth_headers(&user)[1].0, &add_auth_headers(&user)[1].1)
+            .multipart(
+                axum_test::multipart::MultipartForm::new()
+                    .add_text("purpose", "batch")
+                    .add_part("file", file_part),
+            )
+            .await;
+
+        upload_response.assert_status(axum::http::StatusCode::BAD_REQUEST);
+        let error_body = upload_response.text();
+        assert!(error_body.contains("Unsupported URL path"));
+        assert!(error_body.contains("/api/completions"));
+        assert!(error_body.contains("/v1/chat/completions"));
+        assert!(error_body.contains("/v1/embeddings"));
     }
 }
