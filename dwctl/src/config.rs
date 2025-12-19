@@ -362,9 +362,9 @@ pub struct DummyConfig {
 #[serde(default)]
 pub struct Metadata {
     /// Region name displayed in the UI (e.g., "UK South", "US East")
-    pub region: String,
+    pub region: Option<String>,
     /// Organization name displayed in the UI
-    pub organization: String,
+    pub organization: Option<String>,
 }
 
 /// External model source configuration.
@@ -946,8 +946,8 @@ impl Default for Config {
 impl Default for Metadata {
     fn default() -> Self {
         Self {
-            region: "UK South".to_string(),
-            organization: "ACME Corp".to_string(),
+            region: None,
+            organization: None,
         }
     }
 }
