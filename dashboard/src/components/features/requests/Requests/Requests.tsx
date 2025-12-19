@@ -5,7 +5,7 @@ import {
   useRequests,
   useRequestsAggregate,
 } from "../../../../api/control-layer";
-import { transformRequestResponsePairs } from "../../../../utils";
+import type { AnalyticsEntry } from "../../../../api/control-layer/types";
 import { useAuthorization } from "../../../../utils/authorization";
 import { useServerPagination } from "../../../../hooks/useServerPagination";
 import { DataTable } from "../../../ui/data-table";
@@ -14,6 +14,26 @@ import { Combobox } from "../../../ui/combobox";
 import { DateTimeRangeSelector } from "../../../ui/date-time-range-selector";
 import { RequestsAnalytics } from "../RequestsAnalytics";
 import { createRequestColumns } from "./columns";
+import type { RequestsEntry } from "../types";
+
+// Transform API analytics entry to frontend display type
+function transformAnalyticsEntry(entry: AnalyticsEntry): RequestsEntry {
+  return {
+    id: String(entry.id),
+    timestamp: entry.timestamp,
+    method: entry.method,
+    uri: entry.uri,
+    model: entry.model,
+    status_code: entry.status_code,
+    duration_ms: entry.duration_ms,
+    prompt_tokens: entry.prompt_tokens,
+    completion_tokens: entry.completion_tokens,
+    total_tokens: entry.total_tokens,
+    response_type: entry.response_type,
+    user_email: entry.user_email,
+    fusillade_batch_id: entry.fusillade_batch_id,
+  };
+}
 
 export function Requests() {
   const { userRoles } = useAuthorization();
@@ -92,6 +112,7 @@ export function Requests() {
   // Fetch requests data only if user has requests permission AND requests tab is active
   // MSW will intercept these calls in demo mode
   // Query for limit + 1 to detect if there are more pages
+  // Pass model filter to API for server-side filtering
   const {
     data: requestsResponse,
     isLoading: requestsLoading,
@@ -101,6 +122,7 @@ export function Requests() {
       skip: pagination.queryParams.skip,
       limit: queryLimit,
       order_desc: true,
+      model: selectedModel,
     },
     { enabled: hasRequestsPermission && activeTab === "requests" },
     dateRange,
@@ -115,22 +137,18 @@ export function Requests() {
   const error = requestsError;
 
   // Transform backend data to frontend format
-  const allRequestsRaw = requestsResponse
-    ? transformRequestResponsePairs(requestsResponse.requests)
+  const allRequestsRaw = requestsResponse?.entries
+    ? requestsResponse.entries.map(transformAnalyticsEntry)
     : [];
 
   // Check if there are more items (we queried for limit + 1)
   const hasMore = allRequestsRaw.length > pagination.pageSize;
 
   // Remove the extra item if we got it
-  const allRequests = hasMore
+  // Model filtering is now done server-side
+  const requests = hasMore
     ? allRequestsRaw.slice(0, pagination.pageSize)
     : allRequestsRaw;
-
-  // Filter requests by selected model
-  const requests = selectedModel
-    ? allRequests.filter((request) => request.model === selectedModel)
-    : allRequests;
 
   // Calculate pagination state
   const hasPrevPage = pagination.page > 1;

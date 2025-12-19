@@ -22,7 +22,7 @@ import type {
   EndpointValidateResponse,
   EndpointSyncResponse,
   ConfigResponse,
-  ListRequestsResponse,
+  ListAnalyticsResponse,
   ListRequestsQuery,
   RequestsAggregateResponse,
   ModelUserUsageResponse,
@@ -558,7 +558,7 @@ const configApi = {
 };
 
 const requestsApi = {
-  async list(options?: ListRequestsQuery): Promise<ListRequestsResponse> {
+  async list(options?: ListRequestsQuery): Promise<ListAnalyticsResponse> {
     const params = new URLSearchParams();
     if (options?.limit !== undefined)
       params.set("limit", options.limit.toString());
@@ -582,6 +582,9 @@ const requestsApi = {
       params.set("timestamp_before", options.timestamp_before);
     if (options?.order_desc !== undefined)
       params.set("order_desc", options.order_desc.toString());
+    if (options?.model) params.set("model", options.model);
+    if (options?.fusillade_batch_id)
+      params.set("fusillade_batch_id", options.fusillade_batch_id);
 
     const url = `/admin/api/v1/requests${params.toString() ? "?" + params.toString() : ""}`;
     const response = await fetch(url);

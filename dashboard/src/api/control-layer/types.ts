@@ -373,6 +373,27 @@ export interface ListRequestsResponse {
   requests: RequestResponsePair[];
 }
 
+// New simplified analytics entry (from http_analytics table)
+export interface AnalyticsEntry {
+  id: number;
+  timestamp: string;
+  method: string;
+  uri: string;
+  model?: string;
+  status_code?: number;
+  duration_ms?: number;
+  prompt_tokens?: number;
+  completion_tokens?: number;
+  total_tokens?: number;
+  response_type?: string;
+  user_email?: string;
+  fusillade_batch_id?: string;
+}
+
+export interface ListAnalyticsResponse {
+  entries: AnalyticsEntry[];
+}
+
 // AI request/response types (matching Control Layer's tagged ApiAiRequest/ApiAiResponse enums)
 // Now properly tagged for easy discrimination
 export type AiRequest =
@@ -516,6 +537,8 @@ export interface ListRequestsQuery {
   timestamp_after?: string;
   timestamp_before?: string;
   order_desc?: boolean;
+  model?: string;
+  fusillade_batch_id?: string;
 }
 
 // Validation schemas
