@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.18.1](https://github.com/doublewordai/control-layer/compare/v0.18.0...v0.18.1) (2025-12-20)
+
+
+### Bug Fixes
+
+* fusillade 0.11.1 ([#413](https://github.com/doublewordai/control-layer/issues/413)) ([fbc68e4](https://github.com/doublewordai/control-layer/commit/fbc68e4aafa4b9ae128d1114e584e158014b1804))
+
 ## [0.18.0](https://github.com/doublewordai/control-layer/compare/v0.17.4...v0.18.0) (2025-12-20)
 
 
