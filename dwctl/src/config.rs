@@ -73,6 +73,7 @@ use figment::{
 };
 use serde::{Deserialize, Serialize};
 use std::{collections::HashMap, path::PathBuf, sync::Arc, time::Duration};
+use tracing::warn;
 use url::Url;
 
 use crate::api::models::users::Role;
@@ -696,6 +697,12 @@ pub struct DaemonConfig {
     pub processing_timeout_ms: u64,
 
     /// Per-model priority endpoint configurations for SLA escalation
+    /// Parameters:
+    ///     * endpoint: model endpoint name to route escalation to
+    ///     * api_key: optional env variable name for the original. Note different from fusillade config, we use an env var here
+    /// for security so we can pass in api keys at runtime.
+    ///     * path_overwrite: optional path to use instead of the original
+    ///     * model_overwrite: optional model to use instead of the original
     pub priority_endpoints: HashMap<String, fusillade::PriorityEndpointConfig>,
 
     /// How often to check for batches approaching SLA deadlines (seconds)
@@ -764,6 +771,17 @@ impl DaemonConfig {
         &self,
         model_capacity_limits: Option<std::sync::Arc<dashmap::DashMap<String, usize>>>,
     ) -> fusillade::daemon::DaemonConfig {
+        // For security we pass in api keys as env vars. Here we read them into config passed to fusillade.
+        let mut priority_endpoints_map = self.priority_endpoints.clone();
+        for (_, endpoint) in priority_endpoints_map.iter_mut() {
+            endpoint.api_key.as_mut().map(|env_var| match std::env::var(&env_var) {
+                Err(_) => {
+                    warn!("Priority endpoint configured with api_key env var '{}' which is not set", env_var);
+                    None
+                }
+                Ok(value) => Some(value),
+            });
+        }
         fusillade::daemon::DaemonConfig {
             claim_batch_size: self.claim_batch_size,
             default_model_concurrency: self.default_model_concurrency,
@@ -778,7 +796,7 @@ impl DaemonConfig {
             status_log_interval_ms: self.status_log_interval_ms,
             claim_timeout_ms: self.claim_timeout_ms,
             processing_timeout_ms: self.processing_timeout_ms,
-            priority_endpoints: Arc::new(DashMap::from_iter(self.priority_endpoints.clone())),
+            priority_endpoints: Arc::new(DashMap::from_iter(priority_endpoints_map)),
             sla_check_interval_seconds: self.sla_check_interval_seconds,
             sla_thresholds: self.sla_thresholds.clone(),
             ..Default::default()
