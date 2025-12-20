@@ -1,5 +1,22 @@
 # Changelog
 
+## [0.18.0](https://github.com/doublewordai/control-layer/compare/v0.17.4...v0.18.0) (2025-12-20)
+
+
+### Features
+
+* expose sla config ([#407](https://github.com/doublewordai/control-layer/issues/407)) ([bda10de](https://github.com/doublewordai/control-layer/commit/bda10de899719cbfb922494ef5e195144de97fb0))
+* server-side search and filtering for users, groups, models, batches and files ([#404](https://github.com/doublewordai/control-layer/issues/404)) ([ab065a6](https://github.com/doublewordai/control-layer/commit/ab065a67472d17c1ccd84b3bbc483c18e9f24d88))
+
+
+### Bug Fixes
+
+* **deps:** update dependency lucide-react to ^0.562.0 ([#398](https://github.com/doublewordai/control-layer/issues/398)) ([105cf52](https://github.com/doublewordai/control-layer/commit/105cf5214c01e9d8bf65312c594528c154b5ae74))
+* jsonl sanitization ([#405](https://github.com/doublewordai/control-layer/issues/405)) ([2dc9fef](https://github.com/doublewordai/control-layer/commit/2dc9fef72b2cd395fad5eeee5109211dc819d35b))
+* make region + organization optional, remove endpoint filter or standard users ([#409](https://github.com/doublewordai/control-layer/issues/409)) ([496e7ea](https://github.com/doublewordai/control-layer/commit/496e7ea558457d7784d32492d6b31a78176eb297))
+* read api key in via env var ([#408](https://github.com/doublewordai/control-layer/issues/408)) ([c13200a](https://github.com/doublewordai/control-layer/commit/c13200a120083841af4a07783fd6536c947ed986))
+* Uptime and simplification for standard users ([#412](https://github.com/doublewordai/control-layer/issues/412)) ([18028e0](https://github.com/doublewordai/control-layer/commit/18028e098fccd2dac4c50125f108fda40f5e589f))
+
 ## [0.17.4](https://github.com/doublewordai/control-layer/compare/v0.17.3...v0.17.4) (2025-12-18)
 
 
