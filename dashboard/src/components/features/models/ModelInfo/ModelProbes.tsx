@@ -52,9 +52,10 @@ import { ProbeTimeline } from "./ProbeTimeline";
 
 interface ModelProbesProps {
   model: Model;
+  canManageProbes?: boolean;
 }
 
-const ModelProbes: React.FC<ModelProbesProps> = ({ model }) => {
+const ModelProbes: React.FC<ModelProbesProps> = ({ model, canManageProbes = false }) => {
   const [showCreateForm, setShowCreateForm] = useState(false);
   const [intervalSeconds, setIntervalSeconds] = useState(60);
   const [pingType, setPingType] = useState<"default" | "custom">("default");
@@ -257,10 +258,12 @@ const ModelProbes: React.FC<ModelProbesProps> = ({ model }) => {
             <p className="text-gray-600 mb-4">
               Monitoring is not enabled for this model
             </p>
-            <Button onClick={() => setShowCreateForm(true)}>
-              <Plus className="mr-2 h-4 w-4" />
-              Start Monitoring
-            </Button>
+            {canManageProbes && (
+              <Button onClick={() => setShowCreateForm(true)}>
+                <Plus className="mr-2 h-4 w-4" />
+                Start Monitoring
+              </Button>
+            )}
           </div>
         </CardContent>
       </Card>
@@ -280,49 +283,51 @@ const ModelProbes: React.FC<ModelProbesProps> = ({ model }) => {
                   Monitor endpoint availability and response times
                 </CardDescription>
               </div>
-              <div className="flex gap-2">
-                <Button
-                  variant="outline"
-                  size="sm"
-                  onClick={() => handleToggleActive(modelProbe)}
-                  disabled={
-                    activateProbeMutation.isPending ||
-                    deactivateProbeMutation.isPending
-                  }
-                >
-                  {modelProbe.active ? (
-                    <>
-                      <Pause className="mr-2 h-4 w-4" />
-                      Pause
-                    </>
-                  ) : (
-                    <>
-                      <Play className="mr-2 h-4 w-4" />
-                      Resume
-                    </>
-                  )}
-                </Button>
-                <Button
-                  variant="outline"
-                  size="sm"
-                  onClick={() => handleExecuteNow(modelProbe.id)}
-                  disabled={isExecuting}
-                >
-                  <RefreshCw
-                    className={`mr-2 h-4 w-4 ${isExecuting ? "animate-spin" : ""}`}
-                  />
-                  Run Now
-                </Button>
-                <Button
-                  variant="outline"
-                  size="sm"
-                  onClick={() => handleDeleteProbe(modelProbe.id)}
-                  disabled={deleteProbeMutation.isPending}
-                >
-                  <StopCircle className="mr-2 h-4 w-4" />
-                  Stop Monitoring
-                </Button>
-              </div>
+              {canManageProbes && (
+                <div className="flex gap-2">
+                  <Button
+                    variant="outline"
+                    size="sm"
+                    onClick={() => handleToggleActive(modelProbe)}
+                    disabled={
+                      activateProbeMutation.isPending ||
+                      deactivateProbeMutation.isPending
+                    }
+                  >
+                    {modelProbe.active ? (
+                      <>
+                        <Pause className="mr-2 h-4 w-4" />
+                        Pause
+                      </>
+                    ) : (
+                      <>
+                        <Play className="mr-2 h-4 w-4" />
+                        Resume
+                      </>
+                    )}
+                  </Button>
+                  <Button
+                    variant="outline"
+                    size="sm"
+                    onClick={() => handleExecuteNow(modelProbe.id)}
+                    disabled={isExecuting}
+                  >
+                    <RefreshCw
+                      className={`mr-2 h-4 w-4 ${isExecuting ? "animate-spin" : ""}`}
+                    />
+                    Run Now
+                  </Button>
+                  <Button
+                    variant="outline"
+                    size="sm"
+                    onClick={() => handleDeleteProbe(modelProbe.id)}
+                    disabled={deleteProbeMutation.isPending}
+                  >
+                    <StopCircle className="mr-2 h-4 w-4" />
+                    Stop Monitoring
+                  </Button>
+                </div>
+              )}
             </div>
           </CardHeader>
           <CardContent>
@@ -339,13 +344,14 @@ const ModelProbes: React.FC<ModelProbesProps> = ({ model }) => {
                   <p className="text-sm font-medium">
                     {modelProbe.interval_seconds}s
                   </p>
-                  <Popover
-                    open={editingInterval}
-                    onOpenChange={setEditingInterval}
-                  >
-                    <PopoverTrigger asChild>
-                      <Edit2 className="h-3.5 w-3.5 opacity-0 group-hover/edit-cell:opacity-100 transition-opacity cursor-pointer text-gray-600 hover:text-gray-900" />
-                    </PopoverTrigger>
+                  {canManageProbes && (
+                    <Popover
+                      open={editingInterval}
+                      onOpenChange={setEditingInterval}
+                    >
+                      <PopoverTrigger asChild>
+                        <Edit2 className="h-3.5 w-3.5 opacity-0 group-hover/edit-cell:opacity-100 transition-opacity cursor-pointer text-gray-600 hover:text-gray-900" />
+                      </PopoverTrigger>
                     <PopoverContent className="w-80" align="start">
                       <div className="space-y-2">
                         <h4 className="font-medium text-sm">Edit Interval</h4>
@@ -416,6 +422,7 @@ const ModelProbes: React.FC<ModelProbesProps> = ({ model }) => {
                       </div>
                     </PopoverContent>
                   </Popover>
+                  )}
                 </div>
               </div>
             </div>
