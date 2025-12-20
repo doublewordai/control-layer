@@ -147,23 +147,25 @@ const Models: React.FC = () => {
                 </Select>
               )}
 
-              {/* View mode tabs */}
-              <TabsList className="w-full sm:w-auto">
-                <TabsTrigger
-                  value="grid"
-                  className="flex items-center gap-2 flex-1 sm:flex-initial"
-                >
-                  <LayoutGrid className="h-4 w-4" />
-                  Grid
-                </TabsTrigger>
-                <TabsTrigger
-                  value="status"
-                  className="flex items-center gap-2 flex-1 sm:flex-initial"
-                >
-                  <Activity className="h-4 w-4" />
-                  Status
-                </TabsTrigger>
-              </TabsList>
+              {/* View mode tabs - only for platform managers */}
+              {canManageGroups && (
+                <TabsList className="w-full sm:w-auto">
+                  <TabsTrigger
+                    value="grid"
+                    className="flex items-center gap-2 flex-1 sm:flex-initial"
+                  >
+                    <LayoutGrid className="h-4 w-4" />
+                    Grid
+                  </TabsTrigger>
+                  <TabsTrigger
+                    value="status"
+                    className="flex items-center gap-2 flex-1 sm:flex-initial"
+                  >
+                    <Activity className="h-4 w-4" />
+                    Status
+                  </TabsTrigger>
+                </TabsList>
+              )}
             </div>
           </div>
         </div>
