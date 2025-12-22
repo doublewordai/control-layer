@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.18.2](https://github.com/doublewordai/control-layer/compare/v0.18.1...v0.18.2) (2025-12-22)
+
+
+### Bug Fixes
+
+* response headers for incomplete output files didnt match the docs ([#406](https://github.com/doublewordai/control-layer/issues/406)) ([e8ea0d1](https://github.com/doublewordai/control-layer/commit/e8ea0d1f07b5326819a2fbf6a3ae1f538d9bf7cc))
+
 ## [0.18.1](https://github.com/doublewordai/control-layer/compare/v0.18.0...v0.18.1) (2025-12-20)
 
 
