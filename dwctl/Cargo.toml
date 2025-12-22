@@ -1,6 +1,6 @@
 [package]
 name = "dwctl"
-version = "0.18.1"
+version = "0.18.3"
 edition = "2024"
 description = "The Doubleword Control Layer - A self-hostable observability and analytics platform for LLM applications"
 license = "MIT OR Apache-2.0"
@@ -61,7 +61,7 @@ utoipa = { version = "5.0", features = [
   "uuid",
   "macros",
 ] }
-utoipa-rapidoc = { version = "6.0", features = ["axum"] }
+utoipa-scalar = { version = "0.3", features = ["axum"] }
 figment = { version = "0.10", features = ["yaml", "env", "test"] }
 rand = "0.8"
 # Authentication

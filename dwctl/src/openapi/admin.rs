@@ -1,4 +1,7 @@
-//! OpenAPI/Swagger documentation configuration for the admin API.
+//! OpenAPI documentation for the Admin API.
+//!
+//! This module defines the OpenAPI spec for `/admin/api/v1/*` endpoints,
+//! including user management, groups, deployments, and other administrative functions.
 
 use utoipa::{
     Modify, OpenApi,
@@ -7,9 +10,10 @@ use utoipa::{
 
 use crate::{api, sync};
 
-struct SecurityAddon;
+/// Security schemes for the Admin API.
+struct AdminSecurityAddon;
 
-impl Modify for SecurityAddon {
+impl Modify for AdminSecurityAddon {
     fn modify(&self, openapi: &mut utoipa::openapi::OpenApi) {
         if let Some(components) = openapi.components.as_mut() {
             // Add Bearer token authentication (API keys)
@@ -44,7 +48,7 @@ impl Modify for SecurityAddon {
     servers(
         (url = "/admin/api/v1", description = "Admin API server")
     ),
-    modifiers(&SecurityAddon),
+    modifiers(&AdminSecurityAddon),
     paths(
         api::handlers::auth::register,
         api::handlers::auth::login,
@@ -90,19 +94,6 @@ impl Modify for SecurityAddon {
         api::handlers::transactions::create_transaction,
         api::handlers::transactions::get_transaction,
         api::handlers::transactions::list_transactions,
-        api::handlers::files::upload_file,
-        api::handlers::files::list_files,
-        api::handlers::files::get_file,
-        api::handlers::files::get_file_content,
-        api::handlers::files::get_file_cost_estimate,
-        api::handlers::files::delete_file,
-        api::handlers::batches::create_batch,
-        api::handlers::batches::get_batch,
-        api::handlers::batches::get_batch_analytics,
-        api::handlers::batches::cancel_batch,
-        api::handlers::batches::retry_failed_batch_requests,
-        api::handlers::batches::retry_specific_requests,
-        api::handlers::batches::list_batches,
         api::handlers::config::get_config,
         api::handlers::probes::create_probe,
         api::handlers::probes::list_probes,
@@ -157,26 +148,6 @@ impl Modify for SecurityAddon {
             api::models::transactions::CreditTransactionResponse,
             crate::db::models::credits::CreditTransactionType,
             sync::endpoint_sync::EndpointSyncResponse,
-            api::models::files::ListFilesQuery,
-            api::models::files::FileResponse,
-            api::models::files::FileDeleteResponse,
-            api::models::files::FileListResponse,
-            api::models::files::FileCostEstimate,
-            api::models::files::ModelCostBreakdown,
-            api::models::files::ObjectType,
-            api::models::files::Purpose,
-            api::models::files::ListObject,
-            api::models::batches::CreateBatchRequest,
-            api::models::batches::RetryRequestsRequest,
-            api::models::batches::BatchResponse,
-            api::models::batches::BatchAnalytics,
-            api::models::batches::BatchObjectType,
-            api::models::batches::RequestCounts,
-            api::models::batches::BatchListResponse,
-            api::models::batches::ListObjectType,
-            api::models::batches::ListBatchesQuery,
-            api::models::batches::BatchErrors,
-            api::models::batches::BatchError,
             api::models::probes::CreateProbe,
             api::models::probes::TestProbeRequest,
             api::models::probes::ProbesQuery,
@@ -210,16 +181,14 @@ impl Modify for SecurityAddon {
         (name = "models", description = "Deployed model management"),
         (name = "groups", description = "Group management API"),
         (name = "transactions", description = "Credit transaction management API"),
-        (name = "files", description = "File management API"),
-        (name = "batches", description = "Batch processing API"),
         (name = "config", description = "Configuration API"),
         (name = "probes", description = "Probe monitoring API"),
         (name = "requests", description = "Request logging and analytics API"),
     ),
     info(
-        title = "Onwards Pilot API",
+        title = "Admin API",
         version = "0.1.0",
         description = "API for managing users, API keys, inference endpoints, and deployed models",
     ),
 )]
-pub struct ApiDoc;
+pub struct AdminApiDoc;

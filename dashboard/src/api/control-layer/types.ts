@@ -24,6 +24,7 @@ export interface ConfigResponse {
   region: string;
   organization: string;
   payment_enabled: boolean;
+  docs_url: string;
   batches?: {
     enabled: boolean;
     allowed_completion_windows: string[]; // Available SLAs like ["24h", "1h", "12h"]
