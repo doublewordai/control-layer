@@ -465,16 +465,18 @@ fn create_file_stream(
     path = "/files",
     tag = "files",
     summary = "Upload file",
-    description = "Upload a file that can be used with the Batch API. Files must be JSONL format.",
+    description = "Upload a JSONL file for batch processing.
+
+Each line must be a valid JSON object containing `custom_id`, `method`, `url`, and `body` fields. The `model` field in the body must reference a model your API key has access to.",
     request_body(
         content_type = "multipart/form-data",
-        description = "File upload with purpose and optional expiration policy"
+        description = "Multipart form with `file` (the JSONL file) and `purpose` (must be `batch`)."
     ),
     responses(
-        (status = 201, description = "File uploaded successfully", body = FileResponse),
-        (status = 400, description = "Invalid request"),
-        (status = 413, description = "Payload too large"),
-        (status = 500, description = "Internal server error")
+        (status = 201, description = "File uploaded and validated successfully.", body = FileResponse),
+        (status = 400, description = "Invalid file format, malformed JSON, missing required fields, or referencing an inaccessible model."),
+        (status = 413, description = "File exceeds the maximum allowed size."),
+        (status = 500, description = "An unexpected error occurred. Retry the request or contact support if the issue persists.")
     )
 )]
 #[tracing::instrument(skip(state, current_user, multipart), fields(user_id = %current_user.id))]
@@ -571,10 +573,12 @@ pub async fn upload_file(
     path = "/files",
     tag = "files",
     summary = "List files",
-    description = "Returns a list of files with cursor-based pagination (OpenAI-compatible). Use the `last_id` from the response as the `after` parameter to get the next page.",
+    description = "Returns a paginated list of your uploaded files.
+
+Use cursor-based pagination: pass `last_id` from the response as the `after` parameter to fetch the next page.",
     responses(
-        (status = 200, description = "List of files with pagination metadata (first_id, last_id, has_more)", body = FileListResponse),
-        (status = 500, description = "Internal server error")
+        (status = 200, description = "List of files. Check `has_more` to determine if additional pages exist.", body = FileListResponse),
+        (status = 500, description = "An unexpected error occurred. Retry the request or contact support if the issue persists.")
     ),
     params(
         ListFilesQuery
@@ -671,14 +675,14 @@ pub async fn list_files(
     path = "/files/{file_id}",
     tag = "files",
     summary = "Retrieve file",
-    description = "Returns information about a specific file.",
+    description = "Returns metadata about a specific file, including its size, creation time, and purpose.",
     responses(
-        (status = 200, description = "File metadata", body = FileResponse),
-        (status = 404, description = "File not found"),
-        (status = 500, description = "Internal server error")
+        (status = 200, description = "File metadata.", body = FileResponse),
+        (status = 404, description = "File not found or you don't have access to it."),
+        (status = 500, description = "An unexpected error occurred. Retry the request or contact support if the issue persists.")
     ),
     params(
-        ("file_id" = String, Path, description = "The ID of the file to retrieve")
+        ("file_id" = String, Path, description = "The file ID returned when the file was uploaded.")
     )
 )]
 #[tracing::instrument(skip(state, current_user), fields(user_id = %current_user.id, file_id = %file_id_str))]
@@ -737,14 +741,16 @@ pub async fn get_file(
     path = "/files/{file_id}/content",
     tag = "files",
     summary = "Retrieve file content",
-    description = "Download the content of a file as JSONL. Returns the file metadata and request templates. Supports pagination via limit and offset parameters.",
+    description = "Download the content of a file as JSONL.
+
+For input files, returns the original request templates. For output files, returns the completed responses. Supports pagination via `limit` and `offset` query parameters.",
     responses(
-        (status = 200, description = "File content", content_type = "application/x-ndjson"),
-        (status = 404, description = "File not found"),
-        (status = 500, description = "Internal server error")
+        (status = 200, description = "File content as newline-delimited JSON. Check the `X-Incomplete` header to determine if more content exists.", content_type = "application/x-ndjson"),
+        (status = 404, description = "File not found or you don't have access to it."),
+        (status = 500, description = "An unexpected error occurred. Retry the request or contact support if the issue persists.")
     ),
     params(
-        ("file_id" = String, Path, description = "The ID of the file to retrieve content from"),
+        ("file_id" = String, Path, description = "The file ID returned when the file was uploaded."),
         FileContentQuery
     )
 )]
@@ -925,14 +931,16 @@ pub async fn get_file_content(
     path = "/files/{file_id}",
     tag = "files",
     summary = "Delete file",
-    description = "Delete a file by ID",
+    description = "Permanently delete a file.
+
+Deleting a file also deletes any batches that were created from it. This action cannot be undone.",
     responses(
-        (status = 200, description = "File deleted successfully", body = FileDeleteResponse),
-        (status = 404, description = "File not found"),
-        (status = 500, description = "Internal server error")
+        (status = 200, description = "File deleted successfully.", body = FileDeleteResponse),
+        (status = 404, description = "File not found or you don't have access to it."),
+        (status = 500, description = "An unexpected error occurred. Retry the request or contact support if the issue persists.")
     ),
     params(
-        ("file_id" = String, Path, description = "The ID of the file to delete")
+        ("file_id" = String, Path, description = "The file ID returned when the file was uploaded.")
     )
 )]
 #[tracing::instrument(skip(state, current_user), fields(user_id = %current_user.id, file_id = %file_id_str))]
@@ -989,14 +997,16 @@ pub async fn delete_file(
     path = "/files/{file_id}/cost-estimate",
     tag = "files",
     summary = "Get file cost estimate",
-    description = "Estimate the cost of processing a batch file based on file size and model pricing. Returns per-model breakdown and total cost.",
+    description = "Estimate the cost of processing a batch file before creating a batch.
+
+Returns a breakdown by model including estimated input/output tokens and cost. Useful for validating costs before committing to a batch run.",
     responses(
-        (status = 200, description = "Cost estimate", body = FileCostEstimate),
-        (status = 404, description = "File not found"),
-        (status = 500, description = "Internal server error")
+        (status = 200, description = "Cost estimate with per-model breakdown.", body = FileCostEstimate),
+        (status = 404, description = "File not found or you don't have access to it."),
+        (status = 500, description = "An unexpected error occurred. Retry the request or contact support if the issue persists.")
     ),
     params(
-        ("file_id" = String, Path, description = "The ID of the file to estimate cost for")
+        ("file_id" = String, Path, description = "The file ID returned when the file was uploaded.")
     )
 )]
 #[tracing::instrument(skip(state, current_user), fields(user_id = %current_user.id, file_id = %file_id_str))]
