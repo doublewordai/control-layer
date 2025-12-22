@@ -216,7 +216,9 @@ Each line in the file should be a JSON object with:
 - `custom_id` — your identifier for tracking the request
 - `method` — HTTP method (POST)
 - `url` — endpoint path (e.g., `/v1/chat/completions`)
-- `body` — the request payload"),
+- `body` — the request payload
+
+[Learn more about the JSONL file format →](https://docs.doubleword.ai/batches/jsonl-files)"),
         (name = "batches", description = "Process large volumes of requests asynchronously.
 
 Batch processing is ideal when you:
@@ -224,7 +226,9 @@ Batch processing is ideal when you:
 - Want to process data in bulk (e.g., embeddings for a document corpus)
 - Are running offline evaluations or data pipelines
 
-Batches complete within 24 hours. You can track progress, cancel in-flight batches, and retry failed requests."),
+Choose your completion window: 1 hour or 24 hours. You can track progress, cancel in-flight batches, and retry failed requests.
+
+[Getting started with the Batch API →](https://docs.doubleword.ai/batches/getting-started-with-batched-api)"),
         (name = "chat", description = "Create model responses for chat conversations.
 
 Supports:
