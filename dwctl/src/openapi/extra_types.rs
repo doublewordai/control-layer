@@ -4,7 +4,6 @@
 //! is done by the `onwards` routing layer, but these types provide OpenAPI documentation.
 
 use serde::{Deserialize, Serialize};
-use serde_json::json;
 use utoipa::ToSchema;
 
 // ============================================================================

@@ -4,7 +4,6 @@ use crate::api::models::Pagination;
 
 use super::pagination::CursorPagination;
 use serde::{Deserialize, Serialize};
-use serde_json::json;
 use utoipa::{IntoParams, ToSchema};
 
 /// Query parameters for listing files (OpenAI-compatible cursor-based pagination)
