@@ -223,7 +223,10 @@ pub async fn list_transactions(
     }
 
     // Get aggregated batch data from SQL
-    let (batch_transactions, batched_source_ids) = repo.get_aggregated_batches(&usage_source_ids).await?;
+    let crate::db::handlers::credits::AggregatedBatches {
+        batched_transactions: batch_transactions,
+        batched_source_ids,
+    } = repo.get_aggregated_batches(&usage_source_ids).await?;
 
     // Filter out transactions that were batched
     let batched_set: std::collections::HashSet<String> = batched_source_ids.into_iter().collect();

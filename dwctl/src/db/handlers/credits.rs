@@ -46,6 +46,15 @@ impl From<CreditTransaction> for CreditTransactionDBResponse {
     }
 }
 
+/// Result of aggregating batch transactions
+#[derive(Debug)]
+pub struct AggregatedBatches {
+    /// Aggregated transactions with their associated batch IDs
+    pub batched_transactions: Vec<(CreditTransactionDBResponse, Uuid)>,
+    /// All source_ids that belong to batches (for filtering)
+    pub batched_source_ids: Vec<String>,
+}
+
 pub struct Credits<'c> {
     db: &'c mut PgConnection,
 }
@@ -250,12 +259,8 @@ impl<'c> Credits<'c> {
     }
 
     /// Get aggregated batch data for usage transactions with batch IDs
-    /// Returns (batched_transactions_with_batch_ids, batched_source_ids)
     #[instrument(skip(self, source_ids), fields(count = source_ids.len()), err)]
-    pub async fn get_aggregated_batches(
-        &mut self,
-        source_ids: &[String],
-    ) -> Result<(Vec<(CreditTransactionDBResponse, Uuid)>, Vec<String>)> {
+    pub async fn get_aggregated_batches(&mut self, source_ids: &[String]) -> Result<AggregatedBatches> {
         // Two-step aggregation to ensure we get the full batch totals:
         // Step 1: Find which batch_ids are present in the provided source_ids
         // Step 2: Aggregate ALL transactions for those batch_ids (not just the ones in source_ids)
@@ -317,7 +322,10 @@ impl<'c> Credits<'c> {
             all_batched_source_ids.extend(row.batched_source_ids);
         }
 
-        Ok((batched_transactions, all_batched_source_ids))
+        Ok(AggregatedBatches {
+            batched_transactions,
+            batched_source_ids: all_batched_source_ids,
+        })
     }
 }
 
