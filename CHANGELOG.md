@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.18.3](https://github.com/doublewordai/control-layer/compare/v0.18.2...v0.18.3) (2025-12-22)
+
+
+### Bug Fixes
+
+* tidy up openapi docs ([#420](https://github.com/doublewordai/control-layer/issues/420)) ([609adf4](https://github.com/doublewordai/control-layer/commit/609adf4c725abcbfa9849d29ac8532e4e6a6fb81))
+
 ## [0.18.2](https://github.com/doublewordai/control-layer/compare/v0.18.1...v0.18.2) (2025-12-22)
 
 
