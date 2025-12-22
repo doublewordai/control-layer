@@ -9,7 +9,7 @@ use crate::{
     auth::permissions::{self, RequiresPermission, operation, resource},
     db::{
         handlers::Credits,
-        models::credits::{CreditTransactionCreateDBRequest, CreditTransactionDBResponse, CreditTransactionType},
+        models::credits::{CreditTransactionCreateDBRequest, CreditTransactionType},
     },
     errors::{Error, Result},
     types::{Operation, Permission, Resource},

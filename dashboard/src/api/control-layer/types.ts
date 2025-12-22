@@ -687,6 +687,7 @@ export interface TransactionsQuery {
   limit?: number;
   skip?: number;
   userId?: string; // Filter transactions by user (UUID)
+  group_batches?: boolean; // Group transactions by batch (merges batch requests into single entries)
 }
 
 export interface AddFundsRequest {

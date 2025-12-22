@@ -74,7 +74,7 @@ export function TransactionHistory({
     data: transactionsData,
     isLoading: isLoadingTransactions,
     refetch: refetchTransactions,
-  } = useTransactions({ userId });
+  } = useTransactions({ userId, group_batches: true });
 
   // Get transactions - use fetched data in both demo and API mode
   // In demo mode, MSW returns data from transactions.json
