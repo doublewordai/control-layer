@@ -230,12 +230,12 @@ pub async fn list_transactions(
     let mut result: Vec<CreditTransactionResponse> = transactions
         .into_iter()
         .filter(|tx| !batched_set.contains(&tx.source_id))
-        .map(|tx| CreditTransactionResponse::from_db(tx, false))
+        .map(CreditTransactionResponse::from)
         .collect();
 
     // Add batch transactions (they already have description set)
-    for batch_tx in batch_transactions {
-        result.push(CreditTransactionResponse::from_db(batch_tx, true));
+    for (batch_tx, batch_id) in batch_transactions {
+        result.push(CreditTransactionResponse::from_db_with_batch_id(batch_tx, Some(batch_id)));
     }
 
     // Re-sort by created_at

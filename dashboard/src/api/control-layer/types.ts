@@ -663,6 +663,7 @@ export interface Transaction {
   id: string;
   user_id: string; // UUID
   transaction_type: TransactionType;
+  batch_id?: string; // Batch ID (present when this is a grouped batch of multiple usage transactions)
   amount: number; // Amount in dollars
   balance_after: number; // Balance in dollars
   previous_transaction_id?: string; // UUID
