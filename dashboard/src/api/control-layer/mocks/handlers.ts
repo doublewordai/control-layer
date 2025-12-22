@@ -943,6 +943,8 @@ export const handlers = [
     return HttpResponse.json({
       region: "UK South",
       organization: "ACME Corp",
+      payment_enabled: true,
+      docs_url: "https://docs.doubleword.ai/control-layer",
     });
   }),
 

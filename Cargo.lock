@@ -238,9 +238,9 @@ dependencies = [
 
 [[package]]
 name = "async-lock"
-version = "3.4.1"
+version = "3.4.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "5fd03604047cee9b6ce9de9f70c6cd540a0520c813cbd49bae61f33ab80ed1dc"
+checksum = "290f7f2596bd5b78a9fec8088ccd89180d7f9f55b94b0576823bbbdc72ee8311"
 dependencies = [
  "event-listener 5.4.1",
  "event-listener-strategy",
@@ -275,9 +275,9 @@ dependencies = [
 
 [[package]]
 name = "async-openai-macros"
-version = "0.1.0"
+version = "0.1.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "0289cba6d5143bfe8251d57b4a8cac036adf158525a76533a7082ba65ec76398"
+checksum = "81872a8e595e8ceceab71c6ba1f9078e313b452a1e31934e6763ef5d308705e4"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -406,9 +406,9 @@ dependencies = [
 
 [[package]]
 name = "axum"
-version = "0.8.7"
+version = "0.8.8"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "5b098575ebe77cb6d14fc7f32749631a6e44edbef6b796f89b020e99ba20d425"
+checksum = "8b52af3cb4058c895d37317bb27508dccc8e5f2d39454016b297bf4a400597b8"
 dependencies = [
  "axum-core 0.5.5",
  "bytes",
@@ -483,7 +483,7 @@ version = "0.8.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "42e1a6651f119707ec6c416f38fdb5be223707627fe6d47f912850634c106215"
 dependencies = [
- "axum 0.8.7",
+ "axum 0.8.8",
  "bytes",
  "futures-core",
  "http 1.4.0",
@@ -503,7 +503,7 @@ version = "0.9.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "fb15221c30bbb32e99873d348d89d7bc2138d6199520aa473a1bdb0d8e5721e8"
 dependencies = [
- "axum 0.8.7",
+ "axum 0.8.8",
  "bytes",
  "futures-core",
  "http 1.4.0",
@@ -526,7 +526,7 @@ dependencies = [
  "anyhow",
  "assert-json-diff",
  "auto-future",
- "axum 0.8.7",
+ "axum 0.8.8",
  "bytes",
  "bytesize",
  "cookie",
@@ -1266,7 +1266,7 @@ checksum = "1aaf95b3e5c8f23aa320147307562d361db0ae0d51242340f558153b4eb2439b"
 
 [[package]]
 name = "dwctl"
-version = "0.18.2"
+version = "0.18.3"
 dependencies = [
  "aes-gcm",
  "anyhow",
@@ -1274,7 +1274,7 @@ dependencies = [
  "async-openai",
  "async-stripe",
  "async-trait",
- "axum 0.8.7",
+ "axum 0.8.8",
  "axum-prometheus 0.9.0",
  "axum-test",
  "base64 0.22.1",
@@ -1328,7 +1328,7 @@ dependencies = [
  "tracing-subscriber",
  "url",
  "utoipa",
- "utoipa-rapidoc",
+ "utoipa-scalar",
  "uuid",
  "wiremock",
 ]
@@ -2476,9 +2476,9 @@ dependencies = [
 
 [[package]]
 name = "itoa"
-version = "1.0.15"
+version = "1.0.16"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "4a5f13b858c8d314ee3e8f639011f7ccefe71f97f96e50151fb991f267928e2c"
+checksum = "7ee5b5339afb4c41626dde77b7a611bd4f2c202b897852b4bcf5d03eddc61010"
 
 [[package]]
 name = "js-sys"
@@ -2782,9 +2782,9 @@ dependencies = [
 
 [[package]]
 name = "moka"
-version = "0.12.11"
+version = "0.12.12"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "8261cd88c312e0004c1d51baad2980c66528dfdb2bee62003e643a4d8f86b077"
+checksum = "a3dec6bd31b08944e08b58fd99373893a6c17054d6f3ea5006cc894f4f4eee2a"
 dependencies = [
  "async-lock",
  "crossbeam-channel",
@@ -2795,7 +2795,6 @@ dependencies = [
  "futures-util",
  "parking_lot 0.12.5",
  "portable-atomic",
- "rustc_version",
  "smallvec",
  "tagptr",
  "uuid",
@@ -3013,7 +3012,7 @@ checksum = "33bf71f8688855bf8419d9a75f8f6446c1fb8c98b8b7082eeda5240d6480bfd8"
 dependencies = [
  "anyhow",
  "async-trait",
- "axum 0.8.7",
+ "axum 0.8.8",
  "axum-prometheus 0.8.0",
  "bon",
  "clap",
@@ -3179,7 +3178,7 @@ checksum = "b71c5ba1c445cf62752a81ac699c113109bbb4bfae9f7d01c30e664537ec59d9"
 dependencies = [
  "anyhow",
  "async-stream",
- "axum 0.8.7",
+ "axum 0.8.8",
  "bytes",
  "futures",
  "http-body-util",
@@ -3446,9 +3445,9 @@ dependencies = [
 
 [[package]]
 name = "portable-atomic"
-version = "1.11.1"
+version = "1.12.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f84267b20a16ea918e43c6a88433c2d54fa145c92a811b5b047ccbe153674483"
+checksum = "f59e70c4aef1e55797c2e8fd94a4f2a973fc972cfde0e0b05f683667b0cd39dd"
 
 [[package]]
 name = "postgresql_archive"
@@ -4274,15 +4273,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "357703d41365b4b27c590e3ed91eabb1b663f07c4c084095e60cbed4362dff0d"
 
 [[package]]
-name = "rustc_version"
-version = "0.4.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "cfcb3a22ef46e85b45de6ee7e79d063319ebb6594faafcf1c225ea92ab6e9b92"
-dependencies = [
- "semver",
-]
-
-[[package]]
 name = "rustix"
 version = "1.1.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4339,9 +4329,9 @@ checksum = "b39cdef0fa800fc44525c84ccb54a029961a8215f9619753635a9c0d2538d46d"
 
 [[package]]
 name = "ryu"
-version = "1.0.20"
+version = "1.0.21"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "28d3b2b1366ec20994f1fd18c3c594f05c5dd4bc44d8bb0c1c632c8d6829481f"
+checksum = "62049b2877bf12821e8f9ad256ee38fdc31db7387ec2d3b3f403024de2034aea"
 
 [[package]]
 name = "same-file"
@@ -5691,12 +5681,12 @@ dependencies = [
 ]
 
 [[package]]
-name = "utoipa-rapidoc"
-version = "6.0.0"
+name = "utoipa-scalar"
+version = "0.3.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e5f8f5abd341cce16bb4f09a8bafc087d4884a004f25fb980e538d51d6501dab"
+checksum = "59559e1509172f6b26c1cdbc7247c4ddd1ac6560fe94b584f81ee489b141f719"
 dependencies = [
- "axum 0.8.7",
+ "axum 0.8.8",
  "serde",
  "serde_json",
  "utoipa",

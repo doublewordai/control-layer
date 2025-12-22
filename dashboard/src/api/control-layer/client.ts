@@ -1098,8 +1098,15 @@ const filesApi = {
     return { content, incomplete, lastLine };
   },
 
-  async getCostEstimate(id: string): Promise<FileCostEstimate> {
-    const response = await fetch(`/ai/v1/files/${id}/cost-estimate`);
+  async getCostEstimate(
+    id: string,
+    completionWindow?: string,
+  ): Promise<FileCostEstimate> {
+    const url = new URL(`/ai/v1/files/${id}/cost-estimate`, window.location.origin);
+    if (completionWindow) {
+      url.searchParams.set("completion_window", completionWindow);
+    }
+    const response = await fetch(url.toString());
     if (!response.ok) {
       throw new Error(`Failed to fetch file cost estimate: ${response.status}`);
     }

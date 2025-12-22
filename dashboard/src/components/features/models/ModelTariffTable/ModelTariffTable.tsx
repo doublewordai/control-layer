@@ -19,13 +19,18 @@ import {
   TableHeader,
   TableRow,
 } from "../../../ui/table";
-import type { ModelTariff, TariffDefinition, TariffApiKeyPurpose } from "@/api/control-layer";
+import type {
+  ModelTariff,
+  TariffDefinition,
+  TariffApiKeyPurpose,
+} from "@/api/control-layer";
 
 interface TariffFormData {
   name: string;
   input_price_per_million: string;
   output_price_per_million: string;
   api_key_purpose: TariffApiKeyPurpose | "none";
+  completion_window: string; // SLA like "24h", "1h", etc.
 }
 
 // Internal representation with temporary IDs for editing
@@ -39,6 +44,7 @@ interface ModelTariffTableProps {
   onChange: (tariffs: TariffDefinition[]) => void;
   isLoading?: boolean;
   readOnly?: boolean;
+  availableSLAs?: string[]; // Available completion windows like ["24h", "1h", "12h"]
 }
 
 const EMPTY_FORM: TariffFormData = {
@@ -46,6 +52,7 @@ const EMPTY_FORM: TariffFormData = {
   input_price_per_million: "",
   output_price_per_million: "",
   api_key_purpose: "none",
+  completion_window: "",
 };
 
 const API_KEY_PURPOSE_LABELS: Record<TariffApiKeyPurpose | "none", string> = {
@@ -60,6 +67,7 @@ export const ModelTariffTable: React.FC<ModelTariffTableProps> = ({
   onChange,
   isLoading = false,
   readOnly = false,
+  availableSLAs = ["24h"], // Default to 24h if not provided
 }) => {
   // Local state: convert ModelTariff[] to TariffEdit[] for editing
   const [localTariffs, setLocalTariffs] = useState<TariffEdit[]>([]);
@@ -70,16 +78,17 @@ export const ModelTariffTable: React.FC<ModelTariffTableProps> = ({
 
   // Initialize local state from props (only active tariffs)
   useEffect(() => {
-    const activeTariffs = tariffs.filter(t => t.is_active);
+    const activeTariffs = tariffs.filter((t) => t.is_active);
     setLocalTariffs(
       activeTariffs.map((t) => ({
         name: t.name,
         input_price_per_token: t.input_price_per_token,
         output_price_per_token: t.output_price_per_token,
         api_key_purpose: t.api_key_purpose,
+        completion_window: t.completion_window,
         valid_from: t.valid_from,
         _tempId: t.id,
-      }))
+      })),
     );
   }, [tariffs]);
 
@@ -88,8 +97,20 @@ export const ModelTariffTable: React.FC<ModelTariffTableProps> = ({
     setLocalTariffs(newTariffs);
     // Convert to TariffDefinition[] (remove _tempId and valid_from)
     onChange(
-      newTariffs.map(({ _tempId, valid_from: _valid_from, ...def }) => def)
+      newTariffs.map(({ _tempId, valid_from: _valid_from, ...def }) => def),
     );
+  };
+
+  // Generate default name based on purpose and SLA
+  const getDefaultName = (
+    purpose: TariffApiKeyPurpose | "none",
+    sla?: string,
+  ): string => {
+    if (purpose === "none") return "";
+    if (purpose === "batch" && sla) {
+      return `Batch (${sla})`;
+    }
+    return API_KEY_PURPOSE_LABELS[purpose];
   };
 
   const validateForm = (): boolean => {
@@ -115,6 +136,11 @@ export const ModelTariffTable: React.FC<ModelTariffTableProps> = ({
       newErrors.output_price = "Must be a valid positive number";
     }
 
+    // Batch tariffs must have a completion_window
+    if (formData.api_key_purpose === "batch" && !formData.completion_window) {
+      newErrors.completion_window = "SLA is required for batch tariffs";
+    }
+
     setErrors(newErrors);
     return Object.keys(newErrors).length === 0;
   };
@@ -135,7 +161,8 @@ export const ModelTariffTable: React.FC<ModelTariffTableProps> = ({
     if (!validateForm()) return;
 
     const inputPrice = Number(formData.input_price_per_million) / 1000000 || 0;
-    const outputPrice = Number(formData.output_price_per_million) / 1000000 || 0;
+    const outputPrice =
+      Number(formData.output_price_per_million) / 1000000 || 0;
 
     const newTariff: TariffEdit = {
       name: formData.name,
@@ -145,6 +172,7 @@ export const ModelTariffTable: React.FC<ModelTariffTableProps> = ({
         formData.api_key_purpose === "none"
           ? undefined
           : formData.api_key_purpose,
+      completion_window: formData.completion_window || undefined,
       _tempId: `temp-${Date.now()}-${Math.random()}`,
     };
 
@@ -164,6 +192,7 @@ export const ModelTariffTable: React.FC<ModelTariffTableProps> = ({
         parseFloat(tariff.output_price_per_token) * 1000000
       ).toString(),
       api_key_purpose: tariff.api_key_purpose || "none",
+      completion_window: tariff.completion_window || "",
     });
     setErrors({});
   };
@@ -178,7 +207,8 @@ export const ModelTariffTable: React.FC<ModelTariffTableProps> = ({
     if (!validateForm()) return;
 
     const inputPrice = Number(formData.input_price_per_million) / 1000000 || 0;
-    const outputPrice = Number(formData.output_price_per_million) / 1000000 || 0;
+    const outputPrice =
+      Number(formData.output_price_per_million) / 1000000 || 0;
 
     const updatedTariffs = localTariffs.map((t) =>
       t._tempId === tempId
@@ -191,8 +221,9 @@ export const ModelTariffTable: React.FC<ModelTariffTableProps> = ({
               formData.api_key_purpose === "none"
                 ? undefined
                 : formData.api_key_purpose,
+            completion_window: formData.completion_window || undefined,
           }
-        : t
+        : t,
     );
 
     updateTariffs(updatedTariffs);
@@ -205,16 +236,24 @@ export const ModelTariffTable: React.FC<ModelTariffTableProps> = ({
   };
 
   // Get available API key purposes for dropdown (exclude already-used ones, except "none")
+  // For batch purpose, allow multiple tariffs (one per SLA)
   const getAvailablePurposes = (excludeTempId?: string) => {
     const usedPurposes = new Set(
       localTariffs
-        .filter((t) => t._tempId !== excludeTempId && t.api_key_purpose !== undefined)
-        .map((t) => t.api_key_purpose)
+        .filter(
+          (t) => t._tempId !== excludeTempId && t.api_key_purpose !== undefined,
+        )
+        .map((t) => t.api_key_purpose),
     );
 
-    return Object.entries(API_KEY_PURPOSE_LABELS).filter(
-      ([value]) => value === "none" || !usedPurposes.has(value as TariffApiKeyPurpose)
-    );
+    return Object.entries(API_KEY_PURPOSE_LABELS).filter(([value]) => {
+      // Always allow "none"
+      if (value === "none") return true;
+      // Allow batch even if one exists (can have multiple with different SLAs)
+      if (value === "batch") return true;
+      // For other purposes, exclude if already used
+      return !usedPurposes.has(value as TariffApiKeyPurpose);
+    });
   };
 
   const renderRow = (tariff: TariffEdit) => {
@@ -226,12 +265,18 @@ export const ModelTariffTable: React.FC<ModelTariffTableProps> = ({
           <TableCell>
             <Select
               value={formData.api_key_purpose}
-              onValueChange={(value) =>
+              onValueChange={(value) => {
+                const purpose = value as TariffApiKeyPurpose | "none";
+                const newName = getDefaultName(
+                  purpose,
+                  formData.completion_window,
+                );
                 setFormData({
                   ...formData,
-                  api_key_purpose: value as TariffApiKeyPurpose | "none",
-                })
-              }
+                  api_key_purpose: purpose,
+                  name: newName,
+                });
+              }}
             >
               <SelectTrigger className="w-full">
                 <SelectValue />
@@ -291,6 +336,46 @@ export const ModelTariffTable: React.FC<ModelTariffTableProps> = ({
             )}
           </TableCell>
           <TableCell>
+            {formData.api_key_purpose === "batch" ? (
+              <>
+                <Select
+                  value={formData.completion_window}
+                  onValueChange={(value) => {
+                    const newName = getDefaultName(
+                      formData.api_key_purpose,
+                      value,
+                    );
+                    setFormData({
+                      ...formData,
+                      completion_window: value,
+                      name: newName,
+                    });
+                  }}
+                >
+                  <SelectTrigger
+                    className={`w-full ${errors.completion_window ? "border-red-500" : ""}`}
+                  >
+                    <SelectValue placeholder="Select SLA" />
+                  </SelectTrigger>
+                  <SelectContent>
+                    {availableSLAs.map((sla) => (
+                      <SelectItem key={sla} value={sla}>
+                        {sla}
+                      </SelectItem>
+                    ))}
+                  </SelectContent>
+                </Select>
+                {errors.completion_window && (
+                  <p className="text-xs text-red-500 mt-1">
+                    {errors.completion_window}
+                  </p>
+                )}
+              </>
+            ) : (
+              <span className="text-sm text-gray-400 italic">N/A</span>
+            )}
+          </TableCell>
+          <TableCell>
             {tariff.valid_from ? (
               <span className="text-sm text-gray-600">
                 {new Date(tariff.valid_from).toLocaleString()}
@@ -327,15 +412,24 @@ export const ModelTariffTable: React.FC<ModelTariffTableProps> = ({
       <TableRow key={tariff._tempId}>
         <TableCell>
           {tariff.api_key_purpose
-            ? API_KEY_PURPOSE_LABELS[tariff.api_key_purpose]
+            ? tariff.api_key_purpose === "batch" && tariff.completion_window
+              ? `${API_KEY_PURPOSE_LABELS[tariff.api_key_purpose]} (${tariff.completion_window})`
+              : API_KEY_PURPOSE_LABELS[tariff.api_key_purpose]
             : API_KEY_PURPOSE_LABELS.none}
         </TableCell>
         <TableCell>{tariff.name}</TableCell>
-        <TableCell>
-          {formatTariffPrice(tariff.input_price_per_token)}
-        </TableCell>
+        <TableCell>{formatTariffPrice(tariff.input_price_per_token)}</TableCell>
         <TableCell>
           {formatTariffPrice(tariff.output_price_per_token)}
+        </TableCell>
+        <TableCell>
+          {tariff.completion_window ? (
+            <span className="text-sm text-gray-600">
+              {tariff.completion_window}
+            </span>
+          ) : (
+            <span className="text-sm text-gray-400 italic">N/A</span>
+          )}
         </TableCell>
         <TableCell>
           {tariff.valid_from ? (
@@ -394,17 +488,18 @@ export const ModelTariffTable: React.FC<ModelTariffTableProps> = ({
           <TableHeader>
             <TableRow>
               <TableHead className="w-[180px]">API Key Purpose</TableHead>
-              <TableHead>Name</TableHead>
-              <TableHead className="w-[150px]">Input (per 1M)</TableHead>
-              <TableHead className="w-[150px]">Output (per 1M)</TableHead>
-              <TableHead className="w-[130px]">Valid From</TableHead>
-              <TableHead className="w-[100px]">Actions</TableHead>
+              <TableHead className="w-[180px]">Name</TableHead>
+              <TableHead className="w-20">Input (per 1M)</TableHead>
+              <TableHead className="w-20">Output (per 1M)</TableHead>
+              <TableHead className="w-20">SLA</TableHead>
+              <TableHead className="w-20">Valid From</TableHead>
+              <TableHead className="w-20">Actions</TableHead>
             </TableRow>
           </TableHeader>
           <TableBody>
             {localTariffs.length === 0 && !isAdding && (
               <TableRow>
-                <TableCell colSpan={6} className="text-center text-gray-500">
+                <TableCell colSpan={7} className="text-center text-gray-500">
                   No tariffs configured. Add one to get started.
                 </TableCell>
               </TableRow>
@@ -415,24 +510,28 @@ export const ModelTariffTable: React.FC<ModelTariffTableProps> = ({
                 <TableCell>
                   <Select
                     value={formData.api_key_purpose}
-                    onValueChange={(value) =>
+                    onValueChange={(value) => {
+                      const purpose = value as TariffApiKeyPurpose | "none";
+                      const newName = getDefaultName(
+                        purpose,
+                        formData.completion_window,
+                      );
                       setFormData({
                         ...formData,
-                        api_key_purpose: value as TariffApiKeyPurpose | "none",
-                      })
-                    }
+                        api_key_purpose: purpose,
+                        name: newName,
+                      });
+                    }}
                   >
                     <SelectTrigger className="w-full">
                       <SelectValue />
                     </SelectTrigger>
                     <SelectContent>
-                      {getAvailablePurposes().map(
-                        ([value, label]) => (
-                          <SelectItem key={value} value={value}>
-                            {label}
-                          </SelectItem>
-                        )
-                      )}
+                      {getAvailablePurposes().map(([value, label]) => (
+                        <SelectItem key={value} value={value}>
+                          {label}
+                        </SelectItem>
+                      ))}
                     </SelectContent>
                   </Select>
                 </TableCell>
@@ -483,6 +582,46 @@ export const ModelTariffTable: React.FC<ModelTariffTableProps> = ({
                     <p className="text-xs text-red-500 mt-1">
                       {errors.output_price}
                     </p>
+                  )}
+                </TableCell>
+                <TableCell>
+                  {formData.api_key_purpose === "batch" ? (
+                    <>
+                      <Select
+                        value={formData.completion_window}
+                        onValueChange={(value) => {
+                          const newName = getDefaultName(
+                            formData.api_key_purpose,
+                            value,
+                          );
+                          setFormData({
+                            ...formData,
+                            completion_window: value,
+                            name: newName,
+                          });
+                        }}
+                      >
+                        <SelectTrigger
+                          className={`w-full ${errors.completion_window ? "border-red-500" : ""}`}
+                        >
+                          <SelectValue placeholder="Select SLA" />
+                        </SelectTrigger>
+                        <SelectContent>
+                          {availableSLAs.map((sla) => (
+                            <SelectItem key={sla} value={sla}>
+                              {sla}
+                            </SelectItem>
+                          ))}
+                        </SelectContent>
+                      </Select>
+                      {errors.completion_window && (
+                        <p className="text-xs text-red-500 mt-1">
+                          {errors.completion_window}
+                        </p>
+                      )}
+                    </>
+                  ) : (
+                    <span className="text-sm text-gray-400 italic">N/A</span>
                   )}
                 </TableCell>
                 <TableCell>

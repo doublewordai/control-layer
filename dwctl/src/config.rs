@@ -359,17 +359,29 @@ pub struct DummyConfig {
 /// Frontend metadata displayed in the UI.
 ///
 /// These values are exposed to the frontend and shown in the user interface.
-#[derive(Debug, Clone, Deserialize, Serialize, Default)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(default)]
 pub struct Metadata {
     /// Region name displayed in the UI (e.g., "UK South", "US East")
     pub region: Option<String>,
     /// Organization name displayed in the UI
     pub organization: Option<String>,
-    /// Documentation URL displayed in the UI (e.g., "https://docs.example.com/batches")
-    pub docs_url: Option<String>,
+    /// Documentation URL shown in the UI header
+    pub docs_url: String,
+
     /// JSONL documentation URL displayed in batch modals (e.g., "https://docs.example.com/batches/jsonl-files")
     pub docs_jsonl_url: Option<String>,
+}
+
+impl Default for Metadata {
+    fn default() -> Self {
+        Self {
+            region: None,
+            organization: None,
+            docs_url: "https://docs.doubleword.ai/control-layer".to_string(),
+            docs_jsonl_url: None,
+        }
+    }
 }
 
 /// External model source configuration.
@@ -632,6 +644,10 @@ impl Default for FilesConfig {
 pub struct BatchConfig {
     /// Enable batches API endpoints (default: true)
     pub enabled: bool,
+    /// Allowed completion windows (SLAs) for batch processing.
+    /// These define the maximum time from batch creation to completion.
+    /// Default: vec!["24h".to_string()]
+    pub allowed_completion_windows: Vec<String>,
     /// Files configuration for batch file uploads/downloads
     pub files: FilesConfig,
 }
@@ -640,6 +656,7 @@ impl Default for BatchConfig {
     fn default() -> Self {
         Self {
             enabled: true,
+            allowed_completion_windows: vec!["24h".to_string()],
             files: FilesConfig::default(),
         }
     }
@@ -740,6 +757,24 @@ pub struct DaemonConfig {
     /// ```
     #[serde(default)]
     pub sla_thresholds: Vec<fusillade::SlaThreshold>,
+
+    /// Batch table column names to include as request headers.
+    /// These values are sent as `x-fusillade-batch-{column}` headers with each request.
+    /// Example: ["id", "created_by", "endpoint"] produces headers like:
+    ///   - x-fusillade-batch-id
+    ///   - x-fusillade-batch-created-by
+    ///   - x-fusillade-batch-endpoint
+    #[serde(default = "default_batch_metadata_fields_dwctl")]
+    pub batch_metadata_fields: Vec<String>,
+}
+
+fn default_batch_metadata_fields_dwctl() -> Vec<String> {
+    vec![
+        "id".to_string(),
+        "endpoint".to_string(),
+        "created_at".to_string(),
+        "completion_window".to_string(),
+    ]
 }
 
 impl Default for DaemonConfig {
@@ -758,6 +793,7 @@ impl Default for DaemonConfig {
             status_log_interval_ms: Some(2000),
             claim_timeout_ms: 60000,
             processing_timeout_ms: 600000,
+            batch_metadata_fields: default_batch_metadata_fields_dwctl(),
             priority_endpoints: HashMap::new(),
             sla_check_interval_seconds: 60,
             sla_thresholds: vec![],
@@ -800,6 +836,7 @@ impl DaemonConfig {
             status_log_interval_ms: self.status_log_interval_ms,
             claim_timeout_ms: self.claim_timeout_ms,
             processing_timeout_ms: self.processing_timeout_ms,
+            batch_metadata_fields: self.batch_metadata_fields.clone(),
             priority_endpoints: Arc::new(DashMap::from_iter(priority_endpoints_map)),
             sla_check_interval_seconds: self.sla_check_interval_seconds,
             sla_thresholds: self.sla_thresholds.clone(),

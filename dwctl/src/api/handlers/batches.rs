@@ -114,13 +114,15 @@ fn to_batch_response(batch: fusillade::Batch) -> BatchResponse {
     path = "/batches",
     tag = "batches",
     summary = "Create batch",
-    description = "Creates and executes a batch from an uploaded file of requests",
+    description = "Create and start processing a batch from an uploaded file.
+
+The batch will begin processing immediately. Use `GET /batches/{batch_id}` to monitor progress.",
     request_body = CreateBatchRequest,
     responses(
-        (status = 201, description = "Batch created successfully", body = BatchResponse),
-        (status = 400, description = "Invalid request"),
-        (status = 404, description = "Input file not found"),
-        (status = 500, description = "Internal server error")
+        (status = 201, description = "Batch created and queued for processing.", body = BatchResponse),
+        (status = 400, description = "Invalid request — check that the endpoint and completion_window are valid."),
+        (status = 404, description = "Input file not found or you don't have access to it."),
+        (status = 500, description = "An unexpected error occurred. Retry the request or contact support if the issue persists.")
     )
 )]
 #[tracing::instrument(skip(state, current_user), fields(user_id = %current_user.id, input_file_id = %req.input_file_id))]
@@ -129,10 +131,14 @@ pub async fn create_batch(
     current_user: RequiresPermission<resource::Batches, operation::CreateOwn>,
     Json(req): Json<CreateBatchRequest>,
 ) -> Result<(StatusCode, Json<BatchResponse>)> {
-    // Validate completion_window
-    if req.completion_window != "24h" {
+    // Validate completion_window against configured allowed values
+    if !state.config.batches.allowed_completion_windows.contains(&req.completion_window) {
         return Err(Error::BadRequest {
-            message: "Only '24h' completion_window is currently supported".to_string(),
+            message: format!(
+                "Unsupported completion_window '{}'. Allowed: {}",
+                req.completion_window,
+                state.config.batches.allowed_completion_windows.join(", ")
+            ),
         });
     }
 
@@ -206,14 +212,16 @@ pub async fn create_batch(
     path = "/batches/{batch_id}",
     tag = "batches",
     summary = "Retrieve batch",
-    description = "Retrieves a batch by ID",
+    description = "Retrieve the current status and details of a batch.
+
+Poll this endpoint to monitor progress. Results are streamed to `output_file_id` as they complete — you can start downloading results before the batch finishes.",
     responses(
-        (status = 200, description = "Batch retrieved successfully", body = BatchResponse),
-        (status = 404, description = "Batch not found"),
-        (status = 500, description = "Internal server error")
+        (status = 200, description = "Batch details including status, progress counts, and output file IDs.", body = BatchResponse),
+        (status = 404, description = "Batch not found or you don't have access to it."),
+        (status = 500, description = "An unexpected error occurred. Retry the request or contact support if the issue persists.")
     ),
     params(
-        ("batch_id" = String, Path, description = "The ID of the batch to retrieve")
+        ("batch_id" = String, Path, description = "The batch ID returned when the batch was created.")
     )
 )]
 #[tracing::instrument(skip(state, current_user), fields(user_id = %current_user.id, batch_id = %batch_id_str))]
@@ -256,14 +264,16 @@ pub async fn get_batch(
     path = "/batches/{batch_id}/analytics",
     tag = "batches",
     summary = "Get batch analytics",
-    description = "Retrieves aggregated analytics metrics for a batch, including token usage, costs, and performance metrics",
+    description = "Retrieve aggregated metrics for a batch including token usage, costs, and latency statistics.
+
+Analytics update in real-time as requests complete.",
     responses(
-        (status = 200, description = "Batch analytics retrieved successfully", body = BatchAnalytics),
-        (status = 404, description = "Batch not found or no analytics available"),
-        (status = 500, description = "Internal server error")
+        (status = 200, description = "Batch analytics with token counts, costs, and performance metrics.", body = BatchAnalytics),
+        (status = 404, description = "Batch not found or you don't have access to it."),
+        (status = 500, description = "An unexpected error occurred. Retry the request or contact support if the issue persists.")
     ),
     params(
-        ("batch_id" = String, Path, description = "The ID of the batch to retrieve analytics for")
+        ("batch_id" = String, Path, description = "The batch ID returned when the batch was created.")
     )
 )]
 #[tracing::instrument(skip(state, current_user), fields(user_id = %current_user.id, batch_id = %batch_id_str))]
@@ -313,14 +323,16 @@ pub async fn get_batch_analytics(
     path = "/batches/{batch_id}/cancel",
     tag = "batches",
     summary = "Cancel batch",
-    description = "Cancels an in-progress batch",
+    description = "Cancel an in-progress batch.
+
+Pending requests will not be processed. Requests already in progress will complete. The batch status will transition to `cancelling` then `cancelled`.",
     responses(
-        (status = 200, description = "Batch cancellation initiated", body = BatchResponse),
-        (status = 404, description = "Batch not found"),
-        (status = 500, description = "Internal server error")
+        (status = 200, description = "Cancellation initiated. The batch will finish processing in-flight requests.", body = BatchResponse),
+        (status = 404, description = "Batch not found or you don't have access to it."),
+        (status = 500, description = "An unexpected error occurred. Retry the request or contact support if the issue persists.")
     ),
     params(
-        ("batch_id" = String, Path, description = "The ID of the batch to cancel")
+        ("batch_id" = String, Path, description = "The batch ID returned when the batch was created.")
     )
 )]
 #[tracing::instrument(skip(state, current_user), fields(user_id = %current_user.id, batch_id = %batch_id_str))]
@@ -383,22 +395,18 @@ pub async fn cancel_batch(
     delete,
     path = "/batches/{batch_id}",
     tag = "batches",
-    summary = "Delete a batch",
-    description = "Delete a batch and all its associated requests. This is a destructive operation that cannot be undone.",
+    summary = "Delete batch",
+    description = "Permanently delete a batch and all its associated data.
+
+This action cannot be undone. The input file is not deleted.",
     responses(
-        (status = 204, description = "Batch deleted successfully"),
-        (status = 400, description = "Invalid batch ID format"),
-        (status = 403, description = "Forbidden - user does not have permission to delete this batch"),
-        (status = 404, description = "Batch not found"),
-        (status = 500, description = "Internal server error")
+        (status = 204, description = "Batch deleted successfully."),
+        (status = 400, description = "Invalid batch ID format."),
+        (status = 404, description = "Batch not found or you don't have access to it."),
+        (status = 500, description = "An unexpected error occurred. Retry the request or contact support if the issue persists.")
     ),
     params(
-        ("batch_id" = String, Path, description = "Batch ID")
-    ),
-    security(
-        ("BearerAuth" = []),
-        ("CookieAuth" = []),
-        ("X-Doubleword-User" = [])
+        ("batch_id" = String, Path, description = "The batch ID returned when the batch was created.")
     )
 )]
 #[tracing::instrument(skip(state, current_user), fields(batch_id = %batch_id_str))]
@@ -452,14 +460,17 @@ pub async fn delete_batch(
     path = "/batches/{batch_id}/retry",
     tag = "batches",
     summary = "Retry failed requests",
-    description = "Retries all failed requests in a batch by resetting them to pending state",
+    description = "Retry all failed requests in a batch.
+
+Failed requests are reset to pending and will be processed again. Use this after fixing transient issues or increasing rate limits.",
     responses(
-        (status = 200, description = "Failed requests retry initiated", body = BatchResponse),
-        (status = 404, description = "Batch not found"),
-        (status = 500, description = "Internal server error")
+        (status = 200, description = "Failed requests queued for retry.", body = BatchResponse),
+        (status = 400, description = "No failed requests to retry in this batch."),
+        (status = 404, description = "Batch not found or you don't have access to it."),
+        (status = 500, description = "An unexpected error occurred. Retry the request or contact support if the issue persists.")
     ),
     params(
-        ("batch_id" = String, Path, description = "The ID of the batch to retry failed requests for")
+        ("batch_id" = String, Path, description = "The batch ID returned when the batch was created.")
     )
 )]
 #[tracing::instrument(skip(state, current_user), fields(user_id = %current_user.id, batch_id = %batch_id_str))]
@@ -576,15 +587,18 @@ pub async fn retry_failed_batch_requests(
     path = "/batches/{batch_id}/retry-requests",
     tag = "batches",
     summary = "Retry specific requests",
-    description = "Retries specific failed requests in a batch by their IDs",
+    description = "Retry specific failed requests by their IDs.
+
+Use this for fine-grained control over which requests to retry, rather than retrying all failures.",
     request_body = RetryRequestsRequest,
     responses(
-        (status = 200, description = "Specific requests retry initiated", body = BatchResponse),
-        (status = 404, description = "Batch not found"),
-        (status = 500, description = "Internal server error")
+        (status = 200, description = "Specified requests queued for retry.", body = BatchResponse),
+        (status = 400, description = "No valid request IDs provided."),
+        (status = 404, description = "Batch not found or you don't have access to it."),
+        (status = 500, description = "An unexpected error occurred. Retry the request or contact support if the issue persists.")
     ),
     params(
-        ("batch_id" = String, Path, description = "The ID of the batch containing the requests to retry")
+        ("batch_id" = String, Path, description = "The batch ID returned when the batch was created.")
     )
 )]
 #[tracing::instrument(skip(state, current_user, req), fields(user_id = %current_user.id, batch_id = %batch_id_str))]
@@ -688,10 +702,12 @@ pub async fn retry_specific_requests(
     path = "/batches",
     tag = "batches",
     summary = "List batches",
-    description = "Returns a list of batches",
+    description = "Returns a paginated list of your batches, newest first.
+
+Use cursor-based pagination: pass `last_id` from the response as the `after` parameter to fetch the next page.",
     responses(
-        (status = 200, description = "List of batches", body = BatchListResponse),
-        (status = 500, description = "Internal server error")
+        (status = 200, description = "List of batches. Check `has_more` to determine if additional pages exist.", body = BatchListResponse),
+        (status = 500, description = "An unexpected error occurred. Retry the request or contact support if the issue persists.")
     ),
     params(
         ListBatchesQuery
@@ -743,4 +759,331 @@ pub async fn list_batches(
         last_id,
         has_more,
     }))
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::api::models::batches::CreateBatchRequest;
+    use crate::api::models::users::Role;
+    use crate::test_utils::*;
+    use axum::http::StatusCode;
+    use sqlx::PgPool;
+
+    #[sqlx::test]
+    #[test_log::test]
+    async fn test_create_batch_with_default_24h_sla(pool: PgPool) {
+        let (app, _bg_services) = create_test_app(pool.clone(), false).await;
+        let user = create_test_user_with_roles(&pool, vec![Role::StandardUser, Role::BatchAPIUser]).await;
+        let group = create_test_group(&pool).await;
+        add_user_to_group(&pool, user.id, group.id).await;
+
+        // Create a deployment and add to group so user has access to the model
+        let deployment = create_test_deployment(&pool, user.id, "gpt-4-model", "gpt-4").await;
+        add_deployment_to_group(&pool, deployment.id, group.id, user.id).await;
+
+        // Upload a batch file first
+        let jsonl_content = r#"{"custom_id":"request-1","method":"POST","url":"/v1/chat/completions","body":{"model":"gpt-4","messages":[{"role":"user","content":"Hello"}]}}"#;
+        let file_part = axum_test::multipart::Part::bytes(jsonl_content.as_bytes()).file_name("test-batch.jsonl");
+        let multipart = axum_test::multipart::MultipartForm::new()
+            .add_part("file", file_part)
+            .add_part("purpose", axum_test::multipart::Part::text("batch"));
+        let upload_resp = app
+            .post("/ai/v1/files")
+            .multipart(multipart)
+            .add_header(&add_auth_headers(&user)[0].0, &add_auth_headers(&user)[0].1)
+            .add_header(&add_auth_headers(&user)[1].0, &add_auth_headers(&user)[1].1)
+            .await;
+        upload_resp.assert_status(StatusCode::CREATED);
+        let file: serde_json::Value = upload_resp.json();
+        let file_id = file["id"].as_str().unwrap();
+
+        // Create batch with 24h SLA (default allowed)
+        let create_req = CreateBatchRequest {
+            input_file_id: file_id.to_string(),
+            endpoint: "/v1/chat/completions".to_string(),
+            completion_window: "24h".to_string(),
+            metadata: None,
+        };
+
+        let resp = app
+            .post("/ai/v1/batches")
+            .json(&create_req)
+            .add_header(&add_auth_headers(&user)[0].0, &add_auth_headers(&user)[0].1)
+            .add_header(&add_auth_headers(&user)[1].0, &add_auth_headers(&user)[1].1)
+            .await;
+        resp.assert_status(StatusCode::CREATED);
+    }
+
+    #[sqlx::test]
+    #[test_log::test]
+    async fn test_create_batch_with_unsupported_sla(pool: PgPool) {
+        let (app, _bg_services) = create_test_app(pool.clone(), false).await;
+        let user = create_test_user_with_roles(&pool, vec![Role::StandardUser, Role::BatchAPIUser]).await;
+        let group = create_test_group(&pool).await;
+        add_user_to_group(&pool, user.id, group.id).await;
+
+        // Create a deployment and add to group so user has access to the model
+        let deployment = create_test_deployment(&pool, user.id, "gpt-4-model", "gpt-4").await;
+        add_deployment_to_group(&pool, deployment.id, group.id, user.id).await;
+
+        // Upload a batch file first
+        let jsonl_content = r#"{"custom_id":"request-1","method":"POST","url":"/v1/chat/completions","body":{"model":"gpt-4","messages":[{"role":"user","content":"Hello"}]}}"#;
+        let file_part = axum_test::multipart::Part::bytes(jsonl_content.as_bytes()).file_name("test-batch.jsonl");
+        let multipart = axum_test::multipart::MultipartForm::new()
+            .add_part("file", file_part)
+            .add_part("purpose", axum_test::multipart::Part::text("batch"));
+        let upload_resp = app
+            .post("/ai/v1/files")
+            .multipart(multipart)
+            .add_header(&add_auth_headers(&user)[0].0, &add_auth_headers(&user)[0].1)
+            .add_header(&add_auth_headers(&user)[1].0, &add_auth_headers(&user)[1].1)
+            .await;
+        upload_resp.assert_status(StatusCode::CREATED);
+        let file: serde_json::Value = upload_resp.json();
+        let file_id = file["id"].as_str().unwrap();
+
+        // Try to create batch with unsupported 1h SLA
+        let create_req = CreateBatchRequest {
+            input_file_id: file_id.to_string(),
+            endpoint: "/v1/chat/completions".to_string(),
+            completion_window: "1h".to_string(),
+            metadata: None,
+        };
+
+        let resp = app
+            .post("/ai/v1/batches")
+            .json(&create_req)
+            .add_header(&add_auth_headers(&user)[0].0, &add_auth_headers(&user)[0].1)
+            .add_header(&add_auth_headers(&user)[1].0, &add_auth_headers(&user)[1].1)
+            .await;
+        resp.assert_status(StatusCode::BAD_REQUEST);
+        let error_text = resp.text();
+        assert!(error_text.contains("Unsupported completion_window"));
+    }
+
+    #[sqlx::test]
+    #[test_log::test]
+    async fn test_create_batch_with_custom_allowed_sla(pool: PgPool) {
+        // Create app with custom config allowing multiple SLAs
+        let mut config = create_test_config();
+        config.batches.allowed_completion_windows = vec!["1h".to_string(), "24h".to_string(), "48h".to_string()];
+
+        let (app, _bg_services) = create_test_app_with_config(pool.clone(), config, false).await;
+        let user = create_test_user_with_roles(&pool, vec![Role::StandardUser, Role::BatchAPIUser]).await;
+        let group = create_test_group(&pool).await;
+        add_user_to_group(&pool, user.id, group.id).await;
+
+        // Create a deployment and add to group so user has access to the model
+        let deployment = create_test_deployment(&pool, user.id, "gpt-4-model", "gpt-4").await;
+        add_deployment_to_group(&pool, deployment.id, group.id, user.id).await;
+
+        // Upload a batch file first
+        let jsonl_content = r#"{"custom_id":"request-1","method":"POST","url":"/v1/chat/completions","body":{"model":"gpt-4","messages":[{"role":"user","content":"Hello"}]}}"#;
+        let file_part = axum_test::multipart::Part::bytes(jsonl_content.as_bytes()).file_name("test-batch.jsonl");
+        let multipart = axum_test::multipart::MultipartForm::new()
+            .add_part("file", file_part)
+            .add_part("purpose", axum_test::multipart::Part::text("batch"));
+        let upload_resp = app
+            .post("/ai/v1/files")
+            .multipart(multipart)
+            .add_header(&add_auth_headers(&user)[0].0, &add_auth_headers(&user)[0].1)
+            .add_header(&add_auth_headers(&user)[1].0, &add_auth_headers(&user)[1].1)
+            .await;
+        upload_resp.assert_status(StatusCode::CREATED);
+        let file: serde_json::Value = upload_resp.json();
+        let file_id = file["id"].as_str().unwrap();
+
+        // Create batch with 1h SLA (now allowed in custom config)
+        let create_req = CreateBatchRequest {
+            input_file_id: file_id.to_string(),
+            endpoint: "/v1/chat/completions".to_string(),
+            completion_window: "1h".to_string(),
+            metadata: None,
+        };
+
+        let resp = app
+            .post("/ai/v1/batches")
+            .json(&create_req)
+            .add_header(&add_auth_headers(&user)[0].0, &add_auth_headers(&user)[0].1)
+            .add_header(&add_auth_headers(&user)[1].0, &add_auth_headers(&user)[1].1)
+            .await;
+        resp.assert_status(StatusCode::CREATED);
+
+        // Also test that 48h works
+        let upload_resp2 = app
+            .post("/ai/v1/files")
+            .multipart(
+                axum_test::multipart::MultipartForm::new()
+                    .add_part(
+                        "file",
+                        axum_test::multipart::Part::bytes(jsonl_content.as_bytes()).file_name("test-batch-2.jsonl"),
+                    )
+                    .add_part("purpose", axum_test::multipart::Part::text("batch")),
+            )
+            .add_header(&add_auth_headers(&user)[0].0, &add_auth_headers(&user)[0].1)
+            .add_header(&add_auth_headers(&user)[1].0, &add_auth_headers(&user)[1].1)
+            .await;
+        upload_resp2.assert_status(StatusCode::CREATED);
+        let file2: serde_json::Value = upload_resp2.json();
+        let file_id2 = file2["id"].as_str().unwrap();
+
+        let create_req2 = CreateBatchRequest {
+            input_file_id: file_id2.to_string(),
+            endpoint: "/v1/chat/completions".to_string(),
+            completion_window: "48h".to_string(),
+            metadata: None,
+        };
+
+        let resp2 = app
+            .post("/ai/v1/batches")
+            .json(&create_req2)
+            .add_header(&add_auth_headers(&user)[0].0, &add_auth_headers(&user)[0].1)
+            .add_header(&add_auth_headers(&user)[1].0, &add_auth_headers(&user)[1].1)
+            .await;
+        resp2.assert_status(StatusCode::CREATED);
+    }
+
+    #[sqlx::test]
+    #[test_log::test]
+    async fn test_sla_to_expiry_timestamp_24h(pool: PgPool) {
+        let (app, _bg_services) = create_test_app(pool.clone(), false).await;
+        let user = create_test_user_with_roles(&pool, vec![Role::StandardUser, Role::BatchAPIUser]).await;
+        let group = create_test_group(&pool).await;
+        add_user_to_group(&pool, user.id, group.id).await;
+
+        // Create a deployment and add to group so user has access to the model
+        let deployment = create_test_deployment(&pool, user.id, "gpt-4-model", "gpt-4").await;
+        add_deployment_to_group(&pool, deployment.id, group.id, user.id).await;
+
+        // Upload a batch file first
+        let jsonl_content = r#"{"custom_id":"request-1","method":"POST","url":"/v1/chat/completions","body":{"model":"gpt-4","messages":[{"role":"user","content":"Hello"}]}}"#;
+        let file_part = axum_test::multipart::Part::bytes(jsonl_content.as_bytes()).file_name("test-batch.jsonl");
+        let multipart = axum_test::multipart::MultipartForm::new()
+            .add_part("file", file_part)
+            .add_part("purpose", axum_test::multipart::Part::text("batch"));
+        let upload_resp = app
+            .post("/ai/v1/files")
+            .multipart(multipart)
+            .add_header(&add_auth_headers(&user)[0].0, &add_auth_headers(&user)[0].1)
+            .add_header(&add_auth_headers(&user)[1].0, &add_auth_headers(&user)[1].1)
+            .await;
+        upload_resp.assert_status(StatusCode::CREATED);
+        let file: serde_json::Value = upload_resp.json();
+        let file_id = file["id"].as_str().unwrap();
+
+        // Record the time before creating the batch
+        let now = chrono::Utc::now();
+
+        // Create batch with 24h SLA
+        let create_req = CreateBatchRequest {
+            input_file_id: file_id.to_string(),
+            endpoint: "/v1/chat/completions".to_string(),
+            completion_window: "24h".to_string(),
+            metadata: None,
+        };
+
+        let resp = app
+            .post("/ai/v1/batches")
+            .json(&create_req)
+            .add_header(&add_auth_headers(&user)[0].0, &add_auth_headers(&user)[0].1)
+            .add_header(&add_auth_headers(&user)[1].0, &add_auth_headers(&user)[1].1)
+            .await;
+        resp.assert_status(StatusCode::CREATED);
+        let batch: serde_json::Value = resp.json();
+
+        // Verify the batch has an expires_at timestamp
+        let expires_at = batch["expires_at"].as_i64().expect("expires_at should be present");
+
+        // Convert to DateTime for easier comparison
+        let expires_at_dt = chrono::DateTime::from_timestamp(expires_at, 0).expect("Invalid timestamp");
+
+        // Calculate expected expiry (24 hours from now)
+        let expected_expiry = now + chrono::Duration::hours(24);
+
+        // Allow 1 minute tolerance for test execution time
+        let tolerance = chrono::Duration::minutes(1);
+        let diff = (expires_at_dt - expected_expiry).abs();
+
+        assert!(
+            diff < tolerance,
+            "Expiry timestamp should be ~24h from now. Expected: {}, Got: {}, Diff: {} seconds",
+            expected_expiry,
+            expires_at_dt,
+            diff.num_seconds()
+        );
+    }
+
+    #[sqlx::test]
+    #[test_log::test]
+    async fn test_sla_to_expiry_timestamp_custom(pool: PgPool) {
+        // Create app with custom config allowing 1h SLA
+        let mut config = create_test_config();
+        config.batches.allowed_completion_windows = vec!["1h".to_string(), "24h".to_string()];
+
+        let (app, _bg_services) = create_test_app_with_config(pool.clone(), config, false).await;
+        let user = create_test_user_with_roles(&pool, vec![Role::StandardUser, Role::BatchAPIUser]).await;
+        let group = create_test_group(&pool).await;
+        add_user_to_group(&pool, user.id, group.id).await;
+
+        // Create a deployment and add to group so user has access to the model
+        let deployment = create_test_deployment(&pool, user.id, "gpt-4-model", "gpt-4").await;
+        add_deployment_to_group(&pool, deployment.id, group.id, user.id).await;
+
+        // Upload a batch file first
+        let jsonl_content = r#"{"custom_id":"request-1","method":"POST","url":"/v1/chat/completions","body":{"model":"gpt-4","messages":[{"role":"user","content":"Hello"}]}}"#;
+        let file_part = axum_test::multipart::Part::bytes(jsonl_content.as_bytes()).file_name("test-batch.jsonl");
+        let multipart = axum_test::multipart::MultipartForm::new()
+            .add_part("file", file_part)
+            .add_part("purpose", axum_test::multipart::Part::text("batch"));
+        let upload_resp = app
+            .post("/ai/v1/files")
+            .multipart(multipart)
+            .add_header(&add_auth_headers(&user)[0].0, &add_auth_headers(&user)[0].1)
+            .add_header(&add_auth_headers(&user)[1].0, &add_auth_headers(&user)[1].1)
+            .await;
+        upload_resp.assert_status(StatusCode::CREATED);
+        let file: serde_json::Value = upload_resp.json();
+        let file_id = file["id"].as_str().unwrap();
+
+        // Record the time before creating the batch
+        let now = chrono::Utc::now();
+
+        // Create batch with 1h SLA
+        let create_req = CreateBatchRequest {
+            input_file_id: file_id.to_string(),
+            endpoint: "/v1/chat/completions".to_string(),
+            completion_window: "1h".to_string(),
+            metadata: None,
+        };
+
+        let resp = app
+            .post("/ai/v1/batches")
+            .json(&create_req)
+            .add_header(&add_auth_headers(&user)[0].0, &add_auth_headers(&user)[0].1)
+            .add_header(&add_auth_headers(&user)[1].0, &add_auth_headers(&user)[1].1)
+            .await;
+        resp.assert_status(StatusCode::CREATED);
+        let batch: serde_json::Value = resp.json();
+
+        // Verify the batch has an expires_at timestamp
+        let expires_at = batch["expires_at"].as_i64().expect("expires_at should be present");
+
+        // Convert to DateTime for easier comparison
+        let expires_at_dt = chrono::DateTime::from_timestamp(expires_at, 0).expect("Invalid timestamp");
+
+        // Calculate expected expiry (1 hour from now)
+        let expected_expiry = now + chrono::Duration::hours(1);
+
+        // Allow 1 minute tolerance for test execution time
+        let tolerance = chrono::Duration::minutes(1);
+        let diff = (expires_at_dt - expected_expiry).abs();
+
+        assert!(
+            diff < tolerance,
+            "Expiry timestamp should be ~1h from now. Expected: {}, Got: {}, Diff: {} seconds",
+            expected_expiry,
+            expires_at_dt,
+            diff.num_seconds()
+        );
+    }
 }

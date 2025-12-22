@@ -575,6 +575,7 @@ mod tests {
                 input_price_per_token: Decimal::from_str("0.001").unwrap(),
                 output_price_per_token: Decimal::from_str("0.002").unwrap(),
                 api_key_purpose: None,
+                completion_window: None,
                 valid_from: Utc::now(),
                 valid_until: None,
                 is_active: true,

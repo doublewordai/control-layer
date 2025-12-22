@@ -1,4 +1,4 @@
-import { useState, useEffect } from "react";
+import { useState, useEffect, useMemo } from "react";
 import { Play, AlertCircle, X, Upload, ExternalLink } from "lucide-react";
 import {
   Dialog,
@@ -13,10 +13,18 @@ import { Label } from "../../ui/label";
 import { Input } from "../../ui/input";
 import { Combobox } from "../../ui/combobox";
 import {
+  Select,
+  SelectContent,
+  SelectItem,
+  SelectTrigger,
+  SelectValue,
+} from "../../ui/select";
+import {
   useCreateBatch,
   useFiles,
   useUploadFile,
   useConfig,
+  useFileCostEstimate,
 } from "../../../api/control-layer/hooks";
 import { toast } from "sonner";
 import type { FileObject } from "../../features/batches/types";
@@ -45,6 +53,7 @@ export function CreateBatchModal({
   );
   const [expirationSeconds, setExpirationSeconds] = useState<number>(2592000); // 30 days default
   const [endpoint, setEndpoint] = useState<string>("/v1/chat/completions");
+  const [completionWindow, setCompletionWindow] = useState<string>("24h"); // Default SLA
   const [description, setDescription] = useState<string>("");
   const [error, setError] = useState<string | null>(null);
   const [dragActive, setDragActive] = useState(false);
@@ -52,7 +61,13 @@ export function CreateBatchModal({
 
   const createBatchMutation = useCreateBatch();
   const uploadMutation = useUploadFile();
+
+  // Fetch config to get available SLAs
   const { data: config } = useConfig();
+  const availableSLAs = useMemo(
+    () => config?.batches?.allowed_completion_windows || ["24h"],
+    [config?.batches?.allowed_completion_windows],
+  );
 
   // Fetch available files for combobox (only input files with purpose "batch")
   const { data: filesResponse } = useFiles({
@@ -61,6 +76,19 @@ export function CreateBatchModal({
   });
 
   const availableFiles = filesResponse?.data || [];
+
+  // Fetch cost estimate for selected file with current SLA
+  const { data: costEstimate, isLoading: isLoadingCost } = useFileCostEstimate(
+    selectedFileId || undefined,
+    completionWindow,
+  );
+
+  // Update default SLA when available SLAs change
+  useEffect(() => {
+    if (availableSLAs.length > 0 && !availableSLAs.includes(completionWindow)) {
+      setCompletionWindow(availableSLAs[0]);
+    }
+  }, [availableSLAs, completionWindow]);
 
   // Update selected file when preselected file changes
   useEffect(() => {
@@ -168,7 +196,7 @@ export function CreateBatchModal({
       await createBatchMutation.mutateAsync({
         input_file_id: finalFileId,
         endpoint,
-        completion_window: "24h",
+        completion_window: completionWindow,
         metadata: Object.keys(metadata).length > 0 ? metadata : undefined,
       });
 
@@ -182,6 +210,7 @@ export function CreateBatchModal({
       setSelectedFileId(null);
       setFileToUpload(null);
       setEndpoint("/v1/chat/completions");
+      setCompletionWindow(availableSLAs[0] || "24h");
       setDescription("");
       setExpirationSeconds(2592000);
       setError(null);
@@ -197,6 +226,7 @@ export function CreateBatchModal({
     setSelectedFileId(preselectedFile?.id || null);
     setFileToUpload(null);
     setEndpoint("/v1/chat/completions");
+    setCompletionWindow(availableSLAs[0] || "24h");
     setDescription("");
     setExpirationSeconds(2592000);
     setError(null);
@@ -389,6 +419,72 @@ export function CreateBatchModal({
               Add a description to help identify this batch later
             </p>
           </div>
+
+          {/* SLA Selection */}
+          <div className="space-y-2">
+            <Label htmlFor="completion-window">Completion Window (SLA)</Label>
+            <Select
+              value={completionWindow}
+              onValueChange={setCompletionWindow}
+              disabled={isPending}
+            >
+              <SelectTrigger id="completion-window">
+                <SelectValue />
+              </SelectTrigger>
+              <SelectContent>
+                {availableSLAs.map((sla) => (
+                  <SelectItem key={sla} value={sla}>
+                    {sla}
+                  </SelectItem>
+                ))}
+              </SelectContent>
+            </Select>
+            <p className="text-xs text-gray-500">
+              Select the maximum time allowed for batch completion
+            </p>
+          </div>
+
+          {/* Cost Estimate */}
+          {selectedFileId && (
+            <div className="bg-gray-50 border border-gray-200 rounded-lg p-3">
+              <div className="space-y-2">
+                <p className="text-sm font-medium text-gray-900">
+                  Cost Estimate
+                </p>
+                {isLoadingCost ? (
+                  <div className="flex items-center gap-2 text-sm text-gray-600">
+                    <div className="animate-spin rounded-full h-3 w-3 border-b-2 border-gray-600"></div>
+                    Calculating...
+                  </div>
+                ) : costEstimate ? (
+                  <div className="space-y-1.5">
+                    <div className="flex justify-between text-sm">
+                      <span className="text-gray-600">Total Requests:</span>
+                      <span className="font-medium text-gray-900">
+                        {costEstimate.total_requests.toLocaleString()}
+                      </span>
+                    </div>
+                    <div className="flex justify-between text-sm">
+                      <span className="text-gray-600">Estimated Cost:</span>
+                      <span className="font-semibold text-gray-900">
+                        $
+                        {parseFloat(costEstimate.total_estimated_cost).toFixed(
+                          4,
+                        )}
+                      </span>
+                    </div>
+                    <div className="text-xs text-gray-500 pt-1">
+                      Based on {completionWindow} SLA pricing
+                    </div>
+                  </div>
+                ) : (
+                  <p className="text-sm text-gray-500">
+                    Cost estimate unavailable
+                  </p>
+                )}
+              </div>
+            </div>
+          )}
 
           {/* Info Box */}
           <div className="bg-blue-50 border border-blue-200 rounded-lg p-3">

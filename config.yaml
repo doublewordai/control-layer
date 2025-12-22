@@ -163,6 +163,15 @@ batches:
   # When disabled, these endpoints will not be available (default: true)
   enabled: true
 
+  # Allowed completion windows (SLAs) for batch processing
+  # These define the maximum time from batch creation to completion
+  # Default: ["24h"] - only 24 hour completion window is allowed
+  allowed_completion_windows:
+    - "24h"
+    - "1h"
+    # - "12h"  # Uncomment to allow 12 hour SLA
+    # - "48h"  # Uncomment to allow 48 hour SLA
+
   # Files configuration for batch file uploads/downloads
   files:
     max_file_size: 2147483648 # 2 GB - maximum size for file uploads

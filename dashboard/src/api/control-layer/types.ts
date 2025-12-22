@@ -24,8 +24,13 @@ export interface ConfigResponse {
   region: string;
   organization: string;
   payment_enabled: boolean;
-  docs_url?: string;
+
   docs_jsonl_url?: string;
+  docs_url: string;
+  batches?: {
+    enabled: boolean;
+    allowed_completion_windows: string[]; // Available SLAs like ["24h", "1h", "12h"]
+  };
 }
 
 // Model metrics time series point
@@ -64,6 +69,7 @@ export interface ModelTariff {
   valid_from: string; // ISO 8601 timestamp
   valid_until?: string | null; // ISO 8601 timestamp, null means currently active
   api_key_purpose?: TariffApiKeyPurpose | null;
+  completion_window?: string | null; // SLA like "24h", "1h" - required for batch tariffs
   is_active: boolean;
 }
 
@@ -73,6 +79,7 @@ export interface TariffDefinition {
   input_price_per_token: string; // Decimal string to preserve precision
   output_price_per_token: string; // Decimal string to preserve precision
   api_key_purpose?: TariffApiKeyPurpose | null;
+  completion_window?: string | null; // SLA like "24h", "1h" - required for batch tariffs
 }
 
 // Base model types
@@ -888,7 +895,7 @@ export interface Batch {
   endpoint: string;
   errors?: BatchErrors | null;
   input_file_id: string;
-  completion_window: "24h";
+  completion_window: string; // SLA like "24h", "1h", "12h", "48h"
   status: BatchStatus;
   output_file_id?: string | null;
   error_file_id?: string | null;
@@ -917,7 +924,7 @@ export interface BatchListResponse {
 export interface BatchCreateRequest {
   input_file_id: string;
   endpoint: string;
-  completion_window: "24h";
+  completion_window: string; // SLA like "24h", "1h", "12h", "48h"
   metadata?: Record<string, string>;
   output_expires_after?: {
     anchor: "created_at";

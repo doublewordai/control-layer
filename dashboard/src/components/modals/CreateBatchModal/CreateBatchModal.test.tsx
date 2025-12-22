@@ -79,6 +79,26 @@ describe("CreateBatchModal", () => {
       error: null,
       refetch: vi.fn(),
     } as any);
+
+    // Default mock for useConfig
+    vi.mocked(hooks.useConfig).mockReturnValue({
+      data: {
+        batches: {
+          allowed_completion_windows: ["24h"],
+        },
+      },
+      isLoading: false,
+      error: null,
+      refetch: vi.fn(),
+    } as any);
+
+    // Default mock for useFileCostEstimate
+    vi.mocked(hooks.useFileCostEstimate).mockReturnValue({
+      data: null,
+      isLoading: false,
+      error: null,
+      refetch: vi.fn(),
+    } as any);
   });
 
   describe("Basic interactions", () => {

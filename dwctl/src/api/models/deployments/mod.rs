@@ -83,6 +83,10 @@ pub struct TariffDefinition {
     pub output_price_per_token: rust_decimal::Decimal,
     /// Optional API key purpose this tariff applies to (realtime, batch, playground)
     pub api_key_purpose: Option<crate::db::models::api_keys::ApiKeyPurpose>,
+    /// Optional completion window (SLA) for batch tariffs (e.g., "24h", "1h")
+    /// Required when api_key_purpose is Batch to support multiple pricing tiers per SLA
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub completion_window: Option<String>,
 }
 
 /// The data required to create a new model.

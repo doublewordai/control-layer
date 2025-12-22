@@ -741,10 +741,13 @@ export function useDeleteFile() {
   });
 }
 
-export function useFileCostEstimate(id: string | undefined) {
+export function useFileCostEstimate(
+  id: string | undefined,
+  completionWindow?: string,
+) {
   return useQuery({
-    queryKey: ["files", id, "cost-estimate"],
-    queryFn: () => dwctlApi.files.getCostEstimate(id!),
+    queryKey: ["files", id, "cost-estimate", completionWindow],
+    queryFn: () => dwctlApi.files.getCostEstimate(id!, completionWindow),
     enabled: !!id,
     staleTime: 5 * 60 * 1000, // Cache for 5 minutes since estimates don't change
   });

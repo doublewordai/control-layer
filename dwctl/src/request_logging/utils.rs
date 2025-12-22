@@ -119,28 +119,22 @@ pub(crate) fn decompress_response_if_needed(
     }
 }
 
-/// Extract value from request headers
+/// Extract string value from request headers
 ///
 /// # Arguments
 /// * `request_data` - The HTTP request data containing headers
+/// * `header_name` - The name of the header to extract
 ///
 /// # Returns
 /// * `Some(Uuid)` - Successfully extracted and parsed UUID (either full or padded from 8-char hex)
 /// * `None` - Header missing, empty, or invalid format
-pub(crate) fn extract_header_value_as_uuid(request_data: &outlet::RequestData, header_name: &str) -> Option<uuid::Uuid> {
+pub(crate) fn extract_header_as_uuid(request_data: &outlet::RequestData, header_name: &str) -> Option<uuid::Uuid> {
     request_data
         .headers
         .get(header_name)
         .and_then(|values| values.first())
         .and_then(|bytes| std::str::from_utf8(bytes).ok())
-        .and_then(|s| {
-            // Try parsing as full UUID first
-            if let Ok(uuid) = uuid::Uuid::parse_str(s) {
-                return Some(uuid);
-            }
-
-            None
-        })
+        .and_then(|s| uuid::Uuid::parse_str(s).ok())
 }
 
 /// Extracts a header value as a raw string from request headers.
@@ -152,7 +146,7 @@ pub(crate) fn extract_header_value_as_uuid(request_data: &outlet::RequestData, h
 /// # Returns
 /// * `Some(String)` - Successfully extracted string value
 /// * `None` - Header missing, empty, or invalid UTF-8
-pub(crate) fn extract_header_value_as_string(request_data: &outlet::RequestData, header_name: &str) -> Option<String> {
+pub(crate) fn extract_header_as_string(request_data: &outlet::RequestData, header_name: &str) -> Option<String> {
     request_data
         .headers
         .get(header_name)
@@ -165,8 +159,8 @@ pub(crate) fn extract_header_value_as_string(request_data: &outlet::RequestData,
 #[cfg(test)]
 mod tests {
     use super::{
-        decompress_response_if_needed, extract_header_value_as_string, parse_non_streaming_response, parse_sse_chunks,
-        parse_streaming_response, process_sse_chunks,
+        decompress_response_if_needed, extract_header_as_string, parse_non_streaming_response, parse_sse_chunks, parse_streaming_response,
+        process_sse_chunks,
     };
     use crate::request_logging::models::{AiResponse, ChatCompletionChunk, SseParseError};
     use axum::http::{Method, Uri};
@@ -394,10 +388,10 @@ mod tests {
             body: None,
         };
 
-        let result = extract_header_value_as_string(&request_data, "x-fusillade-request-id");
+        let result = extract_header_as_string(&request_data, "x-fusillade-request-id").and_then(|s| uuid::Uuid::parse_str(&s).ok());
 
         assert!(result.is_some());
-        assert_eq!(result.unwrap(), test_uuid.to_string());
+        assert_eq!(result.unwrap(), test_uuid);
     }
 
     #[test]
@@ -414,7 +408,7 @@ mod tests {
             body: None,
         };
 
-        let result = extract_header_value_as_string(&request_data, "x-fusillade-request-id");
+        let result = extract_header_as_string(&request_data, "x-fusillade-request-id");
 
         assert!(result.is_none());
     }
@@ -434,14 +428,14 @@ mod tests {
             body: None,
         };
 
-        let result = extract_header_value_as_string(&request_data, "x-fusillade-request-id");
+        let result = extract_header_as_string(&request_data, "x-fusillade-request-id");
 
         assert!(result.is_none());
     }
 
     #[test]
-    fn test_extract_header_value_as_string_returns_non_uuid_values() {
-        // extract_header_value_as_string returns raw string values without UUID validation
+    fn test_extract_header_as_string_returns_non_uuid_values() {
+        // extract_header_as_string returns raw string values without UUID validation
         let mut headers = HashMap::new();
         headers.insert("x-fusillade-request-id".to_string(), vec![Bytes::from("notvalid")]);
 
@@ -454,11 +448,13 @@ mod tests {
             body: None,
         };
 
-        let result = extract_header_value_as_string(&request_data, "x-fusillade-request-id");
+        // String extraction succeeds
+        let header_str = extract_header_as_string(&request_data, "x-fusillade-request-id");
+        assert_eq!(header_str, Some("notvalid".to_string()));
 
         // Should return the raw string value, not validate as UUID
-        assert!(result.is_some());
-        assert_eq!(result.unwrap(), "notvalid");
+        assert!(header_str.is_some());
+        assert_eq!(header_str.unwrap(), "notvalid");
     }
 
     #[test]
@@ -476,7 +472,7 @@ mod tests {
             body: None,
         };
 
-        let result = extract_header_value_as_string(&request_data, "x-fusillade-request-id");
+        let result = extract_header_as_string(&request_data, "x-fusillade-request-id");
 
         assert!(result.is_none());
     }
@@ -499,7 +495,7 @@ mod tests {
             body: None,
         };
 
-        let result = extract_header_value_as_string(&request_data, "x-fusillade-request-id");
+        let result = extract_header_as_string(&request_data, "x-fusillade-request-id").and_then(|s| uuid::Uuid::parse_str(&s).ok());
 
         assert!(result.is_some());
         let uuid = result.unwrap();

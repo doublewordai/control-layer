@@ -189,7 +189,7 @@ use tower_http::{
 };
 use tracing::{Level, debug, info, instrument};
 use utoipa::OpenApi;
-use utoipa_rapidoc::RapiDoc;
+use utoipa_scalar::{Scalar, Servable};
 use uuid::Uuid;
 
 pub use types::{ApiKeyId, DeploymentId, GroupId, InferenceEndpointId, UserId};
@@ -884,8 +884,10 @@ pub async fn build_router(state: &mut AppState, onwards_router: Router) -> anyho
         .merge(auth_routes)
         .nest("/ai/v1", ai_router)
         .nest("/admin/api/v1", api_routes_with_state)
-        .merge(RapiDoc::with_openapi("/admin/openapi.json", AdminApiDoc::openapi()).path("/admin/docs"))
-        .merge(RapiDoc::with_openapi("/ai/openapi.json", AiApiDoc::openapi()).path("/ai/docs"))
+        .route("/admin/openapi.json", get(|| async { axum::Json(AdminApiDoc::openapi()) }))
+        .route("/ai/openapi.json", get(|| async { axum::Json(AiApiDoc::openapi()) }))
+        .merge(Scalar::with_url("/admin/docs", AdminApiDoc::openapi()))
+        .merge(Scalar::with_url("/ai/docs", AiApiDoc::openapi()))
         .fallback_service(fallback);
 
     // Create CORS layer from config
@@ -2206,13 +2208,16 @@ mod test {
 
     #[tokio::test]
     async fn test_openapi_json_endpoints() {
+        use axum::routing::get;
         use utoipa::OpenApi;
-        use utoipa_rapidoc::RapiDoc;
+        use utoipa_scalar::{Scalar, Servable};
 
         // Create a test router with both OpenAPI endpoints
         let router = axum::Router::new()
-            .merge(RapiDoc::with_openapi("/admin/openapi.json", AdminApiDoc::openapi()).path("/admin/docs"))
-            .merge(RapiDoc::with_openapi("/ai/openapi.json", AiApiDoc::openapi()).path("/ai/docs"));
+            .route("/admin/openapi.json", get(|| async { axum::Json(AdminApiDoc::openapi()) }))
+            .route("/ai/openapi.json", get(|| async { axum::Json(AiApiDoc::openapi()) }))
+            .merge(Scalar::with_url("/admin/docs", AdminApiDoc::openapi()))
+            .merge(Scalar::with_url("/ai/docs", AiApiDoc::openapi()));
 
         let server = axum_test::TestServer::new(router).expect("Failed to create test server");
 
