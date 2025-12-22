@@ -24,6 +24,7 @@ export interface ConfigResponse {
   region: string;
   organization: string;
   payment_enabled: boolean;
+  docs_url: string;
 }
 
 // Model metrics time series point

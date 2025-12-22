@@ -359,13 +359,25 @@ pub struct DummyConfig {
 /// Frontend metadata displayed in the UI.
 ///
 /// These values are exposed to the frontend and shown in the user interface.
-#[derive(Debug, Clone, Deserialize, Serialize, Default)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(default)]
 pub struct Metadata {
     /// Region name displayed in the UI (e.g., "UK South", "US East")
     pub region: Option<String>,
     /// Organization name displayed in the UI
     pub organization: Option<String>,
+    /// Documentation URL shown in the UI header
+    pub docs_url: String,
+}
+
+impl Default for Metadata {
+    fn default() -> Self {
+        Self {
+            region: None,
+            organization: None,
+            docs_url: "https://docs.doubleword.ai/control-layer".to_string(),
+        }
+    }
 }
 
 /// External model source configuration.
