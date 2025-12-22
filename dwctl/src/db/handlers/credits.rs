@@ -268,10 +268,10 @@ impl<'c> Credits<'c> {
                 SUM(ct.amount) as "total_amount!",
                 MAX(ct.balance_after) as "max_balance_after!",
                 MAX(ct.created_at) as "max_created_at!",
-                (ARRAY_AGG(ct.id))[1] as "first_id!",
-                (ARRAY_AGG(ct.user_id))[1] as "first_user_id!",
-                (ARRAY_AGG(ct.source_id))[1] as "first_source_id!",
-                (ARRAY_AGG(ct.previous_transaction_id))[1] as "first_previous_transaction_id",
+                MIN(ct.id::text)::uuid as "first_id!",
+                MIN(ct.user_id::text)::uuid as "first_user_id!",
+                MIN(ct.source_id) as "first_source_id!",
+                MIN(ct.previous_transaction_id::text)::uuid as "first_previous_transaction_id",
                 MIN(ha.model) as "model",
                 ARRAY_AGG(ct.source_id) as "batched_source_ids!"
             FROM credits_transactions ct
