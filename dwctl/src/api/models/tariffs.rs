@@ -27,6 +27,10 @@ pub struct TariffResponse {
     /// Optional API key purpose this tariff applies to (realtime, batch, playground)
     /// If null, tariff is not automatically applied
     pub api_key_purpose: Option<ApiKeyPurpose>,
+    /// Optional completion window (SLA) for batch tariffs (e.g., "24h", "1h")
+    /// Only applicable when api_key_purpose is Batch
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub completion_window: Option<String>,
     pub valid_from: DateTime<Utc>,
     pub valid_until: Option<DateTime<Utc>>,
     /// Indicates if this tariff is currently active (valid_until IS NULL)
@@ -43,6 +47,7 @@ impl From<ModelTariff> for TariffResponse {
             input_price_per_token: tariff.input_price_per_token,
             output_price_per_token: tariff.output_price_per_token,
             api_key_purpose: tariff.api_key_purpose,
+            completion_window: tariff.completion_window,
             valid_from: tariff.valid_from,
             valid_until: tariff.valid_until,
             is_active: tariff.valid_until.is_none(),

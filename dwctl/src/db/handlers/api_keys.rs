@@ -2573,8 +2573,9 @@ mod tests {
                     name: "default".to_string(),
                     input_price_per_token: Decimal::new(1, 6),  // $0.000001 per token
                     output_price_per_token: Decimal::new(2, 6), // $0.000002 per token
-                    valid_from: None,
                     api_key_purpose: None,
+                    completion_window: None,
+                    valid_from: None,
                 })
                 .await
                 .unwrap();
@@ -2685,6 +2686,7 @@ mod tests {
                     input_price_per_token: Decimal::new(1, 6),  // $0.000001 per token
                     output_price_per_token: Decimal::new(2, 6), // $0.000002 per token
                     api_key_purpose: None,
+                    completion_window: None,
                     valid_from: None,
                 })
                 .await
@@ -3333,8 +3335,9 @@ mod tests {
                     name: "default".to_string(),
                     input_price_per_token: Decimal::new(1, 6),  // $0.000001 per token
                     output_price_per_token: Decimal::new(2, 6), // $0.000002 per token
-                    valid_from: None,
                     api_key_purpose: None,
+                    completion_window: None,
+                    valid_from: None,
                 })
                 .await
                 .unwrap();
@@ -3468,8 +3471,9 @@ mod tests {
                     name: "free".to_string(),
                     input_price_per_token: Decimal::ZERO,
                     output_price_per_token: Decimal::ZERO,
-                    valid_from: None,
                     api_key_purpose: None,
+                    completion_window: None,
+                    valid_from: None,
                 })
                 .await
                 .unwrap();

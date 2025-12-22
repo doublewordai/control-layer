@@ -1102,14 +1102,6 @@ const ModelInfo: React.FC = () => {
                                   className="bg-gray-50 rounded-lg p-3"
                                 >
                                   <div className="flex items-center gap-2 mb-2">
-                                    {tariff.api_key_purpose && (
-                                      <span className="text-xs bg-blue-100 text-blue-700 px-2 py-0.5 rounded">
-                                        {tariff.api_key_purpose
-                                          .charAt(0)
-                                          .toUpperCase() +
-                                          tariff.api_key_purpose.slice(1)}
-                                      </span>
-                                    )}
                                     <p className="font-medium text-sm">
                                       {tariff.name}
                                     </p>

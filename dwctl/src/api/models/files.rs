@@ -38,6 +38,14 @@ pub struct FileContentQuery {
     pub pagination: Pagination,
 }
 
+/// Query parameters for file cost estimate
+#[derive(Debug, Deserialize, IntoParams, ToSchema)]
+pub struct FileCostEstimateQuery {
+    /// Completion window (SLA) for batch processing (e.g., "24h", "1h", "48h")
+    /// If not provided, defaults to "24h"
+    pub completion_window: Option<String>,
+}
+
 /// File object response (OpenAI-compatible)
 #[derive(Debug, Serialize, Deserialize, ToSchema)]
 pub struct FileResponse {
