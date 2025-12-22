@@ -397,7 +397,7 @@ mod tests {
         let result = extract_header_value_as_string(&request_data, "x-fusillade-request-id");
 
         assert!(result.is_some());
-        assert_eq!(result.unwrap(), test_uuid);
+        assert_eq!(result.unwrap(), test_uuid.to_string());
     }
 
     #[test]
@@ -440,7 +440,8 @@ mod tests {
     }
 
     #[test]
-    fn test_extract_fusillade_request_id_invalid_uuid() {
+    fn test_extract_header_value_as_string_returns_non_uuid_values() {
+        // extract_header_value_as_string returns raw string values without UUID validation
         let mut headers = HashMap::new();
         headers.insert("x-fusillade-request-id".to_string(), vec![Bytes::from("notvalid")]);
 
@@ -455,7 +456,9 @@ mod tests {
 
         let result = extract_header_value_as_string(&request_data, "x-fusillade-request-id");
 
-        assert!(result.is_none());
+        // Should return the raw string value, not validate as UUID
+        assert!(result.is_some());
+        assert_eq!(result.unwrap(), "notvalid");
     }
 
     #[test]

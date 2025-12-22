@@ -805,13 +805,25 @@ where
     /// - Returns parsed `AiResponse` or `SerializationError`
     /// - Asynchronously stores analytics metrics to database
     /// - Logs errors if analytics storage fails
+    ///
+    /// # Analytics Storage
+    /// Analytics are stored for ALL responses, including error responses (4xx, 5xx).
+    /// Even if the response cannot be parsed as a valid AI response, the request
+    /// metadata (status code, duration, model, user, etc.) is still recorded.
     pub fn create_serializer(self) -> impl Fn(&RequestData, &ResponseData) -> Result<AiResponse, SerializationError> + Send + Sync {
         move |request_data: &RequestData, response_data: &ResponseData| {
-            // The full response that gets written to the outlet-postgres database
-            let parsed_response = parse_ai_response(request_data, response_data)?;
+            // Try to parse the response - may fail for error responses (4xx, 5xx)
+            let parse_result = parse_ai_response(request_data, response_data);
 
-            // Basic metrics
-            let metrics = UsageMetrics::extract(self.instance_id, request_data, response_data, &parsed_response, &self.config);
+            // Use parsed response for metrics, or fallback to Other for error responses
+            let metrics_response = match &parse_result {
+                Ok(response) => response.clone(),
+                Err(_) => AiResponse::Other(Value::Null),
+            };
+
+            // Basic metrics - extracted regardless of parse success
+            // This captures status_code, duration, model from request, etc.
+            let metrics = UsageMetrics::extract(self.instance_id, request_data, response_data, &metrics_response, &self.config);
 
             // Auth information
             let auth = Auth::from_request(request_data, &self.config);
@@ -822,9 +834,9 @@ where
             let request_data_clone = request_data.clone();
 
             // The write to the analytics table and metrics recording
+            // This runs for ALL responses, including errors
             tokio::spawn(async move {
                 // Store to database - this enriches with user/pricing data and returns complete row
-                // Use "batch" tariff by default - can be made configurable per request if needed
                 match store_analytics_record(&pool_clone, &metrics, &auth, &request_data_clone).await {
                     Ok(complete_row) => {
                         // Record metrics using the complete row (called AFTER database write)
@@ -842,7 +854,9 @@ where
                 }
             });
 
-            Ok(parsed_response)
+            // Return the parse result - outlet-postgres will handle SerializationError
+            // by storing the fallback_data (base64 encoded response)
+            parse_result
         }
     }
 }
