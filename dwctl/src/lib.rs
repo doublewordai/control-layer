@@ -1764,7 +1764,7 @@ mod test {
             balance
         );
 
-        // Verify request was logged: Check outlet recorded the request via API
+        // Verify request was logged: Check http_analytics recorded the request via API
         let requests_response = server
             .get(&format!("/admin/api/v1/requests?user_id={}&limit=1", regular_user.id))
             .add_header(&admin_headers[0].0, &admin_headers[0].1)
@@ -1773,18 +1773,17 @@ mod test {
 
         assert_eq!(requests_response.status_code(), 200, "Should fetch logged requests");
         let requests: serde_json::Value = requests_response.json();
-        let logged_entry = &requests["requests"][0];
+        let logged_entry = &requests["entries"][0];
 
-        // Request details
-        assert_eq!(logged_entry["request"]["method"], "POST");
-        assert_eq!(logged_entry["request"]["uri"], "http://localhost/chat/completions");
+        // Request details (now flat structure in AnalyticsEntry)
+        assert_eq!(logged_entry["method"], "POST");
+        assert_eq!(logged_entry["uri"], "http://localhost/chat/completions");
 
-        // Response details
-        assert_eq!(logged_entry["response"]["status_code"], 200);
-        let usage = &logged_entry["response"]["body"]["data"]["usage"];
-        assert_eq!(usage["prompt_tokens"], 9, "Should have 9 prompt tokens from mock");
-        assert_eq!(usage["completion_tokens"], 12, "Should have 12 completion tokens from mock");
-        assert_eq!(usage["total_tokens"], 21, "Should match mocked token count");
+        // Response details (now flat structure in AnalyticsEntry)
+        assert_eq!(logged_entry["status_code"], 200);
+        assert_eq!(logged_entry["prompt_tokens"], 9, "Should have 9 prompt tokens from mock");
+        assert_eq!(logged_entry["completion_tokens"], 12, "Should have 12 completion tokens from mock");
+        assert_eq!(logged_entry["total_tokens"], 21, "Should match mocked token count");
 
         // Note: Pricing is now fetched from tariffs table, not from response headers
 

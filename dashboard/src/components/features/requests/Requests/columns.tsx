@@ -1,336 +1,88 @@
 "use client";
 
 import { type ColumnDef } from "@tanstack/react-table";
-import {
-  ArrowUpDown,
-  Clock,
-  MessageSquare,
-  FileText,
-  Layers,
-  HelpCircle,
-} from "lucide-react";
-// Remove dropdown menu imports - no longer needed
+import { Clock, ExternalLink, DollarSign } from "lucide-react";
 import { formatTimestamp, formatDuration } from "../../../../utils";
-import {
-  HoverCard,
-  HoverCardContent,
-  HoverCardTrigger,
-} from "../../../ui/hover-card";
 import { Tooltip, TooltipContent, TooltipTrigger } from "../../../ui/tooltip";
-import ReactMarkdown from "react-markdown";
-import remarkGfm from "remark-gfm";
 import type { RequestsEntry } from "../types";
+import { Link } from "react-router-dom";
 
-const getRequestTypeIcon = (type: RequestsEntry["request_type"]) => {
-  switch (type) {
-    case "chat_completions":
-      return <MessageSquare className="w-4 h-4" />;
-    case "completions":
-      return <FileText className="w-4 h-4" />;
-    case "embeddings":
-      return <Layers className="w-4 h-4" />;
-    case "other":
-    default:
-      return <HelpCircle className="w-4 h-4" />;
+// Calculate estimated cost from tokens and price per token
+function calculateCost(entry: RequestsEntry): number | null {
+  const promptTokens = entry.prompt_tokens;
+  const completionTokens = entry.completion_tokens;
+  const inputPrice = entry.input_price_per_token
+    ? parseFloat(entry.input_price_per_token)
+    : null;
+  const outputPrice = entry.output_price_per_token
+    ? parseFloat(entry.output_price_per_token)
+    : null;
+
+  if (promptTokens === undefined || completionTokens === undefined) {
+    return null;
   }
+
+  if (inputPrice === null && outputPrice === null) {
+    return null;
+  }
+
+  const inputCost = (promptTokens ?? 0) * (inputPrice ?? 0);
+  const outputCost = (completionTokens ?? 0) * (outputPrice ?? 0);
+
+  return inputCost + outputCost;
+}
+
+// Format cost with appropriate precision
+function formatCost(cost: number): string {
+  if (cost < 0.0001) {
+    return `$${cost.toFixed(6)}`;
+  } else if (cost < 0.01) {
+    return `$${cost.toFixed(4)}`;
+  } else {
+    return `$${cost.toFixed(2)}`;
+  }
+}
+
+const getStatusColor = (statusCode?: number) => {
+  if (!statusCode) return "bg-gray-100 text-gray-800";
+  if (statusCode >= 200 && statusCode < 300)
+    return "bg-green-100 text-green-800";
+  if (statusCode >= 400 && statusCode < 500)
+    return "bg-yellow-100 text-yellow-800";
+  if (statusCode >= 500) return "bg-red-100 text-red-800";
+  return "bg-gray-100 text-gray-800";
 };
 
 export const createRequestColumns = (): ColumnDef<RequestsEntry>[] => [
   {
-    accessorKey: "id",
-    header: ({ column }) => {
+    accessorKey: "fusillade_batch_id",
+    header: "Batch",
+    cell: ({ row }) => {
+      const batchId = row.getValue("fusillade_batch_id") as string | undefined;
+      if (!batchId) {
+        return <span className="text-gray-400">-</span>;
+      }
+      const shortId = batchId.slice(0, 8);
       return (
-        <button
-          onClick={() => column.toggleSorting(column.getIsSorted() === "asc")}
-          className="flex items-center text-left font-medium group"
+        <Link
+          to={`/batches/${batchId}`}
+          className="inline-flex items-center gap-1 text-sm text-blue-600 hover:text-blue-800 hover:underline"
         >
-          ID
-          <ArrowUpDown className="ml-2 h-4 w-4 text-gray-400 group-hover:text-gray-700 transition-colors" />
-        </button>
+          <span className="font-mono">{shortId}</span>
+          <ExternalLink className="w-3 h-3" />
+        </Link>
       );
     },
-    cell: ({ row }) => {
-      const request = row.original;
-      return (
-        <span className="font-mono text-sm text-doubleword-neutral-900">
-          {request.id}
-        </span>
-      );
-    },
-    size: 80,
-  },
-  {
-    accessorKey: "request_content",
-    header: "Request",
-    cell: ({ row }) => {
-      const request = row.original;
-      return (
-        <div className="max-w-60">
-          <HoverCard>
-            <HoverCardTrigger asChild>
-              <div className="text-sm text-doubleword-neutral-900 line-clamp-1 wrap-break-words hover:bg-gray-50 rounded cursor-pointer px-1 truncate">
-                <ReactMarkdown
-                  remarkPlugins={[remarkGfm]}
-                  components={{
-                    p: ({ children }) => <>{children}</>,
-                    strong: ({ children }) => (
-                      <strong className="font-semibold">{children}</strong>
-                    ),
-                    em: ({ children }) => (
-                      <em className="italic">{children}</em>
-                    ),
-                    code: ({ children }) => (
-                      <code className="bg-gray-100 px-1 rounded text-xs">
-                        {children}
-                      </code>
-                    ),
-                    // Block elements become inline to prevent line breaks
-                    div: ({ children }) => <>{children}</>,
-                    pre: ({ children }) => (
-                      <code className="bg-gray-100 px-1 rounded text-xs">
-                        {children}
-                      </code>
-                    ),
-                    h1: ({ children }) => (
-                      <strong className="font-semibold">{children}</strong>
-                    ),
-                    h2: ({ children }) => (
-                      <strong className="font-semibold">{children}</strong>
-                    ),
-                    h3: ({ children }) => (
-                      <strong className="font-semibold">{children}</strong>
-                    ),
-                    h4: ({ children }) => (
-                      <strong className="font-semibold">{children}</strong>
-                    ),
-                    h5: ({ children }) => (
-                      <strong className="font-semibold">{children}</strong>
-                    ),
-                    h6: ({ children }) => (
-                      <strong className="font-semibold">{children}</strong>
-                    ),
-                    ul: ({ children }) => <>{children}</>,
-                    ol: ({ children }) => <>{children}</>,
-                    li: ({ children }) => <>{children}</>,
-                    blockquote: ({ children }) => <>{children}</>,
-                    br: () => <span> </span>,
-                  }}
-                >
-                  {request.request_content}
-                </ReactMarkdown>
-              </div>
-            </HoverCardTrigger>
-            <HoverCardContent
-              side="top"
-              className="w-lg max-h-64 overflow-y-auto"
-            >
-              <div className="text-sm prose prose-sm max-w-none">
-                <ReactMarkdown
-                  remarkPlugins={[remarkGfm]}
-                  components={{
-                    p: ({ children }) => (
-                      <p className="mb-2 last:mb-0">{children}</p>
-                    ),
-                    code: ({ children }) => {
-                      return (
-                        <code className="bg-gray-100 px-1 py-0.5 rounded text-xs">
-                          {children}
-                        </code>
-                      );
-                    },
-                    pre: ({ children }) => (
-                      <pre className="bg-gray-100 p-2 rounded text-xs overflow-x-auto">
-                        {children}
-                      </pre>
-                    ),
-                  }}
-                >
-                  {request.request_content}
-                </ReactMarkdown>
-              </div>
-            </HoverCardContent>
-          </HoverCard>
-        </div>
-      );
-    },
-    enableSorting: false,
-    size: 240,
-  },
-  {
-    accessorKey: "response_content",
-    header: "Response",
-    cell: ({ row }) => {
-      const request = row.original;
-      return (
-        <div className="max-w-60">
-          <HoverCard>
-            <HoverCardTrigger asChild>
-              <div className="text-sm text-gray-700 line-clamp-1 wrap-break-words hover:bg-gray-50 rounded cursor-pointer px-1 truncate">
-                <ReactMarkdown
-                  remarkPlugins={[remarkGfm]}
-                  components={{
-                    p: ({ children }) => <>{children}</>,
-                    strong: ({ children }) => (
-                      <strong className="font-semibold">{children}</strong>
-                    ),
-                    em: ({ children }) => (
-                      <em className="italic">{children}</em>
-                    ),
-                    code: ({ children }) => (
-                      <code className="bg-gray-100 px-1 rounded text-xs">
-                        {children}
-                      </code>
-                    ),
-                    // Block elements become inline to prevent line breaks
-                    div: ({ children }) => <>{children}</>,
-                    pre: ({ children }) => (
-                      <code className="bg-gray-100 px-1 rounded text-xs">
-                        {children}
-                      </code>
-                    ),
-                    h1: ({ children }) => (
-                      <strong className="font-semibold">{children}</strong>
-                    ),
-                    h2: ({ children }) => (
-                      <strong className="font-semibold">{children}</strong>
-                    ),
-                    h3: ({ children }) => (
-                      <strong className="font-semibold">{children}</strong>
-                    ),
-                    h4: ({ children }) => (
-                      <strong className="font-semibold">{children}</strong>
-                    ),
-                    h5: ({ children }) => (
-                      <strong className="font-semibold">{children}</strong>
-                    ),
-                    h6: ({ children }) => (
-                      <strong className="font-semibold">{children}</strong>
-                    ),
-                    ul: ({ children }) => <>{children}</>,
-                    ol: ({ children }) => <>{children}</>,
-                    li: ({ children }) => <>{children}</>,
-                    blockquote: ({ children }) => <>{children}</>,
-                    br: () => <span> </span>,
-                    // Show raw table markdown for inline display
-                    table: ({ node }) => {
-                      const tableText =
-                        node?.position?.start && node?.position?.end
-                          ? request.response_content.slice(
-                              node.position.start.offset,
-                              node.position.end.offset,
-                            )
-                          : "[table]";
-                      return <span>{tableText}</span>;
-                    },
-                    thead: () => null,
-                    tbody: () => null,
-                    tr: () => null,
-                    th: () => null,
-                    td: () => null,
-                  }}
-                >
-                  {request.response_content}
-                </ReactMarkdown>
-              </div>
-            </HoverCardTrigger>
-            <HoverCardContent
-              side="top"
-              className="w-lg max-h-64 overflow-y-auto"
-            >
-              <div className="text-sm prose prose-sm max-w-none">
-                <ReactMarkdown
-                  remarkPlugins={[remarkGfm]}
-                  components={{
-                    p: ({ children }) => (
-                      <p className="mb-2 last:mb-0">{children}</p>
-                    ),
-                    code: ({ children }) => {
-                      return (
-                        <code className="bg-gray-100 px-1 py-0.5 rounded text-xs">
-                          {children}
-                        </code>
-                      );
-                    },
-                    pre: ({ children }) => (
-                      <pre className="bg-gray-100 p-2 rounded text-xs overflow-x-auto">
-                        {children}
-                      </pre>
-                    ),
-                    table: ({ children }) => (
-                      <div className="overflow-x-auto">
-                        <table className="min-w-full text-xs border-collapse">
-                          {children}
-                        </table>
-                      </div>
-                    ),
-                    thead: ({ children }) => (
-                      <thead className="bg-gray-50">{children}</thead>
-                    ),
-                    tbody: ({ children }) => <tbody>{children}</tbody>,
-                    tr: ({ children }) => (
-                      <tr className="border-b border-gray-200">{children}</tr>
-                    ),
-                    th: ({ children }) => (
-                      <th className="px-2 py-1 text-left font-medium text-gray-900 border-r border-gray-300 last:border-r-0">
-                        {children}
-                      </th>
-                    ),
-                    td: ({ children }) => (
-                      <td className="px-2 py-1 border-r border-gray-300 last:border-r-0">
-                        {children}
-                      </td>
-                    ),
-                  }}
-                >
-                  {request.response_content}
-                </ReactMarkdown>
-              </div>
-            </HoverCardContent>
-          </HoverCard>
-        </div>
-      );
-    },
-    enableSorting: false,
-    size: 240,
-  },
-  {
-    accessorKey: "timestamp",
-    header: ({ column }) => {
-      return (
-        <button
-          onClick={() => column.toggleSorting(column.getIsSorted() === "asc")}
-          className="flex items-center text-left font-medium group"
-        >
-          Timestamp
-          <ArrowUpDown className="ml-2 h-4 w-4 text-gray-400 group-hover:text-gray-700 transition-colors" />
-        </button>
-      );
-    },
-    cell: ({ row }) => {
-      const timestamp = row.getValue("timestamp") as string;
-      return (
-        <span className="text-doubleword-neutral-900 text-sm">
-          {formatTimestamp(timestamp)}
-        </span>
-      );
-    },
-    size: 120,
+    size: 100,
   },
   {
     accessorKey: "model",
-    header: ({ column }) => {
-      return (
-        <button
-          onClick={() => column.toggleSorting(column.getIsSorted() === "asc")}
-          className="flex items-center text-left font-medium group"
-        >
-          Model
-          <ArrowUpDown className="ml-2 h-4 w-4 text-gray-400 group-hover:text-gray-700 transition-colors" />
-        </button>
-      );
-    },
+    header: "Model",
     cell: ({ row }) => {
-      const model = row.getValue("model") as string;
+      const model = row.getValue("model") as string | undefined;
+      if (!model) {
+        return <span className="text-gray-400">-</span>;
+      }
       return (
         <span className="inline-flex items-center px-2.5 py-0.5 rounded-full text-xs font-medium bg-blue-100 text-blue-800 max-w-full truncate">
           {model}
@@ -340,73 +92,44 @@ export const createRequestColumns = (): ColumnDef<RequestsEntry>[] => [
     size: 120,
   },
   {
-    accessorKey: "usage.total_tokens",
-    header: ({ column }) => {
-      return (
-        <button
-          onClick={() => column.toggleSorting(column.getIsSorted() === "asc")}
-          className="flex items-center text-left font-medium group"
-        >
-          Tokens
-          <ArrowUpDown className="ml-2 h-4 w-4 text-gray-400 group-hover:text-gray-700 transition-colors" />
-        </button>
-      );
-    },
+    accessorKey: "timestamp",
+    header: "Timestamp",
     cell: ({ row }) => {
-      const request = row.original;
-      const usage = request.usage;
-      const isStreaming =
-        request.details.response?.body?.type === "chat_completions_stream";
-
-      if (!usage) {
-        if (isStreaming) {
-          return (
-            <Tooltip>
-              <TooltipTrigger asChild>
-                <span className="text-orange-600 text-xs">No usage data</span>
-              </TooltipTrigger>
-              <TooltipContent>
-                <div className="text-sm">
-                  <p className="font-medium mb-1">
-                    Missing usage data for streaming response
-                  </p>
-                  <p className="mb-2">
-                    To include usage data in streaming responses, add:
-                  </p>
-                  <pre className="px-2 py-1 rounded text-xs font-mono">
-                    {`"stream_options": {"include_usage": true}`}
-                  </pre>
-                </div>
-              </TooltipContent>
-            </Tooltip>
-          );
-        }
-        return <span className="text-gray-400">-</span>;
-      }
-
+      const timestamp = row.getValue("timestamp") as string;
       return (
-        <span className="text-sm text-doubleword-neutral-900">
-          {usage.prompt_tokens} in/{usage.completion_tokens} out
+        <span className="text-doubleword-neutral-900 text-sm">
+          {formatTimestamp(timestamp)}
         </span>
       );
     },
-    size: 90,
+    size: 140,
+  },
+  {
+    accessorKey: "status_code",
+    header: "Status",
+    cell: ({ row }) => {
+      const statusCode = row.getValue("status_code") as number | undefined;
+      if (!statusCode) {
+        return <span className="text-gray-400">-</span>;
+      }
+      return (
+        <span
+          className={`inline-flex items-center px-2 py-0.5 rounded text-xs font-medium ${getStatusColor(statusCode)}`}
+        >
+          {statusCode}
+        </span>
+      );
+    },
+    size: 70,
   },
   {
     accessorKey: "duration_ms",
-    header: ({ column }) => {
-      return (
-        <button
-          onClick={() => column.toggleSorting(column.getIsSorted() === "asc")}
-          className="flex items-center text-left font-medium group"
-        >
-          Duration
-          <ArrowUpDown className="ml-2 h-4 w-4 text-gray-400 group-hover:text-gray-700 transition-colors" />
-        </button>
-      );
-    },
+    header: "Duration",
     cell: ({ row }) => {
-      const duration = row.getValue("duration_ms") as number;
+      const duration = row.getValue("duration_ms") as number | undefined;
+      if (!duration) {
+        return <span className="text-gray-400">-</span>;
+      }
       return (
         <div className="flex items-center gap-1 text-sm text-doubleword-neutral-900">
           <Clock className="w-3 h-3" />
@@ -414,25 +137,116 @@ export const createRequestColumns = (): ColumnDef<RequestsEntry>[] => [
         </div>
       );
     },
+    size: 80,
+  },
+  {
+    accessorKey: "total_tokens",
+    header: "Tokens",
+    cell: ({ row }) => {
+      const request = row.original;
+      const promptTokens = request.prompt_tokens;
+      const completionTokens = request.completion_tokens;
+
+      if (promptTokens === undefined && completionTokens === undefined) {
+        return <span className="text-gray-400">-</span>;
+      }
+
+      return (
+        <Tooltip>
+          <TooltipTrigger asChild>
+            <span className="text-sm text-doubleword-neutral-900 cursor-help">
+              {request.total_tokens?.toLocaleString() ?? "-"}
+            </span>
+          </TooltipTrigger>
+          <TooltipContent>
+            <div className="text-xs">
+              <div>Prompt: {promptTokens?.toLocaleString() ?? "-"}</div>
+              <div>Completion: {completionTokens?.toLocaleString() ?? "-"}</div>
+            </div>
+          </TooltipContent>
+        </Tooltip>
+      );
+    },
+    size: 70,
+  },
+  {
+    id: "cost",
+    header: "Cost",
+    cell: ({ row }) => {
+      const request = row.original;
+      const cost = calculateCost(request);
+
+      if (cost === null) {
+        return <span className="text-gray-400">-</span>;
+      }
+
+      const inputCost =
+        (request.prompt_tokens ?? 0) *
+        (request.input_price_per_token
+          ? parseFloat(request.input_price_per_token)
+          : 0);
+      const outputCost =
+        (request.completion_tokens ?? 0) *
+        (request.output_price_per_token
+          ? parseFloat(request.output_price_per_token)
+          : 0);
+
+      return (
+        <Tooltip>
+          <TooltipTrigger asChild>
+            <span className="text-sm text-green-700 font-medium cursor-help flex items-center gap-1">
+              <DollarSign className="w-3 h-3" />
+              {formatCost(cost).slice(1)}
+            </span>
+          </TooltipTrigger>
+          <TooltipContent>
+            <div className="text-xs">
+              <div>Input: {formatCost(inputCost)}</div>
+              <div>Output: {formatCost(outputCost)}</div>
+            </div>
+          </TooltipContent>
+        </Tooltip>
+      );
+    },
     size: 90,
   },
   {
-    accessorKey: "request_type",
-    header: "Type",
+    accessorKey: "custom_id",
+    header: "Custom ID",
     cell: ({ row }) => {
-      const request = row.original;
+      const customId = row.getValue("custom_id") as string | undefined;
+      if (!customId) {
+        return <span className="text-gray-400">-</span>;
+      }
       return (
-        <div className="flex justify-center">
-          <Tooltip>
-            <TooltipTrigger asChild>
-              <div>{getRequestTypeIcon(request.request_type)}</div>
-            </TooltipTrigger>
-            <TooltipContent>{request.request_type}</TooltipContent>
-          </Tooltip>
-        </div>
+        <Tooltip>
+          <TooltipTrigger asChild>
+            <span className="font-mono text-sm text-doubleword-neutral-700 truncate max-w-48 block cursor-help">
+              {customId}
+            </span>
+          </TooltipTrigger>
+          <TooltipContent>
+            <span className="font-mono text-xs">{customId}</span>
+          </TooltipContent>
+        </Tooltip>
       );
     },
-    enableSorting: false,
-    size: 50,
+    size: 200,
+  },
+  {
+    accessorKey: "response_type",
+    header: "Type",
+    cell: ({ row }) => {
+      const responseType = row.getValue("response_type") as string | undefined;
+      if (!responseType) {
+        return <span className="text-gray-400">-</span>;
+      }
+      return (
+        <span className="text-xs text-doubleword-neutral-700">
+          {responseType}
+        </span>
+      );
+    },
+    size: 100,
   },
 ];

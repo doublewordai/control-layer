@@ -66,7 +66,7 @@ export function CreateBatchModal({
   const { data: config } = useConfig();
   const availableSLAs = useMemo(
     () => config?.batches?.allowed_completion_windows || ["24h"],
-    [config?.batches?.allowed_completion_windows]
+    [config?.batches?.allowed_completion_windows],
   );
 
   // Fetch available files for combobox (only input files with purpose "batch")
@@ -251,15 +251,19 @@ export function CreateBatchModal({
           <DialogTitle>Create New Batch</DialogTitle>
           <DialogDescription>
             Select or upload a{" "}
-            <a
-              href="https://docs.doubleword.ai"
-              target="_blank"
-              rel="noopener noreferrer"
-              className="text-blue-600 hover:text-blue-700 hover:underline inline-flex items-center gap-1"
-            >
-              JSONL file
-              <ExternalLink className="w-3 h-3" />
-            </a>{" "}
+            {config?.docs_jsonl_url ? (
+              <a
+                href={config.docs_jsonl_url}
+                target="_blank"
+                rel="noopener noreferrer"
+                className="text-blue-600 hover:text-blue-700 hover:underline inline-flex items-center gap-1"
+              >
+                JSONL file
+                <ExternalLink className="w-3 h-3" />
+              </a>
+            ) : (
+              "JSONL file"
+            )}{" "}
             to create a batch.
           </DialogDescription>
         </DialogHeader>
@@ -463,7 +467,10 @@ export function CreateBatchModal({
                     <div className="flex justify-between text-sm">
                       <span className="text-gray-600">Estimated Cost:</span>
                       <span className="font-semibold text-gray-900">
-                        ${parseFloat(costEstimate.total_estimated_cost).toFixed(4)}
+                        $
+                        {parseFloat(costEstimate.total_estimated_cost).toFixed(
+                          4,
+                        )}
                       </span>
                     </div>
                     <div className="text-xs text-gray-500 pt-1">

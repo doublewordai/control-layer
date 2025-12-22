@@ -110,6 +110,12 @@ interface DataTableProps<TData, TValue> {
   isLoading?: boolean;
 
   /**
+   * Custom empty state component to display when there are no results
+   * If not provided, shows default "No results." text
+   */
+  emptyState?: React.ReactNode;
+
+  /**
    * Show page size selector
    */
   showPageSizeSelector?: boolean;
@@ -140,9 +146,32 @@ export function DataTable<TData, TValue>({
   serverPagination,
   externalSearch,
   isLoading = false,
+  emptyState,
   showPageSizeSelector = false,
   pageSizeOptions = [10, 25, 50, 100],
 }: DataTableProps<TData, TValue>) {
+  const searchInputRef = React.useRef<HTMLInputElement>(null);
+
+  // Preserve focus on search input when data changes (for external search with debounce)
+  // We check if there's an active search value, which indicates user was typing
+  const prevDataRef = React.useRef(data);
+  React.useLayoutEffect(() => {
+    const dataChanged = prevDataRef.current !== data;
+    prevDataRef.current = data;
+
+    if (
+      externalSearch &&
+      dataChanged &&
+      externalSearch.value &&
+      searchInputRef.current
+    ) {
+      // Restore focus and cursor position to end of input
+      searchInputRef.current.focus();
+      const len = externalSearch.value.length;
+      searchInputRef.current.setSelectionRange(len, len);
+    }
+  }, [data, externalSearch]);
+
   const [sorting, setSorting] = React.useState<SortingState>([]);
   const [columnFilters, setColumnFilters] = React.useState<ColumnFiltersState>(
     [],
@@ -232,6 +261,7 @@ export function DataTable<TData, TValue>({
           <div className="relative w-full sm:w-auto">
             <Search className="absolute left-2 top-2.5 h-4 w-4 text-muted-foreground" />
             <Input
+              ref={searchInputRef}
               placeholder={searchPlaceholder}
               aria-label={searchPlaceholder || "Search table"}
               value={
@@ -449,9 +479,9 @@ export function DataTable<TData, TValue>({
               <TableRow>
                 <TableCell
                   colSpan={columns.length}
-                  className="h-24 text-center"
+                  className={emptyState ? "p-0" : "h-24 text-center"}
                 >
-                  No results.
+                  {emptyState || "No results."}
                 </TableCell>
               </TableRow>
             )}

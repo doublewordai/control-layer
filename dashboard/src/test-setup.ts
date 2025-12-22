@@ -20,7 +20,7 @@ if (typeof window !== "undefined") {
   // eslint-disable-next-line @typescript-eslint/ban-ts-comment
   // @ts-ignore - Polyfill for testing
   if (!Element.prototype.hasPointerCapture) {
-    Element.prototype.hasPointerCapture = function() {
+    Element.prototype.hasPointerCapture = function () {
       return false;
     };
   }
@@ -28,19 +28,19 @@ if (typeof window !== "undefined") {
   // eslint-disable-next-line @typescript-eslint/ban-ts-comment
   // @ts-ignore - Polyfill for testing
   if (!Element.prototype.setPointerCapture) {
-    Element.prototype.setPointerCapture = function() {};
+    Element.prototype.setPointerCapture = function () {};
   }
 
   // eslint-disable-next-line @typescript-eslint/ban-ts-comment
   // @ts-ignore - Polyfill for testing
   if (!Element.prototype.releasePointerCapture) {
-    Element.prototype.releasePointerCapture = function() {};
+    Element.prototype.releasePointerCapture = function () {};
   }
 
   // eslint-disable-next-line @typescript-eslint/ban-ts-comment
   // @ts-ignore - Polyfill for testing
   if (!Element.prototype.scrollIntoView) {
-    Element.prototype.scrollIntoView = function() {};
+    Element.prototype.scrollIntoView = function () {};
   }
 }
 

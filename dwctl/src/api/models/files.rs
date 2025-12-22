@@ -36,6 +36,9 @@ pub struct FileContentQuery {
     #[serde(flatten)]
     #[param(inline)]
     pub pagination: Pagination,
+
+    /// Search query to filter by custom_id (case-insensitive substring match)
+    pub search: Option<String>,
 }
 
 /// Query parameters for file cost estimate

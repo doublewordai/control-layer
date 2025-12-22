@@ -185,7 +185,7 @@ export const createFileColumns = (
       // Create tooltip content with per-model breakdown
       const tooltipContent = (
         <div className="space-y-1">
-          <div className="font-medium">Cost Estimate Breakdown</div>
+          <div className="font-medium">Cost Estimate Breakdown (24hr SLA)</div>
           <div className="text-xs space-y-0.5">
             {estimate.models.map((model) => {
               const modelCost = parseFloat(model.estimated_cost);
