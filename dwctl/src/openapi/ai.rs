@@ -24,7 +24,11 @@ impl Modify for AiSecurityAddon {
                     HttpBuilder::new()
                         .scheme(HttpAuthScheme::Bearer)
                         .bearer_format("API Key")
-                        .description(Some("Enter your API key"))
+                        .description(Some(
+                            "API key authentication. Include your key in the `Authorization` header:\n\n\
+                            ```\nAuthorization: Bearer YOUR_API_KEY\n```\n\n\
+                            API keys can be created and managed in the dashboard.",
+                        ))
                         .build(),
                 ),
             );
@@ -39,46 +43,52 @@ impl Modify for AiSecurityAddon {
 // These functions exist solely to generate OpenAPI documentation for endpoints
 // that are actually handled by the `onwards` routing layer.
 
-/// Create a chat completion (proxied to upstream provider).
+/// Create a chat completion.
 #[utoipa::path(
     post,
     path = "/chat/completions",
     tag = "chat",
     summary = "Create chat completion",
-    description = "Creates a model response for the given chat conversation. This endpoint is proxied to the configured upstream inference provider.",
+    description = "Creates a model response for the given chat conversation.
+
+The conversation is provided as an array of messages, where each message has a `role` (system, user, assistant, or tool) and `content`.
+
+Set `stream: true` to receive partial responses as server-sent events.",
     request_body = extra_types::ChatCompletionRequest,
     responses(
-        (status = 200, description = "Chat completion response", body = extra_types::ChatCompletionResponse),
-        (status = 400, description = "Bad request", body = extra_types::OpenAIErrorResponse),
-        (status = 401, description = "Unauthorized - invalid or missing API key", body = extra_types::OpenAIErrorResponse),
-        (status = 402, description = "Payment required - insufficient credits", body = extra_types::OpenAIErrorResponse),
-        (status = 403, description = "Forbidden - no access to requested model", body = extra_types::OpenAIErrorResponse),
-        (status = 404, description = "Model not found", body = extra_types::OpenAIErrorResponse),
-        (status = 429, description = "Rate limit exceeded", body = extra_types::OpenAIErrorResponse),
-        (status = 500, description = "Internal server error", body = extra_types::OpenAIErrorResponse),
+        (status = 200, description = "Chat completion generated successfully. When streaming, returns a series of SSE events.", body = extra_types::ChatCompletionResponse),
+        (status = 400, description = "Invalid request — check that your messages array is properly formatted and all required fields are present.", body = extra_types::OpenAIErrorResponse),
+        (status = 401, description = "Invalid or missing API key. Ensure your `Authorization` header is set to `Bearer YOUR_API_KEY`.", body = extra_types::OpenAIErrorResponse),
+        (status = 402, description = "Insufficient credits. Top up your account to continue making requests.", body = extra_types::OpenAIErrorResponse),
+        (status = 403, description = "Your API key does not have access to the requested model.", body = extra_types::OpenAIErrorResponse),
+        (status = 404, description = "The specified model does not exist. Use `GET /models` to list available models.", body = extra_types::OpenAIErrorResponse),
+        (status = 429, description = "Rate limit exceeded. Back off and retry after a short delay.", body = extra_types::OpenAIErrorResponse),
+        (status = 500, description = "An unexpected error occurred. Retry the request or contact support if the issue persists.", body = extra_types::OpenAIErrorResponse),
     ),
     security(("BearerAuth" = []))
 )]
 #[allow(unused)]
 fn chat_completions() {}
 
-/// Create embeddings (proxied to upstream provider).
+/// Create embeddings.
 #[utoipa::path(
     post,
     path = "/embeddings",
     tag = "embeddings",
     summary = "Create embeddings",
-    description = "Creates an embedding vector representing the input text. This endpoint is proxied to the configured upstream inference provider.",
+    description = "Creates embedding vectors representing the input text.
+
+Input can be a single string or an array of strings. Each input produces one embedding vector in the response.",
     request_body = extra_types::EmbeddingRequest,
     responses(
-        (status = 200, description = "Embedding response", body = extra_types::EmbeddingResponse),
-        (status = 400, description = "Bad request", body = extra_types::OpenAIErrorResponse),
-        (status = 401, description = "Unauthorized - invalid or missing API key", body = extra_types::OpenAIErrorResponse),
-        (status = 402, description = "Payment required - insufficient credits", body = extra_types::OpenAIErrorResponse),
-        (status = 403, description = "Forbidden - no access to requested model", body = extra_types::OpenAIErrorResponse),
-        (status = 404, description = "Model not found", body = extra_types::OpenAIErrorResponse),
-        (status = 429, description = "Rate limit exceeded", body = extra_types::OpenAIErrorResponse),
-        (status = 500, description = "Internal server error", body = extra_types::OpenAIErrorResponse),
+        (status = 200, description = "Embeddings generated successfully. Each input string has a corresponding entry in the `data` array.", body = extra_types::EmbeddingResponse),
+        (status = 400, description = "Invalid request — check that your input is a string or array of strings.", body = extra_types::OpenAIErrorResponse),
+        (status = 401, description = "Invalid or missing API key. Ensure your `Authorization` header is set to `Bearer YOUR_API_KEY`.", body = extra_types::OpenAIErrorResponse),
+        (status = 402, description = "Insufficient credits. Top up your account to continue making requests.", body = extra_types::OpenAIErrorResponse),
+        (status = 403, description = "Your API key does not have access to the requested model.", body = extra_types::OpenAIErrorResponse),
+        (status = 404, description = "The specified model does not exist. Use `GET /models` to list available models.", body = extra_types::OpenAIErrorResponse),
+        (status = 429, description = "Rate limit exceeded. Back off and retry after a short delay.", body = extra_types::OpenAIErrorResponse),
+        (status = 500, description = "An unexpected error occurred. Retry the request or contact support if the issue persists.", body = extra_types::OpenAIErrorResponse),
     ),
     security(("BearerAuth" = []))
 )]
@@ -91,10 +101,12 @@ fn embeddings() {}
     path = "/models",
     tag = "models",
     summary = "List models",
-    description = "Lists the currently available models, and provides basic information about each one.",
+    description = "Lists the models available to your API key.
+
+The response includes model IDs that can be used in chat completion and embedding requests.",
     responses(
-        (status = 200, description = "List of available models", body = extra_types::ModelsListResponse),
-        (status = 401, description = "Unauthorized - invalid or missing API key", body = extra_types::OpenAIErrorResponse),
+        (status = 200, description = "List of models your API key can access.", body = extra_types::ModelsListResponse),
+        (status = 401, description = "Invalid or missing API key. Ensure your `Authorization` header is set to `Bearer YOUR_API_KEY`.", body = extra_types::OpenAIErrorResponse),
     ),
     security(("BearerAuth" = []))
 )]
@@ -107,14 +119,14 @@ fn list_models() {}
     path = "/models/{model}",
     tag = "models",
     summary = "Retrieve model",
-    description = "Retrieves a model instance, providing basic information about the model.",
+    description = "Retrieves information about a specific model.",
     params(
-        ("model" = String, Path, description = "The ID of the model to retrieve")
+        ("model" = String, Path, description = "The model ID (e.g., `gpt-4`, `text-embedding-ada-002`)")
     ),
     responses(
-        (status = 200, description = "Model information", body = extra_types::ModelObject),
-        (status = 401, description = "Unauthorized - invalid or missing API key", body = extra_types::OpenAIErrorResponse),
-        (status = 404, description = "Model not found", body = extra_types::OpenAIErrorResponse),
+        (status = 200, description = "Model details including ID, owner, and creation timestamp.", body = extra_types::ModelObject),
+        (status = 401, description = "Invalid or missing API key. Ensure your `Authorization` header is set to `Bearer YOUR_API_KEY`.", body = extra_types::OpenAIErrorResponse),
+        (status = 404, description = "The specified model does not exist or you don't have access to it.", body = extra_types::OpenAIErrorResponse),
     ),
     security(("BearerAuth" = []))
 )]
@@ -198,16 +210,70 @@ fn get_model() {}
         )
     ),
     tags(
-        (name = "chat", description = "Chat completions API"),
-        (name = "embeddings", description = "Embeddings API"),
-        (name = "models", description = "Models API"),
-        (name = "files", description = "File management for batch processing"),
-        (name = "batches", description = "Batch processing API"),
+        (name = "chat", description = "Create model responses for chat conversations.
+
+Supports:
+- **Multi-turn dialogue** with conversation history
+- **System prompts** to control model behavior
+- **Tool calling** for function execution and structured outputs
+- **Streaming** for real-time token delivery
+- **Sampling parameters** like temperature, top_p, and frequency penalties"),
+        (name = "embeddings", description = "Generate vector representations of text.
+
+Use embeddings for:
+- **Semantic search** — find content by meaning, not just keywords
+- **Clustering** — group similar documents together
+- **Classification** — categorize text based on similarity to examples
+- **Recommendations** — suggest related content"),
+        (name = "models", description = "List and retrieve information about available models.
+
+Use these endpoints to discover which models you have access to and their capabilities."),
+        (name = "files", description = "Upload and manage JSONL files for batch processing.
+
+Each line in the file should be a JSON object with:
+- `custom_id` — your identifier for tracking the request
+- `method` — HTTP method (POST)
+- `url` — endpoint path (e.g., `/v1/chat/completions`)
+- `body` — the request payload"),
+        (name = "batches", description = "Process large volumes of requests asynchronously.
+
+Batch processing is ideal when you:
+- Have many requests that don't need immediate responses
+- Want to process data in bulk (e.g., embeddings for a document corpus)
+- Are running offline evaluations or data pipelines
+
+Batches complete within 24 hours. You can track progress, cancel in-flight batches, and retry failed requests."),
     ),
     info(
         title = "AI API",
         version = "1.0.0",
-        description = "OpenAI-compatible API for chat completions, embeddings, and batch processing",
+        description = "OpenAI-compatible API for chat completions, embeddings, and batch processing.
+
+## Authentication
+
+All endpoints require an API key passed in the `Authorization` header:
+
+```
+Authorization: Bearer YOUR_API_KEY
+```
+
+## Errors
+
+Errors follow the OpenAI format with `error.message`, `error.type`, and `error.code` fields:
+
+```json
+{
+  \"error\": {
+    \"message\": \"Invalid API key\",
+    \"type\": \"authentication_error\",
+    \"code\": \"invalid_api_key\"
+  }
+}
+```
+
+## Streaming
+
+Chat completions support streaming responses via `\"stream\": true`. Responses are sent as server-sent events (SSE) with `data:` prefixed JSON chunks.",
     ),
 )]
 pub struct AiApiDoc;
