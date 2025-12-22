@@ -802,11 +802,63 @@ pub async fn get_file_content(
     // Collect items to determine if we need to truncate and set headers
     let items: Vec<_> = content_stream.collect().await;
 
-    let has_more = if let Some(req_limit) = requested_limit {
+    // Check if there's more paginated data currently available
+    let has_more_paginated = if let Some(req_limit) = requested_limit {
         items.len() > req_limit
     } else {
-        false // No limit means we fetched everything available
+        false // No limit means we fetched everything currently available
     };
+
+    // For BatchOutput and BatchError files, check if the batch is still running
+    // (which means more data may be written to this file in the future)
+    let file_may_receive_more_data = match file.purpose {
+        Some(fusillade::batch::Purpose::Batch) => false, // Input files are static
+        Some(fusillade::batch::Purpose::BatchOutput) => {
+            let batch = state
+                .request_manager
+                .get_batch_by_output_file_id(fusillade::FileId(file_id), fusillade::batch::OutputFileType::Output)
+                .await
+                .map_err(|e| Error::Internal {
+                    operation: format!("get batch by output file: {}", e),
+                })?;
+            if let Some(batch) = batch {
+                let status = state
+                    .request_manager
+                    .get_batch_status(batch.id)
+                    .await
+                    .map_err(|e| Error::Internal {
+                        operation: format!("get batch status: {}", e),
+                    })?;
+                status.pending_requests > 0 || status.in_progress_requests > 0
+            } else {
+                false
+            }
+        }
+        Some(fusillade::batch::Purpose::BatchError) => {
+            let batch = state
+                .request_manager
+                .get_batch_by_output_file_id(fusillade::FileId(file_id), fusillade::batch::OutputFileType::Error)
+                .await
+                .map_err(|e| Error::Internal {
+                    operation: format!("get batch by error file: {}", e),
+                })?;
+            if let Some(batch) = batch {
+                let status = state
+                    .request_manager
+                    .get_batch_status(batch.id)
+                    .await
+                    .map_err(|e| Error::Internal {
+                        operation: format!("get batch status: {}", e),
+                    })?;
+                status.pending_requests > 0 || status.in_progress_requests > 0
+            } else {
+                false
+            }
+        }
+        None => false, // Shouldn't happen, but assume complete
+    };
+
+    let has_more = has_more_paginated || file_may_receive_more_data;
 
     // Truncate to requested limit if we fetched extra
     let items_to_return = if let Some(req_limit) = requested_limit {
@@ -1126,6 +1178,7 @@ mod tests {
     use crate::db::models::api_keys::ApiKeyPurpose;
     use crate::test_utils::*;
     use sqlx::PgPool;
+    use uuid::Uuid;
 
     #[sqlx::test]
     #[test_log::test]
@@ -1724,5 +1777,274 @@ mod tests {
             "Qwen/Qwen3-VL-30B-A3B-Instruct-FP8"
         );
         assert!(body.get("messages").is_some(), "Messages field should be preserved");
+    }
+
+    /// Test that X-Incomplete is false for static batch input files (no pagination)
+    #[sqlx::test]
+    #[test_log::test]
+    async fn test_x_incomplete_false_for_batch_input_file(pool: PgPool) {
+        let (app, _bg_services) = create_test_app(pool.clone(), false).await;
+        let user = create_test_user_with_roles(&pool, vec![Role::StandardUser, Role::BatchAPIUser]).await;
+        let group = create_test_group(&pool).await;
+        add_user_to_group(&pool, user.id, group.id).await;
+
+        let deployment = create_test_deployment(&pool, user.id, "gpt-4", "gpt-4").await;
+        add_deployment_to_group(&pool, deployment.id, group.id, user.id).await;
+
+        // Upload a batch input file with 3 requests
+        let jsonl_content = r#"{"custom_id":"req-1","method":"POST","url":"/v1/chat/completions","body":{"model":"gpt-4","messages":[{"role":"user","content":"Hi"}]}}
+{"custom_id":"req-2","method":"POST","url":"/v1/chat/completions","body":{"model":"gpt-4","messages":[{"role":"user","content":"Hello"}]}}
+{"custom_id":"req-3","method":"POST","url":"/v1/chat/completions","body":{"model":"gpt-4","messages":[{"role":"user","content":"Hey"}]}}
+"#;
+
+        let file_part = axum_test::multipart::Part::bytes(jsonl_content.as_bytes()).file_name("test.jsonl");
+        let upload_response = app
+            .post("/ai/v1/files")
+            .add_header(&add_auth_headers(&user)[0].0, &add_auth_headers(&user)[0].1)
+            .add_header(&add_auth_headers(&user)[1].0, &add_auth_headers(&user)[1].1)
+            .multipart(
+                axum_test::multipart::MultipartForm::new()
+                    .add_text("purpose", "batch")
+                    .add_part("file", file_part),
+            )
+            .await;
+
+        upload_response.assert_status(axum::http::StatusCode::CREATED);
+        let file: FileResponse = upload_response.json();
+
+        // Download file content
+        let response = app
+            .get(&format!("/ai/v1/files/{}/content", file.id))
+            .add_header(&add_auth_headers(&user)[0].0, &add_auth_headers(&user)[0].1)
+            .add_header(&add_auth_headers(&user)[1].0, &add_auth_headers(&user)[1].1)
+            .await;
+
+        response.assert_status(axum::http::StatusCode::OK);
+
+        // Batch input files are static - should be complete
+        let incomplete_header = response.headers().get("x-incomplete");
+        assert_eq!(
+            incomplete_header.and_then(|h| h.to_str().ok()),
+            Some("false"),
+            "Batch input file should have X-Incomplete: false"
+        );
+    }
+
+    /// Test that X-Incomplete is true when pagination indicates more data
+    #[sqlx::test]
+    #[test_log::test]
+    async fn test_x_incomplete_true_with_pagination(pool: PgPool) {
+        let (app, _bg_services) = create_test_app(pool.clone(), false).await;
+        let user = create_test_user_with_roles(&pool, vec![Role::StandardUser, Role::BatchAPIUser]).await;
+        let group = create_test_group(&pool).await;
+        add_user_to_group(&pool, user.id, group.id).await;
+
+        let deployment = create_test_deployment(&pool, user.id, "gpt-4", "gpt-4").await;
+        add_deployment_to_group(&pool, deployment.id, group.id, user.id).await;
+
+        // Upload file with 5 requests
+        let jsonl_content = r#"{"custom_id":"req-1","method":"POST","url":"/v1/chat/completions","body":{"model":"gpt-4","messages":[{"role":"user","content":"Msg 1"}]}}
+{"custom_id":"req-2","method":"POST","url":"/v1/chat/completions","body":{"model":"gpt-4","messages":[{"role":"user","content":"Msg 2"}]}}
+{"custom_id":"req-3","method":"POST","url":"/v1/chat/completions","body":{"model":"gpt-4","messages":[{"role":"user","content":"Msg 3"}]}}
+{"custom_id":"req-4","method":"POST","url":"/v1/chat/completions","body":{"model":"gpt-4","messages":[{"role":"user","content":"Msg 4"}]}}
+{"custom_id":"req-5","method":"POST","url":"/v1/chat/completions","body":{"model":"gpt-4","messages":[{"role":"user","content":"Msg 5"}]}}
+"#;
+
+        let file_part = axum_test::multipart::Part::bytes(jsonl_content.as_bytes()).file_name("test.jsonl");
+        let upload_response = app
+            .post("/ai/v1/files")
+            .add_header(&add_auth_headers(&user)[0].0, &add_auth_headers(&user)[0].1)
+            .add_header(&add_auth_headers(&user)[1].0, &add_auth_headers(&user)[1].1)
+            .multipart(
+                axum_test::multipart::MultipartForm::new()
+                    .add_text("purpose", "batch")
+                    .add_part("file", file_part),
+            )
+            .await;
+
+        upload_response.assert_status(axum::http::StatusCode::CREATED);
+        let file: FileResponse = upload_response.json();
+
+        // Download with limit=2 (should have more data)
+        let response = app
+            .get(&format!("/ai/v1/files/{}/content?limit=2", file.id))
+            .add_header(&add_auth_headers(&user)[0].0, &add_auth_headers(&user)[0].1)
+            .add_header(&add_auth_headers(&user)[1].0, &add_auth_headers(&user)[1].1)
+            .await;
+
+        response.assert_status(axum::http::StatusCode::OK);
+
+        // Should be incomplete due to pagination
+        let incomplete_header = response.headers().get("x-incomplete");
+        assert_eq!(
+            incomplete_header.and_then(|h| h.to_str().ok()),
+            Some("true"),
+            "Should have X-Incomplete: true when paginated"
+        );
+
+        // Now fetch all data (no limit)
+        let response = app
+            .get(&format!("/ai/v1/files/{}/content", file.id))
+            .add_header(&add_auth_headers(&user)[0].0, &add_auth_headers(&user)[0].1)
+            .add_header(&add_auth_headers(&user)[1].0, &add_auth_headers(&user)[1].1)
+            .await;
+
+        response.assert_status(axum::http::StatusCode::OK);
+
+        // Should be complete when no limit (fetched all)
+        let incomplete_header = response.headers().get("x-incomplete");
+        assert_eq!(
+            incomplete_header.and_then(|h| h.to_str().ok()),
+            Some("false"),
+            "Should have X-Incomplete: false when all data fetched"
+        );
+    }
+
+    /// Test that X-Incomplete reflects batch running status for output files
+    #[sqlx::test]
+    #[test_log::test]
+    async fn test_x_incomplete_for_batch_output_file_running(pool: PgPool) {
+        let (app, _bg_services) = create_test_app(pool.clone(), false).await;
+        let user = create_test_user_with_roles(&pool, vec![Role::StandardUser, Role::BatchAPIUser]).await;
+        let group = create_test_group(&pool).await;
+        add_user_to_group(&pool, user.id, group.id).await;
+
+        let deployment = create_test_deployment(&pool, user.id, "gpt-4", "gpt-4").await;
+        add_deployment_to_group(&pool, deployment.id, group.id, user.id).await;
+
+        // Upload a file
+        let jsonl_content = r#"{"custom_id":"req-1","method":"POST","url":"/v1/chat/completions","body":{"model":"gpt-4","messages":[{"role":"user","content":"Test"}]}}
+"#;
+        let file_part = axum_test::multipart::Part::bytes(jsonl_content.as_bytes()).file_name("test.jsonl");
+        let upload_response = app
+            .post("/ai/v1/files")
+            .add_header(&add_auth_headers(&user)[0].0, &add_auth_headers(&user)[0].1)
+            .add_header(&add_auth_headers(&user)[1].0, &add_auth_headers(&user)[1].1)
+            .multipart(
+                axum_test::multipart::MultipartForm::new()
+                    .add_text("purpose", "batch")
+                    .add_part("file", file_part),
+            )
+            .await;
+
+        upload_response.assert_status(axum::http::StatusCode::CREATED);
+        let file: FileResponse = upload_response.json();
+
+        // Create a batch
+        let batch_response = app
+            .post("/ai/v1/batches")
+            .add_header(&add_auth_headers(&user)[0].0, &add_auth_headers(&user)[0].1)
+            .add_header(&add_auth_headers(&user)[1].0, &add_auth_headers(&user)[1].1)
+            .json(&serde_json::json!({
+                "input_file_id": file.id,
+                "endpoint": "/v1/chat/completions",
+                "completion_window": "24h"
+            }))
+            .await;
+
+        batch_response.assert_status(axum::http::StatusCode::CREATED);
+        let batch: serde_json::Value = batch_response.json();
+        let output_file_id = batch["output_file_id"].as_str().expect("Should have output_file_id");
+
+        // Download output file content - batch is running (pending requests)
+        let response = app
+            .get(&format!("/ai/v1/files/{}/content", output_file_id))
+            .add_header(&add_auth_headers(&user)[0].0, &add_auth_headers(&user)[0].1)
+            .add_header(&add_auth_headers(&user)[1].0, &add_auth_headers(&user)[1].1)
+            .await;
+
+        response.assert_status(axum::http::StatusCode::OK);
+
+        // Should be incomplete - batch has pending requests
+        let incomplete_header = response.headers().get("x-incomplete");
+        assert_eq!(
+            incomplete_header.and_then(|h| h.to_str().ok()),
+            Some("true"),
+            "Output file should be incomplete while batch has pending requests"
+        );
+    }
+
+    /// Test that X-Incomplete is false for output file when batch is complete
+    #[sqlx::test]
+    #[test_log::test]
+    async fn test_x_incomplete_false_for_batch_output_file_complete(pool: PgPool) {
+        let (app, _bg_services) = create_test_app(pool.clone(), false).await;
+        let user = create_test_user_with_roles(&pool, vec![Role::StandardUser, Role::BatchAPIUser]).await;
+        let group = create_test_group(&pool).await;
+        add_user_to_group(&pool, user.id, group.id).await;
+
+        let deployment = create_test_deployment(&pool, user.id, "gpt-4", "gpt-4").await;
+        add_deployment_to_group(&pool, deployment.id, group.id, user.id).await;
+
+        // Upload a file
+        let jsonl_content = r#"{"custom_id":"req-1","method":"POST","url":"/v1/chat/completions","body":{"model":"gpt-4","messages":[{"role":"user","content":"Test"}]}}
+"#;
+        let file_part = axum_test::multipart::Part::bytes(jsonl_content.as_bytes()).file_name("test.jsonl");
+        let upload_response = app
+            .post("/ai/v1/files")
+            .add_header(&add_auth_headers(&user)[0].0, &add_auth_headers(&user)[0].1)
+            .add_header(&add_auth_headers(&user)[1].0, &add_auth_headers(&user)[1].1)
+            .multipart(
+                axum_test::multipart::MultipartForm::new()
+                    .add_text("purpose", "batch")
+                    .add_part("file", file_part),
+            )
+            .await;
+
+        upload_response.assert_status(axum::http::StatusCode::CREATED);
+        let file: FileResponse = upload_response.json();
+
+        // Create a batch
+        let batch_response = app
+            .post("/ai/v1/batches")
+            .add_header(&add_auth_headers(&user)[0].0, &add_auth_headers(&user)[0].1)
+            .add_header(&add_auth_headers(&user)[1].0, &add_auth_headers(&user)[1].1)
+            .json(&serde_json::json!({
+                "input_file_id": file.id,
+                "endpoint": "/v1/chat/completions",
+                "completion_window": "24h"
+            }))
+            .await;
+
+        batch_response.assert_status(axum::http::StatusCode::CREATED);
+        let batch: serde_json::Value = batch_response.json();
+        let batch_id = batch["id"].as_str().expect("Should have id");
+        let output_file_id = batch["output_file_id"].as_str().expect("Should have output_file_id");
+
+        // Manually complete all requests by updating their state in the database
+        // Extract batch UUID from "batch_xxx" format
+        let batch_uuid = batch_id.strip_prefix("batch_").unwrap_or(batch_id);
+        let batch_uuid = Uuid::parse_str(batch_uuid).expect("Valid batch UUID");
+
+        // Use unchecked query since fusillade schema is created at runtime
+        // Must set completed_at to satisfy the completed_fields_check constraint
+        sqlx::query(
+            r#"
+            UPDATE fusillade.requests
+            SET state = 'completed', response_status = 200, response_body = '{"choices":[]}', completed_at = NOW()
+            WHERE batch_id = $1
+            "#,
+        )
+        .bind(batch_uuid)
+        .execute(&pool)
+        .await
+        .expect("Failed to complete requests");
+
+        // Download output file content - batch is now complete
+        let response = app
+            .get(&format!("/ai/v1/files/{}/content", output_file_id))
+            .add_header(&add_auth_headers(&user)[0].0, &add_auth_headers(&user)[0].1)
+            .add_header(&add_auth_headers(&user)[1].0, &add_auth_headers(&user)[1].1)
+            .await;
+
+        response.assert_status(axum::http::StatusCode::OK);
+
+        // Should be complete - all requests finished
+        let incomplete_header = response.headers().get("x-incomplete");
+        assert_eq!(
+            incomplete_header.and_then(|h| h.to_str().ok()),
+            Some("false"),
+            "Output file should be complete when batch has no pending/in-progress requests"
+        );
     }
 }
