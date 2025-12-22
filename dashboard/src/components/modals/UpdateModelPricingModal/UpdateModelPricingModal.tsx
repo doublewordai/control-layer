@@ -10,7 +10,7 @@ import {
   DialogDescription,
 } from "../../ui/dialog";
 import { ModelTariffTable } from "../../features/models/ModelTariffTable";
-import { useModel, useUpdateModel } from "../../../api/control-layer/hooks";
+import { useModel, useUpdateModel, useConfig } from "../../../api/control-layer/hooks";
 import type { TariffDefinition } from "../../../api/control-layer/types";
 import { toast } from "sonner";
 
@@ -28,6 +28,9 @@ export const UpdateModelPricingModal: React.FC<
   const { data: model, isLoading: isLoadingModel } = useModel(modelId, {
     include: "pricing",
   });
+
+  // Fetch config to get available SLAs
+  const { data: config } = useConfig();
 
   // Mutation
   const updateModel = useUpdateModel();
@@ -79,7 +82,7 @@ export const UpdateModelPricingModal: React.FC<
 
   return (
     <Dialog open={isOpen} onOpenChange={onClose}>
-      <DialogContent className="sm:max-w-[900px] max-h-[80vh] overflow-y-auto">
+      <DialogContent className="sm:max-w-[1400px] max-h-[80vh] overflow-y-auto">
         <DialogHeader>
           <DialogTitle className="flex items-center gap-2">
             <DollarSign className="h-5 w-5" />
@@ -101,6 +104,7 @@ export const UpdateModelPricingModal: React.FC<
               tariffs={currentTariffs}
               onChange={handleTariffsChange}
               isLoading={updateModel.isPending}
+              availableSLAs={config?.batches?.allowed_completion_windows || ["24h"]}
             />
           )}
         </div>

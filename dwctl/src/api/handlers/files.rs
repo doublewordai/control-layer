@@ -6,7 +6,8 @@
 //! files disaggregated in postgres.
 
 use crate::api::models::files::{
-    FileContentQuery, FileCostEstimate, FileDeleteResponse, FileListResponse, FileResponse, ListFilesQuery, ListObject, ObjectType, Purpose,
+    FileContentQuery, FileCostEstimate, FileCostEstimateQuery, FileDeleteResponse, FileListResponse, FileResponse, ListFilesQuery,
+    ListObject, ObjectType, Purpose,
 };
 use crate::auth::permissions::{RequiresPermission, can_read_all_resources, operation, resource};
 
@@ -1006,13 +1007,15 @@ Returns a breakdown by model including estimated input/output tokens and cost. U
         (status = 500, description = "An unexpected error occurred. Retry the request or contact support if the issue persists.")
     ),
     params(
-        ("file_id" = String, Path, description = "The file ID returned when the file was uploaded.")
+        ("file_id" = String, Path, description = "The ID of the file to estimate cost for"),
+        FileCostEstimateQuery
     )
 )]
-#[tracing::instrument(skip(state, current_user), fields(user_id = %current_user.id, file_id = %file_id_str))]
+#[tracing::instrument(skip(state, current_user), fields(user_id = %current_user.id, file_id = %file_id_str, completion_window = ?query.completion_window))]
 pub async fn get_file_cost_estimate(
     State(state): State<AppState>,
     Path(file_id_str): Path<String>,
+    Query(query): Query<FileCostEstimateQuery>,
     current_user: RequiresPermission<resource::Files, operation::ReadOwn>,
 ) -> Result<Json<crate::api::models::files::FileCostEstimate>> {
     use rust_decimal::Decimal;
@@ -1117,6 +1120,9 @@ pub async fn get_file_cost_estimate(
     let mut tariffs_repo = Tariffs::new(&mut conn);
     let current_time = Utc::now();
 
+    // Use the completion_window from query params, defaulting to "24h"
+    let completion_window = query.completion_window.as_deref().unwrap_or("24h");
+
     for (model_alias, (request_count, input_tokens)) in model_stats {
         // Look up the deployment and historical average
         let (deployment_opt, avg_output_tokens, model_type) = model_info
@@ -1139,7 +1145,13 @@ pub async fn get_file_cost_estimate(
         let cost = if let Some(deployment) = deployment_opt {
             // Look up tariff pricing for Batch API key purpose, with fallback to realtime
             let pricing_result = tariffs_repo
-                .get_pricing_at_timestamp_with_fallback(deployment.id, Some(&ApiKeyPurpose::Batch), &ApiKeyPurpose::Realtime, current_time)
+                .get_pricing_at_timestamp_with_fallback(
+                    deployment.id,
+                    Some(&ApiKeyPurpose::Batch),
+                    &ApiKeyPurpose::Realtime,
+                    current_time,
+                    Some(completion_window),
+                )
                 .await
                 .map_err(Error::Database)?;
 
@@ -1565,6 +1577,7 @@ mod tests {
                 input_price_per_token: Decimal::from_str("0.00003").unwrap(), // $0.03 per 1K tokens
                 output_price_per_token: Decimal::from_str("0.00006").unwrap(), // $0.06 per 1K tokens
                 api_key_purpose: Some(ApiKeyPurpose::Batch),
+                completion_window: Some("24h".to_string()),
                 valid_from: None,
             })
             .await
@@ -1578,6 +1591,7 @@ mod tests {
                 input_price_per_token: Decimal::from_str("0.000001").unwrap(), // $0.001 per 1K tokens
                 output_price_per_token: Decimal::from_str("0.000002").unwrap(), // $0.002 per 1K tokens
                 api_key_purpose: Some(ApiKeyPurpose::Batch),
+                completion_window: Some("24h".to_string()),
                 valid_from: None,
             })
             .await
@@ -1661,6 +1675,122 @@ mod tests {
         let total_output: i64 = estimate.models.iter().map(|m| m.estimated_output_tokens).sum();
         assert_eq!(estimate.total_estimated_input_tokens, total_input);
         assert_eq!(estimate.total_estimated_output_tokens, total_output);
+    }
+
+    #[sqlx::test]
+    #[test_log::test]
+    async fn test_get_file_cost_estimate_with_different_slas(pool: PgPool) {
+        use rust_decimal::Decimal;
+        use std::str::FromStr;
+
+        let (app, _bg_services) = create_test_app(pool.clone(), false).await;
+        let user = create_test_user_with_roles(&pool, vec![Role::StandardUser, Role::BatchAPIUser]).await;
+        let group = create_test_group(&pool).await;
+        add_user_to_group(&pool, user.id, group.id).await;
+
+        // Create deployment
+        let deployment = create_test_deployment(&pool, user.id, "gpt-4-model", "gpt-4").await;
+        add_deployment_to_group(&pool, deployment.id, group.id, user.id).await;
+
+        // Set pricing for different SLAs
+        use crate::db::handlers::Tariffs;
+        use crate::db::models::tariffs::TariffCreateDBRequest;
+
+        let mut conn = pool.acquire().await.unwrap();
+        let mut tariffs_repo = Tariffs::new(&mut conn);
+
+        // Create batch tariff for 24h SLA (standard pricing)
+        tariffs_repo
+            .create(&TariffCreateDBRequest {
+                deployed_model_id: deployment.id,
+                name: "batch-24h".to_string(),
+                input_price_per_token: Decimal::from_str("0.00003").unwrap(), // $0.03 per 1K tokens
+                output_price_per_token: Decimal::from_str("0.00006").unwrap(), // $0.06 per 1K tokens
+                api_key_purpose: Some(ApiKeyPurpose::Batch),
+                completion_window: Some("24h".to_string()),
+                valid_from: None,
+            })
+            .await
+            .unwrap();
+
+        // Create batch tariff for 1h SLA (higher pricing for faster turnaround)
+        tariffs_repo
+            .create(&TariffCreateDBRequest {
+                deployed_model_id: deployment.id,
+                name: "batch-1h".to_string(),
+                input_price_per_token: Decimal::from_str("0.00006").unwrap(), // $0.06 per 1K tokens (2x)
+                output_price_per_token: Decimal::from_str("0.00012").unwrap(), // $0.12 per 1K tokens (2x)
+                api_key_purpose: Some(ApiKeyPurpose::Batch),
+                completion_window: Some("1h".to_string()),
+                valid_from: None,
+            })
+            .await
+            .unwrap();
+
+        drop(conn);
+
+        // Create test JSONL content
+        let jsonl_content = r#"{"custom_id":"request-1","method":"POST","url":"/v1/chat/completions","body":{"model":"gpt-4","messages":[{"role":"user","content":"Hello"}]}}"#;
+
+        // Upload the file
+        let file_part = axum_test::multipart::Part::bytes(jsonl_content.as_bytes()).file_name("test-batch.jsonl");
+
+        let upload_response = app
+            .post("/ai/v1/files")
+            .add_header(&add_auth_headers(&user)[0].0, &add_auth_headers(&user)[0].1)
+            .add_header(&add_auth_headers(&user)[1].0, &add_auth_headers(&user)[1].1)
+            .multipart(
+                axum_test::multipart::MultipartForm::new()
+                    .add_text("purpose", "batch")
+                    .add_part("file", file_part),
+            )
+            .await;
+
+        upload_response.assert_status(axum::http::StatusCode::CREATED);
+        let file: FileResponse = upload_response.json();
+        let file_id = file.id;
+
+        // Get cost estimate with default (24h) SLA
+        let estimate_24h_response = app
+            .get(&format!("/ai/v1/files/{}/cost-estimate", file_id))
+            .add_header(&add_auth_headers(&user)[0].0, &add_auth_headers(&user)[0].1)
+            .add_header(&add_auth_headers(&user)[1].0, &add_auth_headers(&user)[1].1)
+            .await;
+
+        estimate_24h_response.assert_status(axum::http::StatusCode::OK);
+        let estimate_24h: crate::api::models::files::FileCostEstimate = estimate_24h_response.json();
+
+        // Get cost estimate with 1h SLA
+        let estimate_1h_response = app
+            .get(&format!("/ai/v1/files/{}/cost-estimate?completion_window=1h", file_id))
+            .add_header(&add_auth_headers(&user)[0].0, &add_auth_headers(&user)[0].1)
+            .add_header(&add_auth_headers(&user)[1].0, &add_auth_headers(&user)[1].1)
+            .await;
+
+        estimate_1h_response.assert_status(axum::http::StatusCode::OK);
+        let estimate_1h: crate::api::models::files::FileCostEstimate = estimate_1h_response.json();
+
+        // Verify both estimates have the same token counts
+        assert_eq!(estimate_24h.total_estimated_input_tokens, estimate_1h.total_estimated_input_tokens);
+        assert_eq!(
+            estimate_24h.total_estimated_output_tokens,
+            estimate_1h.total_estimated_output_tokens
+        );
+
+        // Verify 1h SLA costs more than 24h SLA (should be 2x)
+        let cost_24h = Decimal::from_str(&estimate_24h.total_estimated_cost).unwrap();
+        let cost_1h = Decimal::from_str(&estimate_1h.total_estimated_cost).unwrap();
+
+        assert!(cost_1h > cost_24h, "1h SLA should cost more than 24h SLA");
+        assert!(cost_24h > Decimal::ZERO, "24h SLA cost should be greater than zero");
+
+        // Verify the ratio is approximately 2x (allowing for rounding)
+        let ratio = cost_1h / cost_24h;
+        assert!(
+            ratio > Decimal::from_str("1.9").unwrap() && ratio < Decimal::from_str("2.1").unwrap(),
+            "1h SLA should be approximately 2x the cost of 24h SLA, got ratio: {}",
+            ratio
+        );
     }
 
     #[sqlx::test]

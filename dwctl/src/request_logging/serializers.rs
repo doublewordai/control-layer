@@ -3,7 +3,7 @@ use crate::db::errors::Result as DbResult;
 use crate::db::handlers::Credits;
 use crate::db::models::credits::{CreditTransactionCreateDBRequest, CreditTransactionType};
 use crate::request_logging::models::{AiRequest, AiResponse, ChatCompletionChunk, ParsedAIRequest};
-use crate::request_logging::utils::extract_header_value_as_string;
+use crate::request_logging::utils::extract_header_as_string;
 use outlet::{RequestData, ResponseData};
 use outlet_postgres::SerializationError;
 use rust_decimal::{Decimal, prelude::ToPrimitive};
@@ -337,8 +337,26 @@ pub async fn store_analytics_record(
     request_data: &RequestData,
 ) -> DbResult<HttpAnalyticsRow> {
     // Extract fusillade request ID if present
-    let fusillade_batch_id = extract_header_value_as_string(request_data, "x-fusillade-batch-id");
-    let fusillade_request_id = extract_header_value_as_string(request_data, "x-fusillade-request-id");
+    let fusillade_batch_id = extract_header_as_string(request_data, "x-fusillade-batch-id").and_then(|s| uuid::Uuid::parse_str(&s).ok());
+    let fusillade_request_id =
+        extract_header_as_string(request_data, "x-fusillade-request-id").and_then(|s| uuid::Uuid::parse_str(&s).ok());
+
+    // Extract batch metadata headers for tariff pricing
+    let batch_created_at = extract_header_as_string(request_data, "x-fusillade-batch-created-at");
+    let batch_completion_window = extract_header_as_string(request_data, "x-fusillade-batch-completion-window");
+
+    // Parse batch created_at timestamp if available, otherwise use metrics.timestamp
+    let pricing_timestamp = if let Some(created_at_str) = &batch_created_at {
+        created_at_str.parse::<chrono::DateTime<chrono::Utc>>().unwrap_or_else(|e| {
+            warn!(
+                "Failed to parse x-fusillade-batch-created-at header '{}': {}. Falling back to metrics.timestamp",
+                created_at_str, e
+            );
+            metrics.timestamp
+        })
+    } else {
+        metrics.timestamp
+    };
 
     // Extract user information and API key purpose based on auth type
     let (user_id, user_email, access_source, api_key_purpose) = match auth {
@@ -390,7 +408,8 @@ pub async fn store_analytics_record(
                     model_info.model_id,
                     api_key_purpose.as_ref(),
                     &crate::db::models::api_keys::ApiKeyPurpose::Realtime,
-                    metrics.timestamp,
+                    pricing_timestamp,
+                    batch_completion_window.as_deref(),
                 )
                 .await?;
 
@@ -1709,12 +1728,20 @@ mod tests {
                 tariffs_repo.close_tariffs_batch(&tariff_ids).await.unwrap();
             }
 
+            // Default completion_window to "24h" for batch tariffs (required by DB constraint)
+            let completion_window = if purpose == Some(ApiKeyPurpose::Batch) {
+                Some("24h".to_string())
+            } else {
+                None
+            };
+
             let tariff = TariffCreateDBRequest {
                 deployed_model_id,
                 name: tariff_name.to_string(),
                 input_price_per_token,
                 output_price_per_token,
                 api_key_purpose: purpose,
+                completion_window,
                 valid_from,
             };
             tariffs_repo.create(&tariff).await.unwrap();

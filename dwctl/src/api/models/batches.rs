@@ -31,7 +31,7 @@ pub struct BatchError {
 }
 
 /// Request body for creating a batch
-#[derive(Debug, Deserialize, ToSchema)]
+#[derive(Debug, Serialize, Deserialize, ToSchema)]
 pub struct CreateBatchRequest {
     /// The ID of an uploaded file that contains requests for the new batch
     pub input_file_id: String,

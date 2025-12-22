@@ -127,6 +127,19 @@ export const createBatchColumns = (
     },
   },
   {
+    accessorKey: "completion_window",
+    header: "SLA",
+    cell: ({ row }) => {
+      const completionWindow = row.getValue("completion_window") as string;
+      return (
+        <div className="flex items-center gap-1.5 text-sm text-gray-700">
+          <Clock className="w-3.5 h-3.5 text-gray-500" />
+          <span>{completionWindow}</span>
+        </div>
+      );
+    },
+  },
+  {
     accessorKey: "status",
     header: "Status",
     cell: ({ row }) => {

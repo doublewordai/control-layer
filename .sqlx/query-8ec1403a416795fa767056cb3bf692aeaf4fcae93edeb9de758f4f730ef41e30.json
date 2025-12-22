@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "\n            INSERT INTO model_tariffs (\n                deployed_model_id, name, input_price_per_token, output_price_per_token,\n                api_key_purpose, valid_from\n            )\n            VALUES ($1, $2, $3, $4, $5, COALESCE($6, NOW()))\n            RETURNING id, deployed_model_id, name, input_price_per_token, output_price_per_token,\n                      valid_from, valid_until, api_key_purpose as \"api_key_purpose: _\"\n            ",
+  "query": "\n            INSERT INTO model_tariffs (\n                deployed_model_id, name, input_price_per_token, output_price_per_token,\n                api_key_purpose, completion_window, valid_from\n            )\n            VALUES ($1, $2, $3, $4, $5, $6, COALESCE($7, NOW()))\n            RETURNING id, deployed_model_id, name, input_price_per_token, output_price_per_token,\n                      valid_from, valid_until, api_key_purpose as \"api_key_purpose: _\", completion_window\n            ",
   "describe": {
     "columns": [
       {
@@ -42,6 +42,11 @@
         "ordinal": 7,
         "name": "api_key_purpose: _",
         "type_info": "Varchar"
+      },
+      {
+        "ordinal": 8,
+        "name": "completion_window",
+        "type_info": "Varchar"
       }
     ],
     "parameters": {
@@ -50,6 +55,7 @@
         "Varchar",
         "Numeric",
         "Numeric",
+        "Varchar",
         "Varchar",
         "Timestamptz"
       ]
@@ -62,8 +68,9 @@
       false,
       false,
       true,
+      true,
       true
     ]
   },
-  "hash": "d897f833fd721e78ccb2248275b8939fb02e49e3eb99eb50b5debbe7c88183bb"
+  "hash": "8ec1403a416795fa767056cb3bf692aeaf4fcae93edeb9de758f4f730ef41e30"
 }

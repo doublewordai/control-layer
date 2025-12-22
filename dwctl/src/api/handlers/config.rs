@@ -5,6 +5,13 @@ use serde::Serialize;
 
 use crate::{AppState, api::models::users::CurrentUser};
 
+/// Batch configuration subset for API response
+#[derive(Debug, Clone, Serialize)]
+pub struct BatchConfigResponse {
+    pub enabled: bool,
+    pub allowed_completion_windows: Vec<String>,
+}
+
 /// Configuration response with computed fields
 #[derive(Debug, Clone, Serialize)]
 pub struct ConfigResponse {
@@ -12,6 +19,8 @@ pub struct ConfigResponse {
     pub organization: Option<String>,
     pub payment_enabled: bool,
     pub docs_url: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub batches: Option<BatchConfigResponse>,
 }
 
 #[utoipa::path(
@@ -39,6 +48,15 @@ pub async fn get_config(State(state): State<AppState>, _user: CurrentUser) -> im
         // Compute payment_enabled based on whether payment_processor is configured
         payment_enabled: state.config.payment.is_some(),
         docs_url: metadata.docs_url.clone(),
+        // Include batch configuration if batches are enabled
+        batches: if state.config.batches.enabled {
+            Some(BatchConfigResponse {
+                enabled: state.config.batches.enabled,
+                allowed_completion_windows: state.config.batches.allowed_completion_windows.clone(),
+            })
+        } else {
+            None
+        },
     };
 
     Json(response)
@@ -79,5 +97,33 @@ mod tests {
         let response = app.get("/admin/api/v1/config").await;
 
         response.assert_status(StatusCode::UNAUTHORIZED);
+    }
+
+    #[sqlx::test]
+    async fn test_get_config_includes_batch_slas(pool: PgPool) {
+        let (app, _bg_services) = create_test_app(pool.clone(), false).await;
+        let user = create_test_user(&pool, Role::StandardUser).await;
+
+        let headers = add_auth_headers(&user);
+        let response = app
+            .get("/admin/api/v1/config")
+            .add_header(&headers[0].0, &headers[0].1)
+            .add_header(&headers[1].0, &headers[1].1)
+            .await;
+
+        response.assert_status(StatusCode::OK);
+        let json: Value = response.json();
+
+        // Check that batches config is present and includes allowed_completion_windows
+        let batches = json.get("batches").expect("batches field should exist");
+        assert_eq!(batches.get("enabled").and_then(|v| v.as_bool()), Some(true));
+
+        let slas = batches
+            .get("allowed_completion_windows")
+            .and_then(|v| v.as_array())
+            .expect("allowed_completion_windows should be an array");
+
+        // Default config should have "24h"
+        assert!(slas.iter().any(|v| v.as_str() == Some("24h")));
     }
 }

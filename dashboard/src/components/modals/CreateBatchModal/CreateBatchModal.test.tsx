@@ -10,6 +10,8 @@ vi.mock("../../../api/control-layer/hooks", () => ({
   useCreateBatch: vi.fn(),
   useUploadFile: vi.fn(),
   useFiles: vi.fn(),
+  useConfig: vi.fn(),
+  useFileCostEstimate: vi.fn(),
 }));
 
 // Mock sonner toast
@@ -69,6 +71,26 @@ describe("CreateBatchModal", () => {
     // Default mock for useFiles
     vi.mocked(hooks.useFiles).mockReturnValue({
       data: { data: [] },
+      isLoading: false,
+      error: null,
+      refetch: vi.fn(),
+    } as any);
+
+    // Default mock for useConfig
+    vi.mocked(hooks.useConfig).mockReturnValue({
+      data: {
+        batches: {
+          allowed_completion_windows: ["24h"],
+        },
+      },
+      isLoading: false,
+      error: null,
+      refetch: vi.fn(),
+    } as any);
+
+    // Default mock for useFileCostEstimate
+    vi.mocked(hooks.useFileCostEstimate).mockReturnValue({
+      data: null,
       isLoading: false,
       error: null,
       refetch: vi.fn(),

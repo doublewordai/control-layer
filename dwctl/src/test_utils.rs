@@ -39,6 +39,19 @@ pub async fn create_test_app(pool: PgPool, _enable_sync: bool) -> (TestServer, c
     app.into_test_server()
 }
 
+pub async fn create_test_app_with_config(
+    pool: PgPool,
+    config: crate::config::Config,
+    _enable_sync: bool,
+) -> (TestServer, crate::BackgroundServices) {
+    let app = crate::Application::new_with_pool(config, Some(pool))
+        .await
+        .expect("Failed to create application");
+
+    // Convert to test server (sync is always enabled in new())
+    app.into_test_server()
+}
+
 pub fn create_test_config() -> crate::config::Config {
     // Use temp directory for test emails
     let temp_dir = std::env::temp_dir().join(format!("dwctl-test-emails-{}", std::process::id()));
