@@ -265,16 +265,18 @@ export function AppLayout({ children }: { children: React.ReactNode }) {
                   <div className="hidden md:block w-px h-4 bg-border"></div>
                 </>
               )}
-              <a
-                href="https://docs.doubleword.ai/control-layer"
-                target="_blank"
-                rel="noopener noreferrer"
-                className="flex items-center gap-2 text-muted-foreground hover:text-primary transition-colors font-medium"
-              >
-                <span className="hidden sm:inline">Documentation</span>
-                <span className="sm:hidden">Docs</span>
-                <ExternalLink className="w-3 h-3" />
-              </a>
+              {config?.docs_url && (
+                <a
+                  href={config.docs_url}
+                  target="_blank"
+                  rel="noopener noreferrer"
+                  className="flex items-center gap-2 text-muted-foreground hover:text-primary transition-colors font-medium"
+                >
+                  <span className="hidden sm:inline">Documentation</span>
+                  <span className="sm:hidden">Docs</span>
+                  <ExternalLink className="w-3 h-3" />
+                </a>
+              )}
             </div>
           </header>
           <main className="flex-1">{children}</main>

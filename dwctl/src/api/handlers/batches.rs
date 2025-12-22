@@ -114,13 +114,15 @@ fn to_batch_response(batch: fusillade::Batch) -> BatchResponse {
     path = "/batches",
     tag = "batches",
     summary = "Create batch",
-    description = "Creates and executes a batch from an uploaded file of requests",
+    description = "Create and start processing a batch from an uploaded file.
+
+The batch will begin processing immediately. Use `GET /batches/{batch_id}` to monitor progress.",
     request_body = CreateBatchRequest,
     responses(
-        (status = 201, description = "Batch created successfully", body = BatchResponse),
-        (status = 400, description = "Invalid request"),
-        (status = 404, description = "Input file not found"),
-        (status = 500, description = "Internal server error")
+        (status = 201, description = "Batch created and queued for processing.", body = BatchResponse),
+        (status = 400, description = "Invalid request — check that the endpoint and completion_window are valid."),
+        (status = 404, description = "Input file not found or you don't have access to it."),
+        (status = 500, description = "An unexpected error occurred. Retry the request or contact support if the issue persists.")
     )
 )]
 #[tracing::instrument(skip(state, current_user), fields(user_id = %current_user.id, input_file_id = %req.input_file_id))]
@@ -210,14 +212,16 @@ pub async fn create_batch(
     path = "/batches/{batch_id}",
     tag = "batches",
     summary = "Retrieve batch",
-    description = "Retrieves a batch by ID",
+    description = "Retrieve the current status and details of a batch.
+
+Poll this endpoint to monitor progress. Results are streamed to `output_file_id` as they complete — you can start downloading results before the batch finishes.",
     responses(
-        (status = 200, description = "Batch retrieved successfully", body = BatchResponse),
-        (status = 404, description = "Batch not found"),
-        (status = 500, description = "Internal server error")
+        (status = 200, description = "Batch details including status, progress counts, and output file IDs.", body = BatchResponse),
+        (status = 404, description = "Batch not found or you don't have access to it."),
+        (status = 500, description = "An unexpected error occurred. Retry the request or contact support if the issue persists.")
     ),
     params(
-        ("batch_id" = String, Path, description = "The ID of the batch to retrieve")
+        ("batch_id" = String, Path, description = "The batch ID returned when the batch was created.")
     )
 )]
 #[tracing::instrument(skip(state, current_user), fields(user_id = %current_user.id, batch_id = %batch_id_str))]
@@ -260,14 +264,16 @@ pub async fn get_batch(
     path = "/batches/{batch_id}/analytics",
     tag = "batches",
     summary = "Get batch analytics",
-    description = "Retrieves aggregated analytics metrics for a batch, including token usage, costs, and performance metrics",
+    description = "Retrieve aggregated metrics for a batch including token usage, costs, and latency statistics.
+
+Analytics update in real-time as requests complete.",
     responses(
-        (status = 200, description = "Batch analytics retrieved successfully", body = BatchAnalytics),
-        (status = 404, description = "Batch not found or no analytics available"),
-        (status = 500, description = "Internal server error")
+        (status = 200, description = "Batch analytics with token counts, costs, and performance metrics.", body = BatchAnalytics),
+        (status = 404, description = "Batch not found or you don't have access to it."),
+        (status = 500, description = "An unexpected error occurred. Retry the request or contact support if the issue persists.")
     ),
     params(
-        ("batch_id" = String, Path, description = "The ID of the batch to retrieve analytics for")
+        ("batch_id" = String, Path, description = "The batch ID returned when the batch was created.")
     )
 )]
 #[tracing::instrument(skip(state, current_user), fields(user_id = %current_user.id, batch_id = %batch_id_str))]
@@ -317,14 +323,16 @@ pub async fn get_batch_analytics(
     path = "/batches/{batch_id}/cancel",
     tag = "batches",
     summary = "Cancel batch",
-    description = "Cancels an in-progress batch",
+    description = "Cancel an in-progress batch.
+
+Pending requests will not be processed. Requests already in progress will complete. The batch status will transition to `cancelling` then `cancelled`.",
     responses(
-        (status = 200, description = "Batch cancellation initiated", body = BatchResponse),
-        (status = 404, description = "Batch not found"),
-        (status = 500, description = "Internal server error")
+        (status = 200, description = "Cancellation initiated. The batch will finish processing in-flight requests.", body = BatchResponse),
+        (status = 404, description = "Batch not found or you don't have access to it."),
+        (status = 500, description = "An unexpected error occurred. Retry the request or contact support if the issue persists.")
     ),
     params(
-        ("batch_id" = String, Path, description = "The ID of the batch to cancel")
+        ("batch_id" = String, Path, description = "The batch ID returned when the batch was created.")
     )
 )]
 #[tracing::instrument(skip(state, current_user), fields(user_id = %current_user.id, batch_id = %batch_id_str))]
@@ -387,22 +395,18 @@ pub async fn cancel_batch(
     delete,
     path = "/batches/{batch_id}",
     tag = "batches",
-    summary = "Delete a batch",
-    description = "Delete a batch and all its associated requests. This is a destructive operation that cannot be undone.",
+    summary = "Delete batch",
+    description = "Permanently delete a batch and all its associated data.
+
+This action cannot be undone. The input file is not deleted.",
     responses(
-        (status = 204, description = "Batch deleted successfully"),
-        (status = 400, description = "Invalid batch ID format"),
-        (status = 403, description = "Forbidden - user does not have permission to delete this batch"),
-        (status = 404, description = "Batch not found"),
-        (status = 500, description = "Internal server error")
+        (status = 204, description = "Batch deleted successfully."),
+        (status = 400, description = "Invalid batch ID format."),
+        (status = 404, description = "Batch not found or you don't have access to it."),
+        (status = 500, description = "An unexpected error occurred. Retry the request or contact support if the issue persists.")
     ),
     params(
-        ("batch_id" = String, Path, description = "Batch ID")
-    ),
-    security(
-        ("BearerAuth" = []),
-        ("CookieAuth" = []),
-        ("X-Doubleword-User" = [])
+        ("batch_id" = String, Path, description = "The batch ID returned when the batch was created.")
     )
 )]
 #[tracing::instrument(skip(state, current_user), fields(batch_id = %batch_id_str))]
@@ -456,14 +460,17 @@ pub async fn delete_batch(
     path = "/batches/{batch_id}/retry",
     tag = "batches",
     summary = "Retry failed requests",
-    description = "Retries all failed requests in a batch by resetting them to pending state",
+    description = "Retry all failed requests in a batch.
+
+Failed requests are reset to pending and will be processed again. Use this after fixing transient issues or increasing rate limits.",
     responses(
-        (status = 200, description = "Failed requests retry initiated", body = BatchResponse),
-        (status = 404, description = "Batch not found"),
-        (status = 500, description = "Internal server error")
+        (status = 200, description = "Failed requests queued for retry.", body = BatchResponse),
+        (status = 400, description = "No failed requests to retry in this batch."),
+        (status = 404, description = "Batch not found or you don't have access to it."),
+        (status = 500, description = "An unexpected error occurred. Retry the request or contact support if the issue persists.")
     ),
     params(
-        ("batch_id" = String, Path, description = "The ID of the batch to retry failed requests for")
+        ("batch_id" = String, Path, description = "The batch ID returned when the batch was created.")
     )
 )]
 #[tracing::instrument(skip(state, current_user), fields(user_id = %current_user.id, batch_id = %batch_id_str))]
@@ -580,15 +587,18 @@ pub async fn retry_failed_batch_requests(
     path = "/batches/{batch_id}/retry-requests",
     tag = "batches",
     summary = "Retry specific requests",
-    description = "Retries specific failed requests in a batch by their IDs",
+    description = "Retry specific failed requests by their IDs.
+
+Use this for fine-grained control over which requests to retry, rather than retrying all failures.",
     request_body = RetryRequestsRequest,
     responses(
-        (status = 200, description = "Specific requests retry initiated", body = BatchResponse),
-        (status = 404, description = "Batch not found"),
-        (status = 500, description = "Internal server error")
+        (status = 200, description = "Specified requests queued for retry.", body = BatchResponse),
+        (status = 400, description = "No valid request IDs provided."),
+        (status = 404, description = "Batch not found or you don't have access to it."),
+        (status = 500, description = "An unexpected error occurred. Retry the request or contact support if the issue persists.")
     ),
     params(
-        ("batch_id" = String, Path, description = "The ID of the batch containing the requests to retry")
+        ("batch_id" = String, Path, description = "The batch ID returned when the batch was created.")
     )
 )]
 #[tracing::instrument(skip(state, current_user, req), fields(user_id = %current_user.id, batch_id = %batch_id_str))]
@@ -692,10 +702,12 @@ pub async fn retry_specific_requests(
     path = "/batches",
     tag = "batches",
     summary = "List batches",
-    description = "Returns a list of batches",
+    description = "Returns a paginated list of your batches, newest first.
+
+Use cursor-based pagination: pass `last_id` from the response as the `after` parameter to fetch the next page.",
     responses(
-        (status = 200, description = "List of batches", body = BatchListResponse),
-        (status = 500, description = "Internal server error")
+        (status = 200, description = "List of batches. Check `has_more` to determine if additional pages exist.", body = BatchListResponse),
+        (status = 500, description = "An unexpected error occurred. Retry the request or contact support if the issue persists.")
     ),
     params(
         ListBatchesQuery
