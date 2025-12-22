@@ -16,6 +16,7 @@ import {
   useCreateBatch,
   useFiles,
   useUploadFile,
+  useConfig,
 } from "../../../api/control-layer/hooks";
 import { toast } from "sonner";
 import type { FileObject } from "../../features/batches/types";
@@ -51,6 +52,7 @@ export function CreateBatchModal({
 
   const createBatchMutation = useCreateBatch();
   const uploadMutation = useUploadFile();
+  const { data: config } = useConfig();
 
   // Fetch available files for combobox (only input files with purpose "batch")
   const { data: filesResponse } = useFiles({
@@ -219,15 +221,19 @@ export function CreateBatchModal({
           <DialogTitle>Create New Batch</DialogTitle>
           <DialogDescription>
             Select or upload a{" "}
-            <a
-              href="https://docs.doubleword.ai/batches/jsonl-files"
-              target="_blank"
-              rel="noopener noreferrer"
-              className="text-blue-600 hover:text-blue-700 hover:underline inline-flex items-center gap-1"
-            >
-              JSONL file
-              <ExternalLink className="w-3 h-3" />
-            </a>{" "}
+            {config?.docs_jsonl_url ? (
+              <a
+                href={config.docs_jsonl_url}
+                target="_blank"
+                rel="noopener noreferrer"
+                className="text-blue-600 hover:text-blue-700 hover:underline inline-flex items-center gap-1"
+              >
+                JSONL file
+                <ExternalLink className="w-3 h-3" />
+              </a>
+            ) : (
+              "JSONL file"
+            )}{" "}
             to create a batch.
           </DialogDescription>
         </DialogHeader>

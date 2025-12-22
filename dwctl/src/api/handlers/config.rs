@@ -11,6 +11,8 @@ pub struct ConfigResponse {
     pub region: Option<String>,
     pub organization: Option<String>,
     pub payment_enabled: bool,
+    pub docs_url: Option<String>,
+    pub docs_jsonl_url: Option<String>,
 }
 
 #[utoipa::path(
@@ -37,6 +39,8 @@ pub async fn get_config(State(state): State<AppState>, _user: CurrentUser) -> im
         organization: metadata.organization.clone(),
         // Compute payment_enabled based on whether payment_processor is configured
         payment_enabled: state.config.payment.is_some(),
+        docs_url: metadata.docs_url.clone(),
+        docs_jsonl_url: metadata.docs_jsonl_url.clone(),
     };
 
     Json(response)

@@ -366,6 +366,10 @@ pub struct Metadata {
     pub region: Option<String>,
     /// Organization name displayed in the UI
     pub organization: Option<String>,
+    /// Documentation URL displayed in the UI (e.g., "https://docs.example.com/batches")
+    pub docs_url: Option<String>,
+    /// JSONL documentation URL displayed in batch modals (e.g., "https://docs.example.com/batches/jsonl-files")
+    pub docs_jsonl_url: Option<String>,
 }
 
 /// External model source configuration.

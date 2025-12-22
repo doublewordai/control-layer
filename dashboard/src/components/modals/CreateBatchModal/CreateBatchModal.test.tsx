@@ -10,6 +10,12 @@ vi.mock("../../../api/control-layer/hooks", () => ({
   useCreateBatch: vi.fn(),
   useUploadFile: vi.fn(),
   useFiles: vi.fn(),
+  useConfig: vi.fn(() => ({
+    data: {
+      docs_url: "https://docs.example.com",
+      docs_jsonl_url: "https://docs.example.com/jsonl",
+    },
+  })),
 }));
 
 // Mock sonner toast

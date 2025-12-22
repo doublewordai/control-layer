@@ -10,7 +10,7 @@ import {
 } from "lucide-react";
 import { CodeBlock } from "../../ui/code-block";
 import { toast } from "sonner";
-import { useCreateApiKey } from "../../../api/control-layer";
+import { useCreateApiKey, useConfig } from "../../../api/control-layer";
 import { type ModelType } from "../../../utils/modelType";
 import type { Model } from "../../../api/control-layer";
 import {
@@ -61,6 +61,8 @@ const ApiExamplesModal: React.FC<ApiExamplesModalProps> = ({
   const [newKeyName, setNewKeyName] = useState("");
   const [newKeyDescription, setNewKeyDescription] = useState("");
   const [showInfoTooltip, setShowInfoTooltip] = useState(false);
+
+  const { data: config } = useConfig();
 
   const createApiKeyMutation = useCreateApiKey();
 
@@ -539,15 +541,17 @@ chatCompletion();`;
                         </CodeBlock>
                       </div>
                     </div>
-                    <a
-                      href="https://docs.doubleword.ai/batches/jsonl-files"
-                      target="_blank"
-                      rel="noopener noreferrer"
-                      className="text-sm text-blue-600 hover:text-blue-700 hover:underline inline-flex items-center gap-1"
-                    >
-                      How to create a JSONL file
-                      <ExternalLink className="w-3 h-3" />
-                    </a>
+                    {config?.docs_jsonl_url && (
+                      <a
+                        href={config.docs_jsonl_url}
+                        target="_blank"
+                        rel="noopener noreferrer"
+                        className="text-sm text-blue-600 hover:text-blue-700 hover:underline inline-flex items-center gap-1"
+                      >
+                        How to create a JSONL file
+                        <ExternalLink className="w-3 h-3" />
+                      </a>
+                    )}
                   </div>
                 )}
               </div>

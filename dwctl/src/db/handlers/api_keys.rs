@@ -1826,6 +1826,8 @@ mod tests {
             metadata: crate::config::Metadata {
                 region: Some("Test Region".to_string()),
                 organization: Some("Test Org".to_string()),
+                docs_url: None,
+                docs_jsonl_url: None,
             },
             auth: Default::default(),
             enable_metrics: false,
