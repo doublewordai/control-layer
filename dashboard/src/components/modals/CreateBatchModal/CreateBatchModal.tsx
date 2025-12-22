@@ -220,7 +220,7 @@ export function CreateBatchModal({
           <DialogDescription>
             Select or upload a{" "}
             <a
-              href="https://docs.doubleword.ai"
+              href="https://docs.doubleword.ai/batches/jsonl-files"
               target="_blank"
               rel="noopener noreferrer"
               className="text-blue-600 hover:text-blue-700 hover:underline inline-flex items-center gap-1"
