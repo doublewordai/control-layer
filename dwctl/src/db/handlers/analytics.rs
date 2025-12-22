@@ -13,7 +13,7 @@ use crate::{
         deployments::{ModelMetrics, ModelTimeSeriesPoint},
         requests::{ModelUsage, ModelUserUsageResponse, RequestsAggregateResponse, StatusCodeBreakdown, TimeSeriesPoint, UserUsage},
     },
-    db::errors::Result,
+    db::{errors::Result, models::analytics::BatchHttpAnalyticsMetadata},
 };
 use rust_decimal::prelude::ToPrimitive;
 use uuid::Uuid;
@@ -776,13 +776,15 @@ pub async fn get_model_user_usage(
     })
 }
 
-/// Get aggregated analytics metrics for a batch given a list of request IDs
+/// Get batch metadata from http_analytics
+/// This is a shared helper used by both billing (get_aggregated_batches) and analytics (get_batch_analytics)
+/// Note: completion_window is not included as it's stored in the fusillade database
 #[instrument(skip(pool))]
-pub async fn get_batch_analytics(pool: &PgPool, batch_id: &Uuid) -> Result<BatchAnalytics> {
-    // Query analytics for these specific request IDs
+pub async fn get_batch_http_analytics_metadata(pool: &PgPool, batch_id: &Uuid) -> Result<BatchHttpAnalyticsMetadata> {
     let metrics = sqlx::query!(
         r#"
         SELECT
+            MIN(model) as "model",
             COUNT(*) as "total_requests!",
             COALESCE(SUM(prompt_tokens), 0) as "total_prompt_tokens!",
             COALESCE(SUM(completion_tokens), 0) as "total_completion_tokens!",
@@ -799,14 +801,32 @@ pub async fn get_batch_analytics(pool: &PgPool, batch_id: &Uuid) -> Result<Batch
     .fetch_one(pool)
     .await?;
 
+    Ok(BatchHttpAnalyticsMetadata {
+        batch_id: *batch_id,
+        model: metrics.model,
+        request_count: metrics.total_requests,
+        total_prompt_tokens: metrics.total_prompt_tokens,
+        total_completion_tokens: metrics.total_completion_tokens,
+        total_tokens: metrics.total_tokens,
+        avg_duration_ms: metrics.avg_duration_ms,
+        avg_ttfb_ms: metrics.avg_ttfb_ms,
+        calculated_cost: metrics.total_cost,
+    })
+}
+
+/// Get aggregated analytics metrics for a batch given a list of request IDs
+#[instrument(skip(pool))]
+pub async fn get_batch_analytics(pool: &PgPool, batch_id: &Uuid) -> Result<BatchAnalytics> {
+    let metadata = get_batch_http_analytics_metadata(pool, batch_id).await?;
+
     Ok(BatchAnalytics {
-        total_requests: metrics.total_requests,
-        total_prompt_tokens: metrics.total_prompt_tokens.to_i64().unwrap_or(0),
-        total_completion_tokens: metrics.total_completion_tokens.to_i64().unwrap_or(0),
-        total_tokens: metrics.total_tokens.to_i64().unwrap_or(0),
-        avg_duration_ms: metrics.avg_duration_ms.and_then(|d| d.to_f64()),
-        avg_ttfb_ms: metrics.avg_ttfb_ms.and_then(|d| d.to_f64()),
-        total_cost: metrics.total_cost.map(|d| d.to_string()),
+        total_requests: metadata.request_count,
+        total_prompt_tokens: metadata.total_prompt_tokens.to_i64().unwrap_or(0),
+        total_completion_tokens: metadata.total_completion_tokens.to_i64().unwrap_or(0),
+        total_tokens: metadata.total_tokens.to_i64().unwrap_or(0),
+        avg_duration_ms: metadata.avg_duration_ms.and_then(|d| d.to_f64()),
+        avg_ttfb_ms: metadata.avg_ttfb_ms.and_then(|d| d.to_f64()),
+        total_cost: metadata.calculated_cost.map(|d| d.to_string()),
     })
 }
 

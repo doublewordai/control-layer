@@ -60,6 +60,7 @@
 //! }
 //! ```
 
+pub mod analytics;
 pub mod api_keys;
 pub mod credits;
 pub mod deployments;
