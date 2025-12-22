@@ -303,8 +303,20 @@ export const handlers = [
     const include = url.searchParams.get("include");
     const skip = parseInt(url.searchParams.get("skip") || "0");
     const limit = parseInt(url.searchParams.get("limit") || "10");
+    const search = url.searchParams.get("search");
 
     let users = [...usersData];
+
+    // Apply search filter (case-insensitive substring match on username, email, or display_name)
+    if (search) {
+      const searchLower = search.toLowerCase();
+      users = users.filter(
+        (u) =>
+          u.username.toLowerCase().includes(searchLower) ||
+          u.email.toLowerCase().includes(searchLower) ||
+          (u.display_name?.toLowerCase().includes(searchLower) ?? false),
+      );
+    }
 
     if (include?.includes("groups")) {
       const userGroupsData = getUserGroupsData();
