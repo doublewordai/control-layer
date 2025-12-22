@@ -166,7 +166,7 @@ batches:
   # Default: ["24h"] - only 24 hour completion window is allowed
   allowed_completion_windows:
     - "24h"
-    # - "1h"   # Uncomment to allow 1 hour SLA
+    - "1h"
     # - "12h"  # Uncomment to allow 12 hour SLA
     # - "48h"  # Uncomment to allow 48 hour SLA
 
