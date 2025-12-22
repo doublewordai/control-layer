@@ -162,7 +162,7 @@ use crate::{
     db::handlers::{Deployments, Groups, Repository, Users},
     db::models::{deployments::DeploymentCreateDBRequest, users::UserCreateDBRequest},
     metrics::GenAiMetrics,
-    openapi::ApiDoc,
+    openapi::{AdminApiDoc, AiApiDoc},
     request_logging::serializers::{AnalyticsResponseSerializer, parse_ai_request},
 };
 use anyhow::Context;
@@ -878,21 +878,14 @@ pub async fn build_router(state: &mut AppState, onwards_router: Router) -> anyho
 
     let router = Router::new()
         .route("/healthz", get(|| async { "OK" }))
-        .route(
-            "/openai-openapi.yaml",
-            get(|| async {
-                const OPENAPI_SPEC: &str = include_str!("openai-openapi.yaml");
-                (axum::http::StatusCode::OK, [("content-type", "application/yaml")], OPENAPI_SPEC)
-            }),
-        )
         // Webhook routes (external services, not part of client API docs)
         .route("/webhooks/payments", post(api::handlers::payments::webhook_handler))
         .with_state(state.clone())
         .merge(auth_routes)
         .nest("/ai/v1", ai_router)
         .nest("/admin/api/v1", api_routes_with_state)
-        .merge(RapiDoc::with_openapi("/api-docs/openapi.json", ApiDoc::openapi()).path("/admin/docs"))
-        .merge(RapiDoc::new("/openai-openapi.yaml").path("/ai/docs"))
+        .merge(RapiDoc::with_openapi("/admin/openapi.json", AdminApiDoc::openapi()).path("/admin/docs"))
+        .merge(RapiDoc::with_openapi("/ai/openapi.json", AiApiDoc::openapi()).path("/ai/docs"))
         .fallback_service(fallback);
 
     // Create CORS layer from config
@@ -1526,6 +1519,7 @@ mod test {
         api::models::{groups::GroupResponse, users::Role},
         auth::password,
         db::handlers::Users,
+        openapi::{AdminApiDoc, AiApiDoc},
         request_logging::{AiRequest, AiResponse},
         test_utils::*,
     };
@@ -2212,26 +2206,33 @@ mod test {
     }
 
     #[tokio::test]
-    async fn test_openapi_yaml_endpoint() {
-        // Create a simple test router with just the openapi endpoint
-        let router = axum::Router::new().route(
-            "/openai-openapi.yaml",
-            axum::routing::get(|| async {
-                const OPENAPI_SPEC: &str = include_str!("openai-openapi.yaml");
-                (axum::http::StatusCode::OK, [("content-type", "application/yaml")], OPENAPI_SPEC)
-            }),
-        );
+    async fn test_openapi_json_endpoints() {
+        use utoipa::OpenApi;
+        use utoipa_rapidoc::RapiDoc;
+
+        // Create a test router with both OpenAPI endpoints
+        let router = axum::Router::new()
+            .merge(RapiDoc::with_openapi("/admin/openapi.json", AdminApiDoc::openapi()).path("/admin/docs"))
+            .merge(RapiDoc::with_openapi("/ai/openapi.json", AiApiDoc::openapi()).path("/ai/docs"));
 
         let server = axum_test::TestServer::new(router).expect("Failed to create test server");
-        let response = server.get("/openai-openapi.yaml").await;
 
-        assert_eq!(response.status_code().as_u16(), 200);
-        assert_eq!(response.headers().get("content-type").unwrap(), "application/yaml");
+        // Test admin API OpenAPI spec
+        let admin_response = server.get("/admin/openapi.json").await;
+        assert_eq!(admin_response.status_code().as_u16(), 200);
+        let admin_content = admin_response.text();
+        assert!(admin_content.contains("\"openapi\""));
+        assert!(admin_content.contains("Admin API"));
 
-        let content = response.text();
-        assert!(!content.is_empty());
-        // Should contain YAML content (check for openapi version)
-        assert!(content.contains("openapi:") || content.contains("swagger:"));
+        // Test AI API OpenAPI spec
+        let ai_response = server.get("/ai/openapi.json").await;
+        assert_eq!(ai_response.status_code().as_u16(), 200);
+        let ai_content = ai_response.text();
+        assert!(ai_content.contains("\"openapi\""));
+        assert!(ai_content.contains("AI API"));
+        // Should include proxied endpoints
+        assert!(ai_content.contains("/chat/completions"));
+        assert!(ai_content.contains("/embeddings"));
     }
 
     #[sqlx::test]
