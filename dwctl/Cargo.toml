@@ -61,7 +61,7 @@ utoipa = { version = "5.0", features = [
   "uuid",
   "macros",
 ] }
-utoipa-rapidoc = { version = "6.0", features = ["axum"] }
+utoipa-scalar = { version = "0.3", features = ["axum"] }
 figment = { version = "0.10", features = ["yaml", "env", "test"] }
 rand = "0.8"
 # Authentication
