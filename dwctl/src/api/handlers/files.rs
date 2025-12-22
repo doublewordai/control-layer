@@ -6,7 +6,8 @@
 //! files disaggregated in postgres.
 
 use crate::api::models::files::{
-    FileContentQuery, FileCostEstimate, FileCostEstimateQuery, FileDeleteResponse, FileListResponse, FileResponse, ListFilesQuery, ListObject, ObjectType, Purpose,
+    FileContentQuery, FileCostEstimate, FileCostEstimateQuery, FileDeleteResponse, FileListResponse, FileResponse, ListFilesQuery,
+    ListObject, ObjectType, Purpose,
 };
 use crate::auth::permissions::{RequiresPermission, can_read_all_resources, operation, resource};
 
@@ -1708,7 +1709,10 @@ mod tests {
 
         // Verify both estimates have the same token counts
         assert_eq!(estimate_24h.total_estimated_input_tokens, estimate_1h.total_estimated_input_tokens);
-        assert_eq!(estimate_24h.total_estimated_output_tokens, estimate_1h.total_estimated_output_tokens);
+        assert_eq!(
+            estimate_24h.total_estimated_output_tokens,
+            estimate_1h.total_estimated_output_tokens
+        );
 
         // Verify 1h SLA costs more than 24h SLA (should be 2x)
         let cost_24h = Decimal::from_str(&estimate_24h.total_estimated_cost).unwrap();
@@ -1719,8 +1723,11 @@ mod tests {
 
         // Verify the ratio is approximately 2x (allowing for rounding)
         let ratio = cost_1h / cost_24h;
-        assert!(ratio > Decimal::from_str("1.9").unwrap() && ratio < Decimal::from_str("2.1").unwrap(),
-                "1h SLA should be approximately 2x the cost of 24h SLA, got ratio: {}", ratio);
+        assert!(
+            ratio > Decimal::from_str("1.9").unwrap() && ratio < Decimal::from_str("2.1").unwrap(),
+            "1h SLA should be approximately 2x the cost of 24h SLA, got ratio: {}",
+            ratio
+        );
     }
 
     #[sqlx::test]
