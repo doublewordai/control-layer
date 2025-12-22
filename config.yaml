@@ -52,9 +52,9 @@ model_sources: []
 #     url: "http://localhost:8080"
 
 # Frontend metadata
-metadata:
-  region: "UK South"
-  organization: "ACME Corp"
+# metadata:
+#   region: "UK South"
+#   organization: "ACME Corp"
 
 # Authentication configuration
 auth:

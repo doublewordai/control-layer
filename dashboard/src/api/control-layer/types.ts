@@ -229,12 +229,14 @@ export interface GroupsQuery {
   skip?: number;
   limit?: number;
   include?: GroupsInclude;
+  search?: string;
 }
 
 export interface UsersQuery {
   skip?: number;
   limit?: number;
   include?: UsersInclude;
+  search?: string;
 }
 
 // Create endpoint bodies
@@ -793,6 +795,7 @@ export interface FilesListQuery {
   limit?: number;
   order?: "asc" | "desc";
   purpose?: string;
+  search?: string;
 }
 
 export interface ModelCostBreakdown {
@@ -902,6 +905,7 @@ export interface BatchCreateRequest {
 export interface BatchesListQuery {
   after?: string;
   limit?: number;
+  search?: string;
 }
 
 // ===== BATCH REQUESTS (Custom endpoints beyond OpenAI spec) =====

@@ -172,7 +172,9 @@ describe("UsersGroups Component", () => {
       );
 
       // Clear search and verify all users return
-      await user.clear(searchInput);
+      // Use keyboard shortcuts to clear (more reliable than clear())
+      await user.tripleClick(searchInput);
+      await user.keyboard("{Backspace}");
 
       await waitFor(() => {
         expect(within(container).getByText("Sarah Chen")).toBeInTheDocument();

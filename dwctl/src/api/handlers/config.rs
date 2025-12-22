@@ -15,8 +15,8 @@ pub struct BatchConfigResponse {
 /// Configuration response with computed fields
 #[derive(Debug, Clone, Serialize)]
 pub struct ConfigResponse {
-    pub region: String,
-    pub organization: String,
+    pub region: Option<String>,
+    pub organization: Option<String>,
     pub payment_enabled: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub batches: Option<BatchConfigResponse>,

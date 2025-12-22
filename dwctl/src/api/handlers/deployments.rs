@@ -39,7 +39,7 @@ use sqlx::Acquire;
         ("inactive" = Option<bool>, Query, description = "Show inactive models when true (admin only)"),
         ("limit" = Option<i64>, Query, description = "Maximum number of items to return (default: 10, max: 100)"),
         ("skip" = Option<i64>, Query, description = "Number of items to skip (default: 0)"),
-        ("search" = Option<String>, Query, description = "Search query to filter models by alias or model_name (case-insensitive substring match)"),
+        ("search" = Option<String>, Query, description = "Search query to filter models by alias, model_name, or endpoint name (case-insensitive substring match)"),
     ),
     responses(
         (status = 200, description = "Paginated list of deployed models", body = PaginatedResponse<DeployedModelResponse>),

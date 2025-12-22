@@ -1,7 +1,7 @@
 {
   "name": "ai-model-dashboard",
   "private": true,
-  "version": "0.17.3",
+  "version": "0.18.1",
   "type": "module",
   "scripts": {
     "dev": "vite",
@@ -46,7 +46,7 @@
     "clsx": "^2.1.1",
     "cmdk": "^1.1.1",
     "date-fns": "^4.1.0",
-    "lucide-react": "^0.561.0",
+    "lucide-react": "^0.562.0",
     "next-themes": "^0.4.6",
     "openai": "^6.0.0",
     "react": "^19.1.1",

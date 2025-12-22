@@ -19,6 +19,9 @@ pub struct ListGroupsQuery {
 
     /// Include related data (comma-separated: "users", "models")
     pub include: Option<String>,
+
+    /// Search query to filter groups by name or description (case-insensitive substring match)
+    pub search: Option<String>,
 }
 
 // Request models

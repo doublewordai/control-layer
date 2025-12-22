@@ -66,13 +66,14 @@
 //! ```
 
 use clap::Parser;
+use dashmap::DashMap;
 use figment::{
     Figment,
     providers::{Env, Format, Yaml},
 };
 use serde::{Deserialize, Serialize};
-use std::path::PathBuf;
-use std::time::Duration;
+use std::{collections::HashMap, path::PathBuf, sync::Arc, time::Duration};
+use tracing::warn;
 use url::Url;
 
 use crate::api::models::users::Role;
@@ -358,13 +359,13 @@ pub struct DummyConfig {
 /// Frontend metadata displayed in the UI.
 ///
 /// These values are exposed to the frontend and shown in the user interface.
-#[derive(Debug, Clone, Deserialize, Serialize)]
+#[derive(Debug, Clone, Deserialize, Serialize, Default)]
 #[serde(default)]
 pub struct Metadata {
     /// Region name displayed in the UI (e.g., "UK South", "US East")
-    pub region: String,
+    pub region: Option<String>,
     /// Organization name displayed in the UI
-    pub organization: String,
+    pub organization: Option<String>,
 }
 
 /// External model source configuration.
@@ -700,6 +701,47 @@ pub struct DaemonConfig {
     /// and returned to pending (milliseconds). This handles daemon crashes during execution. (default: 600000 = 10 minutes)
     pub processing_timeout_ms: u64,
 
+    /// Per-model priority endpoint configurations for SLA escalation
+    /// Parameters:
+    ///     * endpoint: model endpoint name to route escalation to
+    ///     * api_key: optional env variable name for the original. Note different from fusillade config, we use an env var here
+    /// for security so we can pass in api keys at runtime.
+    ///     * path_overwrite: optional path to use instead of the original
+    ///     * model_overwrite: optional model to use instead of the original
+    pub priority_endpoints: HashMap<String, fusillade::PriorityEndpointConfig>,
+
+    /// How often to check for batches approaching SLA deadlines (seconds)
+    pub sla_check_interval_seconds: u64,
+
+    /// SLA threshold configurations.
+    /// Each threshold defines a time limit and action to take when batches approach expiration.
+    /// The daemon will query the database once per threshold to find at-risk batches.
+    ///
+    /// Example: Two thresholds (warning at 1 hour, critical at 15 minutes)
+    /// ```
+    /// use fusillade::daemon::{SlaThreshold, SlaAction, SlaLogLevel};
+    /// use fusillade::request::RequestStateFilter;
+    ///
+    /// vec![
+    ///     SlaThreshold {
+    ///         name: "warning".to_string(),
+    ///         threshold_seconds: 3600,
+    ///         action: SlaAction::Log { level: SlaLogLevel::Warn },
+    ///         allowed_states: vec![RequestStateFilter::Pending],
+    ///     },
+    ///     SlaThreshold {
+    ///         name: "critical".to_string(),
+    ///         threshold_seconds: 900,
+    ///         action: SlaAction::Log { level: SlaLogLevel::Error },
+    ///         // Act on both pending and claimed requests for critical threshold
+    ///         allowed_states: vec![RequestStateFilter::Pending, RequestStateFilter::Claimed],
+    ///     },
+    /// ]
+    /// # ;
+    /// ```
+    #[serde(default)]
+    pub sla_thresholds: Vec<fusillade::SlaThreshold>,
+
     /// Batch table column names to include as request headers.
     /// These values are sent as `x-fusillade-batch-{column}` headers with each request.
     /// Example: ["id", "created_by", "endpoint"] produces headers like:
@@ -736,6 +778,9 @@ impl Default for DaemonConfig {
             claim_timeout_ms: 60000,
             processing_timeout_ms: 600000,
             batch_metadata_fields: default_batch_metadata_fields_dwctl(),
+            priority_endpoints: HashMap::new(),
+            sla_check_interval_seconds: 60,
+            sla_thresholds: vec![],
         }
     }
 }
@@ -750,6 +795,17 @@ impl DaemonConfig {
         &self,
         model_capacity_limits: Option<std::sync::Arc<dashmap::DashMap<String, usize>>>,
     ) -> fusillade::daemon::DaemonConfig {
+        // For security we pass in api keys as env vars. Here we read them into config passed to fusillade.
+        let mut priority_endpoints_map = self.priority_endpoints.clone();
+        for (_, endpoint) in priority_endpoints_map.iter_mut() {
+            endpoint.api_key.as_mut().map(|env_var| match std::env::var(&env_var) {
+                Err(_) => {
+                    warn!("Priority endpoint configured with api_key env var '{}' which is not set", env_var);
+                    None
+                }
+                Ok(value) => Some(value),
+            });
+        }
         fusillade::daemon::DaemonConfig {
             claim_batch_size: self.claim_batch_size,
             default_model_concurrency: self.default_model_concurrency,
@@ -765,6 +821,9 @@ impl DaemonConfig {
             claim_timeout_ms: self.claim_timeout_ms,
             processing_timeout_ms: self.processing_timeout_ms,
             batch_metadata_fields: self.batch_metadata_fields.clone(),
+            priority_endpoints: Arc::new(DashMap::from_iter(priority_endpoints_map)),
+            sla_check_interval_seconds: self.sla_check_interval_seconds,
+            sla_thresholds: self.sla_thresholds.clone(),
             ..Default::default()
         }
     }
@@ -923,15 +982,6 @@ impl Default for Config {
             enable_request_logging: true,
             enable_otel_export: false,
             credits: CreditsConfig::default(),
-        }
-    }
-}
-
-impl Default for Metadata {
-    fn default() -> Self {
-        Self {
-            region: "UK South".to_string(),
-            organization: "ACME Corp".to_string(),
         }
     }
 }
@@ -1239,8 +1289,8 @@ metadata:
             assert_eq!(config.port, 8080);
 
             // YAML values should be preserved
-            assert_eq!(config.metadata.region, "US East");
-            assert_eq!(config.metadata.organization, "Test Corp");
+            assert_eq!(config.metadata.region, Some("US East".to_string()));
+            assert_eq!(config.metadata.organization, Some("Test Corp".to_string()));
 
             Ok(())
         });

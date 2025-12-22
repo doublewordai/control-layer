@@ -1824,8 +1824,8 @@ mod tests {
                 default_models: None,
             }],
             metadata: crate::config::Metadata {
-                region: "Test Region".to_string(),
-                organization: "Test Org".to_string(),
+                region: Some("Test Region".to_string()),
+                organization: Some("Test Org".to_string()),
             },
             auth: Default::default(),
             enable_metrics: false,

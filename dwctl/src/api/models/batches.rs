@@ -188,4 +188,7 @@ pub struct ListBatchesQuery {
     #[serde(flatten)]
     #[param(inline)]
     pub pagination: CursorPagination,
+
+    /// Search query to filter batches by endpoint or input filename (case-insensitive substring match)
+    pub search: Option<String>,
 }

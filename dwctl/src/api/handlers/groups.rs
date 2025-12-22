@@ -33,6 +33,7 @@ use sqlx::Acquire;
     params(
         ("skip" = Option<i64>, Query, description = "Number of groups to skip"),
         ("limit" = Option<i64>, Query, description = "Maximum number of groups to return"),
+        ("search" = Option<String>, Query, description = "Search query to filter groups by name or description (case-insensitive substring match)"),
     ),
     security(
         ("BearerAuth" = []),
@@ -57,8 +58,17 @@ pub async fn list_groups(
         skip = query.pagination.skip();
         limit = query.pagination.limit();
 
-        groups = repo.list(&GroupFilter::new(skip, limit)).await?;
-        total_count = repo.count().await?;
+        let mut filter = GroupFilter::new(skip, limit);
+
+        // Apply search filter if specified
+        if let Some(search) = query.search.as_ref()
+            && !search.trim().is_empty()
+        {
+            filter = filter.with_search(search.trim().to_string());
+        }
+
+        groups = repo.list(&filter).await?;
+        total_count = repo.count(&filter).await?;
     }
 
     // Parse include parameter

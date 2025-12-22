@@ -40,6 +40,12 @@ const Models: React.FC = () => {
     ...new Set(["all", ...(endpointsData || []).map((e) => e.name).sort()]),
   ];
 
+  // Get endpoint ID from selected provider name for server-side filtering
+  const selectedEndpointId =
+    filterProvider !== "all"
+      ? endpointsData?.find((e) => e.name === filterProvider)?.id
+      : undefined;
+
   // Sync search query to URL params
   useEffect(() => {
     setSearchParams(
@@ -56,11 +62,11 @@ const Models: React.FC = () => {
     );
   }, [searchQuery, setSearchParams]);
 
-  // Reset pagination when search query changes
+  // Reset pagination when search query or endpoint filter changes
   useEffect(() => {
     pagination.handleReset();
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [debouncedSearch]);
+  }, [debouncedSearch, selectedEndpointId]);
 
   const viewMode = searchParams.get("view") || "grid";
   const isStatusMode = viewMode === "status";
@@ -85,9 +91,6 @@ const Models: React.FC = () => {
               <h1 className="text-2xl md:text-3xl font-bold text-doubleword-neutral-900">
                 Models
               </h1>
-              <p className="text-sm md:text-base text-doubleword-neutral-600 mt-1">
-                View and monitor your deployed models
-              </p>
             </div>
             <div className="flex flex-col sm:flex-row items-stretch sm:items-center gap-3">
               {/* Access toggle for admins (not shown in status mode) */}
@@ -123,42 +126,46 @@ const Models: React.FC = () => {
                   aria-label="Search models"
                 />
               </div>
-              <Select
-                value={filterProvider}
-                onValueChange={(value) => setFilterProvider(value)}
-              >
-                <SelectTrigger
-                  className="w-[180px]"
-                  aria-label="Filter by endpoint provider"
+              {canViewEndpoints && (
+                <Select
+                  value={filterProvider}
+                  onValueChange={(value) => setFilterProvider(value)}
                 >
-                  <SelectValue />
-                </SelectTrigger>
-                <SelectContent>
-                  {providers.map((provider) => (
-                    <SelectItem key={provider} value={provider}>
-                      {provider === "all" ? "All Endpoints" : provider}
-                    </SelectItem>
-                  ))}
-                </SelectContent>
-              </Select>
+                  <SelectTrigger
+                    className="w-[180px]"
+                    aria-label="Filter by endpoint provider"
+                  >
+                    <SelectValue />
+                  </SelectTrigger>
+                  <SelectContent>
+                    {providers.map((provider) => (
+                      <SelectItem key={provider} value={provider}>
+                        {provider === "all" ? "All Endpoints" : provider}
+                      </SelectItem>
+                    ))}
+                  </SelectContent>
+                </Select>
+              )}
 
-              {/* View mode tabs */}
-              <TabsList className="w-full sm:w-auto">
-                <TabsTrigger
-                  value="grid"
-                  className="flex items-center gap-2 flex-1 sm:flex-initial"
-                >
-                  <LayoutGrid className="h-4 w-4" />
-                  Grid
-                </TabsTrigger>
-                <TabsTrigger
-                  value="status"
-                  className="flex items-center gap-2 flex-1 sm:flex-initial"
-                >
-                  <Activity className="h-4 w-4" />
-                  Status
-                </TabsTrigger>
-              </TabsList>
+              {/* View mode tabs - only for platform managers */}
+              {canManageGroups && (
+                <TabsList className="w-full sm:w-auto">
+                  <TabsTrigger
+                    value="grid"
+                    className="flex items-center gap-2 flex-1 sm:flex-initial"
+                  >
+                    <LayoutGrid className="h-4 w-4" />
+                    Grid
+                  </TabsTrigger>
+                  <TabsTrigger
+                    value="status"
+                    className="flex items-center gap-2 flex-1 sm:flex-initial"
+                  >
+                    <Activity className="h-4 w-4" />
+                    Status
+                  </TabsTrigger>
+                </TabsList>
+              )}
             </div>
           </div>
         </div>
@@ -168,6 +175,7 @@ const Models: React.FC = () => {
           pagination={pagination}
           searchQuery={debouncedSearch}
           filterProvider={filterProvider}
+          endpointId={selectedEndpointId}
           showAccessibleOnly={showAccessibleOnly}
           isStatusMode={isStatusMode}
           canManageGroups={canManageGroups}
