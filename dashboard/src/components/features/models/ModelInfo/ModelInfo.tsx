@@ -16,6 +16,7 @@ import {
   useModel,
   useEndpoint,
   useUpdateModel,
+  useProbes,
 } from "../../../../api/control-layer";
 import { useAuthorization } from "../../../../utils";
 import {
@@ -153,6 +154,10 @@ const ModelInfo: React.FC = () => {
   } = useEndpoint(model?.hosted_on || "", {
     enabled: !!model?.hosted_on && canViewEndpoints,
   });
+
+  // Fetch probes to show status indicator
+  const { data: probes } = useProbes();
+  const modelProbe = probes?.find((p) => p.deployment_id === model?.id);
 
   const loading = modelLoading || endpointLoading;
   const error = modelError
@@ -394,27 +399,56 @@ const ModelInfo: React.FC = () => {
                       )}
                     </div>
                   ) : (
-                    <h1 className="text-3xl font-bold text-doubleword-neutral-900">
-                      {model.alias}
-                    </h1>
+                    <div className="flex items-center gap-3">
+                      <h1 className="text-3xl font-bold text-doubleword-neutral-900">
+                        {model.alias}
+                      </h1>
+                      {/* Status indicator */}
+                      {modelProbe && (
+                        <div className="flex items-center gap-2">
+                          <div
+                            className={`h-3 w-3 rounded-full ${
+                              model.status?.last_success === true
+                                ? "bg-green-500"
+                                : model.status?.last_success === false
+                                  ? "bg-red-500"
+                                  : "bg-gray-400"
+                            }`}
+                          />
+                          {model.status?.uptime_percentage !== undefined &&
+                            model.status?.uptime_percentage !== null && (
+                              <span className="text-sm text-doubleword-neutral-600">
+                                {model.status.uptime_percentage.toFixed(2)}% uptime (24h)
+                              </span>
+                            )}
+                        </div>
+                      )}
+                    </div>
                   )}
-                  <p className="text-doubleword-neutral-600 mt-1">
-                    {model.model_name}
-                    {canViewEndpoints && (
-                      <> • {endpoint?.name || "Unknown endpoint"}</>
-                    )}
-                  </p>
+                  {canManageGroups && (
+                    <p className="text-doubleword-neutral-600 mt-1">
+                      {model.model_name}
+                      {canViewEndpoints && (
+                        <> • {endpoint?.name || "Unknown endpoint"}</>
+                      )}
+                    </p>
+                  )}
+                  {!canManageGroups && canViewEndpoints && (
+                    <p className="text-doubleword-neutral-600 mt-1">
+                      {endpoint?.name || "Unknown endpoint"}
+                    </p>
+                  )}
                 </div>
                 <div className="flex items-center justify-center sm:justify-start gap-3">
-                  <TabsList className="w-full sm:w-auto">
-                    <TabsTrigger
-                      value="overview"
-                      className="flex items-center gap-2"
-                    >
-                      <Info className="h-4 w-4" />
-                      Overview
-                    </TabsTrigger>
-                    {canManageGroups && (
+                  {canManageGroups && (
+                    <TabsList className="w-full sm:w-auto">
+                      <TabsTrigger
+                        value="overview"
+                        className="flex items-center gap-2"
+                      >
+                        <Info className="h-4 w-4" />
+                        Overview
+                      </TabsTrigger>
                       <TabsTrigger
                         value="usage"
                         className="flex items-center gap-2"
@@ -422,8 +456,6 @@ const ModelInfo: React.FC = () => {
                         <Users className="h-4 w-4" />
                         Usage
                       </TabsTrigger>
-                    )}
-                    {canManageGroups && (
                       <TabsTrigger
                         value="probes"
                         className="flex items-center gap-2"
@@ -431,8 +463,8 @@ const ModelInfo: React.FC = () => {
                         <Activity className="h-4 w-4" />
                         Uptime
                       </TabsTrigger>
-                    )}
-                  </TabsList>
+                    </TabsList>
+                  )}
                 </div>
               </div>
             </div>
@@ -873,59 +905,65 @@ const ModelInfo: React.FC = () => {
                   ) : (
                     <div className="space-y-6">
                       <div className="grid grid-cols-1 md:grid-cols-3 gap-6">
-                        <div>
-                          <div className="flex items-center gap-1 mb-1">
-                            <p className="text-sm text-gray-600">Full Name</p>
-                            <HoverCard openDelay={100} closeDelay={50}>
-                              <HoverCardTrigger asChild>
-                                <Info className="h-3 w-3 text-gray-400 hover:text-gray-600 " />
-                              </HoverCardTrigger>
-                              <HoverCardContent className="w-80" sideOffset={5}>
-                                <p className="text-sm text-muted-foreground">
-                                  The name under which the model is available at
-                                  the upstream endpoint.
-                                </p>
-                              </HoverCardContent>
-                            </HoverCard>
+                        {canManageGroups && (
+                          <div>
+                            <div className="flex items-center gap-1 mb-1">
+                              <p className="text-sm text-gray-600">Full Name</p>
+                              <HoverCard openDelay={100} closeDelay={50}>
+                                <HoverCardTrigger asChild>
+                                  <Info className="h-3 w-3 text-gray-400 hover:text-gray-600 " />
+                                </HoverCardTrigger>
+                                <HoverCardContent className="w-80" sideOffset={5}>
+                                  <p className="text-sm text-muted-foreground">
+                                    The name under which the model is available at
+                                    the upstream endpoint.
+                                  </p>
+                                </HoverCardContent>
+                              </HoverCard>
+                            </div>
+                            <p className="font-medium">{model.model_name}</p>
                           </div>
-                          <p className="font-medium">{model.model_name}</p>
-                        </div>
-                        <div>
-                          <div className="flex items-center gap-1 mb-1">
-                            <p className="text-sm text-gray-600">Alias</p>
-                            <HoverCard openDelay={100} closeDelay={50}>
-                              <HoverCardTrigger asChild>
-                                <Info className="h-3 w-3 text-gray-400 hover:text-gray-600 " />
-                              </HoverCardTrigger>
-                              <HoverCardContent className="w-80" sideOffset={5}>
-                                <p className="text-sm text-muted-foreground">
-                                  The name under which the model will be made
-                                  available in the control layer API.
-                                </p>
-                              </HoverCardContent>
-                            </HoverCard>
+                        )}
+                        {canManageGroups && (
+                          <div>
+                            <div className="flex items-center gap-1 mb-1">
+                              <p className="text-sm text-gray-600">Alias</p>
+                              <HoverCard openDelay={100} closeDelay={50}>
+                                <HoverCardTrigger asChild>
+                                  <Info className="h-3 w-3 text-gray-400 hover:text-gray-600 " />
+                                </HoverCardTrigger>
+                                <HoverCardContent className="w-80" sideOffset={5}>
+                                  <p className="text-sm text-muted-foreground">
+                                    The name under which the model will be made
+                                    available in the control layer API.
+                                  </p>
+                                </HoverCardContent>
+                              </HoverCard>
+                            </div>
+                            <p className="font-medium">{model.alias}</p>
                           </div>
-                          <p className="font-medium">{model.alias}</p>
-                        </div>
-                        <div>
-                          <div className="flex items-center gap-1 mb-1">
-                            <p className="text-sm text-gray-600">Type</p>
-                            <HoverCard openDelay={100} closeDelay={50}>
-                              <HoverCardTrigger asChild>
-                                <Info className="h-3 w-3 text-gray-400 hover:text-gray-600" />
-                              </HoverCardTrigger>
-                              <HoverCardContent className="w-80" sideOffset={5}>
-                                <p className="text-sm text-muted-foreground">
-                                  The type of the model. Determines which
-                                  playground is used.
-                                </p>
-                              </HoverCardContent>
-                            </HoverCard>
+                        )}
+                        {canManageGroups && (
+                          <div>
+                            <div className="flex items-center gap-1 mb-1">
+                              <p className="text-sm text-gray-600">Type</p>
+                              <HoverCard openDelay={100} closeDelay={50}>
+                                <HoverCardTrigger asChild>
+                                  <Info className="h-3 w-3 text-gray-400 hover:text-gray-600" />
+                                </HoverCardTrigger>
+                                <HoverCardContent className="w-80" sideOffset={5}>
+                                  <p className="text-sm text-muted-foreground">
+                                    The type of the model. Determines which
+                                    playground is used.
+                                  </p>
+                                </HoverCardContent>
+                              </HoverCard>
+                            </div>
+                            <Badge variant="outline">
+                              {model.model_type || "UNKNOWN"}
+                            </Badge>
                           </div>
-                          <Badge variant="outline">
-                            {model.model_type || "UNKNOWN"}
-                          </Badge>
-                        </div>
+                        )}
                       </div>
                       <div>
                         <div className="flex items-center gap-1 mb-1">
@@ -1508,7 +1546,7 @@ const ModelInfo: React.FC = () => {
 
         {canManageGroups && (
           <TabsContent value="probes">
-            <ModelProbes model={model} />
+            <ModelProbes model={model} canManageProbes={canManageGroups} />
           </TabsContent>
         )}
       </Tabs>

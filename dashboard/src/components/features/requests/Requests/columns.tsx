@@ -1,7 +1,7 @@
 "use client";
 
 import { type ColumnDef } from "@tanstack/react-table";
-import { ArrowUpDown, Clock, ExternalLink, DollarSign } from "lucide-react";
+import { Clock, ExternalLink, DollarSign } from "lucide-react";
 import { formatTimestamp, formatDuration } from "../../../../utils";
 import { Tooltip, TooltipContent, TooltipTrigger } from "../../../ui/tooltip";
 import type { RequestsEntry } from "../types";
@@ -55,64 +55,29 @@ const getStatusColor = (statusCode?: number) => {
 
 export const createRequestColumns = (): ColumnDef<RequestsEntry>[] => [
   {
-    accessorKey: "id",
-    header: ({ column }) => {
-      return (
-        <button
-          onClick={() => column.toggleSorting(column.getIsSorted() === "asc")}
-          className="flex items-center text-left font-medium group"
-        >
-          ID
-          <ArrowUpDown className="ml-2 h-4 w-4 text-gray-400 group-hover:text-gray-700 transition-colors" />
-        </button>
-      );
-    },
+    accessorKey: "fusillade_batch_id",
+    header: "Batch",
     cell: ({ row }) => {
-      const request = row.original;
+      const batchId = row.getValue("fusillade_batch_id") as string | undefined;
+      if (!batchId) {
+        return <span className="text-gray-400">-</span>;
+      }
+      const shortId = batchId.slice(0, 8);
       return (
-        <span className="font-mono text-sm text-doubleword-neutral-900">
-          {request.id}
-        </span>
-      );
-    },
-    size: 80,
-  },
-  {
-    accessorKey: "timestamp",
-    header: ({ column }) => {
-      return (
-        <button
-          onClick={() => column.toggleSorting(column.getIsSorted() === "asc")}
-          className="flex items-center text-left font-medium group"
+        <Link
+          to={`/batches/${batchId}`}
+          className="inline-flex items-center gap-1 text-sm text-blue-600 hover:text-blue-800 hover:underline"
         >
-          Timestamp
-          <ArrowUpDown className="ml-2 h-4 w-4 text-gray-400 group-hover:text-gray-700 transition-colors" />
-        </button>
+          <span className="font-mono">{shortId}</span>
+          <ExternalLink className="w-3 h-3" />
+        </Link>
       );
     },
-    cell: ({ row }) => {
-      const timestamp = row.getValue("timestamp") as string;
-      return (
-        <span className="text-doubleword-neutral-900 text-sm">
-          {formatTimestamp(timestamp)}
-        </span>
-      );
-    },
-    size: 140,
+    size: 100,
   },
   {
     accessorKey: "model",
-    header: ({ column }) => {
-      return (
-        <button
-          onClick={() => column.toggleSorting(column.getIsSorted() === "asc")}
-          className="flex items-center text-left font-medium group"
-        >
-          Model
-          <ArrowUpDown className="ml-2 h-4 w-4 text-gray-400 group-hover:text-gray-700 transition-colors" />
-        </button>
-      );
-    },
+    header: "Model",
     cell: ({ row }) => {
       const model = row.getValue("model") as string | undefined;
       if (!model) {
@@ -124,21 +89,24 @@ export const createRequestColumns = (): ColumnDef<RequestsEntry>[] => [
         </span>
       );
     },
+    size: 120,
+  },
+  {
+    accessorKey: "timestamp",
+    header: "Timestamp",
+    cell: ({ row }) => {
+      const timestamp = row.getValue("timestamp") as string;
+      return (
+        <span className="text-doubleword-neutral-900 text-sm">
+          {formatTimestamp(timestamp)}
+        </span>
+      );
+    },
     size: 140,
   },
   {
     accessorKey: "status_code",
-    header: ({ column }) => {
-      return (
-        <button
-          onClick={() => column.toggleSorting(column.getIsSorted() === "asc")}
-          className="flex items-center text-left font-medium group"
-        >
-          Status
-          <ArrowUpDown className="ml-2 h-4 w-4 text-gray-400 group-hover:text-gray-700 transition-colors" />
-        </button>
-      );
-    },
+    header: "Status",
     cell: ({ row }) => {
       const statusCode = row.getValue("status_code") as number | undefined;
       if (!statusCode) {
@@ -152,21 +120,11 @@ export const createRequestColumns = (): ColumnDef<RequestsEntry>[] => [
         </span>
       );
     },
-    size: 80,
+    size: 70,
   },
   {
     accessorKey: "duration_ms",
-    header: ({ column }) => {
-      return (
-        <button
-          onClick={() => column.toggleSorting(column.getIsSorted() === "asc")}
-          className="flex items-center text-left font-medium group"
-        >
-          Duration
-          <ArrowUpDown className="ml-2 h-4 w-4 text-gray-400 group-hover:text-gray-700 transition-colors" />
-        </button>
-      );
-    },
+    header: "Duration",
     cell: ({ row }) => {
       const duration = row.getValue("duration_ms") as number | undefined;
       if (!duration) {
@@ -179,21 +137,11 @@ export const createRequestColumns = (): ColumnDef<RequestsEntry>[] => [
         </div>
       );
     },
-    size: 100,
+    size: 80,
   },
   {
     accessorKey: "total_tokens",
-    header: ({ column }) => {
-      return (
-        <button
-          onClick={() => column.toggleSorting(column.getIsSorted() === "asc")}
-          className="flex items-center text-left font-medium group"
-        >
-          Tokens
-          <ArrowUpDown className="ml-2 h-4 w-4 text-gray-400 group-hover:text-gray-700 transition-colors" />
-        </button>
-      );
-    },
+    header: "Tokens",
     cell: ({ row }) => {
       const request = row.original;
       const promptTokens = request.prompt_tokens;
@@ -219,21 +167,11 @@ export const createRequestColumns = (): ColumnDef<RequestsEntry>[] => [
         </Tooltip>
       );
     },
-    size: 90,
+    size: 70,
   },
   {
     id: "cost",
-    header: ({ column }) => {
-      return (
-        <button
-          onClick={() => column.toggleSorting(column.getIsSorted() === "asc")}
-          className="flex items-center text-left font-medium group"
-        >
-          Cost
-          <ArrowUpDown className="ml-2 h-4 w-4 text-gray-400 group-hover:text-gray-700 transition-colors" />
-        </button>
-      );
-    },
+    header: "Cost",
     cell: ({ row }) => {
       const request = row.original;
       const cost = calculateCost(request);
@@ -273,43 +211,6 @@ export const createRequestColumns = (): ColumnDef<RequestsEntry>[] => [
     size: 90,
   },
   {
-    accessorKey: "user_email",
-    header: "User",
-    cell: ({ row }) => {
-      const userEmail = row.getValue("user_email") as string | undefined;
-      if (!userEmail) {
-        return <span className="text-gray-400">-</span>;
-      }
-      return (
-        <span className="text-sm text-doubleword-neutral-900 truncate max-w-32">
-          {userEmail}
-        </span>
-      );
-    },
-    size: 140,
-  },
-  {
-    accessorKey: "fusillade_batch_id",
-    header: "Batch",
-    cell: ({ row }) => {
-      const batchId = row.getValue("fusillade_batch_id") as string | undefined;
-      if (!batchId) {
-        return <span className="text-gray-400">-</span>;
-      }
-      const shortId = batchId.slice(0, 8);
-      return (
-        <Link
-          to={`/batches/${batchId}`}
-          className="inline-flex items-center gap-1 text-sm text-blue-600 hover:text-blue-800 hover:underline"
-        >
-          <span className="font-mono">{shortId}</span>
-          <ExternalLink className="w-3 h-3" />
-        </Link>
-      );
-    },
-    size: 100,
-  },
-  {
     accessorKey: "custom_id",
     header: "Custom ID",
     cell: ({ row }) => {
@@ -320,7 +221,7 @@ export const createRequestColumns = (): ColumnDef<RequestsEntry>[] => [
       return (
         <Tooltip>
           <TooltipTrigger asChild>
-            <span className="font-mono text-sm text-doubleword-neutral-700 truncate max-w-24 block cursor-help">
+            <span className="font-mono text-sm text-doubleword-neutral-700 truncate max-w-48 block cursor-help">
               {customId}
             </span>
           </TooltipTrigger>
@@ -330,7 +231,7 @@ export const createRequestColumns = (): ColumnDef<RequestsEntry>[] => [
         </Tooltip>
       );
     },
-    size: 120,
+    size: 200,
   },
   {
     accessorKey: "response_type",
