@@ -813,14 +813,18 @@ pub async fn get_file_content(
     let file_may_receive_more_data = match file.purpose {
         Some(fusillade::batch::Purpose::Batch) => false, // Input files are static
         Some(fusillade::batch::Purpose::BatchOutput) => {
-            let batch = state.request_manager
+            let batch = state
+                .request_manager
                 .get_batch_by_output_file_id(fusillade::FileId(file_id), fusillade::batch::OutputFileType::Output)
                 .await
                 .map_err(|e| Error::Internal {
                     operation: format!("get batch by output file: {}", e),
                 })?;
             if let Some(batch) = batch {
-                let status = state.request_manager.get_batch_status(batch.id).await
+                let status = state
+                    .request_manager
+                    .get_batch_status(batch.id)
+                    .await
                     .map_err(|e| Error::Internal {
                         operation: format!("get batch status: {}", e),
                     })?;
@@ -830,14 +834,18 @@ pub async fn get_file_content(
             }
         }
         Some(fusillade::batch::Purpose::BatchError) => {
-            let batch = state.request_manager
+            let batch = state
+                .request_manager
                 .get_batch_by_output_file_id(fusillade::FileId(file_id), fusillade::batch::OutputFileType::Error)
                 .await
                 .map_err(|e| Error::Internal {
                     operation: format!("get batch by error file: {}", e),
                 })?;
             if let Some(batch) = batch {
-                let status = state.request_manager.get_batch_status(batch.id).await
+                let status = state
+                    .request_manager
+                    .get_batch_status(batch.id)
+                    .await
                     .map_err(|e| Error::Internal {
                         operation: format!("get batch status: {}", e),
                     })?;
