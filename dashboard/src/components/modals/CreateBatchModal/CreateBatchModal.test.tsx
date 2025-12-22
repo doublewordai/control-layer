@@ -10,6 +10,7 @@ vi.mock("../../../api/control-layer/hooks", () => ({
   useCreateBatch: vi.fn(),
   useUploadFile: vi.fn(),
   useFiles: vi.fn(),
+  useFileCostEstimate: vi.fn(),
   useConfig: vi.fn(() => ({
     data: {
       docs_url: "https://docs.example.com",
