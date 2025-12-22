@@ -368,6 +368,9 @@ pub struct Metadata {
     pub organization: Option<String>,
     /// Documentation URL shown in the UI header
     pub docs_url: String,
+
+    /// JSONL documentation URL displayed in batch modals (e.g., "https://docs.example.com/batches/jsonl-files")
+    pub docs_jsonl_url: Option<String>,
 }
 
 impl Default for Metadata {
@@ -376,6 +379,7 @@ impl Default for Metadata {
             region: None,
             organization: None,
             docs_url: "https://docs.doubleword.ai/control-layer".to_string(),
+            docs_jsonl_url: None,
         }
     }
 }

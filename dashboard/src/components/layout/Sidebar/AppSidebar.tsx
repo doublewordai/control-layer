@@ -232,7 +232,9 @@ export function AppLayout({ children }: { children: React.ReactNode }) {
                   {config.region && (
                     <>
                       <div className="hidden lg:flex items-center gap-2">
-                        <span className="text-muted-foreground/70">Region:</span>
+                        <span className="text-muted-foreground/70">
+                          Region:
+                        </span>
                         <span className="font-medium text-foreground">
                           {config.region}
                         </span>

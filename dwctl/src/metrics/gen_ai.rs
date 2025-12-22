@@ -274,6 +274,7 @@ mod tests {
             provider_name: Some("openai".to_string()),
             fusillade_batch_id: None,
             fusillade_request_id: None,
+            custom_id: None,
         };
 
         // Call the function under test
@@ -385,6 +386,7 @@ mod tests {
             provider_name: Some("anthropic".to_string()),
             fusillade_batch_id: None,
             fusillade_request_id: None,
+            custom_id: None,
         };
 
         metrics.record_from_analytics(&row).await;
@@ -444,6 +446,7 @@ mod tests {
             provider_name: Some("openai".to_string()),
             fusillade_batch_id: None,
             fusillade_request_id: None,
+            custom_id: None,
         };
 
         metrics.record_from_analytics(&row).await;
@@ -514,6 +517,7 @@ mod tests {
             provider_name: Some("openai".to_string()),
             fusillade_batch_id: None,
             fusillade_request_id: None,
+            custom_id: None,
         };
 
         metrics.record_from_analytics(&row).await;
@@ -570,6 +574,7 @@ mod tests {
             provider_name: None, // Missing provider
             fusillade_batch_id: None,
             fusillade_request_id: None,
+            custom_id: None,
         };
 
         metrics.record_from_analytics(&row).await;
@@ -629,6 +634,7 @@ mod tests {
             provider_name: Some("openai".to_string()),
             fusillade_batch_id: None,
             fusillade_request_id: None,
+            custom_id: None,
         };
 
         metrics.record_from_analytics(&row).await;
@@ -685,6 +691,7 @@ mod tests {
             provider_name: Some("custom".to_string()),
             fusillade_batch_id: None,
             fusillade_request_id: None,
+            custom_id: None,
         };
 
         metrics.record_from_analytics(&row).await;
@@ -736,6 +743,7 @@ mod tests {
                 provider_name: Some("openai".to_string()),
                 fusillade_batch_id: None,
                 fusillade_request_id: None,
+                custom_id: None,
             };
 
             metrics.record_from_analytics(&row).await;
@@ -785,6 +793,7 @@ mod tests {
             provider_name: Some("openai".to_string()),
             fusillade_batch_id: None,
             fusillade_request_id: None,
+            custom_id: None,
         };
 
         metrics.record_from_analytics(&row).await;

@@ -176,8 +176,6 @@ export function Batches({
   // Display files as returned by API (server-side filtered by purpose)
   const files = filesForDisplay;
 
-  const isFilesLoading = filesLoading;
-
   // Filter batches by input file if filter is set
   const filteredBatches = React.useMemo(() => {
     if (!batchFileFilter) return batches;
@@ -434,29 +432,6 @@ export function Batches({
     batchAnalytics: batchAnalyticsMap,
   });
 
-  // Loading state
-  if (isFilesLoading || batchesLoading) {
-    return (
-      <div className="py-4 px-6">
-        <div className="mb-4">
-          <h1 className="text-3xl font-bold text-doubleword-neutral-900">
-            Batch Processing
-          </h1>
-          <p className="text-doubleword-neutral-600 mt-2">Loading...</p>
-        </div>
-        <div className="flex items-center justify-center h-64">
-          <div className="text-center">
-            <div
-              className="animate-spin rounded-full h-12 w-12 border-b-2 border-doubleword-accent-blue mx-auto mb-4"
-              aria-label="Loading"
-            ></div>
-            <p className="text-doubleword-neutral-600">Loading...</p>
-          </div>
-        </div>
-      </div>
-    );
-  }
-
   return (
     <div
       className="py-4 px-6"
@@ -550,216 +525,217 @@ export function Batches({
               </Button>
             </div>
           )}
-          {filteredBatches.length === 0 ? (
-            <div className="text-center py-12">
-              <div className="p-4 bg-doubleword-neutral-100 rounded-full w-16 h-16 mx-auto mb-4 flex items-center justify-center">
-                <Box className="w-8 h-8 text-doubleword-neutral-600" />
+          <DataTable
+            columns={batchColumns}
+            data={filteredBatches}
+            searchPlaceholder="Search batches..."
+            externalSearch={{
+              value: batchSearchQuery,
+              onChange: setBatchSearchQuery,
+            }}
+            showColumnToggle={true}
+            pageSize={batchesPagination.pageSize}
+            minRows={batchesPagination.pageSize}
+            rowHeight="40px"
+            initialColumnVisibility={{ id: false }}
+            onRowClick={handleBatchClick}
+            isLoading={batchesLoading}
+            emptyState={
+              <div className="text-center py-12">
+                <div className="p-4 bg-doubleword-neutral-100 rounded-full w-16 h-16 mx-auto mb-4 flex items-center justify-center">
+                  <Box className="w-8 h-8 text-doubleword-neutral-600" />
+                </div>
+                <h3 className="text-lg font-medium text-doubleword-neutral-900 mb-2">
+                  No batches found
+                </h3>
+                <p className="text-doubleword-neutral-600 mb-4">
+                  {batchSearchQuery
+                    ? "Try a different search term"
+                    : "Create a batch from an uploaded file to start processing requests"}
+                </p>
+                {!batchSearchQuery && (
+                  <Button
+                    onClick={() => {
+                      const file = batchFileFilter
+                        ? files.find((f) => f.id === batchFileFilter)
+                        : undefined;
+                      onOpenCreateBatchModal(file);
+                    }}
+                  >
+                    <Play className="w-4 h-4 mr-2" />
+                    {batchFileFilter ? "Create Batch" : "Create First Batch"}
+                  </Button>
+                )}
               </div>
-              <h3 className="text-lg font-medium text-doubleword-neutral-900 mb-2">
-                No batches created
-              </h3>
-              <p className="text-doubleword-neutral-600 mb-4">
-                Create a batch from an uploaded file to start processing
-                requests
-              </p>
-              <Button
-                onClick={() => {
-                  // Find the file object if we have a filter
-                  const file = batchFileFilter
-                    ? files.find((f) => f.id === batchFileFilter)
-                    : undefined;
-                  onOpenCreateBatchModal(file);
-                }}
-              >
-                <Play className="w-4 h-4 mr-2" />
-                {batchFileFilter ? "Create Batch" : "Create First Batch"}
-              </Button>
-            </div>
-          ) : (
-            <>
-              <DataTable
-                columns={batchColumns}
-                data={filteredBatches}
-                searchPlaceholder="Search batches..."
-                externalSearch={{
-                  value: batchSearchQuery,
-                  onChange: setBatchSearchQuery,
-                }}
-                showColumnToggle={true}
-                pageSize={batchesPagination.pageSize}
-                minRows={batchesPagination.pageSize}
-                rowHeight="40px"
-                initialColumnVisibility={{ id: false }}
-                onRowClick={handleBatchClick}
-                headerActions={
-                  <div className="flex items-center gap-2">
-                    <span className="text-sm text-gray-600">Rows:</span>
-                    <Select
-                      value={batchesPagination.pageSize.toString()}
-                      onValueChange={(value) =>
-                        batchesPagination.handlePageSizeChange(Number(value))
-                      }
-                    >
-                      <SelectTrigger className="w-20p h-9">
-                        <SelectValue />
-                      </SelectTrigger>
-                      <SelectContent>
-                        <SelectItem value="10">10</SelectItem>
-                        <SelectItem value="25">25</SelectItem>
-                        <SelectItem value="50">50</SelectItem>
-                        <SelectItem value="100">100</SelectItem>
-                        <SelectItem value="200">200</SelectItem>
-                        <SelectItem value="500">500</SelectItem>
-                      </SelectContent>
-                    </Select>
-                  </div>
+            }
+            headerActions={
+              <div className="flex items-center gap-2">
+                <span className="text-sm text-gray-600">Rows:</span>
+                <Select
+                  value={batchesPagination.pageSize.toString()}
+                  onValueChange={(value) =>
+                    batchesPagination.handlePageSizeChange(Number(value))
+                  }
+                >
+                  <SelectTrigger className="w-20p h-9">
+                    <SelectValue />
+                  </SelectTrigger>
+                  <SelectContent>
+                    <SelectItem value="10">10</SelectItem>
+                    <SelectItem value="25">25</SelectItem>
+                    <SelectItem value="50">50</SelectItem>
+                    <SelectItem value="100">100</SelectItem>
+                    <SelectItem value="200">200</SelectItem>
+                    <SelectItem value="500">500</SelectItem>
+                  </SelectContent>
+                </Select>
+              </div>
+            }
+            paginationMode="server-cursor"
+            serverPagination={{
+              page: batchesPagination.page,
+              pageSize: batchesPagination.pageSize,
+              onNextPage: () => {
+                const lastBatch = batches[batches.length - 1];
+                if (lastBatch) {
+                  batchesPagination.handleNextPage(lastBatch.id);
                 }
-                paginationMode="server-cursor"
-                serverPagination={{
-                  page: batchesPagination.page,
-                  pageSize: batchesPagination.pageSize,
-                  onNextPage: () => {
-                    const lastBatch = batches[batches.length - 1];
-                    if (lastBatch) {
-                      batchesPagination.handleNextPage(lastBatch.id);
-                    }
-                  },
-                  onPrevPage: batchesPagination.handlePrevPage,
-                  onFirstPage: batchesPagination.handleFirstPage,
-                  hasNextPage: batchesHasMore,
-                  hasPrevPage: batchesPagination.hasPrevPage,
-                }}
-              />
-            </>
-          )}
+              },
+              onPrevPage: batchesPagination.handlePrevPage,
+              onFirstPage: batchesPagination.handleFirstPage,
+              hasNextPage: batchesHasMore,
+              hasPrevPage: batchesPagination.hasPrevPage,
+            }}
+          />
         </TabsContent>
 
         <TabsContent value="files" className="space-y-4">
-          {files.length === 0 ? (
-            <div className="text-center py-12">
-              <div className="p-4 bg-doubleword-neutral-100 rounded-full w-16 h-16 mx-auto mb-4 flex items-center justify-center">
-                <FileInput className="w-8 h-8 text-doubleword-neutral-600" />
+          <DataTable
+            columns={fileColumns}
+            data={files}
+            searchPlaceholder="Search files..."
+            externalSearch={{
+              value: fileSearchQuery,
+              onChange: setFileSearchQuery,
+            }}
+            showColumnToggle={true}
+            pageSize={filesPagination.pageSize}
+            minRows={filesPagination.pageSize}
+            rowHeight="40px"
+            initialColumnVisibility={{ id: false }}
+            isLoading={filesLoading}
+            emptyState={
+              <div className="text-center py-12">
+                <div className="p-4 bg-doubleword-neutral-100 rounded-full w-16 h-16 mx-auto mb-4 flex items-center justify-center">
+                  <FileInput className="w-8 h-8 text-doubleword-neutral-600" />
+                </div>
+                <h3 className="text-lg font-medium text-doubleword-neutral-900 mb-2">
+                  {fileSearchQuery ? "No matching files" : "No files uploaded"}
+                </h3>
+                <p className="text-doubleword-neutral-600 mb-4">
+                  {fileSearchQuery
+                    ? "No files match your search. Try a different search term."
+                    : "Upload a .jsonl file to get started with batch processing"}
+                </p>
+                {!fileSearchQuery && (
+                  <Button onClick={() => onOpenUploadModal()}>
+                    <Upload className="w-4 h-4 mr-2" />
+                    Upload First File
+                  </Button>
+                )}
               </div>
-              <h3 className="text-lg font-medium text-doubleword-neutral-900 mb-2">
-                No files uploaded
-              </h3>
-              <p className="text-doubleword-neutral-600 mb-4">
-                Upload a .jsonl file to get started with batch processing
-              </p>
-              <Button onClick={() => onOpenUploadModal()}>
-                <Upload className="w-4 h-4 mr-2" />
-                Upload First File
-              </Button>
-            </div>
-          ) : (
-            <>
-              <DataTable
-                columns={fileColumns}
-                data={files}
-                searchPlaceholder="Search files..."
-                externalSearch={{
-                  value: fileSearchQuery,
-                  onChange: setFileSearchQuery,
-                }}
-                showColumnToggle={true}
-                pageSize={filesPagination.pageSize}
-                minRows={filesPagination.pageSize}
-                rowHeight="40px"
-                initialColumnVisibility={{ id: false }}
-                headerActions={
-                  <div className="flex items-center gap-2">
-                    <div className="inline-flex h-9 items-center justify-center rounded-md bg-muted p-1 text-muted-foreground">
-                      {(["input", "output", "error"] as const).map((type) => {
-                        const Icon =
-                          type === "input"
-                            ? FileInput
-                            : type === "output"
-                              ? FileCheck
-                              : AlertCircle;
-                        const label =
-                          type.charAt(0).toUpperCase() + type.slice(1);
+            }
+            headerActions={
+              <div className="flex items-center gap-2">
+                <div className="inline-flex h-9 items-center justify-center rounded-md bg-muted p-1 text-muted-foreground">
+                  {(["input", "output", "error"] as const).map((type) => {
+                    const Icon =
+                      type === "input"
+                        ? FileInput
+                        : type === "output"
+                          ? FileCheck
+                          : AlertCircle;
+                    const label = type.charAt(0).toUpperCase() + type.slice(1);
 
-                        return (
-                          <button
-                            key={type}
-                            type="button"
-                            title={`${label} files`}
-                            onClick={(e) => {
-                              e.preventDefault();
-                              e.stopPropagation();
-                              // Reset pagination and update file type in a single setSearchParams call
-                              setSearchParams(
-                                (prev) => {
-                                  const params = new URLSearchParams(prev);
-                                  params.set("tab", activeTab);
-                                  if (batchFileFilter) {
-                                    params.set("fileFilter", batchFileFilter);
-                                  } else {
-                                    params.delete("fileFilter");
-                                  }
-                                  if (type !== "input") {
-                                    params.set("fileType", type);
-                                  } else {
-                                    params.delete("fileType");
-                                  }
-                                  // Reset pagination
-                                  params.set("filesPage", "1");
-                                  params.delete("filesAfter");
-                                  return params;
-                                },
-                                { replace: false },
-                              );
-                            }}
-                            className={`inline-flex items-center justify-center whitespace-nowrap rounded-sm px-3 py-1 text-sm font-medium ring-offset-background transition-all focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 ${
-                              fileTypeFilter === type
-                                ? "bg-background text-foreground shadow-sm"
-                                : "hover:bg-background/50"
-                            }`}
-                          >
-                            <Icon className="w-4 h-4" />
-                          </button>
-                        );
-                      })}
-                    </div>
-                    <span className="text-sm text-gray-600">Rows:</span>
-                    <Select
-                      value={filesPagination.pageSize.toString()}
-                      onValueChange={(value) =>
-                        filesPagination.handlePageSizeChange(Number(value))
-                      }
-                    >
-                      <SelectTrigger className="w-20 h-9">
-                        <SelectValue />
-                      </SelectTrigger>
-                      <SelectContent>
-                        <SelectItem value="10">10</SelectItem>
-                        <SelectItem value="25">25</SelectItem>
-                        <SelectItem value="50">50</SelectItem>
-                        <SelectItem value="100">100</SelectItem>
-                        <SelectItem value="200">200</SelectItem>
-                        <SelectItem value="500">500</SelectItem>
-                      </SelectContent>
-                    </Select>
-                  </div>
+                    return (
+                      <button
+                        key={type}
+                        type="button"
+                        title={`${label} files`}
+                        onClick={(e) => {
+                          e.preventDefault();
+                          e.stopPropagation();
+                          // Reset pagination and update file type in a single setSearchParams call
+                          setSearchParams(
+                            (prev) => {
+                              const params = new URLSearchParams(prev);
+                              params.set("tab", activeTab);
+                              if (batchFileFilter) {
+                                params.set("fileFilter", batchFileFilter);
+                              } else {
+                                params.delete("fileFilter");
+                              }
+                              if (type !== "input") {
+                                params.set("fileType", type);
+                              } else {
+                                params.delete("fileType");
+                              }
+                              // Reset pagination
+                              params.set("filesPage", "1");
+                              params.delete("filesAfter");
+                              return params;
+                            },
+                            { replace: false },
+                          );
+                        }}
+                        className={`inline-flex items-center justify-center whitespace-nowrap rounded-sm px-3 py-1 text-sm font-medium ring-offset-background transition-all focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 ${
+                          fileTypeFilter === type
+                            ? "bg-background text-foreground shadow-sm"
+                            : "hover:bg-background/50"
+                        }`}
+                      >
+                        <Icon className="w-4 h-4" />
+                      </button>
+                    );
+                  })}
+                </div>
+                <span className="text-sm text-gray-600">Rows:</span>
+                <Select
+                  value={filesPagination.pageSize.toString()}
+                  onValueChange={(value) =>
+                    filesPagination.handlePageSizeChange(Number(value))
+                  }
+                >
+                  <SelectTrigger className="w-20 h-9">
+                    <SelectValue />
+                  </SelectTrigger>
+                  <SelectContent>
+                    <SelectItem value="10">10</SelectItem>
+                    <SelectItem value="25">25</SelectItem>
+                    <SelectItem value="50">50</SelectItem>
+                    <SelectItem value="100">100</SelectItem>
+                    <SelectItem value="200">200</SelectItem>
+                    <SelectItem value="500">500</SelectItem>
+                  </SelectContent>
+                </Select>
+              </div>
+            }
+            paginationMode="server-cursor"
+            serverPagination={{
+              page: filesPagination.page,
+              pageSize: filesPagination.pageSize,
+              onNextPage: () => {
+                const lastFile = files[files.length - 1];
+                if (lastFile) {
+                  filesPagination.handleNextPage(lastFile.id);
                 }
-                paginationMode="server-cursor"
-                serverPagination={{
-                  page: filesPagination.page,
-                  pageSize: filesPagination.pageSize,
-                  onNextPage: () => {
-                    const lastFile = files[files.length - 1];
-                    if (lastFile) {
-                      filesPagination.handleNextPage(lastFile.id);
-                    }
-                  },
-                  onPrevPage: filesPagination.handlePrevPage,
-                  onFirstPage: filesPagination.handleFirstPage,
-                  hasNextPage: filesHasMore,
-                  hasPrevPage: filesPagination.hasPrevPage,
-                }}
-              />
-            </>
-          )}
+              },
+              onPrevPage: filesPagination.handlePrevPage,
+              onFirstPage: filesPagination.handleFirstPage,
+              hasNextPage: filesHasMore,
+              hasPrevPage: filesPagination.hasPrevPage,
+            }}
+          />
         </TabsContent>
       </Tabs>
     </div>

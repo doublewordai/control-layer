@@ -108,6 +108,15 @@ pub struct ListRequestsQuery {
 
     /// Order by timestamp descending (newest first) - default: true
     pub order_desc: Option<bool>,
+
+    /// Filter by model name
+    pub model: Option<String>,
+
+    /// Filter by fusillade batch ID
+    pub fusillade_batch_id: Option<uuid::Uuid>,
+
+    /// Filter by custom_id (case-insensitive search)
+    pub custom_id: Option<String>,
 }
 
 /// API-compatible HTTP request representation
@@ -148,6 +157,93 @@ pub struct ListRequestsResponse {
     pub requests: Vec<RequestResponsePair>,
 }
 
+// ===== ANALYTICS ENTRY TYPES (for simplified requests list) =====
+
+/// Filter parameters for querying http_analytics table
+#[derive(Debug, Default)]
+pub struct HttpAnalyticsFilter {
+    /// Filter by HTTP method
+    pub method: Option<String>,
+    /// Filter by URI pattern (SQL LIKE)
+    pub uri_pattern: Option<String>,
+    /// Filter by exact status code
+    pub status_code: Option<i32>,
+    /// Filter by minimum status code
+    pub status_code_min: Option<i32>,
+    /// Filter by maximum status code
+    pub status_code_max: Option<i32>,
+    /// Filter by minimum duration
+    pub min_duration_ms: Option<i64>,
+    /// Filter by maximum duration
+    pub max_duration_ms: Option<i64>,
+    /// Filter requests after this timestamp
+    pub timestamp_after: Option<DateTime<Utc>>,
+    /// Filter requests before this timestamp
+    pub timestamp_before: Option<DateTime<Utc>>,
+    /// Filter by model name
+    pub model: Option<String>,
+    /// Filter by fusillade batch ID
+    pub fusillade_batch_id: Option<uuid::Uuid>,
+    /// Filter by custom_id (case-insensitive search)
+    pub custom_id: Option<String>,
+}
+
+/// A single analytics entry from the http_analytics table
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct AnalyticsEntry {
+    /// Unique identifier
+    pub id: i64,
+    /// Request timestamp
+    pub timestamp: DateTime<Utc>,
+    /// HTTP method
+    pub method: String,
+    /// Request URI
+    pub uri: String,
+    /// Model name (if applicable)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+    /// HTTP status code
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub status_code: Option<i32>,
+    /// Request duration in milliseconds
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub duration_ms: Option<i64>,
+    /// Number of prompt/input tokens
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub prompt_tokens: Option<i64>,
+    /// Number of completion/output tokens
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub completion_tokens: Option<i64>,
+    /// Total tokens (prompt + completion)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub total_tokens: Option<i64>,
+    /// Response type (chat_completion, embedding, etc.)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub response_type: Option<String>,
+    /// User email (if authenticated)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub user_email: Option<String>,
+    /// Fusillade batch ID (if part of a batch)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub fusillade_batch_id: Option<uuid::Uuid>,
+    /// Input/prompt price per token (for cost calculation)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub input_price_per_token: Option<String>,
+    /// Output/completion price per token (for cost calculation)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub output_price_per_token: Option<String>,
+    /// Custom ID from fusillade batch request
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub custom_id: Option<String>,
+}
+
+/// Response containing a list of analytics entries
+#[derive(Debug, Serialize, Deserialize, ToSchema)]
+pub struct ListAnalyticsResponse {
+    /// List of analytics entries
+    pub entries: Vec<AnalyticsEntry>,
+}
+
 impl Default for ListRequestsQuery {
     fn default() -> Self {
         Self {
@@ -162,6 +258,9 @@ impl Default for ListRequestsQuery {
             timestamp_after: None,
             timestamp_before: None,
             order_desc: Some(true),
+            model: None,
+            fusillade_batch_id: None,
+            custom_id: None,
         }
     }
 }

@@ -18,6 +18,7 @@ pub struct ConfigResponse {
     pub region: Option<String>,
     pub organization: Option<String>,
     pub payment_enabled: bool,
+    pub docs_jsonl_url: Option<String>,
     pub docs_url: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub batches: Option<BatchConfigResponse>,
@@ -42,21 +43,23 @@ pub struct ConfigResponse {
 pub async fn get_config(State(state): State<AppState>, _user: CurrentUser) -> impl IntoResponse {
     let metadata = &state.config.metadata;
 
+    let batches_config = if state.config.batches.enabled {
+        Some(BatchConfigResponse {
+            enabled: state.config.batches.enabled,
+            allowed_completion_windows: state.config.batches.allowed_completion_windows.clone(),
+        })
+    } else {
+        None
+    };
+
     let response = ConfigResponse {
         region: metadata.region.clone(),
         organization: metadata.organization.clone(),
         // Compute payment_enabled based on whether payment_processor is configured
         payment_enabled: state.config.payment.is_some(),
         docs_url: metadata.docs_url.clone(),
-        // Include batch configuration if batches are enabled
-        batches: if state.config.batches.enabled {
-            Some(BatchConfigResponse {
-                enabled: state.config.batches.enabled,
-                allowed_completion_windows: state.config.batches.allowed_completion_windows.clone(),
-            })
-        } else {
-            None
-        },
+        docs_jsonl_url: metadata.docs_jsonl_url.clone(),
+        batches: batches_config,
     };
 
     Json(response)

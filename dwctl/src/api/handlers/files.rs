@@ -793,7 +793,10 @@ pub async fn get_file_content(
 
     // Stream the file content as JSONL, starting from offset
     let offset = query.pagination.skip.unwrap_or(0) as usize;
-    let content_stream = state.request_manager.get_file_content_stream(fusillade::FileId(file_id), offset);
+    let search = query.search.clone();
+    let content_stream = state
+        .request_manager
+        .get_file_content_stream(fusillade::FileId(file_id), offset, search);
 
     // Apply limit if specified, fetching one extra to detect if there are more results
     let requested_limit = query.pagination.limit.map(|l| l as usize);
