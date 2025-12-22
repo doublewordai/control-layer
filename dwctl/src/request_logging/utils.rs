@@ -140,8 +140,8 @@ pub(crate) fn extract_header_as_string(request_data: &outlet::RequestData, heade
 #[cfg(test)]
 mod tests {
     use super::{
-        decompress_response_if_needed, extract_header_as_string, parse_non_streaming_response, parse_sse_chunks,
-        parse_streaming_response, process_sse_chunks,
+        decompress_response_if_needed, extract_header_as_string, parse_non_streaming_response, parse_sse_chunks, parse_streaming_response,
+        process_sse_chunks,
     };
     use crate::request_logging::models::{AiResponse, ChatCompletionChunk, SseParseError};
     use axum::http::{Method, Uri};
@@ -369,8 +369,7 @@ mod tests {
             body: None,
         };
 
-        let result = extract_header_as_string(&request_data, "x-fusillade-request-id")
-            .and_then(|s| uuid::Uuid::parse_str(&s).ok());
+        let result = extract_header_as_string(&request_data, "x-fusillade-request-id").and_then(|s| uuid::Uuid::parse_str(&s).ok());
 
         assert!(result.is_some());
         assert_eq!(result.unwrap(), test_uuid);
@@ -476,8 +475,7 @@ mod tests {
             body: None,
         };
 
-        let result = extract_header_as_string(&request_data, "x-fusillade-request-id")
-            .and_then(|s| uuid::Uuid::parse_str(&s).ok());
+        let result = extract_header_as_string(&request_data, "x-fusillade-request-id").and_then(|s| uuid::Uuid::parse_str(&s).ok());
 
         assert!(result.is_some());
         let uuid = result.unwrap();

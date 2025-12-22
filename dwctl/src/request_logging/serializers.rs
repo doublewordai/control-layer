@@ -337,10 +337,9 @@ pub async fn store_analytics_record(
     request_data: &RequestData,
 ) -> DbResult<HttpAnalyticsRow> {
     // Extract fusillade request ID if present
-    let fusillade_batch_id = extract_header_as_string(request_data, "x-fusillade-batch-id")
-        .and_then(|s| uuid::Uuid::parse_str(&s).ok());
-    let fusillade_request_id = extract_header_as_string(request_data, "x-fusillade-request-id")
-        .and_then(|s| uuid::Uuid::parse_str(&s).ok());
+    let fusillade_batch_id = extract_header_as_string(request_data, "x-fusillade-batch-id").and_then(|s| uuid::Uuid::parse_str(&s).ok());
+    let fusillade_request_id =
+        extract_header_as_string(request_data, "x-fusillade-request-id").and_then(|s| uuid::Uuid::parse_str(&s).ok());
 
     // Extract batch metadata headers for tariff pricing
     let batch_created_at = extract_header_as_string(request_data, "x-fusillade-batch-created-at");
