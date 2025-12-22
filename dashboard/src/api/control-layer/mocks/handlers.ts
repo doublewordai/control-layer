@@ -931,6 +931,7 @@ export const handlers = [
     return HttpResponse.json({
       region: "UK South",
       organization: "ACME Corp",
+      docs_url: "https://docs.doubleword.ai/control-layer",
     });
   }),
 

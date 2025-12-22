@@ -1,4 +1,5 @@
 import {
+  useConfig,
   useTransactions,
   useUser,
   useUserBalance,
@@ -16,6 +17,7 @@ export function Header() {
 
   const isComparisonPage = location.pathname.startsWith("/compare/");
   const { data: currentUser } = useUser("current");
+  const { data: config } = useConfig();
   const { isFeatureEnabled } = useSettings();
   const isDemoMode = isFeatureEnabled("demo");
 
@@ -57,16 +59,20 @@ export function Header() {
               {formatDollars(currentBalance)}
             </span>
           </div>
-          <div className="w-px h-4 bg-doubleword-neutral-200"></div>
-          <a
-            href="https://docs.doubleword.ai/control-layer"
-            target="_blank"
-            rel="noopener noreferrer"
-            className="flex items-center gap-2 text-doubleword-text-tertiary hover:text-doubleword-primary transition-colors font-medium"
-          >
-            <span>Documentation</span>
-            <ExternalLink className="w-3 h-3" />
-          </a>
+          {config?.docs_url && (
+            <>
+              <div className="w-px h-4 bg-doubleword-neutral-200"></div>
+              <a
+                href={config.docs_url}
+                target="_blank"
+                rel="noopener noreferrer"
+                className="flex items-center gap-2 text-doubleword-text-tertiary hover:text-doubleword-primary transition-colors font-medium"
+              >
+                <span>Documentation</span>
+                <ExternalLink className="w-3 h-3" />
+              </a>
+            </>
+          )}
         </div>
       </div>
     </div>
