@@ -1,4 +1,4 @@
-import { useState, useEffect } from "react";
+import { useState, useEffect, useMemo } from "react";
 import { Play, AlertCircle, X, Upload, ExternalLink } from "lucide-react";
 import {
   Dialog,
@@ -63,7 +63,10 @@ export function CreateBatchModal({
 
   // Fetch config to get available SLAs
   const { data: config } = useConfig();
-  const availableSLAs = config?.batches?.allowed_completion_windows || ["24h"];
+  const availableSLAs = useMemo(
+    () => config?.batches?.allowed_completion_windows || ["24h"],
+    [config?.batches?.allowed_completion_windows]
+  );
 
   // Fetch available files for combobox (only input files with purpose "batch")
   const { data: filesResponse } = useFiles({

@@ -1728,13 +1728,20 @@ mod tests {
                 tariffs_repo.close_tariffs_batch(&tariff_ids).await.unwrap();
             }
 
+            // Default completion_window to "24h" for batch tariffs (required by DB constraint)
+            let completion_window = if purpose == Some(ApiKeyPurpose::Batch) {
+                Some("24h".to_string())
+            } else {
+                None
+            };
+
             let tariff = TariffCreateDBRequest {
                 deployed_model_id,
                 name: tariff_name.to_string(),
                 input_price_per_token,
                 output_price_per_token,
                 api_key_purpose: purpose,
-                completion_window: None,
+                completion_window,
                 valid_from,
             };
             tariffs_repo.create(&tariff).await.unwrap();
