@@ -11,6 +11,7 @@ vi.mock("../../../api/control-layer/hooks", () => ({
   useUploadFile: vi.fn(),
   useFiles: vi.fn(),
   useConfig: vi.fn(),
+  useFileCostEstimate: vi.fn(),
 }));
 
 // Mock sonner toast
@@ -82,6 +83,14 @@ describe("CreateBatchModal", () => {
           allowed_completion_windows: ["24h"],
         },
       },
+      isLoading: false,
+      error: null,
+      refetch: vi.fn(),
+    } as any);
+
+    // Default mock for useFileCostEstimate
+    vi.mocked(hooks.useFileCostEstimate).mockReturnValue({
+      data: null,
       isLoading: false,
       error: null,
       refetch: vi.fn(),

@@ -24,6 +24,7 @@ import {
   useFiles,
   useUploadFile,
   useConfig,
+  useFileCostEstimate,
 } from "../../../api/control-layer/hooks";
 import { toast } from "sonner";
 import type { FileObject } from "../../features/batches/types";
@@ -75,6 +76,12 @@ export function CreateBatchModal({
   });
 
   const availableFiles = filesResponse?.data || [];
+
+  // Fetch cost estimate for selected file with current SLA
+  const { data: costEstimate, isLoading: isLoadingCost } = useFileCostEstimate(
+    selectedFileId || undefined,
+    completionWindow,
+  );
 
   // Update default SLA when available SLAs change
   useEffect(() => {
@@ -432,6 +439,45 @@ export function CreateBatchModal({
               Select the maximum time allowed for batch completion
             </p>
           </div>
+
+          {/* Cost Estimate */}
+          {selectedFileId && (
+            <div className="bg-gray-50 border border-gray-200 rounded-lg p-3">
+              <div className="space-y-2">
+                <p className="text-sm font-medium text-gray-900">
+                  Cost Estimate
+                </p>
+                {isLoadingCost ? (
+                  <div className="flex items-center gap-2 text-sm text-gray-600">
+                    <div className="animate-spin rounded-full h-3 w-3 border-b-2 border-gray-600"></div>
+                    Calculating...
+                  </div>
+                ) : costEstimate ? (
+                  <div className="space-y-1.5">
+                    <div className="flex justify-between text-sm">
+                      <span className="text-gray-600">Total Requests:</span>
+                      <span className="font-medium text-gray-900">
+                        {costEstimate.total_requests.toLocaleString()}
+                      </span>
+                    </div>
+                    <div className="flex justify-between text-sm">
+                      <span className="text-gray-600">Estimated Cost:</span>
+                      <span className="font-semibold text-gray-900">
+                        ${parseFloat(costEstimate.total_estimated_cost).toFixed(4)}
+                      </span>
+                    </div>
+                    <div className="text-xs text-gray-500 pt-1">
+                      Based on {completionWindow} SLA pricing
+                    </div>
+                  </div>
+                ) : (
+                  <p className="text-sm text-gray-500">
+                    Cost estimate unavailable
+                  </p>
+                )}
+              </div>
+            </div>
+          )}
 
           {/* Info Box */}
           <div className="bg-blue-50 border border-blue-200 rounded-lg p-3">
