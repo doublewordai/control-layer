@@ -65,6 +65,7 @@ export function FileRequests() {
   // Reset pagination when debounced search changes
   useEffect(() => {
     pagination.handleReset();
+    /* eslint-disable-next-line */
   }, [debouncedSearch]);
 
   // Get file details - works for input, output, or error files
