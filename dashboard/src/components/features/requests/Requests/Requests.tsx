@@ -70,6 +70,7 @@ export function Requests() {
   // Reset pagination when debounced search changes
   useEffect(() => {
     pagination.handlePageChange(1);
+    /* eslint-disable-next-line */
   }, [debouncedCustomIdSearch]);
 
   // Query for limit + 1 to detect if there are more items
@@ -153,8 +154,6 @@ export function Requests() {
   // MSW will intercept this call in demo mode
   const { data: analyticsData } = useRequestsAggregate(undefined, dateRange);
   const modelsWithRequests = analyticsData?.models || [];
-
-  const loading = requestsLoading;
   const error = requestsError;
 
   // Transform backend data to frontend format

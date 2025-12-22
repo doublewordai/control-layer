@@ -295,7 +295,8 @@ describe("Batches", () => {
   });
 
   describe("Loading State", () => {
-    it("should show loading state when files are loading", () => {
+    it("should show loading state when files are loading", async () => {
+      const user = userEvent.setup();
       vi.mocked(hooks.useFiles).mockReturnValue({
         data: undefined,
         isLoading: true,
@@ -307,9 +308,12 @@ describe("Batches", () => {
         wrapper: createWrapper(),
       });
 
-      // Use getAllByText since there are multiple "Loading..." texts
-      const loadingTexts = within(container).getAllByText("Loading...");
-      expect(loadingTexts.length).toBeGreaterThan(0);
+      // Switch to files tab to see files loading state
+      await user.click(within(container).getByRole("tab", { name: /files/i }));
+
+      // DataTable shows skeleton loading with animate-pulse class
+      const skeletonElements = container.querySelectorAll(".animate-pulse");
+      expect(skeletonElements.length).toBeGreaterThan(0);
     });
 
     it("should show loading state when batches are loading", () => {
@@ -324,13 +328,13 @@ describe("Batches", () => {
         wrapper: createWrapper(),
       });
 
-      // Use getAllByText since there are multiple "Loading..." texts
-      const loadingTexts = within(container).getAllByText("Loading...");
-      expect(loadingTexts.length).toBeGreaterThan(0);
+      // DataTable shows skeleton loading with animate-pulse class
+      const skeletonElements = container.querySelectorAll(".animate-pulse");
+      expect(skeletonElements.length).toBeGreaterThan(0);
     });
 
     it("should show spinner when loading", () => {
-      vi.mocked(hooks.useFiles).mockReturnValue({
+      vi.mocked(hooks.useBatches).mockReturnValue({
         data: undefined,
         isLoading: true,
         error: null,
@@ -341,8 +345,9 @@ describe("Batches", () => {
         wrapper: createWrapper(),
       });
 
-      const spinner = container.querySelector(".animate-spin");
-      expect(spinner).toBeInTheDocument();
+      // DataTable shows skeleton loading with animate-pulse class
+      const skeletonElements = container.querySelectorAll(".animate-pulse");
+      expect(skeletonElements.length).toBeGreaterThan(0);
     });
   });
 
@@ -377,8 +382,6 @@ describe("Batches", () => {
     });
 
     it("should show empty state when no batches exist", async () => {
-      const user = userEvent.setup();
-
       vi.mocked(hooks.useBatches).mockReturnValue({
         data: { data: [] },
         isLoading: false,
@@ -390,13 +393,9 @@ describe("Batches", () => {
         wrapper: createWrapper(),
       });
 
-      // Switch to batches tab
-      await user.click(
-        within(container).getByRole("tab", { name: /batches/i }),
-      );
-
+      // Batches tab is active by default, so empty state should be visible
       expect(
-        within(container).getByText("No batches created"),
+        within(container).getByText("No batches found"),
       ).toBeInTheDocument();
       expect(
         within(container).getByText(
