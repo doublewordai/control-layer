@@ -210,6 +210,21 @@ fn get_model() {}
         )
     ),
     tags(
+        (name = "files", description = "Upload and manage JSONL files for batch processing.
+
+Each line in the file should be a JSON object with:
+- `custom_id` — your identifier for tracking the request
+- `method` — HTTP method (POST)
+- `url` — endpoint path (e.g., `/v1/chat/completions`)
+- `body` — the request payload"),
+        (name = "batches", description = "Process large volumes of requests asynchronously.
+
+Batch processing is ideal when you:
+- Have many requests that don't need immediate responses
+- Want to process data in bulk (e.g., embeddings for a document corpus)
+- Are running offline evaluations or data pipelines
+
+Batches complete within 24 hours. You can track progress, cancel in-flight batches, and retry failed requests."),
         (name = "chat", description = "Create model responses for chat conversations.
 
 Supports:
@@ -228,21 +243,6 @@ Use embeddings for:
         (name = "models", description = "List and retrieve information about available models.
 
 Use these endpoints to discover which models you have access to and their capabilities."),
-        (name = "files", description = "Upload and manage JSONL files for batch processing.
-
-Each line in the file should be a JSON object with:
-- `custom_id` — your identifier for tracking the request
-- `method` — HTTP method (POST)
-- `url` — endpoint path (e.g., `/v1/chat/completions`)
-- `body` — the request payload"),
-        (name = "batches", description = "Process large volumes of requests asynchronously.
-
-Batch processing is ideal when you:
-- Have many requests that don't need immediate responses
-- Want to process data in bulk (e.g., embeddings for a document corpus)
-- Are running offline evaluations or data pipelines
-
-Batches complete within 24 hours. You can track progress, cancel in-flight batches, and retry failed requests."),
     ),
     info(
         title = "AI API",
