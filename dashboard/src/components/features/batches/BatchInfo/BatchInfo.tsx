@@ -24,6 +24,7 @@ import { Badge } from "../../../ui/badge";
 import { Button } from "../../../ui/button";
 import { Skeleton } from "../../../ui/skeleton";
 import type { BatchStatus } from "../../../../api/control-layer/types";
+import { useAuthorization } from "../../../../utils/authorization";
 
 const BatchInfo: React.FC = () => {
   const { batchId } = useParams<{ batchId: string }>();
@@ -37,6 +38,13 @@ const BatchInfo: React.FC = () => {
     batchId!,
   );
   const retryMutation = useRetryBatch();
+
+  // TODO: this role check is inconsistent with other components
+  // that use useAuthorization => hasPermission. We should standardise.
+  const { userRoles } = useAuthorization();
+  const hasRequestsPermission = userRoles.some(
+    (role) => role === "RequestViewer",
+  );
 
   const handleRetry = () => {
     if (batchId) {
@@ -377,17 +385,19 @@ const BatchInfo: React.FC = () => {
             <Card className="p-0 gap-0 rounded-lg">
               <CardHeader className="flex w-full justify-between px-6 pt-5 pb-4">
                 <CardTitle>Metrics</CardTitle>
-                <Button
-                  variant="outline"
-                  onClick={() =>
-                    navigate(
-                      `/analytics?tab=requests&fusillade_batch_id=${batchId}&from=/batches/${batchId}`,
-                    )
-                  }
-                >
-                  View Request Analytics
-                  <ExternalLink className="ml-2 h-4 w-4" />
-                </Button>
+                {hasRequestsPermission && (
+                  <Button
+                    variant="outline"
+                    onClick={() =>
+                      navigate(
+                        `/analytics?tab=requests&fusillade_batch_id=${batchId}&from=/batches/${batchId}`,
+                      )
+                    }
+                  >
+                    View Request Analytics
+                    <ExternalLink className="ml-2 h-4 w-4" />
+                  </Button>
+                )}
               </CardHeader>
               <CardContent className="px-6 pb-6 pt-0">
                 {analyticsLoading ? (
