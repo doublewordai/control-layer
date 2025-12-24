@@ -425,8 +425,8 @@ mod tests {
         api::models::users::{CurrentUser, Role},
         db::handlers::{Users, repository::Repository},
         errors::Error,
-        test_utils::create_test_config,
-        test_utils::require_admin,
+        test::utils::create_test_config,
+        test::utils::require_admin,
     };
     use axum::{extract::FromRequestParts as _, http::request::Parts};
     use sqlx::PgPool;
@@ -456,7 +456,7 @@ mod tests {
         };
 
         // Create a test user first
-        let test_user = crate::test_utils::create_test_user(&pool, Role::StandardUser).await;
+        let test_user = crate::test::utils::create_test_user(&pool, Role::StandardUser).await;
 
         // Test extracting existing user
         let external_user_id = test_user.external_user_id.as_ref().unwrap();
@@ -839,7 +839,7 @@ mod tests {
         };
 
         // Create a user first
-        let test_user = crate::test_utils::create_test_user(&pool, Role::StandardUser).await;
+        let test_user = crate::test::utils::create_test_user(&pool, Role::StandardUser).await;
         let external_user_id = test_user.external_user_id.as_ref().unwrap();
 
         // Try to login with auto_create disabled - should work because user exists
@@ -1081,7 +1081,7 @@ mod tests {
         config.auth.native.enabled = true;
 
         // Create a user with StandardUser role
-        let user = crate::test_utils::create_test_user(&pool, Role::StandardUser).await;
+        let user = crate::test::utils::create_test_user(&pool, Role::StandardUser).await;
 
         // Create a JWT token
         let current_user = CurrentUser {
@@ -1152,7 +1152,7 @@ mod tests {
         let mut config = create_test_config();
         config.auth.native.enabled = true;
 
-        let user = crate::test_utils::create_test_user(&pool, Role::StandardUser).await;
+        let user = crate::test::utils::create_test_user(&pool, Role::StandardUser).await;
 
         // Create a JWT token
         let current_user = CurrentUser {

@@ -213,7 +213,7 @@ mod tests {
     use crate::{
         api::models::users::Role,
         db::{handlers::Credits as CreditsHandler, models::credits::CreditTransactionCreateDBRequest},
-        test_utils::*,
+        test::utils::*,
         types::UserId,
     };
     use rust_decimal::Decimal;

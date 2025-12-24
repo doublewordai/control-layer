@@ -430,7 +430,7 @@ mod tests {
     use crate::api::models::users::Role;
     use crate::db::handlers::{Credits, Groups, Repository};
     use crate::db::models::{credits::CreditTransactionCreateDBRequest, groups::GroupCreateDBRequest};
-    use crate::test_utils::*;
+    use crate::test::utils::*;
     use rust_decimal::Decimal;
     use serde_json::json;
     use sqlx::PgPool;

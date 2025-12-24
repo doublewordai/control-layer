@@ -459,7 +459,7 @@ mod tests {
     }
 
     fn create_test_config() -> crate::config::Config {
-        crate::test_utils::create_test_config()
+        crate::test::utils::create_test_config()
     }
 
     #[sqlx::test]

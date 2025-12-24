@@ -625,7 +625,7 @@ mod tests {
             },
         },
         errors::Error,
-        test_utils::get_test_endpoint_id,
+        test::utils::get_test_endpoint_id,
     };
 
     use rust_decimal::Decimal;
@@ -885,7 +885,7 @@ mod tests {
             group_tx.commit().await.unwrap();
         }
         // Create inference endpoint for deployments
-        let config = crate::test_utils::create_test_config();
+        let config = crate::test::utils::create_test_config();
         crate::seed_database(&config.model_sources, &pool).await.unwrap();
 
         // Get a valid endpoint ID
@@ -1003,7 +1003,7 @@ mod tests {
         }
 
         // Create inference endpoint for deployments
-        let config = crate::test_utils::create_test_config();
+        let config = crate::test::utils::create_test_config();
         crate::seed_database(&config.model_sources, &pool).await.unwrap();
 
         {
@@ -1144,7 +1144,7 @@ mod tests {
         }
 
         // Create inference endpoint for deployments
-        let config = crate::test_utils::create_test_config();
+        let config = crate::test::utils::create_test_config();
 
         crate::seed_database(&config.model_sources, &pool).await.unwrap();
 
@@ -1298,7 +1298,7 @@ mod tests {
         }
 
         // Create inference endpoint for deployments
-        let config = crate::test_utils::create_test_config();
+        let config = crate::test::utils::create_test_config();
         crate::seed_database(&config.model_sources, &pool).await.unwrap();
 
         {
@@ -1479,7 +1479,7 @@ mod tests {
         }
         {
             // Create inference endpoint for deployments
-            let config = crate::test_utils::create_test_config();
+            let config = crate::test::utils::create_test_config();
             crate::seed_database(&config.model_sources, &pool).await.unwrap();
 
             {
@@ -1649,7 +1649,7 @@ mod tests {
             user = user_repo.create(&user_create).await.unwrap();
         }
         // Create inference endpoint for deployments
-        let config = crate::test_utils::create_test_config();
+        let config = crate::test::utils::create_test_config();
         crate::seed_database(&config.model_sources, &pool).await.unwrap();
         let test_endpoint_id = get_test_endpoint_id(&pool).await;
         {
@@ -2358,7 +2358,7 @@ mod tests {
         tx.commit().await.unwrap();
 
         // Create inference endpoint for deployments
-        let config = crate::test_utils::create_test_config();
+        let config = crate::test::utils::create_test_config();
         crate::seed_database(&config.model_sources, &pool).await.unwrap();
         let test_endpoint_id = get_test_endpoint_id(&pool).await;
 
@@ -2545,7 +2545,7 @@ mod tests {
         }
 
         // Seed database and get endpoint ID
-        let config = crate::test_utils::create_test_config();
+        let config = crate::test::utils::create_test_config();
         crate::seed_database(&config.model_sources, pool).await.unwrap();
         let test_endpoint_id = get_test_endpoint_id(pool).await;
 
@@ -2657,7 +2657,7 @@ mod tests {
         }
 
         // Seed database and get endpoint ID
-        let config = crate::test_utils::create_test_config();
+        let config = crate::test::utils::create_test_config();
         crate::seed_database(&config.model_sources, &pool).await.unwrap();
         let test_endpoint_id = get_test_endpoint_id(&pool).await;
 
@@ -3190,7 +3190,7 @@ mod tests {
         }
 
         // Seed database and get endpoint ID
-        let config = crate::test_utils::create_test_config();
+        let config = crate::test::utils::create_test_config();
         crate::seed_database(&config.model_sources, &pool).await.unwrap();
         let test_endpoint_id = get_test_endpoint_id(&pool).await;
 
@@ -3307,7 +3307,7 @@ mod tests {
         }
 
         // Seed database and get endpoint ID
-        let config = crate::test_utils::create_test_config();
+        let config = crate::test::utils::create_test_config();
         crate::seed_database(&config.model_sources, &pool).await.unwrap();
         let test_endpoint_id = get_test_endpoint_id(&pool).await;
 
@@ -3443,7 +3443,7 @@ mod tests {
         }
 
         // Seed database and get endpoint ID
-        let config = crate::test_utils::create_test_config();
+        let config = crate::test::utils::create_test_config();
         crate::seed_database(&config.model_sources, &pool).await.unwrap();
         let test_endpoint_id = get_test_endpoint_id(&pool).await;
 
