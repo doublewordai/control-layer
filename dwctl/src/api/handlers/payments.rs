@@ -304,7 +304,7 @@ pub async fn webhook_handler(State(state): State<AppState>, headers: axum::http:
 mod tests {
     use super::*;
     use crate::config::DummyConfig;
-    use crate::{config::PaymentConfig, test_utils::create_test_config};
+    use crate::{config::PaymentConfig, test::utils::create_test_config};
     use axum::Router;
     use axum::routing::{patch, post};
     use axum_test::TestServer;
@@ -328,8 +328,8 @@ mod tests {
             .build();
 
         // Create a test user
-        let user = crate::test_utils::create_test_user(&pool, crate::api::models::users::Role::StandardUser).await;
-        let auth_headers = crate::test_utils::add_auth_headers(&user);
+        let user = crate::test::utils::create_test_user(&pool, crate::api::models::users::Role::StandardUser).await;
+        let auth_headers = crate::test::utils::add_auth_headers(&user);
 
         let app = Router::new()
             .route("/payments", post(create_payment))
@@ -436,8 +436,8 @@ mod tests {
             .request_manager(request_manager)
             .build();
 
-        let user = crate::test_utils::create_test_user(&pool, crate::api::models::users::Role::StandardUser).await;
-        let auth_headers = crate::test_utils::add_auth_headers(&user);
+        let user = crate::test::utils::create_test_user(&pool, crate::api::models::users::Role::StandardUser).await;
+        let auth_headers = crate::test::utils::add_auth_headers(&user);
 
         let app = Router::new().route("/payments", post(create_payment)).with_state(state);
 
@@ -470,8 +470,8 @@ mod tests {
             .request_manager(request_manager)
             .build();
 
-        let user = crate::test_utils::create_test_user(&pool, crate::api::models::users::Role::StandardUser).await;
-        let auth_headers = crate::test_utils::add_auth_headers(&user);
+        let user = crate::test::utils::create_test_user(&pool, crate::api::models::users::Role::StandardUser).await;
+        let auth_headers = crate::test::utils::add_auth_headers(&user);
 
         let app = Router::new().route("/payments", post(create_payment)).with_state(state);
 
@@ -504,9 +504,9 @@ mod tests {
             .request_manager(request_manager)
             .build();
 
-        let payer = crate::test_utils::create_test_user(&pool, crate::api::models::users::Role::StandardUser).await;
-        let recipient = crate::test_utils::create_test_user(&pool, crate::api::models::users::Role::StandardUser).await;
-        let auth_headers = crate::test_utils::add_auth_headers(&payer);
+        let payer = crate::test::utils::create_test_user(&pool, crate::api::models::users::Role::StandardUser).await;
+        let recipient = crate::test::utils::create_test_user(&pool, crate::api::models::users::Role::StandardUser).await;
+        let auth_headers = crate::test::utils::add_auth_headers(&payer);
 
         let app = Router::new()
             .route("/payments", post(create_payment))

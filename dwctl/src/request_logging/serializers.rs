@@ -1251,7 +1251,7 @@ mod tests {
             &request_data,
             &response_data,
             &parsed_response,
-            &crate::test_utils::create_test_config(),
+            &crate::test::utils::create_test_config(),
         );
 
         assert_eq!(metrics.instance_id, instance_id);
@@ -1319,7 +1319,7 @@ mod tests {
             &request_data,
             &response_data,
             &parsed_response,
-            &crate::test_utils::create_test_config(),
+            &crate::test::utils::create_test_config(),
         );
 
         assert_eq!(metrics.instance_id, instance_id);
@@ -1385,7 +1385,7 @@ mod tests {
             &request_data,
             &response_data,
             &parsed_response,
-            &crate::test_utils::create_test_config(),
+            &crate::test::utils::create_test_config(),
         );
 
         assert_eq!(metrics.prompt_tokens, 8);
@@ -1434,7 +1434,7 @@ mod tests {
             &request_data,
             &response_data,
             &parsed_response,
-            &crate::test_utils::create_test_config(),
+            &crate::test::utils::create_test_config(),
         );
 
         assert_eq!(metrics.prompt_tokens, 6);
@@ -1489,7 +1489,7 @@ mod tests {
             &request_data,
             &response_data,
             &parsed_response,
-            &crate::test_utils::create_test_config(),
+            &crate::test::utils::create_test_config(),
         );
 
         assert_eq!(metrics.prompt_tokens, 10);
@@ -1538,7 +1538,7 @@ mod tests {
             &request_data,
             &response_data,
             &parsed_response,
-            &crate::test_utils::create_test_config(),
+            &crate::test::utils::create_test_config(),
         );
 
         assert_eq!(metrics.prompt_tokens, 4);
@@ -1655,7 +1655,7 @@ mod tests {
         use crate::db::models::api_keys::{ApiKeyCreateDBRequest, ApiKeyPurpose};
         use crate::db::models::credits::{CreditTransactionCreateDBRequest, CreditTransactionType};
         use crate::db::models::tariffs::TariffCreateDBRequest;
-        use crate::test_utils::create_test_user;
+        use crate::test::utils::create_test_user;
         use crate::types::DeploymentId;
         use rust_decimal::Decimal;
         use std::str::FromStr;

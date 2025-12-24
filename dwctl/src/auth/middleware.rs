@@ -119,7 +119,7 @@ mod tests {
                 deployments::DeploymentCreateDBRequest, groups::GroupCreateDBRequest, inference_endpoints::InferenceEndpointCreateDBRequest,
             },
         },
-        test_utils::{create_test_config, create_test_user},
+        test::utils::{create_test_config, create_test_user},
     };
 
     #[sqlx::test]

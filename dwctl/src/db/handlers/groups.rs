@@ -579,7 +579,7 @@ mod tests {
     use super::*;
     use crate::db::handlers::api_keys::ApiKeys;
     use crate::db::models::api_keys::ApiKeyPurpose;
-    use crate::test_utils::get_test_endpoint_id;
+    use crate::test::utils::get_test_endpoint_id;
     use crate::{
         db::{
             handlers::{Credits, Deployments, Users, users::UserFilter},
@@ -625,7 +625,7 @@ mod tests {
         .expect("Failed to create test user");
 
         // Create inference endpoint for deployments
-        let config = crate::test_utils::create_test_config();
+        let config = crate::test::utils::create_test_config();
         seed_database(&config.model_sources, pool)
             .await
             .expect("Failed to create inference endpoints");

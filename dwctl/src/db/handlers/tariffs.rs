@@ -286,8 +286,8 @@ mod tests {
         crate::seed_database(&sources, &pool).await.unwrap();
 
         // Create a test user
-        let user = crate::test_utils::create_test_user(&pool, crate::api::models::users::Role::StandardUser).await;
-        let test_endpoint_id = crate::test_utils::get_test_endpoint_id(&pool).await;
+        let user = crate::test::utils::create_test_user(&pool, crate::api::models::users::Role::StandardUser).await;
+        let test_endpoint_id = crate::test::utils::get_test_endpoint_id(&pool).await;
 
         // Create a test deployment
         let deployment_id = DeploymentId::new_v4();
@@ -362,8 +362,8 @@ mod tests {
         crate::seed_database(&sources, &pool).await.unwrap();
 
         // Create a test user
-        let user = crate::test_utils::create_test_user(&pool, crate::api::models::users::Role::StandardUser).await;
-        let test_endpoint_id = crate::test_utils::get_test_endpoint_id(&pool).await;
+        let user = crate::test::utils::create_test_user(&pool, crate::api::models::users::Role::StandardUser).await;
+        let test_endpoint_id = crate::test::utils::get_test_endpoint_id(&pool).await;
 
         // Create a test deployment
         let deployment_id = DeploymentId::new_v4();
@@ -420,8 +420,8 @@ mod tests {
         crate::seed_database(&sources, &pool).await.unwrap();
 
         // Create a test user
-        let user = crate::test_utils::create_test_user(&pool, crate::api::models::users::Role::StandardUser).await;
-        let test_endpoint_id = crate::test_utils::get_test_endpoint_id(&pool).await;
+        let user = crate::test::utils::create_test_user(&pool, crate::api::models::users::Role::StandardUser).await;
+        let test_endpoint_id = crate::test::utils::get_test_endpoint_id(&pool).await;
 
         // Create a test deployment
         let deployment_id = DeploymentId::new_v4();
@@ -478,8 +478,8 @@ mod tests {
         crate::seed_database(&sources, &pool).await.unwrap();
 
         // Create a test user
-        let user = crate::test_utils::create_test_user(&pool, crate::api::models::users::Role::StandardUser).await;
-        let test_endpoint_id = crate::test_utils::get_test_endpoint_id(&pool).await;
+        let user = crate::test::utils::create_test_user(&pool, crate::api::models::users::Role::StandardUser).await;
+        let test_endpoint_id = crate::test::utils::get_test_endpoint_id(&pool).await;
 
         // Create a test deployment
         let deployment_id = DeploymentId::new_v4();

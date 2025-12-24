@@ -575,7 +575,7 @@ mod tests {
     use crate::api::models::inference_endpoints::InferenceEndpointResponse;
     use crate::api::models::pagination::PaginatedResponse;
     use crate::api::models::users::Role;
-    use crate::test_utils::*;
+    use crate::test::utils::*;
     use serde_json::json;
     use sqlx::PgPool;
     use wiremock::{

@@ -205,7 +205,7 @@ mod tests {
 
     /// Helper to create a test user in the database
     async fn create_test_user(pool: &PgPool) -> CurrentUser {
-        let user = crate::test_utils::create_test_user(pool, Role::StandardUser).await;
+        let user = crate::test::utils::create_test_user(pool, Role::StandardUser).await;
 
         CurrentUser {
             id: user.id,

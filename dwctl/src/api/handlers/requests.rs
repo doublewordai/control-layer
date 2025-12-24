@@ -148,7 +148,7 @@ pub async fn aggregate_by_user(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{api::models::requests::ListAnalyticsResponse, api::models::users::Role, test_utils::*};
+    use crate::{api::models::requests::ListAnalyticsResponse, api::models::users::Role, test::utils::*};
     use chrono::{Duration, Utc};
     use sqlx::PgPool;
     use std::sync::atomic::{AtomicI64, Ordering};

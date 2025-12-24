@@ -68,7 +68,7 @@ pub async fn get_config(State(state): State<AppState>, _user: CurrentUser) -> im
 #[cfg(test)]
 mod tests {
     use crate::api::models::users::Role;
-    use crate::test_utils::{add_auth_headers, create_test_app, create_test_user};
+    use crate::test::utils::{add_auth_headers, create_test_app, create_test_user};
     use axum::http::StatusCode;
     use serde_json::Value;
     use sqlx::PgPool;

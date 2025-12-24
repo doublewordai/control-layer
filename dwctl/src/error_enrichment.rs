@@ -179,14 +179,14 @@ mod tests {
             credits::{CreditTransactionCreateDBRequest, CreditTransactionType},
         },
     };
-    use crate::{api::models::users::Role, test_utils::create_test_user};
+    use crate::{api::models::users::Role, test::utils::create_test_user};
     use rust_decimal::Decimal;
 
     /// Integration test: Error enrichment middleware enriches 403 with balance info
     #[sqlx::test]
     #[test_log::test]
     async fn test_error_enrichment_middleware_enriches_403_with_balance(pool: PgPool) {
-        use crate::test_utils::{add_deployment_to_group, add_user_to_group, create_test_group};
+        use crate::test::utils::{add_deployment_to_group, add_user_to_group, create_test_group};
 
         // Create test user with an API key
         let user = create_test_user(&pool, Role::StandardUser).await;
@@ -268,9 +268,9 @@ mod tests {
             .unwrap();
 
         // We need to ensure user is part of a group with access to the deployment to avoid 403
-        let endpoint_id = crate::test_utils::create_test_endpoint(&pool, "test-endpoint", user.id).await;
+        let endpoint_id = crate::test::utils::create_test_endpoint(&pool, "test-endpoint", user.id).await;
         let deployment_id =
-            crate::test_utils::create_test_model(&pool, "authorized-model-name", "authorized-model", endpoint_id, user.id).await;
+            crate::test::utils::create_test_model(&pool, "authorized-model-name", "authorized-model", endpoint_id, user.id).await;
 
         let group = create_test_group(&pool).await;
         add_user_to_group(&pool, user.id, group.id).await;
@@ -298,7 +298,7 @@ mod tests {
     #[sqlx::test]
     #[test_log::test]
     async fn test_error_enrichment_middleware_passes_through_legitimate_403(pool: PgPool) {
-        use crate::test_utils::{add_deployment_to_group, add_user_to_group, create_test_group};
+        use crate::test::utils::{add_deployment_to_group, add_user_to_group, create_test_group};
 
         // Create test user with positive balance and model access
         let user = create_test_user(&pool, Role::StandardUser).await;
@@ -337,9 +337,9 @@ mod tests {
             .unwrap();
 
         // Create a deployment with 'authorized-model' alias and grant access to the group
-        let endpoint_id = crate::test_utils::create_test_endpoint(&pool, "test-endpoint", user.id).await;
+        let endpoint_id = crate::test::utils::create_test_endpoint(&pool, "test-endpoint", user.id).await;
         let deployment_id =
-            crate::test_utils::create_test_model(&pool, "authorized-model-name", "authorized-model", endpoint_id, user.id).await;
+            crate::test::utils::create_test_model(&pool, "authorized-model-name", "authorized-model", endpoint_id, user.id).await;
 
         // Grant access to the group
         add_deployment_to_group(&pool, deployment_id, group.id, user.id).await;

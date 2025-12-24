@@ -1201,7 +1201,7 @@ mod tests {
     use crate::api::models::files::FileResponse;
     use crate::api::models::users::Role;
     use crate::db::models::api_keys::ApiKeyPurpose;
-    use crate::test_utils::*;
+    use crate::test::utils::*;
     use sqlx::PgPool;
     use uuid::Uuid;
 

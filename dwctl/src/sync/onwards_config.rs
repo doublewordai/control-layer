@@ -645,7 +645,7 @@ mod tests {
         use sqlx::postgres::PgListener;
 
         // Create test user
-        let test_user = crate::test_utils::create_test_user(&pool, Role::StandardUser).await;
+        let test_user = crate::test::utils::create_test_user(&pool, Role::StandardUser).await;
 
         // Set up a listener to verify notifications are sent
         let mut listener = PgListener::connect_with(&pool).await.unwrap();
