@@ -765,7 +765,7 @@ pub async fn list_batches(
 mod tests {
     use crate::api::models::batches::CreateBatchRequest;
     use crate::api::models::users::Role;
-    use crate::test_utils::*;
+    use crate::test::utils::*;
     use axum::http::StatusCode;
     use sqlx::PgPool;
 

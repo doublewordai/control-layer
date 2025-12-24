@@ -317,7 +317,7 @@ mod tests {
 
     /// Helper to create a test user in the database
     async fn create_test_user(pool: &PgPool) -> Uuid {
-        let user = crate::test_utils::create_test_user(pool, crate::api::models::users::Role::StandardUser).await;
+        let user = crate::test::utils::create_test_user(pool, crate::api::models::users::Role::StandardUser).await;
         user.id
     }
 
@@ -432,7 +432,7 @@ mod tests {
     #[sqlx::test]
     async fn test_payment_description_self(pool: PgPool) {
         // Test that when a user pays for themselves, description is just "Stripe payment"
-        let user = crate::test_utils::create_test_user(&pool, crate::api::models::users::Role::StandardUser).await;
+        let user = crate::test::utils::create_test_user(&pool, crate::api::models::users::Role::StandardUser).await;
 
         // Set a Stripe customer ID for the user
         let customer_id = "cus_test_self_payment";
@@ -484,8 +484,8 @@ mod tests {
     #[sqlx::test]
     async fn test_payment_description_other(pool: PgPool) {
         // Test that when a user pays for someone else, description includes "from {name}"
-        let payer = crate::test_utils::create_test_user(&pool, crate::api::models::users::Role::StandardUser).await;
-        let recipient = crate::test_utils::create_test_user(&pool, crate::api::models::users::Role::StandardUser).await;
+        let payer = crate::test::utils::create_test_user(&pool, crate::api::models::users::Role::StandardUser).await;
+        let recipient = crate::test::utils::create_test_user(&pool, crate::api::models::users::Role::StandardUser).await;
 
         // Set a Stripe customer ID for the payer
         let customer_id = "cus_test_other_payment";

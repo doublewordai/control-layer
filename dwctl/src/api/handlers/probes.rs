@@ -388,7 +388,7 @@ mod tests {
     use crate::{
         api::models::users::Role,
         db::models::probes::Probe,
-        test_utils::{add_auth_headers, create_test_admin_user, create_test_app, create_test_user},
+        test::utils::{add_auth_headers, create_test_admin_user, create_test_app, create_test_user},
     };
     use sqlx::PgPool;
 

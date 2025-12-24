@@ -535,7 +535,7 @@ fn create_session_cookie(token: &str, config: &crate::config::Config) -> String 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{db::models::credits::CreditTransactionType, test_utils::create_test_config};
+    use crate::{db::models::credits::CreditTransactionType, test::utils::create_test_config};
     use axum_test::TestServer;
     use sqlx::PgPool;
 
@@ -1454,7 +1454,7 @@ mod tests {
 
     #[sqlx::test]
     async fn test_password_reset_full_flow(pool: PgPool) {
-        use crate::test_utils::create_test_config;
+        use crate::test::utils::create_test_config;
 
         // Create a custom config with native auth enabled
         let mut config = create_test_config();
@@ -1613,7 +1613,7 @@ mod tests {
 
     #[sqlx::test]
     async fn test_change_password_success_full(pool: PgPool) {
-        use crate::test_utils::create_test_config;
+        use crate::test::utils::create_test_config;
 
         // Create a custom config with native auth enabled
         let mut config = create_test_config();
@@ -1662,7 +1662,7 @@ mod tests {
             new_password: "newpassword456".to_string(),
         };
 
-        let auth_headers = crate::test_utils::add_auth_headers(&user_response);
+        let auth_headers = crate::test::utils::add_auth_headers(&user_response);
         let response = app
             .post("/authentication/password-change")
             .json(&change_request)
@@ -1695,7 +1695,7 @@ mod tests {
 
     #[sqlx::test]
     async fn test_change_password_wrong_current(pool: PgPool) {
-        use crate::test_utils::create_test_config;
+        use crate::test::utils::create_test_config;
 
         let mut config = create_test_config();
         config.auth.native.enabled = true;
@@ -1742,7 +1742,7 @@ mod tests {
             new_password: "newpassword456".to_string(),
         };
 
-        let auth_headers = crate::test_utils::add_auth_headers(&user_response);
+        let auth_headers = crate::test::utils::add_auth_headers(&user_response);
         let response = app
             .post("/authentication/password-change")
             .json(&change_request)
@@ -1755,7 +1755,7 @@ mod tests {
 
     #[sqlx::test]
     async fn test_change_password_sso_user_cannot_change(pool: PgPool) {
-        use crate::test_utils::create_test_config;
+        use crate::test::utils::create_test_config;
 
         let mut config = create_test_config();
         config.auth.native.enabled = true;
@@ -1793,7 +1793,7 @@ mod tests {
             new_password: "newpassword456".to_string(),
         };
 
-        let auth_headers = crate::test_utils::add_auth_headers(&user_response);
+        let auth_headers = crate::test::utils::add_auth_headers(&user_response);
         let response = app
             .post("/authentication/password-change")
             .json(&change_request)
@@ -1806,7 +1806,7 @@ mod tests {
 
     #[sqlx::test]
     async fn test_change_password_too_short(pool: PgPool) {
-        use crate::test_utils::create_test_config;
+        use crate::test::utils::create_test_config;
 
         let mut config = create_test_config();
         config.auth.native.enabled = true;
@@ -1854,7 +1854,7 @@ mod tests {
             new_password: "short".to_string(),
         };
 
-        let auth_headers = crate::test_utils::add_auth_headers(&user_response);
+        let auth_headers = crate::test::utils::add_auth_headers(&user_response);
         let response = app
             .post("/authentication/password-change")
             .json(&change_request)
@@ -1867,7 +1867,7 @@ mod tests {
 
     #[sqlx::test]
     async fn test_change_password_too_long(pool: PgPool) {
-        use crate::test_utils::create_test_config;
+        use crate::test::utils::create_test_config;
 
         let mut config = create_test_config();
         config.auth.native.enabled = true;
@@ -1915,7 +1915,7 @@ mod tests {
             new_password: "thispasswordiswaytoolongandexceedsthelimit".to_string(),
         };
 
-        let auth_headers = crate::test_utils::add_auth_headers(&user_response);
+        let auth_headers = crate::test::utils::add_auth_headers(&user_response);
         let response = app
             .post("/authentication/password-change")
             .json(&change_request)
@@ -1928,7 +1928,7 @@ mod tests {
 
     #[sqlx::test]
     async fn test_change_password_when_disabled(pool: PgPool) {
-        use crate::test_utils::create_test_config;
+        use crate::test::utils::create_test_config;
 
         let mut config = create_test_config();
         config.auth.native.enabled = false; // Disabled!
@@ -1975,7 +1975,7 @@ mod tests {
             new_password: "newpassword".to_string(),
         };
 
-        let auth_headers = crate::test_utils::add_auth_headers(&user_response);
+        let auth_headers = crate::test::utils::add_auth_headers(&user_response);
         let response = app
             .post("/authentication/password-change")
             .json(&change_request)

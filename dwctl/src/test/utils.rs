@@ -1,5 +1,4 @@
-//! Test utilities for integration testing (available with `test-utils` feature).
-
+//! Test utilities for integration testing
 use crate::config::{
     BatchConfig, DaemonConfig, DaemonEnabled, FilesConfig, LeaderElectionConfig, NativeAuthConfig, OnwardsSyncConfig, PasswordConfig,
     PoolSettings, ProbeSchedulerConfig, ProxyHeaderAuthConfig, SecurityConfig,

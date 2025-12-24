@@ -102,7 +102,7 @@ pub async fn list_daemons(
 mod tests {
     use super::*;
     use crate::api::models::users::Role;
-    use crate::test_utils::{add_auth_headers, create_test_app, create_test_user};
+    use crate::test::utils::{add_auth_headers, create_test_app, create_test_user};
     use axum::http::StatusCode;
     use sqlx::PgPool;
 

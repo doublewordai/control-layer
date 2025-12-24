@@ -647,7 +647,7 @@ mod tests {
                 users::UserCreateDBRequest,
             },
         },
-        test_utils::get_test_endpoint_id,
+        test::utils::get_test_endpoint_id,
     };
 
     use rust_decimal::Decimal;

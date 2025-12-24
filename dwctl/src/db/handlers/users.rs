@@ -684,7 +684,7 @@ mod tests {
     #[test_log::test]
     async fn test_get_system_user(pool: PgPool) {
         let mut conn = pool.acquire().await.unwrap();
-        let admin_user = crate::test_utils::get_system_user(&mut conn).await;
+        let admin_user = crate::test::utils::get_system_user(&mut conn).await;
         assert_eq!(admin_user.username, "system");
         assert_eq!(admin_user.email, "system@internal");
         assert_eq!(admin_user.id.to_string(), "00000000-0000-0000-0000-000000000000");
