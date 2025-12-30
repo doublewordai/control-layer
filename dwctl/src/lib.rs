@@ -449,14 +449,14 @@ pub async fn seed_database(sources: &[config::ModelSource], db: &PgPool) -> Resu
 }
 
 /// Setup database connections, run migrations, and initialize data
-/// Returns: (embedded_db, main_pool, fusillade_pool, outlet_pool)
+/// Returns: (embedded_db, main_pools, fusillade_pools, outlet_pools)
 ///
 /// If `pool` is provided, it will be used directly instead of creating a new connection.
 /// This is useful for tests where sqlx::test provides a pool.
 async fn setup_database(
     config: &Config,
     pool: Option<PgPool>,
-) -> anyhow::Result<(Option<db::embedded::EmbeddedDatabase>, db::DbPools, PgPool, Option<PgPool>)> {
+) -> anyhow::Result<(Option<db::embedded::EmbeddedDatabase>, db::DbPools, db::DbPools, Option<db::DbPools>)> {
     // If a pool is provided (e.g., from tests), use it directly
     let (embedded_db, pool) = if let Some(existing_pool) = pool {
         info!("Using provided database pool");
@@ -543,7 +543,7 @@ async fn setup_database(
 
     // Setup fusillade batch processing pool
     info!("Setting up fusillade batch processing pool");
-    let fusillade_pool = match config.database.fusillade() {
+    let fusillade_pools = match config.database.fusillade() {
         config::ComponentDb::Schema { name, pool: pool_settings } => {
             let schema_name = name.clone();
             let fusillade_pool = sqlx::postgres::PgPoolOptions::new()
@@ -570,13 +570,15 @@ async fn setup_database(
                 .connect_lazy_with(main_connect_opts.clone());
 
             fusillade_pool.execute(&*format!("CREATE SCHEMA IF NOT EXISTS {name}")).await?;
-            fusillade_pool
+            db::DbPools::new(fusillade_pool)
         }
         config::ComponentDb::Dedicated {
-            url, pool: pool_settings, ..
+            url,
+            replica_url,
+            pool: pool_settings,
         } => {
             info!("Using dedicated database for fusillade");
-            sqlx::postgres::PgPoolOptions::new()
+            let primary = sqlx::postgres::PgPoolOptions::new()
                 .max_connections(pool_settings.max_connections)
                 .min_connections(pool_settings.min_connections)
                 .acquire_timeout(std::time::Duration::from_secs(pool_settings.acquire_timeout_secs))
@@ -591,15 +593,38 @@ async fn setup_database(
                     None
                 })
                 .connect(url)
-                .await?
+                .await?;
+
+            if let Some(replica_url) = replica_url {
+                info!("Setting up fusillade read replica");
+                let replica = sqlx::postgres::PgPoolOptions::new()
+                    .max_connections(pool_settings.max_connections)
+                    .min_connections(pool_settings.min_connections)
+                    .acquire_timeout(std::time::Duration::from_secs(pool_settings.acquire_timeout_secs))
+                    .idle_timeout(if pool_settings.idle_timeout_secs > 0 {
+                        Some(std::time::Duration::from_secs(pool_settings.idle_timeout_secs))
+                    } else {
+                        None
+                    })
+                    .max_lifetime(if pool_settings.max_lifetime_secs > 0 {
+                        Some(std::time::Duration::from_secs(pool_settings.max_lifetime_secs))
+                    } else {
+                        None
+                    })
+                    .connect(replica_url)
+                    .await?;
+                db::DbPools::with_replica(primary, replica)
+            } else {
+                db::DbPools::new(primary)
+            }
         }
     };
-    fusillade::migrator().run(&fusillade_pool).await?;
+    fusillade::migrator().run(&*fusillade_pools).await?;
 
     // Setup outlet schema and pool if request logging is enabled
-    let outlet_pool = if config.enable_request_logging {
+    let outlet_pools = if config.enable_request_logging {
         info!("Setting up outlet request logging pool (logging enabled)");
-        let pool = match config.database.outlet() {
+        let pools = match config.database.outlet() {
             config::ComponentDb::Schema { name, pool: pool_settings } => {
                 let schema_name = name.clone();
                 let outlet_pool = sqlx::postgres::PgPoolOptions::new()
@@ -626,13 +651,15 @@ async fn setup_database(
                     .connect_lazy_with(main_connect_opts.clone());
 
                 outlet_pool.execute(&*format!("CREATE SCHEMA IF NOT EXISTS {name}")).await?;
-                outlet_pool
+                db::DbPools::new(outlet_pool)
             }
             config::ComponentDb::Dedicated {
-                url, pool: pool_settings, ..
+                url,
+                replica_url,
+                pool: pool_settings,
             } => {
                 info!("Using dedicated database for outlet");
-                sqlx::postgres::PgPoolOptions::new()
+                let primary = sqlx::postgres::PgPoolOptions::new()
                     .max_connections(pool_settings.max_connections)
                     .min_connections(pool_settings.min_connections)
                     .acquire_timeout(std::time::Duration::from_secs(pool_settings.acquire_timeout_secs))
@@ -647,12 +674,35 @@ async fn setup_database(
                         None
                     })
                     .connect(url)
-                    .await?
+                    .await?;
+
+                if let Some(replica_url) = replica_url {
+                    info!("Setting up outlet read replica");
+                    let replica = sqlx::postgres::PgPoolOptions::new()
+                        .max_connections(pool_settings.max_connections)
+                        .min_connections(pool_settings.min_connections)
+                        .acquire_timeout(std::time::Duration::from_secs(pool_settings.acquire_timeout_secs))
+                        .idle_timeout(if pool_settings.idle_timeout_secs > 0 {
+                            Some(std::time::Duration::from_secs(pool_settings.idle_timeout_secs))
+                        } else {
+                            None
+                        })
+                        .max_lifetime(if pool_settings.max_lifetime_secs > 0 {
+                            Some(std::time::Duration::from_secs(pool_settings.max_lifetime_secs))
+                        } else {
+                            None
+                        })
+                        .connect(replica_url)
+                        .await?;
+                    db::DbPools::with_replica(primary, replica)
+                } else {
+                    db::DbPools::new(primary)
+                }
             }
         };
-        outlet_postgres::migrator().run(&pool).await?;
+        outlet_postgres::migrator().run(&*pools).await?;
 
-        Some(pool)
+        Some(pools)
     } else {
         info!("Skipping outlet pool setup (logging disabled)");
         None
@@ -671,7 +721,7 @@ async fn setup_database(
     // Seed database with initial configuration (only runs once)
     seed_database(&config.model_sources, &db_pools).await?;
 
-    Ok((embedded_db, db_pools, fusillade_pool, outlet_pool))
+    Ok((embedded_db, db_pools, fusillade_pools, outlet_pools))
 }
 
 /// Create CORS layer from configuration
@@ -1466,8 +1516,8 @@ pub struct Application {
     app_state: AppState,
     config: Config,
     db_pools: db::DbPools,
-    _fusillade_pool: PgPool,
-    _outlet_pool: Option<PgPool>,
+    _fusillade_pools: db::DbPools,
+    _outlet_pools: Option<db::DbPools>,
     _embedded_db: Option<db::embedded::EmbeddedDatabase>,
     bg_services: BackgroundServices,
 }
@@ -1489,26 +1539,28 @@ impl Application {
         debug!("Starting control layer with configuration: {:#?}", config);
 
         // Setup database connections, run migrations, and initialize data
-        let (_embedded_db, db_pools, fusillade_pool, outlet_pool) = setup_database(&config, pool).await?;
+        let (_embedded_db, db_pools, fusillade_pools, outlet_pools) = setup_database(&config, pool).await?;
 
         // Create a shutdown token for coordinating graceful shutdown of background tasks
         let shutdown_token = tokio_util::sync::CancellationToken::new();
 
         // Setup background services (onwards integration, probe scheduler, batch daemon, leader election)
+        // Use primary pool for fusillade (via Deref)
         let bg_services =
-            setup_background_services((*db_pools).clone(), fusillade_pool.clone(), config.clone(), shutdown_token.clone()).await?;
+            setup_background_services((*db_pools).clone(), (*fusillade_pools).clone(), config.clone(), shutdown_token.clone()).await?;
 
         // Build onwards router from targets
         let onwards_app_state = onwards::AppState::new(bg_services.onwards_targets.clone());
         let onwards_router = onwards::build_router(onwards_app_state);
 
         // Build app state and router
+        // Extract primary pool for outlet_db (via Deref)
         let mut app_state = AppState::builder()
             .db(db_pools.clone())
             .config(config.clone())
             .is_leader(bg_services.is_leader)
             .request_manager(bg_services.request_manager.clone())
-            .maybe_outlet_db(outlet_pool.clone())
+            .maybe_outlet_db(outlet_pools.as_ref().map(|p| (**p).clone()))
             .build();
 
         let router = build_router(&mut app_state, onwards_router).await?;
@@ -1518,8 +1570,8 @@ impl Application {
             app_state,
             config,
             db_pools,
-            _fusillade_pool: fusillade_pool,
-            _outlet_pool: outlet_pool,
+            _fusillade_pools: fusillade_pools,
+            _outlet_pools: outlet_pools,
             _embedded_db,
             bg_services,
         })
