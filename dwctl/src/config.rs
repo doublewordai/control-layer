@@ -167,43 +167,71 @@ impl Default for PoolSettings {
     }
 }
 
-/// Database connection pool configuration.
+/// How a component (fusillade/outlet) connects to its database.
 ///
-/// Controls connection pooling for each database pool.
-/// Each pool serves a different schema/purpose:
-/// - Main pool: public schema for application data
-/// - Fusillade pool: fusillade schema for batch processing (only if batches.enabled)
-/// - Outlet pool: outlet schema for request logging (only if enable_request_logging)
+/// Components can either share the main database using a separate PostgreSQL schema,
+/// or use a completely dedicated database with its own connection settings.
 #[derive(Debug, Clone, Deserialize, Serialize)]
-#[serde(default)]
-pub struct DatabasePoolConfig {
-    /// Main application pool settings
-    pub main: PoolSettings,
-    /// Fusillade batch processing pool settings (used only if batches.enabled)
-    pub fusillade: PoolSettings,
-    /// Outlet request logging pool settings (used only if enable_request_logging)
-    pub outlet: PoolSettings,
+#[serde(tag = "mode", rename_all = "snake_case")]
+pub enum ComponentDb {
+    /// Share the main database using a separate PostgreSQL schema.
+    /// This is the default and recommended for most deployments.
+    Schema {
+        /// Schema name (e.g., "fusillade", "outlet")
+        name: String,
+        /// Connection pool settings for this component
+        #[serde(default)]
+        pool: PoolSettings,
+    },
+    /// Use a dedicated database with its own connection.
+    /// Useful for isolating workloads or using read replicas.
+    Dedicated {
+        /// Primary database URL
+        url: String,
+        /// Optional read replica URL for read-heavy operations
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        replica_url: Option<String>,
+        /// Connection pool settings
+        #[serde(default)]
+        pool: PoolSettings,
+    },
 }
 
-impl Default for DatabasePoolConfig {
-    fn default() -> Self {
-        Self {
-            main: PoolSettings::default(),
-            fusillade: PoolSettings {
-                max_connections: 20,
-                min_connections: 2,
-                acquire_timeout_secs: 30,
-                idle_timeout_secs: 600,
-                max_lifetime_secs: 1800,
-            },
-            outlet: PoolSettings {
-                max_connections: 5,
-                min_connections: 0,
-                acquire_timeout_secs: 30,
-                idle_timeout_secs: 600,
-                max_lifetime_secs: 1800,
-            },
+impl ComponentDb {
+    /// Get the pool settings for this component
+    pub fn pool_settings(&self) -> &PoolSettings {
+        match self {
+            ComponentDb::Schema { pool, .. } => pool,
+            ComponentDb::Dedicated { pool, .. } => pool,
         }
+    }
+}
+
+/// Default fusillade component configuration (schema mode with "fusillade" schema)
+pub fn default_fusillade_component() -> ComponentDb {
+    ComponentDb::Schema {
+        name: "fusillade".into(),
+        pool: PoolSettings {
+            max_connections: 20,
+            min_connections: 2,
+            acquire_timeout_secs: 30,
+            idle_timeout_secs: 600,
+            max_lifetime_secs: 1800,
+        },
+    }
+}
+
+/// Default outlet component configuration (schema mode with "outlet" schema)
+pub fn default_outlet_component() -> ComponentDb {
+    ComponentDb::Schema {
+        name: "outlet".into(),
+        pool: PoolSettings {
+            max_connections: 5,
+            min_connections: 0,
+            acquire_timeout_secs: 30,
+            idle_timeout_secs: 600,
+            max_lifetime_secs: 1800,
+        },
     }
 }
 
@@ -211,6 +239,9 @@ impl Default for DatabasePoolConfig {
 ///
 /// Supports either an embedded PostgreSQL instance (for development) or an external
 /// PostgreSQL database (recommended for production).
+///
+/// Components (fusillade, outlet) can either share the main database using separate
+/// schemas, or use dedicated databases with their own connection settings.
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(tag = "type", rename_all = "lowercase")]
 pub enum DatabaseConfig {
@@ -222,17 +253,32 @@ pub enum DatabaseConfig {
         /// Whether to persist data between restarts (default: false/ephemeral)
         #[serde(default)]
         persistent: bool,
-        /// Connection pool configuration
+        /// Main database connection pool settings
         #[serde(default)]
-        pool_config: DatabasePoolConfig,
+        pool: PoolSettings,
+        /// Fusillade batch processing database configuration
+        #[serde(default = "default_fusillade_component")]
+        fusillade: ComponentDb,
+        /// Outlet request logging database configuration
+        #[serde(default = "default_outlet_component")]
+        outlet: ComponentDb,
     },
     /// Use external PostgreSQL database
     External {
-        /// Connection string for external database
+        /// Connection string for the main database
         url: String,
-        /// Connection pool configuration
+        /// Optional read replica URL for the main database
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        replica_url: Option<String>,
+        /// Main database connection pool settings
         #[serde(default)]
-        pool_config: DatabasePoolConfig,
+        pool: PoolSettings,
+        /// Fusillade batch processing database configuration
+        #[serde(default = "default_fusillade_component")]
+        fusillade: ComponentDb,
+        /// Outlet request logging database configuration
+        #[serde(default = "default_outlet_component")]
+        outlet: ComponentDb,
     },
 }
 
@@ -244,22 +290,26 @@ impl Default for DatabaseConfig {
             DatabaseConfig::Embedded {
                 data_dir: None,
                 persistent: false,
-                pool_config: DatabasePoolConfig::default(),
+                pool: PoolSettings::default(),
+                fusillade: default_fusillade_component(),
+                outlet: default_outlet_component(),
             }
         }
         #[cfg(not(feature = "embedded-db"))]
         {
             DatabaseConfig::External {
                 url: "postgres://localhost:5432/control_layer".to_string(),
-                pool_config: DatabasePoolConfig::default(),
+                replica_url: None,
+                pool: PoolSettings::default(),
+                fusillade: default_fusillade_component(),
+                outlet: default_outlet_component(),
             }
         }
     }
 }
 
 impl DatabaseConfig {
-    /// Get the database URL, resolving embedded if needed
-    /// This is used during startup to get the connection string
+    /// Check if using embedded database
     pub fn is_embedded(&self) -> bool {
         matches!(self, DatabaseConfig::Embedded { .. })
     }
@@ -268,6 +318,14 @@ impl DatabaseConfig {
     pub fn external_url(&self) -> Option<&str> {
         match self {
             DatabaseConfig::External { url, .. } => Some(url),
+            DatabaseConfig::Embedded { .. } => None,
+        }
+    }
+
+    /// Get external replica URL if available
+    pub fn external_replica_url(&self) -> Option<&str> {
+        match self {
+            DatabaseConfig::External { replica_url, .. } => replica_url.as_deref(),
             DatabaseConfig::Embedded { .. } => None,
         }
     }
@@ -288,11 +346,27 @@ impl DatabaseConfig {
         }
     }
 
-    /// Get the pool configuration
-    pub fn pool_config(&self) -> &DatabasePoolConfig {
+    /// Get the main database pool settings
+    pub fn main_pool_settings(&self) -> &PoolSettings {
         match self {
-            DatabaseConfig::Embedded { pool_config, .. } => pool_config,
-            DatabaseConfig::External { pool_config, .. } => pool_config,
+            DatabaseConfig::Embedded { pool, .. } => pool,
+            DatabaseConfig::External { pool, .. } => pool,
+        }
+    }
+
+    /// Get the fusillade component database configuration
+    pub fn fusillade(&self) -> &ComponentDb {
+        match self {
+            DatabaseConfig::Embedded { fusillade, .. } => fusillade,
+            DatabaseConfig::External { fusillade, .. } => fusillade,
+        }
+    }
+
+    /// Get the outlet component database configuration
+    pub fn outlet(&self) -> &ComponentDb {
+        match self {
+            DatabaseConfig::Embedded { outlet, .. } => outlet,
+            DatabaseConfig::External { outlet, .. } => outlet,
         }
     }
 }
@@ -1125,10 +1199,18 @@ impl Config {
     pub fn load(args: &Args) -> Result<Self, figment::Error> {
         let mut config: Self = Self::figment(args).extract()?;
 
-        // if database_url is set, use it (preserving existing pool_config)
+        // if database_url is set, use it (preserving existing pool and component settings)
         if let Some(url) = config.database_url.take() {
-            let pool_config = config.database.pool_config().clone();
-            config.database = DatabaseConfig::External { url, pool_config };
+            let pool = config.database.main_pool_settings().clone();
+            let fusillade = config.database.fusillade().clone();
+            let outlet = config.database.outlet().clone();
+            config.database = DatabaseConfig::External {
+                url,
+                replica_url: None,
+                pool,
+                fusillade,
+                outlet,
+            };
         }
 
         config.validate().map_err(|e| figment::Error::from(e.to_string()))?;

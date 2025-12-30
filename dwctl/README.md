@@ -70,6 +70,77 @@ The service uses `config.yaml` (or `DWCTL_*` environment variables):
 - `DWCTL_PORT`: Server port (default: 3001)
 - `DATABASE_URL`: PostgreSQL connection string
 
+### Database Configuration
+
+The control layer uses PostgreSQL for data storage. By default, all components share a single database using separate schemas:
+
+- **Main schema** (`public`): Core application data (users, groups, models, etc.)
+- **Fusillade schema** (`fusillade`): Batch processing data
+- **Outlet schema** (`outlet`): Request logging data
+
+#### Basic Configuration
+
+```yaml
+database:
+  type: external
+  url: postgres://user:pass@localhost:5432/dwctl
+```
+
+#### With Read Replica
+
+For high-traffic deployments, you can configure a read replica for read-heavy operations:
+
+```yaml
+database:
+  type: external
+  url: postgres://user:pass@primary:5432/dwctl
+  replica_url: postgres://user:pass@replica:5432/dwctl
+```
+
+#### Component Database Isolation
+
+Components can optionally use dedicated databases instead of schemas. This is useful for:
+- Isolating workloads (batch processing won't affect main app)
+- Independent scaling and backups
+- Using different database instances for different components
+
+```yaml
+database:
+  type: external
+  url: postgres://user:pass@localhost:5432/dwctl
+
+  # Use dedicated database for batch processing
+  fusillade:
+    mode: dedicated
+    url: postgres://user:pass@localhost:5432/fusillade
+    replica_url: postgres://user:pass@replica:5432/fusillade
+    pool:
+      max_connections: 30
+
+  # Keep outlet in main database (default behavior)
+  outlet:
+    mode: schema
+    name: outlet
+    pool:
+      max_connections: 5
+```
+
+#### Connection Pool Settings
+
+Each component can have its own pool configuration:
+
+```yaml
+database:
+  type: external
+  url: postgres://user:pass@localhost:5432/dwctl
+  pool:
+    max_connections: 10
+    min_connections: 0
+    acquire_timeout_secs: 30
+    idle_timeout_secs: 600
+    max_lifetime_secs: 1800
+```
+
 ## Authentication
 
 Control Layer supports two authentication methods:

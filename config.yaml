@@ -12,12 +12,60 @@ database:
   # Configure connectivity to an external postgres database here
   type: external
   url: postgres://postgres:password@localhost:5432/dwctl
+
+  # Optional: Read replica URL for read-heavy operations (analytics, config sync)
+  # replica_url: postgres://postgres:password@replica:5432/dwctl
+
+  # Main database pool settings
+  # pool:
+  #   max_connections: 10
+  #   min_connections: 0
+  #   acquire_timeout_secs: 30
+  #   idle_timeout_secs: 600
+  #   max_lifetime_secs: 1800
+
   # We also bundle a copy of postgres with dwctl. It's launched on a random
   # port, and data is stored in $HOME/.dwctl_data/ To have data persist
   # across restarts, set persistent=true.
   # We strongly recommend setting up external postgres in production!
   # type: embedded
   # persistent: true
+
+  # Component databases: fusillade (batch processing) and outlet (request logging)
+  # By default, these use separate schemas within the main database.
+  # You can optionally configure them to use dedicated databases.
+
+  # Fusillade - batch processing database
+  # Default: uses "fusillade" schema in main database
+  # fusillade:
+  #   mode: schema
+  #   name: fusillade
+  #   pool:
+  #     max_connections: 20
+  #     min_connections: 2
+  #
+  # Alternative: use a dedicated database for fusillade
+  # fusillade:
+  #   mode: dedicated
+  #   url: postgres://postgres:password@localhost:5432/fusillade
+  #   replica_url: postgres://postgres:password@replica:5432/fusillade
+  #   pool:
+  #     max_connections: 20
+
+  # Outlet - request logging database
+  # Default: uses "outlet" schema in main database
+  # outlet:
+  #   mode: schema
+  #   name: outlet
+  #   pool:
+  #     max_connections: 5
+  #
+  # Alternative: use a dedicated database for outlet
+  # outlet:
+  #   mode: dedicated
+  #   url: postgres://postgres:password@localhost:5432/outlet
+  #   pool:
+  #     max_connections: 5
 
 # Admin user email - will be created on first startup
 admin_email: "test@doubleword.ai"

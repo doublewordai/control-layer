@@ -1810,8 +1810,11 @@ mod tests {
             port: 3001,
             database_url: None,
             database: crate::config::DatabaseConfig::External {
-                pool_config: crate::config::DatabasePoolConfig::default(),
                 url: "postgres://test@localhost/test".to_string(),
+                replica_url: None,
+                pool: Default::default(),
+                fusillade: crate::config::default_fusillade_component(),
+                outlet: crate::config::default_outlet_component(),
             },
             admin_email: "admin@example.org".to_string(),
             admin_password: None,
