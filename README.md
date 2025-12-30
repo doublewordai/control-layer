@@ -206,6 +206,45 @@ database:
   # DATABASE_URL environment variable.
   url: "postgres://localhost:5432/control_layer"
 
+  # Optional: Read replica URL for read-heavy operations
+  # replica_url: "postgres://replica:5432/control_layer"
+
+  # Main database connection pool settings
+  # pool:
+  #   max_connections: 10
+  #   min_connections: 0
+  #   acquire_timeout_secs: 30
+  #   idle_timeout_secs: 600
+  #   max_lifetime_secs: 1800
+
+  # Component databases: fusillade (batch processing) and outlet (request logging)
+  # By default, these use separate schemas within the main database.
+  # You can optionally configure them to use dedicated databases.
+
+  # Fusillade - batch processing database
+  # Default: uses "fusillade" schema in main database
+  # fusillade:
+  #   mode: schema
+  #   name: fusillade
+  #   pool:
+  #     max_connections: 20
+  #
+  # Alternative: use a dedicated database
+  # fusillade:
+  #   mode: dedicated
+  #   url: postgres://localhost:5432/fusillade
+  #   replica_url: postgres://replica:5432/fusillade
+  #   pool:
+  #     max_connections: 20
+
+  # Outlet - request logging database
+  # Default: uses "outlet" schema in main database
+  # outlet:
+  #   mode: schema
+  #   name: outlet
+  #   pool:
+  #     max_connections: 5
+
   # Alternatively, you can use embedded postgres (requires compiling with the
   # embedded-db feature, which is not present in the default docker image)
   # type: embedded

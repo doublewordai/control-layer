@@ -488,8 +488,7 @@ async fn setup_database(
             }
         };
 
-        let pool_config = config.database.pool_config();
-        let main_settings = &pool_config.main;
+        let main_settings = config.database.main_pool_settings();
         let pool = sqlx::postgres::PgPoolOptions::new()
             .max_connections(main_settings.max_connections)
             .min_connections(main_settings.min_connections)
@@ -511,69 +510,118 @@ async fn setup_database(
 
     migrator().run(&pool).await?;
 
-    // Get connection options from the main pool to create child pools
-    let connect_opts = pool.connect_options().as_ref().clone();
+    // Get connection options from the main pool to create schema-based child pools
+    let main_connect_opts = pool.connect_options().as_ref().clone();
 
-    // Get pool configuration
-    let pool_config = config.database.pool_config();
+    // Setup fusillade batch processing pool
+    info!("Setting up fusillade batch processing pool");
+    let fusillade_pool = match config.database.fusillade() {
+        config::ComponentDb::Schema { name, pool: pool_settings } => {
+            let schema_name = name.clone();
+            let fusillade_pool = sqlx::postgres::PgPoolOptions::new()
+                .max_connections(pool_settings.max_connections)
+                .min_connections(pool_settings.min_connections)
+                .acquire_timeout(std::time::Duration::from_secs(pool_settings.acquire_timeout_secs))
+                .idle_timeout(if pool_settings.idle_timeout_secs > 0 {
+                    Some(std::time::Duration::from_secs(pool_settings.idle_timeout_secs))
+                } else {
+                    None
+                })
+                .max_lifetime(if pool_settings.max_lifetime_secs > 0 {
+                    Some(std::time::Duration::from_secs(pool_settings.max_lifetime_secs))
+                } else {
+                    None
+                })
+                .after_connect(move |conn, _meta| {
+                    let schema = schema_name.clone();
+                    Box::pin(async move {
+                        conn.execute(&*format!("SET search_path = '{schema}'")).await?;
+                        Ok(())
+                    })
+                })
+                .connect_lazy_with(main_connect_opts.clone());
 
-    // Setup fusillade schema and pool (only if batches are enabled)
-    info!("Setting up fusillade batch processing pool (batches enabled)");
-    let fusillade_settings = &pool_config.fusillade;
-    let fusillade_pool = sqlx::postgres::PgPoolOptions::new()
-        .max_connections(fusillade_settings.max_connections)
-        .min_connections(fusillade_settings.min_connections)
-        .acquire_timeout(std::time::Duration::from_secs(fusillade_settings.acquire_timeout_secs))
-        .idle_timeout(if fusillade_settings.idle_timeout_secs > 0 {
-            Some(std::time::Duration::from_secs(fusillade_settings.idle_timeout_secs))
-        } else {
-            None
-        })
-        .max_lifetime(if fusillade_settings.max_lifetime_secs > 0 {
-            Some(std::time::Duration::from_secs(fusillade_settings.max_lifetime_secs))
-        } else {
-            None
-        })
-        .after_connect(|conn, _meta| {
-            Box::pin(async move {
-                // Set search path to fusillade schema for all connections in this pool
-                conn.execute("SET search_path = 'fusillade'").await?;
-                Ok(())
-            })
-        })
-        .connect_lazy_with(connect_opts.clone());
-
-    fusillade_pool.execute("CREATE SCHEMA IF NOT EXISTS fusillade").await?;
+            fusillade_pool.execute(&*format!("CREATE SCHEMA IF NOT EXISTS {name}")).await?;
+            fusillade_pool
+        }
+        config::ComponentDb::Dedicated {
+            url, pool: pool_settings, ..
+        } => {
+            info!("Using dedicated database for fusillade");
+            sqlx::postgres::PgPoolOptions::new()
+                .max_connections(pool_settings.max_connections)
+                .min_connections(pool_settings.min_connections)
+                .acquire_timeout(std::time::Duration::from_secs(pool_settings.acquire_timeout_secs))
+                .idle_timeout(if pool_settings.idle_timeout_secs > 0 {
+                    Some(std::time::Duration::from_secs(pool_settings.idle_timeout_secs))
+                } else {
+                    None
+                })
+                .max_lifetime(if pool_settings.max_lifetime_secs > 0 {
+                    Some(std::time::Duration::from_secs(pool_settings.max_lifetime_secs))
+                } else {
+                    None
+                })
+                .connect(url)
+                .await?
+        }
+    };
     fusillade::migrator().run(&fusillade_pool).await?;
 
     // Setup outlet schema and pool if request logging is enabled
     let outlet_pool = if config.enable_request_logging {
         info!("Setting up outlet request logging pool (logging enabled)");
-        let outlet_settings = &pool_config.outlet;
-        let pool = sqlx::postgres::PgPoolOptions::new()
-            .max_connections(outlet_settings.max_connections)
-            .min_connections(outlet_settings.min_connections)
-            .acquire_timeout(std::time::Duration::from_secs(outlet_settings.acquire_timeout_secs))
-            .idle_timeout(if outlet_settings.idle_timeout_secs > 0 {
-                Some(std::time::Duration::from_secs(outlet_settings.idle_timeout_secs))
-            } else {
-                None
-            })
-            .max_lifetime(if outlet_settings.max_lifetime_secs > 0 {
-                Some(std::time::Duration::from_secs(outlet_settings.max_lifetime_secs))
-            } else {
-                None
-            })
-            .after_connect(|conn, _meta| {
-                Box::pin(async move {
-                    // Set search path to outlet schema for all connections in this pool
-                    conn.execute("SET search_path = 'outlet'").await?;
-                    Ok(())
-                })
-            })
-            .connect_lazy_with(connect_opts.clone());
+        let pool = match config.database.outlet() {
+            config::ComponentDb::Schema { name, pool: pool_settings } => {
+                let schema_name = name.clone();
+                let outlet_pool = sqlx::postgres::PgPoolOptions::new()
+                    .max_connections(pool_settings.max_connections)
+                    .min_connections(pool_settings.min_connections)
+                    .acquire_timeout(std::time::Duration::from_secs(pool_settings.acquire_timeout_secs))
+                    .idle_timeout(if pool_settings.idle_timeout_secs > 0 {
+                        Some(std::time::Duration::from_secs(pool_settings.idle_timeout_secs))
+                    } else {
+                        None
+                    })
+                    .max_lifetime(if pool_settings.max_lifetime_secs > 0 {
+                        Some(std::time::Duration::from_secs(pool_settings.max_lifetime_secs))
+                    } else {
+                        None
+                    })
+                    .after_connect(move |conn, _meta| {
+                        let schema = schema_name.clone();
+                        Box::pin(async move {
+                            conn.execute(&*format!("SET search_path = '{schema}'")).await?;
+                            Ok(())
+                        })
+                    })
+                    .connect_lazy_with(main_connect_opts.clone());
 
-        pool.execute("CREATE SCHEMA IF NOT EXISTS outlet").await?;
+                outlet_pool.execute(&*format!("CREATE SCHEMA IF NOT EXISTS {name}")).await?;
+                outlet_pool
+            }
+            config::ComponentDb::Dedicated {
+                url, pool: pool_settings, ..
+            } => {
+                info!("Using dedicated database for outlet");
+                sqlx::postgres::PgPoolOptions::new()
+                    .max_connections(pool_settings.max_connections)
+                    .min_connections(pool_settings.min_connections)
+                    .acquire_timeout(std::time::Duration::from_secs(pool_settings.acquire_timeout_secs))
+                    .idle_timeout(if pool_settings.idle_timeout_secs > 0 {
+                        Some(std::time::Duration::from_secs(pool_settings.idle_timeout_secs))
+                    } else {
+                        None
+                    })
+                    .max_lifetime(if pool_settings.max_lifetime_secs > 0 {
+                        Some(std::time::Duration::from_secs(pool_settings.max_lifetime_secs))
+                    } else {
+                        None
+                    })
+                    .connect(url)
+                    .await?
+            }
+        };
         outlet_postgres::migrator().run(&pool).await?;
 
         Some(pool)
