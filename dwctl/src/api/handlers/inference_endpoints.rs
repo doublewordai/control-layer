@@ -235,7 +235,7 @@ pub async fn update_inference_endpoint(
         let endpoint = repo.update(id, &db_request).await?;
 
         // Perform background sync after successful update
-        match endpoint_sync::synchronize_endpoint(endpoint.id, state.db.primary().clone()).await {
+        match endpoint_sync::synchronize_endpoint(endpoint.id, (*state.db).clone()).await {
             Ok(sync_result) => {
                 tracing::info!(
                     "Auto-sync after endpoint {} update: {} changes made",
@@ -563,7 +563,7 @@ pub async fn synchronize_endpoint(
     _: RequiresPermission<resource::Endpoints, operation::UpdateAll>,
 ) -> Result<Json<endpoint_sync::EndpointSyncResponse>> {
     // Perform synchronization
-    let response = endpoint_sync::synchronize_endpoint(id, state.db.primary().clone()).await?;
+    let response = endpoint_sync::synchronize_endpoint(id, (*state.db).clone()).await?;
 
     tracing::info!("Successfully synchronized endpoint {} with {} changes", id, response.changes_made);
     Ok(Json(response))

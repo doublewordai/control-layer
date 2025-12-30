@@ -40,7 +40,7 @@
 //! let user = create_user(state.db.write()).await?;
 //! ```
 
-use sqlx::{PgPool, Postgres, Transaction};
+use sqlx::PgPool;
 use std::ops::Deref;
 
 /// Database pool abstraction supporting read replicas.
@@ -86,28 +86,14 @@ impl DbPools {
     /// Get a pool for write operations or reads requiring strong consistency.
     ///
     /// Always returns the primary pool. Use this for:
-    ///
-    /// # Examples
-    ///
     /// - Creating, updating, or deleting records
     /// - Operations that read-after-write
     /// - Credit/balance operations (require serializable consistency)
     /// - Any operation using advisory locks
+    ///
+    /// Note: For most write operations, you can use Deref coercion directly
+    /// (e.g., `state.db.begin()` or `&*state.db`).
     pub fn write(&self) -> &PgPool {
-        &self.primary
-    }
-
-    /// Begin a transaction on the primary pool.
-    ///
-    /// Transactions always use the primary pool since they may contain writes.
-    pub async fn begin(&self) -> Result<Transaction<'_, Postgres>, sqlx::Error> {
-        self.primary.begin().await
-    }
-
-    /// Direct access to the primary pool.
-    ///
-    /// Use sparingly - prefer `.read()` or `.write()` for clarity.
-    pub fn primary(&self) -> &PgPool {
         &self.primary
     }
 
@@ -127,27 +113,15 @@ impl DbPools {
     }
 }
 
-/// Backwards compatibility: dereferences to the primary pool.
+/// Dereferences to the primary pool.
 ///
-/// This allows existing code using `&state.db` to work unchanged.
-/// New code should prefer explicit `.read()` or `.write()` calls.
+/// This allows natural usage like `state.db.begin()`, `state.db.acquire()`,
+/// or `&*state.db` when you need a `&PgPool`. Use `.read()` when you
+/// explicitly want to route to the replica for read-heavy operations.
 impl Deref for DbPools {
     type Target = PgPool;
 
     fn deref(&self) -> &Self::Target {
         &self.primary
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    // Note: These tests verify the API surface. Integration tests with actual
-    // database connections are in the handler tests.
-
-    #[test]
-    fn test_deref_returns_primary() {
-        // We can't create a real PgPool in unit tests, but we can verify
-        // the type system works correctly through the Deref impl.
-        // The actual pool behavior is tested in integration tests.
     }
 }

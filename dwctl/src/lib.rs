@@ -539,7 +539,7 @@ async fn setup_database(
     };
 
     // Get connection options from the main pool to create schema-based child pools
-    let main_connect_opts = db_pools.primary().connect_options().as_ref().clone();
+    let main_connect_opts = db_pools.connect_options().as_ref().clone();
 
     // Setup fusillade batch processing pool
     info!("Setting up fusillade batch processing pool");
@@ -664,17 +664,12 @@ async fn setup_database(
         iterations: config.auth.native.password.argon2_iterations,
         parallelism: config.auth.native.password.argon2_parallelism,
     };
-    create_initial_admin_user(
-        &config.admin_email,
-        config.admin_password.as_deref(),
-        argon2_params,
-        db_pools.primary(),
-    )
-    .await
-    .map_err(|e| anyhow::anyhow!("Failed to create initial admin user: {}", e))?;
+    create_initial_admin_user(&config.admin_email, config.admin_password.as_deref(), argon2_params, &db_pools)
+        .await
+        .map_err(|e| anyhow::anyhow!("Failed to create initial admin user: {}", e))?;
 
     // Seed database with initial configuration (only runs once)
-    seed_database(&config.model_sources, db_pools.primary()).await?;
+    seed_database(&config.model_sources, &db_pools).await?;
 
     Ok((embedded_db, db_pools, fusillade_pool, outlet_pool))
 }
@@ -753,7 +748,7 @@ pub async fn build_router(state: &mut AppState, onwards_router: Router) -> anyho
         }
 
         let analytics_serializer = AnalyticsResponseSerializer::new(
-            state.db.primary().clone(),
+            (*state.db).clone(),
             uuid::Uuid::new_v4(),
             state.config.clone(),
             state.metrics_recorder.clone(),
@@ -939,7 +934,7 @@ pub async fn build_router(state: &mut AppState, onwards_router: Router) -> anyho
 
     // Apply error enrichment middleware to onwards router (before outlet logging)
     let onwards_router = onwards_router.layer(middleware::from_fn_with_state(
-        state.db.primary().clone(),
+        (*state.db).clone(),
         error_enrichment::error_enrichment_middleware,
     ));
 
@@ -1500,13 +1495,8 @@ impl Application {
         let shutdown_token = tokio_util::sync::CancellationToken::new();
 
         // Setup background services (onwards integration, probe scheduler, batch daemon, leader election)
-        let bg_services = setup_background_services(
-            db_pools.primary().clone(),
-            fusillade_pool.clone(),
-            config.clone(),
-            shutdown_token.clone(),
-        )
-        .await?;
+        let bg_services =
+            setup_background_services((*db_pools).clone(), fusillade_pool.clone(), config.clone(), shutdown_token.clone()).await?;
 
         // Build onwards router from targets
         let onwards_app_state = onwards::AppState::new(bg_services.onwards_targets.clone());
