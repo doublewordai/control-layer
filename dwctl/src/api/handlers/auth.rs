@@ -546,7 +546,11 @@ mod tests {
         config.auth.native.allow_registration = true;
 
         let request_manager = std::sync::Arc::new(fusillade::PostgresRequestManager::new(pool.clone()));
-        let state = AppState::builder().db(pool).config(config).request_manager(request_manager).build();
+        let state = AppState::builder()
+            .db(crate::db::DbPools::new(pool))
+            .config(config)
+            .request_manager(request_manager)
+            .build();
 
         let app = axum::Router::new()
             .route("/auth/register", axum::routing::post(register))
@@ -577,7 +581,11 @@ mod tests {
         config.auth.native.enabled = false;
 
         let request_manager = std::sync::Arc::new(fusillade::PostgresRequestManager::new(pool.clone()));
-        let state = AppState::builder().db(pool).config(config).request_manager(request_manager).build();
+        let state = AppState::builder()
+            .db(crate::db::DbPools::new(pool))
+            .config(config)
+            .request_manager(request_manager)
+            .build();
 
         let app = axum::Router::new()
             .route("/auth/register", axum::routing::post(register))
@@ -603,7 +611,11 @@ mod tests {
         config.auth.native.password.min_length = 10;
 
         let request_manager = std::sync::Arc::new(fusillade::PostgresRequestManager::new(pool.clone()));
-        let state = AppState::builder().db(pool).config(config).request_manager(request_manager).build();
+        let state = AppState::builder()
+            .db(crate::db::DbPools::new(pool))
+            .config(config)
+            .request_manager(request_manager)
+            .build();
 
         let app = axum::Router::new()
             .route("/auth/register", axum::routing::post(register))
@@ -632,7 +644,7 @@ mod tests {
 
         let request_manager = std::sync::Arc::new(fusillade::PostgresRequestManager::new(pool.clone()));
         let state = AppState::builder()
-            .db(pool.clone())
+            .db(crate::db::DbPools::new(pool.clone()))
             .config(config)
             .request_manager(request_manager)
             .build();
@@ -687,7 +699,7 @@ mod tests {
 
         let request_manager = std::sync::Arc::new(fusillade::PostgresRequestManager::new(pool.clone()));
         let state = AppState::builder()
-            .db(pool.clone())
+            .db(crate::db::DbPools::new(pool.clone()))
             .config(config)
             .request_manager(request_manager)
             .build();
@@ -732,7 +744,7 @@ mod tests {
 
         let request_manager = std::sync::Arc::new(fusillade::PostgresRequestManager::new(pool.clone()));
         let state = AppState::builder()
-            .db(pool.clone())
+            .db(crate::db::DbPools::new(pool.clone()))
             .config(config)
             .request_manager(request_manager)
             .build();
@@ -778,7 +790,11 @@ mod tests {
         config.auth.native.allow_registration = true;
 
         let request_manager = std::sync::Arc::new(fusillade::PostgresRequestManager::new(pool.clone()));
-        let state = AppState::builder().db(pool).config(config).request_manager(request_manager).build();
+        let state = AppState::builder()
+            .db(crate::db::DbPools::new(pool))
+            .config(config)
+            .request_manager(request_manager)
+            .build();
 
         let app = axum::Router::new()
             .route("/auth/register-info", axum::routing::get(get_registration_info))
@@ -800,7 +816,11 @@ mod tests {
         config.auth.native.allow_registration = true;
 
         let request_manager = std::sync::Arc::new(fusillade::PostgresRequestManager::new(pool.clone()));
-        let state = AppState::builder().db(pool).config(config).request_manager(request_manager).build();
+        let state = AppState::builder()
+            .db(crate::db::DbPools::new(pool))
+            .config(config)
+            .request_manager(request_manager)
+            .build();
 
         let app = axum::Router::new()
             .route("/auth/register-info", axum::routing::get(get_registration_info))
@@ -822,7 +842,11 @@ mod tests {
         config.auth.native.allow_registration = false;
 
         let request_manager = std::sync::Arc::new(fusillade::PostgresRequestManager::new(pool.clone()));
-        let state = AppState::builder().db(pool).config(config).request_manager(request_manager).build();
+        let state = AppState::builder()
+            .db(crate::db::DbPools::new(pool))
+            .config(config)
+            .request_manager(request_manager)
+            .build();
 
         let app = axum::Router::new()
             .route("/auth/register-info", axum::routing::get(get_registration_info))
@@ -843,7 +867,11 @@ mod tests {
         config.auth.native.enabled = true;
 
         let request_manager = std::sync::Arc::new(fusillade::PostgresRequestManager::new(pool.clone()));
-        let state = AppState::builder().db(pool).config(config).request_manager(request_manager).build();
+        let state = AppState::builder()
+            .db(crate::db::DbPools::new(pool))
+            .config(config)
+            .request_manager(request_manager)
+            .build();
 
         let app = axum::Router::new()
             .route("/auth/login-info", axum::routing::get(get_login_info))
@@ -864,7 +892,11 @@ mod tests {
         config.auth.native.enabled = false;
 
         let request_manager = std::sync::Arc::new(fusillade::PostgresRequestManager::new(pool.clone()));
-        let state = AppState::builder().db(pool).config(config).request_manager(request_manager).build();
+        let state = AppState::builder()
+            .db(crate::db::DbPools::new(pool))
+            .config(config)
+            .request_manager(request_manager)
+            .build();
 
         let app = axum::Router::new()
             .route("/auth/login-info", axum::routing::get(get_login_info))
@@ -886,7 +918,7 @@ mod tests {
 
         let request_manager = std::sync::Arc::new(fusillade::PostgresRequestManager::new(pool.clone()));
         let state = AppState::builder()
-            .db(pool.clone())
+            .db(crate::db::DbPools::new(pool.clone()))
             .config(config)
             .request_manager(request_manager)
             .build();
@@ -946,7 +978,11 @@ mod tests {
         config.auth.native.enabled = false;
 
         let request_manager = std::sync::Arc::new(fusillade::PostgresRequestManager::new(pool.clone()));
-        let state = AppState::builder().db(pool).config(config).request_manager(request_manager).build();
+        let state = AppState::builder()
+            .db(crate::db::DbPools::new(pool))
+            .config(config)
+            .request_manager(request_manager)
+            .build();
 
         let app = axum::Router::new()
             .route("/auth/login", axum::routing::post(login))
@@ -969,7 +1005,11 @@ mod tests {
         config.auth.native.enabled = true;
 
         let request_manager = std::sync::Arc::new(fusillade::PostgresRequestManager::new(pool.clone()));
-        let state = AppState::builder().db(pool).config(config).request_manager(request_manager).build();
+        let state = AppState::builder()
+            .db(crate::db::DbPools::new(pool))
+            .config(config)
+            .request_manager(request_manager)
+            .build();
 
         let app = axum::Router::new()
             .route("/auth/login", axum::routing::post(login))
@@ -993,7 +1033,7 @@ mod tests {
 
         let request_manager = std::sync::Arc::new(fusillade::PostgresRequestManager::new(pool.clone()));
         let state = AppState::builder()
-            .db(pool.clone())
+            .db(crate::db::DbPools::new(pool.clone()))
             .config(config)
             .request_manager(request_manager)
             .build();
@@ -1049,7 +1089,7 @@ mod tests {
 
         let request_manager = std::sync::Arc::new(fusillade::PostgresRequestManager::new(pool.clone()));
         let state = AppState::builder()
-            .db(pool.clone())
+            .db(crate::db::DbPools::new(pool.clone()))
             .config(config)
             .request_manager(request_manager)
             .build();
@@ -1093,7 +1133,11 @@ mod tests {
     async fn test_logout(pool: PgPool) {
         let config = create_test_config();
         let request_manager = std::sync::Arc::new(fusillade::PostgresRequestManager::new(pool.clone()));
-        let state = AppState::builder().db(pool).config(config).request_manager(request_manager).build();
+        let state = AppState::builder()
+            .db(crate::db::DbPools::new(pool))
+            .config(config)
+            .request_manager(request_manager)
+            .build();
 
         let app = axum::Router::new()
             .route("/auth/logout", axum::routing::post(logout))
@@ -1122,7 +1166,7 @@ mod tests {
 
         let request_manager = std::sync::Arc::new(fusillade::PostgresRequestManager::new(pool.clone()));
         let state = AppState::builder()
-            .db(pool.clone())
+            .db(crate::db::DbPools::new(pool.clone()))
             .config(config)
             .request_manager(request_manager)
             .build();
@@ -1183,7 +1227,11 @@ mod tests {
         config.auth.native.password.max_length = 20;
 
         let request_manager = std::sync::Arc::new(fusillade::PostgresRequestManager::new(pool.clone()));
-        let state = AppState::builder().db(pool).config(config).request_manager(request_manager).build();
+        let state = AppState::builder()
+            .db(crate::db::DbPools::new(pool))
+            .config(config)
+            .request_manager(request_manager)
+            .build();
 
         let app = axum::Router::new()
             .route("/auth/register", axum::routing::post(register))
@@ -1209,7 +1257,11 @@ mod tests {
         config.auth.native.allow_registration = false;
 
         let request_manager = std::sync::Arc::new(fusillade::PostgresRequestManager::new(pool.clone()));
-        let state = AppState::builder().db(pool).config(config).request_manager(request_manager).build();
+        let state = AppState::builder()
+            .db(crate::db::DbPools::new(pool))
+            .config(config)
+            .request_manager(request_manager)
+            .build();
 
         let app = axum::Router::new()
             .route("/auth/register", axum::routing::post(register))
@@ -1234,7 +1286,11 @@ mod tests {
         config.auth.native.enabled = false;
 
         let request_manager = std::sync::Arc::new(fusillade::PostgresRequestManager::new(pool.clone()));
-        let state = AppState::builder().db(pool).config(config).request_manager(request_manager).build();
+        let state = AppState::builder()
+            .db(crate::db::DbPools::new(pool))
+            .config(config)
+            .request_manager(request_manager)
+            .build();
 
         let app = axum::Router::new()
             .route("/auth/password-reset", axum::routing::post(request_password_reset))
@@ -1256,7 +1312,11 @@ mod tests {
         config.auth.native.enabled = true;
 
         let request_manager = std::sync::Arc::new(fusillade::PostgresRequestManager::new(pool.clone()));
-        let state = AppState::builder().db(pool).config(config).request_manager(request_manager).build();
+        let state = AppState::builder()
+            .db(crate::db::DbPools::new(pool))
+            .config(config)
+            .request_manager(request_manager)
+            .build();
 
         let app = axum::Router::new()
             .route("/auth/password-reset", axum::routing::post(request_password_reset))
@@ -1283,7 +1343,7 @@ mod tests {
 
         let request_manager = std::sync::Arc::new(fusillade::PostgresRequestManager::new(pool.clone()));
         let state = AppState::builder()
-            .db(pool.clone())
+            .db(crate::db::DbPools::new(pool.clone()))
             .config(config)
             .request_manager(request_manager)
             .build();
@@ -1332,7 +1392,11 @@ mod tests {
         config.auth.native.enabled = false;
 
         let request_manager = std::sync::Arc::new(fusillade::PostgresRequestManager::new(pool.clone()));
-        let state = AppState::builder().db(pool).config(config).request_manager(request_manager).build();
+        let state = AppState::builder()
+            .db(crate::db::DbPools::new(pool))
+            .config(config)
+            .request_manager(request_manager)
+            .build();
 
         let app = axum::Router::new()
             .route(
@@ -1363,7 +1427,11 @@ mod tests {
         config.auth.native.enabled = true;
 
         let request_manager = std::sync::Arc::new(fusillade::PostgresRequestManager::new(pool.clone()));
-        let state = AppState::builder().db(pool).config(config).request_manager(request_manager).build();
+        let state = AppState::builder()
+            .db(crate::db::DbPools::new(pool))
+            .config(config)
+            .request_manager(request_manager)
+            .build();
 
         let app = axum::Router::new()
             .route(
@@ -1395,7 +1463,11 @@ mod tests {
         config.auth.native.password.min_length = 10;
 
         let request_manager = std::sync::Arc::new(fusillade::PostgresRequestManager::new(pool.clone()));
-        let state = AppState::builder().db(pool).config(config).request_manager(request_manager).build();
+        let state = AppState::builder()
+            .db(crate::db::DbPools::new(pool))
+            .config(config)
+            .request_manager(request_manager)
+            .build();
 
         let app = axum::Router::new()
             .route(
@@ -1427,7 +1499,11 @@ mod tests {
         config.auth.native.password.max_length = 20;
 
         let request_manager = std::sync::Arc::new(fusillade::PostgresRequestManager::new(pool.clone()));
-        let state = AppState::builder().db(pool).config(config).request_manager(request_manager).build();
+        let state = AppState::builder()
+            .db(crate::db::DbPools::new(pool))
+            .config(config)
+            .request_manager(request_manager)
+            .build();
 
         let app = axum::Router::new()
             .route(
@@ -1996,7 +2072,7 @@ mod tests {
 
         let request_manager = std::sync::Arc::new(fusillade::PostgresRequestManager::new(pool.clone()));
         let state = AppState::builder()
-            .db(pool.clone())
+            .db(crate::db::DbPools::new(pool.clone()))
             .config(config)
             .request_manager(request_manager)
             .build();
@@ -2037,7 +2113,7 @@ mod tests {
 
         let request_manager = std::sync::Arc::new(fusillade::PostgresRequestManager::new(pool.clone()));
         let state = AppState::builder()
-            .db(pool.clone())
+            .db(crate::db::DbPools::new(pool.clone()))
             .config(config)
             .request_manager(request_manager)
             .build();

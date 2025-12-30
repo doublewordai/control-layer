@@ -573,7 +573,7 @@ async fn test_request_logging_disabled(pool: PgPool) {
     // Build router with request logging disabled
     let request_manager = std::sync::Arc::new(fusillade::PostgresRequestManager::new(pool.clone()));
     let mut app_state = AppState::builder()
-        .db(pool.clone())
+        .db(crate::db::DbPools::new(pool.clone()))
         .config(config)
         .request_manager(request_manager)
         .build();
@@ -729,7 +729,11 @@ async fn test_build_router_with_metrics_disabled(pool: PgPool) {
     config.enable_metrics = false;
 
     let request_manager = std::sync::Arc::new(fusillade::PostgresRequestManager::new(pool.clone()));
-    let mut app_state = AppState::builder().db(pool).config(config).request_manager(request_manager).build();
+    let mut app_state = AppState::builder()
+        .db(crate::db::DbPools::new(pool))
+        .config(config)
+        .request_manager(request_manager)
+        .build();
 
     let onwards_router = axum::Router::new();
     let router = super::build_router(&mut app_state, onwards_router)
@@ -750,7 +754,11 @@ async fn test_build_router_with_metrics_enabled(pool: PgPool) {
     config.enable_metrics = true;
 
     let request_manager = std::sync::Arc::new(fusillade::PostgresRequestManager::new(pool.clone()));
-    let mut app_state = AppState::builder().db(pool).config(config).request_manager(request_manager).build();
+    let mut app_state = AppState::builder()
+        .db(crate::db::DbPools::new(pool))
+        .config(config)
+        .request_manager(request_manager)
+        .build();
 
     let onwards_router = axum::Router::new();
     let router = super::build_router(&mut app_state, onwards_router)

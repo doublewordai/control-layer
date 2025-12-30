@@ -213,14 +213,17 @@ pub use types::{ApiKeyId, DeploymentId, GroupId, InferenceEndpointId, UserId};
 ///
 /// ```ignore
 /// let state = AppState::builder()
-///     .db(pool)
+///     .db(db_pools)
 ///     .config(config)
 ///     .request_manager(request_manager)
 ///     .build();
 /// ```
 #[derive(Clone, Builder)]
 pub struct AppState {
-    pub db: PgPool,
+    /// Database pools (primary + optional replica).
+    /// Implements `Deref<Target = PgPool>` for backwards compatibility.
+    /// Use `.read()` for read-only queries, `.write()` for writes.
+    pub db: db::DbPools,
     pub config: Config,
     pub outlet_db: Option<PgPool>,
     pub metrics_recorder: Option<GenAiMetrics>,
@@ -453,7 +456,7 @@ pub async fn seed_database(sources: &[config::ModelSource], db: &PgPool) -> Resu
 async fn setup_database(
     config: &Config,
     pool: Option<PgPool>,
-) -> anyhow::Result<(Option<db::embedded::EmbeddedDatabase>, PgPool, PgPool, Option<PgPool>)> {
+) -> anyhow::Result<(Option<db::embedded::EmbeddedDatabase>, db::DbPools, PgPool, Option<PgPool>)> {
     // If a pool is provided (e.g., from tests), use it directly
     let (embedded_db, pool) = if let Some(existing_pool) = pool {
         info!("Using provided database pool");
@@ -510,8 +513,33 @@ async fn setup_database(
 
     migrator().run(&pool).await?;
 
+    // Create replica pool if configured
+    let db_pools = if let Some(replica_url) = config.database.external_replica_url() {
+        info!("Setting up read replica pool");
+        let main_settings = config.database.main_pool_settings();
+        let replica_pool = sqlx::postgres::PgPoolOptions::new()
+            .max_connections(main_settings.max_connections)
+            .min_connections(main_settings.min_connections)
+            .acquire_timeout(std::time::Duration::from_secs(main_settings.acquire_timeout_secs))
+            .idle_timeout(if main_settings.idle_timeout_secs > 0 {
+                Some(std::time::Duration::from_secs(main_settings.idle_timeout_secs))
+            } else {
+                None
+            })
+            .max_lifetime(if main_settings.max_lifetime_secs > 0 {
+                Some(std::time::Duration::from_secs(main_settings.max_lifetime_secs))
+            } else {
+                None
+            })
+            .connect(replica_url)
+            .await?;
+        db::DbPools::with_replica(pool, replica_pool)
+    } else {
+        db::DbPools::new(pool)
+    };
+
     // Get connection options from the main pool to create schema-based child pools
-    let main_connect_opts = pool.connect_options().as_ref().clone();
+    let main_connect_opts = db_pools.primary().connect_options().as_ref().clone();
 
     // Setup fusillade batch processing pool
     info!("Setting up fusillade batch processing pool");
@@ -630,20 +658,25 @@ async fn setup_database(
         None
     };
 
-    // Create initial admin user if it doesn't exist
+    // Create initial admin user if it doesn't exist (always use primary for writes)
     let argon2_params = password::Argon2Params {
         memory_kib: config.auth.native.password.argon2_memory_kib,
         iterations: config.auth.native.password.argon2_iterations,
         parallelism: config.auth.native.password.argon2_parallelism,
     };
-    create_initial_admin_user(&config.admin_email, config.admin_password.as_deref(), argon2_params, &pool)
-        .await
-        .map_err(|e| anyhow::anyhow!("Failed to create initial admin user: {}", e))?;
+    create_initial_admin_user(
+        &config.admin_email,
+        config.admin_password.as_deref(),
+        argon2_params,
+        db_pools.primary(),
+    )
+    .await
+    .map_err(|e| anyhow::anyhow!("Failed to create initial admin user: {}", e))?;
 
     // Seed database with initial configuration (only runs once)
-    seed_database(&config.model_sources, &pool).await?;
+    seed_database(&config.model_sources, db_pools.primary()).await?;
 
-    Ok((embedded_db, pool, fusillade_pool, outlet_pool))
+    Ok((embedded_db, db_pools, fusillade_pool, outlet_pool))
 }
 
 /// Create CORS layer from configuration
@@ -720,7 +753,7 @@ pub async fn build_router(state: &mut AppState, onwards_router: Router) -> anyho
         }
 
         let analytics_serializer = AnalyticsResponseSerializer::new(
-            state.db.clone(),
+            state.db.primary().clone(),
             uuid::Uuid::new_v4(),
             state.config.clone(),
             state.metrics_recorder.clone(),
@@ -906,7 +939,7 @@ pub async fn build_router(state: &mut AppState, onwards_router: Router) -> anyho
 
     // Apply error enrichment middleware to onwards router (before outlet logging)
     let onwards_router = onwards_router.layer(middleware::from_fn_with_state(
-        state.db.clone(),
+        state.db.primary().clone(),
         error_enrichment::error_enrichment_middleware,
     ));
 
@@ -1437,7 +1470,7 @@ pub struct Application {
     router: Router,
     app_state: AppState,
     config: Config,
-    pool: PgPool,
+    db_pools: db::DbPools,
     _fusillade_pool: PgPool,
     _outlet_pool: Option<PgPool>,
     _embedded_db: Option<db::embedded::EmbeddedDatabase>,
@@ -1461,13 +1494,19 @@ impl Application {
         debug!("Starting control layer with configuration: {:#?}", config);
 
         // Setup database connections, run migrations, and initialize data
-        let (_embedded_db, pool, fusillade_pool, outlet_pool) = setup_database(&config, pool).await?;
+        let (_embedded_db, db_pools, fusillade_pool, outlet_pool) = setup_database(&config, pool).await?;
 
         // Create a shutdown token for coordinating graceful shutdown of background tasks
         let shutdown_token = tokio_util::sync::CancellationToken::new();
 
         // Setup background services (onwards integration, probe scheduler, batch daemon, leader election)
-        let bg_services = setup_background_services(pool.clone(), fusillade_pool.clone(), config.clone(), shutdown_token.clone()).await?;
+        let bg_services = setup_background_services(
+            db_pools.primary().clone(),
+            fusillade_pool.clone(),
+            config.clone(),
+            shutdown_token.clone(),
+        )
+        .await?;
 
         // Build onwards router from targets
         let onwards_app_state = onwards::AppState::new(bg_services.onwards_targets.clone());
@@ -1475,7 +1514,7 @@ impl Application {
 
         // Build app state and router
         let mut app_state = AppState::builder()
-            .db(pool.clone())
+            .db(db_pools.clone())
             .config(config.clone())
             .is_leader(bg_services.is_leader)
             .request_manager(bg_services.request_manager.clone())
@@ -1488,7 +1527,7 @@ impl Application {
             router,
             app_state,
             config,
-            pool,
+            db_pools,
             _fusillade_pool: fusillade_pool,
             _outlet_pool: outlet_pool,
             _embedded_db,
@@ -1544,7 +1583,7 @@ impl Application {
 
         // Close database connections
         info!("Closing database connections...");
-        self.pool.close().await;
+        self.db_pools.close().await;
 
         // Shutdown telemetry
         info!("Shutting down telemetry...");
