@@ -456,7 +456,12 @@ pub async fn seed_database(sources: &[config::ModelSource], db: &PgPool) -> Resu
 async fn setup_database(
     config: &Config,
     pool: Option<PgPool>,
-) -> anyhow::Result<(Option<db::embedded::EmbeddedDatabase>, db::DbPools, db::DbPools, Option<db::DbPools>)> {
+) -> anyhow::Result<(
+    Option<db::embedded::EmbeddedDatabase>,
+    db::DbPools,
+    db::DbPools,
+    Option<db::DbPools>,
+)> {
     // If a pool is provided (e.g., from tests), use it directly
     let (embedded_db, pool) = if let Some(existing_pool) = pool {
         info!("Using provided database pool");
@@ -1546,8 +1551,13 @@ impl Application {
 
         // Setup background services (onwards integration, probe scheduler, batch daemon, leader election)
         // Use primary pool for fusillade (via Deref)
-        let bg_services =
-            setup_background_services((*db_pools).clone(), (*fusillade_pools).clone(), config.clone(), shutdown_token.clone()).await?;
+        let bg_services = setup_background_services(
+            (*db_pools).clone(),
+            (*fusillade_pools).clone(),
+            config.clone(),
+            shutdown_token.clone(),
+        )
+        .await?;
 
         // Build onwards router from targets
         let onwards_app_state = onwards::AppState::new(bg_services.onwards_targets.clone());
