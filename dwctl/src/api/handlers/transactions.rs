@@ -198,6 +198,21 @@ pub async fn list_transactions(
     let mut pool_conn = state.db.acquire().await.map_err(|e| Error::Database(e.into()))?;
     let mut repo = Credits::new(&mut pool_conn);
 
+    let grouping_enabled = query.group_batches.unwrap_or(false);
+
+    // If grouping enabled, use the optimized SQL query that does everything in one go
+    if grouping_enabled {
+        let transactions_with_batches = repo.list_transactions_with_batches(filter_user_id, skip, limit).await?;
+
+        let result: Vec<CreditTransactionResponse> = transactions_with_batches
+            .into_iter()
+            .map(|(tx, batch_id)| CreditTransactionResponse::from_db_with_batch_id(tx, batch_id))
+            .collect();
+
+        return Ok(Json(result));
+    }
+
+    // Otherwise, use normal pagination without grouping
     let transactions = if let Some(user_id) = filter_user_id {
         repo.list_user_transactions(user_id, skip, limit).await?
     } else {
@@ -1119,5 +1134,424 @@ mod tests {
         let transaction: CreditTransactionResponse = serde_json::from_str(&json_text).expect("Failed to deserialize");
         assert_eq!(transaction.amount.to_string(), precise_amount);
         assert_eq!(transaction.balance_after.to_string(), precise_amount);
+    }
+
+    // Test: Batch grouping aggregates correctly with mixed transaction types
+    #[sqlx::test]
+    #[test_log::test]
+    async fn test_batch_grouping_with_mixed_transactions(pool: PgPool) {
+        let (app, _bg_services) = create_test_app(pool.clone(), false).await;
+        let user = create_test_user(&pool, Role::StandardUser).await;
+
+        // Create diverse transaction data
+        let mut conn = pool.acquire().await.expect("Failed to acquire connection");
+        let mut credits_repo = CreditsHandler::new(&mut conn);
+
+        // 1. Admin grant
+        let grant_request = CreditTransactionCreateDBRequest::admin_grant(
+            user.id,
+            user.id,
+            Decimal::from_str("1000.0").unwrap(),
+            Some("Initial grant".to_string()),
+        );
+        credits_repo
+            .create_transaction(&grant_request)
+            .await
+            .expect("Failed to create grant");
+
+        // 2. Purchase
+        let purchase_request = CreditTransactionCreateDBRequest {
+            user_id: user.id,
+            transaction_type: CreditTransactionType::Purchase,
+            amount: Decimal::from_str("500.0").unwrap(),
+            source_id: Uuid::new_v4().to_string(),
+            description: Some("Purchase".to_string()),
+        };
+        credits_repo
+            .create_transaction(&purchase_request)
+            .await
+            .expect("Failed to create purchase");
+
+        // 3. Create batch data in http_analytics and usage transactions
+        let batch_id_1 = Uuid::new_v4();
+        let batch_id_2 = Uuid::new_v4();
+
+        // Batch 1: 5 requests with gpt-4
+        for i in 0..5 {
+            let analytics_record = sqlx::query!(
+                r#"
+                INSERT INTO http_analytics
+                    (instance_id, correlation_id, timestamp, method, uri, model, user_id, fusillade_batch_id)
+                VALUES ($1, $2, NOW(), $3, $4, $5, $6, $7)
+                RETURNING id
+                "#,
+                Uuid::new_v4(),            // instance_id
+                i as i64,                  // correlation_id
+                "POST",                    // method
+                "/ai/v1/chat/completions", // uri
+                "gpt-4",                   // model
+                user.id,                   // user_id
+                batch_id_1                 // fusillade_batch_id
+            )
+            .fetch_one(&pool)
+            .await
+            .expect("Failed to insert analytics");
+
+            let usage_request = CreditTransactionCreateDBRequest {
+                user_id: user.id,
+                transaction_type: CreditTransactionType::Usage,
+                amount: Decimal::from_str(&format!("{}.0", i + 1)).unwrap(), // 1.0, 2.0, 3.0, 4.0, 5.0
+                source_id: analytics_record.id.to_string(),
+                description: Some(format!("Batch 1 request {}", i)),
+            };
+            credits_repo
+                .create_transaction(&usage_request)
+                .await
+                .expect("Failed to create usage");
+        }
+
+        // Batch 2: 3 requests with gpt-3.5-turbo
+        for i in 0..3 {
+            let analytics_record = sqlx::query!(
+                r#"
+                INSERT INTO http_analytics
+                    (instance_id, correlation_id, timestamp, method, uri, model, user_id, fusillade_batch_id)
+                VALUES ($1, $2, NOW(), $3, $4, $5, $6, $7)
+                RETURNING id
+                "#,
+                Uuid::new_v4(),
+                (5 + i) as i64, // correlation_id (continue from batch 1)
+                "POST",
+                "/ai/v1/chat/completions",
+                "gpt-3.5-turbo",
+                user.id,
+                batch_id_2
+            )
+            .fetch_one(&pool)
+            .await
+            .expect("Failed to insert analytics");
+
+            let usage_request = CreditTransactionCreateDBRequest {
+                user_id: user.id,
+                transaction_type: CreditTransactionType::Usage,
+                amount: Decimal::from_str(&format!("{}.0", (i + 1) * 10)).unwrap(), // 10.0, 20.0, 30.0
+                source_id: analytics_record.id.to_string(),
+                description: Some(format!("Batch 2 request {}", i)),
+            };
+            credits_repo
+                .create_transaction(&usage_request)
+                .await
+                .expect("Failed to create usage");
+        }
+
+        // 4. Individual usage transactions (not in a batch)
+        for i in 0..2 {
+            let analytics_record = sqlx::query!(
+                r#"
+                INSERT INTO http_analytics
+                    (instance_id, correlation_id, timestamp, method, uri, model, user_id, fusillade_batch_id)
+                VALUES ($1, $2, NOW(), $3, $4, $5, $6, NULL)
+                RETURNING id
+                "#,
+                Uuid::new_v4(),
+                (8 + i) as i64, // correlation_id
+                "POST",
+                "/ai/v1/chat/completions",
+                "claude-3-sonnet",
+                user.id
+            )
+            .fetch_one(&pool)
+            .await
+            .expect("Failed to insert analytics");
+
+            let usage_request = CreditTransactionCreateDBRequest {
+                user_id: user.id,
+                transaction_type: CreditTransactionType::Usage,
+                amount: Decimal::from_str(&format!("{}.0", i + 1)).unwrap(), // 1.0, 2.0
+                source_id: analytics_record.id.to_string(),
+                description: Some(format!("Individual request {}", i)),
+            };
+            credits_repo
+                .create_transaction(&usage_request)
+                .await
+                .expect("Failed to create usage");
+        }
+
+        drop(conn);
+
+        // Test 1: WITHOUT batch grouping - should see all 12 individual transactions
+        let response = app
+            .get("/admin/api/v1/transactions?group_batches=false&limit=50")
+            .add_header(&add_auth_headers(&user)[0].0, &add_auth_headers(&user)[0].1)
+            .add_header(&add_auth_headers(&user)[1].0, &add_auth_headers(&user)[1].1)
+            .await;
+
+        response.assert_status_ok();
+        let transactions: Vec<CreditTransactionResponse> = response.json();
+
+        // Should have: 1 grant + 1 purchase + 5 batch1 + 3 batch2 + 2 individual = 12 total
+        assert_eq!(transactions.len(), 12, "Should have 12 individual transactions without grouping");
+
+        // Verify we have the expected transaction types
+        let grant_count = transactions
+            .iter()
+            .filter(|t| t.transaction_type == CreditTransactionType::AdminGrant)
+            .count();
+        let purchase_count = transactions
+            .iter()
+            .filter(|t| t.transaction_type == CreditTransactionType::Purchase)
+            .count();
+        let usage_count = transactions
+            .iter()
+            .filter(|t| t.transaction_type == CreditTransactionType::Usage)
+            .count();
+
+        assert_eq!(grant_count, 1, "Should have 1 admin grant");
+        assert_eq!(purchase_count, 1, "Should have 1 purchase");
+        assert_eq!(usage_count, 10, "Should have 10 usage transactions (5 + 3 + 2)");
+
+        // Test 2: WITH batch grouping - should see aggregated batches
+        let response = app
+            .get("/admin/api/v1/transactions?group_batches=true&limit=50")
+            .add_header(&add_auth_headers(&user)[0].0, &add_auth_headers(&user)[0].1)
+            .add_header(&add_auth_headers(&user)[1].0, &add_auth_headers(&user)[1].1)
+            .await;
+
+        response.assert_status_ok();
+        let transactions: Vec<CreditTransactionResponse> = response.json();
+
+        // Should have: 1 grant + 1 purchase + 1 batch1 + 1 batch2 + 2 individual = 6 total
+        assert_eq!(transactions.len(), 6, "Should have 6 transactions with batch grouping");
+
+        // Find the batched transactions
+        let batch_1_txn = transactions
+            .iter()
+            .find(|t| t.description == Some("Batch - gpt-4".to_string()))
+            .expect("Should have batch 1 aggregated transaction");
+
+        let batch_2_txn = transactions
+            .iter()
+            .find(|t| t.description == Some("Batch - gpt-3.5-turbo".to_string()))
+            .expect("Should have batch 2 aggregated transaction");
+
+        // Verify batch 1 aggregation: 1.0 + 2.0 + 3.0 + 4.0 + 5.0 = 15.0
+        assert_eq!(batch_1_txn.amount, Decimal::from_str("15.0").unwrap(), "Batch 1 should sum to 15.0");
+        assert!(batch_1_txn.batch_id.is_some(), "Batch 1 should have batch_id");
+
+        // Verify batch 2 aggregation: 10.0 + 20.0 + 30.0 = 60.0
+        assert_eq!(batch_2_txn.amount, Decimal::from_str("60.0").unwrap(), "Batch 2 should sum to 60.0");
+        assert!(batch_2_txn.batch_id.is_some(), "Batch 2 should have batch_id");
+
+        // Verify individual usage transactions are still present
+        let individual_usage_count = transactions
+            .iter()
+            .filter(|t| t.transaction_type == CreditTransactionType::Usage && t.batch_id.is_none())
+            .count();
+        assert_eq!(individual_usage_count, 2, "Should still have 2 individual usage transactions");
+    }
+
+    // Test: Batch grouping pagination works correctly
+    #[sqlx::test]
+    #[test_log::test]
+    async fn test_batch_grouping_pagination(pool: PgPool) {
+        let (app, _bg_services) = create_test_app(pool.clone(), false).await;
+        let user = create_test_user(&pool, Role::StandardUser).await;
+
+        let mut conn = pool.acquire().await.expect("Failed to acquire connection");
+        let mut credits_repo = CreditsHandler::new(&mut conn);
+
+        // Create initial balance
+        let grant_request = CreditTransactionCreateDBRequest::admin_grant(
+            user.id,
+            user.id,
+            Decimal::from_str("10000.0").unwrap(),
+            Some("Initial grant".to_string()),
+        );
+        credits_repo
+            .create_transaction(&grant_request)
+            .await
+            .expect("Failed to create grant");
+
+        // Create 5 batches with 10 requests each
+        for batch_num in 0..5 {
+            let batch_id = Uuid::new_v4();
+            for req_num in 0..10 {
+                let analytics_record = sqlx::query!(
+                    r#"
+                    INSERT INTO http_analytics
+                        (instance_id, correlation_id, timestamp, method, uri, model, user_id, fusillade_batch_id)
+                    VALUES ($1, $2, NOW(), $3, $4, $5, $6, $7)
+                    RETURNING id
+                    "#,
+                    Uuid::new_v4(),
+                    (batch_num * 10 + req_num) as i64,
+                    "POST",
+                    "/ai/v1/chat/completions",
+                    format!("model-{}", batch_num),
+                    user.id,
+                    batch_id
+                )
+                .fetch_one(&pool)
+                .await
+                .expect("Failed to insert analytics");
+
+                let usage_request = CreditTransactionCreateDBRequest {
+                    user_id: user.id,
+                    transaction_type: CreditTransactionType::Usage,
+                    amount: Decimal::from_str("1.0").unwrap(),
+                    source_id: analytics_record.id.to_string(),
+                    description: Some(format!("Batch {} request {}", batch_num, req_num)),
+                };
+                credits_repo
+                    .create_transaction(&usage_request)
+                    .await
+                    .expect("Failed to create usage");
+            }
+        }
+
+        drop(conn);
+
+        // Test pagination with grouping
+        // Without grouping: 1 grant + 50 usage = 51 transactions
+        // With grouping: 1 grant + 5 batches = 6 transactions
+
+        // Page 1: limit=3, skip=0
+        let response = app
+            .get("/admin/api/v1/transactions?group_batches=true&limit=3&skip=0")
+            .add_header(&add_auth_headers(&user)[0].0, &add_auth_headers(&user)[0].1)
+            .add_header(&add_auth_headers(&user)[1].0, &add_auth_headers(&user)[1].1)
+            .await;
+
+        response.assert_status_ok();
+        let page1: Vec<CreditTransactionResponse> = response.json();
+        assert_eq!(page1.len(), 3, "Page 1 should have 3 transactions");
+
+        // Page 2: limit=3, skip=3
+        let response = app
+            .get("/admin/api/v1/transactions?group_batches=true&limit=3&skip=3")
+            .add_header(&add_auth_headers(&user)[0].0, &add_auth_headers(&user)[0].1)
+            .add_header(&add_auth_headers(&user)[1].0, &add_auth_headers(&user)[1].1)
+            .await;
+
+        response.assert_status_ok();
+        let page2: Vec<CreditTransactionResponse> = response.json();
+        assert_eq!(page2.len(), 3, "Page 2 should have 3 transactions");
+
+        // Page 3: limit=3, skip=6 (should have 0 since we only have 6 total)
+        let response = app
+            .get("/admin/api/v1/transactions?group_batches=true&limit=3&skip=6")
+            .add_header(&add_auth_headers(&user)[0].0, &add_auth_headers(&user)[0].1)
+            .add_header(&add_auth_headers(&user)[1].0, &add_auth_headers(&user)[1].1)
+            .await;
+
+        response.assert_status_ok();
+        let page3: Vec<CreditTransactionResponse> = response.json();
+        assert_eq!(page3.len(), 0, "Page 3 should be empty");
+
+        // Verify no duplicates across pages
+        let mut all_ids = vec![];
+        all_ids.extend(page1.iter().map(|t| t.id));
+        all_ids.extend(page2.iter().map(|t| t.id));
+
+        let unique_ids: std::collections::HashSet<_> = all_ids.iter().collect();
+        assert_eq!(all_ids.len(), unique_ids.len(), "Should have no duplicate IDs across pages");
+    }
+
+    // Test: Batch grouping works for admin viewing all users
+    #[sqlx::test]
+    #[test_log::test]
+    async fn test_batch_grouping_all_users(pool: PgPool) {
+        let (app, _bg_services) = create_test_app(pool.clone(), false).await;
+        let admin = create_test_user(&pool, Role::PlatformManager).await;
+        let user1 = create_test_user(&pool, Role::StandardUser).await;
+        let user2 = create_test_user(&pool, Role::StandardUser).await;
+
+        let mut conn = pool.acquire().await.expect("Failed to acquire connection");
+        let mut credits_repo = CreditsHandler::new(&mut conn);
+
+        // Create batches for both users
+        for (user, user_name) in &[(user1.id, "user1"), (user2.id, "user2")] {
+            // Initial grant
+            let grant_request = CreditTransactionCreateDBRequest::admin_grant(
+                *user,
+                *user,
+                Decimal::from_str("1000.0").unwrap(),
+                Some(format!("{} grant", user_name)),
+            );
+            credits_repo
+                .create_transaction(&grant_request)
+                .await
+                .expect("Failed to create grant");
+
+            // Create a batch
+            let batch_id = Uuid::new_v4();
+            for i in 0..5 {
+                let analytics_record = sqlx::query!(
+                    r#"
+                    INSERT INTO http_analytics
+                        (instance_id, correlation_id, timestamp, method, uri, model, user_id, fusillade_batch_id)
+                    VALUES ($1, $2, NOW(), $3, $4, $5, $6, $7)
+                    RETURNING id
+                    "#,
+                    Uuid::new_v4(),
+                    i as i64,
+                    "POST",
+                    "/ai/v1/chat/completions",
+                    format!("{}-model", user_name),
+                    user,
+                    batch_id
+                )
+                .fetch_one(&pool)
+                .await
+                .expect("Failed to insert analytics");
+
+                let usage_request = CreditTransactionCreateDBRequest {
+                    user_id: *user,
+                    transaction_type: CreditTransactionType::Usage,
+                    amount: Decimal::from_str(&format!("{}.0", i + 1)).unwrap(),
+                    source_id: analytics_record.id.to_string(),
+                    description: Some(format!("{} batch request {}", user_name, i)),
+                };
+                credits_repo
+                    .create_transaction(&usage_request)
+                    .await
+                    .expect("Failed to create usage");
+            }
+        }
+
+        drop(conn);
+
+        // Admin views all transactions with grouping
+        let response = app
+            .get("/admin/api/v1/transactions?all=true&group_batches=true")
+            .add_header(&add_auth_headers(&admin)[0].0, &add_auth_headers(&admin)[0].1)
+            .add_header(&add_auth_headers(&admin)[1].0, &add_auth_headers(&admin)[1].1)
+            .await;
+
+        response.assert_status_ok();
+        let transactions: Vec<CreditTransactionResponse> = response.json();
+
+        // Should have at least: 2 grants + 2 batches = 4 transactions
+        // (may have more from other tests, but should have at least these)
+        assert!(transactions.len() >= 4, "Should have at least 4 transactions");
+
+        // Verify both users' batches are present
+        let user1_batch = transactions
+            .iter()
+            .find(|t| t.description == Some("Batch - user1-model".to_string()));
+        let user2_batch = transactions
+            .iter()
+            .find(|t| t.description == Some("Batch - user2-model".to_string()));
+
+        assert!(user1_batch.is_some(), "Should have user1's batch");
+        assert!(user2_batch.is_some(), "Should have user2's batch");
+
+        // Each batch should sum to 1+2+3+4+5 = 15.0
+        if let Some(batch) = user1_batch {
+            assert_eq!(batch.amount, Decimal::from_str("15.0").unwrap());
+        }
+        if let Some(batch) = user2_batch {
+            assert_eq!(batch.amount, Decimal::from_str("15.0").unwrap());
+        }
     }
 }
