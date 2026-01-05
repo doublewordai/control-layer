@@ -13,6 +13,7 @@ import {
 import { Card } from "../../../ui/card.tsx";
 import { Button } from "@/components";
 import { useState, useMemo } from "react";
+import { useNavigate } from "react-router-dom";
 import {
   Select,
   SelectContent,
@@ -61,6 +62,7 @@ export function TransactionHistory({
 }: TransactionHistoryProps) {
   const { isFeatureEnabled } = useSettings();
   const isDemoMode = isFeatureEnabled("demo");
+  const navigate = useNavigate();
 
   // Fetch user info for display
   const { data: displayUser } = useUser(filterUserId || userId);
@@ -74,7 +76,7 @@ export function TransactionHistory({
     data: transactionsData,
     isLoading: isLoadingTransactions,
     refetch: refetchTransactions,
-  } = useTransactions({ userId });
+  } = useTransactions({ userId, group_batches: true });
 
   // Get transactions - use fetched data in both demo and API mode
   // In demo mode, MSW returns data from transactions.json
@@ -364,8 +366,36 @@ export function TransactionHistory({
                   transaction.transaction_type === "admin_grant" ||
                   transaction.transaction_type === "purchase";
 
+                const handleRowClick = () => {
+                  if (transaction.batch_id) {
+                    navigate(`/batches/${transaction.batch_id}`);
+                  }
+                };
+
                 return (
-                  <TableRow key={transaction.id}>
+                  <TableRow
+                    key={transaction.id}
+                    onClick={handleRowClick}
+                    tabIndex={transaction.batch_id ? 0 : -1}
+                    onKeyDown={(event) => {
+                      if (!transaction.batch_id) return;
+                      if (event.key === "Enter" || event.key === " ") {
+                        event.preventDefault();
+                        handleRowClick();
+                      }
+                    }}
+                    role={transaction.batch_id ? "button" : undefined}
+                    aria-label={
+                      transaction.batch_id
+                        ? `View batch ${transaction.batch_id} details`
+                        : undefined
+                    }
+                    className={
+                      transaction.batch_id
+                        ? "cursor-pointer hover:bg-doubleword-neutral-50"
+                        : ""
+                    }
+                  >
                     <TableCell>
                       <div
                         className={`p-2 rounded-full ${

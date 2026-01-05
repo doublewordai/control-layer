@@ -46,6 +46,15 @@ impl From<CreditTransaction> for CreditTransactionDBResponse {
     }
 }
 
+/// Result of aggregating batch transactions
+#[derive(Debug)]
+pub struct AggregatedBatches {
+    /// Aggregated transactions with their associated batch IDs
+    pub batched_transactions: Vec<(CreditTransactionDBResponse, Uuid)>,
+    /// All source_ids that belong to batches (for filtering)
+    pub batched_source_ids: Vec<String>,
+}
+
 pub struct Credits<'c> {
     db: &'c mut PgConnection,
 }
@@ -247,6 +256,120 @@ impl<'c> Credits<'c> {
         .await?;
 
         Ok(transaction.map(CreditTransactionDBResponse::from))
+    }
+
+    /// List transactions with batch grouping applied (all in SQL)
+    /// Returns paginated results with batches already aggregated
+    /// Pass None for user_id to get all transactions (admin view)
+    #[instrument(skip(self), fields(user_id = ?user_id.map(|id| abbrev_uuid(&id)), skip = skip, limit = limit), err)]
+    pub async fn list_transactions_with_batches(
+        &mut self,
+        user_id: Option<UserId>,
+        skip: i64,
+        limit: i64,
+    ) -> Result<Vec<(CreditTransactionDBResponse, Option<Uuid>)>> {
+        let rows = sqlx::query!(
+            r#"
+            SELECT * FROM (
+                -- Part 1: Aggregated batch transactions
+                -- Groups multiple batch requests into single rows (e.g., 100 requests → 1 row)
+                SELECT
+                    (array_agg(ct.id ORDER BY ct.created_at))[1] as id,  -- Pick first transaction ID
+                    ct.user_id,                          -- User who owns these transactions
+                    'usage' as "transaction_type!: CreditTransactionType",
+                    SUM(ct.amount) as amount,            -- Total cost of all requests in batch
+                    MAX(ct.balance_after) as balance_after,  -- Final balance (after last request)
+                    MIN(ct.source_id) as source_id,      -- Pick first source_id
+                    (array_agg(ct.previous_transaction_id ORDER BY ct.created_at))[1] as previous_transaction_id,
+                    CASE
+                        WHEN MIN(ha.model) IS NOT NULL THEN 'Batch - ' || MIN(ha.model)
+                        ELSE 'Batch'
+                    END as description,                  -- "Batch - gpt-4" or just "Batch"
+                    MAX(ct.created_at) as created_at,    -- Most recent transaction time in batch
+                    ha.fusillade_batch_id as batch_id    -- The batch ID
+                FROM credits_transactions ct
+                -- Filter by transaction_type before joining to reduce rows
+                JOIN http_analytics ha
+                    ON ct.source_id = ha.id::text
+                    AND ct.transaction_type = 'usage'
+                WHERE ($1::uuid IS NULL OR ct.user_id = $1)  -- Optional user filter (NULL = all users)
+                    AND ha.fusillade_batch_id IS NOT NULL     -- Only requests with batch_id
+                -- NOTE: fusillade_batch_id is user-specific; a batch never spans multiple users.
+                -- We therefore group by both batch_id and user_id to get one row per (user, batch).
+                GROUP BY ha.fusillade_batch_id, ct.user_id
+
+                UNION ALL
+
+                -- Part 2: Non-batched transactions
+                -- Individual transactions: admin grants, purchases, removals, and non-batched usage
+                SELECT
+                    ct.id,
+                    ct.user_id,
+                    ct.transaction_type as "transaction_type!: CreditTransactionType",
+                    ct.amount,
+                    ct.balance_after,
+                    ct.source_id,
+                    ct.previous_transaction_id,
+                    ct.description,
+                    ct.created_at,
+                    NULL::uuid as batch_id              -- Not a batch, so NULL
+                FROM credits_transactions ct
+                -- LEFT JOIN so non-usage transactions (grants, purchases) still appear
+                LEFT JOIN http_analytics ha ON ct.source_id = ha.id::text AND ct.transaction_type = 'usage'
+                WHERE ($1::uuid IS NULL OR ct.user_id = $1)  -- Optional user filter (NULL = all users)
+                    AND (ct.transaction_type != 'usage'       -- All non-usage (grants, purchases, removals)
+                         OR ha.fusillade_batch_id IS NULL)    -- OR usage without batch_id
+            ) combined
+            -- Sort by most recent first, then paginate
+            -- Pagination happens AFTER aggregation for correct results
+            ORDER BY created_at DESC
+            LIMIT $2 OFFSET $3
+            "#,
+            user_id,
+            limit,
+            skip
+        )
+        .fetch_all(&mut *self.db)
+        .await?;
+
+        let mut results = Vec::new();
+        for row in rows {
+            // Aggregated fields are nullable, but should always have values for valid batches
+            // Unwrap with helpful error messages
+            let id = row
+                .id
+                .ok_or_else(|| sqlx::Error::Protocol("Batch aggregation returned NULL id".to_string()))?;
+            let user_id = row
+                .user_id
+                .ok_or_else(|| sqlx::Error::Protocol("Batch aggregation returned NULL user_id".to_string()))?;
+            let amount = row
+                .amount
+                .ok_or_else(|| sqlx::Error::Protocol("Batch aggregation returned NULL amount".to_string()))?;
+            let balance_after = row
+                .balance_after
+                .ok_or_else(|| sqlx::Error::Protocol("Batch aggregation returned NULL balance_after".to_string()))?;
+            let source_id = row
+                .source_id
+                .ok_or_else(|| sqlx::Error::Protocol("Batch aggregation returned NULL source_id".to_string()))?;
+            let created_at = row
+                .created_at
+                .ok_or_else(|| sqlx::Error::Protocol("Batch aggregation returned NULL created_at".to_string()))?;
+
+            let transaction = CreditTransactionDBResponse {
+                id,
+                user_id,
+                transaction_type: row.transaction_type,
+                amount,
+                balance_after,
+                previous_transaction_id: row.previous_transaction_id,
+                description: row.description,
+                source_id,
+                created_at,
+            };
+            results.push((transaction, row.batch_id));
+        }
+
+        Ok(results)
     }
 }
 
