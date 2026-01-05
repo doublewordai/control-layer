@@ -606,7 +606,7 @@ mod tests {
             handlers::{Groups, Repository},
             models::groups::GroupCreateDBRequest,
         },
-        test_utils::*,
+        test::utils::*,
         types::DeploymentId,
     };
     use serde_json::json;

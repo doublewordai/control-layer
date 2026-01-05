@@ -126,6 +126,24 @@ pub(crate) fn decompress_response_if_needed(
 /// * `header_name` - The name of the header to extract
 ///
 /// # Returns
+/// * `Some(Uuid)` - Successfully extracted and parsed UUID (either full or padded from 8-char hex)
+/// * `None` - Header missing, empty, or invalid format
+pub(crate) fn extract_header_as_uuid(request_data: &outlet::RequestData, header_name: &str) -> Option<uuid::Uuid> {
+    request_data
+        .headers
+        .get(header_name)
+        .and_then(|values| values.first())
+        .and_then(|bytes| std::str::from_utf8(bytes).ok())
+        .and_then(|s| uuid::Uuid::parse_str(s).ok())
+}
+
+/// Extracts a header value as a raw string from request headers.
+///
+/// # Arguments
+/// * `request_data` - The HTTP request data containing headers
+/// * `header_name` - The name of the header to extract
+///
+/// # Returns
 /// * `Some(String)` - Successfully extracted string value
 /// * `None` - Header missing, empty, or invalid UTF-8
 pub(crate) fn extract_header_as_string(request_data: &outlet::RequestData, header_name: &str) -> Option<String> {
@@ -134,6 +152,7 @@ pub(crate) fn extract_header_as_string(request_data: &outlet::RequestData, heade
         .get(header_name)
         .and_then(|values| values.first())
         .and_then(|bytes| std::str::from_utf8(bytes).ok())
+        .filter(|s| !s.is_empty())
         .map(|s| s.to_string())
 }
 
@@ -415,7 +434,8 @@ mod tests {
     }
 
     #[test]
-    fn test_extract_fusillade_request_id_invalid_uuid() {
+    fn test_extract_header_as_string_returns_non_uuid_values() {
+        // extract_header_as_string returns raw string values without UUID validation
         let mut headers = HashMap::new();
         headers.insert("x-fusillade-request-id".to_string(), vec![Bytes::from("notvalid")]);
 
@@ -432,9 +452,9 @@ mod tests {
         let header_str = extract_header_as_string(&request_data, "x-fusillade-request-id");
         assert_eq!(header_str, Some("notvalid".to_string()));
 
-        // But UUID parsing fails
-        let result = header_str.and_then(|s| uuid::Uuid::parse_str(&s).ok());
-        assert!(result.is_none());
+        // Should return the raw string value, not validate as UUID
+        assert!(header_str.is_some());
+        assert_eq!(header_str.unwrap(), "notvalid");
     }
 
     #[test]

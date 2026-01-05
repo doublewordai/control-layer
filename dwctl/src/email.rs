@@ -184,7 +184,7 @@ impl EmailService {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::test_utils::create_test_config;
+    use crate::test::utils::create_test_config;
 
     #[tokio::test]
     async fn test_email_service_creation() {

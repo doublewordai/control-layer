@@ -1,5 +1,5 @@
 import { useState, useEffect, useMemo } from "react";
-import { Play, AlertCircle, X, Upload, ExternalLink } from "lucide-react";
+import { Play, AlertCircle, X, Upload, ExternalLink, Info } from "lucide-react";
 import {
   Dialog,
   DialogContent,
@@ -29,6 +29,11 @@ import {
 import { toast } from "sonner";
 import type { FileObject } from "../../features/batches/types";
 import { AlertBox } from "@/components/ui/alert-box";
+import {
+  Tooltip,
+  TooltipContent,
+  TooltipTrigger,
+} from "@/components/ui/tooltip";
 
 interface CreateBatchModalProps {
   isOpen: boolean;
@@ -66,7 +71,7 @@ export function CreateBatchModal({
   const { data: config } = useConfig();
   const availableSLAs = useMemo(
     () => config?.batches?.allowed_completion_windows || ["24h"],
-    [config?.batches?.allowed_completion_windows]
+    [config?.batches?.allowed_completion_windows],
   );
 
   // Fetch available files for combobox (only input files with purpose "batch")
@@ -237,6 +242,13 @@ export function CreateBatchModal({
     ? availableFiles.find((f) => f.id === selectedFileId)
     : null;
 
+  // Clear fileToUpload once selectedFile becomes available (after upload + refetch)
+  useEffect(() => {
+    if (selectedFile && fileToUpload) {
+      setFileToUpload(null);
+    }
+  }, [selectedFile, fileToUpload]);
+
   const fileOptions = availableFiles.map((file) => ({
     value: file.id,
     label: file.filename,
@@ -251,15 +263,19 @@ export function CreateBatchModal({
           <DialogTitle>Create New Batch</DialogTitle>
           <DialogDescription>
             Select or upload a{" "}
-            <a
-              href="https://docs.doubleword.ai"
-              target="_blank"
-              rel="noopener noreferrer"
-              className="text-blue-600 hover:text-blue-700 hover:underline inline-flex items-center gap-1"
-            >
-              JSONL file
-              <ExternalLink className="w-3 h-3" />
-            </a>{" "}
+            {config?.docs_jsonl_url ? (
+              <a
+                href={config.docs_jsonl_url}
+                target="_blank"
+                rel="noopener noreferrer"
+                className="text-blue-600 hover:text-blue-700 hover:underline inline-flex items-center gap-1"
+              >
+                JSONL file
+                <ExternalLink className="w-3 h-3" />
+              </a>
+            ) : (
+              "JSONL file"
+            )}{" "}
             to create a batch.
           </DialogDescription>
         </DialogHeader>
@@ -287,7 +303,9 @@ export function CreateBatchModal({
                           <span>
                             Size: {(fileToUpload.size / 1024).toFixed(1)} KB
                           </span>
-                          <span className="text-blue-600">Ready to upload</span>
+                          <span className="text-blue-600">
+                            {isUploading ? "Uploading..." : "Ready to upload"}
+                          </span>
                         </>
                       ) : (
                         selectedFile && (
@@ -441,39 +459,88 @@ export function CreateBatchModal({
           </div>
 
           {/* Cost Estimate */}
-          {selectedFileId && (
+          {(selectedFileId || fileToUpload) && (
             <div className="bg-gray-50 border border-gray-200 rounded-lg p-3">
               <div className="space-y-2">
-                <p className="text-sm font-medium text-gray-900">
-                  Cost Estimate
-                </p>
-                {isLoadingCost ? (
-                  <div className="flex items-center gap-2 text-sm text-gray-600">
-                    <div className="animate-spin rounded-full h-3 w-3 border-b-2 border-gray-600"></div>
-                    Calculating...
-                  </div>
-                ) : costEstimate ? (
-                  <div className="space-y-1.5">
-                    <div className="flex justify-between text-sm">
-                      <span className="text-gray-600">Total Requests:</span>
-                      <span className="font-medium text-gray-900">
-                        {costEstimate.total_requests.toLocaleString()}
-                      </span>
-                    </div>
-                    <div className="flex justify-between text-sm">
-                      <span className="text-gray-600">Estimated Cost:</span>
-                      <span className="font-semibold text-gray-900">
-                        ${parseFloat(costEstimate.total_estimated_cost).toFixed(4)}
-                      </span>
-                    </div>
-                    <div className="text-xs text-gray-500 pt-1">
-                      Based on {completionWindow} SLA pricing
-                    </div>
-                  </div>
-                ) : (
-                  <p className="text-sm text-gray-500">
-                    Cost estimate unavailable
+                <div className="flex items-center gap-1.5">
+                  <p className="text-sm font-medium text-gray-900">
+                    Cost Estimate
                   </p>
+                  <Tooltip>
+                    <TooltipTrigger asChild>
+                      <Info className="w-3.5 h-3.5 text-gray-400 cursor-help" />
+                    </TooltipTrigger>
+                    <TooltipContent side="top" className="max-w-[250px]">
+                      Based on {completionWindow} SLA pricing and average output
+                      tokens for the requested model(s). Actual cost may vary.
+                    </TooltipContent>
+                  </Tooltip>
+                </div>
+                {selectedFileId ? (
+                  isLoadingCost ? (
+                    <div className="flex items-center gap-2 text-sm text-gray-600">
+                      <div className="animate-spin rounded-full h-3 w-3 border-b-2 border-gray-600"></div>
+                      Calculating...
+                    </div>
+                  ) : costEstimate ? (
+                    <div className="space-y-1.5">
+                      <div className="flex justify-between text-sm">
+                        <span className="text-gray-600">Total Requests:</span>
+                        <span className="font-medium text-gray-900">
+                          {costEstimate.total_requests.toLocaleString()}
+                        </span>
+                      </div>
+                      <div className="flex justify-between text-sm">
+                        <span className="text-gray-600">Estimated Cost:</span>
+                        <span className="font-semibold text-gray-900">
+                          $
+                          {parseFloat(
+                            costEstimate.total_estimated_cost,
+                          ).toFixed(4)}
+                        </span>
+                      </div>
+                    </div>
+                  ) : (
+                    <p className="text-sm text-gray-500">
+                      Cost estimate unavailable
+                    </p>
+                  )
+                ) : (
+                  <button
+                    type="button"
+                    onClick={async () => {
+                      if (!fileToUpload || isPending) return;
+                      setIsUploading(true);
+                      try {
+                        const uploadedFile = await uploadMutation.mutateAsync({
+                          file: fileToUpload,
+                          purpose: "batch",
+                          expires_after: {
+                            anchor: "created_at",
+                            seconds: expirationSeconds,
+                          },
+                        });
+                        setSelectedFileId(uploadedFile.id);
+                        toast.success(
+                          `File "${fileToUpload.name}" uploaded successfully`,
+                        );
+                      } catch (err) {
+                        console.error("Failed to upload file:", err);
+                        setError(
+                          err instanceof Error
+                            ? err.message
+                            : "Failed to upload file. Please try again.",
+                        );
+                      } finally {
+                        setIsUploading(false);
+                      }
+                    }}
+                    disabled={isPending}
+                    className={`text-xs text-blue-600 hover:text-blue-700 hover:underline disabled:opacity-50 flex items-center gap-1 ${isPending ? "cursor-not-allowed" : "cursor-pointer"}`}
+                  >
+                    <Upload className="w-3 h-3" />
+                    Upload file to generate estimate
+                  </button>
                 )}
               </div>
             </div>

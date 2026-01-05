@@ -3,7 +3,7 @@ use crate::db::errors::Result as DbResult;
 use crate::db::handlers::Credits;
 use crate::db::models::credits::{CreditTransactionCreateDBRequest, CreditTransactionType};
 use crate::request_logging::models::{AiRequest, AiResponse, ChatCompletionChunk, ParsedAIRequest};
-use crate::request_logging::utils::extract_header_as_string;
+use crate::request_logging::utils::{extract_header_as_string, extract_header_as_uuid};
 use outlet::{RequestData, ResponseData};
 use outlet_postgres::SerializationError;
 use rust_decimal::{Decimal, prelude::ToPrimitive};
@@ -79,6 +79,7 @@ pub struct HttpAnalyticsRow {
     pub provider_name: Option<String>,
     pub fusillade_batch_id: Option<Uuid>,
     pub fusillade_request_id: Option<Uuid>,
+    pub custom_id: Option<String>,
 }
 
 /// Usage metrics extracted from AI responses (subset of HttpAnalyticsRow)
@@ -336,10 +337,10 @@ pub async fn store_analytics_record(
     auth: &Auth,
     request_data: &RequestData,
 ) -> DbResult<HttpAnalyticsRow> {
-    // Extract fusillade request ID if present
-    let fusillade_batch_id = extract_header_as_string(request_data, "x-fusillade-batch-id").and_then(|s| uuid::Uuid::parse_str(&s).ok());
-    let fusillade_request_id =
-        extract_header_as_string(request_data, "x-fusillade-request-id").and_then(|s| uuid::Uuid::parse_str(&s).ok());
+    // Extract fusillade ID headers if present
+    let fusillade_batch_id = extract_header_as_uuid(request_data, "x-fusillade-batch-id");
+    let fusillade_request_id = extract_header_as_uuid(request_data, "x-fusillade-request-id");
+    let custom_id = extract_header_as_string(request_data, "x-fusillade-custom-id");
 
     // Extract batch metadata headers for tariff pricing
     let batch_created_at = extract_header_as_string(request_data, "x-fusillade-batch-created-at");
@@ -470,6 +471,7 @@ pub async fn store_analytics_record(
         provider_name,
         fusillade_batch_id,
         fusillade_request_id,
+        custom_id,
     };
 
     // Insert the analytics record and get the ID
@@ -479,9 +481,9 @@ pub async fn store_analytics_record(
             instance_id, correlation_id, timestamp, method, uri, model,
             status_code, duration_ms, duration_to_first_byte_ms, prompt_tokens, completion_tokens,
             total_tokens, response_type, user_id, user_email, access_source,
-            input_price_per_token, output_price_per_token, fusillade_batch_id, fusillade_request_id
+            input_price_per_token, output_price_per_token, fusillade_batch_id, fusillade_request_id, custom_id
         )
-        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20)
+        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21)
         ON CONFLICT (instance_id, correlation_id)
         DO UPDATE SET
             status_code = EXCLUDED.status_code,
@@ -497,7 +499,8 @@ pub async fn store_analytics_record(
             input_price_per_token = EXCLUDED.input_price_per_token,
             output_price_per_token = EXCLUDED.output_price_per_token,
             fusillade_batch_id = EXCLUDED.fusillade_batch_id,
-            fusillade_request_id = EXCLUDED.fusillade_request_id
+            fusillade_request_id = EXCLUDED.fusillade_request_id,
+            custom_id = EXCLUDED.custom_id
         RETURNING id
         "#,
         row.instance_id,
@@ -519,7 +522,8 @@ pub async fn store_analytics_record(
         row.input_price_per_token,
         row.output_price_per_token,
         row.fusillade_batch_id,
-        row.fusillade_request_id
+        row.fusillade_request_id,
+        row.custom_id
     )
     .fetch_one(pool)
     .await?;
@@ -819,13 +823,25 @@ where
     /// - Returns parsed `AiResponse` or `SerializationError`
     /// - Asynchronously stores analytics metrics to database
     /// - Logs errors if analytics storage fails
+    ///
+    /// # Analytics Storage
+    /// Analytics are stored for ALL responses, including error responses (4xx, 5xx).
+    /// Even if the response cannot be parsed as a valid AI response, the request
+    /// metadata (status code, duration, model, user, etc.) is still recorded.
     pub fn create_serializer(self) -> impl Fn(&RequestData, &ResponseData) -> Result<AiResponse, SerializationError> + Send + Sync {
         move |request_data: &RequestData, response_data: &ResponseData| {
-            // The full response that gets written to the outlet-postgres database
-            let parsed_response = parse_ai_response(request_data, response_data)?;
+            // Try to parse the response - may fail for error responses (4xx, 5xx)
+            let parse_result = parse_ai_response(request_data, response_data);
 
-            // Basic metrics
-            let metrics = UsageMetrics::extract(self.instance_id, request_data, response_data, &parsed_response, &self.config);
+            // Use parsed response for metrics, or fallback to Other for error responses
+            let metrics_response = match &parse_result {
+                Ok(response) => response.clone(),
+                Err(_) => AiResponse::Other(Value::Null),
+            };
+
+            // Basic metrics - extracted regardless of parse success
+            // This captures status_code, duration, model from request, etc.
+            let metrics = UsageMetrics::extract(self.instance_id, request_data, response_data, &metrics_response, &self.config);
 
             // Auth information
             let auth = Auth::from_request(request_data, &self.config);
@@ -836,9 +852,9 @@ where
             let request_data_clone = request_data.clone();
 
             // The write to the analytics table and metrics recording
+            // This runs for ALL responses, including errors
             tokio::spawn(async move {
                 // Store to database - this enriches with user/pricing data and returns complete row
-                // Use "batch" tariff by default - can be made configurable per request if needed
                 match store_analytics_record(&pool_clone, &metrics, &auth, &request_data_clone).await {
                     Ok(complete_row) => {
                         // Record metrics using the complete row (called AFTER database write)
@@ -856,7 +872,9 @@ where
                 }
             });
 
-            Ok(parsed_response)
+            // Return the parse result - outlet-postgres will handle SerializationError
+            // by storing the fallback_data (base64 encoded response)
+            parse_result
         }
     }
 }
@@ -1233,7 +1251,7 @@ mod tests {
             &request_data,
             &response_data,
             &parsed_response,
-            &crate::test_utils::create_test_config(),
+            &crate::test::utils::create_test_config(),
         );
 
         assert_eq!(metrics.instance_id, instance_id);
@@ -1301,7 +1319,7 @@ mod tests {
             &request_data,
             &response_data,
             &parsed_response,
-            &crate::test_utils::create_test_config(),
+            &crate::test::utils::create_test_config(),
         );
 
         assert_eq!(metrics.instance_id, instance_id);
@@ -1367,7 +1385,7 @@ mod tests {
             &request_data,
             &response_data,
             &parsed_response,
-            &crate::test_utils::create_test_config(),
+            &crate::test::utils::create_test_config(),
         );
 
         assert_eq!(metrics.prompt_tokens, 8);
@@ -1416,7 +1434,7 @@ mod tests {
             &request_data,
             &response_data,
             &parsed_response,
-            &crate::test_utils::create_test_config(),
+            &crate::test::utils::create_test_config(),
         );
 
         assert_eq!(metrics.prompt_tokens, 6);
@@ -1471,7 +1489,7 @@ mod tests {
             &request_data,
             &response_data,
             &parsed_response,
-            &crate::test_utils::create_test_config(),
+            &crate::test::utils::create_test_config(),
         );
 
         assert_eq!(metrics.prompt_tokens, 10);
@@ -1520,7 +1538,7 @@ mod tests {
             &request_data,
             &response_data,
             &parsed_response,
-            &crate::test_utils::create_test_config(),
+            &crate::test::utils::create_test_config(),
         );
 
         assert_eq!(metrics.prompt_tokens, 4);
@@ -1637,7 +1655,7 @@ mod tests {
         use crate::db::models::api_keys::{ApiKeyCreateDBRequest, ApiKeyPurpose};
         use crate::db::models::credits::{CreditTransactionCreateDBRequest, CreditTransactionType};
         use crate::db::models::tariffs::TariffCreateDBRequest;
-        use crate::test_utils::create_test_user;
+        use crate::test::utils::create_test_user;
         use crate::types::DeploymentId;
         use rust_decimal::Decimal;
         use std::str::FromStr;

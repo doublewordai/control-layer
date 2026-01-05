@@ -687,7 +687,7 @@ mod tests {
             handlers::{Deployments, Groups, Repository},
             models::{deployments::DeploymentCreateDBRequest, groups::GroupCreateDBRequest},
         },
-        test_utils::*,
+        test::utils::*,
         types::{DeploymentId, GroupId, UserId},
     };
     use axum::http::StatusCode;

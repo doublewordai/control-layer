@@ -11,10 +11,14 @@ use crate::{
     api::models::{
         batches::BatchAnalytics,
         deployments::{ModelMetrics, ModelTimeSeriesPoint},
-        requests::{ModelUsage, ModelUserUsageResponse, RequestsAggregateResponse, StatusCodeBreakdown, TimeSeriesPoint, UserUsage},
+        requests::{
+            AnalyticsEntry, HttpAnalyticsFilter, ModelUsage, ModelUserUsageResponse, RequestsAggregateResponse, StatusCodeBreakdown,
+            TimeSeriesPoint, UserUsage,
+        },
     },
     db::errors::Result,
 };
+use rust_decimal::Decimal;
 use rust_decimal::prelude::ToPrimitive;
 use uuid::Uuid;
 
@@ -808,6 +812,128 @@ pub async fn get_batch_analytics(pool: &PgPool, batch_id: &Uuid) -> Result<Batch
         avg_ttfb_ms: metrics.avg_ttfb_ms.and_then(|d| d.to_f64()),
         total_cost: metrics.total_cost.map(|d| d.to_string()),
     })
+}
+
+/// Row type for http_analytics query
+#[derive(FromRow)]
+struct HttpAnalyticsRow {
+    pub id: i64,
+    pub timestamp: DateTime<Utc>,
+    pub method: String,
+    pub uri: String,
+    pub model: Option<String>,
+    pub status_code: Option<i32>,
+    pub duration_ms: Option<i64>,
+    pub prompt_tokens: Option<i64>,
+    pub completion_tokens: Option<i64>,
+    pub total_tokens: Option<i64>,
+    pub response_type: Option<String>,
+    pub user_email: Option<String>,
+    pub fusillade_batch_id: Option<Uuid>,
+    pub input_price_per_token: Option<Decimal>,
+    pub output_price_per_token: Option<Decimal>,
+    pub custom_id: Option<String>,
+}
+
+/// List HTTP analytics entries with filtering and pagination
+#[instrument(skip(pool), err)]
+pub async fn list_http_analytics(
+    pool: &PgPool,
+    skip: i64,
+    limit: i64,
+    order_desc: bool,
+    filters: HttpAnalyticsFilter,
+) -> Result<Vec<AnalyticsEntry>> {
+    // Wrap custom_id in wildcards for ILIKE substring matching
+    let custom_id_pattern = filters.custom_id.as_ref().map(|s| format!("%{}%", s));
+
+    let rows = sqlx::query_as!(
+        HttpAnalyticsRow,
+        r#"
+        SELECT
+            id,
+            timestamp,
+            method,
+            uri,
+            model,
+            status_code,
+            duration_ms,
+            prompt_tokens,
+            completion_tokens,
+            total_tokens,
+            response_type,
+            user_email,
+            fusillade_batch_id,
+            input_price_per_token,
+            output_price_per_token,
+            custom_id
+        FROM http_analytics
+        WHERE
+            ($1::timestamptz IS NULL OR timestamp >= $1)
+            AND ($2::timestamptz IS NULL OR timestamp <= $2)
+            AND ($3::text IS NULL OR model = $3)
+            AND ($4::uuid IS NULL OR fusillade_batch_id = $4)
+            AND ($5::text IS NULL OR method = $5)
+            AND ($6::text IS NULL OR uri LIKE $6)
+            AND ($7::int IS NULL OR status_code = $7)
+            AND ($8::int IS NULL OR status_code >= $8)
+            AND ($9::int IS NULL OR status_code <= $9)
+            AND ($10::bigint IS NULL OR duration_ms >= $10)
+            AND ($11::bigint IS NULL OR duration_ms <= $11)
+            AND ($12::text IS NULL OR custom_id ILIKE $12)
+        ORDER BY timestamp DESC
+        LIMIT $13
+        OFFSET $14
+        "#,
+        filters.timestamp_after,
+        filters.timestamp_before,
+        filters.model,
+        filters.fusillade_batch_id,
+        filters.method,
+        filters.uri_pattern,
+        filters.status_code,
+        filters.status_code_min,
+        filters.status_code_max,
+        filters.min_duration_ms,
+        filters.max_duration_ms,
+        custom_id_pattern,
+        limit,
+        skip,
+    )
+    .fetch_all(pool)
+    .await?;
+
+    // Note: The ORDER BY is hardcoded to DESC in the query above.
+    // If we need dynamic ordering, we'd need to use query_as with raw SQL
+    // or have two separate queries. For now, we'll handle ASC by reversing.
+    let mut entries: Vec<AnalyticsEntry> = rows
+        .into_iter()
+        .map(|row| AnalyticsEntry {
+            id: row.id,
+            timestamp: row.timestamp,
+            method: row.method,
+            uri: row.uri,
+            model: row.model,
+            status_code: row.status_code,
+            duration_ms: row.duration_ms,
+            prompt_tokens: row.prompt_tokens,
+            completion_tokens: row.completion_tokens,
+            total_tokens: row.total_tokens,
+            response_type: row.response_type,
+            user_email: row.user_email,
+            fusillade_batch_id: row.fusillade_batch_id,
+            input_price_per_token: row.input_price_per_token.map(|p| p.to_string()),
+            output_price_per_token: row.output_price_per_token.map(|p| p.to_string()),
+            custom_id: row.custom_id,
+        })
+        .collect();
+
+    // If ascending order requested, reverse the results
+    if !order_desc {
+        entries.reverse();
+    }
+
+    Ok(entries)
 }
 
 #[cfg(test)]

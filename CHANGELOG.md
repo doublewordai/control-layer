@@ -1,5 +1,21 @@
 # Changelog
 
+## [0.19.1](https://github.com/doublewordai/control-layer/compare/v0.19.0...v0.19.1) (2025-12-24)
+
+
+### Bug Fixes
+
+* allow early upload in batch model for cost estimates ([#425](https://github.com/doublewordai/control-layer/issues/425)) ([24bb933](https://github.com/doublewordai/control-layer/commit/24bb9334d42336e055d9015db7bc2fc4e51dcf7b))
+* hide view reuest analytics button from users without RequestViewer role ([#427](https://github.com/doublewordai/control-layer/issues/427)) ([c0469f0](https://github.com/doublewordai/control-layer/commit/c0469f0b5d83b603be0c139129431b3873595756))
+
+## [0.19.0](https://github.com/doublewordai/control-layer/compare/v0.18.3...v0.19.0) (2025-12-22)
+
+
+### Features
+
+* allow intake of multiple SLAs ([#390](https://github.com/doublewordai/control-layer/issues/390)) ([dbe0a47](https://github.com/doublewordai/control-layer/commit/dbe0a47d173dc88bea1db43beab82d2577506802))
+* Migrate analytics to http analytics table ([#416](https://github.com/doublewordai/control-layer/issues/416)) ([c5d1253](https://github.com/doublewordai/control-layer/commit/c5d12532ba18a39ab4cb288ff7ff501ce2f5b9ed))
+
 ## [0.18.3](https://github.com/doublewordai/control-layer/compare/v0.18.2...v0.18.3) (2025-12-22)
 
 

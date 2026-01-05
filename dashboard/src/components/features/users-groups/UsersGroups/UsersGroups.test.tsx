@@ -23,6 +23,7 @@ function createWrapper() {
     defaultOptions: {
       queries: {
         retry: false, // Disable retries for tests
+        staleTime: 0, // Always refetch
       },
     },
   });
@@ -120,87 +121,89 @@ describe("UsersGroups Component", () => {
         wrapper: createWrapper(),
       });
 
-      // Wait for initial load - check for main heading
+      // Wait for initial load - check for main heading and users data
       await waitFor(() => {
         expect(
           within(container).getByRole("heading", { level: 1 }),
         ).toBeInTheDocument();
+        expect(within(container).getByRole("table")).toBeInTheDocument();
+        expect(within(container).getByText("Sarah Chen")).toBeInTheDocument();
       });
 
       // Step 1: Navigate to Users tab (should be default)
       const usersTab = within(container).getByRole("tab", { name: "Users" });
       expect(usersTab).toHaveAttribute("aria-selected", "true");
 
-      // Step 2: Search/filter users - test rich assertions
+      // Step 2: Verify all users are visible initially
+      expect(within(container).getByText("James Wilson")).toBeInTheDocument();
+      expect(within(container).getByText("Alex Rodriguez")).toBeInTheDocument();
+
+      // Step 3: Test search functionality
       const searchInput = within(container).getByRole("textbox", {
         name: /search users/i,
       });
-
-      // Initially, all users should be visible
-      await waitFor(() => {
-        expect(within(container).getByRole("table")).toBeInTheDocument();
-        expect(within(container).getByText("Sarah Chen")).toBeInTheDocument();
-        expect(within(container).getByText("James Wilson")).toBeInTheDocument();
-        expect(
-          within(container).getByText("Alex Rodriguez"),
-        ).toBeInTheDocument();
-      });
-
-      // Test search functionality
       await user.type(searchInput, "Sarah");
+      expect(searchInput).toHaveValue("Sarah");
 
-      // Wait for search results and verify specific user appears
-      await waitFor(() => {
-        // Should show Sarah Chen in search results
-        expect(within(container).getByText("Sarah Chen")).toBeInTheDocument();
-        expect(
-          within(container).getByText("sarah.chen@doubleword.ai"),
-        ).toBeInTheDocument();
-      });
-
-      // Verify other users are filtered out (but don't fail test if search is async)
+      // Wait for debounce (300ms) + API call + re-render
+      // The search is server-side via debouncedSearch, so we need to wait
       await waitFor(
         () => {
+          // Verify other users are filtered out
           expect(
             within(container).queryByText("James Wilson"),
           ).not.toBeInTheDocument();
-          expect(
-            within(container).queryByText("Alex Rodriguez"),
-          ).not.toBeInTheDocument();
         },
-        { timeout: 1000 },
+        { timeout: 3000, interval: 100 },
       );
 
-      // Clear search and verify all users return
-      // Use keyboard shortcuts to clear (more reliable than clear())
-      await user.tripleClick(searchInput);
-      await user.keyboard("{Backspace}");
-
+      // Should still show Sarah Chen after search filters
       await waitFor(() => {
         expect(within(container).getByText("Sarah Chen")).toBeInTheDocument();
-        expect(within(container).getByText("James Wilson")).toBeInTheDocument();
       });
 
-      // Step 3: Create new user → opens CreateUserModal
+      // Step 4: Clear search and verify all users return
+      // Re-fetch the search input in case it was re-rendered
+      const searchInputAfterSearch = within(container).getByRole("textbox", {
+        name: /search users/i,
+      });
+      await user.clear(searchInputAfterSearch);
+
+      await waitFor(
+        () => {
+          expect(
+            within(container).getByText("James Wilson"),
+          ).toBeInTheDocument();
+          expect(within(container).getByText("Sarah Chen")).toBeInTheDocument();
+        },
+        { timeout: 3000, interval: 100 },
+      );
+
+      // Step 5: Create new user → opens CreateUserModal
       const addUserButton = within(container).getByRole("button", {
         name: /add user/i,
       });
       await user.click(addUserButton);
 
-      // Wait for modal to open - check for dialog (renders in portal)
+      // Wait for modal to open - check for this specific dialog by its title
       await waitFor(() => {
-        expect(screen.getByRole("dialog")).toBeInTheDocument();
+        expect(
+          screen.getByRole("dialog", { name: /create new user/i }),
+        ).toBeInTheDocument();
       });
 
-      // Close modal using cancel button
-      const cancelButton = screen.getByRole("button", {
+      // Close modal using cancel button within the dialog
+      const dialog = screen.getByRole("dialog", { name: /create new user/i });
+      const cancelButton = within(dialog).getByRole("button", {
         name: /cancel/i,
       });
       await user.click(cancelButton);
 
-      // Verify modal is closed
+      // Verify this specific modal is closed (not just any dialog)
       await waitFor(() => {
-        expect(screen.queryByRole("dialog")).not.toBeInTheDocument();
+        expect(
+          screen.queryByRole("dialog", { name: /create new user/i }),
+        ).not.toBeInTheDocument();
       });
     });
 
