@@ -1281,7 +1281,7 @@ mod tests {
 
         // Test 1: WITHOUT batch grouping - should see all 12 individual transactions
         let response = app
-            .get("/admin/api/v1/transactions?group_batches=false")
+            .get("/admin/api/v1/transactions?group_batches=false&limit=50")
             .add_header(&add_auth_headers(&user)[0].0, &add_auth_headers(&user)[0].1)
             .add_header(&add_auth_headers(&user)[1].0, &add_auth_headers(&user)[1].1)
             .await;
@@ -1312,7 +1312,7 @@ mod tests {
 
         // Test 2: WITH batch grouping - should see aggregated batches
         let response = app
-            .get("/admin/api/v1/transactions?group_batches=true")
+            .get("/admin/api/v1/transactions?group_batches=true&limit=50")
             .add_header(&add_auth_headers(&user)[0].0, &add_auth_headers(&user)[0].1)
             .add_header(&add_auth_headers(&user)[1].0, &add_auth_headers(&user)[1].1)
             .await;
