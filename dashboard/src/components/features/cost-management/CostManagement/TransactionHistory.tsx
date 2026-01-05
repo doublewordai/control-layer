@@ -376,6 +376,14 @@ export function TransactionHistory({
                   <TableRow
                     key={transaction.id}
                     onClick={handleRowClick}
+                    tabIndex={transaction.batch_id ? 0 : -1}
+                    onKeyDown={(event) => {
+                      if (!transaction.batch_id) return;
+                      if (event.key === "Enter" || event.key === " ") {
+                        event.preventDefault();
+                        handleRowClick();
+                      }
+                    }}
                     className={transaction.batch_id ? "cursor-pointer hover:bg-doubleword-neutral-50" : ""}
                   >
                     <TableCell>
