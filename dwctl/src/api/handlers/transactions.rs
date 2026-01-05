@@ -1178,15 +1178,22 @@ mod tests {
 
         // Batch 1: 5 requests with gpt-4
         for i in 0..5 {
-            let analytics_id = Uuid::new_v4();
-            sqlx::query!(
-                "INSERT INTO http_analytics (id, user_id, model, fusillade_batch_id) VALUES ($1, $2, $3, $4)",
-                analytics_id,
-                user.id,
-                "gpt-4",
-                batch_id_1
+            let analytics_record = sqlx::query!(
+                r#"
+                INSERT INTO http_analytics
+                    (instance_id, correlation_id, timestamp, method, uri, model, user_id, fusillade_batch_id)
+                VALUES ($1, $2, NOW(), $3, $4, $5, $6, $7)
+                RETURNING id
+                "#,
+                Uuid::new_v4(),            // instance_id
+                i as i64,                  // correlation_id
+                "POST",                    // method
+                "/ai/v1/chat/completions", // uri
+                "gpt-4",                   // model
+                user.id,                   // user_id
+                batch_id_1                 // fusillade_batch_id
             )
-            .execute(&pool)
+            .fetch_one(&pool)
             .await
             .expect("Failed to insert analytics");
 
@@ -1194,7 +1201,7 @@ mod tests {
                 user_id: user.id,
                 transaction_type: CreditTransactionType::Usage,
                 amount: Decimal::from_str(&format!("{}.0", i + 1)).unwrap(), // 1.0, 2.0, 3.0, 4.0, 5.0
-                source_id: analytics_id.to_string(),
+                source_id: analytics_record.id.to_string(),
                 description: Some(format!("Batch 1 request {}", i)),
             };
             credits_repo
@@ -1205,15 +1212,22 @@ mod tests {
 
         // Batch 2: 3 requests with gpt-3.5-turbo
         for i in 0..3 {
-            let analytics_id = Uuid::new_v4();
-            sqlx::query!(
-                "INSERT INTO http_analytics (id, user_id, model, fusillade_batch_id) VALUES ($1, $2, $3, $4)",
-                analytics_id,
-                user.id,
+            let analytics_record = sqlx::query!(
+                r#"
+                INSERT INTO http_analytics
+                    (instance_id, correlation_id, timestamp, method, uri, model, user_id, fusillade_batch_id)
+                VALUES ($1, $2, NOW(), $3, $4, $5, $6, $7)
+                RETURNING id
+                "#,
+                Uuid::new_v4(),
+                (5 + i) as i64, // correlation_id (continue from batch 1)
+                "POST",
+                "/ai/v1/chat/completions",
                 "gpt-3.5-turbo",
+                user.id,
                 batch_id_2
             )
-            .execute(&pool)
+            .fetch_one(&pool)
             .await
             .expect("Failed to insert analytics");
 
@@ -1221,7 +1235,7 @@ mod tests {
                 user_id: user.id,
                 transaction_type: CreditTransactionType::Usage,
                 amount: Decimal::from_str(&format!("{}.0", (i + 1) * 10)).unwrap(), // 10.0, 20.0, 30.0
-                source_id: analytics_id.to_string(),
+                source_id: analytics_record.id.to_string(),
                 description: Some(format!("Batch 2 request {}", i)),
             };
             credits_repo
@@ -1232,14 +1246,21 @@ mod tests {
 
         // 4. Individual usage transactions (not in a batch)
         for i in 0..2 {
-            let analytics_id = Uuid::new_v4();
-            sqlx::query!(
-                "INSERT INTO http_analytics (id, user_id, model, fusillade_batch_id) VALUES ($1, $2, $3, NULL)",
-                analytics_id,
-                user.id,
-                "claude-3-sonnet"
+            let analytics_record = sqlx::query!(
+                r#"
+                INSERT INTO http_analytics
+                    (instance_id, correlation_id, timestamp, method, uri, model, user_id, fusillade_batch_id)
+                VALUES ($1, $2, NOW(), $3, $4, $5, $6, NULL)
+                RETURNING id
+                "#,
+                Uuid::new_v4(),
+                (8 + i) as i64, // correlation_id
+                "POST",
+                "/ai/v1/chat/completions",
+                "claude-3-sonnet",
+                user.id
             )
-            .execute(&pool)
+            .fetch_one(&pool)
             .await
             .expect("Failed to insert analytics");
 
@@ -1247,7 +1268,7 @@ mod tests {
                 user_id: user.id,
                 transaction_type: CreditTransactionType::Usage,
                 amount: Decimal::from_str(&format!("{}.0", i + 1)).unwrap(), // 1.0, 2.0
-                source_id: analytics_id.to_string(),
+                source_id: analytics_record.id.to_string(),
                 description: Some(format!("Individual request {}", i)),
             };
             credits_repo
@@ -1355,15 +1376,22 @@ mod tests {
         for batch_num in 0..5 {
             let batch_id = Uuid::new_v4();
             for req_num in 0..10 {
-                let analytics_id = Uuid::new_v4();
-                sqlx::query!(
-                    "INSERT INTO http_analytics (id, user_id, model, fusillade_batch_id) VALUES ($1, $2, $3, $4)",
-                    analytics_id,
-                    user.id,
+                let analytics_record = sqlx::query!(
+                    r#"
+                    INSERT INTO http_analytics
+                        (instance_id, correlation_id, timestamp, method, uri, model, user_id, fusillade_batch_id)
+                    VALUES ($1, $2, NOW(), $3, $4, $5, $6, $7)
+                    RETURNING id
+                    "#,
+                    Uuid::new_v4(),
+                    (batch_num * 10 + req_num) as i64,
+                    "POST",
+                    "/ai/v1/chat/completions",
                     format!("model-{}", batch_num),
+                    user.id,
                     batch_id
                 )
-                .execute(&pool)
+                .fetch_one(&pool)
                 .await
                 .expect("Failed to insert analytics");
 
@@ -1371,7 +1399,7 @@ mod tests {
                     user_id: user.id,
                     transaction_type: CreditTransactionType::Usage,
                     amount: Decimal::from_str("1.0").unwrap(),
-                    source_id: analytics_id.to_string(),
+                    source_id: analytics_record.id.to_string(),
                     description: Some(format!("Batch {} request {}", batch_num, req_num)),
                 };
                 credits_repo
@@ -1458,15 +1486,22 @@ mod tests {
             // Create a batch
             let batch_id = Uuid::new_v4();
             for i in 0..5 {
-                let analytics_id = Uuid::new_v4();
-                sqlx::query!(
-                    "INSERT INTO http_analytics (id, user_id, model, fusillade_batch_id) VALUES ($1, $2, $3, $4)",
-                    analytics_id,
-                    user,
+                let analytics_record = sqlx::query!(
+                    r#"
+                    INSERT INTO http_analytics
+                        (instance_id, correlation_id, timestamp, method, uri, model, user_id, fusillade_batch_id)
+                    VALUES ($1, $2, NOW(), $3, $4, $5, $6, $7)
+                    RETURNING id
+                    "#,
+                    Uuid::new_v4(),
+                    i as i64,
+                    "POST",
+                    "/ai/v1/chat/completions",
                     format!("{}-model", user_name),
+                    user,
                     batch_id
                 )
-                .execute(&pool)
+                .fetch_one(&pool)
                 .await
                 .expect("Failed to insert analytics");
 
@@ -1474,7 +1509,7 @@ mod tests {
                     user_id: *user,
                     transaction_type: CreditTransactionType::Usage,
                     amount: Decimal::from_str(&format!("{}.0", i + 1)).unwrap(),
-                    source_id: analytics_id.to_string(),
+                    source_id: analytics_record.id.to_string(),
                     description: Some(format!("{} batch request {}", user_name, i)),
                 };
                 credits_repo
