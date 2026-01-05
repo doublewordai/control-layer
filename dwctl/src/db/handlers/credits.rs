@@ -262,20 +262,25 @@ impl<'c> Credits<'c> {
     /// Returns paginated results with batches already aggregated
     /// Pass None for user_id to get all transactions (admin view)
     #[instrument(skip(self), fields(user_id = ?user_id.map(|id| abbrev_uuid(&id)), skip = skip, limit = limit), err)]
-    pub async fn list_transactions_with_batches(&mut self, user_id: Option<UserId>, skip: i64, limit: i64) -> Result<Vec<(CreditTransactionDBResponse, Option<Uuid>)>> {
+    pub async fn list_transactions_with_batches(
+        &mut self,
+        user_id: Option<UserId>,
+        skip: i64,
+        limit: i64,
+    ) -> Result<Vec<(CreditTransactionDBResponse, Option<Uuid>)>> {
         let rows = sqlx::query!(
             r#"
             SELECT * FROM (
                 -- Part 1: Aggregated batch transactions
                 -- Groups multiple batch requests into single rows (e.g., 100 requests → 1 row)
                 SELECT
-                    MIN(ct.id) as id,                    -- Pick first transaction ID in the batch
+                    (array_agg(ct.id ORDER BY ct.created_at))[1] as id,  -- Pick first transaction ID
                     ct.user_id,                          -- User who owns these transactions
-                    'usage'::credit_transaction_type as "transaction_type!: CreditTransactionType",
+                    'usage' as "transaction_type!: CreditTransactionType",
                     SUM(ct.amount) as amount,            -- Total cost of all requests in batch
                     MAX(ct.balance_after) as balance_after,  -- Final balance (after last request)
                     MIN(ct.source_id) as source_id,      -- Pick first source_id
-                    MIN(ct.previous_transaction_id) as previous_transaction_id,
+                    (array_agg(ct.previous_transaction_id ORDER BY ct.created_at))[1] as previous_transaction_id,
                     CASE
                         WHEN MIN(ha.model) IS NOT NULL THEN 'Batch - ' || MIN(ha.model)
                         ELSE 'Batch'
@@ -327,16 +332,37 @@ impl<'c> Credits<'c> {
 
         let mut results = Vec::new();
         for row in rows {
+            // Aggregated fields are nullable, but should always have values for valid batches
+            // Unwrap with helpful error messages
+            let id = row
+                .id
+                .ok_or_else(|| sqlx::Error::Protocol("Batch aggregation returned NULL id".to_string()))?;
+            let user_id = row
+                .user_id
+                .ok_or_else(|| sqlx::Error::Protocol("Batch aggregation returned NULL user_id".to_string()))?;
+            let amount = row
+                .amount
+                .ok_or_else(|| sqlx::Error::Protocol("Batch aggregation returned NULL amount".to_string()))?;
+            let balance_after = row
+                .balance_after
+                .ok_or_else(|| sqlx::Error::Protocol("Batch aggregation returned NULL balance_after".to_string()))?;
+            let source_id = row
+                .source_id
+                .ok_or_else(|| sqlx::Error::Protocol("Batch aggregation returned NULL source_id".to_string()))?;
+            let created_at = row
+                .created_at
+                .ok_or_else(|| sqlx::Error::Protocol("Batch aggregation returned NULL created_at".to_string()))?;
+
             let transaction = CreditTransactionDBResponse {
-                id: row.id,
-                user_id: row.user_id,
+                id,
+                user_id,
                 transaction_type: row.transaction_type,
-                amount: row.amount,
-                balance_after: row.balance_after,
+                amount,
+                balance_after,
                 previous_transaction_id: row.previous_transaction_id,
                 description: row.description,
-                source_id: row.source_id,
-                created_at: row.created_at,
+                source_id,
+                created_at,
             };
             results.push((transaction, row.batch_id));
         }

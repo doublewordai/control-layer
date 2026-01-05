@@ -1154,7 +1154,10 @@ mod tests {
             Decimal::from_str("1000.0").unwrap(),
             Some("Initial grant".to_string()),
         );
-        credits_repo.create_transaction(&grant_request).await.expect("Failed to create grant");
+        credits_repo
+            .create_transaction(&grant_request)
+            .await
+            .expect("Failed to create grant");
 
         // 2. Purchase
         let purchase_request = CreditTransactionCreateDBRequest {
@@ -1164,7 +1167,10 @@ mod tests {
             source_id: Uuid::new_v4().to_string(),
             description: Some("Purchase".to_string()),
         };
-        credits_repo.create_transaction(&purchase_request).await.expect("Failed to create purchase");
+        credits_repo
+            .create_transaction(&purchase_request)
+            .await
+            .expect("Failed to create purchase");
 
         // 3. Create batch data in http_analytics and usage transactions
         let batch_id_1 = Uuid::new_v4();
@@ -1191,7 +1197,10 @@ mod tests {
                 source_id: analytics_id.to_string(),
                 description: Some(format!("Batch 1 request {}", i)),
             };
-            credits_repo.create_transaction(&usage_request).await.expect("Failed to create usage");
+            credits_repo
+                .create_transaction(&usage_request)
+                .await
+                .expect("Failed to create usage");
         }
 
         // Batch 2: 3 requests with gpt-3.5-turbo
@@ -1215,7 +1224,10 @@ mod tests {
                 source_id: analytics_id.to_string(),
                 description: Some(format!("Batch 2 request {}", i)),
             };
-            credits_repo.create_transaction(&usage_request).await.expect("Failed to create usage");
+            credits_repo
+                .create_transaction(&usage_request)
+                .await
+                .expect("Failed to create usage");
         }
 
         // 4. Individual usage transactions (not in a batch)
@@ -1238,7 +1250,10 @@ mod tests {
                 source_id: analytics_id.to_string(),
                 description: Some(format!("Individual request {}", i)),
             };
-            credits_repo.create_transaction(&usage_request).await.expect("Failed to create usage");
+            credits_repo
+                .create_transaction(&usage_request)
+                .await
+                .expect("Failed to create usage");
         }
 
         drop(conn);
@@ -1257,9 +1272,18 @@ mod tests {
         assert_eq!(transactions.len(), 12, "Should have 12 individual transactions without grouping");
 
         // Verify we have the expected transaction types
-        let grant_count = transactions.iter().filter(|t| t.transaction_type == CreditTransactionType::AdminGrant).count();
-        let purchase_count = transactions.iter().filter(|t| t.transaction_type == CreditTransactionType::Purchase).count();
-        let usage_count = transactions.iter().filter(|t| t.transaction_type == CreditTransactionType::Usage).count();
+        let grant_count = transactions
+            .iter()
+            .filter(|t| t.transaction_type == CreditTransactionType::AdminGrant)
+            .count();
+        let purchase_count = transactions
+            .iter()
+            .filter(|t| t.transaction_type == CreditTransactionType::Purchase)
+            .count();
+        let usage_count = transactions
+            .iter()
+            .filter(|t| t.transaction_type == CreditTransactionType::Usage)
+            .count();
 
         assert_eq!(grant_count, 1, "Should have 1 admin grant");
         assert_eq!(purchase_count, 1, "Should have 1 purchase");
@@ -1322,7 +1346,10 @@ mod tests {
             Decimal::from_str("10000.0").unwrap(),
             Some("Initial grant".to_string()),
         );
-        credits_repo.create_transaction(&grant_request).await.expect("Failed to create grant");
+        credits_repo
+            .create_transaction(&grant_request)
+            .await
+            .expect("Failed to create grant");
 
         // Create 5 batches with 10 requests each
         for batch_num in 0..5 {
@@ -1347,7 +1374,10 @@ mod tests {
                     source_id: analytics_id.to_string(),
                     description: Some(format!("Batch {} request {}", batch_num, req_num)),
                 };
-                credits_repo.create_transaction(&usage_request).await.expect("Failed to create usage");
+                credits_repo
+                    .create_transaction(&usage_request)
+                    .await
+                    .expect("Failed to create usage");
             }
         }
 
@@ -1420,7 +1450,10 @@ mod tests {
                 Decimal::from_str("1000.0").unwrap(),
                 Some(format!("{} grant", user_name)),
             );
-            credits_repo.create_transaction(&grant_request).await.expect("Failed to create grant");
+            credits_repo
+                .create_transaction(&grant_request)
+                .await
+                .expect("Failed to create grant");
 
             // Create a batch
             let batch_id = Uuid::new_v4();
@@ -1444,7 +1477,10 @@ mod tests {
                     source_id: analytics_id.to_string(),
                     description: Some(format!("{} batch request {}", user_name, i)),
                 };
-                credits_repo.create_transaction(&usage_request).await.expect("Failed to create usage");
+                credits_repo
+                    .create_transaction(&usage_request)
+                    .await
+                    .expect("Failed to create usage");
             }
         }
 
