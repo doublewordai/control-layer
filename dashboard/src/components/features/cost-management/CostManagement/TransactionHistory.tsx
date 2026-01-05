@@ -384,7 +384,17 @@ export function TransactionHistory({
                         handleRowClick();
                       }
                     }}
-                    className={transaction.batch_id ? "cursor-pointer hover:bg-doubleword-neutral-50" : ""}
+                    role={transaction.batch_id ? "button" : undefined}
+                    aria-label={
+                      transaction.batch_id
+                        ? `View batch ${transaction.batch_id} details`
+                        : undefined
+                    }
+                    className={
+                      transaction.batch_id
+                        ? "cursor-pointer hover:bg-doubleword-neutral-50"
+                        : ""
+                    }
                   >
                     <TableCell>
                       <div

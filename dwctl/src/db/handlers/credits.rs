@@ -294,7 +294,9 @@ impl<'c> Credits<'c> {
                     AND ct.transaction_type = 'usage'
                 WHERE ($1::uuid IS NULL OR ct.user_id = $1)  -- Optional user filter (NULL = all users)
                     AND ha.fusillade_batch_id IS NOT NULL     -- Only requests with batch_id
-                GROUP BY ha.fusillade_batch_id, ct.user_id   -- One row per batch
+                -- NOTE: fusillade_batch_id is user-specific; a batch never spans multiple users.
+                -- We therefore group by both batch_id and user_id to get one row per (user, batch).
+                GROUP BY ha.fusillade_batch_id, ct.user_id
 
                 UNION ALL
 
