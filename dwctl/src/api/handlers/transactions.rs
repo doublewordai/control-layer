@@ -198,53 +198,28 @@ pub async fn list_transactions(
     let mut pool_conn = state.db.acquire().await.map_err(|e| Error::Database(e.into()))?;
     let mut repo = Credits::new(&mut pool_conn);
 
-    // Fetch transactions
+    let grouping_enabled = query.group_batches.unwrap_or(false);
+
+    // If grouping enabled, use the optimized SQL query that does everything in one go
+    if grouping_enabled {
+        let transactions_with_batches = repo.list_transactions_with_batches(filter_user_id, skip, limit).await?;
+
+        let result: Vec<CreditTransactionResponse> = transactions_with_batches
+            .into_iter()
+            .map(|(tx, batch_id)| CreditTransactionResponse::from_db_with_batch_id(tx, batch_id))
+            .collect();
+
+        return Ok(Json(result));
+    }
+
+    // Otherwise, use normal pagination without grouping
     let transactions = if let Some(user_id) = filter_user_id {
         repo.list_user_transactions(user_id, skip, limit).await?
     } else {
         repo.list_all_transactions(skip, limit).await?
     };
 
-    // If batch grouping not requested, return transactions as-is
-    if !query.group_batches.unwrap_or(false) {
-        return Ok(Json(transactions.into_iter().map(CreditTransactionResponse::from).collect()));
-    }
-
-    // Get source_ids for Usage transactions
-    let usage_source_ids: Vec<String> = transactions
-        .iter()
-        .filter(|t| t.transaction_type == CreditTransactionType::Usage)
-        .map(|t| t.source_id.clone())
-        .collect();
-
-    // If no usage transactions, return as-is
-    if usage_source_ids.is_empty() {
-        return Ok(Json(transactions.into_iter().map(CreditTransactionResponse::from).collect()));
-    }
-
-    // Get aggregated batch data from SQL
-    let crate::db::handlers::credits::AggregatedBatches {
-        batched_transactions: batch_transactions,
-        batched_source_ids,
-    } = repo.get_aggregated_batches(&usage_source_ids).await?;
-
-    // Filter out transactions that were batched
-    let batched_set: std::collections::HashSet<String> = batched_source_ids.into_iter().collect();
-    let mut result: Vec<CreditTransactionResponse> = transactions
-        .into_iter()
-        .filter(|tx| !batched_set.contains(&tx.source_id))
-        .map(CreditTransactionResponse::from)
-        .collect();
-
-    // Add batch transactions (they already have description set)
-    for (batch_tx, batch_id) in batch_transactions {
-        result.push(CreditTransactionResponse::from_db_with_batch_id(batch_tx, Some(batch_id)));
-    }
-
-    // Re-sort by created_at
-    result.sort_by(|a, b| b.created_at.cmp(&a.created_at));
-
-    Ok(Json(result))
+    Ok(Json(transactions.into_iter().map(CreditTransactionResponse::from).collect()))
 }
 
 #[cfg(test)]
