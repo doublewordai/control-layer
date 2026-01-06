@@ -22,7 +22,6 @@ export const DEMO_USERS = {
 
 // Dummy data for transactions
 export const generateDummyTransactions = (): Transaction[] => {
-  let balance = 0;
   let idCounter = 1;
 
   const createTransaction = (
@@ -34,13 +33,6 @@ export const generateDummyTransactions = (): Transaction[] => {
   ): Transaction => {
     const id = String(idCounter++);
 
-    // Update balance based on transaction type
-    if (transaction_type === "admin_grant" || transaction_type === "purchase") {
-      balance += amount;
-    } else {
-      balance -= amount;
-    }
-
     // Use DEMO_GIFT for admin grants, otherwise use user_id
     const source_id =
       transaction_type === "admin_grant" ? "DEMO_GIFT" : user_id;
@@ -50,7 +42,6 @@ export const generateDummyTransactions = (): Transaction[] => {
       user_id,
       transaction_type,
       amount,
-      balance_after: balance,
       source_id,
       description,
       created_at: new Date(

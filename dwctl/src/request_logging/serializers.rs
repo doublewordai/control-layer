@@ -421,7 +421,7 @@ pub async fn store_analytics_record(
                 .map(|s| s.to_string())
                 .or(model_info.provider_name);
 
-            warn!(
+            debug!(
                 "Tariff pricing for model '{}' with purpose '{:?}': {:?}",
                 model_name, api_key_purpose, tariff_pricing
             );

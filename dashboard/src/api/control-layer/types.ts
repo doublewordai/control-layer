@@ -695,7 +695,6 @@ export interface Transaction {
   transaction_type: TransactionType;
   batch_id?: string; // Batch ID (present when this is a grouped batch of multiple usage transactions)
   amount: number; // Amount in dollars
-  balance_after: number; // Balance in dollars
   source_id: string;
   description?: string;
   created_at: string; // ISO 8601 timestamp
@@ -707,10 +706,13 @@ export interface BalanceResponse {
 }
 
 export interface TransactionsListResponse {
-  transactions: Transaction[];
-  total: number;
+  data: Transaction[];
+  total_count: number;
   limit: number;
   skip: number;
+  /** Current user balance when skip=0, or balance at the pagination point when skip>0.
+   * Frontend can compute each row's balance by subtracting signed amounts from this value. */
+  page_start_balance: number;
 }
 
 export interface TransactionsQuery {
