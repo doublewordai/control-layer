@@ -125,3 +125,135 @@ impl Deref for DbPools {
         &self.primary
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use sqlx::postgres::PgPoolOptions;
+
+    /// Helper to create a test database and return its pool and name
+    async fn create_test_db(admin_pool: &PgPool, suffix: &str) -> (PgPool, String) {
+        let db_name = format!("test_dbpools_{}", suffix);
+
+        // Clean up if exists
+        sqlx::query(&format!(
+            "SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE datname = '{}'",
+            db_name
+        ))
+        .execute(admin_pool)
+        .await
+        .ok();
+        sqlx::query(&format!("DROP DATABASE IF EXISTS {}", db_name))
+            .execute(admin_pool)
+            .await
+            .unwrap();
+
+        // Create fresh database
+        sqlx::query(&format!("CREATE DATABASE {}", db_name))
+            .execute(admin_pool)
+            .await
+            .unwrap();
+
+        // Connect to it
+        let url = build_test_url(&db_name);
+        let pool = PgPoolOptions::new().max_connections(2).connect(&url).await.unwrap();
+
+        // Create a marker table to identify which database we're connected to
+        sqlx::query("CREATE TABLE db_marker (name TEXT)").execute(&pool).await.unwrap();
+        sqlx::query(&format!("INSERT INTO db_marker VALUES ('{}')", db_name))
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        (pool, db_name)
+    }
+
+    async fn drop_test_db(admin_pool: &PgPool, db_name: &str) {
+        sqlx::query(&format!(
+            "SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE datname = '{}'",
+            db_name
+        ))
+        .execute(admin_pool)
+        .await
+        .ok();
+        sqlx::query(&format!("DROP DATABASE IF EXISTS {}", db_name))
+            .execute(admin_pool)
+            .await
+            .ok();
+    }
+
+    fn build_test_url(database: &str) -> String {
+        if let Ok(base_url) = std::env::var("DATABASE_URL") {
+            if let Ok(mut url) = url::Url::parse(&base_url) {
+                url.set_path(&format!("/{}", database));
+                return url.to_string();
+            }
+        }
+        format!("postgres://postgres:password@localhost:5432/{}", database)
+    }
+
+    #[sqlx::test]
+    async fn test_dbpools_without_replica(pool: PgPool) {
+        let db_pools = DbPools::new(pool.clone());
+
+        // Without replica, read() should return primary
+        assert!(!db_pools.has_replica());
+
+        // Both read and write should work
+        let read_result: (i32,) = sqlx::query_as("SELECT 1").fetch_one(db_pools.read()).await.unwrap();
+        assert_eq!(read_result.0, 1);
+
+        let write_result: (i32,) = sqlx::query_as("SELECT 2").fetch_one(db_pools.write()).await.unwrap();
+        assert_eq!(write_result.0, 2);
+
+        // Deref should also work
+        let deref_result: (i32,) = sqlx::query_as("SELECT 3").fetch_one(&*db_pools).await.unwrap();
+        assert_eq!(deref_result.0, 3);
+    }
+
+    #[sqlx::test]
+    async fn test_dbpools_with_replica_routes_correctly(_pool: PgPool) {
+        // Create admin connection to postgres database
+        let admin_url = build_test_url("postgres");
+        let admin_pool = PgPoolOptions::new().max_connections(2).connect(&admin_url).await.unwrap();
+
+        // Create two separate databases to simulate primary and replica
+        let (primary_pool, primary_name) = create_test_db(&admin_pool, "primary").await;
+        let (replica_pool, replica_name) = create_test_db(&admin_pool, "replica").await;
+
+        let db_pools = DbPools::with_replica(primary_pool.clone(), replica_pool.clone());
+        assert!(db_pools.has_replica());
+
+        // read() should return replica
+        let read_marker: (String,) = sqlx::query_as("SELECT name FROM db_marker")
+            .fetch_one(db_pools.read())
+            .await
+            .unwrap();
+        assert_eq!(read_marker.0, replica_name, "read() should route to replica");
+
+        // write() should return primary
+        let write_marker: (String,) = sqlx::query_as("SELECT name FROM db_marker")
+            .fetch_one(db_pools.write())
+            .await
+            .unwrap();
+        assert_eq!(write_marker.0, primary_name, "write() should route to primary");
+
+        // Deref should return primary
+        let deref_marker: (String,) = sqlx::query_as("SELECT name FROM db_marker").fetch_one(&*db_pools).await.unwrap();
+        assert_eq!(deref_marker.0, primary_name, "deref should route to primary");
+
+        // Cleanup
+        primary_pool.close().await;
+        replica_pool.close().await;
+        drop_test_db(&admin_pool, &primary_name).await;
+        drop_test_db(&admin_pool, &replica_name).await;
+    }
+
+    #[sqlx::test]
+    async fn test_dbpools_close(pool: PgPool) {
+        let db_pools = DbPools::new(pool);
+
+        // Close should not panic
+        db_pools.close().await;
+    }
+}
