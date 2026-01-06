@@ -479,13 +479,14 @@ describe("Billing Hooks", () => {
       });
 
       expect(result.current.data).toBeDefined();
-      expect(Array.isArray(result.current.data)).toBe(true);
-      expect(result.current.data!.length).toBeGreaterThan(0);
-      expect(result.current.data![0]).toHaveProperty("id");
-      expect(result.current.data![0]).toHaveProperty("user_id");
-      expect(result.current.data![0]).toHaveProperty("transaction_type");
-      expect(result.current.data![0]).toHaveProperty("amount");
-      expect(result.current.data![0]).toHaveProperty("balance_after");
+      expect(result.current.data).toHaveProperty("data");
+      expect(result.current.data).toHaveProperty("page_start_balance");
+      expect(Array.isArray(result.current.data!.data)).toBe(true);
+      expect(result.current.data!.data.length).toBeGreaterThan(0);
+      expect(result.current.data!.data[0]).toHaveProperty("id");
+      expect(result.current.data!.data[0]).toHaveProperty("user_id");
+      expect(result.current.data!.data[0]).toHaveProperty("transaction_type");
+      expect(result.current.data!.data[0]).toHaveProperty("amount");
     });
 
     it("should fetch transactions with userId filter", async () => {
@@ -499,9 +500,9 @@ describe("Billing Hooks", () => {
       });
 
       expect(result.current.data).toBeDefined();
-      expect(Array.isArray(result.current.data)).toBe(true);
+      expect(Array.isArray(result.current.data!.data)).toBe(true);
       // All transactions should belong to the specified user
-      expect(result.current.data!.every((t) => t.user_id === userId)).toBe(
+      expect(result.current.data!.data.every((t) => t.user_id === userId)).toBe(
         true,
       );
     });
@@ -519,7 +520,7 @@ describe("Billing Hooks", () => {
       });
 
       expect(result.current.data).toBeDefined();
-      expect(result.current.data!.length).toBeLessThanOrEqual(3);
+      expect(result.current.data!.data.length).toBeLessThanOrEqual(3);
     });
 
     it("should handle errors", async () => {
@@ -565,7 +566,6 @@ describe("Billing Hooks", () => {
       expect(result.current.data!.user_id).toBe(fundsData.user_id);
       expect(result.current.data!.amount).toBe(fundsData.amount);
       expect(result.current.data!.transaction_type).toBe("admin_grant");
-      expect(result.current.data!.balance_after).toBeGreaterThan(0);
     });
 
     it("should add funds without description", async () => {

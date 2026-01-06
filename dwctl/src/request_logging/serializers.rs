@@ -421,7 +421,7 @@ pub async fn store_analytics_record(
                 .map(|s| s.to_string())
                 .or(model_info.provider_name);
 
-            warn!(
+            debug!(
                 "Tariff pricing for model '{}' with purpose '{:?}': {:?}",
                 model_name, api_key_purpose, tariff_pricing
             );
@@ -605,7 +605,6 @@ pub async fn store_analytics_record(
                                         user_id = %user_id,
                                         transaction_id = %result.id,
                                         amount = %total_cost,
-                                        balance_after = %result.balance_after,
                                         model = %model,
                                         "Credits deducted for API usage"
                                     );
@@ -1896,7 +1895,6 @@ mod tests {
 
             let usage_tx = usage_tx.unwrap();
             assert_eq!(usage_tx.amount, expected_cost, "Transaction amount should preserve full precision");
-            assert_eq!(usage_tx.balance_after, expected_balance, "Balance after should match");
         }
 
         #[sqlx::test]
@@ -2223,10 +2221,7 @@ mod tests {
             // Debug: Print all transactions to see the chain
             println!("\n=== All Transactions (most recent first) ===");
             for tx in &transactions {
-                println!(
-                    "  {:?} | amount: {} | balance_after: {} | prev_id: {:?}",
-                    tx.transaction_type, tx.amount, tx.balance_after, tx.previous_transaction_id
-                );
+                println!("  {:?} | amount: {}", tx.transaction_type, tx.amount);
             }
 
             // Verify: Final balance is correct (10 requests * 0.01 each = 0.10 total)

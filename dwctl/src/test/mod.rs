@@ -224,12 +224,15 @@ async fn test_e2e_ai_proxy_with_mocked_inference(pool: PgPool) {
 
         info!("Received {:?}", serde_json::to_string(&transactions));
         // Find the usage transaction (there should be an admin_grant and a usage transaction)
-        let usage_tx = transactions
+        // Response is now TransactionListResponse with data array
+        let usage_tx = transactions["data"]
             .as_array()
             .and_then(|x| x.iter().find(|tx| tx["transaction_type"] == "usage"));
 
         if let Some(tx) = usage_tx {
-            break tx.clone();
+            // Get page_start_balance which represents the user's current balance (since skip=0)
+            let page_start_balance: f64 = transactions["page_start_balance"].as_str().unwrap().parse().unwrap();
+            break (tx.clone(), page_start_balance);
         } else {
             tries += 1;
             if tries >= 50 {
@@ -239,10 +242,10 @@ async fn test_e2e_ai_proxy_with_mocked_inference(pool: PgPool) {
         }
     };
 
-    assert_eq!(usage_tx["transaction_type"], "usage", "Should be usage transaction");
+    assert_eq!(usage_tx.0["transaction_type"], "usage", "Should be usage transaction");
     // Amount is returned as string due to high precision decimal
-    let amount: f64 = usage_tx["amount"].as_str().unwrap().parse().unwrap();
-    let balance: f64 = usage_tx["balance_after"].as_str().unwrap().parse().unwrap();
+    let amount: f64 = usage_tx.0["amount"].as_str().unwrap().parse().unwrap();
+    let balance = usage_tx.1; // page_start_balance represents the user's current balance
     assert!(amount > 0.0, "Usage amount should be positive (absolute value), got: {}", amount);
     assert!(
         balance < 1000.0,
