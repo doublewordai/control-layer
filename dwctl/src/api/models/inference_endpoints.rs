@@ -84,7 +84,7 @@ impl From<OpenRouterModelsResponse> for OpenAIModelsResponse {
             .data
             .into_iter()
             .map(|model| OpenAIModel {
-                id: model.id.clone(),
+                id: model.id,
                 object: "model".to_string(),
                 created: model.created,
                 owned_by: "openrouter".to_string(),
