@@ -1,3 +1,5 @@
+-- no-transaction
+
 -- Add expression index for efficient joins between credits_transactions and http_analytics
 --
 -- The join `credits_transactions.source_id = http_analytics.id::text` requires a type cast
