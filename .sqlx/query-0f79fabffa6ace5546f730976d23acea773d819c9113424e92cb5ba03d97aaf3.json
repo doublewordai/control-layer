@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "\n            SELECT id, user_id, transaction_type as \"transaction_type: CreditTransactionType\", amount, balance_after, source_id, previous_transaction_id, description, created_at\n            FROM credits_transactions\n            ORDER BY created_at DESC, id DESC\n            OFFSET $1\n            LIMIT $2\n            ",
+  "query": "\n            INSERT INTO credits_transactions (user_id, transaction_type, amount, source_id, description)\n            VALUES ($1, $2, $3, $4, $5)\n            RETURNING id, user_id, transaction_type as \"transaction_type: CreditTransactionType\", amount, source_id,\n                      balance_after, previous_transaction_id, description, created_at, seq\n            ",
   "describe": {
     "columns": [
       {
@@ -25,13 +25,13 @@
       },
       {
         "ordinal": 4,
-        "name": "balance_after",
-        "type_info": "Numeric"
+        "name": "source_id",
+        "type_info": "Text"
       },
       {
         "ordinal": 5,
-        "name": "source_id",
-        "type_info": "Text"
+        "name": "balance_after",
+        "type_info": "Numeric"
       },
       {
         "ordinal": 6,
@@ -47,12 +47,20 @@
         "ordinal": 8,
         "name": "created_at",
         "type_info": "Timestamptz"
+      },
+      {
+        "ordinal": 9,
+        "name": "seq",
+        "type_info": "Int8"
       }
     ],
     "parameters": {
       "Left": [
-        "Int8",
-        "Int8"
+        "Uuid",
+        "Text",
+        "Numeric",
+        "Text",
+        "Text"
       ]
     },
     "nullable": [
@@ -60,12 +68,13 @@
       false,
       false,
       false,
-      true,
       false,
       true,
       true,
+      true,
+      false,
       false
     ]
   },
-  "hash": "0013944d2aa7d7080d3bc39d603d0d52a67490da9217ce9954a5fe6cd9f15a58"
+  "hash": "0f79fabffa6ace5546f730976d23acea773d819c9113424e92cb5ba03d97aaf3"
 }

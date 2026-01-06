@@ -252,7 +252,7 @@ pub async fn load_targets_from_db(db: &PgPool) -> Result<Targets, anyhow::Error>
                     )
                     FROM credits_transactions ct
                     WHERE ct.user_id = u.id
-                    AND (c.checkpoint_time IS NULL OR ct.created_at > c.checkpoint_time)),
+                    AND (c.checkpoint_seq IS NULL OR ct.seq > c.checkpoint_seq)),
                     0
                 ) as balance
             FROM users u

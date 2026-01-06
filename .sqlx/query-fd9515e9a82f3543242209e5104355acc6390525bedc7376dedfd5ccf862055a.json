@@ -1,0 +1,28 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n            SELECT\n                COALESCE(c.user_id, t.user_id) as \"user_id!\",\n                COALESCE(c.balance, 0) + COALESCE(SUM(\n                    CASE WHEN t.transaction_type IN ('admin_grant', 'purchase') THEN t.amount ELSE -t.amount END\n                ), 0) as \"balance!\"\n            FROM user_balance_checkpoints c\n            FULL OUTER JOIN credits_transactions t\n                ON t.user_id = c.user_id\n                AND t.seq > c.checkpoint_seq\n            WHERE c.user_id = ANY($1) OR t.user_id = ANY($1)\n            GROUP BY c.user_id, t.user_id, c.balance\n            ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "user_id!",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 1,
+        "name": "balance!",
+        "type_info": "Numeric"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "UuidArray"
+      ]
+    },
+    "nullable": [
+      null,
+      null
+    ]
+  },
+  "hash": "fd9515e9a82f3543242209e5104355acc6390525bedc7376dedfd5ccf862055a"
+}

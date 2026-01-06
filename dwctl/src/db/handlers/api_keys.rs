@@ -441,7 +441,7 @@ impl<'c> ApiKeys<'c> {
                         FROM credits_transactions ct
                         LEFT JOIN user_balance_checkpoints c ON c.user_id = ak.user_id
                         WHERE ct.user_id = ak.user_id
-                        AND (c.checkpoint_time IS NULL OR ct.created_at > c.checkpoint_time)
+                        AND (c.checkpoint_seq IS NULL OR ct.seq > c.checkpoint_seq)
                         ),
                         0
                     )
@@ -492,7 +492,7 @@ impl<'c> ApiKeys<'c> {
                         FROM credits_transactions ct
                         LEFT JOIN user_balance_checkpoints c ON c.user_id = ak.user_id
                         WHERE ct.user_id = ak.user_id
-                        AND (c.checkpoint_time IS NULL OR ct.created_at > c.checkpoint_time)
+                        AND (c.checkpoint_seq IS NULL OR ct.seq > c.checkpoint_seq)
                         ),
                         0
                     )

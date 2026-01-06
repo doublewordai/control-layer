@@ -1,48 +1,56 @@
 -- Add checkpoint-based balance calculation to remove advisory locking from credit transactions
 -- This enables lock-free writes with O(1) amortized read complexity
+--
+-- Uses BIGSERIAL sequence numbers (not timestamps) for reliable ordering.
+-- Timestamps can collide at microsecond precision under high concurrency,
+-- but sequence numbers guarantee strict ordering.
 
--- 1. Create checkpoint table for caching running balances
+-- 1. Add sequence column to credits_transactions for reliable ordering
+ALTER TABLE credits_transactions ADD COLUMN seq BIGSERIAL;
+
+COMMENT ON COLUMN credits_transactions.seq IS 'Auto-incrementing sequence number for reliable transaction ordering in checkpoint calculations';
+
+-- 2. Create checkpoint table for caching running balances
 CREATE TABLE user_balance_checkpoints (
     user_id UUID PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE,
-    checkpoint_time TIMESTAMPTZ NOT NULL,
+    checkpoint_seq BIGINT NOT NULL,
     balance DECIMAL(20, 9) NOT NULL,
     updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 
 COMMENT ON TABLE user_balance_checkpoints IS 'Cached balance checkpoints for efficient balance calculation without locking';
-COMMENT ON COLUMN user_balance_checkpoints.checkpoint_time IS 'Timestamp up to which transactions are included in the checkpoint balance';
-COMMENT ON COLUMN user_balance_checkpoints.balance IS 'Aggregated balance of all transactions up to checkpoint_time';
+COMMENT ON COLUMN user_balance_checkpoints.checkpoint_seq IS 'Sequence number of the last transaction included in the checkpoint balance';
+COMMENT ON COLUMN user_balance_checkpoints.balance IS 'Aggregated balance of all transactions up to checkpoint_seq';
 
--- 2. Create covering index for efficient delta queries
--- This allows fetching transactions since checkpoint without a table lookup
+-- 3. Create covering index for efficient delta queries using seq
 CREATE INDEX idx_credits_checkpoint_delta ON credits_transactions
-    (user_id, created_at DESC) INCLUDE (transaction_type, amount);
+    (user_id, seq DESC) INCLUDE (transaction_type, amount);
 
--- 3. Make balance_after nullable (we stop populating it for new transactions)
+-- 4. Make balance_after nullable (we stop populating it for new transactions)
 ALTER TABLE credits_transactions
     ALTER COLUMN balance_after DROP NOT NULL;
 
--- 4. Backfill checkpoints for all existing users with transactions
-INSERT INTO user_balance_checkpoints (user_id, checkpoint_time, balance)
+-- 5. Backfill checkpoints for all existing users with transactions
+INSERT INTO user_balance_checkpoints (user_id, checkpoint_seq, balance)
 SELECT
     user_id,
-    MAX(created_at) as checkpoint_time,
+    MAX(seq) as checkpoint_seq,
     SUM(CASE WHEN transaction_type IN ('admin_grant', 'purchase') THEN amount ELSE -amount END) as balance
 FROM credits_transactions
 GROUP BY user_id
 ON CONFLICT (user_id) DO NOTHING;
 
--- 5. Update the balance threshold notification trigger to use checkpoint-based calculation
+-- 6. Update the balance threshold notification trigger to use seq-based calculation
 CREATE OR REPLACE FUNCTION notify_on_balance_threshold_crossing() RETURNS trigger AS $$
 DECLARE
     old_balance DECIMAL(20, 9);
     new_balance DECIMAL(20, 9);
     checkpoint_balance DECIMAL(20, 9);
-    checkpoint_time TIMESTAMPTZ;
+    checkpoint_seq BIGINT;
     delta_sum DECIMAL(20, 9);
 BEGIN
     -- Get checkpoint for this user (may not exist for new users)
-    SELECT c.balance, c.checkpoint_time INTO checkpoint_balance, checkpoint_time
+    SELECT c.balance, c.checkpoint_seq INTO checkpoint_balance, checkpoint_seq
     FROM user_balance_checkpoints c
     WHERE c.user_id = NEW.user_id;
 
@@ -55,13 +63,13 @@ BEGIN
         FROM credits_transactions
         WHERE user_id = NEW.user_id AND id != NEW.id;
     ELSE
-        -- Sum transactions after checkpoint but before this one
+        -- Sum transactions after checkpoint but before this one (using seq for reliable ordering)
         SELECT COALESCE(SUM(
             CASE WHEN transaction_type IN ('admin_grant', 'purchase') THEN amount ELSE -amount END
         ), 0) INTO delta_sum
         FROM credits_transactions
         WHERE user_id = NEW.user_id
-          AND created_at > checkpoint_time
+          AND seq > checkpoint_seq
           AND id != NEW.id;
 
         old_balance := checkpoint_balance + delta_sum;

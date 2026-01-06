@@ -35,6 +35,8 @@ pub struct CreditTransaction {
     pub description: Option<String>,
     pub source_id: String,
     pub created_at: DateTime<Utc>,
+    /// Sequence number for reliable ordering in checkpoint calculations.
+    pub seq: i64,
 }
 
 impl From<CreditTransaction> for CreditTransactionDBResponse {
@@ -57,7 +59,7 @@ impl From<CreditTransaction> for CreditTransactionDBResponse {
 #[derive(Debug, Clone)]
 pub struct BalanceCheckpoint {
     pub user_id: UserId,
-    pub checkpoint_time: DateTime<Utc>,
+    pub checkpoint_seq: i64,
     pub balance: Decimal,
 }
 
@@ -93,7 +95,7 @@ impl<'c> Credits<'c> {
             INSERT INTO credits_transactions (user_id, transaction_type, amount, source_id, description)
             VALUES ($1, $2, $3, $4, $5)
             RETURNING id, user_id, transaction_type as "transaction_type: CreditTransactionType", amount, source_id,
-                      balance_after, previous_transaction_id, description, created_at
+                      balance_after, previous_transaction_id, description, created_at, seq
             "#,
             request.user_id,
             &request.transaction_type as &CreditTransactionType,
@@ -119,22 +121,22 @@ impl<'c> Credits<'c> {
         Ok(CreditTransactionDBResponse::from(transaction))
     }
 
-    /// Calculate balance using checkpoint + delta, returning both balance and latest transaction time.
+    /// Calculate balance using checkpoint + delta, returning both balance and latest transaction seq.
     ///
     /// This is the core calculation used by both `get_user_balance` and `refresh_checkpoint`.
-    /// Returns (balance, latest_transaction_time). If no transactions exist, returns (0, None).
-    async fn calculate_balance_with_timestamp(&mut self, user_id: UserId) -> Result<(Decimal, Option<DateTime<Utc>>)> {
+    /// Returns (balance, latest_seq). If no transactions exist, returns (0, None).
+    async fn calculate_balance_with_seq(&mut self, user_id: UserId) -> Result<(Decimal, Option<i64>)> {
         let result = sqlx::query!(
             r#"
             SELECT
                 COALESCE(c.balance, 0) + COALESCE(SUM(
                     CASE WHEN t.transaction_type IN ('admin_grant', 'purchase') THEN t.amount ELSE -t.amount END
                 ), 0) as "balance!",
-                MAX(t.created_at) as latest_tx_time
+                MAX(t.seq) as latest_seq
             FROM user_balance_checkpoints c
             FULL OUTER JOIN credits_transactions t
                 ON t.user_id = c.user_id
-                AND t.created_at > c.checkpoint_time
+                AND t.seq > c.checkpoint_seq
             WHERE c.user_id = $1 OR t.user_id = $1
             GROUP BY c.balance
             "#,
@@ -144,7 +146,7 @@ impl<'c> Credits<'c> {
         .await?;
 
         match result {
-            Some(row) => Ok((row.balance, row.latest_tx_time)),
+            Some(row) => Ok((row.balance, row.latest_seq)),
             None => Ok((Decimal::ZERO, None)),
         }
     }
@@ -155,21 +157,21 @@ impl<'c> Credits<'c> {
     /// Uses the existing checkpoint as a base (if present) - only aggregates delta transactions.
     #[instrument(skip(self), fields(user_id = %abbrev_uuid(&user_id)), err)]
     pub async fn refresh_checkpoint(&mut self, user_id: UserId) -> Result<()> {
-        let (balance, latest_tx_time) = self.calculate_balance_with_timestamp(user_id).await?;
+        let (balance, latest_seq) = self.calculate_balance_with_seq(user_id).await?;
 
         // Only update checkpoint if there are transactions
-        if let Some(checkpoint_time) = latest_tx_time {
+        if let Some(checkpoint_seq) = latest_seq {
             sqlx::query!(
                 r#"
-                INSERT INTO user_balance_checkpoints (user_id, checkpoint_time, balance)
+                INSERT INTO user_balance_checkpoints (user_id, checkpoint_seq, balance)
                 VALUES ($1, $2, $3)
                 ON CONFLICT (user_id) DO UPDATE SET
-                    checkpoint_time = EXCLUDED.checkpoint_time,
+                    checkpoint_seq = EXCLUDED.checkpoint_seq,
                     balance = EXCLUDED.balance,
                     updated_at = NOW()
                 "#,
                 user_id,
-                checkpoint_time,
+                checkpoint_seq,
                 balance
             )
             .execute(&mut *self.db)
@@ -185,7 +187,7 @@ impl<'c> Credits<'c> {
     /// If no checkpoint exists, it falls back to aggregating all transactions.
     #[instrument(skip(self), fields(user_id = %abbrev_uuid(&user_id)), err)]
     pub async fn get_user_balance(&mut self, user_id: UserId) -> Result<Decimal> {
-        let (balance, _) = self.calculate_balance_with_timestamp(user_id).await?;
+        let (balance, _) = self.calculate_balance_with_seq(user_id).await?;
         Ok(balance)
     }
 
@@ -202,7 +204,7 @@ impl<'c> Credits<'c> {
             FROM user_balance_checkpoints c
             FULL OUTER JOIN credits_transactions t
                 ON t.user_id = c.user_id
-                AND t.created_at > c.checkpoint_time
+                AND t.seq > c.checkpoint_seq
             WHERE c.user_id = ANY($1) OR t.user_id = ANY($1)
             GROUP BY c.user_id, t.user_id, c.balance
             "#,
@@ -231,10 +233,10 @@ impl<'c> Credits<'c> {
         let transactions = sqlx::query_as!(
             CreditTransaction,
             r#"
-            SELECT id, user_id, transaction_type as "transaction_type: CreditTransactionType", amount, balance_after, source_id, previous_transaction_id, description, created_at
+            SELECT id, user_id, transaction_type as "transaction_type: CreditTransactionType", amount, balance_after, source_id, previous_transaction_id, description, created_at, seq
             FROM credits_transactions
             WHERE user_id = $1
-            ORDER BY created_at DESC, id DESC
+            ORDER BY seq DESC
             OFFSET $2
             LIMIT $3
             "#,
@@ -254,9 +256,9 @@ impl<'c> Credits<'c> {
         let transactions = sqlx::query_as!(
             CreditTransaction,
             r#"
-            SELECT id, user_id, transaction_type as "transaction_type: CreditTransactionType", amount, balance_after, source_id, previous_transaction_id, description, created_at
+            SELECT id, user_id, transaction_type as "transaction_type: CreditTransactionType", amount, balance_after, source_id, previous_transaction_id, description, created_at, seq
             FROM credits_transactions
-            ORDER BY created_at DESC, id DESC
+            ORDER BY seq DESC
             OFFSET $1
             LIMIT $2
             "#,
@@ -276,7 +278,7 @@ impl<'c> Credits<'c> {
             CreditTransaction,
             r#"
             SELECT id, user_id, transaction_type as "transaction_type: CreditTransactionType",
-                amount, balance_after, previous_transaction_id, source_id, description, created_at
+                amount, balance_after, previous_transaction_id, source_id, description, created_at, seq
             FROM credits_transactions
             WHERE id = $1
             "#,
@@ -357,7 +359,7 @@ impl<'c> Credits<'c> {
                 SELECT transaction_type, amount
                 FROM credits_transactions
                 WHERE user_id = $1
-                ORDER BY created_at DESC, id DESC
+                ORDER BY seq DESC
                 LIMIT $2
             ) recent
             "#,
@@ -386,18 +388,19 @@ impl<'c> Credits<'c> {
                 -- Part 1: Aggregated batch transactions
                 -- Groups multiple batch requests into single rows (e.g., 100 requests → 1 row)
                 SELECT
-                    (array_agg(ct.id ORDER BY ct.created_at))[1] as id,  -- Pick first transaction ID
+                    (array_agg(ct.id ORDER BY ct.seq))[1] as id,  -- Pick first transaction ID
                     ct.user_id,                          -- User who owns these transactions
                     'usage' as "transaction_type!: CreditTransactionType",
                     SUM(ct.amount) as amount,            -- Total cost of all requests in batch
                     MAX(ct.balance_after) as balance_after,  -- Final balance (after last request)
                     MIN(ct.source_id) as source_id,      -- Pick first source_id
-                    (array_agg(ct.previous_transaction_id ORDER BY ct.created_at))[1] as previous_transaction_id,
+                    (array_agg(ct.previous_transaction_id ORDER BY ct.seq))[1] as previous_transaction_id,
                     CASE
                         WHEN MIN(ha.model) IS NOT NULL THEN 'Batch - ' || MIN(ha.model)
                         ELSE 'Batch'
                     END as description,                  -- "Batch - gpt-4" or just "Batch"
                     MAX(ct.created_at) as created_at,    -- Most recent transaction time in batch
+                    MAX(ct.seq) as max_seq,              -- Highest seq in batch (for ordering)
                     ha.fusillade_batch_id as batch_id    -- The batch ID
                 FROM credits_transactions ct
                 -- Filter by transaction_type before joining to reduce rows
@@ -424,6 +427,7 @@ impl<'c> Credits<'c> {
                     ct.previous_transaction_id,
                     ct.description,
                     ct.created_at,
+                    ct.seq as max_seq,                   -- Individual transaction seq
                     NULL::uuid as batch_id              -- Not a batch, so NULL
                 FROM credits_transactions ct
                 -- LEFT JOIN so non-usage transactions (grants, purchases) still appear
@@ -432,9 +436,9 @@ impl<'c> Credits<'c> {
                     AND (ct.transaction_type != 'usage'       -- All non-usage (grants, purchases, removals)
                          OR ha.fusillade_batch_id IS NULL)    -- OR usage without batch_id
             ) combined
-            -- Sort by most recent first, then paginate
+            -- Sort by seq (most recent first), then paginate
             -- Pagination happens AFTER aggregation for correct results
-            ORDER BY created_at DESC
+            ORDER BY max_seq DESC
             LIMIT $2 OFFSET $3
             "#,
             user_id,
@@ -690,15 +694,14 @@ mod tests {
             .await
             .expect("Failed to list transactions");
 
-        // Should be ordered by created_at DESC, id DESC (most recent first)
+        // Should be ordered by seq DESC (most recent first)
+        // Since seq is monotonically increasing, this effectively orders by creation time
         assert_eq!(transactions.len(), n_of_transactions as usize);
         for i in 0..(transactions.len() - 1) {
             let t1 = &transactions[i];
             let t2 = &transactions[i + 1];
-            assert!(t1.created_at >= t2.created_at, "Transactions are not ordered by created_at DESC");
-            if t1.created_at == t2.created_at {
-                assert!(t1.id > t2.id, "Transactions with same created_at are not ordered by id DESC");
-            }
+            // Higher seq means more recent, so created_at should be >= as well
+            assert!(t1.created_at >= t2.created_at, "Transactions are not ordered correctly");
         }
     }
 
