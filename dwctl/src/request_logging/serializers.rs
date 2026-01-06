@@ -359,20 +359,20 @@ pub async fn store_analytics_record(
         metrics.timestamp
     };
 
+    // Acquire a single connection upfront and reuse for all DB operations
+    let mut conn = pool.acquire().await?;
+
     // Extract user information and API key purpose based on auth type
     let (user_id, user_email, access_source, api_key_purpose) = match auth {
         Auth::ApiKey { bearer_token } => {
             // Try to get user ID, email, and purpose from API key
             use crate::db::handlers::api_keys::ApiKeys;
-            let mut conn = pool.acquire().await?;
-            {
-                let mut repo = ApiKeys::new(&mut conn);
-                match repo.get_user_info_by_secret(bearer_token).await? {
-                    Some((user_id, email, purpose)) => (Some(user_id), Some(email), AccessSource::ApiKey, Some(purpose)),
-                    None => {
-                        warn!("Unknown API key used");
-                        (None, None, AccessSource::UnknownApiKey, None)
-                    }
+            let mut repo = ApiKeys::new(&mut conn);
+            match repo.get_user_info_by_secret(bearer_token).await? {
+                Some((user_id, email, purpose)) => (Some(user_id), Some(email), AccessSource::ApiKey, Some(purpose)),
+                None => {
+                    warn!("Unknown API key used");
+                    (None, None, AccessSource::UnknownApiKey, None)
                 }
             }
         }
@@ -395,13 +395,12 @@ pub async fn store_analytics_record(
             "#,
             model_name
         )
-        .fetch_optional(pool)
+        .fetch_optional(&mut *conn)
         .await?;
 
         if let Some(model_info) = model_info {
             // Use the tariff repository to get pricing at timestamp
             use crate::db::handlers::Tariffs;
-            let mut conn = pool.acquire().await?;
             let mut tariffs_repo = Tariffs::new(&mut conn);
 
             let tariff_pricing = tariffs_repo
@@ -525,7 +524,7 @@ pub async fn store_analytics_record(
         row.fusillade_request_id,
         row.custom_id
     )
-    .fetch_one(pool)
+    .fetch_one(&mut *conn)
     .await?;
 
     // =======================================================================
@@ -570,67 +569,38 @@ pub async fn store_analytics_record(
                         "Cost is greater than zero, proceeding with credit deduction"
                     );
 
-                    let mut conn = pool.acquire().await?;
+                    // Create usage transaction referencing the analytics record
+                    // Skip balance check - it was only used for warning logs
                     let mut credits = Credits::new(&mut conn);
-
-                    // Get user balance to check for negative balance warning
-                    match credits.get_user_balance(user_id).await {
-                        Ok(balance) => {
-                            // Warn if this will result in negative balance
-                            if balance < total_cost {
-                                warn!(
-                                    user_id = %user_id,
-                                    current_balance = %balance,
-                                    cost = %total_cost,
-                                    "API usage will result in negative balance"
-                                );
-                            }
-
-                            // Create usage transaction referencing the analytics record
-                            match credits
-                                .create_transaction(&CreditTransactionCreateDBRequest {
-                                    user_id,
-                                    transaction_type: CreditTransactionType::Usage,
-                                    amount: total_cost,
-                                    source_id: analytics_id.to_string(),
-                                    description: Some(format!(
-                                        "API usage: {} ({} input + {} output tokens)",
-                                        model, row.prompt_tokens, row.completion_tokens
-                                    )),
-                                })
-                                .await
-                            {
-                                Ok(result) => {
-                                    debug!(
-                                        user_id = %user_id,
-                                        transaction_id = %result.id,
-                                        amount = %total_cost,
-                                        model = %model,
-                                        "Credits deducted for API usage"
-                                    );
-                                    crate::metrics::record_credit_deduction(
-                                        &user_id.to_string(),
-                                        model,
-                                        total_cost.to_f64().unwrap_or(0.0),
-                                    );
-                                }
-                                Err(e) => {
-                                    tracing::error!(
-                                        error = %e,
-                                        correlation_id = %row.correlation_id,
-                                        user_id = %user_id,
-                                        "Failed to create credit transaction for API usage"
-                                    );
-                                    crate::metrics::record_credit_deduction_error();
-                                }
-                            }
+                    match credits
+                        .create_transaction(&CreditTransactionCreateDBRequest {
+                            user_id,
+                            transaction_type: CreditTransactionType::Usage,
+                            amount: total_cost,
+                            source_id: analytics_id.to_string(),
+                            description: Some(format!(
+                                "API usage: {} ({} input + {} output tokens)",
+                                model, row.prompt_tokens, row.completion_tokens
+                            )),
+                        })
+                        .await
+                    {
+                        Ok(result) => {
+                            debug!(
+                                user_id = %user_id,
+                                transaction_id = %result.id,
+                                amount = %total_cost,
+                                model = %model,
+                                "Credits deducted for API usage"
+                            );
+                            crate::metrics::record_credit_deduction(&user_id.to_string(), model, total_cost.to_f64().unwrap_or(0.0));
                         }
                         Err(e) => {
                             tracing::error!(
                                 error = %e,
                                 correlation_id = %row.correlation_id,
                                 user_id = %user_id,
-                                "Failed to get user balance for credit deduction"
+                                "Failed to create credit transaction for API usage"
                             );
                             crate::metrics::record_credit_deduction_error();
                         }
