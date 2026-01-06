@@ -660,10 +660,6 @@ pub async fn store_analytics_record(
         }
     }
 
-    // Record analytics processing lag (time from request to storage complete)
-    let lag_seconds = chrono::Utc::now().signed_duration_since(metrics.timestamp).num_milliseconds() as f64 / 1000.0;
-    histogram!("analytics_lag_seconds").record(lag_seconds);
-
     Ok(row)
 }
 
@@ -861,7 +857,14 @@ where
             // This runs for ALL responses, including errors
             tokio::spawn(async move {
                 // Store to database - this enriches with user/pricing data and returns complete row
-                match store_analytics_record(&pool_clone, &metrics, &auth, &request_data_clone).await {
+                let result = store_analytics_record(&pool_clone, &metrics, &auth, &request_data_clone).await;
+
+                // Record analytics processing lag regardless of success/failure
+                // This measures time from original request to storage attempt completion
+                let lag_seconds = chrono::Utc::now().signed_duration_since(metrics.timestamp).num_milliseconds() as f64 / 1000.0;
+                histogram!("analytics_lag_seconds").record(lag_seconds);
+
+                match result {
                     Ok(complete_row) => {
                         // Record metrics using the complete row (called AFTER database write)
                         if let Some(ref recorder) = metrics_recorder_clone {
