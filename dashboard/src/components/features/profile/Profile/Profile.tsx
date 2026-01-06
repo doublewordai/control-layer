@@ -54,23 +54,26 @@ export const Profile: React.FC = () => {
     );
   };
 
-  const getAuthProviderDisplay = (
-    authSource: string,
-    username?: string,
-  ): string => {
+  const getAuthProviderDisplay = (currentUser: User): string => {
+    const { authSource, externalUserId } = currentUser;
+
     if (authSource === "native" || authSource === "system") {
       return authSource;
     }
-    if (username) {
-      const lowerUsername = username.toLowerCase();
-      if (lowerUsername.startsWith("github|")) {
+
+    // attempt to parse common providers from external ID
+    if (externalUserId) {
+      const lowerExternalId = externalUserId.toLowerCase();
+      if (lowerExternalId.startsWith("github")) {
         return "GitHub";
       }
-      if (lowerUsername.startsWith("google|")) {
+      if (lowerExternalId.startsWith("google")) {
         return "Google";
       }
+      return "Oauth";
     }
-    return "Proxy-Header";
+
+    return "email";
   };
 
   const getRoleDescription = (role: Role): string => {
@@ -333,19 +336,11 @@ export const Profile: React.FC = () => {
                     <Tooltip>
                       <TooltipTrigger asChild>
                         <span className="text-gray-900 truncate">
-                          {getAuthProviderDisplay(
-                            currentUser.auth_source,
-                            currentUser.username,
-                          )}
+                          {getAuthProviderDisplay(currentUser)}
                         </span>
                       </TooltipTrigger>
                       <TooltipContent>
-                        <p>
-                          {getAuthProviderDisplay(
-                            currentUser.auth_source,
-                            currentUser.username,
-                          )}
-                        </p>
+                        <p>{getAuthProviderDisplay(currentUser)}</p>
                       </TooltipContent>
                     </Tooltip>
                   </div>
