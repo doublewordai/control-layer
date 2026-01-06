@@ -128,27 +128,29 @@ impl<'c> Credits<'c> {
     async fn calculate_balance_with_seq(&mut self, user_id: UserId) -> Result<(Decimal, Option<i64>)> {
         let result = sqlx::query!(
             r#"
+            WITH user_checkpoint AS (
+                SELECT checkpoint_seq, balance
+                FROM user_balance_checkpoints
+                WHERE user_id = $1
+            )
             SELECT
-                COALESCE(c.balance, 0) + COALESCE(SUM(
-                    CASE WHEN t.transaction_type IN ('admin_grant', 'purchase') THEN t.amount ELSE -t.amount END
+                COALESCE((SELECT balance FROM user_checkpoint), 0) +
+                COALESCE((
+                    SELECT SUM(
+                        CASE WHEN transaction_type IN ('admin_grant', 'purchase') THEN amount ELSE -amount END
+                    )
+                    FROM credits_transactions
+                    WHERE user_id = $1
+                    AND seq > COALESCE((SELECT checkpoint_seq FROM user_checkpoint), 0)
                 ), 0) as "balance!",
-                MAX(t.seq) as latest_seq
-            FROM user_balance_checkpoints c
-            FULL OUTER JOIN credits_transactions t
-                ON t.user_id = c.user_id
-                AND t.seq > c.checkpoint_seq
-            WHERE c.user_id = $1 OR t.user_id = $1
-            GROUP BY c.balance
+                (SELECT MAX(seq) FROM credits_transactions WHERE user_id = $1) as latest_seq
             "#,
             user_id
         )
-        .fetch_optional(&mut *self.db)
+        .fetch_one(&mut *self.db)
         .await?;
 
-        match result {
-            Some(row) => Ok((row.balance, row.latest_seq)),
-            None => Ok((Decimal::ZERO, None)),
-        }
+        Ok((result.balance, result.latest_seq))
     }
 
     /// Refresh the balance checkpoint for a user.
@@ -197,16 +199,18 @@ impl<'c> Credits<'c> {
         let rows = sqlx::query!(
             r#"
             SELECT
-                COALESCE(c.user_id, t.user_id) as "user_id!",
-                COALESCE(c.balance, 0) + COALESCE(SUM(
-                    CASE WHEN t.transaction_type IN ('admin_grant', 'purchase') THEN t.amount ELSE -t.amount END
-                ), 0) as "balance!"
-            FROM user_balance_checkpoints c
-            FULL OUTER JOIN credits_transactions t
-                ON t.user_id = c.user_id
-                AND t.seq > c.checkpoint_seq
-            WHERE c.user_id = ANY($1) OR t.user_id = ANY($1)
-            GROUP BY c.user_id, t.user_id, c.balance
+                u.user_id as "user_id!",
+                COALESCE(c.balance, 0) + COALESCE(delta.sum, 0) as "balance!"
+            FROM unnest($1::uuid[]) AS u(user_id)
+            LEFT JOIN user_balance_checkpoints c ON c.user_id = u.user_id
+            LEFT JOIN LATERAL (
+                SELECT SUM(
+                    CASE WHEN transaction_type IN ('admin_grant', 'purchase') THEN amount ELSE -amount END
+                ) as sum
+                FROM credits_transactions t
+                WHERE t.user_id = u.user_id
+                AND t.seq > COALESCE(c.checkpoint_seq, 0)
+            ) delta ON true
             "#,
             user_ids
         )
