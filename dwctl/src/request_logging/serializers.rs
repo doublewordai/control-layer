@@ -605,7 +605,6 @@ pub async fn store_analytics_record(
                                         user_id = %user_id,
                                         transaction_id = %result.id,
                                         amount = %total_cost,
-                                        balance_after = %result.balance_after,
                                         model = %model,
                                         "Credits deducted for API usage"
                                     );
@@ -1896,7 +1895,8 @@ mod tests {
 
             let usage_tx = usage_tx.unwrap();
             assert_eq!(usage_tx.amount, expected_cost, "Transaction amount should preserve full precision");
-            assert_eq!(usage_tx.balance_after, expected_balance, "Balance after should match");
+            // balance_after is no longer stored for new transactions (checkpoint-based system)
+            assert!(usage_tx.balance_after.is_none());
         }
 
         #[sqlx::test]
@@ -2224,7 +2224,7 @@ mod tests {
             println!("\n=== All Transactions (most recent first) ===");
             for tx in &transactions {
                 println!(
-                    "  {:?} | amount: {} | balance_after: {} | prev_id: {:?}",
+                    "  {:?} | amount: {} | balance_after: {:?} | prev_id: {:?}",
                     tx.transaction_type, tx.amount, tx.balance_after, tx.previous_transaction_id
                 );
             }

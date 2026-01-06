@@ -62,9 +62,6 @@ pub struct CreditTransactionResponse {
     /// Amount of credits (returned as string to preserve precision)
     #[schema(value_type = String)]
     pub amount: Decimal,
-    /// Balance after this transaction (returned as string to preserve precision)
-    #[schema(value_type = String)]
-    pub balance_after: Decimal,
     /// Previous transaction ID
     #[schema(value_type = Option<String>, format = "uuid")]
     pub previous_transaction_id: Option<Uuid>,
@@ -74,6 +71,24 @@ pub struct CreditTransactionResponse {
     pub description: Option<String>,
     /// When the transaction was created
     pub created_at: DateTime<Utc>,
+}
+
+/// Paginated response for transaction listing with balance context.
+/// Mirrors PaginatedResponse structure with additional balance field.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct TransactionListResponse {
+    /// The transactions for the current page
+    pub data: Vec<CreditTransactionResponse>,
+    /// Total number of transactions matching the query (before pagination)
+    pub total_count: i64,
+    /// Number of items skipped
+    pub skip: i64,
+    /// Maximum items returned per page
+    pub limit: i64,
+    /// Balance after the first (most recent) transaction on this page.
+    /// Frontend can compute each row's balance by subtracting signed amounts from this value.
+    #[schema(value_type = String)]
+    pub page_start_balance: Decimal,
 }
 
 /// Query parameters for listing transactions
@@ -106,7 +121,6 @@ impl CreditTransactionResponse {
             transaction_type: db.transaction_type,
             batch_id,
             amount: db.amount,
-            balance_after: db.balance_after,
             previous_transaction_id: db.previous_transaction_id,
             source_id: db.source_id,
             description: db.description,

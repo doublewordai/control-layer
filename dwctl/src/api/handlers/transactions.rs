@@ -3,7 +3,7 @@
 use crate::{
     AppState,
     api::models::{
-        transactions::{CreditTransactionCreate, CreditTransactionResponse, ListTransactionsQuery},
+        transactions::{CreditTransactionCreate, CreditTransactionResponse, ListTransactionsQuery, TransactionListResponse},
         users::CurrentUser,
     },
     auth::permissions::{self, RequiresPermission, operation, resource},
@@ -12,7 +12,7 @@ use crate::{
         models::credits::{CreditTransactionCreateDBRequest, CreditTransactionType},
     },
     errors::{Error, Result},
-    types::{Operation, Permission, Resource},
+    types::{Operation, Permission, Resource, UserId},
 };
 use axum::{
     extract::{Path, Query, State},
@@ -138,12 +138,12 @@ pub async fn get_transaction(
     path = "/transactions",
     tag = "transactions",
     summary = "List credit transactions",
-    description = "Get a list of credit transactions. By default, returns only the current user's transactions. Use 'all=true' to get all transactions (BillingManager/PlatformManager only). Use 'user_id' parameter to filter by a specific user (BillingManager/PlatformManager only for other users).",
+    description = "Get a paginated list of credit transactions with balance context. By default, returns only the current user's transactions. Use 'all=true' to get all transactions (BillingManager/PlatformManager only). Use 'user_id' parameter to filter by a specific user (BillingManager/PlatformManager only for other users).",
     params(
         ListTransactionsQuery
     ),
     responses(
-        (status = 200, description = "List of transactions", body = [CreditTransactionResponse]),
+        (status = 200, description = "Paginated list of transactions with balance context", body = TransactionListResponse),
         (status = 401, description = "Unauthorized"),
         (status = 403, description = "Forbidden - cannot access other users' transactions or all transactions without proper permissions"),
         (status = 500, description = "Internal server error"),
@@ -159,7 +159,7 @@ pub async fn list_transactions(
     State(state): State<AppState>,
     Query(query): Query<ListTransactionsQuery>,
     current_user: CurrentUser,
-) -> Result<Json<Vec<CreditTransactionResponse>>> {
+) -> Result<Json<TransactionListResponse>> {
     let skip = query.pagination.skip();
     let limit = query.pagination.limit();
 
@@ -200,26 +200,58 @@ pub async fn list_transactions(
 
     let grouping_enabled = query.group_batches.unwrap_or(false);
 
-    // If grouping enabled, use the optimized SQL query that does everything in one go
-    if grouping_enabled {
+    // Get transactions for this page
+    let (transactions, total_count) = if grouping_enabled {
         let transactions_with_batches = repo.list_transactions_with_batches(filter_user_id, skip, limit).await?;
-
-        let result: Vec<CreditTransactionResponse> = transactions_with_batches
+        let count = repo.count_transactions_with_batches(filter_user_id).await?;
+        let txs: Vec<CreditTransactionResponse> = transactions_with_batches
             .into_iter()
             .map(|(tx, batch_id)| CreditTransactionResponse::from_db_with_batch_id(tx, batch_id))
             .collect();
-
-        return Ok(Json(result));
-    }
-
-    // Otherwise, use normal pagination without grouping
-    let transactions = if let Some(user_id) = filter_user_id {
-        repo.list_user_transactions(user_id, skip, limit).await?
+        (txs, count)
+    } else if let Some(user_id) = filter_user_id {
+        let txs = repo.list_user_transactions(user_id, skip, limit).await?;
+        let count = repo.count_user_transactions(user_id).await?;
+        (txs.into_iter().map(CreditTransactionResponse::from).collect(), count)
     } else {
-        repo.list_all_transactions(skip, limit).await?
+        let txs = repo.list_all_transactions(skip, limit).await?;
+        let count = repo.count_all_transactions().await?;
+        (txs.into_iter().map(CreditTransactionResponse::from).collect(), count)
     };
 
-    Ok(Json(transactions.into_iter().map(CreditTransactionResponse::from).collect()))
+    // Calculate page_start_balance
+    // For single-user queries, this is the balance after the first transaction on this page
+    // For all-users queries (no filter), we return 0 since per-user balance doesn't make sense
+    let page_start_balance = if let Some(user_id) = filter_user_id {
+        calculate_page_start_balance(&mut repo, user_id, skip).await?
+    } else {
+        // When viewing all users' transactions, per-row balance doesn't apply
+        Decimal::ZERO
+    };
+
+    Ok(Json(TransactionListResponse {
+        data: transactions,
+        total_count,
+        skip,
+        limit,
+        page_start_balance,
+    }))
+}
+
+/// Calculate the balance at the start of a page (balance after the first transaction on this page).
+/// - If skip=0: returns current balance
+/// - If skip=N: returns current_balance - sum(signed amounts of first N transactions)
+async fn calculate_page_start_balance(repo: &mut Credits<'_>, user_id: UserId, skip: i64) -> Result<Decimal> {
+    let current_balance = repo.get_user_balance(user_id).await?;
+
+    if skip == 0 {
+        return Ok(current_balance);
+    }
+
+    // Sum the signed amounts of the first `skip` transactions (most recent ones we're skipping)
+    let skipped_sum = repo.sum_recent_transactions(user_id, skip).await?;
+
+    Ok(current_balance - skipped_sum)
 }
 
 #[cfg(test)]
@@ -459,7 +491,8 @@ mod tests {
             .await;
 
         response.assert_status_ok();
-        let transactions: Vec<CreditTransactionResponse> = response.json();
+        let response_body: TransactionListResponse = response.json();
+        let transactions = &response_body.data;
 
         // Should only see their own transactions
         assert!(transactions.iter().all(|t| t.user_id == user1.id));
@@ -505,7 +538,8 @@ mod tests {
             .await;
 
         response.assert_status_ok();
-        let transactions: Vec<CreditTransactionResponse> = response.json();
+        let response_body: TransactionListResponse = response.json();
+        let transactions = &response_body.data;
 
         // Should only see billing_manager's own transactions
         assert!(transactions.iter().all(|t| t.user_id == billing_manager.id));
@@ -531,7 +565,8 @@ mod tests {
             .await;
 
         response.assert_status_ok();
-        let transactions: Vec<CreditTransactionResponse> = response.json();
+        let response_body: TransactionListResponse = response.json();
+        let transactions = &response_body.data;
 
         // Should only see user1's transactions
         assert!(transactions.iter().all(|t| t.user_id == user1.id));
@@ -676,7 +711,8 @@ mod tests {
         assert_eq!(transaction.transaction_type, CreditTransactionType::AdminRemoval);
         assert_eq!(transaction.source_id, billing_manager.id.to_string());
         assert_eq!(transaction.description, Some("Over removal".to_string()));
-        assert_eq!(transaction.balance_after, Decimal::from_str("-50.0").unwrap());
+        // Note: balance_after is no longer returned in API response - use page_start_balance
+        // for balance context when listing transactions
     }
 
     // Test: GET /transactions/{id} returns own transaction for RequestViewer
@@ -765,7 +801,8 @@ mod tests {
             .await;
 
         response.assert_status_ok();
-        let transactions: Vec<CreditTransactionResponse> = response.json();
+        let response_body: TransactionListResponse = response.json();
+        let transactions = &response_body.data;
 
         // Should only see their own transactions
         assert!(transactions.iter().all(|t| t.user_id == user1.id));
@@ -793,7 +830,8 @@ mod tests {
             .await;
 
         response.assert_status_ok();
-        let transactions: Vec<CreditTransactionResponse> = response.json();
+        let response_body: TransactionListResponse = response.json();
+        let transactions = &response_body.data;
 
         // Should only see platform_manager's own transactions
         assert!(transactions.iter().all(|t| t.user_id == platform_manager.id));
@@ -837,7 +875,8 @@ mod tests {
             .await;
 
         response.assert_status_ok();
-        let transactions: Vec<CreditTransactionResponse> = response.json();
+        let response_body: TransactionListResponse = response.json();
+        let transactions = &response_body.data;
 
         // Should only see user1's transactions
         assert!(transactions.iter().all(|t| t.user_id == user1.id));
@@ -863,7 +902,8 @@ mod tests {
             .await;
 
         response.assert_status_ok();
-        let transactions: Vec<CreditTransactionResponse> = response.json();
+        let response_body: TransactionListResponse = response.json();
+        let transactions = &response_body.data;
         assert_eq!(transactions.len(), 2);
 
         // Test skip
@@ -874,7 +914,8 @@ mod tests {
             .await;
 
         response.assert_status_ok();
-        let transactions: Vec<CreditTransactionResponse> = response.json();
+        let response_body: TransactionListResponse = response.json();
+        let transactions = &response_body.data;
         assert_eq!(transactions.len(), 2);
     }
 
@@ -899,7 +940,8 @@ mod tests {
             .await;
 
         response.assert_status_ok();
-        let transactions: Vec<CreditTransactionResponse> = response.json();
+        let response_body: TransactionListResponse = response.json();
+        let transactions = &response_body.data;
 
         // Should only see their own transactions
         assert!(transactions.iter().all(|t| t.user_id == billing_manager.id));
@@ -927,7 +969,8 @@ mod tests {
             .await;
 
         response.assert_status_ok();
-        let transactions: Vec<CreditTransactionResponse> = response.json();
+        let response_body: TransactionListResponse = response.json();
+        let transactions = &response_body.data;
 
         // Should see transactions from all users
         assert!(transactions.iter().any(|t| t.user_id == billing_manager.id));
@@ -972,7 +1015,8 @@ mod tests {
             .await;
 
         response.assert_status_ok();
-        let transactions: Vec<CreditTransactionResponse> = response.json();
+        let response_body: TransactionListResponse = response.json();
+        let transactions = &response_body.data;
 
         // Should see all transactions, not just user1's
         assert!(transactions.iter().any(|t| t.user_id == user1.id));
@@ -1000,7 +1044,8 @@ mod tests {
             .await;
 
         response.assert_status_ok();
-        let transactions: Vec<CreditTransactionResponse> = response.json();
+        let response_body: TransactionListResponse = response.json();
+        let transactions = &response_body.data;
 
         // Should see transactions from all users
         assert!(transactions.iter().any(|t| t.user_id == platform_manager.id));
@@ -1061,7 +1106,8 @@ mod tests {
             .await;
 
         response.assert_status_ok();
-        let transactions: Vec<CreditTransactionResponse> = response.json();
+        let response_body: TransactionListResponse = response.json();
+        let transactions = &response_body.data;
 
         // Should have at least our transaction
         assert!(!transactions.is_empty());
@@ -1098,7 +1144,6 @@ mod tests {
 
         // Print for debugging
         println!("JSON amount field: {:?}", json_value["amount"]);
-        println!("JSON balance_after field: {:?}", json_value["balance_after"]);
 
         // Check what type the amount field is
         match &json_value["amount"] {
@@ -1116,24 +1161,11 @@ mod tests {
             }
         }
 
-        // Also check balance_after
-        match &json_value["balance_after"] {
-            serde_json::Value::String(s) => {
-                println!("✓ Balance serialized as string (arbitrary precision): {}", s);
-                assert_eq!(s, precise_amount, "String representation should match exactly");
-            }
-            serde_json::Value::Number(n) => {
-                println!("✗ Balance serialized as number (may lose precision): {}", n);
-            }
-            other => {
-                panic!("Unexpected JSON type for balance_after: {:?}", other);
-            }
-        }
-
         // Test round-trip: deserialize and verify precision is preserved
         let transaction: CreditTransactionResponse = serde_json::from_str(&json_text).expect("Failed to deserialize");
         assert_eq!(transaction.amount.to_string(), precise_amount);
-        assert_eq!(transaction.balance_after.to_string(), precise_amount);
+        // Note: balance_after is no longer in the API response - use page_start_balance
+        // for balance context when listing transactions
     }
 
     // Test: Batch grouping aggregates correctly with mixed transaction types
@@ -1287,7 +1319,8 @@ mod tests {
             .await;
 
         response.assert_status_ok();
-        let transactions: Vec<CreditTransactionResponse> = response.json();
+        let response_body: TransactionListResponse = response.json();
+        let transactions = &response_body.data;
 
         // Should have: 1 grant + 1 purchase + 5 batch1 + 3 batch2 + 2 individual = 12 total
         assert_eq!(transactions.len(), 12, "Should have 12 individual transactions without grouping");
@@ -1318,7 +1351,8 @@ mod tests {
             .await;
 
         response.assert_status_ok();
-        let transactions: Vec<CreditTransactionResponse> = response.json();
+        let response_body: TransactionListResponse = response.json();
+        let transactions = &response_body.data;
 
         // Should have: 1 grant + 1 purchase + 1 batch1 + 1 batch2 + 2 individual = 6 total
         assert_eq!(transactions.len(), 6, "Should have 6 transactions with batch grouping");
@@ -1423,7 +1457,8 @@ mod tests {
             .await;
 
         response.assert_status_ok();
-        let page1: Vec<CreditTransactionResponse> = response.json();
+        let page1_body: TransactionListResponse = response.json();
+        let page1 = &page1_body.data;
         assert_eq!(page1.len(), 3, "Page 1 should have 3 transactions");
 
         // Page 2: limit=3, skip=3
@@ -1434,7 +1469,8 @@ mod tests {
             .await;
 
         response.assert_status_ok();
-        let page2: Vec<CreditTransactionResponse> = response.json();
+        let page2_body: TransactionListResponse = response.json();
+        let page2 = &page2_body.data;
         assert_eq!(page2.len(), 3, "Page 2 should have 3 transactions");
 
         // Page 3: limit=3, skip=6 (should have 0 since we only have 6 total)
@@ -1445,7 +1481,8 @@ mod tests {
             .await;
 
         response.assert_status_ok();
-        let page3: Vec<CreditTransactionResponse> = response.json();
+        let page3_body: TransactionListResponse = response.json();
+        let page3 = &page3_body.data;
         assert_eq!(page3.len(), 0, "Page 3 should be empty");
 
         // Verify no duplicates across pages
@@ -1529,7 +1566,8 @@ mod tests {
             .await;
 
         response.assert_status_ok();
-        let transactions: Vec<CreditTransactionResponse> = response.json();
+        let response_body: TransactionListResponse = response.json();
+        let transactions = &response_body.data;
 
         // Should have at least: 2 grants + 2 batches = 4 transactions
         // (may have more from other tests, but should have at least these)

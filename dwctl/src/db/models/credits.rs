@@ -48,7 +48,8 @@ pub struct CreditTransactionDBResponse {
     pub user_id: UserId,
     pub transaction_type: CreditTransactionType,
     pub amount: Decimal,
-    pub balance_after: Decimal,
+    /// Balance after this transaction. None for new transactions using checkpoint-based calculation.
+    pub balance_after: Option<Decimal>,
     pub previous_transaction_id: Option<Uuid>,
     pub source_id: String,
     pub description: Option<String>,

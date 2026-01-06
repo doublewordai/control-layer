@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "\n            INSERT INTO credits_transactions (user_id, transaction_type, amount, balance_after, previous_transaction_id, source_id, description)\n            VALUES ($1, $2, $3, $4, $5, $6, $7)\n            RETURNING id, user_id, transaction_type as \"transaction_type: CreditTransactionType\", amount, source_id, balance_after, previous_transaction_id, description, created_at\n            ",
+  "query": "\n            INSERT INTO credits_transactions (user_id, transaction_type, amount, source_id, description)\n            VALUES ($1, $2, $3, $4, $5)\n            RETURNING id, user_id, transaction_type as \"transaction_type: CreditTransactionType\", amount, source_id,\n                      balance_after, previous_transaction_id, description, created_at\n            ",
   "describe": {
     "columns": [
       {
@@ -54,8 +54,6 @@
         "Uuid",
         "Text",
         "Numeric",
-        "Numeric",
-        "Uuid",
         "Text",
         "Text"
       ]
@@ -66,11 +64,11 @@
       false,
       false,
       false,
-      false,
+      true,
       true,
       true,
       false
     ]
   },
-  "hash": "b18edc6598edf9c15a360a6b8c87bbdaa0007277225f81cc1e82f1bca087751e"
+  "hash": "c989ff7f51fc3c5b2d1a6c3ce48e62d0d9b38a8ec80ff1e9a37912a22462ea74"
 }
