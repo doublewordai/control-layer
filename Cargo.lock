@@ -493,9 +493,9 @@ dependencies = [
 
 [[package]]
 name = "axum-prometheus"
-version = "0.10.0"
+version = "0.9.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "dd44522c72edf6a45dfdd73ea201937bdaa8610cdf473151f694900837ab3879"
+checksum = "fb15221c30bbb32e99873d348d89d7bc2138d6199520aa473a1bdb0d8e5721e8"
 dependencies = [
  "axum 0.8.8",
  "bytes",
@@ -504,7 +504,7 @@ dependencies = [
  "http-body 1.0.1",
  "matchit 0.8.4",
  "metrics",
- "metrics-exporter-prometheus 0.18.1",
+ "metrics-exporter-prometheus 0.17.2",
  "pin-project-lite",
  "tokio",
  "tower 0.5.2",
@@ -1259,7 +1259,11 @@ checksum = "1aaf95b3e5c8f23aa320147307562d361db0ae0d51242340f558153b4eb2439b"
 
 [[package]]
 name = "dwctl"
+<<<<<<< HEAD
 version = "0.21.0"
+=======
+version = "0.19.1"
+>>>>>>> main
 dependencies = [
  "aes-gcm",
  "anyhow",
@@ -1268,7 +1272,7 @@ dependencies = [
  "async-stripe",
  "async-trait",
  "axum 0.8.8",
- "axum-prometheus 0.10.0",
+ "axum-prometheus 0.9.0",
  "axum-test",
  "base64 0.22.1",
  "bon",
@@ -2737,9 +2741,9 @@ dependencies = [
 
 [[package]]
 name = "metrics-exporter-prometheus"
-version = "0.18.1"
+version = "0.17.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "3589659543c04c7dc5526ec858591015b87cd8746583b51b48ef4353f99dbcda"
+checksum = "2b166dea96003ee2531cf14833efedced545751d800f03535801d833313f8c15"
 dependencies = [
  "base64 0.22.1",
  "indexmap 2.12.1",
