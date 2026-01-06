@@ -176,7 +176,6 @@ auth:
 
   # Security settings
   security:
-    enable_csrf: true
     jwt_expiry: "1h"
     cors:
       allowed_origins:
