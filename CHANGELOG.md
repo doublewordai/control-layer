@@ -1,5 +1,13 @@
 # Changelog
 
+## [0.21.1](https://github.com/doublewordai/control-layer/compare/v0.21.0...v0.21.1) (2026-01-06)
+
+
+### Bug Fixes
+
+* compute balance on read instead of on write ([#445](https://github.com/doublewordai/control-layer/issues/445)) ([839373c](https://github.com/doublewordai/control-layer/commit/839373cbc1cfcd9460769649526ad045eabcdb7c))
+* Prettier auth source ([#443](https://github.com/doublewordai/control-layer/issues/443)) ([e021696](https://github.com/doublewordai/control-layer/commit/e02169679ec3c1de3863e1acbb263a7d17fade58))
+
 ## [0.21.0](https://github.com/doublewordai/control-layer/compare/v0.20.0...v0.21.0) (2026-01-06)
 
 
