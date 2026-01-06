@@ -1346,6 +1346,7 @@ model_sources:
 
             let args = Args {
                 config: "test.yaml".to_string(),
+                validate: false,
             };
 
             let config = Config::load(&args)?;
@@ -1384,6 +1385,7 @@ metadata:
 
             let args = Args {
                 config: "test.yaml".to_string(),
+                validate: false,
             };
 
             let config = Config::load(&args)?;
@@ -1423,6 +1425,7 @@ auth:
 
             let args = Args {
                 config: "test.yaml".to_string(),
+                validate: false,
             };
 
             let config = Config::load(&args)?;
