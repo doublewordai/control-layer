@@ -143,6 +143,7 @@ export interface Group {
 export interface User {
   id: string;
   username: string;
+  external_user_id: string;
   email: string;
   display_name?: string;
   avatar_url?: string;
