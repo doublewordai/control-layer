@@ -89,6 +89,11 @@ pub struct Args {
     /// Path to configuration file
     #[arg(short = 'f', long, env = "DWCTL_CONFIG", default_value = "config.yaml")]
     pub config: String,
+
+    /// Validate configuration and exit without starting the server.
+    /// Useful for CI/CD pipelines to catch config errors before deployment.
+    #[arg(long)]
+    pub validate: bool,
 }
 
 /// Main application configuration.
@@ -96,7 +101,7 @@ pub struct Args {
 /// This is the root configuration structure loaded from YAML and environment variables.
 /// All fields have sensible defaults defined in the `Default` implementation.
 #[derive(Debug, Clone, Deserialize, Serialize)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct Config {
     /// HTTP server host to bind to (e.g., "0.0.0.0" for all interfaces)
     pub host: String,
@@ -140,7 +145,7 @@ pub struct Config {
 ///
 /// These settings control connection pool behavior for optimal performance.
 #[derive(Debug, Clone, Deserialize, Serialize)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct PoolSettings {
     /// Maximum number of connections in the pool
     pub max_connections: u32,
@@ -434,7 +439,7 @@ pub struct DummyConfig {
 ///
 /// These values are exposed to the frontend and shown in the user interface.
 #[derive(Debug, Clone, Deserialize, Serialize)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct Metadata {
     /// Region name displayed in the UI (e.g., "UK South", "US East")
     pub region: Option<String>,
@@ -484,7 +489,7 @@ pub struct DefaultModel {
 
 /// Authentication configuration for all supported auth methods.
 #[derive(Debug, Clone, Deserialize, Serialize)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct AuthConfig {
     /// Native username/password authentication
     pub native: NativeAuthConfig,
@@ -511,7 +516,7 @@ impl Default for AuthConfig {
 
 /// Native username/password authentication configuration.
 #[derive(Debug, Clone, Deserialize, Serialize)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct NativeAuthConfig {
     /// Enable native authentication (login/registration)
     pub enabled: bool,
@@ -530,7 +535,7 @@ pub struct NativeAuthConfig {
 /// This authentication method reads user identity from HTTP headers set by an upstream
 /// proxy (e.g., SSO proxy). Enables integration with external authentication systems.
 #[derive(Debug, Clone, Deserialize, Serialize)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct ProxyHeaderAuthConfig {
     /// Enable proxy header authentication
     ///
@@ -575,7 +580,7 @@ pub struct ProxyHeaderAuthConfig {
 
 /// Session cookie configuration.
 #[derive(Debug, Clone, Deserialize, Serialize)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct SessionConfig {
     /// Session timeout duration
     #[serde(with = "humantime_serde")]
@@ -590,7 +595,7 @@ pub struct SessionConfig {
 
 /// Password validation rules.
 #[derive(Debug, Clone, Deserialize, Serialize)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct PasswordConfig {
     /// Minimum password length
     pub min_length: usize,
@@ -606,7 +611,7 @@ pub struct PasswordConfig {
 
 /// Security configuration for JWT and CORS.
 #[derive(Debug, Clone, Deserialize, Serialize)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct SecurityConfig {
     /// JWT token expiry duration
     #[serde(with = "humantime_serde")]
@@ -617,7 +622,7 @@ pub struct SecurityConfig {
 
 /// CORS (Cross-Origin Resource Sharing) configuration.
 #[derive(Debug, Clone, Deserialize, Serialize)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct CorsConfig {
     /// Allowed origins for CORS requests
     pub allowed_origins: Vec<CorsOrigin>,
@@ -630,6 +635,7 @@ pub struct CorsConfig {
 /// Email configuration for password resets and notifications.
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(default)]
+// Note: Cannot use deny_unknown_fields here due to #[serde(flatten)] on transport
 pub struct EmailConfig {
     /// Email transport method
     #[serde(flatten)]
@@ -668,7 +674,7 @@ pub enum EmailTransportConfig {
 
 /// Password reset email configuration.
 #[derive(Debug, Clone, Deserialize, Serialize)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct PasswordResetEmailConfig {
     /// How long reset tokens are valid
     #[serde(with = "humantime_serde")]
@@ -679,7 +685,7 @@ pub struct PasswordResetEmailConfig {
 
 /// File upload/download configuration for batch processing.
 #[derive(Debug, Clone, Deserialize, Serialize)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct FilesConfig {
     /// Maximum file size in bytes (default: 100MB)
     pub max_file_size: u64,
@@ -714,7 +720,7 @@ impl Default for FilesConfig {
 /// request processing. Note: The batch processing daemon configuration has been moved
 /// to `background_services.batch_daemon`.
 #[derive(Debug, Clone, Deserialize, Serialize)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct BatchConfig {
     /// Enable batches API endpoints (default: true)
     pub enabled: bool,
@@ -740,7 +746,7 @@ impl Default for BatchConfig {
 ///
 /// The daemon processes batch requests asynchronously in the background.
 #[derive(Debug, Clone, Deserialize, Serialize)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct DaemonConfig {
     /// When to run the daemon (default: "leader")
     /// - "always": Always run the daemon
@@ -936,7 +942,7 @@ pub enum DaemonEnabled {
 /// Leader election uses PostgreSQL advisory locks to elect a single leader instance that
 /// runs background services like health probes and batch processing.
 #[derive(Debug, Clone, Deserialize, Serialize)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct LeaderElectionConfig {
     /// Enable leader election (default: true)
     /// When false, this instance always runs as leader (useful for single-instance deployments and testing)
@@ -953,7 +959,7 @@ impl Default for LeaderElectionConfig {
 ///
 /// Controls which background services are enabled on this instance.
 #[derive(Debug, Clone, Deserialize, Serialize, Default)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct BackgroundServicesConfig {
     /// Configuration for onwards config sync service
     pub onwards_sync: OnwardsSyncConfig,
@@ -970,7 +976,7 @@ pub struct BackgroundServicesConfig {
 /// This service syncs database configuration changes to the onwards routing layer via PostgreSQL LISTEN/NOTIFY.
 /// Disabling this will prevent the AI proxy from receiving config updates (not recommended for production).
 #[derive(Debug, Clone, Deserialize, Serialize)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct OnwardsSyncConfig {
     /// Enable onwards config sync service (default: true)
     pub enabled: bool,
@@ -986,7 +992,7 @@ impl Default for OnwardsSyncConfig {
 ///
 /// The probe scheduler periodically checks inference endpoint health and removes failing backends from rotation.
 #[derive(Debug, Clone, Deserialize, Serialize)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct ProbeSchedulerConfig {
     /// Enable probe scheduler service (default: true)
     /// When leader election is enabled, the probe scheduler only runs on the elected leader
@@ -1034,7 +1040,7 @@ where
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 /// Credit system configuration.
 ///
 /// Controls how credits are allocated to users for tracking AI usage.
@@ -1340,6 +1346,7 @@ model_sources:
 
             let args = Args {
                 config: "test.yaml".to_string(),
+                validate: false,
             };
 
             let config = Config::load(&args)?;
@@ -1378,6 +1385,7 @@ metadata:
 
             let args = Args {
                 config: "test.yaml".to_string(),
+                validate: false,
             };
 
             let config = Config::load(&args)?;
@@ -1417,6 +1425,7 @@ auth:
 
             let args = Args {
                 config: "test.yaml".to_string(),
+                validate: false,
             };
 
             let config = Config::load(&args)?;
