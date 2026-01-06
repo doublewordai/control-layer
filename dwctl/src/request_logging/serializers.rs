@@ -4,6 +4,7 @@ use crate::db::handlers::Credits;
 use crate::db::models::credits::{CreditTransactionCreateDBRequest, CreditTransactionType};
 use crate::request_logging::models::{AiRequest, AiResponse, ChatCompletionChunk, ParsedAIRequest};
 use crate::request_logging::utils::{extract_header_as_string, extract_header_as_uuid};
+use metrics::{counter, histogram};
 use outlet::{RequestData, ResponseData};
 use outlet_postgres::SerializationError;
 use rust_decimal::{Decimal, prelude::ToPrimitive};
@@ -608,11 +609,13 @@ pub async fn store_analytics_record(
                                         model = %model,
                                         "Credits deducted for API usage"
                                     );
-                                    crate::metrics::record_credit_deduction(
-                                        &user_id.to_string(),
-                                        model,
-                                        total_cost.to_f64().unwrap_or(0.0),
-                                    );
+                                    let cents = (total_cost.to_f64().unwrap_or(0.0) * 100.0).round() as u64;
+                                    counter!(
+                                        "credits_deducted_total",
+                                        "user_id" => user_id.to_string(),
+                                        "model" => model.to_string()
+                                    )
+                                    .increment(cents);
                                 }
                                 Err(e) => {
                                     tracing::error!(
@@ -621,7 +624,7 @@ pub async fn store_analytics_record(
                                         user_id = %user_id,
                                         "Failed to create credit transaction for API usage"
                                     );
-                                    crate::metrics::record_credit_deduction_error();
+                                    counter!("credits_deduction_errors_total").increment(1);
                                 }
                             }
                         }
@@ -632,7 +635,7 @@ pub async fn store_analytics_record(
                                 user_id = %user_id,
                                 "Failed to get user balance for credit deduction"
                             );
-                            crate::metrics::record_credit_deduction_error();
+                            counter!("credits_deduction_errors_total").increment(1);
                         }
                     }
                 } else {
@@ -656,6 +659,10 @@ pub async fn store_analytics_record(
             );
         }
     }
+
+    // Record analytics processing lag (time from request to storage complete)
+    let lag_seconds = chrono::Utc::now().signed_duration_since(metrics.timestamp).num_milliseconds() as f64 / 1000.0;
+    histogram!("analytics_lag_seconds").record(lag_seconds);
 
     Ok(row)
 }

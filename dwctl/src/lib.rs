@@ -174,9 +174,10 @@ use axum::{
     Router, ServiceExt, http, middleware,
     routing::{delete, get, patch, post},
 };
-use axum_prometheus::PrometheusMetricLayer;
+use axum_prometheus::PrometheusMetricLayerBuilder;
 use bon::Builder;
 pub use config::Config;
+use metrics_exporter_prometheus::{Matcher, PrometheusBuilder};
 use outlet::{RequestLoggerConfig, RequestLoggerLayer};
 use outlet_postgres::PostgresHandler;
 use request_logging::{AiResponse, ParsedAIRequest};
@@ -1030,7 +1031,19 @@ pub async fn build_router(state: &mut AppState, onwards_router: Router) -> anyho
 
     // Add Prometheus metrics if enabled
     if state.config.enable_metrics {
-        let (prometheus_layer, metric_handle) = PrometheusMetricLayer::pair();
+        // Custom histogram buckets for analytics lag (100ms to 10 minutes)
+        const ANALYTICS_LAG_BUCKETS: &[f64] = &[0.1, 0.5, 1.0, 5.0, 10.0, 30.0, 60.0, 120.0, 300.0, 600.0];
+
+        let metric_handle = PrometheusBuilder::new()
+            .set_buckets_for_metric(Matcher::Full("analytics_lag_seconds".to_string()), ANALYTICS_LAG_BUCKETS)
+            .expect("Failed to set custom buckets for analytics_lag_seconds")
+            .install_recorder()
+            .expect("Failed to install Prometheus recorder");
+
+        let prometheus_layer = PrometheusMetricLayerBuilder::new()
+            .with_metrics_from_fn(|| metric_handle.clone())
+            .build_pair()
+            .0;
 
         // Get the GenAI registry from the metrics recorder (already initialized earlier)
         let gen_ai_registry = if let Some(ref recorder) = state.metrics_recorder {
