@@ -230,7 +230,7 @@ async fn test_e2e_ai_proxy_with_mocked_inference(pool: PgPool) {
             .and_then(|x| x.iter().find(|tx| tx["transaction_type"] == "usage"));
 
         if let Some(tx) = usage_tx {
-            // Get page_start_balance which represents current balance after all transactions in the page
+            // Get page_start_balance which represents the user's current balance (since skip=0)
             let page_start_balance: f64 = transactions["page_start_balance"].as_str().unwrap().parse().unwrap();
             break (tx.clone(), page_start_balance);
         } else {

@@ -29,9 +29,6 @@ pub struct CreditTransaction {
     #[sqlx(rename = "transaction_type")]
     pub transaction_type: CreditTransactionType,
     pub amount: Decimal,
-    /// Balance after this transaction. None for new transactions using checkpoint-based calculation.
-    pub balance_after: Option<Decimal>,
-    pub previous_transaction_id: Option<Uuid>,
     pub description: Option<String>,
     pub source_id: String,
     pub created_at: DateTime<Utc>,
@@ -46,8 +43,6 @@ impl From<CreditTransaction> for CreditTransactionDBResponse {
             user_id: tx.user_id,
             transaction_type: tx.transaction_type,
             amount: tx.amount,
-            balance_after: tx.balance_after,
-            previous_transaction_id: tx.previous_transaction_id,
             description: tx.description,
             source_id: tx.source_id,
             created_at: tx.created_at,
@@ -88,14 +83,14 @@ impl<'c> Credits<'c> {
     #[instrument(skip(self, request), fields(user_id = %abbrev_uuid(&request.user_id), transaction_type = ?request.transaction_type, amount = %request.amount), err)]
     pub async fn create_transaction(&mut self, request: &CreditTransactionCreateDBRequest) -> Result<CreditTransactionDBResponse> {
         // Lock-free INSERT - no advisory lock, no balance calculation
-        // balance_after is NULL for new transactions; balance is calculated on read via checkpoints
+        // Balance is calculated on read via checkpoints
         let transaction = sqlx::query_as!(
             CreditTransaction,
             r#"
             INSERT INTO credits_transactions (user_id, transaction_type, amount, source_id, description)
             VALUES ($1, $2, $3, $4, $5)
             RETURNING id, user_id, transaction_type as "transaction_type: CreditTransactionType", amount, source_id,
-                      balance_after, previous_transaction_id, description, created_at, seq
+                      description, created_at, seq
             "#,
             request.user_id,
             &request.transaction_type as &CreditTransactionType,
@@ -237,7 +232,7 @@ impl<'c> Credits<'c> {
         let transactions = sqlx::query_as!(
             CreditTransaction,
             r#"
-            SELECT id, user_id, transaction_type as "transaction_type: CreditTransactionType", amount, balance_after, source_id, previous_transaction_id, description, created_at, seq
+            SELECT id, user_id, transaction_type as "transaction_type: CreditTransactionType", amount, source_id, description, created_at, seq
             FROM credits_transactions
             WHERE user_id = $1
             ORDER BY seq DESC
@@ -260,7 +255,7 @@ impl<'c> Credits<'c> {
         let transactions = sqlx::query_as!(
             CreditTransaction,
             r#"
-            SELECT id, user_id, transaction_type as "transaction_type: CreditTransactionType", amount, balance_after, source_id, previous_transaction_id, description, created_at, seq
+            SELECT id, user_id, transaction_type as "transaction_type: CreditTransactionType", amount, source_id, description, created_at, seq
             FROM credits_transactions
             ORDER BY seq DESC
             OFFSET $1
@@ -282,7 +277,7 @@ impl<'c> Credits<'c> {
             CreditTransaction,
             r#"
             SELECT id, user_id, transaction_type as "transaction_type: CreditTransactionType",
-                amount, balance_after, previous_transaction_id, source_id, description, created_at, seq
+                amount, source_id, description, created_at, seq
             FROM credits_transactions
             WHERE id = $1
             "#,
@@ -396,9 +391,7 @@ impl<'c> Credits<'c> {
                     ct.user_id,                          -- User who owns these transactions
                     'usage' as "transaction_type!: CreditTransactionType",
                     SUM(ct.amount) as amount,            -- Total cost of all requests in batch
-                    MAX(ct.balance_after) as balance_after,  -- Final balance (after last request)
                     MIN(ct.source_id) as source_id,      -- Pick first source_id
-                    (array_agg(ct.previous_transaction_id ORDER BY ct.seq))[1] as previous_transaction_id,
                     CASE
                         WHEN MIN(ha.model) IS NOT NULL THEN 'Batch - ' || MIN(ha.model)
                         ELSE 'Batch'
@@ -426,9 +419,7 @@ impl<'c> Credits<'c> {
                     ct.user_id,
                     ct.transaction_type as "transaction_type!: CreditTransactionType",
                     ct.amount,
-                    ct.balance_after,
                     ct.source_id,
-                    ct.previous_transaction_id,
                     ct.description,
                     ct.created_at,
                     ct.seq as max_seq,                   -- Individual transaction seq
@@ -465,8 +456,6 @@ impl<'c> Credits<'c> {
             let amount = row
                 .amount
                 .ok_or_else(|| sqlx::Error::Protocol("Batch aggregation returned NULL amount".to_string()))?;
-            // balance_after is no longer stored for new transactions (checkpoint-based system)
-            // It will be None for all new transactions
             let source_id = row
                 .source_id
                 .ok_or_else(|| sqlx::Error::Protocol("Batch aggregation returned NULL source_id".to_string()))?;
@@ -479,8 +468,6 @@ impl<'c> Credits<'c> {
                 user_id,
                 transaction_type: row.transaction_type,
                 amount,
-                balance_after: row.balance_after, // Now optional
-                previous_transaction_id: row.previous_transaction_id,
                 description: row.description,
                 source_id,
                 created_at,
@@ -740,8 +727,6 @@ mod tests {
                     assert_eq!(tx.transaction_type, CreditTransactionType::AdminGrant);
                     assert_eq!(tx.amount, Decimal::from(i * 10));
                     assert_eq!(tx.description, Some(format!("Transaction {}", i + 1)));
-                    // balance_after is no longer stored for new transactions
-                    assert!(tx.balance_after.is_none());
                 }
                 None => panic!("Transaction ID {} not found", transaction_ids[i - 1]),
             };

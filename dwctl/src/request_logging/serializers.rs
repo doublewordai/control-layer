@@ -1895,8 +1895,6 @@ mod tests {
 
             let usage_tx = usage_tx.unwrap();
             assert_eq!(usage_tx.amount, expected_cost, "Transaction amount should preserve full precision");
-            // balance_after is no longer stored for new transactions (checkpoint-based system)
-            assert!(usage_tx.balance_after.is_none());
         }
 
         #[sqlx::test]
@@ -2223,10 +2221,7 @@ mod tests {
             // Debug: Print all transactions to see the chain
             println!("\n=== All Transactions (most recent first) ===");
             for tx in &transactions {
-                println!(
-                    "  {:?} | amount: {} | balance_after: {:?} | prev_id: {:?}",
-                    tx.transaction_type, tx.amount, tx.balance_after, tx.previous_transaction_id
-                );
+                println!("  {:?} | amount: {}", tx.transaction_type, tx.amount);
             }
 
             // Verify: Final balance is correct (10 requests * 0.01 each = 0.10 total)

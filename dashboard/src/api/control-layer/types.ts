@@ -696,7 +696,6 @@ export interface Transaction {
   batch_id?: string; // Batch ID (present when this is a grouped batch of multiple usage transactions)
   amount: number; // Amount in dollars
   balance_after: number; // Balance in dollars
-  previous_transaction_id?: string; // UUID
   source_id: string;
   description?: string;
   created_at: string; // ISO 8601 timestamp

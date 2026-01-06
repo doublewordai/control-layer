@@ -24,7 +24,6 @@ export const DEMO_USERS = {
 export const generateDummyTransactions = (): Transaction[] => {
   let balance = 0;
   let idCounter = 1;
-  let previousTxId: string | undefined = undefined;
 
   const createTransaction = (
     user_id: string,
@@ -52,7 +51,6 @@ export const generateDummyTransactions = (): Transaction[] => {
       transaction_type,
       amount,
       balance_after: balance,
-      previous_transaction_id: previousTxId,
       source_id,
       description,
       created_at: new Date(
@@ -60,7 +58,6 @@ export const generateDummyTransactions = (): Transaction[] => {
       ).toISOString(),
     };
 
-    previousTxId = id;
     return tx;
   };
 

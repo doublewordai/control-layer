@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "\n            SELECT id, user_id, transaction_type as \"transaction_type: CreditTransactionType\", amount, balance_after, source_id, previous_transaction_id, description, created_at, seq\n            FROM credits_transactions\n            WHERE user_id = $1\n            ORDER BY seq DESC\n            OFFSET $2\n            LIMIT $3\n            ",
+  "query": "\n            SELECT id, user_id, transaction_type as \"transaction_type: CreditTransactionType\", amount, source_id, description, created_at, seq\n            FROM credits_transactions\n            WHERE user_id = $1\n            ORDER BY seq DESC\n            OFFSET $2\n            LIMIT $3\n            ",
   "describe": {
     "columns": [
       {
@@ -25,31 +25,21 @@
       },
       {
         "ordinal": 4,
-        "name": "balance_after",
-        "type_info": "Numeric"
-      },
-      {
-        "ordinal": 5,
         "name": "source_id",
         "type_info": "Text"
       },
       {
-        "ordinal": 6,
-        "name": "previous_transaction_id",
-        "type_info": "Uuid"
-      },
-      {
-        "ordinal": 7,
+        "ordinal": 5,
         "name": "description",
         "type_info": "Text"
       },
       {
-        "ordinal": 8,
+        "ordinal": 6,
         "name": "created_at",
         "type_info": "Timestamptz"
       },
       {
-        "ordinal": 9,
+        "ordinal": 7,
         "name": "seq",
         "type_info": "Int8"
       }
@@ -66,13 +56,11 @@
       false,
       false,
       false,
-      true,
       false,
-      true,
       true,
       false,
       false
     ]
   },
-  "hash": "ba4f6e9ea030337ed46d68d9b013a312c79ed2fa2fad88715c52132aeb97d7cb"
+  "hash": "21148b9a13c2126d612e6820eb0cf7ce66315014de13643d0198e2a79b71561b"
 }

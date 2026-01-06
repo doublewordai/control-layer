@@ -1374,7 +1374,6 @@ export const handlers = [
       transaction_type: "admin_grant",
       amount: body.amount,
       balance_after: currentBalance + body.amount,
-      previous_transaction_id: userTransactions[0]?.id,
       source_id: "admin",
       description: body.description || "Funds added by admin",
       created_at: new Date().toISOString(),

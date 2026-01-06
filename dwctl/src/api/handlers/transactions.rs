@@ -220,7 +220,8 @@ pub async fn list_transactions(
     };
 
     // Calculate page_start_balance
-    // For single-user queries, this is the balance after the first transaction on this page
+    // For single-user queries: current balance when skip=0, or balance at the pagination
+    // point (before the first transaction on this page) when skip>0
     // For all-users queries (no filter), we return 0 since per-user balance doesn't make sense
     let page_start_balance = if let Some(user_id) = filter_user_id {
         calculate_page_start_balance(&mut repo, user_id, skip).await?
@@ -238,9 +239,9 @@ pub async fn list_transactions(
     }))
 }
 
-/// Calculate the balance at the start of a page (balance after the first transaction on this page).
-/// - If skip=0: returns current balance
-/// - If skip=N: returns current_balance - sum(signed amounts of first N transactions)
+/// Calculate the balance at the start of a page for pagination purposes.
+/// - If skip=0: returns current balance (balance after all transactions)
+/// - If skip=N: returns balance at the pagination point (before the first transaction on this page)
 async fn calculate_page_start_balance(repo: &mut Credits<'_>, user_id: UserId, skip: i64) -> Result<Decimal> {
     let current_balance = repo.get_user_balance(user_id).await?;
 
