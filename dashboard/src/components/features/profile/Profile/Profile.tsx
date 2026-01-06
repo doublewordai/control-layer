@@ -24,7 +24,7 @@ import {
 import { Input } from "../../../ui/input";
 import { Button } from "../../../ui/button";
 import { AVAILABLE_ROLES, getRoleDisplayName } from "../../../../utils/roles";
-import type { Role } from "../../../../api/control-layer/types";
+import type { Role, User } from "../../../../api/control-layer/types";
 import { dwctlApi } from "../../../../api/control-layer/client";
 import { ApiError } from "../../../../api/control-layer/errors";
 
@@ -54,23 +54,26 @@ export const Profile: React.FC = () => {
     );
   };
 
-  const getAuthProviderDisplay = (
-    authSource: string,
-    username?: string,
-  ): string => {
-    if (authSource === "native" || authSource === "system") {
-      return authSource;
+  const getAuthProviderDisplay = (currentUser: User): string => {
+    const { auth_source, external_user_id } = currentUser;
+
+    if (auth_source === "native" || auth_source === "system") {
+      return auth_source;
     }
-    if (username) {
-      const lowerUsername = username.toLowerCase();
-      if (lowerUsername.startsWith("github|")) {
+
+    // attempt to parse common providers from external ID
+    if (external_user_id) {
+      const lowerExternalId = external_user_id.toLowerCase();
+      if (lowerExternalId.startsWith("github")) {
         return "GitHub";
       }
-      if (lowerUsername.startsWith("google|")) {
+      if (lowerExternalId.startsWith("google")) {
         return "Google";
       }
+      return "Oauth";
     }
-    return "Proxy-Header";
+
+    return "email";
   };
 
   const getRoleDescription = (role: Role): string => {
@@ -333,19 +336,11 @@ export const Profile: React.FC = () => {
                     <Tooltip>
                       <TooltipTrigger asChild>
                         <span className="text-gray-900 truncate">
-                          {getAuthProviderDisplay(
-                            currentUser.auth_source,
-                            currentUser.username,
-                          )}
+                          {getAuthProviderDisplay(currentUser)}
                         </span>
                       </TooltipTrigger>
                       <TooltipContent>
-                        <p>
-                          {getAuthProviderDisplay(
-                            currentUser.auth_source,
-                            currentUser.username,
-                          )}
-                        </p>
+                        <p>{getAuthProviderDisplay(currentUser)}</p>
                       </TooltipContent>
                     </Tooltip>
                   </div>
