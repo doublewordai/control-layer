@@ -1,5 +1,17 @@
 # Changelog
 
+## [0.20.0](https://github.com/doublewordai/control-layer/compare/v0.19.1...v0.20.0) (2026-01-06)
+
+
+### Features
+
+* support separate databases for fusillade/outlet with optional read replicas ([#433](https://github.com/doublewordai/control-layer/issues/433)) ([8c24cd0](https://github.com/doublewordai/control-layer/commit/8c24cd0d72927cc95b3dc91df5452f5a82a7a4bd))
+
+
+### Bug Fixes
+
+* **deps:** update rust crate axum-prometheus to 0.10 ([#436](https://github.com/doublewordai/control-layer/issues/436)) ([6472ebf](https://github.com/doublewordai/control-layer/commit/6472ebfdc5e16986e64e32009c465dde9dff5877))
+
 ## [0.19.1](https://github.com/doublewordai/control-layer/compare/v0.19.0...v0.19.1) (2025-12-24)
 
 
