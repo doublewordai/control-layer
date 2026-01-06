@@ -1,3 +1,4 @@
+pub mod databases;
 pub mod sla;
 pub mod utils;
 
@@ -573,7 +574,7 @@ async fn test_request_logging_disabled(pool: PgPool) {
     // Build router with request logging disabled
     let request_manager = std::sync::Arc::new(fusillade::PostgresRequestManager::new(pool.clone()));
     let mut app_state = AppState::builder()
-        .db(pool.clone())
+        .db(crate::db::DbPools::new(pool.clone()))
         .config(config)
         .request_manager(request_manager)
         .build();
@@ -604,6 +605,177 @@ async fn test_request_logging_disabled(pool: PgPool) {
     } else {
         panic!("Outlet schema should not exist when request logging is disabled");
     }
+}
+
+#[sqlx::test]
+#[test_log::test]
+async fn test_dedicated_databases_for_components(pool: PgPool) {
+    use crate::config::{ComponentDb, PoolSettings};
+    use crate::test::databases::TestDatabases;
+
+    // Create dedicated databases for fusillade and outlet
+    let test_dbs = TestDatabases::new(&pool, "dedicated_components")
+        .await
+        .expect("Failed to create test databases");
+
+    // Create config with dedicated database mode
+    let mut config = crate::test::utils::create_test_config();
+    config.enable_request_logging = true;
+    config.batches.enabled = true;
+    config.background_services.leader_election.enabled = false;
+
+    // Configure fusillade to use dedicated database
+    config.database = crate::config::DatabaseConfig::External {
+        url: "ignored".to_string(), // Will be overridden by pool
+        replica_url: None,
+        pool: PoolSettings::default(),
+        fusillade: ComponentDb::Dedicated {
+            url: test_dbs.fusillade_url.clone(),
+            replica_url: None,
+            pool: PoolSettings {
+                max_connections: 4,
+                min_connections: 0,
+                ..Default::default()
+            },
+        },
+        outlet: ComponentDb::Dedicated {
+            url: test_dbs.outlet_url.clone(),
+            replica_url: None,
+            pool: PoolSettings {
+                max_connections: 4,
+                min_connections: 0,
+                ..Default::default()
+            },
+        },
+    };
+
+    // Create application - this will run migrations on the dedicated databases
+    let app = crate::Application::new_with_pool(config, Some(pool.clone()))
+        .await
+        .expect("Failed to create application with dedicated databases");
+
+    // Verify fusillade tables exist in the dedicated database
+    let fusillade_pool = sqlx::postgres::PgPoolOptions::new()
+        .max_connections(2)
+        .connect(&test_dbs.fusillade_url)
+        .await
+        .expect("Should connect to fusillade database");
+    let fusillade_tables: Vec<(String,)> = sqlx::query_as(
+        "SELECT table_name FROM information_schema.tables
+         WHERE table_schema = 'public' AND table_type = 'BASE TABLE'",
+    )
+    .fetch_all(&fusillade_pool)
+    .await
+    .expect("Should list fusillade tables");
+    assert!(
+        fusillade_tables.iter().any(|(name,)| name == "batches"),
+        "Fusillade dedicated database should have batches table after migrations"
+    );
+
+    // Verify outlet_db exists and is using the dedicated database
+    let outlet_pool = app.app_state.outlet_db.clone().expect("outlet_db should exist");
+
+    // Verify we can query the outlet database
+    let outlet_tables: Vec<(String,)> = sqlx::query_as(
+        "SELECT table_name FROM information_schema.tables
+         WHERE table_schema = 'public' AND table_type = 'BASE TABLE'",
+    )
+    .fetch_all(&outlet_pool)
+    .await
+    .expect("Should list outlet tables");
+    assert!(
+        outlet_tables.iter().any(|(name,)| name == "http_requests"),
+        "Outlet database should have http_requests table after migration"
+    );
+
+    // Verify the main database does NOT have the outlet schema (since we're using dedicated)
+    let outlet_schema_in_main: Option<i64> =
+        sqlx::query_scalar("SELECT COUNT(*) FROM information_schema.schemata WHERE schema_name = 'outlet'")
+            .fetch_one(&pool)
+            .await
+            .expect("Should query main db");
+    assert_eq!(
+        outlet_schema_in_main,
+        Some(0),
+        "Main database should not have outlet schema when using dedicated database"
+    );
+
+    // Make a request and verify it gets logged to the dedicated outlet database
+    let repository: outlet_postgres::RequestRepository<AiRequest, AiResponse> = outlet_postgres::RequestRepository::new(outlet_pool);
+
+    let (server, bg_services) = app.into_test_server();
+
+    // Make a test request
+    let _ = server.get("/ai/v1/models").await;
+
+    // Wait for logging to complete
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+    let result = repository
+        .query(RequestFilter {
+            method: Some("GET".into()),
+            ..Default::default()
+        })
+        .await
+        .expect("Should be able to query requests from dedicated outlet db");
+    assert_eq!(result.len(), 1, "Request should be logged to dedicated outlet database");
+
+    // Create a batch user and verify batch is stored in dedicated fusillade database
+    use crate::api::models::users::Role;
+    use crate::test::utils::{
+        add_auth_headers, add_deployment_to_group, create_test_endpoint, create_test_model, create_test_user_with_roles,
+    };
+    use axum::http::StatusCode;
+    use axum_test::multipart::MultipartForm;
+
+    let batch_user = create_test_user_with_roles(&pool, vec![Role::StandardUser, Role::BatchAPIUser]).await;
+    let auth_headers = add_auth_headers(&batch_user);
+
+    // Set up a model for batch validation
+    let endpoint_id = create_test_endpoint(&pool, "test-endpoint", batch_user.id).await;
+    let deployment_id = create_test_model(&pool, "test-model", "test-model", endpoint_id, batch_user.id).await;
+    add_deployment_to_group(&pool, deployment_id, uuid::Uuid::nil(), batch_user.id).await;
+
+    // Upload a batch file
+    let jsonl_content = r#"{"custom_id": "req-1", "method": "POST", "url": "/v1/chat/completions", "body": {"model": "test-model", "messages": [{"role": "user", "content": "Test"}]}}"#;
+    let multipart = MultipartForm::new().add_text("purpose", "batch").add_text("file", jsonl_content);
+
+    let file_response = server
+        .post("/ai/v1/files")
+        .add_header(&auth_headers[0].0, &auth_headers[0].1)
+        .add_header(&auth_headers[1].0, &auth_headers[1].1)
+        .multipart(multipart)
+        .await;
+    file_response.assert_status(StatusCode::CREATED);
+    let file: crate::api::models::files::FileResponse = file_response.json();
+
+    // Create a batch
+    let create_batch_json = serde_json::json!({
+        "input_file_id": file.id,
+        "endpoint": "/v1/chat/completions",
+        "completion_window": "24h"
+    });
+    let batch_response = server
+        .post("/ai/v1/batches")
+        .add_header(&auth_headers[0].0, &auth_headers[0].1)
+        .add_header(&auth_headers[1].0, &auth_headers[1].1)
+        .json(&create_batch_json)
+        .await;
+    batch_response.assert_status(StatusCode::CREATED);
+    let batch: crate::api::models::batches::BatchResponse = batch_response.json();
+
+    // Verify batch exists in the dedicated fusillade database
+    let batch_count: Option<i64> = sqlx::query_scalar("SELECT COUNT(*) FROM batches WHERE id = $1")
+        .bind(uuid::Uuid::parse_str(&batch.id).unwrap())
+        .fetch_one(&fusillade_pool)
+        .await
+        .expect("Should query fusillade database");
+    assert_eq!(batch_count, Some(1), "Batch should be stored in dedicated fusillade database");
+
+    // Cleanup
+    fusillade_pool.close().await;
+    bg_services.shutdown().await;
+    test_dbs.cleanup().await.expect("Failed to cleanup test databases");
 }
 
 #[sqlx::test]
@@ -729,7 +901,11 @@ async fn test_build_router_with_metrics_disabled(pool: PgPool) {
     config.enable_metrics = false;
 
     let request_manager = std::sync::Arc::new(fusillade::PostgresRequestManager::new(pool.clone()));
-    let mut app_state = AppState::builder().db(pool).config(config).request_manager(request_manager).build();
+    let mut app_state = AppState::builder()
+        .db(crate::db::DbPools::new(pool))
+        .config(config)
+        .request_manager(request_manager)
+        .build();
 
     let onwards_router = axum::Router::new();
     let router = super::build_router(&mut app_state, onwards_router)
@@ -750,7 +926,11 @@ async fn test_build_router_with_metrics_enabled(pool: PgPool) {
     config.enable_metrics = true;
 
     let request_manager = std::sync::Arc::new(fusillade::PostgresRequestManager::new(pool.clone()));
-    let mut app_state = AppState::builder().db(pool).config(config).request_manager(request_manager).build();
+    let mut app_state = AppState::builder()
+        .db(crate::db::DbPools::new(pool))
+        .config(config)
+        .request_manager(request_manager)
+        .build();
 
     let onwards_router = axum::Router::new();
     let router = super::build_router(&mut app_state, onwards_router)

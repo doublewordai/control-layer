@@ -58,25 +58,29 @@ pub fn create_test_config() -> crate::config::Config {
     crate::config::Config {
         database_url: None,
         database: crate::config::DatabaseConfig::External {
-            pool_config: crate::config::DatabasePoolConfig {
-                main: PoolSettings {
-                    max_connections: 4,
-                    min_connections: 1,
-                    ..Default::default()
-                },
-                fusillade: PoolSettings {
-                    max_connections: 4,
-                    min_connections: 0,
-                    ..Default::default()
-                },
-                outlet: PoolSettings {
+            url: "Something".to_string(), // Will get overriden by env var
+            replica_url: None,
+            pool: PoolSettings {
+                max_connections: 4,
+                min_connections: 1,
+                ..Default::default()
+            },
+            fusillade: crate::config::ComponentDb::Schema {
+                name: "fusillade".to_string(),
+                pool: PoolSettings {
                     max_connections: 4,
                     min_connections: 0,
                     ..Default::default()
                 },
             },
-            // Will get overriden by env var
-            url: "Something".to_string(),
+            outlet: crate::config::ComponentDb::Schema {
+                name: "outlet".to_string(),
+                pool: PoolSettings {
+                    max_connections: 4,
+                    min_connections: 0,
+                    ..Default::default()
+                },
+            },
         },
         host: "127.0.0.1".to_string(),
         port: 0,
