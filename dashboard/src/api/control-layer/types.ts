@@ -693,6 +693,7 @@ export interface Transaction {
   id: string;
   user_id: string; // UUID
   transaction_type: TransactionType;
+  batch_id?: string; // Batch ID (present when this is a grouped batch of multiple usage transactions)
   amount: number; // Amount in dollars
   balance_after: number; // Balance in dollars
   previous_transaction_id?: string; // UUID
@@ -717,6 +718,7 @@ export interface TransactionsQuery {
   limit?: number;
   skip?: number;
   userId?: string; // Filter transactions by user (UUID)
+  group_batches?: boolean; // Group transactions by batch (merges batch requests into single entries)
 }
 
 export interface AddFundsRequest {

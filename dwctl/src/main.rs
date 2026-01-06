@@ -38,6 +38,12 @@ async fn main() -> anyhow::Result<()> {
     // Load configuration
     let config = Config::load(&args)?;
 
+    // If --validate flag is set, exit successfully after config validation
+    if args.validate {
+        println!("Configuration is valid.");
+        return Ok(());
+    }
+
     // Initialize telemetry (tracing + optional OpenTelemetry)
     telemetry::init_telemetry(config.enable_otel_export)?;
 

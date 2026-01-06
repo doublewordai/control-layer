@@ -89,6 +89,11 @@ pub struct Args {
     /// Path to configuration file
     #[arg(short = 'f', long, env = "DWCTL_CONFIG", default_value = "config.yaml")]
     pub config: String,
+
+    /// Validate configuration and exit without starting the server.
+    /// Useful for CI/CD pipelines to catch config errors before deployment.
+    #[arg(long)]
+    pub validate: bool,
 }
 
 /// Main application configuration.
@@ -96,7 +101,7 @@ pub struct Args {
 /// This is the root configuration structure loaded from YAML and environment variables.
 /// All fields have sensible defaults defined in the `Default` implementation.
 #[derive(Debug, Clone, Deserialize, Serialize)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct Config {
     /// HTTP server host to bind to (e.g., "0.0.0.0" for all interfaces)
     pub host: String,
@@ -140,7 +145,7 @@ pub struct Config {
 ///
 /// These settings control connection pool behavior for optimal performance.
 #[derive(Debug, Clone, Deserialize, Serialize)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct PoolSettings {
     /// Maximum number of connections in the pool
     pub max_connections: u32,
@@ -167,43 +172,71 @@ impl Default for PoolSettings {
     }
 }
 
-/// Database connection pool configuration.
+/// How a component (fusillade/outlet) connects to its database.
 ///
-/// Controls connection pooling for each database pool.
-/// Each pool serves a different schema/purpose:
-/// - Main pool: public schema for application data
-/// - Fusillade pool: fusillade schema for batch processing (only if batches.enabled)
-/// - Outlet pool: outlet schema for request logging (only if enable_request_logging)
+/// Components can either share the main database using a separate PostgreSQL schema,
+/// or use a completely dedicated database with its own connection settings.
 #[derive(Debug, Clone, Deserialize, Serialize)]
-#[serde(default)]
-pub struct DatabasePoolConfig {
-    /// Main application pool settings
-    pub main: PoolSettings,
-    /// Fusillade batch processing pool settings (used only if batches.enabled)
-    pub fusillade: PoolSettings,
-    /// Outlet request logging pool settings (used only if enable_request_logging)
-    pub outlet: PoolSettings,
+#[serde(tag = "mode", rename_all = "snake_case")]
+pub enum ComponentDb {
+    /// Share the main database using a separate PostgreSQL schema.
+    /// This is the default and recommended for most deployments.
+    Schema {
+        /// Schema name (e.g., "fusillade", "outlet")
+        name: String,
+        /// Connection pool settings for this component
+        #[serde(default)]
+        pool: PoolSettings,
+    },
+    /// Use a dedicated database with its own connection.
+    /// Useful for isolating workloads or using read replicas.
+    Dedicated {
+        /// Primary database URL
+        url: String,
+        /// Optional read replica URL for read-heavy operations
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        replica_url: Option<String>,
+        /// Connection pool settings
+        #[serde(default)]
+        pool: PoolSettings,
+    },
 }
 
-impl Default for DatabasePoolConfig {
-    fn default() -> Self {
-        Self {
-            main: PoolSettings::default(),
-            fusillade: PoolSettings {
-                max_connections: 20,
-                min_connections: 2,
-                acquire_timeout_secs: 30,
-                idle_timeout_secs: 600,
-                max_lifetime_secs: 1800,
-            },
-            outlet: PoolSettings {
-                max_connections: 5,
-                min_connections: 0,
-                acquire_timeout_secs: 30,
-                idle_timeout_secs: 600,
-                max_lifetime_secs: 1800,
-            },
+impl ComponentDb {
+    /// Get the pool settings for this component
+    pub fn pool_settings(&self) -> &PoolSettings {
+        match self {
+            ComponentDb::Schema { pool, .. } => pool,
+            ComponentDb::Dedicated { pool, .. } => pool,
         }
+    }
+}
+
+/// Default fusillade component configuration (schema mode with "fusillade" schema)
+pub fn default_fusillade_component() -> ComponentDb {
+    ComponentDb::Schema {
+        name: "fusillade".into(),
+        pool: PoolSettings {
+            max_connections: 20,
+            min_connections: 2,
+            acquire_timeout_secs: 30,
+            idle_timeout_secs: 600,
+            max_lifetime_secs: 1800,
+        },
+    }
+}
+
+/// Default outlet component configuration (schema mode with "outlet" schema)
+pub fn default_outlet_component() -> ComponentDb {
+    ComponentDb::Schema {
+        name: "outlet".into(),
+        pool: PoolSettings {
+            max_connections: 5,
+            min_connections: 0,
+            acquire_timeout_secs: 30,
+            idle_timeout_secs: 600,
+            max_lifetime_secs: 1800,
+        },
     }
 }
 
@@ -211,6 +244,9 @@ impl Default for DatabasePoolConfig {
 ///
 /// Supports either an embedded PostgreSQL instance (for development) or an external
 /// PostgreSQL database (recommended for production).
+///
+/// Components (fusillade, outlet) can either share the main database using separate
+/// schemas, or use dedicated databases with their own connection settings.
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(tag = "type", rename_all = "lowercase")]
 pub enum DatabaseConfig {
@@ -222,17 +258,32 @@ pub enum DatabaseConfig {
         /// Whether to persist data between restarts (default: false/ephemeral)
         #[serde(default)]
         persistent: bool,
-        /// Connection pool configuration
+        /// Main database connection pool settings
         #[serde(default)]
-        pool_config: DatabasePoolConfig,
+        pool: PoolSettings,
+        /// Fusillade batch processing database configuration
+        #[serde(default = "default_fusillade_component")]
+        fusillade: ComponentDb,
+        /// Outlet request logging database configuration
+        #[serde(default = "default_outlet_component")]
+        outlet: ComponentDb,
     },
     /// Use external PostgreSQL database
     External {
-        /// Connection string for external database
+        /// Connection string for the main database
         url: String,
-        /// Connection pool configuration
+        /// Optional read replica URL for the main database
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        replica_url: Option<String>,
+        /// Main database connection pool settings
         #[serde(default)]
-        pool_config: DatabasePoolConfig,
+        pool: PoolSettings,
+        /// Fusillade batch processing database configuration
+        #[serde(default = "default_fusillade_component")]
+        fusillade: ComponentDb,
+        /// Outlet request logging database configuration
+        #[serde(default = "default_outlet_component")]
+        outlet: ComponentDb,
     },
 }
 
@@ -244,22 +295,26 @@ impl Default for DatabaseConfig {
             DatabaseConfig::Embedded {
                 data_dir: None,
                 persistent: false,
-                pool_config: DatabasePoolConfig::default(),
+                pool: PoolSettings::default(),
+                fusillade: default_fusillade_component(),
+                outlet: default_outlet_component(),
             }
         }
         #[cfg(not(feature = "embedded-db"))]
         {
             DatabaseConfig::External {
                 url: "postgres://localhost:5432/control_layer".to_string(),
-                pool_config: DatabasePoolConfig::default(),
+                replica_url: None,
+                pool: PoolSettings::default(),
+                fusillade: default_fusillade_component(),
+                outlet: default_outlet_component(),
             }
         }
     }
 }
 
 impl DatabaseConfig {
-    /// Get the database URL, resolving embedded if needed
-    /// This is used during startup to get the connection string
+    /// Check if using embedded database
     pub fn is_embedded(&self) -> bool {
         matches!(self, DatabaseConfig::Embedded { .. })
     }
@@ -268,6 +323,14 @@ impl DatabaseConfig {
     pub fn external_url(&self) -> Option<&str> {
         match self {
             DatabaseConfig::External { url, .. } => Some(url),
+            DatabaseConfig::Embedded { .. } => None,
+        }
+    }
+
+    /// Get external replica URL if available
+    pub fn external_replica_url(&self) -> Option<&str> {
+        match self {
+            DatabaseConfig::External { replica_url, .. } => replica_url.as_deref(),
             DatabaseConfig::Embedded { .. } => None,
         }
     }
@@ -288,11 +351,27 @@ impl DatabaseConfig {
         }
     }
 
-    /// Get the pool configuration
-    pub fn pool_config(&self) -> &DatabasePoolConfig {
+    /// Get the main database pool settings
+    pub fn main_pool_settings(&self) -> &PoolSettings {
         match self {
-            DatabaseConfig::Embedded { pool_config, .. } => pool_config,
-            DatabaseConfig::External { pool_config, .. } => pool_config,
+            DatabaseConfig::Embedded { pool, .. } => pool,
+            DatabaseConfig::External { pool, .. } => pool,
+        }
+    }
+
+    /// Get the fusillade component database configuration
+    pub fn fusillade(&self) -> &ComponentDb {
+        match self {
+            DatabaseConfig::Embedded { fusillade, .. } => fusillade,
+            DatabaseConfig::External { fusillade, .. } => fusillade,
+        }
+    }
+
+    /// Get the outlet component database configuration
+    pub fn outlet(&self) -> &ComponentDb {
+        match self {
+            DatabaseConfig::Embedded { outlet, .. } => outlet,
+            DatabaseConfig::External { outlet, .. } => outlet,
         }
     }
 }
@@ -360,7 +439,7 @@ pub struct DummyConfig {
 ///
 /// These values are exposed to the frontend and shown in the user interface.
 #[derive(Debug, Clone, Deserialize, Serialize)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct Metadata {
     /// Region name displayed in the UI (e.g., "UK South", "US East")
     pub region: Option<String>,
@@ -410,7 +489,7 @@ pub struct DefaultModel {
 
 /// Authentication configuration for all supported auth methods.
 #[derive(Debug, Clone, Deserialize, Serialize)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct AuthConfig {
     /// Native username/password authentication
     pub native: NativeAuthConfig,
@@ -437,7 +516,7 @@ impl Default for AuthConfig {
 
 /// Native username/password authentication configuration.
 #[derive(Debug, Clone, Deserialize, Serialize)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct NativeAuthConfig {
     /// Enable native authentication (login/registration)
     pub enabled: bool,
@@ -456,7 +535,7 @@ pub struct NativeAuthConfig {
 /// This authentication method reads user identity from HTTP headers set by an upstream
 /// proxy (e.g., SSO proxy). Enables integration with external authentication systems.
 #[derive(Debug, Clone, Deserialize, Serialize)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct ProxyHeaderAuthConfig {
     /// Enable proxy header authentication
     ///
@@ -501,7 +580,7 @@ pub struct ProxyHeaderAuthConfig {
 
 /// Session cookie configuration.
 #[derive(Debug, Clone, Deserialize, Serialize)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct SessionConfig {
     /// Session timeout duration
     #[serde(with = "humantime_serde")]
@@ -516,7 +595,7 @@ pub struct SessionConfig {
 
 /// Password validation rules.
 #[derive(Debug, Clone, Deserialize, Serialize)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct PasswordConfig {
     /// Minimum password length
     pub min_length: usize,
@@ -532,7 +611,7 @@ pub struct PasswordConfig {
 
 /// Security configuration for JWT and CORS.
 #[derive(Debug, Clone, Deserialize, Serialize)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct SecurityConfig {
     /// JWT token expiry duration
     #[serde(with = "humantime_serde")]
@@ -543,7 +622,7 @@ pub struct SecurityConfig {
 
 /// CORS (Cross-Origin Resource Sharing) configuration.
 #[derive(Debug, Clone, Deserialize, Serialize)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct CorsConfig {
     /// Allowed origins for CORS requests
     pub allowed_origins: Vec<CorsOrigin>,
@@ -556,6 +635,7 @@ pub struct CorsConfig {
 /// Email configuration for password resets and notifications.
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(default)]
+// Note: Cannot use deny_unknown_fields here due to #[serde(flatten)] on transport
 pub struct EmailConfig {
     /// Email transport method
     #[serde(flatten)]
@@ -594,7 +674,7 @@ pub enum EmailTransportConfig {
 
 /// Password reset email configuration.
 #[derive(Debug, Clone, Deserialize, Serialize)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct PasswordResetEmailConfig {
     /// How long reset tokens are valid
     #[serde(with = "humantime_serde")]
@@ -605,7 +685,7 @@ pub struct PasswordResetEmailConfig {
 
 /// File upload/download configuration for batch processing.
 #[derive(Debug, Clone, Deserialize, Serialize)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct FilesConfig {
     /// Maximum file size in bytes (default: 100MB)
     pub max_file_size: u64,
@@ -640,7 +720,7 @@ impl Default for FilesConfig {
 /// request processing. Note: The batch processing daemon configuration has been moved
 /// to `background_services.batch_daemon`.
 #[derive(Debug, Clone, Deserialize, Serialize)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct BatchConfig {
     /// Enable batches API endpoints (default: true)
     pub enabled: bool,
@@ -666,7 +746,7 @@ impl Default for BatchConfig {
 ///
 /// The daemon processes batch requests asynchronously in the background.
 #[derive(Debug, Clone, Deserialize, Serialize)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct DaemonConfig {
     /// When to run the daemon (default: "leader")
     /// - "always": Always run the daemon
@@ -862,7 +942,7 @@ pub enum DaemonEnabled {
 /// Leader election uses PostgreSQL advisory locks to elect a single leader instance that
 /// runs background services like health probes and batch processing.
 #[derive(Debug, Clone, Deserialize, Serialize)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct LeaderElectionConfig {
     /// Enable leader election (default: true)
     /// When false, this instance always runs as leader (useful for single-instance deployments and testing)
@@ -879,7 +959,7 @@ impl Default for LeaderElectionConfig {
 ///
 /// Controls which background services are enabled on this instance.
 #[derive(Debug, Clone, Deserialize, Serialize, Default)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct BackgroundServicesConfig {
     /// Configuration for onwards config sync service
     pub onwards_sync: OnwardsSyncConfig,
@@ -896,7 +976,7 @@ pub struct BackgroundServicesConfig {
 /// This service syncs database configuration changes to the onwards routing layer via PostgreSQL LISTEN/NOTIFY.
 /// Disabling this will prevent the AI proxy from receiving config updates (not recommended for production).
 #[derive(Debug, Clone, Deserialize, Serialize)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct OnwardsSyncConfig {
     /// Enable onwards config sync service (default: true)
     pub enabled: bool,
@@ -912,7 +992,7 @@ impl Default for OnwardsSyncConfig {
 ///
 /// The probe scheduler periodically checks inference endpoint health and removes failing backends from rotation.
 #[derive(Debug, Clone, Deserialize, Serialize)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct ProbeSchedulerConfig {
     /// Enable probe scheduler service (default: true)
     /// When leader election is enabled, the probe scheduler only runs on the elected leader
@@ -960,7 +1040,7 @@ where
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 /// Credit system configuration.
 ///
 /// Controls how credits are allocated to users for tracking AI usage.
@@ -1125,10 +1205,18 @@ impl Config {
     pub fn load(args: &Args) -> Result<Self, figment::Error> {
         let mut config: Self = Self::figment(args).extract()?;
 
-        // if database_url is set, use it (preserving existing pool_config)
+        // if database_url is set, use it (preserving existing pool and component settings)
         if let Some(url) = config.database_url.take() {
-            let pool_config = config.database.pool_config().clone();
-            config.database = DatabaseConfig::External { url, pool_config };
+            let pool = config.database.main_pool_settings().clone();
+            let fusillade = config.database.fusillade().clone();
+            let outlet = config.database.outlet().clone();
+            config.database = DatabaseConfig::External {
+                url,
+                replica_url: None,
+                pool,
+                fusillade,
+                outlet,
+            };
         }
 
         config.validate().map_err(|e| figment::Error::from(e.to_string()))?;
@@ -1258,6 +1346,7 @@ model_sources:
 
             let args = Args {
                 config: "test.yaml".to_string(),
+                validate: false,
             };
 
             let config = Config::load(&args)?;
@@ -1296,6 +1385,7 @@ metadata:
 
             let args = Args {
                 config: "test.yaml".to_string(),
+                validate: false,
             };
 
             let config = Config::load(&args)?;
@@ -1335,6 +1425,7 @@ auth:
 
             let args = Args {
                 config: "test.yaml".to_string(),
+                validate: false,
             };
 
             let config = Config::load(&args)?;
