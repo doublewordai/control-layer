@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.21.0](https://github.com/doublewordai/control-layer/compare/v0.20.0...v0.21.0) (2026-01-06)
+
+
+### Features
+
+* add --validate flag and strict config parsing ([#441](https://github.com/doublewordai/control-layer/issues/441)) ([48cc236](https://github.com/doublewordai/control-layer/commit/48cc2366be15d2a9e3caef54ce5fb234257dcf52))
+
 ## [0.20.0](https://github.com/doublewordai/control-layer/compare/v0.19.1...v0.20.0) (2026-01-06)
 
 
