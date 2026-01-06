@@ -1,6 +1,6 @@
 //! Model fetching from external sources.
 
-use crate::api::models::inference_endpoints::{AnthropicModelsResponse, OpenAIModelsResponse};
+use crate::api::models::inference_endpoints::{AnthropicModelsResponse, OpenAIModelsResponse, OpenRouterModelsResponse};
 use crate::db::models::inference_endpoints::InferenceEndpointDBResponse;
 use anyhow::anyhow;
 use async_trait::async_trait;
@@ -102,12 +102,17 @@ fn ensure_slash(url: &Url) -> Url {
 pub enum ModelFormat {
     OpenAI,
     Anthropic,
+    OpenRouter,
 }
 
 impl From<&Url> for ModelFormat {
     fn from(value: &Url) -> Self {
-        if value.as_str().starts_with("https://api.anthropic.com") {
+        let url_str = value.as_str();
+        if url_str.starts_with("https://api.anthropic.com") {
             return Self::Anthropic;
+        }
+        if url_str.starts_with("https://openrouter.ai") {
+            return Self::OpenRouter;
         }
         Self::OpenAI
     }
@@ -186,6 +191,37 @@ impl FetchModels for FetchModelsReqwest {
                     Ok(parsed) => Ok(parsed.into()),
                     Err(e) => {
                         tracing::error!("Failed to make request to anthropic API for models");
+                        tracing::error!("Url was: {}", url);
+                        tracing::error!("Failed to parse models response as JSON. Error: {}", e);
+                        tracing::error!("Response body was: {}", body_text);
+                        Err(anyhow!("error decoding response body: {}", e))
+                    }
+                }
+            }
+            ModelFormat::OpenRouter => {
+                if let Some(api_key) = &self.openai_api_key {
+                    request = request.header(&self.auth_header_name, format!("{}{}", self.auth_header_prefix, api_key));
+                };
+
+                let response = request.timeout(self.request_timeout).send().await?;
+
+                if !response.status().is_success() {
+                    let status = response.status();
+                    let body = response.text().await.unwrap_or_default();
+                    tracing::error!("Failed to make request to OpenRouter API for models");
+                    tracing::error!("Url was: {}", url);
+                    return Err(anyhow!("OpenRouter API error: {} - {}", status, body));
+                }
+
+                // Get the response body as text first for logging
+                let body_text = response.text().await?;
+                tracing::debug!("Models API response body: {}", body_text);
+
+                // Try to parse the JSON
+                match serde_json::from_str::<OpenRouterModelsResponse>(&body_text) {
+                    Ok(parsed) => Ok(parsed.into()),
+                    Err(e) => {
+                        tracing::error!("Failed to make request to OpenRouter API for models");
                         tracing::error!("Url was: {}", url);
                         tracing::error!("Failed to parse models response as JSON. Error: {}", e);
                         tracing::error!("Response body was: {}", body_text);
@@ -562,6 +598,100 @@ mod tests {
         let url = Url::parse("https://some-other-provider.com/v1/").unwrap();
         let format: ModelFormat = (&url).into();
         assert!(matches!(format, ModelFormat::OpenAI));
+    }
+
+    #[test]
+    fn test_model_format_detection_openrouter() {
+        let url = Url::parse("https://openrouter.ai/api/v1/").unwrap();
+        let format: ModelFormat = (&url).into();
+        assert!(matches!(format, ModelFormat::OpenRouter));
+    }
+
+    #[tokio::test]
+    async fn test_fetch_openrouter_format() {
+        let mock_server = MockServer::start().await;
+
+        // Set up mock response - OpenRouter format
+        Mock::given(method("GET"))
+            .and(path("/models"))
+            .and(header("Authorization", "Bearer test-api-key"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "data": [
+                    {
+                        "id": "openai/gpt-4-turbo",
+                        "name": "GPT-4 Turbo",
+                        "created": 1234567890,
+                        "description": "Latest GPT-4 Turbo model"
+                    },
+                    {
+                        "id": "anthropic/claude-3-opus",
+                        "name": "Claude 3 Opus",
+                        "created": 1234567891,
+                        "description": "Most capable Claude model"
+                    }
+                ]
+            })))
+            .expect(1)
+            .mount(&mock_server)
+            .await;
+
+        // Use format_override to force OpenRouter format with mock server URL
+        let config = SyncConfig {
+            openai_api_key: Some("test-api-key".to_string()),
+            openai_base_url: mock_server.uri().parse().unwrap(),
+            auth_header_name: "Authorization".to_string(),
+            auth_header_prefix: "Bearer ".to_string(),
+            request_timeout: Duration::from_secs(30),
+            format_override: Some(ModelFormat::OpenRouter),
+        };
+
+        let fetcher = FetchModelsReqwest::new(config);
+        let result = fetcher.fetch().await.unwrap();
+
+        // OpenRouter response gets converted to OpenAI format
+        assert_eq!(result.object, "list");
+        assert_eq!(result.data.len(), 2);
+        assert_eq!(result.data[0].id, "openai/gpt-4-turbo");
+        assert_eq!(result.data[1].id, "anthropic/claude-3-opus");
+        assert_eq!(result.data[0].object, "model");
+        assert_eq!(result.data[0].owned_by, "openrouter");
+    }
+
+    #[tokio::test]
+    async fn test_fetch_openrouter_format_minimal_fields() {
+        let mock_server = MockServer::start().await;
+
+        // Set up mock response with minimal fields (only required fields)
+        Mock::given(method("GET"))
+            .and(path("/models"))
+            .and(header("Authorization", "Bearer test-api-key"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "data": [
+                    {
+                        "id": "minimal/model"
+                    }
+                ]
+            })))
+            .expect(1)
+            .mount(&mock_server)
+            .await;
+
+        let config = SyncConfig {
+            openai_api_key: Some("test-api-key".to_string()),
+            openai_base_url: mock_server.uri().parse().unwrap(),
+            auth_header_name: "Authorization".to_string(),
+            auth_header_prefix: "Bearer ".to_string(),
+            request_timeout: Duration::from_secs(30),
+            format_override: Some(ModelFormat::OpenRouter),
+        };
+
+        let fetcher = FetchModelsReqwest::new(config);
+        let result = fetcher.fetch().await.unwrap();
+
+        assert_eq!(result.object, "list");
+        assert_eq!(result.data.len(), 1);
+        assert_eq!(result.data[0].id, "minimal/model");
+        assert_eq!(result.data[0].object, "model");
     }
 
     #[tokio::test]
