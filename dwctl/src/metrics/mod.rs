@@ -7,6 +7,6 @@ mod credits;
 mod gen_ai;
 mod recorder;
 
-pub use credits::{record_credit_deduction, record_credit_deduction_error};
+pub use credits::{record_analytics_lag, record_credit_deduction, record_credit_deduction_error};
 pub use gen_ai::GenAiMetrics;
 pub use recorder::MetricsRecorder;

@@ -657,6 +657,13 @@ pub async fn store_analytics_record(
         }
     }
 
+    // Record analytics processing lag (time from request to storage complete)
+    let lag_seconds = chrono::Utc::now()
+        .signed_duration_since(metrics.timestamp)
+        .num_milliseconds() as f64
+        / 1000.0;
+    crate::metrics::record_analytics_lag(lag_seconds);
+
     Ok(row)
 }
 
