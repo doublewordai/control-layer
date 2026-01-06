@@ -61,6 +61,42 @@ impl From<AnthropicModelsResponse> for OpenAIModelsResponse {
     }
 }
 
+/// A model from the OpenRouter API
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct OpenRouterModel {
+    pub id: String,
+    #[serde(default)]
+    pub name: Option<String>,
+    pub created: Option<i64>,
+    #[serde(default)]
+    pub description: Option<String>,
+}
+
+/// Response from the /api/v1/models endpoint of the OpenRouter API
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct OpenRouterModelsResponse {
+    pub data: Vec<OpenRouterModel>,
+}
+
+impl From<OpenRouterModelsResponse> for OpenAIModelsResponse {
+    fn from(openrouter: OpenRouterModelsResponse) -> Self {
+        let data = openrouter
+            .data
+            .into_iter()
+            .map(|model| OpenAIModel {
+                id: model.id.clone(),
+                object: "model".to_string(),
+                created: model.created,
+                owned_by: "openrouter".to_string(),
+            })
+            .collect();
+        Self {
+            object: "list".to_string(),
+            data,
+        }
+    }
+}
+
 /// Query parameters for listing inference endpoints
 #[derive(Debug, Deserialize, IntoParams, ToSchema)]
 pub struct ListEndpointsQuery {
