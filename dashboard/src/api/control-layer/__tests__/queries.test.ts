@@ -658,50 +658,51 @@ describe("Type Safety", () => {
 describe("dwctlApi.cost", () => {
   describe("listTransactions", () => {
     it("should fetch transactions without query parameters", async () => {
-      const transactions = await dwctlApi.cost.listTransactions();
+      const response = await dwctlApi.cost.listTransactions();
 
-      expect(transactions).toBeInstanceOf(Array);
-      expect(transactions.length).toBeGreaterThan(0);
-      expect(transactions[0]).toHaveProperty("id");
-      expect(transactions[0]).toHaveProperty("user_id");
-      expect(transactions[0]).toHaveProperty("transaction_type");
-      expect(transactions[0]).toHaveProperty("amount");
-      expect(transactions[0]).toHaveProperty("balance_after");
-      expect(transactions[0]).toHaveProperty("created_at");
+      expect(response).toHaveProperty("data");
+      expect(response).toHaveProperty("page_start_balance");
+      expect(response.data).toBeInstanceOf(Array);
+      expect(response.data.length).toBeGreaterThan(0);
+      expect(response.data[0]).toHaveProperty("id");
+      expect(response.data[0]).toHaveProperty("user_id");
+      expect(response.data[0]).toHaveProperty("transaction_type");
+      expect(response.data[0]).toHaveProperty("amount");
+      expect(response.data[0]).toHaveProperty("created_at");
     });
 
     it("should fetch transactions with userId filter", async () => {
       const userId = "550e8400-e29b-41d4-a716-446655440001";
-      const transactions = await dwctlApi.cost.listTransactions({
+      const response = await dwctlApi.cost.listTransactions({
         userId,
       });
 
-      expect(transactions).toBeInstanceOf(Array);
-      expect(transactions.every((t) => t.user_id === userId)).toBe(true);
+      expect(response.data).toBeInstanceOf(Array);
+      expect(response.data.every((t) => t.user_id === userId)).toBe(true);
     });
 
     it("should fetch transactions with pagination", async () => {
-      const transactions = await dwctlApi.cost.listTransactions({
+      const response = await dwctlApi.cost.listTransactions({
         limit: 5,
         skip: 0,
       });
 
-      expect(transactions).toBeInstanceOf(Array);
-      expect(transactions.length).toBeLessThanOrEqual(5);
+      expect(response.data).toBeInstanceOf(Array);
+      expect(response.data.length).toBeLessThanOrEqual(5);
     });
 
     it("should return transactions with correct types", async () => {
-      const transactions = await dwctlApi.cost.listTransactions();
-      const transaction = transactions[0];
+      const response = await dwctlApi.cost.listTransactions();
+      const transaction = response.data[0];
 
       expect(typeof transaction.id).toBe("string");
       expect(typeof transaction.user_id).toBe("string");
       expect(typeof transaction.amount).toBe("number");
-      expect(typeof transaction.balance_after).toBe("number");
       expect(typeof transaction.created_at).toBe("string");
       expect(["admin_grant", "admin_removal", "usage", "purchase"]).toContain(
         transaction.transaction_type,
       );
+      expect(typeof response.page_start_balance).toBe("number");
     });
   });
 
@@ -721,7 +722,6 @@ describe("dwctlApi.cost", () => {
       expect(result.user_id).toBe(userId);
       expect(result.amount).toBe(amount);
       expect(result.transaction_type).toBe("admin_grant");
-      expect(result.balance_after).toBeGreaterThan(0);
     });
 
     it("should handle funds addition without description", async () => {

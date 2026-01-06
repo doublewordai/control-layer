@@ -241,12 +241,22 @@ pub async fn load_targets_from_db(db: &PgPool) -> Result<Targets, anyhow::Error>
     // - api_keys with access control logic
     let rows = sqlx::query!(
         r#"
-        WITH latest_balances AS (
-            SELECT DISTINCT ON (user_id)
-                user_id,
-                balance_after
-            FROM credits_transactions
-            ORDER BY user_id, created_at DESC, id DESC
+        WITH user_balances AS (
+            -- Calculate balance using checkpoint + delta for efficiency
+            SELECT
+                u.id as user_id,
+                COALESCE(c.balance, 0) + COALESCE(
+                    (SELECT SUM(
+                        CASE WHEN ct.transaction_type IN ('purchase', 'admin_grant')
+                        THEN ct.amount ELSE -ct.amount END
+                    )
+                    FROM credits_transactions ct
+                    WHERE ct.user_id = u.id
+                    AND (c.checkpoint_seq IS NULL OR ct.seq > c.checkpoint_seq)),
+                    0
+                ) as balance
+            FROM users u
+            LEFT JOIN user_balance_checkpoints c ON c.user_id = u.id
         )
         SELECT
             -- Deployment fields (only what we need)
@@ -301,8 +311,8 @@ pub async fn load_targets_from_db(db: &PgPool) -> Result<Targets, anyhow::Error>
             AND (
                 ak.user_id = '00000000-0000-0000-0000-000000000000'
                 OR EXISTS (
-                    SELECT 1 FROM latest_balances lb
-                    WHERE lb.user_id = ak.user_id AND lb.balance_after > 0
+                    SELECT 1 FROM user_balances ub
+                    WHERE ub.user_id = ak.user_id AND ub.balance > 0
                 )
                 OR (
                     -- Free model check: no active tariffs with pricing

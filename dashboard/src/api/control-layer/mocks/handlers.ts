@@ -104,6 +104,17 @@ const getGroupUsersData = (): Record<string, string[]> => {
   return groupUsersData;
 };
 
+// Compute user balance from transactions (sum of credits minus debits)
+function computeUserBalance(userId: string): number {
+  const userTransactions = transactionsData.filter((t) => t.user_id === userId);
+  return userTransactions.reduce((balance, tx) => {
+    const isCredit =
+      tx.transaction_type === "admin_grant" ||
+      tx.transaction_type === "purchase";
+    return isCredit ? balance + tx.amount : balance - tx.amount;
+  }, 0);
+}
+
 // Function to compute real metrics from requests data, shifted to appear as today's activity
 function computeModelMetrics(modelAlias: string) {
   const modelRequests = requestsData.filter((req) => req.model === modelAlias);
@@ -358,14 +369,8 @@ export const handlers = [
     // Add billing information if requested
     let result = { ...user };
     if (include?.includes("billing")) {
-      // Get user's last transaction to determine current balance
-      const userTransactions = transactionsData
-        .filter((t) => t.user_id === user.id)
-        .sort(
-          (a, b) =>
-            new Date(b.created_at).getTime() - new Date(a.created_at).getTime(),
-        );
-      const creditBalance = userTransactions[0]?.balance_after || 0;
+      // Compute current balance from all transactions
+      const creditBalance = computeUserBalance(user.id);
       result = { ...result, credit_balance: creditBalance };
     }
 
@@ -1324,7 +1329,7 @@ export const handlers = [
     const limitParam = url.searchParams.get("limit");
     const skipParam = url.searchParams.get("skip");
 
-    const limit = limitParam ? parseInt(limitParam, 10) : undefined;
+    const limit = limitParam ? parseInt(limitParam, 10) : 100;
     const skip = skipParam ? parseInt(skipParam, 10) : 0;
 
     // If no userId provided, default to current user (first user in demo)
@@ -1341,12 +1346,20 @@ export const handlers = [
         new Date(b.created_at).getTime() - new Date(a.created_at).getTime(),
     );
 
-    // Apply pagination
-    const paginatedTransactions = limit
-      ? filteredTransactions.slice(skip, skip + limit)
-      : filteredTransactions.slice(skip);
+    // Compute current balance for the user
+    const currentBalance = computeUserBalance(userId || "");
 
-    return HttpResponse.json(paginatedTransactions);
+    // Apply pagination
+    const paginatedTransactions = filteredTransactions.slice(skip, skip + limit);
+
+    // Return new response format with page_start_balance
+    return HttpResponse.json({
+      data: paginatedTransactions,
+      total_count: filteredTransactions.length,
+      skip,
+      limit,
+      page_start_balance: currentBalance,
+    });
   }),
 
   http.post("/admin/api/v1/transactions", async ({ request }) => {
@@ -1358,23 +1371,12 @@ export const handlers = [
       return HttpResponse.json({ error: "User not found" }, { status: 404 });
     }
 
-    // Get user's last transaction to determine current balance
-    const userTransactions = transactionsData
-      .filter((t) => t.user_id === body.user_id)
-      .sort(
-        (a, b) =>
-          new Date(b.created_at).getTime() - new Date(a.created_at).getTime(),
-      );
-    const currentBalance = userTransactions[0]?.balance_after || 0;
-
-    // Create new transaction
+    // Create new transaction (no balance_after stored)
     const newTransaction: Transaction = {
       id: `txn-${Date.now()}`,
       user_id: body.user_id,
       transaction_type: "admin_grant",
       amount: body.amount,
-      balance_after: currentBalance + body.amount,
-      previous_transaction_id: userTransactions[0]?.id,
       source_id: "admin",
       description: body.description || "Funds added by admin",
       created_at: new Date().toISOString(),

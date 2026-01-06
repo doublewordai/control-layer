@@ -8,12 +8,18 @@ use crate::{
     types::{UserId, abbrev_uuid},
 };
 use chrono::{DateTime, Utc};
+use rand::random;
 use rust_decimal::{Decimal, prelude::ToPrimitive};
 use serde::{Deserialize, Serialize};
-use sqlx::{Connection, FromRow, PgConnection};
+use sqlx::{FromRow, PgConnection};
 use std::collections::HashMap;
 use tracing::{error, instrument, trace};
 use uuid::Uuid;
+
+/// Probability of refreshing checkpoint on each transaction (1 in N).
+/// With N=1000, checkpoint lags by ~1000 transactions on average,
+/// meaning balance reads aggregate ~500 rows on average.
+const CHECKPOINT_REFRESH_PROBABILITY: u32 = 1000;
 
 // Database entity model for credit transaction
 #[derive(Debug, Clone, Serialize, Deserialize, FromRow)]
@@ -23,11 +29,11 @@ pub struct CreditTransaction {
     #[sqlx(rename = "transaction_type")]
     pub transaction_type: CreditTransactionType,
     pub amount: Decimal,
-    pub balance_after: Decimal,
-    pub previous_transaction_id: Option<Uuid>,
     pub description: Option<String>,
     pub source_id: String,
     pub created_at: DateTime<Utc>,
+    /// Sequence number for reliable ordering in checkpoint calculations.
+    pub seq: i64,
 }
 
 impl From<CreditTransaction> for CreditTransactionDBResponse {
@@ -37,13 +43,19 @@ impl From<CreditTransaction> for CreditTransactionDBResponse {
             user_id: tx.user_id,
             transaction_type: tx.transaction_type,
             amount: tx.amount,
-            balance_after: tx.balance_after,
-            previous_transaction_id: tx.previous_transaction_id,
             description: tx.description,
             source_id: tx.source_id,
             created_at: tx.created_at,
         }
     }
+}
+
+/// Checkpoint data for a user's balance
+#[derive(Debug, Clone)]
+pub struct BalanceCheckpoint {
+    pub user_id: UserId,
+    pub checkpoint_seq: i64,
+    pub balance: Decimal,
 }
 
 /// Result of aggregating batch transactions
@@ -65,116 +77,135 @@ impl<'c> Credits<'c> {
     }
 
     /// Create a new credit transaction
-    /// This method validates the balance_after is correct based on the current balance
+    ///
+    /// This is a lock-free append-only INSERT. Balance is calculated on read via checkpoints.
+    /// Probabilistically refreshes the checkpoint (1 in CHECKPOINT_REFRESH_PROBABILITY chance).
     #[instrument(skip(self, request), fields(user_id = %abbrev_uuid(&request.user_id), transaction_type = ?request.transaction_type, amount = %request.amount), err)]
     pub async fn create_transaction(&mut self, request: &CreditTransactionCreateDBRequest) -> Result<CreditTransactionDBResponse> {
-        // Start the transaction
-        let mut tx = self.db.begin().await?;
-
-        // Convert UUID to int64 for advisory lock
-        // We use the first 8 bytes of the UUID as the lock key
-        let user_uuid_bytes = request.user_id.as_bytes();
-        let lock_key = i64::from_be_bytes([
-            user_uuid_bytes[0],
-            user_uuid_bytes[1],
-            user_uuid_bytes[2],
-            user_uuid_bytes[3],
-            user_uuid_bytes[4],
-            user_uuid_bytes[5],
-            user_uuid_bytes[6],
-            user_uuid_bytes[7],
-        ]);
-
-        // Use pg_advisory_xact_lock which is transaction-scoped (auto-releases on commit/rollback)
-        // This will BLOCK until the lock is available, ensuring serialization
-        sqlx::query!("SELECT pg_advisory_xact_lock($1) as lock_result", lock_key)
-            .fetch_one(&mut *tx)
-            .await?;
-
-        trace!("Acquired advisory lock for user_id {}", request.user_id);
-
-        // Now safely get the current balance - no race condition possible
-        let (current_balance, last_transaction_id) = match sqlx::query!(
-            r#"
-            SELECT balance_after, id
-            FROM credits_transactions
-            WHERE user_id = $1
-            ORDER BY created_at DESC, id DESC
-            LIMIT 1
-            "#,
-            request.user_id
-        )
-        .fetch_one(&mut *tx)
-        .await
-        {
-            Ok(record) => (record.balance_after, Some(record.id)),
-            Err(sqlx::Error::RowNotFound) => (Decimal::ZERO, None),
-            Err(e) => return Err(e.into()),
-        };
-
-        // Calculate what the new balance should be based on transaction type
-        // Use checked arithmetic to prevent overflow panics
-        let new_balance = match request.transaction_type {
-            CreditTransactionType::AdminGrant | CreditTransactionType::Purchase => current_balance
-                .checked_add(request.amount)
-                .ok_or_else(|| sqlx::Error::Protocol("Balance overflow: resulting balance exceeds maximum".to_string()))?,
-            CreditTransactionType::AdminRemoval | CreditTransactionType::Usage => current_balance
-                .checked_sub(request.amount)
-                .ok_or_else(|| sqlx::Error::Protocol("Balance underflow: resulting balance exceeds minimum".to_string()))?,
-        };
-
-        // Insert the transaction, there is protection on the DB so will return an error if balance goes negative which is why there isn't a check here.
+        // Lock-free INSERT - no advisory lock, no balance calculation
+        // Balance is calculated on read via checkpoints
         let transaction = sqlx::query_as!(
             CreditTransaction,
             r#"
-            INSERT INTO credits_transactions (user_id, transaction_type, amount, balance_after, previous_transaction_id, source_id, description)
-            VALUES ($1, $2, $3, $4, $5, $6, $7)
-            RETURNING id, user_id, transaction_type as "transaction_type: CreditTransactionType", amount, source_id, balance_after, previous_transaction_id, description, created_at
+            INSERT INTO credits_transactions (user_id, transaction_type, amount, source_id, description)
+            VALUES ($1, $2, $3, $4, $5)
+            RETURNING id, user_id, transaction_type as "transaction_type: CreditTransactionType", amount, source_id,
+                      description, created_at, seq
             "#,
             request.user_id,
             &request.transaction_type as &CreditTransactionType,
             request.amount,
-            new_balance,
-            last_transaction_id,
             request.source_id,
             request.description
         )
-        .fetch_one(&mut *tx)
+        .fetch_one(&mut *self.db)
         .await?;
 
-        tx.commit().await?;
+        trace!("Created transaction {} for user_id {}", transaction.id, request.user_id);
+
+        // Probabilistically refresh checkpoint (1 in N chance)
+        // This amortizes checkpoint maintenance across writes
+        if random::<u32>().is_multiple_of(CHECKPOINT_REFRESH_PROBABILITY) {
+            trace!("Refreshing checkpoint for user_id {}", request.user_id);
+            if let Err(e) = self.refresh_checkpoint(request.user_id).await {
+                // Log but don't fail the transaction - checkpoint refresh is best-effort
+                error!("Failed to refresh checkpoint for user_id {}: {}", request.user_id, e);
+            }
+        }
 
         Ok(CreditTransactionDBResponse::from(transaction))
     }
 
-    /// Get current balance for a user (latest balance_after from credits_transactions)
-    /// This is a read-only operation without locking
-    #[instrument(skip(self), fields(user_id = %abbrev_uuid(&user_id)), err)]
-    pub async fn get_user_balance(&mut self, user_id: UserId) -> Result<Decimal> {
+    /// Calculate balance using checkpoint + delta, returning both balance and latest transaction seq.
+    ///
+    /// This is the core calculation used by both `get_user_balance` and `refresh_checkpoint`.
+    /// Returns (balance, latest_seq). If no transactions exist, returns (0, None).
+    async fn calculate_balance_with_seq(&mut self, user_id: UserId) -> Result<(Decimal, Option<i64>)> {
         let result = sqlx::query!(
             r#"
-            SELECT balance_after
-            FROM credits_transactions
-            WHERE user_id = $1
-            ORDER BY created_at DESC, id DESC
-            LIMIT 1
+            WITH user_checkpoint AS (
+                SELECT checkpoint_seq, balance
+                FROM user_balance_checkpoints
+                WHERE user_id = $1
+            )
+            SELECT
+                COALESCE((SELECT balance FROM user_checkpoint), 0) +
+                COALESCE((
+                    SELECT SUM(
+                        CASE WHEN transaction_type IN ('admin_grant', 'purchase') THEN amount ELSE -amount END
+                    )
+                    FROM credits_transactions
+                    WHERE user_id = $1
+                    AND seq > COALESCE((SELECT checkpoint_seq FROM user_checkpoint), 0)
+                ), 0) as "balance!",
+                (SELECT MAX(seq) FROM credits_transactions WHERE user_id = $1) as latest_seq
             "#,
             user_id
         )
-        .fetch_optional(&mut *self.db)
+        .fetch_one(&mut *self.db)
         .await?;
 
-        Ok(result.map(|r| r.balance_after).unwrap_or(Decimal::ZERO))
+        Ok((result.balance, result.latest_seq))
     }
 
+    /// Refresh the balance checkpoint for a user.
+    ///
+    /// This is called probabilistically during writes to keep checkpoints fresh.
+    /// Uses the existing checkpoint as a base (if present) - only aggregates delta transactions.
+    #[instrument(skip(self), fields(user_id = %abbrev_uuid(&user_id)), err)]
+    pub async fn refresh_checkpoint(&mut self, user_id: UserId) -> Result<()> {
+        let (balance, latest_seq) = self.calculate_balance_with_seq(user_id).await?;
+
+        // Only update checkpoint if there are transactions
+        if let Some(checkpoint_seq) = latest_seq {
+            sqlx::query!(
+                r#"
+                INSERT INTO user_balance_checkpoints (user_id, checkpoint_seq, balance)
+                VALUES ($1, $2, $3)
+                ON CONFLICT (user_id) DO UPDATE SET
+                    checkpoint_seq = EXCLUDED.checkpoint_seq,
+                    balance = EXCLUDED.balance,
+                    updated_at = NOW()
+                "#,
+                user_id,
+                checkpoint_seq,
+                balance
+            )
+            .execute(&mut *self.db)
+            .await?;
+        }
+
+        Ok(())
+    }
+
+    /// Get current balance for a user using checkpoint + delta calculation.
+    ///
+    /// This reads the cached checkpoint balance and adds any transactions since the checkpoint.
+    /// If no checkpoint exists, it falls back to aggregating all transactions.
+    #[instrument(skip(self), fields(user_id = %abbrev_uuid(&user_id)), err)]
+    pub async fn get_user_balance(&mut self, user_id: UserId) -> Result<Decimal> {
+        let (balance, _) = self.calculate_balance_with_seq(user_id).await?;
+        Ok(balance)
+    }
+
+    /// Get balances for multiple users using checkpoint + delta calculation.
     #[instrument(skip(self, user_ids), fields(count = user_ids.len()), err)]
     pub async fn get_users_balances_bulk(&mut self, user_ids: &[UserId]) -> Result<HashMap<UserId, f64>> {
         let rows = sqlx::query!(
             r#"
-            SELECT DISTINCT ON (user_id) user_id, balance_after
-            FROM credits_transactions
-            WHERE user_id = ANY($1)
-            ORDER BY user_id, created_at DESC, id DESC
+            SELECT
+                u.user_id as "user_id!",
+                COALESCE(c.balance, 0) + COALESCE(delta.sum, 0) as "balance!"
+            FROM unnest($1::uuid[]) AS u(user_id)
+            LEFT JOIN user_balance_checkpoints c ON c.user_id = u.user_id
+            LEFT JOIN LATERAL (
+                SELECT SUM(
+                    CASE WHEN transaction_type IN ('admin_grant', 'purchase') THEN amount ELSE -amount END
+                ) as sum
+                FROM credits_transactions t
+                WHERE t.user_id = u.user_id
+                AND t.seq > COALESCE(c.checkpoint_seq, 0)
+            ) delta ON true
             "#,
             user_ids
         )
@@ -185,7 +216,7 @@ impl<'c> Credits<'c> {
         for row in rows {
             balances_map.insert(
                 row.user_id,
-                row.balance_after.to_f64().unwrap_or_else(|| {
+                row.balance.to_f64().unwrap_or_else(|| {
                     error!("Failed to convert balance to f64 for user_id {}", row.user_id);
                     0.0
                 }),
@@ -201,10 +232,10 @@ impl<'c> Credits<'c> {
         let transactions = sqlx::query_as!(
             CreditTransaction,
             r#"
-            SELECT id, user_id, transaction_type as "transaction_type: CreditTransactionType", amount, balance_after, source_id, previous_transaction_id, description, created_at
+            SELECT id, user_id, transaction_type as "transaction_type: CreditTransactionType", amount, source_id, description, created_at, seq
             FROM credits_transactions
             WHERE user_id = $1
-            ORDER BY created_at DESC, id DESC
+            ORDER BY seq DESC
             OFFSET $2
             LIMIT $3
             "#,
@@ -224,9 +255,9 @@ impl<'c> Credits<'c> {
         let transactions = sqlx::query_as!(
             CreditTransaction,
             r#"
-            SELECT id, user_id, transaction_type as "transaction_type: CreditTransactionType", amount, balance_after, source_id, previous_transaction_id, description, created_at
+            SELECT id, user_id, transaction_type as "transaction_type: CreditTransactionType", amount, source_id, description, created_at, seq
             FROM credits_transactions
-            ORDER BY created_at DESC, id DESC
+            ORDER BY seq DESC
             OFFSET $1
             LIMIT $2
             "#,
@@ -246,7 +277,7 @@ impl<'c> Credits<'c> {
             CreditTransaction,
             r#"
             SELECT id, user_id, transaction_type as "transaction_type: CreditTransactionType",
-                amount, balance_after, previous_transaction_id, source_id, description, created_at
+                amount, source_id, description, created_at, seq
             FROM credits_transactions
             WHERE id = $1
             "#,
@@ -256,6 +287,88 @@ impl<'c> Credits<'c> {
         .await?;
 
         Ok(transaction.map(CreditTransactionDBResponse::from))
+    }
+
+    /// Count total transactions for a specific user
+    #[instrument(skip(self), fields(user_id = %abbrev_uuid(&user_id)), err)]
+    pub async fn count_user_transactions(&mut self, user_id: UserId) -> Result<i64> {
+        let result = sqlx::query!("SELECT COUNT(*) as count FROM credits_transactions WHERE user_id = $1", user_id)
+            .fetch_one(&mut *self.db)
+            .await?;
+
+        Ok(result.count.unwrap_or(0))
+    }
+
+    /// Count total transactions across all users
+    #[instrument(skip(self), err)]
+    pub async fn count_all_transactions(&mut self) -> Result<i64> {
+        let result = sqlx::query!("SELECT COUNT(*) as count FROM credits_transactions")
+            .fetch_one(&mut *self.db)
+            .await?;
+
+        Ok(result.count.unwrap_or(0))
+    }
+
+    /// Count transactions with batch grouping applied
+    /// Returns the count of aggregated results (batches count as 1, not N)
+    #[instrument(skip(self), fields(user_id = ?user_id.map(|id| abbrev_uuid(&id))), err)]
+    pub async fn count_transactions_with_batches(&mut self, user_id: Option<UserId>) -> Result<i64> {
+        let result = sqlx::query!(
+            r#"
+            SELECT COUNT(*) as count FROM (
+                -- Batched transactions (grouped by batch_id)
+                SELECT ha.fusillade_batch_id as id
+                FROM credits_transactions ct
+                JOIN http_analytics ha
+                    ON ct.source_id = ha.id::text
+                    AND ct.transaction_type = 'usage'
+                WHERE ($1::uuid IS NULL OR ct.user_id = $1)
+                    AND ha.fusillade_batch_id IS NOT NULL
+                GROUP BY ha.fusillade_batch_id, ct.user_id
+
+                UNION ALL
+
+                -- Non-batched transactions
+                SELECT ct.id
+                FROM credits_transactions ct
+                LEFT JOIN http_analytics ha ON ct.source_id = ha.id::text AND ct.transaction_type = 'usage'
+                WHERE ($1::uuid IS NULL OR ct.user_id = $1)
+                    AND (ct.transaction_type != 'usage' OR ha.fusillade_batch_id IS NULL)
+            ) combined
+            "#,
+            user_id
+        )
+        .fetch_one(&mut *self.db)
+        .await?;
+
+        Ok(result.count.unwrap_or(0))
+    }
+
+    /// Sum the signed amounts of the most recent N transactions for a user.
+    /// Positive transactions (admin_grant, purchase) are positive, negative (usage, admin_removal) are negative.
+    /// This is used to calculate the balance at a specific point in the transaction history.
+    #[instrument(skip(self), fields(user_id = %abbrev_uuid(&user_id), count = count), err)]
+    pub async fn sum_recent_transactions(&mut self, user_id: UserId, count: i64) -> Result<Decimal> {
+        let result = sqlx::query!(
+            r#"
+            SELECT COALESCE(SUM(
+                CASE WHEN transaction_type IN ('admin_grant', 'purchase') THEN amount ELSE -amount END
+            ), 0) as "sum!"
+            FROM (
+                SELECT transaction_type, amount
+                FROM credits_transactions
+                WHERE user_id = $1
+                ORDER BY seq DESC
+                LIMIT $2
+            ) recent
+            "#,
+            user_id,
+            count
+        )
+        .fetch_one(&mut *self.db)
+        .await?;
+
+        Ok(result.sum)
     }
 
     /// List transactions with batch grouping applied (all in SQL)
@@ -274,18 +387,17 @@ impl<'c> Credits<'c> {
                 -- Part 1: Aggregated batch transactions
                 -- Groups multiple batch requests into single rows (e.g., 100 requests → 1 row)
                 SELECT
-                    (array_agg(ct.id ORDER BY ct.created_at))[1] as id,  -- Pick first transaction ID
+                    (array_agg(ct.id ORDER BY ct.seq))[1] as id,  -- Pick first transaction ID
                     ct.user_id,                          -- User who owns these transactions
                     'usage' as "transaction_type!: CreditTransactionType",
                     SUM(ct.amount) as amount,            -- Total cost of all requests in batch
-                    MAX(ct.balance_after) as balance_after,  -- Final balance (after last request)
                     MIN(ct.source_id) as source_id,      -- Pick first source_id
-                    (array_agg(ct.previous_transaction_id ORDER BY ct.created_at))[1] as previous_transaction_id,
                     CASE
                         WHEN MIN(ha.model) IS NOT NULL THEN 'Batch - ' || MIN(ha.model)
                         ELSE 'Batch'
                     END as description,                  -- "Batch - gpt-4" or just "Batch"
                     MAX(ct.created_at) as created_at,    -- Most recent transaction time in batch
+                    MAX(ct.seq) as max_seq,              -- Highest seq in batch (for ordering)
                     ha.fusillade_batch_id as batch_id    -- The batch ID
                 FROM credits_transactions ct
                 -- Filter by transaction_type before joining to reduce rows
@@ -307,11 +419,10 @@ impl<'c> Credits<'c> {
                     ct.user_id,
                     ct.transaction_type as "transaction_type!: CreditTransactionType",
                     ct.amount,
-                    ct.balance_after,
                     ct.source_id,
-                    ct.previous_transaction_id,
                     ct.description,
                     ct.created_at,
+                    ct.seq as max_seq,                   -- Individual transaction seq
                     NULL::uuid as batch_id              -- Not a batch, so NULL
                 FROM credits_transactions ct
                 -- LEFT JOIN so non-usage transactions (grants, purchases) still appear
@@ -320,9 +431,9 @@ impl<'c> Credits<'c> {
                     AND (ct.transaction_type != 'usage'       -- All non-usage (grants, purchases, removals)
                          OR ha.fusillade_batch_id IS NULL)    -- OR usage without batch_id
             ) combined
-            -- Sort by most recent first, then paginate
+            -- Sort by seq (most recent first), then paginate
             -- Pagination happens AFTER aggregation for correct results
-            ORDER BY created_at DESC
+            ORDER BY max_seq DESC
             LIMIT $2 OFFSET $3
             "#,
             user_id,
@@ -345,9 +456,6 @@ impl<'c> Credits<'c> {
             let amount = row
                 .amount
                 .ok_or_else(|| sqlx::Error::Protocol("Batch aggregation returned NULL amount".to_string()))?;
-            let balance_after = row
-                .balance_after
-                .ok_or_else(|| sqlx::Error::Protocol("Batch aggregation returned NULL balance_after".to_string()))?;
             let source_id = row
                 .source_id
                 .ok_or_else(|| sqlx::Error::Protocol("Batch aggregation returned NULL source_id".to_string()))?;
@@ -360,8 +468,6 @@ impl<'c> Credits<'c> {
                 user_id,
                 transaction_type: row.transaction_type,
                 amount,
-                balance_after,
-                previous_transaction_id: row.previous_transaction_id,
                 description: row.description,
                 source_id,
                 created_at,
@@ -434,8 +540,11 @@ mod tests {
         assert_eq!(transaction.user_id, user_id);
         assert_eq!(transaction.transaction_type, CreditTransactionType::AdminGrant);
         assert_eq!(transaction.amount, Decimal::from_str("100.50").unwrap());
-        assert_eq!(transaction.balance_after, Decimal::from_str("100.50").unwrap());
         assert_eq!(transaction.description, Some("Test grant".to_string()));
+
+        // Verify balance via get_user_balance (balance_after is no longer stored for new transactions)
+        let balance = credits.get_user_balance(user_id).await.expect("Failed to get balance");
+        assert_eq!(balance, Decimal::from_str("100.50").unwrap());
     }
 
     #[sqlx::test]
@@ -505,10 +614,13 @@ mod tests {
         assert_eq!(transaction1.user_id, user_id);
         assert_eq!(transaction1.transaction_type, CreditTransactionType::AdminGrant);
         assert_eq!(transaction1.amount, Decimal::from_str("100.50").unwrap());
-        assert_eq!(transaction1.balance_after, Decimal::from_str("100.50").unwrap());
         assert_eq!(transaction1.description, None);
 
-        // Try to create second transaction with wrong balance_after
+        // Verify balance after first transaction
+        let balance = credits.get_user_balance(user_id).await.expect("Failed to get balance");
+        assert_eq!(balance, Decimal::from_str("100.50").unwrap());
+
+        // Create second transaction
         let request2 = CreditTransactionCreateDBRequest::admin_grant(user_id, user_id, Decimal::from_str("50.0").unwrap(), None);
 
         let transaction2 = credits
@@ -519,8 +631,11 @@ mod tests {
         assert_eq!(transaction2.user_id, user_id);
         assert_eq!(transaction2.transaction_type, CreditTransactionType::AdminGrant);
         assert_eq!(transaction2.amount, Decimal::from_str("50.0").unwrap());
-        assert_eq!(transaction2.balance_after, Decimal::from_str("150.50").unwrap());
         assert_eq!(transaction2.description, None);
+
+        // Verify balance after second transaction
+        let balance = credits.get_user_balance(user_id).await.expect("Failed to get balance");
+        assert_eq!(balance, Decimal::from_str("150.50").unwrap());
 
         // Create third transaction that deducts credits
         let request3 = CreditTransactionCreateDBRequest {
@@ -539,8 +654,11 @@ mod tests {
         assert_eq!(transaction3.user_id, user_id);
         assert_eq!(transaction3.transaction_type, CreditTransactionType::AdminRemoval);
         assert_eq!(transaction3.amount, Decimal::from_str("30.0").unwrap());
-        assert_eq!(transaction3.balance_after, Decimal::from_str("120.50").unwrap());
         assert_eq!(transaction3.description, Some("Usage deduction".to_string()));
+
+        // Verify final balance
+        let balance = credits.get_user_balance(user_id).await.expect("Failed to get balance");
+        assert_eq!(balance, Decimal::from_str("120.50").unwrap());
     }
 
     #[sqlx::test]
@@ -567,15 +685,14 @@ mod tests {
             .await
             .expect("Failed to list transactions");
 
-        // Should be ordered by created_at DESC, id DESC (most recent first)
+        // Should be ordered by seq DESC (most recent first)
+        // Since seq is monotonically increasing, this effectively orders by creation time
         assert_eq!(transactions.len(), n_of_transactions as usize);
         for i in 0..(transactions.len() - 1) {
             let t1 = &transactions[i];
             let t2 = &transactions[i + 1];
-            assert!(t1.created_at >= t2.created_at, "Transactions are not ordered by created_at DESC");
-            if t1.created_at == t2.created_at {
-                assert!(t1.id > t2.id, "Transactions with same created_at are not ordered by id DESC");
-            }
+            // Higher seq means more recent, so created_at should be >= as well
+            assert!(t1.created_at >= t2.created_at, "Transactions are not ordered correctly");
         }
     }
 
@@ -598,7 +715,6 @@ mod tests {
             transaction_ids.push(credits.create_transaction(&request).await.expect("Failed to create transaction").id);
         }
 
-        let mut total_balance: Decimal = Decimal::ZERO;
         for i in 1..n_of_transactions + 1 {
             match credits
                 .get_transaction_by_id(transaction_ids[i - 1])
@@ -611,12 +727,16 @@ mod tests {
                     assert_eq!(tx.transaction_type, CreditTransactionType::AdminGrant);
                     assert_eq!(tx.amount, Decimal::from(i * 10));
                     assert_eq!(tx.description, Some(format!("Transaction {}", i + 1)));
-                    total_balance += tx.amount;
-                    assert_eq!(tx.balance_after, total_balance);
                 }
                 None => panic!("Transaction ID {} not found", transaction_ids[i - 1]),
             };
         }
+
+        // Verify total balance via get_user_balance
+        let total_balance = credits.get_user_balance(user_id).await.expect("Failed to get balance");
+        // Sum of 10 + 20 + ... + 100 = 550
+        assert_eq!(total_balance, Decimal::from(550));
+
         // Assert non existent transaction ID returns None
         assert!(
             credits
@@ -688,7 +808,9 @@ mod tests {
             .expect("Failed to list transactions");
         assert_eq!(transactions.len(), 1);
         assert_eq!(transactions[0].user_id, user1_id);
-        assert_eq!(transactions[0].balance_after, Decimal::from_str("100.0").unwrap());
+        // Verify balance via get_user_balance
+        let balance = credits.get_user_balance(user1_id).await.expect("Failed to get balance");
+        assert_eq!(balance, Decimal::from_str("100.0").unwrap());
 
         // List user2's transactions
         let transactions = credits
@@ -697,7 +819,9 @@ mod tests {
             .expect("Failed to list transactions");
         assert_eq!(transactions.len(), 1);
         assert_eq!(transactions[0].user_id, user2_id);
-        assert_eq!(transactions[0].balance_after, Decimal::from_str("200.0").unwrap());
+        // Verify balance via get_user_balance
+        let balance = credits.get_user_balance(user2_id).await.expect("Failed to get balance");
+        assert_eq!(balance, Decimal::from_str("200.0").unwrap());
 
         // List non existent user's transactions
         let non_existent_user_id = Uuid::new_v4();
@@ -980,9 +1104,13 @@ mod tests {
         assert!(result.is_err(), "Should NOT receive notification when staying in positive range");
     }
 
+    /// Test that concurrent transactions correctly update the balance.
+    /// With the checkpoint-based system, we verify that:
+    /// 1. All concurrent transactions are created successfully
+    /// 2. The final balance is correct after all transactions complete
     #[sqlx::test]
     #[test_log::test]
-    async fn test_concurrent_transactions_no_race_condition(pool: PgPool) {
+    async fn test_concurrent_transactions_balance_correctness(pool: PgPool) {
         use std::sync::Arc;
         use tokio::task;
 
@@ -1003,7 +1131,10 @@ mod tests {
             .expect("Failed to create initial transaction");
         drop(conn);
 
-        // Spawn 10 concurrent transactions that each add 10 credits
+        // Spawn 100 concurrent transactions
+        // 50 grants of 10.0 each = +500.0
+        // 50 removals of 5.0 each = -250.0
+        // Net change = +250.0
         let pool = Arc::new(pool);
         let mut handles = vec![];
 
@@ -1039,7 +1170,7 @@ mod tests {
             handle.await.expect("Task panicked");
         }
 
-        // Verify we have exactly 11 transactions (1 initial + 10 concurrent)
+        // Verify we have exactly 101 transactions (1 initial + 100 concurrent)
         let mut conn = pool.acquire().await.expect("Failed to acquire connection");
         let mut credits = Credits::new(&mut conn);
         let transactions = credits
@@ -1047,86 +1178,15 @@ mod tests {
             .await
             .expect("Failed to list transactions");
 
-        // Build a HashMap of transaction ID -> transaction for O(1) lookups
-        println!("Total transactions: {}", transactions.len());
+        assert_eq!(transactions.len(), 101, "Should have 101 transactions");
 
-        use std::collections::HashMap;
-        let tx_map: HashMap<Uuid, &CreditTransactionDBResponse> = transactions.iter().map(|tx| (tx.id, tx)).collect();
-
-        // Find the head of the chain (the most recent transaction with no successor)
-        // This is the transaction that isn't referenced as a previous_transaction_id by any other
-        let mut is_previous = std::collections::HashSet::new();
-        for tx in &transactions {
-            if let Some(prev_id) = tx.previous_transaction_id {
-                is_previous.insert(prev_id);
-            }
-        }
-
-        let head = transactions
-            .iter()
-            .find(|tx| !is_previous.contains(&tx.id))
-            .expect("Failed to find head of transaction chain");
-
-        println!(
-            "Head transaction: id={}, balance={}, type={:?}",
-            head.id, head.balance_after, head.transaction_type
-        );
-
-        // Walk the chain backwards from head to tail, validating each transaction
-        let mut current = Some(head);
-        let mut visited = std::collections::HashSet::new();
-        let mut chain_valid = true;
-
-        while let Some(tx) = current {
-            // Check for cycles
-            if !visited.insert(tx.id) {
-                panic!("Cycle detected in transaction chain at id={}", tx.id);
-            }
-
-            // Helpful debug output if test is failing
-            // println!(
-            //     "Chain: id={}, prev_id={:?}, amount={}, balance_after={}, type={:?}",
-            //     tx.id, tx.previous_transaction_id, tx.amount, tx.balance_after, tx.transaction_type
-            // );
-
-            // Validate this transaction's balance based on the previous one
-            if let Some(prev_id) = tx.previous_transaction_id {
-                let prev_tx = tx_map
-                    .get(&prev_id)
-                    .unwrap_or_else(|| panic!("Previous transaction {} not found in map", prev_id));
-
-                let expected_balance = match tx.transaction_type {
-                    CreditTransactionType::AdminGrant | CreditTransactionType::Purchase => prev_tx.balance_after + tx.amount,
-                    CreditTransactionType::AdminRemoval | CreditTransactionType::Usage => prev_tx.balance_after - tx.amount,
-                };
-
-                if tx.balance_after != expected_balance {
-                    println!(
-                        "ERROR: Transaction {} has balance {} but expected {} (prev={}, amount={}, type={:?})",
-                        tx.id, tx.balance_after, expected_balance, prev_tx.balance_after, tx.amount, tx.transaction_type
-                    );
-                    chain_valid = false;
-                }
-
-                current = Some(prev_tx);
-            } else {
-                // This is the initial transaction, should have balance = amount
-                assert_eq!(
-                    tx.balance_after, tx.amount,
-                    "Initial transaction should have balance_after == amount"
-                );
-                current = None;
-            }
-        }
-
-        assert!(chain_valid, "Transaction chain validation failed - race condition detected!");
-
-        // Verify final balance agrees with last transaction's balance_after
+        // Verify final balance: 1000 + 500 - 250 = 1250
         let final_balance = credits.get_user_balance(user_id).await.expect("Failed to get balance");
         assert_eq!(
-            final_balance, transactions[0].balance_after,
-            "Expected {} but got {}",
-            transactions[0].balance_after, final_balance
+            final_balance,
+            Decimal::from_str("1250.0").unwrap(),
+            "Expected 1250.0 but got {}",
+            final_balance
         );
     }
 
@@ -1148,20 +1208,21 @@ mod tests {
 
         assert_eq!(transaction.user_id, user_id);
         assert_eq!(transaction.amount, large_amount);
-        assert_eq!(transaction.balance_after, large_amount);
+
+        // Verify balance after first transaction
+        let balance = credits.get_user_balance(user_id).await.expect("Failed to get balance");
+        assert_eq!(balance, large_amount);
 
         // Add another large amount
         let request2 =
             CreditTransactionCreateDBRequest::admin_grant(user_id, user_id, large_amount, Some("Second large grant".to_string()));
 
-        let transaction2 = credits
+        credits
             .create_transaction(&request2)
             .await
             .expect("Failed to create second large transaction");
 
-        assert_eq!(transaction2.balance_after, Decimal::from_str("200000000.00").unwrap());
-
-        // Verify balance
+        // Verify final balance
         let balance = credits.get_user_balance(user_id).await.expect("Failed to get balance");
         assert_eq!(balance, Decimal::from_str("200000000.00").unwrap());
     }
@@ -1185,7 +1246,10 @@ mod tests {
 
         // Amount should preserve all decimal places (no rounding)
         assert_eq!(transaction.amount, Decimal::from_str("100.12345678").unwrap());
-        assert_eq!(transaction.balance_after, Decimal::from_str("100.12345678").unwrap());
+
+        // Verify balance preserves precision
+        let balance = credits.get_user_balance(user_id).await.expect("Failed to get balance");
+        assert_eq!(balance, Decimal::from_str("100.12345678").unwrap());
 
         // Test micro-transaction precision (like per-token costs)
         let micro_request = CreditTransactionCreateDBRequest {
@@ -1203,7 +1267,9 @@ mod tests {
 
         // Micro-transaction should preserve full precision
         assert_eq!(micro_transaction.amount, Decimal::from_str("0.000000405").unwrap());
-        assert_eq!(micro_transaction.balance_after, Decimal::from_str("100.123456375").unwrap());
-        // 100.12345678 - 0.000000405
+
+        // Verify balance after micro-transaction: 100.12345678 - 0.000000405 = 100.123456375
+        let balance = credits.get_user_balance(user_id).await.expect("Failed to get balance");
+        assert_eq!(balance, Decimal::from_str("100.123456375").unwrap());
     }
 }

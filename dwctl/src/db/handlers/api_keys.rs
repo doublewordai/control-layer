@@ -428,18 +428,24 @@ impl<'c> ApiKeys<'c> {
             WHERE dg.deployment_id = $1
             AND (
                 ak.user_id = $2  -- System user always has access
-                OR EXISTS (
-                    -- User's latest transaction has positive balance
-                    SELECT 1 FROM credits_transactions ct
-                    WHERE ct.user_id = ak.user_id
-                    AND ct.balance_after > 0
-                    AND NOT EXISTS (
-                        -- Make sure there's no newer transaction
-                        SELECT 1 FROM credits_transactions ct2
-                        WHERE ct2.user_id = ct.user_id
-                        AND (ct2.created_at > ct.created_at OR (ct2.created_at = ct.created_at AND ct2.id > ct.id))
+                OR (
+                    -- User has positive balance (checkpoint + delta calculation)
+                    SELECT COALESCE(
+                        (SELECT c.balance FROM user_balance_checkpoints c WHERE c.user_id = ak.user_id),
+                        0
+                    ) + COALESCE(
+                        (SELECT SUM(
+                            CASE WHEN ct.transaction_type IN ('purchase', 'admin_grant')
+                            THEN ct.amount ELSE -ct.amount END
+                        )
+                        FROM credits_transactions ct
+                        LEFT JOIN user_balance_checkpoints c ON c.user_id = ak.user_id
+                        WHERE ct.user_id = ak.user_id
+                        AND (c.checkpoint_seq IS NULL OR ct.seq > c.checkpoint_seq)
+                        ),
+                        0
                     )
-                )
+                ) > 0
                 OR (
                     -- Free models are accessible to all users (zero balance OK)
                     -- A model is free if it has no active tariffs or all active tariffs are zero-priced
@@ -473,18 +479,24 @@ impl<'c> ApiKeys<'c> {
             AND ak.user_id != '00000000-0000-0000-0000-000000000000'  -- Exclude system user (already covered above)
             AND (
                 ak.user_id = $2  -- System user always has access
-                OR EXISTS (
-                    -- User's latest transaction has positive balance
-                    SELECT 1 FROM credits_transactions ct
-                    WHERE ct.user_id = ak.user_id
-                    AND ct.balance_after > 0
-                    AND NOT EXISTS (
-                        -- Make sure there's no newer transaction
-                        SELECT 1 FROM credits_transactions ct2
-                        WHERE ct2.user_id = ct.user_id
-                        AND (ct2.created_at > ct.created_at OR (ct2.created_at = ct.created_at AND ct2.id > ct.id))
+                OR (
+                    -- User has positive balance (checkpoint + delta calculation)
+                    SELECT COALESCE(
+                        (SELECT c.balance FROM user_balance_checkpoints c WHERE c.user_id = ak.user_id),
+                        0
+                    ) + COALESCE(
+                        (SELECT SUM(
+                            CASE WHEN ct.transaction_type IN ('purchase', 'admin_grant')
+                            THEN ct.amount ELSE -ct.amount END
+                        )
+                        FROM credits_transactions ct
+                        LEFT JOIN user_balance_checkpoints c ON c.user_id = ak.user_id
+                        WHERE ct.user_id = ak.user_id
+                        AND (c.checkpoint_seq IS NULL OR ct.seq > c.checkpoint_seq)
+                        ),
+                        0
                     )
-                )
+                ) > 0
                 OR (
                     -- Free models are accessible to all users (zero balance OK)
                     -- A model is free if it has no active tariffs or all active tariffs are zero-priced
