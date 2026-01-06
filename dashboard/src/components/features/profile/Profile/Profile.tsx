@@ -24,7 +24,7 @@ import {
 import { Input } from "../../../ui/input";
 import { Button } from "../../../ui/button";
 import { AVAILABLE_ROLES, getRoleDisplayName } from "../../../../utils/roles";
-import type { Role } from "../../../../api/control-layer/types";
+import type { Role, User } from "../../../../api/control-layer/types";
 import { dwctlApi } from "../../../../api/control-layer/client";
 import { ApiError } from "../../../../api/control-layer/errors";
 
@@ -55,15 +55,15 @@ export const Profile: React.FC = () => {
   };
 
   const getAuthProviderDisplay = (currentUser: User): string => {
-    const { authSource, externalUserId } = currentUser;
+    const { auth_source, external_user_id } = currentUser;
 
-    if (authSource === "native" || authSource === "system") {
-      return authSource;
+    if (auth_source === "native" || auth_source === "system") {
+      return auth_source;
     }
 
     // attempt to parse common providers from external ID
-    if (externalUserId) {
-      const lowerExternalId = externalUserId.toLowerCase();
+    if (external_user_id) {
+      const lowerExternalId = external_user_id.toLowerCase();
       if (lowerExternalId.startsWith("github")) {
         return "GitHub";
       }
