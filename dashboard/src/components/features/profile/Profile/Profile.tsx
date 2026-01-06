@@ -54,6 +54,25 @@ export const Profile: React.FC = () => {
     );
   };
 
+  const getAuthProviderDisplay = (
+    authSource: string,
+    username?: string,
+  ): string => {
+    if (authSource === "native" || authSource === "system") {
+      return authSource;
+    }
+    if (username) {
+      const lowerUsername = username.toLowerCase();
+      if (lowerUsername.startsWith("github|")) {
+        return "GitHub";
+      }
+      if (lowerUsername.startsWith("google|")) {
+        return "Google";
+      }
+    }
+    return "Proxy-Header";
+  };
+
   const getRoleDescription = (role: Role): string => {
     const descriptions: Record<Role, string> = {
       StandardUser:
@@ -237,13 +256,13 @@ export const Profile: React.FC = () => {
                   />
                 )}
                 <h3 className="text-lg font-medium text-gray-900 truncate px-2">
-                  {currentUser?.email}
-                </h3>
-                <p className="text-sm text-gray-500 truncate px-2">
                   {displayName ||
                     currentUser?.display_name ||
                     currentUser?.username ||
                     "Unknown User"}
+                </h3>
+                <p className="text-sm text-gray-500 truncate px-2">
+                  {currentUser?.email}
                 </p>
               </div>
             </div>
@@ -255,10 +274,8 @@ export const Profile: React.FC = () => {
               </h4>
               <div className="space-y-3">
                 <div className="flex items-center text-sm">
-                  <AtSign className="w-4 h-4 text-gray-400 mr-2 flex-shrink-0" />
-                  <span className="text-gray-600 w-20 flex-shrink-0">
-                    Email:
-                  </span>
+                  <AtSign className="w-4 h-4 text-gray-400 mr-2 shrink-0" />
+                  <span className="text-gray-600 w-20 shrink-0">Email:</span>
                   <Tooltip>
                     <TooltipTrigger asChild>
                       <span className="text-gray-900 truncate">
@@ -288,10 +305,8 @@ export const Profile: React.FC = () => {
                 </div>*/}
                 {currentUser?.created_at && (
                   <div className="flex items-center text-sm">
-                    <Calendar className="w-4 h-4 text-gray-400 mr-2 flex-shrink-0" />
-                    <span className="text-gray-600 w-20 flex-shrink-0">
-                      Joined:
-                    </span>
+                    <Calendar className="w-4 h-4 text-gray-400 mr-2 shrink-0" />
+                    <span className="text-gray-600 w-20 shrink-0">Joined:</span>
                     <Tooltip>
                       <TooltipTrigger asChild>
                         <span className="text-gray-900 truncate">
@@ -305,28 +320,32 @@ export const Profile: React.FC = () => {
                   </div>
                 )}
                 <div className="flex items-center text-sm">
-                  <Shield className="w-4 h-4 text-gray-400 mr-2 flex-shrink-0" />
-                  <span className="text-gray-600 w-20 flex-shrink-0">
-                    Type:
-                  </span>
+                  <Shield className="w-4 h-4 text-gray-400 mr-2 shrink-0" />
+                  <span className="text-gray-600 w-20 shrink-0">Type:</span>
                   <span className="text-gray-900">
                     {currentUser?.is_admin ? "Admin" : "User"}
                   </span>
                 </div>
                 {currentUser?.auth_source && (
                   <div className="flex items-center text-sm">
-                    <LockIcon className="w-4 h-4 text-gray-400 mr-2 flex-shrink-0" />
-                    <span className="text-gray-600 w-20 flex-shrink-0">
-                      Auth:
-                    </span>
+                    <LockIcon className="w-4 h-4 text-gray-400 mr-2 shrink-0" />
+                    <span className="text-gray-600 w-20 shrink-0">Auth:</span>
                     <Tooltip>
                       <TooltipTrigger asChild>
-                        <span className="text-gray-900 capitalize truncate">
-                          {currentUser.auth_source}
+                        <span className="text-gray-900 truncate">
+                          {getAuthProviderDisplay(
+                            currentUser.auth_source,
+                            currentUser.username,
+                          )}
                         </span>
                       </TooltipTrigger>
                       <TooltipContent>
-                        <p>{currentUser.auth_source}</p>
+                        <p>
+                          {getAuthProviderDisplay(
+                            currentUser.auth_source,
+                            currentUser.username,
+                          )}
+                        </p>
                       </TooltipContent>
                     </Tooltip>
                   </div>
