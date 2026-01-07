@@ -411,9 +411,10 @@ export function useCreateApiKey() {
       data: ApiKeyCreateRequest;
       userId?: string;
     }) => dwctlApi.users.apiKeys.create(data, userId),
-    onSuccess: (_, { userId = "current" }) => {
+    onSuccess: () => {
+      // Invalidate all API key queries to ensure table updates
       queryClient.invalidateQueries({
-        queryKey: queryKeys.apiKeys.query(userId),
+        queryKey: queryKeys.apiKeys.all,
       });
     },
   });
