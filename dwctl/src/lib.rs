@@ -1530,8 +1530,11 @@ async fn setup_background_services(
             });
         }
         let metrics_shutdown = shutdown_token.clone();
+        let metrics_config = db::PoolMetricsConfig {
+            sample_interval: config.background_services.pool_metrics.sample_interval,
+        };
         background_tasks.spawn("pool-metrics-sampler", async move {
-            db::run_pool_metrics_sampler(pools, db::PoolMetricsConfig::default(), metrics_shutdown).await
+            db::run_pool_metrics_sampler(pools, metrics_config, metrics_shutdown).await
         });
     }
 
