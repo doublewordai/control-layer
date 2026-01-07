@@ -1,16 +1,9 @@
 "use client";
 
 import { type ColumnDef } from "@tanstack/react-table";
-import { ArrowUpDown, Trash2, Key, MoreHorizontal } from "lucide-react";
+import { ArrowUpDown, Trash2, Key } from "lucide-react";
 import { Button } from "../../../ui/button";
 import { Checkbox } from "../../../ui/checkbox";
-import {
-  DropdownMenu,
-  DropdownMenuContent,
-  DropdownMenuItem,
-  DropdownMenuLabel,
-  DropdownMenuTrigger,
-} from "../../../ui/dropdown-menu";
 import type { ApiKey } from "../../../../api/control-layer/types";
 
 interface ColumnActions {
@@ -98,37 +91,37 @@ export const createColumns = (actions: ColumnActions): ColumnDef<ApiKey>[] => {
         );
       },
     },
-    {
-      id: "rateLimit",
-      header: "Rate Limit",
-      cell: ({ row }) => {
-        const apiKey = row.original;
-        const { requests_per_second, burst_size } = apiKey;
+    // {
+    //   id: "rateLimit",
+    //   header: "Rate Limit",
+    //   cell: ({ row }) => {
+    //     const apiKey = row.original;
+    //     const { requests_per_second, burst_size } = apiKey;
 
-        if (!requests_per_second && !burst_size) {
-          return (
-            <span className="text-doubleword-neutral-400 text-sm">
-              No limit
-            </span>
-          );
-        }
+    //     if (!requests_per_second && !burst_size) {
+    //       return (
+    //         <span className="text-doubleword-neutral-400 text-sm">
+    //           No limit
+    //         </span>
+    //       );
+    //     }
 
-        return (
-          <div className="text-sm">
-            {requests_per_second && (
-              <div className="text-doubleword-neutral-700">
-                {requests_per_second} req/s
-              </div>
-            )}
-            {burst_size && (
-              <div className="text-doubleword-neutral-500">
-                burst: {burst_size}
-              </div>
-            )}
-          </div>
-        );
-      },
-    },
+    //     return (
+    //       <div className="text-sm">
+    //         {requests_per_second && (
+    //           <div className="text-doubleword-neutral-700">
+    //             {requests_per_second} req/s
+    //           </div>
+    //         )}
+    //         {burst_size && (
+    //           <div className="text-doubleword-neutral-500">
+    //             burst: {burst_size}
+    //           </div>
+    //         )}
+    //       </div>
+    //     );
+    //   },
+    // },
     {
       accessorKey: "created_at",
       header: ({ column }) => {
@@ -157,28 +150,19 @@ export const createColumns = (actions: ColumnActions): ColumnDef<ApiKey>[] => {
     },
     {
       id: "actions",
+      header: "Actions",
       cell: ({ row }) => {
         const apiKey = row.original;
 
         return (
-          <DropdownMenu>
-            <DropdownMenuTrigger asChild>
-              <Button variant="ghost" className="h-8 w-8 p-0">
-                <span className="sr-only">Open menu</span>
-                <MoreHorizontal className="h-4 w-4" />
-              </Button>
-            </DropdownMenuTrigger>
-            <DropdownMenuContent align="end">
-              <DropdownMenuLabel>Actions</DropdownMenuLabel>
-              <DropdownMenuItem
-                onClick={() => actions.onDelete(apiKey)}
-                className="text-red-600"
-              >
-                <Trash2 className="mr-2 h-4 w-4" />
-                Delete
-              </DropdownMenuItem>
-            </DropdownMenuContent>
-          </DropdownMenu>
+          <Button
+            variant="ghost"
+            size="sm"
+            onClick={() => actions.onDelete(apiKey)}
+            className="text-red-600 hover:text-red-700 hover:bg-red-50"
+          >
+            <Trash2 className="h-4 w-4" />
+          </Button>
         );
       },
     },
