@@ -860,9 +860,10 @@ where
                 let result = store_analytics_record(&pool_clone, &metrics, &auth, &request_data_clone).await;
 
                 // Record analytics processing lag regardless of success/failure
-                // This measures time from original request to storage attempt completion
-                let lag_seconds = chrono::Utc::now().signed_duration_since(metrics.timestamp).num_milliseconds() as f64 / 1000.0;
-                histogram!("analytics_lag_seconds").record(lag_seconds);
+                // This measures time from response completion to storage attempt completion
+                let total_ms = chrono::Utc::now().signed_duration_since(metrics.timestamp).num_milliseconds();
+                let lag_ms = total_ms - metrics.duration_ms;
+                histogram!("analytics_lag_seconds").record(lag_ms as f64 / 1000.0);
 
                 match result {
                     Ok(complete_row) => {
