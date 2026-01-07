@@ -611,7 +611,7 @@ pub async fn store_analytics_record(
                                     );
                                     let cents = (total_cost.to_f64().unwrap_or(0.0) * 100.0).round() as u64;
                                     counter!(
-                                        "credits_deducted_total",
+                                        "dwctl_credits_deducted_total",
                                         "user_id" => user_id.to_string(),
                                         "model" => model.to_string()
                                     )
@@ -624,7 +624,7 @@ pub async fn store_analytics_record(
                                         user_id = %user_id,
                                         "Failed to create credit transaction for API usage"
                                     );
-                                    counter!("credits_deduction_errors_total").increment(1);
+                                    counter!("dwctl_credits_deduction_errors_total").increment(1);
                                 }
                             }
                         }
@@ -635,7 +635,7 @@ pub async fn store_analytics_record(
                                 user_id = %user_id,
                                 "Failed to get user balance for credit deduction"
                             );
-                            counter!("credits_deduction_errors_total").increment(1);
+                            counter!("dwctl_credits_deduction_errors_total").increment(1);
                         }
                     }
                 } else {
@@ -863,7 +863,7 @@ where
                 // This measures time from response completion to storage attempt completion
                 let total_ms = chrono::Utc::now().signed_duration_since(metrics.timestamp).num_milliseconds();
                 let lag_ms = total_ms - metrics.duration_ms;
-                histogram!("analytics_lag_seconds").record(lag_ms as f64 / 1000.0);
+                histogram!("dwctl_analytics_lag_seconds").record(lag_ms as f64 / 1000.0);
 
                 match result {
                     Ok(complete_row) => {
