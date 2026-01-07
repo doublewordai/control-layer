@@ -1,3 +1,4 @@
+import { useState } from "react";
 import { NavLink, Link, useNavigate } from "react-router-dom";
 import {
   Settings,
@@ -13,6 +14,7 @@ import {
   ChevronUp,
   DollarSign,
   BarChart3,
+  LifeBuoy,
 } from "lucide-react";
 import {
   useUser,
@@ -24,6 +26,7 @@ import { UserAvatar } from "../../ui";
 import { useAuthorization } from "../../../utils";
 import { useAuth } from "../../../contexts/auth";
 import { useSettings } from "../../../contexts";
+import { SupportRequestModal } from "../../modals";
 import type { FeatureFlags } from "../../../contexts/settings/types";
 import onwardsLogo from "../../../assets/onwards-logo.svg";
 import {
@@ -63,6 +66,7 @@ export function AppSidebar() {
   const { canAccessRoute } = useAuthorization();
   const { logout } = useAuth();
   const { isFeatureEnabled } = useSettings();
+  const [isSupportModalOpen, setIsSupportModalOpen] = useState(false);
 
   const allNavItems: NavItem[] = [
     { path: "/models", icon: Layers, label: "Models" },
@@ -183,6 +187,10 @@ export function AppSidebar() {
               <DollarSign className="w-4 h-4 mr-2" />
               Billing
             </DropdownMenuItem>
+            <DropdownMenuItem onClick={() => setIsSupportModalOpen(true)}>
+              <LifeBuoy className="w-4 h-4 mr-2" />
+              Support
+            </DropdownMenuItem>
             <DropdownMenuItem onClick={() => logout()}>
               <LogOut className="w-4 h-4 mr-2" />
               Logout
@@ -190,6 +198,11 @@ export function AppSidebar() {
           </DropdownMenuContent>
         </DropdownMenu>
       </SidebarFooter>
+
+      <SupportRequestModal
+        isOpen={isSupportModalOpen}
+        onClose={() => setIsSupportModalOpen(false)}
+      />
     </Sidebar>
   );
 }

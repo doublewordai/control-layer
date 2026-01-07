@@ -125,17 +125,6 @@ export function Batches({
     defaultPageSize: 10,
   });
 
-  // Reset pagination when search changes
-  useEffect(() => {
-    filesPagination.handleFirstPage();
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [debouncedFileSearch]);
-
-  useEffect(() => {
-    batchesPagination.handleFirstPage();
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [debouncedBatchSearch]);
-
   // API queries
   // Paginated files query for display in Files tab
   // Map fileType to purpose filter
@@ -531,7 +520,10 @@ export function Batches({
             searchPlaceholder="Search batches..."
             externalSearch={{
               value: batchSearchQuery,
-              onChange: setBatchSearchQuery,
+              onChange: (value) => {
+                setBatchSearchQuery(value);
+                batchesPagination.handleFirstPage();
+              },
             }}
             showColumnToggle={true}
             pageSize={batchesPagination.pageSize}
@@ -585,8 +577,6 @@ export function Batches({
                     <SelectItem value="25">25</SelectItem>
                     <SelectItem value="50">50</SelectItem>
                     <SelectItem value="100">100</SelectItem>
-                    <SelectItem value="200">200</SelectItem>
-                    <SelectItem value="500">500</SelectItem>
                   </SelectContent>
                 </Select>
               </div>
@@ -616,7 +606,10 @@ export function Batches({
             searchPlaceholder="Search files..."
             externalSearch={{
               value: fileSearchQuery,
-              onChange: setFileSearchQuery,
+              onChange: (value) => {
+                setFileSearchQuery(value);
+                filesPagination.handleFirstPage();
+              },
             }}
             showColumnToggle={true}
             pageSize={filesPagination.pageSize}
@@ -714,8 +707,6 @@ export function Batches({
                     <SelectItem value="25">25</SelectItem>
                     <SelectItem value="50">50</SelectItem>
                     <SelectItem value="100">100</SelectItem>
-                    <SelectItem value="200">200</SelectItem>
-                    <SelectItem value="500">500</SelectItem>
                   </SelectContent>
                 </Select>
               </div>

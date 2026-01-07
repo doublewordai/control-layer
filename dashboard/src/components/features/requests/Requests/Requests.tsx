@@ -354,6 +354,8 @@ export function Requests() {
                 onChange: setCustomIdSearch,
               }}
               showColumnToggle={true}
+              pageSize={pagination.pageSize}
+              minRows={pagination.pageSize}
               rowHeight="40px"
               initialColumnVisibility={{ timestamp: false }}
               paginationMode="server-cursor"
@@ -370,7 +372,7 @@ export function Requests() {
                 hasPrevPage: hasPrevPage,
               }}
               showPageSizeSelector={true}
-              pageSizeOptions={[10, 25, 50]}
+              pageSizeOptions={[10, 25, 50, 100]}
               isLoading={requestsLoading}
               emptyState={
                 <div className="text-center py-12">

@@ -17,7 +17,7 @@ import {
   SelectTrigger,
   SelectValue,
 } from "../../ui/select";
-import { useUploadFile } from "../../../api/control-layer/hooks";
+import { useUploadFile, useConfig } from "../../../api/control-layer/hooks";
 import { toast } from "sonner";
 import { AlertBox } from "@/components/ui/alert-box";
 
@@ -49,6 +49,7 @@ export function UploadFileModal({
   const [error, setError] = useState<string | null>(null);
 
   const uploadMutation = useUploadFile();
+  const { data: config } = useConfig();
 
   // Update file when preselected file changes
   useEffect(() => {
@@ -153,15 +154,19 @@ export function UploadFileModal({
           <DialogTitle>Upload Batch File</DialogTitle>
           <DialogDescription>
             Upload a{" "}
-            <a
-              href="https://docs.doubleword.ai"
-              target="_blank"
-              rel="noopener noreferrer"
-              className="text-blue-600 hover:text-blue-700 hover:underline inline-flex items-center gap-1"
-            >
-              JSONL file
-              <ExternalLink className="w-3 h-3" />
-            </a>{" "}
+            {config?.docs_jsonl_url ? (
+              <a
+                href={config.docs_jsonl_url}
+                target="_blank"
+                rel="noopener noreferrer"
+                className="text-blue-600 hover:text-blue-700 hover:underline inline-flex items-center gap-1"
+              >
+                JSONL file
+                <ExternalLink className="w-3 h-3" />
+              </a>
+            ) : (
+              "JSONL file"
+            )}{" "}
             to process multiple requests asynchronously.
           </DialogDescription>
         </DialogHeader>
@@ -262,16 +267,22 @@ export function UploadFileModal({
                 <p className="font-medium mb-1">JSONL Format Required</p>
                 <p className="text-blue-700">
                   Each line should be a valid JSON object representing a batch
-                  request. See the{" "}
-                  <a
-                    href="https://docs.doubleword.ai"
-                    target="_blank"
-                    rel="noopener noreferrer"
-                    className="underline hover:text-blue-900"
-                  >
-                    documentation
-                  </a>{" "}
-                  for examples.
+                  request.
+                  {config?.docs_jsonl_url && (
+                    <>
+                      {" "}
+                      See the{" "}
+                      <a
+                        href={config.docs_jsonl_url}
+                        target="_blank"
+                        rel="noopener noreferrer"
+                        className="underline hover:text-blue-900"
+                      >
+                        documentation
+                      </a>{" "}
+                      for examples.
+                    </>
+                  )}
                 </p>
               </div>
             </div>
