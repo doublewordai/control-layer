@@ -1738,9 +1738,9 @@ checksum = "e6d5a32815ae3f33302d95fdcb2ce17862f8c65363dcfd29360480ba1001fc9c"
 
 [[package]]
 name = "fusillade"
-version = "0.12.2"
+version = "0.12.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "5b5e040f1c83ce3de7ebc5b49cd0abcb6f8f1243d46e3a61f6ee281fac7368f5"
+checksum = "3de004e241ed464483490d43a6c54b0981847198127fe4937c47609ac1082cf7"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -3416,9 +3416,9 @@ dependencies = [
 
 [[package]]
 name = "outlet"
-version = "0.4.2"
+version = "0.4.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b71c5ba1c445cf62752a81ac699c113109bbb4bfae9f7d01c30e664537ec59d9"
+checksum = "673b9c8576287972fad699668cc6e3161d563bc2fedd041981e1c1d99c9df7af"
 dependencies = [
  "anyhow",
  "async-stream",
@@ -3426,6 +3426,7 @@ dependencies = [
  "bytes",
  "futures",
  "http-body-util",
+ "metrics",
  "pin-project-lite",
  "serde",
  "serde_json",
@@ -3441,14 +3442,15 @@ dependencies = [
 
 [[package]]
 name = "outlet-postgres"
-version = "0.4.3"
+version = "0.4.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a3e8d6f18710fac9fb7ff38a6fa8f9b4c977841feafcfa6ab44bd49ce5e9aefc"
+checksum = "cd2f01e7f90f8ff010ec45984c8e0e91aed91afc067ed9e5747b81de8db4b767"
 dependencies = [
  "base64 0.22.1",
  "bytes",
  "chrono",
  "http 1.4.0",
+ "metrics",
  "outlet",
  "serde",
  "serde_json",
