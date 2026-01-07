@@ -214,7 +214,7 @@ impl OnwardsConfigSync {
                                         // Record cache sync lag metric (time from DB change to cache update)
                                         if let Some((table_name, lag)) = notify_info {
                                             let lag_seconds = lag.as_secs_f64();
-                                            histogram!("cache_sync_lag_seconds", "table" => table_name.to_string())
+                                            histogram!("dwctl_cache_sync_lag_seconds", "table" => table_name.to_string())
                                                 .record(lag_seconds);
                                             info!("Updated onwards configuration successfully (sync lag: {:.3}ms from {})",
                                                   lag_seconds * 1000.0, table_name);

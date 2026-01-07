@@ -54,7 +54,7 @@ pub async fn run_pool_metrics_sampler(
     // Record max connections once at startup (it doesn't change)
     for labeled in &pools {
         let max = labeled.pool.options().get_max_connections();
-        gauge!("db_pool_connections_max", "pool" => labeled.name.to_string()).set(max as f64);
+        gauge!("dwctl_db_pool_connections_max", "pool" => labeled.name.to_string()).set(max as f64);
     }
 
     let mut interval = tokio::time::interval(config.sample_interval);
@@ -72,11 +72,11 @@ pub async fn run_pool_metrics_sampler(
                     let idle = labeled.pool.num_idle();
                     let in_use = size as usize - idle;
 
-                    gauge!("db_pool_connections_total", "pool" => labeled.name.to_string())
+                    gauge!("dwctl_db_pool_connections_total", "pool" => labeled.name.to_string())
                         .set(size as f64);
-                    gauge!("db_pool_connections_idle", "pool" => labeled.name.to_string())
+                    gauge!("dwctl_db_pool_connections_idle", "pool" => labeled.name.to_string())
                         .set(idle as f64);
-                    gauge!("db_pool_connections_in_use", "pool" => labeled.name.to_string())
+                    gauge!("dwctl_db_pool_connections_in_use", "pool" => labeled.name.to_string())
                         .set(in_use as f64);
 
                     debug!(
