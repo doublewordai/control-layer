@@ -969,6 +969,28 @@ pub struct BackgroundServicesConfig {
     pub batch_daemon: DaemonConfig,
     /// Leader election configuration for multi-instance deployments
     pub leader_election: LeaderElectionConfig,
+    /// Configuration for database pool metrics sampling
+    pub pool_metrics: PoolMetricsSamplerConfig,
+}
+
+/// Database pool metrics sampling configuration.
+///
+/// Controls how often database connection pool metrics are sampled and recorded.
+/// Metrics include connection counts (total, idle, in-use, max) for each pool.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct PoolMetricsSamplerConfig {
+    /// How often to sample pool metrics (default: 5s)
+    #[serde(with = "humantime_serde")]
+    pub sample_interval: Duration,
+}
+
+impl Default for PoolMetricsSamplerConfig {
+    fn default() -> Self {
+        Self {
+            sample_interval: Duration::from_secs(5),
+        }
+    }
 }
 
 /// Onwards configuration sync service configuration.
