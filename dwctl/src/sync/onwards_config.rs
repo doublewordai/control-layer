@@ -2,13 +2,13 @@
 
 use std::{collections::HashMap, num::NonZeroU32, sync::Arc};
 
+use metrics::histogram;
 use onwards::target::{
     Auth, ConcurrencyLimitParameters, ConfigFile, KeyDefinition, RateLimitParameters, TargetSpec, Targets, WatchTargetsStream,
 };
 use sqlx::{PgPool, postgres::PgListener};
 use tokio::sync::{mpsc, watch};
 use tokio_util::sync::CancellationToken;
-use metrics::histogram;
 use tracing::{debug, error, info, instrument, warn};
 
 /// Status events for testing/observability
@@ -37,10 +37,7 @@ fn parse_notify_payload(payload: &str) -> Option<(&str, std::time::Duration)> {
     let epoch_micros: i64 = parts[1].parse().ok()?;
 
     // Calculate elapsed time since the notification was sent
-    let now_micros = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .ok()?
-        .as_micros() as i64;
+    let now_micros = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).ok()?.as_micros() as i64;
 
     let lag_micros = now_micros.saturating_sub(epoch_micros);
     Some((table_name, std::time::Duration::from_micros(lag_micros as u64)))
@@ -701,7 +698,11 @@ mod tests {
         let (table_name, lag) = result.unwrap();
         assert_eq!(table_name, "deployed_models");
         // Lag should be around 1 second
-        assert!(lag.as_millis() >= 1000 && lag.as_millis() < 1100, "Lag should be ~1s, got {:?}", lag);
+        assert!(
+            lag.as_millis() >= 1000 && lag.as_millis() < 1100,
+            "Lag should be ~1s, got {:?}",
+            lag
+        );
 
         // Test invalid payloads
         assert!(parse_notify_payload("").is_none());

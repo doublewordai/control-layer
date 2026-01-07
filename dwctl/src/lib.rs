@@ -1236,6 +1236,7 @@ impl BackgroundTaskBuilder {
 async fn setup_background_services(
     pool: PgPool,
     fusillade_pool: PgPool,
+    outlet_pool: Option<PgPool>,
     config: Config,
     shutdown_token: tokio_util::sync::CancellationToken,
 ) -> anyhow::Result<BackgroundServices> {
@@ -1287,6 +1288,9 @@ async fn setup_background_services(
     const LEADER_LOCK_ID: i64 = 0x4457_4354_5052_4F42_i64;
 
     let probe_scheduler = probes::ProbeScheduler::new(pool.clone(), config.clone());
+
+    // Clone fusillade pool for metrics before moving into request manager
+    let fusillade_pool_for_metrics = fusillade_pool.clone();
 
     // Initialize the fusillade request manager (for batch processing)
     let request_manager = Arc::new(
@@ -1506,6 +1510,30 @@ async fn setup_background_services(
         });
     }
 
+    // Start pool metrics sampler if metrics are enabled
+    if config.enable_metrics {
+        let mut pools = vec![
+            db::LabeledPool {
+                name: "main",
+                pool: pool.clone(),
+            },
+            db::LabeledPool {
+                name: "fusillade",
+                pool: fusillade_pool_for_metrics,
+            },
+        ];
+        if let Some(outlet) = outlet_pool {
+            pools.push(db::LabeledPool {
+                name: "outlet",
+                pool: outlet,
+            });
+        }
+        let metrics_shutdown = shutdown_token.clone();
+        background_tasks.spawn("pool-metrics-sampler", async move {
+            db::run_pool_metrics_sampler(pools, db::PoolMetricsConfig::default(), metrics_shutdown).await
+        });
+    }
+
     let (background_tasks, task_names) = background_tasks.into_parts();
 
     Ok(BackgroundServices {
@@ -1573,6 +1601,7 @@ impl Application {
         let bg_services = setup_background_services(
             (*db_pools).clone(),
             (*fusillade_pools).clone(),
+            outlet_pools.as_ref().map(|p| (**p).clone()),
             config.clone(),
             shutdown_token.clone(),
         )
