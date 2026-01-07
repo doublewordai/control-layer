@@ -78,6 +78,7 @@ use url::Url;
 
 use crate::api::models::users::Role;
 use crate::errors::Error;
+use crate::sample_files::SampleFilesConfig;
 
 // DB sync channel name
 pub static ONWARDS_CONFIG_CHANGED_CHANNEL: &str = "auth_config_changed";
@@ -139,6 +140,8 @@ pub struct Config {
     pub enable_otel_export: bool,
     /// Credit system configuration
     pub credits: CreditsConfig,
+    /// Sample file generation configuration for new users
+    pub sample_files: SampleFilesConfig,
 }
 
 /// Individual pool configuration with all SQLx parameters.
@@ -1100,6 +1103,7 @@ impl Default for Config {
             enable_request_logging: true,
             enable_otel_export: false,
             credits: CreditsConfig::default(),
+            sample_files: SampleFilesConfig::default(),
         }
     }
 }
