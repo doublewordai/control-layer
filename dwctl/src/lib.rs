@@ -1034,9 +1034,15 @@ pub async fn build_router(state: &mut AppState, onwards_router: Router) -> anyho
         // Custom histogram buckets for analytics lag (100ms to 10 minutes)
         const ANALYTICS_LAG_BUCKETS: &[f64] = &[0.1, 0.5, 1.0, 5.0, 10.0, 30.0, 60.0, 120.0, 300.0, 600.0];
 
+        // Custom histogram buckets for cache sync lag (1ms to 10s)
+        // Typical sync should be <100ms, >1s indicates a problem
+        const CACHE_SYNC_LAG_BUCKETS: &[f64] = &[0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0];
+
         let metric_handle = PrometheusBuilder::new()
             .set_buckets_for_metric(Matcher::Full("analytics_lag_seconds".to_string()), ANALYTICS_LAG_BUCKETS)
             .expect("Failed to set custom buckets for analytics_lag_seconds")
+            .set_buckets_for_metric(Matcher::Full("cache_sync_lag_seconds".to_string()), CACHE_SYNC_LAG_BUCKETS)
+            .expect("Failed to set custom buckets for cache_sync_lag_seconds")
             .install_recorder()
             .expect("Failed to install Prometheus recorder");
 
@@ -1230,6 +1236,7 @@ impl BackgroundTaskBuilder {
 async fn setup_background_services(
     pool: PgPool,
     fusillade_pool: PgPool,
+    outlet_pool: Option<PgPool>,
     config: Config,
     shutdown_token: tokio_util::sync::CancellationToken,
 ) -> anyhow::Result<BackgroundServices> {
@@ -1281,6 +1288,9 @@ async fn setup_background_services(
     const LEADER_LOCK_ID: i64 = 0x4457_4354_5052_4F42_i64;
 
     let probe_scheduler = probes::ProbeScheduler::new(pool.clone(), config.clone());
+
+    // Clone fusillade pool for metrics before moving into request manager
+    let fusillade_pool_for_metrics = fusillade_pool.clone();
 
     // Initialize the fusillade request manager (for batch processing)
     let request_manager = Arc::new(
@@ -1500,6 +1510,30 @@ async fn setup_background_services(
         });
     }
 
+    // Start pool metrics sampler if metrics are enabled
+    if config.enable_metrics {
+        let mut pools = vec![
+            db::LabeledPool {
+                name: "main",
+                pool: pool.clone(),
+            },
+            db::LabeledPool {
+                name: "fusillade",
+                pool: fusillade_pool_for_metrics,
+            },
+        ];
+        if let Some(outlet) = outlet_pool {
+            pools.push(db::LabeledPool {
+                name: "outlet",
+                pool: outlet,
+            });
+        }
+        let metrics_shutdown = shutdown_token.clone();
+        background_tasks.spawn("pool-metrics-sampler", async move {
+            db::run_pool_metrics_sampler(pools, db::PoolMetricsConfig::default(), metrics_shutdown).await
+        });
+    }
+
     let (background_tasks, task_names) = background_tasks.into_parts();
 
     Ok(BackgroundServices {
@@ -1567,6 +1601,7 @@ impl Application {
         let bg_services = setup_background_services(
             (*db_pools).clone(),
             (*fusillade_pools).clone(),
+            outlet_pools.as_ref().map(|p| (**p).clone()),
             config.clone(),
             shutdown_token.clone(),
         )

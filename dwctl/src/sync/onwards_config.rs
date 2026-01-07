@@ -2,6 +2,7 @@
 
 use std::{collections::HashMap, num::NonZeroU32, sync::Arc};
 
+use metrics::histogram;
 use onwards::target::{
     Auth, ConcurrencyLimitParameters, ConfigFile, KeyDefinition, RateLimitParameters, TargetSpec, Targets, WatchTargetsStream,
 };
@@ -23,6 +24,24 @@ use crate::{
     config::ONWARDS_CONFIG_CHANGED_CHANNEL,
     types::{ApiKeyId, DeploymentId},
 };
+
+/// Parse the NOTIFY payload to extract the timestamp
+/// Payload format: "table_name:epoch_microseconds"
+/// Returns the table name and the elapsed time since the notification was sent
+fn parse_notify_payload(payload: &str) -> Option<(&str, std::time::Duration)> {
+    let parts: Vec<&str> = payload.split(':').collect();
+    if parts.len() != 2 {
+        return None;
+    }
+    let table_name = parts[0];
+    let epoch_micros: i64 = parts[1].parse().ok()?;
+
+    // Calculate elapsed time since the notification was sent
+    let now_micros = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).ok()?.as_micros() as i64;
+
+    let lag_micros = now_micros.saturating_sub(epoch_micros);
+    Some((table_name, std::time::Duration::from_micros(lag_micros as u64)))
+}
 
 /// Complete data needed for one onwards target configuration
 #[derive(Debug, Clone)]
@@ -157,6 +176,9 @@ impl OnwardsConfigSync {
                                 debug!("Received notification on channel: {} with payload: {:?}",
                                       notification.channel(), notification.payload());
 
+                                // Parse the notification timestamp for lag measurement
+                                let notify_info = parse_notify_payload(notification.payload());
+
                                 // Debounce: skip if we just reloaded recently
                                 if last_reload_time.elapsed() < MIN_RELOAD_INTERVAL {
                                     debug!("Skipping reload due to debouncing (last reload was {:?} ago)",
@@ -188,7 +210,17 @@ impl OnwardsConfigSync {
                                             // If all receivers are dropped, we can exit
                                             break;
                                         }
-                                        info!("Updated onwards configuration successfully");
+
+                                        // Record cache sync lag metric (time from DB change to cache update)
+                                        if let Some((table_name, lag)) = notify_info {
+                                            let lag_seconds = lag.as_secs_f64();
+                                            histogram!("cache_sync_lag_seconds", "table" => table_name.to_string())
+                                                .record(lag_seconds);
+                                            info!("Updated onwards configuration successfully (sync lag: {:.3}ms from {})",
+                                                  lag_seconds * 1000.0, table_name);
+                                        } else {
+                                            info!("Updated onwards configuration successfully");
+                                        }
                                     }
                                     Err(e) => {
                                         error!("Failed to load targets from database: {}", e);
@@ -585,7 +617,7 @@ mod tests {
     use tokio_util::sync::CancellationToken;
     use uuid::Uuid;
 
-    use crate::sync::onwards_config::{OnwardsTarget, SyncConfig, convert_to_config_file};
+    use crate::sync::onwards_config::{OnwardsTarget, SyncConfig, convert_to_config_file, parse_notify_payload};
 
     // Helper function to create a test target
     fn create_test_target(model_name: &str, alias: &str, endpoint_url: &str) -> OnwardsTarget {
@@ -641,6 +673,42 @@ mod tests {
         // Should have exactly one target
         assert_eq!(config.targets.len(), 1);
         assert!(config.targets.contains_key("valid-alias"));
+    }
+
+    #[test]
+    fn test_parse_notify_payload() {
+        // Test valid payload
+        let now_micros = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_micros() as i64;
+        let payload = format!("api_keys:{}", now_micros);
+        let result = parse_notify_payload(&payload);
+        assert!(result.is_some());
+        let (table_name, lag) = result.unwrap();
+        assert_eq!(table_name, "api_keys");
+        // Lag should be very small (< 100ms) since we just created the timestamp
+        assert!(lag.as_millis() < 100, "Lag should be < 100ms, got {:?}", lag);
+
+        // Test payload from 1 second ago
+        let old_micros = now_micros - 1_000_000; // 1 second ago
+        let old_payload = format!("deployed_models:{}", old_micros);
+        let result = parse_notify_payload(&old_payload);
+        assert!(result.is_some());
+        let (table_name, lag) = result.unwrap();
+        assert_eq!(table_name, "deployed_models");
+        // Lag should be around 1 second
+        assert!(
+            lag.as_millis() >= 1000 && lag.as_millis() < 1100,
+            "Lag should be ~1s, got {:?}",
+            lag
+        );
+
+        // Test invalid payloads
+        assert!(parse_notify_payload("").is_none());
+        assert!(parse_notify_payload("no_colon").is_none());
+        assert!(parse_notify_payload("table:not_a_number").is_none());
+        assert!(parse_notify_payload("too:many:colons").is_none());
     }
 
     #[sqlx::test]

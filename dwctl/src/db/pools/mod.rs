@@ -40,8 +40,12 @@
 //! let user = create_user(state.db.write()).await?;
 //! ```
 
+pub mod metrics;
+
 use sqlx::PgPool;
 use std::ops::Deref;
+
+pub use metrics::{LabeledPool, PoolMetricsConfig, run_pool_metrics_sampler};
 
 /// Database pool abstraction supporting read replicas.
 ///
