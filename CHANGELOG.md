@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.24.2](https://github.com/doublewordai/control-layer/compare/v0.24.1...v0.24.2) (2026-01-07)
+
+
+### Bug Fixes
+
+* when rerouting to api endpoint, strip /ai prefix to not double up ([727fe8b](https://github.com/doublewordai/control-layer/commit/727fe8bc88df503b873598c5eead61feeb56a484))
+
 ## [0.24.1](https://github.com/doublewordai/control-layer/compare/v0.24.0...v0.24.1) (2026-01-07)
 
 
