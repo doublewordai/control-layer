@@ -1034,9 +1034,15 @@ pub async fn build_router(state: &mut AppState, onwards_router: Router) -> anyho
         // Custom histogram buckets for analytics lag (100ms to 10 minutes)
         const ANALYTICS_LAG_BUCKETS: &[f64] = &[0.1, 0.5, 1.0, 5.0, 10.0, 30.0, 60.0, 120.0, 300.0, 600.0];
 
+        // Custom histogram buckets for cache sync lag (1ms to 10s)
+        // Typical sync should be <100ms, >1s indicates a problem
+        const CACHE_SYNC_LAG_BUCKETS: &[f64] = &[0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0];
+
         let metric_handle = PrometheusBuilder::new()
             .set_buckets_for_metric(Matcher::Full("analytics_lag_seconds".to_string()), ANALYTICS_LAG_BUCKETS)
             .expect("Failed to set custom buckets for analytics_lag_seconds")
+            .set_buckets_for_metric(Matcher::Full("cache_sync_lag_seconds".to_string()), CACHE_SYNC_LAG_BUCKETS)
+            .expect("Failed to set custom buckets for cache_sync_lag_seconds")
             .install_recorder()
             .expect("Failed to install Prometheus recorder");
 
