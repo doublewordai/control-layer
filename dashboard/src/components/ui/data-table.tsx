@@ -218,6 +218,11 @@ export function DataTable<TData, TValue>({
 
   const selectedRows = table.getFilteredSelectedRowModel().rows;
 
+  // Update table page size when currentPageSize changes (e.g., from URL params)
+  React.useEffect(() => {
+    table.setPageSize(currentPageSize);
+  }, [currentPageSize, table]);
+
   // Call onSelectionChange when selection changes
   React.useEffect(() => {
     if (onSelectionChange) {
