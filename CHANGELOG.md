@@ -1,5 +1,59 @@
 # Changelog
 
+## [0.22.0](https://github.com/doublewordai/control-layer/compare/v0.21.1...v0.22.0) (2026-01-07)
+
+
+### Features
+
+* add analytics processing lag metric ([#449](https://github.com/doublewordai/control-layer/issues/449)) ([6afa7e8](https://github.com/doublewordai/control-layer/commit/6afa7e8bdb75e170cc78e583d9441703c70525b2))
+* cache sync & pool metrics ([#454](https://github.com/doublewordai/control-layer/issues/454)) ([8929ec9](https://github.com/doublewordai/control-layer/commit/8929ec965ff5a0b19de80a2fa01bd582a56aa2f2))
+
+
+### Bug Fixes
+
+* check by externalID for auth_source ([#446](https://github.com/doublewordai/control-layer/issues/446)) ([bf51e28](https://github.com/doublewordai/control-layer/commit/bf51e2893392d24ff32f09c51c5a5285b4772e5a))
+* use COALESCE for checkpoint seq comparison to enable index usage ([#448](https://github.com/doublewordai/control-layer/issues/448)) ([48dcfd5](https://github.com/doublewordai/control-layer/commit/48dcfd504207a6dfb83ff1a4c8123266062ef6bc))
+
+
+### Performance Improvements
+
+* add expression index for http_analytics id::text joins ([#450](https://github.com/doublewordai/control-layer/issues/450)) ([a31f26b](https://github.com/doublewordai/control-layer/commit/a31f26bcc64d045dfb24f37d92e1461b428d53ed))
+
+## [0.21.1](https://github.com/doublewordai/control-layer/compare/v0.21.0...v0.21.1) (2026-01-06)
+
+
+### Bug Fixes
+
+* compute balance on read instead of on write ([#445](https://github.com/doublewordai/control-layer/issues/445)) ([839373c](https://github.com/doublewordai/control-layer/commit/839373cbc1cfcd9460769649526ad045eabcdb7c))
+* Prettier auth source ([#443](https://github.com/doublewordai/control-layer/issues/443)) ([e021696](https://github.com/doublewordai/control-layer/commit/e02169679ec3c1de3863e1acbb263a7d17fade58))
+
+## [0.21.0](https://github.com/doublewordai/control-layer/compare/v0.20.0...v0.21.0) (2026-01-06)
+
+
+### Features
+
+* add --validate flag and strict config parsing ([#441](https://github.com/doublewordai/control-layer/issues/441)) ([48cc236](https://github.com/doublewordai/control-layer/commit/48cc2366be15d2a9e3caef54ce5fb234257dcf52))
+
+## [0.20.0](https://github.com/doublewordai/control-layer/compare/v0.19.1...v0.20.0) (2026-01-06)
+
+
+### Features
+
+* support separate databases for fusillade/outlet with optional read replicas ([#433](https://github.com/doublewordai/control-layer/issues/433)) ([8c24cd0](https://github.com/doublewordai/control-layer/commit/8c24cd0d72927cc95b3dc91df5452f5a82a7a4bd))
+
+
+### Bug Fixes
+
+* **deps:** update rust crate axum-prometheus to 0.10 ([#436](https://github.com/doublewordai/control-layer/issues/436)) ([6472ebf](https://github.com/doublewordai/control-layer/commit/6472ebfdc5e16986e64e32009c465dde9dff5877))
+
+## [0.19.1](https://github.com/doublewordai/control-layer/compare/v0.19.0...v0.19.1) (2025-12-24)
+
+
+### Bug Fixes
+
+* allow early upload in batch model for cost estimates ([#425](https://github.com/doublewordai/control-layer/issues/425)) ([24bb933](https://github.com/doublewordai/control-layer/commit/24bb9334d42336e055d9015db7bc2fc4e51dcf7b))
+* hide view reuest analytics button from users without RequestViewer role ([#427](https://github.com/doublewordai/control-layer/issues/427)) ([c0469f0](https://github.com/doublewordai/control-layer/commit/c0469f0b5d83b603be0c139129431b3873595756))
+
 ## [0.19.0](https://github.com/doublewordai/control-layer/compare/v0.18.3...v0.19.0) (2025-12-22)
 
 

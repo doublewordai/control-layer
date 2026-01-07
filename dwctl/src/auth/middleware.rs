@@ -160,7 +160,7 @@ mod tests {
         let state = {
             let request_manager = std::sync::Arc::new(fusillade::PostgresRequestManager::new(pool.clone()));
             crate::AppState::builder()
-                .db(pool.clone())
+                .db(crate::db::DbPools::new(pool.clone()))
                 .config(config)
                 .request_manager(request_manager)
                 .build()
@@ -244,7 +244,7 @@ mod tests {
         let state = {
             let request_manager = std::sync::Arc::new(fusillade::PostgresRequestManager::new(pool.clone()));
             crate::AppState::builder()
-                .db(pool.clone())
+                .db(crate::db::DbPools::new(pool.clone()))
                 .config(config)
                 .request_manager(request_manager)
                 .build()
@@ -275,7 +275,7 @@ mod tests {
         let state = {
             let request_manager = std::sync::Arc::new(fusillade::PostgresRequestManager::new(pool.clone()));
             crate::AppState::builder()
-                .db(pool.clone())
+                .db(crate::db::DbPools::new(pool.clone()))
                 .config(config)
                 .request_manager(request_manager)
                 .build()
@@ -301,7 +301,7 @@ mod tests {
         let state = {
             let request_manager = std::sync::Arc::new(fusillade::PostgresRequestManager::new(pool.clone()));
             crate::AppState::builder()
-                .db(pool.clone())
+                .db(crate::db::DbPools::new(pool.clone()))
                 .config(config)
                 .request_manager(request_manager)
                 .build()
@@ -330,7 +330,7 @@ mod tests {
         let state = {
             let request_manager = std::sync::Arc::new(fusillade::PostgresRequestManager::new(pool.clone()));
             crate::AppState::builder()
-                .db(pool.clone())
+                .db(crate::db::DbPools::new(pool.clone()))
                 .config(config)
                 .request_manager(request_manager)
                 .build()
@@ -362,7 +362,7 @@ mod tests {
         let state = {
             let request_manager = std::sync::Arc::new(fusillade::PostgresRequestManager::new(pool.clone()));
             crate::AppState::builder()
-                .db(pool.clone())
+                .db(crate::db::DbPools::new(pool.clone()))
                 .config(config)
                 .request_manager(request_manager)
                 .build()
@@ -434,7 +434,7 @@ mod tests {
         let state = {
             let request_manager = std::sync::Arc::new(fusillade::PostgresRequestManager::new(pool.clone()));
             crate::AppState::builder()
-                .db(pool.clone())
+                .db(crate::db::DbPools::new(pool.clone()))
                 .config(config)
                 .request_manager(request_manager)
                 .build()
@@ -533,7 +533,7 @@ mod tests {
 
         let request_manager = std::sync::Arc::new(fusillade::PostgresRequestManager::new(pool.clone()));
         let state = crate::AppState {
-            db: pool.clone(),
+            db: crate::db::DbPools::new(pool.clone()),
             config: config.clone(),
             outlet_db: None,
             metrics_recorder: None,
@@ -636,7 +636,7 @@ mod tests {
 
         let request_manager = std::sync::Arc::new(fusillade::PostgresRequestManager::new(pool.clone()));
         let state = crate::AppState {
-            db: pool.clone(),
+            db: crate::db::DbPools::new(pool.clone()),
             config: config.clone(),
             outlet_db: None,
             metrics_recorder: None,
@@ -741,7 +741,7 @@ mod tests {
 
         let request_manager = std::sync::Arc::new(fusillade::PostgresRequestManager::new(pool.clone()));
         let state = crate::AppState {
-            db: pool.clone(),
+            db: crate::db::DbPools::new(pool.clone()),
             config: config.clone(),
             outlet_db: None,
             metrics_recorder: None,
@@ -819,7 +819,7 @@ mod tests {
         let state = {
             let request_manager = std::sync::Arc::new(fusillade::PostgresRequestManager::new(pool.clone()));
             crate::AppState::builder()
-                .db(pool.clone())
+                .db(crate::db::DbPools::new(pool.clone()))
                 .config(config)
                 .request_manager(request_manager)
                 .build()
@@ -922,7 +922,7 @@ mod tests {
 
         let request_manager = std::sync::Arc::new(fusillade::PostgresRequestManager::new(pool.clone()));
         let state = crate::AppState {
-            db: pool.clone(),
+            db: crate::db::DbPools::new(pool.clone()),
             config: config.clone(),
             outlet_db: None,
             metrics_recorder: None,
@@ -1027,7 +1027,7 @@ mod tests {
 
         let request_manager = std::sync::Arc::new(fusillade::PostgresRequestManager::new(pool.clone()));
         let state = crate::AppState {
-            db: pool.clone(),
+            db: crate::db::DbPools::new(pool.clone()),
             config: config.clone(),
             outlet_db: None,
             metrics_recorder: None,

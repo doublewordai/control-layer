@@ -3,6 +3,7 @@
 use crate::request_logging::models::AiResponse;
 use outlet_postgres::SerializationError;
 use std::io::Read as _;
+use tracing::instrument;
 
 use super::models::{ChatCompletionChunk, SseParseError};
 
@@ -72,6 +73,7 @@ fn process_sse_chunks(chunks: Vec<String>) -> AiResponse {
 ///
 /// # Errors
 /// Returns error if both SSE parsing and JSON deserialization fail
+#[instrument(skip_all)]
 pub(crate) fn parse_streaming_response(body_str: &str) -> Result<AiResponse, Box<dyn std::error::Error>> {
     // Streaming: expect SSE, fallback to JSON
     parse_sse_chunks(body_str)
@@ -84,6 +86,7 @@ pub(crate) fn parse_streaming_response(body_str: &str) -> Result<AiResponse, Box
 ///
 /// # Errors
 /// Returns error if JSON deserialization fails
+#[instrument(skip_all)]
 pub(crate) fn parse_non_streaming_response(body_str: &str) -> Result<AiResponse, Box<dyn std::error::Error>> {
     serde_json::from_str(body_str).map_err(|e| Box::new(e) as Box<dyn std::error::Error>)
 }
@@ -92,6 +95,7 @@ pub(crate) fn parse_non_streaming_response(body_str: &str) -> Result<AiResponse,
 ///
 /// # Errors
 /// Returns `SerializationError` if brotli decompression fails
+#[instrument(skip_all, name = "decompress_response")]
 pub(crate) fn decompress_response_if_needed(
     bytes: &[u8],
     headers: &std::collections::HashMap<String, Vec<bytes::Bytes>>,

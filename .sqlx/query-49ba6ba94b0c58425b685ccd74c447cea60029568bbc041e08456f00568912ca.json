@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "\n            SELECT id, user_id, transaction_type as \"transaction_type: CreditTransactionType\",\n                amount, balance_after, previous_transaction_id, source_id, description, created_at\n            FROM credits_transactions\n            WHERE id = $1\n            ",
+  "query": "\n            SELECT id, user_id, transaction_type as \"transaction_type: CreditTransactionType\",\n                amount, source_id, description, created_at, seq\n            FROM credits_transactions\n            WHERE id = $1\n            ",
   "describe": {
     "columns": [
       {
@@ -25,28 +25,23 @@
       },
       {
         "ordinal": 4,
-        "name": "balance_after",
-        "type_info": "Numeric"
-      },
-      {
-        "ordinal": 5,
-        "name": "previous_transaction_id",
-        "type_info": "Uuid"
-      },
-      {
-        "ordinal": 6,
         "name": "source_id",
         "type_info": "Text"
       },
       {
-        "ordinal": 7,
+        "ordinal": 5,
         "name": "description",
         "type_info": "Text"
       },
       {
-        "ordinal": 8,
+        "ordinal": 6,
         "name": "created_at",
         "type_info": "Timestamptz"
+      },
+      {
+        "ordinal": 7,
+        "name": "seq",
+        "type_info": "Int8"
       }
     ],
     "parameters": {
@@ -62,9 +57,8 @@
       false,
       true,
       false,
-      true,
       false
     ]
   },
-  "hash": "31c9b2db31aec779a27f33ee23833daa0157eed67374105c5a42f50a5b33c5fc"
+  "hash": "49ba6ba94b0c58425b685ccd74c447cea60029568bbc041e08456f00568912ca"
 }

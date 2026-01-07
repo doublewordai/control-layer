@@ -13,6 +13,7 @@ import {
 import { Card } from "../../../ui/card.tsx";
 import { Button } from "@/components";
 import { useState, useMemo } from "react";
+import { useNavigate } from "react-router-dom";
 import {
   Select,
   SelectContent,
@@ -61,6 +62,7 @@ export function TransactionHistory({
 }: TransactionHistoryProps) {
   const { isFeatureEnabled } = useSettings();
   const isDemoMode = isFeatureEnabled("demo");
+  const navigate = useNavigate();
 
   // Fetch user info for display
   const { data: displayUser } = useUser(filterUserId || userId);
@@ -71,16 +73,46 @@ export function TransactionHistory({
   // Always pass userId to filter transactions by the specific user
   // Backend enforces permissions: non-admins can only see their own transactions
   const {
-    data: transactionsData,
+    data: transactionsResponse,
     isLoading: isLoadingTransactions,
     refetch: refetchTransactions,
-  } = useTransactions({ userId });
+  } = useTransactions({ userId, group_batches: true });
 
-  // Get transactions - use fetched data in both demo and API mode
-  // In demo mode, MSW returns data from transactions.json
+  // Get transactions and page_start_balance from response
   const transactions = useMemo<Transaction[]>(() => {
-    return transactionsData || [];
-  }, [transactionsData]);
+    return transactionsResponse?.data || [];
+  }, [transactionsResponse]);
+
+  const pageStartBalance = transactionsResponse?.page_start_balance ?? 0;
+
+  // Compute balance_after for each transaction
+  // Transactions are in desc order (most recent first), so we iterate and "undo" each transaction
+  // to compute what the balance was after that transaction
+  const balanceByTransactionId = useMemo(() => {
+    const balanceMap = new Map<string, number>();
+    let runningBalance = Number(pageStartBalance);
+
+    for (const tx of transactions) {
+      // The balance after this transaction is the current running balance
+      balanceMap.set(tx.id, runningBalance);
+
+      // "Undo" this transaction to get the balance before it
+      // Note: amount may come as string from API for precision, so coerce to number
+      const amount = Number(tx.amount);
+      const isCredit =
+        tx.transaction_type === "admin_grant" ||
+        tx.transaction_type === "purchase";
+      if (isCredit) {
+        // Was a credit, so before this tx the balance was lower
+        runningBalance -= amount;
+      } else {
+        // Was a debit, so before this tx the balance was higher
+        runningBalance += amount;
+      }
+    }
+
+    return balanceMap;
+  }, [transactions, pageStartBalance]);
 
   const isLoading = !isDemoMode && isLoadingTransactions;
 
@@ -364,8 +396,36 @@ export function TransactionHistory({
                   transaction.transaction_type === "admin_grant" ||
                   transaction.transaction_type === "purchase";
 
+                const handleRowClick = () => {
+                  if (transaction.batch_id) {
+                    navigate(`/batches/${transaction.batch_id}`);
+                  }
+                };
+
                 return (
-                  <TableRow key={transaction.id}>
+                  <TableRow
+                    key={transaction.id}
+                    onClick={handleRowClick}
+                    tabIndex={transaction.batch_id ? 0 : -1}
+                    onKeyDown={(event) => {
+                      if (!transaction.batch_id) return;
+                      if (event.key === "Enter" || event.key === " ") {
+                        event.preventDefault();
+                        handleRowClick();
+                      }
+                    }}
+                    role={transaction.batch_id ? "button" : undefined}
+                    aria-label={
+                      transaction.batch_id
+                        ? `View batch ${transaction.batch_id} details`
+                        : undefined
+                    }
+                    className={
+                      transaction.batch_id
+                        ? "cursor-pointer hover:bg-doubleword-neutral-50"
+                        : ""
+                    }
+                  >
                     <TableCell>
                       <div
                         className={`p-2 rounded-full ${
@@ -401,7 +461,9 @@ export function TransactionHistory({
                     </TableCell>
                     <TableCell className="text-right">
                       <p className="text-sm text-doubleword-neutral-600">
-                        {formatDollars(transaction.balance_after)}
+                        {formatDollars(
+                          balanceByTransactionId.get(transaction.id) ?? 0
+                        )}
                       </p>
                     </TableCell>
                   </TableRow>

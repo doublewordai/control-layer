@@ -143,6 +143,7 @@ export interface Group {
 export interface User {
   id: string;
   username: string;
+  external_user_id: string;
   email: string;
   display_name?: string;
   avatar_url?: string;
@@ -693,9 +694,8 @@ export interface Transaction {
   id: string;
   user_id: string; // UUID
   transaction_type: TransactionType;
+  batch_id?: string; // Batch ID (present when this is a grouped batch of multiple usage transactions)
   amount: number; // Amount in dollars
-  balance_after: number; // Balance in dollars
-  previous_transaction_id?: string; // UUID
   source_id: string;
   description?: string;
   created_at: string; // ISO 8601 timestamp
@@ -707,16 +707,20 @@ export interface BalanceResponse {
 }
 
 export interface TransactionsListResponse {
-  transactions: Transaction[];
-  total: number;
+  data: Transaction[];
+  total_count: number;
   limit: number;
   skip: number;
+  /** Current user balance when skip=0, or balance at the pagination point when skip>0.
+   * Frontend can compute each row's balance by subtracting signed amounts from this value. */
+  page_start_balance: number;
 }
 
 export interface TransactionsQuery {
   limit?: number;
   skip?: number;
   userId?: string; // Filter transactions by user (UUID)
+  group_batches?: boolean; // Group transactions by batch (merges batch requests into single entries)
 }
 
 export interface AddFundsRequest {

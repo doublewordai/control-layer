@@ -24,7 +24,7 @@ import {
 import { Input } from "../../../ui/input";
 import { Button } from "../../../ui/button";
 import { AVAILABLE_ROLES, getRoleDisplayName } from "../../../../utils/roles";
-import type { Role } from "../../../../api/control-layer/types";
+import type { Role, User } from "../../../../api/control-layer/types";
 import { dwctlApi } from "../../../../api/control-layer/client";
 import { ApiError } from "../../../../api/control-layer/errors";
 
@@ -52,6 +52,28 @@ export const Profile: React.FC = () => {
     setRoles((prev) =>
       prev.includes(role) ? prev.filter((r) => r !== role) : [...prev, role],
     );
+  };
+
+  const getAuthProviderDisplay = (currentUser: User): string => {
+    const { auth_source, external_user_id } = currentUser;
+
+    if (auth_source === "native" || auth_source === "system") {
+      return auth_source;
+    }
+
+    // attempt to parse common providers from external ID
+    if (external_user_id) {
+      const lowerExternalId = external_user_id.toLowerCase();
+      if (lowerExternalId.startsWith("github")) {
+        return "GitHub";
+      }
+      if (lowerExternalId.startsWith("google")) {
+        return "Google";
+      }
+      return "Oauth";
+    }
+
+    return "email";
   };
 
   const getRoleDescription = (role: Role): string => {
@@ -237,13 +259,13 @@ export const Profile: React.FC = () => {
                   />
                 )}
                 <h3 className="text-lg font-medium text-gray-900 truncate px-2">
-                  {currentUser?.email}
-                </h3>
-                <p className="text-sm text-gray-500 truncate px-2">
                   {displayName ||
                     currentUser?.display_name ||
                     currentUser?.username ||
                     "Unknown User"}
+                </h3>
+                <p className="text-sm text-gray-500 truncate px-2">
+                  {currentUser?.email}
                 </p>
               </div>
             </div>
@@ -255,10 +277,8 @@ export const Profile: React.FC = () => {
               </h4>
               <div className="space-y-3">
                 <div className="flex items-center text-sm">
-                  <AtSign className="w-4 h-4 text-gray-400 mr-2 flex-shrink-0" />
-                  <span className="text-gray-600 w-20 flex-shrink-0">
-                    Email:
-                  </span>
+                  <AtSign className="w-4 h-4 text-gray-400 mr-2 shrink-0" />
+                  <span className="text-gray-600 w-20 shrink-0">Email:</span>
                   <Tooltip>
                     <TooltipTrigger asChild>
                       <span className="text-gray-900 truncate">
@@ -288,10 +308,8 @@ export const Profile: React.FC = () => {
                 </div>*/}
                 {currentUser?.created_at && (
                   <div className="flex items-center text-sm">
-                    <Calendar className="w-4 h-4 text-gray-400 mr-2 flex-shrink-0" />
-                    <span className="text-gray-600 w-20 flex-shrink-0">
-                      Joined:
-                    </span>
+                    <Calendar className="w-4 h-4 text-gray-400 mr-2 shrink-0" />
+                    <span className="text-gray-600 w-20 shrink-0">Joined:</span>
                     <Tooltip>
                       <TooltipTrigger asChild>
                         <span className="text-gray-900 truncate">
@@ -305,28 +323,24 @@ export const Profile: React.FC = () => {
                   </div>
                 )}
                 <div className="flex items-center text-sm">
-                  <Shield className="w-4 h-4 text-gray-400 mr-2 flex-shrink-0" />
-                  <span className="text-gray-600 w-20 flex-shrink-0">
-                    Type:
-                  </span>
+                  <Shield className="w-4 h-4 text-gray-400 mr-2 shrink-0" />
+                  <span className="text-gray-600 w-20 shrink-0">Type:</span>
                   <span className="text-gray-900">
                     {currentUser?.is_admin ? "Admin" : "User"}
                   </span>
                 </div>
                 {currentUser?.auth_source && (
                   <div className="flex items-center text-sm">
-                    <LockIcon className="w-4 h-4 text-gray-400 mr-2 flex-shrink-0" />
-                    <span className="text-gray-600 w-20 flex-shrink-0">
-                      Auth:
-                    </span>
+                    <LockIcon className="w-4 h-4 text-gray-400 mr-2 shrink-0" />
+                    <span className="text-gray-600 w-20 shrink-0">Auth:</span>
                     <Tooltip>
                       <TooltipTrigger asChild>
-                        <span className="text-gray-900 capitalize truncate">
-                          {currentUser.auth_source}
+                        <span className="text-gray-900 truncate">
+                          {getAuthProviderDisplay(currentUser)}
                         </span>
                       </TooltipTrigger>
                       <TooltipContent>
-                        <p>{currentUser.auth_source}</p>
+                        <p>{getAuthProviderDisplay(currentUser)}</p>
                       </TooltipContent>
                     </Tooltip>
                   </div>

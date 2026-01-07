@@ -1,0 +1,22 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n            SELECT COUNT(*) as count FROM (\n                -- Batched transactions (grouped by batch_id)\n                SELECT ha.fusillade_batch_id as id\n                FROM credits_transactions ct\n                JOIN http_analytics ha\n                    ON ct.source_id = ha.id::text\n                    AND ct.transaction_type = 'usage'\n                WHERE ($1::uuid IS NULL OR ct.user_id = $1)\n                    AND ha.fusillade_batch_id IS NOT NULL\n                GROUP BY ha.fusillade_batch_id, ct.user_id\n\n                UNION ALL\n\n                -- Non-batched transactions\n                SELECT ct.id\n                FROM credits_transactions ct\n                LEFT JOIN http_analytics ha ON ct.source_id = ha.id::text AND ct.transaction_type = 'usage'\n                WHERE ($1::uuid IS NULL OR ct.user_id = $1)\n                    AND (ct.transaction_type != 'usage' OR ha.fusillade_batch_id IS NULL)\n            ) combined\n            ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "count",
+        "type_info": "Int8"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid"
+      ]
+    },
+    "nullable": [
+      null
+    ]
+  },
+  "hash": "950ec9531df15be13de19d3cb4b00e68f9051fc860379b8fce3f37ae516272b5"
+}

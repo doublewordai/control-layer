@@ -47,8 +47,6 @@ import {
   DropdownMenuItem,
   DropdownMenuTrigger,
 } from "@/components/ui/dropdown-menu";
-import type { Transaction } from "@/api/control-layer/types";
-import { useMemo } from "react";
 import { formatDollars } from "@/utils/money";
 
 interface NavItem {
@@ -207,16 +205,12 @@ export function AppLayout({ children }: { children: React.ReactNode }) {
   const { data: transactionsData } = useTransactions({
     userId: user?.id || "",
   });
-  // Get transactions - use fetched data in both demo and API mode
-  // In demo mode, MSW returns data from transactions.json
-  const transactions = useMemo<Transaction[]>(() => {
-    return transactionsData || [];
-  }, [transactionsData]);
 
-  // Calculate current balance (in demo mode, use latest transaction balance)
+  // Calculate current balance
+  // In demo mode, use page_start_balance from transactions response; otherwise use user balance
   const currentBalance =
-    isDemoMode && transactions.length > 0
-      ? transactions[0]?.balance_after || balance
+    isDemoMode && transactionsData?.page_start_balance !== undefined
+      ? transactionsData.page_start_balance
       : balance;
 
   return (
