@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "\n            SELECT id, user_id, transaction_type as \"transaction_type: CreditTransactionType\", amount, balance_after, source_id, previous_transaction_id, description, created_at\n            FROM credits_transactions\n            WHERE user_id = $1\n            ORDER BY created_at DESC, id DESC\n            OFFSET $2\n            LIMIT $3\n            ",
+  "query": "\n            INSERT INTO credits_transactions (user_id, transaction_type, amount, source_id, description, fusillade_batch_id)\n            VALUES ($1, $2, $3, $4, $5, $6)\n            RETURNING id, user_id, transaction_type as \"transaction_type: CreditTransactionType\", amount, source_id,\n                      description, created_at, seq\n            ",
   "describe": {
     "columns": [
       {
@@ -25,35 +25,33 @@
       },
       {
         "ordinal": 4,
-        "name": "balance_after",
-        "type_info": "Numeric"
-      },
-      {
-        "ordinal": 5,
         "name": "source_id",
         "type_info": "Text"
       },
       {
-        "ordinal": 6,
-        "name": "previous_transaction_id",
-        "type_info": "Uuid"
-      },
-      {
-        "ordinal": 7,
+        "ordinal": 5,
         "name": "description",
         "type_info": "Text"
       },
       {
-        "ordinal": 8,
+        "ordinal": 6,
         "name": "created_at",
         "type_info": "Timestamptz"
+      },
+      {
+        "ordinal": 7,
+        "name": "seq",
+        "type_info": "Int8"
       }
     ],
     "parameters": {
       "Left": [
         "Uuid",
-        "Int8",
-        "Int8"
+        "Text",
+        "Numeric",
+        "Text",
+        "Text",
+        "Uuid"
       ]
     },
     "nullable": [
@@ -62,11 +60,10 @@
       false,
       false,
       false,
+      true,
       false,
-      true,
-      true,
       false
     ]
   },
-  "hash": "0238c7dfaf7e1859710f5bd943c182b017d3dc79c6fbae15a8e56d7bb0e73615"
+  "hash": "2b2acebe7adcdc4bfae4f07c906b5fb744a34221e458321aae5ab95dbc74e0fe"
 }

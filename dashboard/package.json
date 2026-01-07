@@ -1,7 +1,7 @@
 {
   "name": "ai-model-dashboard",
   "private": true,
-  "version": "0.19.1",
+  "version": "0.23.0",
   "type": "module",
   "scripts": {
     "dev": "vite",
@@ -78,7 +78,7 @@
     "eslint-plugin-react": "^7.37.5",
     "eslint-plugin-react-hooks": "^5.2.0",
     "eslint-plugin-react-refresh": "^0.4.20",
-    "globals": "^16.4.0",
+    "globals": "^17.0.0",
     "jsdom": "^27.0.0",
     "msw": "^2.10.5",
     "rollup-plugin-visualizer": "^6.0.5",

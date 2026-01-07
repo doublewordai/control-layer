@@ -1,9 +1,51 @@
+//! Request and response serialization for AI proxy analytics.
+//!
+//! This module provides the serialization layer between the [outlet] request logging
+//! middleware and the analytics database. It parses incoming AI requests, extracts
+//! usage metrics from responses, records analytics data, and handles credit deduction.
+//!
+//! # Request Path
+//!
+//! When [outlet] intercepts an incoming request, it calls [`parse_ai_request`] to parse
+//! the JSON body into an [`AiRequest`] variant (ChatCompletions, Completions, Embeddings,
+//! or Other). This happens synchronously before the request is forwarded upstream.
+//!
+//! # Response Path
+//!
+//! After the upstream response completes, [outlet] calls the response serializer.
+//! This is split into two phases:
+//!
+//! **Inline** (in the serializer closure):
+//! 1. Parse response body via [`parse_ai_response`] (handles JSON, SSE streams, compression)
+//! 2. Extract [`UsageMetrics`] (tokens, model, duration)
+//! 3. Extract auth info from headers
+//! 4. Return parsed [`AiResponse`] to outlet
+//!
+//! **Fire-and-forget** (spawned via `tokio::spawn`):
+//! 1. Lookup API key → user_id, email
+//! 2. Lookup model tariffs → price per token
+//! 3. Write [`HttpAnalyticsRow`] to `http_analytics` table
+//! 4. Deduct credits (if 2xx status and pricing configured)
+//! 5. Record Prometheus metrics
+//!
+//! The spawned task runs independently - outlet doesn't wait for it.
+//!
+//! # Credit Deduction
+//!
+//! Credits are deducted based on token usage and model-specific pricing. The serializer
+//! looks up the model's tariffs (input/output price per token) and creates a credit
+//! transaction for each successful request. Failed requests (non-2xx status codes) do
+//! not incur charges.
+//!
+//! [outlet]: https://github.com/doublewordai/outlet
+
 use crate::config::Config;
 use crate::db::errors::Result as DbResult;
 use crate::db::handlers::Credits;
 use crate::db::models::credits::{CreditTransactionCreateDBRequest, CreditTransactionType};
 use crate::request_logging::models::{AiRequest, AiResponse, ChatCompletionChunk, ParsedAIRequest};
 use crate::request_logging::utils::{extract_header_as_string, extract_header_as_uuid};
+use metrics::{counter, histogram};
 use outlet::{RequestData, ResponseData};
 use outlet_postgres::SerializationError;
 use rust_decimal::{Decimal, prelude::ToPrimitive};
@@ -11,7 +53,7 @@ use serde_json::Value;
 use sqlx::PgPool;
 use std::fmt;
 use std::str;
-use tracing::{debug, error, instrument, warn};
+use tracing::{Instrument, debug, error, info_span, instrument, warn};
 use uuid::Uuid;
 
 use super::utils;
@@ -115,6 +157,7 @@ pub struct UsageMetrics {
 /// # Behavior
 /// - Returns `AiRequest::Other(Value::Null)` for missing or empty bodies
 /// - On parse failure, returns error with base64-encoded body for safe PostgreSQL storage
+#[instrument(skip_all)]
 pub fn parse_ai_request(request_data: &RequestData) -> Result<ParsedAIRequest, SerializationError> {
     let headers = request_data
         .headers
@@ -173,6 +216,7 @@ pub fn parse_ai_request(request_data: &RequestData) -> Result<ParsedAIRequest, S
 /// - Handles gzip/brotli decompression based on Content-Encoding headers
 /// - Parses streaming responses (SSE format) vs non-streaming based on request stream parameter
 /// - On parse failure, returns error with base64-encoded decompressed body
+#[instrument(skip_all)]
 pub fn parse_ai_response(request_data: &RequestData, response_data: &ResponseData) -> Result<AiResponse, SerializationError> {
     let bytes = match &response_data.body {
         Some(body) => body.as_ref(),
@@ -221,6 +265,7 @@ impl UsageMetrics {
     ///
     /// # Returns
     /// A `UsageMetrics` struct with extracted model, tokens, and timing data
+    #[instrument(skip_all, name = "extract_usage_metrics")]
     pub fn extract(
         instance_id: Uuid,
         request_data: &RequestData,
@@ -265,6 +310,7 @@ impl UsageMetrics {
 
 impl Auth {
     /// Extract authentication from request headers
+    #[instrument(skip_all, name = "extract_auth")]
     pub fn from_request(request_data: &RequestData, _config: &Config) -> Self {
         // Check for API key in Authorization header
         if let Some(auth_header) = Self::get_header_value(request_data, "authorization")
@@ -396,6 +442,7 @@ pub async fn store_analytics_record(
             model_name
         )
         .fetch_optional(pool)
+        .instrument(info_span!("fetch_model_info"))
         .await?;
 
         if let Some(model_info) = model_info {
@@ -421,7 +468,7 @@ pub async fn store_analytics_record(
                 .map(|s| s.to_string())
                 .or(model_info.provider_name);
 
-            warn!(
+            debug!(
                 "Tariff pricing for model '{}' with purpose '{:?}': {:?}",
                 model_name, api_key_purpose, tariff_pricing
             );
@@ -526,6 +573,7 @@ pub async fn store_analytics_record(
         row.custom_id
     )
     .fetch_one(pool)
+    .instrument(info_span!("insert_http_analytics"))
     .await?;
 
     // =======================================================================
@@ -587,6 +635,7 @@ pub async fn store_analytics_record(
                             }
 
                             // Create usage transaction referencing the analytics record
+                            // Include fusillade_batch_id to enable fast batch grouping in transactions list
                             match credits
                                 .create_transaction(&CreditTransactionCreateDBRequest {
                                     user_id,
@@ -597,6 +646,7 @@ pub async fn store_analytics_record(
                                         "API usage: {} ({} input + {} output tokens)",
                                         model, row.prompt_tokens, row.completion_tokens
                                     )),
+                                    fusillade_batch_id: row.fusillade_batch_id,
                                 })
                                 .await
                             {
@@ -605,15 +655,16 @@ pub async fn store_analytics_record(
                                         user_id = %user_id,
                                         transaction_id = %result.id,
                                         amount = %total_cost,
-                                        balance_after = %result.balance_after,
                                         model = %model,
                                         "Credits deducted for API usage"
                                     );
-                                    crate::metrics::record_credit_deduction(
-                                        &user_id.to_string(),
-                                        model,
-                                        total_cost.to_f64().unwrap_or(0.0),
-                                    );
+                                    let cents = (total_cost.to_f64().unwrap_or(0.0) * 100.0).round() as u64;
+                                    counter!(
+                                        "dwctl_credits_deducted_total",
+                                        "user_id" => user_id.to_string(),
+                                        "model" => model.to_string()
+                                    )
+                                    .increment(cents);
                                 }
                                 Err(e) => {
                                     tracing::error!(
@@ -622,7 +673,7 @@ pub async fn store_analytics_record(
                                         user_id = %user_id,
                                         "Failed to create credit transaction for API usage"
                                     );
-                                    crate::metrics::record_credit_deduction_error();
+                                    counter!("dwctl_credits_deduction_errors_total").increment(1);
                                 }
                             }
                         }
@@ -633,7 +684,7 @@ pub async fn store_analytics_record(
                                 user_id = %user_id,
                                 "Failed to get user balance for credit deduction"
                             );
-                            crate::metrics::record_credit_deduction_error();
+                            counter!("dwctl_credits_deduction_errors_total").increment(1);
                         }
                     }
                 } else {
@@ -830,6 +881,13 @@ where
     /// metadata (status code, duration, model, user, etc.) is still recorded.
     pub fn create_serializer(self) -> impl Fn(&RequestData, &ResponseData) -> Result<AiResponse, SerializationError> + Send + Sync {
         move |request_data: &RequestData, response_data: &ResponseData| {
+            let serializer_span = info_span!(
+                "response_serializer",
+                correlation_id = request_data.correlation_id,
+                status = %response_data.status
+            );
+            let _guard = serializer_span.enter();
+
             // Try to parse the response - may fail for error responses (4xx, 5xx)
             let parse_result = parse_ai_response(request_data, response_data);
 
@@ -850,27 +908,40 @@ where
             let pool_clone = self.pool.clone();
             let metrics_recorder_clone = self.metrics_recorder.clone();
             let request_data_clone = request_data.clone();
+            let correlation_id = request_data.correlation_id;
 
             // The write to the analytics table and metrics recording
             // This runs for ALL responses, including errors
-            tokio::spawn(async move {
-                // Store to database - this enriches with user/pricing data and returns complete row
-                match store_analytics_record(&pool_clone, &metrics, &auth, &request_data_clone).await {
-                    Ok(complete_row) => {
-                        // Record metrics using the complete row (called AFTER database write)
-                        if let Some(ref recorder) = metrics_recorder_clone {
-                            recorder.record_from_analytics(&complete_row).await;
+            let async_span = info_span!("analytics_storage", correlation_id = correlation_id);
+            tokio::spawn(
+                async move {
+                    // Store to database - this enriches with user/pricing data and returns complete row
+                    let result = store_analytics_record(&pool_clone, &metrics, &auth, &request_data_clone).await;
+
+                    // Record analytics processing lag regardless of success/failure
+                    // This measures time from response completion to storage attempt completion
+                    let total_ms = chrono::Utc::now().signed_duration_since(metrics.timestamp).num_milliseconds();
+                    let lag_ms = total_ms - metrics.duration_ms;
+                    histogram!("dwctl_analytics_lag_seconds").record(lag_ms as f64 / 1000.0);
+
+                    match result {
+                        Ok(complete_row) => {
+                            // Record metrics using the complete row (called AFTER database write)
+                            if let Some(ref recorder) = metrics_recorder_clone {
+                                recorder.record_from_analytics(&complete_row).await;
+                            }
+                        }
+                        Err(e) => {
+                            error!(
+                                correlation_id = metrics.correlation_id,
+                                error = %e,
+                                "Failed to store analytics data"
+                            );
                         }
                     }
-                    Err(e) => {
-                        error!(
-                            correlation_id = metrics.correlation_id,
-                            error = %e,
-                            "Failed to store analytics data"
-                        );
-                    }
                 }
-            });
+                .instrument(async_span),
+            );
 
             // Return the parse result - outlet-postgres will handle SerializationError
             // by storing the fallback_data (base64 encoded response)
@@ -1782,6 +1853,7 @@ mod tests {
                         amount: balance,
                         source_id: "test_setup".to_string(),
                         description: Some("Initial test balance".to_string()),
+                        fusillade_batch_id: None,
                     })
                     .await
                     .expect("Failed to create initial balance");
@@ -1896,7 +1968,6 @@ mod tests {
 
             let usage_tx = usage_tx.unwrap();
             assert_eq!(usage_tx.amount, expected_cost, "Transaction amount should preserve full precision");
-            assert_eq!(usage_tx.balance_after, expected_balance, "Balance after should match");
         }
 
         #[sqlx::test]
@@ -2113,6 +2184,7 @@ mod tests {
                     amount: initial_balance,
                     source_id: "test_setup".to_string(),
                     description: Some("Initial test balance".to_string()),
+                    fusillade_batch_id: None,
                 })
                 .await
                 .expect("Failed to create initial balance");
@@ -2223,10 +2295,7 @@ mod tests {
             // Debug: Print all transactions to see the chain
             println!("\n=== All Transactions (most recent first) ===");
             for tx in &transactions {
-                println!(
-                    "  {:?} | amount: {} | balance_after: {} | prev_id: {:?}",
-                    tx.transaction_type, tx.amount, tx.balance_after, tx.previous_transaction_id
-                );
+                println!("  {:?} | amount: {}", tx.transaction_type, tx.amount);
             }
 
             // Verify: Final balance is correct (10 requests * 0.01 each = 0.10 total)

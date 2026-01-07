@@ -12,6 +12,7 @@ import {
 import { Tabs, TabsList, TabsTrigger } from "../../../ui/tabs";
 import { Input } from "../../../ui/input";
 import { ModelsContent } from "./ModelsContent";
+import { SupportRequestModal } from "../../../modals";
 import { useEndpoints } from "@/api/control-layer/hooks";
 import { useDebounce } from "@/hooks/useDebounce";
 import { useServerPagination } from "@/hooks/useServerPagination";
@@ -19,6 +20,7 @@ import { useServerPagination } from "@/hooks/useServerPagination";
 const Models: React.FC = () => {
   const [searchParams, setSearchParams] = useSearchParams();
   const { hasPermission } = useAuthorization();
+  const [isSupportModalOpen, setIsSupportModalOpen] = useState(false);
   const canManageGroups = hasPermission("manage-groups");
   const canViewAnalytics = hasPermission("analytics");
   const canViewEndpoints = hasPermission("endpoints");
@@ -87,10 +89,16 @@ const Models: React.FC = () => {
         {/* Header */}
         <div className="mb-6">
           <div className="flex flex-col lg:flex-row lg:items-center lg:justify-between gap-4">
-            <div>
+            <div className="flex items-baseline gap-3">
               <h1 className="text-2xl md:text-3xl font-bold text-doubleword-neutral-900">
                 Models
               </h1>
+              <button
+                onClick={() => setIsSupportModalOpen(true)}
+                className="text-sm text-blue-600 hover:text-blue-700"
+              >
+                Request a model
+              </button>
             </div>
             <div className="flex flex-col sm:flex-row items-stretch sm:items-center gap-3">
               {/* Access toggle for admins (not shown in status mode) */}
@@ -186,6 +194,12 @@ const Models: React.FC = () => {
           onClearFilters={handleClearFilters}
         />
       </Tabs>
+
+      <SupportRequestModal
+        isOpen={isSupportModalOpen}
+        onClose={() => setIsSupportModalOpen(false)}
+        defaultSubject="Model/Feature Request"
+      />
     </div>
   );
 };

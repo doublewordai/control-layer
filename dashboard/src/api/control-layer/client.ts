@@ -51,7 +51,7 @@ import type {
   BatchListResponse,
   BatchesListQuery,
   BatchAnalytics,
-  Transaction,
+  TransactionsListResponse,
   AddFundsRequest,
   AddFundsResponse,
   DaemonsListResponse,
@@ -776,11 +776,12 @@ const authApi = {
 
 // Cost management API
 const costApi = {
-  async listTransactions(query?: TransactionsQuery): Promise<Transaction[]> {
+  async listTransactions(query?: TransactionsQuery): Promise<TransactionsListResponse> {
     const params = new URLSearchParams();
     if (query?.limit) params.set("limit", query.limit.toString());
     if (query?.skip) params.set("skip", query.skip.toString());
     if (query?.userId) params.set("user_id", query.userId);
+    if (query?.group_batches !== undefined) params.set("group_batches", query.group_batches.toString());
 
     const url = `/admin/api/v1/transactions${params.toString() ? "?" + params.toString() : ""}`;
     const response = await fetch(url);

@@ -428,18 +428,24 @@ impl<'c> ApiKeys<'c> {
             WHERE dg.deployment_id = $1
             AND (
                 ak.user_id = $2  -- System user always has access
-                OR EXISTS (
-                    -- User's latest transaction has positive balance
-                    SELECT 1 FROM credits_transactions ct
-                    WHERE ct.user_id = ak.user_id
-                    AND ct.balance_after > 0
-                    AND NOT EXISTS (
-                        -- Make sure there's no newer transaction
-                        SELECT 1 FROM credits_transactions ct2
-                        WHERE ct2.user_id = ct.user_id
-                        AND (ct2.created_at > ct.created_at OR (ct2.created_at = ct.created_at AND ct2.id > ct.id))
+                OR (
+                    -- User has positive balance (checkpoint + delta calculation)
+                    SELECT COALESCE(
+                        (SELECT c.balance FROM user_balance_checkpoints c WHERE c.user_id = ak.user_id),
+                        0
+                    ) + COALESCE(
+                        (SELECT SUM(
+                            CASE WHEN ct.transaction_type IN ('purchase', 'admin_grant')
+                            THEN ct.amount ELSE -ct.amount END
+                        )
+                        FROM credits_transactions ct
+                        LEFT JOIN user_balance_checkpoints c ON c.user_id = ak.user_id
+                        WHERE ct.user_id = ak.user_id
+                        AND ct.seq > COALESCE(c.checkpoint_seq, 0)
+                        ),
+                        0
                     )
-                )
+                ) > 0
                 OR (
                     -- Free models are accessible to all users (zero balance OK)
                     -- A model is free if it has no active tariffs or all active tariffs are zero-priced
@@ -473,18 +479,24 @@ impl<'c> ApiKeys<'c> {
             AND ak.user_id != '00000000-0000-0000-0000-000000000000'  -- Exclude system user (already covered above)
             AND (
                 ak.user_id = $2  -- System user always has access
-                OR EXISTS (
-                    -- User's latest transaction has positive balance
-                    SELECT 1 FROM credits_transactions ct
-                    WHERE ct.user_id = ak.user_id
-                    AND ct.balance_after > 0
-                    AND NOT EXISTS (
-                        -- Make sure there's no newer transaction
-                        SELECT 1 FROM credits_transactions ct2
-                        WHERE ct2.user_id = ct.user_id
-                        AND (ct2.created_at > ct.created_at OR (ct2.created_at = ct.created_at AND ct2.id > ct.id))
+                OR (
+                    -- User has positive balance (checkpoint + delta calculation)
+                    SELECT COALESCE(
+                        (SELECT c.balance FROM user_balance_checkpoints c WHERE c.user_id = ak.user_id),
+                        0
+                    ) + COALESCE(
+                        (SELECT SUM(
+                            CASE WHEN ct.transaction_type IN ('purchase', 'admin_grant')
+                            THEN ct.amount ELSE -ct.amount END
+                        )
+                        FROM credits_transactions ct
+                        LEFT JOIN user_balance_checkpoints c ON c.user_id = ak.user_id
+                        WHERE ct.user_id = ak.user_id
+                        AND ct.seq > COALESCE(c.checkpoint_seq, 0)
+                        ),
+                        0
                     )
-                )
+                ) > 0
                 OR (
                     -- Free models are accessible to all users (zero balance OK)
                     -- A model is free if it has no active tariffs or all active tariffs are zero-priced
@@ -948,6 +960,7 @@ mod tests {
                     source_id: user.id.to_string(),
                     transaction_type: CreditTransactionType::AdminGrant,
                     description: Some("Initial credit for testing".to_string()),
+                    fusillade_batch_id: None,
                 })
                 .await
                 .unwrap();
@@ -1077,6 +1090,7 @@ mod tests {
                     source_id: user.id.to_string(),
                     transaction_type: CreditTransactionType::AdminGrant,
                     description: Some("Initial credit for testing".to_string()),
+                    fusillade_batch_id: None,
                 })
                 .await
                 .unwrap();
@@ -1219,6 +1233,7 @@ mod tests {
                     source_id: user.id.to_string(),
                     transaction_type: CreditTransactionType::AdminGrant,
                     description: Some("Initial credit for testing".to_string()),
+                    fusillade_batch_id: None,
                 })
                 .await
                 .unwrap();
@@ -1397,6 +1412,7 @@ mod tests {
                     source_id: user1.id.to_string(),
                     transaction_type: CreditTransactionType::AdminGrant,
                     description: Some("Initial credit for testing".to_string()),
+                    fusillade_batch_id: None,
                 })
                 .await
                 .unwrap();
@@ -1407,6 +1423,7 @@ mod tests {
                     source_id: user2.id.to_string(),
                     transaction_type: CreditTransactionType::AdminGrant,
                     description: Some("Initial credit for testing".to_string()),
+                    fusillade_batch_id: None,
                 })
                 .await
                 .unwrap();
@@ -1567,6 +1584,7 @@ mod tests {
                     source_id: user.id.to_string(),
                     transaction_type: CreditTransactionType::AdminGrant,
                     description: Some("Initial credit for testing".to_string()),
+                    fusillade_batch_id: None,
                 })
                 .await
                 .unwrap();
@@ -1705,6 +1723,7 @@ mod tests {
                     source_id: user.id.to_string(),
                     transaction_type: CreditTransactionType::AdminGrant,
                     description: Some("Initial credit for testing".to_string()),
+                    fusillade_batch_id: None,
                 })
                 .await
                 .unwrap();
@@ -1810,8 +1829,11 @@ mod tests {
             port: 3001,
             database_url: None,
             database: crate::config::DatabaseConfig::External {
-                pool_config: crate::config::DatabasePoolConfig::default(),
                 url: "postgres://test@localhost/test".to_string(),
+                replica_url: None,
+                pool: Default::default(),
+                fusillade: crate::config::default_fusillade_component(),
+                outlet: crate::config::default_outlet_component(),
             },
             admin_email: "admin@example.org".to_string(),
             admin_password: None,
@@ -1896,6 +1918,7 @@ mod tests {
                     source_id: user.id.to_string(),
                     transaction_type: CreditTransactionType::AdminGrant,
                     description: Some("Initial credit for testing".to_string()),
+                    fusillade_batch_id: None,
                 })
                 .await
                 .unwrap();
@@ -2747,6 +2770,7 @@ mod tests {
                 amount: Decimal::new(1000, 0),               // 1000 credits
                 source_id: uuid::Uuid::new_v4().to_string(), // Mimics Stripe payment ID
                 description: Some("Initial credits".to_string()),
+                fusillade_batch_id: None,
             })
             .await
             .unwrap();
@@ -2759,6 +2783,7 @@ mod tests {
                 amount: Decimal::new(100, 0),
                 source_id: uuid::Uuid::new_v4().to_string(), // Mimics Stripe payment ID
                 description: Some("Initial credits".to_string()),
+                fusillade_batch_id: None,
             })
             .await
             .unwrap();
@@ -2770,6 +2795,7 @@ mod tests {
                 amount: Decimal::new(120, 0),                // Deduct all credits
                 source_id: uuid::Uuid::new_v4().to_string(), // Mimics request ID from http_analytics
                 description: Some("Used all credits".to_string()),
+                fusillade_batch_id: None,
             })
             .await
             .unwrap();
@@ -2883,6 +2909,7 @@ mod tests {
                     amount: Decimal::new(10000, 2), // 100.00 credits
                     source_id: "test".to_string(),
                     description: Some("Platform Manager credits".to_string()),
+                    fusillade_batch_id: None,
                 })
                 .await
                 .unwrap();
@@ -3021,6 +3048,7 @@ mod tests {
                     amount: Decimal::new(100, 2),                // +1.00
                     source_id: uuid::Uuid::new_v4().to_string(), // Mimics Stripe payment ID
                     description: Some("Initial credits".to_string()),
+                    fusillade_batch_id: None,
                 })
                 .await
                 .unwrap();
@@ -3032,6 +3060,7 @@ mod tests {
                     amount: Decimal::new(1100, 2),               // -11.00
                     source_id: uuid::Uuid::new_v4().to_string(), // Mimics request ID from http_analytics
                     description: Some("Negative balance".to_string()),
+                    fusillade_batch_id: None,
                 })
                 .await
                 .unwrap();
@@ -3122,6 +3151,7 @@ mod tests {
                     amount: Decimal::new(10000, 2), // +100.00
                     source_id: "test".to_string(),
                     description: Some("Added credits".to_string()),
+                    fusillade_batch_id: None,
                 })
                 .await
                 .unwrap();

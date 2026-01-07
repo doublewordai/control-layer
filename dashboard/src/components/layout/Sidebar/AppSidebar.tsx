@@ -1,3 +1,4 @@
+import { useState } from "react";
 import { NavLink, Link, useNavigate } from "react-router-dom";
 import {
   Settings,
@@ -13,6 +14,7 @@ import {
   ChevronUp,
   DollarSign,
   BarChart3,
+  LifeBuoy,
 } from "lucide-react";
 import {
   useUser,
@@ -24,6 +26,7 @@ import { UserAvatar } from "../../ui";
 import { useAuthorization } from "../../../utils";
 import { useAuth } from "../../../contexts/auth";
 import { useSettings } from "../../../contexts";
+import { SupportRequestModal } from "../../modals";
 import type { FeatureFlags } from "../../../contexts/settings/types";
 import onwardsLogo from "../../../assets/onwards-logo.svg";
 import {
@@ -47,8 +50,6 @@ import {
   DropdownMenuItem,
   DropdownMenuTrigger,
 } from "@/components/ui/dropdown-menu";
-import type { Transaction } from "@/api/control-layer/types";
-import { useMemo } from "react";
 import { formatDollars } from "@/utils/money";
 
 interface NavItem {
@@ -65,6 +66,7 @@ export function AppSidebar() {
   const { canAccessRoute } = useAuthorization();
   const { logout } = useAuth();
   const { isFeatureEnabled } = useSettings();
+  const [isSupportModalOpen, setIsSupportModalOpen] = useState(false);
 
   const allNavItems: NavItem[] = [
     { path: "/models", icon: Layers, label: "Models" },
@@ -185,6 +187,10 @@ export function AppSidebar() {
               <DollarSign className="w-4 h-4 mr-2" />
               Billing
             </DropdownMenuItem>
+            <DropdownMenuItem onClick={() => setIsSupportModalOpen(true)}>
+              <LifeBuoy className="w-4 h-4 mr-2" />
+              Support
+            </DropdownMenuItem>
             <DropdownMenuItem onClick={() => logout()}>
               <LogOut className="w-4 h-4 mr-2" />
               Logout
@@ -192,6 +198,11 @@ export function AppSidebar() {
           </DropdownMenuContent>
         </DropdownMenu>
       </SidebarFooter>
+
+      <SupportRequestModal
+        isOpen={isSupportModalOpen}
+        onClose={() => setIsSupportModalOpen(false)}
+      />
     </Sidebar>
   );
 }
@@ -207,16 +218,12 @@ export function AppLayout({ children }: { children: React.ReactNode }) {
   const { data: transactionsData } = useTransactions({
     userId: user?.id || "",
   });
-  // Get transactions - use fetched data in both demo and API mode
-  // In demo mode, MSW returns data from transactions.json
-  const transactions = useMemo<Transaction[]>(() => {
-    return transactionsData || [];
-  }, [transactionsData]);
 
-  // Calculate current balance (in demo mode, use latest transaction balance)
+  // Calculate current balance
+  // In demo mode, use page_start_balance from transactions response; otherwise use user balance
   const currentBalance =
-    isDemoMode && transactions.length > 0
-      ? transactions[0]?.balance_after || balance
+    isDemoMode && transactionsData?.page_start_balance !== undefined
+      ? transactionsData.page_start_balance
       : balance;
 
   return (

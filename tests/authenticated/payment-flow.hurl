@@ -87,7 +87,7 @@ GET http://localhost:3001/admin/api/v1/transactions
 dwctl_session: {{admin_jwt}}
 HTTP 200
 [Asserts]
-jsonpath "$" isCollection
-jsonpath "$[0].source_id" exists
-jsonpath "$[0].transaction_type" exists
-jsonpath "$[0].description" exists
+jsonpath "$.data" isCollection
+jsonpath "$.data[0].source_id" exists
+jsonpath "$.data[0].transaction_type" exists
+jsonpath "$.data[0].description" exists

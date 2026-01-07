@@ -91,3 +91,6 @@ pub mod embedded;
 pub mod errors;
 pub mod handlers;
 pub mod models;
+pub mod pools;
+
+pub use pools::{DbPools, LabeledPool, PoolMetricsConfig, run_pool_metrics_sampler};
