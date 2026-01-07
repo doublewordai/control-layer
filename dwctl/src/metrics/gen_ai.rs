@@ -8,6 +8,7 @@
 
 use async_trait::async_trait;
 use prometheus::{HistogramOpts, HistogramVec, Registry};
+use tracing::instrument;
 
 use crate::{metrics::MetricsRecorder, request_logging::serializers::HttpAnalyticsRow};
 
@@ -146,6 +147,7 @@ impl GenAiMetrics {
 
 #[async_trait]
 impl MetricsRecorder for GenAiMetrics {
+    #[instrument(skip_all)]
     async fn record_from_analytics(&self, row: &HttpAnalyticsRow) {
         // Extract operation from response_type
         let operation = match row.response_type.as_str() {
