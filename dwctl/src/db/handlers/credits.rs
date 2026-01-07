@@ -365,7 +365,6 @@ impl<'c> Credits<'c> {
     async fn aggregate_user_batches(&mut self, user_id: UserId) -> Result<()> {
         // Atomically mark transactions as aggregated and aggregate them in one query
         // This uses UPDATE ... RETURNING with aggregation via CTE to avoid race conditions
-        // JOIN with http_analytics to get the model name for display
         let result = sqlx::query!(
             r#"
             WITH marked AS (
@@ -374,17 +373,7 @@ impl<'c> Credits<'c> {
                 WHERE user_id = $1
                   AND fusillade_batch_id IS NOT NULL
                   AND is_aggregated = false
-                RETURNING fusillade_batch_id, amount, seq, created_at, source_id
-            ),
-            with_model AS (
-                SELECT
-                    m.fusillade_batch_id,
-                    m.amount,
-                    m.seq,
-                    m.created_at,
-                    ha.model as model
-                FROM marked m
-                LEFT JOIN http_analytics ha ON m.source_id = ha.id::text
+                RETURNING fusillade_batch_id, amount, seq, created_at
             ),
             aggregated AS (
                 SELECT
@@ -392,19 +381,17 @@ impl<'c> Credits<'c> {
                     SUM(amount) as total_amount,
                     COUNT(*) as tx_count,
                     MAX(seq) as max_seq,
-                    MIN(created_at) as created_at,
-                    MIN(model) as model
-                FROM with_model
+                    MIN(created_at) as created_at
+                FROM marked
                 GROUP BY fusillade_batch_id
             )
-            INSERT INTO batch_aggregates (fusillade_batch_id, user_id, total_amount, transaction_count, max_seq, model, created_at, updated_at)
-            SELECT fusillade_batch_id, $1, total_amount, tx_count::int, max_seq, model, created_at, NOW()
+            INSERT INTO batch_aggregates (fusillade_batch_id, user_id, total_amount, transaction_count, max_seq, created_at, updated_at)
+            SELECT fusillade_batch_id, $1, total_amount, tx_count::int, max_seq, created_at, NOW()
             FROM aggregated
             ON CONFLICT (fusillade_batch_id) DO UPDATE SET
                 total_amount = batch_aggregates.total_amount + EXCLUDED.total_amount,
                 transaction_count = batch_aggregates.transaction_count + EXCLUDED.transaction_count,
                 max_seq = GREATEST(batch_aggregates.max_seq, EXCLUDED.max_seq),
-                model = COALESCE(batch_aggregates.model, EXCLUDED.model),
                 updated_at = NOW()
             RETURNING fusillade_batch_id
             "#,
@@ -452,10 +439,7 @@ impl<'c> Credits<'c> {
                     'usage' as "transaction_type!: CreditTransactionType",
                     ba.total_amount as amount,
                     ba.fusillade_batch_id::text as source_id,
-                    CASE
-                        WHEN ba.model IS NOT NULL THEN 'Batch - ' || ba.model
-                        ELSE 'Batch'
-                    END as description,
+                    'Batch' as description,
                     ba.created_at,
                     ba.max_seq,
                     ba.fusillade_batch_id as batch_id,

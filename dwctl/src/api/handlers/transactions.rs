@@ -1363,23 +1363,23 @@ mod tests {
         // Should have: 1 grant + 1 purchase + 1 batch1 + 1 batch2 + 2 individual = 6 total
         assert_eq!(transactions.len(), 6, "Should have 6 transactions with batch grouping");
 
-        // Find the batched transactions
+        // Find the batched transactions by their aggregated amounts
+        // Batch 1: 1.0 + 2.0 + 3.0 + 4.0 + 5.0 = 15.0
+        // Batch 2: 10.0 + 20.0 + 30.0 = 60.0
         let batch_1_txn = transactions
             .iter()
-            .find(|t| t.description == Some("Batch - gpt-4".to_string()))
-            .expect("Should have batch 1 aggregated transaction");
+            .find(|t| t.description == Some("Batch".to_string()) && t.amount == Decimal::from_str("15.0").unwrap())
+            .expect("Should have batch 1 aggregated transaction (amount 15.0)");
 
         let batch_2_txn = transactions
             .iter()
-            .find(|t| t.description == Some("Batch - gpt-3.5-turbo".to_string()))
-            .expect("Should have batch 2 aggregated transaction");
+            .find(|t| t.description == Some("Batch".to_string()) && t.amount == Decimal::from_str("60.0").unwrap())
+            .expect("Should have batch 2 aggregated transaction (amount 60.0)");
 
-        // Verify batch 1 aggregation: 1.0 + 2.0 + 3.0 + 4.0 + 5.0 = 15.0
-        assert_eq!(batch_1_txn.amount, Decimal::from_str("15.0").unwrap(), "Batch 1 should sum to 15.0");
+        // Verify batch 1 has batch_id
         assert!(batch_1_txn.batch_id.is_some(), "Batch 1 should have batch_id");
 
-        // Verify batch 2 aggregation: 10.0 + 20.0 + 30.0 = 60.0
-        assert_eq!(batch_2_txn.amount, Decimal::from_str("60.0").unwrap(), "Batch 2 should sum to 60.0");
+        // Verify batch 2 has batch_id
         assert!(batch_2_txn.batch_id.is_some(), "Batch 2 should have batch_id");
 
         // Verify individual usage transactions are still present
