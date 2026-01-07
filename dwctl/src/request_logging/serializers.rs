@@ -635,6 +635,7 @@ pub async fn store_analytics_record(
                             }
 
                             // Create usage transaction referencing the analytics record
+                            // Include fusillade_batch_id to enable fast batch grouping in transactions list
                             match credits
                                 .create_transaction(&CreditTransactionCreateDBRequest {
                                     user_id,
@@ -645,6 +646,7 @@ pub async fn store_analytics_record(
                                         "API usage: {} ({} input + {} output tokens)",
                                         model, row.prompt_tokens, row.completion_tokens
                                     )),
+                                    fusillade_batch_id: row.fusillade_batch_id,
                                 })
                                 .await
                             {
@@ -1851,6 +1853,7 @@ mod tests {
                         amount: balance,
                         source_id: "test_setup".to_string(),
                         description: Some("Initial test balance".to_string()),
+                        fusillade_batch_id: None,
                     })
                     .await
                     .expect("Failed to create initial balance");
@@ -2181,6 +2184,7 @@ mod tests {
                     amount: initial_balance,
                     source_id: "test_setup".to_string(),
                     description: Some("Initial test balance".to_string()),
+                    fusillade_batch_id: None,
                 })
                 .await
                 .expect("Failed to create initial balance");

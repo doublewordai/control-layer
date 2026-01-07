@@ -1133,6 +1133,7 @@ mod tests {
                     amount: Decimal::new(1000, 2),
                     source_id: "test".to_string(),
                     description: Some("Added credits".to_string()),
+                    fusillade_batch_id: None,
                 })
                 .await
                 .unwrap();

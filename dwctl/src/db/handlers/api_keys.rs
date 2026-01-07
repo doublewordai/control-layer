@@ -960,6 +960,7 @@ mod tests {
                     source_id: user.id.to_string(),
                     transaction_type: CreditTransactionType::AdminGrant,
                     description: Some("Initial credit for testing".to_string()),
+                    fusillade_batch_id: None,
                 })
                 .await
                 .unwrap();
@@ -1089,6 +1090,7 @@ mod tests {
                     source_id: user.id.to_string(),
                     transaction_type: CreditTransactionType::AdminGrant,
                     description: Some("Initial credit for testing".to_string()),
+                    fusillade_batch_id: None,
                 })
                 .await
                 .unwrap();
@@ -1231,6 +1233,7 @@ mod tests {
                     source_id: user.id.to_string(),
                     transaction_type: CreditTransactionType::AdminGrant,
                     description: Some("Initial credit for testing".to_string()),
+                    fusillade_batch_id: None,
                 })
                 .await
                 .unwrap();
@@ -1409,6 +1412,7 @@ mod tests {
                     source_id: user1.id.to_string(),
                     transaction_type: CreditTransactionType::AdminGrant,
                     description: Some("Initial credit for testing".to_string()),
+                    fusillade_batch_id: None,
                 })
                 .await
                 .unwrap();
@@ -1419,6 +1423,7 @@ mod tests {
                     source_id: user2.id.to_string(),
                     transaction_type: CreditTransactionType::AdminGrant,
                     description: Some("Initial credit for testing".to_string()),
+                    fusillade_batch_id: None,
                 })
                 .await
                 .unwrap();
@@ -1579,6 +1584,7 @@ mod tests {
                     source_id: user.id.to_string(),
                     transaction_type: CreditTransactionType::AdminGrant,
                     description: Some("Initial credit for testing".to_string()),
+                    fusillade_batch_id: None,
                 })
                 .await
                 .unwrap();
@@ -1717,6 +1723,7 @@ mod tests {
                     source_id: user.id.to_string(),
                     transaction_type: CreditTransactionType::AdminGrant,
                     description: Some("Initial credit for testing".to_string()),
+                    fusillade_batch_id: None,
                 })
                 .await
                 .unwrap();
@@ -1912,6 +1919,7 @@ mod tests {
                     source_id: user.id.to_string(),
                     transaction_type: CreditTransactionType::AdminGrant,
                     description: Some("Initial credit for testing".to_string()),
+                    fusillade_batch_id: None,
                 })
                 .await
                 .unwrap();
@@ -2763,6 +2771,7 @@ mod tests {
                 amount: Decimal::new(1000, 0),               // 1000 credits
                 source_id: uuid::Uuid::new_v4().to_string(), // Mimics Stripe payment ID
                 description: Some("Initial credits".to_string()),
+                fusillade_batch_id: None,
             })
             .await
             .unwrap();
@@ -2775,6 +2784,7 @@ mod tests {
                 amount: Decimal::new(100, 0),
                 source_id: uuid::Uuid::new_v4().to_string(), // Mimics Stripe payment ID
                 description: Some("Initial credits".to_string()),
+                fusillade_batch_id: None,
             })
             .await
             .unwrap();
@@ -2786,6 +2796,7 @@ mod tests {
                 amount: Decimal::new(120, 0),                // Deduct all credits
                 source_id: uuid::Uuid::new_v4().to_string(), // Mimics request ID from http_analytics
                 description: Some("Used all credits".to_string()),
+                fusillade_batch_id: None,
             })
             .await
             .unwrap();
@@ -2899,6 +2910,7 @@ mod tests {
                     amount: Decimal::new(10000, 2), // 100.00 credits
                     source_id: "test".to_string(),
                     description: Some("Platform Manager credits".to_string()),
+                    fusillade_batch_id: None,
                 })
                 .await
                 .unwrap();
@@ -3037,6 +3049,7 @@ mod tests {
                     amount: Decimal::new(100, 2),                // +1.00
                     source_id: uuid::Uuid::new_v4().to_string(), // Mimics Stripe payment ID
                     description: Some("Initial credits".to_string()),
+                    fusillade_batch_id: None,
                 })
                 .await
                 .unwrap();
@@ -3048,6 +3061,7 @@ mod tests {
                     amount: Decimal::new(1100, 2),               // -11.00
                     source_id: uuid::Uuid::new_v4().to_string(), // Mimics request ID from http_analytics
                     description: Some("Negative balance".to_string()),
+                    fusillade_batch_id: None,
                 })
                 .await
                 .unwrap();
@@ -3138,6 +3152,7 @@ mod tests {
                     amount: Decimal::new(10000, 2), // +100.00
                     source_id: "test".to_string(),
                     description: Some("Added credits".to_string()),
+                    fusillade_batch_id: None,
                 })
                 .await
                 .unwrap();

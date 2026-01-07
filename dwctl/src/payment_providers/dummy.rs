@@ -158,6 +158,7 @@ impl PaymentProvider for DummyProvider {
             amount: payment_session.amount,
             source_id: session_id.to_string(),
             description: Some(description),
+            fusillade_batch_id: None,
         };
 
         match credits.create_transaction(&request).await {

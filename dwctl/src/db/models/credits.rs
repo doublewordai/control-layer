@@ -26,6 +26,8 @@ pub struct CreditTransactionCreateDBRequest {
     pub amount: Decimal,
     pub source_id: String,
     pub description: Option<String>,
+    /// Batch ID for fusillade batch requests (denormalized from http_analytics)
+    pub fusillade_batch_id: Option<Uuid>,
 }
 
 impl CreditTransactionCreateDBRequest {
@@ -37,6 +39,7 @@ impl CreditTransactionCreateDBRequest {
             amount,
             source_id: format!("{}_{}", grantor_id, uuid::Uuid::new_v4()),
             description,
+            fusillade_batch_id: None,
         }
     }
 }
