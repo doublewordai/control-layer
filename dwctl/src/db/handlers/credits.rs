@@ -310,17 +310,17 @@ impl<'c> Credits<'c> {
         Ok(result.count.unwrap_or(0))
     }
 
-    /// Count transactions with batch grouping applied
-    /// Returns the count of aggregated results (batches count as 1, not N)
-    /// Uses pre-aggregated batch_aggregates table for O(1) batch counting
-    #[instrument(skip(self), fields(user_id = ?user_id.map(|id| abbrev_uuid(&id))), err)]
-    pub async fn count_transactions_with_batches(&mut self, user_id: Option<UserId>) -> Result<i64> {
+    /// Count transactions with batch grouping applied for a specific user.
+    /// Returns the count of aggregated results (batches count as 1, not N).
+    /// Uses pre-aggregated batch_aggregates table for O(1) batch counting.
+    #[instrument(skip(self), fields(user_id = %abbrev_uuid(&user_id)), err)]
+    pub async fn count_transactions_with_batches(&mut self, user_id: UserId) -> Result<i64> {
         let result = sqlx::query!(
             r#"
             SELECT
-                (SELECT COUNT(*) FROM batch_aggregates WHERE ($1::uuid IS NULL OR user_id = $1))
+                (SELECT COUNT(*) FROM batch_aggregates WHERE user_id = $1)
                 +
-                (SELECT COUNT(*) FROM credits_transactions WHERE ($1::uuid IS NULL OR user_id = $1) AND fusillade_batch_id IS NULL)
+                (SELECT COUNT(*) FROM credits_transactions WHERE user_id = $1 AND fusillade_batch_id IS NULL)
             as "count!"
             "#,
             user_id
@@ -409,20 +409,13 @@ impl<'c> Credits<'c> {
 
     /// List transactions with batch grouping applied using pre-aggregated batch_aggregates table.
     /// Uses optimized query with pre-limited UNION branches for O(limit) performance.
-    /// Pass None for user_id to fall back to old slow query (admin view).
-    #[instrument(skip(self), fields(user_id = ?user_id.map(|id| abbrev_uuid(&id)), skip = skip, limit = limit), err)]
+    #[instrument(skip(self), fields(user_id = %abbrev_uuid(&user_id), skip = skip, limit = limit), err)]
     pub async fn list_transactions_with_batches(
         &mut self,
-        user_id: Option<UserId>,
+        user_id: UserId,
         skip: i64,
         limit: i64,
     ) -> Result<Vec<(CreditTransactionDBResponse, Option<Uuid>)>> {
-        // For admin view (no user filter), fall back to old query
-        // The optimization only works with user_id filter due to index design
-        let Some(user_id) = user_id else {
-            return self.list_transactions_with_batches_slow(None, skip, limit).await;
-        };
-
         // Perform lazy aggregation for any new unaggregated transactions
         self.aggregate_user_batches(user_id).await?;
 
@@ -495,101 +488,6 @@ impl<'c> Credits<'c> {
             let created_at = row
                 .created_at
                 .ok_or_else(|| sqlx::Error::Protocol("Query returned NULL created_at".to_string()))?;
-
-            let transaction = CreditTransactionDBResponse {
-                id,
-                user_id: row_user_id,
-                transaction_type: row.transaction_type,
-                amount,
-                description: row.description,
-                source_id,
-                created_at,
-            };
-            results.push((transaction, row.batch_id));
-        }
-
-        Ok(results)
-    }
-
-    /// Slow fallback query for admin view (no user filter).
-    /// This uses the old JOIN-based approach which is slow but works for all users.
-    #[instrument(skip(self), fields(user_id = ?user_id.map(|id| abbrev_uuid(&id)), skip = skip, limit = limit), err)]
-    async fn list_transactions_with_batches_slow(
-        &mut self,
-        user_id: Option<UserId>,
-        skip: i64,
-        limit: i64,
-    ) -> Result<Vec<(CreditTransactionDBResponse, Option<Uuid>)>> {
-        let rows = sqlx::query!(
-            r#"
-            SELECT * FROM (
-                -- Part 1: Aggregated batch transactions
-                SELECT
-                    (array_agg(ct.id ORDER BY ct.seq))[1] as id,
-                    ct.user_id,
-                    'usage' as "transaction_type!: CreditTransactionType",
-                    SUM(ct.amount) as amount,
-                    MIN(ct.source_id) as source_id,
-                    CASE
-                        WHEN MIN(ha.model) IS NOT NULL THEN 'Batch - ' || MIN(ha.model)
-                        ELSE 'Batch'
-                    END as description,
-                    MAX(ct.created_at) as created_at,
-                    MAX(ct.seq) as max_seq,
-                    ha.fusillade_batch_id as batch_id
-                FROM credits_transactions ct
-                JOIN http_analytics ha
-                    ON ct.source_id = ha.id::text
-                    AND ct.transaction_type = 'usage'
-                WHERE ($1::uuid IS NULL OR ct.user_id = $1)
-                    AND ha.fusillade_batch_id IS NOT NULL
-                GROUP BY ha.fusillade_batch_id, ct.user_id
-
-                UNION ALL
-
-                -- Part 2: Non-batched transactions
-                SELECT
-                    ct.id,
-                    ct.user_id,
-                    ct.transaction_type as "transaction_type!: CreditTransactionType",
-                    ct.amount,
-                    ct.source_id,
-                    ct.description,
-                    ct.created_at,
-                    ct.seq as max_seq,
-                    NULL::uuid as batch_id
-                FROM credits_transactions ct
-                LEFT JOIN http_analytics ha ON ct.source_id = ha.id::text AND ct.transaction_type = 'usage'
-                WHERE ($1::uuid IS NULL OR ct.user_id = $1)
-                    AND (ct.transaction_type != 'usage' OR ha.fusillade_batch_id IS NULL)
-            ) combined
-            ORDER BY max_seq DESC
-            LIMIT $2 OFFSET $3
-            "#,
-            user_id,
-            limit,
-            skip
-        )
-        .fetch_all(&mut *self.db)
-        .await?;
-
-        let mut results = Vec::new();
-        for row in rows {
-            let id = row
-                .id
-                .ok_or_else(|| sqlx::Error::Protocol("Batch aggregation returned NULL id".to_string()))?;
-            let row_user_id = row
-                .user_id
-                .ok_or_else(|| sqlx::Error::Protocol("Batch aggregation returned NULL user_id".to_string()))?;
-            let amount = row
-                .amount
-                .ok_or_else(|| sqlx::Error::Protocol("Batch aggregation returned NULL amount".to_string()))?;
-            let source_id = row
-                .source_id
-                .ok_or_else(|| sqlx::Error::Protocol("Batch aggregation returned NULL source_id".to_string()))?;
-            let created_at = row
-                .created_at
-                .ok_or_else(|| sqlx::Error::Protocol("Batch aggregation returned NULL created_at".to_string()))?;
 
             let transaction = CreditTransactionDBResponse {
                 id,
