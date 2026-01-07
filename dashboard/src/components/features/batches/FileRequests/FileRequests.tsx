@@ -1,4 +1,4 @@
-import { useState, useMemo, useEffect } from "react";
+import { useState, useMemo } from "react";
 import { useParams, useNavigate, useSearchParams } from "react-router-dom";
 import {
   ArrowLeft,
@@ -61,12 +61,6 @@ export function FileRequests() {
 
   // Use pagination hook for URL-based pagination state
   const pagination = useServerPagination({ defaultPageSize: 10 });
-
-  // Reset pagination when debounced search changes
-  useEffect(() => {
-    pagination.handleReset();
-    /* eslint-disable-next-line */
-  }, [debouncedSearch]);
 
   // Get file details - works for input, output, or error files
   const { data: file } = useFile(fileId || "");
@@ -179,7 +173,10 @@ export function FileRequests() {
         searchPlaceholder="Search by custom ID..."
         externalSearch={{
           value: searchInput,
-          onChange: setSearchInput,
+          onChange: (value) => {
+            setSearchInput(value);
+            pagination.handleReset();
+          },
         }}
         showColumnToggle={true}
         pageSize={pagination.pageSize}

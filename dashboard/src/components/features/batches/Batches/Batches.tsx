@@ -125,17 +125,6 @@ export function Batches({
     defaultPageSize: 10,
   });
 
-  // Reset pagination when search changes
-  useEffect(() => {
-    filesPagination.handleFirstPage();
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [debouncedFileSearch]);
-
-  useEffect(() => {
-    batchesPagination.handleFirstPage();
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [debouncedBatchSearch]);
-
   // API queries
   // Paginated files query for display in Files tab
   // Map fileType to purpose filter
@@ -531,7 +520,10 @@ export function Batches({
             searchPlaceholder="Search batches..."
             externalSearch={{
               value: batchSearchQuery,
-              onChange: setBatchSearchQuery,
+              onChange: (value) => {
+                setBatchSearchQuery(value);
+                batchesPagination.handleFirstPage();
+              },
             }}
             showColumnToggle={true}
             pageSize={batchesPagination.pageSize}
@@ -614,7 +606,10 @@ export function Batches({
             searchPlaceholder="Search files..."
             externalSearch={{
               value: fileSearchQuery,
-              onChange: setFileSearchQuery,
+              onChange: (value) => {
+                setFileSearchQuery(value);
+                filesPagination.handleFirstPage();
+              },
             }}
             showColumnToggle={true}
             pageSize={filesPagination.pageSize}
