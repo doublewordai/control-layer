@@ -1,5 +1,18 @@
 # Changelog
 
+## [0.23.0](https://github.com/doublewordai/control-layer/compare/v0.22.0...v0.23.0) (2026-01-07)
+
+
+### Features
+
+* add tracing instrumentation to request serialization flow ([#459](https://github.com/doublewordai/control-layer/issues/459)) ([f8cd68a](https://github.com/doublewordai/control-layer/commit/f8cd68a9ba92b2698b3a6150d6e88d5bc308464b))
+* make pool metrics sample interval configurable ([#457](https://github.com/doublewordai/control-layer/issues/457)) ([1bd23c7](https://github.com/doublewordai/control-layer/commit/1bd23c7741f06e9ce422b6d3b4629aca81db2336))
+
+
+### Bug Fixes
+
+* **deps:** update rust crate fusillade to 0.13.0 ([#462](https://github.com/doublewordai/control-layer/issues/462)) ([b6682dd](https://github.com/doublewordai/control-layer/commit/b6682dd38855660cf5c633061994e595f6e804ae))
+
 ## [0.22.0](https://github.com/doublewordai/control-layer/compare/v0.21.1...v0.22.0) (2026-01-07)
 
 
