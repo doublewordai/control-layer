@@ -68,7 +68,8 @@ const AI_API_BASE_URL = import.meta.env.VITE_AI_API_BASE_URL || '';
 const getAiApiUrl = (path: string): string => {
   if (AI_API_BASE_URL) {
     // When using api.doubleword.ai, strip /ai prefix because ingress adds it
-    return `${AI_API_BASE_URL}${path.replace(/^\/ai/, '')}`;
+    // Use lookahead to match /ai only when followed by / to avoid false matches
+    return `${AI_API_BASE_URL}${path.replace(/^\/ai(?=\/)/, '')}`;
   }
   // When using same origin (app.doubleword.ai), keep /ai prefix
   return path;
