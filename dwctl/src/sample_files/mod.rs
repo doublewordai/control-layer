@@ -64,7 +64,7 @@ pub fn find_matching_model(deployments: &[DeploymentDBResponse], generator: &dyn
 ///
 /// This function iterates through all registered sample generators and creates
 /// a sample file for each one where the user has access to a matching model.
-/// Files are created via the fusillade storage layer.
+/// Files are created via the fusillade storage layer with proper ownership metadata.
 ///
 /// # Arguments
 /// * `storage` - The fusillade storage implementation
@@ -84,6 +84,9 @@ pub async fn create_sample_files_for_user<S: Storage>(
     accessible_deployments: &[DeploymentDBResponse],
     config: &SampleFilesConfig,
 ) -> Result<Vec<FileId>> {
+    use fusillade::{FileMetadata, FileStreamItem};
+    use futures::stream;
+
     let mut created_files = Vec::new();
 
     for generator in get_generators() {
@@ -100,9 +103,33 @@ pub async fn create_sample_files_for_user<S: Storage>(
         // Generate requests using the generator
         let templates = generator.generate(&model_alias, api_key, endpoint, config.requests_per_file);
 
-        // Create file via fusillade
+        // Calculate file size (each template serialized as JSON + newline)
+        let size_bytes: i64 = templates
+            .iter()
+            .map(|t| {
+                serde_json::to_string(t)
+                    .map(|s| s.len() as i64 + 1) // +1 for newline
+                    .unwrap_or(0)
+            })
+            .sum();
+
+        // Build stream items with metadata including purpose, uploaded_by, and size
+        let mut items = vec![FileStreamItem::Metadata(FileMetadata {
+            filename: Some(generator.name().to_string()),
+            description: Some(generator.description().to_string()),
+            purpose: Some("batch".to_string()),
+            uploaded_by: Some(user_id.to_string()),
+            size_bytes: Some(size_bytes),
+            ..Default::default()
+        })];
+
+        for template in templates {
+            items.push(FileStreamItem::Template(template));
+        }
+
+        // Create file via fusillade with streaming to include metadata
         let file_id = storage
-            .create_file(generator.name().to_string(), Some(generator.description().to_string()), templates)
+            .create_file_stream(stream::iter(items))
             .await
             .map_err(|e| crate::errors::Error::Internal {
                 operation: format!("create sample file '{}': {}", generator.name(), e),
