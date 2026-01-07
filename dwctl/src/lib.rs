@@ -224,6 +224,7 @@ pub struct AppState {
     pub config: Config,
     pub outlet_db: Option<PgPool>,
     pub metrics_recorder: Option<GenAiMetrics>,
+    pub shared_metrics_registry: Option<Arc<prometheus::Registry>>,
     #[builder(default = false)]
     pub is_leader: bool,
     pub request_manager: Arc<fusillade::PostgresRequestManager<fusillade::ReqwestHttpClient>>,
@@ -661,16 +662,21 @@ fn create_cors_layer(config: &Config) -> anyhow::Result<CorsLayer> {
 /// Returns an error if CORS configuration is invalid or metrics initialization fails.
 #[instrument(skip_all)]
 pub async fn build_router(state: &mut AppState, onwards_router: Router) -> anyhow::Result<Router> {
+    // Initialize metrics if enabled
+    if state.config.enable_metrics {
+        let registry = Arc::new(prometheus::Registry::new());
+
+        // Create GenAI metrics for user-facing API
+        let gen_ai_metrics = GenAiMetrics::new(&registry)
+            .map_err(|e| anyhow::anyhow!("Failed to create GenAI metrics: {}", e))?;
+        state.metrics_recorder = Some(gen_ai_metrics);
+
+        // Store shared registry (daemon will create its own metrics from this)
+        state.shared_metrics_registry = Some(registry);
+    }
+
     // Setup request logging if enabled
     let outlet_layer = if let Some(outlet_pool) = state.outlet_db.as_ref() {
-        // Initialize GenAI metrics BEFORE creating analytics serializer if metrics enabled
-        if state.config.enable_metrics {
-            let gen_ai_registry = prometheus::Registry::new();
-            let gen_ai_metrics =
-                GenAiMetrics::new(&gen_ai_registry).map_err(|e| anyhow::anyhow!("Failed to create GenAI metrics: {}", e))?;
-            state.metrics_recorder = Some(gen_ai_metrics);
-        }
-
         let analytics_serializer = AnalyticsResponseSerializer::new(
             state.db.clone(),
             uuid::Uuid::new_v4(),
@@ -901,15 +907,18 @@ pub async fn build_router(state: &mut AppState, onwards_router: Router) -> anyho
     if state.config.enable_metrics {
         let (prometheus_layer, metric_handle) = PrometheusMetricLayer::pair();
 
-        // Get the GenAI registry from the metrics recorder (already initialized earlier)
-        let gen_ai_registry = if let Some(ref recorder) = state.metrics_recorder {
+        // Get the shared registry (contains both GenAI and Fusillade metrics)
+        let metrics_registry = if let Some(ref shared_reg) = state.shared_metrics_registry {
+            shared_reg.as_ref().clone()
+        } else if let Some(ref recorder) = state.metrics_recorder {
+            // Fallback: use GenAI-only registry if shared registry wasn't initialized
             recorder.registry().clone()
         } else {
-            // Fallback: create empty registry if somehow metrics recorder wasn't initialized
+            // Fallback: create empty registry if somehow metrics weren't initialized
             prometheus::Registry::new()
         };
 
-        // Add metrics endpoint that combines both axum-prometheus and GenAI metrics
+        // Add metrics endpoint that combines axum-prometheus, GenAI, and Fusillade metrics
         router = router
             .route(
                 "/internal/metrics",
@@ -919,14 +928,14 @@ pub async fn build_router(state: &mut AppState, onwards_router: Router) -> anyho
                     // Get axum-prometheus metrics
                     let mut axum_metrics = metric_handle.render();
 
-                    // Get GenAI metrics
+                    // Get all metrics from shared registry (GenAI + Fusillade)
                     let encoder = TextEncoder::new();
-                    let gen_ai_families = gen_ai_registry.gather();
-                    let mut gen_ai_buffer = vec![];
-                    encoder.encode(&gen_ai_families, &mut gen_ai_buffer).unwrap();
+                    let metric_families = metrics_registry.gather();
+                    let mut buffer = vec![];
+                    encoder.encode(&metric_families, &mut buffer).unwrap();
 
                     // Combine both
-                    axum_metrics.push_str(&String::from_utf8_lossy(&gen_ai_buffer));
+                    axum_metrics.push_str(&String::from_utf8_lossy(&buffer));
                     axum_metrics
                 }),
             )
@@ -1180,7 +1189,11 @@ async fn setup_background_services(
         use fusillade::DaemonExecutor;
         match config.background_services.batch_daemon.enabled {
             DaemonEnabled::Always | DaemonEnabled::Leader => {
-                let daemon_handle = request_manager.clone().run(shutdown_token.clone())?;
+                let daemon_handle = request_manager.clone().run(
+                    shutdown_token.clone(),
+                    #[cfg(feature = "fusillade-metrics")]
+                    state.shared_metrics_registry.clone(),
+                )?;
                 // Spawn task that propagates daemon errors
                 background_tasks.spawn("fusillade-daemon", async move {
                     match daemon_handle.await {
@@ -1213,7 +1226,11 @@ async fn setup_background_services(
         use crate::config::DaemonEnabled;
         if config.background_services.batch_daemon.enabled == DaemonEnabled::Always {
             use fusillade::DaemonExecutor;
-            let daemon_handle = request_manager.clone().run(shutdown_token.clone())?;
+            let daemon_handle = request_manager.clone().run(
+                shutdown_token.clone(),
+                #[cfg(feature = "fusillade-metrics")]
+                state.shared_metrics_registry.clone(),
+            )?;
             // Spawn task that propagates daemon errors
             background_tasks.spawn("fusillade-daemon", async move {
                 match daemon_handle.await {
