@@ -67,6 +67,7 @@ pub async fn create_transaction(
         amount: data.amount,
         source_id: data.source_id,
         description: data.description,
+        fusillade_batch_id: None,
     };
 
     let transaction = repo.create_transaction(&db_request).await?;
@@ -1199,6 +1200,7 @@ mod tests {
             amount: Decimal::from_str("500.0").unwrap(),
             source_id: Uuid::new_v4().to_string(),
             description: Some("Purchase".to_string()),
+            fusillade_batch_id: None,
         };
         credits_repo
             .create_transaction(&purchase_request)
@@ -1236,6 +1238,7 @@ mod tests {
                 amount: Decimal::from_str(&format!("{}.0", i + 1)).unwrap(), // 1.0, 2.0, 3.0, 4.0, 5.0
                 source_id: analytics_record.id.to_string(),
                 description: Some(format!("Batch 1 request {}", i)),
+                fusillade_batch_id: Some(batch_id_1),
             };
             credits_repo
                 .create_transaction(&usage_request)
@@ -1270,6 +1273,7 @@ mod tests {
                 amount: Decimal::from_str(&format!("{}.0", (i + 1) * 10)).unwrap(), // 10.0, 20.0, 30.0
                 source_id: analytics_record.id.to_string(),
                 description: Some(format!("Batch 2 request {}", i)),
+                fusillade_batch_id: Some(batch_id_2),
             };
             credits_repo
                 .create_transaction(&usage_request)
@@ -1303,6 +1307,7 @@ mod tests {
                 amount: Decimal::from_str(&format!("{}.0", i + 1)).unwrap(), // 1.0, 2.0
                 source_id: analytics_record.id.to_string(),
                 description: Some(format!("Individual request {}", i)),
+                fusillade_batch_id: None, // Not in a batch
             };
             credits_repo
                 .create_transaction(&usage_request)
@@ -1436,6 +1441,7 @@ mod tests {
                     amount: Decimal::from_str("1.0").unwrap(),
                     source_id: analytics_record.id.to_string(),
                     description: Some(format!("Batch {} request {}", batch_num, req_num)),
+                    fusillade_batch_id: Some(batch_id),
                 };
                 credits_repo
                     .create_transaction(&usage_request)
@@ -1549,6 +1555,7 @@ mod tests {
                     amount: Decimal::from_str(&format!("{}.0", i + 1)).unwrap(),
                     source_id: analytics_record.id.to_string(),
                     description: Some(format!("{} batch request {}", user_name, i)),
+                    fusillade_batch_id: Some(batch_id),
                 };
                 credits_repo
                     .create_transaction(&usage_request)
