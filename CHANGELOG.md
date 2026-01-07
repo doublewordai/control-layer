@@ -1,5 +1,17 @@
 # Changelog
 
+## [0.24.0](https://github.com/doublewordai/control-layer/compare/v0.23.0...v0.24.0) (2026-01-07)
+
+
+### Features
+
+* batch aggregation optimization for transactions endpoint ([#465](https://github.com/doublewordai/control-layer/issues/465)) ([d567568](https://github.com/doublewordai/control-layer/commit/d5675681083b5d8f76a8d16da26d7dbe1b8af89d))
+
+
+### Bug Fixes
+
+* Jansix testing fe fixes ([#464](https://github.com/doublewordai/control-layer/issues/464)) ([4492b47](https://github.com/doublewordai/control-layer/commit/4492b4748b9570c158d9e6318251bd2e7c14ce3f))
+
 ## [0.23.0](https://github.com/doublewordai/control-layer/compare/v0.22.0...v0.23.0) (2026-01-07)
 
 
