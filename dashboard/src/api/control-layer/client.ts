@@ -1107,12 +1107,13 @@ const filesApi = {
     id: string,
     completionWindow?: string,
   ): Promise<FileCostEstimate> {
-    const baseUrl = AI_API_BASE_URL || window.location.origin;
-    const url = new URL(`/ai/v1/files/${id}/cost-estimate`, baseUrl);
+    const params = new URLSearchParams();
     if (completionWindow) {
-      url.searchParams.set("completion_window", completionWindow);
+      params.set("completion_window", completionWindow);
     }
-    const response = await fetch(url.toString());
+    
+    const url = `${AI_API_BASE_URL}/ai/v1/files/${id}/cost-estimate${params.toString() ? "?" + params.toString() : ""}`;
+    const response = await fetch(url);
     if (!response.ok) {
       throw new Error(`Failed to fetch file cost estimate: ${response.status}`);
     }
