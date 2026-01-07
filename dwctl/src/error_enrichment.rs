@@ -215,6 +215,7 @@ mod tests {
                 amount: Decimal::new(5000, 2),
                 source_id: uuid::Uuid::new_v4().to_string(),
                 description: Some("Initial credits".to_string()),
+                fusillade_batch_id: None,
             })
             .await
             .unwrap();
@@ -263,6 +264,7 @@ mod tests {
                 amount: Decimal::new(10000, 2),
                 source_id: uuid::Uuid::new_v4().to_string(),
                 description: Some("Usage".to_string()),
+                fusillade_batch_id: None,
             })
             .await
             .unwrap();
@@ -332,6 +334,7 @@ mod tests {
                 amount: Decimal::new(5000, 2),
                 source_id: uuid::Uuid::new_v4().to_string(),
                 description: Some("Initial credits".to_string()),
+                fusillade_batch_id: None,
             })
             .await
             .unwrap();
