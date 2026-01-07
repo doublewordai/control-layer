@@ -1189,11 +1189,7 @@ async fn setup_background_services(
         use fusillade::DaemonExecutor;
         match config.background_services.batch_daemon.enabled {
             DaemonEnabled::Always | DaemonEnabled::Leader => {
-                let daemon_handle = request_manager.clone().run(
-                    shutdown_token.clone(),
-                    #[cfg(feature = "fusillade-metrics")]
-                    state.shared_metrics_registry.clone(),
-                )?;
+                let daemon_handle = request_manager.clone().run(shutdown_token.clone())?;
                 // Spawn task that propagates daemon errors
                 background_tasks.spawn("fusillade-daemon", async move {
                     match daemon_handle.await {
@@ -1226,11 +1222,7 @@ async fn setup_background_services(
         use crate::config::DaemonEnabled;
         if config.background_services.batch_daemon.enabled == DaemonEnabled::Always {
             use fusillade::DaemonExecutor;
-            let daemon_handle = request_manager.clone().run(
-                shutdown_token.clone(),
-                #[cfg(feature = "fusillade-metrics")]
-                state.shared_metrics_registry.clone(),
-            )?;
+            let daemon_handle = request_manager.clone().run(shutdown_token.clone())?;
             // Spawn task that propagates daemon errors
             background_tasks.spawn("fusillade-daemon", async move {
                 match daemon_handle.await {
