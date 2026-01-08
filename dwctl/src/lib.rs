@@ -1021,7 +1021,7 @@ pub async fn build_router(state: &mut AppState, onwards_router: Router) -> anyho
         .route("/ai/openapi.json", get(|| async { axum::Json(AiApiDoc::openapi()) }))
         .merge(Scalar::with_url("/admin/docs", AdminApiDoc::openapi()))
         .merge(Scalar::with_url("/ai/docs", AiApiDoc::openapi()))
-        .fallback_service(fallback);
+        .fallback_service(fallback.with_state(state.clone()));
 
     // Create CORS layer from config
     let cors_layer = create_cors_layer(&state.config)?;
