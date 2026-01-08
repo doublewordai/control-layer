@@ -126,18 +126,6 @@ const UsersGroups: React.FC = () => {
   const loading = usersLoading || groupsLoading;
   const error = usersError || groupsError;
 
-  // Reset pagination when user search changes
-  useEffect(() => {
-    usersPagination.handleReset();
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [debouncedUserSearch]);
-
-  // Reset pagination when group search changes
-  useEffect(() => {
-    groupsPagination.handleReset();
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [debouncedGroupSearch]);
-
   // Selected users and groups for bulk operations
   const [selectedUsers, setSelectedUsers] = useState<DisplayUser[]>([]);
   const [selectedGroups, setSelectedGroups] = useState<Set<string>>(new Set());
@@ -423,7 +411,10 @@ const UsersGroups: React.FC = () => {
             searchPlaceholder="Search users..."
             externalSearch={{
               value: userSearchQuery,
-              onChange: setUserSearchQuery,
+              onChange: (value) => {
+                setUserSearchQuery(value);
+                usersPagination.handleReset();
+              },
             }}
             paginationMode="server"
             serverPagination={{

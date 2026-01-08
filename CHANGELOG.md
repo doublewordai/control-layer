@@ -1,5 +1,63 @@
 # Changelog
 
+## [0.25.0](https://github.com/doublewordai/control-layer/compare/v0.24.3...v0.25.0) (2026-01-08)
+
+
+### Features
+
+* add progress bar for file uploads ([#477](https://github.com/doublewordai/control-layer/issues/477)) ([296a06a](https://github.com/doublewordai/control-layer/commit/296a06a747e94b28f1538c371b2b9dd52587a80c))
+
+
+### Bug Fixes
+
+* refresh API keys table and make HTML title configurable ([#469](https://github.com/doublewordai/control-layer/issues/469)) ([b7c4538](https://github.com/doublewordai/control-layer/commit/b7c4538ace9e7af6cb9f3197a5367b8fb5a277b2))
+
+## [0.24.3](https://github.com/doublewordai/control-layer/compare/v0.24.2...v0.24.3) (2026-01-08)
+
+
+### Bug Fixes
+
+* when sending api requests cross origin, need to send credentials ([#474](https://github.com/doublewordai/control-layer/issues/474)) ([d6d2c3c](https://github.com/doublewordai/control-layer/commit/d6d2c3c83fbfab860c60b54b9d716f6e8426fd4c))
+
+## [0.24.2](https://github.com/doublewordai/control-layer/compare/v0.24.1...v0.24.2) (2026-01-07)
+
+
+### Bug Fixes
+
+* when rerouting to api endpoint, strip /ai prefix to not double up ([727fe8b](https://github.com/doublewordai/control-layer/commit/727fe8bc88df503b873598c5eead61feeb56a484))
+
+## [0.24.1](https://github.com/doublewordai/control-layer/compare/v0.24.0...v0.24.1) (2026-01-07)
+
+
+### Bug Fixes
+
+* configurable cross-origin for files and batches endpoints ([4717166](https://github.com/doublewordai/control-layer/commit/471716687d67a4a1045cf95c47ddffcff11715cf))
+
+## [0.24.0](https://github.com/doublewordai/control-layer/compare/v0.23.0...v0.24.0) (2026-01-07)
+
+
+### Features
+
+* batch aggregation optimization for transactions endpoint ([#465](https://github.com/doublewordai/control-layer/issues/465)) ([d567568](https://github.com/doublewordai/control-layer/commit/d5675681083b5d8f76a8d16da26d7dbe1b8af89d))
+
+
+### Bug Fixes
+
+* Jansix testing fe fixes ([#464](https://github.com/doublewordai/control-layer/issues/464)) ([4492b47](https://github.com/doublewordai/control-layer/commit/4492b4748b9570c158d9e6318251bd2e7c14ce3f))
+
+## [0.23.0](https://github.com/doublewordai/control-layer/compare/v0.22.0...v0.23.0) (2026-01-07)
+
+
+### Features
+
+* add tracing instrumentation to request serialization flow ([#459](https://github.com/doublewordai/control-layer/issues/459)) ([f8cd68a](https://github.com/doublewordai/control-layer/commit/f8cd68a9ba92b2698b3a6150d6e88d5bc308464b))
+* make pool metrics sample interval configurable ([#457](https://github.com/doublewordai/control-layer/issues/457)) ([1bd23c7](https://github.com/doublewordai/control-layer/commit/1bd23c7741f06e9ce422b6d3b4629aca81db2336))
+
+
+### Bug Fixes
+
+* **deps:** update rust crate fusillade to 0.13.0 ([#462](https://github.com/doublewordai/control-layer/issues/462)) ([b6682dd](https://github.com/doublewordai/control-layer/commit/b6682dd38855660cf5c633061994e595f6e804ae))
+
 ## [0.22.0](https://github.com/doublewordai/control-layer/compare/v0.21.1...v0.22.0) (2026-01-07)
 
 

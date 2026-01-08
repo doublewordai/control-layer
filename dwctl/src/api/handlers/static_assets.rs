@@ -2,17 +2,27 @@
 
 use axum::{
     body::Body,
+    extract::State,
     http::{Response, StatusCode, Uri},
     response::{Html, IntoResponse},
 };
 use base64::Engine;
 use tracing::{debug, error, instrument};
 
-use crate::static_assets;
+use crate::{AppState, static_assets};
+
+/// Default title used when no custom title is configured
+const DEFAULT_TITLE: &str = "Doubleword Control Layer";
+
+/// Inject the configured title into index.html content
+fn inject_title(html: &str, title: Option<&str>) -> String {
+    let title = title.unwrap_or(DEFAULT_TITLE);
+    html.replace(&format!("<title>{}</title>", DEFAULT_TITLE), &format!("<title>{}</title>", title))
+}
 
 /// Serve embedded static assets with SPA fallback
-#[instrument]
-pub async fn serve_embedded_asset(uri: Uri) -> impl IntoResponse {
+#[instrument(skip(state))]
+pub async fn serve_embedded_asset(State(state): State<AppState>, uri: Uri) -> impl IntoResponse {
     let mut path = uri.path().trim_start_matches('/');
 
     // If path is empty or ends with /, serve index.html
@@ -54,6 +64,17 @@ pub async fn serve_embedded_asset(uri: Uri) -> impl IntoResponse {
             "no-cache"
         };
 
+        // For index.html, inject the configured title
+        if path == "index.html" {
+            let html = String::from_utf8_lossy(&content.data);
+            let html_with_title = inject_title(&html, state.config.metadata.title.as_deref());
+            return Response::builder()
+                .header(axum::http::header::CONTENT_TYPE, mime.as_ref())
+                .header(axum::http::header::CACHE_CONTROL, cache_control)
+                .body(Body::from(html_with_title))
+                .unwrap();
+        }
+
         return Response::builder()
             .header(axum::http::header::CONTENT_TYPE, mime.as_ref())
             .header(axum::http::header::CACHE_CONTROL, cache_control)
@@ -63,10 +84,12 @@ pub async fn serve_embedded_asset(uri: Uri) -> impl IntoResponse {
 
     // If not found, serve index.html for SPA client-side routing
     if let Some(index) = static_assets::Assets::get("index.html") {
+        let html = String::from_utf8_lossy(&index.data);
+        let html_with_title = inject_title(&html, state.config.metadata.title.as_deref());
         return Response::builder()
             .header(axum::http::header::CONTENT_TYPE, "text/html")
             .header(axum::http::header::CACHE_CONTROL, "no-cache")
-            .body(Body::from(index.data.into_owned()))
+            .body(Body::from(html_with_title))
             .unwrap();
     }
 
@@ -75,14 +98,15 @@ pub async fn serve_embedded_asset(uri: Uri) -> impl IntoResponse {
 }
 
 /// SPA fallback handler - serves index.html for client-side routes
-#[instrument(err)]
-pub async fn spa_fallback(uri: Uri) -> Result<Html<String>, StatusCode> {
+#[instrument(skip(state), err)]
+pub async fn spa_fallback(State(state): State<AppState>, uri: Uri) -> Result<Html<String>, StatusCode> {
     debug!("Hitting SPA fallback for: {}", uri.path());
 
-    // Serve embedded index.html
+    // Serve embedded index.html with injected title
     if let Some(index) = static_assets::Assets::get("index.html") {
-        let content = String::from_utf8_lossy(&index.data).to_string();
-        Ok(Html(content))
+        let html = String::from_utf8_lossy(&index.data);
+        let html_with_title = inject_title(&html, state.config.metadata.title.as_deref());
+        Ok(Html(html_with_title))
     } else {
         Err(StatusCode::INTERNAL_SERVER_ERROR)
     }

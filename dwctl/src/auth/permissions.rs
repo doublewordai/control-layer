@@ -329,6 +329,7 @@ pub fn role_has_permission(role: &Role, resource: Resource, operation: Operation
                     | (Resource::Batches, Operation::CreateOwn) // Can create own batches
                     | (Resource::Batches, Operation::ReadOwn)   // Can read own batches
                     | (Resource::Batches, Operation::UpdateOwn) // Can cancel own batches
+                    | (Resource::Batches, Operation::DeleteOwn) // Can delete own batches
             )
         }
     }

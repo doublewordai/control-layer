@@ -450,6 +450,9 @@ pub struct Metadata {
 
     /// JSONL documentation URL displayed in batch modals (e.g., "https://docs.example.com/batches/jsonl-files")
     pub docs_jsonl_url: Option<String>,
+
+    /// Custom HTML title for the dashboard (e.g., "ACME Corp Control Layer")
+    pub title: Option<String>,
 }
 
 impl Default for Metadata {
@@ -459,6 +462,7 @@ impl Default for Metadata {
             organization: None,
             docs_url: "https://docs.doubleword.ai/control-layer".to_string(),
             docs_jsonl_url: None,
+            title: None,
         }
     }
 }

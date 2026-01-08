@@ -411,9 +411,10 @@ export function useCreateApiKey() {
       data: ApiKeyCreateRequest;
       userId?: string;
     }) => dwctlApi.users.apiKeys.create(data, userId),
-    onSuccess: (_, { userId = "current" }) => {
+    onSuccess: () => {
+      // Invalidate all API key queries to ensure table updates
       queryClient.invalidateQueries({
-        queryKey: queryKeys.apiKeys.query(userId),
+        queryKey: queryKeys.apiKeys.all,
       });
     },
   });
@@ -724,6 +725,23 @@ export function useUploadFile() {
 
   return useMutation({
     mutationFn: (data: FileUploadRequest) => dwctlApi.files.upload(data),
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: queryKeys.files.lists() });
+    },
+  });
+}
+
+export function useUploadFileWithProgress() {
+  const queryClient = useQueryClient();
+
+  return useMutation({
+    mutationFn: ({
+      data,
+      onProgress,
+    }: {
+      data: FileUploadRequest;
+      onProgress?: (percent: number) => void;
+    }) => dwctlApi.files.uploadWithProgress(data, onProgress),
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: queryKeys.files.lists() });
     },

@@ -17,7 +17,7 @@ import {
   SelectTrigger,
   SelectValue,
 } from "../../ui/select";
-import { useUploadFile } from "../../../api/control-layer/hooks";
+import { useUploadFileWithProgress, useConfig } from "../../../api/control-layer/hooks";
 import { toast } from "sonner";
 import { AlertBox } from "@/components/ui/alert-box";
 
@@ -47,8 +47,10 @@ export function UploadFileModal({
   const [expirationSeconds, setExpirationSeconds] = useState<number>(2592000); // 30 days default
   const [dragActive, setDragActive] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [uploadProgress, setUploadProgress] = useState<number>(0);
 
-  const uploadMutation = useUploadFile();
+  const uploadMutation = useUploadFileWithProgress();
+  const { data: config } = useConfig();
 
   // Update file when preselected file changes
   useEffect(() => {
@@ -114,23 +116,30 @@ export function UploadFileModal({
       return;
     }
 
+    setUploadProgress(0);
+
     try {
       await uploadMutation.mutateAsync({
-        file,
-        purpose: "batch",
-        expires_after: {
-          anchor: "created_at",
-          seconds: expirationSeconds,
+        data: {
+          file,
+          purpose: "batch",
+          expires_after: {
+            anchor: "created_at",
+            seconds: expirationSeconds,
+          },
         },
+        onProgress: setUploadProgress,
       });
 
       toast.success(`File "${file.name}" uploaded successfully`);
       setFile(null);
       setExpirationSeconds(2592000);
+      setUploadProgress(0);
       onSuccess?.();
       onClose();
     } catch (error) {
       console.error("Failed to upload file:", error);
+      setUploadProgress(0);
       setError(
         error instanceof Error
           ? error.message
@@ -143,6 +152,7 @@ export function UploadFileModal({
     setFile(null);
     setExpirationSeconds(2592000);
     setError(null);
+    setUploadProgress(0);
     onClose();
   };
 
@@ -153,15 +163,19 @@ export function UploadFileModal({
           <DialogTitle>Upload Batch File</DialogTitle>
           <DialogDescription>
             Upload a{" "}
-            <a
-              href="https://docs.doubleword.ai"
-              target="_blank"
-              rel="noopener noreferrer"
-              className="text-blue-600 hover:text-blue-700 hover:underline inline-flex items-center gap-1"
-            >
-              JSONL file
-              <ExternalLink className="w-3 h-3" />
-            </a>{" "}
+            {config?.docs_jsonl_url ? (
+              <a
+                href={config.docs_jsonl_url}
+                target="_blank"
+                rel="noopener noreferrer"
+                className="text-blue-600 hover:text-blue-700 hover:underline inline-flex items-center gap-1"
+              >
+                JSONL file
+                <ExternalLink className="w-3 h-3" />
+              </a>
+            ) : (
+              "JSONL file"
+            )}{" "}
             to process multiple requests asynchronously.
           </DialogDescription>
         </DialogHeader>
@@ -228,6 +242,22 @@ export function UploadFileModal({
             )}
           </div>
 
+          {/* Upload Progress Bar */}
+          {uploadMutation.isPending && (
+            <div className="space-y-2">
+              <div className="flex justify-between text-sm">
+                <span className="text-gray-600">Uploading...</span>
+                <span className="text-gray-900 font-medium">{uploadProgress}%</span>
+              </div>
+              <div className="h-2 bg-gray-200 rounded-full overflow-hidden">
+                <div
+                  className="h-full bg-blue-600 rounded-full transition-all duration-150 ease-out"
+                  style={{ width: `${uploadProgress}%` }}
+                />
+              </div>
+            </div>
+          )}
+
           {/* Expiration Select */}
           <div className="space-y-2">
             <Label htmlFor="expiration">File Expiration</Label>
@@ -262,16 +292,22 @@ export function UploadFileModal({
                 <p className="font-medium mb-1">JSONL Format Required</p>
                 <p className="text-blue-700">
                   Each line should be a valid JSON object representing a batch
-                  request. See the{" "}
-                  <a
-                    href="https://docs.doubleword.ai"
-                    target="_blank"
-                    rel="noopener noreferrer"
-                    className="underline hover:text-blue-900"
-                  >
-                    documentation
-                  </a>{" "}
-                  for examples.
+                  request.
+                  {config?.docs_jsonl_url && (
+                    <>
+                      {" "}
+                      See the{" "}
+                      <a
+                        href={config.docs_jsonl_url}
+                        target="_blank"
+                        rel="noopener noreferrer"
+                        className="underline hover:text-blue-900"
+                      >
+                        documentation
+                      </a>{" "}
+                      for examples.
+                    </>
+                  )}
                 </p>
               </div>
             </div>
@@ -295,7 +331,7 @@ export function UploadFileModal({
             {uploadMutation.isPending ? (
               <>
                 <div className="animate-spin rounded-full h-4 w-4 border-b-2 border-white mr-2"></div>
-                Uploading...
+                Uploading... {uploadProgress}%
               </>
             ) : (
               <>

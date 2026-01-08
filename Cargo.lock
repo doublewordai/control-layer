@@ -1365,7 +1365,7 @@ checksum = "92773504d58c093f6de2459af4af33faa518c13451eb8f2b5698ed3d36e7c813"
 
 [[package]]
 name = "dwctl"
-version = "0.22.0"
+version = "0.24.0"
 dependencies = [
  "aes-gcm",
  "anyhow",
@@ -3417,9 +3417,9 @@ dependencies = [
 
 [[package]]
 name = "outlet"
-version = "0.4.3"
+version = "0.4.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "673b9c8576287972fad699668cc6e3161d563bc2fedd041981e1c1d99c9df7af"
+checksum = "cf1fe92691fe9a54b63b9b5e424801da9a1d1f3c7dd0b3492fcbfb1e2e1e4a98"
 dependencies = [
  "anyhow",
  "async-stream",

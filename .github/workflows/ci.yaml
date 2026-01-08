@@ -232,6 +232,8 @@ jobs:
           tags: ${{ steps.meta.outputs.tags }}
           sbom: true
           provenance: true
+          build-args: |
+            VITE_AI_API_BASE_URL=${{ secrets.VITE_AI_API_BASE_URL }}
 
       - name: Record build time
         id: build-time-step
