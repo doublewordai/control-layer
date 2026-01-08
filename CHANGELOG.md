@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.24.3](https://github.com/doublewordai/control-layer/compare/v0.24.2...v0.24.3) (2026-01-08)
+
+
+### Bug Fixes
+
+* when sending api requests cross origin, need to send credentials ([#474](https://github.com/doublewordai/control-layer/issues/474)) ([d6d2c3c](https://github.com/doublewordai/control-layer/commit/d6d2c3c83fbfab860c60b54b9d716f6e8426fd4c))
+
 ## [0.24.2](https://github.com/doublewordai/control-layer/compare/v0.24.1...v0.24.2) (2026-01-07)
 
 
