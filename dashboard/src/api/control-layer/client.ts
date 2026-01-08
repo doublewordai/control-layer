@@ -75,6 +75,17 @@ const getAiApiUrl = (path: string): string => {
   return path;
 };
 
+// Helper to fetch AI API endpoints with proper credentials for cross-origin requests
+const fetchAiApi = (path: string, init?: RequestInit): Promise<Response> => {
+  const url = getAiApiUrl(path);
+  // When making cross-origin requests, include credentials for session cookies
+  const options: RequestInit = {
+    ...init,
+    credentials: AI_API_BASE_URL ? 'include' : (init?.credentials || 'same-origin'),
+  };
+  return fetch(url, options);
+};
+
 // Resource APIs
 const userApi = {
   async list(options?: UsersQuery): Promise<PaginatedResponse<User>> {
@@ -1035,8 +1046,7 @@ const filesApi = {
     if (options?.purpose) params.set("purpose", options.purpose);
     if (options?.search) params.set("search", options.search);
 
-    const url = getAiApiUrl(`/ai/v1/files${params.toString() ? "?" + params.toString() : ""}`);
-    const response = await fetch(url);
+    const response = await fetchAiApi(`/ai/v1/files${params.toString() ? "?" + params.toString() : ""}`);
     if (!response.ok) {
       throw new Error(`Failed to fetch files: ${response.status}`);
     }
@@ -1044,7 +1054,7 @@ const filesApi = {
   },
 
   async get(id: string): Promise<FileObject> {
-    const response = await fetch(getAiApiUrl(`/ai/v1/files/${id}`));
+    const response = await fetchAiApi(`/ai/v1/files/${id}`);
     if (!response.ok) {
       throw new Error(`Failed to fetch file: ${response.status}`);
     }
@@ -1064,7 +1074,7 @@ const filesApi = {
       );
     }
 
-    const response = await fetch(getAiApiUrl("/ai/v1/files"), {
+    const response = await fetchAiApi("/ai/v1/files", {
       method: "POST",
       body: formData,
     });
@@ -1081,7 +1091,7 @@ const filesApi = {
   },
 
   async delete(id: string): Promise<FileDeleteResponse> {
-    const response = await fetch(getAiApiUrl(`/ai/v1/files/${id}`), {
+    const response = await fetchAiApi(`/ai/v1/files/${id}`, {
       method: "DELETE",
     });
     if (!response.ok) {
@@ -1101,8 +1111,7 @@ const filesApi = {
     if (options?.skip) params.set("skip", options.skip.toString());
     if (options?.search) params.set("search", options.search);
 
-    const url = getAiApiUrl(`/ai/v1/files/${id}/content${params.toString() ? "?" + params.toString() : ""}`);
-    const response = await fetch(url);
+    const response = await fetchAiApi(`/ai/v1/files/${id}/content${params.toString() ? "?" + params.toString() : ""}`);
     if (!response.ok) {
       throw new Error(`Failed to fetch file content: ${response.status}`);
     }
@@ -1123,8 +1132,7 @@ const filesApi = {
       params.set("completion_window", completionWindow);
     }
     
-    const url = getAiApiUrl(`/ai/v1/files/${id}/cost-estimate${params.toString() ? "?" + params.toString() : ""}`);
-    const response = await fetch(url);
+    const response = await fetchAiApi(`/ai/v1/files/${id}/cost-estimate${params.toString() ? "?" + params.toString() : ""}`);
     if (!response.ok) {
       throw new Error(`Failed to fetch file cost estimate: ${response.status}`);
     }
@@ -1139,8 +1147,7 @@ const batchesApi = {
     if (options?.limit) params.set("limit", options.limit.toString());
     if (options?.search) params.set("search", options.search);
 
-    const url = getAiApiUrl(`/ai/v1/batches${params.toString() ? "?" + params.toString() : ""}`);
-    const response = await fetch(url);
+    const response = await fetchAiApi(`/ai/v1/batches${params.toString() ? "?" + params.toString() : ""}`);
     if (!response.ok) {
       throw new Error(`Failed to fetch batches: ${response.status}`);
     }
@@ -1148,7 +1155,7 @@ const batchesApi = {
   },
 
   async get(id: string): Promise<Batch> {
-    const response = await fetch(getAiApiUrl(`/ai/v1/batches/${id}`));
+    const response = await fetchAiApi(`/ai/v1/batches/${id}`);
     if (!response.ok) {
       throw new Error(`Failed to fetch batch: ${response.status}`);
     }
@@ -1156,7 +1163,7 @@ const batchesApi = {
   },
 
   async create(data: BatchCreateRequest): Promise<Batch> {
-    const response = await fetch(getAiApiUrl("/ai/v1/batches"), {
+    const response = await fetchAiApi("/ai/v1/batches", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify(data),
@@ -1174,7 +1181,7 @@ const batchesApi = {
   },
 
   async cancel(id: string): Promise<Batch> {
-    const response = await fetch(getAiApiUrl(`/ai/v1/batches/${id}/cancel`), {
+    const response = await fetchAiApi(`/ai/v1/batches/${id}/cancel`, {
       method: "POST",
     });
     if (!response.ok) {
@@ -1184,7 +1191,7 @@ const batchesApi = {
   },
 
   async delete(id: string): Promise<void> {
-    const response = await fetch(getAiApiUrl(`/ai/v1/batches/${id}`), {
+    const response = await fetchAiApi(`/ai/v1/batches/${id}`, {
       method: "DELETE",
     });
     if (!response.ok) {
@@ -1193,7 +1200,7 @@ const batchesApi = {
   },
 
   async retry(id: string): Promise<Batch> {
-    const response = await fetch(getAiApiUrl(`/ai/v1/batches/${id}/retry`), {
+    const response = await fetchAiApi(`/ai/v1/batches/${id}/retry`, {
       method: "POST",
     });
     if (!response.ok) {
@@ -1203,7 +1210,7 @@ const batchesApi = {
   },
 
   async retryRequests(id: string, requestIds: string[]): Promise<Batch> {
-    const response = await fetch(getAiApiUrl(`/ai/v1/batches/${id}/retry-requests`), {
+    const response = await fetchAiApi(`/ai/v1/batches/${id}/retry-requests`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ request_ids: requestIds }),
@@ -1215,7 +1222,7 @@ const batchesApi = {
   },
 
   async getAnalytics(id: string): Promise<BatchAnalytics> {
-    const response = await fetch(getAiApiUrl(`/ai/v1/batches/${id}/analytics`));
+    const response = await fetchAiApi(`/ai/v1/batches/${id}/analytics`);
     if (!response.ok) {
       throw new Error(`Failed to fetch batch analytics: ${response.status}`);
     }
@@ -1232,9 +1239,7 @@ const batchesApi = {
     }
 
     // Download the output file content
-    const response = await fetch(
-      getAiApiUrl(`/ai/v1/files/${batch.output_file_id}/content`),
-    );
+    const response = await fetchAiApi(`/ai/v1/files/${batch.output_file_id}/content`);
     if (!response.ok) {
       throw new Error(`Failed to download batch results: ${response.status}`);
     }
@@ -1247,8 +1252,7 @@ const daemonsApi = {
     const params = new URLSearchParams();
     if (options?.status) params.set("status", options.status);
 
-    const url = getAiApiUrl(`/ai/v1/daemons${params.toString() ? "?" + params.toString() : ""}`);
-    const response = await fetch(url);
+    const response = await fetchAiApi(`/ai/v1/daemons${params.toString() ? "?" + params.toString() : ""}`);
     if (!response.ok) {
       throw new Error(`Failed to fetch daemons: ${response.status}`);
     }
