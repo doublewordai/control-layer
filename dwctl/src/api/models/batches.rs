@@ -273,6 +273,7 @@ pub enum ListObjectType {
 }
 
 use super::pagination::CursorPagination;
+use crate::api::models::Pagination;
 
 /// Query parameters for listing batches
 #[derive(Debug, Deserialize, IntoParams, ToSchema)]
@@ -283,5 +284,17 @@ pub struct ListBatchesQuery {
     pub pagination: CursorPagination,
 
     /// Search query to filter batches by endpoint or input filename (case-insensitive substring match)
+    pub search: Option<String>,
+}
+
+/// Query parameters for batch results
+#[derive(Debug, Deserialize, IntoParams, ToSchema)]
+pub struct BatchResultsQuery {
+    /// Pagination parameters (limit and skip)
+    #[serde(flatten)]
+    #[param(inline)]
+    pub pagination: Pagination,
+
+    /// Search query to filter by custom_id (case-insensitive substring match)
     pub search: Option<String>,
 }

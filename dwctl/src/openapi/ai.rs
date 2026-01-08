@@ -159,6 +159,7 @@ fn get_model() {}
         api::handlers::batches::create_batch,
         api::handlers::batches::get_batch,
         api::handlers::batches::get_batch_analytics,
+        api::handlers::batches::get_batch_results,
         api::handlers::batches::cancel_batch,
         api::handlers::batches::delete_batch,
         api::handlers::batches::retry_failed_batch_requests,

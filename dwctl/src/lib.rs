@@ -968,6 +968,7 @@ pub async fn build_router(state: &mut AppState, onwards_router: Router) -> anyho
                 .route("/batches/{batch_id}", get(api::handlers::batches::get_batch))
                 .route("/batches/{batch_id}", delete(api::handlers::batches::delete_batch))
                 .route("/batches/{batch_id}/analytics", get(api::handlers::batches::get_batch_analytics))
+                .route("/batches/{batch_id}/results", get(api::handlers::batches::get_batch_results))
                 .route("/batches/{batch_id}/cancel", post(api::handlers::batches::cancel_batch))
                 .route(
                     "/batches/{batch_id}/retry",
