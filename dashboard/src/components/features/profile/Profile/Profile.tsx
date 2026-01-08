@@ -23,7 +23,7 @@ import {
 import { Input } from "../../../ui/input";
 import { Button } from "../../../ui/button";
 import { AVAILABLE_ROLES, getRoleDisplayName } from "../../../../utils/roles";
-import type { Role, User } from "../../../../api/control-layer/types";
+import type { Role } from "../../../../api/control-layer/types";
 import { dwctlApi } from "../../../../api/control-layer/client";
 import { ApiError } from "../../../../api/control-layer/errors";
 
