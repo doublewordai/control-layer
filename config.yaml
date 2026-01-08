@@ -269,6 +269,24 @@ background_services:
     # Observability
     status_log_interval_ms: 2000 # Interval for logging daemon status (set to null to disable)
 
+    # SLA Daemon configuration
+    # priority_endpoints:
+    #   gemma:
+    #     endpoint: https://generativelanguage.googleapis.com/v1beta/openai
+    #     api_key: GOOGLE_AI_API_KEY
+    #     model_override: models/gemma-3-27b-it
+
+    # sla_check_interval_seconds: 60
+
+    # sla_thresholds:
+    #   - name: api
+    #     threshold_seconds: 600
+    #     action: escalate
+    #     allowed_states:
+    #       - processing
+    #       - pending
+    #       - failed
+
   # Leader election - coordinates which instance runs leader-only services
   # When disabled, all instances run as leader (useful for single-instance deployments)
   leader_election:
