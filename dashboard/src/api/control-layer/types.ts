@@ -812,6 +812,7 @@ export interface FileListResponse {
 export interface FileUploadRequest {
   file: File;
   purpose: string;
+  filename?: string;
   expires_after?: {
     anchor: "created_at";
     seconds: number;

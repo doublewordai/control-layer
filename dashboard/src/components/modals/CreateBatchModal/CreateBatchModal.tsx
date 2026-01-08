@@ -56,6 +56,9 @@ export function CreateBatchModal({
   const [fileToUpload, setFileToUpload] = useState<File | null>(
     preselectedFileToUpload || null,
   );
+  const [filename, setFilename] = useState<string>(
+    preselectedFileToUpload?.name || "",
+  );
   const [expirationSeconds, setExpirationSeconds] = useState<number>(2592000); // 30 days default
   const [endpoint, setEndpoint] = useState<string>("/v1/chat/completions");
   const [completionWindow, setCompletionWindow] = useState<string>("24h"); // Default SLA
@@ -108,6 +111,7 @@ export function CreateBatchModal({
   useEffect(() => {
     if (preselectedFileToUpload) {
       setFileToUpload(preselectedFileToUpload);
+      setFilename(preselectedFileToUpload.name);
       setSelectedFileId(null);
     }
   }, [preselectedFileToUpload]);
@@ -131,6 +135,7 @@ export function CreateBatchModal({
       const droppedFile = e.dataTransfer.files[0];
       if (droppedFile.name.endsWith(".jsonl")) {
         setFileToUpload(droppedFile);
+        setFilename(droppedFile.name);
         setSelectedFileId(null); // Clear combobox selection
         setError(null);
       } else {
@@ -144,6 +149,7 @@ export function CreateBatchModal({
       const file = e.target.files[0];
       if (file.name.endsWith(".jsonl")) {
         setFileToUpload(file);
+        setFilename(file.name);
         setSelectedFileId(null); // Clear combobox selection
         setError(null);
       } else {
@@ -154,6 +160,7 @@ export function CreateBatchModal({
 
   const handleRemoveFile = () => {
     setFileToUpload(null);
+    setFilename("");
     setSelectedFileId(null);
   };
 
@@ -162,6 +169,12 @@ export function CreateBatchModal({
 
     // If a file needs to be uploaded, upload it first
     if (fileToUpload) {
+      const finalFilename = filename.trim() || fileToUpload.name;
+      if (!finalFilename.endsWith(".jsonl")) {
+        setError("Filename must end with .jsonl");
+        return;
+      }
+
       setIsUploading(true);
       setUploadProgress(0);
       try {
@@ -169,6 +182,7 @@ export function CreateBatchModal({
           data: {
             file: fileToUpload,
             purpose: "batch",
+            filename: finalFilename,
             expires_after: {
               anchor: "created_at",
               seconds: expirationSeconds,
@@ -177,7 +191,7 @@ export function CreateBatchModal({
           onProgress: setUploadProgress,
         });
         finalFileId = uploadedFile.id;
-        toast.success(`File "${fileToUpload.name}" uploaded successfully`);
+        toast.success(`File "${finalFilename}" uploaded successfully`);
       } catch (error) {
         console.error("Failed to upload file:", error);
         setError(
@@ -212,15 +226,17 @@ export function CreateBatchModal({
         metadata: Object.keys(metadata).length > 0 ? metadata : undefined,
       });
 
-      const fileName =
+      const displayFileName =
+        filename.trim() ||
         fileToUpload?.name ||
         availableFiles.find((f) => f.id === finalFileId)?.filename ||
         "file";
-      toast.success(`Batch created successfully from "${fileName}"`);
+      toast.success(`Batch created successfully from "${displayFileName}"`);
 
       // Reset form
       setSelectedFileId(null);
       setFileToUpload(null);
+      setFilename("");
       setEndpoint("/v1/chat/completions");
       setCompletionWindow(availableSLAs[0] || "24h");
       setDescription("");
@@ -237,6 +253,7 @@ export function CreateBatchModal({
   const handleClose = () => {
     setSelectedFileId(preselectedFile?.id || null);
     setFileToUpload(null);
+    setFilename("");
     setEndpoint("/v1/chat/completions");
     setCompletionWindow(availableSLAs[0] || "24h");
     setDescription("");
@@ -301,9 +318,12 @@ export function CreateBatchModal({
               <div className="bg-gray-50 rounded-lg p-3 space-y-2 relative">
                 <div className="flex items-start justify-between gap-2">
                   <div className="flex-1 min-w-0">
-                    <p className="text-sm font-medium text-gray-900 truncate">
-                      {fileToUpload?.name || selectedFile?.filename}
-                    </p>
+                    {/* Only show filename for already-uploaded files, not for files to upload */}
+                    {selectedFile && (
+                      <p className="text-sm font-medium text-gray-900 truncate">
+                        {selectedFile.filename}
+                      </p>
+                    )}
                     <div className="flex gap-4 text-xs text-gray-600">
                       {fileToUpload ? (
                         <>
@@ -344,6 +364,23 @@ export function CreateBatchModal({
                       className="h-full bg-blue-600 rounded-full transition-all duration-150 ease-out"
                       style={{ width: `${uploadProgress}%` }}
                     />
+                  </div>
+                )}
+                {/* Filename Input - only for files to upload */}
+                {fileToUpload && (
+                  <div className="space-y-1 pt-2">
+                    <Label htmlFor="filename" className="text-xs">Filename</Label>
+                    <Input
+                      id="filename"
+                      value={filename}
+                      onChange={(e) => setFilename(e.target.value)}
+                      placeholder="Enter filename"
+                      disabled={isPending}
+                      className="h-8 text-sm"
+                    />
+                    <p className="text-xs text-gray-500">
+                      Rename the file before uploading. Must end with .jsonl
+                    </p>
                   </div>
                 )}
               </div>
@@ -526,6 +563,11 @@ export function CreateBatchModal({
                     type="button"
                     onClick={async () => {
                       if (!fileToUpload || isPending) return;
+                      const finalFilename = filename.trim() || fileToUpload.name;
+                      if (!finalFilename.endsWith(".jsonl")) {
+                        setError("Filename must end with .jsonl");
+                        return;
+                      }
                       setIsUploading(true);
                       setUploadProgress(0);
                       try {
@@ -533,6 +575,7 @@ export function CreateBatchModal({
                           data: {
                             file: fileToUpload,
                             purpose: "batch",
+                            filename: finalFilename,
                             expires_after: {
                               anchor: "created_at",
                               seconds: expirationSeconds,
@@ -542,7 +585,7 @@ export function CreateBatchModal({
                         });
                         setSelectedFileId(uploadedFile.id);
                         toast.success(
-                          `File "${fileToUpload.name}" uploaded successfully`,
+                          `File "${finalFilename}" uploaded successfully`,
                         );
                       } catch (err) {
                         console.error("Failed to upload file:", err);

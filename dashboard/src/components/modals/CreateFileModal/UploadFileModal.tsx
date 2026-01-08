@@ -10,6 +10,7 @@ import {
 } from "../../ui/dialog";
 import { Button } from "../../ui/button";
 import { Label } from "../../ui/label";
+import { Input } from "../../ui/input";
 import {
   Select,
   SelectContent,
@@ -44,6 +45,7 @@ export function UploadFileModal({
   preselectedFile,
 }: UploadFileModalProps) {
   const [file, setFile] = useState<File | null>(preselectedFile || null);
+  const [filename, setFilename] = useState<string>(preselectedFile?.name || "");
   const [expirationSeconds, setExpirationSeconds] = useState<number>(2592000); // 30 days default
   const [dragActive, setDragActive] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -56,6 +58,7 @@ export function UploadFileModal({
   useEffect(() => {
     if (preselectedFile) {
       setFile(preselectedFile);
+      setFilename(preselectedFile.name);
     }
   }, [preselectedFile]);
 
@@ -78,6 +81,7 @@ export function UploadFileModal({
       const droppedFile = e.dataTransfer.files[0];
       if (droppedFile.name.endsWith(".jsonl")) {
         setFile(droppedFile);
+        setFilename(droppedFile.name);
       } else {
         setError("Please upload a .jsonl file");
       }
@@ -89,6 +93,7 @@ export function UploadFileModal({
       const selectedFile = e.target.files[0];
       if (selectedFile.name.endsWith(".jsonl")) {
         setFile(selectedFile);
+        setFilename(selectedFile.name);
         setError(null);
       } else {
         setError("Please upload a .jsonl file");
@@ -100,6 +105,7 @@ export function UploadFileModal({
     e.preventDefault();
     e.stopPropagation();
     setFile(null);
+    setFilename("");
     setError(null);
     // Reset the file input element
     const fileInput = document.getElementById(
@@ -116,6 +122,12 @@ export function UploadFileModal({
       return;
     }
 
+    const finalFilename = filename.trim() || file.name;
+    if (!finalFilename.endsWith(".jsonl")) {
+      setError("Filename must end with .jsonl");
+      return;
+    }
+
     setUploadProgress(0);
 
     try {
@@ -123,6 +135,7 @@ export function UploadFileModal({
         data: {
           file,
           purpose: "batch",
+          filename: finalFilename,
           expires_after: {
             anchor: "created_at",
             seconds: expirationSeconds,
@@ -131,8 +144,9 @@ export function UploadFileModal({
         onProgress: setUploadProgress,
       });
 
-      toast.success(`File "${file.name}" uploaded successfully`);
+      toast.success(`File "${finalFilename}" uploaded successfully`);
       setFile(null);
+      setFilename("");
       setExpirationSeconds(2592000);
       setUploadProgress(0);
       onSuccess?.();
@@ -150,6 +164,7 @@ export function UploadFileModal({
 
   const handleClose = () => {
     setFile(null);
+    setFilename("");
     setExpirationSeconds(2592000);
     setError(null);
     setUploadProgress(0);
@@ -213,7 +228,6 @@ export function UploadFileModal({
               <div className="space-y-2">
                 <FileText className="w-12 h-12 mx-auto text-green-600" />
                 <div>
-                  <p className="font-medium text-green-900">{file.name}</p>
                   <p className="text-sm text-green-700">
                     {(file.size / 1024).toFixed(2)} KB
                   </p>
@@ -241,6 +255,23 @@ export function UploadFileModal({
               </div>
             )}
           </div>
+
+          {/* Filename Input */}
+          {file && (
+            <div className="space-y-2">
+              <Label htmlFor="filename">Filename</Label>
+              <Input
+                id="filename"
+                value={filename}
+                onChange={(e) => setFilename(e.target.value)}
+                placeholder="Enter filename"
+                disabled={uploadMutation.isPending}
+              />
+              <p className="text-xs text-gray-500">
+                You can rename the file before uploading. Must end with .jsonl
+              </p>
+            </div>
+          )}
 
           {/* Upload Progress Bar */}
           {uploadMutation.isPending && (
