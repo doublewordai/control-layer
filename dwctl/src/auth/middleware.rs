@@ -537,6 +537,7 @@ mod tests {
             config: config.clone(),
             outlet_db: None,
             metrics_recorder: None,
+            metrics_facade_handle: None,
             is_leader: false,
             request_manager,
         };
@@ -640,6 +641,7 @@ mod tests {
             config: config.clone(),
             outlet_db: None,
             metrics_recorder: None,
+            metrics_facade_handle: None,
             is_leader: false,
             request_manager,
         };
@@ -745,6 +747,7 @@ mod tests {
             config: config.clone(),
             outlet_db: None,
             metrics_recorder: None,
+            metrics_facade_handle: None,
             is_leader: false,
             request_manager,
         };
@@ -926,6 +929,7 @@ mod tests {
             config: config.clone(),
             outlet_db: None,
             metrics_recorder: None,
+            metrics_facade_handle: None,
             is_leader: false,
             request_manager,
         };
@@ -1031,6 +1035,7 @@ mod tests {
             config: config.clone(),
             outlet_db: None,
             metrics_recorder: None,
+            metrics_facade_handle: None,
             is_leader: false,
             request_manager,
         };

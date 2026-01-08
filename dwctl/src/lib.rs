@@ -224,7 +224,7 @@ pub struct AppState {
     pub config: Config,
     pub outlet_db: Option<PgPool>,
     pub metrics_recorder: Option<GenAiMetrics>,
-    pub shared_metrics_registry: Option<Arc<prometheus::Registry>>,
+    pub metrics_facade_handle: Option<metrics_exporter_prometheus::PrometheusHandle>,
     #[builder(default = false)]
     pub is_leader: bool,
     pub request_manager: Arc<fusillade::PostgresRequestManager<fusillade::ReqwestHttpClient>>,
@@ -664,15 +664,20 @@ fn create_cors_layer(config: &Config) -> anyhow::Result<CorsLayer> {
 pub async fn build_router(state: &mut AppState, onwards_router: Router) -> anyhow::Result<Router> {
     // Initialize metrics if enabled
     if state.config.enable_metrics {
+        // Create GenAI metrics with their own prometheus registry
         let registry = Arc::new(prometheus::Registry::new());
-
-        // Create GenAI metrics for user-facing API
         let gen_ai_metrics = GenAiMetrics::new(&registry)
             .map_err(|e| anyhow::anyhow!("Failed to create GenAI metrics: {}", e))?;
         state.metrics_recorder = Some(gen_ai_metrics);
 
-        // Store shared registry (daemon will create its own metrics from this)
-        state.shared_metrics_registry = Some(registry);
+        // Install global metrics recorder for fusillade metrics facade
+        // This is separate from GenAI metrics - fusillade uses metrics::counter!() etc.
+        let builder = metrics_exporter_prometheus::PrometheusBuilder::new();
+        let handle = builder
+            .install_recorder()
+            .map_err(|e| anyhow::anyhow!("Failed to install metrics recorder: {}", e))?;
+        state.metrics_facade_handle = Some(handle);
+        tracing::info!("Installed global metrics recorder for fusillade metrics facade");
     }
 
     // Setup request logging if enabled
@@ -907,16 +912,11 @@ pub async fn build_router(state: &mut AppState, onwards_router: Router) -> anyho
     if state.config.enable_metrics {
         let (prometheus_layer, metric_handle) = PrometheusMetricLayer::pair();
 
-        // Get the shared registry (contains both GenAI and Fusillade metrics)
-        let metrics_registry = if let Some(ref shared_reg) = state.shared_metrics_registry {
-            shared_reg.as_ref().clone()
-        } else if let Some(ref recorder) = state.metrics_recorder {
-            // Fallback: use GenAI-only registry if shared registry wasn't initialized
-            recorder.registry().clone()
-        } else {
-            // Fallback: create empty registry if somehow metrics weren't initialized
-            prometheus::Registry::new()
-        };
+        // Get GenAI metrics registry
+        let gen_ai_registry = state.metrics_recorder.as_ref().map(|r| r.registry().clone());
+
+        // Get fusillade metrics facade handle
+        let facade_handle = state.metrics_facade_handle.clone();
 
         // Add metrics endpoint that combines axum-prometheus, GenAI, and Fusillade metrics
         router = router
@@ -925,18 +925,25 @@ pub async fn build_router(state: &mut AppState, onwards_router: Router) -> anyho
                 get(|| async move {
                     use prometheus::{Encoder, TextEncoder};
 
-                    // Get axum-prometheus metrics
-                    let mut axum_metrics = metric_handle.render();
+                    // Start with axum-prometheus metrics
+                    let mut combined_metrics = metric_handle.render();
 
-                    // Get all metrics from shared registry (GenAI + Fusillade)
-                    let encoder = TextEncoder::new();
-                    let metric_families = metrics_registry.gather();
-                    let mut buffer = vec![];
-                    encoder.encode(&metric_families, &mut buffer).unwrap();
+                    // Add GenAI metrics (prometheus registry based)
+                    if let Some(ref registry) = gen_ai_registry {
+                        let encoder = TextEncoder::new();
+                        let metric_families = registry.gather();
+                        let mut buffer = vec![];
+                        encoder.encode(&metric_families, &mut buffer).unwrap();
+                        combined_metrics.push_str(&String::from_utf8_lossy(&buffer));
+                    }
 
-                    // Combine both
-                    axum_metrics.push_str(&String::from_utf8_lossy(&buffer));
-                    axum_metrics
+                    // Add fusillade metrics (metrics facade based)
+                    if let Some(ref handle) = facade_handle {
+                        let facade_metrics = handle.render();
+                        combined_metrics.push_str(&facade_metrics);
+                    }
+
+                    combined_metrics
                 }),
             )
             .layer(prometheus_layer);
