@@ -573,33 +573,34 @@ const BatchInfo: React.FC = () => {
                       </div>
                     )}
 
-                    {batch.output_file_id && (
-                      <div className="flex items-center gap-2 p-2 bg-green-50 rounded">
-                        <FileCheck className="w-4 h-4 text-green-600" />
-                        <div className="flex-1 min-w-0">
-                          <p className="text-sm font-medium text-gray-700">
-                            Output File
-                          </p>
-                          <p className="text-xs text-gray-500 font-mono truncate">
-                            {batch.output_file_id}
-                          </p>
+                    {batch.output_file_id &&
+                      batch.request_counts.completed > 0 && (
+                        <div className="flex items-center gap-2 p-2 bg-green-50 rounded">
+                          <FileCheck className="w-4 h-4 text-green-600" />
+                          <div className="flex-1 min-w-0">
+                            <p className="text-sm font-medium text-gray-700">
+                              Output File
+                            </p>
+                            <p className="text-xs text-gray-500 font-mono truncate">
+                              {batch.output_file_id}
+                            </p>
+                          </div>
+                          <Button
+                            variant="ghost"
+                            size="sm"
+                            onClick={() =>
+                              navigate(
+                                `/batches/files/${batch.output_file_id}/content?from=/batches/${batchId}`,
+                              )
+                            }
+                            className="shrink-0"
+                          >
+                            View
+                          </Button>
                         </div>
-                        <Button
-                          variant="ghost"
-                          size="sm"
-                          onClick={() =>
-                            navigate(
-                              `/batches/files/${batch.output_file_id}/content?from=/batches/${batchId}`,
-                            )
-                          }
-                          className="shrink-0"
-                        >
-                          View
-                        </Button>
-                      </div>
-                    )}
+                      )}
 
-                    {batch.error_file_id && (
+                    {batch.error_file_id && batch.request_counts.failed > 0 && (
                       <div className="flex items-center gap-2 p-2 bg-red-50 rounded">
                         <AlertCircle className="w-4 h-4 text-red-600" />
                         <div className="flex-1 min-w-0">
