@@ -560,7 +560,7 @@ export function CreateBatchModal({
                     className={`text-xs text-blue-600 hover:text-blue-700 hover:underline disabled:opacity-50 flex items-center gap-1 ${isPending ? "cursor-not-allowed" : "cursor-pointer"}`}
                   >
                     <Upload className="w-3 h-3" />
-                    Upload now to see cost estimate
+                    Upload now to see estimate of batch inference cost
                   </button>
                 )}
               </div>
