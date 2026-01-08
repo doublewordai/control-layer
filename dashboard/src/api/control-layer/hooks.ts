@@ -731,6 +731,23 @@ export function useUploadFile() {
   });
 }
 
+export function useUploadFileWithProgress() {
+  const queryClient = useQueryClient();
+
+  return useMutation({
+    mutationFn: ({
+      data,
+      onProgress,
+    }: {
+      data: FileUploadRequest;
+      onProgress?: (percent: number) => void;
+    }) => dwctlApi.files.uploadWithProgress(data, onProgress),
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: queryKeys.files.lists() });
+    },
+  });
+}
+
 export function useDeleteFile() {
   const queryClient = useQueryClient();
 

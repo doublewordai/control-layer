@@ -1090,6 +1090,57 @@ const filesApi = {
     return response.json();
   },
 
+  async uploadWithProgress(
+    data: FileUploadRequest,
+    onProgress?: (percent: number) => void,
+  ): Promise<FileObject> {
+    return new Promise((resolve, reject) => {
+      const xhr = new XMLHttpRequest();
+      const formData = new FormData();
+      formData.append("file", data.file);
+      formData.append("purpose", data.purpose);
+
+      if (data.expires_after) {
+        formData.append("expires_after[anchor]", data.expires_after.anchor);
+        formData.append(
+          "expires_after[seconds]",
+          data.expires_after.seconds.toString(),
+        );
+      }
+
+      xhr.upload.onprogress = (event) => {
+        if (event.lengthComputable && onProgress) {
+          onProgress(Math.round((event.loaded / event.total) * 100));
+        }
+      };
+
+      xhr.onload = () => {
+        if (xhr.status >= 200 && xhr.status < 300) {
+          try {
+            resolve(JSON.parse(xhr.responseText));
+          } catch {
+            reject(new Error("Invalid JSON response from server"));
+          }
+        } else {
+          reject(
+            new ApiError(
+              xhr.status,
+              xhr.responseText || `Failed to upload file: ${xhr.status}`,
+            ),
+          );
+        }
+      };
+
+      xhr.onerror = () => reject(new Error("Network error during upload"));
+      xhr.onabort = () => reject(new Error("Upload aborted"));
+
+      const url = getAiApiUrl("/ai/v1/files");
+      xhr.open("POST", url);
+      xhr.withCredentials = !!AI_API_BASE_URL;
+      xhr.send(formData);
+    });
+  },
+
   async delete(id: string): Promise<FileDeleteResponse> {
     const response = await fetchAiApi(`/ai/v1/files/${id}`, {
       method: "DELETE",

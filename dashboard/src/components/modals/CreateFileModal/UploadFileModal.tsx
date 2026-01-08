@@ -17,7 +17,7 @@ import {
   SelectTrigger,
   SelectValue,
 } from "../../ui/select";
-import { useUploadFile, useConfig } from "../../../api/control-layer/hooks";
+import { useUploadFileWithProgress, useConfig } from "../../../api/control-layer/hooks";
 import { toast } from "sonner";
 import { AlertBox } from "@/components/ui/alert-box";
 
@@ -47,8 +47,9 @@ export function UploadFileModal({
   const [expirationSeconds, setExpirationSeconds] = useState<number>(2592000); // 30 days default
   const [dragActive, setDragActive] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [uploadProgress, setUploadProgress] = useState<number>(0);
 
-  const uploadMutation = useUploadFile();
+  const uploadMutation = useUploadFileWithProgress();
   const { data: config } = useConfig();
 
   // Update file when preselected file changes
@@ -115,23 +116,30 @@ export function UploadFileModal({
       return;
     }
 
+    setUploadProgress(0);
+
     try {
       await uploadMutation.mutateAsync({
-        file,
-        purpose: "batch",
-        expires_after: {
-          anchor: "created_at",
-          seconds: expirationSeconds,
+        data: {
+          file,
+          purpose: "batch",
+          expires_after: {
+            anchor: "created_at",
+            seconds: expirationSeconds,
+          },
         },
+        onProgress: setUploadProgress,
       });
 
       toast.success(`File "${file.name}" uploaded successfully`);
       setFile(null);
       setExpirationSeconds(2592000);
+      setUploadProgress(0);
       onSuccess?.();
       onClose();
     } catch (error) {
       console.error("Failed to upload file:", error);
+      setUploadProgress(0);
       setError(
         error instanceof Error
           ? error.message
@@ -144,6 +152,7 @@ export function UploadFileModal({
     setFile(null);
     setExpirationSeconds(2592000);
     setError(null);
+    setUploadProgress(0);
     onClose();
   };
 
@@ -233,6 +242,22 @@ export function UploadFileModal({
             )}
           </div>
 
+          {/* Upload Progress Bar */}
+          {uploadMutation.isPending && (
+            <div className="space-y-2">
+              <div className="flex justify-between text-sm">
+                <span className="text-gray-600">Uploading...</span>
+                <span className="text-gray-900 font-medium">{uploadProgress}%</span>
+              </div>
+              <div className="h-2 bg-gray-200 rounded-full overflow-hidden">
+                <div
+                  className="h-full bg-blue-600 rounded-full transition-all duration-150 ease-out"
+                  style={{ width: `${uploadProgress}%` }}
+                />
+              </div>
+            </div>
+          )}
+
           {/* Expiration Select */}
           <div className="space-y-2">
             <Label htmlFor="expiration">File Expiration</Label>
@@ -306,7 +331,7 @@ export function UploadFileModal({
             {uploadMutation.isPending ? (
               <>
                 <div className="animate-spin rounded-full h-4 w-4 border-b-2 border-white mr-2"></div>
-                Uploading...
+                Uploading... {uploadProgress}%
               </>
             ) : (
               <>
