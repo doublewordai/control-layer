@@ -1,5 +1,18 @@
 # Changelog
 
+## [0.26.0](https://github.com/doublewordai/control-layer/compare/v0.25.0...v0.26.0) (2026-01-08)
+
+
+### Features
+
+* improve batch modal UX with filename editing and copy updates ([#478](https://github.com/doublewordai/control-layer/issues/478)) ([a9af15d](https://github.com/doublewordai/control-layer/commit/a9af15dacc68bded996a739f81fdd794fc02e0e3))
+
+
+### Bug Fixes
+
+* round down in progress % ([#482](https://github.com/doublewordai/control-layer/issues/482)) ([ca42d89](https://github.com/doublewordai/control-layer/commit/ca42d8958e1cdad1a5adcc6bc9f45a9715950414))
+* test sla e2e ([#479](https://github.com/doublewordai/control-layer/issues/479)) ([c685cd0](https://github.com/doublewordai/control-layer/commit/c685cd095cf8b7455699b4af7e4e848922999d35))
+
 ## [0.25.0](https://github.com/doublewordai/control-layer/compare/v0.24.3...v0.25.0) (2026-01-08)
 
 
