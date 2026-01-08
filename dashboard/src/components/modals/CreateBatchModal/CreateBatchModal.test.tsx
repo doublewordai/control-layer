@@ -9,6 +9,7 @@ import * as hooks from "../../../api/control-layer/hooks";
 vi.mock("../../../api/control-layer/hooks", () => ({
   useCreateBatch: vi.fn(),
   useUploadFile: vi.fn(),
+  useUploadFileWithProgress: vi.fn(),
   useFiles: vi.fn(),
   useFileCostEstimate: vi.fn(),
   useConfig: vi.fn(() => ({
@@ -55,6 +56,26 @@ describe("CreateBatchModal", () => {
 
     // Default mock for useUploadFile
     vi.mocked(hooks.useUploadFile).mockReturnValue({
+      mutateAsync: vi.fn(),
+      isPending: false,
+      isError: false,
+      error: null,
+      isSuccess: false,
+      data: undefined,
+      mutate: vi.fn(),
+      reset: vi.fn(),
+      status: "idle",
+      context: undefined,
+      failureCount: 0,
+      failureReason: null,
+      isIdle: true,
+      isPaused: false,
+      submittedAt: 0,
+      variables: undefined,
+    } as any);
+
+    // Default mock for useUploadFileWithProgress
+    vi.mocked(hooks.useUploadFileWithProgress).mockReturnValue({
       mutateAsync: vi.fn(),
       isPending: false,
       isError: false,
@@ -183,7 +204,7 @@ describe("CreateBatchModal", () => {
 
       // Add a description
       const descriptionInput = screen.getByPlaceholderText(
-        /daily evaluation batch/i,
+        /Data generation task/i,
       );
       await user.type(descriptionInput, "Test batch");
 
@@ -331,7 +352,7 @@ describe("CreateBatchModal", () => {
 
       // Find and focus the description input - use screen since Dialog renders in a portal
       const descriptionInput = screen.getByPlaceholderText(
-        /daily evaluation batch/i,
+        /Data generation task/i,
       );
       await user.click(descriptionInput);
       await user.type(descriptionInput, "Test batch description");
@@ -393,7 +414,7 @@ describe("CreateBatchModal", () => {
 
       // Find and focus the description input - use screen since Dialog renders in a portal
       const descriptionInput = screen.getByPlaceholderText(
-        /daily evaluation batch/i,
+        /Data generation task/i,
       );
       await user.click(descriptionInput);
       await user.type(descriptionInput, "Test description");
@@ -440,7 +461,7 @@ describe("CreateBatchModal", () => {
 
       // Find and focus the description input - use screen since Dialog renders in a portal
       const descriptionInput = screen.getByPlaceholderText(
-        /daily evaluation batch/i,
+        /Data generation task/i,
       );
       await user.click(descriptionInput);
       await user.type(descriptionInput, "Test description");
@@ -489,7 +510,7 @@ describe("CreateBatchModal", () => {
 
       // Find and focus the description input (don't type anything) - use screen since Dialog renders in a portal
       const descriptionInput = screen.getByPlaceholderText(
-        /daily evaluation batch/i,
+        /Data generation task/i,
       );
       await user.click(descriptionInput);
 

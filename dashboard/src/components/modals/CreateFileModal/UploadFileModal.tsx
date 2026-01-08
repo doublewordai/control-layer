@@ -10,6 +10,7 @@ import {
 } from "../../ui/dialog";
 import { Button } from "../../ui/button";
 import { Label } from "../../ui/label";
+import { Input } from "../../ui/input";
 import {
   Select,
   SelectContent,
@@ -48,6 +49,7 @@ export function UploadFileModal({
   const [dragActive, setDragActive] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [uploadProgress, setUploadProgress] = useState<number>(0);
+  const [filename, setFilename] = useState<string>("");
 
   const uploadMutation = useUploadFileWithProgress();
   const { data: config } = useConfig();
@@ -78,6 +80,7 @@ export function UploadFileModal({
       const droppedFile = e.dataTransfer.files[0];
       if (droppedFile.name.endsWith(".jsonl")) {
         setFile(droppedFile);
+        setFilename(droppedFile.name);
       } else {
         setError("Please upload a .jsonl file");
       }
@@ -89,6 +92,7 @@ export function UploadFileModal({
       const selectedFile = e.target.files[0];
       if (selectedFile.name.endsWith(".jsonl")) {
         setFile(selectedFile);
+        setFilename(selectedFile.name);
         setError(null);
       } else {
         setError("Please upload a .jsonl file");
@@ -123,6 +127,7 @@ export function UploadFileModal({
         data: {
           file,
           purpose: "batch",
+          filename: filename || undefined,
           expires_after: {
             anchor: "created_at",
             seconds: expirationSeconds,
@@ -131,10 +136,11 @@ export function UploadFileModal({
         onProgress: setUploadProgress,
       });
 
-      toast.success(`File "${file.name}" uploaded successfully`);
+      toast.success(`File "${filename || file.name}" uploaded successfully`);
       setFile(null);
       setExpirationSeconds(2592000);
       setUploadProgress(0);
+      setFilename("");
       onSuccess?.();
       onClose();
     } catch (error) {
@@ -153,6 +159,7 @@ export function UploadFileModal({
     setExpirationSeconds(2592000);
     setError(null);
     setUploadProgress(0);
+    setFilename("");
     onClose();
   };
 
@@ -255,6 +262,22 @@ export function UploadFileModal({
                   style={{ width: `${uploadProgress}%` }}
                 />
               </div>
+            </div>
+          )}
+
+          {/* Filename Input (optional) */}
+          {file && (
+            <div className="space-y-2">
+              <Label htmlFor="filename">
+                New filename <span className="text-gray-400">(optional)</span>
+              </Label>
+              <Input
+                id="filename"
+                value={filename}
+                onChange={(e) => setFilename(e.target.value)}
+                placeholder={file.name}
+                disabled={uploadMutation.isPending}
+              />
             </div>
           )}
 
