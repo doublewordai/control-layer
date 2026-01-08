@@ -1,5 +1,17 @@
 # Changelog
 
+## [0.25.0](https://github.com/doublewordai/control-layer/compare/v0.24.3...v0.25.0) (2026-01-08)
+
+
+### Features
+
+* add progress bar for file uploads ([#477](https://github.com/doublewordai/control-layer/issues/477)) ([296a06a](https://github.com/doublewordai/control-layer/commit/296a06a747e94b28f1538c371b2b9dd52587a80c))
+
+
+### Bug Fixes
+
+* refresh API keys table and make HTML title configurable ([#469](https://github.com/doublewordai/control-layer/issues/469)) ([b7c4538](https://github.com/doublewordai/control-layer/commit/b7c4538ace9e7af6cb9f3197a5367b8fb5a277b2))
+
 ## [0.24.3](https://github.com/doublewordai/control-layer/compare/v0.24.2...v0.24.3) (2026-01-08)
 
 
