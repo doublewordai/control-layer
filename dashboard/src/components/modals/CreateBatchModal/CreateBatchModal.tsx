@@ -22,7 +22,7 @@ import {
 import {
   useCreateBatch,
   useFiles,
-  useUploadFile,
+  useUploadFileWithProgress,
   useConfig,
   useFileCostEstimate,
 } from "../../../api/control-layer/hooks";
@@ -63,9 +63,10 @@ export function CreateBatchModal({
   const [error, setError] = useState<string | null>(null);
   const [dragActive, setDragActive] = useState(false);
   const [isUploading, setIsUploading] = useState(false);
+  const [uploadProgress, setUploadProgress] = useState<number>(0);
 
   const createBatchMutation = useCreateBatch();
-  const uploadMutation = useUploadFile();
+  const uploadMutation = useUploadFileWithProgress();
 
   // Fetch config to get available SLAs
   const { data: config } = useConfig();
@@ -162,14 +163,18 @@ export function CreateBatchModal({
     // If a file needs to be uploaded, upload it first
     if (fileToUpload) {
       setIsUploading(true);
+      setUploadProgress(0);
       try {
         const uploadedFile = await uploadMutation.mutateAsync({
-          file: fileToUpload,
-          purpose: "batch",
-          expires_after: {
-            anchor: "created_at",
-            seconds: expirationSeconds,
+          data: {
+            file: fileToUpload,
+            purpose: "batch",
+            expires_after: {
+              anchor: "created_at",
+              seconds: expirationSeconds,
+            },
           },
+          onProgress: setUploadProgress,
         });
         finalFileId = uploadedFile.id;
         toast.success(`File "${fileToUpload.name}" uploaded successfully`);
@@ -181,9 +186,11 @@ export function CreateBatchModal({
             : "Failed to upload file. Please try again.",
         );
         setIsUploading(false);
+        setUploadProgress(0);
         return;
       } finally {
         setIsUploading(false);
+        setUploadProgress(0);
       }
     }
 
@@ -291,7 +298,7 @@ export function CreateBatchModal({
 
             {/* Show selected file or file to upload */}
             {selectedFile || fileToUpload ? (
-              <div className="bg-gray-50 rounded-lg p-3 space-y-1 relative">
+              <div className="bg-gray-50 rounded-lg p-3 space-y-2 relative">
                 <div className="flex items-start justify-between gap-2">
                   <div className="flex-1 min-w-0">
                     <p className="text-sm font-medium text-gray-900 truncate">
@@ -304,7 +311,7 @@ export function CreateBatchModal({
                             Size: {(fileToUpload.size / 1024).toFixed(1)} KB
                           </span>
                           <span className="text-blue-600">
-                            {isUploading ? "Uploading..." : "Ready to upload"}
+                            {isUploading ? `Uploading... ${uploadProgress}%` : "Ready to upload"}
                           </span>
                         </>
                       ) : (
@@ -330,6 +337,15 @@ export function CreateBatchModal({
                     <X className="w-4 h-4" />
                   </Button>
                 </div>
+                {/* Upload Progress Bar */}
+                {isUploading && (
+                  <div className="h-2 bg-gray-200 rounded-full overflow-hidden">
+                    <div
+                      className="h-full bg-blue-600 rounded-full transition-all duration-150 ease-out"
+                      style={{ width: `${uploadProgress}%` }}
+                    />
+                  </div>
+                )}
               </div>
             ) : (
               <>
@@ -511,14 +527,18 @@ export function CreateBatchModal({
                     onClick={async () => {
                       if (!fileToUpload || isPending) return;
                       setIsUploading(true);
+                      setUploadProgress(0);
                       try {
                         const uploadedFile = await uploadMutation.mutateAsync({
-                          file: fileToUpload,
-                          purpose: "batch",
-                          expires_after: {
-                            anchor: "created_at",
-                            seconds: expirationSeconds,
+                          data: {
+                            file: fileToUpload,
+                            purpose: "batch",
+                            expires_after: {
+                              anchor: "created_at",
+                              seconds: expirationSeconds,
+                            },
                           },
+                          onProgress: setUploadProgress,
                         });
                         setSelectedFileId(uploadedFile.id);
                         toast.success(
@@ -533,13 +553,14 @@ export function CreateBatchModal({
                         );
                       } finally {
                         setIsUploading(false);
+                        setUploadProgress(0);
                       }
                     }}
                     disabled={isPending}
                     className={`text-xs text-blue-600 hover:text-blue-700 hover:underline disabled:opacity-50 flex items-center gap-1 ${isPending ? "cursor-not-allowed" : "cursor-pointer"}`}
                   >
                     <Upload className="w-3 h-3" />
-                    Upload file to generate estimate
+                    Upload now to see cost estimate
                   </button>
                 )}
               </div>
@@ -582,7 +603,7 @@ export function CreateBatchModal({
             {isPending ? (
               <>
                 <div className="animate-spin rounded-full h-4 w-4 border-b-2 border-white mr-2"></div>
-                {isUploading ? "Uploading..." : "Creating..."}
+                {isUploading ? `Uploading... ${uploadProgress}%` : "Creating..."}
               </>
             ) : (
               <>
