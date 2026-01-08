@@ -178,7 +178,7 @@ export const createBatchColumns = (
               {completed + failed + canceled} / {total}
             </span>
             <span>
-              {Math.round(completedPercent + failedPercent + canceledPercent)}%
+              {Math.floor(completedPercent + failedPercent + canceledPercent)}%
             </span>
           </div>
           <div className="relative h-2 w-full bg-gray-200 rounded-full overflow-hidden">
