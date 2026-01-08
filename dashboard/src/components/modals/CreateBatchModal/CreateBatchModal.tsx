@@ -22,7 +22,7 @@ import {
 import {
   useCreateBatch,
   useFiles,
-  useUploadFile,
+  useUploadFileWithProgress,
   useConfig,
   useFileCostEstimate,
 } from "../../../api/control-layer/hooks";
@@ -63,9 +63,11 @@ export function CreateBatchModal({
   const [error, setError] = useState<string | null>(null);
   const [dragActive, setDragActive] = useState(false);
   const [isUploading, setIsUploading] = useState(false);
+  const [filename, setFilename] = useState<string>("");
+  const [uploadProgress, setUploadProgress] = useState<number>(0);
 
   const createBatchMutation = useCreateBatch();
-  const uploadMutation = useUploadFile();
+  const uploadMutation = useUploadFileWithProgress();
 
   // Fetch config to get available SLAs
   const { data: config } = useConfig();
@@ -130,6 +132,7 @@ export function CreateBatchModal({
       const droppedFile = e.dataTransfer.files[0];
       if (droppedFile.name.endsWith(".jsonl")) {
         setFileToUpload(droppedFile);
+        setFilename(droppedFile.name);
         setSelectedFileId(null); // Clear combobox selection
         setError(null);
       } else {
@@ -143,6 +146,7 @@ export function CreateBatchModal({
       const file = e.target.files[0];
       if (file.name.endsWith(".jsonl")) {
         setFileToUpload(file);
+        setFilename(file.name);
         setSelectedFileId(null); // Clear combobox selection
         setError(null);
       } else {
@@ -154,6 +158,7 @@ export function CreateBatchModal({
   const handleRemoveFile = () => {
     setFileToUpload(null);
     setSelectedFileId(null);
+    setFilename("");
   };
 
   const handleSubmit = async () => {
@@ -162,17 +167,22 @@ export function CreateBatchModal({
     // If a file needs to be uploaded, upload it first
     if (fileToUpload) {
       setIsUploading(true);
+      setUploadProgress(0);
       try {
         const uploadedFile = await uploadMutation.mutateAsync({
-          file: fileToUpload,
-          purpose: "batch",
-          expires_after: {
-            anchor: "created_at",
-            seconds: expirationSeconds,
+          data: {
+            file: fileToUpload,
+            purpose: "batch",
+            filename: filename || undefined,
+            expires_after: {
+              anchor: "created_at",
+              seconds: expirationSeconds,
+            },
           },
+          onProgress: setUploadProgress,
         });
         finalFileId = uploadedFile.id;
-        toast.success(`File "${fileToUpload.name}" uploaded successfully`);
+        toast.success(`File "${filename || fileToUpload.name}" uploaded successfully`);
       } catch (error) {
         console.error("Failed to upload file:", error);
         setError(
@@ -181,9 +191,11 @@ export function CreateBatchModal({
             : "Failed to upload file. Please try again.",
         );
         setIsUploading(false);
+        setUploadProgress(0);
         return;
       } finally {
         setIsUploading(false);
+        setUploadProgress(0);
       }
     }
 
@@ -218,6 +230,8 @@ export function CreateBatchModal({
       setCompletionWindow(availableSLAs[0] || "24h");
       setDescription("");
       setExpirationSeconds(2592000);
+      setFilename("");
+      setUploadProgress(0);
       setError(null);
       onSuccess?.();
       onClose();
@@ -234,6 +248,8 @@ export function CreateBatchModal({
     setCompletionWindow(availableSLAs[0] || "24h");
     setDescription("");
     setExpirationSeconds(2592000);
+    setFilename("");
+    setUploadProgress(0);
     setError(null);
     onClose();
   };
@@ -330,6 +346,15 @@ export function CreateBatchModal({
                     <X className="w-4 h-4" />
                   </Button>
                 </div>
+                {/* Upload Progress Bar */}
+                {isUploading && (
+                  <div className="h-2 bg-gray-200 rounded-full overflow-hidden">
+                    <div
+                      className="h-full bg-blue-600 rounded-full transition-all duration-150 ease-out"
+                      style={{ width: `${uploadProgress}%` }}
+                    />
+                  </div>
+                )}
               </div>
             ) : (
               <>
@@ -406,6 +431,22 @@ export function CreateBatchModal({
             )}
           </div>
 
+          {/* New Filename (optional, only for files to upload) */}
+          {fileToUpload && (
+            <div className="space-y-2">
+              <Label htmlFor="filename">
+                New filename <span className="text-gray-400">(optional)</span>
+              </Label>
+              <Input
+                id="filename"
+                value={filename}
+                onChange={(e) => setFilename(e.target.value)}
+                placeholder={fileToUpload.name}
+                disabled={isPending}
+              />
+            </div>
+          )}
+
           {/* Description (Optional) */}
           <div className="space-y-2">
             <Label htmlFor="description">
@@ -413,7 +454,7 @@ export function CreateBatchModal({
             </Label>
             <Input
               id="description"
-              placeholder="e.g., Daily evaluation batch"
+              placeholder="e.g., Data generation task"
               value={description}
               onChange={(e) => setDescription(e.target.value)}
               onKeyDown={(e) => {
@@ -511,18 +552,23 @@ export function CreateBatchModal({
                     onClick={async () => {
                       if (!fileToUpload || isPending) return;
                       setIsUploading(true);
+                      setUploadProgress(0);
                       try {
                         const uploadedFile = await uploadMutation.mutateAsync({
-                          file: fileToUpload,
-                          purpose: "batch",
-                          expires_after: {
-                            anchor: "created_at",
-                            seconds: expirationSeconds,
+                          data: {
+                            file: fileToUpload,
+                            purpose: "batch",
+                            filename: filename || undefined,
+                            expires_after: {
+                              anchor: "created_at",
+                              seconds: expirationSeconds,
+                            },
                           },
+                          onProgress: setUploadProgress,
                         });
                         setSelectedFileId(uploadedFile.id);
                         toast.success(
-                          `File "${fileToUpload.name}" uploaded successfully`,
+                          `File "${filename || fileToUpload.name}" uploaded successfully`,
                         );
                       } catch (err) {
                         console.error("Failed to upload file:", err);
@@ -533,13 +579,14 @@ export function CreateBatchModal({
                         );
                       } finally {
                         setIsUploading(false);
+                        setUploadProgress(0);
                       }
                     }}
                     disabled={isPending}
                     className={`text-xs text-blue-600 hover:text-blue-700 hover:underline disabled:opacity-50 flex items-center gap-1 ${isPending ? "cursor-not-allowed" : "cursor-pointer"}`}
                   >
                     <Upload className="w-3 h-3" />
-                    Upload file to generate estimate
+                    Complete file upload to generate inference cost estimate
                   </button>
                 )}
               </div>
