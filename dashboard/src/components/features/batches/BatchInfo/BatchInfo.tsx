@@ -109,7 +109,23 @@ const BatchInfo: React.FC = () => {
     );
   }
 
+  // Check if batch is queued (in_progress but no requests completed yet)
+  const isQueued =
+    batch.status === "in_progress" &&
+    batch.request_counts.completed === 0 &&
+    batch.request_counts.failed === 0;
+
   const getStatusBadge = (status: BatchStatus) => {
+    // Handle queued state
+    if (isQueued) {
+      return (
+        <Badge variant="secondary" className="flex items-center gap-1 w-fit">
+          <Clock className="w-3 h-3 text-gray-500" />
+          Queued
+        </Badge>
+      );
+    }
+
     const statusConfig: Record<
       BatchStatus,
       {
@@ -246,8 +262,10 @@ const BatchInfo: React.FC = () => {
       <div className="grid grid-cols-1 lg:grid-cols-3 gap-6">
         {/* Main Content */}
         <div className="lg:col-span-2 space-y-6">
-          {/* Progress Card */}
-          {batch.status !== "failed" &&
+          {/* Progress Card - hide when queued or in terminal states */}
+          {!isQueued &&
+            batch.status !== "validating" &&
+            batch.status !== "failed" &&
             batch.status !== "cancelled" &&
             batch.status !== "expired" && (
               <Card className="p-0 gap-0 rounded-lg">
@@ -388,95 +406,99 @@ const BatchInfo: React.FC = () => {
               </Card>
             )}
 
-          {/* Analytics Card */}
-          {analytics && (
-            <Card className="p-0 gap-0 rounded-lg">
-              <CardHeader className="flex w-full justify-between px-6 pt-5 pb-4">
-                <CardTitle>Metrics</CardTitle>
-                {hasRequestsPermission && (
-                  <Button
-                    variant="outline"
-                    onClick={() =>
-                      navigate(
-                        `/analytics?tab=requests&fusillade_batch_id=${batchId}&from=/batches/${batchId}`,
-                      )
-                    }
-                  >
-                    View Request Analytics
-                    <ExternalLink className="ml-2 h-4 w-4" />
-                  </Button>
-                )}
-              </CardHeader>
-              <CardContent className="px-6 pb-6 pt-0">
-                {analyticsLoading ? (
-                  <div className="space-y-4">
-                    <Skeleton className="h-20 w-full" />
-                    <Skeleton className="h-20 w-full" />
-                  </div>
-                ) : analytics.total_requests > 0 ? (
-                  <div className="space-y-6">
-                    {/* Token Usage */}
-                    <div>
-                      <h4 className="text-sm font-medium text-gray-900 mb-3">
-                        Token Usage
-                      </h4>
-                      <div className="grid grid-cols-3 gap-4">
-                        <div className="text-center p-3 rounded-lg">
-                          <p className="text-2xl font-bold">
-                            {analytics.total_prompt_tokens.toLocaleString()}
-                          </p>
-                          <p className="text-xs text-gray-600 mt-1">
-                            Prompt Tokens
-                          </p>
-                        </div>
-                        <div className="text-center p-3 rounded-lg">
-                          <p className="text-2xl font-bold">
-                            {analytics.total_completion_tokens.toLocaleString()}
-                          </p>
-                          <p className="text-xs text-gray-600 mt-1">
-                            Completion Tokens
-                          </p>
-                        </div>
-                        <div className="text-center p-3 rounded-lg">
-                          <p className="text-2xl font-bold text-gray-900">
-                            {analytics.total_tokens.toLocaleString()}
-                          </p>
-                          <p className="text-xs text-gray-600 mt-1">
-                            Total Tokens
-                          </p>
-                        </div>
-                      </div>
+          {/* Analytics Card - hide when no requests have been processed */}
+          {analytics &&
+            (batch.request_counts.completed > 0 ||
+              batch.request_counts.failed > 0) && (
+              <Card className="p-0 gap-0 rounded-lg">
+                <CardHeader className="flex w-full justify-between px-6 pt-5 pb-4">
+                  <CardTitle>Metrics</CardTitle>
+                  {hasRequestsPermission && (
+                    <Button
+                      variant="outline"
+                      onClick={() =>
+                        navigate(
+                          `/analytics?tab=requests&fusillade_batch_id=${batchId}&from=/batches/${batchId}`,
+                        )
+                      }
+                    >
+                      View Request Analytics
+                      <ExternalLink className="ml-2 h-4 w-4" />
+                    </Button>
+                  )}
+                </CardHeader>
+                <CardContent className="px-6 pb-6 pt-0">
+                  {analyticsLoading ? (
+                    <div className="space-y-4">
+                      <Skeleton className="h-20 w-full" />
+                      <Skeleton className="h-20 w-full" />
                     </div>
-
-                    {/* Cost */}
-                    {analytics.total_cost &&
-                      parseFloat(analytics.total_cost) > 0 && (
-                        <div className="border-t pt-6">
-                          <h4 className="text-sm font-medium text-gray-900 mb-3">
-                            Cost
-                          </h4>
-                          <div className="p-4 rounded-lg text-center">
-                            <p className="text-3xl font-bold text-green-700">
-                              ${parseFloat(analytics.total_cost).toFixed(4)}
+                  ) : analytics.total_requests > 0 ? (
+                    <div className="space-y-6">
+                      {/* Token Usage */}
+                      <div>
+                        <h4 className="text-sm font-medium text-gray-900 mb-3">
+                          Token Usage
+                        </h4>
+                        <div className="grid grid-cols-3 gap-4">
+                          <div className="text-center p-3 rounded-lg">
+                            <p className="text-2xl font-bold">
+                              {analytics.total_prompt_tokens.toLocaleString()}
                             </p>
                             <p className="text-xs text-gray-600 mt-1">
-                              Total Cost
+                              Prompt Tokens
+                            </p>
+                          </div>
+                          <div className="text-center p-3 rounded-lg">
+                            <p className="text-2xl font-bold">
+                              {analytics.total_completion_tokens.toLocaleString()}
+                            </p>
+                            <p className="text-xs text-gray-600 mt-1">
+                              Completion Tokens
+                            </p>
+                          </div>
+                          <div className="text-center p-3 rounded-lg">
+                            <p className="text-2xl font-bold text-gray-900">
+                              {analytics.total_tokens.toLocaleString()}
+                            </p>
+                            <p className="text-xs text-gray-600 mt-1">
+                              Total Tokens
                             </p>
                           </div>
                         </div>
-                      )}
-                  </div>
-                ) : (
-                  <div className="text-center py-8 text-gray-500">
-                    <p className="text-sm">No analytics data available yet.</p>
-                    <p className="text-xs mt-1">
-                      Analytics will appear as requests complete.
-                    </p>
-                  </div>
-                )}
-              </CardContent>
-            </Card>
-          )}
+                      </div>
+
+                      {/* Cost */}
+                      {analytics.total_cost &&
+                        parseFloat(analytics.total_cost) > 0 && (
+                          <div className="border-t pt-6">
+                            <h4 className="text-sm font-medium text-gray-900 mb-3">
+                              Cost
+                            </h4>
+                            <div className="p-4 rounded-lg text-center">
+                              <p className="text-3xl font-bold text-green-700">
+                                ${parseFloat(analytics.total_cost).toFixed(4)}
+                              </p>
+                              <p className="text-xs text-gray-600 mt-1">
+                                Total Cost
+                              </p>
+                            </div>
+                          </div>
+                        )}
+                    </div>
+                  ) : (
+                    <div className="text-center py-8 text-gray-500">
+                      <p className="text-sm">
+                        No analytics data available yet.
+                      </p>
+                      <p className="text-xs mt-1">
+                        Analytics will appear as requests complete.
+                      </p>
+                    </div>
+                  )}
+                </CardContent>
+              </Card>
+            )}
 
           {/* Batch Details */}
           <Card className="p-0 gap-0 rounded-lg">
