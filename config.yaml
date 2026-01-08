@@ -101,7 +101,7 @@ model_sources: []
 
 # Frontend metadata
 metadata:
-  title: "ACME Corp Control Layer"
+  title: "Doubleword Control Layer"
   # region: "UK South"
   # organization: "ACME Corp"
   docs_url: "https://docs.doubleword.ai/batches"
