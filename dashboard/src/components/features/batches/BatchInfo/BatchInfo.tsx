@@ -226,6 +226,14 @@ const BatchInfo: React.FC = () => {
                 <p className="text-doubleword-neutral-600 mt-1 font-mono text-sm">
                   {batch.id}
                 </p>
+                {description && (
+                  <h2
+                    className="text-xl text-doubleword-neutral-700 mt-1 truncate max-w-sm"
+                    title={description}
+                  >
+                    {description}
+                  </h2>
+                )}
               </div>
               <div className="flex items-center gap-3">
                 {getStatusBadge(batch.status)}
