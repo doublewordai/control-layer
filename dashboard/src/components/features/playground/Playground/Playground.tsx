@@ -68,27 +68,46 @@ const Playground: React.FC = () => {
     category: string;
   } | null>(null);
 
+  // Fetch model from URL if specified
   const { data: urlModelsData, error: modelsError } = useModels({
     limit: 1,
     search: selectedModelAlias,
   });
   const urlModels = useMemo(() => urlModelsData?.data ?? [], [urlModelsData]);
 
+  // Fetch first accessible chat model as default (only when no URL model specified)
+  const { data: defaultModelsData } = useModels({
+    limit: 1,
+    accessible: true,
+  });
+  const defaultModels = useMemo(
+    () => defaultModelsData?.data ?? [],
+    [defaultModelsData],
+  );
+
   // Convert models data to array and handle URL model selection
   useEffect(() => {
-    if (urlModels && urlModels.length > 0) {
+    // If already have a selected model, don't change it
+    if (selectedModel) return;
+
+    if (selectedModelAlias && urlModels && urlModels.length > 0) {
       // If a model ID is specified in URL, select it
-      if (selectedModelAlias) {
-        const model = urlModels.find((m) => m.alias === selectedModelAlias);
-        if (model) {
-          setSelectedModel(model);
-          setModelType(
-            (model.model_type?.toLowerCase() as ModelType) || "chat",
-          );
-        }
+      const model = urlModels.find((m) => m.alias === selectedModelAlias);
+      if (model) {
+        setSelectedModel(model);
+        setModelType((model.model_type?.toLowerCase() as ModelType) || "chat");
       }
+    } else if (!selectedModelAlias && defaultModels.length > 0) {
+      // No URL model specified, select the first accessible model as default
+      const model = defaultModels[0];
+      setSelectedModel(model);
+      setModelType((model.model_type?.toLowerCase() as ModelType) || "chat");
+      // Update URL to reflect the selected model
+      navigate(`/playground?model=${encodeURIComponent(model.alias)}`, {
+        replace: true,
+      });
     }
-  }, [urlModels, selectedModelAlias]);
+  }, [urlModels, selectedModelAlias, defaultModels, selectedModel, navigate]);
 
   // Handle models loading error
   useEffect(() => {
