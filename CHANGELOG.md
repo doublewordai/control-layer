@@ -10,6 +10,7 @@
 
 ### Bug Fixes
 
+* remove race condition in sla integration test ([7f4209f](https://github.com/doublewordai/control-layer/commit/7f4209f00d29b0e5da371dcc2c1c2e9f39e558f6))
 * round down in progress % ([#482](https://github.com/doublewordai/control-layer/issues/482)) ([ca42d89](https://github.com/doublewordai/control-layer/commit/ca42d8958e1cdad1a5adcc6bc9f45a9715950414))
 * test sla e2e ([#479](https://github.com/doublewordai/control-layer/issues/479)) ([c685cd0](https://github.com/doublewordai/control-layer/commit/c685cd095cf8b7455699b4af7e4e848922999d35))
 
