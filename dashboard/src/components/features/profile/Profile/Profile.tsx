@@ -9,7 +9,6 @@ import {
   Eye,
   EyeOff,
   Lock,
-  LockIcon,
 } from "lucide-react";
 import { useUser, useUpdateUser } from "../../../../api/control-layer/hooks";
 import {
@@ -52,28 +51,6 @@ export const Profile: React.FC = () => {
     setRoles((prev) =>
       prev.includes(role) ? prev.filter((r) => r !== role) : [...prev, role],
     );
-  };
-
-  const getAuthProviderDisplay = (currentUser: User): string => {
-    const { auth_source, external_user_id } = currentUser;
-
-    if (auth_source === "native" || auth_source === "system") {
-      return auth_source;
-    }
-
-    // attempt to parse common providers from external ID
-    if (external_user_id) {
-      const lowerExternalId = external_user_id.toLowerCase();
-      if (lowerExternalId.startsWith("github")) {
-        return "GitHub";
-      }
-      if (lowerExternalId.startsWith("google")) {
-        return "Google";
-      }
-      return "Oauth";
-    }
-
-    return "email";
   };
 
   const getRoleDescription = (role: Role): string => {
@@ -329,22 +306,6 @@ export const Profile: React.FC = () => {
                     {currentUser?.is_admin ? "Admin" : "User"}
                   </span>
                 </div>
-                {currentUser?.auth_source && (
-                  <div className="flex items-center text-sm">
-                    <LockIcon className="w-4 h-4 text-gray-400 mr-2 shrink-0" />
-                    <span className="text-gray-600 w-20 shrink-0">Auth:</span>
-                    <Tooltip>
-                      <TooltipTrigger asChild>
-                        <span className="text-gray-900 truncate">
-                          {getAuthProviderDisplay(currentUser)}
-                        </span>
-                      </TooltipTrigger>
-                      <TooltipContent>
-                        <p>{getAuthProviderDisplay(currentUser)}</p>
-                      </TooltipContent>
-                    </Tooltip>
-                  </div>
-                )}
               </div>
             </div>
           </div>
