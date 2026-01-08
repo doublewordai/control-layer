@@ -60,7 +60,7 @@ export function FileRequests() {
   const debouncedSearch = useDebounce(searchInput, 300);
 
   // Use pagination hook for URL-based pagination state
-  const pagination = useServerPagination({ defaultPageSize: 10 });
+  const pagination = useServerPagination({});
 
   // Get file details - works for input, output, or error files
   const { data: file } = useFile(fileId || "");
@@ -211,7 +211,7 @@ export function FileRequests() {
               </SelectTrigger>
               <SelectContent>
                 <SelectItem value="10">10</SelectItem>
-                <SelectItem value="25">25</SelectItem>
+                <SelectItem value="20">20</SelectItem>
                 <SelectItem value="50">50</SelectItem>
                 <SelectItem value="100">100</SelectItem>
               </SelectContent>
