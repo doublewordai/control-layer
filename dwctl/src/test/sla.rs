@@ -649,34 +649,43 @@ async fn test_sla_escalation_for_failed_batch(pool: PgPool) {
 
     let (initial_primary, initial_escalation) = tracker.get_counts();
     tracing::info!("   Initial state: primary={}, escalation={}", initial_primary, initial_escalation);
-    assert_eq!(initial_escalation, 0, "No escalations should have occurred yet");
+    // Note: We don't assert escalation==0 here because the SLA daemon might have already
+    // run between setting batch.failed_at and now. The real verification happens later.
 
-    let mut escalation_detected = false;
-    let start = tokio::time::Instant::now();
-    let timeout = tokio::time::Duration::from_secs(10); // Give it up to 10 seconds (SLA check runs every 5s)
+    let mut escalation_detected = initial_escalation >= 3;
 
-    while start.elapsed() < timeout {
-        tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+    if escalation_detected {
+        tracing::info!(
+            "🎯 Escalation already detected! {} requests sent to fallback server",
+            initial_escalation
+        );
+    } else {
+        let start = tokio::time::Instant::now();
+        let timeout = tokio::time::Duration::from_secs(10); // Give it up to 10 seconds (SLA check runs every 5s)
 
-        let (primary_count, escalation_count) = tracker.get_counts();
+        while start.elapsed() < timeout {
+            tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
 
-        if escalation_count >= 3 {
-            escalation_detected = true;
-            tracing::info!(
-                "🎯 Escalation detected! {} requests sent to fallback server despite batch failure",
-                escalation_count
-            );
-            break;
-        }
+            let (primary_count, escalation_count) = tracker.get_counts();
 
-        // Log progress every second
-        if start.elapsed().as_secs().is_multiple_of(1) && start.elapsed().as_millis() % 1000 < 100 {
-            tracing::info!(
-                "   Check ({}s): primary={}, escalation={}",
-                start.elapsed().as_secs(),
-                primary_count,
-                escalation_count
-            );
+            if escalation_count >= 3 {
+                escalation_detected = true;
+                tracing::info!(
+                    "🎯 Escalation detected! {} requests sent to fallback server despite batch failure",
+                    escalation_count
+                );
+                break;
+            }
+
+            // Log progress every second
+            if start.elapsed().as_secs().is_multiple_of(1) && start.elapsed().as_millis() % 1000 < 100 {
+                tracing::info!(
+                    "   Check ({}s): primary={}, escalation={}",
+                    start.elapsed().as_secs(),
+                    primary_count,
+                    escalation_count
+                );
+            }
         }
     }
 
