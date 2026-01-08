@@ -903,8 +903,7 @@ impl DaemonConfig {
                 match std::env::var(&env_var_or_key) {
                     Err(_) => {
                         warn!(
-                            "Priority endpoint configured with api_key '{}' - env var not found, using as literal value",
-                            env_var_or_key
+                            "Priority endpoint configured with api_key - env var not found, using as literal value"
                         );
                         // Keep the original value (could be a literal key for testing)
                     }
