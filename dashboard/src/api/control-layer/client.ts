@@ -1097,7 +1097,7 @@ const filesApi = {
     return new Promise((resolve, reject) => {
       const xhr = new XMLHttpRequest();
       const formData = new FormData();
-      formData.append("file", data.file);
+      formData.append("file", data.file, data.filename || data.file.name);
       formData.append("purpose", data.purpose);
 
       if (data.expires_after) {
