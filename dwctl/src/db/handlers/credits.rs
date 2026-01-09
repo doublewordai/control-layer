@@ -1365,4 +1365,252 @@ mod tests {
         let balance = credits.get_user_balance(user_id).await.expect("Failed to get balance");
         assert_eq!(balance, Decimal::from_str("100.123456375").unwrap());
     }
+
+    #[sqlx::test]
+    #[test_log::test]
+    async fn test_list_transactions_with_date_range_filter(pool: PgPool) {
+        let user_id = create_test_user(&pool).await;
+        let mut conn = pool.acquire().await.expect("Failed to acquire connection");
+        let mut credits = Credits::new(&mut conn);
+
+        // Create 3 transactions
+        credits.create_transaction(&CreditTransactionCreateDBRequest::admin_grant(
+            user_id, user_id, Decimal::from_str("100.0").unwrap(), Some("Transaction 1".to_string()),
+        )).await.expect("Failed to create transaction 1");
+
+        let tx2 = credits.create_transaction(&CreditTransactionCreateDBRequest::admin_grant(
+            user_id, user_id, Decimal::from_str("200.0").unwrap(), Some("Transaction 2".to_string()),
+        )).await.expect("Failed to create transaction 2");
+
+        credits.create_transaction(&CreditTransactionCreateDBRequest::admin_grant(
+            user_id, user_id, Decimal::from_str("300.0").unwrap(), Some("Transaction 3".to_string()),
+        )).await.expect("Failed to create transaction 3");
+
+        // Filter: from tx2's timestamp onwards (should get tx2 and tx3)
+        let start_date = Some(tx2.created_at);
+        let end_date = Some(Utc::now() + chrono::Duration::hours(1));
+
+        let filtered_txs = credits
+            .list_user_transactions(user_id, 0, 10, start_date, end_date)
+            .await
+            .expect("Failed to list filtered transactions");
+
+        assert_eq!(filtered_txs.len(), 2, "Should return 2 transactions within date range");
+
+        let count = credits
+            .count_user_transactions(user_id, start_date, end_date)
+            .await
+            .expect("Failed to count filtered transactions");
+
+        assert_eq!(count, 2, "Count should match filtered transactions");
+
+        // Test: Filter with no dates (should get all 3)
+        let all_txs = credits
+            .list_user_transactions(user_id, 0, 10, None, None)
+            .await
+            .expect("Failed to list all transactions");
+
+        assert_eq!(all_txs.len(), 3, "Should return all 3 transactions with no date filter");
+    }
+
+    #[sqlx::test]
+    #[test_log::test]
+    async fn test_list_transactions_with_only_start_date(pool: PgPool) {
+        let user_id = create_test_user(&pool).await;
+        let mut conn = pool.acquire().await.expect("Failed to acquire connection");
+        let mut credits = Credits::new(&mut conn);
+
+        // Create 3 transactions
+        credits.create_transaction(&CreditTransactionCreateDBRequest::admin_grant(
+            user_id, user_id, Decimal::from_str("100.0").unwrap(), Some("Transaction 1".to_string()),
+        )).await.expect("Failed to create transaction 1");
+
+        let tx2 = credits.create_transaction(&CreditTransactionCreateDBRequest::admin_grant(
+            user_id, user_id, Decimal::from_str("200.0").unwrap(), Some("Transaction 2".to_string()),
+        )).await.expect("Failed to create transaction 2");
+
+        credits.create_transaction(&CreditTransactionCreateDBRequest::admin_grant(
+            user_id, user_id, Decimal::from_str("300.0").unwrap(), Some("Transaction 3".to_string()),
+        )).await.expect("Failed to create transaction 3");
+
+        // Filter from tx2's timestamp onwards (should get tx2 and tx3)
+        let start_date = Some(tx2.created_at);
+
+        let filtered_txs = credits
+            .list_user_transactions(user_id, 0, 10, start_date, None)
+            .await
+            .expect("Failed to list transactions with start_date");
+
+        assert_eq!(filtered_txs.len(), 2, "Should return 2 transactions after cutoff");
+
+        let count = credits
+            .count_user_transactions(user_id, start_date, None)
+            .await
+            .expect("Failed to count transactions");
+
+        assert_eq!(count as usize, filtered_txs.len(), "Count should match filtered results");
+    }
+
+    #[sqlx::test]
+    #[test_log::test]
+    async fn test_list_transactions_with_only_end_date(pool: PgPool) {
+        let user_id = create_test_user(&pool).await;
+        let mut conn = pool.acquire().await.expect("Failed to acquire connection");
+        let mut credits = Credits::new(&mut conn);
+
+        // Create 3 transactions
+        credits.create_transaction(&CreditTransactionCreateDBRequest::admin_grant(
+            user_id, user_id, Decimal::from_str("100.0").unwrap(), Some("Transaction 1".to_string()),
+        )).await.expect("Failed to create transaction 1");
+
+        let tx2 = credits.create_transaction(&CreditTransactionCreateDBRequest::admin_grant(
+            user_id, user_id, Decimal::from_str("200.0").unwrap(), Some("Transaction 2".to_string()),
+        )).await.expect("Failed to create transaction 2");
+
+        credits.create_transaction(&CreditTransactionCreateDBRequest::admin_grant(
+            user_id, user_id, Decimal::from_str("300.0").unwrap(), Some("Transaction 3".to_string()),
+        )).await.expect("Failed to create transaction 3");
+
+        // Filter up to tx2's timestamp (should get tx1 and tx2)
+        let end_date = Some(tx2.created_at);
+
+        let filtered_txs = credits
+            .list_user_transactions(user_id, 0, 10, None, end_date)
+            .await
+            .expect("Failed to list transactions with end_date");
+
+        assert_eq!(filtered_txs.len(), 2, "Should return 2 transactions before cutoff");
+
+        let count = credits
+            .count_user_transactions(user_id, None, end_date)
+            .await
+            .expect("Failed to count transactions");
+
+        assert_eq!(count as usize, filtered_txs.len(), "Count should match filtered results");
+    }
+
+    #[sqlx::test]
+    #[test_log::test]
+    async fn test_list_all_transactions_with_date_filter(pool: PgPool) {
+        let user1_id = create_test_user(&pool).await;
+        let user2_id = create_test_user(&pool).await;
+        let mut conn = pool.acquire().await.expect("Failed to acquire connection");
+        let mut credits = Credits::new(&mut conn);
+
+        // Create transaction for user 1
+        credits.create_transaction(&CreditTransactionCreateDBRequest::admin_grant(
+            user1_id, user1_id, Decimal::from_str("100.0").unwrap(), Some("User 1 transaction".to_string()),
+        )).await.expect("Failed to create transaction");
+
+        // Create transaction for user 2
+        let tx2 = credits.create_transaction(&CreditTransactionCreateDBRequest::admin_grant(
+            user2_id, user2_id, Decimal::from_str("200.0").unwrap(), Some("User 2 transaction".to_string()),
+        )).await.expect("Failed to create transaction");
+
+        // Filter from tx2's timestamp (should get user2's transaction only)
+        let start_date = Some(tx2.created_at);
+
+        let filtered_txs = credits
+            .list_all_transactions(0, 10, start_date, None)
+            .await
+            .expect("Failed to list all transactions with filter");
+
+        assert_eq!(filtered_txs.len(), 1, "Should have 1 transaction after cutoff");
+
+        let count = credits
+            .count_all_transactions(start_date, None)
+            .await
+            .expect("Failed to count all transactions");
+
+        assert_eq!(count as usize, filtered_txs.len(), "Count should match filtered results");
+    }
+
+    #[sqlx::test]
+    #[test_log::test]
+    async fn test_transactions_with_batches_date_filter(pool: PgPool) {
+        let user_id = create_test_user(&pool).await;
+        let mut conn = pool.acquire().await.expect("Failed to acquire connection");
+        let mut credits = Credits::new(&mut conn);
+
+        let batch_id = Uuid::new_v4();
+
+        // Create batch transactions
+        let mut batch_txs = Vec::new();
+        for i in 0..3 {
+            let tx = credits.create_transaction(&CreditTransactionCreateDBRequest {
+                user_id,
+                transaction_type: CreditTransactionType::Usage,
+                amount: Decimal::from_str(&format!("{}.0", i + 1)).unwrap(),
+                source_id: format!("batch-{}", i),
+                description: Some(format!("Batch transaction {}", i)),
+                fusillade_batch_id: Some(batch_id),
+            }).await.expect("Failed to create batch transaction");
+            batch_txs.push(tx);
+        }
+
+        // Create non-batch transaction
+        let non_batch_tx = credits.create_transaction(&CreditTransactionCreateDBRequest::admin_grant(
+            user_id, user_id, Decimal::from_str("100.0").unwrap(), Some("Non-batch transaction".to_string()),
+        )).await.expect("Failed to create non-batch transaction");
+
+        // Test with no filter - should get all (1 batch grouped + 1 non-batch = 2)
+        let all_txs = credits
+            .list_transactions_with_batches(user_id, 0, 10, None, None)
+            .await
+            .expect("Failed to list all batched transactions");
+
+        assert_eq!(all_txs.len(), 2, "Should have batch + non-batch");
+
+        // Test with date filter from non_batch_tx timestamp (should get non-batch only)
+        let start_date = Some(non_batch_tx.created_at);
+
+        let filtered_txs = credits
+            .list_transactions_with_batches(user_id, 0, 10, start_date, None)
+            .await
+            .expect("Failed to list batched transactions with filter");
+
+        assert_eq!(filtered_txs.len(), 1, "Should have only non-batch transaction");
+
+        let count = credits
+            .count_transactions_with_batches(user_id, start_date, None)
+            .await
+            .expect("Failed to count batched transactions");
+
+        assert_eq!(count as usize, filtered_txs.len(), "Count should match filtered grouped results");
+    }
+
+    #[sqlx::test]
+    #[test_log::test]
+    async fn test_date_filter_handles_empty_results(pool: PgPool) {
+        let user_id = create_test_user(&pool).await;
+        let mut conn = pool.acquire().await.expect("Failed to acquire connection");
+        let mut credits = Credits::new(&mut conn);
+
+        // Create a transaction now
+        let request = CreditTransactionCreateDBRequest::admin_grant(
+            user_id,
+            user_id,
+            Decimal::from_str("100.0").unwrap(),
+            Some("Test transaction".to_string()),
+        );
+        credits.create_transaction(&request).await.expect("Failed to create transaction");
+
+        // Filter for transactions from a week ago to 2 days ago (should return nothing)
+        let start_date = Some(Utc::now() - chrono::Duration::days(7));
+        let end_date = Some(Utc::now() - chrono::Duration::days(2));
+
+        let filtered_txs = credits
+            .list_user_transactions(user_id, 0, 10, start_date, end_date)
+            .await
+            .expect("Failed to list transactions");
+
+        assert_eq!(filtered_txs.len(), 0, "Should return no transactions outside date range");
+
+        let count = credits
+            .count_user_transactions(user_id, start_date, end_date)
+            .await
+            .expect("Failed to count transactions");
+
+        assert_eq!(count, 0, "Count should be 0 for empty results");
+    }
 }
