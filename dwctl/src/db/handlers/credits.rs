@@ -245,6 +245,7 @@ impl<'c> Credits<'c> {
         user_id: UserId,
         skip: i64,
         limit: i64,
+<<<<<<< HEAD
         filters: &TransactionFilters,
     ) -> Result<Vec<CreditTransactionDBResponse>> {
         let transaction_types: Option<Vec<String>> = filters
@@ -252,6 +253,11 @@ impl<'c> Credits<'c> {
             .as_ref()
             .map(|types| types.iter().map(|t| transaction_type_to_string(t)).collect());
 
+=======
+        start_date: Option<DateTime<Utc>>,
+        end_date: Option<DateTime<Utc>>,
+    ) -> Result<Vec<CreditTransactionDBResponse>> {
+>>>>>>> main
         let transactions = sqlx::query_as!(
             CreditTransaction,
             r#"
@@ -286,6 +292,7 @@ impl<'c> Credits<'c> {
         &mut self,
         skip: i64,
         limit: i64,
+<<<<<<< HEAD
         filters: &TransactionFilters,
     ) -> Result<Vec<CreditTransactionDBResponse>> {
         let transaction_types: Option<Vec<String>> = filters
@@ -293,15 +300,25 @@ impl<'c> Credits<'c> {
             .as_ref()
             .map(|types| types.iter().map(|t| transaction_type_to_string(t)).collect());
 
+=======
+        start_date: Option<DateTime<Utc>>,
+        end_date: Option<DateTime<Utc>>,
+    ) -> Result<Vec<CreditTransactionDBResponse>> {
+>>>>>>> main
         let transactions = sqlx::query_as!(
             CreditTransaction,
             r#"
             SELECT id, user_id, transaction_type as "transaction_type: CreditTransactionType", amount, source_id, description, created_at, seq
             FROM credits_transactions
+<<<<<<< HEAD
             WHERE ($3::text IS NULL OR description ILIKE '%' || $3 || '%')
               AND ($4::text[] IS NULL OR transaction_type::text = ANY($4))
               AND ($5::timestamptz IS NULL OR created_at >= $5)
               AND ($6::timestamptz IS NULL OR created_at <= $6)
+=======
+            WHERE ($3::timestamptz IS NULL OR created_at >= $3)
+                AND ($4::timestamptz IS NULL OR created_at <= $4)
+>>>>>>> main
             ORDER BY seq DESC
             OFFSET $1
             LIMIT $2

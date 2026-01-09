@@ -81,9 +81,18 @@ export function TransactionHistory({
     { from: Date; to: Date } | undefined
   >();
   const [searchTerm, setSearchTerm] = useState<string>("");
+<<<<<<< HEAD
   const debouncedSearch = useDebounce(searchTerm, 300);
 
   // Fetch balance
+=======
+
+  // Pagination state
+  const [currentPage, setCurrentPage] = useState(1);
+  const itemsPerPage = 10;
+
+  // Fetch balance and transactions
+>>>>>>> main
   const { refetch: refetchBalance } = useUserBalance(userId);
 
   // Helper to map UI transaction type to API transaction_types
