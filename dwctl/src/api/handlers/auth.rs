@@ -598,7 +598,9 @@ fn create_session_cookie(token: &str, config: &crate::config::Config) -> String 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{db::models::credits::CreditTransactionType, test::utils::create_test_config};
+    use crate::{
+        api::models::transactions::TransactionFilters, db::models::credits::CreditTransactionType, test::utils::create_test_config,
+    };
     use axum_test::TestServer;
     use sqlx::PgPool;
 
@@ -743,7 +745,10 @@ mod tests {
         );
 
         // Verify the transaction exists with correct details
-        let transactions = credits_repo.list_user_transactions(body.user.id, 0, 10, None, None).await.unwrap();
+        let transactions = credits_repo
+            .list_user_transactions(body.user.id, 0, 10, &TransactionFilters::default())
+            .await
+            .unwrap();
 
         assert_eq!(transactions.len(), 1, "Should have exactly one transaction");
         assert_eq!(transactions[0].amount, rust_decimal::Decimal::new(10000, 2));
@@ -1013,7 +1018,6 @@ mod tests {
         };
 
         let created_user = user_repo.create(&user_create).await.unwrap();
-        drop(user_repo);
         drop(conn);
 
         let app = axum::Router::new()
@@ -1130,7 +1134,6 @@ mod tests {
         };
 
         user_repo.create(&user_create).await.unwrap();
-        drop(user_repo);
         drop(conn);
 
         let app = axum::Router::new()
@@ -1177,7 +1180,6 @@ mod tests {
         };
 
         user_repo.create(&user_create).await.unwrap();
-        drop(user_repo);
         drop(conn);
 
         let app = axum::Router::new()
@@ -1264,7 +1266,6 @@ mod tests {
         };
 
         user_repo.create(&user_create).await.unwrap();
-        drop(user_repo);
         drop(conn);
 
         let app = axum::Router::new()
@@ -1431,7 +1432,6 @@ mod tests {
         };
 
         user_repo.create(&user_create).await.unwrap();
-        drop(user_repo);
         drop(conn);
 
         let app = axum::Router::new()
@@ -1641,7 +1641,6 @@ mod tests {
         };
 
         let _created_user = user_repo.create(&user_create).await.unwrap();
-        drop(user_repo);
         drop(conn);
 
         // Step 1: Request password reset
@@ -1793,7 +1792,6 @@ mod tests {
         };
 
         let created_user = user_repo.create(&user_create).await.unwrap();
-        drop(user_repo);
         drop(conn);
 
         let user_response = UserResponse::from(created_user);
@@ -1874,7 +1872,6 @@ mod tests {
         };
 
         let created_user = user_repo.create(&user_create).await.unwrap();
-        drop(user_repo);
         drop(conn);
 
         let user_response = UserResponse::from(created_user);
@@ -1925,7 +1922,6 @@ mod tests {
         };
 
         let created_user = user_repo.create(&user_create).await.unwrap();
-        drop(user_repo);
         drop(conn);
 
         let user_response = UserResponse::from(created_user);
@@ -1986,7 +1982,6 @@ mod tests {
         };
 
         let created_user = user_repo.create(&user_create).await.unwrap();
-        drop(user_repo);
         drop(conn);
 
         let user_response = UserResponse::from(created_user);
@@ -2047,7 +2042,6 @@ mod tests {
         };
 
         let created_user = user_repo.create(&user_create).await.unwrap();
-        drop(user_repo);
         drop(conn);
 
         let user_response = UserResponse::from(created_user);
@@ -2107,7 +2101,6 @@ mod tests {
         };
 
         let created_user = user_repo.create(&user_create).await.unwrap();
-        drop(user_repo);
         drop(conn);
 
         let user_response = UserResponse::from(created_user);
