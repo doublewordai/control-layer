@@ -1260,7 +1260,10 @@ mod tests {
         );
 
         // Verify the transaction exists with correct details
-        let transactions = credits_repo.list_user_transactions(current_user.id, 0, 10).await.unwrap();
+        let transactions = credits_repo
+            .list_user_transactions(current_user.id, 0, 10, None, None)
+            .await
+            .unwrap();
 
         assert_eq!(transactions.len(), 1, "Should have exactly one transaction");
         assert_eq!(transactions[0].amount, rust_decimal::Decimal::new(10000, 2));
@@ -1323,7 +1326,7 @@ mod tests {
         );
 
         // Verify still only one transaction
-        let transactions = credits_repo.list_user_transactions(user.id, 0, 10).await.unwrap();
+        let transactions = credits_repo.list_user_transactions(user.id, 0, 10, None, None).await.unwrap();
         assert_eq!(transactions.len(), 1, "Should still have exactly one transaction");
     }
 }

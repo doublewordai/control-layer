@@ -229,20 +229,31 @@ impl<'c> Credits<'c> {
 
     /// List transactions for a specific user with pagination
     #[instrument(skip(self), fields(user_id = %abbrev_uuid(&user_id), skip = skip, limit = limit), err)]
-    pub async fn list_user_transactions(&mut self, user_id: UserId, skip: i64, limit: i64) -> Result<Vec<CreditTransactionDBResponse>> {
+    pub async fn list_user_transactions(
+        &mut self,
+        user_id: UserId,
+        skip: i64,
+        limit: i64,
+        start_date: Option<DateTime<Utc>>,
+        end_date: Option<DateTime<Utc>>,
+    ) -> Result<Vec<CreditTransactionDBResponse>> {
         let transactions = sqlx::query_as!(
             CreditTransaction,
             r#"
             SELECT id, user_id, transaction_type as "transaction_type: CreditTransactionType", amount, source_id, description, created_at, seq
             FROM credits_transactions
             WHERE user_id = $1
+                AND ($4::timestamptz IS NULL OR created_at >= $4)
+                AND ($5::timestamptz IS NULL OR created_at <= $5)
             ORDER BY seq DESC
             OFFSET $2
             LIMIT $3
             "#,
             user_id,
             skip,
-            limit
+            limit,
+            start_date,
+            end_date
         )
         .fetch_all(&mut *self.db)
         .await?;
@@ -252,18 +263,28 @@ impl<'c> Credits<'c> {
 
     /// List all transactions across all users (admin view)
     #[instrument(skip(self), fields(skip = skip, limit = limit), err)]
-    pub async fn list_all_transactions(&mut self, skip: i64, limit: i64) -> Result<Vec<CreditTransactionDBResponse>> {
+    pub async fn list_all_transactions(
+        &mut self,
+        skip: i64,
+        limit: i64,
+        start_date: Option<DateTime<Utc>>,
+        end_date: Option<DateTime<Utc>>,
+    ) -> Result<Vec<CreditTransactionDBResponse>> {
         let transactions = sqlx::query_as!(
             CreditTransaction,
             r#"
             SELECT id, user_id, transaction_type as "transaction_type: CreditTransactionType", amount, source_id, description, created_at, seq
             FROM credits_transactions
+            WHERE ($3::timestamptz IS NULL OR created_at >= $3)
+                AND ($4::timestamptz IS NULL OR created_at <= $4)
             ORDER BY seq DESC
             OFFSET $1
             LIMIT $2
             "#,
             skip,
-            limit
+            limit,
+            start_date,
+            end_date
         )
         .fetch_all(&mut *self.db)
         .await?;
@@ -292,8 +313,18 @@ impl<'c> Credits<'c> {
 
     /// Count total transactions for a specific user
     #[instrument(skip(self), fields(user_id = %abbrev_uuid(&user_id)), err)]
-    pub async fn count_user_transactions(&mut self, user_id: UserId) -> Result<i64> {
-        let result = sqlx::query!("SELECT COUNT(*) as count FROM credits_transactions WHERE user_id = $1", user_id)
+    pub async fn count_user_transactions(
+        &mut self,
+        user_id: UserId,
+        start_date: Option<DateTime<Utc>>,
+        end_date: Option<DateTime<Utc>>,
+    ) -> Result<i64> {
+        let result = sqlx::query!(
+            "SELECT COUNT(*) as count FROM credits_transactions WHERE user_id = $1 AND ($2::timestamptz IS NULL OR created_at >= $2) AND ($3::timestamptz IS NULL OR created_at <= $3)",
+            user_id,
+            start_date,
+            end_date
+        )
             .fetch_one(&mut *self.db)
             .await?;
 
@@ -302,8 +333,12 @@ impl<'c> Credits<'c> {
 
     /// Count total transactions across all users
     #[instrument(skip(self), err)]
-    pub async fn count_all_transactions(&mut self) -> Result<i64> {
-        let result = sqlx::query!("SELECT COUNT(*) as count FROM credits_transactions")
+    pub async fn count_all_transactions(&mut self, start_date: Option<DateTime<Utc>>, end_date: Option<DateTime<Utc>>) -> Result<i64> {
+        let result = sqlx::query!(
+            "SELECT COUNT(*) as count FROM credits_transactions WHERE ($1::timestamptz IS NULL OR created_at >= $1) AND ($2::timestamptz IS NULL OR created_at <= $2)",
+            start_date,
+            end_date
+        )
             .fetch_one(&mut *self.db)
             .await?;
 
@@ -314,16 +349,23 @@ impl<'c> Credits<'c> {
     /// Returns the count of aggregated results (batches count as 1, not N).
     /// Uses pre-aggregated batch_aggregates table for O(1) batch counting.
     #[instrument(skip(self), fields(user_id = %abbrev_uuid(&user_id)), err)]
-    pub async fn count_transactions_with_batches(&mut self, user_id: UserId) -> Result<i64> {
+    pub async fn count_transactions_with_batches(
+        &mut self,
+        user_id: UserId,
+        start_date: Option<DateTime<Utc>>,
+        end_date: Option<DateTime<Utc>>,
+    ) -> Result<i64> {
         let result = sqlx::query!(
             r#"
             SELECT
-                (SELECT COUNT(*) FROM batch_aggregates WHERE user_id = $1)
+                (SELECT COUNT(*) FROM batch_aggregates WHERE user_id = $1 AND ($2::timestamptz IS NULL OR created_at >= $2) AND ($3::timestamptz IS NULL OR created_at <= $3))
                 +
-                (SELECT COUNT(*) FROM credits_transactions WHERE user_id = $1 AND fusillade_batch_id IS NULL)
+                (SELECT COUNT(*) FROM credits_transactions WHERE user_id = $1 AND fusillade_batch_id IS NULL AND ($2::timestamptz IS NULL OR created_at >= $2) AND ($3::timestamptz IS NULL OR created_at <= $3))
             as "count!"
             "#,
-            user_id
+            user_id,
+            start_date,
+            end_date
         )
         .fetch_one(&mut *self.db)
         .await?;
@@ -415,6 +457,8 @@ impl<'c> Credits<'c> {
         user_id: UserId,
         skip: i64,
         limit: i64,
+        start_date: Option<DateTime<Utc>>,
+        end_date: Option<DateTime<Utc>>,
     ) -> Result<Vec<(CreditTransactionDBResponse, Option<Uuid>)>> {
         // Perform lazy aggregation for any new unaggregated transactions
         self.aggregate_user_batches(user_id).await?;
@@ -439,6 +483,8 @@ impl<'c> Credits<'c> {
                     ba.transaction_count as batch_count
                 FROM batch_aggregates ba
                 WHERE ba.user_id = $1
+                    AND ($5::timestamptz IS NULL OR ba.created_at >= $5)
+                    AND ($6::timestamptz IS NULL OR ba.created_at <= $6)
                 ORDER BY ba.max_seq DESC
                 LIMIT $2)
 
@@ -459,6 +505,8 @@ impl<'c> Credits<'c> {
                 FROM credits_transactions ct
                 WHERE ct.user_id = $1
                   AND ct.fusillade_batch_id IS NULL
+                  AND ($5::timestamptz IS NULL OR ct.created_at >= $5)
+                  AND ($6::timestamptz IS NULL OR ct.created_at <= $6)
                 ORDER BY ct.seq DESC
                 LIMIT $2)
             ) combined
@@ -468,7 +516,9 @@ impl<'c> Credits<'c> {
             user_id,
             fetch_limit,
             limit,
-            skip
+            skip,
+            start_date,
+            end_date
         )
         .fetch_all(&mut *self.db)
         .await?;
@@ -709,7 +759,7 @@ mod tests {
         }
 
         let transactions = credits
-            .list_user_transactions(user_id, 0, n_of_transactions)
+            .list_user_transactions(user_id, 0, n_of_transactions, None, None)
             .await
             .expect("Failed to list transactions");
 
@@ -793,21 +843,21 @@ mod tests {
 
         // Test limit
         let transactions = credits
-            .list_user_transactions(user_id, 0, 2)
+            .list_user_transactions(user_id, 0, 2, None, None)
             .await
             .expect("Failed to list transactions");
         assert_eq!(transactions.len(), 2);
 
         // Test skip
         let transactions = credits
-            .list_user_transactions(user_id, 2, 2)
+            .list_user_transactions(user_id, 2, 2, None, None)
             .await
             .expect("Failed to list transactions");
         assert_eq!(transactions.len(), 2);
 
         // Test skip beyond available
         let transactions = credits
-            .list_user_transactions(user_id, 10, 2)
+            .list_user_transactions(user_id, 10, 2, None, None)
             .await
             .expect("Failed to list transactions");
         assert_eq!(transactions.len(), 0);
@@ -831,7 +881,7 @@ mod tests {
 
         // List user1's transactions
         let transactions = credits
-            .list_user_transactions(user1_id, 0, 10)
+            .list_user_transactions(user1_id, 0, 10, None, None)
             .await
             .expect("Failed to list transactions");
         assert_eq!(transactions.len(), 1);
@@ -842,7 +892,7 @@ mod tests {
 
         // List user2's transactions
         let transactions = credits
-            .list_user_transactions(user2_id, 0, 10)
+            .list_user_transactions(user2_id, 0, 10, None, None)
             .await
             .expect("Failed to list transactions");
         assert_eq!(transactions.len(), 1);
@@ -854,7 +904,7 @@ mod tests {
         // List non existent user's transactions
         let non_existent_user_id = Uuid::new_v4();
         let transactions = credits
-            .list_user_transactions(non_existent_user_id, 0, 10)
+            .list_user_transactions(non_existent_user_id, 0, 10, None, None)
             .await
             .expect("Failed to list transactions");
         assert_eq!(transactions.len(), 0);
@@ -885,7 +935,10 @@ mod tests {
         );
         credits.create_transaction(&request2).await.expect("Failed to create transaction");
 
-        let transactions = credits.list_all_transactions(0, 10).await.expect("Failed to list transactions");
+        let transactions = credits
+            .list_all_transactions(0, 10, None, None)
+            .await
+            .expect("Failed to list transactions");
 
         // Should have at least our 2 transactions
         assert!(transactions.len() >= 2);
@@ -912,11 +965,17 @@ mod tests {
         }
 
         // Test limit
-        let transactions = credits.list_all_transactions(0, 2).await.expect("Failed to list transactions");
+        let transactions = credits
+            .list_all_transactions(0, 2, None, None)
+            .await
+            .expect("Failed to list transactions");
         assert_eq!(transactions.len(), 2);
 
         // Test skip
-        let transactions = credits.list_all_transactions(2, 2).await.expect("Failed to list transactions");
+        let transactions = credits
+            .list_all_transactions(2, 2, None, None)
+            .await
+            .expect("Failed to list transactions");
         assert!(transactions.len() >= 2);
     }
 
@@ -1001,7 +1060,7 @@ mod tests {
 
         // Verify only one transaction exists
         let transactions = credits
-            .list_user_transactions(user_id, 0, 10)
+            .list_user_transactions(user_id, 0, 10, None, None)
             .await
             .expect("Failed to list transactions");
         assert_eq!(transactions.len(), 1);
@@ -1207,7 +1266,7 @@ mod tests {
         let mut conn = pool.acquire().await.expect("Failed to acquire connection");
         let mut credits = Credits::new(&mut conn);
         let transactions = credits
-            .list_user_transactions(user_id, 0, 1000)
+            .list_user_transactions(user_id, 0, 1000, None, None)
             .await
             .expect("Failed to list transactions");
 
