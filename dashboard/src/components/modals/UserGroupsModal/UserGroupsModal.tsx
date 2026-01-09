@@ -1,5 +1,7 @@
 import React, { useEffect, useMemo, useState } from "react";
-import { Users, Plus, Trash2 } from "lucide-react";
+import { Users, Plus, Trash2, Search } from "lucide-react";
+import { useDebounce } from "../../../hooks/useDebounce";
+import { Input } from "../../ui/input";
 import {
   Dialog,
   DialogContent,
@@ -34,6 +36,10 @@ export const UserGroupsModal: React.FC<UserGroupsModalProps> = ({
 }) => {
   const [error, setError] = useState<string | null>(null);
 
+  // Search state for groups (server-side)
+  const [searchQuery, setSearchQuery] = useState("");
+  const debouncedSearch = useDebounce(searchQuery, 300);
+
   // Pagination hook
   const pagination = useServerPagination({
     paramPrefix: "userGroupsModal",
@@ -45,6 +51,7 @@ export const UserGroupsModal: React.FC<UserGroupsModalProps> = ({
   const { data: groupsResponse, isLoading: loading } = useGroups({
     include: "users",
     enabled: isOpen,
+    search: debouncedSearch || undefined,
     ...pagination.queryParams,
   });
   const addUserToGroupMutation = useAddUserToGroup();
@@ -66,6 +73,8 @@ export const UserGroupsModal: React.FC<UserGroupsModalProps> = ({
   const handleClose = () => {
     // Clear pagination params from URL
     pagination.handleClear();
+    // Clear search query
+    setSearchQuery("");
     onClose();
   };
 
@@ -144,22 +153,44 @@ export const UserGroupsModal: React.FC<UserGroupsModalProps> = ({
                 </p>
               </div>
 
+              {/* Search input */}
+              <div className="relative mb-4">
+                <Search className="absolute left-2 top-2.5 h-4 w-4 text-muted-foreground" />
+                <Input
+                  type="text"
+                  placeholder="Search groups..."
+                  value={searchQuery}
+                  onChange={(e) => {
+                    setSearchQuery(e.target.value);
+                    pagination.handleReset();
+                  }}
+                  className="pl-8"
+                  aria-label="Search groups"
+                />
+              </div>
+
               {!groupsData || groupsData.length === 0 ? (
                 <div className="text-center py-8">
                   <Users className="w-12 h-12 text-gray-400 mx-auto mb-3" />
-                  <p className="text-gray-500">No groups available</p>
-                  <p className="text-sm text-gray-400 mb-4">
-                    Create groups first to manage user membership
+                  <p className="text-gray-500">
+                    {searchQuery ? "No groups found" : "No groups available"}
                   </p>
-                  <button
-                    onClick={() => {
-                      onClose();
-                      window.location.hash = "#/users-groups";
-                    }}
-                    className="px-4 py-2 bg-blue-600 text-white rounded-lg hover:bg-blue-700 transition-colors"
-                  >
-                    Create Groups
-                  </button>
+                  <p className="text-sm text-gray-400 mb-4">
+                    {searchQuery
+                      ? "Try a different search term"
+                      : "Create groups first to manage user membership"}
+                  </p>
+                  {!searchQuery && (
+                    <button
+                      onClick={() => {
+                        onClose();
+                        window.location.hash = "#/users-groups";
+                      }}
+                      className="px-4 py-2 bg-blue-600 text-white rounded-lg hover:bg-blue-700 transition-colors"
+                    >
+                      Create Groups
+                    </button>
+                  )}
                 </div>
               ) : (
                 groupsData.map((group: BackendGroup) => (
