@@ -1,5 +1,18 @@
 # Changelog
 
+## [0.28.0](https://github.com/doublewordai/control-layer/compare/v0.27.1...v0.28.0) (2026-01-09)
+
+
+### Features
+
+* sample file generators ([#468](https://github.com/doublewordai/control-layer/issues/468)) ([0c375c2](https://github.com/doublewordai/control-layer/commit/0c375c237230da8d5859595356d32610bd566672))
+
+
+### Bug Fixes
+
+* make transaction time filtering server side ([#490](https://github.com/doublewordai/control-layer/issues/490)) ([6e5928e](https://github.com/doublewordai/control-layer/commit/6e5928e8c6b13d067b0de8b0554e882d778893fe))
+* removed references to expiry of files, and some UI warnings for large… ([#491](https://github.com/doublewordai/control-layer/issues/491)) ([5ff255d](https://github.com/doublewordai/control-layer/commit/5ff255d45c9169f303ec2d59d28586de67deab21))
+
 ## [0.27.1](https://github.com/doublewordai/control-layer/compare/v0.27.0...v0.27.1) (2026-01-09)
 
 
