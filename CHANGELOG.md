@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.28.2](https://github.com/doublewordai/control-layer/compare/v0.28.1...v0.28.2) (2026-01-09)
+
+
+### Bug Fixes
+
+* in processign state, the progress bar pulses, now less aggrressively ([#497](https://github.com/doublewordai/control-layer/issues/497)) ([d87f24a](https://github.com/doublewordai/control-layer/commit/d87f24a84e5f80802be892264dd8d75b9a71744c))
+
 ## [0.28.1](https://github.com/doublewordai/control-layer/compare/v0.28.0...v0.28.1) (2026-01-09)
 
 
