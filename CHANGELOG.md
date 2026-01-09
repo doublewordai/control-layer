@@ -1,5 +1,18 @@
 # Changelog
 
+## [0.27.0](https://github.com/doublewordai/control-layer/compare/v0.26.0...v0.27.0) (2026-01-09)
+
+
+### Features
+
+* add request_origin and batch_sla labels to gen_ai metrics and http_analytics ([#486](https://github.com/doublewordai/control-layer/issues/486)) ([e49b29e](https://github.com/doublewordai/control-layer/commit/e49b29e8feeac392f7eb37c79d83f79c51b76eb9))
+
+
+### Bug Fixes
+
+* change the ordering of prometheus initialization and background … ([#485](https://github.com/doublewordai/control-layer/issues/485)) ([d3520e1](https://github.com/doublewordai/control-layer/commit/d3520e1a0b4221bd536c06bf92735861dcddb787))
+* Jansix UI fixes 2 ([#481](https://github.com/doublewordai/control-layer/issues/481)) ([ee8290c](https://github.com/doublewordai/control-layer/commit/ee8290cd532395e7706e9e829a7cbd4bcce09e6b))
+
 ## [0.26.0](https://github.com/doublewordai/control-layer/compare/v0.25.0...v0.26.0) (2026-01-08)
 
 
