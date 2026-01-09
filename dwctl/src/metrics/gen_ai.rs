@@ -45,6 +45,8 @@ impl GenAiMetrics {
                 "server_address",
                 "server_port",
                 "error_type",
+                "request_origin",
+                "batch_sla",
             ],
         )?;
         registry.register(Box::new(request_duration.clone()))?;
@@ -67,6 +69,8 @@ impl GenAiMetrics {
                 "gen_ai_response_model",
                 "server_address",
                 "server_port",
+                "request_origin",
+                "batch_sla",
             ],
         )?;
         registry.register(Box::new(time_to_first_token.clone()))?;
@@ -87,6 +91,8 @@ impl GenAiMetrics {
                 "gen_ai_response_model",
                 "server_address",
                 "server_port",
+                "request_origin",
+                "batch_sla",
             ],
         )?;
         registry.register(Box::new(time_per_output_token.clone()))?;
@@ -106,6 +112,8 @@ impl GenAiMetrics {
                 "gen_ai_token_type",
                 "server_address",
                 "server_port",
+                "request_origin",
+                "batch_sla",
             ],
         )?;
         registry.register(Box::new(token_usage.clone()))?;
@@ -174,6 +182,8 @@ impl MetricsRecorder for GenAiMetrics {
         let provider_name = row.provider_name.as_deref().unwrap_or("");
         let request_model = row.request_model.as_deref().unwrap_or("");
         let response_model = row.response_model.as_deref().unwrap_or("");
+        let request_origin = &row.request_origin;
+        let batch_sla = &row.batch_sla;
 
         // Record request duration (always)
         let duration_labels = vec![
@@ -184,12 +194,23 @@ impl MetricsRecorder for GenAiMetrics {
             server_address,
             server_port,
             &error_type,
+            request_origin,
+            batch_sla,
         ];
         self.record_request_duration(row.duration_ms as f64 / 1000.0, &duration_labels);
 
         // Record time to first token (only for streaming)
         if is_streaming && let Some(ttfb_ms) = row.duration_to_first_byte_ms {
-            let ttft_labels = vec![operation, provider_name, request_model, response_model, server_address, server_port];
+            let ttft_labels = vec![
+                operation,
+                provider_name,
+                request_model,
+                response_model,
+                server_address,
+                server_port,
+                request_origin,
+                batch_sla,
+            ];
             self.record_time_to_first_token(ttfb_ms as f64 / 1000.0, &ttft_labels);
         }
 
@@ -199,7 +220,16 @@ impl MetricsRecorder for GenAiMetrics {
         {
             let time_after_first_token = (row.duration_ms - ttfb_ms) as f64 / 1000.0;
             let time_per_token = time_after_first_token / row.completion_tokens as f64;
-            let tpot_labels = vec![operation, provider_name, request_model, response_model, server_address, server_port];
+            let tpot_labels = vec![
+                operation,
+                provider_name,
+                request_model,
+                response_model,
+                server_address,
+                server_port,
+                request_origin,
+                batch_sla,
+            ];
             self.record_time_per_output_token(time_per_token, &tpot_labels);
         }
 
@@ -213,6 +243,8 @@ impl MetricsRecorder for GenAiMetrics {
                 "input",
                 server_address,
                 server_port,
+                request_origin,
+                batch_sla,
             ];
             self.record_token_usage(row.prompt_tokens as f64, &input_labels);
         }
@@ -227,6 +259,8 @@ impl MetricsRecorder for GenAiMetrics {
                 "output",
                 server_address,
                 server_port,
+                request_origin,
+                batch_sla,
             ];
             self.record_token_usage(row.completion_tokens as f64, &output_labels);
         }
@@ -277,6 +311,8 @@ mod tests {
             fusillade_batch_id: None,
             fusillade_request_id: None,
             custom_id: None,
+            request_origin: "api".to_string(),
+            batch_sla: String::new(),
         };
 
         // Call the function under test
@@ -389,6 +425,8 @@ mod tests {
             fusillade_batch_id: None,
             fusillade_request_id: None,
             custom_id: None,
+            request_origin: "api".to_string(),
+            batch_sla: String::new(),
         };
 
         metrics.record_from_analytics(&row).await;
@@ -449,6 +487,8 @@ mod tests {
             fusillade_batch_id: None,
             fusillade_request_id: None,
             custom_id: None,
+            request_origin: "api".to_string(),
+            batch_sla: String::new(),
         };
 
         metrics.record_from_analytics(&row).await;
@@ -520,6 +560,8 @@ mod tests {
             fusillade_batch_id: None,
             fusillade_request_id: None,
             custom_id: None,
+            request_origin: "api".to_string(),
+            batch_sla: String::new(),
         };
 
         metrics.record_from_analytics(&row).await;
@@ -577,6 +619,8 @@ mod tests {
             fusillade_batch_id: None,
             fusillade_request_id: None,
             custom_id: None,
+            request_origin: "api".to_string(),
+            batch_sla: String::new(),
         };
 
         metrics.record_from_analytics(&row).await;
@@ -637,6 +681,8 @@ mod tests {
             fusillade_batch_id: None,
             fusillade_request_id: None,
             custom_id: None,
+            request_origin: "api".to_string(),
+            batch_sla: String::new(),
         };
 
         metrics.record_from_analytics(&row).await;
@@ -694,6 +740,8 @@ mod tests {
             fusillade_batch_id: None,
             fusillade_request_id: None,
             custom_id: None,
+            request_origin: "api".to_string(),
+            batch_sla: String::new(),
         };
 
         metrics.record_from_analytics(&row).await;
@@ -746,6 +794,8 @@ mod tests {
                 fusillade_batch_id: None,
                 fusillade_request_id: None,
                 custom_id: None,
+                request_origin: "api".to_string(),
+                batch_sla: String::new(),
             };
 
             metrics.record_from_analytics(&row).await;
@@ -796,6 +846,8 @@ mod tests {
             fusillade_batch_id: None,
             fusillade_request_id: None,
             custom_id: None,
+            request_origin: "api".to_string(),
+            batch_sla: String::new(),
         };
 
         metrics.record_from_analytics(&row).await;

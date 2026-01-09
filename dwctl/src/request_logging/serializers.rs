@@ -122,6 +122,15 @@ pub struct HttpAnalyticsRow {
     pub fusillade_batch_id: Option<Uuid>,
     pub fusillade_request_id: Option<Uuid>,
     pub custom_id: Option<String>,
+    /// Request origin: "api", "frontend", or "fusillade"
+    pub request_origin: String,
+    /// Batch SLA completion window: "1h", "24h", etc.
+    ///
+    /// This is recorded as an empty string (`""`) for non-batch requests rather than
+    /// using `None`/`NULL`. The empty-string sentinel is intentional so that
+    /// Prometheus metrics can be filtered with a simple `batch_sla=""` label
+    /// selector, at the cost of a small increase in label cardinality.
+    pub batch_sla: String,
 }
 
 /// Usage metrics extracted from AI responses (subset of HttpAnalyticsRow)
@@ -519,6 +528,17 @@ pub async fn store_analytics_record(
         fusillade_batch_id,
         fusillade_request_id,
         custom_id,
+        request_origin: match (&api_key_purpose, &fusillade_batch_id) {
+            // Any explicit fusillade batch ID takes precedence
+            (_, Some(_)) => "fusillade".to_string(),
+            // Batch API keys without an explicit fusillade_batch_id are still considered fusillade
+            (Some(crate::db::models::api_keys::ApiKeyPurpose::Batch), None) => "fusillade".to_string(),
+            // Playground keys map to the frontend origin
+            (Some(crate::db::models::api_keys::ApiKeyPurpose::Playground), _) => "frontend".to_string(),
+            // Everything else is treated as generic API usage
+            _ => "api".to_string(),
+        },
+        batch_sla: batch_completion_window.clone().unwrap_or_default(),
     };
 
     // Insert the analytics record and get the ID
@@ -528,9 +548,10 @@ pub async fn store_analytics_record(
             instance_id, correlation_id, timestamp, method, uri, model,
             status_code, duration_ms, duration_to_first_byte_ms, prompt_tokens, completion_tokens,
             total_tokens, response_type, user_id, user_email, access_source,
-            input_price_per_token, output_price_per_token, fusillade_batch_id, fusillade_request_id, custom_id
+            input_price_per_token, output_price_per_token, fusillade_batch_id, fusillade_request_id, custom_id,
+            request_origin, batch_sla
         )
-        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21)
+        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23)
         ON CONFLICT (instance_id, correlation_id)
         DO UPDATE SET
             status_code = EXCLUDED.status_code,
@@ -547,7 +568,9 @@ pub async fn store_analytics_record(
             output_price_per_token = EXCLUDED.output_price_per_token,
             fusillade_batch_id = EXCLUDED.fusillade_batch_id,
             fusillade_request_id = EXCLUDED.fusillade_request_id,
-            custom_id = EXCLUDED.custom_id
+            custom_id = EXCLUDED.custom_id,
+            request_origin = EXCLUDED.request_origin,
+            batch_sla = EXCLUDED.batch_sla
         RETURNING id
         "#,
         row.instance_id,
@@ -570,7 +593,9 @@ pub async fn store_analytics_record(
         row.output_price_per_token,
         row.fusillade_batch_id,
         row.fusillade_request_id,
-        row.custom_id
+        row.custom_id,
+        row.request_origin,
+        row.batch_sla
     )
     .fetch_one(pool)
     .instrument(info_span!("insert_http_analytics"))
