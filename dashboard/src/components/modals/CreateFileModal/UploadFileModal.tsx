@@ -319,12 +319,13 @@ export function UploadFileModal({
               </div>
               <div className="h-2 bg-gray-200 rounded-full overflow-hidden">
                 <div
-                  className={`h-full rounded-full transition-all duration-150 ease-out ${
-                    isProcessing 
-                      ? "bg-blue-600 animate-pulse" 
-                      : "bg-blue-600"
-                  }`}
-                  style={{ width: `${uploadProgress}%` }}
+                  className="h-full rounded-full transition-all duration-150 ease-out bg-blue-600"
+                  style={{ 
+                    width: `${uploadProgress}%`,
+                    ...(isProcessing && {
+                      animation: 'gentlePulse 3s ease-in-out infinite'
+                    })
+                  }}
                 />
               </div>
               {isProcessing && (
