@@ -122,6 +122,10 @@ pub struct HttpAnalyticsRow {
     pub fusillade_batch_id: Option<Uuid>,
     pub fusillade_request_id: Option<Uuid>,
     pub custom_id: Option<String>,
+    /// Request origin: "api", "frontend", or "fusillade"
+    pub request_origin: String,
+    /// Batch SLA completion window: "1h", "24h", etc. Empty for non-batch requests.
+    pub batch_sla: String,
 }
 
 /// Usage metrics extracted from AI responses (subset of HttpAnalyticsRow)
@@ -519,6 +523,12 @@ pub async fn store_analytics_record(
         fusillade_batch_id,
         fusillade_request_id,
         custom_id,
+        request_origin: match (&api_key_purpose, &fusillade_batch_id) {
+            (_, Some(_)) => "fusillade".to_string(),
+            (Some(crate::db::models::api_keys::ApiKeyPurpose::Playground), _) => "frontend".to_string(),
+            _ => "api".to_string(),
+        },
+        batch_sla: batch_completion_window.clone().unwrap_or_default(),
     };
 
     // Insert the analytics record and get the ID
