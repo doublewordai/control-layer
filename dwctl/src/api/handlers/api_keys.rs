@@ -454,7 +454,7 @@ mod tests {
         let user = create_test_user(&pool, Role::StandardUser).await;
         let group = create_test_group(&pool).await;
         add_user_to_group(&pool, user.id, group.id).await;
-        create_test_api_key_for_user(&pool, user.id).await;
+        let api_key = create_test_api_key_for_user(&pool, user.id).await;
 
         let response = app
             .get("/admin/api/v1/users/current/api-keys")
@@ -466,7 +466,7 @@ mod tests {
         let paginated: PaginatedResponse<ApiKeyInfoResponse> = response.json();
         assert_eq!(paginated.data.len(), 1);
         assert_eq!(paginated.total_count, 1);
-        assert_eq!(paginated.data[0].name, "Test API Key");
+        assert_eq!(paginated.data[0].name, api_key.name);
     }
 
     // Add new pagination test for the handler
