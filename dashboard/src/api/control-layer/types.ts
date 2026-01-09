@@ -721,6 +721,8 @@ export interface TransactionsQuery {
   skip?: number;
   userId?: string; // Filter transactions by user (UUID)
   group_batches?: boolean; // Group transactions by batch (merges batch requests into single entries)
+  start_date?: string; // Filter transactions created on or after this date/time (ISO 8601 format)
+  end_date?: string; // Filter transactions created on or before this date/time (ISO 8601 format)
 }
 
 export interface AddFundsRequest {
