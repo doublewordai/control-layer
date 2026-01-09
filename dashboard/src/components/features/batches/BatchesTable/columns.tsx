@@ -100,7 +100,7 @@ export const createBatchColumns = (
   },
   {
     id: "input_file",
-    header: "Input File",
+    header: "Input File ID",
     cell: ({ row }) => {
       const batch = row.original as Batch;
       const inputFile = actions.getInputFile(batch);
@@ -113,16 +113,21 @@ export const createBatchColumns = (
       const truncatedId = inputFile.id.slice(0, 8) + "...";
 
       return (
-        <div
-          className="flex items-center gap-2 cursor-pointer hover:text-blue-600 transition-colors"
-          onClick={(e) => {
-            e.stopPropagation();
-            actions.onViewFile(inputFile);
-          }}
-        >
-          <FileText className="w-4 h-4 text-gray-500" />
-          <span className="font-mono text-sm">{truncatedId}</span>
-        </div>
+        <Tooltip delayDuration={300}>
+          <TooltipTrigger asChild>
+            <div
+              className="flex items-center gap-2 cursor-pointer hover:text-blue-600 transition-colors"
+              onClick={(e) => {
+                e.stopPropagation();
+                actions.onViewFile(inputFile);
+              }}
+            >
+              <FileText className="w-4 h-4 text-gray-500" />
+              <span className="font-mono text-sm">{truncatedId}</span>
+            </div>
+          </TooltipTrigger>
+          <TooltipContent>{inputFile.id}</TooltipContent>
+        </Tooltip>
       );
     },
   },
@@ -131,12 +136,7 @@ export const createBatchColumns = (
     header: "SLA",
     cell: ({ row }) => {
       const completionWindow = row.getValue("completion_window") as string;
-      return (
-        <div className="flex items-center gap-1.5 text-sm text-gray-700">
-          <Clock className="w-3.5 h-3.5 text-gray-500" />
-          <span>{completionWindow}</span>
-        </div>
-      );
+      return <span className="text-sm text-gray-700">{completionWindow}</span>;
     },
   },
   {
