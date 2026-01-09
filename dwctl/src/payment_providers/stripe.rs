@@ -3,10 +3,18 @@
 use async_trait::async_trait;
 use rust_decimal::Decimal;
 use sqlx::PgPool;
-use stripe::{
-    CheckoutSession, CheckoutSessionCustomerCreation, CheckoutSessionMode, CheckoutSessionPaymentStatus, CheckoutSessionUiMode, Client,
-    CreateCheckoutSession, CreateCheckoutSessionAutomaticTax, CreateCheckoutSessionLineItems,
+use stripe::Client;
+use stripe_checkout::{
+    CheckoutSessionId, CheckoutSessionMode, CheckoutSessionPaymentStatus, CheckoutSessionUiMode,
+    checkout_session::{
+        CreateCheckoutSession, CreateCheckoutSessionAutomaticTax,
+        CreateCheckoutSessionCustomerCreation, CreateCheckoutSessionLineItems,
+        CreateCheckoutSessionTaxIdCollection, RetrieveCheckoutSession,
+    },
 };
+use stripe_checkout::checkout_session::{CreateCheckoutSessionInvoiceCreation, CreateCheckoutSessionNameCollection, CreateCheckoutSessionNameCollectionBusiness};
+use stripe_types::Currency;
+use stripe_webhook::{EventObject, Webhook};
 
 use crate::{
     api::models::users::CurrentUser,
@@ -46,42 +54,45 @@ impl PaymentProvider for StripeProvider {
         let user_id_string = user.id.to_string();
         let recipient_id = creditee_id.unwrap_or(&user_id_string);
 
-        // Build checkout session parameters
-        let mut checkout_params = CreateCheckoutSession {
-            cancel_url: Some(cancel_url),
-            success_url: Some(success_url),
-            client_reference_id: Some(recipient_id), // This is who will receive the credits
-            currency: Some(stripe::Currency::USD),
-            line_items: Some(vec![CreateCheckoutSessionLineItems {
-                price: Some(self.config.price_id.clone()),
-                quantity: Some(1),
-                ..Default::default()
-            }]),
-            automatic_tax: Some(CreateCheckoutSessionAutomaticTax {
-                enabled: true,
-                ..Default::default()
-            }),
-            mode: Some(CheckoutSessionMode::Payment),
-            ui_mode: Some(CheckoutSessionUiMode::Hosted),
-            expand: &["line_items"],
-            allow_promotion_codes: if self.config.allow_promotion_codes { Some(true) } else { None },
-            ..Default::default()
-        };
+        let mut checkout_params = CreateCheckoutSession::new()
+            .cancel_url(cancel_url)
+            .success_url(success_url)
+            .client_reference_id(recipient_id) // This is who will receive the credits
+            .currency(Currency::USD)
+            .line_items(vec![CreateCheckoutSessionLineItems {
+            price: Some(self.config.price_id.clone()),
+            quantity: Some(1),
+            ..Default::default()}])
+            .automatic_tax(CreateCheckoutSessionAutomaticTax::new(true))
+            .mode(CheckoutSessionMode::Payment)
+            .ui_mode(CheckoutSessionUiMode::Hosted)
+            .expand(vec!["line_items".to_string()])
+            .tax_id_collection(CreateCheckoutSessionTaxIdCollection::new(true))
+            .name_collection(CreateCheckoutSessionNameCollection {
+                business: Some(CreateCheckoutSessionNameCollectionBusiness::new(true)),
+                individual: None,
+            });
+
+        // Enable invoice creation if configured
+        if self.config.enable_invoice_creation {
+            checkout_params = checkout_params.invoice_creation(CreateCheckoutSessionInvoiceCreation::new(true));
+        }
 
         // Include existing customer ID if we have one
         if let Some(existing_id) = &user.payment_provider_id {
             // This is who is giving the credits
-            tracing::info!("Using existing Stripe customer ID {} for user {}", existing_id, user.id);
-            checkout_params.customer = Some(existing_id.as_str().parse().unwrap());
+            tracing::debug!("Using existing Stripe customer ID {} for user {}", existing_id, user.id);
+            checkout_params = checkout_params.customer(existing_id.as_str());
         } else {
-            tracing::info!("No customer ID found for user {}, Stripe will create one", user.id);
+            tracing::debug!("No customer ID found for user {}, Stripe will create one", user.id);
             // Provide customer email for the new customer
-            checkout_params.customer_email = Some(&user.email);
-            checkout_params.customer_creation = Some(CheckoutSessionCustomerCreation::Always);
+            checkout_params = checkout_params
+                .customer_email(&user.email)
+                .customer_creation(CreateCheckoutSessionCustomerCreation::Always);
         }
 
         // Create checkout session
-        let checkout_session = CheckoutSession::create(&self.client, checkout_params).await.map_err(|e| {
+        let checkout_session = checkout_params.send(&self.client).await.map_err(|e| {
             tracing::error!("Failed to create Stripe checkout session: {:?}", e);
             PaymentError::ProviderApi(e.to_string())
         })?;
@@ -94,13 +105,15 @@ impl PaymentProvider for StripeProvider {
         );
 
         // If we didn't have a customer ID before, save the newly created one
-        if user.payment_provider_id.is_none() && checkout_session.customer.is_some() {
-            let customer_id = checkout_session.customer.as_ref().unwrap().id().to_string();
-            tracing::trace!("Saving newly created customer ID {} for user {}", customer_id, user.id);
+        if user.payment_provider_id.is_none() {
+            if let Some(customer) = &checkout_session.customer {
+                let customer_id = customer.id().to_string();
+                tracing::debug!("Saving newly created customer ID {} for user {}", customer_id, user.id);
 
-            sqlx::query!("UPDATE users SET payment_provider_id = $1 WHERE id = $2", customer_id, user.id)
-                .execute(db_pool)
-                .await?;
+                sqlx::query!("UPDATE users SET payment_provider_id = $1 WHERE id = $2", customer_id, user.id)
+                    .execute(db_pool)
+                    .await?;
+            }
         }
 
         // Return checkout URL for hosted checkout
@@ -111,12 +124,14 @@ impl PaymentProvider for StripeProvider {
     }
 
     async fn get_payment_session(&self, session_id: &str) -> Result<PaymentSession> {
-        let session_id: stripe::CheckoutSessionId = session_id
+        let session_id: CheckoutSessionId = session_id
             .parse()
             .map_err(|_| PaymentError::InvalidData("Invalid Stripe session ID".to_string()))?;
 
         // Retrieve full checkout session with line items
-        let checkout_session = CheckoutSession::retrieve(&self.client, &session_id, &["line_items"])
+        let checkout_session = RetrieveCheckoutSession::new(session_id)
+            .expand(vec!["line_items".to_string()])
+            .send(&self.client)
             .await
             .map_err(|e| {
                 tracing::error!("Failed to retrieve Stripe checkout session: {:?}", e);
@@ -268,7 +283,7 @@ impl PaymentProvider for StripeProvider {
             })?;
 
         // Validate the webhook signature and construct the event
-        let event = stripe::Webhook::construct_event(body, signature, &self.config.webhook_secret).map_err(|e| {
+        let event = Webhook::construct_event(body, signature, &self.config.webhook_secret).map_err(|e| {
             tracing::error!("Failed to construct webhook event: {:?}", e);
             PaymentError::InvalidData(format!("Webhook validation failed: {}", e))
         })?;
@@ -277,7 +292,8 @@ impl PaymentProvider for StripeProvider {
 
         // Convert Stripe event to our generic WebhookEvent
         let session_id = match &event.data.object {
-            stripe::EventObject::CheckoutSession(session) => Some(session.id.to_string()),
+            EventObject::CheckoutSessionCompleted(session)
+            | EventObject::CheckoutSessionAsyncPaymentSucceeded(session) => Some(session.id.to_string()),
             _ => None,
         };
 
@@ -316,6 +332,22 @@ mod tests {
     use sqlx::PgPool;
     use uuid::Uuid;
 
+    /// Initialize the default crypto provider for rustls.
+    ///
+    /// Required because rustls 0.23+ needs an explicit crypto provider installed
+    /// when multiple providers (ring and aws-lc-rs) are available in the dependency tree.
+    /// In production, the database connection (made during Application::new) initializes
+    /// this automatically. In tests, we need to do it explicitly before creating Stripe clients.
+    fn init_crypto_provider() {
+        use std::sync::Once;
+        static INIT: Once = Once::new();
+        INIT.call_once(|| {
+            let _ = rustls::crypto::CryptoProvider::install_default(
+                rustls::crypto::aws_lc_rs::default_provider()
+            );
+        });
+    }
+
     /// Helper to create a test user in the database
     async fn create_test_user(pool: &PgPool) -> Uuid {
         let user = crate::test::utils::create_test_user(pool, crate::api::models::users::Role::StandardUser).await;
@@ -324,37 +356,40 @@ mod tests {
 
     #[test]
     fn test_stripe_provider_from_config() {
+        init_crypto_provider();
         let config = crate::config::StripeConfig {
             api_key: "sk_test_fake".to_string(),
             price_id: "price_fake".to_string(),
             webhook_secret: "whsec_fake".to_string(),
             host_url: None,
-            allow_promotion_codes: false,
+            enable_invoice_creation: false,
         };
         let provider = StripeProvider::from(config);
 
         assert_eq!(provider.config.api_key, "sk_test_fake");
         assert_eq!(provider.config.price_id, "price_fake");
         assert_eq!(provider.config.webhook_secret, "whsec_fake");
-        assert!(!provider.config.allow_promotion_codes);
+        assert!(!provider.config.enable_invoice_creation);
     }
 
     #[test]
-    fn test_stripe_provider_with_promotion_codes() {
+    fn test_stripe_provider_with_invoice_creation() {
+        init_crypto_provider();
         let config = crate::config::StripeConfig {
             api_key: "sk_test_fake".to_string(),
             price_id: "price_fake".to_string(),
             webhook_secret: "whsec_fake".to_string(),
             host_url: None,
-            allow_promotion_codes: true,
+            enable_invoice_creation: true,
         };
         let provider = StripeProvider::from(config);
 
-        assert!(provider.config.allow_promotion_codes);
+        assert!(provider.config.enable_invoice_creation);
     }
 
     #[sqlx::test]
     async fn test_stripe_idempotency_fast_path(pool: PgPool) {
+        init_crypto_provider();
         // Test the fast path: transaction already exists in DB
         let user_id = create_test_user(&pool).await;
         let session_id = "cs_test_fake_session_123";
@@ -379,7 +414,7 @@ mod tests {
             price_id: "price_fake".to_string(),
             webhook_secret: "whsec_fake".to_string(),
             host_url: None,
-            allow_promotion_codes: false,
+            enable_invoice_creation: false,
         };
         let provider = StripeProvider::from(config);
 
