@@ -1,5 +1,13 @@
 # Changelog
 
+## [0.28.1](https://github.com/doublewordai/control-layer/compare/v0.28.0...v0.28.1) (2026-01-09)
+
+
+### Bug Fixes
+
+* regenerated sqlx queries ([#495](https://github.com/doublewordai/control-layer/issues/495)) ([1c1f111](https://github.com/doublewordai/control-layer/commit/1c1f111af309cc77a736dc724afb5a12470019a8))
+* various search and UI fixes ([#494](https://github.com/doublewordai/control-layer/issues/494)) ([dc99ef2](https://github.com/doublewordai/control-layer/commit/dc99ef28aa0b319616f227b8a18dd4db1f3c5cac))
+
 ## [0.28.0](https://github.com/doublewordai/control-layer/compare/v0.27.1...v0.28.0) (2026-01-09)
 
 
