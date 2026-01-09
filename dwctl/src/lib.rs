@@ -876,6 +876,7 @@ pub async fn build_router(state: &mut AppState, onwards_router: Router) -> anyho
         // Payment processing
         .route("/payments", post(api::handlers::payments::create_payment))
         .route("/payments/{id}", patch(api::handlers::payments::process_payment))
+        .route("/billing-portal", post(api::handlers::payments::create_billing_portal_session))
         // Inference endpoints management (admin only for write operations)
         .route("/endpoints", get(api::handlers::inference_endpoints::list_inference_endpoints))
         .route("/endpoints", post(api::handlers::inference_endpoints::create_inference_endpoint))

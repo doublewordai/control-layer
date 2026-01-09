@@ -323,6 +323,16 @@ impl PaymentProvider for StripeProvider {
         // Use the existing process_payment_session method
         self.process_payment_session(db_pool, session_id).await
     }
+
+    async fn create_billing_portal_session(&self, _db_pool: &PgPool, user: &CurrentUser, return_url: &str) -> Result<String> {
+        // Fetch user's payment provider customer ID from user struct
+        let customer_id = user.payment_provider_id.as_ref().ok_or(PaymentError::NoCustomerId)?;
+
+        // For now, return a placeholder URL
+        // TODO: Implement Stripe Billing Portal API
+        let _ = return_url; // Suppress unused warning
+        Ok(format!("https://billing.stripe.com/customer/{}", customer_id))
+    }
 }
 
 #[cfg(test)]

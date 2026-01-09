@@ -300,6 +300,77 @@ pub async fn webhook_handler(State(state): State<AppState>, headers: axum::http:
     }
 }
 
+/// Create a billing portal session for customer self-service
+///
+/// This endpoint creates a billing portal session URL for customers to manage
+/// their billing details, view invoices, and update payment methods.
+#[utoipa::path(
+    post,
+    path = "/billing-portal",
+    tag = "payments",
+    summary = "Create billing portal session",
+    description = "Creates a billing portal session for the authenticated user. Requires the user to have a payment_provider_id (customer ID) set. The return URL is automatically constructed from the configured host_url.",
+    responses(
+        (status = 200, description = "Billing portal session created successfully. Returns JSON with portal URL.", body = inline(Object)),
+        (status = 400, description = "User does not have a payment provider customer ID"),
+        (status = 503, description = "No payment provider configured or missing host_url"),
+    ),
+    security(
+        ("BearerAuth" = []),
+        ("CookieAuth" = []),
+        ("X-Doubleword-User" = [])
+    )
+)]
+#[tracing::instrument(skip_all)]
+pub async fn create_billing_portal_session(
+    State(state): State<AppState>,
+    user: CurrentUser,
+) -> Result<Response, StatusCode> {
+    // Get payment provider from config
+    let payment_config = match state.config.payment.clone() {
+        Some(config) => config,
+        None => {
+            tracing::warn!("Billing portal requested but no payment provider is configured");
+            let error_response = Json(json!({
+                "message": "Billing management is currently unavailable. Please contact support."
+            }));
+            return Ok((StatusCode::SERVICE_UNAVAILABLE, error_response).into_response());
+        }
+    };
+
+    // Get host URL from payment config (required for building return URL)
+    let origin = match payment_config.host_url() {
+        Some(configured_host) => configured_host.to_string(),
+        None => {
+            tracing::error!("No host_url configured in payment config - this is required for billing portal");
+            let error_response = Json(json!({
+                "message": "Billing management is currently unavailable. Please contact support."
+            }));
+            return Ok((StatusCode::SERVICE_UNAVAILABLE, error_response).into_response());
+        }
+    };
+
+    // Build return URL from host_url (similar to how create_payment builds success/cancel URLs)
+    let return_url = format!("{}/cost-management", origin);
+
+    let provider = payment_providers::create_provider(payment_config);
+
+    // Create billing portal session using the provider trait
+    let portal_url = provider
+        .create_billing_portal_session(&state.db, &user, &return_url)
+        .await
+        .map_err(|e| {
+            tracing::error!("Failed to create billing portal session: {:?}", e);
+            StatusCode::from(e)
+        })?;
+
+    // Return the portal URL as JSON for the frontend to navigate to
+    Ok(Json(json!({
+        "url": portal_url
+    }))
+    .into_response())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
