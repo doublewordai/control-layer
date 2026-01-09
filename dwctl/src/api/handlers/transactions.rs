@@ -204,20 +204,26 @@ pub async fn list_transactions(
 
     // Get transactions for this page
     let (transactions, total_count) = if let (true, Some(user_id)) = (grouping_enabled, filter_user_id) {
-        let transactions_with_batches = repo.list_transactions_with_batches(user_id, skip, limit).await?;
-        let count = repo.count_transactions_with_batches(user_id).await?;
+        let transactions_with_batches = repo
+            .list_transactions_with_batches(user_id, skip, limit, query.start_date, query.end_date)
+            .await?;
+        let count = repo
+            .count_transactions_with_batches(user_id, query.start_date, query.end_date)
+            .await?;
         let txs: Vec<CreditTransactionResponse> = transactions_with_batches
             .into_iter()
             .map(|(tx, batch_id)| CreditTransactionResponse::from_db_with_batch_id(tx, batch_id))
             .collect();
         (txs, count)
     } else if let Some(user_id) = filter_user_id {
-        let txs = repo.list_user_transactions(user_id, skip, limit).await?;
-        let count = repo.count_user_transactions(user_id).await?;
+        let txs = repo
+            .list_user_transactions(user_id, skip, limit, query.start_date, query.end_date)
+            .await?;
+        let count = repo.count_user_transactions(user_id, query.start_date, query.end_date).await?;
         (txs.into_iter().map(CreditTransactionResponse::from).collect(), count)
     } else {
-        let txs = repo.list_all_transactions(skip, limit).await?;
-        let count = repo.count_all_transactions().await?;
+        let txs = repo.list_all_transactions(skip, limit, query.start_date, query.end_date).await?;
+        let count = repo.count_all_transactions(query.start_date, query.end_date).await?;
         (txs.into_iter().map(CreditTransactionResponse::from).collect(), count)
     };
 

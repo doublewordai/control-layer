@@ -103,6 +103,16 @@ pub struct ListTransactionsQuery {
     /// Group transactions by fusillade_batch_id (merges batch requests into single entries)
     pub group_batches: Option<bool>,
 
+    /// Filter transactions created on or after this date/time (ISO 8601 format)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[param(value_type = Option<String>, format = "date-time")]
+    pub start_date: Option<DateTime<Utc>>,
+
+    /// Filter transactions created on or before this date/time (ISO 8601 format)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[param(value_type = Option<String>, format = "date-time")]
+    pub end_date: Option<DateTime<Utc>>,
+
     /// Pagination parameters
     #[serde(flatten)]
     #[param(inline)]

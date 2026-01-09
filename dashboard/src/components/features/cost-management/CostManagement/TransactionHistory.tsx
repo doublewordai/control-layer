@@ -67,16 +67,33 @@ export function TransactionHistory({
   // Fetch user info for display
   const { data: displayUser } = useUser(filterUserId || userId);
 
+  // Filter states (must be declared before API calls that use them)
+  const [transactionType, setTransactionType] = useState<string>("all");
+  const [dateRange, setDateRange] = useState<
+    { from: Date; to: Date } | undefined
+  >();
+  const [searchTerm, setSearchTerm] = useState<string>("");
+
+  // Pagination state
+  const [currentPage, setCurrentPage] = useState(1);
+  const itemsPerPage = 10;
+
   // Fetch balance and transactions
   const { refetch: refetchBalance } = useUserBalance(userId);
 
   // Always pass userId to filter transactions by the specific user
   // Backend enforces permissions: non-admins can only see their own transactions
+  // Pass date range for server-side filtering
   const {
     data: transactionsResponse,
     isLoading: isLoadingTransactions,
     refetch: refetchTransactions,
-  } = useTransactions({ userId, group_batches: true });
+  } = useTransactions({
+    userId,
+    group_batches: true,
+    start_date: dateRange?.from.toISOString(),
+    end_date: dateRange?.to.toISOString(),
+  });
 
   // Get transactions and page_start_balance from response
   const transactions = useMemo<Transaction[]>(() => {
@@ -116,17 +133,6 @@ export function TransactionHistory({
 
   const isLoading = !isDemoMode && isLoadingTransactions;
 
-  // Filter states
-  const [transactionType, setTransactionType] = useState<string>("all");
-  const [dateRange, setDateRange] = useState<
-    { from: Date; to: Date } | undefined
-  >();
-  const [searchTerm, setSearchTerm] = useState<string>("");
-
-  // Pagination state
-  const [currentPage, setCurrentPage] = useState(1);
-  const itemsPerPage = 10;
-
   // Helper functions
   const formatDate = (isoString: string) => {
     const date = new Date(isoString);
@@ -139,7 +145,7 @@ export function TransactionHistory({
     }).format(date);
   };
 
-  // Apply filters
+  // Apply filters (client-side filtering for non-date filters)
   const filteredTransactions = useMemo(() => {
     let filtered = [...transactions];
 
@@ -178,18 +184,10 @@ export function TransactionHistory({
       }
     }
 
-    // Filter by date range
-    if (dateRange?.from && dateRange?.to) {
-      filtered = filtered.filter((t) => {
-        const transactionDate = new Date(t.created_at);
-        return (
-          transactionDate >= dateRange.from && transactionDate <= dateRange.to
-        );
-      });
-    }
+    // Note: Date filtering is now done server-side via the API
 
     return filtered;
-  }, [transactions, transactionType, dateRange, searchTerm, filterUserId]);
+  }, [transactions, transactionType, searchTerm, filterUserId]);
 
   // Paginate filtered transactions
   const paginatedTransactions = useMemo(() => {
