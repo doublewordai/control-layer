@@ -527,7 +527,7 @@ mod tests {
             roles: user.roles,
             display_name: user.display_name,
             avatar_url: user.avatar_url,
-            payment_provider_id: user.payment_provider_id,
+            payment_provider_id: None,
         };
         let jwt_token = session::create_session_token(&current_user, &config).unwrap();
 
@@ -630,7 +630,7 @@ mod tests {
             roles: jwt_user.roles,
             display_name: jwt_user.display_name,
             avatar_url: jwt_user.avatar_url,
-            payment_provider_id: jwt_user.payment_provider_id,
+            payment_provider_id: None,
         };
         let jwt_token = session::create_session_token(&current_user, &config).unwrap();
 
@@ -735,7 +735,7 @@ mod tests {
             roles: user.roles.clone(),
             display_name: user.display_name,
             avatar_url: user.avatar_url,
-            payment_provider_id: user.payment_provider_id,
+            payment_provider_id: None,
         };
         let jwt_token = session::create_session_token(&current_user, &config).unwrap();
 
@@ -1021,7 +1021,7 @@ mod tests {
             roles: user.roles,
             display_name: user.display_name,
             avatar_url: user.avatar_url,
-            payment_provider_id: user.payment_provider_id,
+            payment_provider_id: None,
         };
         let jwt_token = session::create_session_token(&current_user, &config).unwrap();
 

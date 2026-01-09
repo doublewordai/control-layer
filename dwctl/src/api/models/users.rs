@@ -60,7 +60,7 @@ pub struct UserResponse {
     pub groups: Option<Vec<GroupResponse>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub credit_balance: Option<f64>,
-    pub payment_provider_id: Option<String>,
+    pub has_payment_provider_id: bool,
 }
 
 /// Query parameters for listing users
@@ -98,20 +98,6 @@ impl CurrentUser {
     }
 }
 
-impl From<UserResponse> for CurrentUser {
-    fn from(response: UserResponse) -> Self {
-        Self {
-            id: response.id,
-            username: response.username,
-            email: response.email,
-            is_admin: response.is_admin,
-            roles: response.roles,
-            display_name: response.display_name,
-            avatar_url: response.avatar_url,
-            payment_provider_id: None, // UserResponse doesn't include payment_provider_id
-        }
-    }
-}
 
 impl From<UserDBResponse> for UserResponse {
     fn from(db: UserDBResponse) -> Self {
@@ -130,7 +116,7 @@ impl From<UserDBResponse> for UserResponse {
             last_login: None,     // UserDBResponse doesn't have last_login
             groups: None,         // By default, relationships are not included
             credit_balance: None, // By default, credit balances are not included
-            payment_provider_id: db.payment_provider_id,
+            has_payment_provider_id: db.payment_provider_id.is_some(),
         }
     }
 }
@@ -146,6 +132,21 @@ impl UserResponse {
     pub fn with_credit_balance(mut self, balance: f64) -> Self {
         self.credit_balance = Some(balance);
         self
+    }
+}
+
+impl From<UserDBResponse> for CurrentUser {
+    fn from(db: UserDBResponse) -> Self {
+        Self {
+            id: db.id,
+            username: db.username,
+            email: db.email,
+            is_admin: db.is_admin,
+            roles: db.roles,
+            display_name: db.display_name,
+            avatar_url: db.avatar_url,
+            payment_provider_id: db.payment_provider_id,
+        }
     }
 }
 
