@@ -148,7 +148,7 @@ export function DataTable<TData, TValue>({
   isLoading = false,
   emptyState,
   showPageSizeSelector = false,
-  pageSizeOptions = [10, 25, 50, 100],
+  pageSizeOptions = [10, 20, 50, 100],
 }: DataTableProps<TData, TValue>) {
   const searchInputRef = React.useRef<HTMLInputElement>(null);
 

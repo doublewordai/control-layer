@@ -302,7 +302,7 @@ pub async fn create_test_api_key_for_user(pool: &PgPool, user_id: UserId) -> Api
     let request = ApiKeyCreateDBRequest::new(
         user_id,
         ApiKeyCreate {
-            name: "Test API Key".to_string(),
+            name: format!("Test API Key {}", Uuid::new_v4().simple()),
             description: Some("Test description".to_string()),
             purpose: ApiKeyPurpose::Realtime,
             requests_per_second: None,

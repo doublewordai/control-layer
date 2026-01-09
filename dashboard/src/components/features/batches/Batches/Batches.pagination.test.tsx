@@ -598,7 +598,7 @@ describe("Batches - Pagination", () => {
       const user = userEvent.setup();
 
       const smallPageFiles = createMockFiles(1, 11);
-      const largePageFiles = createMockFiles(1, 26); // 25 per page + 1
+      const largePageFiles = createMockFiles(1, 21); // 20 per page + 1
 
       vi.mocked(hooks.useFiles).mockImplementation((params?: any) => {
         if (!params || (!params.purpose && !params.limit)) {
@@ -620,7 +620,7 @@ describe("Batches - Pagination", () => {
           } as any;
         }
 
-        if (params.limit === 26) {
+        if (params.limit === 21) {
           return {
             data: { data: largePageFiles },
             isLoading: false,
@@ -689,12 +689,12 @@ describe("Batches - Pagination", () => {
       await waitFor(() => {
         // need to use screen here as the element is rendered in a radix portal
         // outside of the container
-        expect(screen.getByText("25")).toBeInTheDocument();
+        expect(screen.getByText("20")).toBeInTheDocument();
       });
 
       // Click the option
-      const option25 = screen.getByText("25");
-      await user.click(option25);
+      const option20 = screen.getByText("20");
+      await user.click(option20);
 
       // Should reset to page 1 after changing page size
       await waitFor(() => {
