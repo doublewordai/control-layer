@@ -1374,17 +1374,35 @@ mod tests {
         let mut credits = Credits::new(&mut conn);
 
         // Create 3 transactions
-        credits.create_transaction(&CreditTransactionCreateDBRequest::admin_grant(
-            user_id, user_id, Decimal::from_str("100.0").unwrap(), Some("Transaction 1".to_string()),
-        )).await.expect("Failed to create transaction 1");
+        credits
+            .create_transaction(&CreditTransactionCreateDBRequest::admin_grant(
+                user_id,
+                user_id,
+                Decimal::from_str("100.0").unwrap(),
+                Some("Transaction 1".to_string()),
+            ))
+            .await
+            .expect("Failed to create transaction 1");
 
-        let tx2 = credits.create_transaction(&CreditTransactionCreateDBRequest::admin_grant(
-            user_id, user_id, Decimal::from_str("200.0").unwrap(), Some("Transaction 2".to_string()),
-        )).await.expect("Failed to create transaction 2");
+        let tx2 = credits
+            .create_transaction(&CreditTransactionCreateDBRequest::admin_grant(
+                user_id,
+                user_id,
+                Decimal::from_str("200.0").unwrap(),
+                Some("Transaction 2".to_string()),
+            ))
+            .await
+            .expect("Failed to create transaction 2");
 
-        credits.create_transaction(&CreditTransactionCreateDBRequest::admin_grant(
-            user_id, user_id, Decimal::from_str("300.0").unwrap(), Some("Transaction 3".to_string()),
-        )).await.expect("Failed to create transaction 3");
+        credits
+            .create_transaction(&CreditTransactionCreateDBRequest::admin_grant(
+                user_id,
+                user_id,
+                Decimal::from_str("300.0").unwrap(),
+                Some("Transaction 3".to_string()),
+            ))
+            .await
+            .expect("Failed to create transaction 3");
 
         // Filter: from tx2's timestamp onwards (should get tx2 and tx3)
         let start_date = Some(tx2.created_at);
@@ -1421,17 +1439,35 @@ mod tests {
         let mut credits = Credits::new(&mut conn);
 
         // Create 3 transactions
-        credits.create_transaction(&CreditTransactionCreateDBRequest::admin_grant(
-            user_id, user_id, Decimal::from_str("100.0").unwrap(), Some("Transaction 1".to_string()),
-        )).await.expect("Failed to create transaction 1");
+        credits
+            .create_transaction(&CreditTransactionCreateDBRequest::admin_grant(
+                user_id,
+                user_id,
+                Decimal::from_str("100.0").unwrap(),
+                Some("Transaction 1".to_string()),
+            ))
+            .await
+            .expect("Failed to create transaction 1");
 
-        let tx2 = credits.create_transaction(&CreditTransactionCreateDBRequest::admin_grant(
-            user_id, user_id, Decimal::from_str("200.0").unwrap(), Some("Transaction 2".to_string()),
-        )).await.expect("Failed to create transaction 2");
+        let tx2 = credits
+            .create_transaction(&CreditTransactionCreateDBRequest::admin_grant(
+                user_id,
+                user_id,
+                Decimal::from_str("200.0").unwrap(),
+                Some("Transaction 2".to_string()),
+            ))
+            .await
+            .expect("Failed to create transaction 2");
 
-        credits.create_transaction(&CreditTransactionCreateDBRequest::admin_grant(
-            user_id, user_id, Decimal::from_str("300.0").unwrap(), Some("Transaction 3".to_string()),
-        )).await.expect("Failed to create transaction 3");
+        credits
+            .create_transaction(&CreditTransactionCreateDBRequest::admin_grant(
+                user_id,
+                user_id,
+                Decimal::from_str("300.0").unwrap(),
+                Some("Transaction 3".to_string()),
+            ))
+            .await
+            .expect("Failed to create transaction 3");
 
         // Filter from tx2's timestamp onwards (should get tx2 and tx3)
         let start_date = Some(tx2.created_at);
@@ -1459,17 +1495,35 @@ mod tests {
         let mut credits = Credits::new(&mut conn);
 
         // Create 3 transactions
-        credits.create_transaction(&CreditTransactionCreateDBRequest::admin_grant(
-            user_id, user_id, Decimal::from_str("100.0").unwrap(), Some("Transaction 1".to_string()),
-        )).await.expect("Failed to create transaction 1");
+        credits
+            .create_transaction(&CreditTransactionCreateDBRequest::admin_grant(
+                user_id,
+                user_id,
+                Decimal::from_str("100.0").unwrap(),
+                Some("Transaction 1".to_string()),
+            ))
+            .await
+            .expect("Failed to create transaction 1");
 
-        let tx2 = credits.create_transaction(&CreditTransactionCreateDBRequest::admin_grant(
-            user_id, user_id, Decimal::from_str("200.0").unwrap(), Some("Transaction 2".to_string()),
-        )).await.expect("Failed to create transaction 2");
+        let tx2 = credits
+            .create_transaction(&CreditTransactionCreateDBRequest::admin_grant(
+                user_id,
+                user_id,
+                Decimal::from_str("200.0").unwrap(),
+                Some("Transaction 2".to_string()),
+            ))
+            .await
+            .expect("Failed to create transaction 2");
 
-        credits.create_transaction(&CreditTransactionCreateDBRequest::admin_grant(
-            user_id, user_id, Decimal::from_str("300.0").unwrap(), Some("Transaction 3".to_string()),
-        )).await.expect("Failed to create transaction 3");
+        credits
+            .create_transaction(&CreditTransactionCreateDBRequest::admin_grant(
+                user_id,
+                user_id,
+                Decimal::from_str("300.0").unwrap(),
+                Some("Transaction 3".to_string()),
+            ))
+            .await
+            .expect("Failed to create transaction 3");
 
         // Filter up to tx2's timestamp (should get tx1 and tx2)
         let end_date = Some(tx2.created_at);
@@ -1498,14 +1552,26 @@ mod tests {
         let mut credits = Credits::new(&mut conn);
 
         // Create transaction for user 1
-        credits.create_transaction(&CreditTransactionCreateDBRequest::admin_grant(
-            user1_id, user1_id, Decimal::from_str("100.0").unwrap(), Some("User 1 transaction".to_string()),
-        )).await.expect("Failed to create transaction");
+        credits
+            .create_transaction(&CreditTransactionCreateDBRequest::admin_grant(
+                user1_id,
+                user1_id,
+                Decimal::from_str("100.0").unwrap(),
+                Some("User 1 transaction".to_string()),
+            ))
+            .await
+            .expect("Failed to create transaction");
 
         // Create transaction for user 2
-        let tx2 = credits.create_transaction(&CreditTransactionCreateDBRequest::admin_grant(
-            user2_id, user2_id, Decimal::from_str("200.0").unwrap(), Some("User 2 transaction".to_string()),
-        )).await.expect("Failed to create transaction");
+        let tx2 = credits
+            .create_transaction(&CreditTransactionCreateDBRequest::admin_grant(
+                user2_id,
+                user2_id,
+                Decimal::from_str("200.0").unwrap(),
+                Some("User 2 transaction".to_string()),
+            ))
+            .await
+            .expect("Failed to create transaction");
 
         // Filter from tx2's timestamp (should get user2's transaction only)
         let start_date = Some(tx2.created_at);
@@ -1537,21 +1603,30 @@ mod tests {
         // Create batch transactions
         let mut batch_txs = Vec::new();
         for i in 0..3 {
-            let tx = credits.create_transaction(&CreditTransactionCreateDBRequest {
-                user_id,
-                transaction_type: CreditTransactionType::Usage,
-                amount: Decimal::from_str(&format!("{}.0", i + 1)).unwrap(),
-                source_id: format!("batch-{}", i),
-                description: Some(format!("Batch transaction {}", i)),
-                fusillade_batch_id: Some(batch_id),
-            }).await.expect("Failed to create batch transaction");
+            let tx = credits
+                .create_transaction(&CreditTransactionCreateDBRequest {
+                    user_id,
+                    transaction_type: CreditTransactionType::Usage,
+                    amount: Decimal::from_str(&format!("{}.0", i + 1)).unwrap(),
+                    source_id: format!("batch-{}", i),
+                    description: Some(format!("Batch transaction {}", i)),
+                    fusillade_batch_id: Some(batch_id),
+                })
+                .await
+                .expect("Failed to create batch transaction");
             batch_txs.push(tx);
         }
 
         // Create non-batch transaction
-        let non_batch_tx = credits.create_transaction(&CreditTransactionCreateDBRequest::admin_grant(
-            user_id, user_id, Decimal::from_str("100.0").unwrap(), Some("Non-batch transaction".to_string()),
-        )).await.expect("Failed to create non-batch transaction");
+        let non_batch_tx = credits
+            .create_transaction(&CreditTransactionCreateDBRequest::admin_grant(
+                user_id,
+                user_id,
+                Decimal::from_str("100.0").unwrap(),
+                Some("Non-batch transaction".to_string()),
+            ))
+            .await
+            .expect("Failed to create non-batch transaction");
 
         // Test with no filter - should get all (1 batch grouped + 1 non-batch = 2)
         let all_txs = credits
