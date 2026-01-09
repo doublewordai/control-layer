@@ -727,7 +727,8 @@ const BatchInfo: React.FC = () => {
                   </div>
                 )}
 
-                {batch.expired_at && (
+                {/* TODO: Enable when backend expiration enforcement is implemented */}
+                {/* {batch.expired_at && (
                   <div>
                     <p className="text-sm text-gray-600 mb-1">Expired</p>
                     <p className="text-sm font-medium">
@@ -743,7 +744,7 @@ const BatchInfo: React.FC = () => {
                       {formatTimestamp(batch.expires_at)}
                     </p>
                   </div>
-                )}
+                )} */}
 
                 {/* Duration */}
                 {batch.in_progress_at && batch.completed_at && (
