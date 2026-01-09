@@ -532,13 +532,9 @@ pub async fn store_analytics_record(
             // Any explicit fusillade batch ID takes precedence
             (_, Some(_)) => "fusillade".to_string(),
             // Batch API keys without an explicit fusillade_batch_id are still considered fusillade
-            (Some(crate::db::models::api_keys::ApiKeyPurpose::Batch), None) => {
-                "fusillade".to_string()
-            }
+            (Some(crate::db::models::api_keys::ApiKeyPurpose::Batch), None) => "fusillade".to_string(),
             // Playground keys map to the frontend origin
-            (Some(crate::db::models::api_keys::ApiKeyPurpose::Playground), _) => {
-                "frontend".to_string()
-            }
+            (Some(crate::db::models::api_keys::ApiKeyPurpose::Playground), _) => "frontend".to_string(),
             // Everything else is treated as generic API usage
             _ => "api".to_string(),
         },
