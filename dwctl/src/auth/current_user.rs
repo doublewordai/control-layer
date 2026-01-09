@@ -3,7 +3,10 @@
 use crate::db::errors::DbError;
 use crate::{
     AppState,
-    api::models::users::{CurrentUser, Role},
+    api::models::{
+        transactions::TransactionFilters,
+        users::{CurrentUser, Role},
+    },
     auth::session,
     db::handlers::{Repository, Users},
     errors::{Error, Result},
@@ -422,7 +425,10 @@ impl FromRequestParts<AppState> for CurrentUser {
 mod tests {
     use crate::{
         AppState,
-        api::models::users::{CurrentUser, Role},
+        api::models::{
+            transactions::TransactionFilters,
+            users::{CurrentUser, Role},
+        },
         db::handlers::{Users, repository::Repository},
         errors::Error,
         test::utils::create_test_config,
@@ -1261,7 +1267,7 @@ mod tests {
 
         // Verify the transaction exists with correct details
         let transactions = credits_repo
-            .list_user_transactions(current_user.id, 0, 10, None, None)
+            .list_user_transactions(current_user.id, 0, 10, &TransactionFilters::default())
             .await
             .unwrap();
 
@@ -1326,7 +1332,10 @@ mod tests {
         );
 
         // Verify still only one transaction
-        let transactions = credits_repo.list_user_transactions(user.id, 0, 10, None, None).await.unwrap();
+        let transactions = credits_repo
+            .list_user_transactions(user.id, 0, 10, &TransactionFilters::default())
+            .await
+            .unwrap();
         assert_eq!(transactions.len(), 1, "Should still have exactly one transaction");
     }
 }

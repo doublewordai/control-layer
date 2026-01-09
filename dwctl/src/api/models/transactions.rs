@@ -114,14 +114,10 @@ pub struct ListTransactionsQuery {
     #[param(value_type = Option<String>, format = "date-time")]
     pub start_date: Option<DateTime<Utc>>,
 
-    /// Filter by transaction types (comma-separated: "admin_grant,purchase" or "usage,admin_removal")
-    pub transaction_types: Option<String>,
-
-    /// Filter transactions created after this timestamp
-    pub timestamp_after: Option<DateTime<Utc>>,
-
-    /// Filter transactions created before this timestamp
-    pub timestamp_before: Option<DateTime<Utc>>,
+    /// Filter transactions created on or before this date/time (ISO 8601 format)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[param(value_type = Option<String>, format = "date-time")]
+    pub end_date: Option<DateTime<Utc>>,
 
     /// Pagination parameters
     #[serde(flatten)]

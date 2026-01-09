@@ -583,9 +583,9 @@ impl<'c> Credits<'c> {
                     ba.transaction_count as batch_count
                 FROM batch_aggregates ba
                 WHERE ba.user_id = $1
-                  AND $8::bool = true
+                  AND $7::bool = true
                   AND ($5::text IS NULL OR 'Batch' ILIKE '%' || $5 || '%')
-                  AND ($7::timestamptz IS NULL OR ba.created_at >= $7)
+                  AND ($8::timestamptz IS NULL OR ba.created_at >= $8)
                   AND ($9::timestamptz IS NULL OR ba.created_at <= $9)
                 ORDER BY ba.max_seq DESC
                 LIMIT $2)
@@ -609,7 +609,7 @@ impl<'c> Credits<'c> {
                   AND ct.fusillade_batch_id IS NULL
                   AND ($5::text IS NULL OR ct.description ILIKE '%' || $5 || '%')
                   AND ($6::text[] IS NULL OR ct.transaction_type::text = ANY($6))
-                  AND ($7::timestamptz IS NULL OR ct.created_at >= $7)
+                  AND ($8::timestamptz IS NULL OR ct.created_at >= $8)
                   AND ($9::timestamptz IS NULL OR ct.created_at <= $9)
                 ORDER BY ct.seq DESC
                 LIMIT $2)
@@ -617,16 +617,15 @@ impl<'c> Credits<'c> {
             ORDER BY max_seq DESC
             LIMIT $3 OFFSET $4
             "#,
-            user_id,
-            fetch_limit,
-            limit,
-            skip,
-            filters.start_date,
-            filters.end_date,
-            include_batches,
-            search_matches_batch,
-            filters.search.as_deref(),
-            transaction_types.as_deref(),
+            user_id,                      // $1
+            fetch_limit,                  // $2
+            limit,                        // $3
+            skip,                         // $4
+            filters.search.as_deref(),    // $5
+            transaction_types.as_deref(), // $6
+            include_batches,              // $7
+            filters.start_date,           // $8
+            filters.end_date,             // $9
         )
         .fetch_all(&mut *self.db)
         .await?;

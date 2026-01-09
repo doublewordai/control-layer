@@ -13,6 +13,7 @@ use crate::{
             AuthResponse, AuthSuccessResponse, ChangePasswordRequest, LoginInfo, LoginRequest, LoginResponse, LogoutResponse,
             PasswordResetConfirmRequest, PasswordResetRequest, PasswordResetResponse, RegisterRequest, RegisterResponse, RegistrationInfo,
         },
+        transactions::TransactionFilters,
         users::{CurrentUser, Role, UserResponse},
     },
     auth::{password, session},
@@ -680,7 +681,10 @@ mod tests {
         );
 
         // Verify the transaction exists with correct details
-        let transactions = credits_repo.list_user_transactions(body.user.id, 0, 10, None, None).await.unwrap();
+        let transactions = credits_repo
+            .list_user_transactions(body.user.id, 0, 10, &TransactionFilters::default())
+            .await
+            .unwrap();
 
         assert_eq!(transactions.len(), 1, "Should have exactly one transaction");
         assert_eq!(transactions[0].amount, rust_decimal::Decimal::new(10000, 2));

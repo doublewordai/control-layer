@@ -39,6 +39,7 @@
 //!
 //! [outlet]: https://github.com/doublewordai/outlet
 
+use crate::api::models::transactions::TransactionFilters;
 use crate::config::Config;
 use crate::db::errors::Result as DbResult;
 use crate::db::handlers::Credits;
@@ -1987,7 +1988,10 @@ mod tests {
             assert_eq!(final_balance, expected_balance, "Balance should be deducted correctly");
 
             // Verify: Transaction was created
-            let transactions = credits.list_user_transactions(user_id, 0, 10, None, None).await.unwrap();
+            let transactions = credits
+                .list_user_transactions(user_id, 0, 10, &TransactionFilters::default())
+                .await
+                .unwrap();
             let usage_tx = transactions.iter().find(|tx| tx.transaction_type == CreditTransactionType::Usage);
             assert!(usage_tx.is_some(), "Usage transaction should be created");
 
@@ -2059,7 +2063,10 @@ mod tests {
             let balance = credits.get_user_balance(user_id).await.unwrap();
             assert_eq!(balance, Decimal::from_str("10.00").unwrap(), "Balance should not change");
 
-            let transactions = credits.list_user_transactions(user_id, 0, 10, None, None).await.unwrap();
+            let transactions = credits
+                .list_user_transactions(user_id, 0, 10, &TransactionFilters::default())
+                .await
+                .unwrap();
             let usage_tx = transactions.iter().find(|tx| tx.transaction_type == CreditTransactionType::Usage);
             assert!(usage_tx.is_none(), "No Usage transaction should be created for zero cost");
         }
@@ -2097,7 +2104,10 @@ mod tests {
             let expected_balance = initial_balance - expected_cost;
             assert_eq!(final_balance, expected_balance, "Balance should reflect overdraft");
             // Verify: Usage transaction was created
-            let transactions = credits.list_user_transactions(user_id, 0, 10, None, None).await.unwrap();
+            let transactions = credits
+                .list_user_transactions(user_id, 0, 10, &TransactionFilters::default())
+                .await
+                .unwrap();
             let usage_tx = transactions.iter().find(|tx| tx.transaction_type == CreditTransactionType::Usage);
             assert!(
                 usage_tx.is_some(),
@@ -2235,7 +2245,10 @@ mod tests {
             );
 
             // Verify: No Usage transaction created
-            let transactions = credits.list_user_transactions(user_id, 0, 10, None, None).await.unwrap();
+            let transactions = credits
+                .list_user_transactions(user_id, 0, 10, &TransactionFilters::default())
+                .await
+                .unwrap();
             let usage_tx = transactions.iter().find(|tx| tx.transaction_type == CreditTransactionType::Usage);
             assert!(usage_tx.is_none(), "No Usage transaction should be created for Playground users");
 
@@ -2301,7 +2314,10 @@ mod tests {
             // Verify: All transactions were created successfully
             let mut conn = pool.acquire().await.unwrap();
             let mut credits = Credits::new(&mut conn);
-            let transactions = credits.list_user_transactions(user_id, 0, 20, None, None).await.unwrap();
+            let transactions = credits
+                .list_user_transactions(user_id, 0, 20, &TransactionFilters::default())
+                .await
+                .unwrap();
 
             let usage_transactions: Vec<_> = transactions
                 .iter()
@@ -2367,7 +2383,10 @@ mod tests {
             assert_eq!(final_balance, expected_balance, "Balance should only deduct for input tokens");
 
             // Verify transaction amount
-            let transactions = credits.list_user_transactions(user_id, 0, 10, None, None).await.unwrap();
+            let transactions = credits
+                .list_user_transactions(user_id, 0, 10, &TransactionFilters::default())
+                .await
+                .unwrap();
             let usage_tx = transactions
                 .iter()
                 .find(|tx| tx.transaction_type == CreditTransactionType::Usage)
@@ -2405,7 +2424,10 @@ mod tests {
             assert_eq!(final_balance, expected_balance, "Balance should only deduct for output tokens");
 
             // Verify transaction amount
-            let transactions = credits.list_user_transactions(user_id, 0, 10, None, None).await.unwrap();
+            let transactions = credits
+                .list_user_transactions(user_id, 0, 10, &TransactionFilters::default())
+                .await
+                .unwrap();
             let usage_tx = transactions
                 .iter()
                 .find(|tx| tx.transaction_type == CreditTransactionType::Usage)
@@ -2439,7 +2461,10 @@ mod tests {
             assert_eq!(final_balance, initial_balance, "Balance should remain unchanged with no pricing");
 
             // Verify NO Usage transaction was created
-            let transactions = credits.list_user_transactions(user_id, 0, 10, None, None).await.unwrap();
+            let transactions = credits
+                .list_user_transactions(user_id, 0, 10, &TransactionFilters::default())
+                .await
+                .unwrap();
             let usage_tx = transactions.iter().find(|tx| tx.transaction_type == CreditTransactionType::Usage);
 
             assert!(usage_tx.is_none(), "No Usage transaction should be created when pricing is None");
@@ -2628,7 +2653,10 @@ mod tests {
             // Verify: Check transactions
             let mut conn = pool.acquire().await.unwrap();
             let mut credits = Credits::new(&mut conn);
-            let transactions = credits.list_user_transactions(user_id, 0, 10, None, None).await.unwrap();
+            let transactions = credits
+                .list_user_transactions(user_id, 0, 10, &TransactionFilters::default())
+                .await
+                .unwrap();
 
             let usage_transactions: Vec<_> = transactions
                 .iter()
@@ -2752,7 +2780,10 @@ mod tests {
             // Verify: Check transactions
             let mut conn = pool.acquire().await.unwrap();
             let mut credits = Credits::new(&mut conn);
-            let transactions = credits.list_user_transactions(user_id, 0, 10, None, None).await.unwrap();
+            let transactions = credits
+                .list_user_transactions(user_id, 0, 10, &TransactionFilters::default())
+                .await
+                .unwrap();
 
             let usage_transactions: Vec<_> = transactions
                 .iter()
@@ -2848,7 +2879,10 @@ mod tests {
             // Verify: Transaction amount uses realtime pricing
             let mut conn = pool.acquire().await.unwrap();
             let mut credits = Credits::new(&mut conn);
-            let transactions = credits.list_user_transactions(user_id, 0, 10, None, None).await.unwrap();
+            let transactions = credits
+                .list_user_transactions(user_id, 0, 10, &TransactionFilters::default())
+                .await
+                .unwrap();
 
             let usage_tx = transactions
                 .iter()
@@ -2966,7 +3000,10 @@ mod tests {
             // Verify: Check transaction amounts
             let mut conn = pool.acquire().await.unwrap();
             let mut credits = Credits::new(&mut conn);
-            let transactions = credits.list_user_transactions(user_id, 0, 10, None, None).await.unwrap();
+            let transactions = credits
+                .list_user_transactions(user_id, 0, 10, &TransactionFilters::default())
+                .await
+                .unwrap();
 
             let usage_transactions: Vec<_> = transactions
                 .iter()
