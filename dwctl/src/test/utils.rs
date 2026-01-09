@@ -144,6 +144,7 @@ pub fn create_test_config() -> crate::config::Config {
             leader_election: LeaderElectionConfig { enabled: false },
             ..Default::default()
         },
+        sample_files: crate::sample_files::SampleFilesConfig::default(),
     }
 }
 

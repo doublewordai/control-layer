@@ -17,8 +17,10 @@ use crate::{
     },
     auth::{password, session},
     db::{
-        handlers::{PasswordResetTokens, Repository, Users, credits::Credits},
-        models::{credits::CreditTransactionCreateDBRequest, users::UserCreateDBRequest},
+        handlers::{Deployments, PasswordResetTokens, Repository, Users, api_keys::ApiKeys, credits::Credits},
+        models::{
+            api_keys::ApiKeyPurpose, credits::CreditTransactionCreateDBRequest, deployments::ModelStatus, users::UserCreateDBRequest,
+        },
     },
     email::EmailService,
     errors::Error,
@@ -143,6 +145,18 @@ pub async fn register(State(state): State<AppState>, Json(request): Json<Registe
     }
 
     tx.commit().await.map_err(|e| Error::Database(e.into()))?;
+
+    // Create sample files for new user if enabled (non-blocking, failures are logged)
+    if state.config.sample_files.enabled && state.config.batches.enabled {
+        let user_id = created_user.id;
+        let state_clone = state.clone();
+        tokio::spawn(async move {
+            if let Err(e) = create_sample_files_for_new_user(&state_clone, user_id).await {
+                tracing::warn!(user_id = %user_id, error = %e, "Failed to create sample files for new user");
+            }
+        });
+    }
+
     let user_response = UserResponse::from(created_user);
 
     // Create session token
@@ -158,6 +172,55 @@ pub async fn register(State(state): State<AppState>, Json(request): Json<Registe
     };
 
     Ok(RegisterResponse { auth_response, cookie })
+}
+
+/// Helper function to create sample files for a newly registered user.
+///
+/// This function is called asynchronously after user registration to avoid
+/// blocking the registration response. Failures are logged but don't affect
+/// the user creation.
+async fn create_sample_files_for_new_user(state: &AppState, user_id: Uuid) -> Result<(), Error> {
+    use crate::db::handlers::deployments::DeploymentFilter;
+    use crate::sample_files;
+
+    let mut conn = state.db.acquire().await.map_err(|e| Error::Database(e.into()))?;
+
+    // Get the user's batch API key
+    let mut api_keys_repo = ApiKeys::new(&mut conn);
+    let api_key = api_keys_repo
+        .get_or_create_hidden_key(user_id, ApiKeyPurpose::Batch)
+        .await
+        .map_err(Error::Database)?;
+
+    // Get deployments accessible to this user
+    let mut deployments_repo = Deployments::new(&mut conn);
+    let filter = DeploymentFilter::new(0, i64::MAX)
+        .with_accessible_to(user_id)
+        .with_statuses(vec![ModelStatus::Active])
+        .with_deleted(false);
+    let accessible_deployments = deployments_repo.list(&filter).await.map_err(Error::Database)?;
+
+    // Construct batch execution endpoint
+    let endpoint = format!("http://{}:{}/ai", state.config.host, state.config.port);
+
+    // Create sample files using the sample_files module
+    let created_files = sample_files::create_sample_files_for_user(
+        state.request_manager.as_ref(),
+        user_id,
+        &api_key,
+        &endpoint,
+        &accessible_deployments,
+        &state.config.sample_files,
+    )
+    .await?;
+
+    tracing::info!(
+        user_id = %user_id,
+        file_count = created_files.len(),
+        "Created sample files for new user"
+    );
+
+    Ok(())
 }
 
 /// Get login information

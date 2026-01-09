@@ -147,6 +147,7 @@ mod openapi;
 mod payment_providers;
 mod probes;
 mod request_logging;
+pub mod sample_files;
 mod static_assets;
 mod sync;
 pub mod telemetry;
