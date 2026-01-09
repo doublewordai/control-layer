@@ -229,6 +229,13 @@ export function UploadFileModal({
           </DialogDescription>
         </DialogHeader>
 
+        <style>{`
+          @keyframes gentlePulse {
+            0%, 100% { opacity: 1; }
+            50% { opacity: 0.3; }
+          }
+        `}</style>
+
         <AlertBox variant="error" className="mb-4">
           {error}
         </AlertBox>
@@ -319,12 +326,12 @@ export function UploadFileModal({
               </div>
               <div className="h-2 bg-gray-200 rounded-full overflow-hidden">
                 <div
-                  className={`h-full rounded-full transition-all duration-150 ease-out ${
-                    isProcessing 
-                      ? "bg-blue-600 animate-pulse" 
-                      : "bg-blue-600"
-                  }`}
-                  style={{ width: `${uploadProgress}%` }}
+                  className="h-full rounded-full transition-all duration-150 ease-out bg-blue-600"
+                  style={{ 
+                    width: `${uploadProgress}%`,
+                    opacity: isProcessing ? undefined : 1,
+                    animation: isProcessing ? 'gentlePulse 3s ease-in-out infinite' : undefined,
+                  }}
                 />
               </div>
               {isProcessing && (
