@@ -1956,6 +1956,8 @@ mod tests {
         #[sqlx::test]
         #[test_log::test]
         async fn test_credit_deduction_successful(pool: sqlx::PgPool) {
+            use crate::api::models::transactions::TransactionFilters;
+
             // Setup: Create test model and tariff
             let model_id = create_test_model(&pool, "gpt-4").await;
             let input_price = Decimal::from_str("0.00001").unwrap();
