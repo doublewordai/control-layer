@@ -13,7 +13,7 @@ import {
 import { Card } from "../../../ui/card.tsx";
 import { Button } from "@/components";
 import { useState, useMemo } from "react";
-import { useNavigate } from "react-router-dom";
+import { useNavigate, useSearchParams } from "react-router-dom";
 import {
   Select,
   SelectContent,
@@ -63,12 +63,29 @@ export function TransactionHistory({
   const { isFeatureEnabled } = useSettings();
   const isDemoMode = isFeatureEnabled("demo");
   const navigate = useNavigate();
+  const [searchParams, setSearchParams] = useSearchParams();
 
   // Fetch user info for display
   const { data: displayUser } = useUser(filterUserId || userId);
 
-  // Fetch balance and transactions
+  // Fetch balance
   const { refetch: refetchBalance } = useUserBalance(userId);
+
+  // Read pagination state from URL params
+  const currentPage = parseInt(searchParams.get("txPage") || "1", 10);
+  const pageSize = parseInt(searchParams.get("txPageSize") || "10", 10);
+
+  // Read filter state from URL params
+  const transactionType = searchParams.get("txType") || "all";
+
+  // Local state for filters that don't need URL persistence
+  const [dateRange, setDateRange] = useState<
+    { from: Date; to: Date } | undefined
+  >();
+  const [searchTerm, setSearchTerm] = useState<string>("");
+
+  // Calculate skip for server-side pagination
+  const skip = (currentPage - 1) * pageSize;
 
   // Always pass userId to filter transactions by the specific user
   // Backend enforces permissions: non-admins can only see their own transactions
@@ -76,13 +93,19 @@ export function TransactionHistory({
     data: transactionsResponse,
     isLoading: isLoadingTransactions,
     refetch: refetchTransactions,
-  } = useTransactions({ userId, group_batches: true });
+  } = useTransactions({
+    userId,
+    group_batches: true,
+    limit: pageSize,
+    skip,
+  });
 
-  // Get transactions and page_start_balance from response
+  // Get transactions and metadata from response
   const transactions = useMemo<Transaction[]>(() => {
     return transactionsResponse?.data || [];
   }, [transactionsResponse]);
 
+  const totalCount = transactionsResponse?.total_count ?? 0;
   const pageStartBalance = transactionsResponse?.page_start_balance ?? 0;
 
   // Compute balance_after for each transaction
@@ -116,17 +139,6 @@ export function TransactionHistory({
 
   const isLoading = !isDemoMode && isLoadingTransactions;
 
-  // Filter states
-  const [transactionType, setTransactionType] = useState<string>("all");
-  const [dateRange, setDateRange] = useState<
-    { from: Date; to: Date } | undefined
-  >();
-  const [searchTerm, setSearchTerm] = useState<string>("");
-
-  // Pagination state
-  const [currentPage, setCurrentPage] = useState(1);
-  const itemsPerPage = 10;
-
   // Helper functions
   const formatDate = (isoString: string) => {
     const date = new Date(isoString);
@@ -139,7 +151,8 @@ export function TransactionHistory({
     }).format(date);
   };
 
-  // Apply filters
+  // Apply client-side filters (transaction type, search, date range)
+  // Note: These filters work on the current page's data only
   const filteredTransactions = useMemo(() => {
     let filtered = [...transactions];
 
@@ -191,28 +204,45 @@ export function TransactionHistory({
     return filtered;
   }, [transactions, transactionType, dateRange, searchTerm, filterUserId]);
 
-  // Paginate filtered transactions
-  const paginatedTransactions = useMemo(() => {
-    const startIndex = (currentPage - 1) * itemsPerPage;
-    const endIndex = startIndex + itemsPerPage;
-    return filteredTransactions.slice(startIndex, endIndex);
-  }, [filteredTransactions, currentPage, itemsPerPage]);
-
-  const totalPages = Math.ceil(filteredTransactions.length / itemsPerPage);
+  const totalPages = Math.ceil(totalCount / pageSize);
 
   const hasActiveFilters =
     transactionType !== "all" || dateRange !== undefined || searchTerm !== "";
 
+  // URL param update helpers
+  const updateUrlParams = (updates: Record<string, string | null>) => {
+    setSearchParams((prev) => {
+      const next = new URLSearchParams(prev);
+      for (const [key, value] of Object.entries(updates)) {
+        if (value === null) {
+          next.delete(key);
+        } else {
+          next.set(key, value);
+        }
+      }
+      return next;
+    });
+  };
+
+  const handlePageChange = (newPage: number) => {
+    updateUrlParams({ txPage: newPage.toString() });
+  };
+
+  const handlePageSizeChange = (newSize: string) => {
+    updateUrlParams({ txPage: "1", txPageSize: newSize });
+  };
+
   const clearFilters = () => {
-    setTransactionType("all");
     setDateRange(undefined);
     setSearchTerm("");
-    setCurrentPage(1); // Reset to first page when clearing filters
+    updateUrlParams({ txType: null, txPage: "1" });
   };
 
   const handleTransactionTypeChange = (value: string) => {
-    setTransactionType(value);
-    setCurrentPage(1); // Reset to first page when filter changes
+    updateUrlParams({
+      txType: value === "all" ? null : value,
+      txPage: "1",
+    });
   };
 
   // Reset to page 1 when date range changes
@@ -220,13 +250,13 @@ export function TransactionHistory({
     range: { from: Date; to: Date } | undefined,
   ) => {
     setDateRange(range);
-    setCurrentPage(1);
+    handlePageChange(1);
   };
 
   // Reset to page 1 when search term changes
   const handleSearchChange = (value: string) => {
     setSearchTerm(value);
-    setCurrentPage(1);
+    handlePageChange(1);
   };
 
   // Refresh handler
@@ -357,6 +387,22 @@ export function TransactionHistory({
               onChange={handleDateRangeChange}
             />
 
+            {/* Page Size Selector */}
+            <Select
+              value={pageSize.toString()}
+              onValueChange={handlePageSizeChange}
+            >
+              <SelectTrigger className="w-[80px]">
+                <SelectValue />
+              </SelectTrigger>
+              <SelectContent>
+                <SelectItem value="10">10</SelectItem>
+                <SelectItem value="20">20</SelectItem>
+                <SelectItem value="50">50</SelectItem>
+                <SelectItem value="100">100</SelectItem>
+              </SelectContent>
+            </Select>
+
             <Button
               variant="ghost"
               size="sm"
@@ -372,8 +418,8 @@ export function TransactionHistory({
           {/* Filter Status */}
           {hasActiveFilters && (
             <div className="text-sm text-doubleword-neutral-600">
-              Showing {filteredTransactions.length} of {transactions.length}{" "}
-              transactions
+              Showing {filteredTransactions.length} of {transactions.length} on
+              this page (filtered from {totalCount} total)
             </div>
           )}
         </div>
@@ -390,7 +436,7 @@ export function TransactionHistory({
               </TableRow>
             </TableHeader>
             <TableBody>
-              {paginatedTransactions.map((transaction) => {
+              {filteredTransactions.map((transaction) => {
                 // Determine if transaction is a credit (adds money) or debit (removes money)
                 const isCredit =
                   transaction.transaction_type === "admin_grant" ||
@@ -398,7 +444,14 @@ export function TransactionHistory({
 
                 const handleRowClick = () => {
                   if (transaction.batch_id) {
-                    navigate(`/batches/${transaction.batch_id}`);
+                    // Preserve current URL params when navigating to batch detail
+                    const currentParams = searchParams.toString();
+                    const fromUrl = currentParams
+                      ? `/cost-management?${currentParams}`
+                      : "/cost-management";
+                    navigate(
+                      `/batches/${transaction.batch_id}?from=${encodeURIComponent(fromUrl)}`,
+                    );
                   }
                 };
 
@@ -462,7 +515,7 @@ export function TransactionHistory({
                     <TableCell className="text-right">
                       <p className="text-sm text-doubleword-neutral-600">
                         {formatDollars(
-                          balanceByTransactionId.get(transaction.id) ?? 0
+                          balanceByTransactionId.get(transaction.id) ?? 0,
                         )}
                       </p>
                     </TableCell>
@@ -495,21 +548,25 @@ export function TransactionHistory({
         )}
 
         {/* Pagination Controls */}
-        {filteredTransactions.length > itemsPerPage && (
+        {totalCount > 0 && (
           <div className="flex items-center justify-between border-t border-doubleword-neutral-200 pt-2">
             <div className="text-sm text-doubleword-neutral-600">
-              Showing {(currentPage - 1) * itemsPerPage + 1} to{" "}
-              {Math.min(
-                currentPage * itemsPerPage,
-                filteredTransactions.length,
-              )}{" "}
-              of {filteredTransactions.length} transactions
+              Showing {skip + 1} to {Math.min(skip + pageSize, totalCount)} of{" "}
+              {totalCount} transactions
             </div>
             <div className="flex items-center gap-2">
               <Button
                 variant="outline"
                 size="sm"
-                onClick={() => setCurrentPage((p) => Math.max(1, p - 1))}
+                onClick={() => handlePageChange(1)}
+                disabled={currentPage === 1}
+              >
+                First
+              </Button>
+              <Button
+                variant="outline"
+                size="sm"
+                onClick={() => handlePageChange(currentPage - 1)}
                 disabled={currentPage === 1}
               >
                 <ChevronLeft className="w-4 h-4" />
@@ -521,10 +578,8 @@ export function TransactionHistory({
               <Button
                 variant="outline"
                 size="sm"
-                onClick={() =>
-                  setCurrentPage((p) => Math.min(totalPages, p + 1))
-                }
-                disabled={currentPage === totalPages}
+                onClick={() => handlePageChange(currentPage + 1)}
+                disabled={currentPage >= totalPages}
               >
                 Next
                 <ChevronRight className="w-4 h-4" />

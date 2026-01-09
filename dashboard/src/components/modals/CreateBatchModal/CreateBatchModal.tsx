@@ -77,9 +77,11 @@ export function CreateBatchModal({
   );
 
   // Fetch available files for combobox (only input files with purpose "batch")
+  // Only fetch when modal is open to avoid unnecessary queries on page load
   const { data: filesResponse } = useFiles({
     purpose: "batch",
-    limit: 1000, // Fetch plenty for the dropdown
+    limit: 100,
+    enabled: isOpen,
   });
 
   const availableFiles = filesResponse?.data || [];
@@ -182,7 +184,9 @@ export function CreateBatchModal({
           onProgress: setUploadProgress,
         });
         finalFileId = uploadedFile.id;
-        toast.success(`File "${filename || fileToUpload.name}" uploaded successfully`);
+        toast.success(
+          `File "${filename || fileToUpload.name}" uploaded successfully`,
+        );
       } catch (error) {
         console.error("Failed to upload file:", error);
         setError(
