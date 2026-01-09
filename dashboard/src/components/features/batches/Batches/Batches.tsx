@@ -623,7 +623,7 @@ export function Batches({
             pageSize={filesPagination.pageSize}
             minRows={filesPagination.pageSize}
             rowHeight="40px"
-            initialColumnVisibility={{ id: false }}
+            initialColumnVisibility={{}}
             isLoading={filesLoading}
             emptyState={
               <div className="text-center py-12">
