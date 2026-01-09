@@ -807,21 +807,13 @@ const costApi = {
     if (query?.limit) params.set("limit", query.limit.toString());
     if (query?.skip) params.set("skip", query.skip.toString());
     if (query?.userId) params.set("user_id", query.userId);
-<<<<<<< HEAD
-    if (query?.group_batches !== undefined) params.set("group_batches", query.group_batches.toString());
-    if (query?.start_date) params.set("start_date", query.start_date);
-    if (query?.end_date) params.set("end_date", query.end_date);
-=======
     if (query?.group_batches !== undefined)
       params.set("group_batches", query.group_batches.toString());
     if (query?.search) params.set("search", query.search);
     if (query?.transaction_types)
       params.set("transaction_types", query.transaction_types);
-    if (query?.timestamp_after)
-      params.set("timestamp_after", query.timestamp_after);
-    if (query?.timestamp_before)
-      params.set("timestamp_before", query.timestamp_before);
->>>>>>> d4ec6cd8 (fix: transaction filtering)
+    if (query?.start_date) params.set("start_date", query.start_date);
+    if (query?.end_date) params.set("end_date", query.end_date);
 
     const url = `/admin/api/v1/transactions${params.toString() ? "?" + params.toString() : ""}`;
     const response = await fetch(url);

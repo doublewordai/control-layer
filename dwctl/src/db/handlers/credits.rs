@@ -68,6 +68,16 @@ pub struct AggregatedBatches {
     pub batched_source_ids: Vec<String>,
 }
 
+/// Convert CreditTransactionType to its snake_case string representation for SQL queries
+fn transaction_type_to_string(t: &CreditTransactionType) -> String {
+    match t {
+        CreditTransactionType::Purchase => "purchase".to_string(),
+        CreditTransactionType::AdminGrant => "admin_grant".to_string(),
+        CreditTransactionType::AdminRemoval => "admin_removal".to_string(),
+        CreditTransactionType::Usage => "usage".to_string(),
+    }
+}
+
 pub struct Credits<'c> {
     db: &'c mut PgConnection,
 }
@@ -240,7 +250,7 @@ impl<'c> Credits<'c> {
         let transaction_types: Option<Vec<String>> = filters
             .transaction_types
             .as_ref()
-            .map(|types| types.iter().map(|t| t.to_string()).collect());
+            .map(|types| types.iter().map(|t| transaction_type_to_string(t)).collect());
 
         let transactions = sqlx::query_as!(
             CreditTransaction,
@@ -261,8 +271,8 @@ impl<'c> Credits<'c> {
             limit,
             filters.search.as_deref(),
             transaction_types.as_deref(),
-            filters.timestamp_after,
-            filters.timestamp_before,
+            filters.start_date,
+            filters.end_date,
         )
         .fetch_all(&mut *self.db)
         .await?;
@@ -281,7 +291,7 @@ impl<'c> Credits<'c> {
         let transaction_types: Option<Vec<String>> = filters
             .transaction_types
             .as_ref()
-            .map(|types| types.iter().map(|t| t.to_string()).collect());
+            .map(|types| types.iter().map(|t| transaction_type_to_string(t)).collect());
 
         let transactions = sqlx::query_as!(
             CreditTransaction,
@@ -300,8 +310,8 @@ impl<'c> Credits<'c> {
             limit,
             filters.search.as_deref(),
             transaction_types.as_deref(),
-            filters.timestamp_after,
-            filters.timestamp_before,
+            filters.start_date,
+            filters.end_date,
         )
         .fetch_all(&mut *self.db)
         .await?;
@@ -334,7 +344,7 @@ impl<'c> Credits<'c> {
         let transaction_types: Option<Vec<String>> = filters
             .transaction_types
             .as_ref()
-            .map(|types| types.iter().map(|t| t.to_string()).collect());
+            .map(|types| types.iter().map(|t| transaction_type_to_string(t)).collect());
 
         let result = sqlx::query!(
             r#"
@@ -349,8 +359,8 @@ impl<'c> Credits<'c> {
             user_id,
             filters.search.as_deref(),
             transaction_types.as_deref(),
-            filters.timestamp_after,
-            filters.timestamp_before,
+            filters.start_date,
+            filters.end_date,
         )
         .fetch_one(&mut *self.db)
         .await?;
@@ -364,7 +374,7 @@ impl<'c> Credits<'c> {
         let transaction_types: Option<Vec<String>> = filters
             .transaction_types
             .as_ref()
-            .map(|types| types.iter().map(|t| t.to_string()).collect());
+            .map(|types| types.iter().map(|t| transaction_type_to_string(t)).collect());
 
         let result = sqlx::query!(
             r#"
@@ -377,8 +387,8 @@ impl<'c> Credits<'c> {
             "#,
             filters.search.as_deref(),
             transaction_types.as_deref(),
-            filters.timestamp_after,
-            filters.timestamp_before,
+            filters.start_date,
+            filters.end_date,
         )
         .fetch_one(&mut *self.db)
         .await?;
@@ -394,7 +404,7 @@ impl<'c> Credits<'c> {
         let transaction_types: Option<Vec<String>> = filters
             .transaction_types
             .as_ref()
-            .map(|types| types.iter().map(|t| t.to_string()).collect());
+            .map(|types| types.iter().map(|t| transaction_type_to_string(t)).collect());
 
         // Check if we should include batch aggregates (they're always type 'usage')
         let include_batches = filters
@@ -403,32 +413,39 @@ impl<'c> Credits<'c> {
             .map(|types| types.iter().any(|t| matches!(t, CreditTransactionType::Usage)))
             .unwrap_or(true);
 
+        // Check if search term would match "Batch" description
+        let search_matches_batch = filters
+            .search
+            .as_ref()
+            .map(|s| "batch".contains(&s.to_lowercase()) || s.to_lowercase().contains("batch"))
+            .unwrap_or(true);
+
         let result = sqlx::query!(
             r#"
             SELECT
-                (CASE WHEN $6::bool THEN
+                (CASE WHEN $4::bool AND $5::bool THEN
                     (SELECT COUNT(*) FROM batch_aggregates
                      WHERE user_id = $1
-                       AND ($2::text IS NULL OR 'Batch' ILIKE '%' || $2 || '%')
-                       AND ($4::timestamptz IS NULL OR created_at >= $4)
-                       AND ($5::timestamptz IS NULL OR created_at <= $5))
+                       AND ($2::timestamptz IS NULL OR created_at >= $2)
+                       AND ($3::timestamptz IS NULL OR created_at <= $3))
                 ELSE 0 END)
                 +
                 (SELECT COUNT(*) FROM credits_transactions
                  WHERE user_id = $1
                    AND fusillade_batch_id IS NULL
-                   AND ($2::text IS NULL OR description ILIKE '%' || $2 || '%')
-                   AND ($3::text[] IS NULL OR transaction_type::text = ANY($3))
-                   AND ($4::timestamptz IS NULL OR created_at >= $4)
-                   AND ($5::timestamptz IS NULL OR created_at <= $5))
+                   AND ($6::text IS NULL OR description ILIKE '%' || $6 || '%')
+                   AND ($7::text[] IS NULL OR transaction_type::text = ANY($7))
+                   AND ($2::timestamptz IS NULL OR created_at >= $2)
+                   AND ($3::timestamptz IS NULL OR created_at <= $3))
             as "count!"
             "#,
             user_id,
+            filters.start_date,
+            filters.end_date,
+            include_batches,
+            search_matches_batch,
             filters.search.as_deref(),
             transaction_types.as_deref(),
-            filters.timestamp_after,
-            filters.timestamp_before,
-            include_batches,
         )
         .fetch_one(&mut *self.db)
         .await?;
@@ -528,13 +545,20 @@ impl<'c> Credits<'c> {
         let transaction_types: Option<Vec<String>> = filters
             .transaction_types
             .as_ref()
-            .map(|types| types.iter().map(|t| t.to_string()).collect());
+            .map(|types| types.iter().map(|t| transaction_type_to_string(t)).collect());
 
         // Check if we should include batch aggregates (they're always type 'usage')
         let include_batches = filters
             .transaction_types
             .as_ref()
             .map(|types| types.iter().any(|t| matches!(t, CreditTransactionType::Usage)))
+            .unwrap_or(true);
+
+        // Check if search term would match "Batch" description
+        let search_matches_batch = filters
+            .search
+            .as_ref()
+            .map(|s| "batch".contains(&s.to_lowercase()) || s.to_lowercase().contains("batch"))
             .unwrap_or(true);
 
         // Optimized query using pre-limited UNION branches for Merge Append
@@ -545,6 +569,7 @@ impl<'c> Credits<'c> {
             SELECT * FROM (
                 -- Top N from batch_aggregates (index scan on idx_batch_agg_user_seq)
                 -- Only included if transaction_types filter includes 'usage' or is not set
+                -- and search term matches "Batch" description
                 (SELECT
                     ba.fusillade_batch_id as id,
                     ba.user_id,
@@ -558,15 +583,10 @@ impl<'c> Credits<'c> {
                     ba.transaction_count as batch_count
                 FROM batch_aggregates ba
                 WHERE ba.user_id = $1
-<<<<<<< HEAD
-                    AND ($5::timestamptz IS NULL OR ba.created_at >= $5)
-                    AND ($6::timestamptz IS NULL OR ba.created_at <= $6)
-=======
                   AND $8::bool = true
                   AND ($5::text IS NULL OR 'Batch' ILIKE '%' || $5 || '%')
                   AND ($7::timestamptz IS NULL OR ba.created_at >= $7)
                   AND ($9::timestamptz IS NULL OR ba.created_at <= $9)
->>>>>>> d4ec6cd8 (fix: transaction filtering)
                 ORDER BY ba.max_seq DESC
                 LIMIT $2)
 
@@ -587,30 +607,26 @@ impl<'c> Credits<'c> {
                 FROM credits_transactions ct
                 WHERE ct.user_id = $1
                   AND ct.fusillade_batch_id IS NULL
-<<<<<<< HEAD
-                  AND ($5::timestamptz IS NULL OR ct.created_at >= $5)
-                  AND ($6::timestamptz IS NULL OR ct.created_at <= $6)
-=======
                   AND ($5::text IS NULL OR ct.description ILIKE '%' || $5 || '%')
                   AND ($6::text[] IS NULL OR ct.transaction_type::text = ANY($6))
                   AND ($7::timestamptz IS NULL OR ct.created_at >= $7)
                   AND ($9::timestamptz IS NULL OR ct.created_at <= $9)
->>>>>>> d4ec6cd8 (fix: transaction filtering)
                 ORDER BY ct.seq DESC
                 LIMIT $2)
             ) combined
             ORDER BY max_seq DESC
             LIMIT $3 OFFSET $4
             "#,
-            user_id,                      // $1
-            fetch_limit,                  // $2
-            limit,                        // $3
-            skip,                         // $4
-            filters.search.as_deref(),    // $5
-            transaction_types.as_deref(), // $6
-            filters.timestamp_after,      // $7
-            include_batches,              // $8
-            filters.timestamp_before,     // $9
+            user_id,
+            fetch_limit,
+            limit,
+            skip,
+            filters.start_date,
+            filters.end_date,
+            include_batches,
+            search_matches_batch,
+            filters.search.as_deref(),
+            transaction_types.as_deref(),
         )
         .fetch_all(&mut *self.db)
         .await?;
@@ -851,7 +867,7 @@ mod tests {
         }
 
         let transactions = credits
-            .list_user_transactions(user_id, 0, n_of_transactions, None, None)
+            .list_user_transactions(user_id, 0, n_of_transactions, &TransactionFilters::default())
             .await
             .expect("Failed to list transactions");
 
@@ -935,21 +951,21 @@ mod tests {
 
         // Test limit
         let transactions = credits
-            .list_user_transactions(user_id, 0, 2, None, None)
+            .list_user_transactions(user_id, 0, 2, &TransactionFilters::default())
             .await
             .expect("Failed to list transactions");
         assert_eq!(transactions.len(), 2);
 
         // Test skip
         let transactions = credits
-            .list_user_transactions(user_id, 2, 2, None, None)
+            .list_user_transactions(user_id, 2, 2, &TransactionFilters::default())
             .await
             .expect("Failed to list transactions");
         assert_eq!(transactions.len(), 2);
 
         // Test skip beyond available
         let transactions = credits
-            .list_user_transactions(user_id, 10, 2, None, None)
+            .list_user_transactions(user_id, 10, 2, &TransactionFilters::default())
             .await
             .expect("Failed to list transactions");
         assert_eq!(transactions.len(), 0);
@@ -973,7 +989,7 @@ mod tests {
 
         // List user1's transactions
         let transactions = credits
-            .list_user_transactions(user1_id, 0, 10, None, None)
+            .list_user_transactions(user1_id, 0, 10, &TransactionFilters::default())
             .await
             .expect("Failed to list transactions");
         assert_eq!(transactions.len(), 1);
@@ -984,7 +1000,7 @@ mod tests {
 
         // List user2's transactions
         let transactions = credits
-            .list_user_transactions(user2_id, 0, 10, None, None)
+            .list_user_transactions(user2_id, 0, 10, &TransactionFilters::default())
             .await
             .expect("Failed to list transactions");
         assert_eq!(transactions.len(), 1);
@@ -996,7 +1012,7 @@ mod tests {
         // List non existent user's transactions
         let non_existent_user_id = Uuid::new_v4();
         let transactions = credits
-            .list_user_transactions(non_existent_user_id, 0, 10, None, None)
+            .list_user_transactions(non_existent_user_id, 0, 10, &TransactionFilters::default())
             .await
             .expect("Failed to list transactions");
         assert_eq!(transactions.len(), 0);
@@ -1028,7 +1044,7 @@ mod tests {
         credits.create_transaction(&request2).await.expect("Failed to create transaction");
 
         let transactions = credits
-            .list_all_transactions(0, 10, None, None)
+            .list_all_transactions(0, 10, &TransactionFilters::default())
             .await
             .expect("Failed to list transactions");
 
@@ -1058,14 +1074,14 @@ mod tests {
 
         // Test limit
         let transactions = credits
-            .list_all_transactions(0, 2, None, None)
+            .list_all_transactions(0, 2, &TransactionFilters::default())
             .await
             .expect("Failed to list transactions");
         assert_eq!(transactions.len(), 2);
 
         // Test skip
         let transactions = credits
-            .list_all_transactions(2, 2, None, None)
+            .list_all_transactions(2, 2, &TransactionFilters::default())
             .await
             .expect("Failed to list transactions");
         assert!(transactions.len() >= 2);
@@ -1152,7 +1168,7 @@ mod tests {
 
         // Verify only one transaction exists
         let transactions = credits
-            .list_user_transactions(user_id, 0, 10, None, None)
+            .list_user_transactions(user_id, 0, 10, &TransactionFilters::default())
             .await
             .expect("Failed to list transactions");
         assert_eq!(transactions.len(), 1);
@@ -1358,7 +1374,7 @@ mod tests {
         let mut conn = pool.acquire().await.expect("Failed to acquire connection");
         let mut credits = Credits::new(&mut conn);
         let transactions = credits
-            .list_user_transactions(user_id, 0, 1000, None, None)
+            .list_user_transactions(user_id, 0, 1000, &TransactionFilters::default())
             .await
             .expect("Failed to list transactions");
 

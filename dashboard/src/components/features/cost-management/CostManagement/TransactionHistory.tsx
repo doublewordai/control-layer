@@ -12,8 +12,9 @@ import {
 } from "lucide-react";
 import { Card } from "../../../ui/card.tsx";
 import { Button } from "@/components";
-import { useState, useMemo } from "react";
+import { useState, useMemo, useCallback } from "react";
 import { useNavigate, useSearchParams } from "react-router-dom";
+import { useServerPagination } from "@/hooks/useServerPagination";
 import {
   Select,
   SelectContent,
@@ -69,12 +70,8 @@ export function TransactionHistory({
   // Fetch user info for display
   const { data: displayUser } = useUser(filterUserId || userId);
 
-  // Fetch balance
-  const { refetch: refetchBalance } = useUserBalance(userId);
-
-  // Read pagination state from URL params
-  const currentPage = parseInt(searchParams.get("txPage") || "1", 10);
-  const pageSize = parseInt(searchParams.get("txPageSize") || "10", 10);
+  // Server-side pagination
+  const pagination = useServerPagination({ paramPrefix: "tx" });
 
   // Read filter state from URL params
   const transactionType = searchParams.get("txType") || "all";
@@ -86,8 +83,8 @@ export function TransactionHistory({
   const [searchTerm, setSearchTerm] = useState<string>("");
   const debouncedSearch = useDebounce(searchTerm, 300);
 
-  // Calculate skip for server-side pagination
-  const skip = (currentPage - 1) * pageSize;
+  // Fetch balance
+  const { refetch: refetchBalance } = useUserBalance(userId);
 
   // Helper to map UI transaction type to API transaction_types
   const getTransactionTypesParam = (type: string): string | undefined => {
@@ -98,7 +95,7 @@ export function TransactionHistory({
 
   // Always pass userId to filter transactions by the specific user
   // Backend enforces permissions: non-admins can only see their own transactions
-  // Pass date range for server-side filtering
+  // Pass all filters for server-side filtering and pagination
   const {
     data: transactionsResponse,
     isLoading: isLoadingTransactions,
@@ -106,13 +103,11 @@ export function TransactionHistory({
   } = useTransactions({
     userId,
     group_batches: true,
-    limit: pageSize,
-    skip,
-    // Server-side filters
+    ...pagination.queryParams,
     search: debouncedSearch.trim() || undefined,
     transaction_types: getTransactionTypesParam(transactionType),
-    timestamp_after: dateRange?.from?.toISOString(),
-    timestamp_before: dateRange?.to?.toISOString(),
+    start_date: dateRange?.from?.toISOString(),
+    end_date: dateRange?.to?.toISOString(),
   });
 
   // Get transactions and metadata from response
@@ -166,64 +161,67 @@ export function TransactionHistory({
     }).format(date);
   };
 
-  // Filtering is now done server-side, so we use transactions directly
-  // The filterUserId is applied by passing userId to the API
-  const filteredTransactions = transactions;
-
-  const totalPages = Math.ceil(totalCount / pageSize);
+  // Calculate total pages from server response
+  const totalPages = Math.ceil(totalCount / pagination.pageSize);
 
   const hasActiveFilters =
     transactionType !== "all" || dateRange !== undefined || searchTerm !== "";
 
-  // URL param update helpers
-  const updateUrlParams = (updates: Record<string, string | null>) => {
-    setSearchParams((prev) => {
-      const next = new URLSearchParams(prev);
-      for (const [key, value] of Object.entries(updates)) {
-        if (value === null) {
-          next.delete(key);
-        } else {
-          next.set(key, value);
+  // URL param update helper - updates params and resets to page 1
+  const updateUrlParamsAndResetPage = useCallback(
+    (updates: Record<string, string | null>) => {
+      setSearchParams((prev) => {
+        const next = new URLSearchParams(prev);
+        for (const [key, value] of Object.entries(updates)) {
+          if (value === null) {
+            next.delete(key);
+          } else {
+            next.set(key, value);
+          }
         }
-      }
-      return next;
-    });
-  };
+        // Reset to page 1 when filters change
+        next.set("txPage", "1");
+        return next;
+      });
+    },
+    [setSearchParams],
+  );
 
-  const handlePageChange = (newPage: number) => {
-    updateUrlParams({ txPage: newPage.toString() });
-  };
-
-  const handlePageSizeChange = (newSize: string) => {
-    updateUrlParams({ txPage: "1", txPageSize: newSize });
-  };
-
-  const clearFilters = () => {
+  const clearFilters = useCallback(() => {
     setDateRange(undefined);
     setSearchTerm("");
-    updateUrlParams({ txType: null, txPage: "1" });
-  };
-
-  const handleTransactionTypeChange = (value: string) => {
-    updateUrlParams({
-      txType: value === "all" ? null : value,
-      txPage: "1",
+    setSearchParams((prev) => {
+      const next = new URLSearchParams(prev);
+      next.delete("txType");
+      next.set("txPage", "1");
+      return next;
     });
-  };
+  }, [setSearchParams]);
+
+  const handleTransactionTypeChange = useCallback(
+    (value: string) => {
+      updateUrlParamsAndResetPage({ txType: value === "all" ? null : value });
+    },
+    [updateUrlParamsAndResetPage],
+  );
 
   // Reset to page 1 when date range changes
-  const handleDateRangeChange = (
-    range: { from: Date; to: Date } | undefined,
-  ) => {
-    setDateRange(range);
-    handlePageChange(1);
-  };
+  const handleDateRangeChange = useCallback(
+    (range: { from: Date; to: Date } | undefined) => {
+      setDateRange(range);
+      pagination.handleReset();
+    },
+    [pagination],
+  );
 
   // Reset to page 1 when search term changes
-  const handleSearchChange = (value: string) => {
-    setSearchTerm(value);
-    handlePageChange(1);
-  };
+  const handleSearchChange = useCallback(
+    (value: string) => {
+      setSearchTerm(value);
+      pagination.handleReset();
+    },
+    [pagination],
+  );
 
   // Refresh handler
   const [isRefreshing, setIsRefreshing] = useState(false);
@@ -355,8 +353,10 @@ export function TransactionHistory({
 
             {/* Page Size Selector */}
             <Select
-              value={pageSize.toString()}
-              onValueChange={handlePageSizeChange}
+              value={pagination.pageSize.toString()}
+              onValueChange={(value) =>
+                pagination.handlePageSizeChange(parseInt(value, 10))
+              }
             >
               <SelectTrigger className="w-[80px]">
                 <SelectValue />
@@ -384,8 +384,9 @@ export function TransactionHistory({
           {/* Filter Status */}
           {hasActiveFilters && (
             <div className="text-sm text-doubleword-neutral-600">
-              Showing {filteredTransactions.length} filtered transactions (page{" "}
-              {currentPage} of {totalPages})
+              Showing {totalCount} filtered transaction
+              {totalCount !== 1 ? "s" : ""} (page {pagination.page} of{" "}
+              {totalPages || 1})
             </div>
           )}
         </div>
@@ -402,7 +403,7 @@ export function TransactionHistory({
               </TableRow>
             </TableHeader>
             <TableBody>
-              {filteredTransactions.map((transaction) => {
+              {transactions.map((transaction) => {
                 // Determine if transaction is a credit (adds money) or debit (removes money)
                 const isCredit =
                   transaction.transaction_type === "admin_grant" ||
@@ -492,7 +493,7 @@ export function TransactionHistory({
           </Table>
         </div>
 
-        {filteredTransactions.length === 0 && (
+        {transactions.length === 0 && (
           <div className="text-center py-8">
             <DollarSign className="w-12 h-12 text-doubleword-neutral-300 mx-auto mb-3" />
             <p className="text-doubleword-neutral-600">
@@ -517,35 +518,39 @@ export function TransactionHistory({
         {totalCount > 0 && (
           <div className="flex items-center justify-between border-t border-doubleword-neutral-200 pt-2">
             <div className="text-sm text-doubleword-neutral-600">
-              Showing {skip + 1} to {Math.min(skip + pageSize, totalCount)} of{" "}
-              {totalCount} transactions
+              Showing {pagination.queryParams.skip + 1} to{" "}
+              {Math.min(
+                pagination.queryParams.skip + pagination.pageSize,
+                totalCount,
+              )}{" "}
+              of {totalCount} transactions
             </div>
             <div className="flex items-center gap-2">
               <Button
                 variant="outline"
                 size="sm"
-                onClick={() => handlePageChange(1)}
-                disabled={currentPage === 1}
+                onClick={() => pagination.handlePageChange(1)}
+                disabled={pagination.page === 1}
               >
                 First
               </Button>
               <Button
                 variant="outline"
                 size="sm"
-                onClick={() => handlePageChange(currentPage - 1)}
-                disabled={currentPage === 1}
+                onClick={() => pagination.handlePageChange(pagination.page - 1)}
+                disabled={pagination.page === 1}
               >
                 <ChevronLeft className="w-4 h-4" />
                 Previous
               </Button>
               <div className="text-sm text-doubleword-neutral-600">
-                Page {currentPage} of {totalPages}
+                Page {pagination.page} of {totalPages}
               </div>
               <Button
                 variant="outline"
                 size="sm"
-                onClick={() => handlePageChange(currentPage + 1)}
-                disabled={currentPage >= totalPages}
+                onClick={() => pagination.handlePageChange(pagination.page + 1)}
+                disabled={pagination.page >= totalPages}
               >
                 Next
                 <ChevronRight className="w-4 h-4" />

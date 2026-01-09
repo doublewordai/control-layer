@@ -109,6 +109,14 @@ pub struct ListTransactionsQuery {
     /// Filter by transaction types (comma-separated: "admin_grant,purchase" or "usage,admin_removal")
     pub transaction_types: Option<String>,
 
+    /// Filter transactions created on or after this date/time (ISO 8601 format)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[param(value_type = Option<String>, format = "date-time")]
+    pub start_date: Option<DateTime<Utc>>,
+
+    /// Filter by transaction types (comma-separated: "admin_grant,purchase" or "usage,admin_removal")
+    pub transaction_types: Option<String>,
+
     /// Filter transactions created after this timestamp
     pub timestamp_after: Option<DateTime<Utc>>,
 
@@ -126,12 +134,12 @@ pub struct ListTransactionsQuery {
 pub struct TransactionFilters {
     pub search: Option<String>,
     pub transaction_types: Option<Vec<CreditTransactionType>>,
-    pub timestamp_after: Option<DateTime<Utc>>,
-    pub timestamp_before: Option<DateTime<Utc>>,
+    pub start_date: Option<DateTime<Utc>>,
+    pub end_date: Option<DateTime<Utc>>,
 }
 
 impl ListTransactionsQuery {
-    /// Parse transaction_types string into TransactionFilters
+    /// Parse query parameters into TransactionFilters struct
     pub fn to_filters(&self) -> TransactionFilters {
         let transaction_types = self.transaction_types.as_ref().map(|types_str| {
             types_str
@@ -149,8 +157,8 @@ impl ListTransactionsQuery {
         TransactionFilters {
             search: self.search.clone(),
             transaction_types,
-            timestamp_after: self.timestamp_after,
-            timestamp_before: self.timestamp_before,
+            start_date: self.start_date,
+            end_date: self.end_date,
         }
     }
 }
