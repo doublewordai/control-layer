@@ -13,7 +13,6 @@ use crate::{
             AuthResponse, AuthSuccessResponse, ChangePasswordRequest, LoginInfo, LoginRequest, LoginResponse, LogoutResponse,
             PasswordResetConfirmRequest, PasswordResetRequest, PasswordResetResponse, RegisterRequest, RegisterResponse, RegistrationInfo,
         },
-        transactions::TransactionFilters,
         users::{CurrentUser, Role, UserResponse},
     },
     auth::{password, session},

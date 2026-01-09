@@ -39,7 +39,6 @@
 //!
 //! [outlet]: https://github.com/doublewordai/outlet
 
-use crate::api::models::transactions::TransactionFilters;
 use crate::config::Config;
 use crate::db::errors::Result as DbResult;
 use crate::db::handlers::Credits;

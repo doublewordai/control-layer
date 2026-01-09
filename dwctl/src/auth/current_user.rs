@@ -3,10 +3,7 @@
 use crate::db::errors::DbError;
 use crate::{
     AppState,
-    api::models::{
-        transactions::TransactionFilters,
-        users::{CurrentUser, Role},
-    },
+    api::models::users::{CurrentUser, Role},
     auth::session,
     db::handlers::{Repository, Users},
     errors::{Error, Result},
