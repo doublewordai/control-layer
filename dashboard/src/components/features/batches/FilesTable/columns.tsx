@@ -155,7 +155,7 @@ export const createFileColumns = (
     id: "cost_estimate",
     header: () => {
       return (
-        <div className="flex items-center justify-end text-middle font-medium">Est. Cost</div>
+        <div className="flex items-center justify-end text-right font-medium">Est. Cost</div>
       );
     },
     cell: ({ row }) => {
