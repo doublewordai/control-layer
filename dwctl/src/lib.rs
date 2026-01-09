@@ -182,7 +182,7 @@ use outlet::{RequestLoggerConfig, RequestLoggerLayer};
 use outlet_postgres::PostgresHandler;
 use request_logging::{AiResponse, ParsedAIRequest};
 use sqlx::{Executor, PgPool};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use tokio::net::TcpListener;
 use tower::Layer;
 use tower_http::{
@@ -228,8 +228,6 @@ pub struct AppState {
     pub config: Config,
     pub outlet_db: Option<PgPool>,
     pub metrics_recorder: Option<GenAiMetrics>,
-    /// Prometheus metrics handle for rendering metrics
-    pub prometheus_handle: Option<PrometheusHandle>,
     #[builder(default = false)]
     pub is_leader: bool,
     pub request_manager: Arc<fusillade::PostgresRequestManager<fusillade::ReqwestHttpClient>>,
@@ -238,6 +236,35 @@ pub struct AppState {
 /// Get the dwctl database migrator
 pub fn migrator() -> sqlx::migrate::Migrator {
     sqlx::migrate!("./migrations")
+}
+
+/// Global Prometheus handle - ensures recorder is only installed once
+static PROMETHEUS_HANDLE: OnceLock<PrometheusHandle> = OnceLock::new();
+
+/// Get or install the Prometheus metrics recorder.
+///
+/// This function is idempotent - the first call installs the global recorder,
+/// subsequent calls return the existing handle. This allows both production code
+/// (which calls early for background service metrics) and tests (which may call
+/// later via build_router) to work correctly.
+fn get_or_install_prometheus_handle() -> PrometheusHandle {
+    PROMETHEUS_HANDLE
+        .get_or_init(|| {
+            // Custom histogram buckets for analytics lag (100ms to 10 minutes)
+            const ANALYTICS_LAG_BUCKETS: &[f64] = &[0.1, 0.5, 1.0, 5.0, 10.0, 30.0, 60.0, 120.0, 300.0, 600.0];
+
+            // Custom histogram buckets for cache sync lag (1ms to 10s)
+            const CACHE_SYNC_LAG_BUCKETS: &[f64] = &[0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0];
+
+            PrometheusBuilder::new()
+                .set_buckets_for_metric(Matcher::Full("dwctl_analytics_lag_seconds".to_string()), ANALYTICS_LAG_BUCKETS)
+                .expect("Failed to set custom buckets for dwctl_analytics_lag_seconds")
+                .set_buckets_for_metric(Matcher::Full("dwctl_cache_sync_lag_seconds".to_string()), CACHE_SYNC_LAG_BUCKETS)
+                .expect("Failed to set custom buckets for dwctl_cache_sync_lag_seconds")
+                .install_recorder()
+                .expect("Failed to install Prometheus recorder")
+        })
+        .clone()
 }
 
 /// Create the initial admin user if it doesn't exist.
@@ -1031,8 +1058,10 @@ pub async fn build_router(state: &mut AppState, onwards_router: Router) -> anyho
     // Apply CORS to main router (request logging already applied to onwards_router above)
     let mut router = router.layer(cors_layer);
 
-    // Add Prometheus metrics if enabled (recorder already installed in Application::new_with_pool)
-    if let Some(metric_handle) = state.prometheus_handle.clone() {
+    // Add Prometheus metrics if enabled
+    if state.config.enable_metrics {
+        let metric_handle = get_or_install_prometheus_handle();
+
         let prometheus_layer = PrometheusMetricLayerBuilder::new()
             .with_prefix("dwctl")
             .with_metrics_from_fn(move || metric_handle.clone())
@@ -1047,8 +1076,8 @@ pub async fn build_router(state: &mut AppState, onwards_router: Router) -> anyho
             prometheus::Registry::new()
         };
 
-        // Clone handle again for the endpoint closure
-        let endpoint_handle = state.prometheus_handle.clone().unwrap();
+        // Get handle for the endpoint closure
+        let endpoint_handle = get_or_install_prometheus_handle();
 
         // Add metrics endpoint that combines both axum-prometheus and GenAI metrics
         router = router
@@ -1589,25 +1618,9 @@ impl Application {
 
         // Install Prometheus recorder BEFORE background services start
         // This ensures metrics set during background service initialization are captured
-        let prometheus_handle = if config.enable_metrics {
-            // Custom histogram buckets for analytics lag (100ms to 10 minutes)
-            const ANALYTICS_LAG_BUCKETS: &[f64] = &[0.1, 0.5, 1.0, 5.0, 10.0, 30.0, 60.0, 120.0, 300.0, 600.0];
-
-            // Custom histogram buckets for cache sync lag (1ms to 10s)
-            const CACHE_SYNC_LAG_BUCKETS: &[f64] = &[0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0];
-
-            Some(
-                PrometheusBuilder::new()
-                    .set_buckets_for_metric(Matcher::Full("dwctl_analytics_lag_seconds".to_string()), ANALYTICS_LAG_BUCKETS)
-                    .expect("Failed to set custom buckets for dwctl_analytics_lag_seconds")
-                    .set_buckets_for_metric(Matcher::Full("dwctl_cache_sync_lag_seconds".to_string()), CACHE_SYNC_LAG_BUCKETS)
-                    .expect("Failed to set custom buckets for dwctl_cache_sync_lag_seconds")
-                    .install_recorder()
-                    .expect("Failed to install Prometheus recorder"),
-            )
-        } else {
-            None
-        };
+        if config.enable_metrics {
+            get_or_install_prometheus_handle();
+        }
 
         // Create a shutdown token for coordinating graceful shutdown of background tasks
         let shutdown_token = tokio_util::sync::CancellationToken::new();
@@ -1635,7 +1648,6 @@ impl Application {
             .is_leader(bg_services.is_leader)
             .request_manager(bg_services.request_manager.clone())
             .maybe_outlet_db(outlet_pools.as_ref().map(|p| (**p).clone()))
-            .maybe_prometheus_handle(prometheus_handle)
             .build();
 
         let router = build_router(&mut app_state, onwards_router).await?;

@@ -537,7 +537,6 @@ mod tests {
             config: config.clone(),
             outlet_db: None,
             metrics_recorder: None,
-            prometheus_handle: None,
             is_leader: false,
             request_manager,
         };
@@ -641,7 +640,6 @@ mod tests {
             config: config.clone(),
             outlet_db: None,
             metrics_recorder: None,
-            prometheus_handle: None,
             is_leader: false,
             request_manager,
         };
@@ -747,7 +745,6 @@ mod tests {
             config: config.clone(),
             outlet_db: None,
             metrics_recorder: None,
-            prometheus_handle: None,
             is_leader: false,
             request_manager,
         };
@@ -929,7 +926,6 @@ mod tests {
             config: config.clone(),
             outlet_db: None,
             metrics_recorder: None,
-            prometheus_handle: None,
             is_leader: false,
             request_manager,
         };
@@ -1035,7 +1031,6 @@ mod tests {
             config: config.clone(),
             outlet_db: None,
             metrics_recorder: None,
-            prometheus_handle: None,
             is_leader: false,
             request_manager,
         };
