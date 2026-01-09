@@ -106,7 +106,7 @@ export const createFileColumns = (
       defaultHidden: true,
     },
   },
-  // Hidden until backend expiration enforcement is implemented
+  // Disabled for now - expiration not yet enforced on backend
   // {
   //   accessorKey: "expires_at",
   //   header: "Expires",
@@ -236,12 +236,14 @@ export const createFileColumns = (
     size: 200, // Constrain the actions column width
     cell: ({ row }) => {
       const file = row.original;
-      const isExpired =
-        file.expires_at && new Date(file.expires_at * 1000) < new Date();
+      // Disabled for now - expiration not yet enforced on backend
+      // const isExpired =
+      //   file.expires_at && new Date(file.expires_at * 1000) < new Date();
 
       return (
         <div className="flex items-center justify-end gap-1">
-          {!isExpired && file.purpose === "batch" && (
+          {/* TODO: when expiration is enforced on backend, disable certain actions */}
+          {file.purpose === "batch" && (
             <Tooltip delayDuration={500}>
               <TooltipTrigger asChild>
                 <Button
@@ -293,24 +295,22 @@ export const createFileColumns = (
               <TooltipContent>View Batches</TooltipContent>
             </Tooltip>
           )}
-          {!isExpired && (
-            <Tooltip delayDuration={500}>
-              <TooltipTrigger asChild>
-                <Button
-                  variant="ghost"
-                  size="sm"
-                  className="h-7 w-7 p-0 text-gray-700 hover:bg-gray-100 hover:text-gray-900"
-                  onClick={(e) => {
-                    e.stopPropagation();
-                    actions.onDownloadCode(file);
-                  }}
-                >
-                  <Download className="h-4 w-4" />
-                </Button>
-              </TooltipTrigger>
-              <TooltipContent>Download File</TooltipContent>
-            </Tooltip>
-          )}
+          <Tooltip delayDuration={500}>
+            <TooltipTrigger asChild>
+              <Button
+                variant="ghost"
+                size="sm"
+                className="h-7 w-7 p-0 text-gray-700 hover:bg-gray-100 hover:text-gray-900"
+                onClick={(e) => {
+                  e.stopPropagation();
+                  actions.onDownloadCode(file);
+                }}
+              >
+                <Download className="h-4 w-4" />
+              </Button>
+            </TooltipTrigger>
+            <TooltipContent>Download File</TooltipContent>
+          </Tooltip>
           <Tooltip delayDuration={500}>
             <TooltipTrigger asChild>
               <Button

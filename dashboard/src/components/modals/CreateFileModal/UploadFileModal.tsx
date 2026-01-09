@@ -31,6 +31,7 @@ interface UploadFileModalProps {
 }
 
 // Hidden for now - expiration not yet enforced on backend
+// For API compatibility, we send a default expiration of 30 days
 // const EXPIRATION_PRESETS = [
 //   { label: "1 hour", seconds: 3600 },
 //   { label: "24 hours", seconds: 86400 },
@@ -56,6 +57,7 @@ export function UploadFileModal({
   const [dragActive, setDragActive] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [uploadProgress, setUploadProgress] = useState<number>(0);
+  const [isProcessing, setIsProcessing] = useState<boolean>(false);
   const [filename, setFilename] = useState<string>("");
 
   const uploadMutation = useUploadFileWithProgress();
@@ -147,6 +149,7 @@ export function UploadFileModal({
     }
 
     setUploadProgress(0);
+    setIsProcessing(false);
 
     try {
       await uploadMutation.mutateAsync({
@@ -159,19 +162,30 @@ export function UploadFileModal({
             seconds: expirationSeconds,
           },
         },
-        onProgress: setUploadProgress,
+        onProgress: (percent) => {
+          // Cap at 95% to show there's still processing happening
+          const cappedPercent = Math.min(percent, 95);
+          setUploadProgress(cappedPercent);
+          
+          // If we've reached 95%, mark as processing
+          if (cappedPercent >= 95) {
+            setIsProcessing(true);
+          }
+        },
       });
 
       toast.success(`File "${filename || file.name}" uploaded successfully`);
       setFile(null);
       setExpirationSeconds(2592000);
       setUploadProgress(0);
+      setIsProcessing(false);
       setFilename("");
       onSuccess?.();
       onClose();
     } catch (error) {
       console.error("Failed to upload file:", error);
       setUploadProgress(0);
+      setIsProcessing(false);
       setError(
         error instanceof Error
           ? error.message
@@ -185,6 +199,7 @@ export function UploadFileModal({
     setExpirationSeconds(2592000);
     setError(null);
     setUploadProgress(0);
+    setIsProcessing(false);
     setFilename("");
     onClose();
   };
@@ -295,15 +310,28 @@ export function UploadFileModal({
           {uploadMutation.isPending && (
             <div className="space-y-2">
               <div className="flex justify-between text-sm">
-                <span className="text-gray-600">Uploading...</span>
-                <span className="text-gray-900 font-medium">{uploadProgress}%</span>
+                <span className="text-gray-600">
+                  {isProcessing ? "Processing on server..." : "Uploading..."}
+                </span>
+                {!isProcessing && (
+                  <span className="text-gray-900 font-medium">{uploadProgress}%</span>
+                )}
               </div>
               <div className="h-2 bg-gray-200 rounded-full overflow-hidden">
                 <div
-                  className="h-full bg-blue-600 rounded-full transition-all duration-150 ease-out"
+                  className={`h-full rounded-full transition-all duration-150 ease-out ${
+                    isProcessing 
+                      ? "bg-blue-600 animate-pulse" 
+                      : "bg-blue-600"
+                  }`}
                   style={{ width: `${uploadProgress}%` }}
                 />
               </div>
+              {isProcessing && (
+                <p className="text-xs text-gray-600 text-center">
+                  Upload complete. Server is processing the file...
+                </p>
+              )}
             </div>
           )}
 

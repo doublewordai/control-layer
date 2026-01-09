@@ -727,7 +727,7 @@ const BatchInfo: React.FC = () => {
                   </div>
                 )}
 
-                {/* Hidden until backend expiration enforcement is implemented */}
+                {/* TODO: Enable when backend expiration enforcement is implemented */}
                 {/* {batch.expired_at && (
                   <div>
                     <p className="text-sm text-gray-600 mb-1">Expired</p>
