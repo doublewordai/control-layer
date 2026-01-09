@@ -283,7 +283,14 @@ export function Batches({
   // File actions
   const handleViewFileRequests = (file: FileObject) => {
     if ((file as any)._isEmpty) return;
-    navigate(`/batches/files/${file.id}/content?returnTab=${activeTab}`);
+    // Preserve current URL params when navigating to file content
+    const currentParams = searchParams.toString();
+    const fromUrl = currentParams
+      ? `/batches?${currentParams}`
+      : `/batches?tab=${activeTab}`;
+    navigate(
+      `/batches/files/${file.id}/content?from=${encodeURIComponent(fromUrl)}`,
+    );
   };
 
   const handleDeleteFile = (file: FileObject) => {
@@ -406,7 +413,10 @@ export function Batches({
 
   const handleBatchClick = (batch: Batch) => {
     if ((batch as any)._isEmpty) return;
-    navigate(`/batches/${batch.id}?from=/batches`);
+    // Preserve current URL params (pagination, search, filters) when navigating to batch detail
+    const currentParams = searchParams.toString();
+    const fromUrl = currentParams ? `/batches?${currentParams}` : "/batches";
+    navigate(`/batches/${batch.id}?from=${encodeURIComponent(fromUrl)}`);
   };
 
   const batchColumns = createBatchColumns({
@@ -613,7 +623,7 @@ export function Batches({
             pageSize={filesPagination.pageSize}
             minRows={filesPagination.pageSize}
             rowHeight="40px"
-            initialColumnVisibility={{ id: false }}
+            initialColumnVisibility={{}}
             isLoading={filesLoading}
             emptyState={
               <div className="text-center py-12">

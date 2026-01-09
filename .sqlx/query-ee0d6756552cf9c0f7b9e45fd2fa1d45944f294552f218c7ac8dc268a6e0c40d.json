@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "\n            SELECT id, user_id, transaction_type as \"transaction_type: CreditTransactionType\", amount, source_id, description, created_at, seq\n            FROM credits_transactions\n            WHERE ($3::timestamptz IS NULL OR created_at >= $3)\n                AND ($4::timestamptz IS NULL OR created_at <= $4)\n            ORDER BY seq DESC\n            OFFSET $1\n            LIMIT $2\n            ",
+  "query": "\n            SELECT id, user_id, transaction_type as \"transaction_type: CreditTransactionType\", amount, source_id, description, created_at, seq\n            FROM credits_transactions\n            WHERE user_id = $1\n              AND ($4::text IS NULL OR description ILIKE '%' || $4 || '%')\n              AND ($5::text[] IS NULL OR transaction_type::text = ANY($5))\n              AND ($6::timestamptz IS NULL OR created_at >= $6)\n              AND ($7::timestamptz IS NULL OR created_at <= $7)\n            ORDER BY seq DESC\n            OFFSET $2\n            LIMIT $3\n            ",
   "describe": {
     "columns": [
       {
@@ -46,8 +46,11 @@
     ],
     "parameters": {
       "Left": [
+        "Uuid",
         "Int8",
         "Int8",
+        "Text",
+        "TextArray",
         "Timestamptz",
         "Timestamptz"
       ]
@@ -63,5 +66,5 @@
       false
     ]
   },
-  "hash": "02ff77042cb5970ed38ea572197a2f011923a9a20215cffc936f060ff3aa67fc"
+  "hash": "ee0d6756552cf9c0f7b9e45fd2fa1d45944f294552f218c7ac8dc268a6e0c40d"
 }

@@ -55,6 +55,24 @@ export const createFileColumns = (
     },
   },
   {
+    accessorKey: "id",
+    header: "File ID",
+    cell: ({ row }) => {
+      const id = row.getValue("id") as string;
+      const truncatedId = id.slice(0, 8) + "...";
+      return (
+        <Tooltip delayDuration={300}>
+          <TooltipTrigger asChild>
+            <span className="font-mono text-xs text-gray-600 cursor-help">
+              {truncatedId}
+            </span>
+          </TooltipTrigger>
+          <TooltipContent>{id}</TooltipContent>
+        </Tooltip>
+      );
+    },
+  },
+  {
     accessorKey: "filename",
     header: ({ column }) => {
       return (
@@ -92,18 +110,6 @@ export const createFileColumns = (
           <span className="font-medium">{file.filename}</span>
         </div>
       );
-    },
-  },
-  {
-    accessorKey: "id",
-    header: "File ID",
-    cell: ({ row }) => {
-      const id = row.getValue("id") as string;
-      return <span className="font-mono text-xs text-gray-600">{id}</span>;
-    },
-    enableHiding: true,
-    meta: {
-      defaultHidden: true,
     },
   },
   // Disabled for now - expiration not yet enforced on backend
@@ -148,14 +154,18 @@ export const createFileColumns = (
     },
     cell: ({ row }) => {
       const bytes = row.getValue("bytes") as number;
-      return <div className="text-right text-gray-700">{formatBytes(bytes)}</div>;
+      return (
+        <div className="text-right text-gray-700">{formatBytes(bytes)}</div>
+      );
     },
   },
   {
     id: "cost_estimate",
     header: () => {
       return (
-        <div className="flex items-center justify-end text-right font-medium">Est. Cost</div>
+        <div className="flex items-center justify-end text-right font-medium">
+          Est. Cost
+        </div>
       );
     },
     cell: ({ row }) => {

@@ -255,7 +255,6 @@ export function DateTimeRangeSelector({
                     value={startTime}
                     onChange={(e) => setStartTime(e.target.value)}
                     className="h-8"
-                    readOnly
                   />
                 </div>
                 <div className="flex-1">
@@ -268,7 +267,6 @@ export function DateTimeRangeSelector({
                     value={endTime}
                     onChange={(e) => setEndTime(e.target.value)}
                     className="h-8"
-                    readOnly
                   />
                 </div>
               </div>

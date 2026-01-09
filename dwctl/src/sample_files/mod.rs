@@ -156,13 +156,13 @@ mod tests {
 
     fn create_test_deployment(alias: &str, model_type: ModelType, capabilities: Option<Vec<String>>) -> DeploymentDBResponse {
         DeploymentDBResponse {
-            id: uuid::Uuid::new_v4().into(),
+            id: uuid::Uuid::new_v4(),
             model_name: alias.to_string(),
             alias: alias.to_string(),
             description: None,
             model_type: Some(model_type),
             capabilities,
-            hosted_on: uuid::Uuid::new_v4().into(),
+            hosted_on: uuid::Uuid::new_v4(),
             requests_per_second: None,
             burst_size: None,
             capacity: None,
@@ -170,7 +170,7 @@ mod tests {
             status: crate::db::models::deployments::ModelStatus::Active,
             created_at: chrono::Utc::now(),
             updated_at: chrono::Utc::now(),
-            created_by: uuid::Uuid::new_v4().into(),
+            created_by: uuid::Uuid::new_v4(),
             deleted: false,
             last_sync: None,
             provider_pricing: None,

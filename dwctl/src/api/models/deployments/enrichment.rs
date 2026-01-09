@@ -337,14 +337,14 @@ mod tests {
 
     fn create_test_model() -> DeployedModelResponse {
         DeployedModelResponse {
-            id: Uuid::new_v4().into(),
+            id: Uuid::new_v4(),
             model_name: "test-model".to_string(),
             alias: "test-alias".to_string(),
             description: None,
             model_type: None,
             capabilities: None,
-            created_by: Uuid::new_v4().into(),
-            hosted_on: Uuid::new_v4().into(),
+            created_by: Some(Uuid::new_v4()),
+            hosted_on: Uuid::new_v4(),
             created_at: Utc::now(),
             updated_at: Utc::now(),
             requests_per_second: Some(100.0),
@@ -365,7 +365,7 @@ mod tests {
         let model = create_test_model();
         let model_id = model.id;
 
-        let group_id: GroupId = Uuid::new_v4().into();
+        let group_id: GroupId = Uuid::new_v4();
         let mut model_groups_map = HashMap::new();
         model_groups_map.insert(model_id, vec![group_id]);
 
@@ -376,7 +376,7 @@ mod tests {
                 id: group_id,
                 name: "Test Group".to_string(),
                 description: Some("Test description".to_string()),
-                created_by: Uuid::new_v4().into(),
+                created_by: Uuid::new_v4(),
                 created_at: Utc::now(),
                 updated_at: Utc::now(),
                 source: "native".to_string(),
@@ -468,7 +468,7 @@ mod tests {
         assert!(result.status.is_some());
         let status = result.status.unwrap();
         assert_eq!(status.probe_id, Some(probe_id));
-        assert_eq!(status.active, true);
+        assert!(status.active);
         assert_eq!(status.interval_seconds, Some(60));
         assert_eq!(status.uptime_percentage, Some(99.5));
     }
@@ -484,7 +484,7 @@ mod tests {
         assert!(result.status.is_some());
         let status = result.status.unwrap();
         assert_eq!(status.probe_id, None);
-        assert_eq!(status.active, false);
+        assert!(!status.active);
         assert_eq!(status.interval_seconds, None);
     }
 
@@ -521,7 +521,7 @@ mod tests {
                 requires_api_key: true,
                 auth_header_name: "Authorization".to_string(),
                 auth_header_prefix: "Bearer ".to_string(),
-                created_by: Uuid::new_v4().into(),
+                created_by: Uuid::new_v4(),
                 created_at: Utc::now(),
                 updated_at: Utc::now(),
             },

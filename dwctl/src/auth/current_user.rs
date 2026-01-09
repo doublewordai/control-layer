@@ -422,7 +422,10 @@ impl FromRequestParts<AppState> for CurrentUser {
 mod tests {
     use crate::{
         AppState,
-        api::models::users::{CurrentUser, Role},
+        api::models::{
+            transactions::TransactionFilters,
+            users::{CurrentUser, Role},
+        },
         db::handlers::{Users, repository::Repository},
         errors::Error,
         test::utils::create_test_config,
@@ -1002,7 +1005,7 @@ mod tests {
         ];
 
         for external_user_id in test_cases {
-            let email = format!("{}@example.com", external_user_id.replace('|', "_").replace('@', "_"));
+            let email = format!("{}@example.com", external_user_id.replace(['|', '@'], "_"));
 
             let request = axum::http::Request::builder()
                 .uri("http://localhost/test")
@@ -1237,7 +1240,6 @@ mod tests {
         let mut users_repo = Users::new(&mut pool_conn);
         let existing = users_repo.get_user_by_email(new_email).await.unwrap();
         assert!(existing.is_none());
-        drop(users_repo);
         drop(pool_conn);
 
         // Extract should auto-create the user
@@ -1261,7 +1263,7 @@ mod tests {
 
         // Verify the transaction exists with correct details
         let transactions = credits_repo
-            .list_user_transactions(current_user.id, 0, 10, None, None)
+            .list_user_transactions(current_user.id, 0, 10, &TransactionFilters::default())
             .await
             .unwrap();
 
@@ -1307,7 +1309,6 @@ mod tests {
         let mut credits_repo = Credits::new(&mut conn);
         let balance = credits_repo.get_user_balance(user.id).await.unwrap();
         assert_eq!(balance, rust_decimal::Decimal::new(10000, 2));
-        drop(credits_repo);
         drop(conn);
 
         // Second login with same user - should NOT grant credits again
@@ -1326,7 +1327,10 @@ mod tests {
         );
 
         // Verify still only one transaction
-        let transactions = credits_repo.list_user_transactions(user.id, 0, 10, None, None).await.unwrap();
+        let transactions = credits_repo
+            .list_user_transactions(user.id, 0, 10, &TransactionFilters::default())
+            .await
+            .unwrap();
         assert_eq!(transactions.len(), 1, "Should still have exactly one transaction");
     }
 }
