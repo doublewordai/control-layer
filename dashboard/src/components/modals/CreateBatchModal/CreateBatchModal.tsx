@@ -26,6 +26,7 @@ import {
   useConfig,
   useFileCostEstimate,
 } from "../../../api/control-layer/hooks";
+import { useDebounce } from "../../../hooks/useDebounce";
 import { toast } from "sonner";
 import type { FileObject } from "../../features/batches/types";
 import { AlertBox } from "@/components/ui/alert-box";
@@ -65,6 +66,9 @@ export function CreateBatchModal({
   const [isUploading, setIsUploading] = useState(false);
   const [filename, setFilename] = useState<string>("");
   const [uploadProgress, setUploadProgress] = useState<number>(0);
+  const [fileSearchQuery, setFileSearchQuery] = useState<string>("");
+  const debouncedFileSearch = useDebounce(fileSearchQuery, 300);
+  const [hasLoadedFiles, setHasLoadedFiles] = useState(false);
 
   const createBatchMutation = useCreateBatch();
   const uploadMutation = useUploadFileWithProgress();
@@ -80,11 +84,19 @@ export function CreateBatchModal({
   // Only fetch when modal is open to avoid unnecessary queries on page load
   const { data: filesResponse } = useFiles({
     purpose: "batch",
-    limit: 100,
+    limit: 20,
+    search: debouncedFileSearch.trim() || undefined,
     enabled: isOpen,
   });
 
   const availableFiles = filesResponse?.data || [];
+
+  // Track if we've ever loaded files (to keep combobox visible during search)
+  useEffect(() => {
+    if (availableFiles.length > 0 && !hasLoadedFiles) {
+      setHasLoadedFiles(true);
+    }
+  }, [availableFiles.length, hasLoadedFiles]);
 
   // Fetch cost estimate for selected file with current SLA
   const { data: costEstimate, isLoading: isLoadingCost } = useFileCostEstimate(
@@ -254,6 +266,8 @@ export function CreateBatchModal({
     setExpirationSeconds(2592000);
     setFilename("");
     setUploadProgress(0);
+    setFileSearchQuery("");
+    setHasLoadedFiles(false);
     setError(null);
     onClose();
   };
@@ -363,7 +377,7 @@ export function CreateBatchModal({
             ) : (
               <>
                 {/* Combobox for selecting existing file */}
-                {availableFiles.length > 0 && (
+                {(availableFiles.length > 0 || hasLoadedFiles) && (
                   <div className="space-y-2">
                     <Combobox
                       options={fileOptions}
@@ -373,6 +387,7 @@ export function CreateBatchModal({
                         setFileToUpload(null); // Clear file to upload
                         setError(null);
                       }}
+                      onSearchChange={setFileSearchQuery}
                       placeholder="Select an existing file..."
                       searchPlaceholder="Search files..."
                       emptyMessage="No files found."
@@ -385,7 +400,7 @@ export function CreateBatchModal({
                 )}
 
                 {/* Separator */}
-                {availableFiles.length > 0 && (
+                {(availableFiles.length > 0 || hasLoadedFiles) && (
                   <div className="relative py-2">
                     <div className="absolute inset-0 flex items-center">
                       <span className="w-full border-t" />
