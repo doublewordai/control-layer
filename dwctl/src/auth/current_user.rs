@@ -1005,7 +1005,7 @@ mod tests {
         ];
 
         for external_user_id in test_cases {
-            let email = format!("{}@example.com", external_user_id.replace('|', "_").replace('@', "_"));
+            let email = format!("{}@example.com", external_user_id.replace(['|', '@'], "_"));
 
             let request = axum::http::Request::builder()
                 .uri("http://localhost/test")
@@ -1240,7 +1240,6 @@ mod tests {
         let mut users_repo = Users::new(&mut pool_conn);
         let existing = users_repo.get_user_by_email(new_email).await.unwrap();
         assert!(existing.is_none());
-        drop(users_repo);
         drop(pool_conn);
 
         // Extract should auto-create the user
@@ -1310,7 +1309,6 @@ mod tests {
         let mut credits_repo = Credits::new(&mut conn);
         let balance = credits_repo.get_user_balance(user.id).await.unwrap();
         assert_eq!(balance, rust_decimal::Decimal::new(10000, 2));
-        drop(credits_repo);
         drop(conn);
 
         // Second login with same user - should NOT grant credits again

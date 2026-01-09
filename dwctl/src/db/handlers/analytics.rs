@@ -1359,13 +1359,12 @@ mod tests {
         assert_eq!(claude3.percentage, 30.0);
     }
 
-    // Helper function to insert analytics data with fusillade_request_id
-    async fn insert_test_analytics_with_batch_id(
-        pool: &PgPool,
+    // Test analytics data with batch parameters
+    struct TestBatchAnalyticsData<'a> {
         fusillade_batch_id: Uuid,
         fusillade_request_id: Option<Uuid>,
         timestamp: DateTime<Utc>,
-        model: &str,
+        model: &'a str,
         status_code: i32,
         duration_ms: f64,
         duration_to_first_byte_ms: Option<f64>,
@@ -1373,7 +1372,10 @@ mod tests {
         completion_tokens: i64,
         input_price_per_token: Option<f64>,
         output_price_per_token: Option<f64>,
-    ) {
+    }
+
+    // Helper function to insert analytics data with fusillade_request_id
+    async fn insert_test_analytics_with_batch_id(pool: &PgPool, data: TestBatchAnalyticsData<'_>) {
         use rust_decimal::Decimal;
         use uuid::Uuid;
 
@@ -1388,18 +1390,18 @@ mod tests {
             "#,
             Uuid::new_v4(),
             1i64,
-            timestamp,
-            status_code,
-            duration_ms as i64,
-            duration_to_first_byte_ms.map(|d| d as i64),
-            model,
-            prompt_tokens,
-            completion_tokens,
-            prompt_tokens + completion_tokens,
-            fusillade_batch_id,
-            fusillade_request_id,
-            input_price_per_token.map(Decimal::from_f64_retain).flatten(),
-            output_price_per_token.map(Decimal::from_f64_retain).flatten(),
+            data.timestamp,
+            data.status_code,
+            data.duration_ms as i64,
+            data.duration_to_first_byte_ms.map(|d| d as i64),
+            data.model,
+            data.prompt_tokens,
+            data.completion_tokens,
+            data.prompt_tokens + data.completion_tokens,
+            data.fusillade_batch_id,
+            data.fusillade_request_id,
+            data.input_price_per_token.map(Decimal::from_f64_retain).flatten(),
+            data.output_price_per_token.map(Decimal::from_f64_retain).flatten(),
         )
         .execute(pool)
         .await
@@ -1414,17 +1416,19 @@ mod tests {
         // Insert a single analytics record
         insert_test_analytics_with_batch_id(
             &pool,
-            batch_id,
-            Some(Uuid::new_v4()),
-            now,
-            "gpt-4",
-            200,
-            150.0,
-            Some(50.0),
-            100,
-            50,
-            Some(0.00001), // $0.00001 per token
-            Some(0.00003), // $0.00003 per token
+            TestBatchAnalyticsData {
+                fusillade_batch_id: batch_id,
+                fusillade_request_id: Some(Uuid::new_v4()),
+                timestamp: now,
+                model: "gpt-4",
+                status_code: 200,
+                duration_ms: 150.0,
+                duration_to_first_byte_ms: Some(50.0),
+                prompt_tokens: 100,
+                completion_tokens: 50,
+                input_price_per_token: Some(0.00001),  // $0.00001 per token
+                output_price_per_token: Some(0.00003), // $0.00003 per token
+            },
         )
         .await;
 
@@ -1451,49 +1455,55 @@ mod tests {
         // Insert multiple analytics records for the same batch
         insert_test_analytics_with_batch_id(
             &pool,
-            batch_id,
-            Some(Uuid::new_v4()),
-            now,
-            "gpt-4",
-            200,
-            100.0,
-            Some(30.0),
-            50,
-            25,
-            Some(0.00001),
-            Some(0.00003),
+            TestBatchAnalyticsData {
+                fusillade_batch_id: batch_id,
+                fusillade_request_id: Some(Uuid::new_v4()),
+                timestamp: now,
+                model: "gpt-4",
+                status_code: 200,
+                duration_ms: 100.0,
+                duration_to_first_byte_ms: Some(30.0),
+                prompt_tokens: 50,
+                completion_tokens: 25,
+                input_price_per_token: Some(0.00001),
+                output_price_per_token: Some(0.00003),
+            },
         )
         .await;
 
         insert_test_analytics_with_batch_id(
             &pool,
-            batch_id,
-            Some(Uuid::new_v4()),
-            now,
-            "gpt-4",
-            200,
-            200.0,
-            Some(70.0),
-            100,
-            50,
-            Some(0.00001),
-            Some(0.00003),
+            TestBatchAnalyticsData {
+                fusillade_batch_id: batch_id,
+                fusillade_request_id: Some(Uuid::new_v4()),
+                timestamp: now,
+                model: "gpt-4",
+                status_code: 200,
+                duration_ms: 200.0,
+                duration_to_first_byte_ms: Some(70.0),
+                prompt_tokens: 100,
+                completion_tokens: 50,
+                input_price_per_token: Some(0.00001),
+                output_price_per_token: Some(0.00003),
+            },
         )
         .await;
 
         insert_test_analytics_with_batch_id(
             &pool,
-            batch_id,
-            Some(Uuid::new_v4()),
-            now,
-            "claude-3",
-            200,
-            150.0,
-            Some(40.0),
-            75,
-            35,
-            Some(0.00002),
-            Some(0.00004),
+            TestBatchAnalyticsData {
+                fusillade_batch_id: batch_id,
+                fusillade_request_id: Some(Uuid::new_v4()),
+                timestamp: now,
+                model: "claude-3",
+                status_code: 200,
+                duration_ms: 150.0,
+                duration_to_first_byte_ms: Some(40.0),
+                prompt_tokens: 75,
+                completion_tokens: 35,
+                input_price_per_token: Some(0.00002),
+                output_price_per_token: Some(0.00004),
+            },
         )
         .await;
 
@@ -1545,34 +1555,38 @@ mod tests {
         // Insert records for batch 1
         insert_test_analytics_with_batch_id(
             &pool,
-            batch_id_1,
-            Some(Uuid::new_v4()),
-            now,
-            "gpt-4",
-            200,
-            100.0,
-            Some(30.0),
-            50,
-            25,
-            Some(0.00001),
-            Some(0.00003),
+            TestBatchAnalyticsData {
+                fusillade_batch_id: batch_id_1,
+                fusillade_request_id: Some(Uuid::new_v4()),
+                timestamp: now,
+                model: "gpt-4",
+                status_code: 200,
+                duration_ms: 100.0,
+                duration_to_first_byte_ms: Some(30.0),
+                prompt_tokens: 50,
+                completion_tokens: 25,
+                input_price_per_token: Some(0.00001),
+                output_price_per_token: Some(0.00003),
+            },
         )
         .await;
 
         // Insert records for batch 2 (should not be included)
         insert_test_analytics_with_batch_id(
             &pool,
-            batch_id_2,
-            Some(Uuid::new_v4()),
-            now,
-            "gpt-4",
-            200,
-            200.0,
-            Some(40.0),
-            100,
-            50,
-            Some(0.00001),
-            Some(0.00003),
+            TestBatchAnalyticsData {
+                fusillade_batch_id: batch_id_2,
+                fusillade_request_id: Some(Uuid::new_v4()),
+                timestamp: now,
+                model: "gpt-4",
+                status_code: 200,
+                duration_ms: 200.0,
+                duration_to_first_byte_ms: Some(40.0),
+                prompt_tokens: 100,
+                completion_tokens: 50,
+                input_price_per_token: Some(0.00001),
+                output_price_per_token: Some(0.00003),
+            },
         )
         .await;
 
@@ -1595,17 +1609,19 @@ mod tests {
         // Insert record without TTFB and pricing data
         insert_test_analytics_with_batch_id(
             &pool,
-            batch_id,
-            Some(Uuid::new_v4()),
-            now,
-            "gpt-4",
-            200,
-            100.0,
-            None, // No TTFB
-            50,
-            25,
-            None, // No input price
-            None, // No output price
+            TestBatchAnalyticsData {
+                fusillade_batch_id: batch_id,
+                fusillade_request_id: Some(Uuid::new_v4()),
+                timestamp: now,
+                model: "gpt-4",
+                status_code: 200,
+                duration_ms: 100.0,
+                duration_to_first_byte_ms: None, // No TTFB
+                prompt_tokens: 50,
+                completion_tokens: 25,
+                input_price_per_token: None,  // No input price
+                output_price_per_token: None, // No output price
+            },
         )
         .await;
 
@@ -1633,50 +1649,56 @@ mod tests {
         // Insert multiple records for the same batch with different request IDs
         insert_test_analytics_with_batch_id(
             &pool,
-            batch_id,
-            Some(Uuid::new_v4()),
-            now,
-            "gpt-4",
-            200,
-            100.0,
-            Some(30.0),
-            50,
-            25,
-            Some(0.00001),
-            Some(0.00003),
+            TestBatchAnalyticsData {
+                fusillade_batch_id: batch_id,
+                fusillade_request_id: Some(Uuid::new_v4()),
+                timestamp: now,
+                model: "gpt-4",
+                status_code: 200,
+                duration_ms: 100.0,
+                duration_to_first_byte_ms: Some(30.0),
+                prompt_tokens: 50,
+                completion_tokens: 25,
+                input_price_per_token: Some(0.00001),
+                output_price_per_token: Some(0.00003),
+            },
         )
         .await;
 
         insert_test_analytics_with_batch_id(
             &pool,
-            batch_id,
-            Some(Uuid::new_v4()),
-            now,
-            "gpt-4",
-            200,
-            150.0,
-            Some(45.0),
-            75,
-            30,
-            Some(0.00001),
-            Some(0.00003),
+            TestBatchAnalyticsData {
+                fusillade_batch_id: batch_id,
+                fusillade_request_id: Some(Uuid::new_v4()),
+                timestamp: now,
+                model: "gpt-4",
+                status_code: 200,
+                duration_ms: 150.0,
+                duration_to_first_byte_ms: Some(45.0),
+                prompt_tokens: 75,
+                completion_tokens: 30,
+                input_price_per_token: Some(0.00001),
+                output_price_per_token: Some(0.00003),
+            },
         )
         .await;
 
         // Insert record for a different batch (should not be included)
         insert_test_analytics_with_batch_id(
             &pool,
-            other_batch_id,
-            Some(Uuid::new_v4()),
-            now,
-            "gpt-4",
-            200,
-            200.0,
-            Some(40.0),
-            100,
-            50,
-            Some(0.00001),
-            Some(0.00003),
+            TestBatchAnalyticsData {
+                fusillade_batch_id: other_batch_id,
+                fusillade_request_id: Some(Uuid::new_v4()),
+                timestamp: now,
+                model: "gpt-4",
+                status_code: 200,
+                duration_ms: 200.0,
+                duration_to_first_byte_ms: Some(40.0),
+                prompt_tokens: 100,
+                completion_tokens: 50,
+                input_price_per_token: Some(0.00001),
+                output_price_per_token: Some(0.00003),
+            },
         )
         .await;
 

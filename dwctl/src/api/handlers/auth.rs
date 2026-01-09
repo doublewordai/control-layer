@@ -1018,7 +1018,6 @@ mod tests {
         };
 
         let created_user = user_repo.create(&user_create).await.unwrap();
-        drop(user_repo);
         drop(conn);
 
         let app = axum::Router::new()
@@ -1135,7 +1134,6 @@ mod tests {
         };
 
         user_repo.create(&user_create).await.unwrap();
-        drop(user_repo);
         drop(conn);
 
         let app = axum::Router::new()
@@ -1182,7 +1180,6 @@ mod tests {
         };
 
         user_repo.create(&user_create).await.unwrap();
-        drop(user_repo);
         drop(conn);
 
         let app = axum::Router::new()
@@ -1269,7 +1266,6 @@ mod tests {
         };
 
         user_repo.create(&user_create).await.unwrap();
-        drop(user_repo);
         drop(conn);
 
         let app = axum::Router::new()
@@ -1436,7 +1432,6 @@ mod tests {
         };
 
         user_repo.create(&user_create).await.unwrap();
-        drop(user_repo);
         drop(conn);
 
         let app = axum::Router::new()
@@ -1646,7 +1641,6 @@ mod tests {
         };
 
         let _created_user = user_repo.create(&user_create).await.unwrap();
-        drop(user_repo);
         drop(conn);
 
         // Step 1: Request password reset
@@ -1798,7 +1792,6 @@ mod tests {
         };
 
         let created_user = user_repo.create(&user_create).await.unwrap();
-        drop(user_repo);
         drop(conn);
 
         let user_response = UserResponse::from(created_user);
@@ -1879,7 +1872,6 @@ mod tests {
         };
 
         let created_user = user_repo.create(&user_create).await.unwrap();
-        drop(user_repo);
         drop(conn);
 
         let user_response = UserResponse::from(created_user);
@@ -1930,7 +1922,6 @@ mod tests {
         };
 
         let created_user = user_repo.create(&user_create).await.unwrap();
-        drop(user_repo);
         drop(conn);
 
         let user_response = UserResponse::from(created_user);
@@ -1991,7 +1982,6 @@ mod tests {
         };
 
         let created_user = user_repo.create(&user_create).await.unwrap();
-        drop(user_repo);
         drop(conn);
 
         let user_response = UserResponse::from(created_user);
@@ -2052,7 +2042,6 @@ mod tests {
         };
 
         let created_user = user_repo.create(&user_create).await.unwrap();
-        drop(user_repo);
         drop(conn);
 
         let user_response = UserResponse::from(created_user);
@@ -2112,7 +2101,6 @@ mod tests {
         };
 
         let created_user = user_repo.create(&user_create).await.unwrap();
-        drop(user_repo);
         drop(conn);
 
         let user_response = UserResponse::from(created_user);

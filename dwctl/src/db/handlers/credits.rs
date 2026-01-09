@@ -250,7 +250,7 @@ impl<'c> Credits<'c> {
         let transaction_types: Option<Vec<String>> = filters
             .transaction_types
             .as_ref()
-            .map(|types| types.iter().map(|t| transaction_type_to_string(t)).collect());
+            .map(|types| types.iter().map(transaction_type_to_string).collect());
 
         let transactions = sqlx::query_as!(
             CreditTransaction,
@@ -291,7 +291,7 @@ impl<'c> Credits<'c> {
         let transaction_types: Option<Vec<String>> = filters
             .transaction_types
             .as_ref()
-            .map(|types| types.iter().map(|t| transaction_type_to_string(t)).collect());
+            .map(|types| types.iter().map(transaction_type_to_string).collect());
 
         let transactions = sqlx::query_as!(
             CreditTransaction,
@@ -344,7 +344,7 @@ impl<'c> Credits<'c> {
         let transaction_types: Option<Vec<String>> = filters
             .transaction_types
             .as_ref()
-            .map(|types| types.iter().map(|t| transaction_type_to_string(t)).collect());
+            .map(|types| types.iter().map(transaction_type_to_string).collect());
 
         let result = sqlx::query!(
             r#"
@@ -374,7 +374,7 @@ impl<'c> Credits<'c> {
         let transaction_types: Option<Vec<String>> = filters
             .transaction_types
             .as_ref()
-            .map(|types| types.iter().map(|t| transaction_type_to_string(t)).collect());
+            .map(|types| types.iter().map(transaction_type_to_string).collect());
 
         let result = sqlx::query!(
             r#"
@@ -404,7 +404,7 @@ impl<'c> Credits<'c> {
         let transaction_types: Option<Vec<String>> = filters
             .transaction_types
             .as_ref()
-            .map(|types| types.iter().map(|t| transaction_type_to_string(t)).collect());
+            .map(|types| types.iter().map(transaction_type_to_string).collect());
 
         // Check if we should include batch aggregates (they're always type 'usage')
         let include_batches = filters
@@ -545,7 +545,7 @@ impl<'c> Credits<'c> {
         let transaction_types: Option<Vec<String>> = filters
             .transaction_types
             .as_ref()
-            .map(|types| types.iter().map(|t| transaction_type_to_string(t)).collect());
+            .map(|types| types.iter().map(transaction_type_to_string).collect());
 
         // Check if we should include batch aggregates (they're always type 'usage')
         let include_batches = filters
