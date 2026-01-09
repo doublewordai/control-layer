@@ -101,6 +101,9 @@ const userApi = {
     if (options?.limit !== undefined) {
       params.set("limit", options.limit.toString());
     }
+    if (options?.search) {
+      params.set("search", options.search);
+    }
 
     const url = `/admin/api/v1/users${params.toString() ? "?" + params.toString() : ""}`;
     const response = await fetch(url);
