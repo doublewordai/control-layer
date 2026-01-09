@@ -40,6 +40,7 @@ import type { Transaction } from "@/api/control-layer";
 import { useUserBalance, useTransactions, useUser } from "@/api/control-layer";
 import { useSettings } from "@/contexts";
 import { formatDollars } from "@/utils/money.ts";
+import { useDebounce } from "@/hooks/useDebounce";
 
 export type AddFundsConfig =
   | { type: "direct"; onAddFunds: () => void }
@@ -83,9 +84,17 @@ export function TransactionHistory({
     { from: Date; to: Date } | undefined
   >();
   const [searchTerm, setSearchTerm] = useState<string>("");
+  const debouncedSearch = useDebounce(searchTerm, 300);
 
   // Calculate skip for server-side pagination
   const skip = (currentPage - 1) * pageSize;
+
+  // Helper to map UI transaction type to API transaction_types
+  const getTransactionTypesParam = (type: string): string | undefined => {
+    if (type === "credit") return "admin_grant,purchase";
+    if (type === "debit") return "admin_removal,usage";
+    return undefined; // "all" means no filter
+  };
 
   // Always pass userId to filter transactions by the specific user
   // Backend enforces permissions: non-admins can only see their own transactions
@@ -99,6 +108,11 @@ export function TransactionHistory({
     group_batches: true,
     limit: pageSize,
     skip,
+    // Server-side filters
+    search: debouncedSearch.trim() || undefined,
+    transaction_types: getTransactionTypesParam(transactionType),
+    timestamp_after: dateRange?.from?.toISOString(),
+    timestamp_before: dateRange?.to?.toISOString(),
   });
 
   // Get transactions and metadata from response
@@ -152,50 +166,9 @@ export function TransactionHistory({
     }).format(date);
   };
 
-  // Apply client-side filters (transaction type, search, date range)
-  // Note: These filters work on the current page's data only
-  const filteredTransactions = useMemo(() => {
-    let filtered = [...transactions];
-
-    // Filter by specific user if provided
-    if (filterUserId) {
-      filtered = filtered.filter((t) => t.user_id === filterUserId);
-    }
-
-    // Filter by search term
-    if (searchTerm) {
-      const lowerSearch = searchTerm.toLowerCase();
-      filtered = filtered.filter((t) => {
-        const description = (t.description || "").toLowerCase();
-        const amount = formatDollars(t.amount).toLowerCase();
-        return (
-          description.includes(lowerSearch) || amount.includes(lowerSearch)
-        );
-      });
-    }
-
-    // Filter by transaction type
-    if (transactionType !== "all") {
-      // Map UI filter values to backend transaction types
-      if (transactionType === "credit") {
-        filtered = filtered.filter(
-          (t) =>
-            t.transaction_type === "admin_grant" ||
-            t.transaction_type === "purchase",
-        );
-      } else if (transactionType === "debit") {
-        filtered = filtered.filter(
-          (t) =>
-            t.transaction_type === "admin_removal" ||
-            t.transaction_type === "usage",
-        );
-      }
-    }
-
-    // Note: Date filtering is now done server-side via the API
-
-    return filtered;
-  }, [transactions, transactionType, searchTerm, filterUserId]);
+  // Filtering is now done server-side, so we use transactions directly
+  // The filterUserId is applied by passing userId to the API
+  const filteredTransactions = transactions;
 
   const totalPages = Math.ceil(totalCount / pageSize);
 
@@ -411,8 +384,8 @@ export function TransactionHistory({
           {/* Filter Status */}
           {hasActiveFilters && (
             <div className="text-sm text-doubleword-neutral-600">
-              Showing {filteredTransactions.length} of {transactions.length} on
-              this page (filtered from {totalCount} total)
+              Showing {filteredTransactions.length} filtered transactions (page{" "}
+              {currentPage} of {totalPages})
             </div>
           )}
         </div>

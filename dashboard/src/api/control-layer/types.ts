@@ -721,8 +721,15 @@ export interface TransactionsQuery {
   skip?: number;
   userId?: string; // Filter transactions by user (UUID)
   group_batches?: boolean; // Group transactions by batch (merges batch requests into single entries)
+<<<<<<< HEAD
   start_date?: string; // Filter transactions created on or after this date/time (ISO 8601 format)
   end_date?: string; // Filter transactions created on or before this date/time (ISO 8601 format)
+=======
+  search?: string; // Search term for description (case-insensitive)
+  transaction_types?: string; // Comma-separated transaction types (e.g., "admin_grant,purchase" or "usage,admin_removal")
+  timestamp_after?: string; // Filter transactions created after this timestamp (ISO 8601)
+  timestamp_before?: string; // Filter transactions created before this timestamp (ISO 8601)
+>>>>>>> d4ec6cd8 (fix: transaction filtering)
 }
 
 export interface AddFundsRequest {

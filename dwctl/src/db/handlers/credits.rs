@@ -1,6 +1,7 @@
 //! Database repository for credit transactions.
 
 use crate::{
+    api::models::transactions::TransactionFilters,
     db::{
         errors::Result,
         models::credits::{CreditTransactionCreateDBRequest, CreditTransactionDBResponse, CreditTransactionType},
@@ -227,24 +228,30 @@ impl<'c> Credits<'c> {
         Ok(balances_map)
     }
 
-    /// List transactions for a specific user with pagination
-    #[instrument(skip(self), fields(user_id = %abbrev_uuid(&user_id), skip = skip, limit = limit), err)]
+    /// List transactions for a specific user with pagination and optional filters
+    #[instrument(skip(self, filters), fields(user_id = %abbrev_uuid(&user_id), skip = skip, limit = limit), err)]
     pub async fn list_user_transactions(
         &mut self,
         user_id: UserId,
         skip: i64,
         limit: i64,
-        start_date: Option<DateTime<Utc>>,
-        end_date: Option<DateTime<Utc>>,
+        filters: &TransactionFilters,
     ) -> Result<Vec<CreditTransactionDBResponse>> {
+        let transaction_types: Option<Vec<String>> = filters
+            .transaction_types
+            .as_ref()
+            .map(|types| types.iter().map(|t| t.to_string()).collect());
+
         let transactions = sqlx::query_as!(
             CreditTransaction,
             r#"
             SELECT id, user_id, transaction_type as "transaction_type: CreditTransactionType", amount, source_id, description, created_at, seq
             FROM credits_transactions
             WHERE user_id = $1
-                AND ($4::timestamptz IS NULL OR created_at >= $4)
-                AND ($5::timestamptz IS NULL OR created_at <= $5)
+              AND ($4::text IS NULL OR description ILIKE '%' || $4 || '%')
+              AND ($5::text[] IS NULL OR transaction_type::text = ANY($5))
+              AND ($6::timestamptz IS NULL OR created_at >= $6)
+              AND ($7::timestamptz IS NULL OR created_at <= $7)
             ORDER BY seq DESC
             OFFSET $2
             LIMIT $3
@@ -252,8 +259,10 @@ impl<'c> Credits<'c> {
             user_id,
             skip,
             limit,
-            start_date,
-            end_date
+            filters.search.as_deref(),
+            transaction_types.as_deref(),
+            filters.timestamp_after,
+            filters.timestamp_before,
         )
         .fetch_all(&mut *self.db)
         .await?;
@@ -261,30 +270,38 @@ impl<'c> Credits<'c> {
         Ok(transactions.into_iter().map(CreditTransactionDBResponse::from).collect())
     }
 
-    /// List all transactions across all users (admin view)
-    #[instrument(skip(self), fields(skip = skip, limit = limit), err)]
+    /// List all transactions across all users (admin view) with optional filters
+    #[instrument(skip(self, filters), fields(skip = skip, limit = limit), err)]
     pub async fn list_all_transactions(
         &mut self,
         skip: i64,
         limit: i64,
-        start_date: Option<DateTime<Utc>>,
-        end_date: Option<DateTime<Utc>>,
+        filters: &TransactionFilters,
     ) -> Result<Vec<CreditTransactionDBResponse>> {
+        let transaction_types: Option<Vec<String>> = filters
+            .transaction_types
+            .as_ref()
+            .map(|types| types.iter().map(|t| t.to_string()).collect());
+
         let transactions = sqlx::query_as!(
             CreditTransaction,
             r#"
             SELECT id, user_id, transaction_type as "transaction_type: CreditTransactionType", amount, source_id, description, created_at, seq
             FROM credits_transactions
-            WHERE ($3::timestamptz IS NULL OR created_at >= $3)
-                AND ($4::timestamptz IS NULL OR created_at <= $4)
+            WHERE ($3::text IS NULL OR description ILIKE '%' || $3 || '%')
+              AND ($4::text[] IS NULL OR transaction_type::text = ANY($4))
+              AND ($5::timestamptz IS NULL OR created_at >= $5)
+              AND ($6::timestamptz IS NULL OR created_at <= $6)
             ORDER BY seq DESC
             OFFSET $1
             LIMIT $2
             "#,
             skip,
             limit,
-            start_date,
-            end_date
+            filters.search.as_deref(),
+            transaction_types.as_deref(),
+            filters.timestamp_after,
+            filters.timestamp_before,
         )
         .fetch_all(&mut *self.db)
         .await?;
@@ -311,36 +328,60 @@ impl<'c> Credits<'c> {
         Ok(transaction.map(CreditTransactionDBResponse::from))
     }
 
-    /// Count total transactions for a specific user
-    #[instrument(skip(self), fields(user_id = %abbrev_uuid(&user_id)), err)]
-    pub async fn count_user_transactions(
-        &mut self,
-        user_id: UserId,
-        start_date: Option<DateTime<Utc>>,
-        end_date: Option<DateTime<Utc>>,
-    ) -> Result<i64> {
+    /// Count total transactions for a specific user with optional filters
+    #[instrument(skip(self, filters), fields(user_id = %abbrev_uuid(&user_id)), err)]
+    pub async fn count_user_transactions(&mut self, user_id: UserId, filters: &TransactionFilters) -> Result<i64> {
+        let transaction_types: Option<Vec<String>> = filters
+            .transaction_types
+            .as_ref()
+            .map(|types| types.iter().map(|t| t.to_string()).collect());
+
         let result = sqlx::query!(
-            "SELECT COUNT(*) as count FROM credits_transactions WHERE user_id = $1 AND ($2::timestamptz IS NULL OR created_at >= $2) AND ($3::timestamptz IS NULL OR created_at <= $3)",
+            r#"
+            SELECT COUNT(*) as count
+            FROM credits_transactions
+            WHERE user_id = $1
+              AND ($2::text IS NULL OR description ILIKE '%' || $2 || '%')
+              AND ($3::text[] IS NULL OR transaction_type::text = ANY($3))
+              AND ($4::timestamptz IS NULL OR created_at >= $4)
+              AND ($5::timestamptz IS NULL OR created_at <= $5)
+            "#,
             user_id,
-            start_date,
-            end_date
+            filters.search.as_deref(),
+            transaction_types.as_deref(),
+            filters.timestamp_after,
+            filters.timestamp_before,
         )
-            .fetch_one(&mut *self.db)
-            .await?;
+        .fetch_one(&mut *self.db)
+        .await?;
 
         Ok(result.count.unwrap_or(0))
     }
 
-    /// Count total transactions across all users
-    #[instrument(skip(self), err)]
-    pub async fn count_all_transactions(&mut self, start_date: Option<DateTime<Utc>>, end_date: Option<DateTime<Utc>>) -> Result<i64> {
+    /// Count total transactions across all users with optional filters
+    #[instrument(skip(self, filters), err)]
+    pub async fn count_all_transactions(&mut self, filters: &TransactionFilters) -> Result<i64> {
+        let transaction_types: Option<Vec<String>> = filters
+            .transaction_types
+            .as_ref()
+            .map(|types| types.iter().map(|t| t.to_string()).collect());
+
         let result = sqlx::query!(
-            "SELECT COUNT(*) as count FROM credits_transactions WHERE ($1::timestamptz IS NULL OR created_at >= $1) AND ($2::timestamptz IS NULL OR created_at <= $2)",
-            start_date,
-            end_date
+            r#"
+            SELECT COUNT(*) as count
+            FROM credits_transactions
+            WHERE ($1::text IS NULL OR description ILIKE '%' || $1 || '%')
+              AND ($2::text[] IS NULL OR transaction_type::text = ANY($2))
+              AND ($3::timestamptz IS NULL OR created_at >= $3)
+              AND ($4::timestamptz IS NULL OR created_at <= $4)
+            "#,
+            filters.search.as_deref(),
+            transaction_types.as_deref(),
+            filters.timestamp_after,
+            filters.timestamp_before,
         )
-            .fetch_one(&mut *self.db)
-            .await?;
+        .fetch_one(&mut *self.db)
+        .await?;
 
         Ok(result.count.unwrap_or(0))
     }
@@ -348,24 +389,46 @@ impl<'c> Credits<'c> {
     /// Count transactions with batch grouping applied for a specific user.
     /// Returns the count of aggregated results (batches count as 1, not N).
     /// Uses pre-aggregated batch_aggregates table for O(1) batch counting.
-    #[instrument(skip(self), fields(user_id = %abbrev_uuid(&user_id)), err)]
-    pub async fn count_transactions_with_batches(
-        &mut self,
-        user_id: UserId,
-        start_date: Option<DateTime<Utc>>,
-        end_date: Option<DateTime<Utc>>,
-    ) -> Result<i64> {
+    #[instrument(skip(self, filters), fields(user_id = %abbrev_uuid(&user_id)), err)]
+    pub async fn count_transactions_with_batches(&mut self, user_id: UserId, filters: &TransactionFilters) -> Result<i64> {
+        let transaction_types: Option<Vec<String>> = filters
+            .transaction_types
+            .as_ref()
+            .map(|types| types.iter().map(|t| t.to_string()).collect());
+
+        // Check if we should include batch aggregates (they're always type 'usage')
+        let include_batches = filters
+            .transaction_types
+            .as_ref()
+            .map(|types| types.iter().any(|t| matches!(t, CreditTransactionType::Usage)))
+            .unwrap_or(true);
+
         let result = sqlx::query!(
             r#"
             SELECT
-                (SELECT COUNT(*) FROM batch_aggregates WHERE user_id = $1 AND ($2::timestamptz IS NULL OR created_at >= $2) AND ($3::timestamptz IS NULL OR created_at <= $3))
+                (CASE WHEN $6::bool THEN
+                    (SELECT COUNT(*) FROM batch_aggregates
+                     WHERE user_id = $1
+                       AND ($2::text IS NULL OR 'Batch' ILIKE '%' || $2 || '%')
+                       AND ($4::timestamptz IS NULL OR created_at >= $4)
+                       AND ($5::timestamptz IS NULL OR created_at <= $5))
+                ELSE 0 END)
                 +
-                (SELECT COUNT(*) FROM credits_transactions WHERE user_id = $1 AND fusillade_batch_id IS NULL AND ($2::timestamptz IS NULL OR created_at >= $2) AND ($3::timestamptz IS NULL OR created_at <= $3))
+                (SELECT COUNT(*) FROM credits_transactions
+                 WHERE user_id = $1
+                   AND fusillade_batch_id IS NULL
+                   AND ($2::text IS NULL OR description ILIKE '%' || $2 || '%')
+                   AND ($3::text[] IS NULL OR transaction_type::text = ANY($3))
+                   AND ($4::timestamptz IS NULL OR created_at >= $4)
+                   AND ($5::timestamptz IS NULL OR created_at <= $5))
             as "count!"
             "#,
             user_id,
-            start_date,
-            end_date
+            filters.search.as_deref(),
+            transaction_types.as_deref(),
+            filters.timestamp_after,
+            filters.timestamp_before,
+            include_batches,
         )
         .fetch_one(&mut *self.db)
         .await?;
@@ -451,17 +514,28 @@ impl<'c> Credits<'c> {
 
     /// List transactions with batch grouping applied using pre-aggregated batch_aggregates table.
     /// Uses optimized query with pre-limited UNION branches for O(limit) performance.
-    #[instrument(skip(self), fields(user_id = %abbrev_uuid(&user_id), skip = skip, limit = limit), err)]
+    #[instrument(skip(self, filters), fields(user_id = %abbrev_uuid(&user_id), skip = skip, limit = limit), err)]
     pub async fn list_transactions_with_batches(
         &mut self,
         user_id: UserId,
         skip: i64,
         limit: i64,
-        start_date: Option<DateTime<Utc>>,
-        end_date: Option<DateTime<Utc>>,
+        filters: &TransactionFilters,
     ) -> Result<Vec<(CreditTransactionDBResponse, Option<Uuid>)>> {
         // Perform lazy aggregation for any new unaggregated transactions
         self.aggregate_user_batches(user_id).await?;
+
+        let transaction_types: Option<Vec<String>> = filters
+            .transaction_types
+            .as_ref()
+            .map(|types| types.iter().map(|t| t.to_string()).collect());
+
+        // Check if we should include batch aggregates (they're always type 'usage')
+        let include_batches = filters
+            .transaction_types
+            .as_ref()
+            .map(|types| types.iter().any(|t| matches!(t, CreditTransactionType::Usage)))
+            .unwrap_or(true);
 
         // Optimized query using pre-limited UNION branches for Merge Append
         // Each branch fetches skip+limit rows, then pagination applies to combined result
@@ -470,6 +544,7 @@ impl<'c> Credits<'c> {
             r#"
             SELECT * FROM (
                 -- Top N from batch_aggregates (index scan on idx_batch_agg_user_seq)
+                -- Only included if transaction_types filter includes 'usage' or is not set
                 (SELECT
                     ba.fusillade_batch_id as id,
                     ba.user_id,
@@ -483,8 +558,15 @@ impl<'c> Credits<'c> {
                     ba.transaction_count as batch_count
                 FROM batch_aggregates ba
                 WHERE ba.user_id = $1
+<<<<<<< HEAD
                     AND ($5::timestamptz IS NULL OR ba.created_at >= $5)
                     AND ($6::timestamptz IS NULL OR ba.created_at <= $6)
+=======
+                  AND $8::bool = true
+                  AND ($5::text IS NULL OR 'Batch' ILIKE '%' || $5 || '%')
+                  AND ($7::timestamptz IS NULL OR ba.created_at >= $7)
+                  AND ($9::timestamptz IS NULL OR ba.created_at <= $9)
+>>>>>>> d4ec6cd8 (fix: transaction filtering)
                 ORDER BY ba.max_seq DESC
                 LIMIT $2)
 
@@ -505,20 +587,30 @@ impl<'c> Credits<'c> {
                 FROM credits_transactions ct
                 WHERE ct.user_id = $1
                   AND ct.fusillade_batch_id IS NULL
+<<<<<<< HEAD
                   AND ($5::timestamptz IS NULL OR ct.created_at >= $5)
                   AND ($6::timestamptz IS NULL OR ct.created_at <= $6)
+=======
+                  AND ($5::text IS NULL OR ct.description ILIKE '%' || $5 || '%')
+                  AND ($6::text[] IS NULL OR ct.transaction_type::text = ANY($6))
+                  AND ($7::timestamptz IS NULL OR ct.created_at >= $7)
+                  AND ($9::timestamptz IS NULL OR ct.created_at <= $9)
+>>>>>>> d4ec6cd8 (fix: transaction filtering)
                 ORDER BY ct.seq DESC
                 LIMIT $2)
             ) combined
             ORDER BY max_seq DESC
             LIMIT $3 OFFSET $4
             "#,
-            user_id,
-            fetch_limit,
-            limit,
-            skip,
-            start_date,
-            end_date
+            user_id,                      // $1
+            fetch_limit,                  // $2
+            limit,                        // $3
+            skip,                         // $4
+            filters.search.as_deref(),    // $5
+            transaction_types.as_deref(), // $6
+            filters.timestamp_after,      // $7
+            include_batches,              // $8
+            filters.timestamp_before,     // $9
         )
         .fetch_all(&mut *self.db)
         .await?;

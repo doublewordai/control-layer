@@ -103,20 +103,56 @@ pub struct ListTransactionsQuery {
     /// Group transactions by fusillade_batch_id (merges batch requests into single entries)
     pub group_batches: Option<bool>,
 
-    /// Filter transactions created on or after this date/time (ISO 8601 format)
-    #[serde(skip_serializing_if = "Option::is_none")]
-    #[param(value_type = Option<String>, format = "date-time")]
-    pub start_date: Option<DateTime<Utc>>,
+    /// Search term for description (case-insensitive)
+    pub search: Option<String>,
 
-    /// Filter transactions created on or before this date/time (ISO 8601 format)
-    #[serde(skip_serializing_if = "Option::is_none")]
-    #[param(value_type = Option<String>, format = "date-time")]
-    pub end_date: Option<DateTime<Utc>>,
+    /// Filter by transaction types (comma-separated: "admin_grant,purchase" or "usage,admin_removal")
+    pub transaction_types: Option<String>,
+
+    /// Filter transactions created after this timestamp
+    pub timestamp_after: Option<DateTime<Utc>>,
+
+    /// Filter transactions created before this timestamp
+    pub timestamp_before: Option<DateTime<Utc>>,
 
     /// Pagination parameters
     #[serde(flatten)]
     #[param(inline)]
     pub pagination: Pagination,
+}
+
+/// Internal filter struct for repository layer
+#[derive(Debug, Default, Clone)]
+pub struct TransactionFilters {
+    pub search: Option<String>,
+    pub transaction_types: Option<Vec<CreditTransactionType>>,
+    pub timestamp_after: Option<DateTime<Utc>>,
+    pub timestamp_before: Option<DateTime<Utc>>,
+}
+
+impl ListTransactionsQuery {
+    /// Parse transaction_types string into TransactionFilters
+    pub fn to_filters(&self) -> TransactionFilters {
+        let transaction_types = self.transaction_types.as_ref().map(|types_str| {
+            types_str
+                .split(',')
+                .filter_map(|t| match t.trim() {
+                    "admin_grant" => Some(CreditTransactionType::AdminGrant),
+                    "admin_removal" => Some(CreditTransactionType::AdminRemoval),
+                    "usage" => Some(CreditTransactionType::Usage),
+                    "purchase" => Some(CreditTransactionType::Purchase),
+                    _ => None,
+                })
+                .collect()
+        });
+
+        TransactionFilters {
+            search: self.search.clone(),
+            transaction_types,
+            timestamp_after: self.timestamp_after,
+            timestamp_before: self.timestamp_before,
+        }
+    }
 }
 
 // Conversions
