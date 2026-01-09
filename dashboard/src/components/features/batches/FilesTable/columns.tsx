@@ -106,39 +106,40 @@ export const createFileColumns = (
       defaultHidden: true,
     },
   },
-  {
-    accessorKey: "expires_at",
-    header: "Expires",
-    cell: ({ row }) => {
-      const timestamp = row.getValue("expires_at") as number | undefined;
-      if (!timestamp) return <span className="text-gray-400">Never</span>;
+  // Hidden until backend expiration enforcement is implemented
+  // {
+  //   accessorKey: "expires_at",
+  //   header: "Expires",
+  //   cell: ({ row }) => {
+  //     const timestamp = row.getValue("expires_at") as number | undefined;
+  //     if (!timestamp) return <span className="text-gray-400">Never</span>;
 
-      const expiresDate = new Date(timestamp * 1000);
-      const now = new Date();
-      const isExpired = expiresDate < now;
+  //     const expiresDate = new Date(timestamp * 1000);
+  //     const now = new Date();
+  //     const isExpired = expiresDate < now;
 
-      if (isExpired) {
-        return (
-          <span className="text-red-600 font-medium">
-            Expired {formatTimestamp(expiresDate.toISOString())}
-          </span>
-        );
-      }
+  //     if (isExpired) {
+  //       return (
+  //         <span className="text-red-600 font-medium">
+  //           Expired {formatTimestamp(expiresDate.toISOString())}
+  //         </span>
+  //       );
+  //     }
 
-      return (
-        <span className="text-gray-700">
-          {formatTimestamp(expiresDate.toISOString())}
-        </span>
-      );
-    },
-  },
+  //     return (
+  //       <span className="text-gray-700">
+  //         {formatTimestamp(expiresDate.toISOString())}
+  //       </span>
+  //     );
+  //   },
+  // },
   {
     accessorKey: "bytes",
     header: ({ column }) => {
       return (
         <button
           onClick={() => column.toggleSorting(column.getIsSorted() === "asc")}
-          className="flex items-center text-left font-medium group"
+          className="flex items-center justify-end text-right font-medium group w-full"
         >
           Size
           <ArrowUpDown className="ml-2 h-4 w-4 text-gray-400 group-hover:text-gray-700 transition-colors" />
@@ -147,14 +148,14 @@ export const createFileColumns = (
     },
     cell: ({ row }) => {
       const bytes = row.getValue("bytes") as number;
-      return <span className="text-gray-700">{formatBytes(bytes)}</span>;
+      return <div className="text-right text-gray-700">{formatBytes(bytes)}</div>;
     },
   },
   {
     id: "cost_estimate",
     header: () => {
       return (
-        <div className="flex items-center text-left font-medium">Est. Cost</div>
+        <div className="flex items-center justify-end text-middle font-medium">Est. Cost</div>
       );
     },
     cell: ({ row }) => {
@@ -162,14 +163,14 @@ export const createFileColumns = (
 
       // Only show cost estimate for batch input files
       if (file.purpose !== "batch") {
-        return <span className="text-gray-400">—</span>;
+        return <div className="text-right text-gray-400">—</div>;
       }
 
       // Get estimate from the map
       const estimate = actions.fileEstimates.get(file.id);
 
       if (!estimate) {
-        return <span className="text-gray-400">—</span>;
+        return <div className="text-right text-gray-400">—</div>;
       }
 
       const cost = parseFloat(estimate.total_estimated_cost);
@@ -216,27 +217,30 @@ export const createFileColumns = (
       );
 
       return (
-        <Tooltip delayDuration={300}>
-          <TooltipTrigger asChild>
-            <span className="text-gray-700 font-mono cursor-help">
-              {formattedCost}
-            </span>
-          </TooltipTrigger>
-          <TooltipContent>{tooltipContent}</TooltipContent>
-        </Tooltip>
+        <div className="text-right">
+          <Tooltip delayDuration={300}>
+            <TooltipTrigger asChild>
+              <span className="text-gray-700 font-mono cursor-help">
+                {formattedCost}
+              </span>
+            </TooltipTrigger>
+            <TooltipContent>{tooltipContent}</TooltipContent>
+          </Tooltip>
+        </div>
       );
     },
   },
   {
     id: "actions",
-    header: "Actions",
+    header: () => <div className="text-right font-medium">Actions</div>,
+    size: 200, // Constrain the actions column width
     cell: ({ row }) => {
       const file = row.original;
       const isExpired =
         file.expires_at && new Date(file.expires_at * 1000) < new Date();
 
       return (
-        <div className="flex items-center gap-1">
+        <div className="flex items-center justify-end gap-1">
           {!isExpired && file.purpose === "batch" && (
             <Tooltip delayDuration={500}>
               <TooltipTrigger asChild>
