@@ -1744,6 +1744,7 @@ mod tests {
 
     mod credit_deduction_tests {
         use super::super::*;
+        use crate::api::models::transactions::TransactionFilters;
         use crate::api::models::users::Role;
         use crate::db::handlers::Repository;
         use crate::db::handlers::api_keys::ApiKeys;

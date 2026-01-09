@@ -598,7 +598,9 @@ fn create_session_cookie(token: &str, config: &crate::config::Config) -> String 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{db::models::credits::CreditTransactionType, test::utils::create_test_config};
+    use crate::{
+        api::models::transactions::TransactionFilters, db::models::credits::CreditTransactionType, test::utils::create_test_config,
+    };
     use axum_test::TestServer;
     use sqlx::PgPool;
 
