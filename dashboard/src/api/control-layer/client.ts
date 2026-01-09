@@ -807,8 +807,9 @@ const costApi = {
     if (query?.limit) params.set("limit", query.limit.toString());
     if (query?.skip) params.set("skip", query.skip.toString());
     if (query?.userId) params.set("user_id", query.userId);
-    if (query?.group_batches !== undefined)
-      params.set("group_batches", query.group_batches.toString());
+    if (query?.group_batches !== undefined) params.set("group_batches", query.group_batches.toString());
+    if (query?.start_date) params.set("start_date", query.start_date);
+    if (query?.end_date) params.set("end_date", query.end_date);
 
     const url = `/admin/api/v1/transactions${params.toString() ? "?" + params.toString() : ""}`;
     const response = await fetch(url);

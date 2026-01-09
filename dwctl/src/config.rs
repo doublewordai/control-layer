@@ -78,6 +78,7 @@ use url::Url;
 
 use crate::api::models::users::Role;
 use crate::errors::Error;
+use crate::sample_files::SampleFilesConfig;
 
 // DB sync channel name
 pub static ONWARDS_CONFIG_CHANGED_CHANNEL: &str = "auth_config_changed";
@@ -139,6 +140,8 @@ pub struct Config {
     pub enable_otel_export: bool,
     /// Credit system configuration
     pub credits: CreditsConfig,
+    /// Sample file generation configuration for new users
+    pub sample_files: SampleFilesConfig,
 }
 
 /// Individual pool configuration with all SQLx parameters.
@@ -896,15 +899,20 @@ impl DaemonConfig {
         model_capacity_limits: Option<std::sync::Arc<dashmap::DashMap<String, usize>>>,
     ) -> fusillade::daemon::DaemonConfig {
         // For security we pass in api keys as env vars. Here we read them into config passed to fusillade.
+        // If the env var is not set, we keep the original value (useful for testing).
         let mut priority_endpoints_map = self.priority_endpoints.clone();
         for (_, endpoint) in priority_endpoints_map.iter_mut() {
-            endpoint.api_key.as_mut().map(|env_var| match std::env::var(&env_var) {
-                Err(_) => {
-                    warn!("Priority endpoint configured with api_key env var '{}' which is not set", env_var);
-                    None
+            if let Some(env_var_or_key) = endpoint.api_key.as_ref().cloned() {
+                match std::env::var(&env_var_or_key) {
+                    Err(_) => {
+                        warn!("Priority endpoint configured with api_key - env var not found, using as literal value");
+                        // Keep the original value (could be a literal key for testing)
+                    }
+                    Ok(value) => {
+                        endpoint.api_key = Some(value);
+                    }
                 }
-                Ok(value) => Some(value),
-            });
+            }
         }
         fusillade::daemon::DaemonConfig {
             claim_batch_size: self.claim_batch_size,
@@ -1104,6 +1112,7 @@ impl Default for Config {
             enable_request_logging: true,
             enable_otel_export: false,
             credits: CreditsConfig::default(),
+            sample_files: SampleFilesConfig::default(),
         }
     }
 }

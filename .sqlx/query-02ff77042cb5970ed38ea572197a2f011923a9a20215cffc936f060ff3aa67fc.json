@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "\n            SELECT id, user_id, transaction_type as \"transaction_type: CreditTransactionType\", amount, source_id, description, created_at, seq\n            FROM credits_transactions\n            ORDER BY seq DESC\n            OFFSET $1\n            LIMIT $2\n            ",
+  "query": "\n            SELECT id, user_id, transaction_type as \"transaction_type: CreditTransactionType\", amount, source_id, description, created_at, seq\n            FROM credits_transactions\n            WHERE ($3::timestamptz IS NULL OR created_at >= $3)\n                AND ($4::timestamptz IS NULL OR created_at <= $4)\n            ORDER BY seq DESC\n            OFFSET $1\n            LIMIT $2\n            ",
   "describe": {
     "columns": [
       {
@@ -47,7 +47,9 @@
     "parameters": {
       "Left": [
         "Int8",
-        "Int8"
+        "Int8",
+        "Timestamptz",
+        "Timestamptz"
       ]
     },
     "nullable": [
@@ -61,5 +63,5 @@
       false
     ]
   },
-  "hash": "118bbed8ef04ae11906ce90559a6a2e94d3cf30bb4d88b8d105712463a2a3f42"
+  "hash": "02ff77042cb5970ed38ea572197a2f011923a9a20215cffc936f060ff3aa67fc"
 }

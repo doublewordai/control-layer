@@ -1,5 +1,51 @@
 # Changelog
 
+## [0.28.0](https://github.com/doublewordai/control-layer/compare/v0.27.1...v0.28.0) (2026-01-09)
+
+
+### Features
+
+* sample file generators ([#468](https://github.com/doublewordai/control-layer/issues/468)) ([0c375c2](https://github.com/doublewordai/control-layer/commit/0c375c237230da8d5859595356d32610bd566672))
+
+
+### Bug Fixes
+
+* make transaction time filtering server side ([#490](https://github.com/doublewordai/control-layer/issues/490)) ([6e5928e](https://github.com/doublewordai/control-layer/commit/6e5928e8c6b13d067b0de8b0554e882d778893fe))
+* removed references to expiry of files, and some UI warnings for large… ([#491](https://github.com/doublewordai/control-layer/issues/491)) ([5ff255d](https://github.com/doublewordai/control-layer/commit/5ff255d45c9169f303ec2d59d28586de67deab21))
+
+## [0.27.1](https://github.com/doublewordai/control-layer/compare/v0.27.0...v0.27.1) (2026-01-09)
+
+
+### Bug Fixes
+
+* add histogram buckets for fusillade_retry_attempts_on_success ([#488](https://github.com/doublewordai/control-layer/issues/488)) ([2ac41f2](https://github.com/doublewordai/control-layer/commit/2ac41f2b4940eebee5df0cfa36f29f4f898fcccc))
+
+## [0.27.0](https://github.com/doublewordai/control-layer/compare/v0.26.0...v0.27.0) (2026-01-09)
+
+
+### Features
+
+* add request_origin and batch_sla labels to gen_ai metrics and http_analytics ([#486](https://github.com/doublewordai/control-layer/issues/486)) ([e49b29e](https://github.com/doublewordai/control-layer/commit/e49b29e8feeac392f7eb37c79d83f79c51b76eb9))
+
+
+### Bug Fixes
+
+* change the ordering of prometheus initialization and background … ([#485](https://github.com/doublewordai/control-layer/issues/485)) ([d3520e1](https://github.com/doublewordai/control-layer/commit/d3520e1a0b4221bd536c06bf92735861dcddb787))
+* Jansix UI fixes 2 ([#481](https://github.com/doublewordai/control-layer/issues/481)) ([ee8290c](https://github.com/doublewordai/control-layer/commit/ee8290cd532395e7706e9e829a7cbd4bcce09e6b))
+
+## [0.26.0](https://github.com/doublewordai/control-layer/compare/v0.25.0...v0.26.0) (2026-01-08)
+
+
+### Features
+
+* improve batch modal UX with filename editing and copy updates ([#478](https://github.com/doublewordai/control-layer/issues/478)) ([a9af15d](https://github.com/doublewordai/control-layer/commit/a9af15dacc68bded996a739f81fdd794fc02e0e3))
+
+
+### Bug Fixes
+
+* round down in progress % ([#482](https://github.com/doublewordai/control-layer/issues/482)) ([ca42d89](https://github.com/doublewordai/control-layer/commit/ca42d8958e1cdad1a5adcc6bc9f45a9715950414))
+* test sla e2e ([#479](https://github.com/doublewordai/control-layer/issues/479)) ([c685cd0](https://github.com/doublewordai/control-layer/commit/c685cd095cf8b7455699b4af7e4e848922999d35))
+
 ## [0.25.0](https://github.com/doublewordai/control-layer/compare/v0.24.3...v0.25.0) (2026-01-08)
 
 
