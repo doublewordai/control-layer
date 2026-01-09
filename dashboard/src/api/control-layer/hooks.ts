@@ -1058,6 +1058,13 @@ export function useProcessPayment(options?: {
   });
 }
 
+export function useCreateBillingPortalSession() {
+  return useMutation({
+    mutationKey: ["payments", "billing-portal"],
+    mutationFn: () => dwctlApi.payments.createBillingPortalSession(),
+  });
+}
+
 // ===== DAEMONS HOOKS =====
 
 export function useDaemons(options?: DaemonsQuery) {

@@ -42,9 +42,9 @@ import { useSettings } from "@/contexts";
 import { formatDollars } from "@/utils/money.ts";
 
 export type AddFundsConfig =
-  | { type: "direct"; onAddFunds: () => void }
-  | { type: "redirect"; onAddFunds: () => void }
-  | { type: "split"; onPrimaryAction: () => void; onDirectAction: () => void }
+  | { type: "admin-only"; onGiftFunds: () => void }
+  | { type: "purchase-only"; onPurchaseFunds: () => void }
+  | { type: "split"; onPurchaseFunds: () => void; onGiftFunds?: () => void; onBillingPortal?: () => void }
   | undefined;
 
 export interface TransactionHistoryProps {
@@ -274,12 +274,21 @@ export function TransactionHistory({
         <div className="flex items-center gap-3">
           {addFundsConfig && (
             <>
-              {(addFundsConfig.type === "direct" ||
-                addFundsConfig.type === "redirect") && (
+              {addFundsConfig.type === "admin-only" && (
                 <Button
                   variant="outline"
                   size="sm"
-                  onClick={addFundsConfig.onAddFunds}
+                  onClick={addFundsConfig.onGiftFunds}
+                >
+                  <Plus className="w-4 h-4 mr-2" />
+                  Gift Funds
+                </Button>
+              )}
+              {addFundsConfig.type === "purchase-only" && (
+                <Button
+                  variant="outline"
+                  size="sm"
+                  onClick={addFundsConfig.onPurchaseFunds}
                 >
                   <Plus className="w-4 h-4 mr-2" />
                   Add to Credit Balance
@@ -290,7 +299,7 @@ export function TransactionHistory({
                   <Button
                     variant="outline"
                     size="sm"
-                    onClick={addFundsConfig.onPrimaryAction}
+                    onClick={addFundsConfig.onPurchaseFunds}
                     className="rounded-r-none"
                   >
                     <Plus className="w-4 h-4 mr-2" />
@@ -307,9 +316,16 @@ export function TransactionHistory({
                       </Button>
                     </DropdownMenuTrigger>
                     <DropdownMenuContent align="end">
-                      <DropdownMenuItem onClick={addFundsConfig.onDirectAction}>
-                        Grant as admin
-                      </DropdownMenuItem>
+                      {addFundsConfig.onGiftFunds && (
+                        <DropdownMenuItem onClick={addFundsConfig.onGiftFunds}>
+                          Gift Funds
+                        </DropdownMenuItem>
+                      )}
+                      {addFundsConfig.onBillingPortal && (
+                        <DropdownMenuItem onClick={addFundsConfig.onBillingPortal}>
+                          Billing Portal
+                        </DropdownMenuItem>
+                      )}
                     </DropdownMenuContent>
                   </DropdownMenu>
                 </div>
