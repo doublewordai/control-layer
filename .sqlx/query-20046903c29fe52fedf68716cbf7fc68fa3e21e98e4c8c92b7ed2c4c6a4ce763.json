@@ -1,0 +1,28 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n            SELECT\n                r.batch_id,\n                COUNT(*) as count\n            FROM requests r\n            JOIN batches b ON r.batch_id = b.id\n            WHERE b.expires_at < NOW()\n              AND b.completed_at IS NULL\n              AND b.failed_at IS NULL\n              AND b.cancelled_at IS NULL\n              AND b.cancelling_at IS NULL\n              AND r.state = ANY($1)\n            GROUP BY r.batch_id\n            ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "batch_id",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 1,
+        "name": "count",
+        "type_info": "Int8"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "TextArray"
+      ]
+    },
+    "nullable": [
+      false,
+      null
+    ]
+  },
+  "hash": "20046903c29fe52fedf68716cbf7fc68fa3e21e98e4c8c92b7ed2c4c6a4ce763"
+}
