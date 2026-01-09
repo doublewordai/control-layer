@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.27.1](https://github.com/doublewordai/control-layer/compare/v0.27.0...v0.27.1) (2026-01-09)
+
+
+### Bug Fixes
+
+* add histogram buckets for fusillade_retry_attempts_on_success ([#488](https://github.com/doublewordai/control-layer/issues/488)) ([2ac41f2](https://github.com/doublewordai/control-layer/commit/2ac41f2b4940eebee5df0cfa36f29f4f898fcccc))
+
 ## [0.27.0](https://github.com/doublewordai/control-layer/compare/v0.26.0...v0.27.0) (2026-01-09)
 
 
