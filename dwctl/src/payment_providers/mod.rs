@@ -142,5 +142,5 @@ pub trait PaymentProvider: Send + Sync {
     /// * `db_pool` - Database connection pool
     /// * `user` - The authenticated user requesting portal access
     /// * `return_url` - The complete URL to redirect to after the customer is done (e.g., "https://example.com/cost-management")
-    async fn create_billing_portal_session(&self, db_pool: &PgPool, user: &CurrentUser, return_url: &str) -> Result<String>;
+    async fn create_billing_portal_session(&self, user: &CurrentUser, return_url: &str) -> Result<String>;
 }

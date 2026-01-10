@@ -196,7 +196,7 @@ impl PaymentProvider for DummyProvider {
         Ok(())
     }
 
-    async fn create_billing_portal_session(&self, _db_pool: &PgPool, user: &CurrentUser, return_url: &str) -> Result<String> {
+    async fn create_billing_portal_session(&self, user: &CurrentUser, return_url: &str) -> Result<String> {
         // Check if user has a payment provider ID (required for billing portal)
         let _customer_id = user.payment_provider_id.as_ref().ok_or(PaymentError::NoCustomerId)?;
 

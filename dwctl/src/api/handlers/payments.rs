@@ -357,7 +357,7 @@ pub async fn create_billing_portal_session(
 
     // Create billing portal session using the provider trait
     let portal_url = provider
-        .create_billing_portal_session(&state.db, &user, &return_url)
+        .create_billing_portal_session(&user, &return_url)
         .await
         .map_err(|e| {
             tracing::error!("Failed to create billing portal session: {:?}", e);
