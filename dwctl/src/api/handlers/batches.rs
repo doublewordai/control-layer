@@ -6,8 +6,8 @@
 
 use crate::AppState;
 use crate::api::models::batches::{
-    BatchAnalytics, BatchErrors, BatchListResponse, BatchObjectType, BatchResponse, CreateBatchRequest, ListBatchesQuery, ListObjectType,
-    RequestCounts, RetryRequestsRequest,
+    BatchAnalytics, BatchErrors, BatchListResponse, BatchObjectType, BatchResponse, BatchResultsQuery, CreateBatchRequest,
+    ListBatchesQuery, ListObjectType, RequestCounts, RetryRequestsRequest,
 };
 use crate::auth::permissions::{RequiresPermission, can_read_all_resources, has_permission, operation, resource};
 use crate::errors::{Error, Result};
@@ -18,7 +18,9 @@ use axum::{
     http::StatusCode,
 };
 use fusillade::Storage;
+use futures::StreamExt;
 use std::collections::HashMap;
+use std::pin::Pin;
 use uuid::Uuid;
 
 /// Helper function to convert fusillade Batch to OpenAI BatchResponse
@@ -316,6 +318,129 @@ pub async fn get_batch_analytics(
         })?;
 
     Ok(Json(analytics))
+}
+
+#[utoipa::path(
+    get,
+    path = "/batches/{batch_id}/results",
+    tag = "batches",
+    summary = "Get batch results",
+    description = "Stream batch results with merged input/output data as JSONL.
+
+Each line contains the original input body, response body (for completed requests), error message (for failed requests), and current status. Results are filtered to show exactly one entry per input template (excluding superseded requests from escalation races).
+
+Supports pagination via `limit` and `skip` query parameters, and filtering by `custom_id` via the `search` parameter.",
+    responses(
+        (status = 200, description = "Batch results as newline-delimited JSON. Check the `X-Incomplete` header to determine if more results exist.", content_type = "application/x-ndjson"),
+        (status = 404, description = "Batch not found or you don't have access to it."),
+        (status = 500, description = "An unexpected error occurred. Retry the request or contact support if the issue persists.")
+    ),
+    params(
+        ("batch_id" = String, Path, description = "The batch ID returned when the batch was created."),
+        BatchResultsQuery
+    )
+)]
+#[tracing::instrument(skip(state, current_user), fields(user_id = %current_user.id, batch_id = %batch_id_str, limit = ?query.pagination.limit, skip = ?query.pagination.skip))]
+pub async fn get_batch_results(
+    State(state): State<AppState>,
+    Path(batch_id_str): Path<String>,
+    Query(query): Query<BatchResultsQuery>,
+    current_user: RequiresPermission<resource::Batches, operation::ReadOwn>,
+) -> Result<axum::response::Response> {
+    let batch_id = Uuid::parse_str(&batch_id_str).map_err(|_| Error::BadRequest {
+        message: "Invalid batch ID format".to_string(),
+    })?;
+
+    // Get batch first to verify it exists and check permissions
+    let batch = state
+        .request_manager
+        .get_batch(fusillade::BatchId(batch_id))
+        .await
+        .map_err(|_| Error::NotFound {
+            resource: "Batch".to_string(),
+            id: batch_id_str.clone(),
+        })?;
+
+    // Check ownership: users without ReadAll permission can only see their own batches
+    let can_read_all = can_read_all_resources(&current_user, Resource::Batches);
+    if !can_read_all {
+        let user_id = current_user.id.to_string();
+        if batch.created_by.as_deref() != Some(user_id.as_str()) {
+            return Err(Error::NotFound {
+                resource: "Batch".to_string(),
+                id: batch_id_str.clone(),
+            });
+        }
+    }
+
+    // Stream the batch results as JSONL
+    let offset = query.pagination.skip.unwrap_or(0) as usize;
+    let search = query.search.clone();
+    let results_stream = state
+        .request_manager
+        .get_batch_results_stream(fusillade::BatchId(batch_id), offset, search);
+
+    // Apply limit if specified, fetching one extra to detect if there are more results
+    let requested_limit = query.pagination.limit.map(|l| l as usize);
+    let fetch_limit = requested_limit.map(|l| l + 1);
+
+    let results_stream: Pin<Box<dyn futures::Stream<Item = fusillade::Result<fusillade::batch::BatchResultItem>> + Send>> =
+        if let Some(limit) = fetch_limit {
+            Box::pin(results_stream.take(limit))
+        } else {
+            Box::pin(results_stream)
+        };
+
+    // Collect items to determine if we need to truncate and set headers
+    let items: Vec<_> = results_stream.collect().await;
+
+    // Check if there's more data available
+    let has_more_paginated = if let Some(req_limit) = requested_limit {
+        items.len() > req_limit
+    } else {
+        false
+    };
+
+    // Check if batch is still in progress (more results may come)
+    let batch_in_progress = batch.pending_requests > 0 || batch.in_progress_requests > 0;
+    let has_more = has_more_paginated || batch_in_progress;
+
+    // Truncate to requested limit if we fetched extra
+    let items_to_return = if let Some(req_limit) = requested_limit {
+        items.into_iter().take(req_limit).collect::<Vec<_>>()
+    } else {
+        items
+    };
+
+    let line_count = items_to_return.len();
+    let last_line = offset + line_count;
+
+    // Convert items to JSONL
+    let mut jsonl_lines = Vec::new();
+    for result in items_to_return {
+        let json_line = result
+            .and_then(|item| {
+                serde_json::to_string(&item)
+                    .map(|json| format!("{}\n", json))
+                    .map_err(|e| fusillade::FusilladeError::Other(anyhow::anyhow!("JSON serialization failed: {}", e)))
+            })
+            .map_err(|e| Error::Internal {
+                operation: format!("serialize batch result: {}", e),
+            })?;
+        jsonl_lines.push(json_line);
+    }
+
+    let jsonl_content = jsonl_lines.join("");
+
+    let mut response = axum::response::Response::new(axum::body::Body::from(jsonl_content));
+    response
+        .headers_mut()
+        .insert("content-type", "application/x-ndjson".parse().unwrap());
+    response.headers_mut().insert("X-Incomplete", has_more.to_string().parse().unwrap());
+    response.headers_mut().insert("X-Last-Line", last_line.to_string().parse().unwrap());
+    *response.status_mut() = StatusCode::OK;
+
+    Ok(response)
 }
 
 #[utoipa::path(

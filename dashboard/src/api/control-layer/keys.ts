@@ -97,6 +97,10 @@ export const queryKeys = {
       [...queryKeys.batches.requests(id), filters] as const,
     analytics: (id: string) =>
       [...queryKeys.batches.detail(id), "analytics"] as const,
+    results: (id: string) =>
+      [...queryKeys.batches.detail(id), "results"] as const,
+    resultsList: (id: string, filters: any) =>
+      [...queryKeys.batches.results(id), filters] as const,
   },
 
   // Payments
