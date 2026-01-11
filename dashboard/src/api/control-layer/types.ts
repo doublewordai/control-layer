@@ -154,6 +154,7 @@ export interface User {
   updated_at: string; // ISO 8601 timestamp
   auth_source: AuthSource;
   credit_balance?: number; // User's balance in dollars (backend field name is credit_balance)
+  has_payment_provider_id: boolean; // Whether the user has a payment provider customer ID set
 }
 
 export interface ApiKey {

@@ -390,6 +390,7 @@ export const handlers = [
       updated_at: new Date().toISOString(),
       auth_source: "vouch",
       external_user_id: crypto.randomUUID(),
+      has_payment_provider_id: false,
     };
     return HttpResponse.json(newUser, { status: 201 });
   }),
