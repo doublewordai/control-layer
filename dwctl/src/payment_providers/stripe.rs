@@ -3,6 +3,7 @@
 use async_trait::async_trait;
 use rust_decimal::Decimal;
 use sqlx::PgPool;
+use std::sync::Once;
 use stripe::Client;
 use stripe_billing::billing_portal_session::CreateBillingPortalSession;
 use stripe_checkout::{
@@ -27,6 +28,20 @@ use crate::{
     types::UserId,
 };
 
+/// Singleton to ensure rustls crypto provider is initialized exactly once
+static INIT_CRYPTO: Once = Once::new();
+
+/// Ensures the rustls crypto provider is installed.
+/// This is required for rustls 0.23+ when using async-stripe.
+/// Safe to call multiple times - will only initialize once.
+fn ensure_crypto_provider() {
+    INIT_CRYPTO.call_once(|| {
+        rustls::crypto::aws_lc_rs::default_provider()
+            .install_default()
+            .ok(); // Ignore error if already installed by main.rs
+    });
+}
+
 /// Stripe payment provider
 pub struct StripeProvider {
     config: crate::config::StripeConfig,
@@ -35,6 +50,7 @@ pub struct StripeProvider {
 
 impl From<crate::config::StripeConfig> for StripeProvider {
     fn from(config: crate::config::StripeConfig) -> Self {
+        ensure_crypto_provider();
         let client = Client::new(&config.api_key);
         Self { config, client }
     }
