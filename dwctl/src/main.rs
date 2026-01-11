@@ -38,15 +38,6 @@ async fn main() -> anyhow::Result<()> {
     // Load configuration
     let config = Config::load(&args)?;
 
-    // Install rustls crypto provider if using Stripe (required for rustls 0.23+)
-    // Both ring and aws-lc-rs are in the dependency tree from async-stripe upgrade,
-    // so we must explicitly choose one to prevent runtime panic
-    if let Some(dwctl::config::PaymentConfig::Stripe(_)) = &config.payment {
-        rustls::crypto::aws_lc_rs::default_provider()
-            .install_default()
-            .expect("Failed to install rustls crypto provider");
-    }
-
     // If --validate flag is set, exit successfully after config validation
     if args.validate {
         println!("Configuration is valid.");
