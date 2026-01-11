@@ -187,11 +187,11 @@ mod tests {
     }
 
     fn build_test_url(database: &str) -> String {
-        if let Ok(base_url) = std::env::var("DATABASE_URL") {
-            if let Ok(mut url) = url::Url::parse(&base_url) {
-                url.set_path(&format!("/{}", database));
-                return url.to_string();
-            }
+        if let Ok(base_url) = std::env::var("DATABASE_URL")
+            && let Ok(mut url) = url::Url::parse(&base_url)
+        {
+            url.set_path(&format!("/{}", database));
+            return url.to_string();
         }
         format!("postgres://postgres:password@localhost:5432/{}", database)
     }

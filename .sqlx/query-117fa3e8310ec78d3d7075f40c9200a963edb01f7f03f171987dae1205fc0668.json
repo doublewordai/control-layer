@@ -1,0 +1,16 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n            INSERT INTO requests (\n                id, batch_id, template_id, state, custom_id, retry_attempt, model,\n                escalated_from_request_id, is_escalated, superseded_at, superseded_by_request_id\n            )\n            SELECT\n                gen_random_uuid(),\n                r.batch_id,\n                r.template_id,\n                'pending',\n                t.custom_id,\n                r.retry_attempt,\n                r.model,     -- Keep original model for hashmap lookup at runtime\n                r.id,        -- Link back to original request\n                true,        -- is_escalated = true\n                NULL,\n                NULL\n            FROM requests r\n            JOIN request_templates t ON r.template_id = t.id\n            JOIN batches b ON r.batch_id = b.id\n            WHERE r.model = $1\n              AND r.is_escalated = false\n              AND r.state = ANY($2)\n              AND b.expires_at IS NOT NULL\n              AND b.completed_at IS NULL\n              -- Don't exclude failed batches - allow escalation as last resort\n              AND b.cancelled_at IS NULL\n              AND b.cancelling_at IS NULL\n              AND (b.expires_at - NOW()) <= make_interval(secs => $3::float8)\n              -- Only create escalation if one doesn't already exist (in any state)\n              -- This prevents creating duplicate escalations if the first one failed\n              AND NOT EXISTS (\n                  SELECT 1 FROM requests esc\n                  WHERE esc.escalated_from_request_id = r.id\n              )\n            ",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Text",
+        "TextArray",
+        "Float8"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "117fa3e8310ec78d3d7075f40c9200a963edb01f7f03f171987dae1205fc0668"
+}

@@ -1,5 +1,16 @@
-import { useCallback, useRef, useEffect } from "react";
+import { useCallback, useRef, useEffect, useState } from "react";
 import { useSearchParams } from "react-router-dom";
+
+/**
+ * Determines the default page size based on screen height.
+ * Returns 20 for tall displays (>= 900px), otherwise 10.
+ */
+function getDefaultPageSizeForScreen(): number {
+  if (typeof window !== "undefined" && window.innerHeight >= 900) {
+    return 20;
+  }
+  return 10;
+}
 
 /**
  * Options for configuring server-side cursor pagination
@@ -83,10 +94,14 @@ interface UseServerCursorPaginationOptions {
  * ```
  */
 export function useServerCursorPagination(
-  options: UseServerCursorPaginationOptions = {}
+  options: UseServerCursorPaginationOptions = {},
 ) {
-  const { paramPrefix = "", defaultPageSize = 10 } = options;
+  const { paramPrefix = "", defaultPageSize } = options;
   const [searchParams, setSearchParams] = useSearchParams();
+
+  // Determine page size: use provided default, or detect from screen height
+  const [screenDefaultPageSize] = useState(() => getDefaultPageSizeForScreen());
+  const effectiveDefaultPageSize = defaultPageSize ?? screenDefaultPageSize;
 
   // Build parameter names with optional prefix
   const pageParam = paramPrefix ? `${paramPrefix}Page` : "page";
@@ -96,8 +111,8 @@ export function useServerCursorPagination(
   // Read current state from URL params
   const page = parseInt(searchParams.get(pageParam) || "1", 10);
   const pageSize = parseInt(
-    searchParams.get(pageSizeParam) || String(defaultPageSize),
-    10
+    searchParams.get(pageSizeParam) || String(effectiveDefaultPageSize),
+    10,
   );
   const cursor = searchParams.get(cursorParam) || undefined;
 
@@ -131,7 +146,7 @@ export function useServerCursorPagination(
         return next;
       });
     },
-    [cursor, page, pageParam, cursorParam, setSearchParams]
+    [cursor, page, pageParam, cursorParam, setSearchParams],
   );
 
   /**
@@ -186,7 +201,7 @@ export function useServerCursorPagination(
         return next;
       });
     },
-    [pageParam, pageSizeParam, cursorParam, setSearchParams]
+    [pageParam, pageSizeParam, cursorParam, setSearchParams],
   );
 
   // Whether previous page navigation is available

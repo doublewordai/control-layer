@@ -100,7 +100,7 @@ export const createBatchColumns = (
   },
   {
     id: "input_file",
-    header: "Input File",
+    header: "Input File ID",
     cell: ({ row }) => {
       const batch = row.original as Batch;
       const inputFile = actions.getInputFile(batch);
@@ -113,16 +113,21 @@ export const createBatchColumns = (
       const truncatedId = inputFile.id.slice(0, 8) + "...";
 
       return (
-        <div
-          className="flex items-center gap-2 cursor-pointer hover:text-blue-600 transition-colors"
-          onClick={(e) => {
-            e.stopPropagation();
-            actions.onViewFile(inputFile);
-          }}
-        >
-          <FileText className="w-4 h-4 text-gray-500" />
-          <span className="font-mono text-sm">{truncatedId}</span>
-        </div>
+        <Tooltip delayDuration={300}>
+          <TooltipTrigger asChild>
+            <div
+              className="flex items-center gap-2 cursor-pointer hover:text-blue-600 transition-colors"
+              onClick={(e) => {
+                e.stopPropagation();
+                actions.onViewFile(inputFile);
+              }}
+            >
+              <FileText className="w-4 h-4 text-gray-500" />
+              <span className="font-mono text-sm">{truncatedId}</span>
+            </div>
+          </TooltipTrigger>
+          <TooltipContent>{inputFile.id}</TooltipContent>
+        </Tooltip>
       );
     },
   },
@@ -131,19 +136,32 @@ export const createBatchColumns = (
     header: "SLA",
     cell: ({ row }) => {
       const completionWindow = row.getValue("completion_window") as string;
-      return (
-        <div className="flex items-center gap-1.5 text-sm text-gray-700">
-          <Clock className="w-3.5 h-3.5 text-gray-500" />
-          <span>{completionWindow}</span>
-        </div>
-      );
+      return <span className="text-sm text-gray-700">{completionWindow}</span>;
     },
   },
   {
     accessorKey: "status",
     header: "Status",
     cell: ({ row }) => {
+      const batch = row.original as Batch;
       const status = row.getValue("status") as BatchStatus;
+      const { completed, failed } = batch.request_counts;
+
+      // Check if batch is queued (in_progress but no requests completed yet)
+      const isQueued =
+        status === "in_progress" && completed === 0 && failed === 0;
+
+      if (isQueued) {
+        return (
+          <div className="flex items-center gap-2">
+            <Clock className="w-4 h-4 text-gray-500" />
+            <span className="inline-flex items-center px-2.5 py-0.5 rounded-full text-xs font-medium bg-gray-100 text-gray-700">
+              queued
+            </span>
+          </div>
+        );
+      }
+
       return (
         <div className="flex items-center gap-2">
           {getStatusIcon(status)}
@@ -171,36 +189,44 @@ export const createBatchColumns = (
       const failedPercent = total > 0 ? (failed / total) * 100 : 0;
       const canceledPercent = total > 0 ? (canceled / total) * 100 : 0;
 
+      // Determine if batch is queued (in_progress but no requests completed yet)
+      const isQueued =
+        batch.status === "in_progress" && completed === 0 && failed === 0;
+
       return (
         <div className="space-y-1 min-w-[200px]">
           <div className="flex justify-between text-xs text-gray-600">
             <span>
-              {completed + failed + canceled} / {total}
+              {completed} / {total}
             </span>
-            <span>
-              {Math.floor(completedPercent + failedPercent + canceledPercent)}%
-            </span>
+            <span>{Math.floor(completedPercent)}%</span>
           </div>
           <div className="relative h-2 w-full bg-gray-200 rounded-full overflow-hidden">
-            <div
-              className="absolute left-0 top-0 h-full bg-emerald-400 transition-all"
-              style={{ width: `${completedPercent}%` }}
-            />
-            <div
-              className="absolute top-0 h-full bg-rose-400 transition-all"
-              style={{
-                left: `${completedPercent}%`,
-                width: `${failedPercent}%`,
-              }}
-            />
-            {canceled > 0 && (
-              <div
-                className="absolute top-0 h-full bg-gray-400 transition-all"
-                style={{
-                  left: `${completedPercent + failedPercent}%`,
-                  width: `${canceledPercent}%`,
-                }}
-              />
+            {isQueued ? (
+              <div className="absolute left-0 top-0 h-full w-full bg-gray-300" />
+            ) : (
+              <>
+                <div
+                  className="absolute left-0 top-0 h-full bg-emerald-400 transition-all"
+                  style={{ width: `${completedPercent}%` }}
+                />
+                <div
+                  className="absolute top-0 h-full bg-rose-400 transition-all"
+                  style={{
+                    left: `${completedPercent}%`,
+                    width: `${failedPercent}%`,
+                  }}
+                />
+                {canceled > 0 && (
+                  <div
+                    className="absolute top-0 h-full bg-gray-400 transition-all"
+                    style={{
+                      left: `${completedPercent + failedPercent}%`,
+                      width: `${canceledPercent}%`,
+                    }}
+                  />
+                )}
+              </>
             )}
           </div>
         </div>

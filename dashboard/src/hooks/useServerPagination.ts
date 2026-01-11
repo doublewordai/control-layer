@@ -1,5 +1,16 @@
-import { useCallback } from "react";
+import { useCallback, useState } from "react";
 import { useSearchParams } from "react-router-dom";
+
+/**
+ * Determines the default page size based on screen height.
+ * Returns 20 for tall displays (>= 900px), otherwise 10.
+ */
+function getDefaultPageSizeForScreen(): number {
+  if (typeof window !== "undefined" && window.innerHeight >= 900) {
+    return 20;
+  }
+  return 10;
+}
 
 /**
  * Options for configuring server-side offset pagination
@@ -72,8 +83,12 @@ interface UseServerPaginationOptions {
  * ```
  */
 export function useServerPagination(options: UseServerPaginationOptions = {}) {
-  const { paramPrefix = "", defaultPageSize = 10 } = options;
+  const { paramPrefix = "", defaultPageSize } = options;
   const [searchParams, setSearchParams] = useSearchParams();
+
+  // Determine page size: use provided default, or detect from screen height
+  const [screenDefaultPageSize] = useState(() => getDefaultPageSizeForScreen());
+  const effectiveDefaultPageSize = defaultPageSize ?? screenDefaultPageSize;
 
   // Build parameter names with optional prefix
   const pageParam = paramPrefix ? `${paramPrefix}Page` : "page";
@@ -82,7 +97,7 @@ export function useServerPagination(options: UseServerPaginationOptions = {}) {
   // Read current state from URL params
   const page = parseInt(searchParams.get(pageParam) || "1", 10);
   const pageSize = parseInt(
-    searchParams.get(pageSizeParam) || String(defaultPageSize),
+    searchParams.get(pageSizeParam) || String(effectiveDefaultPageSize),
     10,
   );
 

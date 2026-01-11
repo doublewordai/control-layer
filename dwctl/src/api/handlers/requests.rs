@@ -156,53 +156,19 @@ mod tests {
     // Atomic counter to ensure unique correlation_ids across tests
     static CORRELATION_ID_COUNTER: AtomicI64 = AtomicI64::new(1);
 
-    // Helper function to insert test analytics data
-    async fn insert_test_analytics_data(
-        pool: &PgPool,
+    // Test analytics data parameters
+    struct TestAnalyticsData<'a> {
         timestamp: chrono::DateTime<chrono::Utc>,
-        model: &str,
-        status_code: i32,
-        duration_ms: f64,
-        prompt_tokens: i64,
-        completion_tokens: i64,
-    ) {
-        use uuid::Uuid;
-
-        let correlation_id = CORRELATION_ID_COUNTER.fetch_add(1, Ordering::SeqCst);
-
-        sqlx::query!(
-            r#"
-            INSERT INTO http_analytics (
-                instance_id, correlation_id, timestamp, uri, method, status_code, duration_ms,
-                model, prompt_tokens, completion_tokens, total_tokens
-            ) VALUES ($1, $2, $3, '/ai/chat/completions', 'POST', $4, $5, $6, $7, $8, $9)
-            "#,
-            Uuid::new_v4(),
-            correlation_id,
-            timestamp,
-            status_code,
-            duration_ms as i64,
-            model,
-            prompt_tokens,
-            completion_tokens,
-            prompt_tokens + completion_tokens
-        )
-        .execute(pool)
-        .await
-        .expect("Failed to insert test analytics data");
-    }
-
-    // Helper to insert analytics data with batch ID
-    async fn insert_test_analytics_with_batch(
-        pool: &PgPool,
-        timestamp: chrono::DateTime<chrono::Utc>,
-        model: &str,
+        model: &'a str,
         status_code: i32,
         duration_ms: f64,
         prompt_tokens: i64,
         completion_tokens: i64,
         fusillade_batch_id: Option<uuid::Uuid>,
-    ) {
+    }
+
+    // Helper function to insert test analytics data
+    async fn insert_test_analytics(pool: &PgPool, data: TestAnalyticsData<'_>) {
         use uuid::Uuid;
 
         let correlation_id = CORRELATION_ID_COUNTER.fetch_add(1, Ordering::SeqCst);
@@ -216,18 +182,18 @@ mod tests {
             "#,
             Uuid::new_v4(),
             correlation_id,
-            timestamp,
-            status_code,
-            duration_ms as i64,
-            model,
-            prompt_tokens,
-            completion_tokens,
-            prompt_tokens + completion_tokens,
-            fusillade_batch_id
+            data.timestamp,
+            data.status_code,
+            data.duration_ms as i64,
+            data.model,
+            data.prompt_tokens,
+            data.completion_tokens,
+            data.prompt_tokens + data.completion_tokens,
+            data.fusillade_batch_id
         )
         .execute(pool)
         .await
-        .expect("Failed to insert test analytics data with batch");
+        .expect("Failed to insert test analytics data");
     }
 
     #[sqlx::test]
@@ -268,8 +234,32 @@ mod tests {
     async fn test_list_requests_with_data(pool: PgPool) {
         // Insert test data
         let base_time = Utc::now() - Duration::hours(1);
-        insert_test_analytics_data(&pool, base_time, "gpt-4", 200, 100.0, 50, 25).await;
-        insert_test_analytics_data(&pool, base_time, "claude-3", 200, 150.0, 75, 35).await;
+        insert_test_analytics(
+            &pool,
+            TestAnalyticsData {
+                timestamp: base_time,
+                model: "gpt-4",
+                status_code: 200,
+                duration_ms: 100.0,
+                prompt_tokens: 50,
+                completion_tokens: 25,
+                fusillade_batch_id: None,
+            },
+        )
+        .await;
+        insert_test_analytics(
+            &pool,
+            TestAnalyticsData {
+                timestamp: base_time,
+                model: "claude-3",
+                status_code: 200,
+                duration_ms: 150.0,
+                prompt_tokens: 75,
+                completion_tokens: 35,
+                fusillade_batch_id: None,
+            },
+        )
+        .await;
 
         let (app, _bg_services) = create_test_app(pool.clone(), false).await;
         let admin_user = create_test_admin_user(&pool, Role::RequestViewer).await;
@@ -297,9 +287,45 @@ mod tests {
     async fn test_list_requests_with_model_filter(pool: PgPool) {
         // Insert test data for multiple models
         let base_time = Utc::now() - Duration::hours(1);
-        insert_test_analytics_data(&pool, base_time, "gpt-4", 200, 100.0, 50, 25).await;
-        insert_test_analytics_data(&pool, base_time, "gpt-4", 200, 120.0, 60, 30).await;
-        insert_test_analytics_data(&pool, base_time, "claude-3", 200, 150.0, 75, 35).await;
+        insert_test_analytics(
+            &pool,
+            TestAnalyticsData {
+                timestamp: base_time,
+                model: "gpt-4",
+                status_code: 200,
+                duration_ms: 100.0,
+                prompt_tokens: 50,
+                completion_tokens: 25,
+                fusillade_batch_id: None,
+            },
+        )
+        .await;
+        insert_test_analytics(
+            &pool,
+            TestAnalyticsData {
+                timestamp: base_time,
+                model: "gpt-4",
+                status_code: 200,
+                duration_ms: 120.0,
+                prompt_tokens: 60,
+                completion_tokens: 30,
+                fusillade_batch_id: None,
+            },
+        )
+        .await;
+        insert_test_analytics(
+            &pool,
+            TestAnalyticsData {
+                timestamp: base_time,
+                model: "claude-3",
+                status_code: 200,
+                duration_ms: 150.0,
+                prompt_tokens: 75,
+                completion_tokens: 35,
+                fusillade_batch_id: None,
+            },
+        )
+        .await;
 
         let (app, _bg_services) = create_test_app(pool.clone(), false).await;
         let admin_user = create_test_admin_user(&pool, Role::RequestViewer).await;
@@ -327,10 +353,58 @@ mod tests {
         let base_time = Utc::now() - Duration::hours(1);
 
         // Insert data for different batches
-        insert_test_analytics_with_batch(&pool, base_time, "gpt-4", 200, 100.0, 50, 25, Some(batch_id)).await;
-        insert_test_analytics_with_batch(&pool, base_time, "gpt-4", 200, 120.0, 60, 30, Some(batch_id)).await;
-        insert_test_analytics_with_batch(&pool, base_time, "claude-3", 200, 150.0, 75, 35, Some(other_batch_id)).await;
-        insert_test_analytics_with_batch(&pool, base_time, "claude-3", 200, 160.0, 80, 40, None).await;
+        insert_test_analytics(
+            &pool,
+            TestAnalyticsData {
+                timestamp: base_time,
+                model: "gpt-4",
+                status_code: 200,
+                duration_ms: 100.0,
+                prompt_tokens: 50,
+                completion_tokens: 25,
+                fusillade_batch_id: Some(batch_id),
+            },
+        )
+        .await;
+        insert_test_analytics(
+            &pool,
+            TestAnalyticsData {
+                timestamp: base_time,
+                model: "gpt-4",
+                status_code: 200,
+                duration_ms: 120.0,
+                prompt_tokens: 60,
+                completion_tokens: 30,
+                fusillade_batch_id: Some(batch_id),
+            },
+        )
+        .await;
+        insert_test_analytics(
+            &pool,
+            TestAnalyticsData {
+                timestamp: base_time,
+                model: "claude-3",
+                status_code: 200,
+                duration_ms: 150.0,
+                prompt_tokens: 75,
+                completion_tokens: 35,
+                fusillade_batch_id: Some(other_batch_id),
+            },
+        )
+        .await;
+        insert_test_analytics(
+            &pool,
+            TestAnalyticsData {
+                timestamp: base_time,
+                model: "claude-3",
+                status_code: 200,
+                duration_ms: 160.0,
+                prompt_tokens: 80,
+                completion_tokens: 40,
+                fusillade_batch_id: None,
+            },
+        )
+        .await;
 
         let (app, _bg_services) = create_test_app(pool.clone(), false).await;
         let admin_user = create_test_admin_user(&pool, Role::RequestViewer).await;
@@ -353,7 +427,19 @@ mod tests {
     async fn test_aggregate_requests_success(pool: PgPool) {
         // Insert analytics data to test aggregate functionality
         let base_time = Utc::now() - Duration::hours(1);
-        insert_test_analytics_data(&pool, base_time, "gpt-4", 200, 100.0, 50, 25).await;
+        insert_test_analytics(
+            &pool,
+            TestAnalyticsData {
+                timestamp: base_time,
+                model: "gpt-4",
+                status_code: 200,
+                duration_ms: 100.0,
+                prompt_tokens: 50,
+                completion_tokens: 25,
+                fusillade_batch_id: None,
+            },
+        )
+        .await;
 
         let (app, _bg_services) = create_test_app(pool.clone(), false).await;
         let admin_user = create_test_admin_user(&pool, Role::PlatformManager).await;
@@ -375,8 +461,32 @@ mod tests {
     async fn test_aggregate_requests_with_model_filter(pool: PgPool) {
         // Insert analytics data for multiple models
         let base_time = Utc::now() - Duration::hours(1);
-        insert_test_analytics_data(&pool, base_time, "gpt-4", 200, 100.0, 50, 25).await;
-        insert_test_analytics_data(&pool, base_time, "claude-3", 200, 150.0, 75, 35).await;
+        insert_test_analytics(
+            &pool,
+            TestAnalyticsData {
+                timestamp: base_time,
+                model: "gpt-4",
+                status_code: 200,
+                duration_ms: 100.0,
+                prompt_tokens: 50,
+                completion_tokens: 25,
+                fusillade_batch_id: None,
+            },
+        )
+        .await;
+        insert_test_analytics(
+            &pool,
+            TestAnalyticsData {
+                timestamp: base_time,
+                model: "claude-3",
+                status_code: 200,
+                duration_ms: 150.0,
+                prompt_tokens: 75,
+                completion_tokens: 35,
+                fusillade_batch_id: None,
+            },
+        )
+        .await;
 
         let (app, _bg_services) = create_test_app(pool.clone(), false).await;
         let admin_user = create_test_admin_user(&pool, Role::PlatformManager).await;

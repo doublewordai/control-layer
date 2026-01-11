@@ -12,8 +12,9 @@ import {
 } from "lucide-react";
 import { Card } from "../../../ui/card.tsx";
 import { Button } from "@/components";
-import { useState, useMemo } from "react";
-import { useNavigate } from "react-router-dom";
+import { useState, useMemo, useCallback } from "react";
+import { useNavigate, useSearchParams } from "react-router-dom";
+import { useServerPagination } from "@/hooks/useServerPagination";
 import {
   Select,
   SelectContent,
@@ -40,6 +41,7 @@ import type { Transaction } from "@/api/control-layer";
 import { useUserBalance, useTransactions, useUser } from "@/api/control-layer";
 import { useSettings } from "@/contexts";
 import { formatDollars } from "@/utils/money.ts";
+import { useDebounce } from "@/hooks/useDebounce";
 
 export type AddFundsConfig =
   | { type: "direct"; onAddFunds: () => void }
@@ -63,26 +65,57 @@ export function TransactionHistory({
   const { isFeatureEnabled } = useSettings();
   const isDemoMode = isFeatureEnabled("demo");
   const navigate = useNavigate();
+  const [searchParams, setSearchParams] = useSearchParams();
 
   // Fetch user info for display
   const { data: displayUser } = useUser(filterUserId || userId);
 
+  // Server-side pagination
+  const pagination = useServerPagination({ paramPrefix: "tx" });
+
+  // Read filter state from URL params
+  const transactionType = searchParams.get("txType") || "all";
+
+  // Local state for filters that don't need URL persistence
+  const [dateRange, setDateRange] = useState<
+    { from: Date; to: Date } | undefined
+  >();
+  const [searchTerm, setSearchTerm] = useState<string>("");
+  const debouncedSearch = useDebounce(searchTerm, 300);
+
   // Fetch balance and transactions
   const { refetch: refetchBalance } = useUserBalance(userId);
 
+  // Helper to map UI transaction type to API transaction_types
+  const getTransactionTypesParam = (type: string): string | undefined => {
+    if (type === "credit") return "admin_grant,purchase";
+    if (type === "debit") return "admin_removal,usage";
+    return undefined; // "all" means no filter
+  };
+
   // Always pass userId to filter transactions by the specific user
   // Backend enforces permissions: non-admins can only see their own transactions
+  // Pass all filters for server-side filtering and pagination
   const {
     data: transactionsResponse,
     isLoading: isLoadingTransactions,
     refetch: refetchTransactions,
-  } = useTransactions({ userId, group_batches: true });
+  } = useTransactions({
+    userId,
+    group_batches: true,
+    ...pagination.queryParams,
+    search: debouncedSearch.trim() || undefined,
+    transaction_types: getTransactionTypesParam(transactionType),
+    start_date: dateRange?.from?.toISOString(),
+    end_date: dateRange?.to?.toISOString(),
+  });
 
-  // Get transactions and page_start_balance from response
+  // Get transactions and metadata from response
   const transactions = useMemo<Transaction[]>(() => {
     return transactionsResponse?.data || [];
   }, [transactionsResponse]);
 
+  const totalCount = transactionsResponse?.total_count ?? 0;
   const pageStartBalance = transactionsResponse?.page_start_balance ?? 0;
 
   // Compute balance_after for each transaction
@@ -116,17 +149,6 @@ export function TransactionHistory({
 
   const isLoading = !isDemoMode && isLoadingTransactions;
 
-  // Filter states
-  const [transactionType, setTransactionType] = useState<string>("all");
-  const [dateRange, setDateRange] = useState<
-    { from: Date; to: Date } | undefined
-  >();
-  const [searchTerm, setSearchTerm] = useState<string>("");
-
-  // Pagination state
-  const [currentPage, setCurrentPage] = useState(1);
-  const itemsPerPage = 10;
-
   // Helper functions
   const formatDate = (isoString: string) => {
     const date = new Date(isoString);
@@ -139,95 +161,67 @@ export function TransactionHistory({
     }).format(date);
   };
 
-  // Apply filters
-  const filteredTransactions = useMemo(() => {
-    let filtered = [...transactions];
-
-    // Filter by specific user if provided
-    if (filterUserId) {
-      filtered = filtered.filter((t) => t.user_id === filterUserId);
-    }
-
-    // Filter by search term
-    if (searchTerm) {
-      const lowerSearch = searchTerm.toLowerCase();
-      filtered = filtered.filter((t) => {
-        const description = (t.description || "").toLowerCase();
-        const amount = formatDollars(t.amount).toLowerCase();
-        return (
-          description.includes(lowerSearch) || amount.includes(lowerSearch)
-        );
-      });
-    }
-
-    // Filter by transaction type
-    if (transactionType !== "all") {
-      // Map UI filter values to backend transaction types
-      if (transactionType === "credit") {
-        filtered = filtered.filter(
-          (t) =>
-            t.transaction_type === "admin_grant" ||
-            t.transaction_type === "purchase",
-        );
-      } else if (transactionType === "debit") {
-        filtered = filtered.filter(
-          (t) =>
-            t.transaction_type === "admin_removal" ||
-            t.transaction_type === "usage",
-        );
-      }
-    }
-
-    // Filter by date range
-    if (dateRange?.from && dateRange?.to) {
-      filtered = filtered.filter((t) => {
-        const transactionDate = new Date(t.created_at);
-        return (
-          transactionDate >= dateRange.from && transactionDate <= dateRange.to
-        );
-      });
-    }
-
-    return filtered;
-  }, [transactions, transactionType, dateRange, searchTerm, filterUserId]);
-
-  // Paginate filtered transactions
-  const paginatedTransactions = useMemo(() => {
-    const startIndex = (currentPage - 1) * itemsPerPage;
-    const endIndex = startIndex + itemsPerPage;
-    return filteredTransactions.slice(startIndex, endIndex);
-  }, [filteredTransactions, currentPage, itemsPerPage]);
-
-  const totalPages = Math.ceil(filteredTransactions.length / itemsPerPage);
+  // Calculate total pages from server response
+  const totalPages = Math.ceil(totalCount / pagination.pageSize);
 
   const hasActiveFilters =
     transactionType !== "all" || dateRange !== undefined || searchTerm !== "";
 
-  const clearFilters = () => {
-    setTransactionType("all");
+  // URL param update helper - updates params and resets to page 1
+  const updateUrlParamsAndResetPage = useCallback(
+    (updates: Record<string, string | null>) => {
+      setSearchParams((prev) => {
+        const next = new URLSearchParams(prev);
+        for (const [key, value] of Object.entries(updates)) {
+          if (value === null) {
+            next.delete(key);
+          } else {
+            next.set(key, value);
+          }
+        }
+        // Reset to page 1 when filters change
+        next.set("txPage", "1");
+        return next;
+      });
+    },
+    [setSearchParams],
+  );
+
+  const clearFilters = useCallback(() => {
     setDateRange(undefined);
     setSearchTerm("");
-    setCurrentPage(1); // Reset to first page when clearing filters
-  };
+    setSearchParams((prev) => {
+      const next = new URLSearchParams(prev);
+      next.delete("txType");
+      next.set("txPage", "1");
+      return next;
+    });
+  }, [setSearchParams]);
 
-  const handleTransactionTypeChange = (value: string) => {
-    setTransactionType(value);
-    setCurrentPage(1); // Reset to first page when filter changes
-  };
+  const handleTransactionTypeChange = useCallback(
+    (value: string) => {
+      updateUrlParamsAndResetPage({ txType: value === "all" ? null : value });
+    },
+    [updateUrlParamsAndResetPage],
+  );
 
   // Reset to page 1 when date range changes
-  const handleDateRangeChange = (
-    range: { from: Date; to: Date } | undefined,
-  ) => {
-    setDateRange(range);
-    setCurrentPage(1);
-  };
+  const handleDateRangeChange = useCallback(
+    (range: { from: Date; to: Date } | undefined) => {
+      setDateRange(range);
+      pagination.handleReset();
+    },
+    [pagination],
+  );
 
   // Reset to page 1 when search term changes
-  const handleSearchChange = (value: string) => {
-    setSearchTerm(value);
-    setCurrentPage(1);
-  };
+  const handleSearchChange = useCallback(
+    (value: string) => {
+      setSearchTerm(value);
+      pagination.handleReset();
+    },
+    [pagination],
+  );
 
   // Refresh handler
   const [isRefreshing, setIsRefreshing] = useState(false);
@@ -357,6 +351,24 @@ export function TransactionHistory({
               onChange={handleDateRangeChange}
             />
 
+            {/* Page Size Selector */}
+            <Select
+              value={pagination.pageSize.toString()}
+              onValueChange={(value) =>
+                pagination.handlePageSizeChange(parseInt(value, 10))
+              }
+            >
+              <SelectTrigger className="w-[80px]">
+                <SelectValue />
+              </SelectTrigger>
+              <SelectContent>
+                <SelectItem value="10">10</SelectItem>
+                <SelectItem value="20">20</SelectItem>
+                <SelectItem value="50">50</SelectItem>
+                <SelectItem value="100">100</SelectItem>
+              </SelectContent>
+            </Select>
+
             <Button
               variant="ghost"
               size="sm"
@@ -372,8 +384,9 @@ export function TransactionHistory({
           {/* Filter Status */}
           {hasActiveFilters && (
             <div className="text-sm text-doubleword-neutral-600">
-              Showing {filteredTransactions.length} of {transactions.length}{" "}
-              transactions
+              Showing {totalCount} filtered transaction
+              {totalCount !== 1 ? "s" : ""} (page {pagination.page} of{" "}
+              {totalPages || 1})
             </div>
           )}
         </div>
@@ -390,7 +403,7 @@ export function TransactionHistory({
               </TableRow>
             </TableHeader>
             <TableBody>
-              {paginatedTransactions.map((transaction) => {
+              {transactions.map((transaction) => {
                 // Determine if transaction is a credit (adds money) or debit (removes money)
                 const isCredit =
                   transaction.transaction_type === "admin_grant" ||
@@ -398,7 +411,14 @@ export function TransactionHistory({
 
                 const handleRowClick = () => {
                   if (transaction.batch_id) {
-                    navigate(`/batches/${transaction.batch_id}`);
+                    // Preserve current URL params when navigating to batch detail
+                    const currentParams = searchParams.toString();
+                    const fromUrl = currentParams
+                      ? `/cost-management?${currentParams}`
+                      : "/cost-management";
+                    navigate(
+                      `/batches/${transaction.batch_id}?from=${encodeURIComponent(fromUrl)}`,
+                    );
                   }
                 };
 
@@ -462,7 +482,7 @@ export function TransactionHistory({
                     <TableCell className="text-right">
                       <p className="text-sm text-doubleword-neutral-600">
                         {formatDollars(
-                          balanceByTransactionId.get(transaction.id) ?? 0
+                          balanceByTransactionId.get(transaction.id) ?? 0,
                         )}
                       </p>
                     </TableCell>
@@ -473,7 +493,7 @@ export function TransactionHistory({
           </Table>
         </div>
 
-        {filteredTransactions.length === 0 && (
+        {transactions.length === 0 && (
           <div className="text-center py-8">
             <DollarSign className="w-12 h-12 text-doubleword-neutral-300 mx-auto mb-3" />
             <p className="text-doubleword-neutral-600">
@@ -495,36 +515,42 @@ export function TransactionHistory({
         )}
 
         {/* Pagination Controls */}
-        {filteredTransactions.length > itemsPerPage && (
+        {totalCount > 0 && (
           <div className="flex items-center justify-between border-t border-doubleword-neutral-200 pt-2">
             <div className="text-sm text-doubleword-neutral-600">
-              Showing {(currentPage - 1) * itemsPerPage + 1} to{" "}
+              Showing {pagination.queryParams.skip + 1} to{" "}
               {Math.min(
-                currentPage * itemsPerPage,
-                filteredTransactions.length,
+                pagination.queryParams.skip + pagination.pageSize,
+                totalCount,
               )}{" "}
-              of {filteredTransactions.length} transactions
+              of {totalCount} transactions
             </div>
             <div className="flex items-center gap-2">
               <Button
                 variant="outline"
                 size="sm"
-                onClick={() => setCurrentPage((p) => Math.max(1, p - 1))}
-                disabled={currentPage === 1}
+                onClick={() => pagination.handlePageChange(1)}
+                disabled={pagination.page === 1}
+              >
+                First
+              </Button>
+              <Button
+                variant="outline"
+                size="sm"
+                onClick={() => pagination.handlePageChange(pagination.page - 1)}
+                disabled={pagination.page === 1}
               >
                 <ChevronLeft className="w-4 h-4" />
                 Previous
               </Button>
               <div className="text-sm text-doubleword-neutral-600">
-                Page {currentPage} of {totalPages}
+                Page {pagination.page} of {totalPages}
               </div>
               <Button
                 variant="outline"
                 size="sm"
-                onClick={() =>
-                  setCurrentPage((p) => Math.min(totalPages, p + 1))
-                }
-                disabled={currentPage === totalPages}
+                onClick={() => pagination.handlePageChange(pagination.page + 1)}
+                disabled={pagination.page >= totalPages}
               >
                 Next
                 <ChevronRight className="w-4 h-4" />
