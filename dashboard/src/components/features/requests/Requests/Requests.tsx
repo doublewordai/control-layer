@@ -63,9 +63,7 @@ export function Requests() {
   >(getDefaultDateRange());
 
   // Server-side pagination with hasMore detection
-  const pagination = useServerPagination({
-    defaultPageSize: 25,
-  });
+  const pagination = useServerPagination({});
 
   // Reset pagination when debounced search changes
   useEffect(() => {
@@ -372,7 +370,7 @@ export function Requests() {
                 hasPrevPage: hasPrevPage,
               }}
               showPageSizeSelector={true}
-              pageSizeOptions={[10, 25, 50, 100]}
+              pageSizeOptions={[10, 20, 50, 100]}
               isLoading={requestsLoading}
               emptyState={
                 <div className="text-center py-12">

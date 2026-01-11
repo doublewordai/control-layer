@@ -62,14 +62,14 @@ import { ApiError } from "./errors";
 
 // Optional override for AI API endpoints (files, batches, daemons)
 // Falls back to same origin if not set (relative paths)
-const AI_API_BASE_URL = import.meta.env.VITE_AI_API_BASE_URL || '';
+const AI_API_BASE_URL = import.meta.env.VITE_AI_API_BASE_URL || "";
 
 // Helper to construct AI API URLs - strips /ai prefix when using override domain
 const getAiApiUrl = (path: string): string => {
   if (AI_API_BASE_URL) {
     // When using api.doubleword.ai, strip /ai prefix because ingress adds it
     // Use lookahead to match /ai only when followed by / to avoid false matches
-    return `${AI_API_BASE_URL}${path.replace(/^\/ai(?=\/)/, '')}`;
+    return `${AI_API_BASE_URL}${path.replace(/^\/ai(?=\/)/, "")}`;
   }
   // When using same origin (app.doubleword.ai), keep /ai prefix
   return path;
@@ -81,7 +81,9 @@ const fetchAiApi = (path: string, init?: RequestInit): Promise<Response> => {
   // When making cross-origin requests, include credentials for session cookies
   const options: RequestInit = {
     ...init,
-    credentials: AI_API_BASE_URL ? 'include' : (init?.credentials || 'same-origin'),
+    credentials: AI_API_BASE_URL
+      ? "include"
+      : init?.credentials || "same-origin",
   };
   return fetch(url, options);
 };
@@ -98,6 +100,9 @@ const userApi = {
     }
     if (options?.limit !== undefined) {
       params.set("limit", options.limit.toString());
+    }
+    if (options?.search) {
+      params.set("search", options.search);
     }
 
     const url = `/admin/api/v1/users${params.toString() ? "?" + params.toString() : ""}`;
@@ -798,12 +803,20 @@ const authApi = {
 
 // Cost management API
 const costApi = {
-  async listTransactions(query?: TransactionsQuery): Promise<TransactionsListResponse> {
+  async listTransactions(
+    query?: TransactionsQuery,
+  ): Promise<TransactionsListResponse> {
     const params = new URLSearchParams();
     if (query?.limit) params.set("limit", query.limit.toString());
     if (query?.skip) params.set("skip", query.skip.toString());
     if (query?.userId) params.set("user_id", query.userId);
-    if (query?.group_batches !== undefined) params.set("group_batches", query.group_batches.toString());
+    if (query?.group_batches !== undefined)
+      params.set("group_batches", query.group_batches.toString());
+    if (query?.search) params.set("search", query.search);
+    if (query?.transaction_types)
+      params.set("transaction_types", query.transaction_types);
+    if (query?.start_date) params.set("start_date", query.start_date);
+    if (query?.end_date) params.set("end_date", query.end_date);
 
     const url = `/admin/api/v1/transactions${params.toString() ? "?" + params.toString() : ""}`;
     const response = await fetch(url);
@@ -1063,7 +1076,9 @@ const filesApi = {
     if (options?.purpose) params.set("purpose", options.purpose);
     if (options?.search) params.set("search", options.search);
 
-    const response = await fetchAiApi(`/ai/v1/files${params.toString() ? "?" + params.toString() : ""}`);
+    const response = await fetchAiApi(
+      `/ai/v1/files${params.toString() ? "?" + params.toString() : ""}`,
+    );
     if (!response.ok) {
       throw new Error(`Failed to fetch files: ${response.status}`);
     }
@@ -1179,7 +1194,9 @@ const filesApi = {
     if (options?.skip) params.set("skip", options.skip.toString());
     if (options?.search) params.set("search", options.search);
 
-    const response = await fetchAiApi(`/ai/v1/files/${id}/content${params.toString() ? "?" + params.toString() : ""}`);
+    const response = await fetchAiApi(
+      `/ai/v1/files/${id}/content${params.toString() ? "?" + params.toString() : ""}`,
+    );
     if (!response.ok) {
       throw new Error(`Failed to fetch file content: ${response.status}`);
     }
@@ -1199,8 +1216,10 @@ const filesApi = {
     if (completionWindow) {
       params.set("completion_window", completionWindow);
     }
-    
-    const response = await fetchAiApi(`/ai/v1/files/${id}/cost-estimate${params.toString() ? "?" + params.toString() : ""}`);
+
+    const response = await fetchAiApi(
+      `/ai/v1/files/${id}/cost-estimate${params.toString() ? "?" + params.toString() : ""}`,
+    );
     if (!response.ok) {
       throw new Error(`Failed to fetch file cost estimate: ${response.status}`);
     }
@@ -1215,7 +1234,9 @@ const batchesApi = {
     if (options?.limit) params.set("limit", options.limit.toString());
     if (options?.search) params.set("search", options.search);
 
-    const response = await fetchAiApi(`/ai/v1/batches${params.toString() ? "?" + params.toString() : ""}`);
+    const response = await fetchAiApi(
+      `/ai/v1/batches${params.toString() ? "?" + params.toString() : ""}`,
+    );
     if (!response.ok) {
       throw new Error(`Failed to fetch batches: ${response.status}`);
     }
@@ -1307,7 +1328,9 @@ const batchesApi = {
     }
 
     // Download the output file content
-    const response = await fetchAiApi(`/ai/v1/files/${batch.output_file_id}/content`);
+    const response = await fetchAiApi(
+      `/ai/v1/files/${batch.output_file_id}/content`,
+    );
     if (!response.ok) {
       throw new Error(`Failed to download batch results: ${response.status}`);
     }
@@ -1320,7 +1343,9 @@ const daemonsApi = {
     const params = new URLSearchParams();
     if (options?.status) params.set("status", options.status);
 
-    const response = await fetchAiApi(`/ai/v1/daemons${params.toString() ? "?" + params.toString() : ""}`);
+    const response = await fetchAiApi(
+      `/ai/v1/daemons${params.toString() ? "?" + params.toString() : ""}`,
+    );
     if (!response.ok) {
       throw new Error(`Failed to fetch daemons: ${response.status}`);
     }

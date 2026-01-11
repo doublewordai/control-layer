@@ -359,22 +359,6 @@ mod tests {
     use sqlx::PgPool;
     use uuid::Uuid;
 
-    /// Initialize the default crypto provider for rustls.
-    ///
-    /// Required because rustls 0.23+ needs an explicit crypto provider installed
-    /// when multiple providers (ring and aws-lc-rs) are available in the dependency tree.
-    /// In production, the database connection (made during Application::new) initializes
-    /// this automatically. In tests, we need to do it explicitly before creating Stripe clients.
-    fn init_crypto_provider() {
-        use std::sync::Once;
-        static INIT: Once = Once::new();
-        INIT.call_once(|| {
-            let _ = rustls::crypto::CryptoProvider::install_default(
-                rustls::crypto::aws_lc_rs::default_provider()
-            );
-        });
-    }
-
     /// Helper to create a test user in the database
     async fn create_test_user(pool: &PgPool) -> Uuid {
         let user = crate::test::utils::create_test_user(pool, crate::api::models::users::Role::StandardUser).await;
@@ -383,7 +367,6 @@ mod tests {
 
     #[test]
     fn test_stripe_provider_from_config() {
-        init_crypto_provider();
         let config = crate::config::StripeConfig {
             api_key: "sk_test_fake".to_string(),
             price_id: "price_fake".to_string(),
@@ -401,7 +384,6 @@ mod tests {
 
     #[test]
     fn test_stripe_provider_with_invoice_creation() {
-        init_crypto_provider();
         let config = crate::config::StripeConfig {
             api_key: "sk_test_fake".to_string(),
             price_id: "price_fake".to_string(),
@@ -416,7 +398,6 @@ mod tests {
 
     #[sqlx::test]
     async fn test_stripe_idempotency_fast_path(pool: PgPool) {
-        init_crypto_provider();
         // Test the fast path: transaction already exists in DB
         let user_id = create_test_user(&pool).await;
         let session_id = "cs_test_fake_session_123";

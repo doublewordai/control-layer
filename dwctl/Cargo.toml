@@ -1,6 +1,6 @@
 [package]
 name = "dwctl"
-version = "0.26.0"
+version = "0.28.2"
 edition = "2024"
 description = "The Doubleword Control Layer - A self-hostable observability and analytics platform for LLM applications"
 license = "MIT OR Apache-2.0"
@@ -19,7 +19,7 @@ embedded-db = ["dep:postgresql_embedded"]
 
 [dependencies]
 axum = { version = "0.8", features = ["multipart"] }
-fusillade = { version = "0.14.0" }
+fusillade = { version = "0.15.0" }
 tokio = { version = "1.0", features = ["full"] }
 tokio-stream = { version = "0.1", features = ["sync"] }
 tokio-util = "0.7"
@@ -107,6 +107,7 @@ async-stripe = { version = "1.0.0-rc.0", default-features = false, features = ["
 async-stripe-checkout = { version = "1.0.0-rc.0", features = ["checkout_session"] }
 async-stripe-webhook = { version = "1.0.0-rc.0", features = ["async-stripe-checkout", "deserialize"] }
 async-stripe-types = { version = "1.0.0-rc.0" }
+rustls = { version = "0.23", features = ["aws-lc-rs"] }
 async-stripe-billing = { version = "1.0.0-rc.0", features = ["billing_portal_session"] }
 
 [dev-dependencies]

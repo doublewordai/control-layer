@@ -103,10 +103,60 @@ pub struct ListTransactionsQuery {
     /// Group transactions by fusillade_batch_id (merges batch requests into single entries)
     pub group_batches: Option<bool>,
 
+    /// Search term for description (case-insensitive)
+    pub search: Option<String>,
+
+    /// Filter by transaction types (comma-separated: "admin_grant,purchase" or "usage,admin_removal")
+    pub transaction_types: Option<String>,
+
+    /// Filter transactions created on or after this date/time (ISO 8601 format)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[param(value_type = Option<String>, format = "date-time")]
+    pub start_date: Option<DateTime<Utc>>,
+
+    /// Filter transactions created on or before this date/time (ISO 8601 format)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[param(value_type = Option<String>, format = "date-time")]
+    pub end_date: Option<DateTime<Utc>>,
+
     /// Pagination parameters
     #[serde(flatten)]
     #[param(inline)]
     pub pagination: Pagination,
+}
+
+/// Internal filter struct for repository layer
+#[derive(Debug, Default, Clone)]
+pub struct TransactionFilters {
+    pub search: Option<String>,
+    pub transaction_types: Option<Vec<CreditTransactionType>>,
+    pub start_date: Option<DateTime<Utc>>,
+    pub end_date: Option<DateTime<Utc>>,
+}
+
+impl ListTransactionsQuery {
+    /// Parse query parameters into TransactionFilters struct
+    pub fn to_filters(&self) -> TransactionFilters {
+        let transaction_types = self.transaction_types.as_ref().map(|types_str| {
+            types_str
+                .split(',')
+                .filter_map(|t| match t.trim() {
+                    "admin_grant" => Some(CreditTransactionType::AdminGrant),
+                    "admin_removal" => Some(CreditTransactionType::AdminRemoval),
+                    "usage" => Some(CreditTransactionType::Usage),
+                    "purchase" => Some(CreditTransactionType::Purchase),
+                    _ => None,
+                })
+                .collect()
+        });
+
+        TransactionFilters {
+            search: self.search.clone(),
+            transaction_types,
+            start_date: self.start_date,
+            end_date: self.end_date,
+        }
+    }
 }
 
 // Conversions

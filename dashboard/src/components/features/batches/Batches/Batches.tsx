@@ -117,12 +117,10 @@ export function Batches({
   // Pagination hooks with prefixed URL params for multi-table support
   const filesPagination = useServerCursorPagination({
     paramPrefix: "files",
-    defaultPageSize: 10,
   });
 
   const batchesPagination = useServerCursorPagination({
     paramPrefix: "batches",
-    defaultPageSize: 10,
   });
 
   // API queries
@@ -285,7 +283,14 @@ export function Batches({
   // File actions
   const handleViewFileRequests = (file: FileObject) => {
     if ((file as any)._isEmpty) return;
-    navigate(`/batches/files/${file.id}/content?returnTab=${activeTab}`);
+    // Preserve current URL params when navigating to file content
+    const currentParams = searchParams.toString();
+    const fromUrl = currentParams
+      ? `/batches?${currentParams}`
+      : `/batches?tab=${activeTab}`;
+    navigate(
+      `/batches/files/${file.id}/content?from=${encodeURIComponent(fromUrl)}`,
+    );
   };
 
   const handleDeleteFile = (file: FileObject) => {
@@ -408,7 +413,10 @@ export function Batches({
 
   const handleBatchClick = (batch: Batch) => {
     if ((batch as any)._isEmpty) return;
-    navigate(`/batches/${batch.id}?from=/batches`);
+    // Preserve current URL params (pagination, search, filters) when navigating to batch detail
+    const currentParams = searchParams.toString();
+    const fromUrl = currentParams ? `/batches?${currentParams}` : "/batches";
+    navigate(`/batches/${batch.id}?from=${encodeURIComponent(fromUrl)}`);
   };
 
   const batchColumns = createBatchColumns({
@@ -574,7 +582,7 @@ export function Batches({
                   </SelectTrigger>
                   <SelectContent>
                     <SelectItem value="10">10</SelectItem>
-                    <SelectItem value="25">25</SelectItem>
+                    <SelectItem value="20">20</SelectItem>
                     <SelectItem value="50">50</SelectItem>
                     <SelectItem value="100">100</SelectItem>
                   </SelectContent>
@@ -615,7 +623,7 @@ export function Batches({
             pageSize={filesPagination.pageSize}
             minRows={filesPagination.pageSize}
             rowHeight="40px"
-            initialColumnVisibility={{ id: false }}
+            initialColumnVisibility={{}}
             isLoading={filesLoading}
             emptyState={
               <div className="text-center py-12">
@@ -704,7 +712,7 @@ export function Batches({
                   </SelectTrigger>
                   <SelectContent>
                     <SelectItem value="10">10</SelectItem>
-                    <SelectItem value="25">25</SelectItem>
+                    <SelectItem value="20">20</SelectItem>
                     <SelectItem value="50">50</SelectItem>
                     <SelectItem value="100">100</SelectItem>
                   </SelectContent>

@@ -362,6 +362,11 @@ prevent name clashes.
 - Write clear, descriptive commit messages
 - Focus on "why" not "what" (the diff shows what changed)
 - Reference issue numbers when applicable
+- Don't coauthor commits
+- Before commiting, run `just lint rust`, `just test rust` (if you've changed
+any rust code), `just lint ts`, and `just test ts` (if you've changed any ts
+code) to ensure code quality. NEVER PUSH ANY CODE THAT DOESN'T PASS ALL LINTS
+AND TESTS.
 
 **Performance:**
 
@@ -370,3 +375,4 @@ prevent name clashes.
 - Avoid N+1 queries - batch fetch related data when possible
 - To run sqlx migrations, navigate to the appropriate directory (dwctl, or fusillade/) and run `cargo sqlx migrate run`. NEVER try to run sqlx migrate run --source ... --database-url from the root.
 - Instead of calling 'tokio::time::sleep' in tests, try to poll until the condition you're waiting for becomes true. Assert both against the state its in at first, then the state it changes to. Then the tests 1. Aren't slow - because they can change state immediately, and 2. test against the whole flow - both before and after the condition becomes true
+

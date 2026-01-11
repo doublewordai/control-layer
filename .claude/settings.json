@@ -1,0 +1,13 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(just:*)",
+      "Bash(cargo:*)",
+      "Bash(npm:*)",
+      "Bash(sqlx:*)",
+      "Bash(hurl:*)",
+      "Bash(docker:*)"
+    ],
+    "deny": []
+  }
+}

@@ -1683,7 +1683,7 @@ mod tests {
         assert_eq!(access_info.system_api_key, system_key_secret);
 
         // Test with non-existent user - should return None
-        let nonexistent_user_id = uuid::Uuid::new_v4().into();
+        let nonexistent_user_id = uuid::Uuid::new_v4();
         let access_result = deployment_repo
             .check_user_access("access-test-alias", nonexistent_user_id)
             .await

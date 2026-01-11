@@ -199,25 +199,28 @@ pub async fn list_transactions(
     let mut pool_conn = state.db.acquire().await.map_err(|e| Error::Database(e.into()))?;
     let mut repo = Credits::new(&mut pool_conn);
 
+    // Parse filters from query
+    let filters = query.to_filters();
+
     // Batch grouping only works with a user filter (requires per-user batch_aggregates table)
     let grouping_enabled = query.group_batches.unwrap_or(false) && filter_user_id.is_some();
 
     // Get transactions for this page
     let (transactions, total_count) = if let (true, Some(user_id)) = (grouping_enabled, filter_user_id) {
-        let transactions_with_batches = repo.list_transactions_with_batches(user_id, skip, limit).await?;
-        let count = repo.count_transactions_with_batches(user_id).await?;
+        let transactions_with_batches = repo.list_transactions_with_batches(user_id, skip, limit, &filters).await?;
+        let count = repo.count_transactions_with_batches(user_id, &filters).await?;
         let txs: Vec<CreditTransactionResponse> = transactions_with_batches
             .into_iter()
             .map(|(tx, batch_id)| CreditTransactionResponse::from_db_with_batch_id(tx, batch_id))
             .collect();
         (txs, count)
     } else if let Some(user_id) = filter_user_id {
-        let txs = repo.list_user_transactions(user_id, skip, limit).await?;
-        let count = repo.count_user_transactions(user_id).await?;
+        let txs = repo.list_user_transactions(user_id, skip, limit, &filters).await?;
+        let count = repo.count_user_transactions(user_id, &filters).await?;
         (txs.into_iter().map(CreditTransactionResponse::from).collect(), count)
     } else {
-        let txs = repo.list_all_transactions(skip, limit).await?;
-        let count = repo.count_all_transactions().await?;
+        let txs = repo.list_all_transactions(skip, limit, &filters).await?;
+        let count = repo.count_all_transactions(&filters).await?;
         (txs.into_iter().map(CreditTransactionResponse::from).collect(), count)
     };
 
