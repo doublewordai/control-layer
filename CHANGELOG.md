@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.28.3](https://github.com/doublewordai/control-layer/compare/v0.28.2...v0.28.3) (2026-01-12)
+
+
+### Bug Fixes
+
+* need to expose certain custom headers when using cors (blocked by bro… ([#505](https://github.com/doublewordai/control-layer/issues/505)) ([dfd7694](https://github.com/doublewordai/control-layer/commit/dfd76942ff5cc3163c2ceec4ce28b3ea9d86396d))
+
 ## [0.28.2](https://github.com/doublewordai/control-layer/compare/v0.28.1...v0.28.2) (2026-01-09)
 
 
