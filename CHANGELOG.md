@@ -1,5 +1,17 @@
 # Changelog
 
+## [0.29.0](https://github.com/doublewordai/control-layer/compare/v0.28.3...v0.29.0) (2026-01-12)
+
+
+### Features
+
+* Batch request results view ([#484](https://github.com/doublewordai/control-layer/issues/484)) ([05fcf6f](https://github.com/doublewordai/control-layer/commit/05fcf6f17a92d8c62ba82d98294e50fc27ddfd49))
+
+
+### Bug Fixes
+
+* fixed progress bar round down for batch details page also ([#507](https://github.com/doublewordai/control-layer/issues/507)) ([da1dd84](https://github.com/doublewordai/control-layer/commit/da1dd845637af2fc783a10d41c35689ff715012d))
+
 ## [0.28.3](https://github.com/doublewordai/control-layer/compare/v0.28.2...v0.28.3) (2026-01-12)
 
 
