@@ -22,12 +22,17 @@ import {
 } from "../../../ui/dialog";
 import { CodeBlock } from "../../../ui/code-block";
 import { createBatchResultsColumns } from "./batch-results-columns";
+import type { BatchStatus } from "../../../../api/control-layer/types";
 
 interface BatchResultsProps {
   batchId: string;
+  batchStatus?: BatchStatus;
 }
 
-export default function BatchResults({ batchId }: BatchResultsProps) {
+export default function BatchResults({
+  batchId,
+  batchStatus,
+}: BatchResultsProps) {
   // Modal state for viewing content
   const [selectedResult, setSelectedResult] = useState<BatchResultItem | null>(
     null,
@@ -76,7 +81,7 @@ export default function BatchResults({ batchId }: BatchResultsProps) {
     setContentModalOpen(true);
   };
 
-  const columns = createBatchResultsColumns(handleViewContent);
+  const columns = createBatchResultsColumns(handleViewContent, batchStatus);
 
   return (
     <div>

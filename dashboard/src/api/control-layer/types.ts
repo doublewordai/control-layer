@@ -1031,7 +1031,8 @@ export type BatchResultStatus =
   | "pending"
   | "in_progress"
   | "completed"
-  | "failed";
+  | "failed"
+  | "cancelled";
 
 export interface BatchResultItem {
   /** Fusillade request ID (unique identifier) */

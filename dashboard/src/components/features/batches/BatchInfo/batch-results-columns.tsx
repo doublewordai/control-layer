@@ -1,6 +1,9 @@
 import { type ColumnDef } from "@tanstack/react-table";
 import { ArrowUpDown } from "lucide-react";
-import type { BatchResultItem } from "../../../../api/control-layer/types";
+import type {
+  BatchResultItem,
+  BatchStatus,
+} from "../../../../api/control-layer/types";
 
 /**
  * Button component to trigger viewing content
@@ -63,6 +66,7 @@ function StatusBadge({ status }: { status: BatchResultItem["status"] }) {
       label: "Completed",
     },
     failed: { bg: "bg-red-100", text: "text-red-800", label: "Failed" },
+    cancelled: { bg: "bg-gray-100", text: "text-gray-700", label: "Cancelled" },
   };
 
   const config = statusConfig[status] || statusConfig.pending;
@@ -81,6 +85,7 @@ export const createBatchResultsColumns = (
     result: BatchResultItem,
     contentType: "input" | "response",
   ) => void,
+  batchStatus?: BatchStatus,
 ): ColumnDef<BatchResultItem>[] => [
   {
     accessorKey: "custom_id",
@@ -119,7 +124,15 @@ export const createBatchResultsColumns = (
     accessorKey: "status",
     header: "Status",
     cell: ({ row }) => {
-      return <StatusBadge status={row.getValue("status")} />;
+      const status = row.getValue("status") as BatchResultItem["status"];
+      // Show cancelled for pending/in_progress requests when batch is cancelled
+      if (
+        batchStatus === "cancelled" &&
+        (status === "pending" || status === "in_progress")
+      ) {
+        return <StatusBadge status="cancelled" />;
+      }
+      return <StatusBadge status={status} />;
     },
   },
   {
@@ -137,12 +150,25 @@ export const createBatchResultsColumns = (
   },
   {
     id: "response",
-    header: "Response / Error",
+    header: "Response",
     cell: ({ row }) => {
       const result = row.original;
+      // Show cancelled for pending/in_progress requests when batch is cancelled
+      if (
+        batchStatus === "cancelled" &&
+        (result.status === "pending" || result.status === "in_progress")
+      ) {
+        return <span className="text-gray-400 italic text-sm">Cancelled</span>;
+      }
       // Don't show anything for pending/in_progress requests
       if (result.status === "pending" || result.status === "in_progress") {
-        return <span className="text-gray-400 italic text-sm">Processing...</span>;
+        return (
+          <span className="text-gray-400 italic text-sm">Processing...</span>
+        );
+      }
+      // Show cancelled message for cancelled requests
+      if (result.status === "cancelled") {
+        return <span className="text-gray-400 italic text-sm">Cancelled</span>;
       }
       return (
         <ContentButton
