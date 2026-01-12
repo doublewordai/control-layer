@@ -101,6 +101,9 @@ const userApi = {
     if (options?.limit !== undefined) {
       params.set("limit", options.limit.toString());
     }
+    if (options?.search) {
+      params.set("search", options.search);
+    }
 
     const url = `/admin/api/v1/users${params.toString() ? "?" + params.toString() : ""}`;
     const response = await fetch(url);
@@ -807,7 +810,11 @@ const costApi = {
     if (query?.limit) params.set("limit", query.limit.toString());
     if (query?.skip) params.set("skip", query.skip.toString());
     if (query?.userId) params.set("user_id", query.userId);
-    if (query?.group_batches !== undefined) params.set("group_batches", query.group_batches.toString());
+    if (query?.group_batches !== undefined)
+      params.set("group_batches", query.group_batches.toString());
+    if (query?.search) params.set("search", query.search);
+    if (query?.transaction_types)
+      params.set("transaction_types", query.transaction_types);
     if (query?.start_date) params.set("start_date", query.start_date);
     if (query?.end_date) params.set("end_date", query.end_date);
 

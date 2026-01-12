@@ -19,6 +19,7 @@ interface ComboboxProps {
   options: { value: string; label: string }[];
   value?: string;
   onValueChange?: (value: string) => void;
+  onSearchChange?: (search: string) => void;
   placeholder?: string;
   searchPlaceholder?: string;
   emptyMessage?: string;
@@ -30,6 +31,7 @@ export function Combobox({
   options,
   value,
   onValueChange,
+  onSearchChange,
   placeholder = "Select option...",
   searchPlaceholder = "Search options...",
   emptyMessage = "No option found.",
@@ -37,6 +39,12 @@ export function Combobox({
   allowClear = false,
 }: ComboboxProps) {
   const [open, setOpen] = React.useState(false);
+  const [searchValue, setSearchValue] = React.useState("");
+
+  const handleSearchChange = (search: string) => {
+    setSearchValue(search);
+    onSearchChange?.(search);
+  };
 
   return (
     <Popover open={open} onOpenChange={setOpen}>
@@ -59,8 +67,12 @@ export function Combobox({
         className="p-0"
         style={{ width: "var(--radix-popover-trigger-width)" }}
       >
-        <Command>
-          <CommandInput placeholder={searchPlaceholder} />
+        <Command shouldFilter={!onSearchChange}>
+          <CommandInput
+            placeholder={searchPlaceholder}
+            value={searchValue}
+            onValueChange={handleSearchChange}
+          />
           <CommandList>
             <CommandEmpty>{emptyMessage}</CommandEmpty>
             <CommandGroup>
