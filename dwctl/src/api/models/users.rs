@@ -60,6 +60,12 @@ pub struct UserResponse {
     pub groups: Option<Vec<GroupResponse>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub credit_balance: Option<f64>,
+    /// Indicates whether this user has an associated payment provider customer record.
+    ///
+    /// Note: This field replaces the previous `payment_provider_id` response field to avoid
+    /// exposing the underlying payment provider customer ID. API consumers that previously
+    /// relied on `payment_provider_id` should instead use this boolean flag and store or
+    /// manage any provider-specific identifiers on their own side.
     pub has_payment_provider_id: bool,
 }
 
