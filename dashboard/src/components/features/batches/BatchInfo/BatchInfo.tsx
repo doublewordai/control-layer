@@ -211,7 +211,7 @@ const BatchInfo: React.FC = () => {
 
   const progress =
     batch.request_counts.total > 0
-      ? Math.round(
+      ? Math.floor(
           ((batch.request_counts.completed + batch.request_counts.failed) /
             batch.request_counts.total) *
             100,
