@@ -1,5 +1,5 @@
 import { useState, useMemo } from "react";
-import { FileInput } from "lucide-react";
+import { FileInput, AlertCircle } from "lucide-react";
 import { useDebounce } from "../../../../hooks/useDebounce";
 import { DataTable } from "../../../ui/data-table";
 import { CursorPagination } from "../../../ui/cursor-pagination";
@@ -27,11 +27,13 @@ import type { BatchStatus } from "../../../../api/control-layer/types";
 interface BatchResultsProps {
   batchId: string;
   batchStatus?: BatchStatus;
+  inputFileDeleted?: boolean;
 }
 
 export default function BatchResults({
   batchId,
   batchStatus,
+  inputFileDeleted,
 }: BatchResultsProps) {
   // Modal state for viewing content
   const [selectedResult, setSelectedResult] = useState<BatchResultItem | null>(
@@ -104,16 +106,28 @@ export default function BatchResults({
         rowHeight="40px"
         emptyState={
           <div className="text-center py-12">
-            <div className="p-4 bg-doubleword-neutral-100 rounded-full w-16 h-16 mx-auto mb-4 flex items-center justify-center">
-              <FileInput className="w-8 h-8 text-doubleword-neutral-600" />
+            <div
+              className={`p-4 rounded-full w-16 h-16 mx-auto mb-4 flex items-center justify-center ${inputFileDeleted ? "bg-amber-100" : "bg-doubleword-neutral-100"}`}
+            >
+              {inputFileDeleted ? (
+                <AlertCircle className="w-8 h-8 text-amber-600" />
+              ) : (
+                <FileInput className="w-8 h-8 text-doubleword-neutral-600" />
+              )}
             </div>
             <h3 className="text-lg font-medium text-doubleword-neutral-900 mb-2">
-              {debouncedSearch ? "No matching results" : "No results yet"}
+              {debouncedSearch
+                ? "No matching results"
+                : inputFileDeleted
+                  ? "Input file has been deleted"
+                  : "No results yet"}
             </h3>
             <p className="text-doubleword-neutral-600">
               {debouncedSearch
                 ? "No results match your search. Try a different custom ID."
-                : "Results will appear here as requests are processed."}
+                : inputFileDeleted
+                  ? "The original input file for this batch is no longer available."
+                  : "Results will appear here as requests are processed."}
             </p>
           </div>
         }

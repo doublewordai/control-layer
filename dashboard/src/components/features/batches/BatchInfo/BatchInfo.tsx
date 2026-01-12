@@ -868,7 +868,11 @@ const BatchInfo: React.FC = () => {
         </TabsContent>
 
         <TabsContent value="results">
-          <BatchResults batchId={batchId!} batchStatus={batch.status} />
+          <BatchResults
+            batchId={batchId!}
+            batchStatus={batch.status}
+            inputFileDeleted={!batch.input_file_id}
+          />
         </TabsContent>
       </Tabs>
     </div>
