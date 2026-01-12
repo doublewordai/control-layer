@@ -784,6 +784,17 @@ fn create_cors_layer(config: &Config) -> anyhow::Result<CorsLayer> {
     }
 
     info!("Configuring CORS with allowed origins: {:?}", origins);
+
+    // Parse exposed headers as HeaderName
+    let exposed: Vec<http::HeaderName> = config
+        .auth
+        .security
+        .cors
+        .exposed_headers
+        .iter()
+        .filter_map(|h| h.parse().ok())
+        .collect();
+
     let mut cors = CorsLayer::new()
         .allow_origin(origins)
         .allow_methods([
@@ -796,7 +807,7 @@ fn create_cors_layer(config: &Config) -> anyhow::Result<CorsLayer> {
         ])
         .allow_headers([http::header::CONTENT_TYPE, http::header::AUTHORIZATION, http::header::ACCEPT])
         .allow_credentials(config.auth.security.cors.allow_credentials)
-        .expose_headers(vec![http::header::LOCATION]);
+        .expose_headers(exposed);
 
     if let Some(max_age) = config.auth.security.cors.max_age {
         cors = cors.max_age(std::time::Duration::from_secs(max_age));
