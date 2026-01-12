@@ -784,7 +784,7 @@ fn create_cors_layer(config: &Config) -> anyhow::Result<CorsLayer> {
     }
 
     info!("Configuring CORS with allowed origins: {:?}", origins);
-    
+
     // Parse exposed headers as HeaderName
     let exposed: Vec<http::HeaderName> = config
         .auth
