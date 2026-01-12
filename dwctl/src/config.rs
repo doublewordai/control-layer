@@ -637,6 +637,8 @@ pub struct CorsConfig {
     pub allow_credentials: bool,
     /// Cache preflight requests for this many seconds
     pub max_age: Option<u64>,
+    /// Custom headers to expose to the browser (in addition to CORS-safelisted headers)
+    pub exposed_headers: Vec<String>,
 }
 
 /// Email configuration for password resets and notifications.
@@ -1197,6 +1199,7 @@ impl Default for CorsConfig {
             ],
             allow_credentials: true,
             max_age: Some(3600), // Cache preflight for 1 hour
+            exposed_headers: vec!["location".to_string()],
         }
     }
 }
