@@ -5,15 +5,16 @@ use rust_decimal::Decimal;
 use sqlx::PgPool;
 use std::sync::Once;
 use stripe::Client;
+use stripe_checkout::checkout_session::{
+    CreateCheckoutSessionInvoiceCreation, CreateCheckoutSessionNameCollection, CreateCheckoutSessionNameCollectionBusiness,
+};
 use stripe_checkout::{
     CheckoutSessionId, CheckoutSessionMode, CheckoutSessionPaymentStatus, CheckoutSessionUiMode,
     checkout_session::{
-        CreateCheckoutSession, CreateCheckoutSessionAutomaticTax,
-        CreateCheckoutSessionCustomerCreation, CreateCheckoutSessionLineItems,
+        CreateCheckoutSession, CreateCheckoutSessionAutomaticTax, CreateCheckoutSessionCustomerCreation, CreateCheckoutSessionLineItems,
         CreateCheckoutSessionTaxIdCollection, RetrieveCheckoutSession,
     },
 };
-use stripe_checkout::checkout_session::{CreateCheckoutSessionInvoiceCreation, CreateCheckoutSessionNameCollection, CreateCheckoutSessionNameCollectionBusiness};
 use stripe_types::Currency;
 use stripe_webhook::{EventObject, Webhook};
 
@@ -35,9 +36,7 @@ static INIT_CRYPTO: Once = Once::new();
 /// Safe to call multiple times - will only initialize once.
 fn ensure_crypto_provider() {
     INIT_CRYPTO.call_once(|| {
-        rustls::crypto::aws_lc_rs::default_provider()
-            .install_default()
-            .ok(); // Ignore error if already installed by main.rs
+        rustls::crypto::aws_lc_rs::default_provider().install_default().ok(); // Ignore error if already installed by main.rs
     });
 }
 
@@ -76,9 +75,10 @@ impl PaymentProvider for StripeProvider {
             .client_reference_id(recipient_id) // This is who will receive the credits
             .currency(Currency::USD)
             .line_items(vec![CreateCheckoutSessionLineItems {
-            price: Some(self.config.price_id.clone()),
-            quantity: Some(1),
-            ..Default::default()}])
+                price: Some(self.config.price_id.clone()),
+                quantity: Some(1),
+                ..Default::default()
+            }])
             .automatic_tax(CreateCheckoutSessionAutomaticTax::new(true))
             .mode(CheckoutSessionMode::Payment)
             .ui_mode(CheckoutSessionUiMode::Hosted)
@@ -121,15 +121,15 @@ impl PaymentProvider for StripeProvider {
         );
 
         // If we didn't have a customer ID before, save the newly created one
-        if user.payment_provider_id.is_none() {
-            if let Some(customer) = &checkout_session.customer {
-                let customer_id = customer.id().to_string();
-                tracing::debug!("Saving newly created customer ID {} for user {}", customer_id, user.id);
+        if user.payment_provider_id.is_none()
+            && let Some(customer) = &checkout_session.customer
+        {
+            let customer_id = customer.id().to_string();
+            tracing::debug!("Saving newly created customer ID {} for user {}", customer_id, user.id);
 
-                sqlx::query!("UPDATE users SET payment_provider_id = $1 WHERE id = $2", customer_id, user.id)
-                    .execute(db_pool)
-                    .await?;
-            }
+            sqlx::query!("UPDATE users SET payment_provider_id = $1 WHERE id = $2", customer_id, user.id)
+                .execute(db_pool)
+                .await?;
         }
 
         // Return checkout URL for hosted checkout
@@ -308,8 +308,9 @@ impl PaymentProvider for StripeProvider {
 
         // Convert Stripe event to our generic WebhookEvent
         let session_id = match &event.data.object {
-            EventObject::CheckoutSessionCompleted(session)
-            | EventObject::CheckoutSessionAsyncPaymentSucceeded(session) => Some(session.id.to_string()),
+            EventObject::CheckoutSessionCompleted(session) | EventObject::CheckoutSessionAsyncPaymentSucceeded(session) => {
+                Some(session.id.to_string())
+            }
             _ => None,
         };
 
