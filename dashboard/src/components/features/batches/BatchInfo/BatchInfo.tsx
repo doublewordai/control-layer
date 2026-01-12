@@ -15,6 +15,8 @@ import {
   ExternalLink,
   Info,
   List,
+  Download,
+  ChevronDown,
 } from "lucide-react";
 import {
   useBatch,
@@ -26,8 +28,18 @@ import { Badge } from "../../../ui/badge";
 import { Button } from "../../../ui/button";
 import { Skeleton } from "../../../ui/skeleton";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "../../../ui/tabs";
+import {
+  DropdownMenu,
+  DropdownMenuContent,
+  DropdownMenuItem,
+  DropdownMenuTrigger,
+} from "../../../ui/dropdown-menu";
 import type { BatchStatus } from "../../../../api/control-layer/types";
 import { useAuthorization } from "../../../../utils/authorization";
+import {
+  getBatchDownloadFilename,
+  downloadFile,
+} from "../../../../utils/batch";
 import BatchResults from "./BatchResults";
 
 const BatchInfo: React.FC = () => {
@@ -76,6 +88,14 @@ const BatchInfo: React.FC = () => {
   const handleRetry = () => {
     if (batchId) {
       retryMutation.mutate(batchId);
+    }
+  };
+
+  const handleDownload = async (fileId: string, filename: string) => {
+    try {
+      await downloadFile(`/ai/v1/files/${fileId}/content`, filename);
+    } catch (error) {
+      console.error("Download failed:", error);
     }
   };
 
@@ -303,6 +323,63 @@ const BatchInfo: React.FC = () => {
                       Results
                     </TabsTrigger>
                   </TabsList>
+                  <DropdownMenu>
+                    <DropdownMenuTrigger asChild>
+                      <Button
+                        variant="outline"
+                        disabled={
+                          !batch.input_file_id &&
+                          !batch.output_file_id &&
+                          !batch.error_file_id
+                        }
+                      >
+                        <Download className="h-4 w-4 mr-2" />
+                        Download
+                        <ChevronDown className="h-4 w-4 ml-2" />
+                      </Button>
+                    </DropdownMenuTrigger>
+                    <DropdownMenuContent align="end">
+                      {batch.input_file_id && (
+                        <DropdownMenuItem
+                          onClick={() =>
+                            handleDownload(
+                              batch.input_file_id!,
+                              getBatchDownloadFilename(batchId!, "input"),
+                            )
+                          }
+                        >
+                          <FileInput className="h-4 w-4 mr-2" />
+                          Input File
+                        </DropdownMenuItem>
+                      )}
+                      {batch.output_file_id && (
+                        <DropdownMenuItem
+                          onClick={() =>
+                            handleDownload(
+                              batch.output_file_id!,
+                              getBatchDownloadFilename(batchId!, "output"),
+                            )
+                          }
+                        >
+                          <FileCheck className="h-4 w-4 mr-2" />
+                          Output File
+                        </DropdownMenuItem>
+                      )}
+                      {batch.error_file_id && (
+                        <DropdownMenuItem
+                          onClick={() =>
+                            handleDownload(
+                              batch.error_file_id!,
+                              getBatchDownloadFilename(batchId!, "error"),
+                            )
+                          }
+                        >
+                          <AlertCircle className="h-4 w-4 mr-2" />
+                          Error File
+                        </DropdownMenuItem>
+                      )}
+                    </DropdownMenuContent>
+                  </DropdownMenu>
                 </div>
               </div>
             </div>

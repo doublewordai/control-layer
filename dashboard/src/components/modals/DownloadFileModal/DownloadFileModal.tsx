@@ -23,6 +23,7 @@ import {
 import { toast } from "sonner";
 import { useCreateApiKey } from "../../../api/control-layer/hooks";
 import { AlertBox } from "@/components/ui/alert-box";
+import { getBatchDownloadFilename, downloadFile } from "../../../utils/batch";
 
 interface DownloadFileModalProps {
   isOpen: boolean;
@@ -109,28 +110,12 @@ export function DownloadFileModal({
           ? `/ai/v1/files/${resourceId}/content`
           : `/ai/v1/batches/${resourceId}/output`;
 
-      const response = await fetch(endpoint, {
-        headers: {
-          Authorization: `Bearer ${localStorage.getItem("auth_token") || ""}`,
-        },
-      });
-
-      if (!response.ok) {
-        throw new Error("Download failed");
-      }
-
-      const blob = await response.blob();
-      const url = window.URL.createObjectURL(blob);
-      const a = document.createElement("a");
-      a.href = url;
-      a.download =
+      const downloadFilename =
         resourceType === "file"
           ? filename || "downloaded_file.jsonl"
-          : `batch_results_${resourceId}.jsonl`;
-      document.body.appendChild(a);
-      a.click();
-      window.URL.revokeObjectURL(url);
-      document.body.removeChild(a);
+          : getBatchDownloadFilename(resourceId, "output");
+
+      await downloadFile(endpoint, downloadFilename);
 
       toast.success("File downloaded successfully!");
     } catch (error) {
@@ -197,7 +182,7 @@ headers = {
 response = requests.get(url, headers=headers)
 
 # Save to file
-with open("batch_results_${resourceId}.jsonl", "wb") as f:
+with open("${getBatchDownloadFilename(resourceId, "output")}", "wb") as f:
     f.write(response.content)
 
 print("Results downloaded successfully!")`;
@@ -269,7 +254,7 @@ const blob = await response.blob();
 // Save to file
 const arrayBuffer = await blob.arrayBuffer();
 const buffer = Buffer.from(arrayBuffer);
-fs.writeFileSync('batch_results_${resourceId}.jsonl', buffer);
+fs.writeFileSync('${getBatchDownloadFilename(resourceId, "output")}', buffer);
 
 console.log('Results downloaded successfully!');`;
     }
@@ -300,7 +285,7 @@ curl -i -X GET "${getBaseUrl()}/files/${resourceId}/content" \\
     } else {
       return `curl -X GET "${getBaseUrl()}/batches/${resourceId}/output" \\
   -H "Authorization: Bearer ${keyValue}" \\
-  -o "batch_results_${resourceId}.jsonl"`;
+  -o "${getBatchDownloadFilename(resourceId, "output")}"`;
     }
   };
 
