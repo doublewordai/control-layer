@@ -376,9 +376,10 @@ pub async fn get_batch_results(
     // Stream the batch results as JSONL
     let offset = query.pagination.skip.unwrap_or(0) as usize;
     let search = query.search.clone();
+    let status = query.status.clone();
     let results_stream = state
         .request_manager
-        .get_batch_results_stream(fusillade::BatchId(batch_id), offset, search);
+        .get_batch_results_stream(fusillade::BatchId(batch_id), offset, search, status);
 
     // Apply limit if specified, fetching one extra to detect if there are more results
     let requested_limit = query.pagination.limit.map(|l| l as usize);
@@ -394,16 +395,13 @@ pub async fn get_batch_results(
     // Collect items to determine if we need to truncate and set headers
     let items: Vec<_> = results_stream.collect().await;
 
-    // Check if there's more data available
-    let has_more_paginated = if let Some(req_limit) = requested_limit {
+    // Check if there's more data available (more pages to paginate through)
+    // The result set is fixed (one entry per input template), we're just waiting for status changes
+    let has_more = if let Some(req_limit) = requested_limit {
         items.len() > req_limit
     } else {
         false
     };
-
-    // Check if batch is still in progress (more results may come)
-    let batch_in_progress = batch.pending_requests > 0 || batch.in_progress_requests > 0;
-    let has_more = has_more_paginated || batch_in_progress;
 
     // Truncate to requested limit if we fetched extra
     let items_to_return = if let Some(req_limit) = requested_limit {

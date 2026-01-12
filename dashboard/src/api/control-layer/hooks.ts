@@ -990,14 +990,21 @@ export function useDownloadBatchResults() {
 
 export function useBatchResults(
   id: string,
-  options?: { limit?: number; skip?: number; search?: string },
+  options?: {
+    limit?: number;
+    skip?: number;
+    search?: string;
+    status?: string;
+    enabled?: boolean;
+  },
 ) {
   const queryClient = useQueryClient();
+  const { enabled = true, ...queryOptions } = options || {};
 
   return useQuery({
-    queryKey: queryKeys.batches.resultsList(id, options || {}),
-    queryFn: () => dwctlApi.batches.getBatchResults(id, options),
-    enabled: !!id,
+    queryKey: queryKeys.batches.resultsList(id, queryOptions),
+    queryFn: () => dwctlApi.batches.getBatchResults(id, queryOptions),
+    enabled: !!id && enabled,
     // Prefetch next page
     select: (data) => {
       if (data.incomplete && options?.limit && options?.skip !== undefined) {

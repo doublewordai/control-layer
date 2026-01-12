@@ -1303,12 +1303,18 @@ const batchesApi = {
 
   async getBatchResults(
     id: string,
-    options?: { limit?: number; skip?: number; search?: string },
+    options?: {
+      limit?: number;
+      skip?: number;
+      search?: string;
+      status?: string;
+    },
   ): Promise<{ content: string; incomplete: boolean; lastLine: number }> {
     const params = new URLSearchParams();
     if (options?.limit) params.set("limit", options.limit.toString());
     if (options?.skip) params.set("skip", options.skip.toString());
     if (options?.search) params.set("search", options.search);
+    if (options?.status) params.set("status", options.status);
 
     const response = await fetchAiApi(
       `/ai/v1/batches/${id}/results${params.toString() ? "?" + params.toString() : ""}`,

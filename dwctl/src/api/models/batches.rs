@@ -297,4 +297,7 @@ pub struct BatchResultsQuery {
 
     /// Search query to filter by custom_id (case-insensitive substring match)
     pub search: Option<String>,
+
+    /// Filter by request status (completed, failed, pending, in_progress)
+    pub status: Option<String>,
 }

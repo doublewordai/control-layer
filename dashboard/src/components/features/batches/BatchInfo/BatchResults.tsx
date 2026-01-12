@@ -48,16 +48,22 @@ export default function BatchResults({
   const [searchInput, setSearchInput] = useState("");
   const debouncedSearch = useDebounce(searchInput, 300);
 
+  // Status filter state
+  const [statusFilter, setStatusFilter] = useState<string>("all");
+
   // Use pagination hook for URL-based pagination state
   const pagination = useServerPagination({});
 
-  // Build query params with search
+  // Build query params with search and status filter
   const queryParams = useMemo(
     () => ({
       ...pagination.queryParams,
       search: debouncedSearch || undefined,
+      status: statusFilter !== "all" ? statusFilter : undefined,
+      // Skip fetching if input file was deleted - there are no results to show
+      enabled: !inputFileDeleted,
     }),
-    [pagination.queryParams, debouncedSearch],
+    [pagination.queryParams, debouncedSearch, statusFilter, inputFileDeleted],
   );
 
   // Fetch batch results with pagination and search
@@ -116,7 +122,7 @@ export default function BatchResults({
               )}
             </div>
             <h3 className="text-lg font-medium text-doubleword-neutral-900 mb-2">
-              {debouncedSearch
+              {debouncedSearch || statusFilter !== "all"
                 ? "No matching results"
                 : inputFileDeleted
                   ? "Input file has been deleted"
@@ -125,31 +131,57 @@ export default function BatchResults({
             <p className="text-doubleword-neutral-600">
               {debouncedSearch
                 ? "No results match your search. Try a different custom ID."
-                : inputFileDeleted
-                  ? "The original input file for this batch is no longer available."
-                  : "Results will appear here as requests are processed."}
+                : statusFilter !== "all"
+                  ? `No results with status "${statusFilter.replace("_", " ")}".`
+                  : inputFileDeleted
+                    ? "The original input file for this batch is no longer available."
+                    : "Results will appear here as requests are processed."}
             </p>
           </div>
         }
         headerActions={
-          <div className="flex items-center gap-2">
-            <span className="text-sm text-gray-600">Rows:</span>
-            <Select
-              value={pagination.pageSize.toString()}
-              onValueChange={(value) => {
-                pagination.handlePageSizeChange(Number(value));
-              }}
-            >
-              <SelectTrigger className="w-20 h-8">
-                <SelectValue />
-              </SelectTrigger>
-              <SelectContent>
-                <SelectItem value="10">10</SelectItem>
-                <SelectItem value="20">20</SelectItem>
-                <SelectItem value="50">50</SelectItem>
-                <SelectItem value="100">100</SelectItem>
-              </SelectContent>
-            </Select>
+          <div className="flex items-center gap-4">
+            <div className="flex items-center gap-2">
+              <span className="text-sm text-gray-600">Status:</span>
+              <Select
+                value={statusFilter}
+                onValueChange={(value) => {
+                  setStatusFilter(value);
+                  pagination.handleReset();
+                }}
+              >
+                <SelectTrigger className="w-32 h-8">
+                  <SelectValue />
+                </SelectTrigger>
+                <SelectContent>
+                  <SelectItem value="all">All</SelectItem>
+                  <SelectItem value="completed">Completed</SelectItem>
+                  <SelectItem value="failed">Failed</SelectItem>
+                  <SelectItem value="pending">Pending</SelectItem>
+                  <SelectItem value="in_progress">In Progress</SelectItem>
+                  <SelectItem value="cancelled">Cancelled</SelectItem>
+                </SelectContent>
+              </Select>
+            </div>
+            <div className="flex items-center gap-2">
+              <span className="text-sm text-gray-600">Rows:</span>
+              <Select
+                value={pagination.pageSize.toString()}
+                onValueChange={(value) => {
+                  pagination.handlePageSizeChange(Number(value));
+                }}
+              >
+                <SelectTrigger className="w-20 h-8">
+                  <SelectValue />
+                </SelectTrigger>
+                <SelectContent>
+                  <SelectItem value="10">10</SelectItem>
+                  <SelectItem value="20">20</SelectItem>
+                  <SelectItem value="50">50</SelectItem>
+                  <SelectItem value="100">100</SelectItem>
+                </SelectContent>
+              </Select>
+            </div>
           </div>
         }
       />
