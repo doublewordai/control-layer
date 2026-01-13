@@ -120,7 +120,7 @@ impl From<CompositeModel> for CompositeModelDBResponse {
         let lb_strategy = m
             .lb_strategy
             .as_deref()
-            .and_then(LoadBalancingStrategy::from_str)
+            .and_then(LoadBalancingStrategy::try_parse)
             .unwrap_or_default();
 
         Self {
@@ -474,7 +474,7 @@ impl<'c> CompositeModels<'c> {
         enabled: Option<bool>,
     ) -> Result<CompositeModelComponentDBResponse> {
         if let Some(w) = weight
-            && (w < 1 || w > 100)
+            && !(1..=100).contains(&w)
         {
             return Err(DbError::InvalidModelField { field: "weight" });
         }
@@ -763,9 +763,9 @@ mod tests {
                 let create_request = CompositeModelCreateDBRequest::builder()
                     .created_by(user.id)
                     .alias("test-composite".to_string())
-                    .description(Some("Test composite model".to_string()))
-                    .model_type(ModelType::Chat)
-                    .capacity(100)
+                    .maybe_description(Some("Test composite model".to_string()))
+                    .maybe_model_type(Some(ModelType::Chat))
+                    .maybe_capacity(Some(100))
                     .build();
 
                 model = repo.create(&create_request).await.unwrap();

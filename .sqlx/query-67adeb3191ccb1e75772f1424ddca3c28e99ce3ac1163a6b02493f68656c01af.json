@@ -1,0 +1,117 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n            INSERT INTO composite_models (\n                alias, description, model_type, requests_per_second, burst_size,\n                capacity, batch_capacity, lb_strategy, fallback_enabled,\n                fallback_on_rate_limit, fallback_on_status, created_by\n            )\n            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)\n            RETURNING *\n            ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "id",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 1,
+        "name": "alias",
+        "type_info": "Varchar"
+      },
+      {
+        "ordinal": 2,
+        "name": "description",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 3,
+        "name": "model_type",
+        "type_info": "Varchar"
+      },
+      {
+        "ordinal": 4,
+        "name": "requests_per_second",
+        "type_info": "Float4"
+      },
+      {
+        "ordinal": 5,
+        "name": "burst_size",
+        "type_info": "Int4"
+      },
+      {
+        "ordinal": 6,
+        "name": "capacity",
+        "type_info": "Int4"
+      },
+      {
+        "ordinal": 7,
+        "name": "batch_capacity",
+        "type_info": "Int4"
+      },
+      {
+        "ordinal": 8,
+        "name": "created_by",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 9,
+        "name": "created_at",
+        "type_info": "Timestamptz"
+      },
+      {
+        "ordinal": 10,
+        "name": "updated_at",
+        "type_info": "Timestamptz"
+      },
+      {
+        "ordinal": 11,
+        "name": "lb_strategy",
+        "type_info": "Varchar"
+      },
+      {
+        "ordinal": 12,
+        "name": "fallback_enabled",
+        "type_info": "Bool"
+      },
+      {
+        "ordinal": 13,
+        "name": "fallback_on_rate_limit",
+        "type_info": "Bool"
+      },
+      {
+        "ordinal": 14,
+        "name": "fallback_on_status",
+        "type_info": "Int4Array"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Varchar",
+        "Text",
+        "Varchar",
+        "Float4",
+        "Int4",
+        "Int4",
+        "Int4",
+        "Varchar",
+        "Bool",
+        "Bool",
+        "Int4Array",
+        "Uuid"
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      true,
+      true,
+      true,
+      true,
+      true,
+      true,
+      false,
+      false,
+      false,
+      true,
+      true,
+      true,
+      true
+    ]
+  },
+  "hash": "67adeb3191ccb1e75772f1424ddca3c28e99ce3ac1163a6b02493f68656c01af"
+}

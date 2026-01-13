@@ -196,9 +196,7 @@ impl OnwardsConfigSync {
                                         info!("Loaded {} targets from database", new_targets.targets.len());
                                         for entry in new_targets.targets.iter() {
                                             let alias = entry.key();
-                                            let target = entry.value();
-                                            debug!("Target '{}': {} keys configured", alias,
-                                                  target.keys.as_ref().map(|k| k.len()).unwrap_or(0));
+                                            debug!("Target '{}' loaded", alias);
                                         }
 
                                         // Update daemon capacity limits if configured
@@ -603,6 +601,7 @@ use crate::types::CompositeModelId;
 
 /// Data structure for composite model components (prepared for onwards integration)
 #[derive(Debug, Clone)]
+#[allow(dead_code)]
 struct CompositeModelComponent {
     weight: i32,
     // Component target info (from the underlying deployed_model)
@@ -611,6 +610,7 @@ struct CompositeModelComponent {
 
 /// Data structure for composite models (prepared for onwards integration)
 #[derive(Debug, Clone)]
+#[allow(dead_code)]
 struct OnwardsCompositeModel {
     id: CompositeModelId,
     alias: String,
@@ -632,6 +632,7 @@ struct OnwardsCompositeModel {
 
 /// Loads composite models with their components and API keys from the database
 #[tracing::instrument(skip(db))]
+#[allow(dead_code)]
 async fn load_composite_models_from_db(db: &PgPool) -> Result<Vec<OnwardsCompositeModel>, anyhow::Error> {
     debug!("Loading composite models from database");
 
@@ -748,7 +749,7 @@ async fn load_composite_models_from_db(db: &PgPool) -> Result<Vec<OnwardsComposi
             let lb_strategy = row
                 .lb_strategy
                 .as_deref()
-                .and_then(LoadBalancingStrategy::from_str)
+                .and_then(LoadBalancingStrategy::try_parse)
                 .unwrap_or_default();
 
             OnwardsCompositeModel {
@@ -813,6 +814,7 @@ async fn load_composite_models_from_db(db: &PgPool) -> Result<Vec<OnwardsComposi
 ///
 /// Uses onwards 0.10.0 weighted provider types for load balancing across
 /// multiple underlying deployed models.
+#[allow(dead_code)]
 fn convert_composite_to_target_spec(
     composite: &OnwardsCompositeModel,
     key_definitions: &mut HashMap<String, KeyDefinition>,
@@ -919,24 +921,25 @@ fn convert_composite_to_target_spec(
                 max_concurrent_requests: capacity as usize,
             });
 
-            ProviderSpec::builder()
-                .url(target.endpoint_url.clone())
-                .onwards_key(target.endpoint_api_key.clone())
-                .onwards_model(target.model_name.clone())
-                .weight(component.weight.max(1) as u32)
-                .rate_limit(provider_rate_limit)
-                .concurrency_limit(provider_concurrency_limit)
-                .upstream_auth_header_name(if target.auth_header_name != "Authorization" {
+            ProviderSpec {
+                url: target.endpoint_url.clone(),
+                onwards_key: target.endpoint_api_key.clone(),
+                onwards_model: Some(target.model_name.clone()),
+                weight: component.weight.max(1) as u32,
+                rate_limit: provider_rate_limit,
+                concurrency_limit: provider_concurrency_limit,
+                upstream_auth_header_name: if target.auth_header_name != "Authorization" {
                     Some(target.auth_header_name.clone())
                 } else {
                     None
-                })
-                .upstream_auth_header_prefix(if target.auth_header_prefix != "Bearer " {
+                },
+                upstream_auth_header_prefix: if target.auth_header_prefix != "Bearer " {
                     Some(target.auth_header_prefix.clone())
                 } else {
                     None
-                })
-                .build()
+                },
+                response_headers: None,
+            }
         })
         .collect();
 
@@ -949,20 +952,22 @@ fn convert_composite_to_target_spec(
     );
 
     // Create PoolSpec with weighted providers
-    let pool_spec = PoolSpec::builder()
-        .keys(keys)
-        .rate_limit(rate_limit)
-        .concurrency_limit(concurrency_limit)
-        .fallback(fallback)
-        .strategy(strategy)
-        .providers(providers)
-        .build();
+    let pool_spec = PoolSpec {
+        keys,
+        rate_limit,
+        concurrency_limit,
+        fallback,
+        strategy,
+        providers,
+        response_headers: None,
+    };
 
     (composite.alias.clone(), TargetSpecOrList::Pool(pool_spec))
 }
 
 /// Converts both regular targets and composite models to ConfigFile format
 #[tracing::instrument(skip(targets, composites))]
+#[allow(dead_code)]
 fn convert_to_config_file_with_composites(targets: Vec<OnwardsTarget>, composites: Vec<OnwardsCompositeModel>) -> ConfigFile {
     let mut key_definitions = HashMap::new();
 
@@ -1074,6 +1079,7 @@ fn convert_to_config_file_with_composites(targets: Vec<OnwardsTarget>, composite
 
 /// Loads the current targets configuration from the database (including composite models)
 #[tracing::instrument(skip(db))]
+#[allow(dead_code)]
 pub async fn load_targets_from_db_with_composites(db: &PgPool) -> Result<Targets, anyhow::Error> {
     let query_start = std::time::Instant::now();
     debug!("Loading onwards targets from database (with composite models)");
@@ -1245,6 +1251,7 @@ async fn update_daemon_capacity_limits(db: &PgPool, limits: &Arc<dashmap::DashMa
 mod tests {
     use std::{str::FromStr, time::Duration};
 
+    use onwards::target::TargetSpecOrList;
     use tokio::{sync::mpsc, time::timeout};
     use tokio_util::sync::CancellationToken;
     use uuid::Uuid;
@@ -1282,16 +1289,24 @@ mod tests {
 
         // Check model1 (using alias as key)
         let target1 = &config.targets["gpt4-alias"];
-        assert_eq!(target1.url.as_str(), "https://api.openai.com/");
-        assert_eq!(target1.onwards_model, Some("gpt-4".to_string()));
-        // Since we provided empty key data, targets should have no keys configured
-        assert!(target1.keys.is_none() || target1.keys.as_ref().unwrap().is_empty());
+        if let TargetSpecOrList::Single(spec) = target1 {
+            assert_eq!(spec.url.as_str(), "https://api.openai.com/");
+            assert_eq!(spec.onwards_model, Some("gpt-4".to_string()));
+            // Since we provided empty key data, targets should have no keys configured
+            assert!(spec.keys.is_none() || spec.keys.as_ref().unwrap().is_empty());
+        } else {
+            panic!("Expected Single target spec");
+        }
 
         // Check model2 (using alias as key)
         let target2 = &config.targets["claude-alias"];
-        assert_eq!(target2.url.as_str(), "https://api.anthropic.com/");
-        assert_eq!(target2.onwards_model, Some("claude-3".to_string()));
-        assert!(target2.keys.is_none() || target2.keys.as_ref().unwrap().is_empty());
+        if let TargetSpecOrList::Single(spec) = target2 {
+            assert_eq!(spec.url.as_str(), "https://api.anthropic.com/");
+            assert_eq!(spec.onwards_model, Some("claude-3".to_string()));
+            assert!(spec.keys.is_none() || spec.keys.as_ref().unwrap().is_empty());
+        } else {
+            panic!("Expected Single target spec");
+        }
     }
 
     #[test]

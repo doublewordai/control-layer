@@ -29,7 +29,7 @@ impl LoadBalancingStrategy {
         }
     }
 
-    pub fn from_str(s: &str) -> Option<Self> {
+    pub fn try_parse(s: &str) -> Option<Self> {
         match s {
             "weighted_random" => Some(Self::WeightedRandom),
             "priority" => Some(Self::Priority),

@@ -1,0 +1,107 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n            SELECT cm.*\n            FROM composite_models cm\n            JOIN composite_model_groups cmg ON cmg.composite_model_id = cm.id\n            WHERE cm.alias = $1\n            AND cmg.group_id IN (\n                SELECT ug.group_id FROM user_groups ug WHERE ug.user_id = $2\n                UNION\n                SELECT '00000000-0000-0000-0000-000000000000'::uuid\n                WHERE $2 != '00000000-0000-0000-0000-000000000000'::uuid\n            )\n            LIMIT 1\n            ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "id",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 1,
+        "name": "alias",
+        "type_info": "Varchar"
+      },
+      {
+        "ordinal": 2,
+        "name": "description",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 3,
+        "name": "model_type",
+        "type_info": "Varchar"
+      },
+      {
+        "ordinal": 4,
+        "name": "requests_per_second",
+        "type_info": "Float4"
+      },
+      {
+        "ordinal": 5,
+        "name": "burst_size",
+        "type_info": "Int4"
+      },
+      {
+        "ordinal": 6,
+        "name": "capacity",
+        "type_info": "Int4"
+      },
+      {
+        "ordinal": 7,
+        "name": "batch_capacity",
+        "type_info": "Int4"
+      },
+      {
+        "ordinal": 8,
+        "name": "created_by",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 9,
+        "name": "created_at",
+        "type_info": "Timestamptz"
+      },
+      {
+        "ordinal": 10,
+        "name": "updated_at",
+        "type_info": "Timestamptz"
+      },
+      {
+        "ordinal": 11,
+        "name": "lb_strategy",
+        "type_info": "Varchar"
+      },
+      {
+        "ordinal": 12,
+        "name": "fallback_enabled",
+        "type_info": "Bool"
+      },
+      {
+        "ordinal": 13,
+        "name": "fallback_on_rate_limit",
+        "type_info": "Bool"
+      },
+      {
+        "ordinal": 14,
+        "name": "fallback_on_status",
+        "type_info": "Int4Array"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Text",
+        "Uuid"
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      true,
+      true,
+      true,
+      true,
+      true,
+      true,
+      false,
+      false,
+      false,
+      true,
+      true,
+      true,
+      true
+    ]
+  },
+  "hash": "16e48928479c21725ddd98892a9807f241eed81435fa585e31072ab8b73d83eb"
+}

@@ -5,7 +5,7 @@
 
 use super::groups::GroupResponse;
 use super::pagination::Pagination;
-use crate::db::models::composite_models::{CompositeModelComponent, CompositeModelDBResponse, FallbackConfig, LoadBalancingStrategy};
+use crate::db::models::composite_models::{CompositeModelDBResponse, FallbackConfig, LoadBalancingStrategy};
 use crate::db::models::deployments::ModelType;
 use crate::types::{CompositeModelId, DeploymentId, GroupId, UserId};
 use chrono::{DateTime, Utc};

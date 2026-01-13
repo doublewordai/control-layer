@@ -14,7 +14,7 @@ use crate::{
         pagination::PaginatedResponse,
         users::CurrentUser,
     },
-    auth::permissions::{RequiresPermission, can_read_all_resources, has_permission, operation, resource},
+    auth::permissions::{RequiresPermission, can_read_all_resources, operation, resource},
     db::{
         handlers::{CompositeModels, Deployments, Groups, Repository, composite_models::CompositeModelFilter},
         models::composite_models::{
@@ -337,7 +337,7 @@ pub async fn create_composite_model(
         .maybe_burst_size(create.burst_size)
         .maybe_capacity(create.capacity)
         .maybe_batch_capacity(create.batch_capacity)
-        .lb_strategy(Some(create.lb_strategy))
+        .lb_strategy(create.lb_strategy)
         .maybe_fallback_enabled(fallback_enabled)
         .maybe_fallback_on_rate_limit(fallback_on_rate_limit)
         .maybe_fallback_on_status(fallback_on_status)
@@ -615,21 +615,25 @@ pub async fn add_composite_model_component(
     let mut tx = state.db.begin().await.map_err(|e| Error::Database(e.into()))?;
 
     // Verify composite model exists
-    let mut repo = CompositeModels::new(tx.acquire().await.map_err(|e| Error::Database(e.into()))?);
-    if repo.get_by_id(id).await?.is_none() {
-        return Err(Error::NotFound {
-            resource: "composite-model".to_string(),
-            id: id.to_string(),
-        });
+    {
+        let mut repo = CompositeModels::new(tx.acquire().await.map_err(|e| Error::Database(e.into()))?);
+        if repo.get_by_id(id).await?.is_none() {
+            return Err(Error::NotFound {
+                resource: "composite-model".to_string(),
+                id: id.to_string(),
+            });
+        }
     }
 
     // Verify deployment exists
-    let mut deployments_repo = Deployments::new(tx.acquire().await.map_err(|e| Error::Database(e.into()))?);
-    if deployments_repo.get_by_id(deployment_id).await?.is_none() {
-        return Err(Error::NotFound {
-            resource: "deployment".to_string(),
-            id: deployment_id.to_string(),
-        });
+    {
+        let mut deployments_repo = Deployments::new(tx.acquire().await.map_err(|e| Error::Database(e.into()))?);
+        if deployments_repo.get_by_id(deployment_id).await?.is_none() {
+            return Err(Error::NotFound {
+                resource: "deployment".to_string(),
+                id: deployment_id.to_string(),
+            });
+        }
     }
 
     let request = CompositeModelComponentCreateDBRequest {
@@ -639,7 +643,10 @@ pub async fn add_composite_model_component(
         enabled: component.enabled,
     };
 
-    repo.add_component(&request).await?;
+    {
+        let mut repo = CompositeModels::new(tx.acquire().await.map_err(|e| Error::Database(e.into()))?);
+        repo.add_component(&request).await?;
+    }
 
     tx.commit().await.map_err(|e| Error::Database(e.into()))?;
 
@@ -820,21 +827,25 @@ pub async fn add_composite_model_group(
     let mut tx = state.db.begin().await.map_err(|e| Error::Database(e.into()))?;
 
     // Verify composite model exists
-    let mut composite_repo = CompositeModels::new(tx.acquire().await.map_err(|e| Error::Database(e.into()))?);
-    if composite_repo.get_by_id(id).await?.is_none() {
-        return Err(Error::NotFound {
-            resource: "composite-model".to_string(),
-            id: id.to_string(),
-        });
+    {
+        let mut composite_repo = CompositeModels::new(tx.acquire().await.map_err(|e| Error::Database(e.into()))?);
+        if composite_repo.get_by_id(id).await?.is_none() {
+            return Err(Error::NotFound {
+                resource: "composite-model".to_string(),
+                id: id.to_string(),
+            });
+        }
     }
 
     // Verify group exists
-    let mut groups_repo = Groups::new(tx.acquire().await.map_err(|e| Error::Database(e.into()))?);
-    if groups_repo.get_by_id(group_id).await?.is_none() {
-        return Err(Error::NotFound {
-            resource: "group".to_string(),
-            id: group_id.to_string(),
-        });
+    {
+        let mut groups_repo = Groups::new(tx.acquire().await.map_err(|e| Error::Database(e.into()))?);
+        if groups_repo.get_by_id(group_id).await?.is_none() {
+            return Err(Error::NotFound {
+                resource: "group".to_string(),
+                id: group_id.to_string(),
+            });
+        }
     }
 
     let request = CompositeModelGroupCreateDBRequest {
@@ -843,7 +854,10 @@ pub async fn add_composite_model_group(
         granted_by: Some(current_user.id),
     };
 
-    composite_repo.add_group(&request).await?;
+    {
+        let mut composite_repo = CompositeModels::new(tx.acquire().await.map_err(|e| Error::Database(e.into()))?);
+        composite_repo.add_group(&request).await?;
+    }
 
     tx.commit().await.map_err(|e| Error::Database(e.into()))?;
 
@@ -896,7 +910,7 @@ pub async fn remove_composite_model_group(
 }
 
 fn validate_component_weight(weight: i32) -> Result<()> {
-    if weight < 1 || weight > 100 {
+    if !(1..=100).contains(&weight) {
         return Err(Error::BadRequest {
             message: "Weight must be between 1 and 100".to_string(),
         });

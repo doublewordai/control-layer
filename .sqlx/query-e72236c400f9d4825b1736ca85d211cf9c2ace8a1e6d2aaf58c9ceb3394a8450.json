@@ -1,0 +1,14 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "DELETE FROM composite_model_groups WHERE composite_model_id = $1",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Uuid"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "e72236c400f9d4825b1736ca85d211cf9c2ace8a1e6d2aaf58c9ceb3394a8450"
+}
