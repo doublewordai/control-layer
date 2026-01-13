@@ -806,14 +806,12 @@ pub struct DaemonConfig {
     /// and returned to pending (milliseconds). This handles daemon crashes during execution. (default: 600000 = 10 minutes)
     pub processing_timeout_ms: u64,
 
-    /// Per-model priority endpoint configurations for SLA escalation
+    /// Per-model configurations for SLA escalation
     /// Parameters:
-    ///     * endpoint: model endpoint name to route escalation to
-    ///     * api_key: optional env variable name for the original. Note different from fusillade config, we use an env var here
-    /// for security so we can pass in api keys at runtime.
-    ///     * path_overwrite: optional path to use instead of the original
-    ///     * model_overwrite: optional model to use instead of the original
-    pub priority_endpoints: HashMap<String, fusillade::PriorityEndpointConfig>,
+    ///     * escalation_model: model to use instead of the original for escalations
+    ///     * escalation_api_key: optional env variable name for the escalation API key used to authenticate escalated requests.
+    ///       Note: different from fusillade config, we use an env var here for security so we can pass in API keys at runtime.
+    pub model_escalations: HashMap<String, fusillade::ModelEscalationConfig>,
 
     /// How often to check for batches approaching SLA deadlines (seconds)
     pub sla_check_interval_seconds: u64,
@@ -883,7 +881,7 @@ impl Default for DaemonConfig {
             claim_timeout_ms: 60000,
             processing_timeout_ms: 600000,
             batch_metadata_fields: default_batch_metadata_fields_dwctl(),
-            priority_endpoints: HashMap::new(),
+            model_escalations: HashMap::new(),
             sla_check_interval_seconds: 60,
             sla_thresholds: vec![],
         }
@@ -902,16 +900,16 @@ impl DaemonConfig {
     ) -> fusillade::daemon::DaemonConfig {
         // For security we pass in api keys as env vars. Here we read them into config passed to fusillade.
         // If the env var is not set, we keep the original value (useful for testing).
-        let mut priority_endpoints_map = self.priority_endpoints.clone();
-        for (_, endpoint) in priority_endpoints_map.iter_mut() {
-            if let Some(env_var_or_key) = endpoint.api_key.as_ref().cloned() {
+        let mut model_escalations_map = self.model_escalations.clone();
+        for (_, escalation) in model_escalations_map.iter_mut() {
+            if let Some(env_var_or_key) = escalation.escalation_api_key.as_ref().cloned() {
                 match std::env::var(&env_var_or_key) {
                     Err(_) => {
-                        warn!("Priority endpoint configured with api_key - env var not found, using as literal value");
+                        warn!("Model escalation configured with api_key - env var not found, using as literal value");
                         // Keep the original value (could be a literal key for testing)
                     }
                     Ok(value) => {
-                        endpoint.api_key = Some(value);
+                        escalation.escalation_api_key = Some(value);
                     }
                 }
             }
@@ -931,7 +929,7 @@ impl DaemonConfig {
             claim_timeout_ms: self.claim_timeout_ms,
             processing_timeout_ms: self.processing_timeout_ms,
             batch_metadata_fields: self.batch_metadata_fields.clone(),
-            priority_endpoints: Arc::new(DashMap::from_iter(priority_endpoints_map)),
+            model_escalations: Arc::new(DashMap::from_iter(model_escalations_map)),
             sla_check_interval_seconds: self.sla_check_interval_seconds,
             sla_thresholds: self.sla_thresholds.clone(),
             ..Default::default()
