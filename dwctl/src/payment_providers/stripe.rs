@@ -7,7 +7,10 @@ use std::collections::HashMap;
 use std::sync::Once;
 use stripe::Client;
 use stripe_checkout::checkout_session::{
+    CreateCheckoutSessionCustomerUpdate, CreateCheckoutSessionCustomerUpdateAddress, CreateCheckoutSessionCustomerUpdateName,
     CreateCheckoutSessionInvoiceCreation, CreateCheckoutSessionNameCollection, CreateCheckoutSessionNameCollectionBusiness,
+    CreateCheckoutSessionNameCollectionIndividual, CreateCheckoutSessionSavedPaymentMethodOptions,
+    CreateCheckoutSessionSavedPaymentMethodOptionsPaymentMethodRemove, CreateCheckoutSessionSavedPaymentMethodOptionsPaymentMethodSave,
 };
 use stripe_billing::billing_portal_session::CreateBillingPortalSession;
 use stripe_checkout::{
@@ -83,6 +86,16 @@ impl PaymentProvider for StripeProvider {
             .name_collection(CreateCheckoutSessionNameCollection {
                 business: Some(CreateCheckoutSessionNameCollectionBusiness::new(true)),
                 individual: None,
+            })
+            .customer_update(CreateCheckoutSessionCustomerUpdate {
+                address: Some(CreateCheckoutSessionCustomerUpdateAddress::Auto),
+                name: Some(CreateCheckoutSessionCustomerUpdateName::Auto),
+                shipping: None,
+            })
+            .saved_payment_method_options(CreateCheckoutSessionSavedPaymentMethodOptions {
+                allow_redisplay_filters: None,
+                payment_method_save: Some(CreateCheckoutSessionSavedPaymentMethodOptionsPaymentMethodSave::Enabled),
+                payment_method_remove: Some(CreateCheckoutSessionSavedPaymentMethodOptionsPaymentMethodRemove::Enabled),
             });
 
         if let Some(user_receiving_credits) = creditee_id {
@@ -245,13 +258,13 @@ impl PaymentProvider for StripeProvider {
                 && users
                     .set_payment_provider_id_if_empty(payment_session.creditor_id, provider_id)
                     .await?
-                {
-                    tracing::info!(
-                        "Saved newly created stripe ID {} for user ID {}",
-                        provider_id,
-                        payment_session.creditor_id
-                    );
-                }
+            {
+                tracing::info!(
+                    "Saved newly created stripe ID {} for user ID {}",
+                    provider_id,
+                    payment_session.creditor_id
+                );
+            }
 
             description
         };
