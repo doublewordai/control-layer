@@ -8,7 +8,7 @@ use axum::http::StatusCode;
 use rust_decimal::Decimal;
 use sqlx::PgPool;
 
-use crate::{api::models::users::CurrentUser, config::PaymentConfig, UserId};
+use crate::{UserId, api::models::users::CurrentUser, config::PaymentConfig};
 
 pub mod dummy;
 pub mod stripe;

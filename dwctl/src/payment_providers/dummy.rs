@@ -151,7 +151,11 @@ impl PaymentProvider for DummyProvider {
         let mut credits = Credits::new(&mut conn);
         credits.create_transaction(&request).await?;
 
-        tracing::info!("Successfully fulfilled checkout session {} for user {}", session_id, payment_session.creditee_id);
+        tracing::info!(
+            "Successfully fulfilled checkout session {} for user {}",
+            session_id,
+            payment_session.creditee_id
+        );
         Ok(())
     }
 

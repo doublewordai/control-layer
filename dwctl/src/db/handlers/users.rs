@@ -626,11 +626,7 @@ impl<'c> Users<'c> {
     /// Set the payment provider ID for a user if it's not already set
     /// Returns true if the ID was updated, false if the user already had one or user not found
     #[instrument(skip(self), err)]
-    pub async fn set_payment_provider_id_if_empty(
-        &mut self,
-        user_id: UserId,
-        payment_provider_id: &str,
-    ) -> Result<bool> {
+    pub async fn set_payment_provider_id_if_empty(&mut self, user_id: UserId, payment_provider_id: &str) -> Result<bool> {
         let rows_affected = sqlx::query!(
             "UPDATE users SET payment_provider_id = $1 WHERE id = $2 AND payment_provider_id IS NULL",
             payment_provider_id,

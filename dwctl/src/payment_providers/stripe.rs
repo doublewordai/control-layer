@@ -240,11 +240,17 @@ impl PaymentProvider for StripeProvider {
             };
 
             // Save the customer ID if we don't have one yet, so we can offer the billing portal
-            if let Some(ref provider_id) = payment_session.payment_provider_id {
-                if users.set_payment_provider_id_if_empty(payment_session.creditor_id, provider_id).await? {
-                    tracing::info!("Saved newly created stripe ID {} for user ID {}", provider_id, payment_session.creditor_id);
+            if let Some(ref provider_id) = payment_session.payment_provider_id
+                && users
+                    .set_payment_provider_id_if_empty(payment_session.creditor_id, provider_id)
+                    .await?
+                {
+                    tracing::info!(
+                        "Saved newly created stripe ID {} for user ID {}",
+                        provider_id,
+                        payment_session.creditor_id
+                    );
                 }
-            }
 
             description
         };
@@ -262,7 +268,11 @@ impl PaymentProvider for StripeProvider {
         let mut credits = Credits::new(&mut conn);
         credits.create_transaction(&request).await?;
 
-        tracing::info!("Successfully fulfilled checkout session {} for user {}", session_id, payment_session.creditee_id);
+        tracing::info!(
+            "Successfully fulfilled checkout session {} for user {}",
+            session_id,
+            payment_session.creditee_id
+        );
         Ok(())
     }
 

@@ -222,15 +222,13 @@ pub async fn process_payment(
         }))
         .into_response()),
         Err(e) => match e {
-            payment_providers::PaymentError::PaymentNotCompleted => {
-                Ok((
-                    StatusCode::PAYMENT_REQUIRED,
-                    Json(json!({
-                        "message": "Payment is still processing. Please check back in a moment."
-                    })),
-                )
-                    .into_response())
-            }
+            payment_providers::PaymentError::PaymentNotCompleted => Ok((
+                StatusCode::PAYMENT_REQUIRED,
+                Json(json!({
+                    "message": "Payment is still processing. Please check back in a moment."
+                })),
+            )
+                .into_response()),
             payment_providers::PaymentError::AlreadyProcessed => {
                 tracing::trace!("Transaction already processed (idempotent)");
                 Ok(Json(json!({
@@ -248,7 +246,7 @@ pub async fn process_payment(
                 )
                     .into_response())
             }
-        }
+        },
     }
 }
 
