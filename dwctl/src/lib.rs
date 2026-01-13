@@ -952,6 +952,34 @@ pub async fn build_router(state: &mut AppState, onwards_router: Router) -> anyho
         .route("/models/{id}", get(api::handlers::deployments::get_deployed_model))
         .route("/models/{id}", patch(api::handlers::deployments::update_deployed_model))
         .route("/models/{id}", delete(api::handlers::deployments::delete_deployed_model))
+        // Composite models endpoints
+        .route("/composite-models", get(api::handlers::composite_models::list_composite_models))
+        .route("/composite-models", post(api::handlers::composite_models::create_composite_model))
+        .route("/composite-models/{id}", get(api::handlers::composite_models::get_composite_model))
+        .route("/composite-models/{id}", patch(api::handlers::composite_models::update_composite_model))
+        .route("/composite-models/{id}", delete(api::handlers::composite_models::delete_composite_model))
+        .route("/composite-models/{id}/components", get(api::handlers::composite_models::get_composite_model_components))
+        .route(
+            "/composite-models/{id}/components/{deployment_id}",
+            post(api::handlers::composite_models::add_composite_model_component),
+        )
+        .route(
+            "/composite-models/{id}/components/{deployment_id}",
+            patch(api::handlers::composite_models::update_composite_model_component),
+        )
+        .route(
+            "/composite-models/{id}/components/{deployment_id}",
+            delete(api::handlers::composite_models::remove_composite_model_component),
+        )
+        .route("/composite-models/{id}/groups", get(api::handlers::composite_models::get_composite_model_groups))
+        .route(
+            "/composite-models/{id}/groups/{group_id}",
+            post(api::handlers::composite_models::add_composite_model_group),
+        )
+        .route(
+            "/composite-models/{id}/groups/{group_id}",
+            delete(api::handlers::composite_models::remove_composite_model_group),
+        )
         // Groups management
         .route("/groups", get(api::handlers::groups::list_groups))
         .route("/groups", post(api::handlers::groups::create_group))

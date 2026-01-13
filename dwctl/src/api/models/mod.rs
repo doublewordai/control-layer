@@ -5,6 +5,7 @@
 pub mod api_keys;
 pub mod auth;
 pub mod batches;
+pub mod composite_models;
 pub mod daemons;
 pub mod deployments;
 pub mod files;

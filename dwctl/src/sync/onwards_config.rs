@@ -576,6 +576,123 @@ fn convert_to_config_file(targets: Vec<OnwardsTarget>) -> ConfigFile {
     }
 }
 
+// ===== Composite Models Support =====
+// Composite models are virtual models that distribute requests across multiple
+// underlying deployed models based on configurable weights.
+//
+// TODO: Full integration requires `onwards` crate to support weighted targets:
+// ```
+// {"targets": {"gpt-4": [
+//   {"url": "...", "onwards_key": "key1", "weight": 2},
+//   {"url": "...", "onwards_key": "key2", "weight": 1}
+// ]}}
+// ```
+//
+// The database schema and API handlers are ready. Once `onwards` supports weighted
+// targets, uncomment and integrate the composite model loading below.
+
+/// Data structure for composite model components (prepared for onwards integration)
+#[allow(dead_code)]
+#[derive(Debug, Clone)]
+struct CompositeModelComponent {
+    deployed_model_id: DeploymentId,
+    weight: i32,
+    enabled: bool,
+    // Component target info (from the underlying deployed_model)
+    target: OnwardsTarget,
+}
+
+/// Data structure for composite models (prepared for onwards integration)
+#[allow(dead_code)]
+#[derive(Debug, Clone)]
+struct OnwardsCompositeModel {
+    alias: String,
+    requests_per_second: Option<f32>,
+    burst_size: Option<i32>,
+    capacity: Option<i32>,
+    components: Vec<CompositeModelComponent>,
+    // API keys that have access to this composite model
+    api_keys: Vec<OnwardsApiKey>,
+}
+
+/// Loads composite models from the database (for future onwards weighted target support)
+///
+/// This function is prepared for when `onwards` supports weighted targets.
+/// Currently unused but kept to document the data model.
+#[allow(dead_code)]
+async fn load_composite_models_from_db(db: &PgPool) -> Result<Vec<OnwardsCompositeModel>, anyhow::Error> {
+    // Query composite models with their components
+    let rows = sqlx::query!(
+        r#"
+        SELECT
+            cm.id as composite_model_id,
+            cm.alias,
+            cm.requests_per_second,
+            cm.burst_size,
+            cm.capacity,
+            -- Component info
+            cmc.deployed_model_id,
+            cmc.weight,
+            cmc.enabled,
+            -- Underlying deployment info
+            dm.model_name,
+            dm.alias as deployment_alias,
+            dm.requests_per_second as deployment_requests_per_second,
+            dm.burst_size as deployment_burst_size,
+            dm.capacity as deployment_capacity,
+            -- Endpoint info
+            ie.url as "endpoint_url!",
+            ie.api_key as endpoint_api_key,
+            ie.auth_header_name,
+            ie.auth_header_prefix
+        FROM composite_models cm
+        INNER JOIN composite_model_components cmc ON cm.id = cmc.composite_model_id
+        INNER JOIN deployed_models dm ON cmc.deployed_model_id = dm.id
+        INNER JOIN inference_endpoints ie ON dm.hosted_on = ie.id
+        WHERE cmc.enabled = TRUE
+          AND dm.deleted = FALSE
+        ORDER BY cm.id, cmc.weight DESC
+        "#
+    )
+    .fetch_all(db)
+    .await?;
+
+    // Group components by composite model
+    let mut composite_map: HashMap<uuid::Uuid, OnwardsCompositeModel> = HashMap::new();
+
+    for row in rows {
+        let composite = composite_map.entry(row.composite_model_id).or_insert_with(|| OnwardsCompositeModel {
+            alias: row.alias.clone(),
+            requests_per_second: row.requests_per_second,
+            burst_size: row.burst_size,
+            capacity: row.capacity,
+            components: Vec::new(),
+            api_keys: Vec::new(), // TODO: Load API keys with access control
+        });
+
+        composite.components.push(CompositeModelComponent {
+            deployed_model_id: row.deployed_model_id,
+            weight: row.weight,
+            enabled: row.enabled,
+            target: OnwardsTarget {
+                deployment_id: row.deployed_model_id,
+                model_name: row.model_name.clone(),
+                alias: row.deployment_alias.clone(),
+                requests_per_second: row.deployment_requests_per_second,
+                burst_size: row.deployment_burst_size,
+                capacity: row.deployment_capacity,
+                endpoint_url: url::Url::parse(&row.endpoint_url).expect("Invalid URL in database"),
+                endpoint_api_key: row.endpoint_api_key.clone(),
+                auth_header_name: row.auth_header_name.clone(),
+                auth_header_prefix: row.auth_header_prefix.clone(),
+                api_keys: Vec::new(),
+            },
+        });
+    }
+
+    Ok(composite_map.into_values().collect())
+}
+
 /// Updates the daemon capacity limits DashMap with batch_capacity values from deployed_models
 /// Atomically updates the map without clearing it to avoid a window with no limits
 async fn update_daemon_capacity_limits(db: &PgPool, limits: &Arc<dashmap::DashMap<String, usize>>) -> Result<(), anyhow::Error> {
