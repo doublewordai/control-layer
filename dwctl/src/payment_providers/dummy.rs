@@ -72,14 +72,23 @@ impl PaymentProvider for DummyProvider {
             return Err(PaymentError::InvalidData("Invalid dummy session ID format".to_string()));
         }
 
-        let recipient_id = parts[2];
-        let payer_id = parts[3];
+        // Parse IDs directly from parts
+        let creditee_id: crate::types::UserId = parts[2].parse().map_err(|e| {
+            tracing::error!("Failed to parse recipient ID: {:?}", e);
+            PaymentError::InvalidData(format!("Invalid recipient user ID: {}", e))
+        })?;
+
+        let creditor_id: crate::types::UserId = parts[3].parse().map_err(|e| {
+            tracing::error!("Failed to parse payer ID: {:?}", e);
+            PaymentError::InvalidData(format!("Invalid payer user ID: {}", e))
+        })?;
 
         Ok(PaymentSession {
-            user_id: recipient_id.to_string(),
+            creditee_id,
+            creditor_id,
             amount: self.config.amount,
             is_paid: true, // Dummy sessions are always "paid"
-            payer_id: Some(payer_id.to_string()),
+            payment_provider_id: Some(parts[3].to_string()),
         })
     }
 
@@ -114,13 +123,9 @@ impl PaymentProvider for DummyProvider {
         let mut conn = db_pool.acquire().await?;
         let mut credits = Credits::new(&mut conn);
 
-        let creditee_id: crate::types::UserId = payment_session.user_id.parse().map_err(|e| {
-            tracing::error!("Failed to parse user ID: {:?}", e);
-            PaymentError::InvalidData(format!("Invalid user ID: {}", e))
-        })?;
 
         // Build description with payer information if available (same logic as Stripe)
-        let description = if let Some(payer_id_str) = &payment_session.payer_id {
+        let description = if let Some(payer_id_str) = &payment_session.payment_provider_id {
             // Look up the payer by their user ID
             if let Ok(payer_id) = payer_id_str.parse::<crate::types::UserId>() {
                 let payer = sqlx::query!(
@@ -136,7 +141,7 @@ impl PaymentProvider for DummyProvider {
 
                 if let Some(payer) = payer {
                     // Only include "from {name}" if the payer is different from the recipient
-                    if payer.id != creditee_id {
+                    if payer.id != payment_session.creditee_id {
                         let payer_name = payer.display_name.unwrap_or(payer.email);
                         format!("Dummy payment (test) from {}", payer_name)
                     } else {
@@ -153,7 +158,7 @@ impl PaymentProvider for DummyProvider {
         };
 
         let request = CreditTransactionCreateDBRequest {
-            user_id: creditee_id,
+            user_id: payment_session.creditee_id,
             transaction_type: CreditTransactionType::Purchase,
             amount: payment_session.amount,
             source_id: session_id.to_string(),
@@ -163,7 +168,7 @@ impl PaymentProvider for DummyProvider {
 
         match credits.create_transaction(&request).await {
             Ok(_) => {
-                tracing::info!("Successfully fulfilled checkout session {} for user {}", session_id, creditee_id);
+                tracing::info!("Successfully fulfilled checkout session {} for user {}", session_id, payment_session.creditee_id);
                 Ok(())
             }
             Err(crate::db::errors::DbError::UniqueViolation { constraint, .. }) => {

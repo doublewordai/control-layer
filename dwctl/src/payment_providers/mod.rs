@@ -8,7 +8,7 @@ use axum::http::StatusCode;
 use rust_decimal::Decimal;
 use sqlx::PgPool;
 
-use crate::{api::models::users::CurrentUser, config::PaymentConfig};
+use crate::{api::models::users::CurrentUser, config::PaymentConfig, UserId};
 
 pub mod dummy;
 pub mod stripe;
@@ -64,14 +64,16 @@ impl From<PaymentError> for StatusCode {
 /// Represents a completed payment session
 #[derive(Debug, Clone)]
 pub struct PaymentSession {
-    /// User ID associated with this payment (creditee)
-    pub user_id: String,
+    /// Local User ID for the creditee
+    pub creditee_id: UserId,
     /// Amount paid (in dollars)
     pub amount: Decimal,
     /// Whether the payment has been completed
     pub is_paid: bool,
-    /// Optional: User ID of the person who paid
-    pub payer_id: Option<String>,
+    /// Local User ID for the creditor (person who paid)
+    pub creditor_id: UserId,
+    /// Optional: Payment provider ID for the creditor
+    pub payment_provider_id: Option<String>,
 }
 
 /// Represents a webhook event from a payment provider
