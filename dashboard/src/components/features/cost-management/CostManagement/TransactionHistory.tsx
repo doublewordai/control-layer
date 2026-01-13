@@ -162,7 +162,7 @@ export function TransactionHistory({
   };
 
   // Format transaction description with category prefix for usage transactions
-  // Format: "Category: model (tokens)" or "Batch (SLA)" for batches
+  // Format: "Category: model (tokens)" or "Batch (SLA): X requests" for batches
   const formatDescription = (tx: Transaction): string => {
     const baseDescription = tx.description || "No description";
 
@@ -171,12 +171,15 @@ export function TransactionHistory({
       return baseDescription;
     }
 
-    // For batches, show "Batch (SLA)" format
+    // For batches, show "Batch (SLA): X requests" format
     const isBatch = tx.request_origin === "fusillade" || tx.batch_id;
     if (isBatch) {
-      if (tx.batch_sla === "24h") return "Batch (24hr)";
-      if (tx.batch_sla === "1h") return "Batch (1hr)";
-      return "Batch";
+      const requestCount = tx.batch_request_count || 0;
+      const requestsText = requestCount > 0 ? `: ${requestCount} requests` : "";
+
+      if (tx.batch_sla === "24h") return `Batch (24hr)${requestsText}`;
+      if (tx.batch_sla === "1h") return `Batch (1hr)${requestsText}`;
+      return `Batch${requestsText}`;
     }
 
     // For non-batch usage, extract model and tokens from description

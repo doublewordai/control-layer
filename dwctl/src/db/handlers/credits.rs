@@ -75,6 +75,8 @@ pub struct TransactionWithCategory {
     pub batch_id: Option<Uuid>,
     pub request_origin: Option<String>,
     pub batch_sla: Option<String>,
+    /// Number of requests in this batch (1 for non-batch transactions)
+    pub batch_count: i32,
 }
 
 /// Convert CreditTransactionType to its snake_case string representation for SQL queries
@@ -700,6 +702,7 @@ impl<'c> Credits<'c> {
                 batch_id: row.batch_id,
                 request_origin: row.request_origin,
                 batch_sla: row.batch_sla,
+                batch_count: row.batch_count.unwrap_or(1),
             });
         }
 

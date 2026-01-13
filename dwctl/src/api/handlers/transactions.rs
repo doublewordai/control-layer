@@ -232,7 +232,13 @@ pub async fn list_transactions(
                 } else {
                     twc.batch_sla
                 };
-                CreditTransactionResponse::from_db_with_category(twc.transaction, twc.batch_id, twc.request_origin, batch_sla)
+                CreditTransactionResponse::from_db_with_category(
+                    twc.transaction,
+                    twc.batch_id,
+                    twc.request_origin,
+                    batch_sla,
+                    twc.batch_count,
+                )
             })
             .collect();
         (txs, count)

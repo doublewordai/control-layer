@@ -76,6 +76,9 @@ pub struct CreditTransactionResponse {
     /// Only present for usage transactions
     #[serde(skip_serializing_if = "Option::is_none")]
     pub batch_sla: Option<String>,
+    /// Number of requests in this batch (only present for batch transactions, always > 1)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub batch_request_count: Option<i32>,
 }
 
 /// Paginated response for transaction listing with balance context.
@@ -182,6 +185,7 @@ impl CreditTransactionResponse {
             created_at: db.created_at,
             request_origin: None,
             batch_sla: None,
+            batch_request_count: None,
         }
     }
 
@@ -191,7 +195,10 @@ impl CreditTransactionResponse {
         batch_id: Option<Uuid>,
         request_origin: Option<String>,
         batch_sla: Option<String>,
+        batch_count: i32,
     ) -> Self {
+        // Only include batch_request_count for actual batches (count > 1)
+        let batch_request_count = if batch_count > 1 { Some(batch_count) } else { None };
         Self {
             id: db.id,
             user_id: db.user_id,
@@ -203,6 +210,7 @@ impl CreditTransactionResponse {
             created_at: db.created_at,
             request_origin,
             batch_sla,
+            batch_request_count,
         }
     }
 }

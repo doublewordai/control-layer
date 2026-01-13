@@ -703,6 +703,8 @@ export interface Transaction {
   request_origin?: string;
   /** Batch SLA completion window: "1h", "24h", or empty string for non-batch */
   batch_sla?: string;
+  /** Number of requests in this batch (only present for batch transactions) */
+  batch_request_count?: number;
 }
 
 export interface BalanceResponse {
