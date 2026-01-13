@@ -809,8 +809,8 @@ pub struct DaemonConfig {
     /// Per-model priority endpoint configurations for SLA escalation
     /// Parameters:
     ///     * escalation_model: model to use instead of the original for escalations
-    ///     * escalation_api_key: optional env variable name for the original. Note different from fusillade config, we use an env var here
-    /// for security so we can pass in api keys at runtime.
+    ///     * escalation_api_key: optional env variable name for the escalation API key used to authenticate escalated requests.
+    ///       Note: different from fusillade config, we use an env var here for security so we can pass in API keys at runtime.
     pub model_escalations: HashMap<String, fusillade::ModelEscalationConfig>,
 
     /// How often to check for batches approaching SLA deadlines (seconds)
