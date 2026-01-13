@@ -185,6 +185,7 @@ auth:
         - "https://localhost" # Local HTTPS
       allow_credentials: true
       max_age: 3600 # Cache preflight requests for 1 hour
+      # exposed_headers: []  # Optional: Custom headers to expose to browser (e.g., ["X-Incomplete", "X-Last-Line"])
 
 # Credits configuration
 credits:

@@ -315,7 +315,7 @@ const UsersGroups: React.FC = () => {
                 : "border-transparent text-doubleword-neutral-500 hover:text-doubleword-neutral-700"
             }`}
           >
-            Users {usersData ? `(${usersData.total_count})` : ""}
+            Users
           </button>
           <button
             id="groups-tab"
@@ -330,7 +330,7 @@ const UsersGroups: React.FC = () => {
                 : "border-transparent text-doubleword-neutral-500 hover:text-doubleword-neutral-700"
             }`}
           >
-            Groups {groupsData ? `(${groupsData.total_count})` : ""}
+            Groups
           </button>
         </nav>
       </div>

@@ -78,6 +78,7 @@ use url::Url;
 
 use crate::api::models::users::Role;
 use crate::errors::Error;
+use crate::sample_files::SampleFilesConfig;
 
 // DB sync channel name
 pub static ONWARDS_CONFIG_CHANGED_CHANNEL: &str = "auth_config_changed";
@@ -139,6 +140,8 @@ pub struct Config {
     pub enable_otel_export: bool,
     /// Credit system configuration
     pub credits: CreditsConfig,
+    /// Sample file generation configuration for new users
+    pub sample_files: SampleFilesConfig,
 }
 
 /// Individual pool configuration with all SQLx parameters.
@@ -634,6 +637,8 @@ pub struct CorsConfig {
     pub allow_credentials: bool,
     /// Cache preflight requests for this many seconds
     pub max_age: Option<u64>,
+    /// Custom headers to expose to the browser (in addition to CORS-safelisted headers)
+    pub exposed_headers: Vec<String>,
 }
 
 /// Email configuration for password resets and notifications.
@@ -1107,6 +1112,7 @@ impl Default for Config {
             enable_request_logging: true,
             enable_otel_export: false,
             credits: CreditsConfig::default(),
+            sample_files: SampleFilesConfig::default(),
         }
     }
 }
@@ -1191,6 +1197,7 @@ impl Default for CorsConfig {
             ],
             allow_credentials: true,
             max_age: Some(3600), // Cache preflight for 1 hour
+            exposed_headers: vec!["location".to_string()],
         }
     }
 }

@@ -147,6 +147,7 @@ mod openapi;
 mod payment_providers;
 mod probes;
 mod request_logging;
+pub mod sample_files;
 mod static_assets;
 mod sync;
 pub mod telemetry;
@@ -783,6 +784,17 @@ fn create_cors_layer(config: &Config) -> anyhow::Result<CorsLayer> {
     }
 
     info!("Configuring CORS with allowed origins: {:?}", origins);
+
+    // Parse exposed headers as HeaderName
+    let exposed: Vec<http::HeaderName> = config
+        .auth
+        .security
+        .cors
+        .exposed_headers
+        .iter()
+        .filter_map(|h| h.parse().ok())
+        .collect();
+
     let mut cors = CorsLayer::new()
         .allow_origin(origins)
         .allow_methods([
@@ -795,7 +807,7 @@ fn create_cors_layer(config: &Config) -> anyhow::Result<CorsLayer> {
         ])
         .allow_headers([http::header::CONTENT_TYPE, http::header::AUTHORIZATION, http::header::ACCEPT])
         .allow_credentials(config.auth.security.cors.allow_credentials)
-        .expose_headers(vec![http::header::LOCATION]);
+        .expose_headers(exposed);
 
     if let Some(max_age) = config.auth.security.cors.max_age {
         cors = cors.max_age(std::time::Duration::from_secs(max_age));
@@ -1005,6 +1017,7 @@ pub async fn build_router(state: &mut AppState, onwards_router: Router) -> anyho
                 .route("/batches/{batch_id}", get(api::handlers::batches::get_batch))
                 .route("/batches/{batch_id}", delete(api::handlers::batches::delete_batch))
                 .route("/batches/{batch_id}/analytics", get(api::handlers::batches::get_batch_analytics))
+                .route("/batches/{batch_id}/results", get(api::handlers::batches::get_batch_results))
                 .route("/batches/{batch_id}/cancel", post(api::handlers::batches::cancel_batch))
                 .route(
                     "/batches/{batch_id}/retry",

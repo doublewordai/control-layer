@@ -721,6 +721,10 @@ export interface TransactionsQuery {
   skip?: number;
   userId?: string; // Filter transactions by user (UUID)
   group_batches?: boolean; // Group transactions by batch (merges batch requests into single entries)
+  search?: string; // Search term for description (case-insensitive)
+  transaction_types?: string; // Comma-separated transaction types (e.g., "admin_grant,purchase" or "usage,admin_removal")
+  start_date?: string; // Filter transactions created on or after this date/time (ISO 8601 format)
+  end_date?: string; // Filter transactions created on or before this date/time (ISO 8601 format)
 }
 
 export interface AddFundsRequest {
@@ -1022,6 +1026,31 @@ export interface BatchAnalytics {
   avg_duration_ms?: number | null;
   avg_ttfb_ms?: number | null;
   total_cost?: string | null;
+}
+
+// Batch Result Item (merged input/output for Results view)
+export type BatchResultStatus =
+  | "pending"
+  | "in_progress"
+  | "completed"
+  | "failed"
+  | "cancelled";
+
+export interface BatchResultItem {
+  /** Fusillade request ID (unique identifier) */
+  id: string;
+  /** User-provided identifier (NOT unique - may be duplicated) */
+  custom_id: string | null;
+  /** Model used for this request */
+  model: string;
+  /** Original request body from the input template */
+  input_body: Record<string, unknown>;
+  /** Full response object (choices, usage, etc.) for completed requests */
+  response_body: Record<string, unknown> | null;
+  /** Error message for failed requests */
+  error: string | null;
+  /** Current status of the request */
+  status: BatchResultStatus;
 }
 
 // ===== DAEMON MONITORING TYPES =====
