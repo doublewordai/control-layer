@@ -9,8 +9,8 @@ use stripe::Client;
 use stripe_checkout::checkout_session::{
     CreateCheckoutSessionCustomerUpdate, CreateCheckoutSessionCustomerUpdateAddress, CreateCheckoutSessionCustomerUpdateName,
     CreateCheckoutSessionInvoiceCreation, CreateCheckoutSessionNameCollection, CreateCheckoutSessionNameCollectionBusiness,
-    CreateCheckoutSessionNameCollectionIndividual, CreateCheckoutSessionSavedPaymentMethodOptions,
-    CreateCheckoutSessionSavedPaymentMethodOptionsPaymentMethodRemove, CreateCheckoutSessionSavedPaymentMethodOptionsPaymentMethodSave,
+    CreateCheckoutSessionSavedPaymentMethodOptions, CreateCheckoutSessionSavedPaymentMethodOptionsPaymentMethodRemove,
+    CreateCheckoutSessionSavedPaymentMethodOptionsPaymentMethodSave,
 };
 use stripe_billing::billing_portal_session::CreateBillingPortalSession;
 use stripe_checkout::{
@@ -41,7 +41,7 @@ static INIT_CRYPTO: Once = Once::new();
 /// Safe to call multiple times - will only initialize once.
 fn ensure_crypto_provider() {
     INIT_CRYPTO.call_once(|| {
-        rustls::crypto::aws_lc_rs::default_provider().install_default().ok(); // Ignore error if already installed by main.rs
+        rustls::crypto::aws_lc_rs::default_provider().install_default().ok();
     });
 }
 
@@ -321,7 +321,7 @@ impl PaymentProvider for StripeProvider {
         };
 
         let webhook_event = WebhookEvent {
-            event_type: format!("{:?}", event.type_),
+            event_type: event.type_.to_string(),
             session_id,
         };
 
