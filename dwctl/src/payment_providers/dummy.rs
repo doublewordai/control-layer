@@ -30,7 +30,6 @@ impl From<crate::config::DummyConfig> for DummyProvider {
 impl PaymentProvider for DummyProvider {
     async fn create_checkout_session(
         &self,
-        _db_pool: &PgPool,
         user: &CurrentUser,
         creditee_id: Option<&str>,
         _cancel_url: &str,
@@ -214,7 +213,7 @@ mod tests {
 
         // Step 1: Create checkout session
         let checkout_url = provider
-            .create_checkout_session(&pool, &user, None, cancel_url, success_url)
+            .create_checkout_session(&user, None, cancel_url, success_url)
             .await
             .unwrap();
 
@@ -277,7 +276,7 @@ mod tests {
 
         // Create checkout session
         let checkout_url = provider
-            .create_checkout_session(&pool, &user, None, cancel_url, success_url)
+            .create_checkout_session(&user, None, cancel_url, success_url)
             .await
             .unwrap();
 

@@ -59,7 +59,6 @@ impl From<crate::config::StripeConfig> for StripeProvider {
 impl PaymentProvider for StripeProvider {
     async fn create_checkout_session(
         &self,
-        db_pool: &PgPool,
         user: &CurrentUser,
         creditee_id: Option<&str>,
         cancel_url: &str,

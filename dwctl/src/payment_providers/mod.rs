@@ -122,7 +122,6 @@ pub trait PaymentProvider: Send + Sync {
     /// * `success_url` - URL to redirect to if payment succeeds
     async fn create_checkout_session(
         &self,
-        db_pool: &PgPool,
         user: &CurrentUser,
         creditee_id: Option<&str>,
         cancel_url: &str,

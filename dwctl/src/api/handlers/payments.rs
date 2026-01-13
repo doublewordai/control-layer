@@ -159,7 +159,7 @@ pub async fn create_payment(
 
     // Create checkout session using the provider trait
     let checkout_url = provider
-        .create_checkout_session(&state.db, &user, query.creditee_id.as_deref(), &cancel_url, &success_url)
+        .create_checkout_session(&user, query.creditee_id.as_deref(), &cancel_url, &success_url)
         .await
         .map_err(|e| {
             tracing::error!("Failed to create checkout session: {:?}", e);
