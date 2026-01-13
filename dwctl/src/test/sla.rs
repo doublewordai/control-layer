@@ -15,7 +15,7 @@ use crate::{
 };
 use chrono::{Duration, Utc};
 use fusillade::daemon::SlaAction;
-use sqlx::PgPool;
+use sqlx::{PgPool, Row};
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -306,15 +306,15 @@ async fn test_sla_escalation_e2e(pool: PgPool) {
     let jsonl_content = create_test_jsonl();
 
     // Create file in fusillade database
-    sqlx::query!(
+    sqlx::query(
         r#"
         INSERT INTO fusillade.files (id, name, purpose, size_bytes, status, uploaded_by, created_at)
         VALUES ($1, 'test.jsonl', 'batch', $2, 'processed', $3, NOW())
         "#,
-        file_id,
-        jsonl_content.len() as i64,
-        user.id.to_string()
     )
+    .bind(file_id)
+    .bind(jsonl_content.len() as i64)
+    .bind(user.id.to_string())
     .execute(&pool)
     .await
     .expect("Failed to create file");
@@ -323,21 +323,23 @@ async fn test_sla_escalation_e2e(pool: PgPool) {
     // The smart server will respond differently based on model field in request body
     for i in 1..=3 {
         let template_id = Uuid::new_v4();
-        sqlx::query!(
+        sqlx::query(
             r#"
             INSERT INTO fusillade.request_templates (id, file_id, model, api_key, endpoint, path, body, custom_id, method)
             VALUES ($1, $2, 'test-model', $3, $4, '/v1/chat/completions', $5, $6, 'POST')
             "#,
-            template_id,
-            file_id,
-            user_batch_api_key,
-            smart_server.uri(), // Point directly to smart mock server
+        )
+        .bind(template_id)
+        .bind(file_id)
+        .bind(&user_batch_api_key)
+        .bind(smart_server.uri())
+        .bind(
             serde_json::to_string(
-                &serde_json::json!({"model": "test-model", "messages": [{"role": "user", "content": format!("Test {}", i)}]})
+                &serde_json::json!({"model": "test-model", "messages": [{"role": "user", "content": format!("Test {}", i)}]}),
             )
             .unwrap(),
-            format!("req-{}", i)
         )
+        .bind(format!("req-{}", i))
         .execute(&pool)
         .await
         .expect("Failed to create request template");
@@ -349,16 +351,16 @@ async fn test_sla_escalation_e2e(pool: PgPool) {
     let batch_id = Uuid::new_v4();
     let expires_at = Utc::now() + Duration::hours(24);
 
-    sqlx::query!(
+    sqlx::query(
         r#"
         INSERT INTO fusillade.batches (id, created_by, file_id, endpoint, completion_window, expires_at, created_at)
         VALUES ($1, $2, $3, '/v1/chat/completions', '24h', $4, NOW())
         "#,
-        batch_id,
-        user.id.to_string(),
-        file_id,
-        expires_at
     )
+    .bind(batch_id)
+    .bind(user.id.to_string())
+    .bind(file_id)
+    .bind(expires_at)
     .execute(&pool)
     .await
     .expect("Failed to create batch");
@@ -380,15 +382,15 @@ async fn test_sla_escalation_e2e(pool: PgPool) {
         .await
         .expect("Failed to find template");
 
-        sqlx::query!(
+        sqlx::query(
             r#"
             INSERT INTO fusillade.requests (id, batch_id, template_id, model, state, created_at)
             VALUES ($1, $2, $3, 'test-model', 'pending', NOW())
             "#,
-            request_id,
-            batch_id,
-            template_id
         )
+        .bind(request_id)
+        .bind(batch_id)
+        .bind(template_id)
         .execute(&pool)
         .await
         .expect("Failed to create request");
@@ -405,27 +407,25 @@ async fn test_sla_escalation_e2e(pool: PgPool) {
     tracing::info!("   (expires in 25 seconds, SLA threshold is 30 seconds)");
 
     // Debug: Show initial request templates
-    let templates = sqlx::query!(
+    let templates = sqlx::query(
         r#"
         SELECT id, file_id, model, api_key, endpoint, custom_id
         FROM fusillade.request_templates
         WHERE file_id = $1
         ORDER BY custom_id
         "#,
-        file_id
     )
+    .bind(file_id)
     .fetch_all(&pool)
     .await
     .expect("Failed to fetch templates");
 
     tracing::info!("📋 Initial request templates (count: {}):", templates.len());
     for template in &templates {
-        tracing::info!(
-            "   - custom_id: {:?}, model: {:?}, endpoint: {}",
-            template.custom_id,
-            template.model,
-            &template.endpoint
-        );
+        let custom_id: Option<String> = template.try_get("custom_id").ok();
+        let model: Option<String> = template.try_get("model").ok();
+        let endpoint: String = template.try_get("endpoint").unwrap_or_default();
+        tracing::info!("   - custom_id: {:?}, model: {:?}, endpoint: {}", custom_id, model, &endpoint);
     }
 
     // Step 7: Wait for the SLA daemon to detect and escalate requests
@@ -458,15 +458,15 @@ async fn test_sla_escalation_e2e(pool: PgPool) {
 
             // Debug: Show all templates once escalation templates are created
             if escalation_count > 0 && start.elapsed().as_secs() >= 1 {
-                let all_templates = sqlx::query!(
+                let all_templates = sqlx::query(
                     r#"
                     SELECT id, file_id, model, api_key, endpoint, custom_id
                     FROM fusillade.request_templates
                     WHERE file_id = $1
                     ORDER BY custom_id
                     "#,
-                    file_id
                 )
+                .bind(file_id)
                 .fetch_all(&pool)
                 .await
                 .expect("Failed to fetch templates");
@@ -474,12 +474,10 @@ async fn test_sla_escalation_e2e(pool: PgPool) {
                 if all_templates.len() > 3 {
                     tracing::info!("📋 All request templates (count: {}):", all_templates.len());
                     for template in &all_templates {
-                        tracing::info!(
-                            "   - custom_id: {:?}, model: {:?}, endpoint: {}",
-                            template.custom_id,
-                            template.model,
-                            &template.endpoint
-                        );
+                        let custom_id: Option<String> = template.try_get("custom_id").ok();
+                        let model: Option<String> = template.try_get("model").ok();
+                        let endpoint: String = template.try_get("endpoint").unwrap_or_default();
+                        tracing::info!("   - custom_id: {:?}, model: {:?}, endpoint: {}", custom_id, model, &endpoint);
                     }
                 }
             }
@@ -768,15 +766,15 @@ async fn test_sla_escalation_for_failed_batch(pool: PgPool) {
 {"custom_id": "req-3", "method": "POST", "url": "/v1/chat/completions", "body": {"model": "test-model-fail", "messages": [{"role": "user", "content": "Test 3"}]}}"#;
 
     // Create file in fusillade database
-    sqlx::query!(
+    sqlx::query(
         r#"
         INSERT INTO fusillade.files (id, name, purpose, size_bytes, status, uploaded_by, created_at)
         VALUES ($1, 'test-fail.jsonl', 'batch', $2, 'processed', $3, NOW())
         "#,
-        file_id,
-        jsonl_content.len() as i64,
-        user.id.to_string()
     )
+    .bind(file_id)
+    .bind(jsonl_content.len() as i64)
+    .bind(user.id.to_string())
     .execute(&pool)
     .await
     .expect("Failed to create file");
@@ -784,21 +782,23 @@ async fn test_sla_escalation_for_failed_batch(pool: PgPool) {
     // Create request templates pointing directly to primary mock server
     for i in 1..=3 {
         let template_id = Uuid::new_v4();
-        sqlx::query!(
+        sqlx::query(
             r#"
             INSERT INTO fusillade.request_templates (id, file_id, model, api_key, endpoint, path, body, custom_id, method)
             VALUES ($1, $2, 'test-model-fail', $3, $4, '/v1/chat/completions', $5, $6, 'POST')
             "#,
-            template_id,
-            file_id,
-            user_batch_api_key,
-            primary_server.uri(), // Point directly to primary mock server (will fail with 502)
+        )
+        .bind(template_id)
+        .bind(file_id)
+        .bind(&user_batch_api_key)
+        .bind(primary_server.uri())
+        .bind(
             serde_json::to_string(
-                &serde_json::json!({"model": "test-model-fail", "messages": [{"role": "user", "content": format!("Test {}", i)}]})
+                &serde_json::json!({"model": "test-model-fail", "messages": [{"role": "user", "content": format!("Test {}", i)}]}),
             )
             .unwrap(),
-            format!("req-{}", i)
         )
+        .bind(format!("req-{}", i))
         .execute(&pool)
         .await
         .expect("Failed to create request template");
@@ -810,16 +810,16 @@ async fn test_sla_escalation_for_failed_batch(pool: PgPool) {
     let batch_id = Uuid::new_v4();
     let expires_at = Utc::now() + Duration::hours(1);
 
-    sqlx::query!(
+    sqlx::query(
         r#"
         INSERT INTO fusillade.batches (id, created_by, file_id, endpoint, completion_window, expires_at, created_at)
         VALUES ($1, $2, $3, '/v1/chat/completions', '1h', $4, NOW())
         "#,
-        batch_id,
-        user.id.to_string(),
-        file_id,
-        expires_at
     )
+    .bind(batch_id)
+    .bind(user.id.to_string())
+    .bind(file_id)
+    .bind(expires_at)
     .execute(&pool)
     .await
     .expect("Failed to create batch");
@@ -841,15 +841,15 @@ async fn test_sla_escalation_for_failed_batch(pool: PgPool) {
         .await
         .expect("Failed to find template");
 
-        sqlx::query!(
+        sqlx::query(
             r#"
             INSERT INTO fusillade.requests (id, batch_id, template_id, model, state, created_at)
             VALUES ($1, $2, $3, 'test-model-fail', 'pending', NOW())
             "#,
-            request_id,
-            batch_id,
-            template_id
         )
+        .bind(request_id)
+        .bind(batch_id)
+        .bind(template_id)
         .execute(&pool)
         .await
         .expect("Failed to create request");
