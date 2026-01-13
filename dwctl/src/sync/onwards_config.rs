@@ -580,32 +580,35 @@ fn convert_to_config_file(targets: Vec<OnwardsTarget>) -> ConfigFile {
 // Composite models are virtual models that distribute requests across multiple
 // underlying deployed models based on configurable weights.
 //
-// TODO: Full integration requires `onwards` crate to support weighted targets:
-// ```
-// {"targets": {"gpt-4": [
-//   {"url": "...", "onwards_key": "key1", "weight": 2},
-//   {"url": "...", "onwards_key": "key2", "weight": 1}
-// ]}}
-// ```
+// Integration with onwards PR #47 (https://github.com/doublewordai/onwards/pull/47):
+// Once merged, update the onwards dependency and uncomment the integration below.
 //
-// The database schema and API handlers are ready. Once `onwards` supports weighted
-// targets, uncomment and integrate the composite model loading below.
+// The new onwards format supports:
+// ```json
+// {"targets": {"gpt-4": {
+//   "keys": ["key1", "key2"],
+//   "rate_limit": {...},
+//   "providers": [
+//     {"url": "...", "onwards_key": "key1", "onwards_model": "gpt-4", "weight": 2},
+//     {"url": "...", "onwards_key": "key2", "onwards_model": "gpt-4", "weight": 1}
+//   ]
+// }}}
+// ```
+
+use crate::types::CompositeModelId;
 
 /// Data structure for composite model components (prepared for onwards integration)
-#[allow(dead_code)]
 #[derive(Debug, Clone)]
 struct CompositeModelComponent {
-    deployed_model_id: DeploymentId,
     weight: i32,
-    enabled: bool,
     // Component target info (from the underlying deployed_model)
     target: OnwardsTarget,
 }
 
 /// Data structure for composite models (prepared for onwards integration)
-#[allow(dead_code)]
 #[derive(Debug, Clone)]
 struct OnwardsCompositeModel {
+    id: CompositeModelId,
     alias: String,
     requests_per_second: Option<f32>,
     burst_size: Option<i32>,
@@ -615,14 +618,13 @@ struct OnwardsCompositeModel {
     api_keys: Vec<OnwardsApiKey>,
 }
 
-/// Loads composite models from the database (for future onwards weighted target support)
-///
-/// This function is prepared for when `onwards` supports weighted targets.
-/// Currently unused but kept to document the data model.
-#[allow(dead_code)]
+/// Loads composite models with their components and API keys from the database
+#[tracing::instrument(skip(db))]
 async fn load_composite_models_from_db(db: &PgPool) -> Result<Vec<OnwardsCompositeModel>, anyhow::Error> {
-    // Query composite models with their components
-    let rows = sqlx::query!(
+    debug!("Loading composite models from database");
+
+    // Query composite models with their components and underlying deployments
+    let component_rows = sqlx::query!(
         r#"
         SELECT
             cm.id as composite_model_id,
@@ -633,7 +635,6 @@ async fn load_composite_models_from_db(db: &PgPool) -> Result<Vec<OnwardsComposi
             -- Component info
             cmc.deployed_model_id,
             cmc.weight,
-            cmc.enabled,
             -- Underlying deployment info
             dm.model_name,
             dm.alias as deployment_alias,
@@ -657,23 +658,87 @@ async fn load_composite_models_from_db(db: &PgPool) -> Result<Vec<OnwardsComposi
     .fetch_all(db)
     .await?;
 
-    // Group components by composite model
-    let mut composite_map: HashMap<uuid::Uuid, OnwardsCompositeModel> = HashMap::new();
+    // Query API keys with access to composite models (similar logic to deployed_models)
+    let api_key_rows = sqlx::query!(
+        r#"
+        WITH user_balances AS (
+            SELECT
+                u.id as user_id,
+                COALESCE(c.balance, 0) + COALESCE(
+                    (SELECT SUM(
+                        CASE WHEN ct.transaction_type IN ('purchase', 'admin_grant')
+                        THEN ct.amount ELSE -ct.amount END
+                    )
+                    FROM credits_transactions ct
+                    WHERE ct.user_id = u.id
+                    AND ct.seq > COALESCE(c.checkpoint_seq, 0)),
+                    0
+                ) as balance
+            FROM users u
+            LEFT JOIN user_balance_checkpoints c ON c.user_id = u.id
+        )
+        SELECT
+            cm.id as composite_model_id,
+            ak.id as api_key_id,
+            ak.secret as api_key_secret,
+            ak.requests_per_second,
+            ak.burst_size
+        FROM composite_models cm
+        CROSS JOIN LATERAL (
+            SELECT DISTINCT
+                ak.id,
+                ak.secret,
+                ak.requests_per_second,
+                ak.burst_size
+            FROM api_keys ak
+            WHERE (
+                -- System user always has access
+                ak.user_id = '00000000-0000-0000-0000-000000000000'
+                -- OR user is in a group assigned to this composite model
+                OR EXISTS (
+                    SELECT 1 FROM user_groups ug
+                    INNER JOIN composite_model_groups cmg ON ug.group_id = cmg.group_id
+                    WHERE cmg.composite_model_id = cm.id
+                      AND ug.user_id = ak.user_id
+                )
+                -- OR composite model is in public group (nil UUID)
+                OR EXISTS (
+                    SELECT 1 FROM composite_model_groups cmg
+                    WHERE cmg.composite_model_id = cm.id
+                      AND cmg.group_id = '00000000-0000-0000-0000-000000000000'
+                )
+            )
+            -- Require positive balance (system user always passes)
+            AND (
+                ak.user_id = '00000000-0000-0000-0000-000000000000'
+                OR EXISTS (
+                    SELECT 1 FROM user_balances ub
+                    WHERE ub.user_id = ak.user_id AND ub.balance > 0
+                )
+            )
+        ) ak
+        ORDER BY cm.id, ak.id
+        "#
+    )
+    .fetch_all(db)
+    .await?;
 
-    for row in rows {
+    // Group components by composite model
+    let mut composite_map: HashMap<CompositeModelId, OnwardsCompositeModel> = HashMap::new();
+
+    for row in component_rows {
         let composite = composite_map.entry(row.composite_model_id).or_insert_with(|| OnwardsCompositeModel {
+            id: row.composite_model_id,
             alias: row.alias.clone(),
             requests_per_second: row.requests_per_second,
             burst_size: row.burst_size,
             capacity: row.capacity,
             components: Vec::new(),
-            api_keys: Vec::new(), // TODO: Load API keys with access control
+            api_keys: Vec::new(),
         });
 
         composite.components.push(CompositeModelComponent {
-            deployed_model_id: row.deployed_model_id,
             weight: row.weight,
-            enabled: row.enabled,
             target: OnwardsTarget {
                 deployment_id: row.deployed_model_id,
                 model_name: row.model_name.clone(),
@@ -690,7 +755,413 @@ async fn load_composite_models_from_db(db: &PgPool) -> Result<Vec<OnwardsComposi
         });
     }
 
-    Ok(composite_map.into_values().collect())
+    // Add API keys to composite models
+    for row in api_key_rows {
+        if let Some(composite) = composite_map.get_mut(&row.composite_model_id) {
+            // Avoid duplicates
+            if !composite.api_keys.iter().any(|k| k.id == row.api_key_id) {
+                composite.api_keys.push(OnwardsApiKey {
+                    id: row.api_key_id,
+                    secret: row.api_key_secret,
+                    requests_per_second: row.requests_per_second,
+                    burst_size: row.burst_size,
+                });
+            }
+        }
+    }
+
+    let composites: Vec<_> = composite_map.into_values().collect();
+    info!(
+        "Loaded {} composite models with {} total components",
+        composites.len(),
+        composites.iter().map(|c| c.components.len()).sum::<usize>()
+    );
+
+    Ok(composites)
+}
+
+/// Converts a composite model to a TargetSpec with weighted providers
+///
+/// NOTE: This function is ready for onwards PR #47. Once merged:
+/// 1. Update onwards dependency in Cargo.toml
+/// 2. Import the new types (TargetSpecOrList, ProviderSpec, etc.)
+/// 3. Uncomment the conversion code below
+/// 4. Call this from convert_to_config_file
+#[allow(dead_code)]
+fn convert_composite_to_target_spec(
+    composite: &OnwardsCompositeModel,
+    key_definitions: &mut HashMap<String, KeyDefinition>,
+) -> (String, TargetSpec) {
+    // Add this composite model's API keys to key_definitions
+    for api_key in &composite.api_keys {
+        let rate_limit = match (api_key.requests_per_second, api_key.burst_size) {
+            (Some(rps), burst) if rps > 0.0 => {
+                let rps_u32 = NonZeroU32::new((rps.max(1.0) as u32).max(1)).unwrap();
+                let burst_u32 = burst.and_then(|b| NonZeroU32::new(b.max(1) as u32));
+                Some(RateLimitParameters {
+                    requests_per_second: rps_u32,
+                    burst_size: burst_u32,
+                })
+            }
+            _ => None,
+        };
+
+        key_definitions.insert(
+            api_key.id.to_string(),
+            KeyDefinition {
+                key: api_key.secret.clone(),
+                rate_limit,
+                concurrency_limit: None,
+            },
+        );
+    }
+
+    // Get API key secrets for access control
+    let keys = if composite.api_keys.is_empty() {
+        None
+    } else {
+        Some(composite.api_keys.iter().map(|k| k.secret.clone().into()).collect())
+    };
+
+    // Build pool-level rate limiting
+    let rate_limit = match (composite.requests_per_second, composite.burst_size) {
+        (Some(rps), burst) if rps > 0.0 => {
+            let rps_u32 = NonZeroU32::new((rps.max(1.0) as u32).max(1)).unwrap();
+            let burst_u32 = burst.and_then(|b| NonZeroU32::new(b.max(1) as u32));
+            debug!(
+                "Composite model '{}' configured with {}req/s rate limit, burst: {:?}",
+                composite.alias, rps, burst_u32
+            );
+            Some(RateLimitParameters {
+                requests_per_second: rps_u32,
+                burst_size: burst_u32,
+            })
+        }
+        _ => None,
+    };
+
+    // Build pool-level concurrency limiting
+    let concurrency_limit = composite.capacity.map(|capacity| {
+        debug!(
+            "Composite model '{}' configured with {} max concurrent requests",
+            composite.alias, capacity
+        );
+        ConcurrencyLimitParameters {
+            max_concurrent_requests: capacity as usize,
+        }
+    });
+
+    // For now, create a single-provider TargetSpec using the first component
+    // TODO: Once onwards PR #47 is merged, convert to TargetSpecOrList with providers array:
+    //
+    // let providers: Vec<ProviderSpec> = composite.components.iter().map(|component| {
+    //     ProviderSpec {
+    //         url: component.target.endpoint_url.clone(),
+    //         onwards_key: component.target.endpoint_api_key.clone(),
+    //         onwards_model: Some(component.target.model_name.clone()),
+    //         weight: Some(component.weight as u32),
+    //         upstream_auth_header_name: if component.target.auth_header_name != "Authorization" {
+    //             Some(component.target.auth_header_name.clone())
+    //         } else {
+    //             None
+    //         },
+    //         upstream_auth_header_prefix: if component.target.auth_header_prefix != "Bearer " {
+    //             Some(component.target.auth_header_prefix.clone())
+    //         } else {
+    //             None
+    //         },
+    //     }
+    // }).collect();
+    //
+    // return (composite.alias.clone(), TargetSpecOrList::List(PoolTargetSpec {
+    //     keys,
+    //     rate_limit,
+    //     concurrency_limit,
+    //     providers,
+    // }));
+
+    // Temporary: Use first component as the target (weighted routing not yet available)
+    let first_component = &composite.components[0];
+    let target = &first_component.target;
+
+    let upstream_auth_header_name = if target.auth_header_name != "Authorization" {
+        Some(target.auth_header_name.clone())
+    } else {
+        None
+    };
+    let upstream_auth_header_prefix = if target.auth_header_prefix != "Bearer " {
+        Some(target.auth_header_prefix.clone())
+    } else {
+        None
+    };
+
+    let target_spec = TargetSpec {
+        url: target.endpoint_url.clone(),
+        keys,
+        onwards_key: target.endpoint_api_key.clone(),
+        onwards_model: Some(target.model_name.clone()),
+        rate_limit,
+        concurrency_limit,
+        upstream_auth_header_name,
+        upstream_auth_header_prefix,
+        response_headers: None,
+    };
+
+    debug!(
+        "Composite model '{}' temporarily routing to single provider '{}' (weighted routing pending onwards update)",
+        composite.alias,
+        target.alias
+    );
+
+    (composite.alias.clone(), target_spec)
+}
+
+/// Converts both regular targets and composite models to ConfigFile format
+#[tracing::instrument(skip(targets, composites))]
+fn convert_to_config_file_with_composites(
+    targets: Vec<OnwardsTarget>,
+    composites: Vec<OnwardsCompositeModel>,
+) -> ConfigFile {
+    let mut key_definitions = HashMap::new();
+
+    // Convert regular deployed models
+    let mut target_specs: HashMap<String, TargetSpec> = targets
+        .into_iter()
+        .map(|target| {
+            // Add this target's API keys to key_definitions
+            for api_key in &target.api_keys {
+                let rate_limit = match (api_key.requests_per_second, api_key.burst_size) {
+                    (Some(rps), burst) if rps > 0.0 => {
+                        let rps_u32 = NonZeroU32::new((rps.max(1.0) as u32).max(1)).unwrap();
+                        let burst_u32 = burst.and_then(|b| NonZeroU32::new(b.max(1) as u32));
+                        Some(RateLimitParameters {
+                            requests_per_second: rps_u32,
+                            burst_size: burst_u32,
+                        })
+                    }
+                    _ => None,
+                };
+
+                key_definitions.insert(
+                    api_key.id.to_string(),
+                    KeyDefinition {
+                        key: api_key.secret.clone(),
+                        rate_limit,
+                        concurrency_limit: None,
+                    },
+                );
+            }
+
+            let keys = if target.api_keys.is_empty() {
+                None
+            } else {
+                Some(target.api_keys.iter().map(|k| k.secret.clone().into()).collect())
+            };
+
+            let rate_limit = match (target.requests_per_second, target.burst_size) {
+                (Some(rps), burst) if rps > 0.0 => {
+                    let rps_u32 = NonZeroU32::new((rps.max(1.0) as u32).max(1)).unwrap();
+                    let burst_u32 = burst.and_then(|b| NonZeroU32::new(b.max(1) as u32));
+                    Some(RateLimitParameters {
+                        requests_per_second: rps_u32,
+                        burst_size: burst_u32,
+                    })
+                }
+                _ => None,
+            };
+
+            let upstream_auth_header_name = if target.auth_header_name != "Authorization" {
+                Some(target.auth_header_name.clone())
+            } else {
+                None
+            };
+            let upstream_auth_header_prefix = if target.auth_header_prefix != "Bearer " {
+                Some(target.auth_header_prefix.clone())
+            } else {
+                None
+            };
+
+            let concurrency_limit = target.capacity.map(|capacity| ConcurrencyLimitParameters {
+                max_concurrent_requests: capacity as usize,
+            });
+
+            let target_spec = TargetSpec {
+                url: target.endpoint_url.clone(),
+                keys,
+                onwards_key: target.endpoint_api_key.clone(),
+                onwards_model: Some(target.model_name.clone()),
+                rate_limit,
+                concurrency_limit,
+                upstream_auth_header_name,
+                upstream_auth_header_prefix,
+                response_headers: None,
+            };
+
+            (target.alias, target_spec)
+        })
+        .collect();
+
+    // Convert composite models (only those with at least one component)
+    for composite in composites {
+        if composite.components.is_empty() {
+            warn!(
+                "Skipping composite model '{}' with no enabled components",
+                composite.alias
+            );
+            continue;
+        }
+
+        let (alias, spec) = convert_composite_to_target_spec(&composite, &mut key_definitions);
+        target_specs.insert(alias, spec);
+    }
+
+    let auth = if key_definitions.is_empty() {
+        None
+    } else {
+        Some(
+            Auth::builder()
+                .global_keys(std::collections::HashSet::new())
+                .key_definitions(key_definitions)
+                .build(),
+        )
+    };
+
+    ConfigFile {
+        targets: target_specs,
+        auth,
+    }
+}
+
+/// Loads the current targets configuration from the database (including composite models)
+#[tracing::instrument(skip(db))]
+pub async fn load_targets_from_db_with_composites(db: &PgPool) -> Result<Targets, anyhow::Error> {
+    let query_start = std::time::Instant::now();
+    debug!("Loading onwards targets from database (with composite models)");
+
+    // Load regular deployed models (existing logic)
+    let rows = sqlx::query!(
+        r#"
+        WITH user_balances AS (
+            SELECT
+                u.id as user_id,
+                COALESCE(c.balance, 0) + COALESCE(
+                    (SELECT SUM(
+                        CASE WHEN ct.transaction_type IN ('purchase', 'admin_grant')
+                        THEN ct.amount ELSE -ct.amount END
+                    )
+                    FROM credits_transactions ct
+                    WHERE ct.user_id = u.id
+                    AND ct.seq > COALESCE(c.checkpoint_seq, 0)),
+                    0
+                ) as balance
+            FROM users u
+            LEFT JOIN user_balance_checkpoints c ON c.user_id = u.id
+        )
+        SELECT
+            dm.id as deployment_id,
+            dm.model_name,
+            dm.alias,
+            dm.hosted_on,
+            dm.requests_per_second as deployment_requests_per_second,
+            dm.burst_size as deployment_burst_size,
+            dm.capacity,
+            ie.id as endpoint_id,
+            ie.url as "endpoint_url!",
+            ie.api_key as endpoint_api_key,
+            ie.auth_header_name,
+            ie.auth_header_prefix,
+            ak.id as "api_key_id?",
+            ak.secret as "api_key_secret?",
+            ak.requests_per_second as api_key_requests_per_second,
+            ak.burst_size as api_key_burst_size
+        FROM deployed_models dm
+        INNER JOIN inference_endpoints ie ON dm.hosted_on = ie.id
+        LEFT JOIN LATERAL (
+            SELECT DISTINCT
+                ak.id,
+                ak.secret,
+                ak.requests_per_second,
+                ak.burst_size
+            FROM api_keys ak
+            WHERE (
+                ak.user_id = '00000000-0000-0000-0000-000000000000'
+                OR EXISTS (
+                    SELECT 1 FROM user_groups ug
+                    INNER JOIN deployment_groups dg ON ug.group_id = dg.group_id
+                    WHERE dg.deployment_id = dm.id
+                      AND ug.user_id = ak.user_id
+                )
+                OR EXISTS (
+                    SELECT 1 FROM deployment_groups dg
+                    WHERE dg.deployment_id = dm.id
+                      AND dg.group_id = '00000000-0000-0000-0000-000000000000'
+                )
+            )
+            AND (
+                ak.user_id = '00000000-0000-0000-0000-000000000000'
+                OR EXISTS (
+                    SELECT 1 FROM user_balances ub
+                    WHERE ub.user_id = ak.user_id AND ub.balance > 0
+                )
+                OR (
+                    NOT EXISTS (
+                        SELECT 1 FROM model_tariffs mt
+                        WHERE mt.deployed_model_id = dm.id
+                          AND mt.valid_until IS NULL
+                          AND (mt.input_price_per_token > 0 OR mt.output_price_per_token > 0)
+                    )
+                )
+            )
+        ) ak ON true
+        WHERE dm.deleted = FALSE
+        ORDER BY dm.id, ak.id
+        "#
+    )
+    .fetch_all(db)
+    .await?;
+
+    let query_duration = query_start.elapsed();
+    info!("Deployed models query completed in {:?}, fetched {} rows", query_duration, rows.len());
+
+    // Group results into targets
+    let mut targets_map: HashMap<DeploymentId, OnwardsTarget> = HashMap::new();
+    for row in rows {
+        let deployment_id = row.deployment_id;
+        let target = targets_map.entry(deployment_id).or_insert_with(|| OnwardsTarget {
+            deployment_id,
+            model_name: row.model_name.clone(),
+            alias: row.alias.clone(),
+            requests_per_second: row.deployment_requests_per_second,
+            burst_size: row.deployment_burst_size,
+            capacity: row.capacity,
+            endpoint_url: url::Url::parse(&row.endpoint_url).expect("Invalid URL in database"),
+            endpoint_api_key: row.endpoint_api_key.clone(),
+            auth_header_name: row.auth_header_name.clone(),
+            auth_header_prefix: row.auth_header_prefix.clone(),
+            api_keys: Vec::new(),
+        });
+
+        if let (Some(api_key_id), Some(api_key_secret)) = (row.api_key_id, row.api_key_secret) {
+            target.api_keys.push(OnwardsApiKey {
+                id: api_key_id,
+                secret: api_key_secret,
+                requests_per_second: row.api_key_requests_per_second,
+                burst_size: row.api_key_burst_size,
+            });
+        }
+    }
+
+    let targets: Vec<_> = targets_map.into_values().collect();
+    info!("Loaded {} deployed models", targets.len());
+
+    // Load composite models
+    let composites = load_composite_models_from_db(db).await?;
+
+    // Convert to ConfigFile format
+    let config = convert_to_config_file_with_composites(targets, composites);
+
+    // Convert ConfigFile to Targets
+    Targets::from_config(config)
 }
 
 /// Updates the daemon capacity limits DashMap with batch_capacity values from deployed_models
