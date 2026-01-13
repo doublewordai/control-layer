@@ -905,7 +905,7 @@ impl DaemonConfig {
             if let Some(env_var_or_key) = escalation.escalation_api_key.as_ref().cloned() {
                 match std::env::var(&env_var_or_key) {
                     Err(_) => {
-                        warn!("Priority endpoint configured with api_key - env var not found, using as literal value");
+                        warn!("Model escalation configured with api_key - env var not found, using as literal value");
                         // Keep the original value (could be a literal key for testing)
                     }
                     Ok(value) => {
