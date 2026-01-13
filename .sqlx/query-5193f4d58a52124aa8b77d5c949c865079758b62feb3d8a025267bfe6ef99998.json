@@ -1,0 +1,45 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n                SELECT id, custom_id, error, failed_at\n                FROM requests\n                WHERE batch_id = $1\n                  AND state = 'failed'\n                  AND ($2::TIMESTAMPTZ IS NULL OR failed_at > $2 OR (failed_at = $2 AND id > $3))\n                  AND ($6::text IS NULL OR LOWER(custom_id) LIKE $6)\n                ORDER BY failed_at ASC, id ASC\n                OFFSET $4\n                LIMIT $5\n                ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "id",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 1,
+        "name": "custom_id",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 2,
+        "name": "error",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 3,
+        "name": "failed_at",
+        "type_info": "Timestamptz"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Timestamptz",
+        "Uuid",
+        "Int8",
+        "Int8",
+        "Text"
+      ]
+    },
+    "nullable": [
+      false,
+      true,
+      true,
+      true
+    ]
+  },
+  "hash": "5193f4d58a52124aa8b77d5c949c865079758b62feb3d8a025267bfe6ef99998"
+}

@@ -338,6 +338,23 @@ impl<'c> Credits<'c> {
         Ok(transaction.map(CreditTransactionDBResponse::from))
     }
 
+    /// Check if a transaction exists by source_id
+    /// Used for idempotency checks (e.g., duplicate webhook deliveries)
+    pub async fn transaction_exists_by_source_id(&mut self, source_id: &str) -> Result<bool> {
+        let result = sqlx::query!(
+            r#"
+            SELECT id FROM credits_transactions
+            WHERE source_id = $1
+            LIMIT 1
+            "#,
+            source_id
+        )
+        .fetch_optional(&mut *self.db)
+        .await?;
+
+        Ok(result.is_some())
+    }
+
     /// Count total transactions for a specific user with optional filters
     #[instrument(skip(self, filters), fields(user_id = %abbrev_uuid(&user_id)), err)]
     pub async fn count_user_transactions(&mut self, user_id: UserId, filters: &TransactionFilters) -> Result<i64> {

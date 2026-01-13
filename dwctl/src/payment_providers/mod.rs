@@ -8,7 +8,7 @@ use axum::http::StatusCode;
 use rust_decimal::Decimal;
 use sqlx::PgPool;
 
-use crate::{api::models::users::CurrentUser, config::PaymentConfig};
+use crate::{UserId, api::models::users::CurrentUser, config::PaymentConfig};
 
 pub mod dummy;
 pub mod stripe;
@@ -64,17 +64,38 @@ impl From<PaymentError> for StatusCode {
     }
 }
 
+impl From<crate::db::errors::DbError> for PaymentError {
+    fn from(err: crate::db::errors::DbError) -> Self {
+        match err {
+            // Handle the specific case of duplicate source_id as AlreadyProcessed for idempotency
+            crate::db::errors::DbError::UniqueViolation { constraint, .. }
+                if constraint.as_deref() == Some("credits_transactions_source_id_unique") =>
+            {
+                PaymentError::AlreadyProcessed
+            }
+            // Convert all other DbError cases through anyhow to sqlx::Error
+            _ => {
+                // DbError has an Other variant that contains anyhow::Error
+                // We can wrap it as a generic database error
+                PaymentError::InvalidData(format!("Database error: {}", err))
+            }
+        }
+    }
+}
+
 /// Represents a completed payment session
 #[derive(Debug, Clone)]
 pub struct PaymentSession {
-    /// User ID associated with this payment (creditee)
-    pub user_id: String,
+    /// Local User ID for the creditee
+    pub creditee_id: UserId,
     /// Amount paid (in dollars)
     pub amount: Decimal,
     /// Whether the payment has been completed
     pub is_paid: bool,
-    /// Optional: User ID of the person who paid
-    pub payer_id: Option<String>,
+    /// Local User ID for the creditor (person who paid)
+    pub creditor_id: UserId,
+    /// Optional: Payment provider ID for the creditor
+    pub payment_provider_id: Option<String>,
 }
 
 /// Represents a webhook event from a payment provider
@@ -104,7 +125,6 @@ pub trait PaymentProvider: Send + Sync {
     /// * `success_url` - URL to redirect to if payment succeeds
     async fn create_checkout_session(
         &self,
-        db_pool: &PgPool,
         user: &CurrentUser,
         creditee_id: Option<&str>,
         cancel_url: &str,

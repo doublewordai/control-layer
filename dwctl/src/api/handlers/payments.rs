@@ -159,7 +159,7 @@ pub async fn create_payment(
 
     // Create checkout session using the provider trait
     let checkout_url = provider
-        .create_checkout_session(&state.db, &user, query.creditee_id.as_deref(), &cancel_url, &success_url)
+        .create_checkout_session(&user, query.creditee_id.as_deref(), &cancel_url, &success_url)
         .await
         .map_err(|e| {
             tracing::error!("Failed to create checkout session: {:?}", e);
@@ -221,17 +221,23 @@ pub async fn process_payment(
             "message": "Payment processed successfully"
         }))
         .into_response()),
-        Err(e) => {
-            tracing::error!("Failed to process payment session: {:?}", e);
-            if matches!(e, payment_providers::PaymentError::PaymentNotCompleted) {
-                Ok((
-                    StatusCode::PAYMENT_REQUIRED,
-                    Json(json!({
-                        "message": "Payment is still processing. Please check back in a moment."
-                    })),
-                )
-                    .into_response())
-            } else {
+        Err(e) => match e {
+            payment_providers::PaymentError::PaymentNotCompleted => Ok((
+                StatusCode::PAYMENT_REQUIRED,
+                Json(json!({
+                    "message": "Payment is still processing. Please check back in a moment."
+                })),
+            )
+                .into_response()),
+            payment_providers::PaymentError::AlreadyProcessed => {
+                tracing::trace!("Transaction already processed (idempotent)");
+                Ok(Json(json!({
+                    "message": "Payment processed successfully"
+                }))
+                .into_response())
+            }
+            _ => {
+                tracing::error!("Failed to process payment session: {:?}", e);
                 Ok((
                     StatusCode::INTERNAL_SERVER_ERROR,
                     Json(json!({
@@ -240,7 +246,7 @@ pub async fn process_payment(
                 )
                     .into_response())
             }
-        }
+        },
     }
 }
 

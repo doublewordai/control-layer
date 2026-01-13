@@ -1029,6 +1029,31 @@ export interface BatchAnalytics {
   total_cost?: string | null;
 }
 
+// Batch Result Item (merged input/output for Results view)
+export type BatchResultStatus =
+  | "pending"
+  | "in_progress"
+  | "completed"
+  | "failed"
+  | "cancelled";
+
+export interface BatchResultItem {
+  /** Fusillade request ID (unique identifier) */
+  id: string;
+  /** User-provided identifier (NOT unique - may be duplicated) */
+  custom_id: string | null;
+  /** Model used for this request */
+  model: string;
+  /** Original request body from the input template */
+  input_body: Record<string, unknown>;
+  /** Full response object (choices, usage, etc.) for completed requests */
+  response_body: Record<string, unknown> | null;
+  /** Error message for failed requests */
+  error: string | null;
+  /** Current status of the request */
+  status: BatchResultStatus;
+}
+
 // ===== DAEMON MONITORING TYPES =====
 
 export type DaemonStatus = "initializing" | "running" | "dead";

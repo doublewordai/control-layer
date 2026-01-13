@@ -1318,6 +1318,35 @@ const batchesApi = {
     return response.json();
   },
 
+  async getBatchResults(
+    id: string,
+    options?: {
+      limit?: number;
+      skip?: number;
+      search?: string;
+      status?: string;
+    },
+  ): Promise<{ content: string; incomplete: boolean; lastLine: number }> {
+    const params = new URLSearchParams();
+    if (options?.limit) params.set("limit", options.limit.toString());
+    if (options?.skip) params.set("skip", options.skip.toString());
+    if (options?.search) params.set("search", options.search);
+    if (options?.status) params.set("status", options.status);
+
+    const response = await fetchAiApi(
+      `/ai/v1/batches/${id}/results${params.toString() ? "?" + params.toString() : ""}`,
+    );
+    if (!response.ok) {
+      throw new Error(`Failed to fetch batch results: ${response.status}`);
+    }
+
+    const content = await response.text();
+    const incomplete = response.headers.get("X-Incomplete") === "true";
+    const lastLine = parseInt(response.headers.get("X-Last-Line") || "0", 10);
+
+    return { content, incomplete, lastLine };
+  },
+
   // Download batch results via the output file
   async downloadResults(id: string): Promise<Blob> {
     // First get the batch to find the output_file_id
