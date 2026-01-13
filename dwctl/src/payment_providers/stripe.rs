@@ -7,7 +7,10 @@ use std::collections::HashMap;
 use std::sync::Once;
 use stripe::Client;
 use stripe_checkout::checkout_session::{
+    CreateCheckoutSessionCustomerUpdate, CreateCheckoutSessionCustomerUpdateAddress, CreateCheckoutSessionCustomerUpdateName,
     CreateCheckoutSessionInvoiceCreation, CreateCheckoutSessionNameCollection, CreateCheckoutSessionNameCollectionBusiness,
+    CreateCheckoutSessionNameCollectionIndividual, CreateCheckoutSessionSavedPaymentMethodOptions,
+    CreateCheckoutSessionSavedPaymentMethodOptionsPaymentMethodRemove, CreateCheckoutSessionSavedPaymentMethodOptionsPaymentMethodSave,
 };
 use stripe_checkout::{
     CheckoutSessionId, CheckoutSessionMode, CheckoutSessionPaymentStatus, CheckoutSessionUiMode,
@@ -82,6 +85,16 @@ impl PaymentProvider for StripeProvider {
             .name_collection(CreateCheckoutSessionNameCollection {
                 business: Some(CreateCheckoutSessionNameCollectionBusiness::new(true)),
                 individual: None,
+            })
+            .customer_update(CreateCheckoutSessionCustomerUpdate {
+                address: Some(CreateCheckoutSessionCustomerUpdateAddress::Auto),
+                name: Some(CreateCheckoutSessionCustomerUpdateName::Auto),
+                shipping: None,
+            })
+            .saved_payment_method_options(CreateCheckoutSessionSavedPaymentMethodOptions {
+                allow_redisplay_filters: None,
+                payment_method_save: Some(CreateCheckoutSessionSavedPaymentMethodOptionsPaymentMethodSave::Enabled),
+                payment_method_remove: Some(CreateCheckoutSessionSavedPaymentMethodOptionsPaymentMethodRemove::Enabled),
             });
 
         if let Some(user_receiving_credits) = creditee_id {
