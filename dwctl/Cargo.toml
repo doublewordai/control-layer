@@ -51,7 +51,7 @@ tower-http = { version = "0.6", features = ["cors", "fs", "trace"] }
 async-trait = "0.1"
 url = { version = "2.4", features = ["serde"] }
 clap = { version = "4.4", features = ["derive", "env"] }
-reqwest = { version = "0.12", features = ["json", "rustls-tls"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls-webpki-roots-no-provider", "http2", "charset"] }
 humantime = "2.2.0"
 humantime-serde = "1.1"
 utoipa = { version = "5.0", features = [
@@ -102,14 +102,12 @@ mime_guess = "2.0"
 futures = "0.3.31"
 dashmap = { version = "6.1.0", features = ["serde"] }
 moka = { version = "0.12", features = ["future"] }
-# Stripe payment processing
-async-stripe = { version = "0.41.0", default-features = false, features = [
-  "runtime-tokio-hyper",
-  "checkout",
-  "webhook-endpoints",
-  "webhook-events",
-  "connect",
-] }
+# Stripe payment processing - Fixed at rc0 currently as this is the only semi-stable version supporting a modern stripe API
+async-stripe = { version = "1.0.0-rc.0", default-features = false, features = ["rustls-tls-webpki-roots", "rustls-aws-lc-rs"] }
+async-stripe-checkout = { version = "1.0.0-rc.0", features = ["checkout_session"] }
+async-stripe-webhook = { version = "1.0.0-rc.0", features = ["async-stripe-checkout", "deserialize"] }
+async-stripe-types = { version = "1.0.0-rc.0" }
+rustls = { version = "0.23", features = ["aws-lc-rs"] }
 
 [dev-dependencies]
 axum-test = { version = "18.4.1" }
