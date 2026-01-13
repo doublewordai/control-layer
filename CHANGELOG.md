@@ -1,5 +1,21 @@
 # Changelog
 
+## [1.0.0](https://github.com/doublewordai/control-layer/compare/v0.29.0...v1.0.0) (2026-01-13)
+
+
+### ⚠ BREAKING CHANGES
+
+* move to fusillade 1.0.0 and move to model escalations [#513](https://github.com/doublewordai/control-layer/issues/513)
+
+### Features
+
+* move to fusillade 1.0.0 and move to model escalations [[#513](https://github.com/doublewordai/control-layer/issues/513)](https://github.com/doublewordai/control-layer/issues/513) ([61ac5e3](https://github.com/doublewordai/control-layer/commit/61ac5e35835f108a28873bc04f728a9e605cad2e))
+
+
+### Bug Fixes
+
+* move to fusillade 1.0.0 and move to model escalations ([#513](https://github.com/doublewordai/control-layer/issues/513)) ([a01e218](https://github.com/doublewordai/control-layer/commit/a01e21814113f0af6fe85822881a8e69d9b6777c))
+
 ## [0.29.0](https://github.com/doublewordai/control-layer/compare/v0.28.3...v0.29.0) (2026-01-12)
 
 
