@@ -244,13 +244,13 @@ impl PaymentProvider for StripeProvider {
                 && users
                     .set_payment_provider_id_if_empty(payment_session.creditor_id, provider_id)
                     .await?
-                {
-                    tracing::info!(
-                        "Saved newly created stripe ID {} for user ID {}",
-                        provider_id,
-                        payment_session.creditor_id
-                    );
-                }
+            {
+                tracing::info!(
+                    "Saved newly created stripe ID {} for user ID {}",
+                    provider_id,
+                    payment_session.creditor_id
+                );
+            }
 
             description
         };
