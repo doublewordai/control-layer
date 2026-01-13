@@ -506,7 +506,7 @@ export const ModelsContent: React.FC<ModelsContentProps> = ({
                                   <>
                                     {batchTariffs.map((batchTariff, index) => (
                                       <React.Fragment key={batchTariff.id}>
-                                        {index > 0 && <span className="mx-1">|</span>}
+                                        {index > 0 && <span className="mx-1">•</span>}
                                         <HoverCard openDelay={200} closeDelay={100}>
                                           <HoverCardTrigger asChild>
                                             <button
