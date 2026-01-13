@@ -278,10 +278,29 @@ const BatchInfo: React.FC = () => {
         <div className="mb-6">
           <div className="flex items-center gap-4 mb-4">
             <button
-              onClick={() => navigate(fromUrl || "/batches")}
+              onClick={() => {
+                if (activeTab === "results") {
+                  // Go back to details tab
+                  handleTabChange("details");
+                } else {
+                  navigate(fromUrl || "/batches");
+                }
+              }}
               className="p-2 text-gray-500 hover:bg-gray-100 rounded-lg transition-colors"
-              aria-label={fromUrl ? "Go back" : "Back to Batches"}
-              title={fromUrl ? "Go back" : "Back to Batches"}
+              aria-label={
+                activeTab === "results"
+                  ? "Back to Details"
+                  : fromUrl
+                    ? "Go back"
+                    : "Back to Batches"
+              }
+              title={
+                activeTab === "results"
+                  ? "Back to Details"
+                  : fromUrl
+                    ? "Go back"
+                    : "Back to Batches"
+              }
             >
               <ArrowLeft className="w-5 h-5" />
             </button>
@@ -289,7 +308,9 @@ const BatchInfo: React.FC = () => {
               <div className="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-4">
                 <div>
                   <h1 className="text-3xl font-bold text-doubleword-neutral-900">
-                    Batch Details
+                    {activeTab === "results"
+                      ? "Batch Results"
+                      : "Batch Details"}
                   </h1>
                   <div className="flex items-center gap-2 mt-1">
                     <p className="text-doubleword-neutral-600 font-mono text-sm">
@@ -437,27 +458,41 @@ const BatchInfo: React.FC = () => {
 
                         {/* Request Counts */}
                         <div className="grid grid-cols-3 gap-4 pt-4">
-                          <div className="text-center p-3 rounded-lg">
+                          <button
+                            className="text-center p-3 rounded-lg hover:bg-gray-50 transition-colors cursor-pointer disabled:cursor-default disabled:hover:bg-transparent"
+                            onClick={() => {
+                              if (batch.request_counts.total > 0) {
+                                navigate(`/batches/${batchId}?tab=results`);
+                              }
+                            }}
+                            disabled={batch.request_counts.total === 0}
+                            title={
+                              batch.request_counts.total > 0
+                                ? "Click to view all results"
+                                : "No results"
+                            }
+                          >
                             <p className="text-2xl font-bold text-gray-900">
                               {batch.request_counts.total}
                             </p>
                             <p className="text-xs text-gray-600 mt-1">
                               Total Requests
                             </p>
-                          </div>
+                          </button>
                           <button
                             className="text-center p-3 rounded-lg hover:bg-green-50 transition-colors cursor-pointer disabled:cursor-default disabled:hover:bg-transparent"
-                            onClick={() =>
-                              batch.output_file_id &&
-                              navigate(
-                                `/batches/files/${batch.output_file_id}/content?from=/batches/${batchId}`,
-                              )
-                            }
-                            disabled={!batch.output_file_id}
+                            onClick={() => {
+                              if (batch.request_counts.completed > 0) {
+                                navigate(
+                                  `/batches/${batchId}?tab=results&status=completed`,
+                                );
+                              }
+                            }}
+                            disabled={batch.request_counts.completed === 0}
                             title={
-                              batch.output_file_id
-                                ? "Click to view output file"
-                                : "No output file available"
+                              batch.request_counts.completed > 0
+                                ? "Click to view completed results"
+                                : "No completed results"
                             }
                           >
                             <p className="text-2xl font-bold text-green-700">
@@ -469,17 +504,18 @@ const BatchInfo: React.FC = () => {
                           </button>
                           <button
                             className="text-center p-3 rounded-lg hover:bg-red-50 transition-colors cursor-pointer disabled:cursor-default disabled:hover:bg-transparent"
-                            onClick={() =>
-                              batch.error_file_id &&
-                              navigate(
-                                `/batches/files/${batch.error_file_id}/content?from=/batches/${batchId}`,
-                              )
-                            }
-                            disabled={!batch.error_file_id}
+                            onClick={() => {
+                              if (batch.request_counts.failed > 0) {
+                                navigate(
+                                  `/batches/${batchId}?tab=results&status=failed`,
+                                );
+                              }
+                            }}
+                            disabled={batch.request_counts.failed === 0}
                             title={
-                              batch.error_file_id
-                                ? "Click to view error file"
-                                : "No error file available"
+                              batch.request_counts.failed > 0
+                                ? "Click to view failed results"
+                                : "No failed results"
                             }
                           >
                             <p className="text-2xl font-bold text-red-700">
