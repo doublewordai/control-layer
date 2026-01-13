@@ -320,7 +320,7 @@ impl PaymentProvider for StripeProvider {
         };
 
         let webhook_event = WebhookEvent {
-            event_type: format!("{:?}", event.type_),
+            event_type: event.type_.to_string(),
             session_id,
         };
 
