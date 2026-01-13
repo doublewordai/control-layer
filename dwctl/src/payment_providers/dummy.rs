@@ -9,7 +9,7 @@ use sqlx::PgPool;
 use crate::{
     api::models::users::CurrentUser,
     db::{
-        handlers::credits::Credits,
+        handlers::{credits::Credits, repository::Repository},
         models::credits::{CreditTransactionCreateDBRequest, CreditTransactionType},
     },
     payment_providers::{PaymentError, PaymentProvider, PaymentSession, Result, WebhookEvent},
@@ -93,19 +93,12 @@ impl PaymentProvider for DummyProvider {
     }
 
     async fn process_payment_session(&self, db_pool: &PgPool, session_id: &str) -> Result<()> {
-        // Fast path: Check if we've already processed this payment
-        let existing = sqlx::query!(
-            r#"
-            SELECT id FROM credits_transactions
-            WHERE source_id = $1
-            LIMIT 1
-            "#,
-            session_id
-        )
-        .fetch_optional(db_pool)
-        .await?;
+        // Acquire connection early for idempotency check
+        let mut conn = db_pool.acquire().await?;
+        let mut credits = Credits::new(&mut conn);
 
-        if existing.is_some() {
+        // Fast path: Check if we've already processed this payment
+        if credits.transaction_exists_by_source_id(session_id).await? {
             tracing::trace!("Transaction for session_id {} already exists, skipping (fast path)", session_id);
             return Ok(());
         }
@@ -119,42 +112,30 @@ impl PaymentProvider for DummyProvider {
             return Err(PaymentError::PaymentNotCompleted);
         }
 
-        // Create the credit transaction
-        let mut conn = db_pool.acquire().await?;
-        let mut credits = Credits::new(&mut conn);
+        // Build description with creditor information (same pattern as Stripe)
+        let description = {
+            let mut users = crate::db::handlers::users::Users::new(&mut conn);
 
+            // Verify creditor user exists
+            let creditor_user = users.get_by_id(payment_session.creditor_id).await?;
+            if creditor_user.is_none() {
+                tracing::error!(
+                    "Creditor user {} not found for payment session {}. This indicates a data integrity issue.",
+                    payment_session.creditor_id,
+                    session_id
+                );
+            }
 
-        // Build description with payer information if available (same logic as Stripe)
-        let description = if let Some(payer_id_str) = &payment_session.payment_provider_id {
-            // Look up the payer by their user ID
-            if let Ok(payer_id) = payer_id_str.parse::<crate::types::UserId>() {
-                let payer = sqlx::query!(
-                    r#"
-                    SELECT id, display_name, email
-                    FROM users
-                    WHERE id = $1
-                    "#,
-                    payer_id
-                )
-                .fetch_optional(db_pool)
-                .await?;
-
-                if let Some(payer) = payer {
-                    // Only include "from {name}" if the payer is different from the recipient
-                    if payer.id != payment_session.creditee_id {
-                        let payer_name = payer.display_name.unwrap_or(payer.email);
-                        format!("Dummy payment (test) from {}", payer_name)
-                    } else {
-                        "Dummy payment (test)".to_string()
-                    }
-                } else {
-                    "Dummy payment (test)".to_string()
-                }
+            // Build description with payer information
+            if payment_session.creditor_id == payment_session.creditee_id {
+                // Self-payment
+                "Dummy payment (test)".to_string()
+            } else if let Some(creditor) = creditor_user.as_ref() {
+                let creditor_name = creditor.display_name.as_ref().unwrap_or(&creditor.email);
+                format!("Dummy payment (test) from {}", creditor_name)
             } else {
                 "Dummy payment (test)".to_string()
             }
-        } else {
-            "Dummy payment (test)".to_string()
         };
 
         let request = CreditTransactionCreateDBRequest {

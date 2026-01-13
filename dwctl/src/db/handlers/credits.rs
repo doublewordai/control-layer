@@ -3,7 +3,7 @@
 use crate::{
     api::models::transactions::TransactionFilters,
     db::{
-        errors::Result,
+        errors::{DbError, Result},
         models::credits::{CreditTransactionCreateDBRequest, CreditTransactionDBResponse, CreditTransactionType},
     },
     types::{UserId, abbrev_uuid},
@@ -336,6 +336,23 @@ impl<'c> Credits<'c> {
         .await?;
 
         Ok(transaction.map(CreditTransactionDBResponse::from))
+    }
+
+    /// Check if a transaction exists by source_id
+    /// Used for idempotency checks (e.g., duplicate webhook deliveries)
+    pub async fn transaction_exists_by_source_id(&mut self, source_id: &str) -> Result<bool> {
+        let result = sqlx::query!(
+            r#"
+            SELECT id FROM credits_transactions
+            WHERE source_id = $1
+            LIMIT 1
+            "#,
+            source_id
+        )
+        .fetch_optional(&mut *self.db)
+        .await?;
+
+        Ok(result.is_some())
     }
 
     /// Count total transactions for a specific user with optional filters

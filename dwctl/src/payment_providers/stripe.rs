@@ -191,23 +191,18 @@ impl PaymentProvider for StripeProvider {
     }
 
     async fn process_payment_session(&self, db_pool: &PgPool, session_id: &str) -> Result<()> {
+        // Acquire connection early for idempotency check
+        let mut conn = db_pool.acquire().await?;
+
         // Fast path: Check if we've already processed this payment
         // This avoids expensive Stripe API calls for duplicate webhook deliveries,
         // user retries, etc. The unique constraint below handles race conditions.
-        let existing = sqlx::query!(
-            r#"
-            SELECT id FROM credits_transactions
-            WHERE source_id = $1
-            LIMIT 1
-            "#,
-            session_id
-        )
-        .fetch_optional(db_pool)
-        .await?;
-
-        if existing.is_some() {
-            tracing::trace!("Transaction for session_id {} already exists, skipping (fast path)", session_id);
-            return Ok(());
+        {
+            let mut credits = Credits::new(&mut conn);
+            if credits.transaction_exists_by_source_id(session_id).await? {
+                tracing::trace!("Transaction for session_id {} already exists, skipping (fast path)", session_id);
+                return Ok(());
+            }
         }
 
         // Get payment session details
@@ -219,46 +214,43 @@ impl PaymentProvider for StripeProvider {
             return Err(PaymentError::PaymentNotCompleted);
         }
 
-        // Create the credit transaction
-        let mut conn = db_pool.acquire().await?;
-        let mut users = crate::db::handlers::users::Users::new(&mut conn);
+        // Look up creditor user and build description + set creditor stripe ID in db.
+        // This is one block to scope user repo lifetime properly
+        let description = {
+            let mut users = crate::db::handlers::users::Users::new(&mut conn);
 
-        // Verify creditor user exists before proceeding
-        let creditor_user = users.get_by_id(payment_session.creditor_id).await?;
-        if creditor_user.is_none() {
-            tracing::error!(
-                "Creditor user {} not found for payment session {}. This indicates a data integrity issue.",
-                payment_session.creditor_id,
-                session_id
-            );
-        }
+            // Verify creditor user exists before proceeding
+            let creditor_user = users.get_by_id(payment_session.creditor_id).await?;
+            if creditor_user.is_none() {
+                tracing::error!(
+                    "Creditor user {} not found for payment session {}. This indicates a data integrity issue.",
+                    payment_session.creditor_id,
+                    session_id
+                );
+            }
 
-        // Build description with payer information
-        let description = if payment_session.creditor_id == payment_session.creditee_id {
-            // Self-payment
-            "Stripe payment".to_string()
-        } else if let Some(creditor) = creditor_user.as_ref() {
-            let creditor_name = creditor.display_name.as_ref().unwrap_or(&creditor.email);
-            format!("Stripe payment from {}", creditor_name)
-        } else {
-            "Stripe payment".to_string()
+            // Build description with payer information
+            let description = if payment_session.creditor_id == payment_session.creditee_id {
+                // Self-payment
+                "Stripe payment".to_string()
+            } else if let Some(creditor) = creditor_user.as_ref() {
+                let creditor_name = creditor.display_name.as_ref().unwrap_or(&creditor.email);
+                format!("Stripe payment from {}", creditor_name)
+            } else {
+                "Stripe payment".to_string()
+            };
+
+            // Save the customer ID if we don't have one yet, so we can offer the billing portal
+            if let Some(ref provider_id) = payment_session.payment_provider_id {
+                if users.set_payment_provider_id_if_empty(payment_session.creditor_id, provider_id).await? {
+                    tracing::info!("Saved newly created stripe ID {} for user ID {}", provider_id, payment_session.creditor_id);
+                }
+            }
+
+            description
         };
 
-        // Save the customer ID if we don't have one yet, so we can offer the billing portal
-        let rows_affected = sqlx::query!(
-            "UPDATE users SET payment_provider_id = $1 WHERE id = $2 AND payment_provider_id IS NULL",
-            payment_session.payment_provider_id,
-            payment_session.creditor_id
-        )
-            .execute(db_pool)
-            .await?
-            .rows_affected();
-
-        if rows_affected > 0 {
-            tracing::info!("Saved newly created stripe ID {} for user ID {}", payment_session.payment_provider_id, payment_session.creditor_id);
-        }
-
-
+        // Create the credit transaction
         let request = CreditTransactionCreateDBRequest {
             user_id: payment_session.creditee_id,
             transaction_type: CreditTransactionType::Purchase,
