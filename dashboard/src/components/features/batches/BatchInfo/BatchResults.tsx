@@ -1,4 +1,5 @@
-import { useState, useMemo } from "react";
+import { useState, useMemo, useEffect } from "react";
+import { useSearchParams } from "react-router-dom";
 import { FileInput, AlertCircle } from "lucide-react";
 import { useDebounce } from "../../../../hooks/useDebounce";
 import { DataTable } from "../../../ui/data-table";
@@ -35,6 +36,8 @@ export default function BatchResults({
   batchStatus,
   inputFileDeleted,
 }: BatchResultsProps) {
+  const [searchParams, setSearchParams] = useSearchParams();
+
   // Modal state for viewing content
   const [selectedResult, setSelectedResult] = useState<BatchResultItem | null>(
     null,
@@ -48,8 +51,22 @@ export default function BatchResults({
   const [searchInput, setSearchInput] = useState("");
   const debouncedSearch = useDebounce(searchInput, 300);
 
-  // Status filter state
-  const [statusFilter, setStatusFilter] = useState<string>("all");
+  // Status filter state - initialized from URL param
+  const statusFromUrl = searchParams.get("status");
+  const [statusFilter, setStatusFilter] = useState<string>(
+    statusFromUrl || "all",
+  );
+
+  // Sync status filter with URL param changes
+  useEffect(() => {
+    const statusFromUrl = searchParams.get("status");
+    if (statusFromUrl && statusFromUrl !== statusFilter) {
+      setStatusFilter(statusFromUrl);
+    } else if (!statusFromUrl && statusFilter !== "all") {
+      // If URL param is removed, reset to "all"
+      setStatusFilter("all");
+    }
+  }, [searchParams, statusFilter]);
 
   // Use pagination hook for URL-based pagination state
   const pagination = useServerPagination({});
@@ -148,6 +165,14 @@ export default function BatchResults({
                 onValueChange={(value) => {
                   setStatusFilter(value);
                   pagination.handleReset();
+                  // Update URL param
+                  const newParams = new URLSearchParams(searchParams);
+                  if (value === "all") {
+                    newParams.delete("status");
+                  } else {
+                    newParams.set("status", value);
+                  }
+                  setSearchParams(newParams, { replace: true });
                 }}
               >
                 <SelectTrigger className="w-32 h-8">
