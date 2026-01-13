@@ -271,22 +271,26 @@ background_services:
     status_log_interval_ms: 2000 # Interval for logging daemon status (set to null to disable)
 
     # SLA Daemon configuration
-    # priority_endpoints:
-    #   gemma:
-    #     endpoint: https://generativelanguage.googleapis.com/v1beta/openai
-    #     api_key: GOOGLE_AI_API_KEY
-    #     model_override: models/gemma-3-27b-it
+    # Controls how the batch daemon handles SLA violations and escalations
 
-    # sla_check_interval_seconds: 60
+    # Model escalations: Map models to fallback models for SLA escalation
+    # When a request is at risk of missing its SLA, the daemon can create a racing
+    # escalated request using a different (typically faster/more reliable) model
+    # model_escalations:
+    #   gemma-3-27b-it:  # Original model
+    #     escalation_model: google/gemma-3-27b-it # Fallback model for escalation
+    #     escalation_api_key: SYSTEM_API_KEY  # Use backup API key with access
+
+    # sla_check_interval_seconds: 60  # How often to check for SLA violations (default: 60)
 
     # sla_thresholds:
     #   - name: api
-    #     threshold_seconds: 600
+    #     threshold_seconds: 600  # Escalate when batch expires within 10 minutes
     #     action: escalate
     #     allowed_states:
     #       - processing
     #       - pending
-    #       - failed
+    #       - failed  # Can escalate even failed requests for recovery
 
   # Leader election - coordinates which instance runs leader-only services
   # When disabled, all instances run as leader (useful for single-instance deployments)
