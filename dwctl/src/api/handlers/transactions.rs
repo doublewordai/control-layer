@@ -19,7 +19,9 @@ use axum::{
     http::StatusCode,
     response::Json,
 };
+use fusillade::Storage;
 use rust_decimal::Decimal;
+use std::collections::HashMap;
 use uuid::Uuid;
 
 /// Create a new credit transaction
@@ -207,11 +209,31 @@ pub async fn list_transactions(
 
     // Get transactions for this page
     let (transactions, total_count) = if let (true, Some(user_id)) = (grouping_enabled, filter_user_id) {
-        let transactions_with_batches = repo.list_transactions_with_batches(user_id, skip, limit, &filters).await?;
+        let transactions_with_categories = repo.list_transactions_with_batches(user_id, skip, limit, &filters).await?;
         let count = repo.count_transactions_with_batches(user_id, &filters).await?;
-        let txs: Vec<CreditTransactionResponse> = transactions_with_batches
+
+        // Collect unique batch_ids that need SLA lookup from fusillade
+        let batch_ids: Vec<Uuid> = transactions_with_categories.iter().filter_map(|twc| twc.batch_id).collect();
+
+        // Fetch batch completion_window (SLA) from fusillade for each batch
+        let mut batch_sla_map: HashMap<Uuid, String> = HashMap::new();
+        for batch_id in batch_ids {
+            if let Ok(batch) = state.request_manager.get_batch(fusillade::BatchId(batch_id)).await {
+                batch_sla_map.insert(batch_id, batch.completion_window);
+            }
+        }
+
+        let txs: Vec<CreditTransactionResponse> = transactions_with_categories
             .into_iter()
-            .map(|(tx, batch_id)| CreditTransactionResponse::from_db_with_batch_id(tx, batch_id))
+            .map(|twc| {
+                // For batched transactions, get SLA from fusillade; for others, use what we got from http_analytics
+                let batch_sla = if let Some(batch_id) = twc.batch_id {
+                    batch_sla_map.get(&batch_id).cloned()
+                } else {
+                    twc.batch_sla
+                };
+                CreditTransactionResponse::from_db_with_category(twc.transaction, twc.batch_id, twc.request_origin, batch_sla)
+            })
             .collect();
         (txs, count)
     } else if let Some(user_id) = filter_user_id {

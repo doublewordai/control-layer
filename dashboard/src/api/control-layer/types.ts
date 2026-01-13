@@ -699,6 +699,10 @@ export interface Transaction {
   source_id: string;
   description?: string;
   created_at: string; // ISO 8601 timestamp
+  /** Request origin: "api" (direct API), "frontend" (playground), or "fusillade" (batch) */
+  request_origin?: string;
+  /** Batch SLA completion window: "1h", "24h", or empty string for non-batch */
+  batch_sla?: string;
 }
 
 export interface BalanceResponse {

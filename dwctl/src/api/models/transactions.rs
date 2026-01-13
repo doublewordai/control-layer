@@ -68,6 +68,14 @@ pub struct CreditTransactionResponse {
     pub description: Option<String>,
     /// When the transaction was created
     pub created_at: DateTime<Utc>,
+    /// Request origin: "api" (direct API), "frontend" (playground), or "fusillade" (batch)
+    /// Only present for usage transactions
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub request_origin: Option<String>,
+    /// Batch SLA completion window: "1h", "24h", or empty string for non-batch
+    /// Only present for usage transactions
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub batch_sla: Option<String>,
 }
 
 /// Paginated response for transaction listing with balance context.
@@ -161,7 +169,7 @@ impl ListTransactionsQuery {
 
 // Conversions
 impl CreditTransactionResponse {
-    /// Convert from DB response with optional batch_id
+    /// Convert from DB response with optional batch_id (legacy, without category info)
     pub fn from_db_with_batch_id(db: CreditTransactionDBResponse, batch_id: Option<Uuid>) -> Self {
         Self {
             id: db.id,
@@ -172,6 +180,29 @@ impl CreditTransactionResponse {
             source_id: db.source_id,
             description: db.description,
             created_at: db.created_at,
+            request_origin: None,
+            batch_sla: None,
+        }
+    }
+
+    /// Convert from DB response with full category information
+    pub fn from_db_with_category(
+        db: CreditTransactionDBResponse,
+        batch_id: Option<Uuid>,
+        request_origin: Option<String>,
+        batch_sla: Option<String>,
+    ) -> Self {
+        Self {
+            id: db.id,
+            user_id: db.user_id,
+            transaction_type: db.transaction_type,
+            batch_id,
+            amount: db.amount,
+            source_id: db.source_id,
+            description: db.description,
+            created_at: db.created_at,
+            request_origin,
+            batch_sla,
         }
     }
 }
