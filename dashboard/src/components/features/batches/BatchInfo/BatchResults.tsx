@@ -66,7 +66,7 @@ export default function BatchResults({
       // If URL param is removed, reset to "all"
       setStatusFilter("all");
     }
-  }, [searchParams]);
+  }, [searchParams, statusFilter]);
 
   // Use pagination hook for URL-based pagination state
   const pagination = useServerPagination({});
