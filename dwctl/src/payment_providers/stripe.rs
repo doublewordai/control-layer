@@ -9,8 +9,8 @@ use stripe::Client;
 use stripe_checkout::checkout_session::{
     CreateCheckoutSessionCustomerUpdate, CreateCheckoutSessionCustomerUpdateAddress, CreateCheckoutSessionCustomerUpdateName,
     CreateCheckoutSessionInvoiceCreation, CreateCheckoutSessionNameCollection, CreateCheckoutSessionNameCollectionBusiness,
-    CreateCheckoutSessionNameCollectionIndividual, CreateCheckoutSessionSavedPaymentMethodOptions,
-    CreateCheckoutSessionSavedPaymentMethodOptionsPaymentMethodRemove, CreateCheckoutSessionSavedPaymentMethodOptionsPaymentMethodSave,
+    CreateCheckoutSessionSavedPaymentMethodOptions, CreateCheckoutSessionSavedPaymentMethodOptionsPaymentMethodRemove,
+    CreateCheckoutSessionSavedPaymentMethodOptionsPaymentMethodSave,
 };
 use stripe_checkout::{
     CheckoutSessionId, CheckoutSessionMode, CheckoutSessionPaymentStatus, CheckoutSessionUiMode,
