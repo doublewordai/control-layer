@@ -40,7 +40,7 @@ static INIT_CRYPTO: Once = Once::new();
 /// Safe to call multiple times - will only initialize once.
 fn ensure_crypto_provider() {
     INIT_CRYPTO.call_once(|| {
-        rustls::crypto::aws_lc_rs::default_provider().install_default().ok(); // Ignore error if already installed by main.rs
+        rustls::crypto::aws_lc_rs::default_provider().install_default().ok();
     });
 }
 
