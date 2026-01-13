@@ -95,12 +95,14 @@ impl PaymentProvider for DummyProvider {
     async fn process_payment_session(&self, db_pool: &PgPool, session_id: &str) -> Result<()> {
         // Acquire connection early for idempotency check
         let mut conn = db_pool.acquire().await?;
-        let mut credits = Credits::new(&mut conn);
 
         // Fast path: Check if we've already processed this payment
-        if credits.transaction_exists_by_source_id(session_id).await? {
-            tracing::trace!("Transaction for session_id {} already exists, skipping (fast path)", session_id);
-            return Ok(());
+        {
+            let mut credits = Credits::new(&mut conn);
+            if credits.transaction_exists_by_source_id(session_id).await? {
+                tracing::trace!("Transaction for session_id {} already exists, skipping (fast path)", session_id);
+                return Ok(());
+            }
         }
 
         // Get payment session details to extract user_id
@@ -147,29 +149,11 @@ impl PaymentProvider for DummyProvider {
             fusillade_batch_id: None,
         };
 
-        match credits.create_transaction(&request).await {
-            Ok(_) => {
-                tracing::info!("Successfully fulfilled checkout session {} for user {}", session_id, payment_session.creditee_id);
-                Ok(())
-            }
-            Err(crate::db::errors::DbError::UniqueViolation { constraint, .. }) => {
-                // Check if this is a unique constraint violation on source_id
-                if constraint.as_deref() == Some("credits_transactions_source_id_unique") {
-                    tracing::trace!(
-                        "Transaction for session_id {} already processed (caught unique constraint violation), returning success (idempotent)",
-                        session_id
-                    );
-                    Ok(())
-                } else {
-                    tracing::error!("Unexpected unique constraint violation: {:?}", constraint);
-                    Err(PaymentError::Database(sqlx::Error::RowNotFound))
-                }
-            }
-            Err(e) => {
-                tracing::error!("Failed to create credit transaction: {:?}", e);
-                Err(PaymentError::Database(sqlx::Error::RowNotFound))
-            }
-        }
+        let mut credits = Credits::new(&mut conn);
+        credits.create_transaction(&request).await?;
+
+        tracing::info!("Successfully fulfilled checkout session {} for user {}", session_id, payment_session.creditee_id);
+        Ok(())
     }
 
     async fn validate_webhook(&self, _headers: &axum::http::HeaderMap, _body: &str) -> Result<Option<WebhookEvent>> {

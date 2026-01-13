@@ -261,30 +261,10 @@ impl PaymentProvider for StripeProvider {
         };
 
         let mut credits = Credits::new(&mut conn);
-        match credits.create_transaction(&request).await {
-            Ok(_) => {
-                tracing::info!("Successfully fulfilled checkout session {} for user {}", session_id, payment_session.creditee_id);
-                Ok(())
-            }
-            Err(crate::db::errors::DbError::UniqueViolation { constraint, .. }) => {
-                // Check if this is a unique constraint violation on source_id
-                // This can happen if two replicas try to process the same payment simultaneously
-                if constraint.as_deref() == Some("credits_transactions_source_id_unique") {
-                    tracing::trace!(
-                        "Transaction for session_id {} already processed (caught unique constraint violation), returning success (idempotent)",
-                        session_id
-                    );
-                    Ok(())
-                } else {
-                    tracing::error!("Unexpected unique constraint violation: {:?}", constraint);
-                    Err(PaymentError::Database(sqlx::Error::RowNotFound))
-                }
-            }
-            Err(e) => {
-                tracing::error!("Failed to create credit transaction: {:?}", e);
-                Err(PaymentError::Database(sqlx::Error::RowNotFound))
-            }
-        }
+        credits.create_transaction(&request).await?;
+
+        tracing::info!("Successfully fulfilled checkout session {} for user {}", session_id, payment_session.creditee_id);
+        Ok(())
     }
 
     async fn validate_webhook(&self, headers: &axum::http::HeaderMap, body: &str) -> Result<Option<WebhookEvent>> {

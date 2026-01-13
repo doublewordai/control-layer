@@ -221,9 +221,8 @@ pub async fn process_payment(
             "message": "Payment processed successfully"
         }))
         .into_response()),
-        Err(e) => {
-            tracing::error!("Failed to process payment session: {:?}", e);
-            if matches!(e, payment_providers::PaymentError::PaymentNotCompleted) {
+        Err(e) => match e {
+            payment_providers::PaymentError::PaymentNotCompleted => {
                 Ok((
                     StatusCode::PAYMENT_REQUIRED,
                     Json(json!({
@@ -231,7 +230,16 @@ pub async fn process_payment(
                     })),
                 )
                     .into_response())
-            } else {
+            }
+            payment_providers::PaymentError::AlreadyProcessed => {
+                tracing::trace!("Transaction already processed (idempotent)");
+                Ok(Json(json!({
+                    "message": "Payment processed successfully"
+                }))
+                .into_response())
+            }
+            _ => {
+                tracing::error!("Failed to process payment session: {:?}", e);
                 Ok((
                     StatusCode::INTERNAL_SERVER_ERROR,
                     Json(json!({

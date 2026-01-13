@@ -3,7 +3,7 @@
 use crate::{
     api::models::transactions::TransactionFilters,
     db::{
-        errors::{DbError, Result},
+        errors::Result,
         models::credits::{CreditTransactionCreateDBRequest, CreditTransactionDBResponse, CreditTransactionType},
     },
     types::{UserId, abbrev_uuid},

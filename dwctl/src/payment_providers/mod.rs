@@ -61,6 +61,25 @@ impl From<PaymentError> for StatusCode {
     }
 }
 
+impl From<crate::db::errors::DbError> for PaymentError {
+    fn from(err: crate::db::errors::DbError) -> Self {
+        match err {
+            // Handle the specific case of duplicate source_id as AlreadyProcessed for idempotency
+            crate::db::errors::DbError::UniqueViolation { constraint, .. }
+                if constraint.as_deref() == Some("credits_transactions_source_id_unique") =>
+            {
+                PaymentError::AlreadyProcessed
+            }
+            // Convert all other DbError cases through anyhow to sqlx::Error
+            _ => {
+                // DbError has an Other variant that contains anyhow::Error
+                // We can wrap it as a generic database error
+                PaymentError::InvalidData(format!("Database error: {}", err))
+            }
+        }
+    }
+}
+
 /// Represents a completed payment session
 #[derive(Debug, Clone)]
 pub struct PaymentSession {
