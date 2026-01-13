@@ -7,9 +7,8 @@ use crate::{
     AppState,
     api::models::{
         composite_models::{
-            CompositeModelComponentDefinition, CompositeModelComponentResponse, CompositeModelComponentUpdate,
-            CompositeModelCreate, CompositeModelResponse, CompositeModelUpdate, GetCompositeModelQuery,
-            ListCompositeModelsQuery,
+            CompositeModelComponentDefinition, CompositeModelComponentResponse, CompositeModelComponentUpdate, CompositeModelCreate,
+            CompositeModelResponse, CompositeModelUpdate, GetCompositeModelQuery, ListCompositeModelsQuery,
         },
         groups::GroupResponse,
         pagination::PaginatedResponse,
@@ -203,7 +202,15 @@ pub async fn list_composite_models(
 
     let responses: Vec<CompositeModelResponse> = models.into_iter().map(CompositeModelResponse::from).collect();
 
-    let enriched = enrich_composite_models(&state, responses, include_components, include_groups, can_read_rate_limits, can_read_users).await?;
+    let enriched = enrich_composite_models(
+        &state,
+        responses,
+        include_components,
+        include_groups,
+        can_read_rate_limits,
+        can_read_users,
+    )
+    .await?;
 
     Ok(Json(PaginatedResponse::new(enriched, total_count, skip, limit)))
 }
@@ -265,8 +272,15 @@ pub async fn get_composite_model(
     let include_groups = all_includes.contains(&"groups") && can_read_groups;
 
     let response = CompositeModelResponse::from(model);
-    let enriched =
-        enrich_composite_models(&state, vec![response], include_components, include_groups, can_read_rate_limits, can_read_users).await?;
+    let enriched = enrich_composite_models(
+        &state,
+        vec![response],
+        include_components,
+        include_groups,
+        can_read_rate_limits,
+        can_read_users,
+    )
+    .await?;
 
     Ok(Json(enriched.into_iter().next().unwrap()))
 }
@@ -309,6 +323,11 @@ pub async fn create_composite_model(
     // Create the composite model
     let mut repo = CompositeModels::new(tx.acquire().await.map_err(|e| Error::Database(e.into()))?);
 
+    // Extract fallback configuration
+    let (fallback_enabled, fallback_on_rate_limit, fallback_on_status) = create
+        .fallback
+        .map_or((None, None, None), |f| (Some(f.enabled), Some(f.on_rate_limit), Some(f.on_status)));
+
     let db_request = CompositeModelCreateDBRequest::builder()
         .created_by(current_user.id)
         .alias(alias.to_string())
@@ -318,6 +337,10 @@ pub async fn create_composite_model(
         .maybe_burst_size(create.burst_size)
         .maybe_capacity(create.capacity)
         .maybe_batch_capacity(create.batch_capacity)
+        .lb_strategy(Some(create.lb_strategy))
+        .maybe_fallback_enabled(fallback_enabled)
+        .maybe_fallback_on_rate_limit(fallback_on_rate_limit)
+        .maybe_fallback_on_status(fallback_on_status)
         .build();
 
     let model = repo.create(&db_request).await?;
@@ -403,6 +426,11 @@ pub async fn update_composite_model(
         });
     }
 
+    // Extract fallback configuration
+    let (fallback_enabled, fallback_on_rate_limit, fallback_on_status) = update
+        .fallback
+        .map_or((None, None, None), |f| (Some(f.enabled), Some(f.on_rate_limit), Some(f.on_status)));
+
     // Update the model
     let db_request = CompositeModelUpdateDBRequest::builder()
         .maybe_alias(update.alias)
@@ -412,6 +440,10 @@ pub async fn update_composite_model(
         .maybe_burst_size(update.burst_size)
         .maybe_capacity(update.capacity)
         .maybe_batch_capacity(update.batch_capacity)
+        .maybe_lb_strategy(update.lb_strategy)
+        .maybe_fallback_enabled(fallback_enabled)
+        .maybe_fallback_on_rate_limit(fallback_on_rate_limit)
+        .maybe_fallback_on_status(fallback_on_status)
         .build();
 
     let model = repo.update(id, &db_request).await?;

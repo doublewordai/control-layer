@@ -9,8 +9,8 @@ use crate::db::{
     models::{
         composite_models::{
             CompositeModelComponentCreateDBRequest, CompositeModelComponentDBResponse, CompositeModelCreateDBRequest,
-            CompositeModelDBResponse, CompositeModelGroupCreateDBRequest, CompositeModelGroupDBResponse,
-            CompositeModelUpdateDBRequest,
+            CompositeModelDBResponse, CompositeModelGroupCreateDBRequest, CompositeModelGroupDBResponse, CompositeModelUpdateDBRequest,
+            LoadBalancingStrategy,
         },
         deployments::ModelType,
     },
@@ -63,6 +63,14 @@ struct CompositeModel {
     pub burst_size: Option<i32>,
     pub capacity: Option<i32>,
     pub batch_capacity: Option<i32>,
+    /// Load balancing strategy (weighted_random or priority)
+    pub lb_strategy: Option<String>,
+    /// Whether fallback is enabled
+    pub fallback_enabled: Option<bool>,
+    /// Whether to fallback on rate limit
+    pub fallback_on_rate_limit: Option<bool>,
+    /// HTTP status codes that trigger fallback
+    pub fallback_on_status: Option<Vec<i32>>,
     pub created_by: UserId,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
@@ -108,6 +116,13 @@ fn model_type_to_string(t: &ModelType) -> &'static str {
 
 impl From<CompositeModel> for CompositeModelDBResponse {
     fn from(m: CompositeModel) -> Self {
+        // Parse lb_strategy from string, defaulting to WeightedRandom
+        let lb_strategy = m
+            .lb_strategy
+            .as_deref()
+            .and_then(LoadBalancingStrategy::from_str)
+            .unwrap_or_default();
+
         Self {
             id: m.id,
             alias: m.alias,
@@ -117,6 +132,10 @@ impl From<CompositeModel> for CompositeModelDBResponse {
             burst_size: m.burst_size,
             capacity: m.capacity,
             batch_capacity: m.batch_capacity,
+            lb_strategy,
+            fallback_enabled: m.fallback_enabled.unwrap_or(true),
+            fallback_on_rate_limit: m.fallback_on_rate_limit.unwrap_or(true),
+            fallback_on_status: m.fallback_on_status.unwrap_or_else(|| vec![429, 500, 502, 503, 504]),
             created_by: m.created_by,
             created_at: m.created_at,
             updated_at: m.updated_at,
@@ -169,15 +188,17 @@ impl<'c> Repository for CompositeModels<'c> {
         }
 
         let model_type_str = request.model_type.as_ref().map(model_type_to_string);
+        let lb_strategy_str = request.lb_strategy.as_ref().map(LoadBalancingStrategy::as_str);
 
         let model = sqlx::query_as!(
             CompositeModel,
             r#"
             INSERT INTO composite_models (
                 alias, description, model_type, requests_per_second, burst_size,
-                capacity, batch_capacity, created_by
+                capacity, batch_capacity, lb_strategy, fallback_enabled,
+                fallback_on_rate_limit, fallback_on_status, created_by
             )
-            VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
             RETURNING *
             "#,
             alias,
@@ -187,6 +208,10 @@ impl<'c> Repository for CompositeModels<'c> {
             request.burst_size,
             request.capacity,
             request.batch_capacity,
+            lb_strategy_str,
+            request.fallback_enabled,
+            request.fallback_on_rate_limit,
+            request.fallback_on_status.as_deref(),
             request.created_by
         )
         .fetch_one(&mut *self.db)
@@ -239,7 +264,11 @@ impl<'c> Repository for CompositeModels<'c> {
             return Err(DbError::InvalidModelField { field: "alias" });
         }
 
-        let model_type_str: Option<&str> = request.model_type.as_ref().and_then(|inner| inner.as_ref().map(model_type_to_string));
+        let model_type_str: Option<&str> = request
+            .model_type
+            .as_ref()
+            .and_then(|inner| inner.as_ref().map(model_type_to_string));
+        let lb_strategy_str = request.lb_strategy.as_ref().map(LoadBalancingStrategy::as_str);
 
         let model = sqlx::query_as!(
             CompositeModel,
@@ -270,6 +299,10 @@ impl<'c> Repository for CompositeModels<'c> {
                     WHEN $13 THEN $14
                     ELSE batch_capacity
                 END,
+                lb_strategy = COALESCE($15, lb_strategy),
+                fallback_enabled = COALESCE($16, fallback_enabled),
+                fallback_on_rate_limit = COALESCE($17, fallback_on_rate_limit),
+                fallback_on_status = COALESCE($18, fallback_on_status),
                 updated_at = NOW()
             WHERE id = $1
             RETURNING *
@@ -294,6 +327,14 @@ impl<'c> Repository for CompositeModels<'c> {
             // batch_capacity
             request.batch_capacity.is_some() as bool,
             request.batch_capacity.as_ref().and_then(|inner| inner.as_ref()),
+            // lb_strategy
+            lb_strategy_str,
+            // fallback_enabled
+            request.fallback_enabled,
+            // fallback_on_rate_limit
+            request.fallback_on_rate_limit,
+            // fallback_on_status
+            request.fallback_on_status.as_deref(),
         )
         .fetch_one(&mut *self.db)
         .await?;
@@ -516,9 +557,12 @@ impl<'c> CompositeModels<'c> {
         }
 
         // Delete existing components
-        sqlx::query!("DELETE FROM composite_model_components WHERE composite_model_id = $1", composite_model_id)
-            .execute(&mut *self.db)
-            .await?;
+        sqlx::query!(
+            "DELETE FROM composite_model_components WHERE composite_model_id = $1",
+            composite_model_id
+        )
+        .execute(&mut *self.db)
+        .await?;
 
         // Insert new components
         let mut result = Vec::new();
@@ -584,9 +628,12 @@ impl<'c> CompositeModels<'c> {
     /// Get all groups for a composite model
     #[instrument(skip(self), fields(composite_model_id = %abbrev_uuid(&composite_model_id)), err)]
     pub async fn get_groups(&mut self, composite_model_id: CompositeModelId) -> Result<Vec<GroupId>> {
-        let groups = sqlx::query!("SELECT group_id FROM composite_model_groups WHERE composite_model_id = $1", composite_model_id)
-            .fetch_all(&mut *self.db)
-            .await?;
+        let groups = sqlx::query!(
+            "SELECT group_id FROM composite_model_groups WHERE composite_model_id = $1",
+            composite_model_id
+        )
+        .fetch_all(&mut *self.db)
+        .await?;
 
         Ok(groups.into_iter().map(|r| r.group_id).collect())
     }
@@ -617,9 +664,12 @@ impl<'c> CompositeModels<'c> {
     #[instrument(skip(self, group_ids), fields(composite_model_id = %abbrev_uuid(&composite_model_id), count = group_ids.len()), err)]
     pub async fn set_groups(&mut self, composite_model_id: CompositeModelId, group_ids: Vec<GroupId>, granted_by: UserId) -> Result<()> {
         // Delete existing groups
-        sqlx::query!("DELETE FROM composite_model_groups WHERE composite_model_id = $1", composite_model_id)
-            .execute(&mut *self.db)
-            .await?;
+        sqlx::query!(
+            "DELETE FROM composite_model_groups WHERE composite_model_id = $1",
+            composite_model_id
+        )
+        .execute(&mut *self.db)
+        .await?;
 
         // Insert new groups
         for group_id in group_ids {

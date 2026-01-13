@@ -4,7 +4,9 @@ use std::{collections::HashMap, num::NonZeroU32, sync::Arc};
 
 use metrics::histogram;
 use onwards::target::{
-    Auth, ConcurrencyLimitParameters, ConfigFile, KeyDefinition, RateLimitParameters, TargetSpec, Targets, WatchTargetsStream,
+    Auth, ConcurrencyLimitParameters, ConfigFile, FallbackConfig as OnwardsFallbackConfig, KeyDefinition,
+    LoadBalanceStrategy as OnwardsLoadBalanceStrategy, PoolSpec, ProviderSpec, RateLimitParameters, TargetSpec, TargetSpecOrList, Targets,
+    WatchTargetsStream,
 };
 use sqlx::{PgPool, postgres::PgListener};
 use tokio::sync::{mpsc, watch};
@@ -22,6 +24,7 @@ pub enum SyncStatus {
 
 use crate::{
     config::ONWARDS_CONFIG_CHANGED_CHANNEL,
+    db::models::composite_models::LoadBalancingStrategy,
     types::{ApiKeyId, DeploymentId},
 };
 
@@ -552,9 +555,10 @@ fn convert_to_config_file(targets: Vec<OnwardsTarget>) -> ConfigFile {
                 upstream_auth_header_name,
                 upstream_auth_header_prefix,
                 response_headers: None,
+                weight: 1, // Default weight for single-provider targets
             };
 
-            (target.alias, target_spec)
+            (target.alias, TargetSpecOrList::Single(target_spec))
         })
         .collect();
 
@@ -613,6 +617,14 @@ struct OnwardsCompositeModel {
     requests_per_second: Option<f32>,
     burst_size: Option<i32>,
     capacity: Option<i32>,
+    /// Load balancing strategy (weighted_random or priority)
+    lb_strategy: LoadBalancingStrategy,
+    /// Fallback enabled
+    fallback_enabled: bool,
+    /// Fallback on rate limit
+    fallback_on_rate_limit: bool,
+    /// HTTP status codes that trigger fallback
+    fallback_on_status: Vec<i32>,
     components: Vec<CompositeModelComponent>,
     // API keys that have access to this composite model
     api_keys: Vec<OnwardsApiKey>,
@@ -632,6 +644,10 @@ async fn load_composite_models_from_db(db: &PgPool) -> Result<Vec<OnwardsComposi
             cm.requests_per_second,
             cm.burst_size,
             cm.capacity,
+            cm.lb_strategy,
+            cm.fallback_enabled,
+            cm.fallback_on_rate_limit,
+            cm.fallback_on_status,
             -- Component info
             cmc.deployed_model_id,
             cmc.weight,
@@ -727,14 +743,27 @@ async fn load_composite_models_from_db(db: &PgPool) -> Result<Vec<OnwardsComposi
     let mut composite_map: HashMap<CompositeModelId, OnwardsCompositeModel> = HashMap::new();
 
     for row in component_rows {
-        let composite = composite_map.entry(row.composite_model_id).or_insert_with(|| OnwardsCompositeModel {
-            id: row.composite_model_id,
-            alias: row.alias.clone(),
-            requests_per_second: row.requests_per_second,
-            burst_size: row.burst_size,
-            capacity: row.capacity,
-            components: Vec::new(),
-            api_keys: Vec::new(),
+        let composite = composite_map.entry(row.composite_model_id).or_insert_with(|| {
+            // Parse lb_strategy from string, defaulting to WeightedRandom
+            let lb_strategy = row
+                .lb_strategy
+                .as_deref()
+                .and_then(LoadBalancingStrategy::from_str)
+                .unwrap_or_default();
+
+            OnwardsCompositeModel {
+                id: row.composite_model_id,
+                alias: row.alias.clone(),
+                requests_per_second: row.requests_per_second,
+                burst_size: row.burst_size,
+                capacity: row.capacity,
+                lb_strategy,
+                fallback_enabled: row.fallback_enabled.unwrap_or(true),
+                fallback_on_rate_limit: row.fallback_on_rate_limit.unwrap_or(true),
+                fallback_on_status: row.fallback_on_status.clone().unwrap_or_else(|| vec![429, 500, 502, 503, 504]),
+                components: Vec::new(),
+                api_keys: Vec::new(),
+            }
         });
 
         composite.components.push(CompositeModelComponent {
@@ -780,18 +809,14 @@ async fn load_composite_models_from_db(db: &PgPool) -> Result<Vec<OnwardsComposi
     Ok(composites)
 }
 
-/// Converts a composite model to a TargetSpec with weighted providers
+/// Converts a composite model to a TargetSpecOrList with weighted providers
 ///
-/// NOTE: This function is ready for onwards PR #47. Once merged:
-/// 1. Update onwards dependency in Cargo.toml
-/// 2. Import the new types (TargetSpecOrList, ProviderSpec, etc.)
-/// 3. Uncomment the conversion code below
-/// 4. Call this from convert_to_config_file
-#[allow(dead_code)]
+/// Uses onwards 0.10.0 weighted provider types for load balancing across
+/// multiple underlying deployed models.
 fn convert_composite_to_target_spec(
     composite: &OnwardsCompositeModel,
     key_definitions: &mut HashMap<String, KeyDefinition>,
-) -> (String, TargetSpec) {
+) -> (String, TargetSpecOrList) {
     // Add this composite model's API keys to key_definitions
     for api_key in &composite.api_keys {
         let rate_limit = match (api_key.requests_per_second, api_key.burst_size) {
@@ -851,81 +876,98 @@ fn convert_composite_to_target_spec(
         }
     });
 
-    // For now, create a single-provider TargetSpec using the first component
-    // TODO: Once onwards PR #47 is merged, convert to TargetSpecOrList with providers array:
-    //
-    // let providers: Vec<ProviderSpec> = composite.components.iter().map(|component| {
-    //     ProviderSpec {
-    //         url: component.target.endpoint_url.clone(),
-    //         onwards_key: component.target.endpoint_api_key.clone(),
-    //         onwards_model: Some(component.target.model_name.clone()),
-    //         weight: Some(component.weight as u32),
-    //         upstream_auth_header_name: if component.target.auth_header_name != "Authorization" {
-    //             Some(component.target.auth_header_name.clone())
-    //         } else {
-    //             None
-    //         },
-    //         upstream_auth_header_prefix: if component.target.auth_header_prefix != "Bearer " {
-    //             Some(component.target.auth_header_prefix.clone())
-    //         } else {
-    //             None
-    //         },
-    //     }
-    // }).collect();
-    //
-    // return (composite.alias.clone(), TargetSpecOrList::List(PoolTargetSpec {
-    //     keys,
-    //     rate_limit,
-    //     concurrency_limit,
-    //     providers,
-    // }));
-
-    // Temporary: Use first component as the target (weighted routing not yet available)
-    let first_component = &composite.components[0];
-    let target = &first_component.target;
-
-    let upstream_auth_header_name = if target.auth_header_name != "Authorization" {
-        Some(target.auth_header_name.clone())
-    } else {
-        None
+    // Convert our LoadBalancingStrategy to onwards LoadBalanceStrategy
+    let strategy = match composite.lb_strategy {
+        LoadBalancingStrategy::WeightedRandom => OnwardsLoadBalanceStrategy::WeightedRandom,
+        LoadBalancingStrategy::Priority => OnwardsLoadBalanceStrategy::Priority,
     };
-    let upstream_auth_header_prefix = if target.auth_header_prefix != "Bearer " {
-        Some(target.auth_header_prefix.clone())
+
+    // Build fallback configuration
+    let fallback = if composite.fallback_enabled {
+        Some(OnwardsFallbackConfig {
+            enabled: true,
+            on_rate_limit: composite.fallback_on_rate_limit,
+            // Convert i32 status codes to u16 for onwards
+            on_status: composite.fallback_on_status.iter().map(|&s| s as u16).collect(),
+        })
     } else {
         None
     };
 
-    let target_spec = TargetSpec {
-        url: target.endpoint_url.clone(),
-        keys,
-        onwards_key: target.endpoint_api_key.clone(),
-        onwards_model: Some(target.model_name.clone()),
-        rate_limit,
-        concurrency_limit,
-        upstream_auth_header_name,
-        upstream_auth_header_prefix,
-        response_headers: None,
-    };
+    // Build provider specs from components
+    let providers: Vec<ProviderSpec> = composite
+        .components
+        .iter()
+        .map(|component| {
+            let target = &component.target;
+
+            // Build provider-level rate limiting (from underlying deployment)
+            let provider_rate_limit = match (target.requests_per_second, target.burst_size) {
+                (Some(rps), burst) if rps > 0.0 => {
+                    let rps_u32 = NonZeroU32::new((rps.max(1.0) as u32).max(1)).unwrap();
+                    let burst_u32 = burst.and_then(|b| NonZeroU32::new(b.max(1) as u32));
+                    Some(RateLimitParameters {
+                        requests_per_second: rps_u32,
+                        burst_size: burst_u32,
+                    })
+                }
+                _ => None,
+            };
+
+            // Build provider-level concurrency limiting
+            let provider_concurrency_limit = target.capacity.map(|capacity| ConcurrencyLimitParameters {
+                max_concurrent_requests: capacity as usize,
+            });
+
+            ProviderSpec::builder()
+                .url(target.endpoint_url.clone())
+                .onwards_key(target.endpoint_api_key.clone())
+                .onwards_model(target.model_name.clone())
+                .weight(component.weight.max(1) as u32)
+                .rate_limit(provider_rate_limit)
+                .concurrency_limit(provider_concurrency_limit)
+                .upstream_auth_header_name(if target.auth_header_name != "Authorization" {
+                    Some(target.auth_header_name.clone())
+                } else {
+                    None
+                })
+                .upstream_auth_header_prefix(if target.auth_header_prefix != "Bearer " {
+                    Some(target.auth_header_prefix.clone())
+                } else {
+                    None
+                })
+                .build()
+        })
+        .collect();
 
     debug!(
-        "Composite model '{}' temporarily routing to single provider '{}' (weighted routing pending onwards update)",
+        "Composite model '{}' configured with {} providers, strategy: {:?}, fallback: {}",
         composite.alias,
-        target.alias
+        providers.len(),
+        strategy,
+        composite.fallback_enabled
     );
 
-    (composite.alias.clone(), target_spec)
+    // Create PoolSpec with weighted providers
+    let pool_spec = PoolSpec::builder()
+        .keys(keys)
+        .rate_limit(rate_limit)
+        .concurrency_limit(concurrency_limit)
+        .fallback(fallback)
+        .strategy(strategy)
+        .providers(providers)
+        .build();
+
+    (composite.alias.clone(), TargetSpecOrList::Pool(pool_spec))
 }
 
 /// Converts both regular targets and composite models to ConfigFile format
 #[tracing::instrument(skip(targets, composites))]
-fn convert_to_config_file_with_composites(
-    targets: Vec<OnwardsTarget>,
-    composites: Vec<OnwardsCompositeModel>,
-) -> ConfigFile {
+fn convert_to_config_file_with_composites(targets: Vec<OnwardsTarget>, composites: Vec<OnwardsCompositeModel>) -> ConfigFile {
     let mut key_definitions = HashMap::new();
 
-    // Convert regular deployed models
-    let mut target_specs: HashMap<String, TargetSpec> = targets
+    // Convert regular deployed models (wrapped in TargetSpecOrList::Single)
+    let mut target_specs: HashMap<String, TargetSpecOrList> = targets
         .into_iter()
         .map(|target| {
             // Add this target's API keys to key_definitions
@@ -995,19 +1037,17 @@ fn convert_to_config_file_with_composites(
                 upstream_auth_header_name,
                 upstream_auth_header_prefix,
                 response_headers: None,
+                weight: 1, // Default weight for single-provider targets
             };
 
-            (target.alias, target_spec)
+            (target.alias, TargetSpecOrList::Single(target_spec))
         })
         .collect();
 
     // Convert composite models (only those with at least one component)
     for composite in composites {
         if composite.components.is_empty() {
-            warn!(
-                "Skipping composite model '{}' with no enabled components",
-                composite.alias
-            );
+            warn!("Skipping composite model '{}' with no enabled components", composite.alias);
             continue;
         }
 
@@ -1121,7 +1161,11 @@ pub async fn load_targets_from_db_with_composites(db: &PgPool) -> Result<Targets
     .await?;
 
     let query_duration = query_start.elapsed();
-    info!("Deployed models query completed in {:?}, fetched {} rows", query_duration, rows.len());
+    info!(
+        "Deployed models query completed in {:?}, fetched {} rows",
+        query_duration,
+        rows.len()
+    );
 
     // Group results into targets
     let mut targets_map: HashMap<DeploymentId, OnwardsTarget> = HashMap::new();

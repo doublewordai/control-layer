@@ -151,6 +151,8 @@ impl Modify for AdminSecurityAddon {
             api::models::composite_models::CompositeModelComponentUpdate,
             api::models::composite_models::ListCompositeModelsQuery,
             api::models::composite_models::GetCompositeModelQuery,
+            crate::db::models::composite_models::LoadBalancingStrategy,
+            crate::db::models::composite_models::FallbackConfig,
             api::models::groups::GroupCreate,
             api::models::groups::GroupUpdate,
             api::models::groups::GroupResponse,

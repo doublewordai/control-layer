@@ -5,7 +5,7 @@
 
 use super::groups::GroupResponse;
 use super::pagination::Pagination;
-use crate::db::models::composite_models::{CompositeModelComponent, CompositeModelDBResponse};
+use crate::db::models::composite_models::{CompositeModelComponent, CompositeModelDBResponse, FallbackConfig, LoadBalancingStrategy};
 use crate::db::models::deployments::ModelType;
 use crate::types::{CompositeModelId, DeploymentId, GroupId, UserId};
 use chrono::{DateTime, Utc};
@@ -69,6 +69,11 @@ pub struct CompositeModelCreate {
     pub capacity: Option<i32>,
     /// Maximum number of concurrent batch requests allowed (null = defaults to capacity or no limit)
     pub batch_capacity: Option<i32>,
+    /// Load balancing strategy (weighted_random or priority)
+    #[serde(default)]
+    pub lb_strategy: LoadBalancingStrategy,
+    /// Fallback configuration
+    pub fallback: Option<FallbackConfig>,
     /// Components (underlying deployed models with weights)
     pub components: Option<Vec<CompositeModelComponentDefinition>>,
     /// Group IDs that should have access to this composite model
@@ -99,6 +104,10 @@ pub struct CompositeModelUpdate {
     /// Max concurrent batch requests (None = no change, Some(None) = remove limit)
     #[serde(default, skip_serializing_if = "Option::is_none", with = "double_option")]
     pub batch_capacity: Option<Option<i32>>,
+    /// Load balancing strategy (weighted_random or priority)
+    pub lb_strategy: Option<LoadBalancingStrategy>,
+    /// Fallback configuration
+    pub fallback: Option<FallbackConfig>,
     /// Components - if provided, replaces all existing components
     pub components: Option<Vec<CompositeModelComponentDefinition>>,
     /// Groups - if provided, replaces all existing group assignments
@@ -164,6 +173,10 @@ pub struct CompositeModelResponse {
     /// Max concurrent batch requests (null = no limit)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub batch_capacity: Option<i32>,
+    /// Load balancing strategy (weighted_random or priority)
+    pub lb_strategy: LoadBalancingStrategy,
+    /// Fallback configuration
+    pub fallback: FallbackConfig,
     /// Components (underlying deployed models with weights) - only included if requested
     #[serde(skip_serializing_if = "Option::is_none")]
     #[schema(no_recursion)]
@@ -188,6 +201,12 @@ impl From<CompositeModelDBResponse> for CompositeModelResponse {
             burst_size: db.burst_size,
             capacity: db.capacity,
             batch_capacity: db.batch_capacity,
+            lb_strategy: db.lb_strategy,
+            fallback: FallbackConfig {
+                enabled: db.fallback_enabled,
+                on_rate_limit: db.fallback_on_rate_limit,
+                on_status: db.fallback_on_status,
+            },
             components: None,
             groups: None,
         }
