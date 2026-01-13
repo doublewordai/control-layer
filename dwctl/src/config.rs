@@ -806,7 +806,7 @@ pub struct DaemonConfig {
     /// and returned to pending (milliseconds). This handles daemon crashes during execution. (default: 600000 = 10 minutes)
     pub processing_timeout_ms: u64,
 
-    /// Per-model priority endpoint configurations for SLA escalation
+    /// Per-model configurations for SLA escalation
     /// Parameters:
     ///     * escalation_model: model to use instead of the original for escalations
     ///     * escalation_api_key: optional env variable name for the escalation API key used to authenticate escalated requests.
