@@ -87,11 +87,6 @@ impl PaymentProvider for StripeProvider {
                 business: Some(CreateCheckoutSessionNameCollectionBusiness::new(true)),
                 individual: None,
             })
-            .customer_update(CreateCheckoutSessionCustomerUpdate {
-                address: Some(CreateCheckoutSessionCustomerUpdateAddress::Auto),
-                name: Some(CreateCheckoutSessionCustomerUpdateName::Auto),
-                shipping: None,
-            })
             .saved_payment_method_options(CreateCheckoutSessionSavedPaymentMethodOptions {
                 allow_redisplay_filters: None,
                 payment_method_save: Some(CreateCheckoutSessionSavedPaymentMethodOptionsPaymentMethodSave::Enabled),
@@ -113,7 +108,13 @@ impl PaymentProvider for StripeProvider {
         if let Some(existing_id) = &user.payment_provider_id {
             // This is who is giving the credits
             tracing::debug!("Using existing Stripe customer ID {} for user {}", existing_id, user.id);
-            checkout_params = checkout_params.customer(existing_id.as_str());
+            checkout_params = checkout_params
+                .customer(existing_id.as_str())
+                .customer_update(CreateCheckoutSessionCustomerUpdate {
+                    address: Some(CreateCheckoutSessionCustomerUpdateAddress::Auto),
+                    name: Some(CreateCheckoutSessionCustomerUpdateName::Auto),
+                    shipping: None,
+                })
         } else {
             tracing::debug!("No customer ID found for user {}, Stripe will create one", user.id);
             // Provide customer email for the new customer

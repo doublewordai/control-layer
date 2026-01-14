@@ -13,8 +13,8 @@ import {
   ArrowUpDown,
   Info,
   DollarSign,
-  ArrowDown,
-  ArrowUp,
+  ArrowDownToLine,
+  ArrowUpToLine,
 } from "lucide-react";
 import {
   useModels,
@@ -498,29 +498,22 @@ export const ModelsContent: React.FC<ModelsContentProps> = ({
                           {showPricing && (
                             <>
                               {(() => {
-                                const batchTariff = model.tariffs?.find(
+                                const batchTariffs = model.tariffs?.filter(
                                   (t) => t.api_key_purpose === "batch",
-                                );
-                                const realtimeTariff = model.tariffs?.find(
-                                  (t) => t.api_key_purpose === "realtime",
-                                );
+                                ) || [];
 
                                 return (
                                   <>
-                                    {batchTariff && (
-                                      <>
-                                        <HoverCard
-                                          openDelay={200}
-                                          closeDelay={100}
-                                        >
+                                    {batchTariffs.map((batchTariff, index) => (
+                                      <React.Fragment key={batchTariff.id}>
+                                        {index > 0 && <span className="mx-1">•</span>}
+                                        <HoverCard openDelay={200} closeDelay={100}>
                                           <HoverCardTrigger asChild>
                                             <button
                                               className="flex items-center gap-0.5 shrink-0 hover:opacity-70 transition-opacity"
-                                              onClick={(e) =>
-                                                e.stopPropagation()
-                                              }
+                                              onClick={(e) => e.stopPropagation()}
                                             >
-                                              Batch:
+                                              {batchTariff.completion_window || "Batch"}:
                                               {!batchTariff.input_price_per_token &&
                                               !batchTariff.output_price_per_token ? (
                                                 <span className="flex items-center gap-0.5 text-green-700">
@@ -533,41 +526,45 @@ export const ModelsContent: React.FC<ModelsContentProps> = ({
                                                   <span>Free</span>
                                                 </span>
                                               ) : (
-                                                <span className="flex items-center gap-0.5">
-                                                  <ArrowDown className="h-2.5 w-2.5 text-gray-500 shrink-0" />
-                                                  <span className="whitespace-nowrap tabular-nums">
-                                                    {batchTariff.input_price_per_token
-                                                      ? (() => {
-                                                          const price =
-                                                            Number(
-                                                              batchTariff.input_price_per_token,
-                                                            ) * 1000000;
-                                                          return `$${price % 1 === 0 ? price.toFixed(0) : price.toFixed(2)}`;
-                                                        })()
-                                                      : "$0"}
+                                                <span className="flex items-center gap-1">
+                                                  <span className="flex items-center gap-0.5">
+                                                    <ArrowUpToLine className="h-2.5 w-2.5 text-gray-500 shrink-0" />
+                                                    <span className="whitespace-nowrap tabular-nums">
+                                                      {batchTariff.input_price_per_token
+                                                        ? (() => {
+                                                            const price =
+                                                              Number(
+                                                                batchTariff.input_price_per_token,
+                                                              ) * 1000000;
+                                                            return `$${price % 1 === 0 ? price.toFixed(0) : price.toFixed(2)}`;
+                                                          })()
+                                                        : "$0"}
+                                                    </span>
+                                                    <span className="text-[8px] text-gray-400">
+                                                      /M
+                                                    </span>
                                                   </span>
-                                                  <span className="text-[8px] text-gray-400">
-                                                    /M
-                                                  </span>
-                                                  <ArrowUp className="h-2.5 w-2.5 text-gray-500 shrink-0 ml-0.5" />
-                                                  <span className="whitespace-nowrap tabular-nums">
-                                                    {batchTariff.output_price_per_token
-                                                      ? (() => {
-                                                          const price =
-                                                            Number(
-                                                              batchTariff.output_price_per_token,
-                                                            ) * 1000000;
-                                                          return `$${price % 1 === 0 ? price.toFixed(0) : price.toFixed(2)}`;
-                                                        })()
-                                                      : "$0"}
-                                                  </span>
-                                                  <span className="text-[8px] text-gray-400">
-                                                    /M
+                                                  <span className="flex items-center gap-0.5">
+                                                    <ArrowDownToLine className="h-2.5 w-2.5 text-gray-500 shrink-0" />
+                                                    <span className="whitespace-nowrap tabular-nums">
+                                                      {batchTariff.output_price_per_token
+                                                        ? (() => {
+                                                            const price =
+                                                              Number(
+                                                                batchTariff.output_price_per_token,
+                                                              ) * 1000000;
+                                                            return `$${price % 1 === 0 ? price.toFixed(0) : price.toFixed(2)}`;
+                                                          })()
+                                                        : "$0"}
+                                                    </span>
+                                                    <span className="text-[8px] text-gray-400">
+                                                      /M
+                                                    </span>
                                                   </span>
                                                 </span>
                                               )}
                                               <span className="sr-only">
-                                                View batch pricing details
+                                                View {batchTariff.name} pricing details
                                               </span>
                                             </button>
                                           </HoverCardTrigger>
@@ -575,178 +572,61 @@ export const ModelsContent: React.FC<ModelsContentProps> = ({
                                             className="w-48"
                                             sideOffset={5}
                                           >
-                                            Batch:
-                                            {!batchTariff.input_price_per_token &&
-                                            !batchTariff.output_price_per_token ? (
-                                              <div className="text-sm">
-                                                <p className="font-medium text-green-700">
-                                                  Free
-                                                </p>
-                                                <p className="text-xs text-muted-foreground mt-1">
-                                                  No charge for calls to this
-                                                  model
-                                                </p>
-                                              </div>
-                                            ) : (
-                                              <div className="space-y-1 text-xs">
-                                                <p className="text-muted-foreground">
-                                                  Pricing per million tokens:
-                                                </p>
-                                                <p>
-                                                  <span className="font-medium">
-                                                    Input:
-                                                  </span>{" "}
-                                                  {batchTariff.input_price_per_token
-                                                    ? (() => {
-                                                        const price =
-                                                          Number(
-                                                            batchTariff.input_price_per_token,
-                                                          ) * 1000000;
-                                                        return `$${price % 1 === 0 ? price.toFixed(0) : price.toFixed(2)}`;
-                                                      })()
-                                                    : "$0"}
-                                                </p>
-                                                <p>
-                                                  <span className="font-medium">
-                                                    Output:
-                                                  </span>{" "}
-                                                  {batchTariff.output_price_per_token
-                                                    ? (() => {
-                                                        const price =
-                                                          Number(
-                                                            batchTariff.output_price_per_token,
-                                                          ) * 1000000;
-                                                        return `$${price % 1 === 0 ? price.toFixed(0) : price.toFixed(2)}`;
-                                                      })()
-                                                    : "$0"}
-                                                </p>
-                                              </div>
-                                            )}
+                                            <p className="font-medium text-sm mb-1">
+                                              {batchTariff.name}
+                                            </p>
+                                                {!batchTariff.input_price_per_token &&
+                                                !batchTariff.output_price_per_token ? (
+                                                  <div className="text-sm">
+                                                    <p className="font-medium text-green-700">
+                                                      Free
+                                                    </p>
+                                                    <p className="text-xs text-muted-foreground mt-1">
+                                                      No charge for calls to this
+                                                      model
+                                                    </p>
+                                                  </div>
+                                                ) : (
+                                                  <div className="space-y-1 text-xs">
+                                                    <p className="text-muted-foreground">
+                                                      Pricing per million tokens:
+                                                    </p>
+                                                    <p>
+                                                      <span className="font-medium">
+                                                        Input:
+                                                      </span>{" "}
+                                                      {batchTariff.input_price_per_token
+                                                        ? (() => {
+                                                            const price =
+                                                              Number(
+                                                                batchTariff.input_price_per_token,
+                                                              ) * 1000000;
+                                                            return `$${price % 1 === 0 ? price.toFixed(0) : price.toFixed(2)}`;
+                                                          })()
+                                                        : "$0"}
+                                                    </p>
+                                                    <p>
+                                                      <span className="font-medium">
+                                                        Output:
+                                                      </span>{" "}
+                                                      {batchTariff.output_price_per_token
+                                                        ? (() => {
+                                                            const price =
+                                                              Number(
+                                                                batchTariff.output_price_per_token,
+                                                              ) * 1000000;
+                                                            return `$${price % 1 === 0 ? price.toFixed(0) : price.toFixed(2)}`;
+                                                          })()
+                                                        : "$0"}
+                                                    </p>
+                                                  </div>
+                                                )}
                                           </HoverCardContent>
                                         </HoverCard>
-                                        {realtimeTariff && <span>•</span>}
-                                      </>
-                                    )}
+                                      </React.Fragment>
+                                    ))}
 
-                                    {realtimeTariff && (
-                                      <HoverCard
-                                        openDelay={200}
-                                        closeDelay={100}
-                                      >
-                                        <HoverCardTrigger asChild>
-                                          <button
-                                            className="flex items-center gap-0.5 shrink-0 hover:opacity-70 transition-opacity"
-                                            onClick={(e) => e.stopPropagation()}
-                                          >
-                                            Realtime:
-                                            {!realtimeTariff.input_price_per_token &&
-                                            !realtimeTariff.output_price_per_token ? (
-                                              <span className="flex items-center gap-0.5 text-green-700">
-                                                <div className="relative h-2.5 w-2.5">
-                                                  <DollarSign className="h-2.5 w-2.5" />
-                                                  <div className="absolute inset-0 flex items-center justify-center">
-                                                    <div className="w-5 h-px bg-green-700 rotate-[-50deg]" />
-                                                  </div>
-                                                </div>
-                                                <span>Free</span>
-                                              </span>
-                                            ) : (
-                                              <span className="flex items-center gap-0.5">
-                                                <ArrowDown className="h-2.5 w-2.5 text-gray-500 shrink-0" />
-                                                <span className="whitespace-nowrap tabular-nums">
-                                                  {realtimeTariff.input_price_per_token
-                                                    ? (() => {
-                                                        const price =
-                                                          Number(
-                                                            realtimeTariff.input_price_per_token,
-                                                          ) * 1000000;
-                                                        return `$${price % 1 === 0 ? price.toFixed(0) : price.toFixed(2)}`;
-                                                      })()
-                                                    : "$0"}
-                                                </span>
-                                                <span className="text-[8px] text-gray-400">
-                                                  /M
-                                                </span>
-                                                <ArrowUp className="h-2.5 w-2.5 text-gray-500 shrink-0 ml-0.5" />
-                                                <span className="whitespace-nowrap tabular-nums">
-                                                  {realtimeTariff.output_price_per_token
-                                                    ? (() => {
-                                                        const price =
-                                                          Number(
-                                                            realtimeTariff.output_price_per_token,
-                                                          ) * 1000000;
-                                                        return `$${price % 1 === 0 ? price.toFixed(0) : price.toFixed(2)}`;
-                                                      })()
-                                                    : "$0"}
-                                                </span>
-                                                <span className="text-[8px] text-gray-400">
-                                                  /M
-                                                </span>
-                                              </span>
-                                            )}
-                                            <span className="sr-only">
-                                              View realtime pricing details
-                                            </span>
-                                          </button>
-                                        </HoverCardTrigger>
-                                        <HoverCardContent
-                                          className="w-48"
-                                          sideOffset={5}
-                                        >
-                                          Realtime:
-                                          {!realtimeTariff.input_price_per_token &&
-                                          !realtimeTariff.output_price_per_token ? (
-                                            <div className="text-sm">
-                                              <p className="font-medium text-green-700">
-                                                Free
-                                              </p>
-                                              <p className="text-xs text-muted-foreground mt-1">
-                                                No charge for calls to this
-                                                model
-                                              </p>
-                                            </div>
-                                          ) : (
-                                            <div className="space-y-1 text-xs">
-                                              <p className="text-muted-foreground">
-                                                Pricing per million tokens:
-                                              </p>
-                                              <p>
-                                                <span className="font-medium">
-                                                  Input:
-                                                </span>{" "}
-                                                {realtimeTariff.input_price_per_token
-                                                  ? (() => {
-                                                      const price =
-                                                        Number(
-                                                          realtimeTariff.input_price_per_token,
-                                                        ) * 1000000;
-                                                      return `$${price % 1 === 0 ? price.toFixed(0) : price.toFixed(2)}`;
-                                                    })()
-                                                  : "$0"}
-                                              </p>
-                                              <p>
-                                                <span className="font-medium">
-                                                  Output:
-                                                </span>{" "}
-                                                {realtimeTariff.output_price_per_token
-                                                  ? (() => {
-                                                      const price =
-                                                        Number(
-                                                          realtimeTariff.output_price_per_token,
-                                                        ) * 1000000;
-                                                      return `$${price % 1 === 0 ? price.toFixed(0) : price.toFixed(2)}`;
-                                                    })()
-                                                  : "$0"}
-                                              </p>
-                                            </div>
-                                          )}
-                                        </HoverCardContent>
-                                      </HoverCard>
-                                    )}
-
-                                    {!batchTariff &&
-                                      !realtimeTariff &&
-                                      canManageModels && (
+                                    {batchTariffs.length === 0 && canManageModels && (
                                         <button
                                           className="flex items-center gap-1 text-xs text-gray-600 hover:text-gray-900 transition-colors"
                                           onClick={(e) => {
