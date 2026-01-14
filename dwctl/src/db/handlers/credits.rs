@@ -559,8 +559,6 @@ impl<'c> Credits<'c> {
 
     /// List transactions with batch grouping applied using pre-aggregated batch_aggregates table.
     /// Uses optimized query with pre-limited UNION branches for O(limit) performance.
-    /// Returns transactions with category information (request_origin) for display.
-    /// Note: batch_sla for batched transactions is fetched separately from fusillade by the handler.
     #[instrument(skip(self, filters), fields(user_id = %abbrev_uuid(&user_id), skip = skip, limit = limit), err)]
     pub async fn list_transactions_with_batches(
         &mut self,
