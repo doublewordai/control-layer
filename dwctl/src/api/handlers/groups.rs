@@ -25,6 +25,9 @@ use sqlx::Acquire;
     path = "/groups",
     tag = "groups",
     summary = "List groups",
+    description = "Retrieve all groups with optional pagination and search filtering. Groups are \
+        used to organize users and control access to model deployments. Use the `include` query \
+        parameter to fetch related users and models in a single request.",
     responses(
         (status = 200, description = "List of groups", body = Vec<GroupResponse>),
         (status = 401, description = "Unauthorized"),
@@ -183,6 +186,8 @@ pub async fn list_groups(
     path = "/groups",
     tag = "groups",
     summary = "Create group",
+    description = "Create a new group for organizing users and controlling model access. After \
+        creation, use the membership endpoints to add users and grant access to model deployments.",
     request_body = GroupCreate,
     responses(
         (status = 201, description = "Group created successfully", body = GroupResponse),
@@ -491,6 +496,9 @@ pub async fn get_group_users(
     path = "/users/{user_id}/groups",
     tag = "groups",
     summary = "Get user groups",
+    description = "Retrieve all groups that a specific user belongs to. Platform managers can view \
+        any user's groups; standard users can only view their own. This is useful for understanding \
+        a user's model access permissions.",
     responses(
         (status = 200, description = "List of groups for user", body = Vec<GroupResponse>),
         (status = 401, description = "Unauthorized"),
@@ -554,6 +562,9 @@ pub async fn get_user_groups(
     path = "/groups/{group_id}/models/{deployment_id}",
     tag = "models",
     summary = "Grant group access to model",
+    description = "Grant all members of the specified group access to use a model deployment. \
+        Users in the group will be able to make API requests using this model. Access is \
+        additive - granting the same access twice has no effect.",
     responses(
         (status = 204, description = "Group granted access to model successfully"),
         (status = 401, description = "Unauthorized"),
