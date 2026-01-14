@@ -594,6 +594,264 @@ pub async fn delete_deployed_model(
     Ok(Json(deployment_id.to_string()))
 }
 
+// ===== Composite Model Component Handlers =====
+
+use crate::api::models::deployments::{ModelComponentCreate, ModelComponentResponse, ModelComponentUpdate};
+use crate::db::models::deployments::DeploymentComponentCreateDBRequest;
+
+#[utoipa::path(
+    get,
+    path = "/models/{id}/components",
+    tag = "models",
+    summary = "Get composite model components",
+    description = "Get the list of underlying models that make up a composite model",
+    params(
+        ("id" = String, Path, description = "The composite model ID", format = "uuid"),
+    ),
+    responses(
+        (status = 200, description = "List of components", body = Vec<ModelComponentResponse>),
+        (status = 400, description = "Model is not a composite model"),
+        (status = 401, description = "Unauthorized"),
+        (status = 404, description = "Composite model not found"),
+        (status = 500, description = "Internal server error"),
+    ),
+    security(
+        ("BearerAuth" = []),
+        ("CookieAuth" = []),
+        ("X-Doubleword-User" = [])
+    )
+)]
+#[tracing::instrument(skip_all)]
+pub async fn get_model_components(
+    State(state): State<AppState>,
+    Path(id): Path<DeploymentId>,
+    _: RequiresPermission<resource::CompositeModels, operation::ReadAll>,
+) -> Result<Json<Vec<ModelComponentResponse>>> {
+    let mut tx = state.db.begin().await.map_err(|e| Error::Database(e.into()))?;
+
+    // Verify the model exists and is composite
+    {
+        let mut repo = Deployments::new(tx.acquire().await.map_err(|e| Error::Database(e.into()))?);
+        let deployment = repo.get_by_id(id).await?.ok_or_else(|| Error::NotFound {
+            resource: "model".to_string(),
+            id: id.to_string(),
+        })?;
+
+        if !deployment.is_composite {
+            return Err(Error::BadRequest {
+                message: "Model is not a composite model".to_string(),
+            });
+        }
+    }
+
+    // Get components
+    let mut repo = Deployments::new(tx.acquire().await.map_err(|e| Error::Database(e.into()))?);
+    let components = repo.get_components(id).await?;
+
+    let response: Vec<ModelComponentResponse> = components
+        .into_iter()
+        .map(|c| ModelComponentResponse {
+            deployed_model_id: c.deployed_model_id,
+            weight: c.weight,
+            enabled: c.enabled,
+            created_at: c.created_at,
+        })
+        .collect();
+
+    Ok(Json(response))
+}
+
+#[utoipa::path(
+    post,
+    path = "/models/{id}/components/{component_id}",
+    tag = "models",
+    summary = "Add component to composite model",
+    description = "Add an underlying model as a component of a composite model",
+    params(
+        ("id" = String, Path, description = "The composite model ID", format = "uuid"),
+        ("component_id" = String, Path, description = "The deployed model ID to add as a component", format = "uuid"),
+    ),
+    request_body = ModelComponentCreate,
+    responses(
+        (status = 200, description = "Component added", body = ModelComponentResponse),
+        (status = 400, description = "Model is not a composite model or component is not valid"),
+        (status = 401, description = "Unauthorized"),
+        (status = 404, description = "Composite model or component model not found"),
+        (status = 500, description = "Internal server error"),
+    ),
+    security(
+        ("BearerAuth" = []),
+        ("CookieAuth" = []),
+        ("X-Doubleword-User" = [])
+    )
+)]
+#[tracing::instrument(skip_all)]
+pub async fn add_model_component(
+    State(state): State<AppState>,
+    Path((id, component_id)): Path<(DeploymentId, DeploymentId)>,
+    _: RequiresPermission<resource::CompositeModels, operation::UpdateAll>,
+    Json(body): Json<ModelComponentCreate>,
+) -> Result<Json<ModelComponentResponse>> {
+    // Validate weight
+    if !(1..=100).contains(&body.weight) {
+        return Err(Error::BadRequest {
+            message: "Weight must be between 1 and 100".to_string(),
+        });
+    }
+
+    let mut tx = state.db.begin().await.map_err(|e| Error::Database(e.into()))?;
+
+    // Verify both models exist and constraints are met
+    {
+        let mut repo = Deployments::new(tx.acquire().await.map_err(|e| Error::Database(e.into()))?);
+
+        // Check composite model exists and is composite
+        let composite = repo.get_by_id(id).await?.ok_or_else(|| Error::NotFound {
+            resource: "composite model".to_string(),
+            id: id.to_string(),
+        })?;
+
+        if !composite.is_composite {
+            return Err(Error::BadRequest {
+                message: "Model is not a composite model".to_string(),
+            });
+        }
+
+        // Check component model exists and is NOT composite
+        let component = repo.get_by_id(component_id).await?.ok_or_else(|| Error::NotFound {
+            resource: "component model".to_string(),
+            id: component_id.to_string(),
+        })?;
+
+        if component.is_composite {
+            return Err(Error::BadRequest {
+                message: "Cannot add a composite model as a component".to_string(),
+            });
+        }
+    }
+
+    // Add the component
+    let mut repo = Deployments::new(tx.acquire().await.map_err(|e| Error::Database(e.into()))?);
+    let request = DeploymentComponentCreateDBRequest {
+        composite_model_id: id,
+        deployed_model_id: component_id,
+        weight: body.weight,
+        enabled: body.enabled,
+    };
+
+    let component = repo.add_component(&request).await?;
+    tx.commit().await.map_err(|e| Error::Database(e.into()))?;
+
+    Ok(Json(ModelComponentResponse {
+        deployed_model_id: component.deployed_model_id,
+        weight: component.weight,
+        enabled: component.enabled,
+        created_at: component.created_at,
+    }))
+}
+
+#[utoipa::path(
+    patch,
+    path = "/models/{id}/components/{component_id}",
+    tag = "models",
+    summary = "Update component in composite model",
+    description = "Update the weight or enabled status of a component",
+    params(
+        ("id" = String, Path, description = "The composite model ID", format = "uuid"),
+        ("component_id" = String, Path, description = "The deployed model ID of the component", format = "uuid"),
+    ),
+    request_body = ModelComponentUpdate,
+    responses(
+        (status = 200, description = "Component updated", body = ModelComponentResponse),
+        (status = 400, description = "Invalid weight"),
+        (status = 401, description = "Unauthorized"),
+        (status = 404, description = "Composite model or component not found"),
+        (status = 500, description = "Internal server error"),
+    ),
+    security(
+        ("BearerAuth" = []),
+        ("CookieAuth" = []),
+        ("X-Doubleword-User" = [])
+    )
+)]
+#[tracing::instrument(skip_all)]
+pub async fn update_model_component(
+    State(state): State<AppState>,
+    Path((id, component_id)): Path<(DeploymentId, DeploymentId)>,
+    _: RequiresPermission<resource::CompositeModels, operation::UpdateAll>,
+    Json(body): Json<ModelComponentUpdate>,
+) -> Result<Json<ModelComponentResponse>> {
+    // Validate weight if provided
+    if let Some(weight) = body.weight
+        && !(1..=100).contains(&weight)
+    {
+        return Err(Error::BadRequest {
+            message: "Weight must be between 1 and 100".to_string(),
+        });
+    }
+
+    let mut pool_conn = state.db.acquire().await.map_err(|e| Error::Database(e.into()))?;
+    let mut repo = Deployments::new(&mut pool_conn);
+
+    let component = repo
+        .update_component(id, component_id, body.weight, body.enabled)
+        .await?
+        .ok_or_else(|| Error::NotFound {
+            resource: "component".to_string(),
+            id: format!("{}/{}", id, component_id),
+        })?;
+
+    Ok(Json(ModelComponentResponse {
+        deployed_model_id: component.deployed_model_id,
+        weight: component.weight,
+        enabled: component.enabled,
+        created_at: component.created_at,
+    }))
+}
+
+#[utoipa::path(
+    delete,
+    path = "/models/{id}/components/{component_id}",
+    tag = "models",
+    summary = "Remove component from composite model",
+    description = "Remove an underlying model from a composite model",
+    params(
+        ("id" = String, Path, description = "The composite model ID", format = "uuid"),
+        ("component_id" = String, Path, description = "The deployed model ID of the component to remove", format = "uuid"),
+    ),
+    responses(
+        (status = 200, description = "Component removed"),
+        (status = 401, description = "Unauthorized"),
+        (status = 404, description = "Composite model or component not found"),
+        (status = 500, description = "Internal server error"),
+    ),
+    security(
+        ("BearerAuth" = []),
+        ("CookieAuth" = []),
+        ("X-Doubleword-User" = [])
+    )
+)]
+#[tracing::instrument(skip_all)]
+pub async fn remove_model_component(
+    State(state): State<AppState>,
+    Path((id, component_id)): Path<(DeploymentId, DeploymentId)>,
+    _: RequiresPermission<resource::CompositeModels, operation::UpdateAll>,
+) -> Result<Json<String>> {
+    let mut pool_conn = state.db.acquire().await.map_err(|e| Error::Database(e.into()))?;
+    let mut repo = Deployments::new(&mut pool_conn);
+
+    let removed = repo.remove_component(id, component_id).await?;
+
+    if !removed {
+        return Err(Error::NotFound {
+            resource: "component".to_string(),
+            id: format!("{}/{}", id, component_id),
+        });
+    }
+
+    Ok(Json("Component removed".to_string()))
+}
+
 #[cfg(test)]
 mod tests {
 
@@ -1076,7 +1334,7 @@ mod tests {
 
         assert_eq!(created_model.model_name, "test-new-model");
         assert_eq!(created_model.alias, "Test New Model");
-        assert_eq!(created_model.hosted_on, test_endpoint_id);
+        assert_eq!(created_model.hosted_on, Some(test_endpoint_id));
         assert_eq!(created_model.description, Some("A test model created via API".to_string()));
         assert_eq!(created_model.created_by, Some(admin_user.id));
     }
@@ -1106,7 +1364,7 @@ mod tests {
 
         assert_eq!(created_model.model_name, "simple-model");
         assert_eq!(created_model.alias, "simple-model"); // Should default to model_name
-        assert_eq!(created_model.hosted_on, test_endpoint_id);
+        assert_eq!(created_model.hosted_on, Some(test_endpoint_id));
         assert_eq!(created_model.description, None);
         assert_eq!(created_model.created_by, Some(admin_user.id));
     }

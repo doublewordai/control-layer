@@ -1,39 +1,44 @@
--- Add composite models support for weighted load balancing across multiple providers
--- A composite model is a virtual model that distributes requests across multiple
+-- Add composite model support to deployed_models table
+-- Composite models are virtual models that distribute requests across multiple
 -- underlying deployed models based on configurable weights
 
--- Create the composite_models table
-CREATE TABLE composite_models (
-    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-    alias VARCHAR NOT NULL,
-    description TEXT,
-    model_type VARCHAR,  -- Same as deployed_models: CHAT, EMBEDDINGS, RERANKER
+-- Add composite model indicator and configuration columns to deployed_models
+ALTER TABLE deployed_models ADD COLUMN is_composite BOOLEAN NOT NULL DEFAULT FALSE;
 
-    -- Rate limiting (same pattern as deployed_models)
-    requests_per_second REAL,
-    burst_size INTEGER,
-    capacity INTEGER,
-    batch_capacity INTEGER,
+-- Load balancing strategy for composite models: weighted_random or priority
+ALTER TABLE deployed_models ADD COLUMN lb_strategy VARCHAR DEFAULT 'weighted_random';
 
-    -- Ownership and metadata
-    created_by UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
-);
+-- Fallback configuration for composite models
+ALTER TABLE deployed_models ADD COLUMN fallback_enabled BOOLEAN DEFAULT TRUE;
+ALTER TABLE deployed_models ADD COLUMN fallback_on_rate_limit BOOLEAN DEFAULT TRUE;
+-- HTTP status codes that trigger fallback (e.g., [429, 500, 502, 503, 504])
+ALTER TABLE deployed_models ADD COLUMN fallback_on_status INTEGER[] DEFAULT '{429, 500, 502, 503, 504}';
 
 -- Add comments
-COMMENT ON TABLE composite_models IS 'Virtual models that distribute requests across multiple underlying deployed models based on weights';
-COMMENT ON COLUMN composite_models.alias IS 'User-facing model name (e.g., "gpt-4-balanced"). Must be unique across both composite_models and deployed_models aliases';
-COMMENT ON COLUMN composite_models.model_type IS 'Model type: CHAT, EMBEDDINGS, or RERANKER';
-COMMENT ON COLUMN composite_models.requests_per_second IS 'Global rate limit for this composite model';
-COMMENT ON COLUMN composite_models.capacity IS 'Maximum concurrent requests for this composite model';
+COMMENT ON COLUMN deployed_models.is_composite IS 'Whether this is a composite model (virtual model distributing across multiple providers)';
+COMMENT ON COLUMN deployed_models.lb_strategy IS 'Load balancing strategy for composite models: weighted_random (default) or priority';
+COMMENT ON COLUMN deployed_models.fallback_enabled IS 'Whether to fall back to other providers when one fails (composite models only)';
+COMMENT ON COLUMN deployed_models.fallback_on_rate_limit IS 'Fall back when provider is rate limited (composite models only)';
+COMMENT ON COLUMN deployed_models.fallback_on_status IS 'HTTP status codes that trigger fallback to next provider (composite models only)';
 
--- Create the composite_model_components junction table
-CREATE TABLE composite_model_components (
+-- Constraint: composite models must NOT have hosted_on set, regular models MUST have it set
+-- Note: We allow hosted_on to be NULL only for composite models
+ALTER TABLE deployed_models ADD CONSTRAINT deployed_models_composite_check
+    CHECK (
+        (is_composite = TRUE AND hosted_on IS NULL) OR
+        (is_composite = FALSE AND hosted_on IS NOT NULL)
+    );
+
+-- Create the deployed_model_components junction table for composite model components
+CREATE TABLE deployed_model_components (
     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-    composite_model_id UUID NOT NULL REFERENCES composite_models(id) ON DELETE CASCADE,
+    -- The composite model that contains this component
+    composite_model_id UUID NOT NULL REFERENCES deployed_models(id) ON DELETE CASCADE,
+    -- The underlying deployed model that serves as a provider
     deployed_model_id UUID NOT NULL REFERENCES deployed_models(id) ON DELETE CASCADE,
+    -- Weight for load balancing (1-100, higher = more traffic)
     weight INTEGER NOT NULL DEFAULT 1 CHECK (weight >= 1 AND weight <= 100),
+    -- Whether this component is active
     enabled BOOLEAN NOT NULL DEFAULT TRUE,
     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
 
@@ -42,69 +47,52 @@ CREATE TABLE composite_model_components (
 );
 
 -- Add comments
-COMMENT ON TABLE composite_model_components IS 'Junction table linking composite models to their underlying deployed model components with weights';
-COMMENT ON COLUMN composite_model_components.weight IS 'Relative weight for load balancing (1-100). Higher weight = more traffic';
-COMMENT ON COLUMN composite_model_components.enabled IS 'Whether this component is active. Disabled components receive no traffic';
-
--- Create access control table for composite models (same pattern as deployment_groups)
-CREATE TABLE composite_model_groups (
-    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-    composite_model_id UUID NOT NULL REFERENCES composite_models(id) ON DELETE CASCADE,
-    group_id UUID NOT NULL REFERENCES groups(id) ON DELETE CASCADE,
-    granted_by UUID REFERENCES users(id),
-    granted_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-    UNIQUE (composite_model_id, group_id)
-);
-
-COMMENT ON TABLE composite_model_groups IS 'Access control: which groups can use which composite models';
+COMMENT ON TABLE deployed_model_components IS 'Junction table linking composite models to their underlying deployed model components with weights';
+COMMENT ON COLUMN deployed_model_components.composite_model_id IS 'The composite model (must be is_composite=true)';
+COMMENT ON COLUMN deployed_model_components.deployed_model_id IS 'The underlying provider model (must be is_composite=false)';
+COMMENT ON COLUMN deployed_model_components.weight IS 'Relative weight for load balancing (1-100). Higher weight = more traffic';
+COMMENT ON COLUMN deployed_model_components.enabled IS 'Whether this component is active. Disabled components receive no traffic';
 
 -- Indexes for performance
-CREATE INDEX idx_composite_models_alias ON composite_models(alias);
-CREATE INDEX idx_composite_models_created_by ON composite_models(created_by);
-CREATE INDEX idx_composite_model_components_composite_id ON composite_model_components(composite_model_id);
-CREATE INDEX idx_composite_model_components_deployed_id ON composite_model_components(deployed_model_id);
-CREATE INDEX idx_composite_model_groups_composite_id ON composite_model_groups(composite_model_id);
-CREATE INDEX idx_composite_model_groups_group_id ON composite_model_groups(group_id);
+CREATE INDEX idx_deployed_model_components_composite_id ON deployed_model_components(composite_model_id);
+CREATE INDEX idx_deployed_model_components_deployed_id ON deployed_model_components(deployed_model_id);
 
--- Ensure alias uniqueness across both tables
--- We need a function to check this since it spans two tables
-CREATE OR REPLACE FUNCTION check_composite_alias_unique()
+-- Constraint: ensure composite_model_id references a composite model
+-- and deployed_model_id references a non-composite model
+-- This is enforced via triggers since CHECK constraints can't reference other tables
+CREATE OR REPLACE FUNCTION check_deployed_model_component_valid()
 RETURNS TRIGGER AS $$
+DECLARE
+    composite_is_composite BOOLEAN;
+    provider_is_composite BOOLEAN;
 BEGIN
-    -- Check if alias exists in deployed_models
-    IF EXISTS (SELECT 1 FROM deployed_models WHERE alias = NEW.alias AND deleted = false) THEN
-        RAISE EXCEPTION 'Alias "%" already exists in deployed_models', NEW.alias;
+    -- Check that composite_model_id references a composite model
+    SELECT is_composite INTO composite_is_composite
+    FROM deployed_models WHERE id = NEW.composite_model_id;
+
+    IF NOT composite_is_composite THEN
+        RAISE EXCEPTION 'composite_model_id must reference a composite model (is_composite=true)';
     END IF;
+
+    -- Check that deployed_model_id references a non-composite model
+    SELECT is_composite INTO provider_is_composite
+    FROM deployed_models WHERE id = NEW.deployed_model_id;
+
+    IF provider_is_composite THEN
+        RAISE EXCEPTION 'deployed_model_id must reference a regular model (is_composite=false)';
+    END IF;
+
     RETURN NEW;
 END;
 $$ LANGUAGE plpgsql;
 
-CREATE TRIGGER composite_models_alias_unique
-    BEFORE INSERT OR UPDATE OF alias ON composite_models
+CREATE TRIGGER deployed_model_components_validate
+    BEFORE INSERT OR UPDATE ON deployed_model_components
     FOR EACH ROW
-    EXECUTE FUNCTION check_composite_alias_unique();
+    EXECUTE FUNCTION check_deployed_model_component_valid();
 
--- Also add a trigger to deployed_models to check against composite_models
-CREATE OR REPLACE FUNCTION check_deployed_alias_not_composite()
-RETURNS TRIGGER AS $$
-BEGIN
-    -- Only check if not being deleted
-    IF NEW.deleted = false THEN
-        IF EXISTS (SELECT 1 FROM composite_models WHERE alias = NEW.alias) THEN
-            RAISE EXCEPTION 'Alias "%" already exists in composite_models', NEW.alias;
-        END IF;
-    END IF;
-    RETURN NEW;
-END;
-$$ LANGUAGE plpgsql;
-
-CREATE TRIGGER deployed_models_alias_not_composite
-    BEFORE INSERT OR UPDATE OF alias, deleted ON deployed_models
-    FOR EACH ROW
-    EXECUTE FUNCTION check_deployed_alias_not_composite();
-
--- Notify onwards config when composite models change
-CREATE OR REPLACE FUNCTION notify_onwards_config_on_composite_change()
+-- Notify onwards config when components change
+CREATE OR REPLACE FUNCTION notify_onwards_config_on_component_change()
 RETURNS TRIGGER AS $$
 BEGIN
     PERFORM pg_notify('auth_config_changed', json_build_object(
@@ -117,17 +105,7 @@ BEGIN
 END;
 $$ LANGUAGE plpgsql;
 
-CREATE TRIGGER composite_models_notify_onwards
-    AFTER INSERT OR UPDATE OR DELETE ON composite_models
+CREATE TRIGGER deployed_model_components_notify_onwards
+    AFTER INSERT OR UPDATE OR DELETE ON deployed_model_components
     FOR EACH ROW
-    EXECUTE FUNCTION notify_onwards_config_on_composite_change();
-
-CREATE TRIGGER composite_model_components_notify_onwards
-    AFTER INSERT OR UPDATE OR DELETE ON composite_model_components
-    FOR EACH ROW
-    EXECUTE FUNCTION notify_onwards_config_on_composite_change();
-
-CREATE TRIGGER composite_model_groups_notify_onwards
-    AFTER INSERT OR UPDATE OR DELETE ON composite_model_groups
-    FOR EACH ROW
-    EXECUTE FUNCTION notify_onwards_config_on_composite_change();
+    EXECUTE FUNCTION notify_onwards_config_on_component_change();

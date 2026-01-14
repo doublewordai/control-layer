@@ -4,7 +4,9 @@ pub mod enrichment;
 
 use super::pagination::Pagination;
 use crate::api::models::groups::GroupResponse;
-use crate::db::models::deployments::{DeploymentDBResponse, ModelType, ProviderPricing, ProviderPricingUpdate};
+use crate::db::models::deployments::{
+    DeploymentDBResponse, FallbackConfig, LoadBalancingStrategy, ModelType, ProviderPricing, ProviderPricingUpdate,
+};
 use crate::types::{DeploymentId, InferenceEndpointId, UserId};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
@@ -179,8 +181,10 @@ pub struct DeployedModelResponse {
     #[serde(skip_serializing_if = "Option::is_none")]
     #[schema(value_type = Option<String>, format = "uuid")]
     pub created_by: Option<UserId>,
-    #[schema(value_type = String, format = "uuid")]
-    pub hosted_on: InferenceEndpointId,
+    /// Inference endpoint where the model is hosted (null for composite models)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[schema(value_type = Option<String>, format = "uuid")]
+    pub hosted_on: Option<InferenceEndpointId>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
     /// Global per-model rate limit: requests per second (null = no limit)
@@ -216,10 +220,34 @@ pub struct DeployedModelResponse {
     /// Tariffs for this model (only included if requested)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tariffs: Option<Vec<super::tariffs::TariffResponse>>,
+    // Composite model fields
+    /// Whether this is a composite model (virtual model routing to multiple providers)
+    #[serde(default)]
+    pub is_composite: bool,
+    /// Load balancing strategy for composite models
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub lb_strategy: Option<LoadBalancingStrategy>,
+    /// Fallback configuration for composite models
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub fallback: Option<FallbackConfig>,
+    /// Components of this composite model (only included if requested for composite models)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub components: Option<Vec<ModelComponentResponse>>,
 }
 
 impl From<DeploymentDBResponse> for DeployedModelResponse {
     fn from(db: DeploymentDBResponse) -> Self {
+        // Build fallback config for composite models
+        let fallback = if db.is_composite {
+            Some(FallbackConfig {
+                enabled: db.fallback_enabled,
+                on_rate_limit: db.fallback_on_rate_limit,
+                on_status: db.fallback_on_status,
+            })
+        } else {
+            None
+        };
+
         Self {
             id: db.id,
             model_name: db.model_name,
@@ -241,6 +269,11 @@ impl From<DeploymentDBResponse> for DeployedModelResponse {
             provider_pricing: None, // By default, provider pricing is not included
             endpoint: None,         // By default, endpoint is not included
             tariffs: None,          // By default, tariffs are not included
+            // Composite model fields
+            is_composite: db.is_composite,
+            lb_strategy: if db.is_composite { Some(db.lb_strategy) } else { None },
+            fallback,
+            components: None, // By default, components are not included
         }
     }
 }
@@ -301,4 +334,54 @@ impl DeployedModelResponse {
         self.tariffs = Some(tariffs);
         self
     }
+
+    /// Create a response with components included (for composite models)
+    pub fn with_components(mut self, components: Vec<ModelComponentResponse>) -> Self {
+        self.components = Some(components);
+        self
+    }
+}
+
+// ===== Composite Model Component Types =====
+
+/// Request to add a component to a composite model
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct ModelComponentCreate {
+    /// Weight for load balancing (1-100, higher = more traffic)
+    #[serde(default = "default_weight")]
+    pub weight: i32,
+    /// Whether this component is enabled
+    #[serde(default = "default_enabled")]
+    pub enabled: bool,
+}
+
+fn default_weight() -> i32 {
+    1
+}
+
+fn default_enabled() -> bool {
+    true
+}
+
+/// Request to update a component's configuration
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct ModelComponentUpdate {
+    /// New weight for load balancing (1-100)
+    pub weight: Option<i32>,
+    /// Whether this component is enabled
+    pub enabled: Option<bool>,
+}
+
+/// Response for a composite model component
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct ModelComponentResponse {
+    /// The underlying deployed model ID
+    #[schema(value_type = String, format = "uuid")]
+    pub deployed_model_id: DeploymentId,
+    /// Weight for load balancing (1-100)
+    pub weight: i32,
+    /// Whether this component is enabled
+    pub enabled: bool,
+    /// When this component was added
+    pub created_at: DateTime<Utc>,
 }

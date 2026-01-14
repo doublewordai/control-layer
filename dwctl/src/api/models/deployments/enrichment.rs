@@ -123,10 +123,10 @@ impl<'a> DeployedModelEnricher<'a> {
                     let mut endpoints_conn = self.db.acquire().await.map_err(|e| Error::Database(e.into())).ok()?;
                     let mut endpoints_repo = InferenceEndpoints::new(&mut endpoints_conn);
 
-                    // Collect all unique endpoint IDs
+                    // Collect all unique endpoint IDs (filtering out composite models which have None hosted_on)
                     let endpoint_ids: Vec<InferenceEndpointId> = models
                         .iter()
-                        .map(|m| m.hosted_on)
+                        .filter_map(|m| m.hosted_on)
                         .collect::<std::collections::HashSet<_>>()
                         .into_iter()
                         .collect();
@@ -306,7 +306,8 @@ impl<'a> DeployedModelEnricher<'a> {
         endpoints_map: &Option<HashMap<InferenceEndpointId, InferenceEndpointResponse>>,
     ) -> DeployedModelResponse {
         if let Some(endpoints_map) = endpoints_map
-            && let Some(endpoint) = endpoints_map.get(&model.hosted_on)
+            && let Some(hosted_on) = model.hosted_on
+            && let Some(endpoint) = endpoints_map.get(&hosted_on)
         {
             model = model.with_endpoint(endpoint.clone());
         }
@@ -344,7 +345,7 @@ mod tests {
             model_type: None,
             capabilities: None,
             created_by: Some(Uuid::new_v4()),
-            hosted_on: Uuid::new_v4(),
+            hosted_on: Some(Uuid::new_v4()),
             created_at: Utc::now(),
             updated_at: Utc::now(),
             requests_per_second: Some(100.0),
@@ -357,6 +358,11 @@ mod tests {
             provider_pricing: None,
             endpoint: None,
             tariffs: None,
+            // Composite model fields (regular model = not composite)
+            is_composite: false,
+            lb_strategy: None,
+            fallback: None,
+            components: None,
         }
     }
 
@@ -507,7 +513,7 @@ mod tests {
     #[test]
     fn test_apply_endpoint_with_data() {
         let model = create_test_model();
-        let endpoint_id = model.hosted_on;
+        let endpoint_id = model.hosted_on.expect("test model should have hosted_on");
 
         let mut endpoints_map = HashMap::new();
         endpoints_map.insert(

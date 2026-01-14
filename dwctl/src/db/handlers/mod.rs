@@ -59,7 +59,6 @@
 
 pub mod analytics;
 pub mod api_keys;
-pub mod composite_models;
 pub mod credits;
 pub mod deployments;
 pub mod groups;
@@ -69,7 +68,6 @@ pub mod repository;
 pub mod tariffs;
 pub mod users;
 
-pub use composite_models::CompositeModels;
 pub use credits::Credits;
 pub use deployments::Deployments;
 pub use groups::Groups;

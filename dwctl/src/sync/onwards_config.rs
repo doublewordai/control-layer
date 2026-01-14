@@ -24,7 +24,7 @@ pub enum SyncStatus {
 
 use crate::{
     config::ONWARDS_CONFIG_CHANGED_CHANNEL,
-    db::models::composite_models::LoadBalancingStrategy,
+    db::models::deployments::LoadBalancingStrategy,
     types::{ApiKeyId, DeploymentId},
 };
 
@@ -359,6 +359,7 @@ pub async fn load_targets_from_db(db: &PgPool) -> Result<Targets, anyhow::Error>
             )
         ) ak ON true
         WHERE dm.deleted = FALSE
+          AND dm.is_composite = FALSE
         ORDER BY dm.id, ak.id
         "#
     )
@@ -367,7 +368,7 @@ pub async fn load_targets_from_db(db: &PgPool) -> Result<Targets, anyhow::Error>
 
     let query_duration = query_start.elapsed();
     info!(
-        "Mega-query completed in {:?}, fetched {} rows ({} rows/ms)",
+        "Mega-query (non-composite models) completed in {:?}, fetched {} rows ({} rows/ms)",
         query_duration,
         rows.len(),
         if query_duration.as_millis() > 0 {
@@ -582,22 +583,8 @@ fn convert_to_config_file(targets: Vec<OnwardsTarget>) -> ConfigFile {
 // Composite models are virtual models that distribute requests across multiple
 // underlying deployed models based on configurable weights.
 //
-// Integration with onwards PR #47 (https://github.com/doublewordai/onwards/pull/47):
-// Once merged, update the onwards dependency and uncomment the integration below.
-//
-// The new onwards format supports:
-// ```json
-// {"targets": {"gpt-4": {
-//   "keys": ["key1", "key2"],
-//   "rate_limit": {...},
-//   "providers": [
-//     {"url": "...", "onwards_key": "key1", "onwards_model": "gpt-4", "weight": 2},
-//     {"url": "...", "onwards_key": "key2", "onwards_model": "gpt-4", "weight": 1}
-//   ]
-// }}}
-// ```
-
-use crate::types::CompositeModelId;
+// Composite models are stored in the deployed_models table with is_composite = TRUE.
+// They have NULL hosted_on and instead have components in deployed_model_components.
 
 /// Data structure for composite model components (prepared for onwards integration)
 #[derive(Debug, Clone)]
@@ -612,7 +599,7 @@ struct CompositeModelComponent {
 #[derive(Debug, Clone)]
 #[allow(dead_code)]
 struct OnwardsCompositeModel {
-    id: CompositeModelId,
+    id: DeploymentId,
     alias: String,
     requests_per_second: Option<f32>,
     burst_size: Option<i32>,
@@ -636,7 +623,7 @@ struct OnwardsCompositeModel {
 async fn load_composite_models_from_db(db: &PgPool) -> Result<Vec<OnwardsCompositeModel>, anyhow::Error> {
     debug!("Loading composite models from database");
 
-    // Query composite models with their components and underlying deployments
+    // Query composite models (deployed_models with is_composite = TRUE) with their components
     let component_rows = sqlx::query!(
         r#"
         SELECT
@@ -650,8 +637,8 @@ async fn load_composite_models_from_db(db: &PgPool) -> Result<Vec<OnwardsComposi
             cm.fallback_on_rate_limit,
             cm.fallback_on_status,
             -- Component info
-            cmc.deployed_model_id,
-            cmc.weight,
+            dmc.deployed_model_id,
+            dmc.weight,
             -- Underlying deployment info
             dm.model_name,
             dm.alias as deployment_alias,
@@ -663,19 +650,21 @@ async fn load_composite_models_from_db(db: &PgPool) -> Result<Vec<OnwardsComposi
             ie.api_key as endpoint_api_key,
             ie.auth_header_name,
             ie.auth_header_prefix
-        FROM composite_models cm
-        INNER JOIN composite_model_components cmc ON cm.id = cmc.composite_model_id
-        INNER JOIN deployed_models dm ON cmc.deployed_model_id = dm.id
+        FROM deployed_models cm
+        INNER JOIN deployed_model_components dmc ON cm.id = dmc.composite_model_id
+        INNER JOIN deployed_models dm ON dmc.deployed_model_id = dm.id
         INNER JOIN inference_endpoints ie ON dm.hosted_on = ie.id
-        WHERE cmc.enabled = TRUE
+        WHERE cm.is_composite = TRUE
+          AND cm.deleted = FALSE
+          AND dmc.enabled = TRUE
           AND dm.deleted = FALSE
-        ORDER BY cm.id, cmc.weight DESC
+        ORDER BY cm.id, dmc.weight DESC
         "#
     )
     .fetch_all(db)
     .await?;
 
-    // Query API keys with access to composite models (similar logic to deployed_models)
+    // Query API keys with access to composite models (uses deployment_groups since composites are in deployed_models)
     let api_key_rows = sqlx::query!(
         r#"
         WITH user_balances AS (
@@ -700,7 +689,7 @@ async fn load_composite_models_from_db(db: &PgPool) -> Result<Vec<OnwardsComposi
             ak.secret as api_key_secret,
             ak.requests_per_second,
             ak.burst_size
-        FROM composite_models cm
+        FROM deployed_models cm
         CROSS JOIN LATERAL (
             SELECT DISTINCT
                 ak.id,
@@ -711,18 +700,18 @@ async fn load_composite_models_from_db(db: &PgPool) -> Result<Vec<OnwardsComposi
             WHERE (
                 -- System user always has access
                 ak.user_id = '00000000-0000-0000-0000-000000000000'
-                -- OR user is in a group assigned to this composite model
+                -- OR user is in a group assigned to this composite model (via deployment_groups)
                 OR EXISTS (
                     SELECT 1 FROM user_groups ug
-                    INNER JOIN composite_model_groups cmg ON ug.group_id = cmg.group_id
-                    WHERE cmg.composite_model_id = cm.id
+                    INNER JOIN deployment_groups dg ON ug.group_id = dg.group_id
+                    WHERE dg.deployment_id = cm.id
                       AND ug.user_id = ak.user_id
                 )
                 -- OR composite model is in public group (nil UUID)
                 OR EXISTS (
-                    SELECT 1 FROM composite_model_groups cmg
-                    WHERE cmg.composite_model_id = cm.id
-                      AND cmg.group_id = '00000000-0000-0000-0000-000000000000'
+                    SELECT 1 FROM deployment_groups dg
+                    WHERE dg.deployment_id = cm.id
+                      AND dg.group_id = '00000000-0000-0000-0000-000000000000'
                 )
             )
             -- Require positive balance (system user always passes)
@@ -734,6 +723,8 @@ async fn load_composite_models_from_db(db: &PgPool) -> Result<Vec<OnwardsComposi
                 )
             )
         ) ak
+        WHERE cm.is_composite = TRUE
+          AND cm.deleted = FALSE
         ORDER BY cm.id, ak.id
         "#
     )
@@ -741,7 +732,7 @@ async fn load_composite_models_from_db(db: &PgPool) -> Result<Vec<OnwardsComposi
     .await?;
 
     // Group components by composite model
-    let mut composite_map: HashMap<CompositeModelId, OnwardsCompositeModel> = HashMap::new();
+    let mut composite_map: HashMap<DeploymentId, OnwardsCompositeModel> = HashMap::new();
 
     for row in component_rows {
         let composite = composite_map.entry(row.composite_model_id).or_insert_with(|| {
@@ -1160,6 +1151,7 @@ pub async fn load_targets_from_db_with_composites(db: &PgPool) -> Result<Targets
             )
         ) ak ON true
         WHERE dm.deleted = FALSE
+          AND dm.is_composite = FALSE
         ORDER BY dm.id, ak.id
         "#
     )
@@ -1168,7 +1160,7 @@ pub async fn load_targets_from_db_with_composites(db: &PgPool) -> Result<Targets
 
     let query_duration = query_start.elapsed();
     info!(
-        "Deployed models query completed in {:?}, fetched {} rows",
+        "Regular (non-composite) deployed models query completed in {:?}, fetched {} rows",
         query_duration,
         rows.len()
     );
@@ -1405,12 +1397,18 @@ mod tests {
                 description: None,
                 model_type: None,
                 capabilities: None,
-                hosted_on: endpoint.id,
+                hosted_on: Some(endpoint.id),
                 requests_per_second: None,
                 burst_size: None,
                 capacity: None,
                 batch_capacity: None,
                 provider_pricing: None,
+                // Composite model fields (regular model = not composite)
+                is_composite: false,
+                lb_strategy: None,
+                fallback_enabled: None,
+                fallback_on_rate_limit: None,
+                fallback_on_status: None,
             })
             .await
             .unwrap();

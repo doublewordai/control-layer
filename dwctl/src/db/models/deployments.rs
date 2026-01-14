@@ -1,7 +1,10 @@
 //! Database models for deployments.
+//!
+//! This module includes support for both regular deployed models (backed by a single
+//! inference endpoint) and composite models (virtual models that distribute requests
+//! across multiple underlying models based on configurable weights).
 
 use crate::api::models::deployments::{DeployedModelCreate, DeployedModelUpdate};
-use crate::db::handlers::inference_endpoints::InferenceEndpoints;
 use crate::types::{DeploymentId, InferenceEndpointId, UserId};
 use bon::Builder;
 use chrono::{DateTime, Utc};
@@ -246,6 +249,97 @@ impl ModelStatus {
     }
 }
 
+/// Load balancing strategy for composite models
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum LoadBalancingStrategy {
+    /// Distribute requests randomly based on weights (default)
+    #[default]
+    WeightedRandom,
+    /// Try providers in order of weight (highest first), falling back on failure
+    Priority,
+}
+
+impl LoadBalancingStrategy {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::WeightedRandom => "weighted_random",
+            Self::Priority => "priority",
+        }
+    }
+
+    pub fn try_parse(s: &str) -> Option<Self> {
+        match s {
+            "weighted_random" => Some(Self::WeightedRandom),
+            "priority" => Some(Self::Priority),
+            _ => None,
+        }
+    }
+}
+
+fn default_true() -> bool {
+    true
+}
+
+fn default_fallback_status_codes() -> Vec<i32> {
+    vec![429, 500, 502, 503, 504]
+}
+
+/// Fallback configuration for composite models
+#[derive(Debug, Clone, Default, Serialize, Deserialize, ToSchema)]
+pub struct FallbackConfig {
+    /// Whether fallback is enabled (default: true)
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    /// Fall back when provider is rate limited (default: true)
+    #[serde(default = "default_true")]
+    pub on_rate_limit: bool,
+    /// HTTP status codes that trigger fallback (default: [429, 500, 502, 503, 504])
+    #[serde(default = "default_fallback_status_codes")]
+    pub on_status: Vec<i32>,
+}
+
+impl FallbackConfig {
+    pub fn new() -> Self {
+        Self {
+            enabled: true,
+            on_rate_limit: true,
+            on_status: default_fallback_status_codes(),
+        }
+    }
+}
+
+/// A component of a composite model (a deployed model with a weight)
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct DeploymentComponent {
+    #[schema(value_type = String, format = "uuid")]
+    pub deployed_model_id: DeploymentId,
+    /// Relative weight for load balancing (1-100)
+    pub weight: i32,
+    /// Whether this component is active
+    pub enabled: bool,
+}
+
+/// Database request for adding a component to a composite model
+#[derive(Debug, Clone)]
+pub struct DeploymentComponentCreateDBRequest {
+    pub composite_model_id: DeploymentId,
+    pub deployed_model_id: DeploymentId,
+    pub weight: i32,
+    pub enabled: bool,
+}
+
+/// Database response for a deployment component
+#[derive(Debug, Clone)]
+pub struct DeploymentComponentDBResponse {
+    pub id: uuid::Uuid,
+    pub composite_model_id: DeploymentId,
+    pub deployed_model_id: DeploymentId,
+    pub weight: i32,
+    pub enabled: bool,
+    pub created_at: DateTime<Utc>,
+}
+
 /// Database request for creating a new deployment
 #[derive(Debug, Clone, Builder)]
 pub struct DeploymentCreateDBRequest {
@@ -255,18 +349,28 @@ pub struct DeploymentCreateDBRequest {
     pub description: Option<String>,
     pub model_type: Option<ModelType>,
     pub capabilities: Option<Vec<String>>,
-    #[builder(default = InferenceEndpoints::default_endpoint_id())]
-    pub hosted_on: InferenceEndpointId,
+    /// Inference endpoint for regular models. Must be None for composite models.
+    pub hosted_on: Option<InferenceEndpointId>,
     pub requests_per_second: Option<f32>,
     pub burst_size: Option<i32>,
     pub capacity: Option<i32>,
     pub batch_capacity: Option<i32>,
     // Provider/downstream pricing
     pub provider_pricing: Option<ProviderPricing>,
+    // Composite model fields
+    /// Whether this is a composite model
+    #[builder(default)]
+    pub is_composite: bool,
+    /// Load balancing strategy for composite models (defaults to weighted_random)
+    pub lb_strategy: Option<LoadBalancingStrategy>,
+    /// Fallback configuration for composite models
+    pub fallback_enabled: Option<bool>,
+    pub fallback_on_rate_limit: Option<bool>,
+    pub fallback_on_status: Option<Vec<i32>>,
 }
 
 impl DeploymentCreateDBRequest {
-    /// Creates a deployment request from API model creation data
+    /// Creates a deployment request from API model creation data (for regular models)
     pub fn from_api_create(created_by: UserId, create: DeployedModelCreate) -> Self {
         Self::builder()
             .created_by(created_by)
@@ -281,6 +385,7 @@ impl DeploymentCreateDBRequest {
             .maybe_capacity(create.capacity)
             .maybe_batch_capacity(create.batch_capacity)
             .maybe_provider_pricing(create.provider_pricing)
+            .is_composite(false)
             .build()
     }
 }
@@ -302,6 +407,11 @@ pub struct DeploymentUpdateDBRequest {
     pub batch_capacity: Option<Option<i32>>,
     // Provider pricing updates
     pub provider_pricing: Option<ProviderPricingUpdate>,
+    // Composite model fields (only applicable when is_composite = true)
+    pub lb_strategy: Option<LoadBalancingStrategy>,
+    pub fallback_enabled: Option<bool>,
+    pub fallback_on_rate_limit: Option<bool>,
+    pub fallback_on_status: Option<Vec<i32>>,
 }
 
 impl From<DeployedModelUpdate> for DeploymentUpdateDBRequest {
@@ -348,7 +458,8 @@ pub struct DeploymentDBResponse {
     pub model_type: Option<ModelType>,
     pub capabilities: Option<Vec<String>>,
     pub created_by: UserId,
-    pub hosted_on: InferenceEndpointId,
+    /// Inference endpoint for regular models. None for composite models.
+    pub hosted_on: Option<InferenceEndpointId>,
     pub status: ModelStatus,
     pub last_sync: Option<DateTime<Utc>>,
     pub deleted: bool,
@@ -360,4 +471,13 @@ pub struct DeploymentDBResponse {
     pub batch_capacity: Option<i32>,
     // Provider/downstream pricing
     pub provider_pricing: Option<ProviderPricing>,
+    // Composite model fields
+    /// Whether this is a composite model
+    pub is_composite: bool,
+    /// Load balancing strategy for composite models
+    pub lb_strategy: LoadBalancingStrategy,
+    /// Fallback configuration for composite models
+    pub fallback_enabled: bool,
+    pub fallback_on_rate_limit: bool,
+    pub fallback_on_status: Vec<i32>,
 }

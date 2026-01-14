@@ -1794,12 +1794,18 @@ mod tests {
                     description: None,
                     model_type: None,
                     capabilities: None,
-                    hosted_on: endpoint.id,
+                    hosted_on: Some(endpoint.id),
                     requests_per_second: None,
                     burst_size: None,
                     capacity: None,
                     batch_capacity: None,
                     provider_pricing: None,
+                    // Composite model fields (regular model = not composite)
+                    is_composite: false,
+                    lb_strategy: None,
+                    fallback_enabled: None,
+                    fallback_on_rate_limit: None,
+                    fallback_on_status: None,
                 })
                 .await
                 .unwrap();

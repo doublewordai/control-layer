@@ -34,7 +34,6 @@
 pub mod api_keys;
 pub mod auth;
 pub mod batches;
-pub mod composite_models;
 pub mod config;
 pub mod daemons;
 pub mod deployments;

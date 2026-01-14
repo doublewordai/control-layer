@@ -952,45 +952,22 @@ pub async fn build_router(state: &mut AppState, onwards_router: Router) -> anyho
         .route("/models/{id}", get(api::handlers::deployments::get_deployed_model))
         .route("/models/{id}", patch(api::handlers::deployments::update_deployed_model))
         .route("/models/{id}", delete(api::handlers::deployments::delete_deployed_model))
-        // Composite models endpoints
-        .route("/composite-models", get(api::handlers::composite_models::list_composite_models))
-        .route("/composite-models", post(api::handlers::composite_models::create_composite_model))
-        .route("/composite-models/{id}", get(api::handlers::composite_models::get_composite_model))
+        // Composite model component management (for models where is_composite=true)
         .route(
-            "/composite-models/{id}",
-            patch(api::handlers::composite_models::update_composite_model),
+            "/models/{id}/components",
+            get(api::handlers::deployments::get_model_components),
         )
         .route(
-            "/composite-models/{id}",
-            delete(api::handlers::composite_models::delete_composite_model),
+            "/models/{id}/components/{component_id}",
+            post(api::handlers::deployments::add_model_component),
         )
         .route(
-            "/composite-models/{id}/components",
-            get(api::handlers::composite_models::get_composite_model_components),
+            "/models/{id}/components/{component_id}",
+            patch(api::handlers::deployments::update_model_component),
         )
         .route(
-            "/composite-models/{id}/components/{deployment_id}",
-            post(api::handlers::composite_models::add_composite_model_component),
-        )
-        .route(
-            "/composite-models/{id}/components/{deployment_id}",
-            patch(api::handlers::composite_models::update_composite_model_component),
-        )
-        .route(
-            "/composite-models/{id}/components/{deployment_id}",
-            delete(api::handlers::composite_models::remove_composite_model_component),
-        )
-        .route(
-            "/composite-models/{id}/groups",
-            get(api::handlers::composite_models::get_composite_model_groups),
-        )
-        .route(
-            "/composite-models/{id}/groups/{group_id}",
-            post(api::handlers::composite_models::add_composite_model_group),
-        )
-        .route(
-            "/composite-models/{id}/groups/{group_id}",
-            delete(api::handlers::composite_models::remove_composite_model_group),
+            "/models/{id}/components/{component_id}",
+            delete(api::handlers::deployments::remove_model_component),
         )
         // Groups management
         .route("/groups", get(api::handlers::groups::list_groups))

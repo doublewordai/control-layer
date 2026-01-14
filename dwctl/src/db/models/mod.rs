@@ -61,7 +61,6 @@
 //! ```
 
 pub mod api_keys;
-pub mod composite_models;
 pub mod credits;
 pub mod deployments;
 pub mod groups;
