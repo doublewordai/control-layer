@@ -68,6 +68,17 @@ pub struct AggregatedBatches {
     pub batched_source_ids: Vec<String>,
 }
 
+/// Extended transaction data with category information for display
+#[derive(Debug, Clone)]
+pub struct TransactionWithCategory {
+    pub transaction: CreditTransactionDBResponse,
+    pub batch_id: Option<Uuid>,
+    pub request_origin: Option<String>,
+    pub batch_sla: Option<String>,
+    /// Number of requests in this batch (1 for non-batch transactions)
+    pub batch_count: i32,
+}
+
 /// Convert CreditTransactionType to its snake_case string representation for SQL queries
 fn transaction_type_to_string(t: &CreditTransactionType) -> String {
     match t {
@@ -555,7 +566,7 @@ impl<'c> Credits<'c> {
         skip: i64,
         limit: i64,
         filters: &TransactionFilters,
-    ) -> Result<Vec<(CreditTransactionDBResponse, Option<Uuid>)>> {
+    ) -> Result<Vec<TransactionWithCategory>> {
         // Perform lazy aggregation for any new unaggregated transactions
         self.aggregate_user_batches(user_id).await?;
 
@@ -580,6 +591,8 @@ impl<'c> Credits<'c> {
 
         // Optimized query using pre-limited UNION branches for Merge Append
         // Each branch fetches skip+limit rows, then pagination applies to combined result
+        // request_origin is hardcoded as "fusillade" for batches since they always come from Fusillade
+        // batch_sla is returned as NULL for batches - the handler fetches it from fusillade
         let fetch_limit = skip + limit;
         let rows = sqlx::query!(
             r#"
@@ -587,17 +600,21 @@ impl<'c> Credits<'c> {
                 -- Top N from batch_aggregates (index scan on idx_batch_agg_user_seq)
                 -- Only included if transaction_types filter includes 'usage' or is not set
                 -- and search term matches "Batch" description
+                -- request_origin is always "fusillade" for batches
+                -- batch_sla is NULL here - fetched from fusillade by the handler
                 (SELECT
                     ba.fusillade_batch_id as id,
                     ba.user_id,
                     'usage' as "transaction_type!: CreditTransactionType",
                     ba.total_amount as amount,
                     ba.fusillade_batch_id::text as source_id,
-                    'Batch' as description,
+                    'Batch'::text as description,
                     ba.created_at,
                     ba.max_seq,
                     ba.fusillade_batch_id as batch_id,
-                    ba.transaction_count as batch_count
+                    ba.transaction_count as batch_count,
+                    'fusillade'::text as request_origin,
+                    NULL::text as batch_sla
                 FROM batch_aggregates ba
                 WHERE ba.user_id = $1
                   AND $7::bool = true
@@ -611,6 +628,7 @@ impl<'c> Credits<'c> {
                 UNION ALL
 
                 -- Top N from non-batched transactions (index scan on idx_credits_tx_non_batched)
+                -- JOIN with http_analytics to get request_origin for non-batch usage transactions
                 (SELECT
                     ct.id,
                     ct.user_id,
@@ -621,8 +639,11 @@ impl<'c> Credits<'c> {
                     ct.created_at,
                     ct.seq as max_seq,
                     NULL::uuid as batch_id,
-                    1::int as batch_count
+                    1::int as batch_count,
+                    ha.request_origin as request_origin,
+                    ha.batch_sla as batch_sla
                 FROM credits_transactions ct
+                LEFT JOIN http_analytics ha ON ha.id::text = ct.source_id
                 WHERE ct.user_id = $1
                   AND ct.fusillade_batch_id IS NULL
                   AND ($5::text IS NULL OR ct.description ILIKE '%' || $5 || '%')
@@ -674,7 +695,13 @@ impl<'c> Credits<'c> {
                 source_id,
                 created_at,
             };
-            results.push((transaction, row.batch_id));
+            results.push(TransactionWithCategory {
+                transaction,
+                batch_id: row.batch_id,
+                request_origin: row.request_origin,
+                batch_sla: row.batch_sla,
+                batch_count: row.batch_count.unwrap_or(1),
+            });
         }
 
         Ok(results)
