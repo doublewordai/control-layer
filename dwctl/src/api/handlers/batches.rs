@@ -127,10 +127,11 @@ The batch will begin processing immediately. Use `GET /batches/{batch_id}` to mo
         (status = 500, description = "An unexpected error occurred. Retry the request or contact support if the issue persists.")
     )
 )]
-#[tracing::instrument(skip(state, current_user), fields(user_id = %current_user.id, input_file_id = %req.input_file_id))]
+#[tracing::instrument(skip(state, current_user, api_key_purpose), fields(user_id = %current_user.id, input_file_id = %req.input_file_id))]
 pub async fn create_batch(
     State(state): State<AppState>,
     current_user: RequiresPermission<resource::Batches, operation::CreateOwn>,
+    api_key_purpose: crate::auth::current_user::ApiKeyPurposeExtractor,
     Json(req): Json<CreateBatchRequest>,
 ) -> Result<(StatusCode, Json<BatchResponse>)> {
     // Validate completion_window against configured allowed values
@@ -187,8 +188,19 @@ pub async fn create_batch(
         }
     }
 
-    // Convert metadata to serde_json::Value
-    let metadata = req.metadata.and_then(|m| serde_json::to_value(m).ok());
+    // Determine request_source from authentication method
+    // - Session cookie auth (returns Playground) -> "frontend" (dashboard/UI access)
+    // - Playground API key -> "frontend"
+    // - All other API keys -> "api"
+    let request_source = match api_key_purpose.0 {
+        Some(crate::db::models::api_keys::ApiKeyPurpose::Playground) => "frontend",
+        _ => "api",
+    };
+
+    // Convert metadata to HashMap and inject request_source
+    let mut metadata_map = req.metadata.unwrap_or_default();
+    metadata_map.insert("request_source".to_string(), request_source.to_string());
+    let metadata = serde_json::to_value(metadata_map).ok();
 
     // Create batch input
     let batch_input = fusillade::BatchInput {

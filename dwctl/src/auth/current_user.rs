@@ -1,6 +1,7 @@
 //! User extraction from request authentication.
 
 use crate::db::errors::DbError;
+use crate::db::models::api_keys::ApiKeyPurpose;
 use crate::{
     AppState,
     api::models::users::{CurrentUser, Role},
@@ -330,6 +331,72 @@ async fn try_api_key_auth(parts: &axum::http::request::Parts, db: &PgPool) -> Op
         avatar_url: api_key_data.avatar_url,
         payment_provider_id: api_key_data.payment_provider_id,
     }))
+}
+
+/// Extractor for API key purpose from request headers.
+///
+/// This extracts the purpose of the API key used in the Authorization header,
+/// which can be used to determine the request source (e.g., "frontend" for Playground keys,
+/// "api" for regular API keys).
+///
+/// Returns:
+/// - `Some(Playground)` if authenticated via session cookie (frontend access)
+/// - `Some(purpose)` if authenticated via API key with known purpose
+/// - `None` if no valid authentication found
+#[derive(Debug, Clone)]
+pub struct ApiKeyPurposeExtractor(pub Option<ApiKeyPurpose>);
+
+impl FromRequestParts<AppState> for ApiKeyPurposeExtractor {
+    type Rejection = std::convert::Infallible;
+
+    async fn from_request_parts(parts: &mut Parts, state: &AppState) -> std::result::Result<Self, Self::Rejection> {
+        // First, check for API key in Authorization header
+        if let Some(auth_header) = parts.headers.get(axum::http::header::AUTHORIZATION) {
+            if let Ok(auth_str) = auth_header.to_str() {
+                if let Some(api_key) = auth_str.strip_prefix("Bearer ") {
+                    // Look up API key purpose in database
+                    if let Ok(mut conn) = state.db.acquire().await {
+                        let purpose = sqlx::query_scalar!(
+                            r#"SELECT purpose as "purpose!: ApiKeyPurpose" FROM api_keys WHERE secret = $1"#,
+                            api_key
+                        )
+                        .fetch_optional(&mut *conn)
+                        .await
+                        .ok()
+                        .flatten();
+
+                        if purpose.is_some() {
+                            return Ok(ApiKeyPurposeExtractor(purpose));
+                        }
+                    }
+                }
+            }
+        }
+
+        // If no API key found, check for session cookie authentication
+        // Session cookie auth means the request is coming from the frontend
+        if state.config.auth.native.enabled {
+            if let Some(cookie_header) = parts.headers.get(axum::http::header::COOKIE) {
+                if let Ok(cookie_str) = cookie_header.to_str() {
+                    let cookie_name = &state.config.auth.native.session.cookie_name;
+                    for cookie in cookie_str.split(';') {
+                        let cookie = cookie.trim();
+                        if let Some((name, value)) = cookie.split_once('=') {
+                            if name == cookie_name {
+                                // Verify the JWT is valid
+                                if session::verify_session_token(value, &state.config).is_ok() {
+                                    // Valid session cookie = frontend access
+                                    return Ok(ApiKeyPurposeExtractor(Some(ApiKeyPurpose::Playground)));
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        Ok(ApiKeyPurposeExtractor(None))
+    }
 }
 
 impl FromRequestParts<AppState> for CurrentUser {
