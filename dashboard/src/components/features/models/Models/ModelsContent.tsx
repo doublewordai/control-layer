@@ -528,7 +528,7 @@ export const ModelsContent: React.FC<ModelsContentProps> = ({
                                               ) : (
                                                 <span className="flex items-center gap-1">
                                                   <span className="flex items-center gap-0.5">
-                                                    <ArrowDownToLine className="h-2.5 w-2.5 text-gray-500 shrink-0" />
+                                                    <ArrowUpToLine className="h-2.5 w-2.5 text-gray-500 shrink-0" />
                                                     <span className="whitespace-nowrap tabular-nums">
                                                       {batchTariff.input_price_per_token
                                                         ? (() => {
@@ -545,7 +545,7 @@ export const ModelsContent: React.FC<ModelsContentProps> = ({
                                                     </span>
                                                   </span>
                                                   <span className="flex items-center gap-0.5">
-                                                    <ArrowUpToLine className="h-2.5 w-2.5 text-gray-500 shrink-0" />
+                                                    <ArrowDownToLine className="h-2.5 w-2.5 text-gray-500 shrink-0" />
                                                     <span className="whitespace-nowrap tabular-nums">
                                                       {batchTariff.output_price_per_token
                                                         ? (() => {
