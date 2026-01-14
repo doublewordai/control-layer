@@ -1,5 +1,13 @@
 # Changelog
 
+## [1.1.1](https://github.com/doublewordai/control-layer/compare/v1.1.0...v1.1.1) (2026-01-14)
+
+
+### Bug Fixes
+
+* icons ([#522](https://github.com/doublewordai/control-layer/issues/522)) ([2ec4914](https://github.com/doublewordai/control-layer/commit/2ec491454c2aa3242692175a3cf26d2aa6b4b1ef))
+* weird stripe api restraint ([#523](https://github.com/doublewordai/control-layer/issues/523)) ([cbe7b3f](https://github.com/doublewordai/control-layer/commit/cbe7b3f06e8a0c87d05f9221eb2f7e4282f2b61e))
+
 ## [1.1.0](https://github.com/doublewordai/control-layer/compare/v1.0.0...v1.1.0) (2026-01-14)
 
 
