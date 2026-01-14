@@ -1,5 +1,17 @@
 # Changelog
 
+## [1.1.0](https://github.com/doublewordai/control-layer/compare/v1.0.0...v1.1.0) (2026-01-14)
+
+
+### Features
+
+* show both slas on model summaries ([#517](https://github.com/doublewordai/control-layer/issues/517)) ([908688c](https://github.com/doublewordai/control-layer/commit/908688c45435d7df3e5595141c94f0d86e00dbc6))
+
+
+### Bug Fixes
+
+* return to details and result count links ([#514](https://github.com/doublewordai/control-layer/issues/514)) ([e315fee](https://github.com/doublewordai/control-layer/commit/e315fee4b79f6d179065f9571df03cdd6ef7e1d9))
+
 ## [1.0.0](https://github.com/doublewordai/control-layer/compare/v0.29.0...v1.0.0) (2026-01-13)
 
 
