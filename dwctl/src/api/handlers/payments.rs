@@ -306,6 +306,71 @@ pub async fn webhook_handler(State(state): State<AppState>, headers: axum::http:
     }
 }
 
+/// Create a billing portal session for customer self-service
+///
+/// This endpoint creates a billing portal session URL for customers to manage
+/// their billing details, view invoices, and update payment methods.
+#[utoipa::path(
+    post,
+    path = "/billing-portal",
+    tag = "payments",
+    summary = "Create billing portal session",
+    description = "Creates a billing portal session for the authenticated user. Requires the user to have a payment_provider_id (customer ID) set. The return URL is automatically constructed from the configured host_url.",
+    responses(
+        (status = 200, description = "Billing portal session created successfully. Returns JSON with portal URL.", body = inline(Object)),
+        (status = 400, description = "User does not have a payment provider customer ID"),
+        (status = 503, description = "No payment provider configured or missing host_url"),
+    ),
+    security(
+        ("BearerAuth" = []),
+        ("CookieAuth" = []),
+        ("X-Doubleword-User" = [])
+    )
+)]
+#[tracing::instrument(skip_all)]
+pub async fn create_billing_portal_session(State(state): State<AppState>, user: CurrentUser) -> Result<Response, StatusCode> {
+    // Get payment provider from config
+    let payment_config = match state.config.payment.clone() {
+        Some(config) => config,
+        None => {
+            tracing::warn!("Billing portal requested but no payment provider is configured");
+            let error_response = Json(json!({
+                "message": "Billing management is currently unavailable. Please contact support."
+            }));
+            return Ok((StatusCode::SERVICE_UNAVAILABLE, error_response).into_response());
+        }
+    };
+
+    // Get host URL from payment config (required for building return URL)
+    let origin = match payment_config.host_url() {
+        Some(configured_host) => configured_host.to_string(),
+        None => {
+            tracing::error!("No host_url configured in payment config - this is required for billing portal");
+            let error_response = Json(json!({
+                "message": "Billing management is currently unavailable. Please contact support."
+            }));
+            return Ok((StatusCode::SERVICE_UNAVAILABLE, error_response).into_response());
+        }
+    };
+
+    // Build return URL from host_url (similar to how create_payment builds success/cancel URLs)
+    let return_url = format!("{}/cost-management", origin);
+
+    let provider = payment_providers::create_provider(payment_config);
+
+    // Create billing portal session using the provider trait
+    let portal_url = provider.create_billing_portal_session(&user, &return_url).await.map_err(|e| {
+        tracing::error!("Failed to create billing portal session: {:?}", e);
+        StatusCode::from(e)
+    })?;
+
+    // Return the portal URL as JSON for the frontend to navigate to
+    Ok(Json(json!({
+        "url": portal_url
+    }))
+    .into_response())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -547,5 +612,196 @@ mod tests {
             "Redirect URL should contain payment status: {}",
             checkout_url
         );
+    }
+
+    #[sqlx::test]
+    async fn test_billing_portal_success(pool: PgPool) {
+        // Setup config with dummy provider
+        let mut config = create_test_config();
+        config.payment = Some(PaymentConfig::Dummy(DummyConfig {
+            host_url: Some("http://localhost:3001".to_string()),
+            amount: Decimal::new(100, 0),
+        }));
+
+        // Build AppState
+        let request_manager = std::sync::Arc::new(fusillade::PostgresRequestManager::new(pool.clone()));
+        let state = AppState::builder()
+            .db(crate::db::DbPools::new(pool.clone()))
+            .config(config)
+            .request_manager(request_manager)
+            .build();
+
+        // Create test user
+        let user = crate::test::utils::create_test_user(&pool, crate::api::models::users::Role::StandardUser).await;
+
+        // Set payment provider customer ID in database
+        let customer_id = format!("cus_test_{}", user.id);
+        sqlx::query("UPDATE users SET payment_provider_id = $1 WHERE id = $2")
+            .bind(&customer_id)
+            .bind(user.id)
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        let auth_headers = crate::test::utils::add_auth_headers(&user);
+
+        // Setup router with handler
+        let app = Router::new()
+            .route("/billing-portal", post(create_billing_portal_session))
+            .with_state(state);
+
+        let server = TestServer::new(app).unwrap();
+
+        // Make request
+        let mut request = server.post("/billing-portal");
+        for (key, value) in &auth_headers {
+            request = request.add_header(key.as_str(), value.as_str());
+        }
+        let response = request.await;
+
+        // Assert response
+        response.assert_status(StatusCode::OK);
+        let body: serde_json::Value = response.json();
+
+        // Verify URL structure
+        let url = body["url"].as_str().expect("Response should contain url field");
+        assert!(url.starts_with("http://localhost:3001/cost-management"));
+        assert!(url.contains("dummy_billing_portal=true"));
+        assert!(url.contains(&format!("user_id={}", user.id)));
+    }
+
+    #[sqlx::test]
+    async fn test_billing_portal_no_customer_id(pool: PgPool) {
+        // Setup config with dummy provider
+        let mut config = create_test_config();
+        config.payment = Some(PaymentConfig::Dummy(DummyConfig {
+            host_url: Some("http://localhost:3001".to_string()),
+            amount: Decimal::new(100, 0),
+        }));
+
+        // Build AppState
+        let request_manager = std::sync::Arc::new(fusillade::PostgresRequestManager::new(pool.clone()));
+        let state = AppState::builder()
+            .db(crate::db::DbPools::new(pool.clone()))
+            .config(config)
+            .request_manager(request_manager)
+            .build();
+
+        // Create test user WITHOUT payment_provider_id (default is null)
+        let user = crate::test::utils::create_test_user(&pool, crate::api::models::users::Role::StandardUser).await;
+
+        let auth_headers = crate::test::utils::add_auth_headers(&user);
+
+        // Setup router with handler
+        let app = Router::new()
+            .route("/billing-portal", post(create_billing_portal_session))
+            .with_state(state);
+
+        let server = TestServer::new(app).unwrap();
+
+        // Make request
+        let mut request = server.post("/billing-portal");
+        for (key, value) in &auth_headers {
+            request = request.add_header(key.as_str(), value.as_str());
+        }
+        let response = request.await;
+
+        // Assert 400 Bad Request because user doesn't have customer ID
+        response.assert_status(StatusCode::BAD_REQUEST);
+    }
+
+    #[sqlx::test]
+    async fn test_billing_portal_no_provider_configured(pool: PgPool) {
+        // Setup config WITHOUT payment provider
+        let config = create_test_config();
+        // config.payment is None by default
+
+        // Build AppState
+        let request_manager = std::sync::Arc::new(fusillade::PostgresRequestManager::new(pool.clone()));
+        let state = AppState::builder()
+            .db(crate::db::DbPools::new(pool.clone()))
+            .config(config)
+            .request_manager(request_manager)
+            .build();
+
+        // Create test user
+        let user = crate::test::utils::create_test_user(&pool, crate::api::models::users::Role::StandardUser).await;
+
+        // Set payment provider customer ID in database
+        let customer_id = format!("cus_test_{}", user.id);
+        sqlx::query("UPDATE users SET payment_provider_id = $1 WHERE id = $2")
+            .bind(&customer_id)
+            .bind(user.id)
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        let auth_headers = crate::test::utils::add_auth_headers(&user);
+
+        // Setup router with handler
+        let app = Router::new()
+            .route("/billing-portal", post(create_billing_portal_session))
+            .with_state(state);
+
+        let server = TestServer::new(app).unwrap();
+
+        // Make request
+        let mut request = server.post("/billing-portal");
+        for (key, value) in &auth_headers {
+            request = request.add_header(key.as_str(), value.as_str());
+        }
+        let response = request.await;
+
+        // Assert 503 Service Unavailable because no payment provider configured
+        response.assert_status(StatusCode::SERVICE_UNAVAILABLE);
+    }
+
+    #[sqlx::test]
+    async fn test_billing_portal_no_host_url(pool: PgPool) {
+        // Setup config with dummy provider but NO host_url
+        let mut config = create_test_config();
+        config.payment = Some(PaymentConfig::Dummy(DummyConfig {
+            host_url: None, // Missing host_url
+            amount: Decimal::new(100, 0),
+        }));
+
+        // Build AppState
+        let request_manager = std::sync::Arc::new(fusillade::PostgresRequestManager::new(pool.clone()));
+        let state = AppState::builder()
+            .db(crate::db::DbPools::new(pool.clone()))
+            .config(config)
+            .request_manager(request_manager)
+            .build();
+
+        // Create test user
+        let user = crate::test::utils::create_test_user(&pool, crate::api::models::users::Role::StandardUser).await;
+
+        // Set payment provider customer ID in database
+        let customer_id = format!("cus_test_{}", user.id);
+        sqlx::query("UPDATE users SET payment_provider_id = $1 WHERE id = $2")
+            .bind(&customer_id)
+            .bind(user.id)
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        let auth_headers = crate::test::utils::add_auth_headers(&user);
+
+        // Setup router with handler
+        let app = Router::new()
+            .route("/billing-portal", post(create_billing_portal_session))
+            .with_state(state);
+
+        let server = TestServer::new(app).unwrap();
+
+        // Make request
+        let mut request = server.post("/billing-portal");
+        for (key, value) in &auth_headers {
+            request = request.add_header(key.as_str(), value.as_str());
+        }
+        let response = request.await;
+
+        // Assert 503 Service Unavailable because host_url is not configured
+        response.assert_status(StatusCode::SERVICE_UNAVAILABLE);
     }
 }
