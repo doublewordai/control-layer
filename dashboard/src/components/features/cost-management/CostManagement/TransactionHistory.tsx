@@ -177,10 +177,8 @@ export function TransactionHistory({
     }
 
     // For batches, show "Batch (Source - SLA): X requests" format
-    const isBatch =
-      tx.request_origin === "fusillade" ||
-      tx.request_origin === "frontend" ||
-      tx.batch_id;
+    // A transaction is a batch if it has a batch_id
+    const isBatch = tx.batch_id;
     if (isBatch) {
       const requestCount = tx.batch_request_count || 0;
       const requestsText = requestCount > 0 ? `: ${requestCount} requests` : "";
@@ -188,7 +186,7 @@ export function TransactionHistory({
       // Determine source label: "Frontend" for frontend origin, "API" for everything else
       const source = tx.request_origin === "frontend" ? "Frontend" : "API";
 
-      // Format SLA - should always be present, but handle edge cases
+      // Format SLA - should always be present for batches
       let slaText = "";
       if (tx.batch_sla === "24h") slaText = " - 24hr";
       else if (tx.batch_sla === "1h") slaText = " - 1hr";
