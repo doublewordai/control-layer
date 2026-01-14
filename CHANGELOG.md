@@ -1,5 +1,12 @@
 # Changelog
 
+## [1.1.2](https://github.com/doublewordai/control-layer/compare/v1.1.1...v1.1.2) (2026-01-14)
+
+
+### Bug Fixes
+
+* Billing portal support ([#526](https://github.com/doublewordai/control-layer/issues/526)) ([821845d](https://github.com/doublewordai/control-layer/commit/821845d39e76fb75bafb4d2eec29c0c9083e5979))
+
 ## [1.1.1](https://github.com/doublewordai/control-layer/compare/v1.1.0...v1.1.1) (2026-01-14)
 
 
