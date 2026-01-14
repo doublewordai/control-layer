@@ -6,6 +6,7 @@ use sqlx::PgPool;
 use std::collections::HashMap;
 use std::sync::Once;
 use stripe::Client;
+use stripe_billing::billing_portal_session::CreateBillingPortalSession;
 use stripe_checkout::checkout_session::{
     CreateCheckoutSessionCustomerUpdate, CreateCheckoutSessionCustomerUpdateAddress, CreateCheckoutSessionCustomerUpdateName,
     CreateCheckoutSessionInvoiceCreation, CreateCheckoutSessionNameCollection, CreateCheckoutSessionNameCollectionBusiness,
@@ -86,11 +87,6 @@ impl PaymentProvider for StripeProvider {
                 business: Some(CreateCheckoutSessionNameCollectionBusiness::new(true)),
                 individual: None,
             })
-            .customer_update(CreateCheckoutSessionCustomerUpdate {
-                address: Some(CreateCheckoutSessionCustomerUpdateAddress::Auto),
-                name: Some(CreateCheckoutSessionCustomerUpdateName::Auto),
-                shipping: None,
-            })
             .saved_payment_method_options(CreateCheckoutSessionSavedPaymentMethodOptions {
                 allow_redisplay_filters: None,
                 payment_method_save: Some(CreateCheckoutSessionSavedPaymentMethodOptionsPaymentMethodSave::Enabled),
@@ -112,7 +108,13 @@ impl PaymentProvider for StripeProvider {
         if let Some(existing_id) = &user.payment_provider_id {
             // This is who is giving the credits
             tracing::debug!("Using existing Stripe customer ID {} for user {}", existing_id, user.id);
-            checkout_params = checkout_params.customer(existing_id.as_str());
+            checkout_params = checkout_params
+                .customer(existing_id.as_str())
+                .customer_update(CreateCheckoutSessionCustomerUpdate {
+                    address: Some(CreateCheckoutSessionCustomerUpdateAddress::Auto),
+                    name: Some(CreateCheckoutSessionCustomerUpdateName::Auto),
+                    shipping: None,
+                })
         } else {
             tracing::debug!("No customer ID found for user {}, Stripe will create one", user.id);
             // Provide customer email for the new customer
@@ -344,6 +346,32 @@ impl PaymentProvider for StripeProvider {
 
         // Use the existing process_payment_session method
         self.process_payment_session(db_pool, session_id).await
+    }
+
+    async fn create_billing_portal_session(&self, user: &CurrentUser, return_url: &str) -> Result<String> {
+        // Fetch user's payment provider customer ID from user struct
+        let customer_id_str = user.payment_provider_id.as_ref().ok_or(PaymentError::NoCustomerId)?;
+
+        // Create billing portal session using builder pattern
+        let session = CreateBillingPortalSession::new()
+            .customer(customer_id_str.as_str())
+            .return_url(return_url)
+            .send(&self.client)
+            .await
+            .map_err(|e| {
+                tracing::error!("Failed to create Stripe billing portal session: {:?}", e);
+                PaymentError::ProviderApi(e.to_string())
+            })?;
+
+        tracing::debug!(
+            "Created billing portal session {} for user {} (customer: {})",
+            session.id,
+            user.id,
+            customer_id_str
+        );
+
+        // Return the portal session URL
+        Ok(session.url)
     }
 }
 

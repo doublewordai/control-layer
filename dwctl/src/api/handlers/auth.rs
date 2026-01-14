@@ -165,10 +165,10 @@ pub async fn register(State(state): State<AppState>, Json(request): Json<Registe
         });
     }
 
-    let user_response = UserResponse::from(created_user);
+    let user_response = UserResponse::from(created_user.clone());
+    let current_user = CurrentUser::from(created_user);
 
     // Create session token
-    let current_user = user_response.clone().into();
     let token = session::create_session_token(&current_user, &state.config)?;
 
     // Set session cookie
@@ -311,10 +311,10 @@ pub async fn login(State(state): State<AppState>, Json(request): Json<LoginReque
         });
     }
 
-    let user_response = UserResponse::from(user);
+    let user_response = UserResponse::from(user.clone());
+    let current_user = CurrentUser::from(user);
 
     // Create session token
-    let current_user = user_response.clone().into();
     let token = session::create_session_token(&current_user, &state.config)?;
 
     // Set session cookie

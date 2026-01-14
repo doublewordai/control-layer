@@ -48,13 +48,16 @@ pub enum PaymentError {
 
     #[error("Payment already processed")]
     AlreadyProcessed,
+
+    #[error("User does not have a payment provider customer ID")]
+    NoCustomerId,
 }
 
 impl From<PaymentError> for StatusCode {
     fn from(err: PaymentError) -> Self {
         match err {
             PaymentError::PaymentNotCompleted => StatusCode::PAYMENT_REQUIRED,
-            PaymentError::InvalidData(_) => StatusCode::BAD_REQUEST,
+            PaymentError::InvalidData(_) | PaymentError::NoCustomerId => StatusCode::BAD_REQUEST,
             PaymentError::AlreadyProcessed => StatusCode::OK,
             PaymentError::ProviderApi(_) | PaymentError::Database(_) => StatusCode::INTERNAL_SERVER_ERROR,
         }
@@ -150,4 +153,13 @@ pub trait PaymentProvider: Send + Sync {
     /// This is called after validate_webhook succeeds.
     /// Should be idempotent - processing the same event multiple times should be safe.
     async fn process_webhook_event(&self, db_pool: &PgPool, event: &WebhookEvent) -> Result<()>;
+
+    /// Create a billing portal session for customer self-service
+    ///
+    /// Returns a URL that the user should be redirected to for managing their billing.
+    ///
+    /// # Arguments
+    /// * `user` - The authenticated user requesting portal access
+    /// * `return_url` - The complete URL to redirect to after the customer is done (e.g., "https://example.com/cost-management")
+    async fn create_billing_portal_session(&self, user: &CurrentUser, return_url: &str) -> Result<String>;
 }
