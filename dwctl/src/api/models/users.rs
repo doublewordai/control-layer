@@ -104,7 +104,6 @@ impl CurrentUser {
     }
 }
 
-
 impl From<UserDBResponse> for UserResponse {
     fn from(db: UserDBResponse) -> Self {
         Self {
