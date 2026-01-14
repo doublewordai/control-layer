@@ -6,6 +6,7 @@ use sqlx::PgPool;
 use std::collections::HashMap;
 use std::sync::Once;
 use stripe::Client;
+use stripe_billing::billing_portal_session::CreateBillingPortalSession;
 use stripe_checkout::checkout_session::{
     CreateCheckoutSessionCustomerUpdate, CreateCheckoutSessionCustomerUpdateAddress, CreateCheckoutSessionCustomerUpdateName,
     CreateCheckoutSessionInvoiceCreation, CreateCheckoutSessionNameCollection, CreateCheckoutSessionNameCollectionBusiness,
@@ -345,6 +346,32 @@ impl PaymentProvider for StripeProvider {
 
         // Use the existing process_payment_session method
         self.process_payment_session(db_pool, session_id).await
+    }
+
+    async fn create_billing_portal_session(&self, user: &CurrentUser, return_url: &str) -> Result<String> {
+        // Fetch user's payment provider customer ID from user struct
+        let customer_id_str = user.payment_provider_id.as_ref().ok_or(PaymentError::NoCustomerId)?;
+
+        // Create billing portal session using builder pattern
+        let session = CreateBillingPortalSession::new()
+            .customer(customer_id_str.as_str())
+            .return_url(return_url)
+            .send(&self.client)
+            .await
+            .map_err(|e| {
+                tracing::error!("Failed to create Stripe billing portal session: {:?}", e);
+                PaymentError::ProviderApi(e.to_string())
+            })?;
+
+        tracing::debug!(
+            "Created billing portal session {} for user {} (customer: {})",
+            session.id,
+            user.id,
+            customer_id_str
+        );
+
+        // Return the portal session URL
+        Ok(session.url)
     }
 }
 
