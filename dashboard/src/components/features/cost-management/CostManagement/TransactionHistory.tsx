@@ -161,6 +161,39 @@ export function TransactionHistory({
     }).format(date);
   };
 
+  // Format transaction description with category prefix for usage transactions
+  // Format: "Category: model (tokens)" or "Batch (SLA): X requests" for batches
+  const formatDescription = (tx: Transaction): string => {
+    const baseDescription = tx.description || "No description";
+
+    // Only format usage transactions
+    if (tx.transaction_type !== "usage") {
+      return baseDescription;
+    }
+
+    // For batches, show "Batch (SLA): X requests" format
+    const isBatch = tx.request_origin === "fusillade" || tx.batch_id;
+    if (isBatch) {
+      const requestCount = tx.batch_request_count || 0;
+      const requestsText = requestCount > 0 ? `: ${requestCount} requests` : "";
+
+      if (tx.batch_sla === "24h") return `Batch (24hr)${requestsText}`;
+      if (tx.batch_sla === "1h") return `Batch (1hr)${requestsText}`;
+      return `Batch${requestsText}`;
+    }
+
+    // For non-batch usage, extract model and tokens from description
+    // Expected format: "API usage: ModelName (X input + Y output tokens)"
+    const match = baseDescription.match(/^API usage:\s*(.+)$/i);
+    const details = match ? match[1] : baseDescription;
+
+    // Determine category prefix based on request_origin
+    const category =
+      tx.request_origin === "frontend" ? "Playground" : "Realtime API";
+
+    return `${category}: ${details}`;
+  };
+
   // Calculate total pages from server response
   const totalPages = Math.ceil(totalCount / pagination.pageSize);
 
@@ -477,7 +510,7 @@ export function TransactionHistory({
                     </TableCell>
                     <TableCell>
                       <p className="font-medium text-doubleword-neutral-900">
-                        {transaction.description || "No description"}
+                        {formatDescription(transaction)}
                       </p>
                     </TableCell>
                     <TableCell>
