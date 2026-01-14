@@ -24,40 +24,57 @@ pub struct ListGroupsQuery {
     pub search: Option<String>,
 }
 
-// Request models
+/// Request body for creating a new group.
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct GroupCreate {
+    /// Display name for the group (must be unique)
+    #[schema(example = "Engineering Team")]
     pub name: String,
+    /// Optional description of the group's purpose
+    #[schema(example = "Backend and frontend engineers")]
     pub description: Option<String>,
 }
 
+/// Request body for updating an existing group. All fields are optional;
+/// only provided fields will be updated.
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct GroupUpdate {
+    /// New display name (null to keep unchanged)
+    #[schema(example = "Engineering Team - Updated")]
     pub name: Option<String>,
+    /// New description (null to keep unchanged)
+    #[schema(example = "Updated description")]
     pub description: Option<String>,
 }
 
-// Response model
+/// Full group details returned by the API.
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct GroupResponse {
+    /// Unique identifier for the group
     #[schema(value_type = String, format = "uuid")]
     pub id: GroupId,
+    /// Display name for the group
     pub name: String,
+    /// Description of the group's purpose
     pub description: Option<String>,
+    /// User ID of who created the group (may be hidden based on permissions)
     #[serde(skip_serializing_if = "Option::is_none")]
     #[schema(value_type = Option<String>, format = "uuid")]
     pub created_by: Option<UserId>,
+    /// When the group was created
     pub created_at: DateTime<Utc>,
+    /// When the group was last modified
     pub updated_at: DateTime<Utc>,
-    /// Users in this group (only included if requested)
+    /// Users in this group (only included if `include=users` is specified)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub users: Option<Vec<UserResponse>>,
-    /// Models accessible by this group (only included if requested)
-    #[serde(skip_serializing_if = "Option::is_none")]
+    /// Models accessible by this group (only included if `include=models` is specified)
     /// Note: no_recursion is important! utoipa will panic at runtime, because it overflows the
     /// stack trying to follow the relationship.
+    #[serde(skip_serializing_if = "Option::is_none")]
     #[schema(no_recursion)]
     pub models: Option<Vec<DeployedModelResponse>>,
+    /// Origin of the group (e.g., "local", "oidc")
     pub source: String,
 }
 

@@ -31,6 +31,10 @@ use crate::{
     get,
     path = "/authentication/register",
     tag = "authentication",
+    summary = "Check registration availability",
+    description = "Returns whether user registration is enabled on this instance. \
+        Use this before displaying a registration form to determine if self-registration \
+        is allowed.",
     responses(
         (status = 200, description = "Registration info", body = RegistrationInfo),
     )
@@ -53,6 +57,10 @@ pub async fn get_registration_info(State(state): State<AppState>) -> Result<Json
     path = "/authentication/register",
     request_body = RegisterRequest,
     tag = "authentication",
+    summary = "Register new account",
+    description = "Create a new user account with email and password. On success, returns the \
+        created user and sets a session cookie for immediate login. Registration must be enabled \
+        in the instance configuration. New users receive default roles and initial credits if configured.",
     responses(
         (status = 201, description = "User registered successfully", body = AuthResponse),
         (status = 400, description = "Invalid input"),
@@ -228,6 +236,10 @@ async fn create_sample_files_for_new_user(state: &AppState, user_id: Uuid) -> Re
     get,
     path = "/authentication/login",
     tag = "authentication",
+    summary = "Check login availability",
+    description = "Returns whether native (email/password) login is enabled on this instance. \
+        Use this before displaying a login form. If disabled, users should authenticate via \
+        configured SSO providers instead.",
     responses(
         (status = 200, description = "Login info", body = LoginInfo),
     )
@@ -250,6 +262,10 @@ pub async fn get_login_info(State(state): State<AppState>) -> Result<Json<LoginI
     path = "/authentication/login",
     request_body = LoginRequest,
     tag = "authentication",
+    summary = "Login with credentials",
+    description = "Authenticate with email and password. On success, returns the user details \
+        and sets a session cookie. Native authentication must be enabled in the instance \
+        configuration. The session cookie can be used for subsequent authenticated requests.",
     responses(
         (status = 200, description = "Login successful", body = AuthResponse),
         (status = 401, description = "Invalid credentials"),
@@ -317,6 +333,9 @@ pub async fn login(State(state): State<AppState>, Json(request): Json<LoginReque
     post,
     path = "/authentication/logout",
     tag = "authentication",
+    summary = "End session",
+    description = "Log out the current user by clearing the session cookie. After calling this \
+        endpoint, subsequent requests will require re-authentication.",
     responses(
         (status = 200, description = "Logout successful", body = AuthSuccessResponse),
     )
@@ -342,6 +361,11 @@ pub async fn logout(State(state): State<AppState>) -> Result<LogoutResponse, Err
     path = "/authentication/password-resets",
     request_body = PasswordResetRequest,
     tag = "authentication",
+    summary = "Request password reset",
+    description = "Request a password reset email for the specified email address. For security, \
+        this endpoint always returns success even if the email doesn't exist (to prevent email \
+        enumeration). If the email is valid and associated with a native auth account, a reset \
+        link will be sent.",
     responses(
         (status = 200, description = "Password reset email sent", body = PasswordResetResponse),
         (status = 400, description = "Invalid request"),
@@ -394,6 +418,10 @@ pub async fn request_password_reset(
     path = "/authentication/password-resets/{token_id}/confirm",
     request_body = PasswordResetConfirmRequest,
     tag = "authentication",
+    summary = "Complete password reset",
+    description = "Set a new password using the token received via email. The token_id is from the \
+        URL and the raw token is included in the request body. Tokens expire after a configured \
+        period and can only be used once.",
     responses(
         (status = 200, description = "Password reset successful", body = PasswordResetResponse),
         (status = 400, description = "Invalid or expired token"),

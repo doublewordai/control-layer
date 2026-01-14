@@ -171,6 +171,8 @@ impl Modify for AdminSecurityAddon {
             api::models::requests::ModelUserUsageResponse,
             api::models::requests::TimeSeriesPoint,
             api::models::requests::RequestsAggregateResponse,
+            api::handlers::config::ConfigResponse,
+            api::handlers::config::BatchConfigResponse,
         )
     ),
     tags(
