@@ -2,36 +2,48 @@
 
 use axum::{Json, extract::State, response::IntoResponse};
 use serde::Serialize;
+use utoipa::ToSchema;
 
 use crate::{AppState, api::models::users::CurrentUser};
 
-/// Batch configuration subset for API response
-#[derive(Debug, Clone, Serialize)]
+/// Batch processing configuration
+#[derive(Debug, Clone, Serialize, ToSchema)]
 pub struct BatchConfigResponse {
+    /// Whether batch processing is enabled on this instance
     pub enabled: bool,
+    /// Available completion window options (e.g., "1h", "24h")
     pub allowed_completion_windows: Vec<String>,
 }
 
-/// Configuration response with computed fields
-#[derive(Debug, Clone, Serialize)]
+/// Instance configuration and capabilities
+#[derive(Debug, Clone, Serialize, ToSchema)]
 pub struct ConfigResponse {
+    /// Cloud region identifier (e.g., "us-east-1"), if configured
     pub region: Option<String>,
+    /// Organization name for this instance, if configured
     pub organization: Option<String>,
+    /// Whether payment processing is enabled
     pub payment_enabled: bool,
+    /// URL to JSONL documentation for batch file format, if available
     pub docs_jsonl_url: Option<String>,
+    /// URL to the documentation site
     pub docs_url: String,
+    /// Batch processing configuration, only present if batches are enabled
     #[serde(skip_serializing_if = "Option::is_none")]
     pub batches: Option<BatchConfigResponse>,
 }
 
 #[utoipa::path(
-    delete,
+    get,
     path = "/config",
     tag = "config",
-    summary = "Get config",
-    description = "Get current app configuration",
+    summary = "Get instance configuration",
+    description = "Returns the current instance configuration including region, organization, \
+        payment status, and batch processing capabilities. Use this endpoint to discover \
+        what features are available on this Control Layer deployment.",
     responses(
-        (status = 200, description = "Got metadata"),
+        (status = 200, description = "Instance configuration", body = ConfigResponse),
+        (status = 401, description = "Authentication required"),
     ),
     security(
         ("BearerAuth" = []),

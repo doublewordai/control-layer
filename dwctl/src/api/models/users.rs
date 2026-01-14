@@ -8,56 +8,93 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use utoipa::{IntoParams, ToSchema};
 
-// Role enum for different job functions
+/// User role determining access permissions and capabilities.
+///
+/// Roles are additive - a user can have multiple roles, and their effective
+/// permissions are the union of all role permissions.
 #[derive(Debug, Clone, Serialize, Deserialize, sqlx::Type, PartialEq, ToSchema)]
 #[sqlx(type_name = "user_role", rename_all = "UPPERCASE")]
 pub enum Role {
+    /// Full administrative access: manage users, groups, deployments, and endpoints
     PlatformManager,
+    /// Read-only access to API request logs and analytics
     RequestViewer,
+    /// Basic user access: can make API requests through assigned model deployments
     StandardUser,
+    /// Access to billing information and credit management
     BillingManager,
+    /// Access to batch processing API endpoints
     BatchAPIUser,
 }
 
-// User request models
+/// Request body for creating a new user.
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct UserCreate {
+    /// Unique username for login (must be unique across the system)
+    #[schema(example = "jsmith")]
     pub username: String,
+    /// User's email address (must be unique across the system)
+    #[schema(example = "john.smith@example.com")]
     pub email: String,
+    /// Human-readable display name shown in the UI
+    #[schema(example = "John Smith")]
     pub display_name: Option<String>,
+    /// URL to the user's avatar image
+    #[schema(example = "https://example.com/avatars/jsmith.png")]
     pub avatar_url: Option<String>,
+    /// Roles to assign to this user (determines permissions)
     pub roles: Vec<Role>,
 }
 
+/// Request body for updating an existing user. All fields are optional;
+/// only provided fields will be updated.
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct UserUpdate {
+    /// New display name (null to keep unchanged)
+    #[schema(example = "John Smith Jr.")]
     pub display_name: Option<String>,
+    /// New avatar URL (null to keep unchanged)
+    #[schema(example = "https://example.com/avatars/jsmith-new.png")]
     pub avatar_url: Option<String>,
+    /// New set of roles (replaces all existing roles; null to keep unchanged)
     pub roles: Option<Vec<Role>>,
 }
 
-// User response models
+/// Full user details returned by the API.
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct UserResponse {
+    /// Unique identifier for the user
     #[schema(value_type = String, format = "uuid")]
     pub id: UserId,
+    /// Unique username for login
     pub username: String,
+    /// User's email address
     pub email: String,
+    /// Human-readable display name
     pub display_name: Option<String>,
+    /// URL to the user's avatar image
     pub avatar_url: Option<String>,
+    /// Whether this user has legacy admin privileges (deprecated, use roles instead)
     pub is_admin: bool,
+    /// Roles assigned to this user
     pub roles: Vec<Role>,
+    /// When the user account was created
     pub created_at: DateTime<Utc>,
+    /// When the user account was last modified
     pub updated_at: DateTime<Utc>,
+    /// When the user last logged in (null if never logged in)
     pub last_login: Option<DateTime<Utc>>,
+    /// Authentication source (e.g., "local", "google", "oidc")
     pub auth_source: String,
+    /// ID from external authentication provider (if using SSO)
     pub external_user_id: Option<String>,
-    /// Groups this user belongs to (only included if requested)
+    /// Groups this user belongs to (only included if `include=groups` is specified)
     /// Note: no_recursion is important! utoipa will panic at runtime, because it overflows the
     /// stack trying to follow the relationship.
     #[serde(skip_serializing_if = "Option::is_none")]
     #[schema(no_recursion)]
     pub groups: Option<Vec<GroupResponse>>,
+    /// User's credit balance (only included if `include=billing` is specified)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub credit_balance: Option<f64>,
     /// Indicates whether this user has an associated payment provider customer record.
@@ -84,16 +121,27 @@ pub struct ListUsersQuery {
     pub search: Option<String>,
 }
 
+/// The currently authenticated user's information.
+/// This is a subset of UserResponse containing only the fields relevant
+/// to the current session.
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct CurrentUser {
+    /// Unique identifier for the user
     #[schema(value_type = String, format = "uuid")]
     pub id: UserId,
+    /// Unique username for login
     pub username: String,
+    /// User's email address
     pub email: String,
+    /// Whether this user has legacy admin privileges
     pub is_admin: bool,
+    /// Roles assigned to this user
     pub roles: Vec<Role>,
+    /// Human-readable display name
     pub display_name: Option<String>,
+    /// URL to the user's avatar image
     pub avatar_url: Option<String>,
+    /// ID in external payment provider
     pub payment_provider_id: Option<String>,
 }
 
@@ -157,5 +205,7 @@ impl From<UserDBResponse> for CurrentUser {
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct GetUserQuery {
+    /// Include related data (comma-separated: "groups", "billing")
+    #[schema(example = "groups,billing")]
     pub include: Option<String>,
 }
