@@ -284,7 +284,7 @@ pub async fn get_system_user(pool: &mut PgConnection) -> UserResponse {
         external_user_id: None,
         groups: None, // Groups not included in test users by default
         credit_balance: None,
-        has_payment_provider_id: false,
+        payment_provider_id: None,
     }
 }
 

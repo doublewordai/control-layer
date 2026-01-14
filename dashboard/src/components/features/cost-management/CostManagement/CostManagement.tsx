@@ -1,6 +1,6 @@
 import { useEffect, useState } from "react";
 import { useSearchParams } from "react-router-dom";
-import { useUser, useAddFunds, useConfig, useCreatePayment, useProcessPayment, useCreateBillingPortalSession } from "@/api/control-layer";
+import { useUser, useAddFunds, useConfig, useCreatePayment, useProcessPayment } from "@/api/control-layer";
 import { toast } from "sonner";
 import { useSettings } from "@/contexts";
 import { TransactionHistory } from "@/components/features/cost-management/CostManagement/TransactionHistory.tsx";
@@ -35,7 +35,6 @@ export function CostManagement() {
 
   const addFundsMutation = useAddFunds();
   const createPaymentMutation = useCreatePayment();
-  const createBillingPortalMutation = useCreateBillingPortalSession();
   const processPaymentMutation = useProcessPayment({
     onSuccess: () => {
       setTimeout(() => {
@@ -58,8 +57,8 @@ export function CostManagement() {
     refetchDisplayUser();
   };
 
-  // Handle redirect to external payment provider
-  const handlePurchaseFundsExternal = () => {
+  // Handle redirect to payment provider
+  const handleRedirectToPaymentProvider = () => {
     const paymentProviderUrl = settings.paymentProviderUrl;
     if (!paymentProviderUrl) {
       return;
@@ -111,7 +110,7 @@ export function CostManagement() {
     }
   }, [processPaymentMutation.isSuccess, showSuccessModal]);
 
-  const handlePurchaseFunds = async () => {
+  const handleAddFunds = async () => {
     if (isDemoMode) {
       // Demo mode: Call the API (which will be intercepted by MSW)
       const fundAmount = 100.0;
@@ -145,56 +144,32 @@ export function CostManagement() {
     }
   };
 
-  const handleGiftFunds = () => {
-    setShowAddFundsModal(true);
-  };
-
-  const handleBillingPortal = async () => {
-    try {
-      // Backend constructs the return URL automatically from host_url config
-      const data = await createBillingPortalMutation.mutateAsync();
-      if (data.url) {
-        // Navigate to billing portal
-        window.location.href = data.url;
-      } else {
-        toast.error("Failed to get billing portal URL");
-      }
-    } catch (error) {
-      console.error("Failed to create billing portal session:", error);
-      toast.error("Failed to access billing portal");
-    }
-  };
-
   // Determine add funds configuration
   const addFundsConfig = (() => {
     const hasPaymentEnabled = isDemoMode || !!config?.payment_enabled;
     const hasPaymentProvider = !!settings.paymentProviderUrl;
-    const hasCustomerId = !!displayUser?.has_payment_provider_id;
 
     if (!hasPaymentEnabled && !hasPaymentProvider) {
       // No payment processing configured at all
       return canManageFunds ? {
-        type: 'admin-only' as const,
-        onGiftFunds: handleGiftFunds
+        type: 'direct' as const,
+        onAddFunds: () => setShowAddFundsModal(true)
       } : undefined;
     }
 
     // Payment processing is configured (either Stripe or external provider)
-    // Show split button if user is admin OR has a customer ID
-    if (canManageFunds || hasCustomerId) {
+    if (canManageFunds) {
+      // Admin: split button (payment redirect/checkout primary, direct in dropdown)
       return {
         type: 'split' as const,
-        onPurchaseFunds: hasPaymentProvider ? handlePurchaseFundsExternal : handlePurchaseFunds,
-        // Only show "Gift Funds" option if user is actually an admin
-        onGiftFunds: canManageFunds ? handleGiftFunds : undefined,
-        // Only show "Billing Portal" if user has a customer ID
-        onBillingPortal: hasCustomerId ? handleBillingPortal : undefined,
+        onPrimaryAction: hasPaymentProvider ? handleRedirectToPaymentProvider : handleAddFunds,
+        onDirectAction: () => setShowAddFundsModal(true)
       };
     } else {
-      // Non-admin without customer ID: simple payment button
+      // Non-admin: simple payment button
       return {
-        type: 'purchase-only' as const,
-        onPurchaseFunds: hasPaymentProvider ? handlePurchaseFundsExternal : handlePurchaseFunds
+        type: hasPaymentProvider ? 'redirect' as const : 'direct' as const,
+        onAddFunds: hasPaymentProvider ? handleRedirectToPaymentProvider : handleAddFunds
       };
     }
   })();
@@ -209,7 +184,6 @@ export function CostManagement() {
             showCard={false}
             filterUserId={filterUserId || undefined}
           />
-          {/* Admin modal for gifting funds to users */}
           {canManageFunds && (
             <AddFundsModal
               isOpen={showAddFundsModal}
@@ -300,7 +274,7 @@ export function CostManagement() {
             </Button>
             <Button onClick={() => {
               setShowCancelledModal(false);
-              handlePurchaseFunds();
+              handleAddFunds();
             }}>
               Try Again
             </Button>

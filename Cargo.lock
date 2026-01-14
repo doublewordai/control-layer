@@ -1549,7 +1549,6 @@ dependencies = [
  "argon2",
  "async-openai",
  "async-stripe",
- "async-stripe-billing",
  "async-stripe-checkout",
  "async-stripe-types",
  "async-stripe-webhook",

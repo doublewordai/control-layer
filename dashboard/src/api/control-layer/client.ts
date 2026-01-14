@@ -891,23 +891,6 @@ const paymentsApi = {
     // Explicitly return to ensure promise resolves
     return;
   },
-
-  async createBillingPortalSession(): Promise<{ url: string }> {
-    const url = `/admin/api/v1/billing-portal`;
-    const response = await fetch(url, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-    });
-
-    if (!response.ok) {
-      const errorData = await response.json().catch(() => ({}));
-      throw new Error(
-        errorData.message || `Failed to create billing portal session: ${response.status}`,
-      );
-    }
-
-    return response.json();
-  },
 };
 
 // Probes API

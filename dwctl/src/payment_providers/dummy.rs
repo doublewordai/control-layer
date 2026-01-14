@@ -168,14 +168,6 @@ impl PaymentProvider for DummyProvider {
         // Dummy provider doesn't use webhooks
         Ok(())
     }
-
-    async fn create_billing_portal_session(&self, user: &CurrentUser, return_url: &str) -> Result<String> {
-        // Check if user has a payment provider ID (required for billing portal)
-        let _customer_id = user.payment_provider_id.as_ref().ok_or(PaymentError::NoCustomerId)?;
-
-        // For dummy provider, return a mock billing portal URL that redirects back to the provided return_url
-        Ok(format!("{}?dummy_billing_portal=true&user_id={}", return_url, user.id))
-    }
 }
 
 #[cfg(test)]

@@ -108,7 +108,6 @@ async-stripe-checkout = { version = "1.0.0-rc.0", features = ["checkout_session"
 async-stripe-webhook = { version = "1.0.0-rc.0", features = ["async-stripe-checkout", "deserialize"] }
 async-stripe-types = { version = "1.0.0-rc.0" }
 rustls = { version = "0.23", features = ["aws-lc-rs"] }
-async-stripe-billing = { version = "1.0.0-rc.0", features = ["billing_portal_session"] }
 
 [dev-dependencies]
 axum-test = { version = "18.4.1" }
