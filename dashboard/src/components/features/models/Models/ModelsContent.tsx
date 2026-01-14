@@ -13,8 +13,8 @@ import {
   ArrowUpDown,
   Info,
   DollarSign,
-  ArrowDown,
-  ArrowUp,
+  ArrowDownToLine,
+  ArrowUpToLine,
 } from "lucide-react";
 import {
   useModels,
@@ -526,36 +526,40 @@ export const ModelsContent: React.FC<ModelsContentProps> = ({
                                                   <span>Free</span>
                                                 </span>
                                               ) : (
-                                                <span className="flex items-center gap-0.5">
-                                                  <ArrowDown className="h-2.5 w-2.5 text-gray-500 shrink-0" />
-                                                  <span className="whitespace-nowrap tabular-nums">
-                                                    {batchTariff.input_price_per_token
-                                                      ? (() => {
-                                                          const price =
-                                                            Number(
-                                                              batchTariff.input_price_per_token,
-                                                            ) * 1000000;
-                                                          return `$${price % 1 === 0 ? price.toFixed(0) : price.toFixed(2)}`;
-                                                        })()
-                                                      : "$0"}
+                                                <span className="flex items-center gap-1">
+                                                  <span className="flex items-center gap-0.5">
+                                                    <ArrowDownToLine className="h-2.5 w-2.5 text-gray-500 shrink-0" />
+                                                    <span className="whitespace-nowrap tabular-nums">
+                                                      {batchTariff.input_price_per_token
+                                                        ? (() => {
+                                                            const price =
+                                                              Number(
+                                                                batchTariff.input_price_per_token,
+                                                              ) * 1000000;
+                                                            return `$${price % 1 === 0 ? price.toFixed(0) : price.toFixed(2)}`;
+                                                          })()
+                                                        : "$0"}
+                                                    </span>
+                                                    <span className="text-[8px] text-gray-400">
+                                                      /M
+                                                    </span>
                                                   </span>
-                                                  <span className="text-[8px] text-gray-400">
-                                                    /M
-                                                  </span>
-                                                  <ArrowUp className="h-2.5 w-2.5 text-gray-500 shrink-0 ml-0.5" />
-                                                  <span className="whitespace-nowrap tabular-nums">
-                                                    {batchTariff.output_price_per_token
-                                                      ? (() => {
-                                                          const price =
-                                                            Number(
-                                                              batchTariff.output_price_per_token,
-                                                            ) * 1000000;
-                                                          return `$${price % 1 === 0 ? price.toFixed(0) : price.toFixed(2)}`;
-                                                        })()
-                                                      : "$0"}
-                                                  </span>
-                                                  <span className="text-[8px] text-gray-400">
-                                                    /M
+                                                  <span className="flex items-center gap-0.5">
+                                                    <ArrowUpToLine className="h-2.5 w-2.5 text-gray-500 shrink-0" />
+                                                    <span className="whitespace-nowrap tabular-nums">
+                                                      {batchTariff.output_price_per_token
+                                                        ? (() => {
+                                                            const price =
+                                                              Number(
+                                                                batchTariff.output_price_per_token,
+                                                              ) * 1000000;
+                                                            return `$${price % 1 === 0 ? price.toFixed(0) : price.toFixed(2)}`;
+                                                          })()
+                                                        : "$0"}
+                                                    </span>
+                                                    <span className="text-[8px] text-gray-400">
+                                                      /M
+                                                    </span>
                                                   </span>
                                                 </span>
                                               )}
