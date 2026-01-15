@@ -1,5 +1,21 @@
 # Changelog
 
+## [2.0.0](https://github.com/doublewordai/control-layer/compare/v1.3.0...v2.0.0) (2026-01-15)
+
+
+### ⚠ BREAKING CHANGES
+
+* This release includes composite/virtual models which changes the API surface for model management.
+
+### Features
+
+* update Cargo.lock for composite models release ([27da89b](https://github.com/doublewordai/control-layer/commit/27da89b2389cba71f140369d7bcd062c0263c2b0))
+
+
+### Bug Fixes
+
+* hide virtual model information from non-platform managers ([#534](https://github.com/doublewordai/control-layer/issues/534)) ([281ba66](https://github.com/doublewordai/control-layer/commit/281ba66f1a1e48b6cccfbae31925779f21996369))
+
 ## [1.3.0](https://github.com/doublewordai/control-layer/compare/v1.2.0...v1.3.0) (2026-01-15)
 
 
