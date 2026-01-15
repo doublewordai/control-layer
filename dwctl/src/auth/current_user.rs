@@ -332,6 +332,29 @@ async fn try_api_key_auth(parts: &axum::http::request::Parts, db: &PgPool) -> Op
     }))
 }
 
+/// Extractor that checks if the request contains an API key in the Authorization header.
+///
+/// Used to determine the request source:
+/// - API key present → request came from API client
+/// - No API key → request came from frontend (cookie auth)
+#[derive(Debug, Clone)]
+pub struct HasApiKey(pub bool);
+
+impl FromRequestParts<AppState> for HasApiKey {
+    type Rejection = std::convert::Infallible;
+
+    async fn from_request_parts(parts: &mut Parts, _state: &AppState) -> std::result::Result<Self, Self::Rejection> {
+        let has_api_key = parts
+            .headers
+            .get(axum::http::header::AUTHORIZATION)
+            .and_then(|h| h.to_str().ok())
+            .map(|s| s.starts_with("Bearer "))
+            .unwrap_or(false);
+
+        Ok(HasApiKey(has_api_key))
+    }
+}
+
 impl FromRequestParts<AppState> for CurrentUser {
     type Rejection = Error;
 

@@ -176,15 +176,23 @@ export function TransactionHistory({
       return baseDescription;
     }
 
-    // For batches, show "Batch (SLA): X requests" format
-    const isBatch = tx.request_origin === "fusillade" || tx.batch_id;
+    // For batches, show "Batch (Source - SLA): X requests" format
+    // A transaction is a batch if it has a batch_id
+    const isBatch = tx.batch_id;
     if (isBatch) {
       const requestCount = tx.batch_request_count || 0;
       const requestsText = requestCount > 0 ? `: ${requestCount} requests` : "";
 
-      if (tx.batch_sla === "24h") return `Batch (24hr)${requestsText}`;
-      if (tx.batch_sla === "1h") return `Batch (1hr)${requestsText}`;
-      return `Batch${requestsText}`;
+      // Determine source label: "Frontend" for frontend origin, "API" for everything else
+      const source = tx.request_origin === "frontend" ? "Frontend" : "API";
+
+      // Format SLA - should always be present for batches
+      let slaText = "";
+      if (tx.batch_sla === "24h") slaText = " - 24hr";
+      else if (tx.batch_sla === "1h") slaText = " - 1hr";
+      else if (tx.batch_sla) slaText = ` - ${tx.batch_sla}`;
+
+      return `Batch (${source}${slaText})${requestsText}`;
     }
 
     // For non-batch usage, extract model and tokens from description
