@@ -46,7 +46,12 @@ import { useDebounce } from "@/hooks/useDebounce";
 export type AddFundsConfig =
   | { type: "admin-only"; onGiftFunds: () => void }
   | { type: "purchase-only"; onPurchaseFunds: () => void }
-  | { type: "split"; onPurchaseFunds: () => void; onGiftFunds?: () => void; onBillingPortal?: () => void }
+  | {
+      type: "split";
+      onPurchaseFunds: () => void;
+      onGiftFunds?: () => void;
+      onBillingPortal?: () => void;
+    }
   | undefined;
 
 export interface TransactionHistoryProps {
@@ -349,7 +354,9 @@ export function TransactionHistory({
                         </DropdownMenuItem>
                       )}
                       {addFundsConfig.onBillingPortal && (
-                        <DropdownMenuItem onClick={addFundsConfig.onBillingPortal}>
+                        <DropdownMenuItem
+                          onClick={addFundsConfig.onBillingPortal}
+                        >
                           Billing Portal
                         </DropdownMenuItem>
                       )}
@@ -368,7 +375,7 @@ export function TransactionHistory({
         <div className="space-y-2">
           <div className="flex flex-wrap items-center gap-2">
             {/* Search Bar */}
-            <div className="relative flex-1 min-w-[250px]">
+            <div className="`relative flex-1 min-w-[250px]">
               <Search className="absolute left-3 top-1/2 -translate-y-1/2 w-4 h-4 text-doubleword-neutral-400" />
               <input
                 type="text"
@@ -448,7 +455,11 @@ export function TransactionHistory({
                 <TableHead>Description</TableHead>
                 <TableHead>Date</TableHead>
                 <TableHead className="text-right">Amount</TableHead>
-                <TableHead className="text-right">Balance</TableHead>
+                <TableHead
+                  className={`text-right ${debouncedSearch || transactionType !== "all" ? "hidden" : ""}`}
+                >
+                  Balance
+                </TableHead>
               </TableRow>
             </TableHeader>
             <TableBody>
@@ -528,7 +539,9 @@ export function TransactionHistory({
                         {formatDollars(transaction.amount, 9)}
                       </p>
                     </TableCell>
-                    <TableCell className="text-right">
+                    <TableCell
+                      className={`text-right ${debouncedSearch || transactionType !== "all" ? "hidden" : ""}`}
+                    >
                       <p className="text-sm text-doubleword-neutral-600">
                         {formatDollars(
                           balanceByTransactionId.get(transaction.id) ?? 0,
