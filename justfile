@@ -926,6 +926,40 @@ db-stop *args="":
         echo "ℹ️  test-postgres container does not exist"
     fi
 
+# Prepare SQLx queries using embedded PostgreSQL (no Docker required)
+#
+# This command starts an embedded PostgreSQL instance, runs migrations,
+# and generates SQLx prepared queries. This is useful for:
+# - CI environments without Docker
+# - Developers who don't want to install PostgreSQL
+# - Initial project setup
+#
+# The embedded PostgreSQL data is stored in ~/.dwctl_xtask/postgres
+# for faster subsequent runs.
+#
+# Examples:
+#   just prepare                 # Generate SQLx prepared queries and exit
+#   just prepare --keep-running  # Keep postgres running for cargo build
+prepare *args="":
+    cargo run -p xtask -- prepare {{args}}
+
+# Start embedded PostgreSQL for development (no Docker required)
+#
+# This command starts an embedded PostgreSQL instance and keeps it running
+# for interactive development. Use this instead of 'just db-start' if you
+# don't have Docker installed.
+#
+# The embedded PostgreSQL:
+# - Uses an ephemeral port (shown in output)
+# - Writes DATABASE_URL to dwctl/.env for sqlx compile-time checks
+# - Runs migrations automatically
+# - Data persists in ~/.dwctl_xtask/postgres
+#
+# Examples:
+#   just db-embedded             # Start embedded postgres for development
+db-embedded:
+    cargo run -p xtask -- serve
+
 # Hidden recipes for internal use
 _drop-test-users:
     @./scripts/drop-test-users.sh

@@ -1,0 +1,16 @@
+[package]
+name = "xtask"
+version = "0.1.0"
+edition = "2024"
+publish = false
+description = "Development tasks for control-layer (embedded postgres for sqlx compilation)"
+
+# This crate intentionally has NO SQLx dependencies to avoid the chicken-and-egg
+# problem: we need to start a database before we can compile SQLx queries, but
+# if this tool used SQLx it couldn't compile without a database.
+
+[dependencies]
+postgresql_embedded = { version = "0.20", features = ["bundled"] }
+tokio = { version = "1", features = ["full"] }
+anyhow = "1"
+clap = { version = "4", features = ["derive"] }
