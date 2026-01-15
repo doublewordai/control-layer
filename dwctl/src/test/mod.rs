@@ -122,6 +122,7 @@ async fn test_e2e_ai_proxy_with_mocked_inference(pool: PgPool) {
         .add_header(&admin_headers[0].0, &admin_headers[0].1)
         .add_header(&admin_headers[1].0, &admin_headers[1].1)
         .json(&serde_json::json!({
+            "type": "standard",
             "model_name": "gpt-3.5-turbo",
             "alias": "test-model",
             "description": "Test model deployment",
@@ -948,4 +949,474 @@ async fn test_build_router_with_metrics_enabled(pool: PgPool) {
     let metrics_content = metrics_response.text();
     // Should contain Prometheus metrics format
     assert!(metrics_content.contains("# HELP") || metrics_content.contains("# TYPE"));
+}
+
+// ===== Composite Model Tests =====
+
+/// Test creating a composite model
+#[sqlx::test]
+#[test_log::test]
+async fn test_create_composite_model(pool: PgPool) {
+    let (server, _bg) = utils::create_test_app(pool.clone(), false).await;
+    let admin = create_test_admin_user(&pool, Role::PlatformManager).await;
+    let headers = add_auth_headers(&admin);
+
+    // Create a composite model
+    let response = server
+        .post("/admin/api/v1/models")
+        .add_header(&headers[0].0, &headers[0].1)
+        .add_header(&headers[1].0, &headers[1].1)
+        .json(&serde_json::json!({
+            "type": "composite",
+            "model_name": "test-composite",
+            "alias": "Test Composite Model",
+            "description": "A composite model for testing",
+            "lb_strategy": "weighted_random",
+            "fallback_enabled": true
+        }))
+        .await;
+
+    assert_eq!(response.status_code(), 200, "Should create composite model");
+    let model: serde_json::Value = response.json();
+    assert_eq!(model["alias"], "Test Composite Model");
+    assert_eq!(model["is_composite"], true);
+    assert!(model["hosted_on"].is_null(), "Composite models should not have hosted_on");
+}
+
+/// Test adding components to a composite model
+#[sqlx::test]
+#[test_log::test]
+async fn test_add_component_to_composite_model(pool: PgPool) {
+    let (server, _bg) = utils::create_test_app(pool.clone(), false).await;
+    let admin = create_test_admin_user(&pool, Role::PlatformManager).await;
+    let headers = add_auth_headers(&admin);
+
+    // Create an endpoint first
+    let endpoint_response = server
+        .post("/admin/api/v1/endpoints")
+        .add_header(&headers[0].0, &headers[0].1)
+        .add_header(&headers[1].0, &headers[1].1)
+        .json(&serde_json::json!({
+            "name": "Test Endpoint",
+            "url": "https://api.example.com/v1"
+        }))
+        .await;
+    assert_eq!(endpoint_response.status_code(), 201);
+    let endpoint: serde_json::Value = endpoint_response.json();
+
+    // Create a standard model (component)
+    let component_response = server
+        .post("/admin/api/v1/models")
+        .add_header(&headers[0].0, &headers[0].1)
+        .add_header(&headers[1].0, &headers[1].1)
+        .json(&serde_json::json!({
+            "type": "standard",
+            "model_name": "gpt-4",
+            "alias": "GPT-4 Provider",
+            "hosted_on": endpoint["id"]
+        }))
+        .await;
+    assert_eq!(component_response.status_code(), 200);
+    let component: serde_json::Value = component_response.json();
+
+    // Create a composite model
+    let composite_response = server
+        .post("/admin/api/v1/models")
+        .add_header(&headers[0].0, &headers[0].1)
+        .add_header(&headers[1].0, &headers[1].1)
+        .json(&serde_json::json!({
+            "type": "composite",
+            "model_name": "multi-gpt",
+            "alias": "Multi-Provider GPT"
+        }))
+        .await;
+    assert_eq!(composite_response.status_code(), 200);
+    let composite: serde_json::Value = composite_response.json();
+
+    // Add component to composite model
+    let add_response = server
+        .post(&format!(
+            "/admin/api/v1/models/{}/components/{}",
+            composite["id"].as_str().unwrap(),
+            component["id"].as_str().unwrap()
+        ))
+        .add_header(&headers[0].0, &headers[0].1)
+        .add_header(&headers[1].0, &headers[1].1)
+        .json(&serde_json::json!({
+            "weight": 50,
+            "enabled": true
+        }))
+        .await;
+    assert_eq!(add_response.status_code(), 200, "Should add component");
+
+    let added: serde_json::Value = add_response.json();
+    assert_eq!(added["weight"], 50);
+    assert_eq!(added["enabled"], true);
+}
+
+/// Test that adding a composite model as a component fails
+#[sqlx::test]
+#[test_log::test]
+async fn test_cannot_add_composite_as_component(pool: PgPool) {
+    let (server, _bg) = utils::create_test_app(pool.clone(), false).await;
+    let admin = create_test_admin_user(&pool, Role::PlatformManager).await;
+    let headers = add_auth_headers(&admin);
+
+    // Create two composite models
+    let composite1_response = server
+        .post("/admin/api/v1/models")
+        .add_header(&headers[0].0, &headers[0].1)
+        .add_header(&headers[1].0, &headers[1].1)
+        .json(&serde_json::json!({
+            "type": "composite",
+            "model_name": "composite-1"
+        }))
+        .await;
+    assert_eq!(composite1_response.status_code(), 200);
+    let composite1: serde_json::Value = composite1_response.json();
+
+    let composite2_response = server
+        .post("/admin/api/v1/models")
+        .add_header(&headers[0].0, &headers[0].1)
+        .add_header(&headers[1].0, &headers[1].1)
+        .json(&serde_json::json!({
+            "type": "composite",
+            "model_name": "composite-2"
+        }))
+        .await;
+    assert_eq!(composite2_response.status_code(), 200);
+    let composite2: serde_json::Value = composite2_response.json();
+
+    // Try to add composite2 as a component of composite1 - should fail
+    let add_response = server
+        .post(&format!(
+            "/admin/api/v1/models/{}/components/{}",
+            composite1["id"].as_str().unwrap(),
+            composite2["id"].as_str().unwrap()
+        ))
+        .add_header(&headers[0].0, &headers[0].1)
+        .add_header(&headers[1].0, &headers[1].1)
+        .json(&serde_json::json!({
+            "weight": 50
+        }))
+        .await;
+    assert_eq!(add_response.status_code(), 400, "Should not allow composite as component");
+}
+
+/// Test that adding components to a non-composite model fails
+#[sqlx::test]
+#[test_log::test]
+async fn test_cannot_add_component_to_standard_model(pool: PgPool) {
+    let (server, _bg) = utils::create_test_app(pool.clone(), false).await;
+    let admin = create_test_admin_user(&pool, Role::PlatformManager).await;
+    let headers = add_auth_headers(&admin);
+
+    // Create an endpoint
+    let endpoint_response = server
+        .post("/admin/api/v1/endpoints")
+        .add_header(&headers[0].0, &headers[0].1)
+        .add_header(&headers[1].0, &headers[1].1)
+        .json(&serde_json::json!({
+            "name": "Test Endpoint",
+            "url": "https://api.example.com/v1"
+        }))
+        .await;
+    assert_eq!(endpoint_response.status_code(), 201);
+    let endpoint: serde_json::Value = endpoint_response.json();
+
+    // Create two standard models
+    let model1_response = server
+        .post("/admin/api/v1/models")
+        .add_header(&headers[0].0, &headers[0].1)
+        .add_header(&headers[1].0, &headers[1].1)
+        .json(&serde_json::json!({
+            "type": "standard",
+            "model_name": "model-1",
+            "hosted_on": endpoint["id"]
+        }))
+        .await;
+    assert_eq!(model1_response.status_code(), 200);
+    let model1: serde_json::Value = model1_response.json();
+
+    let model2_response = server
+        .post("/admin/api/v1/models")
+        .add_header(&headers[0].0, &headers[0].1)
+        .add_header(&headers[1].0, &headers[1].1)
+        .json(&serde_json::json!({
+            "type": "standard",
+            "model_name": "model-2",
+            "hosted_on": endpoint["id"]
+        }))
+        .await;
+    assert_eq!(model2_response.status_code(), 200);
+    let model2: serde_json::Value = model2_response.json();
+
+    // Try to add model2 as component of model1 (standard model) - should fail
+    let add_response = server
+        .post(&format!(
+            "/admin/api/v1/models/{}/components/{}",
+            model1["id"].as_str().unwrap(),
+            model2["id"].as_str().unwrap()
+        ))
+        .add_header(&headers[0].0, &headers[0].1)
+        .add_header(&headers[1].0, &headers[1].1)
+        .json(&serde_json::json!({
+            "weight": 50
+        }))
+        .await;
+    assert_eq!(
+        add_response.status_code(),
+        400,
+        "Should not allow adding components to standard model"
+    );
+}
+
+/// Test updating a component's weight and enabled status
+#[sqlx::test]
+#[test_log::test]
+async fn test_update_component(pool: PgPool) {
+    let (server, _bg) = utils::create_test_app(pool.clone(), false).await;
+    let admin = create_test_admin_user(&pool, Role::PlatformManager).await;
+    let headers = add_auth_headers(&admin);
+
+    // Create endpoint, standard model, and composite model
+    let endpoint_response = server
+        .post("/admin/api/v1/endpoints")
+        .add_header(&headers[0].0, &headers[0].1)
+        .add_header(&headers[1].0, &headers[1].1)
+        .json(&serde_json::json!({
+            "name": "Test Endpoint",
+            "url": "https://api.example.com/v1"
+        }))
+        .await;
+    let endpoint: serde_json::Value = endpoint_response.json();
+
+    let component_response = server
+        .post("/admin/api/v1/models")
+        .add_header(&headers[0].0, &headers[0].1)
+        .add_header(&headers[1].0, &headers[1].1)
+        .json(&serde_json::json!({
+            "type": "standard",
+            "model_name": "gpt-4",
+            "hosted_on": endpoint["id"]
+        }))
+        .await;
+    let component: serde_json::Value = component_response.json();
+
+    let composite_response = server
+        .post("/admin/api/v1/models")
+        .add_header(&headers[0].0, &headers[0].1)
+        .add_header(&headers[1].0, &headers[1].1)
+        .json(&serde_json::json!({
+            "type": "composite",
+            "model_name": "multi-gpt"
+        }))
+        .await;
+    let composite: serde_json::Value = composite_response.json();
+
+    // Add component
+    let add_response = server
+        .post(&format!(
+            "/admin/api/v1/models/{}/components/{}",
+            composite["id"].as_str().unwrap(),
+            component["id"].as_str().unwrap()
+        ))
+        .add_header(&headers[0].0, &headers[0].1)
+        .add_header(&headers[1].0, &headers[1].1)
+        .json(&serde_json::json!({
+            "weight": 50,
+            "enabled": true
+        }))
+        .await;
+    assert_eq!(add_response.status_code(), 200);
+
+    // Update component weight and disable it
+    let update_response = server
+        .patch(&format!(
+            "/admin/api/v1/models/{}/components/{}",
+            composite["id"].as_str().unwrap(),
+            component["id"].as_str().unwrap()
+        ))
+        .add_header(&headers[0].0, &headers[0].1)
+        .add_header(&headers[1].0, &headers[1].1)
+        .json(&serde_json::json!({
+            "weight": 75,
+            "enabled": false
+        }))
+        .await;
+    assert_eq!(update_response.status_code(), 200, "Should update component");
+
+    let updated: serde_json::Value = update_response.json();
+    assert_eq!(updated["weight"], 75);
+    assert_eq!(updated["enabled"], false);
+}
+
+/// Test removing a component from a composite model
+#[sqlx::test]
+#[test_log::test]
+async fn test_remove_component(pool: PgPool) {
+    let (server, _bg) = utils::create_test_app(pool.clone(), false).await;
+    let admin = create_test_admin_user(&pool, Role::PlatformManager).await;
+    let headers = add_auth_headers(&admin);
+
+    // Create endpoint, standard model, and composite model
+    let endpoint_response = server
+        .post("/admin/api/v1/endpoints")
+        .add_header(&headers[0].0, &headers[0].1)
+        .add_header(&headers[1].0, &headers[1].1)
+        .json(&serde_json::json!({
+            "name": "Test Endpoint",
+            "url": "https://api.example.com/v1"
+        }))
+        .await;
+    let endpoint: serde_json::Value = endpoint_response.json();
+
+    let component_response = server
+        .post("/admin/api/v1/models")
+        .add_header(&headers[0].0, &headers[0].1)
+        .add_header(&headers[1].0, &headers[1].1)
+        .json(&serde_json::json!({
+            "type": "standard",
+            "model_name": "gpt-4",
+            "hosted_on": endpoint["id"]
+        }))
+        .await;
+    let component: serde_json::Value = component_response.json();
+
+    let composite_response = server
+        .post("/admin/api/v1/models")
+        .add_header(&headers[0].0, &headers[0].1)
+        .add_header(&headers[1].0, &headers[1].1)
+        .json(&serde_json::json!({
+            "type": "composite",
+            "model_name": "multi-gpt"
+        }))
+        .await;
+    let composite: serde_json::Value = composite_response.json();
+
+    // Add component
+    let add_response = server
+        .post(&format!(
+            "/admin/api/v1/models/{}/components/{}",
+            composite["id"].as_str().unwrap(),
+            component["id"].as_str().unwrap()
+        ))
+        .add_header(&headers[0].0, &headers[0].1)
+        .add_header(&headers[1].0, &headers[1].1)
+        .json(&serde_json::json!({
+            "weight": 50
+        }))
+        .await;
+    assert_eq!(add_response.status_code(), 200);
+
+    // Remove component
+    let remove_response = server
+        .delete(&format!(
+            "/admin/api/v1/models/{}/components/{}",
+            composite["id"].as_str().unwrap(),
+            component["id"].as_str().unwrap()
+        ))
+        .add_header(&headers[0].0, &headers[0].1)
+        .add_header(&headers[1].0, &headers[1].1)
+        .await;
+    assert_eq!(remove_response.status_code(), 200, "Should remove component");
+
+    // Verify component is removed by listing components
+    let list_response = server
+        .get(&format!("/admin/api/v1/models/{}/components", composite["id"].as_str().unwrap()))
+        .add_header(&headers[0].0, &headers[0].1)
+        .add_header(&headers[1].0, &headers[1].1)
+        .await;
+    assert_eq!(list_response.status_code(), 200);
+    let components: Vec<serde_json::Value> = list_response.json();
+    assert!(components.is_empty(), "Component list should be empty after removal");
+}
+
+/// Test weight validation (must be 1-100)
+#[sqlx::test]
+#[test_log::test]
+async fn test_component_weight_validation(pool: PgPool) {
+    let (server, _bg) = utils::create_test_app(pool.clone(), false).await;
+    let admin = create_test_admin_user(&pool, Role::PlatformManager).await;
+    let headers = add_auth_headers(&admin);
+
+    // Create endpoint, standard model, and composite model
+    let endpoint_response = server
+        .post("/admin/api/v1/endpoints")
+        .add_header(&headers[0].0, &headers[0].1)
+        .add_header(&headers[1].0, &headers[1].1)
+        .json(&serde_json::json!({
+            "name": "Test Endpoint",
+            "url": "https://api.example.com/v1"
+        }))
+        .await;
+    let endpoint: serde_json::Value = endpoint_response.json();
+
+    let component_response = server
+        .post("/admin/api/v1/models")
+        .add_header(&headers[0].0, &headers[0].1)
+        .add_header(&headers[1].0, &headers[1].1)
+        .json(&serde_json::json!({
+            "type": "standard",
+            "model_name": "gpt-4",
+            "hosted_on": endpoint["id"]
+        }))
+        .await;
+    let component: serde_json::Value = component_response.json();
+
+    let composite_response = server
+        .post("/admin/api/v1/models")
+        .add_header(&headers[0].0, &headers[0].1)
+        .add_header(&headers[1].0, &headers[1].1)
+        .json(&serde_json::json!({
+            "type": "composite",
+            "model_name": "multi-gpt"
+        }))
+        .await;
+    let composite: serde_json::Value = composite_response.json();
+
+    // Try to add component with weight 0 - should fail
+    let add_response = server
+        .post(&format!(
+            "/admin/api/v1/models/{}/components/{}",
+            composite["id"].as_str().unwrap(),
+            component["id"].as_str().unwrap()
+        ))
+        .add_header(&headers[0].0, &headers[0].1)
+        .add_header(&headers[1].0, &headers[1].1)
+        .json(&serde_json::json!({
+            "weight": 0
+        }))
+        .await;
+    assert_eq!(add_response.status_code(), 400, "Weight 0 should be rejected");
+
+    // Try to add component with weight 101 - should fail
+    let add_response = server
+        .post(&format!(
+            "/admin/api/v1/models/{}/components/{}",
+            composite["id"].as_str().unwrap(),
+            component["id"].as_str().unwrap()
+        ))
+        .add_header(&headers[0].0, &headers[0].1)
+        .add_header(&headers[1].0, &headers[1].1)
+        .json(&serde_json::json!({
+            "weight": 101
+        }))
+        .await;
+    assert_eq!(add_response.status_code(), 400, "Weight 101 should be rejected");
+
+    // Valid weight should succeed
+    let add_response = server
+        .post(&format!(
+            "/admin/api/v1/models/{}/components/{}",
+            composite["id"].as_str().unwrap(),
+            component["id"].as_str().unwrap()
+        ))
+        .add_header(&headers[0].0, &headers[0].1)
+        .add_header(&headers[1].0, &headers[1].1)
+        .json(&serde_json::json!({
+            "weight": 100
+        }))
+        .await;
+    assert_eq!(add_response.status_code(), 200, "Weight 100 should be accepted");
 }

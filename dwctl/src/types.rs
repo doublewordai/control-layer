@@ -104,6 +104,7 @@ pub enum Resource {
     Users,
     Groups,
     Models,
+    CompositeModels,
     Endpoints,
     ApiKeys,
     Analytics,

@@ -4,8 +4,8 @@ use crate::db::{
     errors::{DbError, Result},
     handlers::repository::Repository,
     models::deployments::{
-        DeploymentCreateDBRequest, DeploymentDBResponse, DeploymentUpdateDBRequest, ModelStatus, ModelType, ProviderPricing,
-        ProviderPricingFields,
+        DeploymentComponentCreateDBRequest, DeploymentComponentDBResponse, DeploymentCreateDBRequest, DeploymentDBResponse,
+        DeploymentUpdateDBRequest, LoadBalancingStrategy, ModelStatus, ModelType, ProviderPricing, ProviderPricingFields,
     },
 };
 use crate::types::{DeploymentId, InferenceEndpointId, UserId, abbrev_uuid};
@@ -26,7 +26,8 @@ pub struct DeploymentFilter {
     pub deleted: Option<bool>, // None = show all, Some(false) = show non-deleted only, Some(true) = show deleted only
     pub accessible_to: Option<UserId>, // None = show all deployments, Some(user_id) = show only deployments accessible to that user
     pub aliases: Option<Vec<String>>,
-    pub search: Option<String>, // Case-insensitive substring search on alias and model_name
+    pub search: Option<String>,     // Case-insensitive substring search on alias and model_name
+    pub is_composite: Option<bool>, // None = show all, Some(true) = composite only, Some(false) = non-composite only
 }
 
 impl DeploymentFilter {
@@ -40,6 +41,7 @@ impl DeploymentFilter {
             accessible_to: None, // Default: show all deployments
             aliases: None,
             search: None,
+            is_composite: None, // Default: show all models
         }
     }
 
@@ -72,6 +74,11 @@ impl DeploymentFilter {
         self.search = Some(search);
         self
     }
+
+    pub fn with_composite(mut self, is_composite: bool) -> Self {
+        self.is_composite = Some(is_composite);
+        self
+    }
 }
 
 /// Result of checking user access to a deployment
@@ -93,7 +100,7 @@ struct DeployedModel {
     pub r#type: Option<String>,
     pub capabilities: Option<Vec<String>>,
     pub created_by: UserId,
-    pub hosted_on: InferenceEndpointId,
+    pub hosted_on: Option<InferenceEndpointId>,
     pub status: String,
     pub last_sync: Option<DateTime<Utc>>,
     pub deleted: bool,
@@ -109,6 +116,12 @@ struct DeployedModel {
     pub downstream_output_price_per_token: Option<Decimal>,
     pub downstream_hourly_rate: Option<Decimal>,
     pub downstream_input_token_cost_ratio: Option<Decimal>,
+    // Composite model fields
+    pub is_composite: bool,
+    pub lb_strategy: Option<String>,
+    pub fallback_enabled: Option<bool>,
+    pub fallback_on_rate_limit: Option<bool>,
+    pub fallback_on_status: Option<Vec<i32>>,
 }
 
 pub struct Deployments<'c> {
@@ -124,6 +137,13 @@ impl From<(Option<ModelType>, DeployedModel)> for DeploymentDBResponse {
             hourly_rate: m.downstream_hourly_rate,
             input_token_cost_ratio: m.downstream_input_token_cost_ratio,
         });
+
+        // Parse load balancing strategy (default to WeightedRandom)
+        let lb_strategy = m
+            .lb_strategy
+            .as_deref()
+            .and_then(LoadBalancingStrategy::try_parse)
+            .unwrap_or_default();
 
         Self {
             id: m.id,
@@ -144,6 +164,12 @@ impl From<(Option<ModelType>, DeployedModel)> for DeploymentDBResponse {
             capacity: m.capacity,
             batch_capacity: m.batch_capacity,
             provider_pricing,
+            // Composite model fields
+            is_composite: m.is_composite,
+            lb_strategy,
+            fallback_enabled: m.fallback_enabled.unwrap_or(true),
+            fallback_on_rate_limit: m.fallback_on_rate_limit.unwrap_or(true),
+            fallback_on_status: m.fallback_on_status.unwrap_or_else(|| vec![429, 500, 502, 503, 504]),
         }
     }
 }
@@ -179,6 +205,9 @@ impl<'c> Repository for Deployments<'c> {
         // Extract provider pricing fields
         let pricing_fields = request.provider_pricing.as_ref().map(|p| p.to_flat_fields()).unwrap_or_default();
 
+        // Extract composite model fields
+        let lb_strategy_str = request.lb_strategy.map(|s| s.as_str().to_string());
+
         let model = sqlx::query_as!(
             DeployedModel,
             r#"
@@ -186,9 +215,10 @@ impl<'c> Repository for Deployments<'c> {
                 model_name, alias, description, type, capabilities, created_by, hosted_on, created_at, updated_at,
                 requests_per_second, burst_size, capacity, batch_capacity,
                 downstream_pricing_mode, downstream_input_price_per_token, downstream_output_price_per_token,
-                downstream_hourly_rate, downstream_input_token_cost_ratio
+                downstream_hourly_rate, downstream_input_token_cost_ratio,
+                is_composite, lb_strategy, fallback_enabled, fallback_on_rate_limit, fallback_on_status
             )
-            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23)
             RETURNING *
             "#,
             request.model_name.trim(),
@@ -208,7 +238,12 @@ impl<'c> Repository for Deployments<'c> {
             pricing_fields.input_price_per_token,
             pricing_fields.output_price_per_token,
             pricing_fields.hourly_rate,
-            pricing_fields.input_token_cost_ratio
+            pricing_fields.input_token_cost_ratio,
+            request.is_composite,
+            lb_strategy_str,
+            request.fallback_enabled,
+            request.fallback_on_rate_limit,
+            request.fallback_on_status.as_ref().map(|s| s.as_slice())
         )
         .fetch_one(&mut *self.db)
         .await?;
@@ -227,7 +262,7 @@ impl<'c> Repository for Deployments<'c> {
     async fn get_by_id(&mut self, id: Self::Id) -> Result<Option<Self::Response>> {
         let model = sqlx::query_as!(
             DeployedModel,
-            "SELECT id, model_name, alias, description, type, capabilities, created_by, hosted_on, status, last_sync, deleted, created_at, updated_at, requests_per_second, burst_size, capacity, batch_capacity, downstream_pricing_mode, downstream_input_price_per_token, downstream_output_price_per_token, downstream_hourly_rate, downstream_input_token_cost_ratio FROM deployed_models WHERE id = $1",
+            "SELECT id, model_name, alias, description, type, capabilities, created_by, hosted_on, status, last_sync, deleted, created_at, updated_at, requests_per_second, burst_size, capacity, batch_capacity, downstream_pricing_mode, downstream_input_price_per_token, downstream_output_price_per_token, downstream_hourly_rate, downstream_input_token_cost_ratio, is_composite, lb_strategy, fallback_enabled, fallback_on_rate_limit, fallback_on_status FROM deployed_models WHERE id = $1",
             id
         )
             .fetch_optional(&mut *self.db)
@@ -252,7 +287,7 @@ impl<'c> Repository for Deployments<'c> {
 
         let deployments = sqlx::query_as!(
             DeployedModel,
-            "SELECT id, model_name, alias, description, type, capabilities, created_by, hosted_on, status, last_sync, deleted, created_at, updated_at, requests_per_second, burst_size, capacity, batch_capacity, downstream_pricing_mode, downstream_input_price_per_token, downstream_output_price_per_token, downstream_hourly_rate, downstream_input_token_cost_ratio FROM deployed_models WHERE id = ANY($1)",
+            "SELECT id, model_name, alias, description, type, capabilities, created_by, hosted_on, status, last_sync, deleted, created_at, updated_at, requests_per_second, burst_size, capacity, batch_capacity, downstream_pricing_mode, downstream_input_price_per_token, downstream_output_price_per_token, downstream_hourly_rate, downstream_input_token_cost_ratio, is_composite, lb_strategy, fallback_enabled, fallback_on_rate_limit, fallback_on_status FROM deployed_models WHERE id = ANY($1)",
             ids.as_slice()
         )
             .fetch_all(&mut *self.db)
@@ -311,6 +346,9 @@ impl<'c> Repository for Deployments<'c> {
 
         // Extract provider pricing update information
         let pricing_params = request.provider_pricing.as_ref().map(|p| p.to_update_params()).unwrap_or_default();
+
+        // Extract composite model update fields
+        let lb_strategy_str = request.lb_strategy.map(|s| s.as_str().to_string());
 
         // Info logging for rate limiting
         tracing::info!(
@@ -392,6 +430,12 @@ impl<'c> Repository for Deployments<'c> {
                 ELSE downstream_input_token_cost_ratio
             END,
 
+            -- Composite model fields
+            lb_strategy = COALESCE($32, lb_strategy),
+            fallback_enabled = COALESCE($33, fallback_enabled),
+            fallback_on_rate_limit = COALESCE($34, fallback_on_rate_limit),
+            fallback_on_status = COALESCE($35, fallback_on_status),
+
             updated_at = NOW()
         WHERE id = $1
         RETURNING *
@@ -433,7 +477,12 @@ impl<'c> Repository for Deployments<'c> {
             pricing_params.should_update_hourly, // $28
             pricing_params.hourly,               // $29
             pricing_params.should_update_ratio,  // $30
-            pricing_params.ratio                 // $31
+            pricing_params.ratio,                // $31
+            // For composite model fields
+            lb_strategy_str,                                           // $32
+            request.fallback_enabled,                                  // $33
+            request.fallback_on_rate_limit,                            // $34
+            request.fallback_on_status.as_ref().map(|s| s.as_slice())  // $35
         )
         .fetch_one(&mut *self.db)
         .await?;
@@ -506,6 +555,12 @@ impl<'c> Repository for Deployments<'c> {
             query.push(" OR LOWER(ie.name) LIKE ");
             query.push_bind(search_pattern);
             query.push(")");
+        }
+
+        // Add is_composite filter if specified
+        if let Some(is_composite) = filter.is_composite {
+            query.push(" AND dm.is_composite = ");
+            query.push_bind(is_composite);
         }
 
         // Add ordering and pagination
@@ -628,8 +683,290 @@ impl<'c> Deployments<'c> {
             query.push(")");
         }
 
+        // Add is_composite filter if specified
+        if let Some(is_composite) = filter.is_composite {
+            query.push(" AND dm.is_composite = ");
+            query.push_bind(is_composite);
+        }
+
         let count: (i64,) = query.build_query_as().fetch_one(&mut *self.db).await?;
         Ok(count.0)
+    }
+
+    // ===== Composite Model Component Management =====
+
+    /// Add a component to a composite model
+    #[instrument(skip(self), fields(composite_id = %abbrev_uuid(&request.composite_model_id), deployed_id = %abbrev_uuid(&request.deployed_model_id)), err)]
+    pub async fn add_component(&mut self, request: &DeploymentComponentCreateDBRequest) -> Result<DeploymentComponentDBResponse> {
+        let result = sqlx::query!(
+            r#"
+            WITH inserted AS (
+                INSERT INTO deployed_model_components (composite_model_id, deployed_model_id, weight, enabled, sort_order)
+                VALUES ($1, $2, $3, $4, $5)
+                RETURNING id, composite_model_id, deployed_model_id, weight, enabled, sort_order, created_at
+            )
+            SELECT
+                inserted.id,
+                inserted.composite_model_id,
+                inserted.deployed_model_id,
+                inserted.weight,
+                inserted.enabled,
+                inserted.sort_order,
+                inserted.created_at,
+                dm.alias as model_alias,
+                dm.model_name,
+                dm.description as model_description,
+                dm.type as model_type,
+                dm.hosted_on as endpoint_id,
+                e.name as "endpoint_name?"
+            FROM inserted
+            JOIN deployed_models dm ON dm.id = inserted.deployed_model_id
+            LEFT JOIN inference_endpoints e ON e.id = dm.hosted_on
+            "#,
+            request.composite_model_id,
+            request.deployed_model_id,
+            request.weight,
+            request.enabled,
+            request.sort_order
+        )
+        .fetch_one(&mut *self.db)
+        .await?;
+
+        Ok(DeploymentComponentDBResponse {
+            id: result.id,
+            composite_model_id: result.composite_model_id,
+            deployed_model_id: result.deployed_model_id,
+            weight: result.weight,
+            enabled: result.enabled,
+            sort_order: result.sort_order,
+            created_at: result.created_at,
+            model_alias: result.model_alias,
+            model_name: result.model_name,
+            model_description: result.model_description,
+            model_type: result.model_type,
+            endpoint_id: result.endpoint_id,
+            endpoint_name: result.endpoint_name,
+        })
+    }
+
+    /// Remove a component from a composite model
+    #[instrument(skip(self), fields(composite_id = %abbrev_uuid(&composite_model_id), deployed_id = %abbrev_uuid(&deployed_model_id)), err)]
+    pub async fn remove_component(&mut self, composite_model_id: DeploymentId, deployed_model_id: DeploymentId) -> Result<bool> {
+        let result = sqlx::query!(
+            "DELETE FROM deployed_model_components WHERE composite_model_id = $1 AND deployed_model_id = $2",
+            composite_model_id,
+            deployed_model_id
+        )
+        .execute(&mut *self.db)
+        .await?;
+
+        Ok(result.rows_affected() > 0)
+    }
+
+    /// Get all components of a composite model
+    #[instrument(skip(self), fields(composite_id = %abbrev_uuid(&composite_model_id)), err)]
+    pub async fn get_components(&mut self, composite_model_id: DeploymentId) -> Result<Vec<DeploymentComponentDBResponse>> {
+        let results = sqlx::query!(
+            r#"
+            SELECT
+                dmc.id,
+                dmc.composite_model_id,
+                dmc.deployed_model_id,
+                dmc.weight,
+                dmc.enabled,
+                dmc.sort_order,
+                dmc.created_at,
+                dm.alias as model_alias,
+                dm.model_name,
+                dm.description as model_description,
+                dm.type as model_type,
+                dm.hosted_on as endpoint_id,
+                e.name as "endpoint_name?"
+            FROM deployed_model_components dmc
+            JOIN deployed_models dm ON dm.id = dmc.deployed_model_id
+            LEFT JOIN inference_endpoints e ON e.id = dm.hosted_on
+            WHERE dmc.composite_model_id = $1
+            ORDER BY dmc.sort_order ASC, dmc.weight DESC, dmc.created_at ASC
+            "#,
+            composite_model_id
+        )
+        .fetch_all(&mut *self.db)
+        .await?;
+
+        Ok(results
+            .into_iter()
+            .map(|r| DeploymentComponentDBResponse {
+                id: r.id,
+                composite_model_id: r.composite_model_id,
+                deployed_model_id: r.deployed_model_id,
+                weight: r.weight,
+                enabled: r.enabled,
+                sort_order: r.sort_order,
+                created_at: r.created_at,
+                model_alias: r.model_alias,
+                model_name: r.model_name,
+                model_description: r.model_description,
+                model_type: r.model_type,
+                endpoint_id: r.endpoint_id,
+                endpoint_name: r.endpoint_name,
+            })
+            .collect())
+    }
+
+    /// Get components for multiple composite models in bulk
+    #[instrument(skip(self, composite_model_ids), fields(count = composite_model_ids.len()), err)]
+    pub async fn get_components_bulk(
+        &mut self,
+        composite_model_ids: Vec<DeploymentId>,
+    ) -> Result<std::collections::HashMap<DeploymentId, Vec<DeploymentComponentDBResponse>>> {
+        if composite_model_ids.is_empty() {
+            return Ok(std::collections::HashMap::new());
+        }
+
+        let results = sqlx::query!(
+            r#"
+            SELECT
+                dmc.id,
+                dmc.composite_model_id,
+                dmc.deployed_model_id,
+                dmc.weight,
+                dmc.enabled,
+                dmc.sort_order,
+                dmc.created_at,
+                dm.alias as model_alias,
+                dm.model_name,
+                dm.description as model_description,
+                dm.type as model_type,
+                dm.hosted_on as endpoint_id,
+                e.name as "endpoint_name?"
+            FROM deployed_model_components dmc
+            JOIN deployed_models dm ON dm.id = dmc.deployed_model_id
+            LEFT JOIN inference_endpoints e ON e.id = dm.hosted_on
+            WHERE dmc.composite_model_id = ANY($1)
+            ORDER BY dmc.composite_model_id, dmc.sort_order ASC, dmc.weight DESC, dmc.created_at ASC
+            "#,
+            &composite_model_ids
+        )
+        .fetch_all(&mut *self.db)
+        .await?;
+
+        let mut map: std::collections::HashMap<DeploymentId, Vec<DeploymentComponentDBResponse>> = std::collections::HashMap::new();
+
+        for r in results {
+            map.entry(r.composite_model_id).or_default().push(DeploymentComponentDBResponse {
+                id: r.id,
+                composite_model_id: r.composite_model_id,
+                deployed_model_id: r.deployed_model_id,
+                weight: r.weight,
+                enabled: r.enabled,
+                sort_order: r.sort_order,
+                created_at: r.created_at,
+                model_alias: r.model_alias,
+                model_name: r.model_name,
+                model_description: r.model_description,
+                model_type: r.model_type,
+                endpoint_id: r.endpoint_id,
+                endpoint_name: r.endpoint_name,
+            });
+        }
+
+        Ok(map)
+    }
+
+    /// Set all components of a composite model (replace existing)
+    /// Tuple is (deployed_model_id, weight, enabled, sort_order)
+    #[instrument(skip(self, components), fields(composite_id = %abbrev_uuid(&composite_model_id), count = components.len()), err)]
+    pub async fn set_components(
+        &mut self,
+        composite_model_id: DeploymentId,
+        components: Vec<(DeploymentId, i32, bool, i32)>,
+    ) -> Result<Vec<DeploymentComponentDBResponse>> {
+        // Delete existing components
+        sqlx::query!(
+            "DELETE FROM deployed_model_components WHERE composite_model_id = $1",
+            composite_model_id
+        )
+        .execute(&mut *self.db)
+        .await?;
+
+        // Insert new components
+        let mut results = Vec::new();
+        for (deployed_model_id, weight, enabled, sort_order) in components {
+            let request = DeploymentComponentCreateDBRequest {
+                composite_model_id,
+                deployed_model_id,
+                weight,
+                enabled,
+                sort_order,
+            };
+            results.push(self.add_component(&request).await?);
+        }
+
+        Ok(results)
+    }
+
+    /// Update a component's weight, enabled status, and sort_order
+    #[instrument(skip(self), fields(composite_id = %abbrev_uuid(&composite_model_id), deployed_id = %abbrev_uuid(&deployed_model_id)), err)]
+    pub async fn update_component(
+        &mut self,
+        composite_model_id: DeploymentId,
+        deployed_model_id: DeploymentId,
+        weight: Option<i32>,
+        enabled: Option<bool>,
+        sort_order: Option<i32>,
+    ) -> Result<Option<DeploymentComponentDBResponse>> {
+        let result = sqlx::query!(
+            r#"
+            WITH updated AS (
+                UPDATE deployed_model_components
+                SET weight = COALESCE($3, weight),
+                    enabled = COALESCE($4, enabled),
+                    sort_order = COALESCE($5, sort_order)
+                WHERE composite_model_id = $1 AND deployed_model_id = $2
+                RETURNING id, composite_model_id, deployed_model_id, weight, enabled, sort_order, created_at
+            )
+            SELECT
+                updated.id,
+                updated.composite_model_id,
+                updated.deployed_model_id,
+                updated.weight,
+                updated.enabled,
+                updated.sort_order,
+                updated.created_at,
+                dm.alias as model_alias,
+                dm.model_name,
+                dm.description as model_description,
+                dm.type as model_type,
+                dm.hosted_on as endpoint_id,
+                e.name as "endpoint_name?"
+            FROM updated
+            JOIN deployed_models dm ON dm.id = updated.deployed_model_id
+            LEFT JOIN inference_endpoints e ON e.id = dm.hosted_on
+            "#,
+            composite_model_id,
+            deployed_model_id,
+            weight,
+            enabled,
+            sort_order
+        )
+        .fetch_optional(&mut *self.db)
+        .await?;
+
+        Ok(result.map(|r| DeploymentComponentDBResponse {
+            id: r.id,
+            composite_model_id: r.composite_model_id,
+            deployed_model_id: r.deployed_model_id,
+            weight: r.weight,
+            enabled: r.enabled,
+            sort_order: r.sort_order,
+            created_at: r.created_at,
+            model_alias: r.model_alias,
+            model_name: r.model_name,
+            model_description: r.model_description,
+            model_type: r.model_type,
+            endpoint_id: r.endpoint_id,
+            endpoint_name: r.endpoint_name,
+        }))
     }
 }
 
@@ -742,7 +1079,7 @@ mod tests {
                     .model_name("get-test-model".to_string())
                     .alias("get-test-deployment".to_string())
                     .build();
-                model_create.hosted_on = test_endpoint_id;
+                model_create.hosted_on = Some(test_endpoint_id);
 
                 created_model = repo.create(&model_create).await.unwrap();
                 found_model = repo.get_by_id(created_model.id).await.unwrap();
@@ -840,7 +1177,7 @@ mod tests {
                     .model_name("null-fields-model".to_string())
                     .alias("null-fields-deployment".to_string())
                     .build();
-                model_create.hosted_on = test_endpoint_id;
+                model_create.hosted_on = Some(test_endpoint_id);
 
                 model = repo.create(&model_create).await.unwrap();
             }
@@ -884,7 +1221,7 @@ mod tests {
                     .model_name("to-null-model".to_string())
                     .alias("to-null-deployment".to_string())
                     .build();
-                model_create.hosted_on = test_endpoint_id;
+                model_create.hosted_on = Some(test_endpoint_id);
                 model_create.model_type = Some(ModelType::Chat);
                 model_create.capabilities = Some(vec!["test-capability".to_string()]);
                 model_create.capacity = Some(150);
@@ -942,7 +1279,7 @@ mod tests {
                     .model_name("delete-test-model".to_string())
                     .alias("delete-test-deployment".to_string())
                     .build();
-                model_create.hosted_on = test_endpoint_id;
+                model_create.hosted_on = Some(test_endpoint_id);
 
                 created_model = repo.create(&model_create).await.unwrap();
                 let deleted = repo.delete(created_model.id).await.unwrap();
@@ -981,14 +1318,14 @@ mod tests {
             .model_name("list-test-model-1".to_string())
             .alias("list-test-deployment-1".to_string())
             .build();
-        model1.hosted_on = test_endpoint_id;
+        model1.hosted_on = Some(test_endpoint_id);
 
         let mut model2 = DeploymentCreateDBRequest::builder()
             .created_by(user.id)
             .model_name("list-test-model-2".to_string())
             .alias("list-test-deployment-2".to_string())
             .build();
-        model2.hosted_on = test_endpoint_id;
+        model2.hosted_on = Some(test_endpoint_id);
 
         repo.create(&model1).await.unwrap();
         repo.create(&model2).await.unwrap();
@@ -1025,7 +1362,7 @@ mod tests {
             .model_name("endpoint-filter-model".to_string())
             .alias("endpoint-filter-deployment".to_string())
             .build();
-        model_create.hosted_on = endpoint_id;
+        model_create.hosted_on = Some(endpoint_id);
         let deployment = repo.create(&model_create).await.unwrap();
 
         // Test filtering by endpoint
@@ -1033,7 +1370,7 @@ mod tests {
         let models = repo.list(&filter).await.unwrap();
 
         assert!(models.iter().any(|m| m.id == deployment.id));
-        assert!(models.iter().all(|m| m.hosted_on == endpoint_id));
+        assert!(models.iter().all(|m| m.hosted_on == Some(endpoint_id)));
     }
 
     #[sqlx::test]
@@ -1060,7 +1397,7 @@ mod tests {
             .model_name("status-filter-model".to_string())
             .alias("status-filter-deployment".to_string())
             .build();
-        model_create.hosted_on = test_endpoint_id;
+        model_create.hosted_on = Some(test_endpoint_id);
         let deployment = repo.create(&model_create).await.unwrap();
 
         // Update deployment to a specific status
@@ -1100,7 +1437,7 @@ mod tests {
             .model_name("deleted-filter-model".to_string())
             .alias("deleted-filter-deployment".to_string())
             .build();
-        model_create.hosted_on = test_endpoint_id;
+        model_create.hosted_on = Some(test_endpoint_id);
         let deployment = repo.create(&model_create).await.unwrap();
 
         // Mark deployment as deleted
@@ -1149,13 +1486,13 @@ mod tests {
             .model_name("accessible-model-1".to_string())
             .alias("accessible-deployment-1".to_string())
             .build();
-        model1_create.hosted_on = test_endpoint_id;
+        model1_create.hosted_on = Some(test_endpoint_id);
         let mut model2_create = DeploymentCreateDBRequest::builder()
             .created_by(user1.id)
             .model_name("accessible-model-2".to_string())
             .alias("accessible-deployment-2".to_string())
             .build();
-        model2_create.hosted_on = test_endpoint_id;
+        model2_create.hosted_on = Some(test_endpoint_id);
         let deployment1 = repo.create(&model1_create).await.unwrap();
         let deployment2 = repo.create(&model2_create).await.unwrap();
 
@@ -1225,7 +1562,7 @@ mod tests {
             .model_name("combined-filter-model".to_string())
             .alias("combined-filter-deployment".to_string())
             .build();
-        model_create.hosted_on = endpoint_id;
+        model_create.hosted_on = Some(endpoint_id);
         let deployment = repo.create(&model_create).await.unwrap();
 
         // Update to running status
@@ -1249,7 +1586,7 @@ mod tests {
         let models = repo.list(&filter).await.unwrap();
 
         assert!(models.iter().any(|m| m.id == deployment.id));
-        assert!(models.iter().all(|m| m.hosted_on == endpoint_id));
+        assert!(models.iter().all(|m| m.hosted_on == Some(endpoint_id)));
         assert!(models.iter().all(|m| m.status == ModelStatus::Active));
     }
 
@@ -1279,7 +1616,7 @@ mod tests {
                 .model_name(format!("pagination-model-{i}"))
                 .alias(format!("pagination-deployment-{i}"))
                 .build();
-            model_create.hosted_on = test_endpoint_id;
+            model_create.hosted_on = Some(test_endpoint_id);
             repo.create(&model_create).await.unwrap();
         }
 
@@ -1322,7 +1659,7 @@ mod tests {
             .model_name("embeddings-model".to_string())
             .alias("embeddings-deployment".to_string())
             .build();
-        model_create.hosted_on = test_endpoint_id;
+        model_create.hosted_on = Some(test_endpoint_id);
         model_create.model_type = Some(ModelType::Embeddings);
         model_create.capabilities = Some(vec!["embeddings".to_string(), "similarity".to_string()]);
 
@@ -1360,7 +1697,7 @@ mod tests {
             .model_name("get-embeddings-model".to_string())
             .alias("get-embeddings-deployment".to_string())
             .build();
-        model_create.hosted_on = test_endpoint_id;
+        model_create.hosted_on = Some(test_endpoint_id);
         model_create.model_type = Some(ModelType::Embeddings);
 
         let created_model = repo.create(&model_create).await.unwrap();
@@ -1397,7 +1734,7 @@ mod tests {
             .model_name("bulk-chat-model".to_string())
             .alias("bulk-chat-deployment".to_string())
             .build();
-        chat_create.hosted_on = test_endpoint_id;
+        chat_create.hosted_on = Some(test_endpoint_id);
         chat_create.model_type = Some(ModelType::Chat);
         let chat_deployment = repo.create(&chat_create).await.unwrap();
 
@@ -1407,7 +1744,7 @@ mod tests {
             .model_name("bulk-embeddings-model".to_string())
             .alias("bulk-embeddings-deployment".to_string())
             .build();
-        embeddings_create.hosted_on = test_endpoint_id;
+        embeddings_create.hosted_on = Some(test_endpoint_id);
         embeddings_create.model_type = Some(ModelType::Embeddings);
         let embeddings_deployment = repo.create(&embeddings_create).await.unwrap();
 
@@ -1417,7 +1754,7 @@ mod tests {
             .model_name("bulk-no-type-model".to_string())
             .alias("bulk-no-type-deployment".to_string())
             .build();
-        no_type_create.hosted_on = test_endpoint_id;
+        no_type_create.hosted_on = Some(test_endpoint_id);
         let no_type_deployment = repo.create(&no_type_create).await.unwrap();
 
         // Test bulk retrieval
@@ -1460,7 +1797,7 @@ mod tests {
             .model_name("list-chat-model".to_string())
             .alias("list-chat-deployment".to_string())
             .build();
-        chat_create.hosted_on = test_endpoint_id;
+        chat_create.hosted_on = Some(test_endpoint_id);
         chat_create.model_type = Some(ModelType::Chat);
         let chat_deployment = repo.create(&chat_create).await.unwrap();
 
@@ -1470,7 +1807,7 @@ mod tests {
             .model_name("list-embeddings-model".to_string())
             .alias("list-embeddings-deployment".to_string())
             .build();
-        embeddings_create.hosted_on = test_endpoint_id;
+        embeddings_create.hosted_on = Some(test_endpoint_id);
         embeddings_create.model_type = Some(ModelType::Embeddings);
         let embeddings_deployment = repo.create(&embeddings_create).await.unwrap();
 
@@ -1508,7 +1845,7 @@ mod tests {
             .model_name("chat-to-embeddings-model".to_string())
             .alias("chat-to-embeddings-deployment".to_string())
             .build();
-        model_create.hosted_on = test_endpoint_id;
+        model_create.hosted_on = Some(test_endpoint_id);
         model_create.model_type = Some(ModelType::Chat);
         let created_model = repo.create(&model_create).await.unwrap();
         assert_eq!(created_model.model_type, Some(ModelType::Chat));
@@ -1548,7 +1885,7 @@ mod tests {
             .model_name("embeddings-to-chat-model".to_string())
             .alias("embeddings-to-chat-deployment".to_string())
             .build();
-        model_create.hosted_on = test_endpoint_id;
+        model_create.hosted_on = Some(test_endpoint_id);
         model_create.model_type = Some(ModelType::Embeddings);
         let created_model = repo.create(&model_create).await.unwrap();
         assert_eq!(created_model.model_type, Some(ModelType::Embeddings));
@@ -1642,7 +1979,7 @@ mod tests {
             .model_name("access-test-model".to_string())
             .alias("access-test-alias".to_string())
             .build();
-        deployment_create.hosted_on = test_endpoint_id;
+        deployment_create.hosted_on = Some(test_endpoint_id);
         let deployment = deployment_repo.create(&deployment_create).await.unwrap();
 
         // Create a group
@@ -1974,14 +2311,14 @@ mod tests {
             .model_name("active-test-model".to_string())
             .alias("active-test-deployment".to_string())
             .build();
-        model_create1.hosted_on = test_endpoint_id;
+        model_create1.hosted_on = Some(test_endpoint_id);
 
         let mut model_create2 = DeploymentCreateDBRequest::builder()
             .created_by(user.id)
             .model_name("inactive-test-model".to_string())
             .alias("inactive-test-deployment".to_string())
             .build();
-        model_create2.hosted_on = test_endpoint_id;
+        model_create2.hosted_on = Some(test_endpoint_id);
 
         let deployment1 = repo.create(&model_create1).await.unwrap();
         let deployment2 = repo.create(&model_create2).await.unwrap();
@@ -2044,7 +2381,7 @@ mod tests {
             .model_name("combined-filter-model".to_string())
             .alias("combined-filter-deployment".to_string())
             .build();
-        model_create.hosted_on = test_endpoint_id;
+        model_create.hosted_on = Some(test_endpoint_id);
         let deployment = repo.create(&model_create).await.unwrap();
 
         // Set deployment to inactive and deleted

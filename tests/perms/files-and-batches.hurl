@@ -89,6 +89,7 @@ POST http://localhost:3001/admin/api/v1/models
 [Cookies]
 dwctl_session: {{admin_jwt}}
 {
+  "type": "standard",
   "model_name": "gpt-4-mock",
   "alias": "gpt-4-mock-permtest",
   "hosted_on": "{{test_endpoint_id}}"
@@ -108,6 +109,7 @@ POST http://localhost:3001/admin/api/v1/models
 [Cookies]
 dwctl_session: {{admin_jwt}}
 {
+  "type": "standard",
   "model_name": "mock-gpt-thinking",
   "alias": "mock-gpt-thinking-permtest",
   "hosted_on": "{{test_endpoint_id}}"
@@ -127,6 +129,7 @@ POST http://localhost:3001/admin/api/v1/models
 [Cookies]
 dwctl_session: {{admin_jwt}}
 {
+  "type": "standard",
   "model_name": "mock-gpt-markdown",
   "alias": "mock-gpt-markdown-permtest",
   "hosted_on": "{{test_endpoint_id}}"

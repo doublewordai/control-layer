@@ -22,6 +22,9 @@ export const queryKeys = {
     }) => ["models", "query", options] as const,
     byId: (id: string, include?: string) =>
       ["models", "byId", id, include] as const,
+    // Composite model components
+    components: (modelId: string) =>
+      ["models", "byId", modelId, "components"] as const,
   },
 
   // Groups

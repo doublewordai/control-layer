@@ -6,6 +6,7 @@ import type {
   UserUpdateRequest,
   GroupCreateRequest,
   GroupUpdateRequest,
+  ModelCreate,
   ModelUpdateRequest,
   ApiKeyCreateRequest,
   ApiKeysQuery,
@@ -28,6 +29,8 @@ import type {
   DaemonsQuery,
   Model,
   Endpoint,
+  AddComponentRequest,
+  UpdateComponentRequest,
 } from "./types";
 
 // Config hooks
@@ -161,6 +164,100 @@ export function useUpdateModel() {
         queryKeys.models.byId(updatedModel.id),
         updatedModel,
       );
+    },
+  });
+}
+
+export function useCreateModel() {
+  const queryClient = useQueryClient();
+
+  return useMutation({
+    mutationFn: (data: ModelCreate) => dwctlApi.models.create(data),
+    onSuccess: (createdModel) => {
+      queryClient.invalidateQueries({ queryKey: queryKeys.models.all });
+      queryClient.setQueryData(
+        queryKeys.models.byId(createdModel.id),
+        createdModel,
+      );
+    },
+  });
+}
+
+// Composite model component hooks
+export function useModelComponents(modelId: string, options?: { enabled?: boolean }) {
+  return useQuery({
+    queryKey: queryKeys.models.components(modelId),
+    queryFn: () => dwctlApi.models.components.list(modelId),
+    enabled: options?.enabled ?? true,
+  });
+}
+
+export function useAddModelComponent() {
+  const queryClient = useQueryClient();
+
+  return useMutation({
+    mutationFn: ({
+      modelId,
+      data,
+    }: {
+      modelId: string;
+      data: AddComponentRequest;
+    }) => dwctlApi.models.components.add(modelId, data),
+    onSuccess: (_, variables) => {
+      queryClient.invalidateQueries({
+        queryKey: queryKeys.models.components(variables.modelId),
+      });
+      queryClient.invalidateQueries({
+        queryKey: queryKeys.models.byId(variables.modelId),
+      });
+      queryClient.invalidateQueries({ queryKey: queryKeys.models.all });
+    },
+  });
+}
+
+export function useUpdateModelComponent() {
+  const queryClient = useQueryClient();
+
+  return useMutation({
+    mutationFn: ({
+      modelId,
+      componentModelId,
+      data,
+    }: {
+      modelId: string;
+      componentModelId: string;
+      data: UpdateComponentRequest;
+    }) => dwctlApi.models.components.update(modelId, componentModelId, data),
+    onSuccess: (_, variables) => {
+      queryClient.invalidateQueries({
+        queryKey: queryKeys.models.components(variables.modelId),
+      });
+      queryClient.invalidateQueries({
+        queryKey: queryKeys.models.byId(variables.modelId),
+      });
+    },
+  });
+}
+
+export function useRemoveModelComponent() {
+  const queryClient = useQueryClient();
+
+  return useMutation({
+    mutationFn: ({
+      modelId,
+      componentModelId,
+    }: {
+      modelId: string;
+      componentModelId: string;
+    }) => dwctlApi.models.components.remove(modelId, componentModelId),
+    onSuccess: (_, variables) => {
+      queryClient.invalidateQueries({
+        queryKey: queryKeys.models.components(variables.modelId),
+      });
+      queryClient.invalidateQueries({
+        queryKey: queryKeys.models.byId(variables.modelId),
+      });
+      queryClient.invalidateQueries({ queryKey: queryKeys.models.all });
     },
   });
 }

@@ -691,7 +691,9 @@ mod tests {
             errors::Result,
             handlers::{InferenceEndpoints, Repository, deployments::DeploymentFilter},
             models::{
-                deployments::{DeploymentCreateDBRequest, DeploymentDBResponse, DeploymentUpdateDBRequest, ModelStatus},
+                deployments::{
+                    DeploymentCreateDBRequest, DeploymentDBResponse, DeploymentUpdateDBRequest, LoadBalancingStrategy, ModelStatus,
+                },
                 inference_endpoints::InferenceEndpointDBResponse,
             },
         },
@@ -728,7 +730,7 @@ mod tests {
                 model_type: None,
                 capabilities: None,
                 description: None,
-                hosted_on: InferenceEndpoints::default_endpoint_id(),
+                hosted_on: Some(InferenceEndpoints::default_endpoint_id()),
                 status: mock.status,
                 last_sync: mock.last_sync,
                 deleted: false,
@@ -737,6 +739,12 @@ mod tests {
                 capacity: None,
                 batch_capacity: None,
                 provider_pricing: None,
+                // Composite model fields (regular model = not composite)
+                is_composite: false,
+                lb_strategy: LoadBalancingStrategy::default(),
+                fallback_enabled: true,
+                fallback_on_rate_limit: true,
+                fallback_on_status: vec![429, 500, 502, 503, 504],
             }
         }
     }
@@ -881,7 +889,7 @@ mod tests {
 
             // Apply endpoint filter if specified
             if let Some(endpoint_id) = filter.endpoint_id {
-                results.retain(|d| d.hosted_on == endpoint_id);
+                results.retain(|d| d.hosted_on == Some(endpoint_id));
             }
 
             // Apply status filter

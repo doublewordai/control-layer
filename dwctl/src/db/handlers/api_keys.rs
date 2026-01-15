@@ -908,7 +908,7 @@ mod tests {
             .model_name("test-model".to_string())
             .alias("test-alias".to_string())
             .build();
-        deployment_create.hosted_on = test_endpoint_id;
+        deployment_create.hosted_on = Some(test_endpoint_id);
 
         {
             let mut deployment_tx = tx.begin().await.unwrap();
@@ -1039,7 +1039,7 @@ mod tests {
             .model_name("test-model".to_string())
             .alias("test-alias".to_string())
             .build();
-        deployment_create.hosted_on = test_endpoint_id;
+        deployment_create.hosted_on = Some(test_endpoint_id);
 
         {
             let mut deployment_tx = tx.begin().await.unwrap();
@@ -1182,7 +1182,7 @@ mod tests {
             .model_name("test-model".to_string())
             .alias("test-alias".to_string())
             .build();
-        deployment_create.hosted_on = test_endpoint_id;
+        deployment_create.hosted_on = Some(test_endpoint_id);
 
         {
             let mut deployment_tx = tx.begin().await.unwrap();
@@ -1344,7 +1344,7 @@ mod tests {
             .model_name("shared-model".to_string())
             .alias("shared-alias".to_string())
             .build();
-        deployment_create.hosted_on = test_endpoint_id;
+        deployment_create.hosted_on = Some(test_endpoint_id);
 
         {
             let mut deployment_tx = tx.begin().await.unwrap();
@@ -1519,13 +1519,13 @@ mod tests {
                 .model_name("model-1".to_string())
                 .alias("alias-1".to_string())
                 .build();
-            deployment1_create.hosted_on = test_endpoint_id;
+            deployment1_create.hosted_on = Some(test_endpoint_id);
             let mut deployment2_create = DeploymentCreateDBRequest::builder()
                 .created_by(admin_user.id)
                 .model_name("model-2".to_string())
                 .alias("alias-2".to_string())
                 .build();
-            deployment2_create.hosted_on = test_endpoint_id;
+            deployment2_create.hosted_on = Some(test_endpoint_id);
 
             {
                 let mut deployment_tx = tx.begin().await.unwrap();
@@ -1677,7 +1677,7 @@ mod tests {
                 .model_name("test-model".to_string())
                 .alias("test-alias".to_string())
                 .build();
-            deployment_create.hosted_on = test_endpoint_id;
+            deployment_create.hosted_on = Some(test_endpoint_id);
             deployment = deployment_repo.create(&deployment_create).await.unwrap();
         }
         {
@@ -1868,7 +1868,7 @@ mod tests {
             .model_name("test-model".to_string())
             .alias("test-alias".to_string())
             .build();
-        deployment_create.hosted_on = test_endpoint_id;
+        deployment_create.hosted_on = Some(test_endpoint_id);
 
         {
             let mut deployment_tx = tx.begin().await.unwrap();
@@ -2392,7 +2392,7 @@ mod tests {
             .model_name("bulk-model".to_string())
             .alias("bulk-alias".to_string())
             .build();
-        deployment_create.hosted_on = test_endpoint_id;
+        deployment_create.hosted_on = Some(test_endpoint_id);
 
         let mut deployment_repo = Deployments::new(&mut tx);
         let deployment = deployment_repo.create(&deployment_create).await.unwrap();
@@ -2584,7 +2584,7 @@ mod tests {
                 .model_name(format!("test-model-{}", uuid::Uuid::new_v4()))
                 .alias(format!("test-alias-{}", uuid::Uuid::new_v4()))
                 .build();
-            deployment_create.hosted_on = test_endpoint_id;
+            deployment_create.hosted_on = Some(test_endpoint_id);
             deployment = deployment_repo.create(&deployment_create).await.unwrap();
 
             // Create a tariff with pricing to make this a paid model
@@ -2696,7 +2696,7 @@ mod tests {
                 .model_name("test-model".to_string())
                 .alias("test-alias".to_string())
                 .build();
-            deployment_create.hosted_on = test_endpoint_id;
+            deployment_create.hosted_on = Some(test_endpoint_id);
             deployment = deployment_repo.create(&deployment_create).await.unwrap();
 
             // Create a tariff with pricing to make this a paid model
@@ -3235,7 +3235,7 @@ mod tests {
                 .model_name("free-model".to_string())
                 .alias("free-alias".to_string())
                 .build();
-            deployment_create.hosted_on = test_endpoint_id;
+            deployment_create.hosted_on = Some(test_endpoint_id);
             deployment = deployment_repo.create(&deployment_create).await.unwrap();
             deployment_tx.commit().await.unwrap();
         }
@@ -3353,7 +3353,7 @@ mod tests {
                 .model_name("paid-model".to_string())
                 .alias("paid-alias".to_string())
                 .build();
-            deployment_create.hosted_on = test_endpoint_id;
+            deployment_create.hosted_on = Some(test_endpoint_id);
             deployment = deployment_repo.create(&deployment_create).await.unwrap();
 
             // Create a tariff with pricing to make this a paid model
@@ -3489,7 +3489,7 @@ mod tests {
                 .model_name("zero-price-model".to_string())
                 .alias("zero-price-alias".to_string())
                 .build();
-            deployment_create.hosted_on = test_endpoint_id;
+            deployment_create.hosted_on = Some(test_endpoint_id);
             deployment = deployment_repo.create(&deployment_create).await.unwrap();
 
             // Create a tariff with zero pricing to make this a free model

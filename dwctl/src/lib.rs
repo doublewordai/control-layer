@@ -158,7 +158,10 @@ mod types;
 mod test;
 
 use crate::{
-    api::models::{deployments::DeployedModelCreate, users::Role},
+    api::models::{
+        deployments::{DeployedModelCreate, StandardModelCreate},
+        users::Role,
+    },
     auth::password,
     config::CorsOrigin,
     db::handlers::{Deployments, Groups, Repository, Users},
@@ -434,7 +437,7 @@ pub async fn seed_database(sources: &[config::ModelSource], db: &PgPool) -> Resu
                 if let Ok(row) = model_repo
                     .create(&DeploymentCreateDBRequest::from_api_create(
                         Uuid::nil(),
-                        DeployedModelCreate {
+                        DeployedModelCreate::Standard(StandardModelCreate {
                             model_name: model.name.clone(),
                             alias: Some(model.name.clone()),
                             hosted_on: endpoint_id,
@@ -447,7 +450,7 @@ pub async fn seed_database(sources: &[config::ModelSource], db: &PgPool) -> Resu
                             batch_capacity: None,
                             tariffs: None,
                             provider_pricing: None,
-                        },
+                        }),
                     ))
                     .await
                     && model.add_to_everyone_group
@@ -952,6 +955,20 @@ pub async fn build_router(state: &mut AppState, onwards_router: Router) -> anyho
         .route("/models/{id}", get(api::handlers::deployments::get_deployed_model))
         .route("/models/{id}", patch(api::handlers::deployments::update_deployed_model))
         .route("/models/{id}", delete(api::handlers::deployments::delete_deployed_model))
+        // Composite model component management (for models where is_composite=true)
+        .route("/models/{id}/components", get(api::handlers::deployments::get_model_components))
+        .route(
+            "/models/{id}/components/{component_id}",
+            post(api::handlers::deployments::add_model_component),
+        )
+        .route(
+            "/models/{id}/components/{component_id}",
+            patch(api::handlers::deployments::update_model_component),
+        )
+        .route(
+            "/models/{id}/components/{component_id}",
+            delete(api::handlers::deployments::remove_model_component),
+        )
         // Groups management
         .route("/groups", get(api::handlers::groups::list_groups))
         .route("/groups", post(api::handlers::groups::create_group))

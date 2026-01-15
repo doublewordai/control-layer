@@ -811,7 +811,7 @@ mod tests {
             .model_name("test-model".to_string())
             .alias("test-alias".to_string())
             .build();
-        deployment_create.hosted_on = test_endpoint_id;
+        deployment_create.hosted_on = Some(test_endpoint_id);
         let deployment = deployment_repo
             .create(&deployment_create)
             .await
@@ -881,7 +881,7 @@ mod tests {
                 .model_name(format!("test-model-{i}"))
                 .alias(format!("test-alias-{i}"))
                 .build();
-            deployment_create.hosted_on = test_endpoint_id;
+            deployment_create.hosted_on = Some(test_endpoint_id);
             let deployment = deployment_repo
                 .create(&deployment_create)
                 .await
@@ -1103,7 +1103,7 @@ mod tests {
                 .model_name("cascade-model".to_string())
                 .alias("cascade-alias".to_string())
                 .build();
-            deployment_create.hosted_on = test_endpoint_id;
+            deployment_create.hosted_on = Some(test_endpoint_id);
             deployment = deployment_repo
                 .create(&deployment_create)
                 .await
@@ -1224,7 +1224,7 @@ mod tests {
             .model_name("delete-cascade-model".to_string())
             .alias("delete-cascade-alias".to_string())
             .build();
-        deployment_create.hosted_on = test_endpoint_id;
+        deployment_create.hosted_on = Some(test_endpoint_id);
         let deployment = deployment_repo
             .create(&deployment_create)
             .await
@@ -1327,7 +1327,7 @@ mod tests {
                 .model_name(format!("test-model-{i}"))
                 .alias(format!("test-alias-{i}"))
                 .build();
-            deployment_create.hosted_on = test_endpoint_id;
+            deployment_create.hosted_on = Some(test_endpoint_id);
             let deployment = deployment_repo
                 .create(&deployment_create)
                 .await
