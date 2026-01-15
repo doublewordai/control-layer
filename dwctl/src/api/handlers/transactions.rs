@@ -3,7 +3,9 @@
 use crate::{
     AppState,
     api::models::{
-        transactions::{CreditTransactionCreate, CreditTransactionResponse, ListTransactionsQuery, TransactionListResponse},
+        transactions::{
+            CreditTransactionCreate, CreditTransactionResponse, ListTransactionsQuery, TransactionFilters, TransactionListResponse,
+        },
         users::CurrentUser,
     },
     auth::permissions::{self, RequiresPermission, operation, resource},
@@ -257,8 +259,9 @@ pub async fn list_transactions(
     // point (before the first transaction on this page) when skip>0
     // For all-users queries (no filter), we return 0 since per-user balance doesn't make sense
     // When batch grouping is enabled, use the grouped sum to match the grouped transaction list
+    // Filters are applied to match the same filtering used in the transaction list
     let page_start_balance = if let Some(user_id) = filter_user_id {
-        calculate_page_start_balance(&mut repo, user_id, skip, grouping_enabled).await?
+        calculate_page_start_balance(&mut repo, user_id, skip, grouping_enabled, &filters).await?
     } else {
         // When viewing all users' transactions, per-row balance doesn't apply
         Decimal::ZERO
@@ -277,7 +280,14 @@ pub async fn list_transactions(
 /// - If skip=0: returns current balance (balance after all transactions)
 /// - If skip=N: returns balance at the pagination point (before the first transaction on this page)
 /// - If use_grouped=true: uses grouped transaction view (batch aggregates count as single items)
-async fn calculate_page_start_balance(repo: &mut Credits<'_>, user_id: UserId, skip: i64, use_grouped: bool) -> Result<Decimal> {
+/// - Filters are applied to match the same filtering used in the transaction list
+async fn calculate_page_start_balance(
+    repo: &mut Credits<'_>,
+    user_id: UserId,
+    skip: i64,
+    use_grouped: bool,
+    filters: &TransactionFilters,
+) -> Result<Decimal> {
     let current_balance = repo.get_user_balance(user_id).await?;
 
     if skip == 0 {
@@ -287,10 +297,11 @@ async fn calculate_page_start_balance(repo: &mut Credits<'_>, user_id: UserId, s
     // Sum the signed amounts of the first `skip` transactions (most recent ones we're skipping)
     // When batch grouping is enabled, use the grouped sum so that batch aggregates count as
     // single items, matching the pagination of list_transactions_with_batches
+    // Filters are applied to match the same filtering used in the transaction list
     let skipped_sum = if use_grouped {
-        repo.sum_recent_transactions_grouped(user_id, skip).await?
+        repo.sum_recent_transactions_grouped(user_id, skip, filters).await?
     } else {
-        repo.sum_recent_transactions(user_id, skip).await?
+        repo.sum_recent_transactions(user_id, skip, filters).await?
     };
 
     Ok(current_balance - skipped_sum)
@@ -1830,5 +1841,258 @@ mod tests {
 
         // Verify total count is correct (5 grouped items)
         assert_eq!(page1.total_count, 5, "Total count should be 5 grouped items");
+    }
+
+    // Test: page_start_balance respects transaction type filters
+    // This is a regression test for the bug where filtering by transaction type
+    // showed incorrect balances because the skip calculation ignored filters
+    #[sqlx::test]
+    #[test_log::test]
+    async fn test_page_start_balance_with_type_filter(pool: PgPool) {
+        let (app, _bg_services) = create_test_app(pool.clone(), false).await;
+        let user = create_test_user(&pool, Role::StandardUser).await;
+
+        let mut conn = pool.acquire().await.expect("Failed to acquire connection");
+        let mut credits_repo = CreditsHandler::new(&mut conn);
+
+        // Create a sequence of transactions:
+        // 1. Grant $500 (credit)
+        // 2. Usage $10 (debit)
+        // 3. Grant $200 (credit)
+        // 4. Usage $20 (debit)
+        // 5. Purchase $100 (credit)
+        // 6. Usage $30 (debit)
+        //
+        // Final balance: 500 - 10 + 200 - 20 + 100 - 30 = $740
+
+        // 1. Grant $500
+        let grant1 = CreditTransactionCreateDBRequest::admin_grant(
+            user.id,
+            user.id,
+            Decimal::from_str("500.0").unwrap(),
+            Some("Grant 1".to_string()),
+        );
+        credits_repo.create_transaction(&grant1).await.expect("Failed to create grant 1");
+
+        // 2. Usage $10
+        let analytics1 = sqlx::query!(
+            r#"
+            INSERT INTO http_analytics
+                (instance_id, correlation_id, timestamp, method, uri, model, user_id, fusillade_batch_id)
+            VALUES ($1, $2, NOW(), $3, $4, $5, $6, NULL)
+            RETURNING id
+            "#,
+            Uuid::new_v4(),
+            1_i64,
+            "POST",
+            "/ai/v1/chat/completions",
+            "gpt-4",
+            user.id
+        )
+        .fetch_one(&pool)
+        .await
+        .expect("Failed to insert analytics");
+
+        let usage1 = CreditTransactionCreateDBRequest {
+            user_id: user.id,
+            transaction_type: CreditTransactionType::Usage,
+            amount: Decimal::from_str("10.0").unwrap(),
+            source_id: analytics1.id.to_string(),
+            description: Some("Usage 1".to_string()),
+            fusillade_batch_id: None,
+        };
+        credits_repo.create_transaction(&usage1).await.expect("Failed to create usage 1");
+
+        // 3. Grant $200
+        let grant2 = CreditTransactionCreateDBRequest::admin_grant(
+            user.id,
+            user.id,
+            Decimal::from_str("200.0").unwrap(),
+            Some("Grant 2".to_string()),
+        );
+        credits_repo.create_transaction(&grant2).await.expect("Failed to create grant 2");
+
+        // 4. Usage $20
+        let analytics2 = sqlx::query!(
+            r#"
+            INSERT INTO http_analytics
+                (instance_id, correlation_id, timestamp, method, uri, model, user_id, fusillade_batch_id)
+            VALUES ($1, $2, NOW(), $3, $4, $5, $6, NULL)
+            RETURNING id
+            "#,
+            Uuid::new_v4(),
+            2_i64,
+            "POST",
+            "/ai/v1/chat/completions",
+            "gpt-4",
+            user.id
+        )
+        .fetch_one(&pool)
+        .await
+        .expect("Failed to insert analytics");
+
+        let usage2 = CreditTransactionCreateDBRequest {
+            user_id: user.id,
+            transaction_type: CreditTransactionType::Usage,
+            amount: Decimal::from_str("20.0").unwrap(),
+            source_id: analytics2.id.to_string(),
+            description: Some("Usage 2".to_string()),
+            fusillade_batch_id: None,
+        };
+        credits_repo.create_transaction(&usage2).await.expect("Failed to create usage 2");
+
+        // 5. Purchase $100
+        let purchase = CreditTransactionCreateDBRequest {
+            user_id: user.id,
+            transaction_type: CreditTransactionType::Purchase,
+            amount: Decimal::from_str("100.0").unwrap(),
+            source_id: Uuid::new_v4().to_string(),
+            description: Some("Purchase 1".to_string()),
+            fusillade_batch_id: None,
+        };
+        credits_repo.create_transaction(&purchase).await.expect("Failed to create purchase");
+
+        // 6. Usage $30
+        let analytics3 = sqlx::query!(
+            r#"
+            INSERT INTO http_analytics
+                (instance_id, correlation_id, timestamp, method, uri, model, user_id, fusillade_batch_id)
+            VALUES ($1, $2, NOW(), $3, $4, $5, $6, NULL)
+            RETURNING id
+            "#,
+            Uuid::new_v4(),
+            3_i64,
+            "POST",
+            "/ai/v1/chat/completions",
+            "gpt-4",
+            user.id
+        )
+        .fetch_one(&pool)
+        .await
+        .expect("Failed to insert analytics");
+
+        let usage3 = CreditTransactionCreateDBRequest {
+            user_id: user.id,
+            transaction_type: CreditTransactionType::Usage,
+            amount: Decimal::from_str("30.0").unwrap(),
+            source_id: analytics3.id.to_string(),
+            description: Some("Usage 3".to_string()),
+            fusillade_batch_id: None,
+        };
+        credits_repo.create_transaction(&usage3).await.expect("Failed to create usage 3");
+
+        drop(conn);
+
+        // Verify current balance is $740
+        let response = app
+            .get("/admin/api/v1/transactions?limit=10")
+            .add_header(&add_auth_headers(&user)[0].0, &add_auth_headers(&user)[0].1)
+            .add_header(&add_auth_headers(&user)[1].0, &add_auth_headers(&user)[1].1)
+            .await;
+        response.assert_status_ok();
+        let all_txns: TransactionListResponse = response.json();
+        assert_eq!(
+            all_txns.page_start_balance,
+            Decimal::from_str("740.0").unwrap(),
+            "Current balance should be $740"
+        );
+        assert_eq!(all_txns.total_count, 6, "Should have 6 total transactions");
+
+        // Test filtering by credits only (admin_grant, purchase)
+        // Should show: Purchase $100, Grant $200, Grant $500 (newest first)
+        // Total: 3 credit transactions
+        let response = app
+            .get("/admin/api/v1/transactions?transaction_types=admin_grant,purchase&limit=2&skip=0")
+            .add_header(&add_auth_headers(&user)[0].0, &add_auth_headers(&user)[0].1)
+            .add_header(&add_auth_headers(&user)[1].0, &add_auth_headers(&user)[1].1)
+            .await;
+        response.assert_status_ok();
+        let credits_page1: TransactionListResponse = response.json();
+
+        // page_start_balance for credits-only filter with skip=0 should still be current balance
+        assert_eq!(
+            credits_page1.page_start_balance,
+            Decimal::from_str("740.0").unwrap(),
+            "Credits filter page 1: page_start_balance should be current balance $740"
+        );
+        assert_eq!(credits_page1.total_count, 3, "Should have 3 credit transactions total");
+        assert_eq!(credits_page1.data.len(), 2, "Page 1 should have 2 items");
+
+        // First item should be the most recent credit (Purchase $100)
+        assert_eq!(
+            credits_page1.data[0].description,
+            Some("Purchase 1".to_string()),
+            "First credit should be Purchase 1"
+        );
+        // Second item should be Grant 2 ($200)
+        assert_eq!(
+            credits_page1.data[1].description,
+            Some("Grant 2".to_string()),
+            "Second credit should be Grant 2"
+        );
+
+        // Page 2 of credits filter (skip=2, limit=2)
+        // Should show: Grant $500
+        let response = app
+            .get("/admin/api/v1/transactions?transaction_types=admin_grant,purchase&limit=2&skip=2")
+            .add_header(&add_auth_headers(&user)[0].0, &add_auth_headers(&user)[0].1)
+            .add_header(&add_auth_headers(&user)[1].0, &add_auth_headers(&user)[1].1)
+            .await;
+        response.assert_status_ok();
+        let credits_page2: TransactionListResponse = response.json();
+
+        // page_start_balance for skip=2 with credits filter
+        // We're skipping the 2 most recent CREDIT transactions: Purchase ($100) and Grant 2 ($200)
+        // sum_of_skipped = +$100 + +$200 = $300
+        // page_start_balance = $740 - $300 = $440
+        assert_eq!(
+            credits_page2.page_start_balance,
+            Decimal::from_str("440.0").unwrap(),
+            "Credits filter page 2: page_start_balance should be $440 (after skipping Purchase and Grant 2)"
+        );
+        assert_eq!(credits_page2.data.len(), 1, "Page 2 should have 1 item (Grant 1)");
+        assert_eq!(
+            credits_page2.data[0].description,
+            Some("Grant 1".to_string()),
+            "Only item on page 2 should be Grant 1"
+        );
+
+        // Test filtering by debits only (usage)
+        // Should show: Usage $30, Usage $20, Usage $10 (newest first)
+        // Total: 3 debit transactions
+        let response = app
+            .get("/admin/api/v1/transactions?transaction_types=usage&limit=2&skip=0")
+            .add_header(&add_auth_headers(&user)[0].0, &add_auth_headers(&user)[0].1)
+            .add_header(&add_auth_headers(&user)[1].0, &add_auth_headers(&user)[1].1)
+            .await;
+        response.assert_status_ok();
+        let debits_page1: TransactionListResponse = response.json();
+
+        assert_eq!(
+            debits_page1.page_start_balance,
+            Decimal::from_str("740.0").unwrap(),
+            "Debits filter page 1: page_start_balance should be current balance $740"
+        );
+        assert_eq!(debits_page1.total_count, 3, "Should have 3 debit transactions total");
+
+        // Page 2 of debits filter (skip=2, limit=2)
+        let response = app
+            .get("/admin/api/v1/transactions?transaction_types=usage&limit=2&skip=2")
+            .add_header(&add_auth_headers(&user)[0].0, &add_auth_headers(&user)[0].1)
+            .add_header(&add_auth_headers(&user)[1].0, &add_auth_headers(&user)[1].1)
+            .await;
+        response.assert_status_ok();
+        let debits_page2: TransactionListResponse = response.json();
+
+        // page_start_balance for skip=2 with debits filter
+        // We're skipping the 2 most recent DEBIT transactions: Usage 3 ($30) and Usage 2 ($20)
+        // sum_of_skipped = -$30 + -$20 = -$50
+        // page_start_balance = $740 - (-$50) = $790
+        assert_eq!(
+            debits_page2.page_start_balance,
+            Decimal::from_str("790.0").unwrap(),
+            "Debits filter page 2: page_start_balance should be $790 (after skipping Usage 3 and Usage 2)"
+        );
+        assert_eq!(debits_page2.data.len(), 1, "Page 2 should have 1 item (Usage 1)");
     }
 }

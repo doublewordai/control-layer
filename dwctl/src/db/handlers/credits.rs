@@ -484,8 +484,14 @@ impl<'c> Credits<'c> {
     /// Sum the signed amounts of the most recent N transactions for a user.
     /// Positive transactions (admin_grant, purchase) are positive, negative (usage, admin_removal) are negative.
     /// This is used to calculate the balance at a specific point in the transaction history.
-    #[instrument(skip(self), fields(user_id = %abbrev_uuid(&user_id), count = count), err)]
-    pub async fn sum_recent_transactions(&mut self, user_id: UserId, count: i64) -> Result<Decimal> {
+    /// Accepts optional filters to match the same filtering applied to list queries.
+    #[instrument(skip(self, filters), fields(user_id = %abbrev_uuid(&user_id), count = count), err)]
+    pub async fn sum_recent_transactions(&mut self, user_id: UserId, count: i64, filters: &TransactionFilters) -> Result<Decimal> {
+        let transaction_types: Option<Vec<String>> = filters
+            .transaction_types
+            .as_ref()
+            .map(|types| types.iter().map(transaction_type_to_string).collect());
+
         let result = sqlx::query!(
             r#"
             SELECT COALESCE(SUM(
@@ -495,12 +501,20 @@ impl<'c> Credits<'c> {
                 SELECT transaction_type, amount
                 FROM credits_transactions
                 WHERE user_id = $1
+                  AND ($3::text IS NULL OR description ILIKE '%' || $3 || '%')
+                  AND ($4::text[] IS NULL OR transaction_type::text = ANY($4))
+                  AND ($5::timestamptz IS NULL OR created_at >= $5)
+                  AND ($6::timestamptz IS NULL OR created_at <= $6)
                 ORDER BY seq DESC
                 LIMIT $2
             ) recent
             "#,
             user_id,
-            count
+            count,
+            filters.search.as_deref(),
+            transaction_types.as_deref(),
+            filters.start_date,
+            filters.end_date,
         )
         .fetch_one(&mut *self.db)
         .await?;
@@ -513,10 +527,30 @@ impl<'c> Credits<'c> {
     /// - Batch aggregates count as single items (with their total_amount)
     /// - Non-batched transactions count as single items
     /// This is used to calculate the balance at a specific point when batch grouping is enabled.
-    #[instrument(skip(self), fields(user_id = %abbrev_uuid(&user_id), count = count), err)]
-    pub async fn sum_recent_transactions_grouped(&mut self, user_id: UserId, count: i64) -> Result<Decimal> {
+    /// Accepts optional filters to match the same filtering applied to list queries.
+    #[instrument(skip(self, filters), fields(user_id = %abbrev_uuid(&user_id), count = count), err)]
+    pub async fn sum_recent_transactions_grouped(&mut self, user_id: UserId, count: i64, filters: &TransactionFilters) -> Result<Decimal> {
         // First ensure any pending batch transactions are aggregated
         self.aggregate_user_batches(user_id).await?;
+
+        let transaction_types: Option<Vec<String>> = filters
+            .transaction_types
+            .as_ref()
+            .map(|types| types.iter().map(transaction_type_to_string).collect());
+
+        // Check if we should include batch aggregates (they're always type 'usage')
+        let include_batches = filters
+            .transaction_types
+            .as_ref()
+            .map(|types| types.iter().any(|t| matches!(t, CreditTransactionType::Usage)))
+            .unwrap_or(true);
+
+        // Check if search term would match "Batch" description
+        let search_matches_batch = filters
+            .search
+            .as_ref()
+            .map(|s| "batch".contains(&s.to_lowercase()) || s.to_lowercase().contains("batch"))
+            .unwrap_or(true);
 
         // Sum from the same UNION view used by list_transactions_with_batches
         // All batch aggregates are usage type (negative), non-batched follow normal signing rules
@@ -526,11 +560,17 @@ impl<'c> Credits<'c> {
             FROM (
                 SELECT * FROM (
                     -- Batch aggregates (always usage/negative)
+                    -- Only included if transaction_types filter includes 'usage' or is not set
+                    -- and search term matches "Batch" description
                     (SELECT
                         ba.max_seq,
                         -ba.total_amount as signed_amount
                     FROM batch_aggregates ba
                     WHERE ba.user_id = $1
+                      AND $3::bool = true
+                      AND $4::bool = true
+                      AND ($5::timestamptz IS NULL OR ba.created_at >= $5)
+                      AND ($6::timestamptz IS NULL OR ba.created_at <= $6)
                     ORDER BY ba.max_seq DESC
                     LIMIT $2)
 
@@ -546,6 +586,10 @@ impl<'c> Credits<'c> {
                     FROM credits_transactions ct
                     WHERE ct.user_id = $1
                       AND ct.fusillade_batch_id IS NULL
+                      AND ($7::text IS NULL OR ct.description ILIKE '%' || $7 || '%')
+                      AND ($8::text[] IS NULL OR ct.transaction_type::text = ANY($8))
+                      AND ($5::timestamptz IS NULL OR ct.created_at >= $5)
+                      AND ($6::timestamptz IS NULL OR ct.created_at <= $6)
                     ORDER BY ct.seq DESC
                     LIMIT $2)
                 ) combined
@@ -553,8 +597,14 @@ impl<'c> Credits<'c> {
                 LIMIT $2
             ) recent
             "#,
-            user_id,
-            count
+            user_id,                      // $1
+            count,                        // $2
+            include_batches,              // $3
+            search_matches_batch,         // $4
+            filters.start_date,           // $5
+            filters.end_date,             // $6
+            filters.search.as_deref(),    // $7
+            transaction_types.as_deref(), // $8
         )
         .fetch_one(&mut *self.db)
         .await?;
