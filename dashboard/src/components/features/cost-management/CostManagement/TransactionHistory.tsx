@@ -375,7 +375,7 @@ export function TransactionHistory({
         <div className="space-y-2">
           <div className="flex flex-wrap items-center gap-2">
             {/* Search Bar */}
-            <div className="`relative flex-1 min-w-[250px]">
+            <div className="relative flex-1 min-w-[250px]">
               <Search className="absolute left-3 top-1/2 -translate-y-1/2 w-4 h-4 text-doubleword-neutral-400" />
               <input
                 type="text"
