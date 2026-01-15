@@ -1,5 +1,12 @@
 # Changelog
 
+## [1.3.0](https://github.com/doublewordai/control-layer/compare/v1.2.0...v1.3.0) (2026-01-15)
+
+
+### Features
+
+* Batch request origin in metadata and displayed in transactions history ([#530](https://github.com/doublewordai/control-layer/issues/530)) ([d8ad5a3](https://github.com/doublewordai/control-layer/commit/d8ad5a302c75ce5b110f65b63b772924724f8e51))
+
 ## [1.2.0](https://github.com/doublewordai/control-layer/compare/v1.1.2...v1.2.0) (2026-01-15)
 
 
