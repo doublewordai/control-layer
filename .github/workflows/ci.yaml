@@ -385,6 +385,28 @@ jobs:
           # Report metrics to Somnial
           curl -X POST "https://charts.somnial.co/doubleword-control-layer/e2e-docker-duration?value=${E2E_DURATION}" || true
 
+  notify-deploy:
+    if: github.event_name == 'release' && !github.event.release.prerelease
+    needs: [build, frontend-test, backend-test, security-scan, e2e-test-docker]
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Trigger deployment
+        uses: actions/github-script@v7
+        with:
+          github-token: ${{ secrets.DEPLOY_PAT }}
+          script: |
+            await github.rest.repos.createDispatchEvent({
+              owner: '${{ secrets.DEPLOY_TARGET_OWNER }}',
+              repo: '${{ secrets.DEPLOY_TARGET_REPO }}',
+              event_type: 'control-layer-release',
+              client_payload: {
+                version: '${{ github.event.release.tag_name }}',
+                sha: context.sha
+              }
+            })
+            console.log(`Triggered deployment for version ${{ github.event.release.tag_name }}`)
+
   publish-crates:
     if: github.event_name == 'release' && !github.event.release.prerelease
     runs-on: depot-ubuntu-24.04
