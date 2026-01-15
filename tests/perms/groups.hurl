@@ -58,6 +58,7 @@ POST http://localhost:3001/admin/api/v1/models
 [Cookies]
 dwctl_session: {{admin_jwt}}
 {
+  "type": "standard",
   "model_name": "groups-test-model-1",
   "alias": "groups-test-model-1-alias",
   "hosted_on": "{{groups_test_endpoint_id}}"
@@ -70,6 +71,7 @@ POST http://localhost:3001/admin/api/v1/models
 [Cookies]
 dwctl_session: {{admin_jwt}}
 {
+  "type": "standard",
   "model_name": "groups-test-model-2",
   "alias": "groups-test-model-2-alias",
   "hosted_on": "{{groups_test_endpoint_id}}"

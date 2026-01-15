@@ -59,6 +59,7 @@ POST http://localhost:3001/admin/api/v1/models
 [Cookies]
 dwctl_session: {{admin_jwt}}
 {
+  "type": "standard",
   "model_name": "test-probe-model-1",
   "alias": "test-probe-model-1-alias",
   "hosted_on": "{{probe_endpoint_id}}",
@@ -83,6 +84,7 @@ POST http://localhost:3001/admin/api/v1/models
 [Cookies]
 dwctl_session: {{admin_jwt}}
 {
+  "type": "standard",
   "model_name": "test-probe-model-2",
   "alias": "test-probe-model-2-alias",
   "hosted_on": "{{probe_endpoint_id}}",
@@ -107,6 +109,7 @@ POST http://localhost:3001/admin/api/v1/models
 [Cookies]
 dwctl_session: {{admin_jwt}}
 {
+  "type": "standard",
   "model_name": "test-probe-model-3",
   "alias": "test-probe-model-3-alias",
   "hosted_on": "{{probe_endpoint_id}}",
