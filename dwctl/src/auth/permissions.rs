@@ -53,6 +53,9 @@ pub mod resource {
     pub struct Batches;
 
     #[derive(Default)]
+    pub struct CompositeModels;
+
+    #[derive(Default)]
     pub struct System;
 
     // Convert type-level markers to enum values using Into
@@ -119,6 +122,11 @@ pub mod resource {
     impl From<Batches> for Resource {
         fn from(_: Batches) -> Resource {
             Resource::Batches
+        }
+    }
+    impl From<CompositeModels> for Resource {
+        fn from(_: CompositeModels) -> Resource {
+            Resource::CompositeModels
         }
     }
     impl From<System> for Resource {
@@ -288,6 +296,7 @@ pub fn role_has_permission(role: &Role, resource: Resource, operation: Operation
             matches!(
                 (resource, operation),
                 (Resource::Models, Operation::ReadOwn)            // Can read accessible models (filtered by groups)
+                    | (Resource::CompositeModels, Operation::ReadOwn) // Can read accessible composite models (filtered by groups)
                     | (Resource::ApiKeys, Operation::ReadOwn)     // Can read own API keys
                     | (Resource::ApiKeys, Operation::CreateOwn)   // Can create own API keys
                     | (Resource::ApiKeys, Operation::UpdateOwn)   // Can update own API keys

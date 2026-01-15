@@ -3310,9 +3310,9 @@ checksum = "384b8ab6d37215f3c5301a95a4accb5d64aa607f1fcb26a11b5303878451b4fe"
 
 [[package]]
 name = "onwards"
-version = "0.9.2"
+version = "0.10.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "33bf71f8688855bf8419d9a75f8f6446c1fb8c98b8b7082eeda5240d6480bfd8"
+checksum = "04f55b1fab27cf5654bef8ee0ba17ef0adc76a1a1db84041c53b2f492716b458"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -3327,6 +3327,7 @@ dependencies = [
  "hyper-tls",
  "hyper-util",
  "notify",
+ "rand 0.9.2",
  "serde",
  "serde_json",
  "subtle",

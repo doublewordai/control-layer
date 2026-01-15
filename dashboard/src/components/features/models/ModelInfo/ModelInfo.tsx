@@ -11,12 +11,14 @@ import {
   Info,
   Edit,
   Check,
+  GitMerge,
 } from "lucide-react";
 import {
   useModel,
   useEndpoint,
   useUpdateModel,
   useProbes,
+  useModelComponents,
 } from "../../../../api/control-layer";
 import { useAuthorization } from "../../../../utils";
 import {
@@ -26,6 +28,7 @@ import {
 } from "../../../modals";
 import UserUsageTable from "./UserUsageTable";
 import ModelProbes from "./ModelProbes";
+import ProvidersTab from "./ProvidersTab";
 import {
   Card,
   CardContent,
@@ -82,6 +85,7 @@ const ModelInfo: React.FC = () => {
     // Only allow usage tab if user has permission
     if (tabFromUrl === "usage" && canManageGroups) return "usage";
     if (tabFromUrl === "probes" && canManageGroups) return "probes";
+    if (tabFromUrl === "providers" && canManageGroups) return "providers";
     return "overview";
   });
 
@@ -91,7 +95,8 @@ const ModelInfo: React.FC = () => {
     if (
       tabFromUrl === "overview" ||
       (tabFromUrl === "usage" && canManageGroups) ||
-      (tabFromUrl === "probes" && canManageGroups)
+      (tabFromUrl === "probes" && canManageGroups) ||
+      (tabFromUrl === "providers" && canManageGroups)
     ) {
       setActiveTab(tabFromUrl);
     }
@@ -158,6 +163,11 @@ const ModelInfo: React.FC = () => {
   // Fetch probes to show status indicator
   const { data: probes } = useProbes();
   const modelProbe = probes?.find((p) => p.deployment_id === model?.id);
+
+  // Fetch components (hosted models) for virtual models
+  const { data: components } = useModelComponents(modelId!, {
+    enabled: !!model?.is_composite,
+  });
 
   const loading = modelLoading || endpointLoading;
   const error = modelError
@@ -428,16 +438,35 @@ const ModelInfo: React.FC = () => {
                   {canManageGroups && (
                     <p className="text-doubleword-neutral-600 mt-1">
                       {model.model_name}
-                      {canViewEndpoints && (
-                        <> • {endpoint?.name || "Unknown endpoint"}</>
+                      {model.is_composite ? (
+                        <>
+                          {" "}
+                          •{" "}
+                          <span className="inline-flex items-center gap-1">
+                            <GitMerge className="h-3 w-3" />
+                            Virtual ({components?.length || 0} hosted models)
+                          </span>
+                        </>
+                      ) : (
+                        canViewEndpoints && (
+                          <> • {endpoint?.name || "Unknown endpoint"}</>
+                        )
                       )}
                     </p>
                   )}
-                  {!canManageGroups && canViewEndpoints && (
-                    <p className="text-doubleword-neutral-600 mt-1">
-                      {endpoint?.name || "Unknown endpoint"}
-                    </p>
-                  )}
+                  {!canManageGroups &&
+                    (model.is_composite ? (
+                      <p className="text-doubleword-neutral-600 mt-1 inline-flex items-center gap-1">
+                        <GitMerge className="h-3 w-3" />
+                        Virtual Model
+                      </p>
+                    ) : (
+                      canViewEndpoints && (
+                        <p className="text-doubleword-neutral-600 mt-1">
+                          {endpoint?.name || "Unknown endpoint"}
+                        </p>
+                      )
+                    ))}
                 </div>
                 <div className="flex items-center justify-center sm:justify-start gap-3">
                   {canManageGroups && (
@@ -463,6 +492,15 @@ const ModelInfo: React.FC = () => {
                         <Activity className="h-4 w-4" />
                         Uptime
                       </TabsTrigger>
+                      {model.is_composite && (
+                        <TabsTrigger
+                          value="providers"
+                          className="flex items-center gap-2"
+                        >
+                          <GitMerge className="h-4 w-4" />
+                          Hosted Models
+                        </TabsTrigger>
+                      )}
                     </TabsList>
                   )}
                 </div>
@@ -1539,6 +1577,12 @@ const ModelInfo: React.FC = () => {
         {canManageGroups && (
           <TabsContent value="probes">
             <ModelProbes model={model} canManageProbes={canManageGroups} />
+          </TabsContent>
+        )}
+
+        {canManageGroups && model.is_composite && (
+          <TabsContent value="providers">
+            <ProvidersTab model={model} canManage={canManageGroups} />
           </TabsContent>
         )}
       </Tabs>

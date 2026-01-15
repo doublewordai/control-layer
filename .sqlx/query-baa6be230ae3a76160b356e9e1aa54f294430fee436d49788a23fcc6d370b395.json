@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "SELECT id, model_name, alias, description, type, capabilities, created_by, hosted_on, status, last_sync, deleted, created_at, updated_at, requests_per_second, burst_size, capacity, batch_capacity, downstream_pricing_mode, downstream_input_price_per_token, downstream_output_price_per_token, downstream_hourly_rate, downstream_input_token_cost_ratio FROM deployed_models WHERE id = ANY($1)",
+  "query": "SELECT id, model_name, alias, description, type, capabilities, created_by, hosted_on, status, last_sync, deleted, created_at, updated_at, requests_per_second, burst_size, capacity, batch_capacity, downstream_pricing_mode, downstream_input_price_per_token, downstream_output_price_per_token, downstream_hourly_rate, downstream_input_token_cost_ratio, is_composite, lb_strategy, fallback_enabled, fallback_on_rate_limit, fallback_on_status FROM deployed_models WHERE id = $1",
   "describe": {
     "columns": [
       {
@@ -112,11 +112,36 @@
         "ordinal": 21,
         "name": "downstream_input_token_cost_ratio",
         "type_info": "Numeric"
+      },
+      {
+        "ordinal": 22,
+        "name": "is_composite",
+        "type_info": "Bool"
+      },
+      {
+        "ordinal": 23,
+        "name": "lb_strategy",
+        "type_info": "Varchar"
+      },
+      {
+        "ordinal": 24,
+        "name": "fallback_enabled",
+        "type_info": "Bool"
+      },
+      {
+        "ordinal": 25,
+        "name": "fallback_on_rate_limit",
+        "type_info": "Bool"
+      },
+      {
+        "ordinal": 26,
+        "name": "fallback_on_status",
+        "type_info": "Int4Array"
       }
     ],
     "parameters": {
       "Left": [
-        "UuidArray"
+        "Uuid"
       ]
     },
     "nullable": [
@@ -127,22 +152,27 @@
       true,
       true,
       false,
-      false,
-      false,
       true,
       false,
+      true,
       false,
       false,
+      false,
       true,
       true,
       true,
       true,
       true,
+      true,
+      true,
+      true,
+      true,
+      false,
       true,
       true,
       true,
       true
     ]
   },
-  "hash": "4b9ebb47b3e8ad8a9415bf68ec2cdf336210c3744d1883f2c649e2fb3e58086d"
+  "hash": "baa6be230ae3a76160b356e9e1aa54f294430fee436d49788a23fcc6d370b395"
 }

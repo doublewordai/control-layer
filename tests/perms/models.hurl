@@ -123,6 +123,7 @@ POST http://localhost:3001/admin/api/v1/models
 [Cookies]
 dwctl_session: {{user_jwt}}
 {
+  "type": "standard",
   "model_name": "unauthorized-model",
   "alias": "unauthorized-alias",
   "hosted_on": "{{models_test_endpoint_id}}"
@@ -134,6 +135,7 @@ POST http://localhost:3001/admin/api/v1/models
 [Cookies]
 dwctl_session: {{user2_jwt}}
 {
+  "type": "standard",
   "model_name": "unauthorized-model-2",
   "alias": "unauthorized-alias-2",
   "hosted_on": "{{models_test_endpoint_id}}"
@@ -149,6 +151,7 @@ POST http://localhost:3001/admin/api/v1/models
 [Cookies]
 dwctl_session: {{admin_jwt}}
 {
+  "type": "standard",
   "model_name": "user1-model",
   "alias": "user1-model-alias",
   "hosted_on": "{{models_test_endpoint_id}}",
@@ -184,6 +187,7 @@ POST http://localhost:3001/admin/api/v1/models
 [Cookies]
 dwctl_session: {{admin_jwt}}
 {
+  "type": "standard",
   "model_name": "user2-model",
   "alias": "user2-model-alias",
   "hosted_on": "{{models_test_endpoint_id}}",
@@ -217,6 +221,7 @@ POST http://localhost:3001/admin/api/v1/models
 [Cookies]
 dwctl_session: {{admin_jwt}}
 {
+  "type": "standard",
   "model_name": "public-model",
   "alias": "public-model-alias",
   "hosted_on": "{{models_test_endpoint_id}}",
@@ -250,6 +255,7 @@ POST http://localhost:3001/admin/api/v1/models
 [Cookies]
 dwctl_session: {{admin_jwt}}
 {
+  "type": "standard",
   "model_name": "admin-only-model",
   "alias": "admin-only-model-alias",
   "hosted_on": "{{models_test_endpoint_id}}",
@@ -267,6 +273,7 @@ POST http://localhost:3001/admin/api/v1/models
 [Cookies]
 dwctl_session: {{admin_jwt}}
 {
+  "type": "standard",
   "model_name": "deleted-model",
   "alias": "deleted-model-alias",
   "hosted_on": "{{models_test_endpoint_id}}",
@@ -304,6 +311,7 @@ POST http://localhost:3001/admin/api/v1/models
 [Cookies]
 dwctl_session: {{user_jwt}}
 {
+  "type": "standard",
   "model_name": "unauthorized-model",
   "alias": "unauthorized-alias",
   "hosted_on": "{{models_test_endpoint_id}}"
@@ -315,6 +323,7 @@ POST http://localhost:3001/admin/api/v1/models
 [Cookies]
 dwctl_session: {{user2_jwt}}
 {
+  "type": "standard",
   "model_name": "unauthorized-model-2",
   "alias": "unauthorized-alias-2",
   "hosted_on": "{{models_test_endpoint_id}}"
@@ -452,6 +461,7 @@ POST http://localhost:3001/admin/api/v1/models
 [Cookies]
 dwctl_session: {{admin_jwt}}
 {
+  "type": "standard",
   "model_name": "capacity-test-model",
   "alias": "capacity-test-alias",
   "hosted_on": "{{models_test_endpoint_id}}",
@@ -1203,6 +1213,7 @@ POST http://localhost:3001/admin/api/v1/models
 [Cookies]
 dwctl_session: {{admin_jwt}}
 {
+  "type": "standard",
   "model_name": "temp-delete-test-model",
   "alias": "temp-delete-alias",
   "hosted_on": "{{models_test_endpoint_id}}",

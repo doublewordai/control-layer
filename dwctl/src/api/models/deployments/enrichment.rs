@@ -6,12 +6,15 @@
 
 use crate::{
     api::models::{
-        deployments::{DeployedModelResponse, ModelMetrics, ModelProbeStatus},
+        deployments::{
+            ComponentEndpointSummary, ComponentModelSummary, DeployedModelResponse, ModelComponentResponse, ModelMetrics, ModelProbeStatus,
+            ModelType,
+        },
         inference_endpoints::InferenceEndpointResponse,
     },
     db::{
         handlers::{Groups, InferenceEndpoints, Repository, analytics::get_model_metrics},
-        models::groups::GroupDBResponse,
+        models::{deployments::DeploymentComponentDBResponse, groups::GroupDBResponse},
     },
     errors::{Error, Result},
     types::{DeploymentId, GroupId, InferenceEndpointId},
@@ -35,12 +38,16 @@ pub struct DeployedModelEnricher<'a> {
     pub include_pricing: bool,
     /// Whether to include endpoint information
     pub include_endpoints: bool,
+    /// Whether to include components for composite models
+    pub include_components: bool,
     /// Whether the user can read full pricing details
     pub can_read_pricing: bool,
     /// Whether the user can read rate limiting information
     pub can_read_rate_limits: bool,
     /// Whether the user can read who created models
     pub can_read_users: bool,
+    /// Whether the user can read composite model information (is_composite, lb_strategy, fallback, components)
+    pub can_read_composite_info: bool,
 }
 
 type ProbeStatusTuple = (Option<Uuid>, bool, Option<i32>, Option<DateTime<Utc>>, Option<bool>, Option<f64>);
@@ -69,7 +76,7 @@ impl<'a> DeployedModelEnricher<'a> {
         let model_aliases: Vec<String> = models.iter().map(|m| m.alias.clone()).collect();
 
         // Fetch all includes in parallel for maximum performance
-        let (groups_result, status_map, metrics_map, endpoints_map, pricing_tariffs_map) = tokio::join!(
+        let (groups_result, status_map, metrics_map, endpoints_map, pricing_tariffs_map, components_map) = tokio::join!(
             // Groups query
             async {
                 if self.include_groups {
@@ -123,10 +130,10 @@ impl<'a> DeployedModelEnricher<'a> {
                     let mut endpoints_conn = self.db.acquire().await.map_err(|e| Error::Database(e.into())).ok()?;
                     let mut endpoints_repo = InferenceEndpoints::new(&mut endpoints_conn);
 
-                    // Collect all unique endpoint IDs
+                    // Collect all unique endpoint IDs (filtering out composite models which have None hosted_on)
                     let endpoint_ids: Vec<InferenceEndpointId> = models
                         .iter()
-                        .map(|m| m.hosted_on)
+                        .filter_map(|m| m.hosted_on)
                         .collect::<std::collections::HashSet<_>>()
                         .into_iter()
                         .collect();
@@ -159,6 +166,25 @@ impl<'a> DeployedModelEnricher<'a> {
                     }
 
                     Some(tariffs_map)
+                } else {
+                    None
+                }
+            },
+            // Components query (for composite models)
+            async {
+                if self.include_components && self.can_read_composite_info {
+                    use crate::db::handlers::Deployments;
+
+                    // Get composite model IDs from the models list
+                    let composite_ids: Vec<DeploymentId> = models.iter().filter(|m| m.is_composite == Some(true)).map(|m| m.id).collect();
+
+                    if composite_ids.is_empty() {
+                        return Some(HashMap::new());
+                    }
+
+                    let mut conn = self.db.acquire().await.map_err(|e| Error::Database(e.into())).ok()?;
+                    let mut repo = Deployments::new(&mut conn);
+                    repo.get_components_bulk(composite_ids).await.ok()
                 } else {
                     None
                 }
@@ -199,6 +225,11 @@ impl<'a> DeployedModelEnricher<'a> {
                 model_response = Self::apply_tariffs(model_response, &pricing_tariffs_map);
             }
 
+            // Add components if requested (for composite models)
+            if self.include_components && self.can_read_composite_info {
+                model_response = Self::apply_components(model_response, &components_map);
+            }
+
             // Mask rate limiting info for users without ModelRateLimits permission
             if !self.can_read_rate_limits {
                 model_response = model_response.mask_rate_limiting();
@@ -207,6 +238,11 @@ impl<'a> DeployedModelEnricher<'a> {
 
             if !self.can_read_users {
                 model_response = model_response.mask_created_by();
+            }
+
+            // Mask composite model info for users without permission
+            if !self.can_read_composite_info {
+                model_response = model_response.mask_composite_fields();
             }
 
             enriched_models.push(model_response);
@@ -306,7 +342,8 @@ impl<'a> DeployedModelEnricher<'a> {
         endpoints_map: &Option<HashMap<InferenceEndpointId, InferenceEndpointResponse>>,
     ) -> DeployedModelResponse {
         if let Some(endpoints_map) = endpoints_map
-            && let Some(endpoint) = endpoints_map.get(&model.hosted_on)
+            && let Some(hosted_on) = model.hosted_on
+            && let Some(endpoint) = endpoints_map.get(&hosted_on)
         {
             model = model.with_endpoint(endpoint.clone());
         }
@@ -324,6 +361,47 @@ impl<'a> DeployedModelEnricher<'a> {
             model = model.with_tariffs(tariffs.clone());
         }
         model
+    }
+
+    /// Apply components to a model response (for composite models)
+    fn apply_components(
+        mut model: DeployedModelResponse,
+        components_map: &Option<HashMap<DeploymentId, Vec<DeploymentComponentDBResponse>>>,
+    ) -> DeployedModelResponse {
+        if let Some(components_map) = components_map
+            && let Some(components) = components_map.get(&model.id)
+        {
+            let component_responses: Vec<ModelComponentResponse> =
+                components.iter().map(|c| Self::db_component_to_response(c.clone())).collect();
+            model = model.with_components(component_responses);
+        }
+        model
+    }
+
+    /// Convert a database component response to an API component response
+    fn db_component_to_response(c: DeploymentComponentDBResponse) -> ModelComponentResponse {
+        ModelComponentResponse {
+            weight: c.weight,
+            enabled: c.enabled,
+            sort_order: c.sort_order,
+            created_at: c.created_at,
+            model: ComponentModelSummary {
+                id: c.deployed_model_id,
+                alias: c.model_alias,
+                model_name: c.model_name,
+                description: c.model_description,
+                model_type: c.model_type.and_then(|s| match s.as_str() {
+                    "CHAT" => Some(ModelType::Chat),
+                    "EMBEDDINGS" => Some(ModelType::Embeddings),
+                    "RERANKER" => Some(ModelType::Reranker),
+                    _ => None,
+                }),
+                endpoint: c.endpoint_id.map(|id| ComponentEndpointSummary {
+                    id,
+                    name: c.endpoint_name.unwrap_or_default(),
+                }),
+            },
+        }
     }
 }
 
@@ -344,7 +422,7 @@ mod tests {
             model_type: None,
             capabilities: None,
             created_by: Some(Uuid::new_v4()),
-            hosted_on: Uuid::new_v4(),
+            hosted_on: Some(Uuid::new_v4()),
             created_at: Utc::now(),
             updated_at: Utc::now(),
             requests_per_second: Some(100.0),
@@ -357,6 +435,11 @@ mod tests {
             provider_pricing: None,
             endpoint: None,
             tariffs: None,
+            // Composite model fields (regular model = not composite)
+            is_composite: Some(false),
+            lb_strategy: None,
+            fallback: None,
+            components: None,
         }
     }
 
@@ -507,7 +590,7 @@ mod tests {
     #[test]
     fn test_apply_endpoint_with_data() {
         let model = create_test_model();
-        let endpoint_id = model.hosted_on;
+        let endpoint_id = model.hosted_on.expect("test model should have hosted_on");
 
         let mut endpoints_map = HashMap::new();
         endpoints_map.insert(

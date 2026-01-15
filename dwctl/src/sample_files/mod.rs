@@ -162,7 +162,7 @@ mod tests {
             description: None,
             model_type: Some(model_type),
             capabilities,
-            hosted_on: uuid::Uuid::new_v4(),
+            hosted_on: Some(uuid::Uuid::new_v4()),
             requests_per_second: None,
             burst_size: None,
             capacity: None,
@@ -174,6 +174,12 @@ mod tests {
             deleted: false,
             last_sync: None,
             provider_pricing: None,
+            // Composite model fields (regular model = not composite)
+            is_composite: false,
+            lb_strategy: crate::db::models::deployments::LoadBalancingStrategy::default(),
+            fallback_enabled: true,
+            fallback_on_rate_limit: true,
+            fallback_on_status: vec![429, 500, 502, 503, 504],
         }
     }
 

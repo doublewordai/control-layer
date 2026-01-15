@@ -1086,7 +1086,7 @@ mod tests {
             .model_name("test-model".to_string())
             .alias("test-alias".to_string())
             .build();
-        deployment_create.hosted_on = endpoint_id;
+        deployment_create.hosted_on = Some(endpoint_id);
         let deployment = deployment_repo
             .create(&deployment_create)
             .await
@@ -1157,7 +1157,7 @@ mod tests {
             .model_name("test-model".to_string())
             .alias("test-alias".to_string())
             .build();
-        deployment_create.hosted_on = endpoint_id;
+        deployment_create.hosted_on = Some(endpoint_id);
         let deployment = deployment_repo
             .create(&deployment_create)
             .await
@@ -1238,7 +1238,7 @@ mod tests {
             .model_name("test-model".to_string())
             .alias("test-alias".to_string())
             .build();
-        deployment_create.hosted_on = endpoint_id;
+        deployment_create.hosted_on = Some(endpoint_id);
         let deployment = deployment_repo
             .create(&deployment_create)
             .await
@@ -1313,7 +1313,7 @@ mod tests {
             .model_name("test-model".to_string())
             .alias("test-alias".to_string())
             .build();
-        deployment_create.hosted_on = endpoint_id;
+        deployment_create.hosted_on = Some(endpoint_id);
         let deployment = deployment_repo
             .create(&deployment_create)
             .await

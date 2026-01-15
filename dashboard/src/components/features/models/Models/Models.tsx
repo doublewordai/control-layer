@@ -1,6 +1,14 @@
 import React, { useState, useEffect } from "react";
 import { useSearchParams } from "react-router-dom";
-import { Search, Activity, LayoutGrid } from "lucide-react";
+import {
+  Search,
+  Activity,
+  LayoutGrid,
+  MoreHorizontal,
+  SlidersHorizontal,
+  Layers,
+  ChevronDown,
+} from "lucide-react";
 import { useAuthorization } from "../../../../utils";
 import {
   Select,
@@ -11,8 +19,22 @@ import {
 } from "../../../ui/select";
 import { Tabs, TabsList, TabsTrigger } from "../../../ui/tabs";
 import { Input } from "../../../ui/input";
+import { Button } from "../../../ui/button";
+import {
+  Popover,
+  PopoverContent,
+  PopoverTrigger,
+} from "../../../ui/popover";
+import {
+  DropdownMenu,
+  DropdownMenuContent,
+  DropdownMenuItem,
+  DropdownMenuTrigger,
+} from "../../../ui/dropdown-menu";
+import { Label } from "../../../ui/label";
+import { Switch } from "../../../ui/switch";
 import { ModelsContent } from "./ModelsContent";
-import { SupportRequestModal } from "../../../modals";
+import { SupportRequestModal, CreateVirtualModelModal } from "../../../modals";
 import { useEndpoints } from "@/api/control-layer/hooks";
 import { useDebounce } from "@/hooks/useDebounce";
 import { useServerPagination } from "@/hooks/useServerPagination";
@@ -21,6 +43,8 @@ const Models: React.FC = () => {
   const [searchParams, setSearchParams] = useSearchParams();
   const { hasPermission } = useAuthorization();
   const [isSupportModalOpen, setIsSupportModalOpen] = useState(false);
+  const [isCreateVirtualModalOpen, setIsCreateVirtualModalOpen] =
+    useState(false);
   const canManageGroups = hasPermission("manage-groups");
   const canViewAnalytics = hasPermission("analytics");
   const canViewEndpoints = hasPermission("endpoints");
@@ -28,6 +52,7 @@ const Models: React.FC = () => {
   const canManageModels = hasPermission("manage-models");
 
   const [filterProvider, setFilterProvider] = useState("all");
+  const [filterModelType, setFilterModelType] = useState<"all" | "virtual" | "hosted">("all");
   const [searchQuery, setSearchQuery] = useState(
     searchParams.get("search") || "",
   );
@@ -64,11 +89,11 @@ const Models: React.FC = () => {
     );
   }, [searchQuery, setSearchParams]);
 
-  // Reset pagination when search query or endpoint filter changes
+  // Reset pagination when search query, endpoint, or model type filter changes
   useEffect(() => {
     pagination.handleReset();
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [debouncedSearch, selectedEndpointId]);
+  }, [debouncedSearch, selectedEndpointId, filterModelType]);
 
   const viewMode = searchParams.get("view") || "grid";
   const isStatusMode = viewMode === "status";
@@ -80,6 +105,7 @@ const Models: React.FC = () => {
   const handleClearFilters = () => {
     setSearchQuery("");
     setFilterProvider("all");
+    setFilterModelType("all");
     setShowAccessibleOnly(false);
   };
 
@@ -100,29 +126,8 @@ const Models: React.FC = () => {
                 Request a model
               </button>
             </div>
-            <div className="flex flex-col sm:flex-row items-stretch sm:items-center gap-3">
-              {/* Access toggle for admins (not shown in status mode) */}
-              {!isStatusMode && canManageGroups && (
-                <Select
-                  value={showAccessibleOnly ? "accessible" : "all"}
-                  onValueChange={(value) =>
-                    setShowAccessibleOnly(value === "accessible")
-                  }
-                >
-                  <SelectTrigger
-                    className="w-[180px]"
-                    aria-label="Model access filter"
-                  >
-                    <SelectValue />
-                  </SelectTrigger>
-                  <SelectContent>
-                    <SelectItem value="all">All Models</SelectItem>
-                    <SelectItem value="accessible">
-                      My Accessible Models
-                    </SelectItem>
-                  </SelectContent>
-                </Select>
-              )}
+            <div className="flex flex-col sm:flex-row items-stretch sm:items-center gap-2 sm:gap-3">
+              {/* Search - most frequently used */}
               <div className="relative">
                 <Search className="absolute left-3 top-1/2 transform -translate-y-1/2 text-gray-400 w-4 h-4 z-10 pointer-events-none" />
                 <Input
@@ -134,26 +139,6 @@ const Models: React.FC = () => {
                   aria-label="Search models"
                 />
               </div>
-              {canViewEndpoints && (
-                <Select
-                  value={filterProvider}
-                  onValueChange={(value) => setFilterProvider(value)}
-                >
-                  <SelectTrigger
-                    className="w-[180px]"
-                    aria-label="Filter by endpoint provider"
-                  >
-                    <SelectValue />
-                  </SelectTrigger>
-                  <SelectContent>
-                    {providers.map((provider) => (
-                      <SelectItem key={provider} value={provider}>
-                        {provider === "all" ? "All Endpoints" : provider}
-                      </SelectItem>
-                    ))}
-                  </SelectContent>
-                </Select>
-              )}
 
               {/* View mode tabs - only for platform managers */}
               {canManageGroups && (
@@ -163,16 +148,121 @@ const Models: React.FC = () => {
                     className="flex items-center gap-2 flex-1 sm:flex-initial"
                   >
                     <LayoutGrid className="h-4 w-4" />
-                    Grid
+                    <span className="hidden sm:inline">Grid</span>
                   </TabsTrigger>
                   <TabsTrigger
                     value="status"
                     className="flex items-center gap-2 flex-1 sm:flex-initial"
                   >
                     <Activity className="h-4 w-4" />
-                    Status
+                    <span className="hidden sm:inline">Status</span>
                   </TabsTrigger>
                 </TabsList>
+              )}
+
+              {/* Filter popover - consolidates endpoint, type, and access filters */}
+              {(canViewEndpoints || (!isStatusMode && canManageGroups)) && (
+                <Popover>
+                  <PopoverTrigger asChild>
+                    <Button
+                      variant="outline"
+                      size="sm"
+                      className="relative gap-1"
+                      aria-label="Filter models"
+                    >
+                      <SlidersHorizontal className="h-4 w-4" />
+                      <span className="hidden sm:inline">Filter</span>
+                      <ChevronDown className="h-3 w-3 opacity-50" />
+                      {(filterProvider !== "all" || filterModelType !== "all" || showAccessibleOnly) && (
+                        <span className="absolute -top-1 -right-1 h-2 w-2 rounded-full bg-blue-500" />
+                      )}
+                    </Button>
+                  </PopoverTrigger>
+                  <PopoverContent align="end" className="w-56">
+                    <div className="space-y-4">
+                      {canViewEndpoints && (
+                        <div className="space-y-2">
+                          <Label htmlFor="provider-filter">Endpoint</Label>
+                          <Select
+                            value={filterProvider}
+                            onValueChange={(value) => setFilterProvider(value)}
+                          >
+                            <SelectTrigger
+                              id="provider-filter"
+                              className="w-full"
+                              aria-label="Filter by endpoint provider"
+                            >
+                              <SelectValue />
+                            </SelectTrigger>
+                            <SelectContent>
+                              {providers.map((provider) => (
+                                <SelectItem key={provider} value={provider}>
+                                  {provider === "all" ? "All Endpoints" : provider}
+                                </SelectItem>
+                              ))}
+                            </SelectContent>
+                          </Select>
+                        </div>
+                      )}
+                      <div className="space-y-2">
+                        <Label>Model Type</Label>
+                        <div className="flex rounded-md border border-input overflow-hidden">
+                          {(["all", "virtual", "hosted"] as const).map((type) => (
+                            <button
+                              key={type}
+                              onClick={() => setFilterModelType(type)}
+                              className={`flex-1 px-2 py-1.5 text-xs font-medium transition-colors ${
+                                filterModelType === type
+                                  ? "bg-primary text-primary-foreground"
+                                  : "bg-background hover:bg-muted text-muted-foreground"
+                              }`}
+                              aria-label={`Show ${type === "all" ? "all models" : type + " models"}`}
+                            >
+                              {type === "all" ? "All" : type === "virtual" ? "Virtual" : "Hosted"}
+                            </button>
+                          ))}
+                        </div>
+                      </div>
+                      {!isStatusMode && canManageGroups && (
+                        <div className="flex items-center justify-between">
+                          <Label htmlFor="access-toggle" className="cursor-pointer">
+                            Accessible only
+                          </Label>
+                          <Switch
+                            id="access-toggle"
+                            checked={showAccessibleOnly}
+                            onCheckedChange={setShowAccessibleOnly}
+                            aria-label="Show only my accessible models"
+                          />
+                        </div>
+                      )}
+                    </div>
+                  </PopoverContent>
+                </Popover>
+              )}
+
+              {/* Actions dropdown - for model management actions */}
+              {canManageModels && (
+                <DropdownMenu>
+                  <DropdownMenuTrigger asChild>
+                    <Button
+                      variant="outline"
+                      size="sm"
+                      aria-label="Model actions"
+                    >
+                      <MoreHorizontal className="h-4 w-4" />
+                      <span className="hidden sm:inline ml-1.5">Actions</span>
+                    </Button>
+                  </DropdownMenuTrigger>
+                  <DropdownMenuContent align="end">
+                    <DropdownMenuItem
+                      onClick={() => setIsCreateVirtualModalOpen(true)}
+                    >
+                      <Layers className="h-4 w-4 mr-2" />
+                      Create Virtual Model
+                    </DropdownMenuItem>
+                  </DropdownMenuContent>
+                </DropdownMenu>
               )}
             </div>
           </div>
@@ -183,6 +273,7 @@ const Models: React.FC = () => {
           pagination={pagination}
           searchQuery={debouncedSearch}
           filterProvider={filterProvider}
+          filterModelType={filterModelType}
           endpointId={selectedEndpointId}
           showAccessibleOnly={showAccessibleOnly}
           isStatusMode={isStatusMode}
@@ -199,6 +290,11 @@ const Models: React.FC = () => {
         isOpen={isSupportModalOpen}
         onClose={() => setIsSupportModalOpen(false)}
         defaultSubject="Model/Feature Request"
+      />
+
+      <CreateVirtualModelModal
+        isOpen={isCreateVirtualModalOpen}
+        onClose={() => setIsCreateVirtualModalOpen(false)}
       />
     </div>
   );

@@ -101,14 +101,26 @@ describe("Models Component - Functional Tests", () => {
       const modelCards = within(container).getAllByRole("listitem");
       expect(modelCards.length).toBeGreaterThan(0);
 
-      // Test that provider filter is present and clickable
-      const providerSelect = within(container).getByRole("combobox", {
+      // Test that filter button is present and opens the filter popover
+      const filterButton = within(container).getByRole("button", {
+        name: /filter models/i,
+      });
+      expect(filterButton).toBeInTheDocument();
+
+      // Open the filter popover
+      await user.click(filterButton);
+
+      // The filter popover renders in a portal, so use screen
+      const providerSelect = screen.getByRole("combobox", {
         name: /filter by endpoint provider/i,
       });
       expect(providerSelect).toBeInTheDocument();
 
       // Verify the select shows "All Endpoints" initially
       expect(providerSelect).toHaveTextContent(/all endpoints/i);
+
+      // Close the popover by pressing Escape
+      await user.keyboard("{Escape}");
 
       // Test search functionality
       const searchInput = within(container).getByRole("textbox", {
@@ -212,6 +224,7 @@ describe("Models Component - Functional Tests", () => {
 
   describe("Access Control Journey", () => {
     it("shows access toggle for admin users", async () => {
+      const user = userEvent.setup();
       const { container } = render(<Models />, { wrapper: createWrapper() });
 
       // Wait for models to load
@@ -221,15 +234,25 @@ describe("Models Component - Functional Tests", () => {
         ).toBeInTheDocument();
       });
 
-      // Check for admin access toggle (should be present with mock permissions)
-      const accessToggle = within(container).getByRole("combobox", {
-        name: /model access filter/i,
+      // Check for filter button (which contains the admin access toggle)
+      const filterButton = within(container).getByRole("button", {
+        name: /filter models/i,
+      });
+      expect(filterButton).toBeInTheDocument();
+
+      // Open the filter popover to verify access toggle is present
+      await user.click(filterButton);
+
+      // The filter popover renders in a portal, so use screen
+      const accessToggle = screen.getByRole("switch", {
+        name: /show only my accessible models/i,
       });
       expect(accessToggle).toBeInTheDocument();
+      expect(accessToggle).not.toBeChecked();
     });
 
     it("allows admin users to toggle between all models and accessible models", async () => {
-      const _user = userEvent.setup();
+      const user = userEvent.setup();
       const { container } = render(<Models />, { wrapper: createWrapper() });
 
       // Wait for models to load
@@ -250,11 +273,17 @@ describe("Models Component - Functional Tests", () => {
       const initialCards = within(container).getAllByRole("listitem");
       const _initialCount = initialCards.length;
 
-      // Verify the access toggle shows "All Models" initially
-      const accessToggle = within(container).getByRole("combobox", {
-        name: /model access filter/i,
+      // Open the filter popover
+      const filterButton = within(container).getByRole("button", {
+        name: /filter models/i,
       });
-      expect(accessToggle).toHaveTextContent(/all models/i);
+      await user.click(filterButton);
+
+      // Verify the access toggle is not checked initially (popover renders in portal)
+      const accessToggle = screen.getByRole("switch", {
+        name: /show only my accessible models/i,
+      });
+      expect(accessToggle).not.toBeChecked();
     });
   });
 
@@ -421,11 +450,11 @@ describe("Models Component - Functional Tests", () => {
         ).toBeGreaterThan(0);
       });
 
-      // Verify admin-specific elements are present
-      const accessFilter = within(container).getByRole("combobox", {
-        name: /model access filter/i,
+      // Verify admin-specific elements are present (filter button contains access toggle)
+      const filterButton = within(container).getByRole("button", {
+        name: /filter models/i,
       });
-      expect(accessFilter).toBeInTheDocument();
+      expect(filterButton).toBeInTheDocument();
 
       // Check for admin-only buttons in model cards
       const modelCards = within(container).getAllByRole("listitem");
@@ -497,10 +526,10 @@ describe("Models Component - Functional Tests", () => {
 
       // Verify that admin features are conditionally rendered
       // The mock data should provide admin permissions by default
-      const accessFilter = within(container).getByRole("combobox", {
-        name: /model access filter/i,
+      const filterButton = within(container).getByRole("button", {
+        name: /filter models/i,
       });
-      expect(accessFilter).toBeInTheDocument();
+      expect(filterButton).toBeInTheDocument();
 
       // Check that models show appropriate admin controls
       // This could be group management buttons or dropdown menus

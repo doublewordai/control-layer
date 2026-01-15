@@ -15,6 +15,7 @@ import {
   DollarSign,
   ArrowDownToLine,
   ArrowUpToLine,
+  GitMerge,
 } from "lucide-react";
 import {
   useModels,
@@ -55,6 +56,7 @@ export interface ModelsContentProps {
   >;
   searchQuery: string;
   filterProvider: string;
+  filterModelType: "all" | "virtual" | "hosted";
   endpointId?: string;
   showAccessibleOnly: boolean;
   isStatusMode: boolean;
@@ -70,6 +72,7 @@ export const ModelsContent: React.FC<ModelsContentProps> = ({
   pagination,
   searchQuery,
   filterProvider,
+  filterModelType,
   endpointId,
   showAccessibleOnly,
   isStatusMode,
@@ -89,13 +92,18 @@ export const ModelsContent: React.FC<ModelsContentProps> = ({
   const [pricingModel, setPricingModel] = useState<Model | null>(null);
 
   const includeParam = useMemo(() => {
-    const parts: string[] = ["status"];
+    const parts: string[] = ["status", "components"];
     if (canViewEndpoints) parts.push("endpoints");
     if (canManageGroups) parts.push("groups");
     if (canViewAnalytics) parts.push("metrics");
     if (showPricing) parts.push("pricing");
     return parts.join(",");
   }, [canViewEndpoints, canManageGroups, canViewAnalytics, showPricing]);
+
+  // Convert filterModelType to is_composite API parameter
+  const isCompositeFilter = filterModelType === "all"
+    ? undefined
+    : filterModelType === "virtual";
 
   const {
     data: rawModelsData,
@@ -108,6 +116,7 @@ export const ModelsContent: React.FC<ModelsContentProps> = ({
     accessible: isStatusMode ? true : !canManageGroups || showAccessibleOnly,
     search: searchQuery || undefined,
     endpoint: endpointId,
+    is_composite: isCompositeFilter,
   });
 
   const { data: probesData } = useProbes();
@@ -118,12 +127,10 @@ export const ModelsContent: React.FC<ModelsContentProps> = ({
   const error = modelsError ? (modelsError as Error).message : null;
 
   // Filter models for status mode (only show models with probes)
-  const filteredModels = models.filter((model) => {
-    if (isStatusMode && !model.status?.probe_id) {
-      return false;
-    }
-    return true;
-  });
+  // Note: Model type filtering is now handled server-side via is_composite parameter
+  const filteredModels = isStatusMode
+    ? models.filter((model) => model.status?.probe_id)
+    : models;
 
   const hasNoModels =
     (rawModelsData?.total_count || 0) === 0 && pagination.page === 1;
@@ -298,6 +305,49 @@ export const ModelsContent: React.FC<ModelsContentProps> = ({
                               >
                                 {model.alias}
                               </CardTitle>
+                            )}
+
+                            {model.is_composite && (
+                              <HoverCard openDelay={200} closeDelay={100}>
+                                <HoverCardTrigger asChild>
+                                  <Badge
+                                    variant="outline"
+                                    className="text-xs gap-1 px-1.5 py-0.5 text-gray-600 border-gray-300 hover:bg-gray-50 cursor-default"
+                                    onClick={(e) => e.stopPropagation()}
+                                  >
+                                    <GitMerge className="h-3 w-3" />
+                                    <span>Virtual</span>
+                                  </Badge>
+                                </HoverCardTrigger>
+                                <HoverCardContent
+                                  className="w-56"
+                                  sideOffset={5}
+                                >
+                                  <div className="space-y-2">
+                                    <p className="text-sm font-medium">
+                                      Virtual Model
+                                    </p>
+                                    <p className="text-xs text-muted-foreground">
+                                      Routes requests across multiple hosted
+                                      models with{" "}
+                                      {model.lb_strategy === "priority"
+                                        ? "priority-based failover"
+                                        : "weighted load balancing"}
+                                      .
+                                    </p>
+                                    {model.components &&
+                                      model.components.length > 0 && (
+                                        <p className="text-xs text-muted-foreground">
+                                          {model.components.length} hosted model
+                                          {model.components.length !== 1
+                                            ? "s"
+                                            : ""}{" "}
+                                          configured
+                                        </p>
+                                      )}
+                                  </div>
+                                </HoverCardContent>
+                              </HoverCard>
                             )}
 
                             {model.status?.probe_id && (
@@ -481,15 +531,29 @@ export const ModelsContent: React.FC<ModelsContentProps> = ({
                           )}
                         </div>
 
-                        {/* ROW 2: Endpoint (if user can edit endpoints) */}
-                        {canViewEndpoints && model.endpoint && (
+                        {/* ROW 2: Endpoint or Hosted Model Count */}
+                        {model.is_composite ? (
                           <CardDescription className="flex items-center gap-1.5 min-w-0 mb-2">
                             <span className="text-gray-600 text-sm">
                               <span className="font-medium">
-                                {model.endpoint.name}
+                                {model.components?.length || 0} hosted model
+                                {(model.components?.length || 0) !== 1
+                                  ? "s"
+                                  : ""}
                               </span>
                             </span>
                           </CardDescription>
+                        ) : (
+                          canViewEndpoints &&
+                          model.endpoint && (
+                            <CardDescription className="flex items-center gap-1.5 min-w-0 mb-2">
+                              <span className="text-gray-600 text-sm">
+                                <span className="font-medium">
+                                  {model.endpoint.name}
+                                </span>
+                              </span>
+                            </CardDescription>
+                          )
                         )}
 
                         {/* ROW 3: Tariffs */}
