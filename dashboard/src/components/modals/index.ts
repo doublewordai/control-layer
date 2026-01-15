@@ -1,5 +1,6 @@
 export * from "./AccessManagementModal";
 export * from "./ApiExamples";
+export * from "./CreateVirtualModelModal";
 export * from "./CreateEndpointModal";
 export * from "./CreateGroupModal";
 export * from "./CreateUserModal";

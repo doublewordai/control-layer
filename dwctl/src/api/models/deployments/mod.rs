@@ -35,6 +35,8 @@ pub struct ListModelsQuery {
     pub accessible: Option<bool>,
     /// Search query to filter models by alias or model_name (case-insensitive substring match)
     pub search: Option<String>,
+    /// Filter by composite/virtual model status (true = composite only, false = non-composite only)
+    pub is_composite: Option<bool>,
 }
 
 /// Query parameters for getting a single deployed model
@@ -91,9 +93,19 @@ pub struct TariffDefinition {
     pub completion_window: Option<String>,
 }
 
-/// The data required to create a new model.
+/// The data required to create a new model (standard or composite).
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
-pub struct DeployedModelCreate {
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum DeployedModelCreate {
+    /// Create a standard model backed by a single inference endpoint
+    Standard(StandardModelCreate),
+    /// Create a composite model that routes across multiple providers
+    Composite(CompositeModelCreate),
+}
+
+/// Data for creating a standard model (backed by a single endpoint)
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct StandardModelCreate {
     /// The actual model identifier (e.g., "gpt-4", "claude-3-sonnet")
     pub model_name: String,
     /// User-friendly alias (e.g., "GPT-4 Turbo", "Claude Sonnet") - defaults to model_name if not provided
@@ -121,6 +133,51 @@ pub struct DeployedModelCreate {
     pub tariffs: Option<Vec<TariffDefinition>>,
 }
 
+/// Data for creating a composite model (routes across multiple providers)
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct CompositeModelCreate {
+    /// The model identifier for the composite model (e.g., "gpt-4-multi")
+    pub model_name: String,
+    /// User-friendly alias - defaults to model_name if not provided
+    pub alias: Option<String>,
+    /// Optional description of the composite model
+    pub description: Option<String>,
+    /// Optional model type (Chat or Embeddings)
+    pub model_type: Option<ModelType>,
+    /// Optional array of model capabilities
+    pub capabilities: Option<Vec<String>>,
+    /// Global per-model rate limit: requests per second (null = no limit)
+    pub requests_per_second: Option<f32>,
+    /// Global per-model rate limit: maximum burst size (null = no limit)
+    pub burst_size: Option<i32>,
+    /// Maximum number of concurrent requests allowed for this model (null = no limit)
+    pub capacity: Option<i32>,
+    /// Maximum number of concurrent batch requests allowed for this model (null = defaults to capacity or no limit)
+    pub batch_capacity: Option<i32>,
+    /// Tariffs for this model - if provided, these will be created as active tariffs
+    pub tariffs: Option<Vec<TariffDefinition>>,
+    /// Load balancing strategy (defaults to weighted_random)
+    #[serde(default)]
+    pub lb_strategy: LoadBalancingStrategy,
+    /// Whether to enable automatic fallback on failure (defaults to true)
+    #[serde(default = "default_true")]
+    pub fallback_enabled: bool,
+    /// Whether to trigger fallback on rate limit responses (defaults to true)
+    #[serde(default = "default_true")]
+    pub fallback_on_rate_limit: bool,
+    /// HTTP status codes that trigger fallback (defaults to [500, 502, 503, 504])
+    #[serde(default = "default_fallback_statuses")]
+    pub fallback_on_status: Vec<i32>,
+}
+
+fn default_true() -> bool {
+    true
+}
+
+fn default_fallback_statuses() -> Vec<i32> {
+    vec![500, 502, 503, 504]
+}
+
 /// The data required to update a specific model.
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct DeployedModelUpdate {
@@ -146,6 +203,19 @@ pub struct DeployedModelUpdate {
     /// Tariffs for this model - if provided, closes all existing active tariffs and creates these as new active tariffs
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tariffs: Option<Vec<TariffDefinition>>,
+    // Composite model fields
+    /// Load balancing strategy for composite models (null = no change)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lb_strategy: Option<LoadBalancingStrategy>,
+    /// Whether to enable automatic fallback on failure (null = no change)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fallback_enabled: Option<bool>,
+    /// Whether to trigger fallback on upstream rate limit (429) responses (null = no change)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fallback_on_rate_limit: Option<bool>,
+    /// HTTP status codes that trigger fallback (null = no change)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fallback_on_status: Option<Vec<i32>>,
 }
 
 /// A request to update a specific model (i.e. bundle a `DeployedModelUpdate` with a model id).
@@ -222,8 +292,9 @@ pub struct DeployedModelResponse {
     pub tariffs: Option<Vec<super::tariffs::TariffResponse>>,
     // Composite model fields
     /// Whether this is a composite model (virtual model routing to multiple providers)
-    #[serde(default)]
-    pub is_composite: bool,
+    /// Only included for users with permission to view composite model information
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub is_composite: Option<bool>,
     /// Load balancing strategy for composite models
     #[serde(skip_serializing_if = "Option::is_none")]
     pub lb_strategy: Option<LoadBalancingStrategy>,
@@ -270,7 +341,7 @@ impl From<DeploymentDBResponse> for DeployedModelResponse {
             endpoint: None,         // By default, endpoint is not included
             tariffs: None,          // By default, tariffs are not included
             // Composite model fields
-            is_composite: db.is_composite,
+            is_composite: Some(db.is_composite),
             lb_strategy: if db.is_composite { Some(db.lb_strategy) } else { None },
             fallback,
             components: None, // By default, components are not included
@@ -323,6 +394,15 @@ impl DeployedModelResponse {
         self
     }
 
+    /// Mask composite model fields (for users without permission to see composite info)
+    pub fn mask_composite_fields(mut self) -> Self {
+        self.is_composite = None;
+        self.lb_strategy = None;
+        self.fallback = None;
+        self.components = None;
+        self
+    }
+
     /// Create a response with endpoint information included
     pub fn with_endpoint(mut self, endpoint: super::inference_endpoints::InferenceEndpointResponse) -> Self {
         self.endpoint = Some(endpoint);
@@ -353,6 +433,9 @@ pub struct ModelComponentCreate {
     /// Whether this component is enabled
     #[serde(default = "default_enabled")]
     pub enabled: bool,
+    /// Sort order for priority-based routing (lower = higher priority)
+    #[serde(default)]
+    pub sort_order: i32,
 }
 
 fn default_weight() -> i32 {
@@ -370,18 +453,49 @@ pub struct ModelComponentUpdate {
     pub weight: Option<i32>,
     /// Whether this component is enabled
     pub enabled: Option<bool>,
+    /// Sort order for priority-based routing (lower = higher priority)
+    pub sort_order: Option<i32>,
+}
+
+/// Summary of a model used as a component in a composite model
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct ComponentModelSummary {
+    /// The model ID
+    #[schema(value_type = String, format = "uuid")]
+    pub id: DeploymentId,
+    /// The model alias (user-facing name)
+    pub alias: String,
+    /// The underlying model name
+    pub model_name: String,
+    /// Optional description
+    pub description: Option<String>,
+    /// Model type (CHAT, COMPLETION, EMBEDDING)
+    pub model_type: Option<ModelType>,
+    /// The endpoint hosting this model (if any)
+    pub endpoint: Option<ComponentEndpointSummary>,
+}
+
+/// Summary of an endpoint hosting a component model
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct ComponentEndpointSummary {
+    /// The endpoint ID
+    #[schema(value_type = String, format = "uuid")]
+    pub id: InferenceEndpointId,
+    /// The endpoint name
+    pub name: String,
 }
 
 /// Response for a composite model component
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct ModelComponentResponse {
-    /// The underlying deployed model ID
-    #[schema(value_type = String, format = "uuid")]
-    pub deployed_model_id: DeploymentId,
     /// Weight for load balancing (1-100)
     pub weight: i32,
     /// Whether this component is enabled
     pub enabled: bool,
+    /// Sort order for priority-based routing (lower = higher priority)
+    pub sort_order: i32,
     /// When this component was added
     pub created_at: DateTime<Utc>,
+    /// The underlying model details
+    pub model: ComponentModelSummary,
 }

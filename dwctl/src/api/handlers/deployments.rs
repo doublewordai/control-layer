@@ -5,8 +5,8 @@ use crate::{
     AppState,
     api::models::{
         deployments::{
-            DeployedModelCreate, DeployedModelResponse, DeployedModelUpdate, GetModelQuery, ListModelsQuery,
-            enrichment::DeployedModelEnricher,
+            ComponentEndpointSummary, ComponentModelSummary, DeployedModelCreate, DeployedModelResponse, DeployedModelUpdate,
+            GetModelQuery, ListModelsQuery, ModelComponentResponse, enrichment::DeployedModelEnricher,
         },
         pagination::PaginatedResponse,
         users::CurrentUser,
@@ -14,7 +14,9 @@ use crate::{
     auth::permissions::{RequiresPermission, can_read_all_resources, has_permission, operation, resource},
     db::{
         handlers::{Deployments, InferenceEndpoints, Repository, Tariffs, deployments::DeploymentFilter},
-        models::deployments::{DeploymentCreateDBRequest, DeploymentUpdateDBRequest, ModelStatus},
+        models::deployments::{
+            DeploymentComponentDBResponse, DeploymentCreateDBRequest, DeploymentUpdateDBRequest, ModelStatus, ModelType,
+        },
     },
     errors::{Error, Result},
     types::{DeploymentId, Resource},
@@ -24,6 +26,32 @@ use axum::{
     response::Json,
 };
 use sqlx::Acquire;
+
+/// Convert a DB component response to an API component response
+fn db_component_to_response(c: DeploymentComponentDBResponse) -> ModelComponentResponse {
+    ModelComponentResponse {
+        weight: c.weight,
+        enabled: c.enabled,
+        sort_order: c.sort_order,
+        created_at: c.created_at,
+        model: ComponentModelSummary {
+            id: c.deployed_model_id,
+            alias: c.model_alias,
+            model_name: c.model_name,
+            description: c.model_description,
+            model_type: c.model_type.and_then(|s| match s.as_str() {
+                "CHAT" => Some(ModelType::Chat),
+                "EMBEDDINGS" => Some(ModelType::Embeddings),
+                "RERANKER" => Some(ModelType::Reranker),
+                _ => None,
+            }),
+            endpoint: c.endpoint_id.map(|id| ComponentEndpointSummary {
+                id,
+                name: c.endpoint_name.unwrap_or_default(),
+            }),
+        },
+    }
+}
 
 #[utoipa::path(
     get,
@@ -40,6 +68,7 @@ use sqlx::Acquire;
         ("limit" = Option<i64>, Query, description = "Maximum number of items to return (default: 10, max: 100)"),
         ("skip" = Option<i64>, Query, description = "Number of items to skip (default: 0)"),
         ("search" = Option<String>, Query, description = "Search query to filter models by alias, model_name, or endpoint name (case-insensitive substring match)"),
+        ("is_composite" = Option<bool>, Query, description = "Filter by composite/virtual model status (true = virtual models only, false = hosted models only)"),
     ),
     responses(
         (status = 200, description = "Paginated list of deployed models", body = PaginatedResponse<DeployedModelResponse>),
@@ -132,6 +161,11 @@ pub async fn list_deployed_models(
         filter = filter.with_search(search.trim().to_string());
     }
 
+    // Apply is_composite filter if specified
+    if let Some(is_composite) = query.is_composite {
+        filter = filter.with_composite(is_composite);
+    }
+
     // Parse include parameter
     let all_includes: Vec<&str> = query
         .include
@@ -190,6 +224,7 @@ pub async fn list_deployed_models(
     let include_status = includes.contains(&"status");
     let include_pricing = includes.contains(&"pricing");
     let include_endpoints = includes.contains(&"endpoints");
+    let include_components = includes.contains(&"components");
 
     // Use ModelEnricher to add requested data
     let enricher = DeployedModelEnricher {
@@ -199,9 +234,11 @@ pub async fn list_deployed_models(
         include_status,
         include_pricing,
         include_endpoints,
+        include_components,
         can_read_pricing,
         can_read_rate_limits,
         can_read_users,
+        can_read_composite_info: can_read_all_models,
     };
 
     let response = enricher.enrich_many(models).await?;
@@ -236,8 +273,21 @@ pub async fn create_deployed_model(
     current_user: RequiresPermission<resource::Models, operation::CreateAll>,
     Json(create): Json<DeployedModelCreate>,
 ) -> Result<Json<DeployedModelResponse>> {
-    let model_name = create.model_name.trim();
-    let alias = create.alias.as_deref().unwrap_or(model_name).trim();
+    // Extract common fields and variant-specific data
+    let (model_name, alias, hosted_on, tariffs) = match &create {
+        DeployedModelCreate::Standard(s) => (
+            s.model_name.trim(),
+            s.alias.as_deref().unwrap_or(s.model_name.trim()).trim(),
+            Some(s.hosted_on),
+            s.tariffs.clone(),
+        ),
+        DeployedModelCreate::Composite(c) => (
+            c.model_name.trim(),
+            c.alias.as_deref().unwrap_or(c.model_name.trim()).trim(),
+            None,
+            c.tariffs.clone(),
+        ),
+    };
 
     if model_name.is_empty() || alias.is_empty() {
         return Err(Error::BadRequest {
@@ -247,18 +297,19 @@ pub async fn create_deployed_model(
 
     let mut tx = state.db.begin().await.map_err(|e| Error::Database(e.into()))?;
 
-    // Validate endpoint exists
-    let mut endpoints_repo = InferenceEndpoints::new(tx.acquire().await.map_err(|e| Error::Database(e.into()))?);
-    if endpoints_repo.get_by_id(create.hosted_on).await?.is_none() {
-        return Err(Error::NotFound {
-            resource: "endpoint".to_string(),
-            id: create.hosted_on.to_string(),
-        });
+    // Validate endpoint exists (only for standard models)
+    if let Some(endpoint_id) = hosted_on {
+        let mut endpoints_repo = InferenceEndpoints::new(tx.acquire().await.map_err(|e| Error::Database(e.into()))?);
+        if endpoints_repo.get_by_id(endpoint_id).await?.is_none() {
+            return Err(Error::NotFound {
+                resource: "endpoint".to_string(),
+                id: endpoint_id.to_string(),
+            });
+        }
     }
 
     // Create the deployment - let database constraints handle uniqueness
     let mut repo = Deployments::new(tx.acquire().await.map_err(|e| Error::Database(e.into()))?);
-    let tariffs = create.tariffs.clone();
     let db_request = DeploymentCreateDBRequest::from_api_create(current_user.id, create);
     let model = repo.create(&db_request).await?;
 
@@ -496,6 +547,7 @@ pub async fn get_deployed_model(
     let mut include_status = false;
     let mut include_pricing = false;
     let mut include_endpoints = false;
+    let mut include_components = false;
 
     for &include in &all_includes {
         match include {
@@ -525,6 +577,10 @@ pub async fn get_deployed_model(
                 // Pricing is allowed for all users (enricher handles ReadAll permission)
                 include_pricing = true;
             }
+            "components" => {
+                // Components is allowed for all users (enricher handles composite info permission)
+                include_components = true;
+            }
             _ => {
                 // Unknown includes are ignored
             }
@@ -547,9 +603,11 @@ pub async fn get_deployed_model(
         include_status,
         include_pricing,
         include_endpoints,
+        include_components,
         can_read_pricing,
         can_read_rate_limits,
         can_read_users,
+        can_read_composite_info: can_read_all_models,
     };
 
     response = enricher.enrich_one(response).await?;
@@ -596,7 +654,7 @@ pub async fn delete_deployed_model(
 
 // ===== Composite Model Component Handlers =====
 
-use crate::api::models::deployments::{ModelComponentCreate, ModelComponentResponse, ModelComponentUpdate};
+use crate::api::models::deployments::{ModelComponentCreate, ModelComponentUpdate};
 use crate::db::models::deployments::DeploymentComponentCreateDBRequest;
 
 #[utoipa::path(
@@ -648,15 +706,7 @@ pub async fn get_model_components(
     let mut repo = Deployments::new(tx.acquire().await.map_err(|e| Error::Database(e.into()))?);
     let components = repo.get_components(id).await?;
 
-    let response: Vec<ModelComponentResponse> = components
-        .into_iter()
-        .map(|c| ModelComponentResponse {
-            deployed_model_id: c.deployed_model_id,
-            weight: c.weight,
-            enabled: c.enabled,
-            created_at: c.created_at,
-        })
-        .collect();
+    let response: Vec<ModelComponentResponse> = components.into_iter().map(db_component_to_response).collect();
 
     Ok(Json(response))
 }
@@ -737,17 +787,13 @@ pub async fn add_model_component(
         deployed_model_id: component_id,
         weight: body.weight,
         enabled: body.enabled,
+        sort_order: body.sort_order,
     };
 
     let component = repo.add_component(&request).await?;
     tx.commit().await.map_err(|e| Error::Database(e.into()))?;
 
-    Ok(Json(ModelComponentResponse {
-        deployed_model_id: component.deployed_model_id,
-        weight: component.weight,
-        enabled: component.enabled,
-        created_at: component.created_at,
-    }))
+    Ok(Json(db_component_to_response(component)))
 }
 
 #[utoipa::path(
@@ -794,19 +840,14 @@ pub async fn update_model_component(
     let mut repo = Deployments::new(&mut pool_conn);
 
     let component = repo
-        .update_component(id, component_id, body.weight, body.enabled)
+        .update_component(id, component_id, body.weight, body.enabled, body.sort_order)
         .await?
         .ok_or_else(|| Error::NotFound {
             resource: "component".to_string(),
             id: format!("{}/{}", id, component_id),
         })?;
 
-    Ok(Json(ModelComponentResponse {
-        deployed_model_id: component.deployed_model_id,
-        weight: component.weight,
-        enabled: component.enabled,
-        created_at: component.created_at,
-    }))
+    Ok(Json(db_component_to_response(component)))
 }
 
 #[utoipa::path(
@@ -1314,6 +1355,7 @@ mod tests {
 
         // Create a model via API
         let create_request = json!({
+            "type": "standard",
             "model_name": "test-new-model",
             "alias": "Test New Model",
             "hosted_on": test_endpoint_id.to_string(),
@@ -1348,6 +1390,7 @@ mod tests {
 
         // Create a model with minimal data (alias should default to model_name)
         let create_request = json!({
+            "type": "standard",
             "model_name": "simple-model",
             "hosted_on": test_endpoint_id.to_string()
         });
@@ -1377,6 +1420,7 @@ mod tests {
         let test_endpoint_id = get_test_endpoint_id(&pool).await;
 
         let create_request = json!({
+            "type": "standard",
             "model_name": "forbidden-model",
             "hosted_on": test_endpoint_id.to_string()
         });
@@ -1398,6 +1442,7 @@ mod tests {
         let admin_user = create_test_admin_user(&pool, Role::PlatformManager).await;
 
         let create_request = json!({
+            "type": "standard",
             "model_name": "test-model",
             "hosted_on": "99999999-9999-9999-9999-999999999999"  // Non-existent endpoint
         });
@@ -1866,6 +1911,7 @@ mod tests {
 
         // Create a model via API
         let create_request = json!({
+            "type": "standard",
             "model_name": "pm-new-model",
             "alias": "Platform Manager New Model",
             "hosted_on": test_endpoint_id.to_string(),
@@ -2096,6 +2142,7 @@ mod tests {
 
         // Should be able to create models (PlatformManager permission)
         let create_request = json!({
+            "type": "standard",
             "model_name": "pm-create-test",
             "hosted_on": test_endpoint_id.to_string(),
             "alias": "Platform Manager Created"

@@ -318,6 +318,9 @@ pub struct DeploymentComponent {
     pub weight: i32,
     /// Whether this component is active
     pub enabled: bool,
+    /// Sort order for priority-based routing (lower = higher priority)
+    #[serde(default)]
+    pub sort_order: i32,
 }
 
 /// Database request for adding a component to a composite model
@@ -327,17 +330,28 @@ pub struct DeploymentComponentCreateDBRequest {
     pub deployed_model_id: DeploymentId,
     pub weight: i32,
     pub enabled: bool,
+    pub sort_order: i32,
 }
 
-/// Database response for a deployment component
+/// Database response for a deployment component (flat structure with joined model info)
 #[derive(Debug, Clone)]
 pub struct DeploymentComponentDBResponse {
+    // Component fields
     pub id: uuid::Uuid,
     pub composite_model_id: DeploymentId,
     pub deployed_model_id: DeploymentId,
     pub weight: i32,
     pub enabled: bool,
+    pub sort_order: i32,
     pub created_at: DateTime<Utc>,
+    // Joined model fields
+    pub model_alias: String,
+    pub model_name: String,
+    pub model_description: Option<String>,
+    pub model_type: Option<String>,
+    // Joined endpoint fields
+    pub endpoint_id: Option<InferenceEndpointId>,
+    pub endpoint_name: Option<String>,
 }
 
 /// Database request for creating a new deployment
@@ -370,23 +384,42 @@ pub struct DeploymentCreateDBRequest {
 }
 
 impl DeploymentCreateDBRequest {
-    /// Creates a deployment request from API model creation data (for regular models)
+    /// Creates a deployment request from API model creation data
     pub fn from_api_create(created_by: UserId, create: DeployedModelCreate) -> Self {
-        Self::builder()
-            .created_by(created_by)
-            .model_name(create.model_name.clone())
-            .alias(create.alias.unwrap_or(create.model_name))
-            .maybe_description(create.description)
-            .maybe_model_type(create.model_type)
-            .maybe_capabilities(create.capabilities)
-            .hosted_on(create.hosted_on)
-            .maybe_requests_per_second(create.requests_per_second)
-            .maybe_burst_size(create.burst_size)
-            .maybe_capacity(create.capacity)
-            .maybe_batch_capacity(create.batch_capacity)
-            .maybe_provider_pricing(create.provider_pricing)
-            .is_composite(false)
-            .build()
+        match create {
+            DeployedModelCreate::Standard(standard) => Self::builder()
+                .created_by(created_by)
+                .model_name(standard.model_name.clone())
+                .alias(standard.alias.unwrap_or(standard.model_name))
+                .maybe_description(standard.description)
+                .maybe_model_type(standard.model_type)
+                .maybe_capabilities(standard.capabilities)
+                .hosted_on(standard.hosted_on)
+                .maybe_requests_per_second(standard.requests_per_second)
+                .maybe_burst_size(standard.burst_size)
+                .maybe_capacity(standard.capacity)
+                .maybe_batch_capacity(standard.batch_capacity)
+                .maybe_provider_pricing(standard.provider_pricing)
+                .is_composite(false)
+                .build(),
+            DeployedModelCreate::Composite(composite) => Self::builder()
+                .created_by(created_by)
+                .model_name(composite.model_name.clone())
+                .alias(composite.alias.unwrap_or(composite.model_name))
+                .maybe_description(composite.description)
+                .maybe_model_type(composite.model_type)
+                .maybe_capabilities(composite.capabilities)
+                .maybe_requests_per_second(composite.requests_per_second)
+                .maybe_burst_size(composite.burst_size)
+                .maybe_capacity(composite.capacity)
+                .maybe_batch_capacity(composite.batch_capacity)
+                .is_composite(true)
+                .lb_strategy(composite.lb_strategy)
+                .fallback_enabled(composite.fallback_enabled)
+                .fallback_on_rate_limit(composite.fallback_on_rate_limit)
+                .fallback_on_status(composite.fallback_on_status)
+                .build(),
+        }
     }
 }
 
@@ -426,6 +459,10 @@ impl From<DeployedModelUpdate> for DeploymentUpdateDBRequest {
             .maybe_capacity(update.capacity)
             .maybe_batch_capacity(update.batch_capacity)
             .maybe_provider_pricing(update.provider_pricing)
+            .maybe_lb_strategy(update.lb_strategy)
+            .maybe_fallback_enabled(update.fallback_enabled)
+            .maybe_fallback_on_rate_limit(update.fallback_on_rate_limit)
+            .maybe_fallback_on_status(update.fallback_on_status)
             .build()
     }
 }

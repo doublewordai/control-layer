@@ -21,8 +21,13 @@ COMMENT ON COLUMN deployed_models.fallback_enabled IS 'Whether to fall back to o
 COMMENT ON COLUMN deployed_models.fallback_on_rate_limit IS 'Fall back when provider is rate limited (composite models only)';
 COMMENT ON COLUMN deployed_models.fallback_on_status IS 'HTTP status codes that trigger fallback to next provider (composite models only)';
 
+-- Allow hosted_on to be NULL (required for composite models)
+-- This drops the NOT NULL constraint on the hosted_on column
+ALTER TABLE deployed_models ALTER COLUMN hosted_on DROP NOT NULL;
+
 -- Constraint: composite models must NOT have hosted_on set, regular models MUST have it set
--- Note: We allow hosted_on to be NULL only for composite models
+-- This CHECK constraint ensures data integrity: composite models have NULL hosted_on,
+-- regular models have non-NULL hosted_on
 ALTER TABLE deployed_models ADD CONSTRAINT deployed_models_composite_check
     CHECK (
         (is_composite = TRUE AND hosted_on IS NULL) OR

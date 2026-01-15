@@ -16,6 +16,7 @@ import type {
   UserUpdateRequest,
   GroupUpdateRequest,
   ModelUpdateRequest,
+  ModelCreate,
   EndpointCreateRequest,
   EndpointUpdateRequest,
   EndpointValidateRequest,
@@ -57,6 +58,9 @@ import type {
   DaemonsListResponse,
   DaemonsQuery,
   EndpointsQuery,
+  ModelComponent,
+  AddComponentRequest,
+  UpdateComponentRequest,
 } from "./types";
 import { ApiError } from "./errors";
 
@@ -273,6 +277,88 @@ const modelApi = {
     }
 
     return response.json();
+  },
+
+  async create(data: ModelCreate): Promise<Model> {
+    const response = await fetch("/admin/api/v1/models", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(data),
+    });
+
+    if (!response.ok) {
+      const errorText = await response.text();
+      throw new Error(errorText || `Failed to create model: ${response.status}`);
+    }
+
+    return response.json();
+  },
+
+  // Composite model component operations
+  components: {
+    async list(modelId: string): Promise<ModelComponent[]> {
+      const response = await fetch(`/admin/api/v1/models/${modelId}/components`);
+      if (!response.ok) {
+        throw new Error(`Failed to fetch model components: ${response.status}`);
+      }
+      return response.json();
+    },
+
+    async add(
+      modelId: string,
+      data: AddComponentRequest,
+    ): Promise<ModelComponent> {
+      // Backend expects component_id in the URL path: POST /models/{id}/components/{component_id}
+      const response = await fetch(
+        `/admin/api/v1/models/${modelId}/components/${data.deployed_model_id}`,
+        {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ weight: data.weight, enabled: data.enabled }),
+        },
+      );
+      if (!response.ok) {
+        const errorText = await response.text();
+        throw new Error(
+          errorText || `Failed to add component: ${response.status}`,
+        );
+      }
+      return response.json();
+    },
+
+    async update(
+      modelId: string,
+      componentModelId: string,
+      data: UpdateComponentRequest,
+    ): Promise<ModelComponent> {
+      const response = await fetch(
+        `/admin/api/v1/models/${modelId}/components/${componentModelId}`,
+        {
+          method: "PATCH",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(data),
+        },
+      );
+      if (!response.ok) {
+        const errorText = await response.text();
+        throw new Error(
+          errorText || `Failed to update component: ${response.status}`,
+        );
+      }
+      return response.json();
+    },
+
+    async remove(modelId: string, componentModelId: string): Promise<void> {
+      const response = await fetch(
+        `/admin/api/v1/models/${modelId}/components/${componentModelId}`,
+        {
+          method: "DELETE",
+        },
+      );
+      if (!response.ok) {
+        throw new Error(`Failed to remove component: ${response.status}`);
+      }
+    },
   },
 };
 

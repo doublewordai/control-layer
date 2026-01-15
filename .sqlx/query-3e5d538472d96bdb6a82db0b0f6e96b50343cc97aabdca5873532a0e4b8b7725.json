@@ -1,0 +1,44 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n        WITH user_balances AS (\n            SELECT\n                u.id as user_id,\n                COALESCE(c.balance, 0) + COALESCE(\n                    (SELECT SUM(\n                        CASE WHEN ct.transaction_type IN ('purchase', 'admin_grant')\n                        THEN ct.amount ELSE -ct.amount END\n                    )\n                    FROM credits_transactions ct\n                    WHERE ct.user_id = u.id\n                    AND ct.seq > COALESCE(c.checkpoint_seq, 0)),\n                    0\n                ) as balance\n            FROM users u\n            LEFT JOIN user_balance_checkpoints c ON c.user_id = u.id\n        )\n        SELECT\n            cm.id as composite_model_id,\n            ak.id as api_key_id,\n            ak.secret as api_key_secret,\n            ak.requests_per_second,\n            ak.burst_size\n        FROM deployed_models cm\n        CROSS JOIN LATERAL (\n            SELECT DISTINCT\n                ak.id,\n                ak.secret,\n                ak.requests_per_second,\n                ak.burst_size\n            FROM api_keys ak\n            WHERE (\n                -- System user always has access\n                ak.user_id = '00000000-0000-0000-0000-000000000000'\n                -- OR user is in a group assigned to this composite model (via deployment_groups)\n                OR EXISTS (\n                    SELECT 1 FROM user_groups ug\n                    INNER JOIN deployment_groups dg ON ug.group_id = dg.group_id\n                    WHERE dg.deployment_id = cm.id\n                      AND ug.user_id = ak.user_id\n                )\n                -- OR composite model is in public group (nil UUID)\n                OR EXISTS (\n                    SELECT 1 FROM deployment_groups dg\n                    WHERE dg.deployment_id = cm.id\n                      AND dg.group_id = '00000000-0000-0000-0000-000000000000'\n                )\n            )\n            -- Require positive balance (system user always passes)\n            AND (\n                ak.user_id = '00000000-0000-0000-0000-000000000000'\n                OR EXISTS (\n                    SELECT 1 FROM user_balances ub\n                    WHERE ub.user_id = ak.user_id AND ub.balance > 0\n                )\n            )\n        ) ak\n        WHERE cm.is_composite = TRUE\n          AND cm.deleted = FALSE\n        ORDER BY cm.id, ak.id\n        ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "composite_model_id",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 1,
+        "name": "api_key_id",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 2,
+        "name": "api_key_secret",
+        "type_info": "Varchar"
+      },
+      {
+        "ordinal": 3,
+        "name": "requests_per_second",
+        "type_info": "Float4"
+      },
+      {
+        "ordinal": 4,
+        "name": "burst_size",
+        "type_info": "Int4"
+      }
+    ],
+    "parameters": {
+      "Left": []
+    },
+    "nullable": [
+      false,
+      false,
+      false,
+      true,
+      true
+    ]
+  },
+  "hash": "3e5d538472d96bdb6a82db0b0f6e96b50343cc97aabdca5873532a0e4b8b7725"
+}

@@ -691,7 +691,9 @@ mod tests {
             errors::Result,
             handlers::{InferenceEndpoints, Repository, deployments::DeploymentFilter},
             models::{
-                deployments::{DeploymentCreateDBRequest, DeploymentDBResponse, DeploymentUpdateDBRequest, LoadBalancingStrategy, ModelStatus},
+                deployments::{
+                    DeploymentCreateDBRequest, DeploymentDBResponse, DeploymentUpdateDBRequest, LoadBalancingStrategy, ModelStatus,
+                },
                 inference_endpoints::InferenceEndpointDBResponse,
             },
         },

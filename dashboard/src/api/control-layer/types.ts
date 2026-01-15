@@ -9,6 +9,50 @@ export interface PaginatedResponse<T> {
 }
 
 export type ModelType = "CHAT" | "EMBEDDINGS" | "RERANKER";
+
+// Virtual model types (virtual models route requests across multiple hosted models)
+export type LoadBalancingStrategy = "weighted_random" | "priority";
+
+export interface FallbackConfig {
+  enabled: boolean;
+  on_rate_limit: boolean;
+  on_status: number[];
+}
+
+export interface ComponentEndpointSummary {
+  id: string;
+  name: string;
+}
+
+export interface ComponentModelSummary {
+  id: string;
+  alias: string;
+  model_name: string;
+  description?: string;
+  model_type?: ModelType;
+  endpoint?: ComponentEndpointSummary;
+}
+
+export interface ModelComponent {
+  weight: number; // 1-100
+  enabled: boolean;
+  sort_order: number; // Lower = higher priority for priority-based routing
+  created_at: string;
+  model: ComponentModelSummary;
+}
+
+export interface AddComponentRequest {
+  deployed_model_id: string;
+  weight?: number; // defaults to 1
+  enabled?: boolean; // defaults to true
+  sort_order?: number; // defaults to 0
+}
+
+export interface UpdateComponentRequest {
+  weight?: number;
+  enabled?: boolean;
+  sort_order?: number;
+}
 export type AuthSource = "vouch" | "native" | "system" | "proxy-header";
 export type Role =
   | "PlatformManager"
@@ -90,7 +134,7 @@ export interface Model {
   description?: string | null;
   model_type?: ModelType | null;
   capabilities?: string[] | null;
-  hosted_on: string; // endpoint ID (UUID)
+  hosted_on?: string | null; // endpoint ID (UUID) - null for virtual models
   requests_per_second?: number | null; // Global rate limiting: requests per second
   burst_size?: number | null; // Global rate limiting: burst capacity
   capacity?: number | null; // Maximum concurrent requests allowed
@@ -100,7 +144,51 @@ export interface Model {
   status?: ModelProbeStatus; // only present when include=status
   tariffs?: ModelTariff[]; // only present when include=pricing
   endpoint?: Endpoint; // only present when include=endpoints
+  // Virtual model fields (is_composite maps to "virtual" in UI terminology)
+  is_composite?: boolean; // true = virtual model, false = hosted model
+  lb_strategy?: LoadBalancingStrategy | null;
+  fallback?: FallbackConfig | null;
+  components?: ModelComponent[]; // only present when include=components
 }
+
+// Model creation types - discriminated union with "type" field
+export interface StandardModelCreate {
+  type: "standard";
+  model_name: string;
+  alias?: string;
+  hosted_on: string; // endpoint ID (UUID)
+  description?: string;
+  model_type?: ModelType;
+  capabilities?: string[];
+  requests_per_second?: number;
+  burst_size?: number;
+  capacity?: number;
+  batch_capacity?: number;
+}
+
+// Virtual model creation - routes requests across multiple hosted models
+// Note: API uses "composite" as the type discriminator for backwards compatibility
+export interface VirtualModelCreate {
+  type: "composite" | "virtual"; // API accepts "composite", UI uses "virtual"
+  model_name: string;
+  alias?: string;
+  description?: string;
+  model_type?: ModelType;
+  capabilities?: string[];
+  requests_per_second?: number;
+  burst_size?: number;
+  capacity?: number;
+  batch_capacity?: number;
+  lb_strategy?: LoadBalancingStrategy;
+  fallback_enabled?: boolean;
+  fallback_on_rate_limit?: boolean;
+  fallback_on_status?: number[];
+}
+
+// Backwards compatibility alias
+export type CompositeModelCreate = VirtualModelCreate;
+
+export type ModelCreate = StandardModelCreate | VirtualModelCreate;
 
 export interface Endpoint {
   id: string; // UUID
@@ -179,38 +267,8 @@ export interface ApiKeyCreateResponse extends ApiKey {
 // /admin/api/v1/groups?include=users,models will return user ids and model ids
 // in each element of the groups response. Note that this is only the id; and
 // we need to make another query for the actual data.
-export type ModelsInclude =
-  | "groups"
-  | "metrics"
-  | "status"
-  | "endpoints"
-  | "pricing"
-  | "groups,metrics"
-  | "groups,status"
-  | "groups,endpoints"
-  | "groups,pricing"
-  | "metrics,status"
-  | "metrics,endpoints"
-  | "metrics,pricing"
-  | "status,endpoints"
-  | "status,pricing"
-  | "endpoints,pricing"
-  | "groups,metrics,status"
-  | "groups,metrics,endpoints"
-  | "groups,metrics,pricing"
-  | "groups,status,endpoints"
-  | "groups,status,pricing"
-  | "groups,endpoints,pricing"
-  | "metrics,status,endpoints"
-  | "metrics,status,pricing"
-  | "metrics,endpoints,pricing"
-  | "status,endpoints,pricing"
-  | "groups,metrics,status,endpoints"
-  | "groups,metrics,status,pricing"
-  | "groups,metrics,endpoints,pricing"
-  | "groups,status,endpoints,pricing"
-  | "metrics,status,endpoints,pricing"
-  | "groups,metrics,status,endpoints,pricing";
+// ModelsInclude: comma-separated combination of: groups, metrics, status, endpoints, pricing, components
+export type ModelsInclude = string;
 export type GroupsInclude = "users" | "models" | "users,models";
 export type UsersInclude = "groups";
 
@@ -222,6 +280,7 @@ export interface ModelsQuery {
   include?: ModelsInclude;
   accessible?: boolean; // Filter to only models the current user can access
   search?: string; // Search query to filter models by alias or model_name
+  is_composite?: boolean; // Filter by composite/virtual model status (true = virtual, false = hosted)
 }
 
 export interface EndpointsQuery {
@@ -294,6 +353,11 @@ export interface ModelUpdateRequest {
   capacity?: number | null;
   batch_capacity?: number | null;
   tariffs?: TariffDefinition[];
+  // Composite model fields
+  lb_strategy?: LoadBalancingStrategy | null;
+  fallback_enabled?: boolean | null;
+  fallback_on_rate_limit?: boolean | null;
+  fallback_on_status?: number[] | null;
 }
 
 // Endpoint-specific types

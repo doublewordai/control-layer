@@ -50,7 +50,6 @@ fn parse_notify_payload(payload: &str) -> Option<(&str, std::time::Duration)> {
 #[derive(Debug, Clone)]
 struct OnwardsTarget {
     // Deployment info
-    deployment_id: DeploymentId,
     model_name: String,
     alias: String,
     requests_per_second: Option<f32>,
@@ -91,7 +90,7 @@ pub struct SyncConfig {
 
 impl OnwardsConfigSync {
     /// Creates a new OnwardsConfigSync and returns it along with initial targets and a WatchTargetsStream
-    #[allow(dead_code)]
+    #[cfg(test)]
     #[instrument(skip(db))]
     pub async fn new(db: PgPool) -> Result<(Self, Targets, WatchTargetsStream), anyhow::Error> {
         Self::new_with_daemon_limits(db, None).await
@@ -103,7 +102,7 @@ impl OnwardsConfigSync {
         db: PgPool,
         daemon_capacity_limits: Option<Arc<dashmap::DashMap<String, usize>>>,
     ) -> Result<(Self, Targets, WatchTargetsStream), anyhow::Error> {
-        // Load initial configuration
+        // Load initial configuration (including composite models)
         let initial_targets = load_targets_from_db(&db).await?;
 
         // If daemon limits are provided, populate them
@@ -189,7 +188,7 @@ impl OnwardsConfigSync {
                                     continue;
                                 }
 
-                                // Reload configuration from database
+                                // Reload configuration from database (including composite models)
                                 last_reload_time = std::time::Instant::now();
                                 match load_targets_from_db(&self.db).await {
                                     Ok(new_targets) => {
@@ -262,323 +261,6 @@ impl OnwardsConfigSync {
     }
 }
 
-/// Loads the current targets configuration from the database
-#[tracing::instrument(skip(db))]
-pub async fn load_targets_from_db(db: &PgPool) -> Result<Targets, anyhow::Error> {
-    let query_start = std::time::Instant::now();
-    debug!("Loading onwards targets from database");
-
-    // Single mega-query to refresh the whole cache at once
-    // - deployments (deployed_models)
-    // - endpoints (inference_endpoints)
-    // - api_keys with access control logic
-    let rows = sqlx::query!(
-        r#"
-        WITH user_balances AS (
-            -- Calculate balance using checkpoint + delta for efficiency
-            SELECT
-                u.id as user_id,
-                COALESCE(c.balance, 0) + COALESCE(
-                    (SELECT SUM(
-                        CASE WHEN ct.transaction_type IN ('purchase', 'admin_grant')
-                        THEN ct.amount ELSE -ct.amount END
-                    )
-                    FROM credits_transactions ct
-                    WHERE ct.user_id = u.id
-                    AND ct.seq > COALESCE(c.checkpoint_seq, 0)),
-                    0
-                ) as balance
-            FROM users u
-            LEFT JOIN user_balance_checkpoints c ON c.user_id = u.id
-        )
-        SELECT
-            -- Deployment fields (only what we need)
-            dm.id as deployment_id,
-            dm.model_name,
-            dm.alias,
-            dm.hosted_on,
-            dm.requests_per_second as deployment_requests_per_second,
-            dm.burst_size as deployment_burst_size,
-            dm.capacity,
-            -- Endpoint fields (only what we need)
-            ie.id as endpoint_id,
-            ie.url as "endpoint_url!",
-            ie.api_key as endpoint_api_key,
-            ie.auth_header_name,
-            ie.auth_header_prefix,
-            -- API key fields (nullable due to LEFT JOIN)
-            ak.id as "api_key_id?",
-            ak.secret as "api_key_secret?",
-            ak.requests_per_second as api_key_requests_per_second,
-            ak.burst_size as api_key_burst_size
-        FROM deployed_models dm
-        INNER JOIN inference_endpoints ie ON dm.hosted_on = ie.id
-        LEFT JOIN LATERAL (
-            -- Get all API keys that have access to this deployment
-            SELECT DISTINCT
-                ak.id,
-                ak.secret,
-                ak.requests_per_second,
-                ak.burst_size
-            FROM api_keys ak
-            WHERE (
-                -- System user always has access
-                ak.user_id = '00000000-0000-0000-0000-000000000000'
-
-                -- OR user is in a group assigned to this deployment
-                OR EXISTS (
-                    SELECT 1 FROM user_groups ug
-                    INNER JOIN deployment_groups dg ON ug.group_id = dg.group_id
-                    WHERE dg.deployment_id = dm.id
-                      AND ug.user_id = ak.user_id
-                )
-
-                -- OR deployment is in public group (nil UUID)
-                OR EXISTS (
-                    SELECT 1 FROM deployment_groups dg
-                    WHERE dg.deployment_id = dm.id
-                      AND dg.group_id = '00000000-0000-0000-0000-000000000000'
-                )
-            )
-            -- Access control: require credit OR free model (except system user always passes)
-            AND (
-                ak.user_id = '00000000-0000-0000-0000-000000000000'
-                OR EXISTS (
-                    SELECT 1 FROM user_balances ub
-                    WHERE ub.user_id = ak.user_id AND ub.balance > 0
-                )
-                OR (
-                    -- Free model check: no active tariffs with pricing
-                    NOT EXISTS (
-                        SELECT 1 FROM model_tariffs mt
-                        WHERE mt.deployed_model_id = dm.id
-                          AND mt.valid_until IS NULL
-                          AND (mt.input_price_per_token > 0 OR mt.output_price_per_token > 0)
-                    )
-                )
-            )
-        ) ak ON true
-        WHERE dm.deleted = FALSE
-          AND dm.is_composite = FALSE
-        ORDER BY dm.id, ak.id
-        "#
-    )
-    .fetch_all(db)
-    .await?;
-
-    let query_duration = query_start.elapsed();
-    info!(
-        "Mega-query (non-composite models) completed in {:?}, fetched {} rows ({} rows/ms)",
-        query_duration,
-        rows.len(),
-        if query_duration.as_millis() > 0 {
-            rows.len() as u128 / query_duration.as_millis()
-        } else {
-            rows.len() as u128
-        }
-    );
-
-    if query_duration.as_millis() > 500 {
-        warn!("Mega-query took {:?}, which is slower than expected (>500ms).", query_duration);
-    }
-
-    // Group results into targets
-    let mut targets_map: HashMap<DeploymentId, OnwardsTarget> = HashMap::new();
-
-    for row in rows {
-        let deployment_id = row.deployment_id;
-
-        // Get or create target for this deployment
-        let target = targets_map.entry(deployment_id).or_insert_with(|| OnwardsTarget {
-            deployment_id,
-            model_name: row.model_name.clone(),
-            alias: row.alias.clone(),
-            requests_per_second: row.deployment_requests_per_second,
-            burst_size: row.deployment_burst_size,
-            capacity: row.capacity,
-            endpoint_url: url::Url::parse(&row.endpoint_url).expect("Invalid URL in database"),
-            endpoint_api_key: row.endpoint_api_key.clone(),
-            auth_header_name: row.auth_header_name.clone(),
-            auth_header_prefix: row.auth_header_prefix.clone(),
-            api_keys: Vec::new(),
-        });
-
-        // Add API key if present
-        if let (Some(api_key_id), Some(api_key_secret)) = (row.api_key_id, row.api_key_secret) {
-            target.api_keys.push(OnwardsApiKey {
-                id: api_key_id,
-                secret: api_key_secret,
-                requests_per_second: row.api_key_requests_per_second,
-                burst_size: row.api_key_burst_size,
-            });
-        }
-    }
-
-    let processing_start = std::time::Instant::now();
-    let targets: Vec<_> = targets_map.into_values().collect();
-    let total_api_keys: usize = targets.iter().map(|t| t.api_keys.len()).sum();
-
-    info!(
-        "Grouped into {} deployments with {} total API keys (processing took {:?})",
-        targets.len(),
-        total_api_keys,
-        processing_start.elapsed()
-    );
-
-    for target in &targets {
-        debug!(
-            "Deployment '{}' ({}) has {} API keys",
-            target.alias,
-            target.deployment_id,
-            target.api_keys.len()
-        );
-    }
-
-    // Convert to ConfigFile format
-    let config_start = std::time::Instant::now();
-    let config = convert_to_config_file(targets);
-    debug!("Config conversion took {:?}", config_start.elapsed());
-
-    // Convert ConfigFile to Targets
-    let onwards_start = std::time::Instant::now();
-    let result = Targets::from_config(config);
-    debug!("Onwards config instantiation took {:?}", onwards_start.elapsed());
-
-    let total_duration = query_start.elapsed();
-    info!(
-        "Total load_targets_from_db took {:?} (query: {:?}, processing: {:?}, conversion: {:?}, onwards: {:?})",
-        total_duration,
-        query_duration,
-        processing_start.elapsed(),
-        config_start.elapsed(),
-        onwards_start.elapsed()
-    );
-
-    result
-}
-
-/// Converts onwards targets to the ConfigFile format expected by onwards
-#[tracing::instrument(skip(targets))]
-fn convert_to_config_file(targets: Vec<OnwardsTarget>) -> ConfigFile {
-    // Build both key_definitions and target specs in one iteration
-    let mut key_definitions = HashMap::new();
-    let target_specs = targets
-        .into_iter()
-        .map(|target| {
-            // Add this target's API keys to key_definitions
-            for api_key in &target.api_keys {
-                // Build rate limit if configured
-                let rate_limit = match (api_key.requests_per_second, api_key.burst_size) {
-                    (Some(rps), burst) if rps > 0.0 => {
-                        let rps_u32 = NonZeroU32::new((rps.max(1.0) as u32).max(1)).unwrap();
-                        let burst_u32 = burst.and_then(|b| NonZeroU32::new(b.max(1) as u32));
-
-                        debug!(
-                            "API key '{}' configured with {}req/s rate limit, burst: {:?}",
-                            api_key.secret, rps, burst_u32
-                        );
-
-                        Some(RateLimitParameters {
-                            requests_per_second: rps_u32,
-                            burst_size: burst_u32,
-                        })
-                    }
-                    _ => None,
-                };
-
-                // Add all keys to key_definitions (whether they have rate limits or not)
-                key_definitions.insert(
-                    api_key.id.to_string(),
-                    KeyDefinition {
-                        key: api_key.secret.clone(),
-                        rate_limit,
-                        concurrency_limit: None, // Per-key concurrency limits not yet supported
-                    },
-                );
-            }
-            // Get API key secrets for this deployment (onwards validates against actual secrets)
-            let keys = if target.api_keys.is_empty() {
-                None
-            } else {
-                Some(target.api_keys.iter().map(|k| k.secret.clone().into()).collect())
-            };
-
-            // Build per-target rate limiting parameters if configured
-            let rate_limit = match (target.requests_per_second, target.burst_size) {
-                (Some(rps), burst) if rps > 0.0 => {
-                    let rps_u32 = NonZeroU32::new((rps.max(1.0) as u32).max(1)).unwrap();
-                    let burst_u32 = burst.and_then(|b| NonZeroU32::new(b.max(1) as u32));
-
-                    debug!(
-                        "Model '{}' configured with {}req/s rate limit, burst: {:?}",
-                        target.alias, rps, burst_u32
-                    );
-
-                    Some(RateLimitParameters {
-                        requests_per_second: rps_u32,
-                        burst_size: burst_u32,
-                    })
-                }
-                _ => None,
-            };
-
-            // Only set custom auth headers if they differ from defaults
-            let upstream_auth_header_name = if target.auth_header_name != "Authorization" {
-                Some(target.auth_header_name.clone())
-            } else {
-                None
-            };
-            let upstream_auth_header_prefix = if target.auth_header_prefix != "Bearer " {
-                Some(target.auth_header_prefix.clone())
-            } else {
-                None
-            };
-
-            // Build concurrency limiting parameters if configured
-            let concurrency_limit = target.capacity.map(|capacity| {
-                debug!("Model '{}' configured with {} max concurrent requests", target.alias, capacity);
-
-                ConcurrencyLimitParameters {
-                    max_concurrent_requests: capacity as usize,
-                }
-            });
-
-            // Note: Pricing is now handled via tariffs, not response headers
-            let target_spec = TargetSpec {
-                url: target.endpoint_url.clone(),
-                keys,
-                onwards_key: target.endpoint_api_key.clone(),
-                onwards_model: Some(target.model_name.clone()),
-                rate_limit,
-                concurrency_limit,
-                upstream_auth_header_name,
-                upstream_auth_header_prefix,
-                response_headers: None,
-                weight: 1, // Default weight for single-provider targets
-            };
-
-            (target.alias, TargetSpecOrList::Single(target_spec))
-        })
-        .collect();
-
-    // Build auth section with key definitions (if any exist)
-    let auth = if key_definitions.is_empty() {
-        None
-    } else {
-        Some(
-            Auth::builder()
-                .global_keys(std::collections::HashSet::new())
-                .key_definitions(key_definitions)
-                .build(),
-        )
-    };
-
-    ConfigFile {
-        targets: target_specs,
-        auth,
-    }
-}
-
 // ===== Composite Models Support =====
 // Composite models are virtual models that distribute requests across multiple
 // underlying deployed models based on configurable weights.
@@ -588,7 +270,6 @@ fn convert_to_config_file(targets: Vec<OnwardsTarget>) -> ConfigFile {
 
 /// Data structure for composite model components (prepared for onwards integration)
 #[derive(Debug, Clone)]
-#[allow(dead_code)]
 struct CompositeModelComponent {
     weight: i32,
     // Component target info (from the underlying deployed_model)
@@ -597,8 +278,8 @@ struct CompositeModelComponent {
 
 /// Data structure for composite models (prepared for onwards integration)
 #[derive(Debug, Clone)]
-#[allow(dead_code)]
 struct OnwardsCompositeModel {
+    #[allow(dead_code)] // Useful for debug logging
     id: DeploymentId,
     alias: String,
     requests_per_second: Option<f32>,
@@ -619,7 +300,6 @@ struct OnwardsCompositeModel {
 
 /// Loads composite models with their components and API keys from the database
 #[tracing::instrument(skip(db))]
-#[allow(dead_code)]
 async fn load_composite_models_from_db(db: &PgPool) -> Result<Vec<OnwardsCompositeModel>, anyhow::Error> {
     debug!("Loading composite models from database");
 
@@ -658,7 +338,7 @@ async fn load_composite_models_from_db(db: &PgPool) -> Result<Vec<OnwardsComposi
           AND cm.deleted = FALSE
           AND dmc.enabled = TRUE
           AND dm.deleted = FALSE
-        ORDER BY cm.id, dmc.weight DESC
+        ORDER BY cm.id, dmc.sort_order ASC
         "#
     )
     .fetch_all(db)
@@ -735,6 +415,18 @@ async fn load_composite_models_from_db(db: &PgPool) -> Result<Vec<OnwardsComposi
     let mut composite_map: HashMap<DeploymentId, OnwardsCompositeModel> = HashMap::new();
 
     for row in component_rows {
+        // Parse the endpoint URL, skipping this component if invalid
+        let endpoint_url = match url::Url::parse(&row.endpoint_url) {
+            Ok(url) => url,
+            Err(e) => {
+                warn!(
+                    "Skipping component for composite model '{}': invalid endpoint URL '{}': {}",
+                    row.alias, row.endpoint_url, e
+                );
+                continue;
+            }
+        };
+
         let composite = composite_map.entry(row.composite_model_id).or_insert_with(|| {
             // Parse lb_strategy from string, defaulting to WeightedRandom
             let lb_strategy = row
@@ -761,13 +453,12 @@ async fn load_composite_models_from_db(db: &PgPool) -> Result<Vec<OnwardsComposi
         composite.components.push(CompositeModelComponent {
             weight: row.weight,
             target: OnwardsTarget {
-                deployment_id: row.deployed_model_id,
                 model_name: row.model_name.clone(),
                 alias: row.deployment_alias.clone(),
                 requests_per_second: row.deployment_requests_per_second,
                 burst_size: row.deployment_burst_size,
                 capacity: row.deployment_capacity,
-                endpoint_url: url::Url::parse(&row.endpoint_url).expect("Invalid URL in database"),
+                endpoint_url,
                 endpoint_api_key: row.endpoint_api_key.clone(),
                 auth_header_name: row.auth_header_name.clone(),
                 auth_header_prefix: row.auth_header_prefix.clone(),
@@ -805,7 +496,6 @@ async fn load_composite_models_from_db(db: &PgPool) -> Result<Vec<OnwardsComposi
 ///
 /// Uses onwards 0.10.0 weighted provider types for load balancing across
 /// multiple underlying deployed models.
-#[allow(dead_code)]
 fn convert_composite_to_target_spec(
     composite: &OnwardsCompositeModel,
     key_definitions: &mut HashMap<String, KeyDefinition>,
@@ -958,8 +648,7 @@ fn convert_composite_to_target_spec(
 
 /// Converts both regular targets and composite models to ConfigFile format
 #[tracing::instrument(skip(targets, composites))]
-#[allow(dead_code)]
-fn convert_to_config_file_with_composites(targets: Vec<OnwardsTarget>, composites: Vec<OnwardsCompositeModel>) -> ConfigFile {
+fn convert_to_config_file(targets: Vec<OnwardsTarget>, composites: Vec<OnwardsCompositeModel>) -> ConfigFile {
     let mut key_definitions = HashMap::new();
 
     // Convert regular deployed models (wrapped in TargetSpecOrList::Single)
@@ -1040,11 +729,10 @@ fn convert_to_config_file_with_composites(targets: Vec<OnwardsTarget>, composite
         })
         .collect();
 
-    // Convert composite models (only those with at least one component)
+    // Convert composite models (including those with no components - they'll return 502)
     for composite in composites {
         if composite.components.is_empty() {
-            warn!("Skipping composite model '{}' with no enabled components", composite.alias);
-            continue;
+            debug!("Composite model '{}' has no enabled components - will return 502", composite.alias);
         }
 
         let (alias, spec) = convert_composite_to_target_spec(&composite, &mut key_definitions);
@@ -1070,8 +758,7 @@ fn convert_to_config_file_with_composites(targets: Vec<OnwardsTarget>, composite
 
 /// Loads the current targets configuration from the database (including composite models)
 #[tracing::instrument(skip(db))]
-#[allow(dead_code)]
-pub async fn load_targets_from_db_with_composites(db: &PgPool) -> Result<Targets, anyhow::Error> {
+pub async fn load_targets_from_db(db: &PgPool) -> Result<Targets, anyhow::Error> {
     let query_start = std::time::Instant::now();
     debug!("Loading onwards targets from database (with composite models)");
 
@@ -1170,7 +857,6 @@ pub async fn load_targets_from_db_with_composites(db: &PgPool) -> Result<Targets
     for row in rows {
         let deployment_id = row.deployment_id;
         let target = targets_map.entry(deployment_id).or_insert_with(|| OnwardsTarget {
-            deployment_id,
             model_name: row.model_name.clone(),
             alias: row.alias.clone(),
             requests_per_second: row.deployment_requests_per_second,
@@ -1200,7 +886,7 @@ pub async fn load_targets_from_db_with_composites(db: &PgPool) -> Result<Targets
     let composites = load_composite_models_from_db(db).await?;
 
     // Convert to ConfigFile format
-    let config = convert_to_config_file_with_composites(targets, composites);
+    let config = convert_to_config_file(targets, composites);
 
     // Convert ConfigFile to Targets
     Targets::from_config(config)
@@ -1246,14 +932,12 @@ mod tests {
     use onwards::target::TargetSpecOrList;
     use tokio::{sync::mpsc, time::timeout};
     use tokio_util::sync::CancellationToken;
-    use uuid::Uuid;
 
     use crate::sync::onwards_config::{OnwardsTarget, SyncConfig, convert_to_config_file, parse_notify_payload};
 
     // Helper function to create a test target
     fn create_test_target(model_name: &str, alias: &str, endpoint_url: &str) -> OnwardsTarget {
         OnwardsTarget {
-            deployment_id: Uuid::new_v4(),
             model_name: model_name.to_string(),
             alias: alias.to_string(),
             requests_per_second: None,
@@ -1274,7 +958,7 @@ mod tests {
         let target2 = create_test_target("claude-3", "claude-alias", "https://api.anthropic.com");
 
         let targets = vec![target1, target2];
-        let config = convert_to_config_file(targets);
+        let config = convert_to_config_file(targets, vec![]);
 
         // Verify the config
         assert_eq!(config.targets.len(), 2);
@@ -1307,7 +991,7 @@ mod tests {
         let target = create_test_target("valid-model", "valid-alias", "https://api.valid.com");
 
         let targets = vec![target];
-        let config = convert_to_config_file(targets);
+        let config = convert_to_config_file(targets, vec![]);
 
         // Should have exactly one target
         assert_eq!(config.targets.len(), 1);
