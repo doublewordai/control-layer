@@ -173,7 +173,7 @@ const Models: React.FC = () => {
                       <SlidersHorizontal className="h-4 w-4" />
                       <span className="hidden sm:inline">Filter</span>
                       <ChevronDown className="h-3 w-3 opacity-50" />
-                      {(filterProvider !== "all" || filterModelType !== "all" || showAccessibleOnly) && (
+                      {(filterProvider !== "all" || (canManageGroups && filterModelType !== "all") || showAccessibleOnly) && (
                         <span className="absolute -top-1 -right-1 h-2 w-2 rounded-full bg-blue-500" />
                       )}
                     </Button>
@@ -204,25 +204,27 @@ const Models: React.FC = () => {
                           </Select>
                         </div>
                       )}
-                      <div className="space-y-2">
-                        <Label>Model Type</Label>
-                        <div className="flex rounded-md border border-input overflow-hidden">
-                          {(["all", "virtual", "hosted"] as const).map((type) => (
-                            <button
-                              key={type}
-                              onClick={() => setFilterModelType(type)}
-                              className={`flex-1 px-2 py-1.5 text-xs font-medium transition-colors ${
-                                filterModelType === type
-                                  ? "bg-primary text-primary-foreground"
-                                  : "bg-background hover:bg-muted text-muted-foreground"
-                              }`}
-                              aria-label={`Show ${type === "all" ? "all models" : type + " models"}`}
-                            >
-                              {type === "all" ? "All" : type === "virtual" ? "Virtual" : "Hosted"}
-                            </button>
-                          ))}
+                      {canManageGroups && (
+                        <div className="space-y-2">
+                          <Label>Model Type</Label>
+                          <div className="flex rounded-md border border-input overflow-hidden">
+                            {(["all", "virtual", "hosted"] as const).map((type) => (
+                              <button
+                                key={type}
+                                onClick={() => setFilterModelType(type)}
+                                className={`flex-1 px-2 py-1.5 text-xs font-medium transition-colors ${
+                                  filterModelType === type
+                                    ? "bg-primary text-primary-foreground"
+                                    : "bg-background hover:bg-muted text-muted-foreground"
+                                }`}
+                                aria-label={`Show ${type === "all" ? "all models" : type + " models"}`}
+                              >
+                                {type === "all" ? "All" : type === "virtual" ? "Virtual" : "Hosted"}
+                              </button>
+                            ))}
+                          </div>
                         </div>
-                      </div>
+                      )}
                       {!isStatusMode && canManageGroups && (
                         <div className="flex items-center justify-between">
                           <Label htmlFor="access-toggle" className="cursor-pointer">

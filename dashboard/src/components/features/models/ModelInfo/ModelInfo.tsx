@@ -455,18 +455,12 @@ const ModelInfo: React.FC = () => {
                     </p>
                   )}
                   {!canManageGroups &&
-                    (model.is_composite ? (
-                      <p className="text-doubleword-neutral-600 mt-1 inline-flex items-center gap-1">
-                        <GitMerge className="h-3 w-3" />
-                        Virtual Model
+                    !model.is_composite &&
+                    canViewEndpoints && (
+                      <p className="text-doubleword-neutral-600 mt-1">
+                        {endpoint?.name || "Unknown endpoint"}
                       </p>
-                    ) : (
-                      canViewEndpoints && (
-                        <p className="text-doubleword-neutral-600 mt-1">
-                          {endpoint?.name || "Unknown endpoint"}
-                        </p>
-                      )
-                    ))}
+                    )}
                 </div>
                 <div className="flex items-center justify-center sm:justify-start gap-3">
                   {canManageGroups && (
