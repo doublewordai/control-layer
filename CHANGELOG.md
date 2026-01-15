@@ -1,5 +1,18 @@
 # Changelog
 
+## [1.2.0](https://github.com/doublewordai/control-layer/compare/v1.1.2...v1.2.0) (2026-01-15)
+
+
+### Features
+
+* add composite models for weighted provider load balancing ([#532](https://github.com/doublewordai/control-layer/issues/532)) ([93cfbca](https://github.com/doublewordai/control-layer/commit/93cfbca9de7f2dc0d9817330370f3e21125a5130))
+* Transaction types ([#518](https://github.com/doublewordai/control-layer/issues/518)) ([c9ddf14](https://github.com/doublewordai/control-layer/commit/c9ddf14912b168e06f5821f57ebf01cd6a849be4))
+
+
+### Bug Fixes
+
+* sum_recent_transactions_grouped includes batch_aggregates ([#531](https://github.com/doublewordai/control-layer/issues/531)) ([4a50c31](https://github.com/doublewordai/control-layer/commit/4a50c31fada2387724c88cc04326d917fb743d79))
+
 ## [1.1.2](https://github.com/doublewordai/control-layer/compare/v1.1.1...v1.1.2) (2026-01-14)
 
 
