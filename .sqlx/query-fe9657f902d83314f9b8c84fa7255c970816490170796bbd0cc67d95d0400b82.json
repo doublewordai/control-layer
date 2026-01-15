@@ -1,0 +1,29 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n            SELECT COALESCE(SUM(signed_amount), 0) as \"sum!\"\n            FROM (\n                SELECT * FROM (\n                    -- Batch aggregates (always usage/negative)\n                    -- Only included if transaction_types filter includes 'usage' or is not set\n                    -- and search term matches \"Batch\" description\n                    (SELECT\n                        ba.max_seq,\n                        -ba.total_amount as signed_amount\n                    FROM batch_aggregates ba\n                    WHERE ba.user_id = $1\n                      AND $3::bool = true\n                      AND $4::bool = true\n                      AND ($5::timestamptz IS NULL OR ba.created_at >= $5)\n                      AND ($6::timestamptz IS NULL OR ba.created_at <= $6)\n                    ORDER BY ba.max_seq DESC\n                    LIMIT $2)\n\n                    UNION ALL\n\n                    -- Non-batched transactions\n                    (SELECT\n                        ct.seq as max_seq,\n                        CASE WHEN ct.transaction_type IN ('admin_grant', 'purchase')\n                            THEN ct.amount\n                            ELSE -ct.amount\n                        END as signed_amount\n                    FROM credits_transactions ct\n                    WHERE ct.user_id = $1\n                      AND ct.fusillade_batch_id IS NULL\n                      AND ($7::text IS NULL OR ct.description ILIKE '%' || $7 || '%')\n                      AND ($8::text[] IS NULL OR ct.transaction_type::text = ANY($8))\n                      AND ($5::timestamptz IS NULL OR ct.created_at >= $5)\n                      AND ($6::timestamptz IS NULL OR ct.created_at <= $6)\n                    ORDER BY ct.seq DESC\n                    LIMIT $2)\n                ) combined\n                ORDER BY max_seq DESC\n                LIMIT $2\n            ) recent\n            ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "sum!",
+        "type_info": "Numeric"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Int8",
+        "Bool",
+        "Bool",
+        "Timestamptz",
+        "Timestamptz",
+        "Text",
+        "TextArray"
+      ]
+    },
+    "nullable": [
+      null
+    ]
+  },
+  "hash": "fe9657f902d83314f9b8c84fa7255c970816490170796bbd0cc67d95d0400b82"
+}
