@@ -508,6 +508,60 @@ impl<'c> Credits<'c> {
         Ok(result.sum)
     }
 
+    /// Sum the signed amounts of the most recent N grouped transaction items for a user.
+    /// This operates on the same grouped view as `list_transactions_with_batches`:
+    /// - Batch aggregates count as single items (with their total_amount)
+    /// - Non-batched transactions count as single items
+    /// This is used to calculate the balance at a specific point when batch grouping is enabled.
+    #[instrument(skip(self), fields(user_id = %abbrev_uuid(&user_id), count = count), err)]
+    pub async fn sum_recent_transactions_grouped(&mut self, user_id: UserId, count: i64) -> Result<Decimal> {
+        // First ensure any pending batch transactions are aggregated
+        self.aggregate_user_batches(user_id).await?;
+
+        // Sum from the same UNION view used by list_transactions_with_batches
+        // All batch aggregates are usage type (negative), non-batched follow normal signing rules
+        let result = sqlx::query!(
+            r#"
+            SELECT COALESCE(SUM(signed_amount), 0) as "sum!"
+            FROM (
+                SELECT * FROM (
+                    -- Batch aggregates (always usage/negative)
+                    (SELECT
+                        ba.max_seq,
+                        -ba.total_amount as signed_amount
+                    FROM batch_aggregates ba
+                    WHERE ba.user_id = $1
+                    ORDER BY ba.max_seq DESC
+                    LIMIT $2)
+
+                    UNION ALL
+
+                    -- Non-batched transactions
+                    (SELECT
+                        ct.seq as max_seq,
+                        CASE WHEN ct.transaction_type IN ('admin_grant', 'purchase')
+                            THEN ct.amount
+                            ELSE -ct.amount
+                        END as signed_amount
+                    FROM credits_transactions ct
+                    WHERE ct.user_id = $1
+                      AND ct.fusillade_batch_id IS NULL
+                    ORDER BY ct.seq DESC
+                    LIMIT $2)
+                ) combined
+                ORDER BY max_seq DESC
+                LIMIT $2
+            ) recent
+            "#,
+            user_id,
+            count
+        )
+        .fetch_one(&mut *self.db)
+        .await?;
+
+        Ok(result.sum)
+    }
+
     /// Perform lazy aggregation for a user's unaggregated batched transactions.
     /// This aggregates new transactions into batch_aggregates and marks them as aggregated.
     /// Uses a single atomic UPDATE + aggregate approach to handle concurrent reads safely.
