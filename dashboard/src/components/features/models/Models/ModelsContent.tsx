@@ -307,7 +307,7 @@ export const ModelsContent: React.FC<ModelsContentProps> = ({
                               </CardTitle>
                             )}
 
-                            {model.is_composite && (
+                            {canManageGroups && model.is_composite && (
                               <HoverCard openDelay={200} closeDelay={100}>
                                 <HoverCardTrigger asChild>
                                   <Badge
@@ -531,8 +531,8 @@ export const ModelsContent: React.FC<ModelsContentProps> = ({
                           )}
                         </div>
 
-                        {/* ROW 2: Endpoint or Hosted Model Count */}
-                        {model.is_composite ? (
+                        {/* ROW 2: Endpoint or Hosted Model Count (only for platform managers) */}
+                        {canManageGroups && model.is_composite ? (
                           <CardDescription className="flex items-center gap-1.5 min-w-0 mb-2">
                             <span className="text-gray-600 text-sm">
                               <span className="font-medium">
@@ -544,6 +544,7 @@ export const ModelsContent: React.FC<ModelsContentProps> = ({
                             </span>
                           </CardDescription>
                         ) : (
+                          !model.is_composite &&
                           canViewEndpoints &&
                           model.endpoint && (
                             <CardDescription className="flex items-center gap-1.5 min-w-0 mb-2">
