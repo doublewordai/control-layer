@@ -3,7 +3,9 @@
 use crate::{
     AppState,
     api::models::{
-        transactions::{CreditTransactionCreate, CreditTransactionResponse, ListTransactionsQuery, TransactionListResponse},
+        transactions::{
+            CreditTransactionCreate, CreditTransactionResponse, ListTransactionsQuery, TransactionFilters, TransactionListResponse,
+        },
         users::CurrentUser,
     },
     auth::permissions::{self, RequiresPermission, operation, resource},
@@ -19,6 +21,7 @@ use axum::{
     http::StatusCode,
     response::Json,
 };
+
 use fusillade::Storage;
 use rust_decimal::Decimal;
 use std::collections::HashMap;
@@ -256,8 +259,10 @@ pub async fn list_transactions(
     // For single-user queries: current balance when skip=0, or balance at the pagination
     // point (before the first transaction on this page) when skip>0
     // For all-users queries (no filter), we return 0 since per-user balance doesn't make sense
+    // When batch grouping is enabled, use the grouped sum to match the grouped transaction list
+    // Filters are applied so that date-filtered views show the correct starting balance
     let page_start_balance = if let Some(user_id) = filter_user_id {
-        calculate_page_start_balance(&mut repo, user_id, skip).await?
+        calculate_page_start_balance(&mut repo, user_id, skip, grouping_enabled, &filters).await?
     } else {
         // When viewing all users' transactions, per-row balance doesn't apply
         Decimal::ZERO
@@ -273,19 +278,46 @@ pub async fn list_transactions(
 }
 
 /// Calculate the balance at the start of a page for pagination purposes.
-/// - If skip=0: returns current balance (balance after all transactions)
-/// - If skip=N: returns balance at the pagination point (before the first transaction on this page)
-async fn calculate_page_start_balance(repo: &mut Credits<'_>, user_id: UserId, skip: i64) -> Result<Decimal> {
+/// - Returns the balance that should be shown after the first transaction on the page
+/// - When end_date filter is set, calculates balance at that point in time
+/// - When skip > 0, subtracts the skipped transactions from the starting balance
+/// - If use_grouped=true: uses grouped transaction view (batch aggregates count as single items)
+async fn calculate_page_start_balance(
+    repo: &mut Credits<'_>,
+    user_id: UserId,
+    skip: i64,
+    use_grouped: bool,
+    filters: &TransactionFilters,
+) -> Result<Decimal> {
     let current_balance = repo.get_user_balance(user_id).await?;
 
+    // If there's an end_date filter, we need to calculate the balance at that point in time
+    // by subtracting all transactions that occurred after the end_date
+    let balance_at_filter_end = if let Some(end_date) = filters.end_date {
+        let after_sum = if use_grouped {
+            repo.sum_transactions_after_date_grouped(user_id, end_date).await?
+        } else {
+            repo.sum_transactions_after_date(user_id, end_date).await?
+        };
+        current_balance - after_sum
+    } else {
+        current_balance
+    };
+
     if skip == 0 {
-        return Ok(current_balance);
+        return Ok(balance_at_filter_end);
     }
 
     // Sum the signed amounts of the first `skip` transactions (most recent ones we're skipping)
-    let skipped_sum = repo.sum_recent_transactions(user_id, skip).await?;
+    // within the filtered set. When batch grouping is enabled, use the grouped sum so that
+    // batch aggregates count as single items, matching the pagination of list_transactions_with_batches.
+    let skipped_sum = if use_grouped {
+        repo.sum_recent_transactions_grouped(user_id, skip, filters).await?
+    } else {
+        repo.sum_recent_transactions(user_id, skip, filters).await?
+    };
 
-    Ok(current_balance - skipped_sum)
+    Ok(balance_at_filter_end - skipped_sum)
 }
 
 #[cfg(test)]
@@ -1531,5 +1563,468 @@ mod tests {
 
         let unique_ids: std::collections::HashSet<_> = all_ids.iter().collect();
         assert_eq!(all_ids.len(), unique_ids.len(), "Should have no duplicate IDs across pages");
+    }
+
+    // Test: page_start_balance is calculated correctly with batch grouping
+    // This is a regression test for the bug where page_start_balance was calculated using
+    // raw transaction counts instead of grouped transaction counts
+    #[sqlx::test]
+    #[test_log::test]
+    async fn test_page_start_balance_with_batch_grouping(pool: PgPool) {
+        let (app, _bg_services) = create_test_app(pool.clone(), false).await;
+        let user = create_test_user(&pool, Role::StandardUser).await;
+
+        let mut conn = pool.acquire().await.expect("Failed to acquire connection");
+        let mut credits_repo = CreditsHandler::new(&mut conn);
+
+        // Create initial balance: $1000
+        let grant_request = CreditTransactionCreateDBRequest::admin_grant(
+            user.id,
+            user.id,
+            Decimal::from_str("1000.0").unwrap(),
+            Some("Initial grant".to_string()),
+        );
+        credits_repo
+            .create_transaction(&grant_request)
+            .await
+            .expect("Failed to create grant");
+
+        // Create 3 batches, each with multiple transactions
+        // Batch 1: 5 transactions of $2 each = $10 total (oldest)
+        let batch_id_1 = Uuid::new_v4();
+        for i in 0..5 {
+            let analytics_record = sqlx::query!(
+                r#"
+                INSERT INTO http_analytics
+                    (instance_id, correlation_id, timestamp, method, uri, model, user_id, fusillade_batch_id)
+                VALUES ($1, $2, NOW() - interval '3 hours', $3, $4, $5, $6, $7)
+                RETURNING id
+                "#,
+                Uuid::new_v4(),
+                i as i64,
+                "POST",
+                "/ai/v1/chat/completions",
+                "gpt-4",
+                user.id,
+                batch_id_1
+            )
+            .fetch_one(&pool)
+            .await
+            .expect("Failed to insert analytics");
+
+            let usage_request = CreditTransactionCreateDBRequest {
+                user_id: user.id,
+                transaction_type: CreditTransactionType::Usage,
+                amount: Decimal::from_str("2.0").unwrap(),
+                source_id: analytics_record.id.to_string(),
+                description: Some(format!("Batch 1 request {}", i)),
+                fusillade_batch_id: Some(batch_id_1),
+            };
+            credits_repo
+                .create_transaction(&usage_request)
+                .await
+                .expect("Failed to create usage");
+        }
+
+        // Batch 2: 10 transactions of $3 each = $30 total (middle)
+        let batch_id_2 = Uuid::new_v4();
+        for i in 0..10 {
+            let analytics_record = sqlx::query!(
+                r#"
+                INSERT INTO http_analytics
+                    (instance_id, correlation_id, timestamp, method, uri, model, user_id, fusillade_batch_id)
+                VALUES ($1, $2, NOW() - interval '2 hours', $3, $4, $5, $6, $7)
+                RETURNING id
+                "#,
+                Uuid::new_v4(),
+                (5 + i) as i64,
+                "POST",
+                "/ai/v1/chat/completions",
+                "gpt-4",
+                user.id,
+                batch_id_2
+            )
+            .fetch_one(&pool)
+            .await
+            .expect("Failed to insert analytics");
+
+            let usage_request = CreditTransactionCreateDBRequest {
+                user_id: user.id,
+                transaction_type: CreditTransactionType::Usage,
+                amount: Decimal::from_str("3.0").unwrap(),
+                source_id: analytics_record.id.to_string(),
+                description: Some(format!("Batch 2 request {}", i)),
+                fusillade_batch_id: Some(batch_id_2),
+            };
+            credits_repo
+                .create_transaction(&usage_request)
+                .await
+                .expect("Failed to create usage");
+        }
+
+        // Batch 3: 3 transactions of $5 each = $15 total (newest)
+        let batch_id_3 = Uuid::new_v4();
+        for i in 0..3 {
+            let analytics_record = sqlx::query!(
+                r#"
+                INSERT INTO http_analytics
+                    (instance_id, correlation_id, timestamp, method, uri, model, user_id, fusillade_batch_id)
+                VALUES ($1, $2, NOW() - interval '1 hour', $3, $4, $5, $6, $7)
+                RETURNING id
+                "#,
+                Uuid::new_v4(),
+                (15 + i) as i64,
+                "POST",
+                "/ai/v1/chat/completions",
+                "gpt-4",
+                user.id,
+                batch_id_3
+            )
+            .fetch_one(&pool)
+            .await
+            .expect("Failed to insert analytics");
+
+            let usage_request = CreditTransactionCreateDBRequest {
+                user_id: user.id,
+                transaction_type: CreditTransactionType::Usage,
+                amount: Decimal::from_str("5.0").unwrap(),
+                source_id: analytics_record.id.to_string(),
+                description: Some(format!("Batch 3 request {}", i)),
+                fusillade_batch_id: Some(batch_id_3),
+            };
+            credits_repo
+                .create_transaction(&usage_request)
+                .await
+                .expect("Failed to create usage");
+        }
+
+        // Add a non-batched payment (newest transaction)
+        let payment_request = CreditTransactionCreateDBRequest {
+            user_id: user.id,
+            transaction_type: CreditTransactionType::Purchase,
+            amount: Decimal::from_str("100.0").unwrap(),
+            source_id: Uuid::new_v4().to_string(),
+            description: Some("Dummy payment (test)".to_string()),
+            fusillade_batch_id: None,
+        };
+        credits_repo
+            .create_transaction(&payment_request)
+            .await
+            .expect("Failed to create payment");
+
+        drop(conn);
+
+        // Expected state:
+        // - Initial grant: +$1000 (balance after: $1000)
+        // - Batch 1: -$10 (balance after: $990)
+        // - Batch 2: -$30 (balance after: $960)
+        // - Batch 3: -$15 (balance after: $945)
+        // - Payment: +$100 (balance after: $1045)
+        //
+        // Grouped order (newest first by max_seq):
+        // 1. Payment: +$100 (balance after: $1045)
+        // 2. Batch 3: -$15 (balance after: $945)
+        // 3. Batch 2: -$30 (balance after: $960)
+        // 4. Batch 1: -$10 (balance after: $990)
+        // 5. Initial grant: +$1000 (balance after: $1000)
+        //
+        // Total: 5 grouped items (1 grant + 3 batches + 1 payment)
+
+        // Test page 1 (skip=0, limit=2): Should show Payment and Batch 3
+        let response = app
+            .get("/admin/api/v1/transactions?group_batches=true&limit=2&skip=0")
+            .add_header(&add_auth_headers(&user)[0].0, &add_auth_headers(&user)[0].1)
+            .add_header(&add_auth_headers(&user)[1].0, &add_auth_headers(&user)[1].1)
+            .await;
+
+        response.assert_status_ok();
+        let page1: TransactionListResponse = response.json();
+
+        // page_start_balance for skip=0 should be current balance = $1045
+        assert_eq!(
+            page1.page_start_balance,
+            Decimal::from_str("1045.0").unwrap(),
+            "Page 1 page_start_balance should be current balance $1045"
+        );
+        assert_eq!(page1.data.len(), 2, "Page 1 should have 2 items");
+
+        // Verify the transactions on page 1 (newest first)
+        // First item should be the payment (+$100)
+        assert_eq!(
+            page1.data[0].description,
+            Some("Dummy payment (test)".to_string()),
+            "First item should be the payment"
+        );
+        assert_eq!(
+            page1.data[0].amount,
+            Decimal::from_str("100.0").unwrap(),
+            "Payment amount should be $100"
+        );
+
+        // Second item should be Batch 3 ($15 total)
+        assert_eq!(
+            page1.data[1].description,
+            Some("Batch".to_string()),
+            "Second item should be Batch 3"
+        );
+        assert_eq!(
+            page1.data[1].amount,
+            Decimal::from_str("15.0").unwrap(),
+            "Batch 3 amount should be $15"
+        );
+
+        // Test page 2 (skip=2, limit=2): Should show Batch 2 and Batch 1
+        let response = app
+            .get("/admin/api/v1/transactions?group_batches=true&limit=2&skip=2")
+            .add_header(&add_auth_headers(&user)[0].0, &add_auth_headers(&user)[0].1)
+            .add_header(&add_auth_headers(&user)[1].0, &add_auth_headers(&user)[1].1)
+            .await;
+
+        response.assert_status_ok();
+        let page2: TransactionListResponse = response.json();
+
+        // page_start_balance for skip=2 should be balance after skipping Payment (+$100) and Batch 3 (-$15)
+        // Current balance ($1045) - Payment (+$100) - Batch 3 (-$15) = $1045 - $100 + $15 = $960
+        // Wait, that's wrong. Let me recalculate:
+        // page_start_balance = current_balance - sum_of_skipped_items
+        // sum_of_skipped = +$100 (payment) + (-$15) (batch 3) = $85
+        // page_start_balance = $1045 - $85 = $960
+        assert_eq!(
+            page2.page_start_balance,
+            Decimal::from_str("960.0").unwrap(),
+            "Page 2 page_start_balance should be $960 (balance after Payment and Batch 3)"
+        );
+        assert_eq!(page2.data.len(), 2, "Page 2 should have 2 items");
+
+        // First item on page 2 should be Batch 2 ($30 total)
+        assert_eq!(
+            page2.data[0].description,
+            Some("Batch".to_string()),
+            "First item on page 2 should be Batch 2"
+        );
+        assert_eq!(
+            page2.data[0].amount,
+            Decimal::from_str("30.0").unwrap(),
+            "Batch 2 amount should be $30"
+        );
+
+        // Second item on page 2 should be Batch 1 ($10 total)
+        assert_eq!(
+            page2.data[1].description,
+            Some("Batch".to_string()),
+            "Second item on page 2 should be Batch 1"
+        );
+        assert_eq!(
+            page2.data[1].amount,
+            Decimal::from_str("10.0").unwrap(),
+            "Batch 1 amount should be $10"
+        );
+
+        // Test page 3 (skip=4, limit=2): Should show only the Initial grant
+        let response = app
+            .get("/admin/api/v1/transactions?group_batches=true&limit=2&skip=4")
+            .add_header(&add_auth_headers(&user)[0].0, &add_auth_headers(&user)[0].1)
+            .add_header(&add_auth_headers(&user)[1].0, &add_auth_headers(&user)[1].1)
+            .await;
+
+        response.assert_status_ok();
+        let page3: TransactionListResponse = response.json();
+
+        // page_start_balance for skip=4 should be balance after skipping all except the grant
+        // sum_of_skipped = +$100 + (-$15) + (-$30) + (-$10) = $100 - $55 = $45
+        // page_start_balance = $1045 - $45 = $1000
+        assert_eq!(
+            page3.page_start_balance,
+            Decimal::from_str("1000.0").unwrap(),
+            "Page 3 page_start_balance should be $1000 (balance after initial grant only)"
+        );
+        assert_eq!(page3.data.len(), 1, "Page 3 should have 1 item (the initial grant)");
+
+        // The only item should be the initial grant
+        assert_eq!(
+            page3.data[0].description,
+            Some("Initial grant".to_string()),
+            "Only item on page 3 should be the initial grant"
+        );
+        assert_eq!(
+            page3.data[0].amount,
+            Decimal::from_str("1000.0").unwrap(),
+            "Initial grant amount should be $1000"
+        );
+
+        // Verify total count is correct (5 grouped items)
+        assert_eq!(page1.total_count, 5, "Total count should be 5 grouped items");
+    }
+
+    // Test: page_start_balance is calculated correctly when filtering by date range
+    // This is a regression test for the bug where page_start_balance showed current balance
+    // instead of the balance at the end of the filtered date range
+    #[sqlx::test]
+    #[test_log::test]
+    async fn test_page_start_balance_with_date_filter(pool: PgPool) {
+        let (app, _bg_services) = create_test_app(pool.clone(), false).await;
+        let user = create_test_user(&pool, Role::StandardUser).await;
+
+        // Create all transactions with specific timestamps using raw SQL
+        // Initial grant: +$1000 at 5 hours ago (oldest)
+        sqlx::query!(
+            r#"
+            INSERT INTO credits_transactions (user_id, transaction_type, amount, source_id, description, created_at)
+            VALUES ($1, 'admin_grant', $2, $3, $4, NOW() - interval '5 hours')
+            "#,
+            user.id,
+            Decimal::from_str("1000.0").unwrap(),
+            Uuid::new_v4().to_string(),
+            "Initial grant",
+        )
+        .execute(&pool)
+        .await
+        .expect("Failed to create grant");
+
+        // Transaction 1: -$100 at 3 hours ago
+        sqlx::query!(
+            r#"
+            INSERT INTO credits_transactions (user_id, transaction_type, amount, source_id, description, created_at)
+            VALUES ($1, 'usage', $2, $3, $4, NOW() - interval '3 hours')
+            "#,
+            user.id,
+            Decimal::from_str("100.0").unwrap(),
+            Uuid::new_v4().to_string(),
+            "Usage 3 hours ago",
+        )
+        .execute(&pool)
+        .await
+        .expect("Failed to create transaction");
+
+        // Transaction 2: -$50 at 2 hours ago
+        sqlx::query!(
+            r#"
+            INSERT INTO credits_transactions (user_id, transaction_type, amount, source_id, description, created_at)
+            VALUES ($1, 'usage', $2, $3, $4, NOW() - interval '2 hours')
+            "#,
+            user.id,
+            Decimal::from_str("50.0").unwrap(),
+            Uuid::new_v4().to_string(),
+            "Usage 2 hours ago",
+        )
+        .execute(&pool)
+        .await
+        .expect("Failed to create transaction");
+
+        // Transaction 3: -$25 at 1 hour ago
+        sqlx::query!(
+            r#"
+            INSERT INTO credits_transactions (user_id, transaction_type, amount, source_id, description, created_at)
+            VALUES ($1, 'usage', $2, $3, $4, NOW() - interval '1 hour')
+            "#,
+            user.id,
+            Decimal::from_str("25.0").unwrap(),
+            Uuid::new_v4().to_string(),
+            "Usage 1 hour ago",
+        )
+        .execute(&pool)
+        .await
+        .expect("Failed to create transaction");
+
+        // Transaction 4: +$200 at 30 minutes ago (most recent)
+        sqlx::query!(
+            r#"
+            INSERT INTO credits_transactions (user_id, transaction_type, amount, source_id, description, created_at)
+            VALUES ($1, 'purchase', $2, $3, $4, NOW() - interval '30 minutes')
+            "#,
+            user.id,
+            Decimal::from_str("200.0").unwrap(),
+            Uuid::new_v4().to_string(),
+            "Purchase 30 minutes ago",
+        )
+        .execute(&pool)
+        .await
+        .expect("Failed to create transaction");
+
+        // Expected balances:
+        // Initial: $1000
+        // After -$100: $900
+        // After -$50: $850
+        // After -$25: $825
+        // After +$200: $1025 (current balance)
+
+        // Test 1: No date filter - page_start_balance should be current balance ($1025)
+        let response = app
+            .get("/admin/api/v1/transactions?limit=10")
+            .add_header(&add_auth_headers(&user)[0].0, &add_auth_headers(&user)[0].1)
+            .add_header(&add_auth_headers(&user)[1].0, &add_auth_headers(&user)[1].1)
+            .await;
+
+        response.assert_status_ok();
+        let no_filter: TransactionListResponse = response.json();
+        assert_eq!(
+            no_filter.page_start_balance,
+            Decimal::from_str("1025.0").unwrap(),
+            "Without date filter, page_start_balance should be current balance $1025"
+        );
+
+        // Test 2: Filter with end_date = 90 minutes ago (excludes the +$200 purchase and -$25 usage)
+        // Should show transactions from 3 hours ago and 2 hours ago only
+        // Balance at that point: $1000 - $100 - $50 = $850
+        let end_date = (chrono::Utc::now() - chrono::Duration::minutes(90))
+            .format("%Y-%m-%dT%H:%M:%SZ")
+            .to_string();
+        let start_date = (chrono::Utc::now() - chrono::Duration::hours(4))
+            .format("%Y-%m-%dT%H:%M:%SZ")
+            .to_string();
+
+        let response = app
+            .get(&format!(
+                "/admin/api/v1/transactions?limit=10&start_date={}&end_date={}",
+                start_date, end_date
+            ))
+            .add_header(&add_auth_headers(&user)[0].0, &add_auth_headers(&user)[0].1)
+            .add_header(&add_auth_headers(&user)[1].0, &add_auth_headers(&user)[1].1)
+            .await;
+
+        response.assert_status_ok();
+        let date_filtered: TransactionListResponse = response.json();
+
+        // The page_start_balance should be the balance at the end_date point
+        // Current balance ($1025) - transactions after end_date (+$200 - $25 = +$175) = $850
+        assert_eq!(
+            date_filtered.page_start_balance,
+            Decimal::from_str("850.0").unwrap(),
+            "With end_date filter, page_start_balance should be $850 (balance at that time)"
+        );
+
+        // Should only show 2 transactions (the ones within the date range)
+        assert_eq!(date_filtered.data.len(), 2, "Should have 2 transactions in the filtered range");
+
+        // Test 3: Filter with end_date = 2.5 hours ago (excludes everything except the oldest usage)
+        // Balance at that point: $1000 - $100 = $900
+        let end_date_earlier = (chrono::Utc::now() - chrono::Duration::minutes(150))
+            .format("%Y-%m-%dT%H:%M:%SZ")
+            .to_string();
+
+        let response = app
+            .get(&format!(
+                "/admin/api/v1/transactions?limit=10&start_date={}&end_date={}",
+                start_date, end_date_earlier
+            ))
+            .add_header(&add_auth_headers(&user)[0].0, &add_auth_headers(&user)[0].1)
+            .add_header(&add_auth_headers(&user)[1].0, &add_auth_headers(&user)[1].1)
+            .await;
+
+        response.assert_status_ok();
+        let earlier_filtered: TransactionListResponse = response.json();
+
+        // Current balance ($1025) - transactions after end_date (+$200 - $25 - $50 = +$125) = $900
+        assert_eq!(
+            earlier_filtered.page_start_balance,
+            Decimal::from_str("900.0").unwrap(),
+            "With earlier end_date filter, page_start_balance should be $900"
+        );
+
+        assert_eq!(
+            earlier_filtered.data.len(),
+            1,
+            "Should have 1 transaction in the earlier filtered range"
+        );
     }
 }

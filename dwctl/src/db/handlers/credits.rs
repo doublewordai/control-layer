@@ -481,11 +481,13 @@ impl<'c> Credits<'c> {
         Ok(result.count)
     }
 
-    /// Sum the signed amounts of the most recent N transactions for a user.
+    /// Sum the signed amounts of the most recent N transactions for a user within the date-filtered set.
     /// Positive transactions (admin_grant, purchase) are positive, negative (usage, admin_removal) are negative.
     /// This is used to calculate the balance at a specific point in the transaction history.
-    #[instrument(skip(self), fields(user_id = %abbrev_uuid(&user_id), count = count), err)]
-    pub async fn sum_recent_transactions(&mut self, user_id: UserId, count: i64) -> Result<Decimal> {
+    /// Only date filters are applied - search and type filters are excluded since they break
+    /// chronological ordering which the frontend relies on for running balance calculation.
+    #[instrument(skip(self, filters), fields(user_id = %abbrev_uuid(&user_id), count = count), err)]
+    pub async fn sum_recent_transactions(&mut self, user_id: UserId, count: i64, filters: &TransactionFilters) -> Result<Decimal> {
         let result = sqlx::query!(
             r#"
             SELECT COALESCE(SUM(
@@ -495,12 +497,140 @@ impl<'c> Credits<'c> {
                 SELECT transaction_type, amount
                 FROM credits_transactions
                 WHERE user_id = $1
+                  AND ($3::timestamptz IS NULL OR created_at >= $3)
+                  AND ($4::timestamptz IS NULL OR created_at <= $4)
                 ORDER BY seq DESC
                 LIMIT $2
             ) recent
             "#,
             user_id,
-            count
+            count,
+            filters.start_date,
+            filters.end_date,
+        )
+        .fetch_one(&mut *self.db)
+        .await?;
+
+        Ok(result.sum)
+    }
+
+    /// Sum the signed amounts of all transactions after a given date for a user.
+    /// This is used to calculate the balance at a specific point in time when date filtering.
+    #[instrument(skip(self), fields(user_id = %abbrev_uuid(&user_id)), err)]
+    pub async fn sum_transactions_after_date(&mut self, user_id: UserId, after_date: DateTime<Utc>) -> Result<Decimal> {
+        let result = sqlx::query!(
+            r#"
+            SELECT COALESCE(SUM(
+                CASE WHEN transaction_type IN ('admin_grant', 'purchase') THEN amount ELSE -amount END
+            ), 0) as "sum!"
+            FROM credits_transactions
+            WHERE user_id = $1
+              AND created_at > $2
+            "#,
+            user_id,
+            after_date,
+        )
+        .fetch_one(&mut *self.db)
+        .await?;
+
+        Ok(result.sum)
+    }
+
+    /// Sum the signed amounts of all grouped transaction items after a given date for a user.
+    /// This operates on the same grouped view as `list_transactions_with_batches`.
+    #[instrument(skip(self), fields(user_id = %abbrev_uuid(&user_id)), err)]
+    pub async fn sum_transactions_after_date_grouped(&mut self, user_id: UserId, after_date: DateTime<Utc>) -> Result<Decimal> {
+        // First ensure any pending batch transactions are aggregated
+        self.aggregate_user_batches(user_id).await?;
+
+        let result = sqlx::query!(
+            r#"
+            SELECT COALESCE(SUM(signed_amount), 0) as "sum!"
+            FROM (
+                -- Batch aggregates after the date
+                SELECT -ba.total_amount as signed_amount
+                FROM batch_aggregates ba
+                WHERE ba.user_id = $1
+                  AND ba.created_at > $2
+
+                UNION ALL
+
+                -- Non-batched transactions after the date
+                SELECT
+                    CASE WHEN ct.transaction_type IN ('admin_grant', 'purchase')
+                        THEN ct.amount
+                        ELSE -ct.amount
+                    END as signed_amount
+                FROM credits_transactions ct
+                WHERE ct.user_id = $1
+                  AND ct.fusillade_batch_id IS NULL
+                  AND ct.created_at > $2
+            ) after_date
+            "#,
+            user_id,
+            after_date,
+        )
+        .fetch_one(&mut *self.db)
+        .await?;
+
+        Ok(result.sum)
+    }
+
+    /// Sum the signed amounts of the most recent N grouped transaction items for a user.
+    /// This operates on the same grouped view as `list_transactions_with_batches`:
+    /// - Batch aggregates count as single items (with their total_amount)
+    /// - Non-batched transactions count as single items
+    /// This is used to calculate the balance at a specific point when batch grouping is enabled.
+    /// Only date filters are applied - search and type filters are excluded since they break
+    /// chronological ordering which the frontend relies on for running balance calculation.
+    #[instrument(skip(self, filters), fields(user_id = %abbrev_uuid(&user_id), count = count), err)]
+    pub async fn sum_recent_transactions_grouped(&mut self, user_id: UserId, count: i64, filters: &TransactionFilters) -> Result<Decimal> {
+        // First ensure any pending batch transactions are aggregated
+        self.aggregate_user_batches(user_id).await?;
+
+        // Sum from the same UNION view used by list_transactions_with_batches
+        // All batch aggregates are usage type (negative), non-batched follow normal signing rules
+        // Only date filters are applied to maintain chronological ordering for balance calculation.
+        let result = sqlx::query!(
+            r#"
+            SELECT COALESCE(SUM(signed_amount), 0) as "sum!"
+            FROM (
+                SELECT * FROM (
+                    (SELECT
+                        ba.max_seq,
+                        -ba.total_amount as signed_amount
+                    FROM batch_aggregates ba
+                    WHERE ba.user_id = $1
+                      AND ($3::timestamptz IS NULL OR ba.created_at >= $3)
+                      AND ($4::timestamptz IS NULL OR ba.created_at <= $4)
+                    ORDER BY ba.max_seq DESC
+                    LIMIT $2)
+
+                    UNION ALL
+
+                    -- Non-batched transactions
+                    (SELECT
+                        ct.seq as max_seq,
+                        CASE WHEN ct.transaction_type IN ('admin_grant', 'purchase')
+                            THEN ct.amount
+                            ELSE -ct.amount
+                        END as signed_amount
+                    FROM credits_transactions ct
+                    WHERE ct.user_id = $1
+                      AND ct.fusillade_batch_id IS NULL
+                      AND ($3::timestamptz IS NULL OR ct.created_at >= $3)
+                      AND ($4::timestamptz IS NULL OR ct.created_at <= $4)
+                    ORDER BY ct.seq DESC
+                    LIMIT $2)
+                ) combined
+                ORDER BY max_seq DESC
+                LIMIT $2
+            ) recent
+            "#,
+            user_id,            // $1
+            count,              // $2
+            filters.start_date, // $3
+            filters.end_date,   // $4
         )
         .fetch_one(&mut *self.db)
         .await?;
