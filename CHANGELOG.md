@@ -1,5 +1,17 @@
 # Changelog
 
+## [2.1.0](https://github.com/doublewordai/control-layer/compare/v2.0.0...v2.1.0) (2026-01-15)
+
+
+### Features
+
+* trigger deployment on release ([#538](https://github.com/doublewordai/control-layer/issues/538)) ([0a43fe5](https://github.com/doublewordai/control-layer/commit/0a43fe5332b08725fe8f7e8d85d8d95aa33b71ee))
+
+
+### Bug Fixes
+
+* **dashboard:** pass is_composite filter to models API ([#536](https://github.com/doublewordai/control-layer/issues/536)) ([1ae2181](https://github.com/doublewordai/control-layer/commit/1ae2181be23913cc1710dcd03ad91d4801ec069c))
+
 ## [2.0.0](https://github.com/doublewordai/control-layer/compare/v1.3.0...v2.0.0) (2026-01-15)
 
 
