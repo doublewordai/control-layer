@@ -235,6 +235,8 @@ const modelApi = {
     if (options?.accessible !== undefined)
       params.set("accessible", options.accessible.toString());
     if (options?.search) params.set("search", options.search);
+    if (options?.is_composite !== undefined)
+      params.set("is_composite", options.is_composite.toString());
 
     const url = `/admin/api/v1/models${params.toString() ? "?" + params.toString() : ""}`;
     const response = await fetch(url);
