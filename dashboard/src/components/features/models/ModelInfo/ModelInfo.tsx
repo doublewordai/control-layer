@@ -116,6 +116,7 @@ const ModelInfo: React.FC = () => {
     description: "",
     model_type: "" as "CHAT" | "EMBEDDINGS" | "",
     capabilities: [] as string[],
+    sanitize_responses: false,
     requests_per_second: null as number | null,
     burst_size: null as number | null,
     capacity: null as number | null,
@@ -186,6 +187,7 @@ const ModelInfo: React.FC = () => {
         description: model.description || "",
         model_type: effectiveType as "CHAT" | "EMBEDDINGS",
         capabilities: model.capabilities || [],
+        sanitize_responses: model.sanitize_responses ?? false,
         requests_per_second: model.requests_per_second || null,
         burst_size: model.burst_size || null,
         capacity: model.capacity || null,
@@ -216,6 +218,7 @@ const ModelInfo: React.FC = () => {
               ? null
               : (updateData.model_type as "CHAT" | "EMBEDDINGS"),
           capabilities: updateData.capabilities,
+          sanitize_responses: updateData.sanitize_responses,
           // Always include rate limiting and capacity fields to handle clearing properly
           // Send null as the actual value when clearing (not undefined)
           requests_per_second: updateData.requests_per_second,
@@ -243,6 +246,7 @@ const ModelInfo: React.FC = () => {
         description: model.description || "",
         model_type: effectiveType as "CHAT" | "EMBEDDINGS",
         capabilities: model.capabilities || [],
+        sanitize_responses: model.sanitize_responses ?? false,
         requests_per_second: model.requests_per_second || null,
         burst_size: model.burst_size || null,
         capacity: model.capacity || null,
@@ -619,52 +623,106 @@ const ModelInfo: React.FC = () => {
                               Capabilities
                             </label>
                           </div>
-                          <div className="flex items-center space-x-2">
-                            <input
-                              type="checkbox"
-                              id="vision-capability"
-                              checked={
-                                updateData.capabilities?.includes("vision") ??
-                                false
-                              }
-                              onChange={(e) => {
-                                const newCapabilities = e.target.checked
-                                  ? [
-                                      ...(updateData.capabilities || []),
-                                      "vision",
-                                    ]
-                                  : (updateData.capabilities || []).filter(
-                                      (c) => c !== "vision",
-                                    );
-                                setUpdateData((prev) => ({
-                                  ...prev,
-                                  capabilities: newCapabilities,
-                                }));
-                              }}
-                              className="h-4 w-4 rounded border-gray-300 text-blue-600 focus:ring-blue-500"
-                            />
-                            <label
-                              htmlFor="vision-capability"
-                              className="text-sm font-medium leading-none peer-disabled:cursor-not-allowed peer-disabled:opacity-70 flex items-center gap-1"
-                            >
-                              Vision
-                              <HoverCard openDelay={100} closeDelay={50}>
-                                <HoverCardTrigger asChild>
-                                  <Info className="h-3 w-3 text-gray-400 hover:text-gray-600" />
-                                </HoverCardTrigger>
-                                <HoverCardContent
-                                  className="w-80"
-                                  sideOffset={5}
-                                >
-                                  <p className="text-sm text-muted-foreground">
-                                    Enables image upload in the playground.
-                                  </p>
-                                </HoverCardContent>
-                              </HoverCard>
-                            </label>
+                          <div className="space-y-2">
+                            <div className="flex items-center space-x-2">
+                              <input
+                                type="checkbox"
+                                id="vision-capability"
+                                checked={
+                                  updateData.capabilities?.includes("vision") ??
+                                  false
+                                }
+                                onChange={(e) => {
+                                  const newCapabilities = e.target.checked
+                                    ? [
+                                        ...(updateData.capabilities || []),
+                                        "vision",
+                                      ]
+                                    : (updateData.capabilities || []).filter(
+                                        (c) => c !== "vision",
+                                      );
+                                  setUpdateData((prev) => ({
+                                    ...prev,
+                                    capabilities: newCapabilities,
+                                  }));
+                                }}
+                                className="h-4 w-4 rounded border-gray-300 text-blue-600 focus:ring-blue-500"
+                              />
+                              <label
+                                htmlFor="vision-capability"
+                                className="text-sm font-medium leading-none peer-disabled:cursor-not-allowed peer-disabled:opacity-70 flex items-center gap-1"
+                              >
+                                Vision
+                                <HoverCard openDelay={100} closeDelay={50}>
+                                  <HoverCardTrigger asChild>
+                                    <Info className="h-3 w-3 text-gray-400 hover:text-gray-600" />
+                                  </HoverCardTrigger>
+                                  <HoverCardContent
+                                    className="w-80"
+                                    sideOffset={5}
+                                  >
+                                    <p className="text-sm text-muted-foreground">
+                                      Enables image upload in the playground.
+                                    </p>
+                                  </HoverCardContent>
+                                </HoverCard>
+                              </label>
+                            </div>
                           </div>
                         </div>
                       )}
+
+                      {/* Response Configuration Section */}
+                      <div className="border-t pt-4">
+                        <div className="flex items-center gap-1 mb-3">
+                          <label className="text-sm text-gray-600 font-medium">
+                            Response Configuration
+                          </label>
+                          <HoverCard openDelay={100} closeDelay={50}>
+                            <HoverCardTrigger asChild>
+                              <Info className="h-3 w-3 text-gray-400 hover:text-gray-600" />
+                            </HoverCardTrigger>
+                            <HoverCardContent className="w-80" sideOffset={5}>
+                              <p className="text-sm text-muted-foreground">
+                                Configure how responses from this model are processed before being returned to clients.
+                              </p>
+                            </HoverCardContent>
+                          </HoverCard>
+                        </div>
+                        <div className="flex items-center space-x-2">
+                          <input
+                            type="checkbox"
+                            id="sanitize-responses"
+                            checked={updateData.sanitize_responses ?? false}
+                            onChange={(e) => {
+                              setUpdateData((prev) => ({
+                                ...prev,
+                                sanitize_responses: e.target.checked,
+                              }));
+                            }}
+                            className="h-4 w-4 rounded border-gray-300 text-blue-600 focus:ring-blue-500"
+                          />
+                          <label
+                            htmlFor="sanitize-responses"
+                            className="text-sm font-medium leading-none peer-disabled:cursor-not-allowed peer-disabled:opacity-70 flex items-center gap-1"
+                          >
+                            Sanitize Responses
+                            <HoverCard openDelay={100} closeDelay={50}>
+                              <HoverCardTrigger asChild>
+                                <Info className="h-3 w-3 text-gray-400 hover:text-gray-600" />
+                              </HoverCardTrigger>
+                              <HoverCardContent
+                                className="w-80"
+                                sideOffset={5}
+                              >
+                                <p className="text-sm text-muted-foreground">
+                                  Filter out third-party provider fields from OpenAI compatible responses to ensure clean, standardized API responses.
+                                </p>
+                              </HoverCardContent>
+                            </HoverCard>
+                          </label>
+                        </div>
+                      </div>
 
                       {/* Rate Limiting Section */}
                       <div className="border-t pt-4">
@@ -1033,57 +1091,61 @@ const ModelInfo: React.FC = () => {
                                 Capabilities
                               </p>
                             </div>
-                            <div className="flex items-center space-x-2">
-                              <input
-                                type="checkbox"
-                                id="vision-capability-readonly"
-                                checked={
-                                  model.capabilities?.includes("vision") ??
-                                  false
-                                }
-                                onChange={async (e) => {
-                                  const newCapabilities = e.target.checked
-                                    ? [...(model.capabilities || []), "vision"]
-                                    : (model.capabilities || []).filter(
-                                        (c) => c !== "vision",
-                                      );
+                            <div className="space-y-3">
+                              <div className="flex items-center justify-between">
+                                <div className="flex items-center space-x-2">
+                                  <input
+                                    type="checkbox"
+                                    id="vision-capability-readonly"
+                                    checked={
+                                      model.capabilities?.includes("vision") ??
+                                      false
+                                    }
+                                    onChange={async (e) => {
+                                      const newCapabilities = e.target.checked
+                                        ? [...(model.capabilities || []), "vision"]
+                                        : (model.capabilities || []).filter(
+                                            (c) => c !== "vision",
+                                          );
 
-                                  try {
-                                    await updateModelMutation.mutateAsync({
-                                      id: model.id,
-                                      data: {
-                                        capabilities: newCapabilities,
-                                      },
-                                    });
-                                  } catch (error) {
-                                    console.error(
-                                      "Failed to update capabilities:",
-                                      error,
-                                    );
-                                  }
-                                }}
-                                disabled={updateModelMutation.isPending}
-                                className="h-4 w-4 rounded border-gray-300 text-blue-600 focus:ring-blue-500 disabled:opacity-50"
-                              />
-                              <label
-                                htmlFor="vision-capability-readonly"
-                                className="text-sm font-medium leading-none peer-disabled:cursor-not-allowed peer-disabled:opacity-70 flex items-center gap-1"
-                              >
-                                Vision
-                                <HoverCard openDelay={100} closeDelay={50}>
-                                  <HoverCardTrigger asChild>
-                                    <Info className="h-3 w-3 text-gray-400 hover:text-gray-600" />
-                                  </HoverCardTrigger>
-                                  <HoverCardContent
-                                    className="w-80"
-                                    sideOffset={5}
+                                      try {
+                                        await updateModelMutation.mutateAsync({
+                                          id: model.id,
+                                          data: {
+                                            capabilities: newCapabilities,
+                                          },
+                                        });
+                                      } catch (error) {
+                                        console.error(
+                                          "Failed to update capabilities:",
+                                          error,
+                                        );
+                                      }
+                                    }}
+                                    disabled={updateModelMutation.isPending}
+                                    className="h-4 w-4 rounded border-gray-300 text-blue-600 focus:ring-blue-500 disabled:opacity-50"
+                                  />
+                                  <label
+                                    htmlFor="vision-capability-readonly"
+                                    className="text-sm font-medium leading-none peer-disabled:cursor-not-allowed peer-disabled:opacity-70 flex items-center gap-1"
                                   >
-                                    <p className="text-sm text-muted-foreground">
-                                      Enables image upload in the playground.
-                                    </p>
-                                  </HoverCardContent>
-                                </HoverCard>
-                              </label>
+                                    Vision
+                                    <HoverCard openDelay={100} closeDelay={50}>
+                                      <HoverCardTrigger asChild>
+                                        <Info className="h-3 w-3 text-gray-400 hover:text-gray-600" />
+                                      </HoverCardTrigger>
+                                      <HoverCardContent
+                                        className="w-80"
+                                        sideOffset={5}
+                                      >
+                                        <p className="text-sm text-muted-foreground">
+                                          Enables image upload in the playground.
+                                        </p>
+                                      </HoverCardContent>
+                                    </HoverCard>
+                                  </label>
+                                </div>
+                              </div>
                             </div>
                           </div>
                         )}

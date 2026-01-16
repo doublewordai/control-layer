@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "\n        SELECT\n            cm.id as composite_model_id,\n            cm.alias,\n            cm.requests_per_second,\n            cm.burst_size,\n            cm.capacity,\n            cm.lb_strategy,\n            cm.fallback_enabled,\n            cm.fallback_on_rate_limit,\n            cm.fallback_on_status,\n            -- Component info\n            dmc.deployed_model_id,\n            dmc.weight,\n            -- Underlying deployment info\n            dm.model_name,\n            dm.alias as deployment_alias,\n            dm.requests_per_second as deployment_requests_per_second,\n            dm.burst_size as deployment_burst_size,\n            dm.capacity as deployment_capacity,\n            -- Endpoint info\n            ie.url as \"endpoint_url!\",\n            ie.api_key as endpoint_api_key,\n            ie.auth_header_name,\n            ie.auth_header_prefix\n        FROM deployed_models cm\n        INNER JOIN deployed_model_components dmc ON cm.id = dmc.composite_model_id\n        INNER JOIN deployed_models dm ON dmc.deployed_model_id = dm.id\n        INNER JOIN inference_endpoints ie ON dm.hosted_on = ie.id\n        WHERE cm.is_composite = TRUE\n          AND cm.deleted = FALSE\n          AND dmc.enabled = TRUE\n          AND dm.deleted = FALSE\n        ORDER BY cm.id, dmc.sort_order ASC\n        ",
+  "query": "\n        SELECT\n            cm.id as composite_model_id,\n            cm.alias,\n            cm.requests_per_second,\n            cm.burst_size,\n            cm.capacity,\n            cm.lb_strategy,\n            cm.fallback_enabled,\n            cm.fallback_on_rate_limit,\n            cm.fallback_on_status,\n            cm.sanitize_responses as composite_sanitize_responses,\n            -- Component info\n            dmc.deployed_model_id,\n            dmc.weight,\n            -- Underlying deployment info\n            dm.model_name,\n            dm.alias as deployment_alias,\n            dm.requests_per_second as deployment_requests_per_second,\n            dm.burst_size as deployment_burst_size,\n            dm.capacity as deployment_capacity,\n            dm.sanitize_responses as deployment_sanitize_responses,\n            -- Endpoint info\n            ie.url as \"endpoint_url!\",\n            ie.api_key as endpoint_api_key,\n            ie.auth_header_name,\n            ie.auth_header_prefix\n        FROM deployed_models cm\n        INNER JOIN deployed_model_components dmc ON cm.id = dmc.composite_model_id\n        INNER JOIN deployed_models dm ON dmc.deployed_model_id = dm.id\n        INNER JOIN inference_endpoints ie ON dm.hosted_on = ie.id\n        WHERE cm.is_composite = TRUE\n          AND cm.deleted = FALSE\n          AND dmc.enabled = TRUE\n          AND dm.deleted = FALSE\n        ORDER BY cm.id, dmc.sort_order ASC\n        ",
   "describe": {
     "columns": [
       {
@@ -50,56 +50,66 @@
       },
       {
         "ordinal": 9,
+        "name": "composite_sanitize_responses",
+        "type_info": "Bool"
+      },
+      {
+        "ordinal": 10,
         "name": "deployed_model_id",
         "type_info": "Uuid"
       },
       {
-        "ordinal": 10,
+        "ordinal": 11,
         "name": "weight",
         "type_info": "Int4"
       },
       {
-        "ordinal": 11,
+        "ordinal": 12,
         "name": "model_name",
         "type_info": "Varchar"
       },
       {
-        "ordinal": 12,
+        "ordinal": 13,
         "name": "deployment_alias",
         "type_info": "Varchar"
       },
       {
-        "ordinal": 13,
+        "ordinal": 14,
         "name": "deployment_requests_per_second",
         "type_info": "Float4"
       },
       {
-        "ordinal": 14,
+        "ordinal": 15,
         "name": "deployment_burst_size",
         "type_info": "Int4"
       },
       {
-        "ordinal": 15,
+        "ordinal": 16,
         "name": "deployment_capacity",
         "type_info": "Int4"
       },
       {
-        "ordinal": 16,
+        "ordinal": 17,
+        "name": "deployment_sanitize_responses",
+        "type_info": "Bool"
+      },
+      {
+        "ordinal": 18,
         "name": "endpoint_url!",
         "type_info": "Varchar"
       },
       {
-        "ordinal": 17,
+        "ordinal": 19,
         "name": "endpoint_api_key",
         "type_info": "Text"
       },
       {
-        "ordinal": 18,
+        "ordinal": 20,
         "name": "auth_header_name",
         "type_info": "Varchar"
       },
       {
-        "ordinal": 19,
+        "ordinal": 21,
         "name": "auth_header_prefix",
         "type_info": "Varchar"
       }
@@ -121,14 +131,16 @@
       false,
       false,
       false,
+      false,
       true,
       true,
       true,
+      false,
       false,
       true,
       false,
       false
     ]
   },
-  "hash": "1a3a2ea4845809a30b1d4ae0f367aca3ca6c8593261ee9aa872e9798d60534bc"
+  "hash": "2a08896da893c6aaf6310f0d2ad5da32b69867ddff8b57ca0b8d23c4e10404a1"
 }

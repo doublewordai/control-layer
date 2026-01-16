@@ -149,6 +149,7 @@ export interface Model {
   lb_strategy?: LoadBalancingStrategy | null;
   fallback?: FallbackConfig | null;
   components?: ModelComponent[]; // only present when include=components
+  sanitize_responses?: boolean | null; // only present for virtual models
 }
 
 // Model creation types - discriminated union with "type" field
@@ -183,6 +184,7 @@ export interface VirtualModelCreate {
   fallback_enabled?: boolean;
   fallback_on_rate_limit?: boolean;
   fallback_on_status?: number[];
+  sanitize_responses?: boolean;
 }
 
 // Backwards compatibility alias
@@ -358,6 +360,7 @@ export interface ModelUpdateRequest {
   fallback_enabled?: boolean | null;
   fallback_on_rate_limit?: boolean | null;
   fallback_on_status?: number[] | null;
+  sanitize_responses?: boolean | null;
 }
 
 // Endpoint-specific types

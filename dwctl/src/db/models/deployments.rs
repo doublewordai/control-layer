@@ -381,6 +381,9 @@ pub struct DeploymentCreateDBRequest {
     pub fallback_enabled: Option<bool>,
     pub fallback_on_rate_limit: Option<bool>,
     pub fallback_on_status: Option<Vec<i32>>,
+    /// Whether to sanitize/filter sensitive data from model responses (defaults to true)
+    #[builder(default = true)]
+    pub sanitize_responses: bool,
 }
 
 impl DeploymentCreateDBRequest {
@@ -418,6 +421,7 @@ impl DeploymentCreateDBRequest {
                 .fallback_enabled(composite.fallback_enabled)
                 .fallback_on_rate_limit(composite.fallback_on_rate_limit)
                 .fallback_on_status(composite.fallback_on_status)
+                .sanitize_responses(composite.sanitize_responses)
                 .build(),
         }
     }
@@ -445,6 +449,8 @@ pub struct DeploymentUpdateDBRequest {
     pub fallback_enabled: Option<bool>,
     pub fallback_on_rate_limit: Option<bool>,
     pub fallback_on_status: Option<Vec<i32>>,
+    /// Whether to sanitize/filter sensitive data from model responses
+    pub sanitize_responses: Option<bool>,
 }
 
 impl From<DeployedModelUpdate> for DeploymentUpdateDBRequest {
@@ -463,6 +469,7 @@ impl From<DeployedModelUpdate> for DeploymentUpdateDBRequest {
             .maybe_fallback_enabled(update.fallback_enabled)
             .maybe_fallback_on_rate_limit(update.fallback_on_rate_limit)
             .maybe_fallback_on_status(update.fallback_on_status)
+            .maybe_sanitize_responses(update.sanitize_responses)
             .build()
     }
 }
@@ -517,4 +524,6 @@ pub struct DeploymentDBResponse {
     pub fallback_enabled: bool,
     pub fallback_on_rate_limit: bool,
     pub fallback_on_status: Vec<i32>,
+    /// Whether to sanitize/filter sensitive data from model responses
+    pub sanitize_responses: bool,
 }

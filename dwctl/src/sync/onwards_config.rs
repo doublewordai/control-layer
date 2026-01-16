@@ -55,6 +55,7 @@ struct OnwardsTarget {
     requests_per_second: Option<f32>,
     burst_size: Option<i32>,
     capacity: Option<i32>,
+    sanitize_responses: bool,
 
     // Endpoint info
     endpoint_url: url::Url,
@@ -293,6 +294,8 @@ struct OnwardsCompositeModel {
     fallback_on_rate_limit: bool,
     /// HTTP status codes that trigger fallback
     fallback_on_status: Vec<i32>,
+    /// Whether to sanitize/filter sensitive data from model responses
+    sanitize_responses: bool,
     components: Vec<CompositeModelComponent>,
     // API keys that have access to this composite model
     api_keys: Vec<OnwardsApiKey>,
@@ -316,6 +319,7 @@ async fn load_composite_models_from_db(db: &PgPool) -> Result<Vec<OnwardsComposi
             cm.fallback_enabled,
             cm.fallback_on_rate_limit,
             cm.fallback_on_status,
+            cm.sanitize_responses as composite_sanitize_responses,
             -- Component info
             dmc.deployed_model_id,
             dmc.weight,
@@ -325,6 +329,7 @@ async fn load_composite_models_from_db(db: &PgPool) -> Result<Vec<OnwardsComposi
             dm.requests_per_second as deployment_requests_per_second,
             dm.burst_size as deployment_burst_size,
             dm.capacity as deployment_capacity,
+            dm.sanitize_responses as deployment_sanitize_responses,
             -- Endpoint info
             ie.url as "endpoint_url!",
             ie.api_key as endpoint_api_key,
@@ -445,6 +450,7 @@ async fn load_composite_models_from_db(db: &PgPool) -> Result<Vec<OnwardsComposi
                 fallback_enabled: row.fallback_enabled.unwrap_or(true),
                 fallback_on_rate_limit: row.fallback_on_rate_limit.unwrap_or(true),
                 fallback_on_status: row.fallback_on_status.clone().unwrap_or_else(|| vec![429, 500, 502, 503, 504]),
+                sanitize_responses: row.composite_sanitize_responses,
                 components: Vec::new(),
                 api_keys: Vec::new(),
             }
@@ -458,6 +464,7 @@ async fn load_composite_models_from_db(db: &PgPool) -> Result<Vec<OnwardsComposi
                 requests_per_second: row.deployment_requests_per_second,
                 burst_size: row.deployment_burst_size,
                 capacity: row.deployment_capacity,
+                sanitize_responses: row.deployment_sanitize_responses,
                 endpoint_url,
                 endpoint_api_key: row.endpoint_api_key.clone(),
                 auth_header_name: row.auth_header_name.clone(),
@@ -602,34 +609,44 @@ fn convert_composite_to_target_spec(
                 max_concurrent_requests: capacity as usize,
             });
 
-            ProviderSpec {
-                url: target.endpoint_url.clone(),
-                onwards_key: target.endpoint_api_key.clone(),
-                onwards_model: Some(target.model_name.clone()),
-                weight: component.weight.max(1) as u32,
-                rate_limit: provider_rate_limit,
-                concurrency_limit: provider_concurrency_limit,
-                upstream_auth_header_name: if target.auth_header_name != "Authorization" {
-                    Some(target.auth_header_name.clone())
-                } else {
-                    None
-                },
-                upstream_auth_header_prefix: if target.auth_header_prefix != "Bearer " {
-                    Some(target.auth_header_prefix.clone())
-                } else {
-                    None
-                },
-                response_headers: None,
+            {
+                debug!(
+                    "  Provider '{}' ({}): weight={}, sanitize_response={}",
+                    target.alias, target.model_name, component.weight, composite.sanitize_responses
+                );
+                ProviderSpec {
+                    url: target.endpoint_url.clone(),
+                    onwards_key: target.endpoint_api_key.clone(),
+                    onwards_model: Some(target.model_name.clone()),
+                    weight: component.weight.max(1) as u32,
+                    rate_limit: provider_rate_limit,
+                    concurrency_limit: provider_concurrency_limit,
+                    upstream_auth_header_name: if target.auth_header_name != "Authorization" {
+                        Some(target.auth_header_name.clone())
+                    } else {
+                        None
+                    },
+                    upstream_auth_header_prefix: if target.auth_header_prefix != "Bearer " {
+                        Some(target.auth_header_prefix.clone())
+                    } else {
+                        None
+                    },
+                    response_headers: None,
+                    // For composite models, use the composite model's sanitize_responses setting
+                    // This ensures the virtual model's toggle controls all providers
+                    sanitize_response: composite.sanitize_responses,
+                }
             }
         })
         .collect();
 
     debug!(
-        "Composite model '{}' configured with {} providers, strategy: {:?}, fallback: {}",
+        "Composite model '{}' configured with {} providers, strategy: {:?}, fallback: {}, sanitize_responses: {}",
         composite.alias,
         providers.len(),
         strategy,
-        composite.fallback_enabled
+        composite.fallback_enabled,
+        composite.sanitize_responses
     );
 
     // Create PoolSpec with weighted providers
@@ -641,6 +658,7 @@ fn convert_composite_to_target_spec(
         strategy,
         providers,
         response_headers: None,
+        sanitize_response: composite.sanitize_responses,
     };
 
     (composite.alias.clone(), TargetSpecOrList::Pool(pool_spec))
@@ -723,6 +741,7 @@ fn convert_to_config_file(targets: Vec<OnwardsTarget>, composites: Vec<OnwardsCo
                 upstream_auth_header_prefix,
                 response_headers: None,
                 weight: 1, // Default weight for single-provider targets
+                sanitize_response: target.sanitize_responses,
             };
 
             (target.alias, TargetSpecOrList::Single(target_spec))
@@ -789,6 +808,7 @@ pub async fn load_targets_from_db(db: &PgPool) -> Result<Targets, anyhow::Error>
             dm.requests_per_second as deployment_requests_per_second,
             dm.burst_size as deployment_burst_size,
             dm.capacity,
+            dm.sanitize_responses,
             ie.id as endpoint_id,
             ie.url as "endpoint_url!",
             ie.api_key as endpoint_api_key,
@@ -862,6 +882,7 @@ pub async fn load_targets_from_db(db: &PgPool) -> Result<Targets, anyhow::Error>
             requests_per_second: row.deployment_requests_per_second,
             burst_size: row.deployment_burst_size,
             capacity: row.capacity,
+            sanitize_responses: row.sanitize_responses,
             endpoint_url: url::Url::parse(&row.endpoint_url).expect("Invalid URL in database"),
             endpoint_api_key: row.endpoint_api_key.clone(),
             auth_header_name: row.auth_header_name.clone(),
@@ -943,6 +964,7 @@ mod tests {
             requests_per_second: None,
             burst_size: None,
             capacity: None,
+            sanitize_responses: true,
             endpoint_url: url::Url::parse(endpoint_url).unwrap(),
             endpoint_api_key: None,
             auth_header_name: "Authorization".to_string(),
@@ -1093,6 +1115,7 @@ mod tests {
                 fallback_enabled: None,
                 fallback_on_rate_limit: None,
                 fallback_on_status: None,
+                sanitize_responses: true,
             })
             .await
             .unwrap();

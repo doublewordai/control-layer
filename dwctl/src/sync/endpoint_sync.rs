@@ -745,6 +745,7 @@ mod tests {
                 fallback_enabled: true,
                 fallback_on_rate_limit: true,
                 fallback_on_status: vec![429, 500, 502, 503, 504],
+                sanitize_responses: true,
             }
         }
     }
