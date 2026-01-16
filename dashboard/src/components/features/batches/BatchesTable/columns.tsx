@@ -31,6 +31,8 @@ interface ColumnActions {
   getInputFile: (batch: Batch) => any | undefined;
   onRowClick?: (batch: Batch) => void;
   batchAnalytics?: Map<string, BatchAnalytics>;
+  /** Show the User column (only for PlatformManagers who see all batches) */
+  showUserColumn?: boolean;
 }
 
 const getStatusIcon = (status: BatchStatus) => {
@@ -73,6 +75,28 @@ const getStatusColor = (status: BatchStatus) => {
   }
 };
 
+const userColumn: ColumnDef<Batch> = {
+  id: "user",
+  header: "User",
+  cell: ({ row }) => {
+    const batch = row.original as Batch;
+    const email = batch.metadata?.created_by_email;
+    if (!email) {
+      return <span className="text-gray-400">-</span>;
+    }
+    return (
+      <Tooltip delayDuration={300}>
+        <TooltipTrigger asChild>
+          <span className="text-sm text-gray-700 truncate max-w-[120px] block cursor-default">
+            {email}
+          </span>
+        </TooltipTrigger>
+        <TooltipContent>{email}</TooltipContent>
+      </Tooltip>
+    );
+  },
+};
+
 export const createBatchColumns = (
   actions: ColumnActions,
 ): ColumnDef<Batch>[] => [
@@ -98,27 +122,7 @@ export const createBatchColumns = (
       );
     },
   },
-  {
-    id: "user",
-    header: "User",
-    cell: ({ row }) => {
-      const batch = row.original as Batch;
-      const email = batch.metadata?.created_by_email;
-      if (!email) {
-        return <span className="text-gray-400">-</span>;
-      }
-      return (
-        <Tooltip delayDuration={300}>
-          <TooltipTrigger asChild>
-            <span className="text-sm text-gray-700 truncate max-w-[120px] block cursor-default">
-              {email}
-            </span>
-          </TooltipTrigger>
-          <TooltipContent>{email}</TooltipContent>
-        </Tooltip>
-      );
-    },
-  },
+  ...(actions.showUserColumn ? [userColumn] : []),
   {
     id: "input_file",
     header: "Input File ID",

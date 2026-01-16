@@ -21,6 +21,22 @@ vi.mock("../../../../api/control-layer/hooks", () => ({
     isLoading: false,
     error: null,
   })),
+  // Required by useAuthorization
+  useUser: vi.fn(() => ({
+    data: { roles: ["PlatformManager"] },
+    isLoading: false,
+  })),
+}));
+
+// Mock authorization hook
+vi.mock("../../../../utils/authorization", () => ({
+  useAuthorization: vi.fn(() => ({
+    userRoles: ["PlatformManager"],
+    isLoading: false,
+    hasPermission: () => true,
+    canAccessRoute: () => true,
+    getFirstAccessibleRoute: () => "/batches",
+  })),
 }));
 
 // Mock the modals
