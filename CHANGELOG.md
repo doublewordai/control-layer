@@ -1,5 +1,12 @@
 # Changelog
 
+## [2.1.1](https://github.com/doublewordai/control-layer/compare/v2.1.0...v2.1.1) (2026-01-16)
+
+
+### Bug Fixes
+
+* use exact alias match for tariff lookup ([#544](https://github.com/doublewordai/control-layer/issues/544)) ([5a568de](https://github.com/doublewordai/control-layer/commit/5a568deab85422b1f587de51e013e593060ccd96))
+
 ## [2.1.0](https://github.com/doublewordai/control-layer/compare/v2.0.0...v2.1.0) (2026-01-15)
 
 
