@@ -50,7 +50,7 @@ export const CreateVirtualModelModal: React.FC<CreateVirtualModelModalProps> = (
     fallback_enabled: true,
     fallback_on_rate_limit: true,
     fallback_on_status: DEFAULT_FALLBACK_STATUS_CODES,
-    sanitize_responses: true,
+    sanitize_responses: false,
   });
   const [error, setError] = useState<string | null>(null);
 
@@ -68,7 +68,7 @@ export const CreateVirtualModelModal: React.FC<CreateVirtualModelModalProps> = (
         fallback_enabled: true,
         fallback_on_rate_limit: true,
         fallback_on_status: DEFAULT_FALLBACK_STATUS_CODES,
-        sanitize_responses: true,
+        sanitize_responses: false,
       });
       setError(null);
     }

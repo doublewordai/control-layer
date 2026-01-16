@@ -168,8 +168,8 @@ pub struct CompositeModelCreate {
     /// HTTP status codes that trigger fallback (defaults to [500, 502, 503, 504])
     #[serde(default = "default_fallback_statuses")]
     pub fallback_on_status: Vec<i32>,
-    /// Whether to sanitize/filter sensitive data from model responses (defaults to true)
-    #[serde(default = "default_true")]
+    /// Whether to sanitize/filter sensitive data from model responses (defaults to false)
+    #[serde(default)]
     pub sanitize_responses: bool,
 }
 
