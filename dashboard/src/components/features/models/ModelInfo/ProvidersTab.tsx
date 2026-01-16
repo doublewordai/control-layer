@@ -651,7 +651,6 @@ const EditRoutingModal: React.FC<{
     setFallbackOn5xx(
       model.fallback?.on_status?.some((s) => s >= 500 && s < 600) ?? false
     );
-    setSanitizeResponses(model.sanitize_responses ?? true);
   }, [model]);
 
   const handleSubmit = async () => {
@@ -834,7 +833,6 @@ export const ProvidersTab: React.FC<ProvidersTabProps> = ({
 
   const updateComponentMutation = useUpdateModelComponent();
   const removeMutation = useRemoveModelComponent();
-  const updateModelMutation = useUpdateModel();
 
   const isPriorityMode = model.lb_strategy === "priority";
 

@@ -910,11 +910,7 @@ pub async fn load_targets_from_db(db: &PgPool) -> Result<Targets, anyhow::Error>
     let config = convert_to_config_file(targets, composites);
 
     // Convert ConfigFile to Targets
-    let t = Targets::from_config(config);
-    if let Ok(ref onwards_config) = t {
-        info!("Converted database targets to Onwards Targets successfully: {:?}", onwards_config);
-    }
-    t
+    Targets::from_config(config)
 }
 
 /// Updates the daemon capacity limits DashMap with batch_capacity values from deployed_models
