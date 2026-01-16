@@ -50,6 +50,7 @@ export const CreateVirtualModelModal: React.FC<CreateVirtualModelModalProps> = (
     fallback_enabled: true,
     fallback_on_rate_limit: true,
     fallback_on_status: DEFAULT_FALLBACK_STATUS_CODES,
+    sanitize_responses: false,
   });
   const [error, setError] = useState<string | null>(null);
 
@@ -67,6 +68,7 @@ export const CreateVirtualModelModal: React.FC<CreateVirtualModelModalProps> = (
         fallback_enabled: true,
         fallback_on_rate_limit: true,
         fallback_on_status: DEFAULT_FALLBACK_STATUS_CODES,
+        sanitize_responses: false,
       });
       setError(null);
     }
@@ -91,6 +93,7 @@ export const CreateVirtualModelModal: React.FC<CreateVirtualModelModalProps> = (
       fallback_enabled: formData.fallback_enabled,
       fallback_on_rate_limit: formData.fallback_on_rate_limit,
       fallback_on_status: formData.fallback_on_status,
+      sanitize_responses: formData.sanitize_responses,
     };
 
     try {
@@ -230,6 +233,21 @@ export const CreateVirtualModelModal: React.FC<CreateVirtualModelModalProps> = (
                 ? "Distributes traffic across hosted models based on their weights"
                 : "Routes to highest-weight hosted model first, failing over to next"}
             </p>
+          </div>
+
+          {/* Response Sanitization */}
+          <div className="flex items-center space-x-2">
+            <Checkbox
+              id="sanitize_responses"
+              checked={formData.sanitize_responses}
+              onCheckedChange={(checked) =>
+                setFormData({ ...formData, sanitize_responses: !!checked })
+              }
+              disabled={createModelMutation.isPending}
+            />
+            <Label htmlFor="sanitize_responses" className="font-normal">
+              Sanitize responses (filter out third party fields from OpenAI compatible responses)
+            </Label>
           </div>
 
           {/* Fallback Settings */}

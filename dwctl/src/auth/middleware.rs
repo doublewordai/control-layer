@@ -46,7 +46,7 @@ pub(crate) async fn admin_ai_proxy(state: AppState, mut request: Request) -> Res
     };
 
     // Extract the model name from the request using the shared function
-    let model_name = onwards::extract_model_from_request(request.headers(), &body_bytes).map_err(|_| Error::BadRequest {
+    let model_name = onwards::extract_model_from_request(request.headers(), &body_bytes).ok_or(Error::BadRequest {
         message: "Could not extract model from request".to_string(),
     })?;
 
