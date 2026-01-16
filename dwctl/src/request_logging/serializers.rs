@@ -445,8 +445,7 @@ pub async fn store_analytics_record(
                 ie.url as "provider_url?"
             FROM deployed_models dm
             LEFT JOIN inference_endpoints ie ON dm.hosted_on = ie.id
-            WHERE dm.alias = $1 OR dm.model_name = $1
-            LIMIT 1
+            WHERE dm.alias = $1
             "#,
             model_name
         )
@@ -1806,6 +1805,7 @@ mod tests {
                     fallback_enabled: None,
                     fallback_on_rate_limit: None,
                     fallback_on_status: None,
+                    sanitize_responses: true,
                 })
                 .await
                 .unwrap();

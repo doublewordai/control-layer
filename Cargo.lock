@@ -1542,7 +1542,7 @@ checksum = "92773504d58c093f6de2459af4af33faa518c13451eb8f2b5698ed3d36e7c813"
 
 [[package]]
 name = "dwctl"
-version = "2.1.1"
+version = "2.2.0"
 dependencies = [
  "aes-gcm",
  "anyhow",
@@ -3310,9 +3310,9 @@ checksum = "384b8ab6d37215f3c5301a95a4accb5d64aa607f1fcb26a11b5303878451b4fe"
 
 [[package]]
 name = "onwards"
-version = "0.10.1"
+version = "0.11.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "04f55b1fab27cf5654bef8ee0ba17ef0adc76a1a1db84041c53b2f492716b458"
+checksum = "4c5d9f8cca56b834542842a11b19ceb9c7a118168e739f6af22fba364b8b19dc"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -3323,6 +3323,7 @@ dependencies = [
  "dashmap",
  "futures-util",
  "governor",
+ "http-body-util",
  "hyper",
  "hyper-tls",
  "hyper-util",

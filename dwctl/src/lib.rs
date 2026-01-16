@@ -1675,8 +1675,9 @@ impl Application {
         )
         .await?;
 
-        // Build onwards router from targets
-        let onwards_app_state = onwards::AppState::new(bg_services.onwards_targets.clone());
+        // Build onwards router from targets with response sanitization enabled
+        let onwards_app_state =
+            onwards::AppState::new(bg_services.onwards_targets.clone()).with_response_transform(onwards::create_openai_sanitizer());
         let onwards_router = onwards::build_router(onwards_app_state);
 
         // Build app state and router

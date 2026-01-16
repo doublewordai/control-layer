@@ -122,6 +122,7 @@ struct DeployedModel {
     pub fallback_enabled: Option<bool>,
     pub fallback_on_rate_limit: Option<bool>,
     pub fallback_on_status: Option<Vec<i32>>,
+    pub sanitize_responses: bool,
 }
 
 pub struct Deployments<'c> {
@@ -170,6 +171,7 @@ impl From<(Option<ModelType>, DeployedModel)> for DeploymentDBResponse {
             fallback_enabled: m.fallback_enabled.unwrap_or(true),
             fallback_on_rate_limit: m.fallback_on_rate_limit.unwrap_or(true),
             fallback_on_status: m.fallback_on_status.unwrap_or_else(|| vec![429, 500, 502, 503, 504]),
+            sanitize_responses: m.sanitize_responses,
         }
     }
 }
@@ -216,9 +218,10 @@ impl<'c> Repository for Deployments<'c> {
                 requests_per_second, burst_size, capacity, batch_capacity,
                 downstream_pricing_mode, downstream_input_price_per_token, downstream_output_price_per_token,
                 downstream_hourly_rate, downstream_input_token_cost_ratio,
-                is_composite, lb_strategy, fallback_enabled, fallback_on_rate_limit, fallback_on_status
+                is_composite, lb_strategy, fallback_enabled, fallback_on_rate_limit, fallback_on_status,
+                sanitize_responses
             )
-            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24)
             RETURNING *
             "#,
             request.model_name.trim(),
@@ -243,7 +246,8 @@ impl<'c> Repository for Deployments<'c> {
             lb_strategy_str,
             request.fallback_enabled,
             request.fallback_on_rate_limit,
-            request.fallback_on_status.as_ref().map(|s| s.as_slice())
+            request.fallback_on_status.as_ref().map(|s| s.as_slice()),
+            request.sanitize_responses
         )
         .fetch_one(&mut *self.db)
         .await?;
@@ -262,7 +266,7 @@ impl<'c> Repository for Deployments<'c> {
     async fn get_by_id(&mut self, id: Self::Id) -> Result<Option<Self::Response>> {
         let model = sqlx::query_as!(
             DeployedModel,
-            "SELECT id, model_name, alias, description, type, capabilities, created_by, hosted_on, status, last_sync, deleted, created_at, updated_at, requests_per_second, burst_size, capacity, batch_capacity, downstream_pricing_mode, downstream_input_price_per_token, downstream_output_price_per_token, downstream_hourly_rate, downstream_input_token_cost_ratio, is_composite, lb_strategy, fallback_enabled, fallback_on_rate_limit, fallback_on_status FROM deployed_models WHERE id = $1",
+            "SELECT id, model_name, alias, description, type, capabilities, created_by, hosted_on, status, last_sync, deleted, created_at, updated_at, requests_per_second, burst_size, capacity, batch_capacity, downstream_pricing_mode, downstream_input_price_per_token, downstream_output_price_per_token, downstream_hourly_rate, downstream_input_token_cost_ratio, is_composite, lb_strategy, fallback_enabled, fallback_on_rate_limit, fallback_on_status, sanitize_responses FROM deployed_models WHERE id = $1",
             id
         )
             .fetch_optional(&mut *self.db)
@@ -287,7 +291,7 @@ impl<'c> Repository for Deployments<'c> {
 
         let deployments = sqlx::query_as!(
             DeployedModel,
-            "SELECT id, model_name, alias, description, type, capabilities, created_by, hosted_on, status, last_sync, deleted, created_at, updated_at, requests_per_second, burst_size, capacity, batch_capacity, downstream_pricing_mode, downstream_input_price_per_token, downstream_output_price_per_token, downstream_hourly_rate, downstream_input_token_cost_ratio, is_composite, lb_strategy, fallback_enabled, fallback_on_rate_limit, fallback_on_status FROM deployed_models WHERE id = ANY($1)",
+            "SELECT id, model_name, alias, description, type, capabilities, created_by, hosted_on, status, last_sync, deleted, created_at, updated_at, requests_per_second, burst_size, capacity, batch_capacity, downstream_pricing_mode, downstream_input_price_per_token, downstream_output_price_per_token, downstream_hourly_rate, downstream_input_token_cost_ratio, is_composite, lb_strategy, fallback_enabled, fallback_on_rate_limit, fallback_on_status, sanitize_responses FROM deployed_models WHERE id = ANY($1)",
             ids.as_slice()
         )
             .fetch_all(&mut *self.db)
@@ -435,6 +439,7 @@ impl<'c> Repository for Deployments<'c> {
             fallback_enabled = COALESCE($33, fallback_enabled),
             fallback_on_rate_limit = COALESCE($34, fallback_on_rate_limit),
             fallback_on_status = COALESCE($35, fallback_on_status),
+            sanitize_responses = COALESCE($36, sanitize_responses),
 
             updated_at = NOW()
         WHERE id = $1
@@ -482,7 +487,8 @@ impl<'c> Repository for Deployments<'c> {
             lb_strategy_str,                                           // $32
             request.fallback_enabled,                                  // $33
             request.fallback_on_rate_limit,                            // $34
-            request.fallback_on_status.as_ref().map(|s| s.as_slice())  // $35
+            request.fallback_on_status.as_ref().map(|s| s.as_slice()), // $35
+            request.sanitize_responses                                 // $36
         )
         .fetch_one(&mut *self.db)
         .await?;

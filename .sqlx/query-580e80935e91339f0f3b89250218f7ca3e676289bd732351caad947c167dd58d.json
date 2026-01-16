@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "SELECT id, model_name, alias, description, type, capabilities, created_by, hosted_on, status, last_sync, deleted, created_at, updated_at, requests_per_second, burst_size, capacity, batch_capacity, downstream_pricing_mode, downstream_input_price_per_token, downstream_output_price_per_token, downstream_hourly_rate, downstream_input_token_cost_ratio, is_composite, lb_strategy, fallback_enabled, fallback_on_rate_limit, fallback_on_status FROM deployed_models WHERE id = $1",
+  "query": "SELECT id, model_name, alias, description, type, capabilities, created_by, hosted_on, status, last_sync, deleted, created_at, updated_at, requests_per_second, burst_size, capacity, batch_capacity, downstream_pricing_mode, downstream_input_price_per_token, downstream_output_price_per_token, downstream_hourly_rate, downstream_input_token_cost_ratio, is_composite, lb_strategy, fallback_enabled, fallback_on_rate_limit, fallback_on_status, sanitize_responses FROM deployed_models WHERE id = $1",
   "describe": {
     "columns": [
       {
@@ -137,6 +137,11 @@
         "ordinal": 26,
         "name": "fallback_on_status",
         "type_info": "Int4Array"
+      },
+      {
+        "ordinal": 27,
+        "name": "sanitize_responses",
+        "type_info": "Bool"
       }
     ],
     "parameters": {
@@ -171,8 +176,9 @@
       true,
       true,
       true,
-      true
+      true,
+      false
     ]
   },
-  "hash": "baa6be230ae3a76160b356e9e1aa54f294430fee436d49788a23fcc6d370b395"
+  "hash": "580e80935e91339f0f3b89250218f7ca3e676289bd732351caad947c167dd58d"
 }
