@@ -168,6 +168,9 @@ pub struct CompositeModelCreate {
     /// HTTP status codes that trigger fallback (defaults to [500, 502, 503, 504])
     #[serde(default = "default_fallback_statuses")]
     pub fallback_on_status: Vec<i32>,
+    /// Whether to sanitize/filter sensitive data from model responses (defaults to true)
+    #[serde(default = "default_true")]
+    pub sanitize_responses: bool,
 }
 
 fn default_true() -> bool {
@@ -216,6 +219,9 @@ pub struct DeployedModelUpdate {
     /// HTTP status codes that trigger fallback (null = no change)
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub fallback_on_status: Option<Vec<i32>>,
+    /// Whether to sanitize/filter sensitive data from model responses (null = no change)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sanitize_responses: Option<bool>,
 }
 
 /// A request to update a specific model (i.e. bundle a `DeployedModelUpdate` with a model id).
@@ -304,6 +310,9 @@ pub struct DeployedModelResponse {
     /// Components of this composite model (only included if requested for composite models)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub components: Option<Vec<ModelComponentResponse>>,
+    /// Whether to sanitize/filter sensitive data from model responses (only included for composite models)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sanitize_responses: Option<bool>,
 }
 
 impl From<DeploymentDBResponse> for DeployedModelResponse {
@@ -345,6 +354,7 @@ impl From<DeploymentDBResponse> for DeployedModelResponse {
             lb_strategy: if db.is_composite { Some(db.lb_strategy) } else { None },
             fallback,
             components: None, // By default, components are not included
+            sanitize_responses: Some(db.sanitize_responses),
         }
     }
 }

@@ -478,7 +478,7 @@ const EditWeightModal: React.FC<{
     component?.weight?.toString() || "50",
   );
 
-  const updateMutation = useUpdateModelComponent();
+  const updateComponentMutation = useUpdateModelComponent();
 
   // Update weight when component changes
   React.useEffect(() => {
@@ -491,7 +491,7 @@ const EditWeightModal: React.FC<{
     if (!component) return;
 
     try {
-      await updateMutation.mutateAsync({
+      await updateComponentMutation.mutateAsync({
         modelId,
         componentModelId: component.model.id,
         data: {
@@ -552,12 +552,12 @@ const EditWeightModal: React.FC<{
           <Button
             onClick={handleSubmit}
             disabled={
-              updateMutation.isPending ||
+              updateComponentMutation.isPending ||
               parseInt(weight, 10) < 1 ||
               parseInt(weight, 10) > 100
             }
           >
-            {updateMutation.isPending ? (
+            {updateComponentMutation.isPending ? (
               <>
                 <div className="w-4 h-4 border-2 border-white border-t-transparent rounded-full animate-spin mr-2" />
                 Saving...
@@ -651,6 +651,7 @@ const EditRoutingModal: React.FC<{
     setFallbackOn5xx(
       model.fallback?.on_status?.some((s) => s >= 500 && s < 600) ?? false
     );
+    setSanitizeResponses(model.sanitize_responses ?? true);
   }, [model]);
 
   const handleSubmit = async () => {
@@ -831,8 +832,9 @@ export const ProvidersTab: React.FC<ProvidersTabProps> = ({
     enabled: model.is_composite === true,
   });
 
-  const updateMutation = useUpdateModelComponent();
+  const updateComponentMutation = useUpdateModelComponent();
   const removeMutation = useRemoveModelComponent();
+  const updateModelMutation = useUpdateModel();
 
   const isPriorityMode = model.lb_strategy === "priority";
 
@@ -913,7 +915,7 @@ export const ProvidersTab: React.FC<ProvidersTabProps> = ({
         );
         // Only update if sort_order actually changed
         if (currentComponent && currentComponent.sort_order !== update.newSortOrder) {
-          await updateMutation.mutateAsync({
+          await updateComponentMutation.mutateAsync({
             modelId: model.id,
             componentModelId: update.componentModelId,
             data: { sort_order: update.newSortOrder },
@@ -927,7 +929,7 @@ export const ProvidersTab: React.FC<ProvidersTabProps> = ({
   };
 
   const handleToggle = async (component: ModelComponent) => {
-    await updateMutation.mutateAsync({
+    await updateComponentMutation.mutateAsync({
       modelId: model.id,
       componentModelId: component.model.id,
       data: { enabled: !component.enabled },
@@ -1197,7 +1199,7 @@ export const ProvidersTab: React.FC<ProvidersTabProps> = ({
                         onToggle={() => handleToggle(component)}
                         canManage={canManage}
                         isUpdating={
-                          updateMutation.isPending || removeMutation.isPending
+                          updateComponentMutation.isPending || removeMutation.isPending
                         }
                         isAnyDragging={isAnyDragging}
                       />
@@ -1220,7 +1222,7 @@ export const ProvidersTab: React.FC<ProvidersTabProps> = ({
                     onToggle={() => handleToggle(component)}
                     canManage={canManage}
                     isUpdating={
-                      updateMutation.isPending || removeMutation.isPending
+                      updateComponentMutation.isPending || removeMutation.isPending
                     }
                   />
                 ))}

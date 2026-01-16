@@ -1806,6 +1806,7 @@ mod tests {
                     fallback_enabled: None,
                     fallback_on_rate_limit: None,
                     fallback_on_status: None,
+                    sanitize_responses: true,
                 })
                 .await
                 .unwrap();

@@ -440,6 +440,7 @@ mod tests {
             lb_strategy: None,
             fallback: None,
             components: None,
+            sanitize_responses: None,
         }
     }
 
