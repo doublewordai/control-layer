@@ -193,9 +193,11 @@ pub async fn create_batch(
     // - No API key (cookie auth) -> "frontend"
     let request_source = if has_api_key.0 { "api" } else { "frontend" };
 
-    // Convert metadata to HashMap and inject request_source
+    // Convert metadata to HashMap and inject request_source and user info
     let mut metadata_map = req.metadata.unwrap_or_default();
     metadata_map.insert("request_source".to_string(), request_source.to_string());
+    metadata_map.insert("created_by".to_string(), current_user.id.to_string());
+    metadata_map.insert("created_by_email".to_string(), current_user.email.clone());
     let metadata = serde_json::to_value(metadata_map).ok();
 
     // Create batch input

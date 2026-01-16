@@ -31,6 +31,7 @@ import type {
 } from "../../../../api/control-layer/types";
 import { useServerCursorPagination } from "../../../../hooks/useServerCursorPagination";
 import { useDebounce } from "../../../../hooks/useDebounce";
+import { useAuthorization } from "../../../../utils/authorization";
 
 /**
  * Props for the Batches component.
@@ -64,6 +65,10 @@ export function Batches({
   const navigate = useNavigate();
   const [searchParams, setSearchParams] = useSearchParams();
   const queryClient = useQueryClient();
+  const { userRoles } = useAuthorization();
+
+  // PlatformManagers can see all batches, so show the User column for them
+  const isPlatformManager = userRoles.includes("PlatformManager");
 
   // Drag and drop state (kept locally as it's UI-only)
   const [dragActive, setDragActive] = useState(false);
@@ -427,6 +432,7 @@ export function Batches({
     getInputFile,
     onRowClick: handleBatchClick,
     batchAnalytics: batchAnalyticsMap,
+    showUserColumn: isPlatformManager,
   });
 
   return (

@@ -25,7 +25,10 @@
     },
     "metadata": {
       "customer_id": "user_123",
-      "batch_description": "Daily evaluation batch"
+      "batch_description": "Daily evaluation batch",
+      "created_by": "550e8400-e29b-41d4-a716-446655440001",
+      "created_by_email": "sarah.chen@doubleword.ai",
+      "request_source": "api"
     },
     "usage": {
       "input_tokens": 125000,
@@ -58,7 +61,10 @@
       "failed": 1
     },
     "metadata": {
-      "batch_description": "Current processing batch"
+      "batch_description": "Current processing batch",
+      "created_by": "550e8400-e29b-41d4-a716-446655440002",
+      "created_by_email": "james.wilson@doubleword.ai",
+      "request_source": "frontend"
     }
   },
   {
@@ -94,6 +100,11 @@
       "total": 400,
       "completed": 0,
       "failed": 1
+    },
+    "metadata": {
+      "created_by": "550e8400-e29b-41d4-a716-446655440003",
+      "created_by_email": "alex.rodriguez@doubleword.ai",
+      "request_source": "api"
     }
   },
   {
@@ -121,7 +132,10 @@
       "failed": 0
     },
     "metadata": {
-      "batch_description": "Training data processing"
+      "batch_description": "Training data processing",
+      "created_by": "550e8400-e29b-41d4-a716-446655440004",
+      "created_by_email": "maria.garcia@doubleword.ai",
+      "request_source": "api"
     }
   },
   {
@@ -149,7 +163,10 @@
       "failed": 0
     },
     "metadata": {
-      "batch_description": "Sentiment analysis batch"
+      "batch_description": "Sentiment analysis batch",
+      "created_by": "550e8400-e29b-41d4-a716-446655440001",
+      "created_by_email": "sarah.chen@doubleword.ai",
+      "request_source": "frontend"
     }
   },
   {
@@ -177,7 +194,10 @@
       "failed": 3
     },
     "metadata": {
-      "batch_description": "Translation requests"
+      "batch_description": "Translation requests",
+      "created_by": "550e8400-e29b-41d4-a716-446655440002",
+      "created_by_email": "james.wilson@doubleword.ai",
+      "request_source": "api"
     }
   },
   {
@@ -205,7 +225,10 @@
       "failed": 2
     },
     "metadata": {
-      "batch_description": "Summarization tasks"
+      "batch_description": "Summarization tasks",
+      "created_by": "550e8400-e29b-41d4-a716-446655440003",
+      "created_by_email": "alex.rodriguez@doubleword.ai",
+      "request_source": "api"
     }
   },
   {
@@ -233,7 +256,10 @@
       "failed": 0
     },
     "metadata": {
-      "batch_description": "QA evaluation (cancelled)"
+      "batch_description": "QA evaluation (cancelled)",
+      "created_by": "550e8400-e29b-41d4-a716-446655440004",
+      "created_by_email": "maria.garcia@doubleword.ai",
+      "request_source": "frontend"
     }
   },
   {
@@ -261,7 +287,10 @@
       "failed": 0
     },
     "metadata": {
-      "batch_description": "Code generation tasks"
+      "batch_description": "Code generation tasks",
+      "created_by": "550e8400-e29b-41d4-a716-446655440001",
+      "created_by_email": "sarah.chen@doubleword.ai",
+      "request_source": "api"
     }
   },
   {
@@ -289,7 +318,10 @@
       "failed": 5
     },
     "metadata": {
-      "batch_description": "Content moderation"
+      "batch_description": "Content moderation",
+      "created_by": "550e8400-e29b-41d4-a716-446655440002",
+      "created_by_email": "james.wilson@doubleword.ai",
+      "request_source": "api"
     }
   },
   {
@@ -317,7 +349,10 @@
       "failed": 8
     },
     "metadata": {
-      "batch_description": "Classification tasks"
+      "batch_description": "Classification tasks",
+      "created_by": "550e8400-e29b-41d4-a716-446655440003",
+      "created_by_email": "alex.rodriguez@doubleword.ai",
+      "request_source": "frontend"
     }
   },
   {
@@ -345,7 +380,10 @@
       "failed": 0
     },
     "metadata": {
-      "batch_description": "Entity extraction"
+      "batch_description": "Entity extraction",
+      "created_by": "550e8400-e29b-41d4-a716-446655440004",
+      "created_by_email": "maria.garcia@doubleword.ai",
+      "request_source": "api"
     }
   },
   {
@@ -373,7 +411,10 @@
       "failed": 2
     },
     "metadata": {
-      "batch_description": "Product descriptions"
+      "batch_description": "Product descriptions",
+      "created_by": "550e8400-e29b-41d4-a716-446655440001",
+      "created_by_email": "sarah.chen@doubleword.ai",
+      "request_source": "api"
     }
   },
   {
@@ -401,7 +442,10 @@
       "failed": 3
     },
     "metadata": {
-      "batch_description": "Customer support"
+      "batch_description": "Customer support",
+      "created_by": "550e8400-e29b-41d4-a716-446655440002",
+      "created_by_email": "james.wilson@doubleword.ai",
+      "request_source": "frontend"
     }
   },
   {
@@ -429,7 +473,10 @@
       "failed": 5
     },
     "metadata": {
-      "batch_description": "Documentation generation"
+      "batch_description": "Documentation generation",
+      "created_by": "550e8400-e29b-41d4-a716-446655440003",
+      "created_by_email": "alex.rodriguez@doubleword.ai",
+      "request_source": "api"
     }
   },
   {
@@ -457,7 +504,10 @@
       "failed": 0
     },
     "metadata": {
-      "batch_description": "Data labeling"
+      "batch_description": "Data labeling",
+      "created_by": "550e8400-e29b-41d4-a716-446655440004",
+      "created_by_email": "maria.garcia@doubleword.ai",
+      "request_source": "api"
     }
   },
   {
@@ -485,7 +535,10 @@
       "failed": 0
     },
     "metadata": {
-      "batch_description": "Feedback analysis"
+      "batch_description": "Feedback analysis",
+      "created_by": "550e8400-e29b-41d4-a716-446655440001",
+      "created_by_email": "sarah.chen@doubleword.ai",
+      "request_source": "frontend"
     }
   },
   {
@@ -513,7 +566,10 @@
       "failed": 4
     },
     "metadata": {
-      "batch_description": "Intent recognition"
+      "batch_description": "Intent recognition",
+      "created_by": "550e8400-e29b-41d4-a716-446655440002",
+      "created_by_email": "james.wilson@doubleword.ai",
+      "request_source": "api"
     }
   },
   {
@@ -541,7 +597,10 @@
       "failed": 2
     },
     "metadata": {
-      "batch_description": "Keyword extraction"
+      "batch_description": "Keyword extraction",
+      "created_by": "550e8400-e29b-41d4-a716-446655440003",
+      "created_by_email": "alex.rodriguez@doubleword.ai",
+      "request_source": "api"
     }
   },
   {
@@ -569,7 +628,10 @@
       "failed": 0
     },
     "metadata": {
-      "batch_description": "Language detection"
+      "batch_description": "Language detection",
+      "created_by": "550e8400-e29b-41d4-a716-446655440004",
+      "created_by_email": "maria.garcia@doubleword.ai",
+      "request_source": "frontend"
     }
   },
   {
@@ -597,7 +659,10 @@
       "failed": 3
     },
     "metadata": {
-      "batch_description": "Named entity recognition"
+      "batch_description": "Named entity recognition",
+      "created_by": "550e8400-e29b-41d4-a716-446655440001",
+      "created_by_email": "sarah.chen@doubleword.ai",
+      "request_source": "api"
     }
   },
   {
@@ -625,7 +690,10 @@
       "failed": 6
     },
     "metadata": {
-      "batch_description": "Paraphrase generation"
+      "batch_description": "Paraphrase generation",
+      "created_by": "550e8400-e29b-41d4-a716-446655440002",
+      "created_by_email": "james.wilson@doubleword.ai",
+      "request_source": "api"
     }
   },
   {
@@ -653,7 +721,10 @@
       "failed": 2
     },
     "metadata": {
-      "batch_description": "Question answering"
+      "batch_description": "Question answering",
+      "created_by": "550e8400-e29b-41d4-a716-446655440003",
+      "created_by_email": "alex.rodriguez@doubleword.ai",
+      "request_source": "frontend"
     }
   },
   {
@@ -681,7 +752,10 @@
       "failed": 5
     },
     "metadata": {
-      "batch_description": "Recommendation generation"
+      "batch_description": "Recommendation generation",
+      "created_by": "550e8400-e29b-41d4-a716-446655440004",
+      "created_by_email": "maria.garcia@doubleword.ai",
+      "request_source": "api"
     }
   },
   {
@@ -709,7 +783,10 @@
       "failed": 0
     },
     "metadata": {
-      "batch_description": "Search queries (cancelled)"
+      "batch_description": "Search queries (cancelled)",
+      "created_by": "550e8400-e29b-41d4-a716-446655440001",
+      "created_by_email": "sarah.chen@doubleword.ai",
+      "request_source": "api"
     }
   },
   {
@@ -737,7 +814,10 @@
       "failed": 0
     },
     "metadata": {
-      "batch_description": "Text completion"
+      "batch_description": "Text completion",
+      "created_by": "550e8400-e29b-41d4-a716-446655440002",
+      "created_by_email": "james.wilson@doubleword.ai",
+      "request_source": "frontend"
     }
   },
   {
@@ -765,7 +845,10 @@
       "failed": 7
     },
     "metadata": {
-      "batch_description": "Topic modeling"
+      "batch_description": "Topic modeling",
+      "created_by": "550e8400-e29b-41d4-a716-446655440003",
+      "created_by_email": "alex.rodriguez@doubleword.ai",
+      "request_source": "api"
     }
   },
   {
@@ -793,7 +876,10 @@
       "failed": 3
     },
     "metadata": {
-      "batch_description": "User intent batch"
+      "batch_description": "User intent batch",
+      "created_by": "550e8400-e29b-41d4-a716-446655440004",
+      "created_by_email": "maria.garcia@doubleword.ai",
+      "request_source": "api"
     }
   },
   {
@@ -821,7 +907,10 @@
       "failed": 0
     },
     "metadata": {
-      "batch_description": "Voice transcription"
+      "batch_description": "Voice transcription",
+      "created_by": "550e8400-e29b-41d4-a716-446655440001",
+      "created_by_email": "sarah.chen@doubleword.ai",
+      "request_source": "frontend"
     }
   },
   {
@@ -849,7 +938,10 @@
       "failed": 5
     },
     "metadata": {
-      "batch_description": "Web scraping data"
+      "batch_description": "Web scraping data",
+      "created_by": "550e8400-e29b-41d4-a716-446655440002",
+      "created_by_email": "james.wilson@doubleword.ai",
+      "request_source": "api"
     }
   },
   {
@@ -877,7 +969,10 @@
       "failed": 5
     },
     "metadata": {
-      "batch_description": "XML parsing batch"
+      "batch_description": "XML parsing batch",
+      "created_by": "550e8400-e29b-41d4-a716-446655440003",
+      "created_by_email": "alex.rodriguez@doubleword.ai",
+      "request_source": "api"
     }
   },
   {
@@ -905,7 +1000,10 @@
       "failed": 3
     },
     "metadata": {
-      "batch_description": "YAML processing"
+      "batch_description": "YAML processing",
+      "created_by": "550e8400-e29b-41d4-a716-446655440004",
+      "created_by_email": "maria.garcia@doubleword.ai",
+      "request_source": "frontend"
     }
   },
   {
@@ -933,7 +1031,10 @@
       "failed": 0
     },
     "metadata": {
-      "batch_description": "Zero-shot classification"
+      "batch_description": "Zero-shot classification",
+      "created_by": "550e8400-e29b-41d4-a716-446655440001",
+      "created_by_email": "sarah.chen@doubleword.ai",
+      "request_source": "api"
     }
   },
   {
@@ -961,7 +1062,10 @@
       "failed": 2
     },
     "metadata": {
-      "batch_description": "Aberration detection"
+      "batch_description": "Aberration detection",
+      "created_by": "550e8400-e29b-41d4-a716-446655440002",
+      "created_by_email": "james.wilson@doubleword.ai",
+      "request_source": "api"
     }
   },
   {
@@ -989,7 +1093,10 @@
       "failed": 8
     },
     "metadata": {
-      "batch_description": "Batch inference v1"
+      "batch_description": "Batch inference v1",
+      "created_by": "550e8400-e29b-41d4-a716-446655440003",
+      "created_by_email": "alex.rodriguez@doubleword.ai",
+      "request_source": "frontend"
     }
   }
 ]
