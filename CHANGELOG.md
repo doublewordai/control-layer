@@ -1,5 +1,12 @@
 # Changelog
 
+## [2.2.0](https://github.com/doublewordai/control-layer/compare/v2.1.1...v2.2.0) (2026-01-16)
+
+
+### Features
+
+* add sanitization response option in for models ([#542](https://github.com/doublewordai/control-layer/issues/542)) ([77e71f1](https://github.com/doublewordai/control-layer/commit/77e71f13a9519524c53a4f70448aafc011daee9c))
+
 ## [2.1.1](https://github.com/doublewordai/control-layer/compare/v2.1.0...v2.1.1) (2026-01-16)
 
 
