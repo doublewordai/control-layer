@@ -83,6 +83,31 @@ fn validate_url_path(url: &str) -> Result<()> {
     Ok(())
 }
 
+/// Maximum length for custom_id (matches OpenAI's limit)
+const MAX_CUSTOM_ID_LENGTH: usize = 64;
+
+/// Validate that a custom_id is safe to use as an HTTP header value.
+fn validate_custom_id(custom_id: &str) -> Result<()> {
+    if custom_id.len() > MAX_CUSTOM_ID_LENGTH {
+        return Err(Error::BadRequest {
+            message: format!(
+                "custom_id exceeds maximum length of {} characters (got {})",
+                MAX_CUSTOM_ID_LENGTH,
+                custom_id.len()
+            ),
+        });
+    }
+
+    // Use the http crate's HeaderValue validation - same validation used by reqwest
+    if axum::http::HeaderValue::from_str(custom_id).is_err() {
+        return Err(Error::BadRequest {
+            message: "custom_id contains invalid characters: must be valid ASCII without control characters".to_string(),
+        });
+    }
+
+    Ok(())
+}
+
 impl OpenAIBatchRequest {
     /// Transform OpenAI format to internal format
     ///
@@ -92,6 +117,9 @@ impl OpenAIBatchRequest {
     /// * `accessible_models` - Set of model aliases the user can access
     #[tracing::instrument(skip(self, api_key, accessible_models), fields(custom_id = %self.custom_id, method = %self.method, url = %self.url))]
     fn to_internal(&self, endpoint: &str, api_key: String, accessible_models: &HashSet<String>) -> Result<fusillade::RequestTemplateInput> {
+        // Validate custom_id is safe for HTTP headers
+        validate_custom_id(&self.custom_id)?;
+
         // Validate HTTP method
         let _validated_method = self.method.parse::<AllowedHttpMethod>()?;
 
@@ -1359,6 +1387,72 @@ mod tests {
         upload_response.assert_status(axum::http::StatusCode::BAD_REQUEST);
         let error_body = upload_response.text();
         assert!(error_body.contains("custom_id"));
+    }
+
+    #[sqlx::test]
+    #[test_log::test]
+    async fn test_upload_custom_id_with_control_characters(pool: PgPool) {
+        let (app, _bg_services) = create_test_app(pool.clone(), false).await;
+        let user = create_test_user_with_roles(&pool, vec![Role::StandardUser, Role::BatchAPIUser]).await;
+        let group = create_test_group(&pool).await;
+        add_user_to_group(&pool, user.id, group.id).await;
+        let deployment = create_test_deployment(&pool, user.id, "gpt-4-model", "gpt-4").await;
+        add_deployment_to_group(&pool, deployment.id, group.id, user.id).await;
+
+        // custom_id with newline (header injection attempt)
+        let jsonl_content = "{\"custom_id\":\"request-1\\r\\nX-Injected: malicious\",\"method\":\"POST\",\"url\":\"/v1/chat/completions\",\"body\":{\"model\":\"gpt-4\",\"messages\":[{\"role\":\"user\",\"content\":\"Hello\"}]}}";
+
+        let file_part = axum_test::multipart::Part::bytes(jsonl_content.as_bytes()).file_name("test-batch.jsonl");
+
+        let upload_response = app
+            .post("/ai/v1/files")
+            .add_header(&add_auth_headers(&user)[0].0, &add_auth_headers(&user)[0].1)
+            .add_header(&add_auth_headers(&user)[1].0, &add_auth_headers(&user)[1].1)
+            .multipart(
+                axum_test::multipart::MultipartForm::new()
+                    .add_text("purpose", "batch")
+                    .add_part("file", file_part),
+            )
+            .await;
+
+        upload_response.assert_status(axum::http::StatusCode::BAD_REQUEST);
+        let error_body = upload_response.text();
+        assert!(error_body.contains("invalid characters"));
+    }
+
+    #[sqlx::test]
+    #[test_log::test]
+    async fn test_upload_custom_id_too_long(pool: PgPool) {
+        let (app, _bg_services) = create_test_app(pool.clone(), false).await;
+        let user = create_test_user_with_roles(&pool, vec![Role::StandardUser, Role::BatchAPIUser]).await;
+        let group = create_test_group(&pool).await;
+        add_user_to_group(&pool, user.id, group.id).await;
+        let deployment = create_test_deployment(&pool, user.id, "gpt-4-model", "gpt-4").await;
+        add_deployment_to_group(&pool, deployment.id, group.id, user.id).await;
+
+        // custom_id exceeding 64 character limit
+        let long_id = "a".repeat(65);
+        let jsonl_content = format!(
+            r#"{{"custom_id":"{}","method":"POST","url":"/v1/chat/completions","body":{{"model":"gpt-4","messages":[{{"role":"user","content":"Hello"}}]}}}}"#,
+            long_id
+        );
+
+        let file_part = axum_test::multipart::Part::bytes(jsonl_content.as_bytes()).file_name("test-batch.jsonl");
+
+        let upload_response = app
+            .post("/ai/v1/files")
+            .add_header(&add_auth_headers(&user)[0].0, &add_auth_headers(&user)[0].1)
+            .add_header(&add_auth_headers(&user)[1].0, &add_auth_headers(&user)[1].1)
+            .multipart(
+                axum_test::multipart::MultipartForm::new()
+                    .add_text("purpose", "batch")
+                    .add_part("file", file_part),
+            )
+            .await;
+
+        upload_response.assert_status(axum::http::StatusCode::BAD_REQUEST);
+        let error_body = upload_response.text();
+        assert!(error_body.contains("exceeds maximum length"));
     }
 
     #[sqlx::test]
