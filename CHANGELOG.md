@@ -1,5 +1,12 @@
 # Changelog
 
+## [2.3.0](https://github.com/doublewordai/control-layer/compare/v2.2.0...v2.3.0) (2026-01-19)
+
+
+### Features
+
+* **batches:** show batch creator in platform manager UI ([#541](https://github.com/doublewordai/control-layer/issues/541)) ([bf46658](https://github.com/doublewordai/control-layer/commit/bf46658af06bb502d9f359b24aca150352d67d5d))
+
 ## [2.2.0](https://github.com/doublewordai/control-layer/compare/v2.1.1...v2.2.0) (2026-01-16)
 
 
