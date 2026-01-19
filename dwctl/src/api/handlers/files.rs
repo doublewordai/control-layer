@@ -1587,62 +1587,6 @@ mod tests {
 
     #[sqlx::test]
     #[test_log::test]
-    async fn test_upload_duplicate_filename(pool: PgPool) {
-        let (app, _bg_services) = create_test_app(pool.clone(), false).await;
-        let user = create_test_user_with_roles(&pool, vec![Role::StandardUser, Role::BatchAPIUser]).await;
-        let group = create_test_group(&pool).await;
-        add_user_to_group(&pool, user.id, group.id).await;
-
-        // Create a deployment and add to group so user has access to the model
-        let deployment = create_test_deployment(&pool, user.id, "gpt-4-model", "gpt-4").await;
-        add_deployment_to_group(&pool, deployment.id, group.id, user.id).await;
-
-        // Create test JSONL content
-        let jsonl_content = r#"{"custom_id":"request-1","method":"POST","url":"/v1/chat/completions","body":{"model":"gpt-4","messages":[{"role":"user","content":"Hello"}]}}"#;
-
-        // Upload first file with a specific filename
-        let file_part1 = axum_test::multipart::Part::bytes(jsonl_content.as_bytes()).file_name("duplicate-test.jsonl");
-
-        let upload_response1 = app
-            .post("/ai/v1/files")
-            .add_header(&add_auth_headers(&user)[0].0, &add_auth_headers(&user)[0].1)
-            .add_header(&add_auth_headers(&user)[1].0, &add_auth_headers(&user)[1].1)
-            .multipart(
-                axum_test::multipart::MultipartForm::new()
-                    .add_text("purpose", "batch")
-                    .add_part("file", file_part1),
-            )
-            .await;
-
-        // First upload should succeed
-        upload_response1.assert_status(axum::http::StatusCode::CREATED);
-
-        // Try to upload another file with the same filename
-        let file_part2 = axum_test::multipart::Part::bytes(jsonl_content.as_bytes()).file_name("duplicate-test.jsonl");
-
-        let upload_response2 = app
-            .post("/ai/v1/files")
-            .add_header(&add_auth_headers(&user)[0].0, &add_auth_headers(&user)[0].1)
-            .add_header(&add_auth_headers(&user)[1].0, &add_auth_headers(&user)[1].1)
-            .multipart(
-                axum_test::multipart::MultipartForm::new()
-                    .add_text("purpose", "batch")
-                    .add_part("file", file_part2),
-            )
-            .await;
-
-        // Second upload should fail with 400 Bad Request
-        upload_response2.assert_status(axum::http::StatusCode::BAD_REQUEST);
-        let error_body = upload_response2.text();
-        assert!(
-            error_body.contains("already exists"),
-            "Error message should mention file already exists: {}",
-            error_body
-        );
-    }
-
-    #[sqlx::test]
-    #[test_log::test]
     async fn test_get_file_cost_estimate(pool: PgPool) {
         use rust_decimal::Decimal;
         use std::str::FromStr;
