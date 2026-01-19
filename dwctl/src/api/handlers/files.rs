@@ -1437,7 +1437,7 @@ mod tests {
             long_id
         );
 
-        let file_part = axum_test::multipart::Part::bytes(jsonl_content.as_bytes()).file_name("test-batch.jsonl");
+        let file_part = axum_test::multipart::Part::bytes(jsonl_content.as_bytes().to_vec()).file_name("test-batch.jsonl");
 
         let upload_response = app
             .post("/ai/v1/files")
