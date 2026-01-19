@@ -1,5 +1,17 @@
 # Changelog
 
+## [2.4.0](https://github.com/doublewordai/control-layer/compare/v2.3.0...v2.4.0) (2026-01-19)
+
+
+### Features
+
+* remove unique filename constraint on files ([#548](https://github.com/doublewordai/control-layer/issues/548)) ([2a47665](https://github.com/doublewordai/control-layer/commit/2a476658f4521802ecead5bff89bef82cf7eb72c))
+
+
+### Bug Fixes
+
+* check we'll be able to serialize custom ids at inference time ([#549](https://github.com/doublewordai/control-layer/issues/549)) ([2ba2beb](https://github.com/doublewordai/control-layer/commit/2ba2bebea075ec44c7ae48ab5874ed941324c689))
+
 ## [2.3.0](https://github.com/doublewordai/control-layer/compare/v2.2.0...v2.3.0) (2026-01-19)
 
 
