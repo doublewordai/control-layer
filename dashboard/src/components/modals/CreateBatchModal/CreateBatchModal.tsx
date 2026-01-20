@@ -1,5 +1,5 @@
 import { useState, useEffect, useMemo } from "react";
-import { Play, AlertCircle, X, Upload, ExternalLink, Info } from "lucide-react";
+import { Play, AlertCircle, X, Upload, ExternalLink, Info, AlertTriangle } from "lucide-react";
 import {
   Dialog,
   DialogContent,
@@ -35,6 +35,11 @@ import {
   TooltipContent,
   TooltipTrigger,
 } from "@/components/ui/tooltip";
+import { 
+  formatFileSize, 
+  validateBatchFile, 
+  FILE_SIZE_LIMITS 
+} from "../../../utils/files";
 
 interface CreateBatchModalProps {
   isOpen: boolean;
@@ -64,6 +69,7 @@ export function CreateBatchModal({
   const [error, setError] = useState<string | null>(null);
   const [dragActive, setDragActive] = useState(false);
   const [isUploading, setIsUploading] = useState(false);
+  const [isProcessing, setIsProcessing] = useState(false);
   const [filename, setFilename] = useState<string>("");
   const [uploadProgress, setUploadProgress] = useState<number>(0);
   const [fileSearchQuery, setFileSearchQuery] = useState<string>("");
@@ -144,13 +150,14 @@ export function CreateBatchModal({
 
     if (e.dataTransfer.files && e.dataTransfer.files[0]) {
       const droppedFile = e.dataTransfer.files[0];
-      if (droppedFile.name.endsWith(".jsonl")) {
+      const validation = validateBatchFile(droppedFile);
+      if (validation.isValid) {
         setFileToUpload(droppedFile);
         setFilename(droppedFile.name);
         setSelectedFileId(null); // Clear combobox selection
         setError(null);
       } else {
-        setError("Please upload a .jsonl file");
+        setError(validation.error!);
       }
     }
   };
@@ -158,13 +165,14 @@ export function CreateBatchModal({
   const handleFileChange = (e: React.ChangeEvent<HTMLInputElement>) => {
     if (e.target.files && e.target.files[0]) {
       const file = e.target.files[0];
-      if (file.name.endsWith(".jsonl")) {
+      const validation = validateBatchFile(file);
+      if (validation.isValid) {
         setFileToUpload(file);
         setFilename(file.name);
         setSelectedFileId(null); // Clear combobox selection
         setError(null);
       } else {
-        setError("Please upload a .jsonl file");
+        setError(validation.error!);
       }
     }
   };
@@ -182,6 +190,7 @@ export function CreateBatchModal({
     if (fileToUpload) {
       setIsUploading(true);
       setUploadProgress(0);
+      setIsProcessing(false);
       try {
         const uploadedFile = await uploadMutation.mutateAsync({
           data: {
@@ -193,7 +202,16 @@ export function CreateBatchModal({
               seconds: expirationSeconds,
             },
           },
-          onProgress: setUploadProgress,
+          onProgress: (percent) => {
+            // Cap at 95% to show there's still processing happening
+            const cappedPercent = Math.min(percent, 95);
+            setUploadProgress(cappedPercent);
+            
+            // If we've reached 95%, mark as processing
+            if (cappedPercent >= 95) {
+              setIsProcessing(true);
+            }
+          },
         });
         finalFileId = uploadedFile.id;
         toast.success(
@@ -208,10 +226,12 @@ export function CreateBatchModal({
         );
         setIsUploading(false);
         setUploadProgress(0);
+        setIsProcessing(false);
         return;
       } finally {
         setIsUploading(false);
         setUploadProgress(0);
+        setIsProcessing(false);
       }
     }
 
@@ -248,6 +268,7 @@ export function CreateBatchModal({
       setExpirationSeconds(2592000);
       setFilename("");
       setUploadProgress(0);
+      setIsProcessing(false);
       setError(null);
       onSuccess?.();
       onClose();
@@ -266,6 +287,7 @@ export function CreateBatchModal({
     setExpirationSeconds(2592000);
     setFilename("");
     setUploadProgress(0);
+    setIsProcessing(false);
     setFileSearchQuery("");
     setHasLoadedFiles(false);
     setError(null);
@@ -290,6 +312,8 @@ export function CreateBatchModal({
 
   const isPending = createBatchMutation.isPending || isUploading;
 
+  const isLargeFile = fileToUpload && fileToUpload.size > FILE_SIZE_LIMITS.LARGE_FILE_WARNING_BYTES;
+
   return (
     <Dialog open={isOpen} onOpenChange={handleClose}>
       <DialogContent className="sm:max-w-lg">
@@ -310,7 +334,8 @@ export function CreateBatchModal({
             ) : (
               "JSONL file"
             )}{" "}
-            to create a batch.
+            to create a batch.{" "}
+            <span className="font-semibold text-gray-900">Maximum file size: {FILE_SIZE_LIMITS.MAX_FILE_SIZE_MB}MB</span>
           </DialogDescription>
         </DialogHeader>
 
@@ -335,7 +360,7 @@ export function CreateBatchModal({
                       {fileToUpload ? (
                         <>
                           <span>
-                            Size: {(fileToUpload.size / 1024).toFixed(1)} KB
+                            Size: {formatFileSize(fileToUpload.size)}
                           </span>
                           <span className="text-blue-600">
                             {isUploading ? "Uploading..." : "Ready to upload"}
@@ -345,7 +370,7 @@ export function CreateBatchModal({
                         selectedFile && (
                           <>
                             <span>
-                              Size: {(selectedFile.bytes / 1024).toFixed(1)} KB
+                              Size: {formatFileSize(selectedFile.bytes)}
                             </span>
                             <span>ID: {selectedFile.id}</span>
                           </>
@@ -366,11 +391,31 @@ export function CreateBatchModal({
                 </div>
                 {/* Upload Progress Bar */}
                 {isUploading && (
-                  <div className="h-2 bg-gray-200 rounded-full overflow-hidden">
-                    <div
-                      className="h-full bg-blue-600 rounded-full transition-all duration-150 ease-out"
-                      style={{ width: `${uploadProgress}%` }}
-                    />
+                  <div className="space-y-1">
+                    <div className="flex justify-between text-xs">
+                      <span className="text-gray-600">
+                        {isProcessing ? "Processing on server..." : "Uploading..."}
+                      </span>
+                      {!isProcessing && (
+                        <span className="text-gray-900 font-medium">{uploadProgress}%</span>
+                      )}
+                    </div>
+                    <div className="h-2 bg-gray-200 rounded-full overflow-hidden">
+                      <div
+                        className="h-full rounded-full transition-all duration-150 ease-out bg-blue-600"
+                        style={{ 
+                          width: `${uploadProgress}%`,
+                          ...(isProcessing && {
+                            animation: 'gentlePulse 3s ease-in-out infinite'
+                          })
+                        }}
+                      />
+                    </div>
+                    {isProcessing && (
+                      <p className="text-xs text-gray-600 text-center">
+                        Upload complete. Server is processing the file...
+                      </p>
+                    )}
                   </div>
                 )}
               </div>
@@ -449,6 +494,21 @@ export function CreateBatchModal({
               </>
             )}
           </div>
+
+          {/* Large File Warning */}
+          {isLargeFile && (
+            <div className="bg-amber-50 border border-amber-200 rounded-lg p-3">
+              <div className="flex gap-2">
+                <AlertTriangle className="w-4 h-4 text-amber-600 mt-0.5 shrink-0" />
+                <div className="text-sm text-amber-800">
+                  <p className="font-medium mb-1">Large File Detected</p>
+                  <p className="text-amber-700">
+                    This file is over {FILE_SIZE_LIMITS.LARGE_FILE_WARNING_MB}MB. Large files may take a while to upload depending on your connection speed. Please be patient and keep this window open until the upload completes.
+                  </p>
+                </div>
+              </div>
+            </div>
+          )}
 
           {/* New Filename (optional, only for files to upload) */}
           {fileToUpload && (
@@ -572,6 +632,7 @@ export function CreateBatchModal({
                       if (!fileToUpload || isPending) return;
                       setIsUploading(true);
                       setUploadProgress(0);
+                      setIsProcessing(false);
                       try {
                         const uploadedFile = await uploadMutation.mutateAsync({
                           data: {
@@ -583,7 +644,16 @@ export function CreateBatchModal({
                               seconds: expirationSeconds,
                             },
                           },
-                          onProgress: setUploadProgress,
+                          onProgress: (percent) => {
+                            // Cap at 95% to show there's still processing happening
+                            const cappedPercent = Math.min(percent, 95);
+                            setUploadProgress(cappedPercent);
+                            
+                            // If we've reached 95%, mark as processing
+                            if (cappedPercent >= 95) {
+                              setIsProcessing(true);
+                            }
+                          },
                         });
                         setSelectedFileId(uploadedFile.id);
                         toast.success(
@@ -599,6 +669,7 @@ export function CreateBatchModal({
                       } finally {
                         setIsUploading(false);
                         setUploadProgress(0);
+                        setIsProcessing(false);
                       }
                     }}
                     disabled={isPending}

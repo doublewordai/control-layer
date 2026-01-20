@@ -11,17 +11,14 @@ import {
 import { Button } from "../../ui/button";
 import { Label } from "../../ui/label";
 import { Input } from "../../ui/input";
-// Disabled for now - expiration not yet enforced on backend
-// import {
-//   Select,
-//   SelectContent,
-//   SelectItem,
-//   SelectTrigger,
-//   SelectValue,
-// } from "../../ui/select";
 import { useUploadFileWithProgress, useConfig } from "../../../api/control-layer/hooks";
 import { toast } from "sonner";
 import { AlertBox } from "@/components/ui/alert-box";
+import { 
+  formatFileSize, 
+  validateBatchFile, 
+  FILE_SIZE_LIMITS 
+} from "../../../utils/files";
 
 interface UploadFileModalProps {
   isOpen: boolean;
@@ -29,22 +26,6 @@ interface UploadFileModalProps {
   onSuccess?: () => void;
   preselectedFile?: File;
 }
-
-// Hidden for now - expiration not yet enforced on backend
-// For API compatibility, we send a default expiration of 30 days
-// const EXPIRATION_PRESETS = [
-//   { label: "1 hour", seconds: 3600 },
-//   { label: "24 hours", seconds: 86400 },
-//   { label: "7 days", seconds: 604800 },
-//   { label: "30 days (default)", seconds: 2592000 },
-//   { label: "60 days", seconds: 5184000 },
-//   { label: "90 days", seconds: 7776000 },
-// ];
-
-const MAX_FILE_SIZE_MB = 200;
-const MAX_FILE_SIZE_BYTES = MAX_FILE_SIZE_MB * 1024 * 1024;
-const LARGE_FILE_WARNING_MB = 50;
-const LARGE_FILE_WARNING_BYTES = LARGE_FILE_WARNING_MB * 1024 * 1024;
 
 export function UploadFileModal({
   isOpen,
@@ -80,20 +61,6 @@ export function UploadFileModal({
     }
   };
 
-  const validateFile = (selectedFile: File): boolean => {
-    if (!selectedFile.name.endsWith(".jsonl")) {
-      setError("Please upload a .jsonl file");
-      return false;
-    }
-    
-    if (selectedFile.size > MAX_FILE_SIZE_BYTES) {
-      setError(`File size exceeds ${MAX_FILE_SIZE_MB}MB limit`);
-      return false;
-    }
-    
-    return true;
-  };
-
   const handleDrop = (e: React.DragEvent) => {
     e.preventDefault();
     e.stopPropagation();
@@ -101,10 +68,13 @@ export function UploadFileModal({
 
     if (e.dataTransfer.files && e.dataTransfer.files[0]) {
       const droppedFile = e.dataTransfer.files[0];
-      if (validateFile(droppedFile)) {
+      const validation = validateBatchFile(droppedFile);
+      if (validation.isValid) {
         setFile(droppedFile);
         setFilename(droppedFile.name);
         setError(null);
+      } else {
+        setError(validation.error!);
       }
     }
   };
@@ -112,10 +82,13 @@ export function UploadFileModal({
   const handleFileChange = (e: React.ChangeEvent<HTMLInputElement>) => {
     if (e.target.files && e.target.files[0]) {
       const selectedFile = e.target.files[0];
-      if (validateFile(selectedFile)) {
+      const validation = validateBatchFile(selectedFile);
+      if (validation.isValid) {
         setFile(selectedFile);
         setFilename(selectedFile.name);
         setError(null);
+      } else {
+        setError(validation.error!);
       }
     }
   };
@@ -134,13 +107,7 @@ export function UploadFileModal({
     }
   };
 
-  const formatFileSize = (bytes: number): string => {
-    if (bytes < 1024) return `${bytes} B`;
-    if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(2)} KB`;
-    return `${(bytes / (1024 * 1024)).toFixed(2)} MB`;
-  };
-
-  const isLargeFile = file && file.size > LARGE_FILE_WARNING_BYTES;
+  const isLargeFile = file && file.size > FILE_SIZE_LIMITS.LARGE_FILE_WARNING_BYTES;
 
   const handleSubmit = async () => {
     if (!file) {
@@ -225,7 +192,7 @@ export function UploadFileModal({
               "JSONL file"
             )}{" "}
             to process multiple requests asynchronously.{" "}
-            <span className="font-semibold text-gray-900">Maximum file size: {MAX_FILE_SIZE_MB}MB</span>
+            <span className="font-semibold text-gray-900">Maximum file size: {FILE_SIZE_LIMITS.MAX_FILE_SIZE_MB}MB</span>
           </DialogDescription>
         </DialogHeader>
 
@@ -299,7 +266,7 @@ export function UploadFileModal({
                 <div className="text-sm text-amber-800">
                   <p className="font-medium mb-1">Large File Detected</p>
                   <p className="text-amber-700">
-                    This file is over {LARGE_FILE_WARNING_MB}MB. Large files may take a while to upload depending on your connection speed. Please be patient and keep this window open until the upload completes.
+                    This file is over {FILE_SIZE_LIMITS.LARGE_FILE_WARNING_MB}MB. Large files may take a while to upload depending on your connection speed. Please be patient and keep this window open until the upload completes.
                   </p>
                 </div>
               </div>
@@ -351,32 +318,6 @@ export function UploadFileModal({
               />
             </div>
           )}
-
-          {/* Expiration Select  - Hidden until backend enforcement is implemented */}
-          {/* <div className="space-y-2">
-            <Label htmlFor="expiration">File Expiration</Label>
-            <Select
-              value={expirationSeconds.toString()}
-              onValueChange={(value) => setExpirationSeconds(parseInt(value))}
-            >
-              <SelectTrigger>
-                <SelectValue />
-              </SelectTrigger>
-              <SelectContent>
-                {EXPIRATION_PRESETS.map((preset) => (
-                  <SelectItem
-                    key={preset.seconds}
-                    value={preset.seconds.toString()}
-                  >
-                    {preset.label}
-                  </SelectItem>
-                ))}
-              </SelectContent>
-            </Select>
-            <p className="text-xs text-gray-500">
-              Files will be automatically deleted after this period
-            </p>
-          </div> */}
 
           {/* Help Text */}
           <div className="bg-blue-50 border border-blue-200 rounded-lg p-3">
