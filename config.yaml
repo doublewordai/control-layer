@@ -24,6 +24,15 @@ database:
   #   idle_timeout_secs: 600
   #   max_lifetime_secs: 1800
 
+  # Optional: Separate pool settings for replica connections
+  # If not specified, replica uses the same settings as pool
+  # replica_pool:
+  #   max_connections: 5  # Typically fewer connections for replicas
+  #   min_connections: 0
+  #   acquire_timeout_secs: 30
+  #   idle_timeout_secs: 600
+  #   max_lifetime_secs: 1800
+
   # We also bundle a copy of postgres with dwctl. It's launched on a random
   # port, and data is stored in $HOME/.dwctl_data/ To have data persist
   # across restarts, set persistent=true.
@@ -36,13 +45,16 @@ database:
   # You can optionally configure them to use dedicated databases.
 
   # Fusillade - batch processing database
-  # Default: uses "fusillade" schema in main database
+  # Default: uses "fusillade" schema in main database (inherits main's replica if configured)
   # fusillade:
   #   mode: schema
   #   name: fusillade
   #   pool:
   #     max_connections: 20
   #     min_connections: 2
+  #   # Optional: separate replica pool settings (defaults to pool settings)
+  #   # replica_pool:
+  #   #   max_connections: 10
   #
   # Alternative: use a dedicated database for fusillade
   # fusillade:
@@ -51,14 +63,20 @@ database:
   #   replica_url: postgres://postgres:password@replica:5432/fusillade
   #   pool:
   #     max_connections: 20
+  #   # Optional: separate replica pool settings (defaults to pool settings)
+  #   # replica_pool:
+  #   #   max_connections: 10
 
   # Outlet - request logging database
-  # Default: uses "outlet" schema in main database
+  # Default: uses "outlet" schema in main database (inherits main's replica if configured)
   # outlet:
   #   mode: schema
   #   name: outlet
   #   pool:
   #     max_connections: 5
+  #   # Optional: separate replica pool settings (defaults to pool settings)
+  #   # replica_pool:
+  #   #   max_connections: 3
   #
   # Alternative: use a dedicated database for outlet
   # outlet:
@@ -66,6 +84,9 @@ database:
   #   url: postgres://postgres:password@localhost:5432/outlet
   #   pool:
   #     max_connections: 5
+  #   # Optional: separate replica pool settings (defaults to pool settings)
+  #   # replica_pool:
+  #   #   max_connections: 3
 
 # Admin user email - will be created on first startup
 admin_email: "test@doubleword.ai"

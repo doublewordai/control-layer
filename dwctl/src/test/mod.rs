@@ -633,6 +633,7 @@ async fn test_dedicated_databases_for_components(pool: PgPool) {
         url: "ignored".to_string(), // Will be overridden by pool
         replica_url: None,
         pool: PoolSettings::default(),
+        replica_pool: None,
         fusillade: ComponentDb::Dedicated {
             url: test_dbs.fusillade_url.clone(),
             replica_url: None,
@@ -641,6 +642,7 @@ async fn test_dedicated_databases_for_components(pool: PgPool) {
                 min_connections: 0,
                 ..Default::default()
             },
+            replica_pool: None,
         },
         outlet: ComponentDb::Dedicated {
             url: test_dbs.outlet_url.clone(),
@@ -650,6 +652,7 @@ async fn test_dedicated_databases_for_components(pool: PgPool) {
                 min_connections: 0,
                 ..Default::default()
             },
+            replica_pool: None,
         },
     };
 

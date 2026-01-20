@@ -187,9 +187,13 @@ pub enum ComponentDb {
     Schema {
         /// Schema name (e.g., "fusillade", "outlet")
         name: String,
-        /// Connection pool settings for this component
+        /// Connection pool settings for this component (primary and replica if not specified)
         #[serde(default)]
         pool: PoolSettings,
+        /// Optional separate pool settings for replica connections
+        /// If not specified, uses the same settings as `pool`
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        replica_pool: Option<PoolSettings>,
     },
     /// Use a dedicated database with its own connection.
     /// Useful for isolating workloads or using read replicas.
@@ -199,18 +203,31 @@ pub enum ComponentDb {
         /// Optional read replica URL for read-heavy operations
         #[serde(default, skip_serializing_if = "Option::is_none")]
         replica_url: Option<String>,
-        /// Connection pool settings
+        /// Connection pool settings for primary (and replica if not specified)
         #[serde(default)]
         pool: PoolSettings,
+        /// Optional separate pool settings for replica connections
+        /// If not specified, uses the same settings as `pool`
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        replica_pool: Option<PoolSettings>,
     },
 }
 
 impl ComponentDb {
-    /// Get the pool settings for this component
+    /// Get the primary pool settings for this component
     pub fn pool_settings(&self) -> &PoolSettings {
         match self {
             ComponentDb::Schema { pool, .. } => pool,
             ComponentDb::Dedicated { pool, .. } => pool,
+        }
+    }
+
+    /// Get the replica pool settings for this component
+    /// Returns the replica_pool if specified, otherwise returns the primary pool settings
+    pub fn replica_pool_settings(&self) -> &PoolSettings {
+        match self {
+            ComponentDb::Schema { pool, replica_pool, .. } => replica_pool.as_ref().unwrap_or(pool),
+            ComponentDb::Dedicated { pool, replica_pool, .. } => replica_pool.as_ref().unwrap_or(pool),
         }
     }
 }
@@ -226,6 +243,7 @@ pub fn default_fusillade_component() -> ComponentDb {
             idle_timeout_secs: 600,
             max_lifetime_secs: 1800,
         },
+        replica_pool: None,
     }
 }
 
@@ -240,6 +258,7 @@ pub fn default_outlet_component() -> ComponentDb {
             idle_timeout_secs: 600,
             max_lifetime_secs: 1800,
         },
+        replica_pool: None,
     }
 }
 
@@ -261,9 +280,13 @@ pub enum DatabaseConfig {
         /// Whether to persist data between restarts (default: false/ephemeral)
         #[serde(default)]
         persistent: bool,
-        /// Main database connection pool settings
+        /// Main database connection pool settings for primary (and replica if not specified)
         #[serde(default)]
         pool: PoolSettings,
+        /// Optional separate pool settings for replica connections
+        /// If not specified, uses the same settings as `pool`
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        replica_pool: Option<PoolSettings>,
         /// Fusillade batch processing database configuration
         #[serde(default = "default_fusillade_component")]
         fusillade: ComponentDb,
@@ -278,9 +301,13 @@ pub enum DatabaseConfig {
         /// Optional read replica URL for the main database
         #[serde(default, skip_serializing_if = "Option::is_none")]
         replica_url: Option<String>,
-        /// Main database connection pool settings
+        /// Main database connection pool settings for primary (and replica if not specified)
         #[serde(default)]
         pool: PoolSettings,
+        /// Optional separate pool settings for replica connections
+        /// If not specified, uses the same settings as `pool`
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        replica_pool: Option<PoolSettings>,
         /// Fusillade batch processing database configuration
         #[serde(default = "default_fusillade_component")]
         fusillade: ComponentDb,
@@ -299,6 +326,7 @@ impl Default for DatabaseConfig {
                 data_dir: None,
                 persistent: false,
                 pool: PoolSettings::default(),
+                replica_pool: None,
                 fusillade: default_fusillade_component(),
                 outlet: default_outlet_component(),
             }
@@ -309,6 +337,7 @@ impl Default for DatabaseConfig {
                 url: "postgres://localhost:5432/control_layer".to_string(),
                 replica_url: None,
                 pool: PoolSettings::default(),
+                replica_pool: None,
                 fusillade: default_fusillade_component(),
                 outlet: default_outlet_component(),
             }
@@ -354,11 +383,20 @@ impl DatabaseConfig {
         }
     }
 
-    /// Get the main database pool settings
+    /// Get the main database primary pool settings
     pub fn main_pool_settings(&self) -> &PoolSettings {
         match self {
             DatabaseConfig::Embedded { pool, .. } => pool,
             DatabaseConfig::External { pool, .. } => pool,
+        }
+    }
+
+    /// Get the main database replica pool settings
+    /// Returns the replica_pool if specified, otherwise returns the primary pool settings
+    pub fn main_replica_pool_settings(&self) -> &PoolSettings {
+        match self {
+            DatabaseConfig::Embedded { pool, replica_pool, .. } => replica_pool.as_ref().unwrap_or(pool),
+            DatabaseConfig::External { pool, replica_pool, .. } => replica_pool.as_ref().unwrap_or(pool),
         }
     }
 
@@ -1250,6 +1288,7 @@ impl Config {
                 url,
                 replica_url: None,
                 pool,
+                replica_pool: None,
                 fusillade,
                 outlet,
             };

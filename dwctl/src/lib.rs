@@ -563,18 +563,18 @@ async fn setup_database(
     // Create replica pool if configured
     let db_pools = if let Some(replica_url) = config.database.external_replica_url() {
         info!("Setting up read replica pool");
-        let main_settings = config.database.main_pool_settings();
+        let replica_settings = config.database.main_replica_pool_settings();
         let replica_pool = sqlx::postgres::PgPoolOptions::new()
-            .max_connections(main_settings.max_connections)
-            .min_connections(main_settings.min_connections)
-            .acquire_timeout(std::time::Duration::from_secs(main_settings.acquire_timeout_secs))
-            .idle_timeout(if main_settings.idle_timeout_secs > 0 {
-                Some(std::time::Duration::from_secs(main_settings.idle_timeout_secs))
+            .max_connections(replica_settings.max_connections)
+            .min_connections(replica_settings.min_connections)
+            .acquire_timeout(std::time::Duration::from_secs(replica_settings.acquire_timeout_secs))
+            .idle_timeout(if replica_settings.idle_timeout_secs > 0 {
+                Some(std::time::Duration::from_secs(replica_settings.idle_timeout_secs))
             } else {
                 None
             })
-            .max_lifetime(if main_settings.max_lifetime_secs > 0 {
-                Some(std::time::Duration::from_secs(main_settings.max_lifetime_secs))
+            .max_lifetime(if replica_settings.max_lifetime_secs > 0 {
+                Some(std::time::Duration::from_secs(replica_settings.max_lifetime_secs))
             } else {
                 None
             })
@@ -588,41 +588,58 @@ async fn setup_database(
     // Get connection options from the main pool to create schema-based child pools
     let main_connect_opts = db_pools.connect_options().as_ref().clone();
 
+    // Helper to create a pool with schema-specific search_path
+    // Reuses connection URLs from main pool (both primary and replica if configured)
+    let create_schema_pool = |schema: String, opts: sqlx::postgres::PgConnectOptions, settings: &config::PoolSettings| {
+        sqlx::postgres::PgPoolOptions::new()
+            .max_connections(settings.max_connections)
+            .min_connections(settings.min_connections)
+            .acquire_timeout(std::time::Duration::from_secs(settings.acquire_timeout_secs))
+            .idle_timeout(if settings.idle_timeout_secs > 0 {
+                Some(std::time::Duration::from_secs(settings.idle_timeout_secs))
+            } else {
+                None
+            })
+            .max_lifetime(if settings.max_lifetime_secs > 0 {
+                Some(std::time::Duration::from_secs(settings.max_lifetime_secs))
+            } else {
+                None
+            })
+            .after_connect(move |conn, _meta| {
+                let s = schema.clone();
+                Box::pin(async move {
+                    conn.execute(&*format!("SET search_path = '{s}'")).await?;
+                    Ok(())
+                })
+            })
+            .connect_lazy_with(opts)
+    };
+
     // Setup fusillade batch processing pool
     info!("Setting up fusillade batch processing pool");
     let fusillade_pools = match config.database.fusillade() {
-        config::ComponentDb::Schema { name, pool: pool_settings } => {
-            let schema_name = name.clone();
-            let fusillade_pool = sqlx::postgres::PgPoolOptions::new()
-                .max_connections(pool_settings.max_connections)
-                .min_connections(pool_settings.min_connections)
-                .acquire_timeout(std::time::Duration::from_secs(pool_settings.acquire_timeout_secs))
-                .idle_timeout(if pool_settings.idle_timeout_secs > 0 {
-                    Some(std::time::Duration::from_secs(pool_settings.idle_timeout_secs))
-                } else {
-                    None
-                })
-                .max_lifetime(if pool_settings.max_lifetime_secs > 0 {
-                    Some(std::time::Duration::from_secs(pool_settings.max_lifetime_secs))
-                } else {
-                    None
-                })
-                .after_connect(move |conn, _meta| {
-                    let schema = schema_name.clone();
-                    Box::pin(async move {
-                        conn.execute(&*format!("SET search_path = '{schema}'")).await?;
-                        Ok(())
-                    })
-                })
-                .connect_lazy_with(main_connect_opts.clone());
+        config::ComponentDb::Schema {
+            name, pool: pool_settings, ..
+        } => {
+            // Create primary pool using main's connection, with schema-specific search_path
+            let primary = create_schema_pool(name.clone(), main_connect_opts.clone(), pool_settings);
+            primary.execute(&*format!("CREATE SCHEMA IF NOT EXISTS {name}")).await?;
 
-            fusillade_pool.execute(&*format!("CREATE SCHEMA IF NOT EXISTS {name}")).await?;
-            db::DbPools::new(fusillade_pool)
+            // Create replica pool if main has one configured (inherits main's replica connection)
+            if let Some(replica_opts) = db_pools.replica_connect_options() {
+                info!("Setting up fusillade read replica (schema mode)");
+                let replica_pool_settings = config.database.fusillade().replica_pool_settings();
+                let replica = create_schema_pool(name.clone(), replica_opts, replica_pool_settings);
+                db::DbPools::with_replica(primary, replica)
+            } else {
+                db::DbPools::new(primary)
+            }
         }
         config::ComponentDb::Dedicated {
             url,
             replica_url,
             pool: pool_settings,
+            ..
         } => {
             info!("Using dedicated database for fusillade");
             let primary = sqlx::postgres::PgPoolOptions::new()
@@ -644,17 +661,18 @@ async fn setup_database(
 
             if let Some(replica_url) = replica_url {
                 info!("Setting up fusillade read replica");
+                let replica_pool_settings = config.database.fusillade().replica_pool_settings();
                 let replica = sqlx::postgres::PgPoolOptions::new()
-                    .max_connections(pool_settings.max_connections)
-                    .min_connections(pool_settings.min_connections)
-                    .acquire_timeout(std::time::Duration::from_secs(pool_settings.acquire_timeout_secs))
-                    .idle_timeout(if pool_settings.idle_timeout_secs > 0 {
-                        Some(std::time::Duration::from_secs(pool_settings.idle_timeout_secs))
+                    .max_connections(replica_pool_settings.max_connections)
+                    .min_connections(replica_pool_settings.min_connections)
+                    .acquire_timeout(std::time::Duration::from_secs(replica_pool_settings.acquire_timeout_secs))
+                    .idle_timeout(if replica_pool_settings.idle_timeout_secs > 0 {
+                        Some(std::time::Duration::from_secs(replica_pool_settings.idle_timeout_secs))
                     } else {
                         None
                     })
-                    .max_lifetime(if pool_settings.max_lifetime_secs > 0 {
-                        Some(std::time::Duration::from_secs(pool_settings.max_lifetime_secs))
+                    .max_lifetime(if replica_pool_settings.max_lifetime_secs > 0 {
+                        Some(std::time::Duration::from_secs(replica_pool_settings.max_lifetime_secs))
                     } else {
                         None
                     })
@@ -672,38 +690,28 @@ async fn setup_database(
     let outlet_pools = if config.enable_request_logging {
         info!("Setting up outlet request logging pool (logging enabled)");
         let pools = match config.database.outlet() {
-            config::ComponentDb::Schema { name, pool: pool_settings } => {
-                let schema_name = name.clone();
-                let outlet_pool = sqlx::postgres::PgPoolOptions::new()
-                    .max_connections(pool_settings.max_connections)
-                    .min_connections(pool_settings.min_connections)
-                    .acquire_timeout(std::time::Duration::from_secs(pool_settings.acquire_timeout_secs))
-                    .idle_timeout(if pool_settings.idle_timeout_secs > 0 {
-                        Some(std::time::Duration::from_secs(pool_settings.idle_timeout_secs))
-                    } else {
-                        None
-                    })
-                    .max_lifetime(if pool_settings.max_lifetime_secs > 0 {
-                        Some(std::time::Duration::from_secs(pool_settings.max_lifetime_secs))
-                    } else {
-                        None
-                    })
-                    .after_connect(move |conn, _meta| {
-                        let schema = schema_name.clone();
-                        Box::pin(async move {
-                            conn.execute(&*format!("SET search_path = '{schema}'")).await?;
-                            Ok(())
-                        })
-                    })
-                    .connect_lazy_with(main_connect_opts.clone());
+            config::ComponentDb::Schema {
+                name, pool: pool_settings, ..
+            } => {
+                // Create primary pool using main's connection, with schema-specific search_path
+                let primary = create_schema_pool(name.clone(), main_connect_opts.clone(), pool_settings);
+                primary.execute(&*format!("CREATE SCHEMA IF NOT EXISTS {name}")).await?;
 
-                outlet_pool.execute(&*format!("CREATE SCHEMA IF NOT EXISTS {name}")).await?;
-                db::DbPools::new(outlet_pool)
+                // Create replica pool if main has one configured (inherits main's replica connection)
+                if let Some(replica_opts) = db_pools.replica_connect_options() {
+                    info!("Setting up outlet read replica (schema mode)");
+                    let replica_pool_settings = config.database.outlet().replica_pool_settings();
+                    let replica = create_schema_pool(name.clone(), replica_opts, replica_pool_settings);
+                    db::DbPools::with_replica(primary, replica)
+                } else {
+                    db::DbPools::new(primary)
+                }
             }
             config::ComponentDb::Dedicated {
                 url,
                 replica_url,
                 pool: pool_settings,
+                ..
             } => {
                 info!("Using dedicated database for outlet");
                 let primary = sqlx::postgres::PgPoolOptions::new()
@@ -725,17 +733,18 @@ async fn setup_database(
 
                 if let Some(replica_url) = replica_url {
                     info!("Setting up outlet read replica");
+                    let replica_pool_settings = config.database.outlet().replica_pool_settings();
                     let replica = sqlx::postgres::PgPoolOptions::new()
-                        .max_connections(pool_settings.max_connections)
-                        .min_connections(pool_settings.min_connections)
-                        .acquire_timeout(std::time::Duration::from_secs(pool_settings.acquire_timeout_secs))
-                        .idle_timeout(if pool_settings.idle_timeout_secs > 0 {
-                            Some(std::time::Duration::from_secs(pool_settings.idle_timeout_secs))
+                        .max_connections(replica_pool_settings.max_connections)
+                        .min_connections(replica_pool_settings.min_connections)
+                        .acquire_timeout(std::time::Duration::from_secs(replica_pool_settings.acquire_timeout_secs))
+                        .idle_timeout(if replica_pool_settings.idle_timeout_secs > 0 {
+                            Some(std::time::Duration::from_secs(replica_pool_settings.idle_timeout_secs))
                         } else {
                             None
                         })
-                        .max_lifetime(if pool_settings.max_lifetime_secs > 0 {
-                            Some(std::time::Duration::from_secs(pool_settings.max_lifetime_secs))
+                        .max_lifetime(if replica_pool_settings.max_lifetime_secs > 0 {
+                            Some(std::time::Duration::from_secs(replica_pool_settings.max_lifetime_secs))
                         } else {
                             None
                         })
