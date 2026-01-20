@@ -322,24 +322,7 @@ export function CreateBatchModal({
 
   return (
     <Dialog open={isOpen} onOpenChange={handleClose}>
-      <DialogContent className="sm:max-w-lg max-h-[90vh] overflow-hidden flex flex-col">
-        <style>{`
-          .modal-scrollbar::-webkit-scrollbar {
-            width: 8px;
-            height: 8px;
-          }
-          .modal-scrollbar::-webkit-scrollbar-track {
-            background: #f3f4f6;
-          }
-          .modal-scrollbar::-webkit-scrollbar-thumb {
-            background: #9ca3af;
-            border-radius: 4px;
-          }
-          .modal-scrollbar::-webkit-scrollbar-thumb:hover {
-            background: #6b7280;
-          }
-        `}</style>
-        
+      <DialogContent className="sm:max-w-lg max-h-[90vh] overflow-hidden flex flex-col">        
         <DialogHeader>
           <DialogTitle>Create New Batch</DialogTitle>
           <DialogDescription>
