@@ -29,10 +29,10 @@ const getContentPreview = (
 
   if (contentType === "input") {
     content = result.input_body;
+  } else if (result.response_body) {
+    content = result.response_body;
   } else if (result.error) {
     content = { error: result.error };
-  } else {
-    content = result.response_body;
   }
 
   const previewText = content

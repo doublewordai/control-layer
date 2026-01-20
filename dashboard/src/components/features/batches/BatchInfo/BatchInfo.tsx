@@ -894,7 +894,7 @@ const BatchInfo: React.FC = () => {
                       </div>
                     )}
 
-                    {batch.failed_at && (
+                    {batch.failed_at && batch.status === "failed" && (
                       <div>
                         <p className="text-sm text-gray-600 mb-1">Failed</p>
                         <p className="text-sm font-medium text-red-600">
