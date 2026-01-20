@@ -1,43 +1,10 @@
 import { describe, it, expect } from "vitest";
 import {
-  formatFileSize,
   validateBatchFile,
   FILE_SIZE_LIMITS,
 } from "./files";
 
 describe("files", () => {
-  describe("formatFileSize", () => {
-    it("should format bytes", () => {
-      expect(formatFileSize(0)).toBe("0 B");
-      expect(formatFileSize(100)).toBe("100 B");
-      expect(formatFileSize(1023)).toBe("1023 B");
-    });
-
-    it("should format kilobytes", () => {
-      expect(formatFileSize(1024)).toBe("1.00 KB");
-      expect(formatFileSize(1536)).toBe("1.50 KB");
-      expect(formatFileSize(10240)).toBe("10.00 KB");
-      expect(formatFileSize(500 * 1024)).toBe("500.00 KB");
-    });
-
-    it("should format megabytes", () => {
-      expect(formatFileSize(1024 * 1024)).toBe("1.00 MB");
-      expect(formatFileSize(1.5 * 1024 * 1024)).toBe("1.50 MB");
-      expect(formatFileSize(50 * 1024 * 1024)).toBe("50.00 MB");
-      expect(formatFileSize(200 * 1024 * 1024)).toBe("200.00 MB");
-    });
-
-    it("should handle edge cases", () => {
-      expect(formatFileSize(1023)).toBe("1023 B");
-      expect(formatFileSize(1024 * 1024 - 1)).toBe("1024.00 KB");
-    });
-
-    it("should format with two decimal places", () => {
-      expect(formatFileSize(1536)).toBe("1.50 KB");
-      expect(formatFileSize(1.25 * 1024 * 1024)).toBe("1.25 MB");
-    });
-  });
-
   describe("validateBatchFile", () => {
     it("should validate valid .jsonl files", () => {
       const file = new File(["content"], "test.jsonl", { type: "application/jsonl" });
@@ -125,13 +92,23 @@ describe("files", () => {
       }
     });
 
-    it("should handle files with uppercase extension", () => {
+    it("should accept files with uppercase extension (case-insensitive)", () => {
       const upperFile = new File(["content"], "test.JSONL", { type: "application/jsonl" });
       const result = validateBatchFile(upperFile);
       
-      expect(result.isValid).toBe(false);
-      if (!result.isValid) {
-        expect(result.error).toBe("Please upload a .jsonl file");
+      expect(result.isValid).toBe(true);
+      if (result.isValid) {
+        expect('error' in result).toBe(false);
+      }
+    });
+
+    it("should accept files with mixed case extension", () => {
+      const mixedFile = new File(["content"], "test.JsonL", { type: "application/jsonl" });
+      const result = validateBatchFile(mixedFile);
+      
+      expect(result.isValid).toBe(true);
+      if (result.isValid) {
+        expect('error' in result).toBe(false);
       }
     });
 
@@ -175,8 +152,8 @@ describe("files", () => {
     });
 
     it("should be immutable (as const)", () => {
-      expect(Object.isFrozen(FILE_SIZE_LIMITS)).toBe(false); // as const doesn't freeze at runtime
-      // But TypeScript will prevent modification at compile time
+      expect(Object.isFrozen(FILE_SIZE_LIMITS)).toBe(false);
+      // This is expected - 'as const' provides compile-time type safety, not runtime immutability
     });
   });
 });

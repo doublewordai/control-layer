@@ -1,15 +1,4 @@
 /**
- * Format file size in bytes to human-readable string
- * @param bytes - File size in bytes
- * @returns Formatted file size (e.g., "1.5 MB", "500 KB")
- */
-export function formatFileSize(bytes: number): string {
-  if (bytes < 1024) return `${bytes} B`;
-  if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(2)} KB`;
-  return `${(bytes / (1024 * 1024)).toFixed(2)} MB`;
-}
-
-/**
  * File size constants
  */
 export const FILE_SIZE_LIMITS = {
@@ -32,7 +21,7 @@ export type FileValidationResult =
  * @returns Discriminated union indicating validation success or failure with error
  */
 export function validateBatchFile(file: File): FileValidationResult {
-  if (!file.name.endsWith(".jsonl")) {
+  if (!file.name.toLowerCase().endsWith(".jsonl")) {
     return { isValid: false, error: "Please upload a .jsonl file" };
   }
   
