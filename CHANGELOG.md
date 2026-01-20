@@ -1,5 +1,12 @@
 # Changelog
 
+## [2.5.0](https://github.com/doublewordai/control-layer/compare/v2.4.2...v2.5.0) (2026-01-20)
+
+
+### Features
+
+* add replicas to schema database mode and optional parameters to set both replicas independently ([#561](https://github.com/doublewordai/control-layer/issues/561)) ([0cefcfc](https://github.com/doublewordai/control-layer/commit/0cefcfcb130a5af718baa0a02c856b3f2bd34423))
+
 ## [2.4.2](https://github.com/doublewordai/control-layer/compare/v2.4.1...v2.4.2) (2026-01-20)
 
 
