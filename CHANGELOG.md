@@ -1,5 +1,12 @@
 # Changelog
 
+## [2.4.2](https://github.com/doublewordai/control-layer/compare/v2.4.1...v2.4.2) (2026-01-20)
+
+
+### Bug Fixes
+
+* UX bug responses still showing error ([#557](https://github.com/doublewordai/control-layer/issues/557)) ([a61b6fc](https://github.com/doublewordai/control-layer/commit/a61b6fc23c449ff923a7e46959f2fa290cfd0d07))
+
 ## [2.4.1](https://github.com/doublewordai/control-layer/compare/v2.4.0...v2.4.1) (2026-01-19)
 
 
