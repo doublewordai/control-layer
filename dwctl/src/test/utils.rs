@@ -65,6 +65,7 @@ pub fn create_test_config() -> crate::config::Config {
                 min_connections: 1,
                 ..Default::default()
             },
+            replica_pool: None,
             fusillade: crate::config::ComponentDb::Schema {
                 name: "fusillade".to_string(),
                 pool: PoolSettings {
@@ -72,6 +73,7 @@ pub fn create_test_config() -> crate::config::Config {
                     min_connections: 0,
                     ..Default::default()
                 },
+                replica_pool: None,
             },
             outlet: crate::config::ComponentDb::Schema {
                 name: "outlet".to_string(),
@@ -80,6 +82,7 @@ pub fn create_test_config() -> crate::config::Config {
                     min_connections: 0,
                     ..Default::default()
                 },
+                replica_pool: None,
             },
         },
         host: "127.0.0.1".to_string(),

@@ -1832,6 +1832,7 @@ mod tests {
                 url: "postgres://test@localhost/test".to_string(),
                 replica_url: None,
                 pool: Default::default(),
+                replica_pool: None,
                 fusillade: crate::config::default_fusillade_component(),
                 outlet: crate::config::default_outlet_component(),
             },

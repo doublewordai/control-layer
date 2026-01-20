@@ -106,6 +106,14 @@ impl DbPools {
         self.replica.is_some()
     }
 
+    /// Get replica connection options if a replica pool is configured.
+    ///
+    /// Returns `None` if no replica is configured. This is useful for creating
+    /// schema-based pools that mirror the primary/replica structure.
+    pub fn replica_connect_options(&self) -> Option<sqlx::postgres::PgConnectOptions> {
+        self.replica.as_ref().map(|pool| pool.connect_options().as_ref().clone())
+    }
+
     /// Close all database connections.
     ///
     /// Closes both primary and replica pools (if configured).
