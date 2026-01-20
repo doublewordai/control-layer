@@ -1,4 +1,4 @@
-import { useState, useEffect, useMemo } from "react";
+import { useState, useEffect, useMemo, useCallback } from "react";
 import { Play, AlertCircle, X, Upload, ExternalLink, Info, AlertTriangle } from "lucide-react";
 import {
   Dialog,
@@ -36,10 +36,13 @@ import {
   TooltipTrigger,
 } from "@/components/ui/tooltip";
 import { 
-  formatFileSize, 
   validateBatchFile, 
   FILE_SIZE_LIMITS 
 } from "../../../utils/files";
+
+import { 
+  formatBytes, 
+} from "../../../utils/formatters";
 
 interface CreateBatchModalProps {
   isOpen: boolean;
@@ -133,6 +136,18 @@ export function CreateBatchModal({
     }
   }, [preselectedFileToUpload]);
 
+  // Shared upload progress callback to ensure consistent behavior
+  const handleUploadProgress = useCallback((percent: number) => {
+    // Cap at 95% to show there's still processing happening
+    const cappedPercent = Math.min(percent, 95);
+    setUploadProgress(cappedPercent);
+    
+    // If we've reached 95%, mark as processing
+    if (cappedPercent >= 95) {
+      setIsProcessing(true);
+    }
+  }, []);
+
   const handleDrag = (e: React.DragEvent) => {
     e.preventDefault();
     e.stopPropagation();
@@ -157,7 +172,7 @@ export function CreateBatchModal({
         setSelectedFileId(null); // Clear combobox selection
         setError(null);
       } else {
-        setError(validation.error!);
+        setError(validation.error);
       }
     }
   };
@@ -172,7 +187,7 @@ export function CreateBatchModal({
         setSelectedFileId(null); // Clear combobox selection
         setError(null);
       } else {
-        setError(validation.error!);
+        setError(validation.error);
       }
     }
   };
@@ -202,16 +217,7 @@ export function CreateBatchModal({
               seconds: expirationSeconds,
             },
           },
-          onProgress: (percent) => {
-            // Cap at 95% to show there's still processing happening
-            const cappedPercent = Math.min(percent, 95);
-            setUploadProgress(cappedPercent);
-            
-            // If we've reached 95%, mark as processing
-            if (cappedPercent >= 95) {
-              setIsProcessing(true);
-            }
-          },
+          onProgress: handleUploadProgress,
         });
         finalFileId = uploadedFile.id;
         toast.success(
@@ -316,7 +322,24 @@ export function CreateBatchModal({
 
   return (
     <Dialog open={isOpen} onOpenChange={handleClose}>
-      <DialogContent className="sm:max-w-lg">
+      <DialogContent className="sm:max-w-lg max-h-[90vh] overflow-hidden flex flex-col">
+        <style>{`
+          .modal-scrollbar::-webkit-scrollbar {
+            width: 8px;
+            height: 8px;
+          }
+          .modal-scrollbar::-webkit-scrollbar-track {
+            background: #f3f4f6;
+          }
+          .modal-scrollbar::-webkit-scrollbar-thumb {
+            background: #9ca3af;
+            border-radius: 4px;
+          }
+          .modal-scrollbar::-webkit-scrollbar-thumb:hover {
+            background: #6b7280;
+          }
+        `}</style>
+        
         <DialogHeader>
           <DialogTitle>Create New Batch</DialogTitle>
           <DialogDescription>
@@ -343,364 +366,362 @@ export function CreateBatchModal({
           {error}
         </AlertBox>
 
-        <div className="space-y-6">
-          {/* File Selection/Upload */}
-          <div className="space-y-2">
-            <Label>File Selection</Label>
+        <div 
+          className="flex-1 overflow-y-scroll pr-3 modal-scrollbar"
+          style={{
+            scrollbarGutter: 'stable',
+          }}
+        >
+          <div className="space-y-6 pr-1">
+            {/* File Selection/Upload */}
+            <div className="space-y-2">
+              <Label>File Selection</Label>
 
-            {/* Show selected file or file to upload */}
-            {selectedFile || fileToUpload ? (
-              <div className="bg-gray-50 rounded-lg p-3 space-y-1 relative">
-                <div className="flex items-start justify-between gap-2">
-                  <div className="flex-1 min-w-0">
-                    <p className="text-sm font-medium text-gray-900 truncate">
-                      {fileToUpload?.name || selectedFile?.filename}
-                    </p>
-                    <div className="flex gap-4 text-xs text-gray-600">
-                      {fileToUpload ? (
-                        <>
-                          <span>
-                            Size: {formatFileSize(fileToUpload.size)}
-                          </span>
-                          <span className="text-blue-600">
-                            {isUploading ? "Uploading..." : "Ready to upload"}
-                          </span>
-                        </>
-                      ) : (
-                        selectedFile && (
+              {/* Show selected file or file to upload */}
+              {selectedFile || fileToUpload ? (
+                <div className="bg-gray-50 rounded-lg p-3 space-y-1 relative">
+                  <div className="flex items-start justify-between gap-2">
+                    <div className="flex-1 min-w-0">
+                      <p className="text-sm font-medium text-gray-900 truncate">
+                        {fileToUpload?.name || selectedFile?.filename}
+                      </p>
+                      <div className="flex gap-4 text-xs text-gray-600">
+                        {fileToUpload ? (
                           <>
                             <span>
-                              Size: {formatFileSize(selectedFile.bytes)}
+                              Size: {formatBytes(fileToUpload.size)}
                             </span>
-                            <span>ID: {selectedFile.id}</span>
+                            <span className="text-blue-600">
+                              {isUploading ? "Uploading..." : "Ready to upload"}
+                            </span>
                           </>
-                        )
+                        ) : (
+                          selectedFile && (
+                            <>
+                              <span>
+                                Size: {formatBytes(selectedFile.bytes)}
+                              </span>
+                              <span>ID: {selectedFile.id}</span>
+                            </>
+                          )
+                        )}
+                      </div>
+                    </div>
+                    <Button
+                      type="button"
+                      variant="ghost"
+                      size="sm"
+                      onClick={handleRemoveFile}
+                      className="h-8 w-8 p-0 text-gray-500 hover:text-red-600 hover:bg-red-50 shrink-0"
+                      disabled={isPending}
+                    >
+                      <X className="w-4 h-4" />
+                    </Button>
+                  </div>
+                  {/* Upload Progress Bar */}
+                  {isUploading && (
+                    <div className="space-y-1">
+                      <div className="flex justify-between text-xs">
+                        <span className="text-gray-600">
+                          {isProcessing ? "Processing on server..." : "Uploading..."}
+                        </span>
+                        {!isProcessing && (
+                          <span className="text-gray-900 font-medium">{uploadProgress}%</span>
+                        )}
+                      </div>
+                      <div className="h-2 bg-gray-200 rounded-full overflow-hidden">
+                        <div
+                          className="h-full rounded-full transition-all duration-150 ease-out bg-blue-600"
+                          style={{ 
+                            width: `${uploadProgress}%`,
+                            ...(isProcessing && {
+                              animation: 'gentlePulse 3s ease-in-out infinite'
+                            })
+                          }}
+                        />
+                      </div>
+                      {isProcessing && (
+                        <p className="text-xs text-gray-600 text-center">
+                          Upload complete. Server is processing the file...
+                        </p>
                       )}
                     </div>
-                  </div>
-                  <Button
-                    type="button"
-                    variant="ghost"
-                    size="sm"
-                    onClick={handleRemoveFile}
-                    className="h-8 w-8 p-0 text-gray-500 hover:text-red-600 hover:bg-red-50 shrink-0"
-                    disabled={isPending}
-                  >
-                    <X className="w-4 h-4" />
-                  </Button>
+                  )}
                 </div>
-                {/* Upload Progress Bar */}
-                {isUploading && (
-                  <div className="space-y-1">
-                    <div className="flex justify-between text-xs">
-                      <span className="text-gray-600">
-                        {isProcessing ? "Processing on server..." : "Uploading..."}
-                      </span>
-                      {!isProcessing && (
-                        <span className="text-gray-900 font-medium">{uploadProgress}%</span>
-                      )}
-                    </div>
-                    <div className="h-2 bg-gray-200 rounded-full overflow-hidden">
-                      <div
-                        className="h-full rounded-full transition-all duration-150 ease-out bg-blue-600"
-                        style={{ 
-                          width: `${uploadProgress}%`,
-                          ...(isProcessing && {
-                            animation: 'gentlePulse 3s ease-in-out infinite'
-                          })
+              ) : (
+                <>
+                  {/* Combobox for selecting existing file */}
+                  {(availableFiles.length > 0 || hasLoadedFiles) && (
+                    <div className="space-y-2">
+                      <Combobox
+                        options={fileOptions}
+                        value={selectedFileId || ""}
+                        onValueChange={(value) => {
+                          setSelectedFileId(value);
+                          setFileToUpload(null); // Clear file to upload
+                          setError(null);
                         }}
+                        onSearchChange={setFileSearchQuery}
+                        placeholder="Select an existing file..."
+                        searchPlaceholder="Search files..."
+                        emptyMessage="No files found."
+                        className="w-full"
                       />
-                    </div>
-                    {isProcessing && (
-                      <p className="text-xs text-gray-600 text-center">
-                        Upload complete. Server is processing the file...
+                      <p className="text-xs text-gray-500">
+                        Choose from your uploaded batch files
                       </p>
-                    )}
-                  </div>
-                )}
-              </div>
-            ) : (
-              <>
-                {/* Combobox for selecting existing file */}
-                {(availableFiles.length > 0 || hasLoadedFiles) && (
-                  <div className="space-y-2">
-                    <Combobox
-                      options={fileOptions}
-                      value={selectedFileId || ""}
-                      onValueChange={(value) => {
-                        setSelectedFileId(value);
-                        setFileToUpload(null); // Clear file to upload
-                        setError(null);
-                      }}
-                      onSearchChange={setFileSearchQuery}
-                      placeholder="Select an existing file..."
-                      searchPlaceholder="Search files..."
-                      emptyMessage="No files found."
-                      className="w-full"
+                    </div>
+                  )}
+
+                  {/* Separator */}
+                  {(availableFiles.length > 0 || hasLoadedFiles) && (
+                    <div className="relative py-2">
+                      <div className="absolute inset-0 flex items-center">
+                        <span className="w-full border-t" />
+                      </div>
+                      <div className="relative flex justify-center text-xs uppercase">
+                        <span className="bg-white px-2 text-muted-foreground">
+                          Or
+                        </span>
+                      </div>
+                    </div>
+                  )}
+
+                  {/* Drop zone for new file */}
+                  <div
+                    className={`relative border-2 border-dashed rounded-lg p-6 text-center transition-colors ${
+                      dragActive
+                        ? "border-blue-500 bg-blue-50"
+                        : "border-gray-300 hover:border-gray-400"
+                    }`}
+                    onDragEnter={handleDrag}
+                    onDragLeave={handleDrag}
+                    onDragOver={handleDrag}
+                    onDrop={handleDrop}
+                  >
+                    <input
+                      type="file"
+                      id="file-upload-batch"
+                      accept=".jsonl"
+                      onChange={handleFileChange}
+                      className="absolute inset-0 w-full h-full opacity-0 cursor-pointer"
+                      disabled={isPending}
                     />
-                    <p className="text-xs text-gray-500">
-                      Choose from your uploaded batch files
+
+                    <div className="space-y-2 pointer-events-none">
+                      <Upload className="w-10 h-10 mx-auto text-gray-400" />
+                      <div>
+                        <p className="font-medium text-gray-700 text-sm">
+                          Drop a .jsonl file here
+                        </p>
+                        <p className="text-xs text-gray-500">
+                          or click to browse
+                        </p>
+                      </div>
+                    </div>
+                  </div>
+                </>
+              )}
+            </div>
+
+            {/* Large File Warning */}
+            {isLargeFile && (
+              <div className="bg-amber-50 border border-amber-200 rounded-lg p-3">
+                <div className="flex gap-2">
+                  <AlertTriangle className="w-4 h-4 text-amber-600 mt-0.5 shrink-0" />
+                  <div className="text-sm text-amber-800">
+                    <p className="font-medium mb-1">Large File Detected</p>
+                    <p className="text-amber-700">
+                      This file is over {FILE_SIZE_LIMITS.LARGE_FILE_WARNING_MB}MB. Large files may take a while to upload depending on your connection speed. Please be patient and keep this window open until the upload completes.
                     </p>
                   </div>
-                )}
-
-                {/* Separator */}
-                {(availableFiles.length > 0 || hasLoadedFiles) && (
-                  <div className="relative py-2">
-                    <div className="absolute inset-0 flex items-center">
-                      <span className="w-full border-t" />
-                    </div>
-                    <div className="relative flex justify-center text-xs uppercase">
-                      <span className="bg-white px-2 text-muted-foreground">
-                        Or
-                      </span>
-                    </div>
-                  </div>
-                )}
-
-                {/* Drop zone for new file */}
-                <div
-                  className={`relative border-2 border-dashed rounded-lg p-6 text-center transition-colors ${
-                    dragActive
-                      ? "border-blue-500 bg-blue-50"
-                      : "border-gray-300 hover:border-gray-400"
-                  }`}
-                  onDragEnter={handleDrag}
-                  onDragLeave={handleDrag}
-                  onDragOver={handleDrag}
-                  onDrop={handleDrop}
-                >
-                  <input
-                    type="file"
-                    id="file-upload-batch"
-                    accept=".jsonl"
-                    onChange={handleFileChange}
-                    className="absolute inset-0 w-full h-full opacity-0 cursor-pointer"
-                    disabled={isPending}
-                  />
-
-                  <div className="space-y-2 pointer-events-none">
-                    <Upload className="w-10 h-10 mx-auto text-gray-400" />
-                    <div>
-                      <p className="font-medium text-gray-700 text-sm">
-                        Drop a .jsonl file here
-                      </p>
-                      <p className="text-xs text-gray-500">
-                        or click to browse
-                      </p>
-                    </div>
-                  </div>
-                </div>
-              </>
-            )}
-          </div>
-
-          {/* Large File Warning */}
-          {isLargeFile && (
-            <div className="bg-amber-50 border border-amber-200 rounded-lg p-3">
-              <div className="flex gap-2">
-                <AlertTriangle className="w-4 h-4 text-amber-600 mt-0.5 shrink-0" />
-                <div className="text-sm text-amber-800">
-                  <p className="font-medium mb-1">Large File Detected</p>
-                  <p className="text-amber-700">
-                    This file is over {FILE_SIZE_LIMITS.LARGE_FILE_WARNING_MB}MB. Large files may take a while to upload depending on your connection speed. Please be patient and keep this window open until the upload completes.
-                  </p>
                 </div>
               </div>
-            </div>
-          )}
+            )}
 
-          {/* New Filename (optional, only for files to upload) */}
-          {fileToUpload && (
+            {/* New Filename (optional, only for files to upload) */}
+            {fileToUpload && (
+              <div className="space-y-2">
+                <Label htmlFor="filename">
+                  New filename <span className="text-gray-400">(optional)</span>
+                </Label>
+                <Input
+                  id="filename"
+                  value={filename}
+                  onChange={(e) => setFilename(e.target.value)}
+                  placeholder={fileToUpload.name}
+                  disabled={isPending}
+                />
+              </div>
+            )}
+
+            {/* Description (Optional) */}
             <div className="space-y-2">
-              <Label htmlFor="filename">
-                New filename <span className="text-gray-400">(optional)</span>
+              <Label htmlFor="description">
+                Description <span className="text-gray-400">(optional)</span>
               </Label>
               <Input
-                id="filename"
-                value={filename}
-                onChange={(e) => setFilename(e.target.value)}
-                placeholder={fileToUpload.name}
+                id="description"
+                placeholder="e.g., Data generation task"
+                value={description}
+                onChange={(e) => setDescription(e.target.value)}
+                onKeyDown={(e) => {
+                  if (
+                    e.key === "Enter" &&
+                    !isPending &&
+                    (selectedFileId || fileToUpload)
+                  ) {
+                    e.preventDefault();
+                    handleSubmit();
+                  }
+                }}
+                maxLength={512}
                 disabled={isPending}
               />
+              <p className="text-xs text-gray-500">
+                Add a description to help identify this batch later
+              </p>
             </div>
-          )}
 
-          {/* Description (Optional) */}
-          <div className="space-y-2">
-            <Label htmlFor="description">
-              Description <span className="text-gray-400">(optional)</span>
-            </Label>
-            <Input
-              id="description"
-              placeholder="e.g., Data generation task"
-              value={description}
-              onChange={(e) => setDescription(e.target.value)}
-              onKeyDown={(e) => {
-                if (
-                  e.key === "Enter" &&
-                  !isPending &&
-                  (selectedFileId || fileToUpload)
-                ) {
-                  e.preventDefault();
-                  handleSubmit();
-                }
-              }}
-              maxLength={512}
-              disabled={isPending}
-            />
-            <p className="text-xs text-gray-500">
-              Add a description to help identify this batch later
-            </p>
-          </div>
+            {/* SLA Selection */}
+            <div className="space-y-2">
+              <Label htmlFor="completion-window">Completion Window (SLA)</Label>
+              <Select
+                value={completionWindow}
+                onValueChange={setCompletionWindow}
+                disabled={isPending}
+              >
+                <SelectTrigger id="completion-window">
+                  <SelectValue />
+                </SelectTrigger>
+                <SelectContent>
+                  {availableSLAs.map((sla) => (
+                    <SelectItem key={sla} value={sla}>
+                      {sla}
+                    </SelectItem>
+                  ))}
+                </SelectContent>
+              </Select>
+              <p className="text-xs text-gray-500">
+                Select the maximum time allowed for batch completion
+              </p>
+            </div>
 
-          {/* SLA Selection */}
-          <div className="space-y-2">
-            <Label htmlFor="completion-window">Completion Window (SLA)</Label>
-            <Select
-              value={completionWindow}
-              onValueChange={setCompletionWindow}
-              disabled={isPending}
-            >
-              <SelectTrigger id="completion-window">
-                <SelectValue />
-              </SelectTrigger>
-              <SelectContent>
-                {availableSLAs.map((sla) => (
-                  <SelectItem key={sla} value={sla}>
-                    {sla}
-                  </SelectItem>
-                ))}
-              </SelectContent>
-            </Select>
-            <p className="text-xs text-gray-500">
-              Select the maximum time allowed for batch completion
-            </p>
-          </div>
-
-          {/* Cost Estimate */}
-          {(selectedFileId || fileToUpload) && (
-            <div className="bg-gray-50 border border-gray-200 rounded-lg p-3">
-              <div className="space-y-2">
-                <div className="flex items-center gap-1.5">
-                  <p className="text-sm font-medium text-gray-900">
-                    Cost Estimate
-                  </p>
-                  <Tooltip>
-                    <TooltipTrigger asChild>
-                      <Info className="w-3.5 h-3.5 text-gray-400 cursor-help" />
-                    </TooltipTrigger>
-                    <TooltipContent side="top" className="max-w-[250px]">
-                      Based on {completionWindow} SLA pricing and average output
-                      tokens for the requested model(s). Actual cost may vary.
-                    </TooltipContent>
-                  </Tooltip>
-                </div>
-                {selectedFileId ? (
-                  isLoadingCost ? (
-                    <div className="flex items-center gap-2 text-sm text-gray-600">
-                      <div className="animate-spin rounded-full h-3 w-3 border-b-2 border-gray-600"></div>
-                      Calculating...
-                    </div>
-                  ) : costEstimate ? (
-                    <div className="space-y-1.5">
-                      <div className="flex justify-between text-sm">
-                        <span className="text-gray-600">Total Requests:</span>
-                        <span className="font-medium text-gray-900">
-                          {costEstimate.total_requests.toLocaleString()}
-                        </span>
-                      </div>
-                      <div className="flex justify-between text-sm">
-                        <span className="text-gray-600">Estimated Cost:</span>
-                        <span className="font-semibold text-gray-900">
-                          $
-                          {parseFloat(
-                            costEstimate.total_estimated_cost,
-                          ).toFixed(4)}
-                        </span>
-                      </div>
-                    </div>
-                  ) : (
-                    <p className="text-sm text-gray-500">
-                      Cost estimate unavailable
+            {/* Cost Estimate */}
+            {(selectedFileId || fileToUpload) && (
+              <div className="bg-gray-50 border border-gray-200 rounded-lg p-3">
+                <div className="space-y-2">
+                  <div className="flex items-center gap-1.5">
+                    <p className="text-sm font-medium text-gray-900">
+                      Cost Estimate
                     </p>
-                  )
-                ) : (
-                  <button
-                    type="button"
-                    onClick={async () => {
-                      if (!fileToUpload || isPending) return;
-                      setIsUploading(true);
-                      setUploadProgress(0);
-                      setIsProcessing(false);
-                      try {
-                        const uploadedFile = await uploadMutation.mutateAsync({
-                          data: {
-                            file: fileToUpload,
-                            purpose: "batch",
-                            filename: filename || undefined,
-                            expires_after: {
-                              anchor: "created_at",
-                              seconds: expirationSeconds,
-                            },
-                          },
-                          onProgress: (percent) => {
-                            // Cap at 95% to show there's still processing happening
-                            const cappedPercent = Math.min(percent, 95);
-                            setUploadProgress(cappedPercent);
-                            
-                            // If we've reached 95%, mark as processing
-                            if (cappedPercent >= 95) {
-                              setIsProcessing(true);
-                            }
-                          },
-                        });
-                        setSelectedFileId(uploadedFile.id);
-                        toast.success(
-                          `File "${filename || fileToUpload.name}" uploaded successfully`,
-                        );
-                      } catch (err) {
-                        console.error("Failed to upload file:", err);
-                        setError(
-                          err instanceof Error
-                            ? err.message
-                            : "Failed to upload file. Please try again.",
-                        );
-                      } finally {
-                        setIsUploading(false);
+                    <Tooltip>
+                      <TooltipTrigger asChild>
+                        <Info className="w-3.5 h-3.5 text-gray-400 cursor-help" />
+                      </TooltipTrigger>
+                      <TooltipContent side="top" className="max-w-[250px]">
+                        Based on {completionWindow} SLA pricing and average output
+                        tokens for the requested model(s). Actual cost may vary.
+                      </TooltipContent>
+                    </Tooltip>
+                  </div>
+                  {selectedFileId ? (
+                    isLoadingCost ? (
+                      <div className="flex items-center gap-2 text-sm text-gray-600">
+                        <div className="animate-spin rounded-full h-3 w-3 border-b-2 border-gray-600"></div>
+                        Calculating...
+                      </div>
+                    ) : costEstimate ? (
+                      <div className="space-y-1.5">
+                        <div className="flex justify-between text-sm">
+                          <span className="text-gray-600">Total Requests:</span>
+                          <span className="font-medium text-gray-900">
+                            {costEstimate.total_requests.toLocaleString()}
+                          </span>
+                        </div>
+                        <div className="flex justify-between text-sm">
+                          <span className="text-gray-600">Estimated Cost:</span>
+                          <span className="font-semibold text-gray-900">
+                            $
+                            {parseFloat(
+                              costEstimate.total_estimated_cost,
+                            ).toFixed(4)}
+                          </span>
+                        </div>
+                      </div>
+                    ) : (
+                      <p className="text-sm text-gray-500">
+                        Cost estimate unavailable
+                      </p>
+                    )
+                  ) : (
+                    <button
+                      type="button"
+                      onClick={async () => {
+                        if (!fileToUpload || isPending) return;
+                        setIsUploading(true);
                         setUploadProgress(0);
                         setIsProcessing(false);
-                      }
-                    }}
-                    disabled={isPending}
-                    className={`text-xs text-blue-600 hover:text-blue-700 hover:underline disabled:opacity-50 flex items-center gap-1 ${isPending ? "cursor-not-allowed" : "cursor-pointer"}`}
-                  >
-                    <Upload className="w-3 h-3" />
-                    Complete file upload to generate inference cost estimate
-                  </button>
-                )}
+                        try {
+                          const uploadedFile = await uploadMutation.mutateAsync({
+                            data: {
+                              file: fileToUpload,
+                              purpose: "batch",
+                              filename: filename || undefined,
+                              expires_after: {
+                                anchor: "created_at",
+                                seconds: expirationSeconds,
+                              },
+                            },
+                            onProgress: handleUploadProgress,
+                          });
+                          setSelectedFileId(uploadedFile.id);
+                          toast.success(
+                            `File "${filename || fileToUpload.name}" uploaded successfully`,
+                          );
+                        } catch (err) {
+                          console.error("Failed to upload file:", err);
+                          setError(
+                            err instanceof Error
+                              ? err.message
+                              : "Failed to upload file. Please try again.",
+                          );
+                        } finally {
+                          setIsUploading(false);
+                          setUploadProgress(0);
+                          setIsProcessing(false);
+                        }
+                      }}
+                      disabled={isPending}
+                      className={`text-xs text-blue-600 hover:text-blue-700 hover:underline disabled:opacity-50 flex items-center gap-1 ${isPending ? "cursor-not-allowed" : "cursor-pointer"}`}
+                    >
+                      <Upload className="w-3 h-3" />
+                      Complete file upload to generate inference cost estimate
+                    </button>
+                  )}
+                </div>
               </div>
-            </div>
-          )}
+            )}
 
-          {/* Info Box */}
-          <div className="bg-blue-50 border border-blue-200 rounded-lg p-3">
-            <div className="flex gap-2">
-              <AlertCircle className="w-4 h-4 text-blue-600 mt-0.5 shrink-0" />
-              <div className="text-sm text-blue-800">
-                <p className="font-medium mb-1">Batch Processing</p>
-                <p className="text-blue-700">
-                  {fileToUpload
-                    ? "The file will be uploaded and the batch will process all requests. "
-                    : "The batch will process all requests in the selected file. "}
-                  You can track progress and download results once completed.
-                </p>
+            {/* Info Box */}
+            <div className="bg-blue-50 border border-blue-200 rounded-lg p-3">
+              <div className="flex gap-2">
+                <AlertCircle className="w-4 h-4 text-blue-600 mt-0.5 shrink-0" />
+                <div className="text-sm text-blue-800">
+                  <p className="font-medium mb-1">Batch Processing</p>
+                  <p className="text-blue-700">
+                    {fileToUpload
+                      ? "The file will be uploaded and the batch will process all requests. "
+                      : "The batch will process all requests in the selected file. "}
+                    You can track progress and download results once completed.
+                  </p>
+                </div>
               </div>
             </div>
           </div>
         </div>
 
-        <DialogFooter>
+        <DialogFooter className="mt-4">
           <Button
             type="button"
             variant="outline"

@@ -20,11 +20,18 @@ export const FILE_SIZE_LIMITS = {
 } as const;
 
 /**
+ * Result type for file validation using discriminated union
+ */
+export type FileValidationResult =
+  | { isValid: true }
+  | { isValid: false; error: string };
+
+/**
  * Validate a file for upload
  * @param file - File to validate
- * @returns Object with isValid boolean and optional error message
+ * @returns Discriminated union indicating validation success or failure with error
  */
-export function validateBatchFile(file: File): { isValid: boolean; error?: string } {
+export function validateBatchFile(file: File): FileValidationResult {
   if (!file.name.endsWith(".jsonl")) {
     return { isValid: false, error: "Please upload a .jsonl file" };
   }

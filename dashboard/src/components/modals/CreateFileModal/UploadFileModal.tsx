@@ -1,4 +1,4 @@
-import { useState, useEffect } from "react";
+import { useState, useEffect, useCallback } from "react";
 import { Upload, X, FileText, AlertCircle, ExternalLink, AlertTriangle } from "lucide-react";
 import {
   Dialog,
@@ -15,10 +15,13 @@ import { useUploadFileWithProgress, useConfig } from "../../../api/control-layer
 import { toast } from "sonner";
 import { AlertBox } from "@/components/ui/alert-box";
 import { 
-  formatFileSize, 
   validateBatchFile, 
   FILE_SIZE_LIMITS 
 } from "../../../utils/files";
+import { 
+  formatBytes, 
+} from "../../../utils/formatters";
+
 
 interface UploadFileModalProps {
   isOpen: boolean;
@@ -51,6 +54,18 @@ export function UploadFileModal({
     }
   }, [preselectedFile]);
 
+  // Shared upload progress callback to ensure consistent behavior
+  const handleUploadProgress = useCallback((percent: number) => {
+    // Cap at 95% to show there's still processing happening
+    const cappedPercent = Math.min(percent, 95);
+    setUploadProgress(cappedPercent);
+    
+    // If we've reached 95%, mark as processing
+    if (cappedPercent >= 95) {
+      setIsProcessing(true);
+    }
+  }, []);
+
   const handleDrag = (e: React.DragEvent) => {
     e.preventDefault();
     e.stopPropagation();
@@ -74,7 +89,7 @@ export function UploadFileModal({
         setFilename(droppedFile.name);
         setError(null);
       } else {
-        setError(validation.error!);
+        setError(validation.error);
       }
     }
   };
@@ -88,7 +103,7 @@ export function UploadFileModal({
         setFilename(selectedFile.name);
         setError(null);
       } else {
-        setError(validation.error!);
+        setError(validation.error);
       }
     }
   };
@@ -129,16 +144,7 @@ export function UploadFileModal({
             seconds: expirationSeconds,
           },
         },
-        onProgress: (percent) => {
-          // Cap at 95% to show there's still processing happening
-          const cappedPercent = Math.min(percent, 95);
-          setUploadProgress(cappedPercent);
-          
-          // If we've reached 95%, mark as processing
-          if (cappedPercent >= 95) {
-            setIsProcessing(true);
-          }
-        },
+        onProgress: handleUploadProgress,
       });
 
       toast.success(`File "${filename || file.name}" uploaded successfully`);
@@ -231,7 +237,7 @@ export function UploadFileModal({
                 <div>
                   <p className="font-medium text-green-900">{file.name}</p>
                   <p className="text-sm text-green-700">
-                    {formatFileSize(file.size)}
+                    {formatBytes(file.size)}
                   </p>
                 </div>
                 <Button
