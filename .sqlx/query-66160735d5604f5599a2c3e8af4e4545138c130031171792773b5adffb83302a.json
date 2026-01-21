@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "\n        SELECT\n            ha.user_id,\n            u.email as user_email,\n            COUNT(*) as request_count,\n            COALESCE(SUM(ha.prompt_tokens), 0)::bigint as total_input_tokens,\n            COALESCE(SUM(ha.completion_tokens), 0)::bigint as total_output_tokens,\n            COALESCE(SUM(ha.total_tokens), 0)::bigint as total_tokens,\n            SUM(ha.total_cost)::float8 as total_cost,\n            MAX(ha.timestamp) as last_active_at\n        FROM http_analytics ha\n        LEFT JOIN users u ON u.id = ha.user_id AND u.is_deleted = false\n        WHERE ha.model = $1\n            AND ha.timestamp >= $2\n            AND ha.timestamp <= $3\n            AND ha.user_id IS NOT NULL\n        GROUP BY ha.user_id, u.email\n        ORDER BY request_count DESC\n        ",
+  "query": "\n        SELECT\n            ha.user_id,\n            u.email as user_email,\n            COUNT(*) as request_count,\n            COALESCE(SUM(ha.prompt_tokens), 0)::bigint as total_input_tokens,\n            COALESCE(SUM(ha.completion_tokens), 0)::bigint as total_output_tokens,\n            COALESCE(SUM(ha.total_tokens), 0)::bigint as total_tokens,\n            SUM(ha.total_cost)::float8 as total_cost,\n            MAX(ha.timestamp) as last_active_at\n        FROM http_analytics ha\n        LEFT JOIN users u ON u.id = ha.user_id\n        WHERE ha.model = $1\n            AND ha.timestamp >= $2\n            AND ha.timestamp <= $3\n            AND ha.user_id IS NOT NULL\n        GROUP BY ha.user_id, u.email\n        ORDER BY request_count DESC\n        ",
   "describe": {
     "columns": [
       {
@@ -62,5 +62,5 @@
       null
     ]
   },
-  "hash": "fd44f976af1706a8599ab637efd419172655f358567302ab63a2b7956ea9874a"
+  "hash": "66160735d5604f5599a2c3e8af4e4545138c130031171792773b5adffb83302a"
 }
