@@ -827,7 +827,6 @@ struct HttpAnalyticsRow {
     pub completion_tokens: Option<i64>,
     pub total_tokens: Option<i64>,
     pub response_type: Option<String>,
-    pub user_email: Option<String>,
     pub fusillade_batch_id: Option<Uuid>,
     pub input_price_per_token: Option<Decimal>,
     pub output_price_per_token: Option<Decimal>,
@@ -850,38 +849,36 @@ pub async fn list_http_analytics(
         HttpAnalyticsRow,
         r#"
         SELECT
-            ha.id,
-            ha.timestamp,
-            ha.method,
-            ha.uri,
-            ha.model,
-            ha.status_code,
-            ha.duration_ms,
-            ha.prompt_tokens,
-            ha.completion_tokens,
-            ha.total_tokens,
-            ha.response_type,
-            u.email as "user_email?",
-            ha.fusillade_batch_id,
-            ha.input_price_per_token,
-            ha.output_price_per_token,
-            ha.custom_id
-        FROM http_analytics ha
-        LEFT JOIN users u ON u.id = ha.user_id
+            id,
+            timestamp,
+            method,
+            uri,
+            model,
+            status_code,
+            duration_ms,
+            prompt_tokens,
+            completion_tokens,
+            total_tokens,
+            response_type,
+            fusillade_batch_id,
+            input_price_per_token,
+            output_price_per_token,
+            custom_id
+        FROM http_analytics
         WHERE
-            ($1::timestamptz IS NULL OR ha.timestamp >= $1)
-            AND ($2::timestamptz IS NULL OR ha.timestamp <= $2)
-            AND ($3::text IS NULL OR ha.model = $3)
-            AND ($4::uuid IS NULL OR ha.fusillade_batch_id = $4)
-            AND ($5::text IS NULL OR ha.method = $5)
-            AND ($6::text IS NULL OR ha.uri LIKE $6)
-            AND ($7::int IS NULL OR ha.status_code = $7)
-            AND ($8::int IS NULL OR ha.status_code >= $8)
-            AND ($9::int IS NULL OR ha.status_code <= $9)
-            AND ($10::bigint IS NULL OR ha.duration_ms >= $10)
-            AND ($11::bigint IS NULL OR ha.duration_ms <= $11)
-            AND ($12::text IS NULL OR ha.custom_id ILIKE $12)
-        ORDER BY ha.timestamp DESC
+            ($1::timestamptz IS NULL OR timestamp >= $1)
+            AND ($2::timestamptz IS NULL OR timestamp <= $2)
+            AND ($3::text IS NULL OR model = $3)
+            AND ($4::uuid IS NULL OR fusillade_batch_id = $4)
+            AND ($5::text IS NULL OR method = $5)
+            AND ($6::text IS NULL OR uri LIKE $6)
+            AND ($7::int IS NULL OR status_code = $7)
+            AND ($8::int IS NULL OR status_code >= $8)
+            AND ($9::int IS NULL OR status_code <= $9)
+            AND ($10::bigint IS NULL OR duration_ms >= $10)
+            AND ($11::bigint IS NULL OR duration_ms <= $11)
+            AND ($12::text IS NULL OR custom_id ILIKE $12)
+        ORDER BY timestamp DESC
         LIMIT $13
         OFFSET $14
         "#,
@@ -920,7 +917,6 @@ pub async fn list_http_analytics(
             completion_tokens: row.completion_tokens,
             total_tokens: row.total_tokens,
             response_type: row.response_type,
-            user_email: row.user_email,
             fusillade_batch_id: row.fusillade_batch_id,
             input_price_per_token: row.input_price_per_token.map(|p| p.to_string()),
             output_price_per_token: row.output_price_per_token.map(|p| p.to_string()),
