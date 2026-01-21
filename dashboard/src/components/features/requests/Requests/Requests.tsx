@@ -31,7 +31,6 @@ function transformAnalyticsEntry(entry: AnalyticsEntry): RequestsEntry {
     completion_tokens: entry.completion_tokens,
     total_tokens: entry.total_tokens,
     response_type: entry.response_type,
-    user_email: entry.user_email,
     fusillade_batch_id: entry.fusillade_batch_id,
     input_price_per_token: entry.input_price_per_token,
     output_price_per_token: entry.output_price_per_token,

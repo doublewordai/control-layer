@@ -220,9 +220,6 @@ pub struct AnalyticsEntry {
     /// Response type (chat_completion, embedding, etc.)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub response_type: Option<String>,
-    /// User email (if authenticated)
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub user_email: Option<String>,
     /// Fusillade batch ID (if part of a batch)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub fusillade_batch_id: Option<uuid::Uuid>,
