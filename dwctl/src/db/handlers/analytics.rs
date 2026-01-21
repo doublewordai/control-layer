@@ -710,7 +710,7 @@ pub async fn get_model_user_usage(
         r#"
         SELECT
             ha.user_id,
-            u.email as user_email,
+            u.email as "user_email?",
             COUNT(*) as request_count,
             COALESCE(SUM(ha.prompt_tokens), 0)::bigint as total_input_tokens,
             COALESCE(SUM(ha.completion_tokens), 0)::bigint as total_output_tokens,
@@ -861,7 +861,7 @@ pub async fn list_http_analytics(
             ha.completion_tokens,
             ha.total_tokens,
             ha.response_type,
-            u.email as user_email,
+            u.email as "user_email?",
             ha.fusillade_batch_id,
             ha.input_price_per_token,
             ha.output_price_per_token,
