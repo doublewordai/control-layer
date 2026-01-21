@@ -190,7 +190,7 @@ impl CreditTransactionResponse {
     }
 
     /// Convert from DB response with full category information
-    pub fn from_db_with_category(
+    pub fn from_db_with_metadata(
         db: CreditTransactionDBResponse,
         batch_id: Option<Uuid>,
         request_origin: Option<String>,
