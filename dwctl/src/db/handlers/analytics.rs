@@ -718,7 +718,7 @@ pub async fn get_model_user_usage(
             SUM(ha.total_cost)::float8 as total_cost,
             MAX(ha.timestamp) as last_active_at
         FROM http_analytics ha
-        LEFT JOIN users u ON u.id = ha.user_id AND u.is_deleted = false
+        LEFT JOIN users u ON u.id = ha.user_id
         WHERE ha.model = $1
             AND ha.timestamp >= $2
             AND ha.timestamp <= $3
@@ -867,7 +867,7 @@ pub async fn list_http_analytics(
             ha.output_price_per_token,
             ha.custom_id
         FROM http_analytics ha
-        LEFT JOIN users u ON u.id = ha.user_id AND u.is_deleted = false
+        LEFT JOIN users u ON u.id = ha.user_id
         WHERE
             ($1::timestamptz IS NULL OR ha.timestamp >= $1)
             AND ($2::timestamptz IS NULL OR ha.timestamp <= $2)
