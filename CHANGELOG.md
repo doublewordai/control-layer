@@ -1,5 +1,17 @@
 # Changelog
 
+## [2.6.0](https://github.com/doublewordai/control-layer/compare/v2.5.2...v2.6.0) (2026-01-21)
+
+
+### Features
+
+* add is_internal, batch_metadata_request_origin columns and remove denormalized PII ([#567](https://github.com/doublewordai/control-layer/issues/567)) ([566824f](https://github.com/doublewordai/control-layer/commit/566824f30054d98621853cdf654d13694f9ef45b))
+
+
+### Bug Fixes
+
+* better column name and removed unnecessary email join ([#570](https://github.com/doublewordai/control-layer/issues/570)) ([fb8c1e2](https://github.com/doublewordai/control-layer/commit/fb8c1e24b64bb81143104c8a8f5af63bec5c2784))
+
 ## [2.5.2](https://github.com/doublewordai/control-layer/compare/v2.5.1...v2.5.2) (2026-01-21)
 
 
