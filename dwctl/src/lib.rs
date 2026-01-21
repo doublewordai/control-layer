@@ -512,20 +512,8 @@ async fn setup_database(
         // This ensures all tests verify correct pool routing
         #[cfg(test)]
         let test_replica = {
-            use sqlx::postgres::PgPoolOptions;
             info!("Creating read-only test replica pool for pool routing validation");
-            let replica = PgPoolOptions::new()
-                .max_connections(existing_pool.options().get_max_connections())
-                .after_connect(|conn, _meta| {
-                    Box::pin(async move {
-                        // Set all transactions to read-only by default
-                        sqlx::query("SET default_transaction_read_only = on").execute(&mut *conn).await?;
-                        Ok(())
-                    })
-                })
-                .connect_with(existing_pool.connect_options().as_ref().clone())
-                .await?;
-            Some(replica)
+            Some(test::utils::create_readonly_replica_pool(&existing_pool).await?)
         };
 
         #[cfg(not(test))]

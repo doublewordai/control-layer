@@ -27,6 +27,25 @@ use axum_test::TestServer;
 use sqlx::{PgConnection, PgPool, postgres::PgPoolOptions};
 use uuid::Uuid;
 
+/// Create a read-only replica pool from an existing pool.
+///
+/// The replica pool enforces `default_transaction_read_only = on`,
+/// so any write operations will fail with a PostgreSQL error.
+/// This helps catch pool routing violations in tests.
+pub async fn create_readonly_replica_pool(pool: &PgPool) -> Result<PgPool, sqlx::Error> {
+    PgPoolOptions::new()
+        .max_connections(pool.options().get_max_connections())
+        .after_connect(|conn, _meta| {
+            Box::pin(async move {
+                // Set all transactions to read-only by default
+                sqlx::query("SET default_transaction_read_only = on").execute(&mut *conn).await?;
+                Ok(())
+            })
+        })
+        .connect_with(pool.connect_options().as_ref().clone())
+        .await
+}
+
 /// Create test DbPools with read-only enforcement on replica.
 ///
 /// This creates:
@@ -38,18 +57,7 @@ use uuid::Uuid;
 /// This helps catch pool routing violations in tests.
 pub async fn create_test_db_pools(pool: PgPool) -> crate::db::DbPools {
     let primary = pool.clone();
-
-    // Create a separate pool with read-only enforcement
-    let replica = PgPoolOptions::new()
-        .max_connections(pool.options().get_max_connections())
-        .after_connect(|conn, _meta| {
-            Box::pin(async move {
-                // Set all transactions to read-only by default
-                sqlx::query("SET default_transaction_read_only = on").execute(&mut *conn).await?;
-                Ok(())
-            })
-        })
-        .connect_with(pool.connect_options().as_ref().clone())
+    let replica = create_readonly_replica_pool(&pool)
         .await
         .expect("Failed to create read-only replica pool for testing");
 
