@@ -1828,6 +1828,7 @@ mod tests {
             host: "localhost".to_string(),
             port: 3001,
             database_url: None,
+            database_replica_url: None,
             database: crate::config::DatabaseConfig::External {
                 url: "postgres://test@localhost/test".to_string(),
                 replica_url: None,

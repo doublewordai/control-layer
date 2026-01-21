@@ -57,6 +57,7 @@ pub fn create_test_config() -> crate::config::Config {
 
     crate::config::Config {
         database_url: None,
+        database_replica_url: None,
         database: crate::config::DatabaseConfig::External {
             url: "Something".to_string(), // Will get overriden by env var
             replica_url: None,
