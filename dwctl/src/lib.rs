@@ -1702,7 +1702,7 @@ impl Application {
 
         // Setup background services (onwards integration, probe scheduler, batch daemon, leader election)
         let bg_services = setup_background_services(
-            (*db_pools).clone(),
+            db_pools.read().clone(),
             fusillade_pools.clone(),
             outlet_pools.as_ref().map(|p| (**p).clone()),
             config.clone(),
