@@ -112,7 +112,6 @@ pub struct HttpAnalyticsRow {
     pub total_tokens: i64,
     pub response_type: String,
     pub user_id: Option<Uuid>,
-    pub user_email: Option<String>,
     pub access_source: String,
     pub input_price_per_token: Option<rust_decimal::Decimal>,
     pub output_price_per_token: Option<rust_decimal::Decimal>,
@@ -419,23 +418,23 @@ pub async fn store_analytics_record(
     };
 
     // Extract user information and API key purpose based on auth type
-    let (user_id, user_email, access_source, api_key_purpose) = match auth {
+    let (user_id, access_source, api_key_purpose) = match auth {
         Auth::ApiKey { bearer_token } => {
-            // Try to get user ID, email, and purpose from API key
+            // Try to get user ID and purpose from API key
             use crate::db::handlers::api_keys::ApiKeys;
             let mut conn = pool.acquire().await?;
             {
                 let mut repo = ApiKeys::new(&mut conn);
                 match repo.get_user_info_by_secret(bearer_token).await? {
-                    Some((user_id, email, purpose)) => (Some(user_id), Some(email), AccessSource::ApiKey, Some(purpose)),
+                    Some((user_id, _email, purpose)) => (Some(user_id), AccessSource::ApiKey, Some(purpose)),
                     None => {
                         warn!("Unknown API key used");
-                        (None, None, AccessSource::UnknownApiKey, None)
+                        (None, AccessSource::UnknownApiKey, None)
                     }
                 }
             }
         }
-        Auth::None => (None, None, AccessSource::Unauthenticated, None),
+        Auth::None => (None, AccessSource::Unauthenticated, None),
     };
 
     // Get tariff pricing and provider name
@@ -521,7 +520,6 @@ pub async fn store_analytics_record(
         total_tokens: metrics.total_tokens,
         response_type: metrics.response_type.clone(),
         user_id,
-        user_email: user_email.clone(),
         access_source: access_source.to_string(),
         input_price_per_token: input_price,
         output_price_per_token: output_price,
@@ -551,11 +549,11 @@ pub async fn store_analytics_record(
         INSERT INTO http_analytics (
             instance_id, correlation_id, timestamp, method, uri, model,
             status_code, duration_ms, duration_to_first_byte_ms, prompt_tokens, completion_tokens,
-            total_tokens, response_type, user_id, user_email, access_source,
+            total_tokens, response_type, user_id, access_source,
             input_price_per_token, output_price_per_token, fusillade_batch_id, fusillade_request_id, custom_id,
             request_origin, batch_sla, batch_metadata_request_origin
         )
-        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24)
+        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23)
         ON CONFLICT (instance_id, correlation_id)
         DO UPDATE SET
             status_code = EXCLUDED.status_code,
@@ -566,7 +564,6 @@ pub async fn store_analytics_record(
             total_tokens = EXCLUDED.total_tokens,
             response_type = EXCLUDED.response_type,
             user_id = EXCLUDED.user_id,
-            user_email = EXCLUDED.user_email,
             access_source = EXCLUDED.access_source,
             input_price_per_token = EXCLUDED.input_price_per_token,
             output_price_per_token = EXCLUDED.output_price_per_token,
@@ -592,7 +589,6 @@ pub async fn store_analytics_record(
         row.total_tokens,
         row.response_type,
         row.user_id,
-        row.user_email,
         row.access_source,
         row.input_price_per_token,
         row.output_price_per_token,

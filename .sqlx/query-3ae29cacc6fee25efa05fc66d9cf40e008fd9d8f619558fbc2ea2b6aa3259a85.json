@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "\n        SELECT\n            id,\n            timestamp,\n            method,\n            uri,\n            model,\n            status_code,\n            duration_ms,\n            prompt_tokens,\n            completion_tokens,\n            total_tokens,\n            response_type,\n            user_email,\n            fusillade_batch_id,\n            input_price_per_token,\n            output_price_per_token,\n            custom_id\n        FROM http_analytics\n        WHERE\n            ($1::timestamptz IS NULL OR timestamp >= $1)\n            AND ($2::timestamptz IS NULL OR timestamp <= $2)\n            AND ($3::text IS NULL OR model = $3)\n            AND ($4::uuid IS NULL OR fusillade_batch_id = $4)\n            AND ($5::text IS NULL OR method = $5)\n            AND ($6::text IS NULL OR uri LIKE $6)\n            AND ($7::int IS NULL OR status_code = $7)\n            AND ($8::int IS NULL OR status_code >= $8)\n            AND ($9::int IS NULL OR status_code <= $9)\n            AND ($10::bigint IS NULL OR duration_ms >= $10)\n            AND ($11::bigint IS NULL OR duration_ms <= $11)\n            AND ($12::text IS NULL OR custom_id ILIKE $12)\n        ORDER BY timestamp DESC\n        LIMIT $13\n        OFFSET $14\n        ",
+  "query": "\n        SELECT\n            ha.id,\n            ha.timestamp,\n            ha.method,\n            ha.uri,\n            ha.model,\n            ha.status_code,\n            ha.duration_ms,\n            ha.prompt_tokens,\n            ha.completion_tokens,\n            ha.total_tokens,\n            ha.response_type,\n            u.email as user_email,\n            ha.fusillade_batch_id,\n            ha.input_price_per_token,\n            ha.output_price_per_token,\n            ha.custom_id\n        FROM http_analytics ha\n        LEFT JOIN users u ON u.id = ha.user_id AND u.is_deleted = false\n        WHERE\n            ($1::timestamptz IS NULL OR ha.timestamp >= $1)\n            AND ($2::timestamptz IS NULL OR ha.timestamp <= $2)\n            AND ($3::text IS NULL OR ha.model = $3)\n            AND ($4::uuid IS NULL OR ha.fusillade_batch_id = $4)\n            AND ($5::text IS NULL OR ha.method = $5)\n            AND ($6::text IS NULL OR ha.uri LIKE $6)\n            AND ($7::int IS NULL OR ha.status_code = $7)\n            AND ($8::int IS NULL OR ha.status_code >= $8)\n            AND ($9::int IS NULL OR ha.status_code <= $9)\n            AND ($10::bigint IS NULL OR ha.duration_ms >= $10)\n            AND ($11::bigint IS NULL OR ha.duration_ms <= $11)\n            AND ($12::text IS NULL OR ha.custom_id ILIKE $12)\n        ORDER BY ha.timestamp DESC\n        LIMIT $13\n        OFFSET $14\n        ",
   "describe": {
     "columns": [
       {
@@ -121,5 +121,5 @@
       true
     ]
   },
-  "hash": "8aa6112b725b2c2016cfe2073975129dd56de2844d10d0e9c86c1d7640c2e187"
+  "hash": "3ae29cacc6fee25efa05fc66d9cf40e008fd9d8f619558fbc2ea2b6aa3259a85"
 }
