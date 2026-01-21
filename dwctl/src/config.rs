@@ -1287,17 +1287,23 @@ impl Config {
         // if database_url is set, use it (preserving existing pool and component settings)
         if let Some(url) = config.database_url.take() {
             let pool = config.database.main_pool_settings().clone();
-            let replica_pool = config.database.main_replica_pool_settings().clone();
             let fusillade = config.database.fusillade().clone();
             let outlet = config.database.outlet().clone();
+
+            // Preserve original replica_pool if it was explicitly configured (not using fallback)
+            let original_replica_pool = match &config.database {
+                DatabaseConfig::External { replica_pool, .. } => replica_pool.clone(),
+                DatabaseConfig::Embedded { replica_pool, .. } => replica_pool.clone(),
+            };
+
             // Check if replica_url was set via environment variable
             let replica_url = config.database_replica_url.take();
-            let has_replica = replica_url.is_some();
+
             config.database = DatabaseConfig::External {
                 url,
                 replica_url,
                 pool,
-                replica_pool: if has_replica { Some(replica_pool) } else { None },
+                replica_pool: original_replica_pool, // Always preserve original replica_pool if it existed
                 fusillade,
                 outlet,
             };
