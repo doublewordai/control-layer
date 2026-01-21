@@ -1,5 +1,12 @@
 # Changelog
 
+## [2.5.2](https://github.com/doublewordai/control-layer/compare/v2.5.1...v2.5.2) (2026-01-21)
+
+
+### Bug Fixes
+
+* add top level replica url to help parsing ([#565](https://github.com/doublewordai/control-layer/issues/565)) ([90882a8](https://github.com/doublewordai/control-layer/commit/90882a8206732903e137337e3bbdded7f39588d5))
+
 ## [2.5.1](https://github.com/doublewordai/control-layer/compare/v2.5.0...v2.5.1) (2026-01-20)
 
 

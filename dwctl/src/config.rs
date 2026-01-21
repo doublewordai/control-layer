@@ -111,6 +111,10 @@ pub struct Config {
     /// Deprecated: Use `database` field instead. Kept for backward compatibility.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub database_url: Option<String>,
+    /// Optional: Database replica URL override via environment variable
+    /// Use DATABASE_REPLICA_URL or DWCTL_DATABASE_REPLICA_URL to set this
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub database_replica_url: Option<String>,
     /// Database configuration - either embedded or external PostgreSQL
     pub database: DatabaseConfig,
     /// Email address for the initial admin user (created on first startup)
@@ -1137,6 +1141,7 @@ impl Default for Config {
             host: "0.0.0.0".to_string(),
             port: 3001,
             database_url: None, // Deprecated field
+            database_replica_url: None,
             database: DatabaseConfig::default(),
             admin_email: "test@doubleword.ai".to_string(),
             admin_password: Some("hunter2".to_string()),
@@ -1285,14 +1290,37 @@ impl Config {
             let pool = config.database.main_pool_settings().clone();
             let fusillade = config.database.fusillade().clone();
             let outlet = config.database.outlet().clone();
+
+            // Preserve original replica_pool if it was explicitly configured (not using fallback)
+            let original_replica_pool = match &config.database {
+                DatabaseConfig::External { replica_pool, .. } => replica_pool.clone(),
+                DatabaseConfig::Embedded { replica_pool, .. } => replica_pool.clone(),
+            };
+
+            // Check if replica_url was set via environment variable
+            let replica_url = config.database_replica_url.take();
+
             config.database = DatabaseConfig::External {
                 url,
-                replica_url: None,
+                replica_url,
                 pool,
-                replica_pool: None,
+                replica_pool: original_replica_pool, // Always preserve original replica_pool if it existed
                 fusillade,
                 outlet,
             };
+        } else if let Some(replica_url) = config.database_replica_url.take() {
+            // Only replica_url is set via environment variable, apply it to existing config
+            match &mut config.database {
+                DatabaseConfig::External {
+                    replica_url: current_replica,
+                    ..
+                } => {
+                    *current_replica = Some(replica_url);
+                }
+                DatabaseConfig::Embedded { .. } => {
+                    // Can't set replica for embedded database
+                }
+            }
         }
 
         config.validate().map_err(|e| figment::Error::from(e.to_string()))?;
@@ -1389,8 +1417,14 @@ impl Config {
             .merge(Yaml::file(&args.config))
             // Environment variables can still override specific values
             .merge(Env::prefixed("DWCTL_").split("__"))
-            // Common DATABASE_URL pattern
-            .merge(Env::raw().only(&["DATABASE_URL"]))
+            // Common DATABASE_URL and DATABASE_REPLICA_URL patterns
+            // Accept both DATABASE_REPLICA_URL and DWCTL_DATABASE_REPLICA_URL
+            .merge(Env::raw().only(&["DATABASE_URL", "DATABASE_REPLICA_URL"]))
+            .merge(
+                Env::raw()
+                    .only(&["DWCTL_DATABASE_REPLICA_URL"])
+                    .map(|_| "database_replica_url".into()),
+            )
     }
 
     pub fn bind_address(&self) -> String {
