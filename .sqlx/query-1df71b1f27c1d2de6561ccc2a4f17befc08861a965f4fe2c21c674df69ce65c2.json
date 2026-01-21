@@ -1,0 +1,97 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n            SELECT * FROM (\n                -- Top N from batch_aggregates (index scan on idx_batch_agg_user_seq)\n                -- Only included if transaction_types filter includes 'usage' or is not set\n                -- and search term matches \"Batch\" description\n                -- JOIN with http_analytics to get batch_metadata_request_origin and batch_sla\n                (SELECT\n                    ba.fusillade_batch_id as id,\n                    ba.user_id,\n                    'usage' as \"transaction_type!: CreditTransactionType\",\n                    ba.total_amount as amount,\n                    ba.fusillade_batch_id::text as source_id,\n                    'Batch'::text as description,\n                    ba.created_at,\n                    ba.max_seq,\n                    ba.fusillade_batch_id as batch_id,\n                    ba.transaction_count as batch_count,\n                    COALESCE(NULLIF(sample_ha.batch_metadata_request_origin, ''), 'fusillade') as request_origin,\n                    COALESCE(sample_ha.batch_sla, '') as batch_sla\n                FROM batch_aggregates ba\n                LEFT JOIN LATERAL (\n                    SELECT batch_metadata_request_origin, batch_sla\n                    FROM http_analytics ha\n                    WHERE ha.fusillade_batch_id = ba.fusillade_batch_id\n                    LIMIT 1\n                ) sample_ha ON true\n                WHERE ba.user_id = $1\n                  AND $7::bool = true\n                  AND $10::bool = true\n                  AND ($5::text IS NULL OR 'Batch' ILIKE '%' || $5 || '%')\n                  AND ($8::timestamptz IS NULL OR ba.created_at >= $8)\n                  AND ($9::timestamptz IS NULL OR ba.created_at <= $9)\n                ORDER BY ba.max_seq DESC\n                LIMIT $2)\n\n                UNION ALL\n\n                -- Top N from non-batched transactions (index scan on idx_credits_tx_non_batched)\n                -- JOIN with http_analytics to get request_origin for non-batch usage transactions\n                (SELECT\n                    ct.id,\n                    ct.user_id,\n                    ct.transaction_type as \"transaction_type!: CreditTransactionType\",\n                    ct.amount,\n                    ct.source_id,\n                    ct.description,\n                    ct.created_at,\n                    ct.seq as max_seq,\n                    NULL::uuid as batch_id,\n                    1::int as batch_count,\n                    ha.request_origin as request_origin,\n                    ha.batch_sla as batch_sla\n                FROM credits_transactions ct\n                LEFT JOIN http_analytics ha ON ha.id::text = ct.source_id\n                WHERE ct.user_id = $1\n                  AND ct.fusillade_batch_id IS NULL\n                  AND ($5::text IS NULL OR ct.description ILIKE '%' || $5 || '%')\n                  AND ($6::text[] IS NULL OR ct.transaction_type::text = ANY($6))\n                  AND ($8::timestamptz IS NULL OR ct.created_at >= $8)\n                  AND ($9::timestamptz IS NULL OR ct.created_at <= $9)\n                ORDER BY ct.seq DESC\n                LIMIT $2)\n            ) combined\n            ORDER BY max_seq DESC\n            LIMIT $3 OFFSET $4\n            ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "id",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 1,
+        "name": "user_id",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 2,
+        "name": "transaction_type!: CreditTransactionType",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 3,
+        "name": "amount",
+        "type_info": "Numeric"
+      },
+      {
+        "ordinal": 4,
+        "name": "source_id",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 5,
+        "name": "description",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 6,
+        "name": "created_at",
+        "type_info": "Timestamptz"
+      },
+      {
+        "ordinal": 7,
+        "name": "max_seq",
+        "type_info": "Int8"
+      },
+      {
+        "ordinal": 8,
+        "name": "batch_id",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 9,
+        "name": "batch_count",
+        "type_info": "Int4"
+      },
+      {
+        "ordinal": 10,
+        "name": "request_origin",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 11,
+        "name": "batch_sla",
+        "type_info": "Text"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Int8",
+        "Int8",
+        "Int8",
+        "Text",
+        "TextArray",
+        "Bool",
+        "Timestamptz",
+        "Timestamptz",
+        "Bool"
+      ]
+    },
+    "nullable": [
+      null,
+      null,
+      null,
+      null,
+      null,
+      null,
+      null,
+      null,
+      null,
+      null,
+      null,
+      null
+    ]
+  },
+  "hash": "1df71b1f27c1d2de6561ccc2a4f17befc08861a965f4fe2c21c674df69ce65c2"
+}

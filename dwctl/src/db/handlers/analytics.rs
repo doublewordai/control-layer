@@ -704,26 +704,26 @@ pub async fn get_model_user_usage(
     start_date: DateTime<Utc>,
     end_date: DateTime<Utc>,
 ) -> Result<ModelUserUsageResponse> {
-    // Get user-grouped data (only rows with both user_id and user_email)
+    // Get user-grouped data (join with users table for email)
     let user_rows = sqlx::query_as!(
         UserUsageRow,
         r#"
         SELECT
-            user_id,
-            user_email,
+            ha.user_id,
+            u.email as "user_email?",
             COUNT(*) as request_count,
-            COALESCE(SUM(prompt_tokens), 0)::bigint as total_input_tokens,
-            COALESCE(SUM(completion_tokens), 0)::bigint as total_output_tokens,
-            COALESCE(SUM(total_tokens), 0)::bigint as total_tokens,
-            SUM(total_cost)::float8 as total_cost,
-            MAX(timestamp) as last_active_at
-        FROM http_analytics
-        WHERE model = $1
-            AND timestamp >= $2
-            AND timestamp <= $3
-            AND user_id IS NOT NULL
-            AND user_email IS NOT NULL
-        GROUP BY user_id, user_email
+            COALESCE(SUM(ha.prompt_tokens), 0)::bigint as total_input_tokens,
+            COALESCE(SUM(ha.completion_tokens), 0)::bigint as total_output_tokens,
+            COALESCE(SUM(ha.total_tokens), 0)::bigint as total_tokens,
+            SUM(ha.total_cost)::float8 as total_cost,
+            MAX(ha.timestamp) as last_active_at
+        FROM http_analytics ha
+        LEFT JOIN users u ON u.id = ha.user_id
+        WHERE ha.model = $1
+            AND ha.timestamp >= $2
+            AND ha.timestamp <= $3
+            AND ha.user_id IS NOT NULL
+        GROUP BY ha.user_id, u.email
         ORDER BY request_count DESC
         "#,
         model_alias,
@@ -745,7 +745,6 @@ pub async fn get_model_user_usage(
             AND timestamp >= $2
             AND timestamp <= $3
             AND user_id IS NOT NULL
-            AND user_email IS NOT NULL
         "#,
         model_alias,
         start_date,
@@ -851,37 +850,38 @@ pub async fn list_http_analytics(
         HttpAnalyticsRow,
         r#"
         SELECT
-            id,
-            timestamp,
-            method,
-            uri,
-            model,
-            status_code,
-            duration_ms,
-            prompt_tokens,
-            completion_tokens,
-            total_tokens,
-            response_type,
-            user_email,
-            fusillade_batch_id,
-            input_price_per_token,
-            output_price_per_token,
-            custom_id
-        FROM http_analytics
+            ha.id,
+            ha.timestamp,
+            ha.method,
+            ha.uri,
+            ha.model,
+            ha.status_code,
+            ha.duration_ms,
+            ha.prompt_tokens,
+            ha.completion_tokens,
+            ha.total_tokens,
+            ha.response_type,
+            u.email as "user_email?",
+            ha.fusillade_batch_id,
+            ha.input_price_per_token,
+            ha.output_price_per_token,
+            ha.custom_id
+        FROM http_analytics ha
+        LEFT JOIN users u ON u.id = ha.user_id
         WHERE
-            ($1::timestamptz IS NULL OR timestamp >= $1)
-            AND ($2::timestamptz IS NULL OR timestamp <= $2)
-            AND ($3::text IS NULL OR model = $3)
-            AND ($4::uuid IS NULL OR fusillade_batch_id = $4)
-            AND ($5::text IS NULL OR method = $5)
-            AND ($6::text IS NULL OR uri LIKE $6)
-            AND ($7::int IS NULL OR status_code = $7)
-            AND ($8::int IS NULL OR status_code >= $8)
-            AND ($9::int IS NULL OR status_code <= $9)
-            AND ($10::bigint IS NULL OR duration_ms >= $10)
-            AND ($11::bigint IS NULL OR duration_ms <= $11)
-            AND ($12::text IS NULL OR custom_id ILIKE $12)
-        ORDER BY timestamp DESC
+            ($1::timestamptz IS NULL OR ha.timestamp >= $1)
+            AND ($2::timestamptz IS NULL OR ha.timestamp <= $2)
+            AND ($3::text IS NULL OR ha.model = $3)
+            AND ($4::uuid IS NULL OR ha.fusillade_batch_id = $4)
+            AND ($5::text IS NULL OR ha.method = $5)
+            AND ($6::text IS NULL OR ha.uri LIKE $6)
+            AND ($7::int IS NULL OR ha.status_code = $7)
+            AND ($8::int IS NULL OR ha.status_code >= $8)
+            AND ($9::int IS NULL OR ha.status_code <= $9)
+            AND ($10::bigint IS NULL OR ha.duration_ms >= $10)
+            AND ($11::bigint IS NULL OR ha.duration_ms <= $11)
+            AND ($12::text IS NULL OR ha.custom_id ILIKE $12)
+        ORDER BY ha.timestamp DESC
         LIMIT $13
         OFFSET $14
         "#,
