@@ -10,6 +10,7 @@ use crate::api::models::batches::{
     ListBatchesQuery, ListObjectType, RequestCounts, RetryRequestsRequest,
 };
 use crate::auth::permissions::{RequiresPermission, can_read_all_resources, has_permission, operation, resource};
+use crate::db::handlers::{Users, repository::Repository};
 use crate::errors::{Error, Result};
 use crate::types::{Operation, Resource};
 use axum::{
@@ -24,15 +25,25 @@ use std::pin::Pin;
 use uuid::Uuid;
 
 /// Helper function to convert fusillade Batch to OpenAI BatchResponse
-fn to_batch_response(batch: fusillade::Batch) -> BatchResponse {
+///
+/// If `creator_email` is provided, it will be injected into the metadata as `created_by_email`.
+/// This is used to populate the email without storing it in the batch metadata (PII concern).
+fn to_batch_response_with_email(batch: fusillade::Batch, creator_email: Option<&str>) -> BatchResponse {
     // Convert metadata from serde_json::Value to HashMap<String, String>
-    let metadata: Option<HashMap<String, String>> = batch.metadata.and_then(|m| {
+    let mut metadata: Option<HashMap<String, String>> = batch.metadata.and_then(|m| {
         m.as_object().map(|obj| {
             obj.iter()
                 .filter_map(|(k, v)| v.as_str().map(|s| (k.clone(), s.to_string())))
                 .collect()
         })
     });
+
+    // Inject created_by_email into metadata if we have it
+    if let Some(email) = creator_email {
+        metadata
+            .get_or_insert_with(HashMap::new)
+            .insert("created_by_email".to_string(), email.to_string());
+    }
 
     // Determine OpenAI status from request counts
     let is_finished = batch.pending_requests == 0 && batch.in_progress_requests == 0;
@@ -109,6 +120,14 @@ fn to_batch_response(batch: fusillade::Batch) -> BatchResponse {
         },
         metadata,
     }
+}
+
+/// Helper to fetch creator email for a batch from the database
+async fn fetch_creator_email(db: &sqlx::PgPool, batch: &fusillade::Batch) -> Option<String> {
+    let created_by = batch.created_by.as_ref()?;
+    let user_id = Uuid::parse_str(created_by).ok()?;
+    let mut conn = db.acquire().await.ok()?;
+    Users::new(&mut conn).get_by_id(user_id).await.ok().flatten().map(|u| u.email)
 }
 
 #[utoipa::path(
@@ -194,10 +213,11 @@ pub async fn create_batch(
     let request_source = if has_api_key.0 { "api" } else { "frontend" };
 
     // Convert metadata to HashMap and inject request_source and user info
+    // Note: created_by_email is NOT stored in metadata to avoid PII in denormalized storage.
+    // The email is fetched via user lookup when building API responses.
     let mut metadata_map = req.metadata.unwrap_or_default();
     metadata_map.insert("request_source".to_string(), request_source.to_string());
     metadata_map.insert("created_by".to_string(), current_user.id.to_string());
-    metadata_map.insert("created_by_email".to_string(), current_user.email.clone());
     let metadata = serde_json::to_value(metadata_map).ok();
 
     // Create batch input
@@ -216,7 +236,11 @@ pub async fn create_batch(
 
     tracing::info!("Batch {} created successfully", batch.id);
 
-    Ok((StatusCode::CREATED, Json(to_batch_response(batch))))
+    // For create, we have the current user's email directly
+    Ok((
+        StatusCode::CREATED,
+        Json(to_batch_response_with_email(batch, Some(&current_user.email))),
+    ))
 }
 
 #[utoipa::path(
@@ -268,7 +292,9 @@ pub async fn get_batch(
         }
     }
 
-    Ok(Json(to_batch_response(batch)))
+    // Fetch creator email for the response
+    let creator_email = fetch_creator_email(&state.db, &batch).await;
+    Ok(Json(to_batch_response_with_email(batch, creator_email.as_deref())))
 }
 
 #[utoipa::path(
@@ -521,7 +547,9 @@ pub async fn cancel_batch(
 
     tracing::info!("Batch {} cancelled", batch_id);
 
-    Ok(Json(to_batch_response(batch)))
+    // Fetch creator email for the response
+    let creator_email = fetch_creator_email(&state.db, &batch).await;
+    Ok(Json(to_batch_response_with_email(batch, creator_email.as_deref())))
 }
 
 #[utoipa::path(
@@ -712,7 +740,9 @@ pub async fn retry_failed_batch_requests(
             id: batch_id_str.clone(),
         })?;
 
-    Ok(Json(to_batch_response(batch)))
+    // Fetch creator email for the response
+    let creator_email = fetch_creator_email(&state.db, &batch).await;
+    Ok(Json(to_batch_response_with_email(batch, creator_email.as_deref())))
 }
 
 #[utoipa::path(
@@ -827,7 +857,9 @@ pub async fn retry_specific_requests(
             id: batch_id_str.clone(),
         })?;
 
-    Ok(Json(to_batch_response(batch)))
+    // Fetch creator email for the response
+    let creator_email = fetch_creator_email(&state.db, &batch).await;
+    Ok(Json(to_batch_response_with_email(batch, creator_email.as_deref())))
 }
 
 #[utoipa::path(
@@ -882,8 +914,36 @@ pub async fn list_batches(
     let first_id = batches.first().map(|b| b.id.0.to_string());
     let last_id = batches.last().map(|b| b.id.0.to_string());
 
-    // Convert batches to responses (status is embedded in batch)
-    let data: Vec<_> = batches.into_iter().map(to_batch_response).collect();
+    // Collect unique created_by user IDs from batches
+    let user_ids: Vec<Uuid> = batches
+        .iter()
+        .filter_map(|b| b.created_by.as_ref())
+        .filter_map(|id| Uuid::parse_str(id).ok())
+        .collect::<std::collections::HashSet<_>>()
+        .into_iter()
+        .collect();
+
+    // Bulk fetch user emails
+    let email_map: HashMap<String, String> = if !user_ids.is_empty() {
+        let mut conn = state.db.acquire().await.map_err(|e| Error::Internal {
+            operation: format!("acquire db connection: {}", e),
+        })?;
+        let users = Users::new(&mut conn).get_bulk(user_ids).await.map_err(|e| Error::Internal {
+            operation: format!("fetch users: {}", e),
+        })?;
+        users.into_iter().map(|(id, user)| (id.to_string(), user.email)).collect()
+    } else {
+        HashMap::new()
+    };
+
+    // Convert batches to responses with email injection
+    let data: Vec<_> = batches
+        .into_iter()
+        .map(|batch| {
+            let email = batch.created_by.as_ref().and_then(|id| email_map.get(id)).map(|s| s.as_str());
+            to_batch_response_with_email(batch, email)
+        })
+        .collect();
 
     Ok(Json(BatchListResponse {
         object_type: ListObjectType::List,
