@@ -1,5 +1,31 @@
 # Changelog
 
+## [2.7.1](https://github.com/doublewordai/control-layer/compare/v2.7.0...v2.7.1) (2026-01-21)
+
+
+### Bug Fixes
+
+* revert onwards sync to use main pool due to listen notify ([032b58c](https://github.com/doublewordai/control-layer/commit/032b58cab7afc1ebe65b64e4026722a58aeb54bf))
+
+## [2.7.0](https://github.com/doublewordai/control-layer/compare/v2.6.0...v2.7.0) (2026-01-21)
+
+
+### Features
+
+* implement read and write connections across handlers and tests ([#569](https://github.com/doublewordai/control-layer/issues/569)) ([405f33d](https://github.com/doublewordai/control-layer/commit/405f33df0c1343979be41e566addb85b7b6710cb))
+
+## [2.6.0](https://github.com/doublewordai/control-layer/compare/v2.5.2...v2.6.0) (2026-01-21)
+
+
+### Features
+
+* add is_internal, batch_metadata_request_origin columns and remove denormalized PII ([#567](https://github.com/doublewordai/control-layer/issues/567)) ([566824f](https://github.com/doublewordai/control-layer/commit/566824f30054d98621853cdf654d13694f9ef45b))
+
+
+### Bug Fixes
+
+* better column name and removed unnecessary email join ([#570](https://github.com/doublewordai/control-layer/issues/570)) ([fb8c1e2](https://github.com/doublewordai/control-layer/commit/fb8c1e24b64bb81143104c8a8f5af63bec5c2784))
+
 ## [2.5.2](https://github.com/doublewordai/control-layer/compare/v2.5.1...v2.5.2) (2026-01-21)
 
 

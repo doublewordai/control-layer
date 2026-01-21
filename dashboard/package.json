@@ -1,7 +1,7 @@
 {
   "name": "ai-model-dashboard",
   "private": true,
-  "version": "2.5.2",
+  "version": "2.7.1",
   "type": "module",
   "scripts": {
     "dev": "vite",

@@ -112,7 +112,6 @@ pub struct HttpAnalyticsRow {
     pub total_tokens: i64,
     pub response_type: String,
     pub user_id: Option<Uuid>,
-    pub user_email: Option<String>,
     pub access_source: String,
     pub input_price_per_token: Option<rust_decimal::Decimal>,
     pub output_price_per_token: Option<rust_decimal::Decimal>,
@@ -131,6 +130,9 @@ pub struct HttpAnalyticsRow {
     /// Prometheus metrics can be filtered with a simple `batch_sla=""` label
     /// selector, at the cost of a small increase in label cardinality.
     pub batch_sla: String,
+    /// The request_source from batch metadata (e.g., "api", "frontend").
+    /// Empty string for non-batch requests or when not provided.
+    pub batch_request_source: String,
 }
 
 /// Usage metrics extracted from AI responses (subset of HttpAnalyticsRow)
@@ -400,6 +402,7 @@ pub async fn store_analytics_record(
     // Extract batch metadata headers for tariff pricing
     let batch_created_at = extract_header_as_string(request_data, "x-fusillade-batch-created-at");
     let batch_completion_window = extract_header_as_string(request_data, "x-fusillade-batch-completion-window");
+    let batch_request_source = extract_header_as_string(request_data, "x-fusillade-batch-request-source").unwrap_or_default();
 
     // Parse batch created_at timestamp if available, otherwise use metrics.timestamp
     let pricing_timestamp = if let Some(created_at_str) = &batch_created_at {
@@ -415,23 +418,23 @@ pub async fn store_analytics_record(
     };
 
     // Extract user information and API key purpose based on auth type
-    let (user_id, user_email, access_source, api_key_purpose) = match auth {
+    let (user_id, access_source, api_key_purpose) = match auth {
         Auth::ApiKey { bearer_token } => {
-            // Try to get user ID, email, and purpose from API key
+            // Try to get user ID and purpose from API key
             use crate::db::handlers::api_keys::ApiKeys;
             let mut conn = pool.acquire().await?;
             {
                 let mut repo = ApiKeys::new(&mut conn);
                 match repo.get_user_info_by_secret(bearer_token).await? {
-                    Some((user_id, email, purpose)) => (Some(user_id), Some(email), AccessSource::ApiKey, Some(purpose)),
+                    Some((user_id, _email, purpose)) => (Some(user_id), AccessSource::ApiKey, Some(purpose)),
                     None => {
                         warn!("Unknown API key used");
-                        (None, None, AccessSource::UnknownApiKey, None)
+                        (None, AccessSource::UnknownApiKey, None)
                     }
                 }
             }
         }
-        Auth::None => (None, None, AccessSource::Unauthenticated, None),
+        Auth::None => (None, AccessSource::Unauthenticated, None),
     };
 
     // Get tariff pricing and provider name
@@ -517,7 +520,6 @@ pub async fn store_analytics_record(
         total_tokens: metrics.total_tokens,
         response_type: metrics.response_type.clone(),
         user_id,
-        user_email: user_email.clone(),
         access_source: access_source.to_string(),
         input_price_per_token: input_price,
         output_price_per_token: output_price,
@@ -538,6 +540,7 @@ pub async fn store_analytics_record(
             _ => "api".to_string(),
         },
         batch_sla: batch_completion_window.clone().unwrap_or_default(),
+        batch_request_source,
     };
 
     // Insert the analytics record and get the ID
@@ -546,9 +549,9 @@ pub async fn store_analytics_record(
         INSERT INTO http_analytics (
             instance_id, correlation_id, timestamp, method, uri, model,
             status_code, duration_ms, duration_to_first_byte_ms, prompt_tokens, completion_tokens,
-            total_tokens, response_type, user_id, user_email, access_source,
+            total_tokens, response_type, user_id, access_source,
             input_price_per_token, output_price_per_token, fusillade_batch_id, fusillade_request_id, custom_id,
-            request_origin, batch_sla
+            request_origin, batch_sla, batch_request_source
         )
         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23)
         ON CONFLICT (instance_id, correlation_id)
@@ -561,7 +564,6 @@ pub async fn store_analytics_record(
             total_tokens = EXCLUDED.total_tokens,
             response_type = EXCLUDED.response_type,
             user_id = EXCLUDED.user_id,
-            user_email = EXCLUDED.user_email,
             access_source = EXCLUDED.access_source,
             input_price_per_token = EXCLUDED.input_price_per_token,
             output_price_per_token = EXCLUDED.output_price_per_token,
@@ -569,7 +571,8 @@ pub async fn store_analytics_record(
             fusillade_request_id = EXCLUDED.fusillade_request_id,
             custom_id = EXCLUDED.custom_id,
             request_origin = EXCLUDED.request_origin,
-            batch_sla = EXCLUDED.batch_sla
+            batch_sla = EXCLUDED.batch_sla,
+            batch_request_source = EXCLUDED.batch_request_source
         RETURNING id
         "#,
         row.instance_id,
@@ -586,7 +589,6 @@ pub async fn store_analytics_record(
         row.total_tokens,
         row.response_type,
         row.user_id,
-        row.user_email,
         row.access_source,
         row.input_price_per_token,
         row.output_price_per_token,
@@ -594,7 +596,8 @@ pub async fn store_analytics_record(
         row.fusillade_request_id,
         row.custom_id,
         row.request_origin,
-        row.batch_sla
+        row.batch_sla,
+        row.batch_request_source
     )
     .fetch_one(pool)
     .instrument(info_span!("insert_http_analytics"))

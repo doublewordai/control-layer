@@ -518,7 +518,7 @@ pub async fn upload_file(
     let uploaded_by = Some(current_user.id.to_string());
 
     // Get or create user-specific hidden batch API key for batch request execution
-    let mut conn = state.db.acquire().await.map_err(|e| Error::Database(e.into()))?;
+    let mut conn = state.db.write().acquire().await.map_err(|e| Error::Database(e.into()))?;
     let mut api_keys_repo = ApiKeys::new(&mut conn);
     let user_api_key = api_keys_repo
         .get_or_create_hidden_key(current_user.id, ApiKeyPurpose::Batch)
@@ -1080,7 +1080,7 @@ pub async fn get_file_cost_estimate(
     }
 
     // Fetch all deployments and their pricing information upfront
-    let mut conn = state.db.acquire().await.map_err(|e| Error::Database(e.into()))?;
+    let mut conn = state.db.read().acquire().await.map_err(|e| Error::Database(e.into()))?;
     let mut deployments_repo = Deployments::new(&mut conn);
 
     let filter = DeploymentFilter::new(0, 1000)

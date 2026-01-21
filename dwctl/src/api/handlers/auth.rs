@@ -191,7 +191,7 @@ async fn create_sample_files_for_new_user(state: &AppState, user_id: Uuid) -> Re
     use crate::db::handlers::deployments::DeploymentFilter;
     use crate::sample_files;
 
-    let mut conn = state.db.acquire().await.map_err(|e| Error::Database(e.into()))?;
+    let mut conn = state.db.write().acquire().await.map_err(|e| Error::Database(e.into()))?;
 
     // Get the user's batch API key
     let mut api_keys_repo = ApiKeys::new(&mut conn);
@@ -279,7 +279,7 @@ pub async fn login(State(state): State<AppState>, Json(request): Json<LoginReque
             message: "Native authentication is disabled".to_string(),
         });
     }
-    let mut pool_conn = state.db.acquire().await.map_err(|e| Error::Database(e.into()))?;
+    let mut pool_conn = state.db.read().acquire().await.map_err(|e| Error::Database(e.into()))?;
 
     let mut user_repo = Users::new(&mut pool_conn);
 
@@ -541,7 +541,7 @@ pub async fn change_password(
         });
     }
 
-    let mut pool_conn = state.db.acquire().await.map_err(|e| Error::Database(e.into()))?;
+    let mut pool_conn = state.db.write().acquire().await.map_err(|e| Error::Database(e.into()))?;
     let mut user_repo = Users::new(&mut pool_conn);
 
     // Get the user from database
@@ -638,7 +638,7 @@ mod tests {
         config.auth.native.enabled = true;
         config.auth.native.allow_registration = true;
 
-        let request_manager = std::sync::Arc::new(fusillade::PostgresRequestManager::new(pool.clone()));
+        let request_manager = std::sync::Arc::new(fusillade::PostgresRequestManager::new(crate::db::DbPools::new(pool.clone())));
         let state = AppState::builder()
             .db(crate::db::DbPools::new(pool))
             .config(config)
@@ -673,7 +673,7 @@ mod tests {
         let mut config = create_test_config();
         config.auth.native.enabled = false;
 
-        let request_manager = std::sync::Arc::new(fusillade::PostgresRequestManager::new(pool.clone()));
+        let request_manager = std::sync::Arc::new(fusillade::PostgresRequestManager::new(crate::db::DbPools::new(pool.clone())));
         let state = AppState::builder()
             .db(crate::db::DbPools::new(pool))
             .config(config)
@@ -703,7 +703,7 @@ mod tests {
         config.auth.native.enabled = true;
         config.auth.native.password.min_length = 10;
 
-        let request_manager = std::sync::Arc::new(fusillade::PostgresRequestManager::new(pool.clone()));
+        let request_manager = std::sync::Arc::new(fusillade::PostgresRequestManager::new(crate::db::DbPools::new(pool.clone())));
         let state = AppState::builder()
             .db(crate::db::DbPools::new(pool))
             .config(config)
@@ -735,7 +735,7 @@ mod tests {
         // Set initial credits for standard users
         config.credits.initial_credits_for_standard_users = rust_decimal::Decimal::new(10000, 2); // 100.00 credits
 
-        let request_manager = std::sync::Arc::new(fusillade::PostgresRequestManager::new(pool.clone()));
+        let request_manager = std::sync::Arc::new(fusillade::PostgresRequestManager::new(crate::db::DbPools::new(pool.clone())));
         let state = AppState::builder()
             .db(crate::db::DbPools::new(pool.clone()))
             .config(config)
@@ -796,7 +796,7 @@ mod tests {
         // Set initial credits to zero (default)
         config.credits.initial_credits_for_standard_users = rust_decimal::Decimal::ZERO;
 
-        let request_manager = std::sync::Arc::new(fusillade::PostgresRequestManager::new(pool.clone()));
+        let request_manager = std::sync::Arc::new(fusillade::PostgresRequestManager::new(crate::db::DbPools::new(pool.clone())));
         let state = AppState::builder()
             .db(crate::db::DbPools::new(pool.clone()))
             .config(config)
@@ -841,7 +841,7 @@ mod tests {
         config.auth.native.enabled = true;
         config.auth.native.allow_registration = true;
 
-        let request_manager = std::sync::Arc::new(fusillade::PostgresRequestManager::new(pool.clone()));
+        let request_manager = std::sync::Arc::new(fusillade::PostgresRequestManager::new(crate::db::DbPools::new(pool.clone())));
         let state = AppState::builder()
             .db(crate::db::DbPools::new(pool.clone()))
             .config(config)
@@ -888,7 +888,7 @@ mod tests {
         config.auth.native.enabled = true;
         config.auth.native.allow_registration = true;
 
-        let request_manager = std::sync::Arc::new(fusillade::PostgresRequestManager::new(pool.clone()));
+        let request_manager = std::sync::Arc::new(fusillade::PostgresRequestManager::new(crate::db::DbPools::new(pool.clone())));
         let state = AppState::builder()
             .db(crate::db::DbPools::new(pool))
             .config(config)
@@ -914,7 +914,7 @@ mod tests {
         config.auth.native.enabled = false;
         config.auth.native.allow_registration = true;
 
-        let request_manager = std::sync::Arc::new(fusillade::PostgresRequestManager::new(pool.clone()));
+        let request_manager = std::sync::Arc::new(fusillade::PostgresRequestManager::new(crate::db::DbPools::new(pool.clone())));
         let state = AppState::builder()
             .db(crate::db::DbPools::new(pool))
             .config(config)
@@ -940,7 +940,7 @@ mod tests {
         config.auth.native.enabled = true;
         config.auth.native.allow_registration = false;
 
-        let request_manager = std::sync::Arc::new(fusillade::PostgresRequestManager::new(pool.clone()));
+        let request_manager = std::sync::Arc::new(fusillade::PostgresRequestManager::new(crate::db::DbPools::new(pool.clone())));
         let state = AppState::builder()
             .db(crate::db::DbPools::new(pool))
             .config(config)
@@ -965,7 +965,7 @@ mod tests {
         let mut config = create_test_config();
         config.auth.native.enabled = true;
 
-        let request_manager = std::sync::Arc::new(fusillade::PostgresRequestManager::new(pool.clone()));
+        let request_manager = std::sync::Arc::new(fusillade::PostgresRequestManager::new(crate::db::DbPools::new(pool.clone())));
         let state = AppState::builder()
             .db(crate::db::DbPools::new(pool))
             .config(config)
@@ -990,7 +990,7 @@ mod tests {
         let mut config = create_test_config();
         config.auth.native.enabled = false;
 
-        let request_manager = std::sync::Arc::new(fusillade::PostgresRequestManager::new(pool.clone()));
+        let request_manager = std::sync::Arc::new(fusillade::PostgresRequestManager::new(crate::db::DbPools::new(pool.clone())));
         let state = AppState::builder()
             .db(crate::db::DbPools::new(pool))
             .config(config)
@@ -1015,7 +1015,7 @@ mod tests {
         let mut config = create_test_config();
         config.auth.native.enabled = true;
 
-        let request_manager = std::sync::Arc::new(fusillade::PostgresRequestManager::new(pool.clone()));
+        let request_manager = std::sync::Arc::new(fusillade::PostgresRequestManager::new(crate::db::DbPools::new(pool.clone())));
         let state = AppState::builder()
             .db(crate::db::DbPools::new(pool.clone()))
             .config(config)
@@ -1075,7 +1075,7 @@ mod tests {
         let mut config = create_test_config();
         config.auth.native.enabled = false;
 
-        let request_manager = std::sync::Arc::new(fusillade::PostgresRequestManager::new(pool.clone()));
+        let request_manager = std::sync::Arc::new(fusillade::PostgresRequestManager::new(crate::db::DbPools::new(pool.clone())));
         let state = AppState::builder()
             .db(crate::db::DbPools::new(pool))
             .config(config)
@@ -1102,7 +1102,7 @@ mod tests {
         let mut config = create_test_config();
         config.auth.native.enabled = true;
 
-        let request_manager = std::sync::Arc::new(fusillade::PostgresRequestManager::new(pool.clone()));
+        let request_manager = std::sync::Arc::new(fusillade::PostgresRequestManager::new(crate::db::DbPools::new(pool.clone())));
         let state = AppState::builder()
             .db(crate::db::DbPools::new(pool))
             .config(config)
@@ -1129,7 +1129,7 @@ mod tests {
         let mut config = create_test_config();
         config.auth.native.enabled = true;
 
-        let request_manager = std::sync::Arc::new(fusillade::PostgresRequestManager::new(pool.clone()));
+        let request_manager = std::sync::Arc::new(fusillade::PostgresRequestManager::new(crate::db::DbPools::new(pool.clone())));
         let state = AppState::builder()
             .db(crate::db::DbPools::new(pool.clone()))
             .config(config)
@@ -1184,7 +1184,7 @@ mod tests {
         let mut config = create_test_config();
         config.auth.native.enabled = true;
 
-        let request_manager = std::sync::Arc::new(fusillade::PostgresRequestManager::new(pool.clone()));
+        let request_manager = std::sync::Arc::new(fusillade::PostgresRequestManager::new(crate::db::DbPools::new(pool.clone())));
         let state = AppState::builder()
             .db(crate::db::DbPools::new(pool.clone()))
             .config(config)
@@ -1228,7 +1228,7 @@ mod tests {
     #[sqlx::test]
     async fn test_logout(pool: PgPool) {
         let config = create_test_config();
-        let request_manager = std::sync::Arc::new(fusillade::PostgresRequestManager::new(pool.clone()));
+        let request_manager = std::sync::Arc::new(fusillade::PostgresRequestManager::new(crate::db::DbPools::new(pool.clone())));
         let state = AppState::builder()
             .db(crate::db::DbPools::new(pool))
             .config(config)
@@ -1260,7 +1260,7 @@ mod tests {
         config.auth.native.enabled = true;
         config.auth.native.allow_registration = true;
 
-        let request_manager = std::sync::Arc::new(fusillade::PostgresRequestManager::new(pool.clone()));
+        let request_manager = std::sync::Arc::new(fusillade::PostgresRequestManager::new(crate::db::DbPools::new(pool.clone())));
         let state = AppState::builder()
             .db(crate::db::DbPools::new(pool.clone()))
             .config(config)
@@ -1321,7 +1321,7 @@ mod tests {
         config.auth.native.allow_registration = true;
         config.auth.native.password.max_length = 20;
 
-        let request_manager = std::sync::Arc::new(fusillade::PostgresRequestManager::new(pool.clone()));
+        let request_manager = std::sync::Arc::new(fusillade::PostgresRequestManager::new(crate::db::DbPools::new(pool.clone())));
         let state = AppState::builder()
             .db(crate::db::DbPools::new(pool))
             .config(config)
@@ -1351,7 +1351,7 @@ mod tests {
         config.auth.native.enabled = true;
         config.auth.native.allow_registration = false;
 
-        let request_manager = std::sync::Arc::new(fusillade::PostgresRequestManager::new(pool.clone()));
+        let request_manager = std::sync::Arc::new(fusillade::PostgresRequestManager::new(crate::db::DbPools::new(pool.clone())));
         let state = AppState::builder()
             .db(crate::db::DbPools::new(pool))
             .config(config)
@@ -1380,7 +1380,7 @@ mod tests {
         let mut config = create_test_config();
         config.auth.native.enabled = false;
 
-        let request_manager = std::sync::Arc::new(fusillade::PostgresRequestManager::new(pool.clone()));
+        let request_manager = std::sync::Arc::new(fusillade::PostgresRequestManager::new(crate::db::DbPools::new(pool.clone())));
         let state = AppState::builder()
             .db(crate::db::DbPools::new(pool))
             .config(config)
@@ -1406,7 +1406,7 @@ mod tests {
         let mut config = create_test_config();
         config.auth.native.enabled = true;
 
-        let request_manager = std::sync::Arc::new(fusillade::PostgresRequestManager::new(pool.clone()));
+        let request_manager = std::sync::Arc::new(fusillade::PostgresRequestManager::new(crate::db::DbPools::new(pool.clone())));
         let state = AppState::builder()
             .db(crate::db::DbPools::new(pool))
             .config(config)
@@ -1436,7 +1436,7 @@ mod tests {
         let mut config = create_test_config();
         config.auth.native.enabled = true;
 
-        let request_manager = std::sync::Arc::new(fusillade::PostgresRequestManager::new(pool.clone()));
+        let request_manager = std::sync::Arc::new(fusillade::PostgresRequestManager::new(crate::db::DbPools::new(pool.clone())));
         let state = AppState::builder()
             .db(crate::db::DbPools::new(pool.clone()))
             .config(config)
@@ -1485,7 +1485,7 @@ mod tests {
         let mut config = create_test_config();
         config.auth.native.enabled = false;
 
-        let request_manager = std::sync::Arc::new(fusillade::PostgresRequestManager::new(pool.clone()));
+        let request_manager = std::sync::Arc::new(fusillade::PostgresRequestManager::new(crate::db::DbPools::new(pool.clone())));
         let state = AppState::builder()
             .db(crate::db::DbPools::new(pool))
             .config(config)
@@ -1520,7 +1520,7 @@ mod tests {
         let mut config = create_test_config();
         config.auth.native.enabled = true;
 
-        let request_manager = std::sync::Arc::new(fusillade::PostgresRequestManager::new(pool.clone()));
+        let request_manager = std::sync::Arc::new(fusillade::PostgresRequestManager::new(crate::db::DbPools::new(pool.clone())));
         let state = AppState::builder()
             .db(crate::db::DbPools::new(pool))
             .config(config)
@@ -1556,7 +1556,7 @@ mod tests {
         config.auth.native.enabled = true;
         config.auth.native.password.min_length = 10;
 
-        let request_manager = std::sync::Arc::new(fusillade::PostgresRequestManager::new(pool.clone()));
+        let request_manager = std::sync::Arc::new(fusillade::PostgresRequestManager::new(crate::db::DbPools::new(pool.clone())));
         let state = AppState::builder()
             .db(crate::db::DbPools::new(pool))
             .config(config)
@@ -1592,7 +1592,7 @@ mod tests {
         config.auth.native.enabled = true;
         config.auth.native.password.max_length = 20;
 
-        let request_manager = std::sync::Arc::new(fusillade::PostgresRequestManager::new(pool.clone()));
+        let request_manager = std::sync::Arc::new(fusillade::PostgresRequestManager::new(crate::db::DbPools::new(pool.clone())));
         let state = AppState::builder()
             .db(crate::db::DbPools::new(pool))
             .config(config)
@@ -2157,7 +2157,7 @@ mod tests {
         // Configure default roles to include RequestViewer in addition to StandardUser
         config.auth.default_user_roles = vec![Role::StandardUser, Role::RequestViewer];
 
-        let request_manager = std::sync::Arc::new(fusillade::PostgresRequestManager::new(pool.clone()));
+        let request_manager = std::sync::Arc::new(fusillade::PostgresRequestManager::new(crate::db::DbPools::new(pool.clone())));
         let state = AppState::builder()
             .db(crate::db::DbPools::new(pool.clone()))
             .config(config)
@@ -2198,7 +2198,7 @@ mod tests {
         // Configure default roles without StandardUser - it should still be added
         config.auth.default_user_roles = vec![Role::RequestViewer];
 
-        let request_manager = std::sync::Arc::new(fusillade::PostgresRequestManager::new(pool.clone()));
+        let request_manager = std::sync::Arc::new(fusillade::PostgresRequestManager::new(crate::db::DbPools::new(pool.clone())));
         let state = AppState::builder()
             .db(crate::db::DbPools::new(pool.clone()))
             .config(config)

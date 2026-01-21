@@ -721,8 +721,7 @@ impl<'c> Credits<'c> {
 
         // Optimized query using pre-limited UNION branches for Merge Append
         // Each branch fetches skip+limit rows, then pagination applies to combined result
-        // request_origin is hardcoded as "fusillade" for batches since they always come from Fusillade
-        // batch_sla is returned as NULL for batches - the handler fetches it from fusillade
+        // For batches: join with http_analytics to get batch_request_source and batch_sla
         let fetch_limit = skip + limit;
         let rows = sqlx::query!(
             r#"
@@ -730,8 +729,7 @@ impl<'c> Credits<'c> {
                 -- Top N from batch_aggregates (index scan on idx_batch_agg_user_seq)
                 -- Only included if transaction_types filter includes 'usage' or is not set
                 -- and search term matches "Batch" description
-                -- request_origin is always "fusillade" for batches
-                -- batch_sla is NULL here - fetched from fusillade by the handler
+                -- JOIN with http_analytics to get batch_request_source and batch_sla
                 (SELECT
                     ba.fusillade_batch_id as id,
                     ba.user_id,
@@ -743,9 +741,15 @@ impl<'c> Credits<'c> {
                     ba.max_seq,
                     ba.fusillade_batch_id as batch_id,
                     ba.transaction_count as batch_count,
-                    'fusillade'::text as request_origin,
-                    NULL::text as batch_sla
+                    COALESCE(NULLIF(sample_ha.batch_request_source, ''), 'fusillade') as request_origin,
+                    COALESCE(sample_ha.batch_sla, '') as batch_sla
                 FROM batch_aggregates ba
+                LEFT JOIN LATERAL (
+                    SELECT batch_request_source, batch_sla
+                    FROM http_analytics ha
+                    WHERE ha.fusillade_batch_id = ba.fusillade_batch_id
+                    LIMIT 1
+                ) sample_ha ON true
                 WHERE ba.user_id = $1
                   AND $7::bool = true
                   AND $10::bool = true

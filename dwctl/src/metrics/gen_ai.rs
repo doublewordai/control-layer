@@ -301,7 +301,7 @@ mod tests {
             total_tokens: 60,
             response_type: "chat_completion_stream".to_string(),
             user_id: None,
-            user_email: None,
+
             access_source: "api_key".to_string(),
             input_price_per_token: None,
             output_price_per_token: None,
@@ -313,6 +313,7 @@ mod tests {
             custom_id: None,
             request_origin: "api".to_string(),
             batch_sla: String::new(),
+            batch_request_source: String::new(),
         };
 
         // Call the function under test
@@ -415,7 +416,7 @@ mod tests {
             total_tokens: 120,
             response_type: "chat_completion".to_string(), // NOT streaming
             user_id: None,
-            user_email: None,
+
             access_source: "api_key".to_string(),
             input_price_per_token: None,
             output_price_per_token: None,
@@ -427,6 +428,7 @@ mod tests {
             custom_id: None,
             request_origin: "api".to_string(),
             batch_sla: String::new(),
+            batch_request_source: String::new(),
         };
 
         metrics.record_from_analytics(&row).await;
@@ -477,7 +479,7 @@ mod tests {
             total_tokens: 100,
             response_type: "embeddings".to_string(),
             user_id: None,
-            user_email: None,
+
             access_source: "api_key".to_string(),
             input_price_per_token: None,
             output_price_per_token: None,
@@ -489,6 +491,7 @@ mod tests {
             custom_id: None,
             request_origin: "api".to_string(),
             batch_sla: String::new(),
+            batch_request_source: String::new(),
         };
 
         metrics.record_from_analytics(&row).await;
@@ -550,7 +553,7 @@ mod tests {
             total_tokens: 0,
             response_type: "chat_completion".to_string(),
             user_id: None,
-            user_email: None,
+
             access_source: "api_key".to_string(),
             input_price_per_token: None,
             output_price_per_token: None,
@@ -562,6 +565,7 @@ mod tests {
             custom_id: None,
             request_origin: "api".to_string(),
             batch_sla: String::new(),
+            batch_request_source: String::new(),
         };
 
         metrics.record_from_analytics(&row).await;
@@ -609,7 +613,7 @@ mod tests {
             total_tokens: 30,
             response_type: "completion".to_string(),
             user_id: None,
-            user_email: None,
+
             access_source: "api_key".to_string(),
             input_price_per_token: None,
             output_price_per_token: None,
@@ -621,6 +625,7 @@ mod tests {
             custom_id: None,
             request_origin: "api".to_string(),
             batch_sla: String::new(),
+            batch_request_source: String::new(),
         };
 
         metrics.record_from_analytics(&row).await;
@@ -671,7 +676,7 @@ mod tests {
             total_tokens: 50,
             response_type: "chat_completion".to_string(),
             user_id: None,
-            user_email: None,
+
             access_source: "api_key".to_string(),
             input_price_per_token: None,
             output_price_per_token: None,
@@ -683,6 +688,7 @@ mod tests {
             custom_id: None,
             request_origin: "api".to_string(),
             batch_sla: String::new(),
+            batch_request_source: String::new(),
         };
 
         metrics.record_from_analytics(&row).await;
@@ -730,7 +736,7 @@ mod tests {
             total_tokens: 0,
             response_type: "other".to_string(),
             user_id: None,
-            user_email: None,
+
             access_source: "api_key".to_string(),
             input_price_per_token: None,
             output_price_per_token: None,
@@ -742,6 +748,7 @@ mod tests {
             custom_id: None,
             request_origin: "api".to_string(),
             batch_sla: String::new(),
+            batch_request_source: String::new(),
         };
 
         metrics.record_from_analytics(&row).await;
@@ -784,7 +791,7 @@ mod tests {
                 total_tokens: 0,
                 response_type: "chat_completion".to_string(),
                 user_id: None,
-                user_email: None,
+
                 access_source: "api_key".to_string(),
                 input_price_per_token: None,
                 output_price_per_token: None,
@@ -796,6 +803,7 @@ mod tests {
                 custom_id: None,
                 request_origin: "api".to_string(),
                 batch_sla: String::new(),
+                batch_request_source: String::new(),
             };
 
             metrics.record_from_analytics(&row).await;
@@ -836,7 +844,7 @@ mod tests {
             total_tokens: 50,
             response_type: "base64_embeddings".to_string(),
             user_id: None,
-            user_email: None,
+
             access_source: "api_key".to_string(),
             input_price_per_token: None,
             output_price_per_token: None,
@@ -848,6 +856,7 @@ mod tests {
             custom_id: None,
             request_origin: "api".to_string(),
             batch_sla: String::new(),
+            batch_request_source: String::new(),
         };
 
         metrics.record_from_analytics(&row).await;

@@ -704,26 +704,26 @@ pub async fn get_model_user_usage(
     start_date: DateTime<Utc>,
     end_date: DateTime<Utc>,
 ) -> Result<ModelUserUsageResponse> {
-    // Get user-grouped data (only rows with both user_id and user_email)
+    // Get user-grouped data (join with users table for email)
     let user_rows = sqlx::query_as!(
         UserUsageRow,
         r#"
         SELECT
-            user_id,
-            user_email,
+            ha.user_id,
+            u.email as "user_email?",
             COUNT(*) as request_count,
-            COALESCE(SUM(prompt_tokens), 0)::bigint as total_input_tokens,
-            COALESCE(SUM(completion_tokens), 0)::bigint as total_output_tokens,
-            COALESCE(SUM(total_tokens), 0)::bigint as total_tokens,
-            SUM(total_cost)::float8 as total_cost,
-            MAX(timestamp) as last_active_at
-        FROM http_analytics
-        WHERE model = $1
-            AND timestamp >= $2
-            AND timestamp <= $3
-            AND user_id IS NOT NULL
-            AND user_email IS NOT NULL
-        GROUP BY user_id, user_email
+            COALESCE(SUM(ha.prompt_tokens), 0)::bigint as total_input_tokens,
+            COALESCE(SUM(ha.completion_tokens), 0)::bigint as total_output_tokens,
+            COALESCE(SUM(ha.total_tokens), 0)::bigint as total_tokens,
+            SUM(ha.total_cost)::float8 as total_cost,
+            MAX(ha.timestamp) as last_active_at
+        FROM http_analytics ha
+        LEFT JOIN users u ON u.id = ha.user_id
+        WHERE ha.model = $1
+            AND ha.timestamp >= $2
+            AND ha.timestamp <= $3
+            AND ha.user_id IS NOT NULL
+        GROUP BY ha.user_id, u.email
         ORDER BY request_count DESC
         "#,
         model_alias,
@@ -745,7 +745,6 @@ pub async fn get_model_user_usage(
             AND timestamp >= $2
             AND timestamp <= $3
             AND user_id IS NOT NULL
-            AND user_email IS NOT NULL
         "#,
         model_alias,
         start_date,
@@ -828,7 +827,6 @@ struct HttpAnalyticsRow {
     pub completion_tokens: Option<i64>,
     pub total_tokens: Option<i64>,
     pub response_type: Option<String>,
-    pub user_email: Option<String>,
     pub fusillade_batch_id: Option<Uuid>,
     pub input_price_per_token: Option<Decimal>,
     pub output_price_per_token: Option<Decimal>,
@@ -862,7 +860,6 @@ pub async fn list_http_analytics(
             completion_tokens,
             total_tokens,
             response_type,
-            user_email,
             fusillade_batch_id,
             input_price_per_token,
             output_price_per_token,
@@ -920,7 +917,6 @@ pub async fn list_http_analytics(
             completion_tokens: row.completion_tokens,
             total_tokens: row.total_tokens,
             response_type: row.response_type,
-            user_email: row.user_email,
             fusillade_batch_id: row.fusillade_batch_id,
             input_price_per_token: row.input_price_per_token.map(|p| p.to_string()),
             output_price_per_token: row.output_price_per_token.map(|p| p.to_string()),
