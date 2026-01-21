@@ -234,7 +234,7 @@ pub struct AppState {
     pub metrics_recorder: Option<GenAiMetrics>,
     #[builder(default = false)]
     pub is_leader: bool,
-    pub request_manager: Arc<fusillade::PostgresRequestManager<fusillade::ReqwestHttpClient>>,
+    pub request_manager: Arc<fusillade::PostgresRequestManager<db::DbPools, fusillade::ReqwestHttpClient>>,
 }
 
 /// Get the dwctl database migrator
@@ -505,9 +505,21 @@ async fn setup_database(
     Option<db::DbPools>,
 )> {
     // If a pool is provided (e.g., from tests), use it directly
-    let (embedded_db, pool) = if let Some(existing_pool) = pool {
+    let (embedded_db, pool, test_replica_pool) = if let Some(existing_pool) = pool {
         info!("Using provided database pool");
-        (None, existing_pool)
+
+        // In test mode, automatically create a read-only replica pool for testing
+        // This ensures all tests verify correct pool routing
+        #[cfg(test)]
+        let test_replica = {
+            info!("Creating read-only test replica pool for pool routing validation");
+            Some(test::utils::create_readonly_replica_pool(&existing_pool).await?)
+        };
+
+        #[cfg(not(test))]
+        let test_replica = None;
+
+        (None, existing_pool, test_replica)
     } else {
         // Database connection - handle both embedded and external
         let (_embedded_db, database_url) = match &config.database {
@@ -555,13 +567,16 @@ async fn setup_database(
             })
             .connect(&database_url)
             .await?;
-        (_embedded_db, pool)
+        (_embedded_db, pool, None)
     };
 
     migrator().run(&pool).await?;
 
-    // Create replica pool if configured
-    let db_pools = if let Some(replica_url) = config.database.external_replica_url() {
+    // Create replica pool if configured (or use test replica if in test mode)
+    let db_pools = if let Some(test_replica) = test_replica_pool {
+        info!("Using test replica pool with read-only enforcement");
+        db::DbPools::with_replica(pool, test_replica)
+    } else if let Some(replica_url) = config.database.external_replica_url() {
         info!("Setting up read replica pool");
         let replica_settings = config.database.main_replica_pool_settings();
         let replica_pool = sqlx::postgres::PgPoolOptions::new()
@@ -1177,7 +1192,7 @@ pub async fn build_router(state: &mut AppState, onwards_router: Router) -> anyho
 /// stop all background tasks. When dropped, the `drop_guard` will automatically cancel
 /// the shutdown token, signaling all tasks to stop.
 pub struct BackgroundServices {
-    request_manager: Arc<fusillade::PostgresRequestManager<fusillade::ReqwestHttpClient>>,
+    request_manager: Arc<fusillade::PostgresRequestManager<db::DbPools, fusillade::ReqwestHttpClient>>,
     is_leader: bool,
     onwards_targets: onwards::target::Targets,
     #[cfg_attr(not(test), allow(dead_code))]
@@ -1303,7 +1318,7 @@ impl BackgroundTaskBuilder {
 /// Setup background services (probe scheduler, batch daemon, leader election, onwards integration)
 async fn setup_background_services(
     pool: PgPool,
-    fusillade_pool: PgPool,
+    fusillade_pools: db::DbPools,
     outlet_pool: Option<PgPool>,
     config: Config,
     shutdown_token: tokio_util::sync::CancellationToken,
@@ -1357,12 +1372,12 @@ async fn setup_background_services(
 
     let probe_scheduler = probes::ProbeScheduler::new(pool.clone(), config.clone());
 
-    // Clone fusillade pool for metrics before moving into request manager
-    let fusillade_pool_for_metrics = fusillade_pool.clone();
+    // Clone fusillade pools for metrics before moving into request manager
+    let fusillade_pool_for_metrics = fusillade_pools.write().clone();
 
     // Initialize the fusillade request manager (for batch processing)
     let request_manager = Arc::new(
-        fusillade::PostgresRequestManager::new(fusillade_pool)
+        fusillade::PostgresRequestManager::new(fusillade_pools)
             .with_config(
                 config
                     .background_services
@@ -1674,10 +1689,9 @@ impl Application {
         let shutdown_token = tokio_util::sync::CancellationToken::new();
 
         // Setup background services (onwards integration, probe scheduler, batch daemon, leader election)
-        // Use primary pool for fusillade (via Deref)
         let bg_services = setup_background_services(
-            (*db_pools).clone(),
-            (*fusillade_pools).clone(),
+            db_pools.read().clone(),
+            fusillade_pools.clone(),
             outlet_pools.as_ref().map(|p| (**p).clone()),
             config.clone(),
             shutdown_token.clone(),

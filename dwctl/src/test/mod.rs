@@ -576,7 +576,7 @@ async fn test_request_logging_disabled(pool: PgPool) {
     config.enable_request_logging = false;
 
     // Build router with request logging disabled
-    let request_manager = std::sync::Arc::new(fusillade::PostgresRequestManager::new(pool.clone()));
+    let request_manager = std::sync::Arc::new(fusillade::PostgresRequestManager::new(crate::db::DbPools::new(pool.clone())));
     let mut app_state = AppState::builder()
         .db(crate::db::DbPools::new(pool.clone()))
         .config(config)
@@ -907,7 +907,7 @@ async fn test_build_router_with_metrics_disabled(pool: PgPool) {
     let mut config = create_test_config();
     config.enable_metrics = false;
 
-    let request_manager = std::sync::Arc::new(fusillade::PostgresRequestManager::new(pool.clone()));
+    let request_manager = std::sync::Arc::new(fusillade::PostgresRequestManager::new(crate::db::DbPools::new(pool.clone())));
     let mut app_state = AppState::builder()
         .db(crate::db::DbPools::new(pool))
         .config(config)
@@ -932,7 +932,7 @@ async fn test_build_router_with_metrics_enabled(pool: PgPool) {
     let mut config = create_test_config();
     config.enable_metrics = true;
 
-    let request_manager = std::sync::Arc::new(fusillade::PostgresRequestManager::new(pool.clone()));
+    let request_manager = std::sync::Arc::new(fusillade::PostgresRequestManager::new(crate::db::DbPools::new(pool.clone())));
     let mut app_state = AppState::builder()
         .db(crate::db::DbPools::new(pool))
         .config(config)
@@ -1422,4 +1422,42 @@ async fn test_component_weight_validation(pool: PgPool) {
         }))
         .await;
     assert_eq!(add_response.status_code(), 200, "Weight 100 should be accepted");
+}
+
+/// Test that read-only pool enforcement catches write operations.
+///
+/// This demonstrates the test utility's ability to catch pool routing violations.
+/// The replica pool is configured with `default_transaction_read_only = on`,
+/// so any write operations will fail with a PostgreSQL error.
+#[sqlx::test]
+async fn test_read_pool_enforces_readonly(pool: PgPool) {
+    // Create test pools with read-only enforcement on replica
+    let db_pools = utils::create_test_db_pools(pool).await;
+
+    // Verify the replica pool exists
+    assert!(db_pools.has_replica(), "Test pools should have a replica configured");
+
+    // Try to execute a write operation on the read pool - this should fail
+    let result = sqlx::query("CREATE TEMPORARY TABLE test_readonly_violation (id INT)")
+        .execute(db_pools.read())
+        .await;
+
+    // The query should fail because the replica is read-only
+    assert!(result.is_err(), "Write operation on read pool should fail with read-only error");
+
+    // Verify it's the right kind of error (read-only violation)
+    let error = result.unwrap_err();
+    let error_msg = error.to_string();
+    assert!(
+        error_msg.contains("read-only") || error_msg.contains("cannot execute"),
+        "Error should indicate read-only violation, got: {}",
+        error_msg
+    );
+
+    // Verify the same operation succeeds on the write pool
+    let result = sqlx::query("CREATE TEMPORARY TABLE test_write_ok (id INT)")
+        .execute(db_pools.write())
+        .await;
+
+    assert!(result.is_ok(), "Write operation on write pool should succeed");
 }

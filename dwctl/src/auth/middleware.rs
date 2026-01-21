@@ -158,7 +158,7 @@ mod tests {
             .expect("Failed to create test deployment");
 
         let state = {
-            let request_manager = std::sync::Arc::new(fusillade::PostgresRequestManager::new(pool.clone()));
+            let request_manager = std::sync::Arc::new(fusillade::PostgresRequestManager::new(crate::db::DbPools::new(pool.clone())));
             crate::AppState::builder()
                 .db(crate::db::DbPools::new(pool.clone()))
                 .config(config)
@@ -242,7 +242,7 @@ mod tests {
             .expect("Failed to add deployment to group");
 
         let state = {
-            let request_manager = std::sync::Arc::new(fusillade::PostgresRequestManager::new(pool.clone()));
+            let request_manager = std::sync::Arc::new(fusillade::PostgresRequestManager::new(crate::db::DbPools::new(pool.clone())));
             crate::AppState::builder()
                 .db(crate::db::DbPools::new(pool.clone()))
                 .config(config)
@@ -273,7 +273,7 @@ mod tests {
     async fn test_header_must_be_supplied(pool: PgPool) {
         let config = create_test_config();
         let state = {
-            let request_manager = std::sync::Arc::new(fusillade::PostgresRequestManager::new(pool.clone()));
+            let request_manager = std::sync::Arc::new(fusillade::PostgresRequestManager::new(crate::db::DbPools::new(pool.clone())));
             crate::AppState::builder()
                 .db(crate::db::DbPools::new(pool.clone()))
                 .config(config)
@@ -299,7 +299,7 @@ mod tests {
     async fn test_unknown_user_no_access(pool: PgPool) {
         let config = create_test_config();
         let state = {
-            let request_manager = std::sync::Arc::new(fusillade::PostgresRequestManager::new(pool.clone()));
+            let request_manager = std::sync::Arc::new(fusillade::PostgresRequestManager::new(crate::db::DbPools::new(pool.clone())));
             crate::AppState::builder()
                 .db(crate::db::DbPools::new(pool.clone()))
                 .config(config)
@@ -328,7 +328,7 @@ mod tests {
     async fn test_unknown_model_not_found(pool: PgPool) {
         let config = create_test_config();
         let state = {
-            let request_manager = std::sync::Arc::new(fusillade::PostgresRequestManager::new(pool.clone()));
+            let request_manager = std::sync::Arc::new(fusillade::PostgresRequestManager::new(crate::db::DbPools::new(pool.clone())));
             crate::AppState::builder()
                 .db(crate::db::DbPools::new(pool.clone()))
                 .config(config)
@@ -360,7 +360,7 @@ mod tests {
     async fn test_ignored_paths(pool: PgPool) {
         let config = create_test_config();
         let state = {
-            let request_manager = std::sync::Arc::new(fusillade::PostgresRequestManager::new(pool.clone()));
+            let request_manager = std::sync::Arc::new(fusillade::PostgresRequestManager::new(crate::db::DbPools::new(pool.clone())));
             crate::AppState::builder()
                 .db(crate::db::DbPools::new(pool.clone()))
                 .config(config)
@@ -432,7 +432,7 @@ mod tests {
             .expect("Failed to add deployment to Everyone group");
 
         let state = {
-            let request_manager = std::sync::Arc::new(fusillade::PostgresRequestManager::new(pool.clone()));
+            let request_manager = std::sync::Arc::new(fusillade::PostgresRequestManager::new(crate::db::DbPools::new(pool.clone())));
             crate::AppState::builder()
                 .db(crate::db::DbPools::new(pool.clone()))
                 .config(config)
@@ -531,7 +531,7 @@ mod tests {
         };
         let jwt_token = session::create_session_token(&current_user, &config).unwrap();
 
-        let request_manager = std::sync::Arc::new(fusillade::PostgresRequestManager::new(pool.clone()));
+        let request_manager = std::sync::Arc::new(fusillade::PostgresRequestManager::new(crate::db::DbPools::new(pool.clone())));
         let state = crate::AppState {
             db: crate::db::DbPools::new(pool.clone()),
             config: config.clone(),
@@ -634,7 +634,7 @@ mod tests {
         };
         let jwt_token = session::create_session_token(&current_user, &config).unwrap();
 
-        let request_manager = std::sync::Arc::new(fusillade::PostgresRequestManager::new(pool.clone()));
+        let request_manager = std::sync::Arc::new(fusillade::PostgresRequestManager::new(crate::db::DbPools::new(pool.clone())));
         let state = crate::AppState {
             db: crate::db::DbPools::new(pool.clone()),
             config: config.clone(),
@@ -739,7 +739,7 @@ mod tests {
         };
         let jwt_token = session::create_session_token(&current_user, &config).unwrap();
 
-        let request_manager = std::sync::Arc::new(fusillade::PostgresRequestManager::new(pool.clone()));
+        let request_manager = std::sync::Arc::new(fusillade::PostgresRequestManager::new(crate::db::DbPools::new(pool.clone())));
         let state = crate::AppState {
             db: crate::db::DbPools::new(pool.clone()),
             config: config.clone(),
@@ -817,7 +817,7 @@ mod tests {
         tx.commit().await.unwrap();
 
         let state = {
-            let request_manager = std::sync::Arc::new(fusillade::PostgresRequestManager::new(pool.clone()));
+            let request_manager = std::sync::Arc::new(fusillade::PostgresRequestManager::new(crate::db::DbPools::new(pool.clone())));
             crate::AppState::builder()
                 .db(crate::db::DbPools::new(pool.clone()))
                 .config(config)
@@ -920,7 +920,7 @@ mod tests {
 
         tx.commit().await.unwrap();
 
-        let request_manager = std::sync::Arc::new(fusillade::PostgresRequestManager::new(pool.clone()));
+        let request_manager = std::sync::Arc::new(fusillade::PostgresRequestManager::new(crate::db::DbPools::new(pool.clone())));
         let state = crate::AppState {
             db: crate::db::DbPools::new(pool.clone()),
             config: config.clone(),
@@ -1025,7 +1025,7 @@ mod tests {
         };
         let jwt_token = session::create_session_token(&current_user, &config).unwrap();
 
-        let request_manager = std::sync::Arc::new(fusillade::PostgresRequestManager::new(pool.clone()));
+        let request_manager = std::sync::Arc::new(fusillade::PostgresRequestManager::new(crate::db::DbPools::new(pool.clone())));
         let state = crate::AppState {
             db: crate::db::DbPools::new(pool.clone()),
             config: config.clone(),

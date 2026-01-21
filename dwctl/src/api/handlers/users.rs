@@ -55,7 +55,8 @@ pub async fn list_users(
     current_user: CurrentUser,
     _: RequiresPermission<resource::Users, operation::ReadAll>,
 ) -> Result<Json<PaginatedResponse<UserResponse>>> {
-    let mut tx = state.db.begin().await.map_err(|e| Error::Database(e.into()))?;
+    // Use read replica for this read-only operation
+    let mut conn = state.db.read().acquire().await.map_err(|e| Error::Database(e.into()))?;
     let skip = query.pagination.skip();
     let limit = query.pagination.limit();
 
@@ -70,7 +71,7 @@ pub async fn list_users(
     let users;
     let total_count;
     {
-        let mut repo = Users::new(&mut tx);
+        let mut repo = Users::new(&mut conn);
         users = repo.list(&filter).await?;
         total_count = repo.count(&filter).await?;
     }
@@ -94,7 +95,7 @@ pub async fn list_users(
 
     // If includes billing AND user has permission, create balances_map
     let balances_map = if includes.contains(&"billing") && can_view_billing {
-        let mut credits_repo = Credits::new(&mut tx);
+        let mut credits_repo = Credits::new(&mut conn);
         Some(credits_repo.get_users_balances_bulk(&user_ids).await?)
     } else {
         None
@@ -102,7 +103,7 @@ pub async fn list_users(
 
     // If includes groups, make groups_map and user_groups_map
     let (groups_map, user_groups_map) = if includes.contains(&"groups") {
-        let mut groups_repo = Groups::new(&mut tx);
+        let mut groups_repo = Groups::new(&mut conn);
         let user_groups_map = groups_repo.get_users_groups_bulk(&user_ids).await?;
         // Collect all unique group IDs that we need to fetch
         let all_group_ids: Vec<GroupId> = user_groups_map
@@ -145,8 +146,6 @@ pub async fn list_users(
 
         response_users.push(response_user);
     }
-
-    tx.commit().await.map_err(|e| Error::Database(e.into()))?;
 
     let paginated_response = PaginatedResponse::new(response_users, total_count, skip, limit);
     Ok(Json(paginated_response))
@@ -215,7 +214,8 @@ pub async fn get_user(
         }
     };
 
-    let mut pool_conn = state.db.acquire().await.map_err(|e| Error::Database(e.into()))?;
+    // Use read replica for this read-only operation
+    let mut pool_conn = state.db.read().acquire().await.map_err(|e| Error::Database(e.into()))?;
     let mut repo = Users::new(&mut pool_conn);
 
     let user = repo.get_by_id(target_user_id).await?.ok_or_else(|| Error::NotFound {
@@ -340,7 +340,7 @@ pub async fn update_user(
         });
     }
 
-    let mut conn = state.db.acquire().await.expect("Failed to acquire database connection");
+    let mut conn = state.db.write().acquire().await.expect("Failed to acquire database connection");
 
     let mut repo = Users::new(&mut conn);
     let db_request = UserUpdateDBRequest::new(user_data);
@@ -412,7 +412,7 @@ pub async fn delete_user(
         }
     }
 
-    let mut conn = state.db.acquire().await.expect("Failed to acquire database connection");
+    let mut conn = state.db.write().acquire().await.expect("Failed to acquire database connection");
     let mut repo = Users::new(&mut conn);
 
     match repo.delete(user_id).await? {

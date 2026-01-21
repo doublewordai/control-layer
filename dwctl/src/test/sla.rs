@@ -27,22 +27,20 @@ use wiremock::{Mock, MockServer, ResponseTemplate};
 async fn get_batch_api_key(pool: &PgPool, user_id: Uuid) -> String {
     let mut conn = pool.acquire().await.expect("Failed to acquire connection");
     let mut api_keys_repo = ApiKeys::new(&mut conn);
-    let api_key = api_keys_repo
+    api_keys_repo
         .get_or_create_hidden_key(user_id, ApiKeyPurpose::Batch)
         .await
-        .expect("Failed to get batch API key");
-    api_key
+        .expect("Failed to get batch API key")
 }
 
 /// Helper to get or create a realtime API key for a user (for actual inference requests)
 async fn get_realtime_api_key(pool: &PgPool, user_id: Uuid) -> String {
     let mut conn = pool.acquire().await.expect("Failed to acquire connection");
     let mut api_keys_repo = ApiKeys::new(&mut conn);
-    let api_key = api_keys_repo
+    api_keys_repo
         .get_or_create_hidden_key(user_id, ApiKeyPurpose::Realtime)
         .await
-        .expect("Failed to get realtime API key");
-    api_key
+        .expect("Failed to get realtime API key")
 }
 
 /// Helper struct to track which server received requests

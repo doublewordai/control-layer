@@ -138,6 +138,20 @@ impl Deref for DbPools {
     }
 }
 
+/// Implement fusillade's PoolProvider trait.
+///
+/// This allows DbPools to be used with fusillade's PostgresRequestManager,
+/// enabling read/write pool separation for batch processing operations.
+impl fusillade::PoolProvider for DbPools {
+    fn read(&self) -> &PgPool {
+        self.read()
+    }
+
+    fn write(&self) -> &PgPool {
+        self.write()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
