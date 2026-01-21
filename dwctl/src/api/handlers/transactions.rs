@@ -217,7 +217,7 @@ pub async fn list_transactions(
         let txs: Vec<CreditTransactionResponse> = transactions_with_categories
             .into_iter()
             .map(|twc| {
-                CreditTransactionResponse::from_db_with_category(
+                CreditTransactionResponse::from_db_with_metadata(
                     twc.transaction,
                     twc.batch_id,
                     twc.request_origin,
