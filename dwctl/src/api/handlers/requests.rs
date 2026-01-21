@@ -61,8 +61,8 @@ pub async fn list_requests(
         custom_id: query.custom_id,
     };
 
-    // Query the http_analytics table
-    let entries = list_http_analytics(&state.db, skip, limit, query.order_desc.unwrap_or(true), filter).await?;
+    // Query the http_analytics table - use read replica for analytics
+    let entries = list_http_analytics(state.db.read(), skip, limit, query.order_desc.unwrap_or(true), filter).await?;
 
     Ok(Json(ListAnalyticsResponse { entries }))
 }
@@ -93,8 +93,8 @@ pub async fn aggregate_requests(
     let time_range_end = query.timestamp_before.unwrap_or(now);
     let model_filter = query.model.as_deref();
 
-    // Get aggregated analytics data from http_analytics table
-    let response = get_requests_aggregate(&state.db, time_range_start, time_range_end, model_filter).await?;
+    // Get aggregated analytics data from http_analytics table - use read replica for analytics
+    let response = get_requests_aggregate(state.db.read(), time_range_start, time_range_end, model_filter).await?;
 
     Ok(Json(response))
 }
@@ -139,8 +139,8 @@ pub async fn aggregate_by_user(
     let end_date = query.end_date.unwrap_or_else(Utc::now);
     let start_date = query.start_date.unwrap_or_else(|| end_date - Duration::hours(24));
 
-    // Get usage data from http_analytics table
-    let usage_data = get_model_user_usage(&state.db, &model_alias, start_date, end_date).await?;
+    // Get usage data from http_analytics table - use read replica for analytics
+    let usage_data = get_model_user_usage(state.db.read(), &model_alias, start_date, end_date).await?;
 
     Ok(Json(usage_data))
 }

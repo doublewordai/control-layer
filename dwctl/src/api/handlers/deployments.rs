@@ -97,11 +97,12 @@ pub async fn list_deployed_models(
     let can_read_rate_limits = can_read_all_resources(&current_user, Resource::ModelRateLimits);
     let can_read_metrics = can_read_all_resources(&current_user, Resource::Analytics);
 
-    let mut tx = state.db.begin().await.map_err(|e| Error::Database(e.into()))?;
+    // Use read replica for this read-only operation
+    let mut conn = state.db.read().acquire().await.map_err(|e| Error::Database(e.into()))?;
 
     // Validate endpoint exists if specified
     if let Some(endpoint_id) = query.endpoint {
-        let mut endpoints_repo = InferenceEndpoints::new(tx.acquire().await.map_err(|e| Error::Database(e.into()))?);
+        let mut endpoints_repo = InferenceEndpoints::new(&mut conn);
         if endpoints_repo.get_by_id(endpoint_id).await?.is_none() {
             return Err(Error::NotFound {
                 resource: "endpoint".to_string(),
@@ -111,7 +112,7 @@ pub async fn list_deployed_models(
     }
 
     // Get deployments with the filter
-    let mut repo = Deployments::new(tx.acquire().await.map_err(|e| Error::Database(e.into()))?);
+    let mut repo = Deployments::new(&mut conn);
 
     // Build the filter with pagination parameters
     let (skip, limit) = query.pagination.params();
@@ -485,7 +486,7 @@ pub async fn get_deployed_model(
     let can_read_pricing = can_read_all_resources(&current_user, Resource::Pricing);
     let can_read_metrics = can_read_all_resources(&current_user, Resource::Analytics);
 
-    let mut pool_conn = state.db.acquire().await.map_err(|e| Error::Database(e.into()))?;
+    let mut pool_conn = state.db.read().acquire().await.map_err(|e| Error::Database(e.into()))?;
     let mut repo = Deployments::new(&mut pool_conn);
 
     let model = match repo.get_by_id(deployment_id).await {
@@ -642,7 +643,7 @@ pub async fn delete_deployed_model(
     Path(deployment_id): Path<DeploymentId>,
     _: RequiresPermission<resource::Models, operation::DeleteAll>,
 ) -> Result<Json<String>> {
-    let mut pool_conn = state.db.acquire().await.map_err(|e| Error::Database(e.into()))?;
+    let mut pool_conn = state.db.write().acquire().await.map_err(|e| Error::Database(e.into()))?;
     let mut repo = Deployments::new(&mut pool_conn);
 
     // Hide model by setting deleted flag
@@ -836,7 +837,7 @@ pub async fn update_model_component(
         });
     }
 
-    let mut pool_conn = state.db.acquire().await.map_err(|e| Error::Database(e.into()))?;
+    let mut pool_conn = state.db.write().acquire().await.map_err(|e| Error::Database(e.into()))?;
     let mut repo = Deployments::new(&mut pool_conn);
 
     let component = repo
@@ -878,7 +879,7 @@ pub async fn remove_model_component(
     Path((id, component_id)): Path<(DeploymentId, DeploymentId)>,
     _: RequiresPermission<resource::CompositeModels, operation::UpdateAll>,
 ) -> Result<Json<String>> {
-    let mut pool_conn = state.db.acquire().await.map_err(|e| Error::Database(e.into()))?;
+    let mut pool_conn = state.db.write().acquire().await.map_err(|e| Error::Database(e.into()))?;
     let mut repo = Deployments::new(&mut pool_conn);
 
     let removed = repo.remove_component(id, component_id).await?;

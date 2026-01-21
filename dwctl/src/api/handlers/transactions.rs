@@ -62,7 +62,7 @@ pub async fn create_transaction(
         });
     }
 
-    let mut pool_conn = state.db.acquire().await.map_err(|e| Error::Database(e.into()))?;
+    let mut pool_conn = state.db.write().acquire().await.map_err(|e| Error::Database(e.into()))?;
     let mut repo = Credits::new(&mut pool_conn);
 
     // Create the transaction
@@ -108,7 +108,7 @@ pub async fn get_transaction(
     Path(transaction_id): Path<Uuid>,
     current_user: CurrentUser,
 ) -> Result<Json<CreditTransactionResponse>> {
-    let mut pool_conn = state.db.acquire().await.map_err(|e| Error::Database(e.into()))?;
+    let mut pool_conn = state.db.read().acquire().await.map_err(|e| Error::Database(e.into()))?;
     let mut repo = Credits::new(&mut pool_conn);
 
     // Check permissions: if not BillingManager and not admin, must be own transaction
@@ -201,7 +201,8 @@ pub async fn list_transactions(
         (_, None) => Some(current_user.id),
     };
 
-    let mut pool_conn = state.db.acquire().await.map_err(|e| Error::Database(e.into()))?;
+    // Use write pool for strong consistency - balance calculations require up-to-date data
+    let mut pool_conn = state.db.write().acquire().await.map_err(|e| Error::Database(e.into()))?;
     let mut repo = Credits::new(&mut pool_conn);
 
     // Parse filters from query

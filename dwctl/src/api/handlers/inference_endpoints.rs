@@ -84,7 +84,8 @@ pub async fn list_inference_endpoints(
     Query(query): Query<ListEndpointsQuery>,
     _: RequiresPermission<resource::Endpoints, operation::ReadAll>,
 ) -> Result<Json<Vec<InferenceEndpointResponse>>> {
-    let mut conn = state.db.acquire().await.map_err(|e| Error::Database(e.into()))?;
+    // Use read replica for this read-only operation
+    let mut conn = state.db.read().acquire().await.map_err(|e| Error::Database(e.into()))?;
     let mut repo = InferenceEndpoints::new(&mut conn);
     let skip = query.pagination.skip();
     let limit = query.pagination.limit();
@@ -121,7 +122,8 @@ pub async fn get_inference_endpoint(
     Path(id): Path<InferenceEndpointId>,
     _: RequiresPermission<resource::Endpoints, operation::ReadAll>,
 ) -> Result<Json<InferenceEndpointResponse>> {
-    let mut conn = state.db.acquire().await.map_err(|e| Error::Database(e.into()))?;
+    // Use read replica for this read-only operation
+    let mut conn = state.db.read().acquire().await.map_err(|e| Error::Database(e.into()))?;
     let mut repo = InferenceEndpoints::new(&mut conn);
     match repo.get_by_id(id).await? {
         Some(endpoint) => Ok(Json(endpoint.into())),
@@ -215,7 +217,7 @@ pub async fn update_inference_endpoint(
         Ok(Json(endpoint.into()))
     } else {
         // Simple update without alias mapping
-        let mut conn = state.db.acquire().await.map_err(|e| Error::Database(e.into()))?;
+        let mut conn = state.db.write().acquire().await.map_err(|e| Error::Database(e.into()))?;
         let mut repo = InferenceEndpoints::new(&mut conn);
         let db_request = InferenceEndpointUpdateDBRequest {
             name: update.name,
@@ -293,7 +295,7 @@ pub async fn validate_inference_endpoint(
         InferenceEndpointValidate::Existing { endpoint_id } => {
             // Scope the connection acquisition to release it before making HTTP request
             let endpoint = {
-                let mut conn = state.db.acquire().await.map_err(|e| Error::Database(e.into()))?;
+                let mut conn = state.db.write().acquire().await.map_err(|e| Error::Database(e.into()))?;
                 let mut endpoints_repo = InferenceEndpoints::new(&mut conn);
                 let endpoint = endpoints_repo.get_by_id(endpoint_id).await?;
                 endpoint.ok_or_else(|| Error::NotFound {
@@ -462,7 +464,7 @@ pub async fn delete_inference_endpoint(
     Path(id): Path<InferenceEndpointId>,
     _: RequiresPermission<resource::Endpoints, operation::DeleteAll>,
 ) -> Result<StatusCode> {
-    let mut conn = state.db.acquire().await.map_err(|e| Error::Database(e.into()))?;
+    let mut conn = state.db.write().acquire().await.map_err(|e| Error::Database(e.into()))?;
     let mut repo = InferenceEndpoints::new(&mut conn);
     if repo.delete(id).await? {
         Ok(StatusCode::NO_CONTENT)

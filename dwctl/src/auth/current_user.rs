@@ -473,7 +473,7 @@ mod tests {
     async fn test_existing_user_extraction(pool: PgPool) {
         let config = create_test_config();
         let state = {
-            let request_manager = std::sync::Arc::new(fusillade::PostgresRequestManager::new(pool.clone()));
+            let request_manager = std::sync::Arc::new(fusillade::PostgresRequestManager::new(crate::db::DbPools::new(pool.clone())));
             AppState::builder()
                 .db(crate::db::DbPools::new(pool.clone()))
                 .config(config)
@@ -501,7 +501,7 @@ mod tests {
     async fn test_auto_create_nonexistent_user(pool: PgPool) {
         let config = create_test_config();
         let state = {
-            let request_manager = std::sync::Arc::new(fusillade::PostgresRequestManager::new(pool.clone()));
+            let request_manager = std::sync::Arc::new(fusillade::PostgresRequestManager::new(crate::db::DbPools::new(pool.clone())));
             AppState::builder()
                 .db(crate::db::DbPools::new(pool.clone()))
                 .config(config)
@@ -550,7 +550,7 @@ mod tests {
     async fn test_missing_header_returns_unauthorized(pool: PgPool) {
         let config = create_test_config();
         let state = {
-            let request_manager = std::sync::Arc::new(fusillade::PostgresRequestManager::new(pool.clone()));
+            let request_manager = std::sync::Arc::new(fusillade::PostgresRequestManager::new(crate::db::DbPools::new(pool.clone())));
             AppState::builder()
                 .db(crate::db::DbPools::new(pool.clone()))
                 .config(config)
@@ -574,7 +574,7 @@ mod tests {
     async fn test_backwards_compatibility_single_header(pool: PgPool) {
         let config = create_test_config();
         let state = {
-            let request_manager = std::sync::Arc::new(fusillade::PostgresRequestManager::new(pool.clone()));
+            let request_manager = std::sync::Arc::new(fusillade::PostgresRequestManager::new(crate::db::DbPools::new(pool.clone())));
             AppState::builder()
                 .db(crate::db::DbPools::new(pool.clone()))
                 .config(config)
@@ -616,7 +616,7 @@ mod tests {
     async fn test_multiple_federated_identities_same_email(pool: PgPool) {
         let config = create_test_config();
         let state = {
-            let request_manager = std::sync::Arc::new(fusillade::PostgresRequestManager::new(pool.clone()));
+            let request_manager = std::sync::Arc::new(fusillade::PostgresRequestManager::new(crate::db::DbPools::new(pool.clone())));
             AppState::builder()
                 .db(crate::db::DbPools::new(pool.clone()))
                 .config(config)
@@ -673,7 +673,7 @@ mod tests {
     async fn test_migration_backfill_external_user_id(pool: PgPool) {
         let config = create_test_config();
         let state = {
-            let request_manager = std::sync::Arc::new(fusillade::PostgresRequestManager::new(pool.clone()));
+            let request_manager = std::sync::Arc::new(fusillade::PostgresRequestManager::new(crate::db::DbPools::new(pool.clone())));
             AppState::builder()
                 .db(crate::db::DbPools::new(pool.clone()))
                 .config(config)
@@ -739,7 +739,7 @@ mod tests {
     async fn test_backwards_compat_no_backfill(pool: PgPool) {
         let config = create_test_config();
         let state = {
-            let request_manager = std::sync::Arc::new(fusillade::PostgresRequestManager::new(pool.clone()));
+            let request_manager = std::sync::Arc::new(fusillade::PostgresRequestManager::new(crate::db::DbPools::new(pool.clone())));
             AppState::builder()
                 .db(crate::db::DbPools::new(pool.clone()))
                 .config(config)
@@ -826,7 +826,7 @@ mod tests {
     async fn test_only_email_header_sent_fails(pool: PgPool) {
         let config = create_test_config();
         let state = {
-            let request_manager = std::sync::Arc::new(fusillade::PostgresRequestManager::new(pool.clone()));
+            let request_manager = std::sync::Arc::new(fusillade::PostgresRequestManager::new(crate::db::DbPools::new(pool.clone())));
             AppState::builder()
                 .db(crate::db::DbPools::new(pool.clone()))
                 .config(config)
@@ -856,7 +856,7 @@ mod tests {
         config.auth.proxy_header.auto_create_users = false;
 
         let state = {
-            let request_manager = std::sync::Arc::new(fusillade::PostgresRequestManager::new(pool.clone()));
+            let request_manager = std::sync::Arc::new(fusillade::PostgresRequestManager::new(crate::db::DbPools::new(pool.clone())));
             AppState::builder()
                 .db(crate::db::DbPools::new(pool.clone()))
                 .config(config)
@@ -890,7 +890,7 @@ mod tests {
         config.auth.proxy_header.auto_create_users = false;
 
         let state = {
-            let request_manager = std::sync::Arc::new(fusillade::PostgresRequestManager::new(pool.clone()));
+            let request_manager = std::sync::Arc::new(fusillade::PostgresRequestManager::new(crate::db::DbPools::new(pool.clone())));
             AppState::builder()
                 .db(crate::db::DbPools::new(pool.clone()))
                 .config(config)
@@ -918,7 +918,7 @@ mod tests {
     async fn test_existing_user_email_update(pool: PgPool) {
         let config = create_test_config();
         let state = {
-            let request_manager = std::sync::Arc::new(fusillade::PostgresRequestManager::new(pool.clone()));
+            let request_manager = std::sync::Arc::new(fusillade::PostgresRequestManager::new(crate::db::DbPools::new(pool.clone())));
             AppState::builder()
                 .db(crate::db::DbPools::new(pool.clone()))
                 .config(config)
@@ -972,7 +972,7 @@ mod tests {
     async fn test_idempotent_logins(pool: PgPool) {
         let config = create_test_config();
         let state = {
-            let request_manager = std::sync::Arc::new(fusillade::PostgresRequestManager::new(pool.clone()));
+            let request_manager = std::sync::Arc::new(fusillade::PostgresRequestManager::new(crate::db::DbPools::new(pool.clone())));
             AppState::builder()
                 .db(crate::db::DbPools::new(pool.clone()))
                 .config(config)
@@ -1011,7 +1011,7 @@ mod tests {
     async fn test_special_characters_in_external_user_id(pool: PgPool) {
         let config = create_test_config();
         let state = {
-            let request_manager = std::sync::Arc::new(fusillade::PostgresRequestManager::new(pool.clone()));
+            let request_manager = std::sync::Arc::new(fusillade::PostgresRequestManager::new(crate::db::DbPools::new(pool.clone())));
             AppState::builder()
                 .db(crate::db::DbPools::new(pool.clone()))
                 .config(config)
@@ -1123,7 +1123,7 @@ mod tests {
         let jwt_token = session::create_session_token(&current_user, &config).unwrap();
 
         let state = {
-            let request_manager = std::sync::Arc::new(fusillade::PostgresRequestManager::new(pool.clone()));
+            let request_manager = std::sync::Arc::new(fusillade::PostgresRequestManager::new(crate::db::DbPools::new(pool.clone())));
             AppState::builder()
                 .db(crate::db::DbPools::new(pool.clone()))
                 .config(config.clone())
@@ -1194,7 +1194,7 @@ mod tests {
         let jwt_token = session::create_session_token(&current_user, &config).unwrap();
 
         let state = {
-            let request_manager = std::sync::Arc::new(fusillade::PostgresRequestManager::new(pool.clone()));
+            let request_manager = std::sync::Arc::new(fusillade::PostgresRequestManager::new(crate::db::DbPools::new(pool.clone())));
             AppState::builder()
                 .db(crate::db::DbPools::new(pool.clone()))
                 .config(config.clone())
@@ -1246,7 +1246,7 @@ mod tests {
         config.credits.initial_credits_for_standard_users = rust_decimal::Decimal::new(10000, 2); // 100.00 credits
 
         let state = {
-            let request_manager = std::sync::Arc::new(fusillade::PostgresRequestManager::new(pool.clone()));
+            let request_manager = std::sync::Arc::new(fusillade::PostgresRequestManager::new(crate::db::DbPools::new(pool.clone())));
             AppState::builder()
                 .db(crate::db::DbPools::new(pool.clone()))
                 .config(config)
@@ -1310,7 +1310,7 @@ mod tests {
         config.credits.initial_credits_for_standard_users = rust_decimal::Decimal::new(10000, 2); // 100.00 credits
 
         let state = {
-            let request_manager = std::sync::Arc::new(fusillade::PostgresRequestManager::new(pool.clone()));
+            let request_manager = std::sync::Arc::new(fusillade::PostgresRequestManager::new(crate::db::DbPools::new(pool.clone())));
             AppState::builder()
                 .db(crate::db::DbPools::new(pool.clone()))
                 .config(config)

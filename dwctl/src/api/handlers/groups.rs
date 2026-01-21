@@ -18,7 +18,6 @@ use axum::{
     extract::{Path, Query, State},
     http::StatusCode,
 };
-use sqlx::Acquire;
 
 #[utoipa::path(
     get,
@@ -50,14 +49,15 @@ pub async fn list_groups(
     Query(query): Query<ListGroupsQuery>,
     _: RequiresPermission<resource::Groups, operation::ReadAll>,
 ) -> Result<Json<PaginatedResponse<GroupResponse>>> {
-    let mut tx = state.db.begin().await.map_err(|e| Error::Database(e.into()))?;
+    // Use read replica for this read-only operation
+    let mut conn = state.db.read().acquire().await.map_err(|e| Error::Database(e.into()))?;
 
     let groups;
     let total_count;
     let skip;
     let limit;
     {
-        let mut repo = Groups::new(tx.acquire().await.map_err(|e| Error::Database(e.into()))?);
+        let mut repo = Groups::new(&mut conn);
         skip = query.pagination.skip();
         limit = query.pagination.limit();
 
@@ -94,7 +94,7 @@ pub async fn list_groups(
             // First get the user IDs for each group
             let groups_users_map;
             {
-                let mut repo = Groups::new(tx.acquire().await.map_err(|e| Error::Database(e.into()))?);
+                let mut repo = Groups::new(&mut conn);
                 groups_users_map = repo.get_groups_users_bulk(&group_ids).await?;
             }
             // Collect all unique user IDs
@@ -109,7 +109,7 @@ pub async fn list_groups(
             // Fetch all users in bulk
             let users_bulk;
             {
-                let mut users_repo = Users::new(tx.acquire().await.map_err(|e| Error::Database(e.into()))?);
+                let mut users_repo = Users::new(&mut conn);
                 users_bulk = users_repo.get_bulk(all_user_ids).await?;
             }
 
@@ -132,7 +132,7 @@ pub async fn list_groups(
             // First get the deployment IDs for each group
             let groups_deployments_map;
             {
-                let mut repo = Groups::new(tx.acquire().await.map_err(|e| Error::Database(e.into()))?);
+                let mut repo = Groups::new(&mut conn);
                 groups_deployments_map = repo.get_groups_deployments_bulk(&group_ids).await?;
             }
             // Collect all unique deployment IDs
@@ -145,7 +145,7 @@ pub async fn list_groups(
                 .collect();
 
             // Fetch all deployments in bulk
-            let mut deployments_repo = Deployments::new(tx.acquire().await.map_err(|e| Error::Database(e.into()))?);
+            let mut deployments_repo = Deployments::new(&mut conn);
             let deployments_bulk = deployments_repo.get_bulk(all_deployment_ids).await?;
             // Build a map from group_id to Vec<DeployedModelResponse>
             let mut resolved_map = std::collections::HashMap::new();
@@ -173,9 +173,6 @@ pub async fn list_groups(
         // No includes requested, just convert normally
         response_groups = groups.into_iter().map(GroupResponse::from).collect();
     }
-
-    // Commit the transaction to ensure all reads were atomic
-    tx.commit().await.map_err(|e| Error::Database(e.into()))?;
 
     let paginated_response = PaginatedResponse::new(response_groups, total_count, skip, limit);
     Ok(Json(paginated_response))
@@ -207,7 +204,7 @@ pub async fn create_group(
     current_user: RequiresPermission<resource::Groups, operation::CreateAll>,
     Json(create): Json<GroupCreate>,
 ) -> Result<(StatusCode, Json<GroupResponse>)> {
-    let mut pool_conn = state.db.acquire().await.map_err(|e| Error::Database(e.into()))?;
+    let mut pool_conn = state.db.write().acquire().await.map_err(|e| Error::Database(e.into()))?;
     let mut repo = Groups::new(&mut pool_conn);
     let request = GroupCreateDBRequest::new(current_user.id, create);
 
@@ -241,7 +238,7 @@ pub async fn get_group(
     Path(group_id): Path<GroupId>,
     _: RequiresPermission<resource::Groups, operation::ReadAll>,
 ) -> Result<Json<GroupResponse>> {
-    let mut pool_conn = state.db.acquire().await.map_err(|e| Error::Database(e.into()))?;
+    let mut pool_conn = state.db.read().acquire().await.map_err(|e| Error::Database(e.into()))?;
     let mut repo = Groups::new(&mut pool_conn);
 
     match repo.get_by_id(group_id).await? {
@@ -282,7 +279,7 @@ pub async fn update_group(
     _: RequiresPermission<resource::Groups, operation::UpdateAll>,
     Json(update): Json<GroupUpdate>,
 ) -> Result<Json<GroupResponse>> {
-    let mut pool_conn = state.db.acquire().await.map_err(|e| Error::Database(e.into()))?;
+    let mut pool_conn = state.db.write().acquire().await.map_err(|e| Error::Database(e.into()))?;
     let mut repo = Groups::new(&mut pool_conn);
     let request = GroupUpdateDBRequest::from(update);
 
@@ -316,7 +313,7 @@ pub async fn delete_group(
     Path(group_id): Path<GroupId>,
     _: RequiresPermission<resource::Groups, operation::DeleteAll>,
 ) -> Result<StatusCode> {
-    let mut pool_conn = state.db.acquire().await.map_err(|e| Error::Database(e.into()))?;
+    let mut pool_conn = state.db.write().acquire().await.map_err(|e| Error::Database(e.into()))?;
     let mut repo = Groups::new(&mut pool_conn);
 
     if repo.delete(group_id).await? {
@@ -355,7 +352,7 @@ pub async fn add_user_to_group(
     Path((group_id, user_id)): Path<(GroupId, UserId)>,
     _: RequiresPermission<resource::Groups, operation::UpdateAll>,
 ) -> Result<StatusCode> {
-    let mut pool_conn = state.db.acquire().await.map_err(|e| Error::Database(e.into()))?;
+    let mut pool_conn = state.db.write().acquire().await.map_err(|e| Error::Database(e.into()))?;
     let mut repo = Groups::new(&mut pool_conn);
     repo.add_user_to_group(user_id, group_id).await?;
     Ok(StatusCode::NO_CONTENT)
@@ -388,7 +385,7 @@ pub async fn remove_user_from_group(
     Path((group_id, user_id)): Path<(GroupId, UserId)>,
     _: RequiresPermission<resource::Groups, operation::UpdateAll>,
 ) -> Result<StatusCode> {
-    let mut pool_conn = state.db.acquire().await.map_err(|e| Error::Database(e.into()))?;
+    let mut pool_conn = state.db.write().acquire().await.map_err(|e| Error::Database(e.into()))?;
     let mut repo = Groups::new(&mut pool_conn);
     repo.remove_user_from_group(user_id, group_id).await?;
     Ok(StatusCode::NO_CONTENT)
@@ -420,7 +417,7 @@ pub async fn add_group_to_user(
     Path((user_id, group_id)): Path<(UserId, GroupId)>,
     _: RequiresPermission<resource::Users, operation::UpdateAll>,
 ) -> Result<StatusCode> {
-    let mut pool_conn = state.db.acquire().await.map_err(|e| Error::Database(e.into()))?;
+    let mut pool_conn = state.db.write().acquire().await.map_err(|e| Error::Database(e.into()))?;
     let mut repo = Groups::new(&mut pool_conn);
     repo.add_user_to_group(user_id, group_id).await?;
     Ok(StatusCode::NO_CONTENT)
@@ -453,7 +450,7 @@ pub async fn remove_group_from_user(
     Path((user_id, group_id)): Path<(UserId, GroupId)>,
     _: RequiresPermission<resource::Users, operation::UpdateAll>,
 ) -> Result<StatusCode> {
-    let mut pool_conn = state.db.acquire().await.map_err(|e| Error::Database(e.into()))?;
+    let mut pool_conn = state.db.write().acquire().await.map_err(|e| Error::Database(e.into()))?;
     let mut repo = Groups::new(&mut pool_conn);
     repo.remove_user_from_group(user_id, group_id).await?;
     Ok(StatusCode::NO_CONTENT)
@@ -485,7 +482,7 @@ pub async fn get_group_users(
     Path(group_id): Path<GroupId>,
     _: RequiresPermission<resource::Users, operation::ReadAll>,
 ) -> Result<Json<Vec<UserId>>> {
-    let mut pool_conn = state.db.acquire().await.map_err(|e| Error::Database(e.into()))?;
+    let mut pool_conn = state.db.write().acquire().await.map_err(|e| Error::Database(e.into()))?;
     let mut repo = Groups::new(&mut pool_conn);
 
     Ok(Json(repo.get_group_users(group_id).await?))
@@ -535,7 +532,7 @@ pub async fn get_user_groups(
         });
     }
 
-    let mut pool_conn = state.db.acquire().await.map_err(|e| Error::Database(e.into()))?;
+    let mut pool_conn = state.db.read().acquire().await.map_err(|e| Error::Database(e.into()))?;
     let mut repo = Groups::new(&mut pool_conn);
 
     let groups = repo.get_user_groups(user_id).await?;
@@ -586,7 +583,7 @@ pub async fn add_deployment_to_group(
     Path((group_id, deployment_id)): Path<(GroupId, DeploymentId)>,
     current_user: RequiresPermission<resource::Groups, operation::UpdateAll>,
 ) -> Result<StatusCode> {
-    let mut pool_conn = state.db.acquire().await.map_err(|e| Error::Database(e.into()))?;
+    let mut pool_conn = state.db.write().acquire().await.map_err(|e| Error::Database(e.into()))?;
     let mut repo = Groups::new(&mut pool_conn);
     repo.add_deployment_to_group(deployment_id, group_id, current_user.id).await?;
     Ok(StatusCode::NO_CONTENT)
@@ -618,7 +615,7 @@ pub async fn remove_deployment_from_group(
     Path((group_id, deployment_id)): Path<(GroupId, DeploymentId)>,
     _: RequiresPermission<resource::Groups, operation::UpdateAll>,
 ) -> Result<StatusCode> {
-    let mut pool_conn = state.db.acquire().await.map_err(|e| Error::Database(e.into()))?;
+    let mut pool_conn = state.db.write().acquire().await.map_err(|e| Error::Database(e.into()))?;
     let mut repo = Groups::new(&mut pool_conn);
     repo.remove_deployment_from_group(deployment_id, group_id).await?;
     Ok(StatusCode::NO_CONTENT)
@@ -650,7 +647,7 @@ pub async fn get_group_deployments(
     Path(group_id): Path<GroupId>,
     _: RequiresPermission<resource::Groups, operation::ReadAll>,
 ) -> Result<Json<Vec<DeploymentId>>> {
-    let mut pool_conn = state.db.acquire().await.map_err(|e| Error::Database(e.into()))?;
+    let mut pool_conn = state.db.read().acquire().await.map_err(|e| Error::Database(e.into()))?;
     let mut repo = Groups::new(&mut pool_conn);
     let deployments = repo.get_group_deployments(group_id).await?;
     Ok(Json(deployments))
@@ -682,7 +679,7 @@ pub async fn get_deployment_groups(
     Path(deployment_id): Path<DeploymentId>,
     _: RequiresPermission<resource::Groups, operation::ReadAll>,
 ) -> Result<Json<Vec<GroupId>>> {
-    let mut pool_conn = state.db.acquire().await.map_err(|e| Error::Database(e.into()))?;
+    let mut pool_conn = state.db.write().acquire().await.map_err(|e| Error::Database(e.into()))?;
     let mut repo = Groups::new(&mut pool_conn);
     let groups = repo.get_deployment_groups(deployment_id).await?;
     Ok(Json(groups))
