@@ -895,6 +895,11 @@ pub struct DaemonConfig {
     ///   - x-fusillade-batch-endpoint
     #[serde(default = "default_batch_metadata_fields_dwctl")]
     pub batch_metadata_fields: Vec<String>,
+
+    /// Template insertion strategy (individual vs batched)
+    /// Batched is much faster for large files (30k+ templates)
+    #[serde(default)]
+    pub batch_insert_strategy: Option<fusillade::manager::postgres::BatchInsertStrategy>,
 }
 
 fn default_batch_metadata_fields_dwctl() -> Vec<String> {
@@ -926,6 +931,7 @@ impl Default for DaemonConfig {
             model_escalations: HashMap::new(),
             sla_check_interval_seconds: 60,
             sla_thresholds: vec![],
+            batch_insert_strategy: None,
         }
     }
 }

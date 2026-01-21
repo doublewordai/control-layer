@@ -1369,7 +1369,14 @@ async fn setup_background_services(
                     .batch_daemon
                     .to_fusillade_config_with_limits(Some(model_capacity_limits.clone())),
             )
-            .with_download_buffer_size(config.batches.files.download_buffer_size),
+            .with_download_buffer_size(config.batches.files.download_buffer_size)
+            .with_batch_insert_strategy(
+                config
+                    .background_services
+                    .batch_daemon
+                    .batch_insert_strategy
+                    .unwrap_or_default()  // Use fusillade's Default impl if None
+            )
     );
 
     let is_leader: bool;
