@@ -22,9 +22,7 @@ use axum::{
     response::Json,
 };
 
-use fusillade::Storage;
 use rust_decimal::Decimal;
-use std::collections::HashMap;
 use uuid::Uuid;
 
 /// Create a new credit transaction
@@ -215,64 +213,17 @@ pub async fn list_transactions(
         let transactions_with_categories = repo.list_transactions_with_batches(user_id, skip, limit, &filters).await?;
         let count = repo.count_transactions_with_batches(user_id, &filters).await?;
 
-        // Collect unique batch_ids that need metadata lookup from fusillade
-        let batch_ids: Vec<Uuid> = transactions_with_categories.iter().filter_map(|twc| twc.batch_id).collect();
-
-        // Fetch batch metadata (SLA and request_source) from fusillade for each batch
-        struct BatchInfo {
-            completion_window: String,
-            request_source: Option<String>,
-        }
-        let mut batch_info_map: HashMap<Uuid, BatchInfo> = HashMap::new();
-        for batch_id in batch_ids {
-            match state.request_manager.get_batch(fusillade::BatchId(batch_id)).await {
-                Ok(batch) => {
-                    // Extract request_source from batch metadata
-                    let request_source = batch
-                        .metadata
-                        .as_ref()
-                        .and_then(|m| m.get("request_source"))
-                        .and_then(|v| v.as_str())
-                        .map(|s| s.to_string());
-
-                    batch_info_map.insert(
-                        batch_id,
-                        BatchInfo {
-                            completion_window: batch.completion_window,
-                            request_source,
-                        },
-                    );
-                }
-                Err(e) => {
-                    tracing::warn!(batch_id = %batch_id, error = %e, "Failed to fetch batch from fusillade, using fallback");
-                    // Use fallback values when batch fetch fails
-                    batch_info_map.insert(
-                        batch_id,
-                        BatchInfo {
-                            completion_window: "24h".to_string(), // Default SLA fallback
-                            request_source: None,
-                        },
-                    );
-                }
-            }
-        }
-
+        // batch_sla and request_origin are now fetched directly from http_analytics via the SQL query
         let txs: Vec<CreditTransactionResponse> = transactions_with_categories
             .into_iter()
             .map(|twc| {
-                // For batched transactions, get SLA and request_origin from fusillade;
-                // for non-batched, use what we got from http_analytics
-                let (batch_sla, request_origin) = if let Some(batch_id) = twc.batch_id {
-                    let info = batch_info_map.get(&batch_id);
-                    (
-                        info.map(|i| i.completion_window.clone()),
-                        // Use request_source from batch metadata, fallback to "fusillade" for old batches
-                        info.and_then(|i| i.request_source.clone()).or(Some("fusillade".to_string())),
-                    )
-                } else {
-                    (twc.batch_sla, twc.request_origin)
-                };
-                CreditTransactionResponse::from_db_with_category(twc.transaction, twc.batch_id, request_origin, batch_sla, twc.batch_count)
+                CreditTransactionResponse::from_db_with_category(
+                    twc.transaction,
+                    twc.batch_id,
+                    twc.request_origin,
+                    twc.batch_sla,
+                    twc.batch_count,
+                )
             })
             .collect();
         (txs, count)

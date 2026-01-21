@@ -313,6 +313,7 @@ mod tests {
             custom_id: None,
             request_origin: "api".to_string(),
             batch_sla: String::new(),
+            batch_metadata_request_origin: String::new(),
         };
 
         // Call the function under test
@@ -427,6 +428,7 @@ mod tests {
             custom_id: None,
             request_origin: "api".to_string(),
             batch_sla: String::new(),
+            batch_metadata_request_origin: String::new(),
         };
 
         metrics.record_from_analytics(&row).await;
@@ -489,6 +491,7 @@ mod tests {
             custom_id: None,
             request_origin: "api".to_string(),
             batch_sla: String::new(),
+            batch_metadata_request_origin: String::new(),
         };
 
         metrics.record_from_analytics(&row).await;
@@ -562,6 +565,7 @@ mod tests {
             custom_id: None,
             request_origin: "api".to_string(),
             batch_sla: String::new(),
+            batch_metadata_request_origin: String::new(),
         };
 
         metrics.record_from_analytics(&row).await;
@@ -621,6 +625,7 @@ mod tests {
             custom_id: None,
             request_origin: "api".to_string(),
             batch_sla: String::new(),
+            batch_metadata_request_origin: String::new(),
         };
 
         metrics.record_from_analytics(&row).await;
@@ -683,6 +688,7 @@ mod tests {
             custom_id: None,
             request_origin: "api".to_string(),
             batch_sla: String::new(),
+            batch_metadata_request_origin: String::new(),
         };
 
         metrics.record_from_analytics(&row).await;
@@ -742,6 +748,7 @@ mod tests {
             custom_id: None,
             request_origin: "api".to_string(),
             batch_sla: String::new(),
+            batch_metadata_request_origin: String::new(),
         };
 
         metrics.record_from_analytics(&row).await;
@@ -796,6 +803,7 @@ mod tests {
                 custom_id: None,
                 request_origin: "api".to_string(),
                 batch_sla: String::new(),
+                batch_metadata_request_origin: String::new(),
             };
 
             metrics.record_from_analytics(&row).await;
@@ -848,6 +856,7 @@ mod tests {
             custom_id: None,
             request_origin: "api".to_string(),
             batch_sla: String::new(),
+            batch_metadata_request_origin: String::new(),
         };
 
         metrics.record_from_analytics(&row).await;

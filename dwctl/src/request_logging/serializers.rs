@@ -131,6 +131,9 @@ pub struct HttpAnalyticsRow {
     /// Prometheus metrics can be filtered with a simple `batch_sla=""` label
     /// selector, at the cost of a small increase in label cardinality.
     pub batch_sla: String,
+    /// The request_source from batch metadata (e.g., "api", "frontend").
+    /// Empty string for non-batch requests or when not provided.
+    pub batch_metadata_request_origin: String,
 }
 
 /// Usage metrics extracted from AI responses (subset of HttpAnalyticsRow)
@@ -400,6 +403,7 @@ pub async fn store_analytics_record(
     // Extract batch metadata headers for tariff pricing
     let batch_created_at = extract_header_as_string(request_data, "x-fusillade-batch-created-at");
     let batch_completion_window = extract_header_as_string(request_data, "x-fusillade-batch-completion-window");
+    let batch_metadata_request_origin = extract_header_as_string(request_data, "x-fusillade-batch-request-source").unwrap_or_default();
 
     // Parse batch created_at timestamp if available, otherwise use metrics.timestamp
     let pricing_timestamp = if let Some(created_at_str) = &batch_created_at {
@@ -538,6 +542,7 @@ pub async fn store_analytics_record(
             _ => "api".to_string(),
         },
         batch_sla: batch_completion_window.clone().unwrap_or_default(),
+        batch_metadata_request_origin,
     };
 
     // Insert the analytics record and get the ID
@@ -548,9 +553,9 @@ pub async fn store_analytics_record(
             status_code, duration_ms, duration_to_first_byte_ms, prompt_tokens, completion_tokens,
             total_tokens, response_type, user_id, user_email, access_source,
             input_price_per_token, output_price_per_token, fusillade_batch_id, fusillade_request_id, custom_id,
-            request_origin, batch_sla
+            request_origin, batch_sla, batch_metadata_request_origin
         )
-        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23)
+        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24)
         ON CONFLICT (instance_id, correlation_id)
         DO UPDATE SET
             status_code = EXCLUDED.status_code,
@@ -569,7 +574,8 @@ pub async fn store_analytics_record(
             fusillade_request_id = EXCLUDED.fusillade_request_id,
             custom_id = EXCLUDED.custom_id,
             request_origin = EXCLUDED.request_origin,
-            batch_sla = EXCLUDED.batch_sla
+            batch_sla = EXCLUDED.batch_sla,
+            batch_metadata_request_origin = EXCLUDED.batch_metadata_request_origin
         RETURNING id
         "#,
         row.instance_id,
@@ -594,7 +600,8 @@ pub async fn store_analytics_record(
         row.fusillade_request_id,
         row.custom_id,
         row.request_origin,
-        row.batch_sla
+        row.batch_sla,
+        row.batch_metadata_request_origin
     )
     .fetch_one(pool)
     .instrument(info_span!("insert_http_analytics"))
