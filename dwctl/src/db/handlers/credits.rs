@@ -721,7 +721,7 @@ impl<'c> Credits<'c> {
 
         // Optimized query using pre-limited UNION branches for Merge Append
         // Each branch fetches skip+limit rows, then pagination applies to combined result
-        // For batches: join with http_analytics to get batch_metadata_request_origin and batch_sla
+        // For batches: join with http_analytics to get batch_request_source and batch_sla
         let fetch_limit = skip + limit;
         let rows = sqlx::query!(
             r#"
@@ -729,7 +729,7 @@ impl<'c> Credits<'c> {
                 -- Top N from batch_aggregates (index scan on idx_batch_agg_user_seq)
                 -- Only included if transaction_types filter includes 'usage' or is not set
                 -- and search term matches "Batch" description
-                -- JOIN with http_analytics to get batch_metadata_request_origin and batch_sla
+                -- JOIN with http_analytics to get batch_request_source and batch_sla
                 (SELECT
                     ba.fusillade_batch_id as id,
                     ba.user_id,
@@ -741,11 +741,11 @@ impl<'c> Credits<'c> {
                     ba.max_seq,
                     ba.fusillade_batch_id as batch_id,
                     ba.transaction_count as batch_count,
-                    COALESCE(NULLIF(sample_ha.batch_metadata_request_origin, ''), 'fusillade') as request_origin,
+                    COALESCE(NULLIF(sample_ha.batch_request_source, ''), 'fusillade') as request_origin,
                     COALESCE(sample_ha.batch_sla, '') as batch_sla
                 FROM batch_aggregates ba
                 LEFT JOIN LATERAL (
-                    SELECT batch_metadata_request_origin, batch_sla
+                    SELECT batch_request_source, batch_sla
                     FROM http_analytics ha
                     WHERE ha.fusillade_batch_id = ba.fusillade_batch_id
                     LIMIT 1
