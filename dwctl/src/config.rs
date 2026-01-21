@@ -1304,7 +1304,10 @@ impl Config {
         } else if let Some(replica_url) = config.database_replica_url.take() {
             // Only replica_url is set via environment variable, apply it to existing config
             match &mut config.database {
-                DatabaseConfig::External { replica_url: current_replica, .. } => {
+                DatabaseConfig::External {
+                    replica_url: current_replica,
+                    ..
+                } => {
                     *current_replica = Some(replica_url);
                 }
                 DatabaseConfig::Embedded { .. } => {
