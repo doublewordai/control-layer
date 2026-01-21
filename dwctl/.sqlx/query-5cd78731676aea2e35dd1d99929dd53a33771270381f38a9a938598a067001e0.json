@@ -1,0 +1,125 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n        SELECT\n            ha.id,\n            ha.timestamp,\n            ha.method,\n            ha.uri,\n            ha.model,\n            ha.status_code,\n            ha.duration_ms,\n            ha.prompt_tokens,\n            ha.completion_tokens,\n            ha.total_tokens,\n            ha.response_type,\n            u.email as \"user_email?\",\n            ha.fusillade_batch_id,\n            ha.input_price_per_token,\n            ha.output_price_per_token,\n            ha.custom_id\n        FROM http_analytics ha\n        LEFT JOIN users u ON u.id = ha.user_id\n        WHERE\n            ($1::timestamptz IS NULL OR ha.timestamp >= $1)\n            AND ($2::timestamptz IS NULL OR ha.timestamp <= $2)\n            AND ($3::text IS NULL OR ha.model = $3)\n            AND ($4::uuid IS NULL OR ha.fusillade_batch_id = $4)\n            AND ($5::text IS NULL OR ha.method = $5)\n            AND ($6::text IS NULL OR ha.uri LIKE $6)\n            AND ($7::int IS NULL OR ha.status_code = $7)\n            AND ($8::int IS NULL OR ha.status_code >= $8)\n            AND ($9::int IS NULL OR ha.status_code <= $9)\n            AND ($10::bigint IS NULL OR ha.duration_ms >= $10)\n            AND ($11::bigint IS NULL OR ha.duration_ms <= $11)\n            AND ($12::text IS NULL OR ha.custom_id ILIKE $12)\n        ORDER BY ha.timestamp DESC\n        LIMIT $13\n        OFFSET $14\n        ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "id",
+        "type_info": "Int8"
+      },
+      {
+        "ordinal": 1,
+        "name": "timestamp",
+        "type_info": "Timestamptz"
+      },
+      {
+        "ordinal": 2,
+        "name": "method",
+        "type_info": "Varchar"
+      },
+      {
+        "ordinal": 3,
+        "name": "uri",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 4,
+        "name": "model",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 5,
+        "name": "status_code",
+        "type_info": "Int4"
+      },
+      {
+        "ordinal": 6,
+        "name": "duration_ms",
+        "type_info": "Int8"
+      },
+      {
+        "ordinal": 7,
+        "name": "prompt_tokens",
+        "type_info": "Int8"
+      },
+      {
+        "ordinal": 8,
+        "name": "completion_tokens",
+        "type_info": "Int8"
+      },
+      {
+        "ordinal": 9,
+        "name": "total_tokens",
+        "type_info": "Int8"
+      },
+      {
+        "ordinal": 10,
+        "name": "response_type",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 11,
+        "name": "user_email?",
+        "type_info": "Varchar"
+      },
+      {
+        "ordinal": 12,
+        "name": "fusillade_batch_id",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 13,
+        "name": "input_price_per_token",
+        "type_info": "Numeric"
+      },
+      {
+        "ordinal": 14,
+        "name": "output_price_per_token",
+        "type_info": "Numeric"
+      },
+      {
+        "ordinal": 15,
+        "name": "custom_id",
+        "type_info": "Text"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Timestamptz",
+        "Timestamptz",
+        "Text",
+        "Uuid",
+        "Text",
+        "Text",
+        "Int4",
+        "Int4",
+        "Int4",
+        "Int8",
+        "Int8",
+        "Text",
+        "Int8",
+        "Int8"
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      false,
+      false,
+      true,
+      true,
+      true,
+      true,
+      true,
+      true,
+      true,
+      true,
+      true,
+      true,
+      true,
+      true
+    ]
+  },
+  "hash": "5cd78731676aea2e35dd1d99929dd53a33771270381f38a9a938598a067001e0"
+}

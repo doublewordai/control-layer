@@ -1,0 +1,14 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "UPDATE model_tariffs SET valid_until = NOW() WHERE id = ANY($1)",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "UuidArray"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "8504bbc13cfd1d1322ba071a545161f1f14b2fe896597de8cc495b916684812a"
+}
