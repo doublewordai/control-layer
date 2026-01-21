@@ -15,8 +15,12 @@ database:
 
   # Optional: Read replica URL for read-heavy operations (analytics, config sync)
   # replica_url: postgres://postgres:password@replica:5432/dwctl
+  # Can also be set via environment variables (in order of precedence):
+  #   DATABASE_REPLICA_URL=postgres://postgres:password@replica:5432/dwctl (recommended)
+  #   DWCTL_DATABASE_REPLICA_URL=postgres://postgres:password@replica:5432/dwctl (single underscore)
+  # Note: DWCTL_DATABASE__REPLICA_URL (double underscore) won't work due to config structure
 
-  # Main database pool settings
+  # Main database pool settings for primary (and replica if not specified separately)
   # pool:
   #   max_connections: 10
   #   min_connections: 0
