@@ -295,7 +295,7 @@ pub async fn validate_inference_endpoint(
         InferenceEndpointValidate::Existing { endpoint_id } => {
             // Scope the connection acquisition to release it before making HTTP request
             let endpoint = {
-                let mut conn = state.db.write().acquire().await.map_err(|e| Error::Database(e.into()))?;
+                let mut conn = state.db.read().acquire().await.map_err(|e| Error::Database(e.into()))?;
                 let mut endpoints_repo = InferenceEndpoints::new(&mut conn);
                 let endpoint = endpoints_repo.get_by_id(endpoint_id).await?;
                 endpoint.ok_or_else(|| Error::NotFound {

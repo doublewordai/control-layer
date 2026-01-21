@@ -482,7 +482,7 @@ pub async fn get_group_users(
     Path(group_id): Path<GroupId>,
     _: RequiresPermission<resource::Users, operation::ReadAll>,
 ) -> Result<Json<Vec<UserId>>> {
-    let mut pool_conn = state.db.write().acquire().await.map_err(|e| Error::Database(e.into()))?;
+    let mut pool_conn = state.db.read().acquire().await.map_err(|e| Error::Database(e.into()))?;
     let mut repo = Groups::new(&mut pool_conn);
 
     Ok(Json(repo.get_group_users(group_id).await?))
@@ -679,7 +679,7 @@ pub async fn get_deployment_groups(
     Path(deployment_id): Path<DeploymentId>,
     _: RequiresPermission<resource::Groups, operation::ReadAll>,
 ) -> Result<Json<Vec<GroupId>>> {
-    let mut pool_conn = state.db.write().acquire().await.map_err(|e| Error::Database(e.into()))?;
+    let mut pool_conn = state.db.read().acquire().await.map_err(|e| Error::Database(e.into()))?;
     let mut repo = Groups::new(&mut pool_conn);
     let groups = repo.get_deployment_groups(deployment_id).await?;
     Ok(Json(groups))
