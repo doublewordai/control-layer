@@ -1689,8 +1689,10 @@ impl Application {
         let shutdown_token = tokio_util::sync::CancellationToken::new();
 
         // Setup background services (onwards integration, probe scheduler, batch daemon, leader election)
+        // Note: Must use primary pool (via Deref) because onwards sync uses LISTEN/NOTIFY
+        // which requires direct database connection to primary (not through PgBouncer transaction pooling)
         let bg_services = setup_background_services(
-            db_pools.read().clone(),
+            (*db_pools).clone(),
             fusillade_pools.clone(),
             outlet_pools.as_ref().map(|p| (**p).clone()),
             config.clone(),
