@@ -347,7 +347,7 @@ pub async fn get_batch_analytics(
     }
 
     // Fetch aggregated analytics metrics for this batch
-    let analytics = crate::db::handlers::analytics::get_batch_analytics(&state.db, &batch_id)
+    let analytics = crate::db::handlers::analytics::get_batch_analytics(state.db.read(), &batch_id)
         .await
         .map_err(|e| Error::Internal {
             operation: format!("fetch batch analytics: {}", e),

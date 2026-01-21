@@ -107,7 +107,7 @@ pub async fn create_user_api_key(
         _ => {}
     }
 
-    let mut pool_conn = state.db.acquire().await.map_err(|e| Error::Database(e.into()))?;
+    let mut pool_conn = state.db.write().acquire().await.map_err(|e| Error::Database(e.into()))?;
     let mut repo = ApiKeys::new(&mut pool_conn);
     let db_request = ApiKeyCreateDBRequest::new(target_user_id, data);
 
@@ -178,7 +178,8 @@ pub async fn list_user_api_keys(
         }
     };
 
-    let mut pool_conn = state.db.acquire().await.map_err(|e| Error::Database(e.into()))?;
+    // Use read replica for this read-only operation
+    let mut pool_conn = state.db.read().acquire().await.map_err(|e| Error::Database(e.into()))?;
     let mut repo = ApiKeys::new(&mut pool_conn);
 
     // Extract pagination parameters with defaults & validation
@@ -262,7 +263,8 @@ pub async fn get_user_api_key(
         }
     };
 
-    let mut pool_conn = state.db.acquire().await.map_err(|e| Error::Database(e.into()))?;
+    // Use read replica for this read-only operation
+    let mut pool_conn = state.db.read().acquire().await.map_err(|e| Error::Database(e.into()))?;
     let mut repo = ApiKeys::new(&mut pool_conn);
 
     // Get the specific API key and verify ownership

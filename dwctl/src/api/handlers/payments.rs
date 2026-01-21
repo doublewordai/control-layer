@@ -391,7 +391,7 @@ mod tests {
             amount: Decimal::new(100, 0), // $100
         }));
 
-        let request_manager = std::sync::Arc::new(fusillade::PostgresRequestManager::new(pool.clone()));
+        let request_manager = std::sync::Arc::new(fusillade::PostgresRequestManager::new(crate::db::DbPools::new(pool.clone())));
         let state = AppState::builder()
             .db(crate::db::DbPools::new(pool.clone()))
             .config(config)
@@ -500,7 +500,7 @@ mod tests {
         // Setup config WITHOUT payment provider
         let config = create_test_config();
 
-        let request_manager = std::sync::Arc::new(fusillade::PostgresRequestManager::new(pool.clone()));
+        let request_manager = std::sync::Arc::new(fusillade::PostgresRequestManager::new(crate::db::DbPools::new(pool.clone())));
         let state = AppState::builder()
             .db(crate::db::DbPools::new(pool.clone()))
             .config(config)
@@ -534,7 +534,7 @@ mod tests {
             amount: Decimal::new(50, 0),
         }));
 
-        let request_manager = std::sync::Arc::new(fusillade::PostgresRequestManager::new(pool.clone()));
+        let request_manager = std::sync::Arc::new(fusillade::PostgresRequestManager::new(crate::db::DbPools::new(pool.clone())));
         let state = AppState::builder()
             .db(crate::db::DbPools::new(pool.clone()))
             .config(config)
@@ -568,7 +568,7 @@ mod tests {
             amount: Decimal::new(100, 0),
         }));
 
-        let request_manager = std::sync::Arc::new(fusillade::PostgresRequestManager::new(pool.clone()));
+        let request_manager = std::sync::Arc::new(fusillade::PostgresRequestManager::new(crate::db::DbPools::new(pool.clone())));
         let state = AppState::builder()
             .db(crate::db::DbPools::new(pool.clone()))
             .config(config)
@@ -624,7 +624,7 @@ mod tests {
         }));
 
         // Build AppState
-        let request_manager = std::sync::Arc::new(fusillade::PostgresRequestManager::new(pool.clone()));
+        let request_manager = std::sync::Arc::new(fusillade::PostgresRequestManager::new(crate::db::DbPools::new(pool.clone())));
         let state = AppState::builder()
             .db(crate::db::DbPools::new(pool.clone()))
             .config(config)
@@ -680,7 +680,7 @@ mod tests {
         }));
 
         // Build AppState
-        let request_manager = std::sync::Arc::new(fusillade::PostgresRequestManager::new(pool.clone()));
+        let request_manager = std::sync::Arc::new(fusillade::PostgresRequestManager::new(crate::db::DbPools::new(pool.clone())));
         let state = AppState::builder()
             .db(crate::db::DbPools::new(pool.clone()))
             .config(config)
@@ -717,7 +717,7 @@ mod tests {
         // config.payment is None by default
 
         // Build AppState
-        let request_manager = std::sync::Arc::new(fusillade::PostgresRequestManager::new(pool.clone()));
+        let request_manager = std::sync::Arc::new(fusillade::PostgresRequestManager::new(crate::db::DbPools::new(pool.clone())));
         let state = AppState::builder()
             .db(crate::db::DbPools::new(pool.clone()))
             .config(config)
@@ -766,7 +766,7 @@ mod tests {
         }));
 
         // Build AppState
-        let request_manager = std::sync::Arc::new(fusillade::PostgresRequestManager::new(pool.clone()));
+        let request_manager = std::sync::Arc::new(fusillade::PostgresRequestManager::new(crate::db::DbPools::new(pool.clone())));
         let state = AppState::builder()
             .db(crate::db::DbPools::new(pool.clone()))
             .config(config)
