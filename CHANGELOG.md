@@ -1,5 +1,12 @@
 # Changelog
 
+## [2.5.1](https://github.com/doublewordai/control-layer/compare/v2.5.0...v2.5.1) (2026-01-20)
+
+
+### Bug Fixes
+
+* added file upload UX parity to create batch modal ([#563](https://github.com/doublewordai/control-layer/issues/563)) ([c9fc647](https://github.com/doublewordai/control-layer/commit/c9fc64761e14c9f2c50600a6a663ee883229aee7))
+
 ## [2.5.0](https://github.com/doublewordai/control-layer/compare/v2.4.2...v2.5.0) (2026-01-20)
 
 
