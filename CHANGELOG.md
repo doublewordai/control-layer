@@ -1,5 +1,12 @@
 # Changelog
 
+## [2.7.0](https://github.com/doublewordai/control-layer/compare/v2.6.0...v2.7.0) (2026-01-21)
+
+
+### Features
+
+* implement read and write connections across handlers and tests ([#569](https://github.com/doublewordai/control-layer/issues/569)) ([405f33d](https://github.com/doublewordai/control-layer/commit/405f33df0c1343979be41e566addb85b7b6710cb))
+
 ## [2.6.0](https://github.com/doublewordai/control-layer/compare/v2.5.2...v2.6.0) (2026-01-21)
 
 
