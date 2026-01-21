@@ -1,5 +1,12 @@
 # Changelog
 
+## [2.7.1](https://github.com/doublewordai/control-layer/compare/v2.7.0...v2.7.1) (2026-01-21)
+
+
+### Bug Fixes
+
+* revert onwards sync to use main pool due to listen notify ([032b58c](https://github.com/doublewordai/control-layer/commit/032b58cab7afc1ebe65b64e4026722a58aeb54bf))
+
 ## [2.7.0](https://github.com/doublewordai/control-layer/compare/v2.6.0...v2.7.0) (2026-01-21)
 
 
