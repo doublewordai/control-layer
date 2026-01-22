@@ -168,7 +168,7 @@ async fn test_e2e_ai_proxy_with_mocked_inference(pool: PgPool) {
     let mut status = 404;
     let mut attempts = 0;
     for i in 0..50 {
-        // 50 attempts * 10ms = 500ms max
+        // 50 attempts, no sleep for fast polling
         attempts = i + 1;
         let test_response = server
             .post("/ai/v1/chat/completions")
@@ -184,7 +184,7 @@ async fn test_e2e_ai_proxy_with_mocked_inference(pool: PgPool) {
             // Model is now in onwards config
             break;
         }
-        tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
+        tokio::task::yield_now().await;
     }
     let poll_duration = poll_start.elapsed();
     println!(
@@ -239,7 +239,7 @@ async fn test_e2e_ai_proxy_with_mocked_inference(pool: PgPool) {
             if tries >= 50 {
                 panic!("Usage transaction not found after {} attempts", tries);
             }
-            tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
+            tokio::task::yield_now().await;
         }
     };
 
@@ -316,7 +316,7 @@ async fn test_e2e_ai_proxy_with_mocked_inference(pool: PgPool) {
         if status == 200 {
             break;
         }
-        tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
+        tokio::task::yield_now().await;
     }
 
     // Now proxy auth should work
@@ -557,7 +557,7 @@ async fn test_request_logging_enabled(pool: PgPool) {
     // Make a test request to /ai/ endpoint which should be logged
     let _ = server.get("/ai/v1/models").await;
 
-    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    tokio::task::yield_now().await;
     let result = repository
         .query(RequestFilter {
             method: Some("GET".into()),
@@ -594,7 +594,7 @@ async fn test_request_logging_disabled(pool: PgPool) {
     assert_eq!(response.status_code().as_u16(), 200);
     assert_eq!(response.text(), "OK");
 
-    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    tokio::task::yield_now().await;
 
     // Verify that no outlet schema or tables exist when logging is disabled
     let schema_exists =
@@ -716,7 +716,7 @@ async fn test_dedicated_databases_for_components(pool: PgPool) {
     let _ = server.get("/ai/v1/models").await;
 
     // Wait for logging to complete
-    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    tokio::task::yield_now().await;
 
     let result = repository
         .query(RequestFilter {
