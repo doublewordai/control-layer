@@ -1,5 +1,13 @@
 # Changelog
 
+## [2.7.2](https://github.com/doublewordai/control-layer/compare/v2.7.1...v2.7.2) (2026-01-22)
+
+
+### Bug Fixes
+
+* handle search path at connection time rather then after ([aa9c796](https://github.com/doublewordai/control-layer/commit/aa9c79648fc5083ee56dacacb679b615dfc059b5))
+* make test go zoom, remove sleep behavior in as many unit tests as possible ([#575](https://github.com/doublewordai/control-layer/issues/575)) ([d0adb91](https://github.com/doublewordai/control-layer/commit/d0adb91d8b97d359d50eca1e328aac80f28c20f5))
+
 ## [2.7.1](https://github.com/doublewordai/control-layer/compare/v2.7.0...v2.7.1) (2026-01-21)
 
 
