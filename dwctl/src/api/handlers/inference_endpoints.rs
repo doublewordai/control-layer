@@ -166,7 +166,7 @@ pub async fn update_inference_endpoint(
     Json(update): Json<InferenceEndpointUpdate>,
 ) -> Result<Json<InferenceEndpointResponse>> {
     // Use a transaction if alias mapping is being updated
-    if update.alias_mapping.is_some() {
+    if let Some(alias_mapping) = update.alias_mapping {
         let mut tx = state.db.begin().await.map_err(|e| Error::Database(e.into()))?;
         let mut repo = InferenceEndpoints::new(&mut tx);
         let db_request = InferenceEndpointUpdateDBRequest {
@@ -187,7 +187,6 @@ pub async fn update_inference_endpoint(
         let endpoint = repo.update(id, &db_request).await?;
 
         // Update aliases for existing deployments
-        let alias_mapping = update.alias_mapping.unwrap(); // Safe because we checked above
         let mut deployments_repo = Deployments::new(&mut tx);
         match update_endpoint_aliases(endpoint.clone(), &mut deployments_repo, &alias_mapping).await {
             Ok(sync_result) => {
