@@ -435,7 +435,7 @@ async fn test_sla_escalation_e2e(pool: PgPool) {
     let timeout = tokio::time::Duration::from_secs(10);
 
     while start.elapsed() < timeout {
-        tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+        tokio::task::yield_now().await;
 
         let (primary_count, escalation_count) = tracker.get_counts();
 
@@ -509,7 +509,7 @@ async fn test_sla_escalation_e2e(pool: PgPool) {
                 break;
             }
 
-            tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+            tokio::task::yield_now().await;
         }
     }
 
@@ -891,7 +891,7 @@ async fn test_sla_escalation_for_failed_batch(pool: PgPool) {
             panic!("Timeout waiting for requests to fail");
         }
 
-        tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+        tokio::task::yield_now().await;
     }
 
     // Step 7.5: Manually set batch.failed_at since the trigger was removed for performance
@@ -933,7 +933,7 @@ async fn test_sla_escalation_for_failed_batch(pool: PgPool) {
         let timeout = tokio::time::Duration::from_secs(5); // Give it up to 5 seconds (SLA check runs every 2s)
 
         while start.elapsed() < timeout {
-            tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+            tokio::task::yield_now().await;
 
             let (primary_count, escalation_count) = tracker.get_counts();
 
@@ -984,7 +984,7 @@ async fn test_sla_escalation_for_failed_batch(pool: PgPool) {
                 break;
             }
 
-            tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+            tokio::task::yield_now().await;
         }
     }
 
