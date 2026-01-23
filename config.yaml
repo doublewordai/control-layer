@@ -11,7 +11,7 @@ port: 3001
 database:
   # Configure connectivity to an external postgres database here
   type: external
-  url: postgresql://control_layer:REDACTED@ep-sweet-surf-ab897vvz.eu-west-2.aws.neon.tech/clay?sslmode=require&channel_binding=require&options=-csearch_path%3Dpublic%2Cfusillade
+  url: postgres://postgres:password@localhost:5432/dwctl
 
   # Optional: Read replica URL for read-heavy operations (analytics, config sync)
   # replica_url: postgres://postgres:password@replica:5432/dwctl
@@ -267,7 +267,7 @@ background_services:
   # Probe scheduler - periodically checks inference endpoint health
   # When leader_election is enabled, only runs on the elected leader
   probe_scheduler:
-    enabled: false # Default: true
+    enabled: true # Default: true
 
   # Batch processing daemon - processes batch requests asynchronously
   batch_daemon:
