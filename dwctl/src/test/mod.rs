@@ -551,7 +551,8 @@ async fn test_request_logging_enabled(pool: PgPool) {
 
     // Get outlet_db from app_state to query logs
     let outlet_pool = app.app_state.outlet_db.clone().expect("outlet_db should exist");
-    let repository: outlet_postgres::RequestRepository<PgPool, AiRequest, AiResponse> = outlet_postgres::RequestRepository::new(outlet_pool);
+    let repository: outlet_postgres::RequestRepository<PgPool, AiRequest, AiResponse> =
+        outlet_postgres::RequestRepository::new(outlet_pool);
 
     let (server, _drop_guard) = app.into_test_server();
 
@@ -709,7 +710,8 @@ async fn test_dedicated_databases_for_components(pool: PgPool) {
     );
 
     // Make a request and verify it gets logged to the dedicated outlet database
-    let repository: outlet_postgres::RequestRepository<PgPool, AiRequest, AiResponse> = outlet_postgres::RequestRepository::new(outlet_pool);
+    let repository: outlet_postgres::RequestRepository<PgPool, AiRequest, AiResponse> =
+        outlet_postgres::RequestRepository::new(outlet_pool);
 
     let (server, bg_services) = app.into_test_server();
 

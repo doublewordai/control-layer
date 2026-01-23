@@ -688,11 +688,10 @@ pub async fn get_model_components<P: PoolProvider>(
     Path(id): Path<DeploymentId>,
     _: RequiresPermission<resource::CompositeModels, operation::ReadAll>,
 ) -> Result<Json<Vec<ModelComponentResponse>>> {
-    let mut tx = state.db.read().begin().await.map_err(|e| Error::Database(e.into()))?;
-
     // Verify the model exists and is composite
     {
-        let mut repo = Deployments::new(tx.acquire().await.map_err(|e| Error::Database(e.into()))?);
+        let mut conn = state.db.read().acquire().await.map_err(|e| Error::Database(e.into()))?;
+        let mut repo = Deployments::new(&mut conn);
         let deployment = repo.get_by_id(id).await?.ok_or_else(|| Error::NotFound {
             resource: "model".to_string(),
             id: id.to_string(),
@@ -706,7 +705,8 @@ pub async fn get_model_components<P: PoolProvider>(
     }
 
     // Get components
-    let mut repo = Deployments::new(tx.acquire().await.map_err(|e| Error::Database(e.into()))?);
+    let mut conn = state.db.read().acquire().await.map_err(|e| Error::Database(e.into()))?;
+    let mut repo = Deployments::new(&mut conn);
     let components = repo.get_components(id).await?;
 
     let response: Vec<ModelComponentResponse> = components.into_iter().map(db_component_to_response).collect();
