@@ -1,5 +1,13 @@
 # Changelog
 
+## [2.8.0](https://github.com/doublewordai/control-layer/compare/v2.7.2...v2.8.0) (2026-01-23)
+
+
+### Features
+
+* batched inserts in fusillade ([#583](https://github.com/doublewordai/control-layer/issues/583)) ([98bc430](https://github.com/doublewordai/control-layer/commit/98bc430855aada8351226203a2ab11c935868d41))
+* speed up tests and simplify database handling, also add read and write pool for outlet ([#580](https://github.com/doublewordai/control-layer/issues/580)) ([51f25af](https://github.com/doublewordai/control-layer/commit/51f25aff0d14575c60867b67582eade80e902e9b))
+
 ## [2.7.2](https://github.com/doublewordai/control-layer/compare/v2.7.1...v2.7.2) (2026-01-22)
 
 
