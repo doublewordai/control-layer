@@ -1323,6 +1323,7 @@ async fn setup_background_services(
     config: Config,
     shutdown_token: tokio_util::sync::CancellationToken,
 ) -> anyhow::Result<BackgroundServices> {
+    use fusillade::manager::postgres::BatchInsertStrategy;
     let drop_guard = shutdown_token.clone().drop_guard();
     // Track all background task handles for graceful shutdown
     let mut background_tasks = BackgroundTaskBuilder::new();
@@ -1375,7 +1376,7 @@ async fn setup_background_services(
     // Clone fusillade pools for metrics before moving into request manager
     let fusillade_pool_for_metrics = fusillade_pools.write().clone();
 
-    // Initialize the fusillade request manager (for batch processing)
+    // / Initialize the fusillade request manager (for batch processing)
     let request_manager = Arc::new(
         fusillade::PostgresRequestManager::new(fusillade_pools)
             .with_config(
@@ -1385,13 +1386,9 @@ async fn setup_background_services(
                     .to_fusillade_config_with_limits(Some(model_capacity_limits.clone())),
             )
             .with_download_buffer_size(config.batches.files.download_buffer_size)
-            .with_batch_insert_strategy(
-                config
-                    .background_services
-                    .batch_daemon
-                    .batch_insert_strategy
-                    .unwrap_or_default()  // Use fusillade's Default impl if None
-            )
+            .with_batch_insert_strategy(BatchInsertStrategy::Batched {
+                batch_size: config.batches.files.batch_insert_size,
+            }),
     );
 
     let is_leader: bool;

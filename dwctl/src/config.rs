@@ -750,6 +750,8 @@ pub struct FilesConfig {
     pub upload_buffer_size: usize,
     /// Buffer size for file download streams (default: 100)
     pub download_buffer_size: usize,
+    /// Number of templates to insert in each batch during file upload (default: 5000)
+    pub batch_insert_size: usize,
 }
 
 impl Default for FilesConfig {
@@ -761,6 +763,7 @@ impl Default for FilesConfig {
             max_expiry_seconds: 30 * 24 * 60 * 60, // 30 days
             upload_buffer_size: 100,
             download_buffer_size: 100,
+            batch_insert_size: 5000,
         }
     }
 }
@@ -895,11 +898,6 @@ pub struct DaemonConfig {
     ///   - x-fusillade-batch-endpoint
     #[serde(default = "default_batch_metadata_fields_dwctl")]
     pub batch_metadata_fields: Vec<String>,
-
-    /// Template insertion strategy (individual vs batched)
-    /// Batched is much faster for large files (30k+ templates)
-    #[serde(default)]
-    pub batch_insert_strategy: Option<fusillade::manager::postgres::BatchInsertStrategy>,
 }
 
 fn default_batch_metadata_fields_dwctl() -> Vec<String> {
@@ -932,7 +930,6 @@ impl Default for DaemonConfig {
             model_escalations: HashMap::new(),
             sla_check_interval_seconds: 60,
             sla_thresholds: vec![],
-            batch_insert_strategy: None,
         }
     }
 }
