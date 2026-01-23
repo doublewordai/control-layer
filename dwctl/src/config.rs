@@ -1411,26 +1411,29 @@ impl Config {
             });
         }
 
-        // Validate batch file configuration whenever the request manager is used
+        // Validate batch file configuration whenever the request manager could be used.
         // The PostgresRequestManager is always constructed and uses these values for its batch
-        // insert strategy and buffer sizes, regardless of whether the batches API is enabled.
-        // Only skip validation if the daemon is explicitly disabled.
+        // insert strategy and buffer sizes. These settings are required when:
+        // - The batches API is enabled (file uploads/downloads use the request manager)
+        // - The batch daemon can run (processes batch requests)
         let daemon_can_run = self.background_services.batch_daemon.enabled != DaemonEnabled::Never;
+        let validate_request_manager_config = self.batches.enabled || daemon_can_run;
 
-        if daemon_can_run {
-            // These fields are used by PostgresRequestManager which is always constructed
+        if validate_request_manager_config {
+            // batch_insert_size is used by PostgresRequestManager for database insertion strategy
             if self.batches.files.batch_insert_size == 0 {
                 return Err(Error::Internal {
                     operation: "Config validation: batch_insert_size cannot be 0. Set a positive integer value (recommended: 1000-10000). \
-                               This setting is used by the request manager regardless of whether the batches API is enabled."
+                               This setting is used by the request manager when batches are enabled or the daemon runs."
                         .to_string(),
                 });
             }
 
+            // download_buffer_size is used by PostgresRequestManager for file download streams
             if self.batches.files.download_buffer_size == 0 {
                 return Err(Error::Internal {
                     operation: "Config validation: download_buffer_size cannot be 0. Set a positive integer value (default: 100). \
-                               This setting is used by the request manager regardless of whether the batches API is enabled."
+                               This setting is used by the request manager when batches are enabled or the daemon runs."
                         .to_string(),
                 });
             }
@@ -1438,6 +1441,7 @@ impl Config {
 
         // Validate batches API-specific configuration (only if batches API is enabled)
         if self.batches.enabled {
+            // upload_buffer_size is only used during file uploads (batches API specific)
             if self.batches.files.upload_buffer_size == 0 {
                 return Err(Error::Internal {
                     operation: "Config validation: upload_buffer_size cannot be 0. Set a positive integer value (default: 100)."
@@ -1898,6 +1902,34 @@ secret_key: "test-secret-key"
 
         let result = config.validate();
         assert!(result.is_err()); // Should fail because daemon uses download_buffer_size
+        assert!(result.unwrap_err().to_string().contains("download_buffer_size cannot be 0"));
+    }
+
+    #[test]
+    fn test_batch_insert_size_validated_when_batches_enabled_daemon_never() {
+        let mut config = Config::default();
+        config.auth.native.enabled = true;
+        config.secret_key = Some("test-secret-key".to_string());
+        config.batches.enabled = true; // Batches API enabled
+        config.background_services.batch_daemon.enabled = DaemonEnabled::Never; // Daemon disabled
+        config.batches.files.batch_insert_size = 0; // Invalid
+
+        let result = config.validate();
+        assert!(result.is_err()); // Should fail because batches API needs valid batch_insert_size
+        assert!(result.unwrap_err().to_string().contains("batch_insert_size cannot be 0"));
+    }
+
+    #[test]
+    fn test_download_buffer_validated_when_batches_enabled_daemon_never() {
+        let mut config = Config::default();
+        config.auth.native.enabled = true;
+        config.secret_key = Some("test-secret-key".to_string());
+        config.batches.enabled = true; // Batches API enabled
+        config.background_services.batch_daemon.enabled = DaemonEnabled::Never; // Daemon disabled
+        config.batches.files.download_buffer_size = 0; // Invalid
+
+        let result = config.validate();
+        assert!(result.is_err()); // Should fail because batches API needs valid download_buffer_size
         assert!(result.unwrap_err().to_string().contains("download_buffer_size cannot be 0"));
     }
 }
