@@ -8,6 +8,8 @@ import {
   SlidersHorizontal,
   Layers,
   ChevronDown,
+  X,
+  Check,
 } from "lucide-react";
 import { useAuthorization } from "../../../../utils";
 import {
@@ -35,7 +37,7 @@ import { Label } from "../../../ui/label";
 import { Switch } from "../../../ui/switch";
 import { ModelsContent } from "./ModelsContent";
 import { SupportRequestModal, CreateVirtualModelModal } from "../../../modals";
-import { useEndpoints } from "@/api/control-layer/hooks";
+import { useEndpoints, useGroups } from "@/api/control-layer/hooks";
 import { useDebounce } from "@/hooks/useDebounce";
 import { useServerPagination } from "@/hooks/useServerPagination";
 
@@ -52,6 +54,7 @@ const Models: React.FC = () => {
   const canManageModels = hasPermission("manage-models");
 
   const [filterProvider, setFilterProvider] = useState("all");
+  const [filterGroups, setFilterGroups] = useState<string[]>([]);
   const [filterModelType, setFilterModelType] = useState<"all" | "virtual" | "hosted">("all");
   const [searchQuery, setSearchQuery] = useState(
     searchParams.get("search") || "",
@@ -63,6 +66,7 @@ const Models: React.FC = () => {
   const pagination = useServerPagination({ defaultPageSize: 12 });
 
   const { data: endpointsData } = useEndpoints();
+  const { data: groupsData } = useGroups();
   const providers = [
     ...new Set(["all", ...(endpointsData || []).map((e) => e.name).sort()]),
   ];
@@ -72,6 +76,12 @@ const Models: React.FC = () => {
     filterProvider !== "all"
       ? endpointsData?.find((e) => e.name === filterProvider)?.id
       : undefined;
+
+  // Get group IDs from selected groups for server-side filtering (comma-separated)
+  const selectedGroupIds =
+    filterGroups.length > 0 ? filterGroups.join(",") : undefined;
+
+  const groups = groupsData?.data || [];
 
   // Sync search query to URL params
   useEffect(() => {
@@ -89,11 +99,11 @@ const Models: React.FC = () => {
     );
   }, [searchQuery, setSearchParams]);
 
-  // Reset pagination when search query, endpoint, or model type filter changes
+  // Reset pagination when search query, endpoint, groups, or model type filter changes
   useEffect(() => {
     pagination.handleReset();
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [debouncedSearch, selectedEndpointId, filterModelType]);
+  }, [debouncedSearch, selectedEndpointId, selectedGroupIds, filterModelType]);
 
   const viewMode = searchParams.get("view") || "grid";
   const isStatusMode = viewMode === "status";
@@ -105,6 +115,7 @@ const Models: React.FC = () => {
   const handleClearFilters = () => {
     setSearchQuery("");
     setFilterProvider("all");
+    setFilterGroups([]);
     setFilterModelType("all");
     setShowAccessibleOnly(false);
   };
@@ -173,7 +184,7 @@ const Models: React.FC = () => {
                       <SlidersHorizontal className="h-4 w-4" />
                       <span className="hidden sm:inline">Filter</span>
                       <ChevronDown className="h-3 w-3 opacity-50" />
-                      {(filterProvider !== "all" || (canManageGroups && filterModelType !== "all") || showAccessibleOnly) && (
+                      {(filterProvider !== "all" || filterGroups.length > 0 || (canManageGroups && filterModelType !== "all") || showAccessibleOnly) && (
                         <span className="absolute -top-1 -right-1 h-2 w-2 rounded-full bg-blue-500" />
                       )}
                     </Button>
@@ -202,6 +213,87 @@ const Models: React.FC = () => {
                               ))}
                             </SelectContent>
                           </Select>
+                        </div>
+                      )}
+                      {canManageGroups && (
+                        <div className="space-y-2">
+                          <Label htmlFor="group-filter">Groups</Label>
+                          <Popover>
+                            <PopoverTrigger asChild>
+                              <button
+                                id="group-filter"
+                                className="w-full inline-flex items-center justify-between rounded-md border border-input bg-background px-3 py-2 text-sm ring-offset-background focus:outline-none focus:ring-2 focus:ring-ring focus:ring-offset-2 disabled:cursor-not-allowed disabled:opacity-50"
+                                style={{ whiteSpace: "nowrap" }}
+                              >
+                                <span className="flex-1 text-left truncate">
+                                  {filterGroups.length === 0 ? (
+                                    <span className="text-muted-foreground">
+                                      Select groups...
+                                    </span>
+                                  ) : (
+                                    <span className="flex gap-1 flex-wrap">
+                                      {filterGroups.map((groupId) => {
+                                        const group = groups.find((g) => g.id === groupId);
+                                        return group ? (
+                                          <span
+                                            key={groupId}
+                                            className="inline-flex items-center gap-1 px-2 py-0.5 rounded-md bg-secondary text-secondary-foreground text-xs"
+                                          >
+                                            {group.name}
+                                            <X
+                                              className="h-3 w-3 cursor-pointer hover:opacity-70"
+                                              onClick={(e) => {
+                                                e.stopPropagation();
+                                                setFilterGroups(
+                                                  filterGroups.filter((id) => id !== groupId)
+                                                );
+                                              }}
+                                            />
+                                          </span>
+                                        ) : null;
+                                      })}
+                                    </span>
+                                  )}
+                                </span>
+                                <ChevronDown className="h-4 w-4 opacity-50 shrink-0 ml-2" />
+                              </button>
+                            </PopoverTrigger>
+                            <PopoverContent align="start" className="w-56 p-0">
+                              <div className="max-h-64 overflow-y-auto">
+                                {groups.length === 0 ? (
+                                  <div className="p-3 text-sm text-muted-foreground">
+                                    No groups available
+                                  </div>
+                                ) : (
+                                  groups.map((group) => {
+                                    const isSelected = filterGroups.includes(group.id);
+                                    return (
+                                      <button
+                                        key={group.id}
+                                        onClick={() => {
+                                          if (isSelected) {
+                                            setFilterGroups(
+                                              filterGroups.filter((id) => id !== group.id)
+                                            );
+                                          } else {
+                                            setFilterGroups([...filterGroups, group.id]);
+                                          }
+                                        }}
+                                        className="w-full flex items-center gap-2 rounded-sm py-1.5 pl-2 pr-2 text-sm hover:bg-accent hover:text-accent-foreground transition-colors text-left cursor-default"
+                                      >
+                                        <div className="w-4 h-4 shrink-0 flex items-center justify-center">
+                                          {isSelected && (
+                                            <Check className="h-4 w-4 text-primary" />
+                                          )}
+                                        </div>
+                                        <span>{group.name}</span>
+                                      </button>
+                                    );
+                                  })
+                                )}
+                              </div>
+                            </PopoverContent>
+                          </Popover>
                         </div>
                       )}
                       {canManageGroups && (
@@ -277,6 +369,7 @@ const Models: React.FC = () => {
           filterProvider={filterProvider}
           filterModelType={filterModelType}
           endpointId={selectedEndpointId}
+          groupId={selectedGroupIds}
           showAccessibleOnly={showAccessibleOnly}
           isStatusMode={isStatusMode}
           canManageGroups={canManageGroups}

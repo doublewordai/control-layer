@@ -279,6 +279,7 @@ export interface ModelsQuery {
   skip?: number;
   limit?: number;
   endpoint?: string;
+  group?: string; // Filter by group IDs (comma-separated UUIDs)
   include?: ModelsInclude;
   accessible?: boolean; // Filter to only models the current user can access
   search?: string; // Search query to filter models by alias or model_name
