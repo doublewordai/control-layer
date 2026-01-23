@@ -249,12 +249,12 @@ batches:
   # Files configuration for batch file uploads/downloads
   files:
     max_file_size: 2147483648 # 2 GB - maximum size for file uploads
-    upload_buffer_size: 100 # Buffer size for file upload streams (default: 100)
+    upload_buffer_size: 1000 # Buffer size for file upload streams (default: 100)
     download_buffer_size: 100 # Buffer size for file download streams (default: 100)
     # Database insertion batch size of request templates for file uploads
     # Higher values improve throughput for large files but use more memory
     # Reduce value if you encounter memory spike issues with many concurrent uploads
-    batch_insert_size: 5000
+    batch_insert_size: 1000
 
 # Background services configuration
 # Controls which background services run on this instance
