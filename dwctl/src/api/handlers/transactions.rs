@@ -1,5 +1,7 @@
 //! HTTP handlers for credit transaction endpoints.
 
+use sqlx_pool_router::PoolProvider;
+
 use crate::{
     AppState,
     api::models::{
@@ -48,8 +50,8 @@ use uuid::Uuid;
     )
 )]
 #[tracing::instrument(skip_all)]
-pub async fn create_transaction(
-    State(state): State<AppState>,
+pub async fn create_transaction<P: PoolProvider>(
+    State(state): State<AppState<P>>,
     _perm: RequiresPermission<resource::Credits, operation::CreateAll>,
     Json(data): Json<CreditTransactionCreate>,
 ) -> Result<(StatusCode, Json<CreditTransactionResponse>)> {
@@ -101,8 +103,8 @@ pub async fn create_transaction(
     )
 )]
 #[tracing::instrument(skip_all)]
-pub async fn get_transaction(
-    State(state): State<AppState>,
+pub async fn get_transaction<P: PoolProvider>(
+    State(state): State<AppState<P>>,
     Path(transaction_id): Path<Uuid>,
     current_user: CurrentUser,
 ) -> Result<Json<CreditTransactionResponse>> {
@@ -159,8 +161,8 @@ pub async fn get_transaction(
     )
 )]
 #[tracing::instrument(skip_all)]
-pub async fn list_transactions(
-    State(state): State<AppState>,
+pub async fn list_transactions<P: PoolProvider>(
+    State(state): State<AppState<P>>,
     Query(query): Query<ListTransactionsQuery>,
     current_user: CurrentUser,
 ) -> Result<Json<TransactionListResponse>> {

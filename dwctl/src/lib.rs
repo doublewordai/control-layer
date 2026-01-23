@@ -170,6 +170,8 @@ use crate::{
     openapi::{AdminApiDoc, AiApiDoc},
     request_logging::serializers::{AnalyticsResponseSerializer, parse_ai_request},
 };
+use sqlx_pool_router::{DbPools, PoolProvider};
+
 use anyhow::Context;
 use auth::middleware::admin_ai_proxy_middleware;
 use axum::extract::DefaultBodyLimit;
@@ -224,17 +226,19 @@ pub use types::{ApiKeyId, DeploymentId, GroupId, InferenceEndpointId, UserId};
 ///     .build();
 /// ```
 #[derive(Clone, Builder)]
-pub struct AppState {
+pub struct AppState<P = DbPools>
+where
+    P: PoolProvider + Clone,
+{
     /// Database pools (primary + optional replica).
-    /// Implements `Deref<Target = PgPool>` for backwards compatibility.
     /// Use `.read()` for read-only queries, `.write()` for writes.
-    pub db: db::DbPools,
+    pub db: P,
     pub config: Config,
     pub outlet_db: Option<PgPool>,
     pub metrics_recorder: Option<GenAiMetrics>,
     #[builder(default = false)]
     pub is_leader: bool,
-    pub request_manager: Arc<fusillade::PostgresRequestManager<db::DbPools, fusillade::ReqwestHttpClient>>,
+    pub request_manager: Arc<fusillade::PostgresRequestManager<P, fusillade::ReqwestHttpClient>>,
 }
 
 /// Get the dwctl database migrator
@@ -498,28 +502,19 @@ pub async fn seed_database(sources: &[config::ModelSource], db: &PgPool) -> Resu
 async fn setup_database(
     config: &Config,
     pool: Option<PgPool>,
-) -> anyhow::Result<(
-    Option<db::embedded::EmbeddedDatabase>,
-    db::DbPools,
-    db::DbPools,
-    Option<db::DbPools>,
-)> {
-    // If a pool is provided (e.g., from tests), use it directly
+) -> anyhow::Result<(Option<db::embedded::EmbeddedDatabase>, DbPools, DbPools, Option<DbPools>)> {
+    // If a pool is provided (e.g., from tests), create a TestDbPools which will create a read-only replica
     let (embedded_db, pool, test_replica_pool) = if let Some(existing_pool) = pool {
-        info!("Using provided database pool");
+        info!("Using provided database pool with TestDbPools for read/write separation");
 
-        // In test mode, automatically create a read-only replica pool for testing
-        // This ensures all tests verify correct pool routing
-        #[cfg(test)]
-        let test_replica = {
-            info!("Creating read-only test replica pool for pool routing validation");
-            Some(test::utils::create_readonly_replica_pool(&existing_pool).await?)
-        };
+        // Create TestDbPools which creates a read-only replica for testing
+        let test_pools = sqlx_pool_router::TestDbPools::new(existing_pool.clone())
+            .await
+            .expect("Failed to create TestDbPools");
 
-        #[cfg(not(test))]
-        let test_replica = None;
-
-        (None, existing_pool, test_replica)
+        // Extract the write and read pools to create a DbPools with proper read/write separation
+        let replica_pool = test_pools.read().clone();
+        (None, existing_pool, Some(replica_pool))
     } else {
         // Database connection - handle both embedded and external
         let (_embedded_db, database_url) = match &config.database {
@@ -575,7 +570,7 @@ async fn setup_database(
     // Create replica pool if configured (or use test replica if in test mode)
     let db_pools = if let Some(test_replica) = test_replica_pool {
         info!("Using test replica pool with read-only enforcement");
-        db::DbPools::with_replica(pool, test_replica)
+        DbPools::with_replica(pool, test_replica)
     } else if let Some(replica_url) = config.database.external_replica_url() {
         info!("Setting up read replica pool");
         let replica_settings = config.database.main_replica_pool_settings();
@@ -595,9 +590,9 @@ async fn setup_database(
             })
             .connect(replica_url)
             .await?;
-        db::DbPools::with_replica(pool, replica_pool)
+        DbPools::with_replica(pool, replica_pool)
     } else {
-        db::DbPools::new(pool)
+        DbPools::new(pool)
     };
 
     // Get connection options from the main pool to create schema-based child pools
@@ -645,13 +640,14 @@ async fn setup_database(
             primary.execute(&*format!("CREATE SCHEMA IF NOT EXISTS {name}")).await?;
 
             // Create replica pool if main has one configured (inherits main's replica connection)
-            if let Some(replica_opts) = db_pools.replica_connect_options() {
+            if db_pools.has_replica() {
                 info!("Setting up fusillade read replica (schema mode)");
+                let replica_opts = db_pools.read().connect_options().as_ref().clone();
                 let replica_pool_settings = config.database.fusillade().replica_pool_settings();
                 let replica = create_schema_pool(name.clone(), replica_opts, replica_pool_settings);
-                db::DbPools::with_replica(primary, replica)
+                DbPools::with_replica(primary, replica)
             } else {
-                db::DbPools::new(primary)
+                DbPools::new(primary)
             }
         }
         config::ComponentDb::Dedicated {
@@ -697,9 +693,9 @@ async fn setup_database(
                     })
                     .connect(replica_url)
                     .await?;
-                db::DbPools::with_replica(primary, replica)
+                DbPools::with_replica(primary, replica)
             } else {
-                db::DbPools::new(primary)
+                DbPools::new(primary)
             }
         }
     };
@@ -717,13 +713,14 @@ async fn setup_database(
                 primary.execute(&*format!("CREATE SCHEMA IF NOT EXISTS {name}")).await?;
 
                 // Create replica pool if main has one configured (inherits main's replica connection)
-                if let Some(replica_opts) = db_pools.replica_connect_options() {
+                if db_pools.has_replica() {
                     info!("Setting up outlet read replica (schema mode)");
+                    let replica_opts = db_pools.read().connect_options().as_ref().clone();
                     let replica_pool_settings = config.database.outlet().replica_pool_settings();
                     let replica = create_schema_pool(name.clone(), replica_opts, replica_pool_settings);
-                    db::DbPools::with_replica(primary, replica)
+                    DbPools::with_replica(primary, replica)
                 } else {
-                    db::DbPools::new(primary)
+                    DbPools::new(primary)
                 }
             }
             config::ComponentDb::Dedicated {
@@ -769,9 +766,9 @@ async fn setup_database(
                         })
                         .connect(replica_url)
                         .await?;
-                    db::DbPools::with_replica(primary, replica)
+                    DbPools::with_replica(primary, replica)
                 } else {
-                    db::DbPools::new(primary)
+                    DbPools::new(primary)
                 }
             }
         };
@@ -1196,7 +1193,7 @@ pub async fn build_router(state: &mut AppState, onwards_router: Router) -> anyho
 /// stop all background tasks. When dropped, the `drop_guard` will automatically cancel
 /// the shutdown token, signaling all tasks to stop.
 pub struct BackgroundServices {
-    request_manager: Arc<fusillade::PostgresRequestManager<db::DbPools, fusillade::ReqwestHttpClient>>,
+    request_manager: Arc<fusillade::PostgresRequestManager<DbPools, fusillade::ReqwestHttpClient>>,
     is_leader: bool,
     onwards_targets: onwards::target::Targets,
     #[cfg_attr(not(test), allow(dead_code))]
@@ -1322,7 +1319,7 @@ impl BackgroundTaskBuilder {
 /// Setup background services (probe scheduler, batch daemon, leader election, onwards integration)
 async fn setup_background_services(
     pool: PgPool,
-    fusillade_pools: db::DbPools,
+    fusillade_pools: DbPools,
     outlet_pool: Option<PgPool>,
     config: Config,
     shutdown_token: tokio_util::sync::CancellationToken,
@@ -1657,9 +1654,9 @@ pub struct Application {
     router: Router,
     app_state: AppState,
     config: Config,
-    db_pools: db::DbPools,
-    _fusillade_pools: db::DbPools,
-    _outlet_pools: Option<db::DbPools>,
+    db_pools: DbPools,
+    _fusillade_pools: DbPools,
+    _outlet_pools: Option<DbPools>,
     _embedded_db: Option<db::embedded::EmbeddedDatabase>,
     bg_services: BackgroundServices,
 }

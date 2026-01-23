@@ -72,6 +72,7 @@ use axum::{
 };
 use serde::{Deserialize, Serialize};
 use serde_json::json;
+use sqlx_pool_router::PoolProvider;
 
 use crate::{AppState, api::models::users::CurrentUser, payment_providers};
 
@@ -100,8 +101,8 @@ pub struct PaymentQuery {
     )
 )]
 #[tracing::instrument(skip_all)]
-pub async fn create_payment(
-    State(state): State<AppState>,
+pub async fn create_payment<P: PoolProvider>(
+    State(state): State<AppState<P>>,
     user: CurrentUser,
     axum::extract::Query(query): axum::extract::Query<PaymentQuery>,
 ) -> Result<Response, StatusCode> {
@@ -195,8 +196,8 @@ pub async fn create_payment(
     )
 )]
 #[tracing::instrument(skip_all)]
-pub async fn process_payment(
-    State(state): State<AppState>,
+pub async fn process_payment<P: PoolProvider>(
+    State(state): State<AppState<P>>,
     axum::extract::Path(id): axum::extract::Path<String>,
     _user: CurrentUser,
 ) -> Result<Response, StatusCode> {
@@ -216,7 +217,7 @@ pub async fn process_payment(
     };
 
     // Process the payment session using the provider trait
-    match provider.process_payment_session(&state.db, &id).await {
+    match provider.process_payment_session(state.db.write(), &id).await {
         Ok(()) => Ok(Json(json!({
             "message": "Payment processed successfully"
         }))
@@ -267,7 +268,11 @@ pub async fn process_payment(
     ),
 )]
 #[tracing::instrument(skip_all)]
-pub async fn webhook_handler(State(state): State<AppState>, headers: axum::http::HeaderMap, body: String) -> StatusCode {
+pub async fn webhook_handler<P: PoolProvider>(
+    State(state): State<AppState<P>>,
+    headers: axum::http::HeaderMap,
+    body: String,
+) -> StatusCode {
     // Get payment provider from config
     let provider = match state.config.payment.clone() {
         Some(payment_config) => payment_providers::create_provider(payment_config),
@@ -293,7 +298,7 @@ pub async fn webhook_handler(State(state): State<AppState>, headers: axum::http:
     tracing::trace!("Received webhook event: {}", event.event_type);
 
     // Process the webhook event
-    match provider.process_webhook_event(&state.db, &event).await {
+    match provider.process_webhook_event(state.db.write(), &event).await {
         Ok(()) => {
             tracing::trace!("Successfully processed webhook event: {}", event.event_type);
             StatusCode::OK
@@ -328,7 +333,10 @@ pub async fn webhook_handler(State(state): State<AppState>, headers: axum::http:
     )
 )]
 #[tracing::instrument(skip_all)]
-pub async fn create_billing_portal_session(State(state): State<AppState>, user: CurrentUser) -> Result<Response, StatusCode> {
+pub async fn create_billing_portal_session<P: PoolProvider>(
+    State(state): State<AppState<P>>,
+    user: CurrentUser,
+) -> Result<Response, StatusCode> {
     // Get payment provider from config
     let payment_config = match state.config.payment.clone() {
         Some(config) => config,
@@ -381,6 +389,7 @@ mod tests {
     use axum_test::TestServer;
     use rust_decimal::Decimal;
     use sqlx::PgPool;
+    use sqlx_pool_router::DbPools;
 
     #[sqlx::test]
     async fn test_dummy_payment_flow(pool: PgPool) {
@@ -391,12 +400,7 @@ mod tests {
             amount: Decimal::new(100, 0), // $100
         }));
 
-        let request_manager = std::sync::Arc::new(fusillade::PostgresRequestManager::new(crate::db::DbPools::new(pool.clone())));
-        let state = AppState::builder()
-            .db(crate::db::DbPools::new(pool.clone()))
-            .config(config)
-            .request_manager(request_manager)
-            .build();
+        let state = crate::test::utils::create_test_app_state_with_config(pool.clone(), config).await;
 
         // Create a test user
         let user = crate::test::utils::create_test_user(&pool, crate::api::models::users::Role::StandardUser).await;
@@ -500,12 +504,7 @@ mod tests {
         // Setup config WITHOUT payment provider
         let config = create_test_config();
 
-        let request_manager = std::sync::Arc::new(fusillade::PostgresRequestManager::new(crate::db::DbPools::new(pool.clone())));
-        let state = AppState::builder()
-            .db(crate::db::DbPools::new(pool.clone()))
-            .config(config)
-            .request_manager(request_manager)
-            .build();
+        let state = crate::test::utils::create_test_app_state_with_config(pool.clone(), config).await;
 
         let user = crate::test::utils::create_test_user(&pool, crate::api::models::users::Role::StandardUser).await;
         let auth_headers = crate::test::utils::add_auth_headers(&user);
@@ -534,12 +533,7 @@ mod tests {
             amount: Decimal::new(50, 0),
         }));
 
-        let request_manager = std::sync::Arc::new(fusillade::PostgresRequestManager::new(crate::db::DbPools::new(pool.clone())));
-        let state = AppState::builder()
-            .db(crate::db::DbPools::new(pool.clone()))
-            .config(config)
-            .request_manager(request_manager)
-            .build();
+        let state = crate::test::utils::create_test_app_state_with_config(pool.clone(), config).await;
 
         let user = crate::test::utils::create_test_user(&pool, crate::api::models::users::Role::StandardUser).await;
         let auth_headers = crate::test::utils::add_auth_headers(&user);
@@ -568,12 +562,7 @@ mod tests {
             amount: Decimal::new(100, 0),
         }));
 
-        let request_manager = std::sync::Arc::new(fusillade::PostgresRequestManager::new(crate::db::DbPools::new(pool.clone())));
-        let state = AppState::builder()
-            .db(crate::db::DbPools::new(pool.clone()))
-            .config(config)
-            .request_manager(request_manager)
-            .build();
+        let state = crate::test::utils::create_test_app_state_with_config(pool.clone(), config).await;
 
         let payer = crate::test::utils::create_test_user(&pool, crate::api::models::users::Role::StandardUser).await;
         let recipient = crate::test::utils::create_test_user(&pool, crate::api::models::users::Role::StandardUser).await;
@@ -624,12 +613,7 @@ mod tests {
         }));
 
         // Build AppState
-        let request_manager = std::sync::Arc::new(fusillade::PostgresRequestManager::new(crate::db::DbPools::new(pool.clone())));
-        let state = AppState::builder()
-            .db(crate::db::DbPools::new(pool.clone()))
-            .config(config)
-            .request_manager(request_manager)
-            .build();
+        let state = crate::test::utils::create_test_app_state_with_config(pool.clone(), config).await;
 
         // Create test user
         let user = crate::test::utils::create_test_user(&pool, crate::api::models::users::Role::StandardUser).await;
@@ -680,12 +664,7 @@ mod tests {
         }));
 
         // Build AppState
-        let request_manager = std::sync::Arc::new(fusillade::PostgresRequestManager::new(crate::db::DbPools::new(pool.clone())));
-        let state = AppState::builder()
-            .db(crate::db::DbPools::new(pool.clone()))
-            .config(config)
-            .request_manager(request_manager)
-            .build();
+        let state = crate::test::utils::create_test_app_state_with_config(pool.clone(), config).await;
 
         // Create test user WITHOUT payment_provider_id (default is null)
         let user = crate::test::utils::create_test_user(&pool, crate::api::models::users::Role::StandardUser).await;
@@ -717,12 +696,7 @@ mod tests {
         // config.payment is None by default
 
         // Build AppState
-        let request_manager = std::sync::Arc::new(fusillade::PostgresRequestManager::new(crate::db::DbPools::new(pool.clone())));
-        let state = AppState::builder()
-            .db(crate::db::DbPools::new(pool.clone()))
-            .config(config)
-            .request_manager(request_manager)
-            .build();
+        let state = crate::test::utils::create_test_app_state_with_config(pool.clone(), config).await;
 
         // Create test user
         let user = crate::test::utils::create_test_user(&pool, crate::api::models::users::Role::StandardUser).await;
@@ -766,12 +740,7 @@ mod tests {
         }));
 
         // Build AppState
-        let request_manager = std::sync::Arc::new(fusillade::PostgresRequestManager::new(crate::db::DbPools::new(pool.clone())));
-        let state = AppState::builder()
-            .db(crate::db::DbPools::new(pool.clone()))
-            .config(config)
-            .request_manager(request_manager)
-            .build();
+        let state = crate::test::utils::create_test_app_state_with_config(pool.clone(), config).await;
 
         // Create test user
         let user = crate::test::utils::create_test_user(&pool, crate::api::models::users::Role::StandardUser).await;

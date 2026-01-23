@@ -24,44 +24,30 @@ use crate::{
     },
 };
 use axum_test::TestServer;
-use sqlx::{PgConnection, PgPool, postgres::PgPoolOptions};
+use sqlx::{PgConnection, PgPool};
+use sqlx_pool_router::{PoolProvider, TestDbPools};
 use uuid::Uuid;
 
-/// Create a read-only replica pool from an existing pool.
-///
-/// The replica pool enforces `default_transaction_read_only = on`,
-/// so any write operations will fail with a PostgreSQL error.
-/// This helps catch pool routing violations in tests.
-pub async fn create_readonly_replica_pool(pool: &PgPool) -> Result<PgPool, sqlx::Error> {
-    PgPoolOptions::new()
-        .max_connections(pool.options().get_max_connections())
-        .after_connect(|conn, _meta| {
-            Box::pin(async move {
-                // Set all transactions to read-only by default
-                sqlx::query("SET default_transaction_read_only = on").execute(&mut *conn).await?;
-                Ok(())
-            })
-        })
-        .connect_with(pool.connect_options().as_ref().clone())
-        .await
+/// Create an AppState with TestDbPools for proper read/write replica testing
+/// Use this in tests that need to manually construct AppState instead of using create_test_app
+pub async fn create_test_app_state(pool: PgPool) -> crate::AppState<TestDbPools> {
+    create_test_app_state_with_config(pool, create_test_config()).await
 }
 
-/// Create test DbPools with read-only enforcement on replica.
-///
-/// This creates:
-/// - A primary pool (clone of input) for writes
-/// - A replica pool (new connection) configured as read-only
-///
-/// The replica pool enforces `default_transaction_read_only = on`,
-/// so any write operations will fail with a PostgreSQL error.
-/// This helps catch pool routing violations in tests.
-pub async fn create_test_db_pools(pool: PgPool) -> crate::db::DbPools {
-    let primary = pool.clone();
-    let replica = create_readonly_replica_pool(&pool)
+/// Create an AppState with TestDbPools and custom config
+pub async fn create_test_app_state_with_config(pool: PgPool, config: crate::config::Config) -> crate::AppState<TestDbPools> {
+    let test_pools = TestDbPools::new(pool.clone()).await.expect("Failed to create TestDbPools");
+    let fusillade_pools = TestDbPools::new(pool.clone())
         .await
-        .expect("Failed to create read-only replica pool for testing");
+        .expect("Failed to create fusillade TestDbPools");
 
-    crate::db::DbPools::with_replica(primary, replica)
+    let request_manager = std::sync::Arc::new(fusillade::PostgresRequestManager::new(fusillade_pools));
+
+    crate::AppState::builder()
+        .db(test_pools)
+        .config(config)
+        .request_manager(request_manager)
+        .build()
 }
 
 pub async fn create_test_app(pool: PgPool, _enable_sync: bool) -> (TestServer, crate::BackgroundServices) {

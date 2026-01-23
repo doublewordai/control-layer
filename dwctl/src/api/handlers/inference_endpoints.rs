@@ -1,5 +1,7 @@
 //! HTTP handlers for inference endpoint management.
 
+use sqlx_pool_router::PoolProvider;
+
 use crate::{
     AppState,
     api::models::inference_endpoints::{
@@ -79,8 +81,8 @@ impl FetchModels for MockFetchModels {
     )
 )]
 #[tracing::instrument(skip_all)]
-pub async fn list_inference_endpoints(
-    State(state): State<AppState>,
+pub async fn list_inference_endpoints<P: PoolProvider>(
+    State(state): State<AppState<P>>,
     Query(query): Query<ListEndpointsQuery>,
     _: RequiresPermission<resource::Endpoints, operation::ReadAll>,
 ) -> Result<Json<Vec<InferenceEndpointResponse>>> {
@@ -117,8 +119,8 @@ pub async fn list_inference_endpoints(
     )
 )]
 #[tracing::instrument(skip_all)]
-pub async fn get_inference_endpoint(
-    State(state): State<AppState>,
+pub async fn get_inference_endpoint<P: PoolProvider>(
+    State(state): State<AppState<P>>,
     Path(id): Path<InferenceEndpointId>,
     _: RequiresPermission<resource::Endpoints, operation::ReadAll>,
 ) -> Result<Json<InferenceEndpointResponse>> {
@@ -159,15 +161,15 @@ pub async fn get_inference_endpoint(
     )
 )]
 #[tracing::instrument(skip_all)]
-pub async fn update_inference_endpoint(
-    State(state): State<AppState>,
+pub async fn update_inference_endpoint<P: PoolProvider>(
+    State(state): State<AppState<P>>,
     Path(id): Path<InferenceEndpointId>,
     _: RequiresPermission<resource::Endpoints, operation::UpdateAll>,
     Json(update): Json<InferenceEndpointUpdate>,
 ) -> Result<Json<InferenceEndpointResponse>> {
     // Use a transaction if alias mapping is being updated
     if let Some(alias_mapping) = update.alias_mapping {
-        let mut tx = state.db.begin().await.map_err(|e| Error::Database(e.into()))?;
+        let mut tx = state.db.write().begin().await.map_err(|e| Error::Database(e.into()))?;
         let mut repo = InferenceEndpoints::new(&mut tx);
         let db_request = InferenceEndpointUpdateDBRequest {
             name: update.name,
@@ -236,7 +238,7 @@ pub async fn update_inference_endpoint(
         let endpoint = repo.update(id, &db_request).await?;
 
         // Perform background sync after successful update
-        match endpoint_sync::synchronize_endpoint(endpoint.id, (*state.db).clone()).await {
+        match endpoint_sync::synchronize_endpoint(endpoint.id, state.db.write().clone()).await {
             Ok(sync_result) => {
                 tracing::info!(
                     "Auto-sync after endpoint {} update: {} changes made",
@@ -274,8 +276,8 @@ pub async fn update_inference_endpoint(
     )
 )]
 #[tracing::instrument(skip_all)]
-pub async fn validate_inference_endpoint(
-    State(state): State<AppState>,
+pub async fn validate_inference_endpoint<P: PoolProvider>(
+    State(state): State<AppState<P>>,
     _: RequiresPermission<resource::Endpoints, operation::UpdateAll>,
     Json(validate_request): Json<InferenceEndpointValidate>,
 ) -> Result<Json<InferenceEndpointValidateResponse>> {
@@ -350,8 +352,8 @@ pub async fn validate_inference_endpoint(
     )
 )]
 #[tracing::instrument(skip_all)]
-pub async fn create_inference_endpoint(
-    State(state): State<AppState>,
+pub async fn create_inference_endpoint<P: PoolProvider>(
+    State(state): State<AppState<P>>,
     current_user: RequiresPermission<resource::Endpoints, operation::CreateAll>,
     Json(create_request): Json<InferenceEndpointCreate>,
 ) -> Result<(StatusCode, Json<InferenceEndpointResponse>)> {
@@ -360,7 +362,7 @@ pub async fn create_inference_endpoint(
     })?;
 
     // Start transaction for atomic endpoint creation + sync
-    let mut tx = state.db.begin().await.map_err(|e| Error::Database(e.into()))?;
+    let mut tx = state.db.write().begin().await.map_err(|e| Error::Database(e.into()))?;
 
     // Create the endpoint within the transaction
     let mut repo = InferenceEndpoints::new(&mut tx);
@@ -458,8 +460,8 @@ pub async fn create_inference_endpoint(
     )
 )]
 #[tracing::instrument(skip_all)]
-pub async fn delete_inference_endpoint(
-    State(state): State<AppState>,
+pub async fn delete_inference_endpoint<P: PoolProvider>(
+    State(state): State<AppState<P>>,
     Path(id): Path<InferenceEndpointId>,
     _: RequiresPermission<resource::Endpoints, operation::DeleteAll>,
 ) -> Result<StatusCode> {
@@ -558,13 +560,13 @@ async fn validate_endpoint_connection(
     )
 )]
 #[tracing::instrument(skip_all)]
-pub async fn synchronize_endpoint(
-    State(state): State<AppState>,
+pub async fn synchronize_endpoint<P: PoolProvider>(
+    State(state): State<AppState<P>>,
     Path(id): Path<InferenceEndpointId>,
     _: RequiresPermission<resource::Endpoints, operation::UpdateAll>,
 ) -> Result<Json<endpoint_sync::EndpointSyncResponse>> {
     // Perform synchronization
-    let response = endpoint_sync::synchronize_endpoint(id, (*state.db).clone()).await?;
+    let response = endpoint_sync::synchronize_endpoint(id, state.db.write().clone()).await?;
 
     tracing::info!("Successfully synchronized endpoint {} with {} changes", id, response.changes_made);
     Ok(Json(response))
