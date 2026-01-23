@@ -1,5 +1,12 @@
 # Changelog
 
+## [2.9.0](https://github.com/doublewordai/control-layer/compare/v2.8.0...v2.9.0) (2026-01-23)
+
+
+### Features
+
+* add model filtering by group ([#586](https://github.com/doublewordai/control-layer/issues/586)) ([0be0ef3](https://github.com/doublewordai/control-layer/commit/0be0ef336ef0bc5019cbc66fbcf8b92f2ce7b28e))
+
 ## [2.8.0](https://github.com/doublewordai/control-layer/compare/v2.7.2...v2.8.0) (2026-01-23)
 
 
