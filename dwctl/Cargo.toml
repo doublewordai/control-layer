@@ -1,6 +1,6 @@
 [package]
 name = "dwctl"
-version = "2.7.1"
+version = "2.7.2"
 edition = "2024"
 description = "The Doubleword Control Layer - A self-hostable observability and analytics platform for LLM applications"
 license = "MIT OR Apache-2.0"
@@ -19,7 +19,11 @@ embedded-db = ["dep:postgresql_embedded"]
 
 [dependencies]
 axum = { version = "0.8", features = ["multipart"] }
+<<<<<<< HEAD
 fusillade = { version = "2.1.1" }
+=======
+fusillade = { version = "2.0.1" }
+>>>>>>> main
 tokio = { version = "1.0", features = ["full"] }
 tokio-stream = { version = "0.1", features = ["sync"] }
 tokio-util = "0.7"

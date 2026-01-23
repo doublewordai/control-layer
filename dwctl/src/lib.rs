@@ -605,7 +605,18 @@ async fn setup_database(
 
     // Helper to create a pool with schema-specific search_path
     // Reuses connection URLs from main pool (both primary and replica if configured)
+    // Sets search_path at the connection level (via PgConnectOptions) rather than using
+    // after_connect hooks, ensuring it cannot be unset and works reliably with replicas
     let create_schema_pool = |schema: String, opts: sqlx::postgres::PgConnectOptions, settings: &config::PoolSettings| {
+        // Set search_path directly in connection options so PostgreSQL enforces it
+        // This is more reliable than after_connect hooks, especially with replicas
+        // The options() method formats as: "-c key=value"
+        // We need to create owned values that live long enough for the closure
+        let search_path_key = "search_path".to_string();
+        let search_path_value = schema.clone();
+        info!("Setting search_path={} via connection options for schema pool", schema);
+        let opts_with_schema = opts.options([(search_path_key, search_path_value)]);
+
         sqlx::postgres::PgPoolOptions::new()
             .max_connections(settings.max_connections)
             .min_connections(settings.min_connections)
@@ -620,14 +631,7 @@ async fn setup_database(
             } else {
                 None
             })
-            .after_connect(move |conn, _meta| {
-                let s = schema.clone();
-                Box::pin(async move {
-                    conn.execute(&*format!("SET search_path = '{s}'")).await?;
-                    Ok(())
-                })
-            })
-            .connect_lazy_with(opts)
+            .connect_lazy_with(opts_with_schema)
     };
 
     // Setup fusillade batch processing pool
