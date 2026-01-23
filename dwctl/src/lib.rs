@@ -1326,6 +1326,7 @@ async fn setup_background_services(
     config: Config,
     shutdown_token: tokio_util::sync::CancellationToken,
 ) -> anyhow::Result<BackgroundServices> {
+    use fusillade::manager::postgres::BatchInsertStrategy;
     let drop_guard = shutdown_token.clone().drop_guard();
     // Track all background task handles for graceful shutdown
     let mut background_tasks = BackgroundTaskBuilder::new();
@@ -1387,7 +1388,10 @@ async fn setup_background_services(
                     .batch_daemon
                     .to_fusillade_config_with_limits(Some(model_capacity_limits.clone())),
             )
-            .with_download_buffer_size(config.batches.files.download_buffer_size),
+            .with_download_buffer_size(config.batches.files.download_buffer_size)
+            .with_batch_insert_strategy(BatchInsertStrategy::Batched {
+                batch_size: config.batches.files.batch_insert_size,
+            }),
     );
 
     let is_leader: bool;

@@ -750,6 +750,8 @@ pub struct FilesConfig {
     pub upload_buffer_size: usize,
     /// Buffer size for file download streams (default: 100)
     pub download_buffer_size: usize,
+    /// Number of templates to insert in each batch during file upload (default: 5000)
+    pub batch_insert_size: usize,
 }
 
 impl Default for FilesConfig {
@@ -761,6 +763,7 @@ impl Default for FilesConfig {
             max_expiry_seconds: 30 * 24 * 60 * 60, // 30 days
             upload_buffer_size: 100,
             download_buffer_size: 100,
+            batch_insert_size: 5000,
         }
     }
 }
@@ -1408,6 +1411,99 @@ impl Config {
             });
         }
 
+        // Validate batch file configuration whenever the request manager could be used.
+        // The PostgresRequestManager is always constructed and uses these values for its batch
+        // insert strategy and buffer sizes. These settings are required when:
+        // - The batches API is enabled (file uploads/downloads use the request manager)
+        // - The batch daemon can run (processes batch requests)
+        let daemon_can_run = self.background_services.batch_daemon.enabled != DaemonEnabled::Never;
+        let validate_request_manager_config = self.batches.enabled || daemon_can_run;
+
+        if validate_request_manager_config {
+            // batch_insert_size is used by PostgresRequestManager for database insertion strategy
+            if self.batches.files.batch_insert_size == 0 {
+                return Err(Error::Internal {
+                    operation: "Config validation: batch_insert_size cannot be 0. Set a positive integer value (recommended: 1000-10000). \
+                               This setting is used by the request manager when batches are enabled or the daemon runs."
+                        .to_string(),
+                });
+            }
+
+            // download_buffer_size is used by PostgresRequestManager for file download streams
+            if self.batches.files.download_buffer_size == 0 {
+                return Err(Error::Internal {
+                    operation: "Config validation: download_buffer_size cannot be 0. Set a positive integer value (default: 100). \
+                               This setting is used by the request manager when batches are enabled or the daemon runs."
+                        .to_string(),
+                });
+            }
+        }
+
+        // Validate batches API-specific configuration (only if batches API is enabled)
+        if self.batches.enabled {
+            // upload_buffer_size is only used during file uploads (batches API specific)
+            if self.batches.files.upload_buffer_size == 0 {
+                return Err(Error::Internal {
+                    operation: "Config validation: upload_buffer_size cannot be 0. Set a positive integer value (default: 100)."
+                        .to_string(),
+                });
+            }
+
+            // Validate file size limits are sensible
+            if self.batches.files.max_file_size == 0 {
+                return Err(Error::Internal {
+                    operation: "Config validation: max_file_size cannot be 0. Set a positive value in bytes (default: 100MB).".to_string(),
+                });
+            }
+
+            // Validate expiry times are positive and in sensible order
+            if self.batches.files.min_expiry_seconds <= 0 {
+                return Err(Error::Internal {
+                    operation: "Config validation: min_expiry_seconds must be positive (default: 3600 = 1 hour).".to_string(),
+                });
+            }
+
+            if self.batches.files.default_expiry_seconds <= 0 {
+                return Err(Error::Internal {
+                    operation: "Config validation: default_expiry_seconds must be positive (default: 86400 = 24 hours).".to_string(),
+                });
+            }
+
+            if self.batches.files.max_expiry_seconds <= 0 {
+                return Err(Error::Internal {
+                    operation: "Config validation: max_expiry_seconds must be positive (default: 2592000 = 30 days).".to_string(),
+                });
+            }
+
+            // Validate expiry times are in correct order
+            if self.batches.files.min_expiry_seconds > self.batches.files.default_expiry_seconds {
+                return Err(Error::Internal {
+                    operation: format!(
+                        "Config validation: min_expiry_seconds ({}) cannot be greater than default_expiry_seconds ({})",
+                        self.batches.files.min_expiry_seconds, self.batches.files.default_expiry_seconds
+                    ),
+                });
+            }
+
+            if self.batches.files.default_expiry_seconds > self.batches.files.max_expiry_seconds {
+                return Err(Error::Internal {
+                    operation: format!(
+                        "Config validation: default_expiry_seconds ({}) cannot be greater than max_expiry_seconds ({})",
+                        self.batches.files.default_expiry_seconds, self.batches.files.max_expiry_seconds
+                    ),
+                });
+            }
+
+            if self.batches.files.min_expiry_seconds > self.batches.files.max_expiry_seconds {
+                return Err(Error::Internal {
+                    operation: format!(
+                        "Config validation: min_expiry_seconds ({}) cannot be greater than max_expiry_seconds ({})",
+                        self.batches.files.min_expiry_seconds, self.batches.files.max_expiry_seconds
+                    ),
+                });
+            }
+        }
+
         Ok(())
     }
 
@@ -1598,5 +1694,242 @@ auth:
 
         let result = config.validate();
         assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_batch_insert_size_default() {
+        let config = Config::default();
+        assert_eq!(config.batches.files.batch_insert_size, 5000);
+    }
+
+    #[test]
+    fn test_batch_insert_size_yaml_override() {
+        Jail::expect_with(|jail| {
+            jail.create_file(
+                "test.yaml",
+                r#"
+secret_key: "test-secret-key"
+batches:
+  files:
+    batch_insert_size: 10000
+"#,
+            )?;
+
+            let args = Args {
+                config: "test.yaml".to_string(),
+                validate: false,
+            };
+
+            let config = Config::load(&args)?;
+            assert_eq!(config.batches.files.batch_insert_size, 10000);
+
+            Ok(())
+        });
+    }
+
+    #[test]
+    fn test_batch_insert_size_env_override() {
+        Jail::expect_with(|jail| {
+            jail.create_file(
+                "test.yaml",
+                r#"
+secret_key: "test-secret-key"
+"#,
+            )?;
+
+            jail.set_env("DWCTL_BATCHES__FILES__BATCH_INSERT_SIZE", "7500");
+
+            let args = Args {
+                config: "test.yaml".to_string(),
+                validate: false,
+            };
+
+            let config = Config::load(&args)?;
+            assert_eq!(config.batches.files.batch_insert_size, 7500);
+
+            Ok(())
+        });
+    }
+
+    #[test]
+    fn test_batch_insert_size_zero_validation() {
+        let mut config = Config::default();
+        config.auth.native.enabled = true;
+        config.secret_key = Some("test-secret-key".to_string());
+        config.batches.enabled = true;
+        config.batches.files.batch_insert_size = 0;
+
+        let result = config.validate();
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("batch_insert_size cannot be 0"));
+    }
+
+    #[test]
+    fn test_upload_buffer_size_zero_validation() {
+        let mut config = Config::default();
+        config.auth.native.enabled = true;
+        config.secret_key = Some("test-secret-key".to_string());
+        config.batches.enabled = true;
+        config.batches.files.upload_buffer_size = 0;
+
+        let result = config.validate();
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("upload_buffer_size cannot be 0"));
+    }
+
+    #[test]
+    fn test_download_buffer_size_zero_validation() {
+        let mut config = Config::default();
+        config.auth.native.enabled = true;
+        config.secret_key = Some("test-secret-key".to_string());
+        config.batches.enabled = true;
+        config.batches.files.download_buffer_size = 0;
+
+        let result = config.validate();
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("download_buffer_size cannot be 0"));
+    }
+
+    #[test]
+    fn test_max_file_size_zero_validation() {
+        let mut config = Config::default();
+        config.auth.native.enabled = true;
+        config.secret_key = Some("test-secret-key".to_string());
+        config.batches.enabled = true;
+        config.batches.files.max_file_size = 0;
+
+        let result = config.validate();
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("max_file_size cannot be 0"));
+    }
+
+    #[test]
+    fn test_expiry_times_positive_validation() {
+        let mut config = Config::default();
+        config.auth.native.enabled = true;
+        config.secret_key = Some("test-secret-key".to_string());
+        config.batches.enabled = true;
+
+        // Test min_expiry_seconds
+        config.batches.files.min_expiry_seconds = 0;
+        let result = config.validate();
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("min_expiry_seconds must be positive"));
+
+        // Test default_expiry_seconds
+        config.batches.files.min_expiry_seconds = 3600;
+        config.batches.files.default_expiry_seconds = 0;
+        let result = config.validate();
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("default_expiry_seconds must be positive"));
+
+        // Test max_expiry_seconds
+        config.batches.files.default_expiry_seconds = 86400;
+        config.batches.files.max_expiry_seconds = 0;
+        let result = config.validate();
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("max_expiry_seconds must be positive"));
+    }
+
+    #[test]
+    fn test_expiry_times_order_validation() {
+        let mut config = Config::default();
+        config.auth.native.enabled = true;
+        config.secret_key = Some("test-secret-key".to_string());
+        config.batches.enabled = true;
+
+        // Test min > default
+        config.batches.files.min_expiry_seconds = 86400;
+        config.batches.files.default_expiry_seconds = 3600;
+        config.batches.files.max_expiry_seconds = 2592000;
+        let result = config.validate();
+        assert!(result.is_err());
+        let err_msg = result.unwrap_err().to_string();
+        assert!(err_msg.contains("min_expiry_seconds") && err_msg.contains("default_expiry_seconds"));
+
+        // Test default > max
+        config.batches.files.min_expiry_seconds = 3600;
+        config.batches.files.default_expiry_seconds = 2592000;
+        config.batches.files.max_expiry_seconds = 86400;
+        let result = config.validate();
+        assert!(result.is_err());
+        let err_msg = result.unwrap_err().to_string();
+        assert!(err_msg.contains("default_expiry_seconds") && err_msg.contains("max_expiry_seconds"));
+
+        // Test min > max (should also fail)
+        config.batches.files.min_expiry_seconds = 2592000;
+        config.batches.files.default_expiry_seconds = 86400;
+        config.batches.files.max_expiry_seconds = 3600;
+        let result = config.validate();
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_batch_validation_skipped_when_disabled() {
+        let mut config = Config::default();
+        config.auth.native.enabled = true;
+        config.secret_key = Some("test-secret-key".to_string());
+        config.batches.enabled = false; // Disabled
+        config.background_services.batch_daemon.enabled = DaemonEnabled::Never; // Daemon also disabled
+        config.batches.files.batch_insert_size = 0; // Invalid, but should be ignored when daemon is Never
+
+        let result = config.validate();
+        assert!(result.is_ok()); // Should pass because both batches AND daemon are disabled
+    }
+
+    #[test]
+    fn test_batch_insert_size_validated_when_daemon_enabled() {
+        let mut config = Config::default();
+        config.auth.native.enabled = true;
+        config.secret_key = Some("test-secret-key".to_string());
+        config.batches.enabled = false; // Batches API disabled
+        config.background_services.batch_daemon.enabled = DaemonEnabled::Leader; // But daemon can run
+        config.batches.files.batch_insert_size = 0; // Invalid
+
+        let result = config.validate();
+        assert!(result.is_err()); // Should fail because daemon can run and needs valid batch_insert_size
+        assert!(result.unwrap_err().to_string().contains("batch_insert_size cannot be 0"));
+    }
+
+    #[test]
+    fn test_download_buffer_validated_when_daemon_enabled() {
+        let mut config = Config::default();
+        config.auth.native.enabled = true;
+        config.secret_key = Some("test-secret-key".to_string());
+        config.batches.enabled = false; // Batches API disabled
+        config.background_services.batch_daemon.enabled = DaemonEnabled::Always; // Daemon always runs
+        config.batches.files.download_buffer_size = 0; // Invalid
+
+        let result = config.validate();
+        assert!(result.is_err()); // Should fail because daemon uses download_buffer_size
+        assert!(result.unwrap_err().to_string().contains("download_buffer_size cannot be 0"));
+    }
+
+    #[test]
+    fn test_batch_insert_size_validated_when_batches_enabled_daemon_never() {
+        let mut config = Config::default();
+        config.auth.native.enabled = true;
+        config.secret_key = Some("test-secret-key".to_string());
+        config.batches.enabled = true; // Batches API enabled
+        config.background_services.batch_daemon.enabled = DaemonEnabled::Never; // Daemon disabled
+        config.batches.files.batch_insert_size = 0; // Invalid
+
+        let result = config.validate();
+        assert!(result.is_err()); // Should fail because batches API needs valid batch_insert_size
+        assert!(result.unwrap_err().to_string().contains("batch_insert_size cannot be 0"));
+    }
+
+    #[test]
+    fn test_download_buffer_validated_when_batches_enabled_daemon_never() {
+        let mut config = Config::default();
+        config.auth.native.enabled = true;
+        config.secret_key = Some("test-secret-key".to_string());
+        config.batches.enabled = true; // Batches API enabled
+        config.background_services.batch_daemon.enabled = DaemonEnabled::Never; // Daemon disabled
+        config.batches.files.download_buffer_size = 0; // Invalid
+
+        let result = config.validate();
+        assert!(result.is_err()); // Should fail because batches API needs valid download_buffer_size
+        assert!(result.unwrap_err().to_string().contains("download_buffer_size cannot be 0"));
     }
 }
