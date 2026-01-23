@@ -122,6 +122,30 @@ pub async fn list_deployed_models(
         filter = filter.with_endpoint(endpoint_id);
     };
 
+    // Parse comma-separated group IDs if specified
+    if let Some(ref group_str) = query.group {
+        let group_ids: std::result::Result<Vec<_>, _> = group_str
+            .split(',')
+            .map(|s| s.trim())
+            .filter(|s| !s.is_empty())
+            .map(|s| s.parse::<crate::types::GroupId>())
+            .collect();
+
+        match group_ids {
+            Ok(ids) if !ids.is_empty() => {
+                filter = filter.with_groups(ids);
+            }
+            Ok(_) => {
+                // Empty list after filtering, ignore
+            }
+            Err(_) => {
+                return Err(Error::BadRequest {
+                    message: "Invalid group ID format. Expected comma-separated UUIDs.".to_string(),
+                });
+            }
+        }
+    };
+
     // Handle deleted models - admins can supply query parameter
     if has_system_access {
         if query.deleted.unwrap_or(false) {

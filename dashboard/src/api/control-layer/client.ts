@@ -231,6 +231,7 @@ const modelApi = {
     if (options?.limit !== undefined)
       params.set("limit", options.limit.toString());
     if (options?.endpoint) params.set("endpoint", options.endpoint);
+    if (options?.group) params.set("group", options.group);
     if (options?.include) params.set("include", options.include);
     if (options?.accessible !== undefined)
       params.set("accessible", options.accessible.toString());

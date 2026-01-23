@@ -58,6 +58,7 @@ export interface ModelsContentProps {
   filterProvider: string;
   filterModelType: "all" | "virtual" | "hosted";
   endpointId?: string;
+  groupId?: string;
   showAccessibleOnly: boolean;
   isStatusMode: boolean;
   canManageGroups: boolean;
@@ -74,6 +75,7 @@ export const ModelsContent: React.FC<ModelsContentProps> = ({
   filterProvider,
   filterModelType,
   endpointId,
+  groupId,
   showAccessibleOnly,
   isStatusMode,
   canManageGroups,
@@ -116,6 +118,7 @@ export const ModelsContent: React.FC<ModelsContentProps> = ({
     accessible: isStatusMode ? true : !canManageGroups || showAccessibleOnly,
     search: searchQuery || undefined,
     endpoint: endpointId,
+    group: groupId,
     is_composite: isCompositeFilter,
   });
 

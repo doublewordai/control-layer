@@ -25,6 +25,7 @@ pub struct DeploymentFilter {
     pub statuses: Option<Vec<ModelStatus>>,
     pub deleted: Option<bool>, // None = show all, Some(false) = show non-deleted only, Some(true) = show deleted only
     pub accessible_to: Option<UserId>, // None = show all deployments, Some(user_id) = show only deployments accessible to that user
+    pub group_ids: Option<Vec<crate::types::GroupId>>, // None = show all, Some(group_ids) = show only models in any of these groups
     pub aliases: Option<Vec<String>>,
     pub search: Option<String>,     // Case-insensitive substring search on alias and model_name
     pub is_composite: Option<bool>, // None = show all, Some(true) = composite only, Some(false) = non-composite only
@@ -39,6 +40,7 @@ impl DeploymentFilter {
             statuses: None,
             deleted: None,       // Default: show all models
             accessible_to: None, // Default: show all deployments
+            group_ids: None,     // Default: show all groups
             aliases: None,
             search: None,
             is_composite: None, // Default: show all models
@@ -57,6 +59,11 @@ impl DeploymentFilter {
 
     pub fn with_accessible_to(mut self, user_id: UserId) -> Self {
         self.accessible_to = Some(user_id);
+        self
+    }
+
+    pub fn with_groups(mut self, group_ids: Vec<crate::types::GroupId>) -> Self {
+        self.group_ids = Some(group_ids);
         self
     }
 
@@ -551,6 +558,16 @@ impl<'c> Repository for Deployments<'c> {
             query.push("))");
         }
 
+        // Add group filter if specified
+        if let Some(ref group_ids) = filter.group_ids
+            && !group_ids.is_empty()
+        {
+            query.push(" AND dm.id IN (");
+            query.push("SELECT dg.deployment_id FROM deployment_groups dg WHERE dg.group_id = ANY(");
+            query.push_bind(group_ids);
+            query.push("))");
+        }
+
         // Add search filter if specified (case-insensitive substring match on alias, model_name, or endpoint name)
         if let Some(ref search) = filter.search {
             let search_pattern = format!("%{}%", search.to_lowercase());
@@ -674,6 +691,16 @@ impl<'c> Deployments<'c> {
             query.push(" UNION SELECT '00000000-0000-0000-0000-000000000000'::uuid WHERE ");
             query.push_bind(user_id);
             query.push(" != '00000000-0000-0000-0000-000000000000'::uuid");
+            query.push("))");
+        }
+
+        // Add group filter if specified
+        if let Some(ref group_ids) = filter.group_ids
+            && !group_ids.is_empty()
+        {
+            query.push(" AND dm.id IN (");
+            query.push("SELECT dg.deployment_id FROM deployment_groups dg WHERE dg.group_id = ANY(");
+            query.push_bind(group_ids);
             query.push("))");
         }
 
