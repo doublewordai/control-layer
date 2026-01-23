@@ -2562,4 +2562,100 @@ mod tests {
         let empty_page: PaginatedResponse<DeployedModelResponse> = response.json();
         assert_eq!(empty_page.data.len(), 0, "Offset beyond available models should return empty array");
     }
+
+    #[sqlx::test]
+    #[test_log::test]
+    async fn test_list_models_with_group_filter(pool: PgPool) {
+        let (app, _bg_services) = create_test_app(pool.clone(), false).await;
+        let admin_user = create_test_admin_user(&pool, Role::PlatformManager).await;
+
+        // Create three deployments
+        let deployment1 = create_test_deployment(&pool, admin_user.id, "model-1", "alias-1").await;
+        let deployment2 = create_test_deployment(&pool, admin_user.id, "model-2", "alias-2").await;
+        let deployment3 = create_test_deployment(&pool, admin_user.id, "model-3", "alias-3").await;
+
+        // Create two groups
+        let mut group_conn = pool.acquire().await.unwrap();
+        let mut group_repo = Groups::new(&mut group_conn);
+
+        let group1_create = GroupCreateDBRequest {
+            name: "Production".to_string(),
+            description: Some("Production group".to_string()),
+            created_by: admin_user.id,
+        };
+        let group1 = group_repo.create(&group1_create).await.unwrap();
+
+        let group2_create = GroupCreateDBRequest {
+            name: "Staging".to_string(),
+            description: Some("Staging group".to_string()),
+            created_by: admin_user.id,
+        };
+        let group2 = group_repo.create(&group2_create).await.unwrap();
+
+        // Add deployment1 to group1
+        group_repo
+            .add_deployment_to_group(deployment1.id, group1.id, admin_user.id)
+            .await
+            .unwrap();
+
+        // Add deployment2 to group2
+        group_repo
+            .add_deployment_to_group(deployment2.id, group2.id, admin_user.id)
+            .await
+            .unwrap();
+
+        // deployment3 has no groups
+
+        // Test 1: Filter by single group
+        let response = app
+            .get(&format!("/admin/api/v1/models?group={}", group1.id))
+            .add_header(&add_auth_headers(&admin_user)[0].0, &add_auth_headers(&admin_user)[0].1)
+            .add_header(&add_auth_headers(&admin_user)[1].0, &add_auth_headers(&admin_user)[1].1)
+            .await;
+        response.assert_status_ok();
+        let single_group: PaginatedResponse<DeployedModelResponse> = response.json();
+        assert_eq!(single_group.data.len(), 1, "Should only return models from group1");
+        assert!(get_model_by_id(deployment1.id, &single_group).is_some());
+        assert!(get_model_by_id(deployment2.id, &single_group).is_none());
+        assert!(get_model_by_id(deployment3.id, &single_group).is_none());
+
+        // Test 2: Filter by multiple groups (comma-separated)
+        let response = app
+            .get(&format!("/admin/api/v1/models?group={},{}", group1.id, group2.id))
+            .add_header(&add_auth_headers(&admin_user)[0].0, &add_auth_headers(&admin_user)[0].1)
+            .add_header(&add_auth_headers(&admin_user)[1].0, &add_auth_headers(&admin_user)[1].1)
+            .await;
+        response.assert_status_ok();
+        let multi_group: PaginatedResponse<DeployedModelResponse> = response.json();
+        assert_eq!(multi_group.data.len(), 2, "Should return models from both groups");
+        assert!(get_model_by_id(deployment1.id, &multi_group).is_some());
+        assert!(get_model_by_id(deployment2.id, &multi_group).is_some());
+        assert!(get_model_by_id(deployment3.id, &multi_group).is_none());
+
+        // Test 3: Invalid group ID format should return 400
+        let response = app
+            .get("/admin/api/v1/models?group=invalid-uuid")
+            .add_header(&add_auth_headers(&admin_user)[0].0, &add_auth_headers(&admin_user)[0].1)
+            .add_header(&add_auth_headers(&admin_user)[1].0, &add_auth_headers(&admin_user)[1].1)
+            .await;
+        response.assert_status(axum::http::StatusCode::BAD_REQUEST);
+
+        // Test 4: Mix of valid and invalid UUIDs should return 400
+        let response = app
+            .get(&format!("/admin/api/v1/models?group={},invalid-uuid", group1.id))
+            .add_header(&add_auth_headers(&admin_user)[0].0, &add_auth_headers(&admin_user)[0].1)
+            .add_header(&add_auth_headers(&admin_user)[1].0, &add_auth_headers(&admin_user)[1].1)
+            .await;
+        response.assert_status(axum::http::StatusCode::BAD_REQUEST);
+
+        // Test 5: Empty group parameter (just commas) should work without filtering
+        let response = app
+            .get("/admin/api/v1/models?group=,,,")
+            .add_header(&add_auth_headers(&admin_user)[0].0, &add_auth_headers(&admin_user)[0].1)
+            .add_header(&add_auth_headers(&admin_user)[1].0, &add_auth_headers(&admin_user)[1].1)
+            .await;
+        response.assert_status_ok();
+        let all_models: PaginatedResponse<DeployedModelResponse> = response.json();
+        assert!(all_models.data.len() >= 3, "Empty group list should return all models");
+    }
 }
