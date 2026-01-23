@@ -750,6 +750,8 @@ pub struct FilesConfig {
     pub upload_buffer_size: usize,
     /// Buffer size for file download streams (default: 100)
     pub download_buffer_size: usize,
+    /// Number of templates to insert in each batch during file upload (default: 5000)
+    pub batch_insert_size: usize,
 }
 
 impl Default for FilesConfig {
@@ -761,6 +763,7 @@ impl Default for FilesConfig {
             max_expiry_seconds: 30 * 24 * 60 * 60, // 30 days
             upload_buffer_size: 100,
             download_buffer_size: 100,
+            batch_insert_size: 5000,
         }
     }
 }
