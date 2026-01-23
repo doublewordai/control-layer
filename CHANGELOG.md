@@ -1,5 +1,12 @@
 # Changelog
 
+## [2.9.1](https://github.com/doublewordai/control-layer/compare/v2.9.0...v2.9.1) (2026-01-23)
+
+
+### Bug Fixes
+
+* write pool for get file right after creation, due to tx race conditions ([#588](https://github.com/doublewordai/control-layer/issues/588)) ([3a2b35f](https://github.com/doublewordai/control-layer/commit/3a2b35f4e94f1a77cbf310150d6ac0c24ab02723))
+
 ## [2.9.0](https://github.com/doublewordai/control-layer/compare/v2.8.0...v2.9.0) (2026-01-23)
 
 
